@@ -1,0 +1,88 @@
+// A page described as JSON, and a live editor for it.
+//
+//   quillo run examples/layout.qwe --watch     then open http://localhost:8080
+//
+// layout.json is a tree of blocks: { type, props, children }. One view,
+// Node, renders any block by its type; `{...node.props}` passes the block's
+// props straight to the view or component (keys it does not know are
+// ignored). On the right, the same layout renders in the browser as you
+// edit the JSON on the left.
+
+view Heading(text: str) = <h2>{text}</h2>
+
+view Stat(label: str, value: num, trend: str = "") =
+    <div.stat class={trend}>
+        <span.value>{value}</span>
+        <span.label>{label} {trend == "up" ? "▲" : trend == "down" ? "▼" : ""}</span>
+    </div>
+
+view Card(title: str, children) = <section.card><h3>{title}</h3>{children}</section>
+
+component Counter(label: str, start: int = 0, step: int = 1) {
+    ~n = start
+    <p.counter>
+        {label}: <b>{n}</b>
+        <button @click={() => { n += step }}>+{step}</button>
+    </p>
+}
+
+// Every block type, and what it renders as.
+view Node(node) = match node {
+    { type: "page", children: list } => <div.page>{blocks(children)}</div>
+    { type: "row", children: list } => <div.row>{blocks(children)}</div>
+    { type: "heading" } => <Heading {...node.props}/>
+    { type: "stat" } => <Stat {...node.props}/>
+    { type: "card", children: list } => <Card {...node.props}>{blocks(children)}</Card>
+    { type: "counter" } => <Counter {...node.props}/>
+    { type: "link", text: str } => <a {...node.props}>{text}</a>
+    { type: str as t } => <p.unknown>Unknown block “{t}”</p>
+    _ => <p.unknown>Not a block: {json.stringify(node)}</p>
+}
+
+fn blocks(children) = for c in children => <Node node={c}/>
+
+component Editor(initial: str) {
+    ~source = initial
+    let layout = json.parse(source)
+    <div.editor>
+        <textarea spellcheck={false} bind:value={source}></textarea>
+        <div.preview>
+            {is_err(layout)
+                ? <p.error>{layout.error}</p>
+                : <Node node={layout}/>}
+        </div>
+    </div>
+}
+
+let css = "
+body { font: 15px/1.45 system-ui, sans-serif; margin: 2rem; color: #222; }
+.editor { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; }
+textarea { width: 100%; height: 34rem; font: 12.5px/1.5 ui-monospace, monospace; padding: .75rem; box-sizing: border-box; border: 1px solid #ccc; border-radius: 8px; }
+.preview { border: 1px dashed #ccc; border-radius: 8px; padding: 0 1rem 1rem; }
+.row { display: flex; gap: .75rem; }
+.stat { flex: 1; border: 1px solid #e5e5e5; border-radius: 8px; padding: .5rem .75rem; }
+.stat .value { display: block; font-size: 1.5rem; font-weight: 600; }
+.stat .label { color: #666; } .stat.up .label { color: #1a7f37; } .stat.down .label { color: #b42318; }
+.card { border: 1px solid #e5e5e5; border-radius: 8px; padding: 0 1rem .75rem; margin-top: 1rem; }
+.counter button { margin-left: .5rem; }
+a.button { display: inline-block; padding: .3rem .8rem; border-radius: 6px; background: #222; color: white; text-decoration: none; }
+.unknown { color: #888; font-style: italic; } .error { color: #b42318; font-family: ui-monospace, monospace; font-size: 13px; }
+"
+
+let source = read_file("layout.json")
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>JSON layout</title>
+            <style>{raw(css)}</style>
+        </head>
+        <body>
+            <h1>JSON layout</h1>
+            <Editor initial={source}/>
+        </body>
+    </html>
+
+// The layout alone, rendered on the server, with no JavaScript but the counter.
+route GET /page = <html><head><style>{raw(css)}</style></head><body><Node node={json.parse(source)}/></body></html>

@@ -194,6 +194,9 @@ pub struct RouteDef {
 pub enum AttrVal {
     Bool,
     Expr(Expr),
+    /// `{...map}`: each key of the map becomes an attribute (or a prop).
+    /// Stored under the name `...`.
+    Spread(Expr),
 }
 
 #[derive(Debug, Clone)]

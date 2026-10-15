@@ -297,3 +297,33 @@ fn runaway_recursion_is_an_error_not_a_crash() {
     assert!(e.contains("too much recursion") && e.contains("`down`"), "{}", e);
     assert_eq!(ev("fn down(n) = n == 0 ? 0 : 1 + down(n - 1)\ndown(100)"), "100");
 }
+
+#[test]
+fn spread_and_shorthand_attributes() {
+    // On elements: written-out attributes win, classes add up.
+    assert_eq!(
+        ev(r#"let a = { href: "/x", title: "from map", class: "big", "data-n": 1 }
+<a.link {...a} title="written">go</a>"#),
+        r#"<a class="link big" href="/x" data-n="1" title="written">go</a>"#
+    );
+    // `{name}` is short for name={name}.
+    assert_eq!(ev("let id = \"main\"\nlet hidden = true\n<div {id} {hidden}></div>"), r#"<div id="main" hidden></div>"#);
+    // On views: spread keys fill parameters; extra keys are ignored.
+    let src = r#"
+view Card(title: str, size: str = "m", children) = <section class={size}><h2>{title}</h2>{children}</section>
+let node = { type: "card", props: { title: "Stock", size: "l", unrelated: true } }
+[<Card {...node.props}>x</Card>, <Card {...node.props} size="s"/>, <Card {...null} title="t"/>]
+"#;
+    assert_eq!(
+        ev(src),
+        r#"[<section class="l"><h2>Stock</h2>x</section>, <section class="s"><h2>Stock</h2></section>, <section class="m"><h2>t</h2></section>]"#
+    );
+    let label = "x";
+    let _ = label;
+    assert_eq!(ev("view L(label: str) = <i>{label}</i>\nlet label = \"short\"\n<L {label}/>"), "<i>short</i>");
+    // Still errors: a misspelled written-out prop, a missing one, a non-map spread.
+    assert!(ev_err("view Card(title: str) = <b>{title}</b>\n<Card {...{ title: \"a\" }} titel=\"b\"/>").contains("has no parameter `titel`"));
+    assert!(ev_err("view Card(title: str) = <b>{title}</b>\n<Card {...{ other: 1 }}/>").contains("missing argument `title`"));
+    assert!(ev_err("<p {...5}></p>").contains("`{...}` in <p> needs a map, got int"));
+    assert!(ev_err("<p {1 + 1}></p>").contains("write {name} (short for name={name}) or {...map}"));
+}

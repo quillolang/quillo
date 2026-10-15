@@ -410,6 +410,10 @@
           "match": "\\+=|-=|="
         },
         {
+          "name": "keyword.operator.spread.quillo",
+          "match": "\\.\\.\\."
+        },
+        {
           "name": "keyword.operator.range.quillo",
           "match": "\\.\\."
         },

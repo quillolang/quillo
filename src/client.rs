@@ -317,7 +317,7 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
 
 fn html_assigned(el: &HtmlEl, out: &mut HashSet<String>) {
     for (_, v) in &el.attrs {
-        if let AttrVal::Expr(e) = v {
+        if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
             expr_assigned(e, out)
         }
     }
@@ -1255,10 +1255,15 @@ impl<'a> Compiler<'a> {
             self.line = el.line;
             let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone(), el.line))?;
             let mut props = Vec::new();
+            let mut spreads = Vec::new();
             for (name, v) in &el.attrs {
                 let v = match v {
                     AttrVal::Bool => "true".to_string(),
                     AttrVal::Expr(e) => self.expr(e)?,
+                    AttrVal::Spread(e) => {
+                        spreads.push(self.expr(e)?);
+                        continue;
+                    }
                 };
                 if name == "key" {
                     key = v;
@@ -1266,7 +1271,10 @@ impl<'a> Compiler<'a> {
                     props.push(format!("{}: {}", js_str(name), v));
                 }
             }
-            return Ok(format!("W.comp({}, {{{}}}, {}, {})", f, props.join(", "), kids, key));
+            if spreads.is_empty() {
+                return Ok(format!("W.comp({}, {{{}}}, {}, {})", f, props.join(", "), kids, key));
+            }
+            return Ok(format!("W.comp({}, {{{}}}, {}, {}, [{}])", f, props.join(", "), kids, key, spreads.join(", ")));
         }
         let mut props = Vec::new();
         let mut on: Vec<String> = Vec::new();
@@ -1277,10 +1285,15 @@ impl<'a> Compiler<'a> {
         for c in &el.classes {
             classes.push(self.expr(c)?);
         }
+        let mut spreads = Vec::new();
         for (name, v) in &el.attrs {
             let val = match v {
                 AttrVal::Bool => "true".to_string(),
                 AttrVal::Expr(e) => self.expr(e)?,
+                AttrVal::Spread(e) => {
+                    spreads.push(self.expr(e)?);
+                    continue;
+                }
             };
             if let Some(ev) = name.strip_prefix('@') {
                 on.push(format!("{}: {}", js_str(ev), val));
@@ -1312,6 +1325,17 @@ impl<'a> Compiler<'a> {
             props.push(format!("class: W.cls([{}])", classes.join(", ")));
         }
         let on = if on.is_empty() { "null".to_string() } else { format!("{{{}}}", on.join(", ")) };
+        if !spreads.is_empty() {
+            return Ok(format!(
+                "W.hs({}, [{}], {{{}}}, {}, {}, {})",
+                js_str(&el.tag),
+                spreads.join(", "),
+                props.join(", "),
+                on,
+                kids,
+                key
+            ));
+        }
         Ok(format!("W.h({}, {{{}}}, {}, {}, {})", js_str(&el.tag), props.join(", "), on, kids, key))
     }
 }

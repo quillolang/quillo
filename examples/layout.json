@@ -1,0 +1,16 @@
+{
+  "type": "page",
+  "children": [
+    { "type": "heading", "props": { "text": "Today" } },
+    { "type": "row", "children": [
+      { "type": "stat", "props": { "label": "Orders", "value": 128, "trend": "up" } },
+      { "type": "stat", "props": { "label": "Returns", "value": 4, "trend": "down" } },
+      { "type": "stat", "props": { "label": "Visitors", "value": 3021 } }
+    ]},
+    { "type": "card", "props": { "title": "Stock" }, "children": [
+      { "type": "counter", "props": { "label": "Crates", "start": 5, "step": 5 } },
+      { "type": "link", "text": "Restock", "props": { "href": "#restock", "class": "button", "title": "Order more" } }
+    ]},
+    { "type": "chart" }
+  ]
+}

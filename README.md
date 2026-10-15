@@ -62,7 +62,8 @@ Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders
 (payload-based routing and middleware), [todo.qwe](examples/todo.qwe) (server-rendered
 app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component),
 [scroll.qwe](examples/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window),
-[compose.qwe](examples/compose.qwe) (views and components built from each other).
+[compose.qwe](examples/compose.qwe) (views and components built from each other),
+[layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor).
 
 ## Language tour
 
@@ -238,6 +239,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
   for a brace.
 - `.class` and `#id` shorthand, with `{}` interpolation in the name.
+- `{name}` is short for `name={name}`, and `{...map}` spreads a map's keys as attributes
+  (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. Attributes written
+  out win over spread ones; classes from both are kept. On a view or component, spread
+  keys that are not parameters are ignored, so data with extra fields can be passed
+  straight through; a misspelled attribute written out is still an error.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example ``href={`/todos/${id}`}``.
   `true` renders a bare attribute; `false`/`null` leaves it out.
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.

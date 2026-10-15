@@ -49,6 +49,7 @@ const cases = [
   ['<button @click={() => { count += 1 }}>+</button>', "=>", "storage.type.function.arrow.quillo"],
   ['<input bind:value={draft}/>', "bind", "keyword.other.bind.quillo"],
   ['<Card title="x"/>', "Card", "entity.name.type.component.quillo"],
+  ['<Card {...node.props} {title}/>', "...", "keyword.operator.spread.quillo"],
   ['orders | filter(o => o.total > 100 && o.ok) ?? []', "|", "keyword.operator.pipe.quillo"],
   ['orders | filter(o => o.total > 100 && o.ok) ?? []', "??", "keyword.operator.coalesce.quillo"],
   ['orders | filter(o => o.total > 100 && o.ok) ?? []', "&&", "keyword.operator.logical.quillo"],

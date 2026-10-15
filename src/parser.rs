@@ -1217,6 +1217,30 @@ impl Parser {
                         attrs.push((name, AttrVal::Bool));
                     }
                 }
+                // `{...map}` spreads a map; `{name}` is short for name={name}.
+                Some('{') => {
+                    let line = self.lx.line;
+                    if self.lx.peek_char_at(1) == Some('.')
+                        && self.lx.peek_char_at(2) == Some('.')
+                        && self.lx.peek_char_at(3) == Some('.')
+                    {
+                        self.lx.bump();
+                        self.lx.bump();
+                        self.lx.bump();
+                        let e = self.parse_braced_expr()?;
+                        attrs.push(("...".to_string(), AttrVal::Spread(e)));
+                    } else {
+                        match self.parse_braced_expr()? {
+                            Expr::Ident(name, l) => attrs.push((name.clone(), AttrVal::Expr(Expr::Ident(name, l)))),
+                            _ => {
+                                return Err(QuilloError::new(
+                                    format!("in <{}>, write {{name}} (short for name={{name}}) or {{...map}}", tag),
+                                    line,
+                                ))
+                            }
+                        }
+                    }
+                }
                 None => return self.html_err(format!("unexpected end of input: unclosed <{}>", tag)),
                 Some(c) => return self.html_err(format!("unexpected `{}` in <{}> tag", c, tag)),
             }

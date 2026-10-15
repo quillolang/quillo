@@ -141,6 +141,14 @@ fn calling_a_variable_that_shadows_a_builtin_is_flagged() {
 }
 
 #[test]
+fn spread_attributes() {
+    one("let n = 5\nlet x = <p {...n}></p>", "`{...}` in <p> needs a map, got int");
+    // A spread may supply required props, so they are not reported missing.
+    clean("view Card(title: str) = <b>{title}</b>\nlet props = { title: \"t\" }\nprint(<Card {...props}/>)");
+    one("view Card(title: str) = <b>{title}</b>\nlet props = { title: \"t\" }\nprint(<Card {...props} titel=\"x\"/>)", "<Card> has no parameter `titel`");
+}
+
+#[test]
 fn routes() {
     one("route GET /a/:id/:id = id", "path parameter `id` appears twice");
     one("route GET /x = reply 999", "reply status must be an HTTP status code (100-599), got 999");

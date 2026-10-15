@@ -1070,6 +1070,26 @@ impl Interp {
 
     // ---- HTML ----------------------------------------------------------
 
+    /// A tag's attributes: what `{...map}` spreads, and the ones written out.
+    fn eval_attrs(&mut self, el: &HtmlEl, env: &Env) -> Result<(Vec<(String, Value)>, Vec<(String, Value)>), Ctrl> {
+        let mut spread = Vec::new();
+        let mut explicit = Vec::new();
+        for (name, val) in &el.attrs {
+            match val {
+                AttrVal::Bool => explicit.push((name.clone(), Value::Bool(true))),
+                AttrVal::Expr(e) => explicit.push((name.clone(), self.eval(e, env)?)),
+                AttrVal::Spread(e) => match self.eval(e, env)? {
+                    Value::Map(m) => spread.extend(m.iter().map(|(k, v)| (k.clone(), v.clone()))),
+                    Value::Nil => {}
+                    other => {
+                        return fail(el.line, format!("`{{...}}` in <{}> needs a map, got {}", el.tag, other.type_name()))
+                    }
+                },
+            }
+        }
+        Ok((spread, explicit))
+    }
+
     fn render_el(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
         if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
             return self.render_component(el, env);
@@ -1089,17 +1109,33 @@ impl Interp {
             classes.push(self.eval(c, env)?.display());
         }
         let mut rest = String::new();
-        for (name, val) in &el.attrs {
+        // Written-out attributes win over spread ones, except `class`,
+        // where both count.
+        let (spread, explicit) = self.eval_attrs(el, env)?;
+        let written: HashSet<&str> =
+            explicit.iter().map(|(n, _)| n.strip_prefix("bind:").unwrap_or(n.as_str())).collect();
+        // Written classes first, then the spread's.
+        let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| n == "class");
+        let mut entries: Vec<(String, Value)> = spread
+            .into_iter()
+            .filter(|(n, _)| !written.contains(n.as_str()) && !(n == "id" && el.id.is_some()))
+            .collect();
+        entries.extend(explicit.iter().cloned());
+        entries.extend(spread_class);
+        // A textarea's value is its text, not an attribute.
+        let mut text_value: Option<String> = None;
+        for (name, v) in entries {
             // `@click` handlers only exist in the browser; `bind:value={x}`
             // renders as `value`.
             if name.starts_with('@') || name == "key" {
                 continue;
             }
-            let name = name.strip_prefix("bind:").unwrap_or(name);
-            let v = match val {
-                AttrVal::Bool => Value::Bool(true),
-                AttrVal::Expr(e) => self.eval(e, env)?,
-            };
+            let name = name.strip_prefix("bind:").unwrap_or(&name).to_string();
+            let name = name.as_str();
+            if name == "value" && el.tag == "textarea" {
+                text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
+                continue;
+            }
             if name == "class" {
                 if !matches!(v, Value::Nil | Value::Bool(false)) {
                     classes.push(v.display());
@@ -1126,8 +1162,13 @@ impl Interp {
         if VOID_TAGS.contains(&el.tag.as_str()) {
             return Ok(out);
         }
-        for c in &el.children {
-            self.render_child(c, env, &mut out)?;
+        match text_value {
+            Some(t) => out.push_str(&escape(&t)),
+            None => {
+                for c in &el.children {
+                    self.render_child(c, env, &mut out)?;
+                }
+            }
         }
         out.push_str("</");
         out.push_str(&el.tag);
@@ -1160,16 +1201,14 @@ impl Interp {
         for ch in &el.children {
             self.render_child(ch, env, &mut kids)?;
         }
-        let mut given = Vec::new();
-        for (name, val) in &el.attrs {
-            if name == "key" {
-                continue;
+        let (spread, explicit) = self.eval_attrs(el, env)?;
+        let mut given: Vec<(String, Value)> = explicit.into_iter().filter(|(n, _)| n != "key").collect();
+        // Spread values fill parameters not written out; other spread keys
+        // (extra fields of the data) are ignored.
+        for (k, v) in spread {
+            if k != "key" && k != "children" && !given.iter().any(|(n, _)| *n == k) && c.def.params.iter().any(|p| p.name == k) {
+                given.push((k, v));
             }
-            let v = match val {
-                AttrVal::Bool => Value::Bool(true),
-                AttrVal::Expr(e) => self.eval(e, env)?,
-            };
-            given.push((name.clone(), v));
         }
         let mut args = Vec::new();
         let mut props = Map::new();

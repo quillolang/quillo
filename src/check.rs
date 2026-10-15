@@ -1892,10 +1892,20 @@ impl Checker {
         }
         let is_view = el.tag.chars().next().map_or(false, |c| c.is_uppercase());
         let mut given: Vec<(String, T)> = Vec::new();
+        let mut spread = false;
         for (name, v) in &el.attrs {
             let t = match v {
                 AttrVal::Bool => T::of(BOOL),
                 AttrVal::Expr(e) => self.expr(e),
+                AttrVal::Spread(e) => {
+                    let t = self.expr(e);
+                    self.line = el.line;
+                    if t.bits != 0 && t.bits & (MAP | NIL) == 0 {
+                        self.error(format!("`{{...}}` in <{}> needs a map, got {}", el.tag, bits_text(t.bits)));
+                    }
+                    spread = true;
+                    continue;
+                }
             };
             self.line = el.line;
             if let Some(ev) = name.strip_prefix('@') {
@@ -1957,7 +1967,7 @@ impl Checker {
             }
         }
         for p in &sig.params {
-            if p.name != "children" && !p.optional && !given.iter().any(|(n, _)| n == &p.name) {
+            if p.name != "children" && !p.optional && !spread && !given.iter().any(|(n, _)| n == &p.name) {
                 self.error(format!("<{}> needs `{}`", el.tag, p.name));
             }
         }
@@ -2092,7 +2102,7 @@ fn walk_html(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
     }
     el.classes.iter().for_each(|c| walk_expr(c, f));
     for (_, v) in &el.attrs {
-        if let AttrVal::Expr(e) = v {
+        if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
             walk_expr(e, f)
         }
     }

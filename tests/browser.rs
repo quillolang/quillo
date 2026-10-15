@@ -185,3 +185,32 @@ fn composition_example_works() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/layout.qwe: a JSON-described page, edited live in the browser.
+#[test]
+fn json_layout_renders_and_follows_edits() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(
+        &chrome,
+        &root.join("examples/layout.qwe"),
+        24900 + (std::process::id() % 90) as u16,
+        Some(&root.join("tests/browser/layout.js")),
+    );
+    let want = serde_json::json!({
+        "serverTextarea": true,
+        "stats": ["128", "4", "3021"],
+        "trendClass": "stat up",
+        "link": { "href": "#restock", "cls": "button", "title": "Order more", "text": "Restock" },
+        "unknown": "Unknown block “chart”",
+        "counter": "10",
+        "afterEdit": ["Orders ▲", "Returns ▼", "Visitors", "Refunds ▼"],
+        "error": true,
+        "replaced": "OnlyHi",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

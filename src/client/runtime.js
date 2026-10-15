@@ -618,14 +618,41 @@ function h(tag, props, on, kids, key) {
   return new VEl(tag, props, on, norm(kids, []), isNil(key) ? null : display(key));
 }
 
-// `<Card .../>`: a view call, or a component instance.
-function comp(def, props, kids, key) {
+// `<Card .../>`: a view call, or a component instance. Spread maps fill
+// the parameters not written out; their other keys are ignored.
+function comp(def, props, kids, key, spreads) {
   if (typeof def !== "function") fail(`<${def}> is not a view`);
   const ps = def.$p || [];
   for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
+  for (const m of spreads || []) {
+    if (isNil(m)) continue;
+    if (!isMap(m)) fail(`\`{...}\` in <${def.$name}> needs a map, got ${typeName(m)}`);
+    for (const k of Object.keys(m)) if (ps.includes(k) && k !== "children" && k !== "key" && !hasOwn(props, k)) props[k] = m[k];
+  }
   if (ps.includes("children")) props.children = norm(kids, []);
   if (def.$comp) return new VComp(def, props, isNil(key) ? null : display(key));
   return def(...ps.map((p) => props[p]));
+}
+
+// An element with `{...map}` attributes: written-out ones win, classes add up,
+// and `@event` keys become handlers.
+function hs(tag, spreads, props, on, kids, key) {
+  const p = {};
+  const o = Object.assign({}, on || {});
+  const classes = [];
+  for (const m of spreads) {
+    if (isNil(m)) continue;
+    if (!isMap(m)) fail(`\`{...}\` in <${tag}> needs a map, got ${typeName(m)}`);
+    for (const k of Object.keys(m)) {
+      if (k === "key") continue;
+      if (k === "class") { classes.push(m[k]); continue; }
+      if (k[0] === "@") { if (!hasOwn(o, k.slice(1))) o[k.slice(1)] = m[k]; continue; }
+      if (!hasOwn(props, k)) p[k] = m[k];
+    }
+  }
+  Object.assign(p, props);
+  if (classes.length) p.class = [props.class, ...classes].filter((x) => !isNil(x) && x !== false && x !== "").map(display).join(" ");
+  return h(tag, p, Object.keys(o).length ? o : null, kids, key);
 }
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -894,6 +921,7 @@ W.argty = argty;
 W.retty = retty;
 W.meta = meta;
 W.h = h;
+W.hs = hs;
 W.comp = comp;
 W.display = display;
 W.repr = repr;
