@@ -1356,10 +1356,15 @@ impl Parser {
         if !buf.is_empty() {
             parts.push(TPart::Lit(buf));
         }
-        if parts.is_empty() {
-            return self.html_err("expected a name after `.` or `#`");
+        match parts.len() {
+            0 => self.html_err("expected a name after `.` or `#`"),
+            // `.price`: a plain name, not a template to build each time.
+            1 if matches!(parts[0], TPart::Lit(_)) => match parts.pop() {
+                Some(TPart::Lit(s)) => Ok(Expr::Lit(Lit::Str(s.into()))),
+                _ => unreachable!(),
+            },
+            _ => Ok(Expr::Template(parts)),
         }
-        Ok(Expr::Template(parts))
     }
 
     /// Parses `{expr}` starting at the `{` character, inside an HTML literal.

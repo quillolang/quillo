@@ -290,24 +290,42 @@ impl Name {
 /// A function's or block's few variables are found fastest by comparing
 /// names in order; the globals (every builtin and definition) by hashing.
 enum Vars {
-    Few(Vec<(Name, Value)>),
+    /// The first few in place (no allocation besides the scope's own),
+    /// then a vector.
+    Few([Option<(Name, Value)>; INLINE], Vec<(Name, Value)>),
     Many(HashMap<Box<str>, Value, BuildFx>),
 }
+
+const INLINE: usize = 4;
 
 /// Past this many, a scope's variables move to a hash table.
 const FEW: usize = 16;
 
 impl Vars {
+    fn few() -> Vars {
+        Vars::Few([None, None, None, None], Vec::new())
+    }
+
     fn get(&self, name: &str) -> Option<&Value> {
         match self {
-            Vars::Few(v) => v.iter().rev().find(|(n, _)| n.as_str() == name).map(|(_, x)| x),
+            Vars::Few(slots, more) => slots
+                .iter()
+                .flatten()
+                .chain(more.iter())
+                .find(|(n, _)| n.as_str() == name)
+                .map(|(_, x)| x),
             Vars::Many(m) => m.get(name),
         }
     }
 
     fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
         match self {
-            Vars::Few(v) => v.iter_mut().rev().find(|(n, _)| n.as_str() == name).map(|(_, x)| x),
+            Vars::Few(slots, more) => slots
+                .iter_mut()
+                .flatten()
+                .chain(more.iter_mut())
+                .find(|(n, _)| n.as_str() == name)
+                .map(|(_, x)| x),
             Vars::Many(m) => m.get_mut(name),
         }
     }
@@ -318,12 +336,21 @@ impl Vars {
             return;
         }
         match self {
-            Vars::Few(v) if v.len() < FEW => v.push((Name::new(name), value)),
-            Vars::Few(v) => {
-                let mut m: HashMap<Box<str>, Value, BuildFx> =
-                    std::mem::take(v).into_iter().map(|(k, x)| (k.as_str().into(), x)).collect();
-                m.insert(name.into(), value);
-                *self = Vars::Many(m);
+            Vars::Few(slots, more) => {
+                if let Some(free) = slots.iter_mut().find(|s| s.is_none()) {
+                    *free = Some((Name::new(name), value));
+                } else if more.len() + INLINE < FEW {
+                    more.push((Name::new(name), value));
+                } else {
+                    let mut m: HashMap<Box<str>, Value, BuildFx> = slots
+                        .iter_mut()
+                        .filter_map(|s| s.take())
+                        .chain(more.drain(..))
+                        .map(|(k, x)| (k.as_str().into(), x))
+                        .collect();
+                    m.insert(name.into(), value);
+                    *self = Vars::Many(m);
+                }
             }
             Vars::Many(m) => {
                 m.insert(name.into(), value);
@@ -333,7 +360,9 @@ impl Vars {
 
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
-            Vars::Few(v) => v.iter().map(|(k, x)| (k.as_str().to_string(), x.clone())).collect(),
+            Vars::Few(slots, more) => {
+                slots.iter().flatten().chain(more.iter()).map(|(k, x)| (k.as_str().to_string(), x.clone())).collect()
+            }
             Vars::Many(m) => m.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
         }
     }
@@ -375,7 +404,7 @@ impl Scope {
     }
 
     pub fn child(parent: &Env) -> Env {
-        Arc::new(Scope { vars: VarsCell::new(Vars::Few(Vec::new())), parent: Some(parent.clone()) })
+        Arc::new(Scope { vars: VarsCell::new(Vars::few()), parent: Some(parent.clone()) })
     }
 
     fn vars(&self) -> VarsGuard<'_> {

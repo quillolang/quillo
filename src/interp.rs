@@ -847,6 +847,11 @@ impl Interp {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let scope = Scope::child(env);
+            if let Pattern::Bind(n) = pat {
+                define(&scope, n, item);
+                out.push(self.eval(body, &scope)?);
+                continue;
+            }
             let mut binds = Vec::new();
             if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
                 return fail(line, format!("`for` pattern does not match {}", short(&item)));
@@ -1256,6 +1261,11 @@ impl Interp {
         let it = self.eval(iter, env)?;
         let mut each = |this: &mut Self, item: &Value| -> Result<(), Ctrl> {
             let scope = Scope::child(env);
+            // `for p in items`: nothing to match.
+            if let Pattern::Bind(n) = pat {
+                define(&scope, n, item.clone());
+                return this.render_expr_into(body, &scope, out);
+            }
             let mut binds = Vec::new();
             if this.match_pat(pat, item, Mode::Strict, env, &mut binds)?.is_none() {
                 return fail(line, format!("`for` pattern does not match {}", short(item)));
