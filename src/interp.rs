@@ -186,14 +186,33 @@ pub const BLOCKED_URL: &str = "about:blank#blocked";
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
 pub fn script_url(url: &str) -> bool {
-    let scheme: String = url
-        .trim_start_matches(|c: char| c <= ' ')
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .take(11)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    scheme.starts_with("javascript:") || scheme.starts_with("vbscript:")
+    let mut scheme = [0u8; 11];
+    let mut n = 0;
+    for c in url.trim_start_matches(|c: char| c <= ' ').chars() {
+        if matches!(c, '\t' | '\n' | '\r') {
+            continue;
+        }
+        // Neither scheme has other characters in its first 11.
+        if n == scheme.len() || !c.is_ascii() {
+            break;
+        }
+        scheme[n] = c.to_ascii_lowercase() as u8;
+        n += 1;
+    }
+    let scheme = &scheme[..n];
+    scheme.starts_with(b"javascript:") || scheme.starts_with(b"vbscript:")
+}
+
+/// A value's text, escaped, appended to `out`.
+fn display_escaped(v: &Value, out: &mut String) {
+    match v {
+        Value::Str(s) => escape_into(s, out),
+        Value::Int(n) => {
+            use std::fmt::Write;
+            let _ = write!(out, "{}", n);
+        }
+        other => escape_into(&other.display(), out),
+    }
 }
 
 /// Whether a name can be written as an HTML attribute as it is.
@@ -725,7 +744,14 @@ impl Interp {
         for p in parts {
             match p {
                 TPart::Lit(t) => s.push_str(t),
-                TPart::Expr(x) => s.push_str(&self.eval(x, env)?.display()),
+                TPart::Expr(x) => match self.eval(x, env)? {
+                    Value::Str(t) => s.push_str(&t),
+                    Value::Int(n) => {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{}", n);
+                    }
+                    v => s.push_str(&v.display()),
+                },
             }
         }
         Ok(Value::str(s))
@@ -1167,6 +1193,18 @@ impl Interp {
                 self.render_expr_into(b, env, out)
             }
             Expr::For(pat, iter, body, line) => self.render_for_into(pat, iter, body, env, *line, out),
+            Expr::Template(parts) => {
+                for p in parts {
+                    match p {
+                        TPart::Lit(t) => escape_into(t, out),
+                        TPart::Expr(x) => {
+                            let v = self.eval(x, env)?;
+                            display_escaped(&v, out);
+                        }
+                    }
+                }
+                Ok(())
+            }
             Expr::Match(subj, arms, line) => {
                 let v = self.eval(subj, env)?;
                 for arm in arms {
@@ -1401,6 +1439,47 @@ impl Interp {
         }
         out.push('<');
         out.push_str(&el.tag);
+        // Most elements have no spread, no `class=` and are no <textarea>:
+        // their attributes are written as they are evaluated.
+        let fast = el.tag != "textarea" && el.attrs.iter().all(|(n, a)| !matches!(a, AttrVal::Spread(_)) && n != "class");
+        let text_value = if fast { self.render_attrs_fast(el, env, out)?; None } else { self.render_attrs(el, env, out)? };
+        out.push('>');
+        if VOID_TAGS.contains(&el.tag.as_str()) {
+            return Ok(());
+        }
+        match text_value {
+            Some(t) => out.push_str(&escape(&t)),
+            // A style sheet is raw text to the browser: `.a > b` must stay
+            // as written. Only `</` is changed, so the text cannot end the
+            // element early.
+            None if el.tag == "style" => {
+                for c in &el.children {
+                    if let HtmlChild::Expr(e) = c {
+                        let v = self.eval(e, env)?;
+                        let text = match &v {
+                            Value::Nil | Value::Bool(false) => String::new(),
+                            Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
+                            other => other.display(),
+                        };
+                        out.push_str(&text.replace("</", "<\\/"));
+                    }
+                }
+            }
+            None => {
+                for c in &el.children {
+                    self.render_child(c, env, out)?;
+                }
+            }
+        }
+        out.push_str("</");
+        out.push_str(&el.tag);
+        out.push('>');
+        Ok(())
+    }
+
+    /// Attributes in general: spread maps, `class=` merged with `.classes`,
+    /// a <textarea>'s value as its text (returned).
+    fn render_attrs(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<Option<String>, Ctrl> {
         if let Some(id) = &el.id {
             let v = self.eval(id, env)?;
             out.push_str(&format!(" id=\"{}\"", escape(&v.display())));
@@ -1473,38 +1552,102 @@ impl Interp {
             out.push_str(&format!(" class=\"{}\"", escape(&classes.join(" "))));
         }
         out.push_str(&rest);
-        out.push('>');
-        if VOID_TAGS.contains(&el.tag.as_str()) {
-            return Ok(());
+        Ok(text_value)
+    }
+
+    /// Attributes of an element without spreads or `class=`, written into
+    /// `out` as they are evaluated.
+    fn render_attrs_fast(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        if let Some(id) = &el.id {
+            let v = self.eval(id, env)?;
+            out.push_str(" id=\"");
+            display_escaped(&v, out);
+            out.push('"');
         }
-        match text_value {
-            Some(t) => out.push_str(&escape(&t)),
-            // A style sheet is raw text to the browser: `.a > b` must stay
-            // as written. Only `</` is changed, so the text cannot end the
-            // element early.
-            None if el.tag == "style" => {
-                for c in &el.children {
-                    if let HtmlChild::Expr(e) = c {
-                        let v = self.eval(e, env)?;
-                        let text = match &v {
-                            Value::Nil | Value::Bool(false) => String::new(),
-                            Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
-                            other => other.display(),
-                        };
-                        out.push_str(&text.replace("</", "<\\/"));
+        if !el.classes.is_empty() {
+            out.push_str(" class=\"");
+            for (i, c) in el.classes.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                let v = self.eval(c, env)?;
+                display_escaped(&v, out);
+            }
+            out.push('"');
+        }
+        for (name, val) in &el.attrs {
+            // `@click` handlers only exist in the browser, `key` only matters
+            // there; `bind:value={x}` renders as `value`.
+            if name.starts_with('@') || name == "key" {
+                continue;
+            }
+            let name = name.strip_prefix("bind:").unwrap_or(name);
+            if !attr_name_ok(name) {
+                continue;
+            }
+            match val {
+                AttrVal::Bool => {
+                    out.push(' ');
+                    out.push_str(name);
+                }
+                // A template outside URL attributes goes straight in, part by part.
+                AttrVal::Expr(Expr::Template(parts)) if !URL_ATTRS.contains(&name) => {
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push_str("=\"");
+                    for p in parts {
+                        match p {
+                            TPart::Lit(t) => escape_into(t, out),
+                            TPart::Expr(x) => {
+                                let v = self.eval(x, env)?;
+                                display_escaped(&v, out);
+                            }
+                        }
                     }
+                    out.push('"');
                 }
-            }
-            None => {
-                for c in &el.children {
-                    self.render_child(c, env, out)?;
+                AttrVal::Expr(e) => {
+                    let v = self.eval(e, env)?;
+                    self.write_attr(name, v, out);
                 }
+                AttrVal::Spread(_) => unreachable!("render_attrs handles spreads"),
             }
         }
-        out.push_str("</");
-        out.push_str(&el.tag);
-        out.push('>');
         Ok(())
+    }
+
+    /// ` name="value"`, or ` name` for true, nothing for false and null.
+    /// URLs that would run script are blocked; site paths get the mount's
+    /// prefix.
+    fn write_attr(&self, name: &str, v: Value, out: &mut String) {
+        let v = match (&v, name) {
+            (Value::Str(s), _) if URL_ATTRS.contains(&name) && script_url(s) => Value::str(BLOCKED_URL),
+            (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
+                Value::str(self.with_base(s))
+            }
+            _ => v,
+        };
+        match &v {
+            Value::Bool(true) => {
+                out.push(' ');
+                out.push_str(name);
+            }
+            Value::Bool(false) | Value::Nil => {}
+            Value::List(_) | Value::Map(_) => {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                escape_into(&v.to_json().to_string(), out);
+                out.push('"');
+            }
+            other => {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                display_escaped(other, out);
+                out.push('"');
+            }
+        }
     }
 
     fn render_child(&mut self, c: &HtmlChild, env: &Env, out: &mut String) -> Result<(), Ctrl> {

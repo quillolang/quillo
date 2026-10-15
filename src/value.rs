@@ -204,93 +204,153 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
 
 // ---- environments ------------------------------------------------------
 
-pub type Env = Arc<Mutex<Scope>>;
+pub type Env = Arc<Scope>;
 
+/// Variables, and the scope around them. The parent link is fixed when the
+/// scope is made, so looking a name up walks the chain without locking it.
 pub struct Scope {
-    vars: HashMap<String, Value>,
+    vars: Mutex<Vars>,
     parent: Option<Env>,
 }
 
+/// A function's or block's few variables are found fastest by comparing
+/// names in order; the globals (every builtin and definition) by hashing.
+enum Vars {
+    Few(Vec<(Box<str>, Value)>),
+    Many(HashMap<Box<str>, Value, BuildFx>),
+}
+
+/// Past this many, a scope's variables move to a hash table.
+const FEW: usize = 16;
+
+impl Vars {
+    fn get(&self, name: &str) -> Option<&Value> {
+        match self {
+            Vars::Few(v) => v.iter().rev().find(|(n, _)| &**n == name).map(|(_, x)| x),
+            Vars::Many(m) => m.get(name),
+        }
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+        match self {
+            Vars::Few(v) => v.iter_mut().rev().find(|(n, _)| &**n == name).map(|(_, x)| x),
+            Vars::Many(m) => m.get_mut(name),
+        }
+    }
+
+    fn insert(&mut self, name: &str, value: Value) {
+        if let Some(slot) = self.get_mut(name) {
+            *slot = value;
+            return;
+        }
+        match self {
+            Vars::Few(v) if v.len() < FEW => v.push((name.into(), value)),
+            Vars::Few(v) => {
+                let mut m: HashMap<Box<str>, Value, BuildFx> = std::mem::take(v).into_iter().collect();
+                m.insert(name.into(), value);
+                *self = Vars::Many(m);
+            }
+            Vars::Many(m) => {
+                m.insert(name.into(), value);
+            }
+        }
+    }
+
+    fn entries(&self) -> Vec<(String, Value)> {
+        match self {
+            Vars::Few(v) => v.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
+            Vars::Many(m) => m.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
+        }
+    }
+}
+
+/// FxHash (as in rustc): much faster than the default SipHash for short
+/// names. Only for names from the program's source, never for data from
+/// requests, so it needs no protection against crafted collisions.
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        for &b in chunks.remainder() {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K);
+        }
+    }
+
+    fn write_u8(&mut self, b: u8) {
+        self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub type BuildFx = std::hash::BuildHasherDefault<Fx>;
+
 impl Scope {
     pub fn root() -> Env {
-        Arc::new(Mutex::new(Scope { vars: HashMap::new(), parent: None }))
+        Arc::new(Scope { vars: Mutex::new(Vars::Many(HashMap::default())), parent: None })
     }
 
     pub fn child(parent: &Env) -> Env {
-        Arc::new(Mutex::new(Scope { vars: HashMap::new(), parent: Some(parent.clone()) }))
+        Arc::new(Scope { vars: Mutex::new(Vars::Few(Vec::new())), parent: Some(parent.clone()) })
+    }
+
+    fn vars(&self) -> std::sync::MutexGuard<'_, Vars> {
+        self.vars.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 /// The variables defined directly in a scope (not its parents).
 pub fn scope_vars(env: &Env) -> Vec<(String, Value)> {
-    env.lock().unwrap_or_else(|e| e.into_inner()).vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    env.vars().entries()
 }
 
 pub fn lookup(env: &Env, name: &str) -> Option<Value> {
-    let mut cur = env.clone();
+    let mut cur: &Scope = env;
     loop {
-        let parent = {
-            let s = cur.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = s.vars.get(name) {
-                return Some(v.clone());
-            }
-            s.parent.clone()
-        };
-        cur = parent?;
+        if let Some(v) = cur.vars().get(name) {
+            return Some(v.clone());
+        }
+        cur = cur.parent.as_deref()?;
     }
 }
 
 pub fn define(env: &Env, name: &str, v: Value) {
-    env.lock().unwrap_or_else(|e| e.into_inner()).vars.insert(name.to_string(), v);
+    env.vars().insert(name, v);
 }
 
 /// Like `lookup`, and whether the variable is a global.
 pub fn lookup_global(env: &Env, name: &str) -> Option<(Value, bool)> {
-    let mut cur = env.clone();
+    let mut cur: &Scope = env;
     loop {
-        let parent = {
-            let s = cur.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = s.vars.get(name) {
-                return Some((v.clone(), s.parent.is_none()));
-            }
-            s.parent.clone()
-        };
-        cur = parent?;
+        if let Some(v) = cur.vars().get(name) {
+            return Some((v.clone(), cur.parent.is_none()));
+        }
+        cur = cur.parent.as_deref()?;
     }
 }
 
 /// Like `assign`; `Some(true)` when the variable was a global.
 pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
-    let mut cur = env.clone();
+    let mut cur: &Scope = env;
     loop {
-        let parent = {
-            let mut s = cur.lock().unwrap_or_else(|e| e.into_inner());
-            let root = s.parent.is_none();
-            if let Some(slot) = s.vars.get_mut(name) {
-                *slot = v;
-                return Some(root);
-            }
-            s.parent.clone()
-        };
-        cur = parent?;
+        if let Some(slot) = cur.vars().get_mut(name) {
+            *slot = v;
+            return Some(cur.parent.is_none());
+        }
+        cur = cur.parent.as_deref()?;
     }
 }
 
 /// Updates an existing variable in the nearest scope that has it.
 pub fn assign(env: &Env, name: &str, v: Value) -> bool {
-    let mut cur = env.clone();
-    loop {
-        let parent = {
-            let mut s = cur.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = s.vars.get_mut(name) {
-                *slot = v;
-                return true;
-            }
-            s.parent.clone()
-        };
-        match parent {
-            Some(p) => cur = p,
-            None => return false,
-        }
-    }
+    assign_global(env, name, v).is_some()
 }
