@@ -336,3 +336,13 @@ fn pattern_defaults_are_taken_as_written() {
     // A value that is there must still match.
     assert!(ev_err("match { limit: \"x\" } { { limit: int = null } => limit }").contains("no `match` arm"));
 }
+
+#[test]
+fn style_sheets_are_written_as_is() {
+    let src = "let accent = \"#0b57d0\"\nlet css = `.card > h2 { color: ${accent}; }\na[href^='http'] { content: \"&\"; }`\n<style>{css}</style>";
+    assert_eq!(ev(src), "<style>.card > h2 { color: #0b57d0; }\na[href^='http'] { content: \"&\"; }</style>");
+    // The text cannot close the element and add markup.
+    assert_eq!(ev("<style>{\"</style><script>x</script>\"}</style>"), "<style><\\/style><script>x<\\/script></style>");
+    // Elsewhere, text is still escaped.
+    assert_eq!(ev("<p>{\"a > b\"}</p>"), "<p>a &gt; b</p>");
+}

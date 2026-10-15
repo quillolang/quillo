@@ -76,7 +76,7 @@ route GET / =
         <head>
             <meta charset="utf-8"/>
             <title>JSON layout</title>
-            <style>{raw(css)}</style>
+            <style>{css}</style>
         </head>
         <body>
             <h1>JSON layout</h1>
@@ -85,4 +85,4 @@ route GET / =
     </html>
 
 // The layout alone, rendered on the server, with no JavaScript but the counter.
-route GET /page = <html><head><style>{raw(css)}</style></head><body><Node node={json.parse(source)}/></body></html>
+route GET /page = <html><head><style>{css}</style></head><body><Node node={json.parse(source)}/></body></html>

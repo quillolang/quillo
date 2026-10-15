@@ -1232,6 +1232,22 @@ impl Interp {
         }
         match text_value {
             Some(t) => out.push_str(&escape(&t)),
+            // A style sheet is raw text to the browser: `.a > b` must stay
+            // as written. Only `</` is changed, so the text cannot end the
+            // element early.
+            None if el.tag == "style" => {
+                for c in &el.children {
+                    if let HtmlChild::Expr(e) = c {
+                        let v = self.eval(e, env)?;
+                        let text = match &v {
+                            Value::Nil | Value::Bool(false) => String::new(),
+                            Value::List(items) => items.iter().map(|x| x.display()).collect::<Vec<_>>().join("\n"),
+                            other => other.display(),
+                        };
+                        out.push_str(&text.replace("</", "<\\/"));
+                    }
+                }
+            }
             None => {
                 for c in &el.children {
                     self.render_child(c, env, &mut out)?;

@@ -87,7 +87,7 @@ route GET / =
         <head>
             <meta charset="utf-8"/>
             <title>Infinite scroll</title>
-            <style>{raw(css)}</style>
+            <style>{css}</style>
         </head>
         <body>
             <h1>Infinite scroll</h1>

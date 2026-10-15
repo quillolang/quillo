@@ -251,6 +251,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
+- `<style>{css}</style>` takes a style sheet as it is (no escaping, so `a > b` works);
+  write it as a template string: braces are plain text and `${...}` fills in values.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
 

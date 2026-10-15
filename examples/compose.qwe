@@ -88,7 +88,7 @@ route GET / =
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>Composition</title>
-            <style>{raw(css)}</style>
+            <style>{css}</style>
         </head>
         <body>
             <h1>Composition</h1>
