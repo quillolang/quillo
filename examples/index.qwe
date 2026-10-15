@@ -1,10 +1,16 @@
-// Every example in one server: each .qwe program is mounted under a path.
+// Every example in one server: each .qwe program is mounted under a path,
+// and this page shows them behind a row of tabs.
 //
 //   quillo run examples/index.qwe --watch     then open http://localhost:8080
 //
 // A mounted program runs unchanged, with its own globals and database. Its
 // links, redirects, server fn calls and page changes stay under its prefix:
 // "/products" in spa.qwe is /spa/products here.
+//
+// The tabs are links to /?ex=<id>. In the browser, clicking one changes the
+// URL without reloading this page (url() re-renders the Gallery), so tabs
+// can be bookmarked and Back moves between them; on the server, the same
+// URL renders with that tab open.
 
 mount /hello = "hello.qwe"
 mount /orders = "orders.qwe"
@@ -16,45 +22,66 @@ mount /layout = "layout.qwe"
 mount /spa = "spa.qwe"
 
 let examples = [
-    { path: "/todo", name: "Todo", about: "A server-rendered app with forms and a JSON API. No JavaScript." },
-    { path: "/notes", name: "Notes", about: "SQLite and a live component: open it in two tabs." },
-    { path: "/spa", name: "Shop", about: "A single-page app: links without reloads, a cart, deep links." },
-    { path: "/compose", name: "Composition", about: "Views and components built from each other." },
-    { path: "/layout", name: "JSON layout", about: "A page described as JSON, with a live editor." },
-    { path: "/scroll", name: "Infinite scroll", about: "100,000 rows; only what is on screen is rendered." },
-    { path: "/hello/hello/Quillo", name: "Hello", about: "Routes, typed path params, query patterns." },
-    { path: "/orders/orders", name: "Orders API", about: "Routing on what is inside a JSON body." },
+    { id: "todo", path: "/todo", name: "Todo", about: "A server-rendered app with forms and a JSON API. No JavaScript." },
+    { id: "notes", path: "/notes", name: "Notes", about: "SQLite and a live component: open it in two tabs." },
+    { id: "spa", path: "/spa", name: "Shop", about: "A single-page app: links without reloads, a cart, deep links." },
+    { id: "compose", path: "/compose", name: "Composition", about: "Views and components built from each other." },
+    { id: "layout", path: "/layout", name: "JSON layout", about: "A page described as JSON, with a live editor." },
+    { id: "scroll", path: "/scroll", name: "Infinite scroll", about: "100,000 rows; only what is on screen is rendered." },
+    { id: "hello", path: "/hello/hello/Quillo", name: "Hello", about: "Routes, typed path params, query patterns." },
+    { id: "orders", path: "/orders/orders", name: "Orders API", about: "Routing on what is inside a JSON body." },
 ]
 
-view Example(path: str, name: str, about: str) =
-    <li>
-        <a href={path}>{name}</a>
-        <span>{about}</span>
-    </li>
+component Gallery() {
+    let wanted = url().query.ex
+    let current = find(examples, (e) => e.id == wanted) ?? first(examples)
+
+    <div.gallery>
+        <header>
+            <h1>Quillo examples</h1>
+            <nav.tabs>
+                {for e in examples =>
+                    <a key={e.id} href={`/?ex=${e.id}`} class={e.id == current.id && "active"} title={e.about}>{e.name}</a>}
+            </nav>
+        </header>
+        <div.about>
+            <span>{current.about}</span>
+            <a href={current.path} target="_blank">Open on its own ↗</a>
+        </div>
+        <iframe key={current.id} src={current.path} title={current.name}></iframe>
+    </div>
+}
 
 let accent = "#0b57d0"
 
-// A style sheet is a template string: braces are plain text, ${...} fills in.
 let style = css`
-body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
-ul { list-style: none; padding: 0; }
-li { display: flex; flex-direction: column; padding: .8rem 0; border-bottom: 1px solid #eee; }
-li > a { font-weight: 600; color: ${accent}; text-decoration: none; }
-li > a:hover { text-decoration: underline; }
-li > span { color: #555; }
-code { background: #f3f3f3; padding: .1rem .3rem; border-radius: 4px; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font: 15px/1.4 system-ui, sans-serif; color: #222; }
+.gallery { display: flex; flex-direction: column; height: 100vh; }
+header { display: flex; align-items: center; gap: 1.5rem; padding: 0 1.25rem; border-bottom: 1px solid #e5e5e5; }
+h1 { font-size: 1rem; margin: 0; white-space: nowrap; }
+.tabs { display: flex; gap: .25rem; overflow-x: auto; }
+.tabs a { padding: .9rem .8rem .75rem; color: #555; text-decoration: none; white-space: nowrap; border-bottom: 2px solid transparent; }
+.tabs a:hover { color: #000; }
+.tabs a.active { color: ${accent}; border-bottom-color: ${accent}; font-weight: 600; }
+.about { display: flex; justify-content: space-between; gap: 1rem; padding: .5rem 1.25rem; font-size: 13px; color: #666; background: #fafafa; border-bottom: 1px solid #eee; }
+.about a { color: ${accent}; text-decoration: none; white-space: nowrap; }
+iframe { flex: 1; width: 100%; border: 0; }
+@media (prefers-color-scheme: dark) {
+  body { background: #161616; color: #ddd; }
+  header, .about { border-color: #2a2a2a; } .about { background: #1c1c1c; color: #999; }
+  .tabs a { color: #aaa; } .tabs a:hover { color: #fff; }
+}
 `
 
 route GET / =
     <html>
         <head>
             <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>Quillo examples</title>
             <style>{style}</style>
         </head>
-        <body>
-            <h1>Quillo examples</h1>
-            <p>Each one is its own <code>.qwe</code> program, mounted here with <code>mount</code>.</p>
-            <ul>{for e in examples => <Example {...e}/>}</ul>
-        </body>
+        <body><Gallery/></body>
     </html>

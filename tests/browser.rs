@@ -283,3 +283,25 @@ fn mounted_single_page_app_stays_under_its_prefix() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/index.qwe: tabs switch examples without reloading the page.
+#[test]
+fn example_gallery_tabs_switch_without_reloading() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with_path(&chrome, &root.join("examples/index.qwe"), free_port(), "/", Some(&root.join("tests/browser/gallery.js")));
+    let want = serde_json::json!({
+        "start": ["/", "Todo", "/todo"],
+        "shop": ["/?ex=spa", "Shop", "/spa"],
+        "layout": ["/?ex=layout", "JSON layout", "/layout"],
+        "about": "A page described as JSON, with a live editor.",
+        "back": ["/?ex=spa", "Shop", "/spa"],
+        "external": "_blank",
+        "noReload": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
