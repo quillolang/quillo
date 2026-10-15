@@ -65,6 +65,11 @@ fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) ->
 }
 
 /// Node 22 or later (run.js uses its built-in WebSocket).
+/// A port nothing is listening on (tests run in parallel).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn node_available() -> bool {
     Command::new("node")
         .args(["-e", "process.exit(typeof WebSocket === 'function' ? 0 : 1)"])
@@ -79,7 +84,7 @@ fn live_state_follows_changes_made_elsewhere() {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
-    let result = run_page(&chrome, "live.qwe", 22000 + (std::process::id() % 1000) as u16);
+    let result = run_page(&chrome, "live.qwe", free_port());
     let want = serde_json::json!({
         "before": ["first"],
         "noteArrived": true,
@@ -97,7 +102,7 @@ fn components_hydrate_react_and_call_the_server() {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
-    let result = run_page(&chrome, "app.qwe", 21000 + (std::process::id() % 1000) as u16);
+    let result = run_page(&chrome, "app.qwe", free_port());
     let want = serde_json::json!({
         "count": "7",
         "nestedStart": "1",
@@ -125,7 +130,7 @@ fn infinite_scroll_renders_only_a_window_of_rows() {
     let r = run_page_with(
         &chrome,
         &root.join("examples/scroll.qwe"),
-        23000 + (std::process::id() % 1000) as u16,
+        free_port(),
         Some(&root.join("tests/browser/scroll.js")),
     );
     assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
@@ -148,7 +153,7 @@ fn components_compose() {
         return;
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_with(&chrome, &dir.join("compose.qwe"), 24000 + (std::process::id() % 1000) as u16, Some(&dir.join("compose.js")));
+    let r = run_page_with(&chrome, &dir.join("compose.qwe"), free_port(), Some(&dir.join("compose.js")));
     let want = serde_json::json!({
         "counts": ["2", "4"],
         "total": "Last change: 2",
@@ -172,7 +177,7 @@ fn composition_example_works() {
     let r = run_page_with(
         &chrome,
         &root.join("examples/compose.qwe"),
-        24500 + (std::process::id() % 400) as u16,
+        free_port(),
         Some(&root.join("tests/browser/compose-example.js")),
     );
     let want = serde_json::json!({
@@ -197,7 +202,7 @@ fn json_layout_renders_and_follows_edits() {
     let r = run_page_with(
         &chrome,
         &root.join("examples/layout.qwe"),
-        24900 + (std::process::id() % 90) as u16,
+        free_port(),
         Some(&root.join("tests/browser/layout.js")),
     );
     let want = serde_json::json!({
@@ -227,7 +232,7 @@ fn single_page_app_navigates_without_reloading() {
     let r = run_page_with(
         &chrome,
         &root.join("examples/spa.qwe"),
-        25500 + (std::process::id() % 400) as u16,
+        free_port(),
         Some(&root.join("tests/browser/spa.js")),
     );
     let want = serde_json::json!({
