@@ -694,7 +694,10 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
         if app.watch {
             inject_dev_script(&mut resp, generation);
         }
-        if req.url != "/_quillo/dev" {
+        // Chrome asks every site for this while DevTools is open; it is not
+        // the program's business, so it is not logged.
+        let devtools_probe = req.url == "/.well-known/appspecific/com.chrome.devtools.json";
+        if !devtools_probe {
             eprintln!(
                 "{} {} -> {} ({:.1}ms)",
                 req.method,
