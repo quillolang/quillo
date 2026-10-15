@@ -81,6 +81,11 @@ pub struct Interp {
     pub base: String,
     /// Programs mounted under a path prefix: `mount /notes = "notes.qwe"`.
     pub mounts: Vec<(String, Interp)>,
+    /// Whether the response being made has a component island, and so
+    /// needs the browser bundle.
+    pub rendered_island: bool,
+    /// A buffer lent to the renderer for building attribute values.
+    spare: String,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -396,6 +401,8 @@ impl Interp {
             db: Arc::new(std::sync::Mutex::new(None)),
             base: String::new(),
             mounts: Vec::new(),
+            rendered_island: false,
+            spare: String::new(),
         }
     }
 
@@ -425,6 +432,8 @@ impl Interp {
             db: self.db.clone(),
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
+            rendered_island: false,
+            spare: String::new(),
         }
     }
 
@@ -741,19 +750,7 @@ impl Interp {
     #[inline(never)]
     fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
         let mut s = String::new();
-        for p in parts {
-            match p {
-                TPart::Lit(t) => s.push_str(t),
-                TPart::Expr(x) => match self.eval(x, env)? {
-                    Value::Str(t) => s.push_str(&t),
-                    Value::Int(n) => {
-                        use std::fmt::Write;
-                        let _ = write!(s, "{}", n);
-                    }
-                    v => s.push_str(&v.display()),
-                },
-            }
-        }
+        self.template_into(parts, env, &mut s)?;
         Ok(Value::str(s))
     }
 
@@ -1606,6 +1603,17 @@ impl Interp {
                     }
                     out.push('"');
                 }
+                // In a URL attribute, the whole value is checked first.
+                AttrVal::Expr(Expr::Template(parts)) => {
+                    let mut url = std::mem::take(&mut self.spare);
+                    url.clear();
+                    let r = self.template_into(parts, env, &mut url);
+                    if r.is_ok() {
+                        self.write_url_attr(name, &url, out);
+                    }
+                    self.spare = url;
+                    r?;
+                }
                 AttrVal::Expr(e) => {
                     let v = self.eval(e, env)?;
                     self.write_attr(name, v, out);
@@ -1614,6 +1622,39 @@ impl Interp {
             }
         }
         Ok(())
+    }
+
+    /// A template's text, appended to `out` (unescaped).
+    fn template_into(&mut self, parts: &[TPart], env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        for p in parts {
+            match p {
+                TPart::Lit(t) => out.push_str(t),
+                TPart::Expr(x) => match self.eval(x, env)? {
+                    Value::Str(t) => out.push_str(&t),
+                    Value::Int(n) => {
+                        use std::fmt::Write;
+                        let _ = write!(out, "{}", n);
+                    }
+                    v => out.push_str(&v.display()),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// ` name="url"` for a URL attribute (see `write_attr`).
+    fn write_url_attr(&self, name: &str, url: &str, out: &mut String) {
+        out.push(' ');
+        out.push_str(name);
+        out.push_str("=\"");
+        if script_url(url) {
+            out.push_str(BLOCKED_URL);
+        } else if !self.base.is_empty() && matches!(name, "href" | "src" | "action" | "formaction" | "poster") {
+            escape_into(&self.with_base(url), out);
+        } else {
+            escape_into(url, out);
+        }
+        out.push('"');
     }
 
     /// ` name="value"`, or ` name` for true, nothing for false and null.
@@ -1715,6 +1756,7 @@ impl Interp {
         // too, so only its state travels: its props may be anything,
         // callbacks and HTML included.
         let nested = !self.islands.is_empty();
+        self.rendered_island = true;
         self.islands.push((Map::new(), Map::new()));
         let mut body = String::new();
         let r = self.render_call_into(&c, args, line, &mut body);

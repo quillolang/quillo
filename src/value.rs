@@ -1,7 +1,6 @@
 use crate::ast::FnDef;
 use crate::interp::{Ctrl, Interp};
 use indexmap::IndexMap;
-use std::sync::Mutex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -209,14 +208,89 @@ pub type Env = Arc<Scope>;
 /// Variables, and the scope around them. The parent link is fixed when the
 /// scope is made, so looking a name up walks the chain without locking it.
 pub struct Scope {
-    vars: Mutex<Vars>,
+    vars: VarsCell,
     parent: Option<Env>,
+}
+
+/// The lock on a scope's variables. Quillo code runs under the interpreter
+/// lock, so this is never contended; unlike `std::sync::Mutex` (which on
+/// some systems allocates an OS lock), it is one flag in place.
+struct VarsCell {
+    locked: std::sync::atomic::AtomicBool,
+    vars: std::cell::UnsafeCell<Vars>,
+}
+
+// Access goes through `lock`, which hands out one guard at a time.
+unsafe impl Sync for VarsCell {}
+
+struct VarsGuard<'a>(&'a VarsCell);
+
+impl VarsCell {
+    fn new(vars: Vars) -> Self {
+        VarsCell { locked: std::sync::atomic::AtomicBool::new(false), vars: std::cell::UnsafeCell::new(vars) }
+    }
+
+    fn lock(&self) -> VarsGuard<'_> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        while self.locked.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        VarsGuard(self)
+    }
+}
+
+impl std::ops::Deref for VarsGuard<'_> {
+    type Target = Vars;
+    fn deref(&self) -> &Vars {
+        // SAFETY: the guard holds the flag, so no other reference exists.
+        unsafe { &*self.0.vars.get() }
+    }
+}
+
+impl std::ops::DerefMut for VarsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Vars {
+        // SAFETY: as above.
+        unsafe { &mut *self.0.vars.get() }
+    }
+}
+
+impl Drop for VarsGuard<'_> {
+    fn drop(&mut self) {
+        self.0.locked.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A variable's name, kept in place when short (as nearly all are), so
+/// binding a parameter or loop variable needs no allocation.
+enum Name {
+    Short(u8, [u8; 22]),
+    Long(Box<str>),
+}
+
+impl Name {
+    fn new(s: &str) -> Name {
+        if s.len() <= 22 {
+            let mut b = [0u8; 22];
+            b[..s.len()].copy_from_slice(s.as_bytes());
+            Name::Short(s.len() as u8, b)
+        } else {
+            Name::Long(s.into())
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            // SAFETY: the bytes were copied from a `str`, whole.
+            Name::Short(n, b) => unsafe { std::str::from_utf8_unchecked(&b[..*n as usize]) },
+            Name::Long(s) => s,
+        }
+    }
 }
 
 /// A function's or block's few variables are found fastest by comparing
 /// names in order; the globals (every builtin and definition) by hashing.
 enum Vars {
-    Few(Vec<(Box<str>, Value)>),
+    Few(Vec<(Name, Value)>),
     Many(HashMap<Box<str>, Value, BuildFx>),
 }
 
@@ -226,14 +300,14 @@ const FEW: usize = 16;
 impl Vars {
     fn get(&self, name: &str) -> Option<&Value> {
         match self {
-            Vars::Few(v) => v.iter().rev().find(|(n, _)| &**n == name).map(|(_, x)| x),
+            Vars::Few(v) => v.iter().rev().find(|(n, _)| n.as_str() == name).map(|(_, x)| x),
             Vars::Many(m) => m.get(name),
         }
     }
 
     fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
         match self {
-            Vars::Few(v) => v.iter_mut().rev().find(|(n, _)| &**n == name).map(|(_, x)| x),
+            Vars::Few(v) => v.iter_mut().rev().find(|(n, _)| n.as_str() == name).map(|(_, x)| x),
             Vars::Many(m) => m.get_mut(name),
         }
     }
@@ -244,9 +318,10 @@ impl Vars {
             return;
         }
         match self {
-            Vars::Few(v) if v.len() < FEW => v.push((name.into(), value)),
+            Vars::Few(v) if v.len() < FEW => v.push((Name::new(name), value)),
             Vars::Few(v) => {
-                let mut m: HashMap<Box<str>, Value, BuildFx> = std::mem::take(v).into_iter().collect();
+                let mut m: HashMap<Box<str>, Value, BuildFx> =
+                    std::mem::take(v).into_iter().map(|(k, x)| (k.as_str().into(), x)).collect();
                 m.insert(name.into(), value);
                 *self = Vars::Many(m);
             }
@@ -258,7 +333,7 @@ impl Vars {
 
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
-            Vars::Few(v) => v.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
+            Vars::Few(v) => v.iter().map(|(k, x)| (k.as_str().to_string(), x.clone())).collect(),
             Vars::Many(m) => m.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
         }
     }
@@ -296,15 +371,15 @@ pub type BuildFx = std::hash::BuildHasherDefault<Fx>;
 
 impl Scope {
     pub fn root() -> Env {
-        Arc::new(Scope { vars: Mutex::new(Vars::Many(HashMap::default())), parent: None })
+        Arc::new(Scope { vars: VarsCell::new(Vars::Many(HashMap::default())), parent: None })
     }
 
     pub fn child(parent: &Env) -> Env {
-        Arc::new(Scope { vars: Mutex::new(Vars::Few(Vec::new())), parent: Some(parent.clone()) })
+        Arc::new(Scope { vars: VarsCell::new(Vars::Few(Vec::new())), parent: Some(parent.clone()) })
     }
 
-    fn vars(&self) -> std::sync::MutexGuard<'_, Vars> {
-        self.vars.lock().unwrap_or_else(|e| e.into_inner())
+    fn vars(&self) -> VarsGuard<'_> {
+        self.vars.lock()
     }
 }
 

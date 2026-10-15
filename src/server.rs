@@ -187,6 +187,7 @@ impl Interp {
                 return sub.handle(&inner);
             }
         }
+        self.rendered_island = false;
         let mut resp = self.handle_inner(req);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
@@ -197,15 +198,12 @@ impl Interp {
         }
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
-        if html && req.method != "HEAD" {
-            let body = String::from_utf8_lossy(&resp.body);
-            if body.contains("<quillo-island") && !body.contains("/_quillo/quillo.js") {
+        if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
+            let has = |needle: &[u8]| resp.body.windows(needle.len()).rposition(|w| w == needle);
+            if has(b"/_quillo/quillo.js").is_none() {
                 let tag = format!("<script src=\"{}/_quillo/quillo.js\" defer></script>", self.base);
-                let body = match body.rfind("</body>") {
-                    Some(i) => format!("{}{}{}", &body[..i], tag, &body[i..]),
-                    None => format!("{}{}", body, tag),
-                };
-                resp.body = body.into_bytes();
+                let at = has(b"</body>").unwrap_or(resp.body.len());
+                resp.body.splice(at..at, tag.into_bytes());
             }
         }
         resp
