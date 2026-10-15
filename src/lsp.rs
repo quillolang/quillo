@@ -462,6 +462,7 @@ fn keyword_doc(w: &str) -> Option<String> {
         "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
         "match" => "`match value { pattern [if guard] => result ... }`",
         "use" => "`use \"lib.qwe\"` runs another file once, into the global scope.",
+        "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",
         _ => return None,
     };
     Some(text.to_string())
