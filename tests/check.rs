@@ -141,6 +141,24 @@ fn calling_a_variable_that_shadows_a_builtin_is_flagged() {
 }
 
 #[test]
+fn javascript_truthiness_is_flagged_where_it_differs() {
+    // In Quillo only null, false and errors are false: "" and 0 are true.
+    one("fn f(name: str) = name || \"anonymous\"", "1 warning: `name` counts as true even when it is \"\" (unlike JavaScript), so `||` keeps it: write `name != \"\" ? name : ...`");
+    one("fn f(name: str | null) = name || \"x\"", "or `name ?? ...` to replace only null");
+    one("view Badge(n: int) = <b>{n}</b>\nview V(count: int) = <p>{count && <Badge n={count}/>}</p>", "2 warning: `count` counts as true even when it is 0 (unlike JavaScript), so `&&` always goes on: write `count > 0 && ...`");
+    one("fn f(s: str) = !s", "so `!s` is false: write `s == \"\"`");
+    one("fn f(s: str) = s ? 1 : 2", "so this condition holds: write `s != \"\"`");
+    one("fn f(n: float) { if n { 1 } else { 2 } }", "write `n != 0`");
+    one("fn f(p: map) {\n let n = len(p)\n !n\n}", "3 warning: `n` counts as true even when it is 0");
+    // Not where the meaning is the same, or the type is not known.
+    clean("fn f(ok: bool, x) = (ok || x) && !ok ? x : null");
+    clean("fn f(x: int | null) = x ?? 0");
+    clean("fn f(u: map) = u.name || \"x\"");
+    clean("fn f(xs: list) = xs && len(xs)");
+    clean("fn f(s: str) = s != \"\" ? s : \"x\"");
+}
+
+#[test]
 fn spread_attributes() {
     one("let n = 5\nlet x = <p {...n}></p>", "`{...}` in <p> needs a map, got int");
     // A spread may supply required props, so they are not reported missing.

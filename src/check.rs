@@ -1479,7 +1479,10 @@ impl Checker {
                 let t = self.expr(x);
                 self.line = *line;
                 match op {
-                    UnOp::Not => T::of(BOOL),
+                    UnOp::Not => {
+                        self.js_truthiness(t, x, Truth::Not);
+                        T::of(BOOL)
+                    }
                     UnOp::Neg => {
                         if t.bits != 0 && t.bits & NUM == 0 {
                             self.error(format!("cannot negate {}", bits_text(t.bits)));
@@ -1492,6 +1495,11 @@ impl Checker {
                 let x = self.expr(a);
                 let y = self.expr(b);
                 self.line = *line;
+                match op {
+                    BinOp::Or => self.js_truthiness(x, a, Truth::Or),
+                    BinOp::And => self.js_truthiness(x, a, Truth::And),
+                    _ => {}
+                }
                 if matches!(op, BinOp::Div | BinOp::Mod) && matches!(**b, Expr::Lit(Lit::Int(0))) {
                     self.error("division by zero");
                 }
@@ -1573,7 +1581,8 @@ impl Checker {
                 t.without(ERR)
             }
             Expr::If(c, a, b) => {
-                self.expr(c);
+                let ct = self.expr(c);
+                self.js_truthiness(ct, c, Truth::Cond);
                 let x = self.expr(a);
                 let y = match b {
                     Some(b) => self.expr(b),
@@ -1734,7 +1743,49 @@ impl Checker {
         self.apply(ft, sig, argts, args, &callee_name(callee))
     }
 
-/// `last(items)` where `last` is a local variable: almost always a
+    /// Strings and numbers are always true in Quillo, where only `null`,
+    /// `false` and errors are false; in JavaScript, `""` and `0` are false
+    /// too. Code that reads the same in both then means something else, and
+    /// nothing fails: `name || "anonymous"` keeps an empty name. Warned only
+    /// where the value is known to be a string or a number (or null).
+    fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
+        if t.bits & (STR | NUM) == 0 || t.bits & !(STR | NUM | NIL) != 0 {
+            return;
+        }
+        let x = match e {
+            Expr::Ident(n, _) => n.clone(),
+            Expr::Field(o, n, _) if matches!(**o, Expr::Ident(..)) => format!("{}.{}", callee_name(o), n),
+            _ => "x".into(),
+        };
+        let what = if x == "x" { "this value".to_string() } else { format!("`{}`", x) };
+        let (empty, test) = match (t.bits & STR != 0, t.bits & NUM != 0) {
+            (true, false) => ("\"\"", format!("{} != \"\"", x)),
+            (false, true) => ("0", format!("{} != 0", x)),
+            _ => ("\"\" or 0", format!("{} != \"\" && {} != 0", x, x)),
+        };
+        let nullable = t.bits & NIL != 0;
+        let unless_null = if nullable { " unless it is null" } else { "" };
+        let msg = match how {
+            Truth::Or => format!(
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so `||` keeps it{unless_null}: write `{test} ? {x} : ...`{}",
+                if nullable { format!(", or `{x} ?? ...` to replace only null") } else { String::new() }
+            ),
+            Truth::And => format!(
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so `&&` always goes on{unless_null}: write `{} && ...`",
+                if empty == "0" { format!("{x} > 0") } else { test.clone() }
+            ),
+            Truth::Not => format!(
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so `!{x}` is false{unless_null}: write `{}`",
+                test.replace("!=", "==").replace("&&", "||")
+            ),
+            Truth::Cond => format!(
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so this condition holds{unless_null}: write `{test}`"
+            ),
+        };
+        self.warn(msg);
+    }
+
+    /// `last(items)` where `last` is a local variable: almost always a
     /// mistake, and invisible when the variable's type is unknown.
     fn warn_shadowed_builtin(&mut self, name: &str) {
         let local = self.scopes.iter().rev().find_map(|s| s.get(name).cloned());
@@ -1750,7 +1801,7 @@ impl Checker {
         }
     }
 
-        fn is_local(&self, name: &str) -> bool {
+    fn is_local(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
     }
 
@@ -2025,6 +2076,15 @@ fn route_path(r: &RouteDef) -> String {
         s.push('/');
     }
     s
+}
+
+/// Where a value is used as true or false.
+#[derive(Clone, Copy)]
+enum Truth {
+    Or,
+    And,
+    Not,
+    Cond,
 }
 
 fn callee_name(e: &Expr) -> String {

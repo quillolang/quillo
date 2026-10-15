@@ -104,7 +104,12 @@ Most expressions read as they would in JavaScript. The differences:
   ones are arrows. Blocks give back their last expression, so `return` is only for
   leaving early.
 - `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
-- Only `null`, `false` and error values are falsy: `0` and `""` are truthy.
+- Only `null`, `false` and error values are falsy: `0` and `""` are truthy. Code
+  written by JavaScript habit then runs without failing but means something else:
+  `name || "anonymous"` keeps an empty name, and `count && <Badge/>` shows the badge
+  for 0. Where a value is known to be a string or a number, the checker warns about
+  `||`, `&&`, `!`, `if` and `? :` on it and suggests the explicit form
+  (`name != "" ? name : "anonymous"`, `count > 0 && <Badge/>`).
 - `match`, `|`, patterns, `route`, `reply`, `~state` and `with` effects have no
   JavaScript equivalent.
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
