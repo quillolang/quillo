@@ -380,6 +380,8 @@ pub struct App {
     base_dir: PathBuf,
     /// Development mode: reload on change and refresh open pages.
     pub watch: bool,
+    /// Run the static checker before each reload.
+    pub static_check: bool,
 }
 
 impl App {
@@ -391,6 +393,7 @@ impl App {
             main_file: main_file.to_path_buf(),
             base_dir: base_dir.to_path_buf(),
             watch,
+            static_check: true,
         }
     }
 
@@ -402,9 +405,21 @@ impl App {
     /// Loads the program again from disk and makes it current. A program that
     /// fails to load does not replace one that works.
     pub fn reload(&self) {
+        let mut problems = String::new();
+        if self.static_check {
+            let analysis = crate::check::check_file(&self.main_file);
+            for d in &analysis.diagnostics {
+                eprintln!("{}", d);
+            }
+            problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
+        }
         self.shared.gil.acquire();
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
-        let res = it.load_file(&self.main_file);
+        let res = if problems.is_empty() {
+            it.load_file(&self.main_file)
+        } else {
+            Err(crate::error::WispError::new(problems, 0))
+        };
         self.shared.gil.release();
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         match res {
