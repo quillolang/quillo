@@ -1,7 +1,7 @@
-// wisp run examples/hello.wisp
+// lite run examples/hello.lt
 // then: curl localhost:8080/add/2/40
 
-route GET / = <h1>"Hello from Wisp"</h1>
+route GET / = <h1>"Hello from Lite"</h1>
 
 // Path parameters are variables. `:a(int)` only matches digits and gives an int.
 route GET /hello/:name = "Hello, {name}!"

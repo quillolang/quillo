@@ -146,8 +146,8 @@ impl Interp {
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
         if html && req.method != "HEAD" {
             let body = String::from_utf8_lossy(&resp.body);
-            if body.contains("<wisp-island") && !body.contains("/_wisp/wisp.js") {
-                let tag = "<script src=\"/_wisp/wisp.js\" defer></script>";
+            if body.contains("<lite-island") && !body.contains("/_lite/lite.js") {
+                let tag = "<script src=\"/_lite/lite.js\" defer></script>";
                 let body = match body.rfind("</body>") {
                     Some(i) => format!("{}{}{}", &body[..i], tag, &body[i..]),
                     None => format!("{}{}", body, tag),
@@ -160,7 +160,7 @@ impl Interp {
 
     fn handle_inner(&mut self, req: &HttpRequest) -> HttpResponse {
         let (path, qs) = req.url.split_once('?').unwrap_or((req.url.as_str(), ""));
-        if let Some(rest) = path.strip_prefix("/_wisp/") {
+        if let Some(rest) = path.strip_prefix("/_lite/") {
             return self.handle_internal(rest, req, path, qs);
         }
         let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false)).collect();
@@ -229,9 +229,9 @@ impl Interp {
 }
 
 impl Interp {
-    /// `/_wisp/...`: the browser bundle and `server fn` calls.
+    /// `/_lite/...`: the browser bundle and `server fn` calls.
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
-        if rest == "wisp.js" {
+        if rest == "lite.js" {
             // The browser keeps its copy and asks whether it is still current.
             let etag = format!("\"{:016x}\"", {
                 use std::hash::{Hash, Hasher};
@@ -285,7 +285,7 @@ impl Interp {
             },
             Err(Ctrl::Reply(r)) => render_response(&r),
             Err(Ctrl::Error(e)) => {
-                eprintln!("wisp: error in server fn `{}`: {}", name, e);
+                eprintln!("lite: error in server fn `{}`: {}", name, e);
                 rpc_error(500, &format!("internal error in `{}`", name))
             }
         }
@@ -331,7 +331,7 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Ok(v) | Err(Ctrl::Return(v)) => value_response(v),
         Err(Ctrl::Reply(r)) => render_response(&r),
         Err(Ctrl::Error(e)) => {
-            eprintln!("wisp: error: {}", e);
+            eprintln!("lite: error: {}", e);
             plain(500, &format!("internal error: {}\n", e))
         }
     }
@@ -384,7 +384,7 @@ pub enum Loaded {
 /// The running program, which `--watch` swaps out when its files change.
 pub struct App {
     slot: Mutex<(u64, Arc<Loaded>)>,
-    /// Signalled when `slot` changes, for `/_wisp/events`.
+    /// Signalled when `slot` changes, for `/_lite/events`.
     changed: Condvar,
     shared: Arc<Shared>,
     main_file: PathBuf,
@@ -430,21 +430,21 @@ impl App {
         let res = if problems.is_empty() {
             it.load_file(&self.main_file)
         } else {
-            Err(crate::error::WispError::new(problems, 0))
+            Err(crate::error::LiteError::new(problems, 0))
         };
         self.shared.gil.release();
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         match res {
             Ok(_) => {
-                eprintln!("wisp: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
+                eprintln!("lite: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
                 *slot = (slot.0 + 1, Arc::new(Loaded::Ready(it)));
             }
             Err(e) => {
-                eprintln!("wisp: {}", e);
+                eprintln!("lite: {}", e);
                 if matches!(*slot.1, Loaded::Failed(_)) {
                     *slot = (slot.0 + 1, Arc::new(Loaded::Failed(e.to_string())));
                 } else {
-                    eprintln!("wisp: still serving the previous version");
+                    eprintln!("lite: still serving the previous version");
                 }
             }
         }
@@ -492,16 +492,16 @@ fn watch(app: Arc<App>) {
 }
 
 /// Reloads the page when the program changes. The page keeps one request
-/// open: `/_wisp/events?v=N` answers when the version is no longer N (or
+/// open: `/_lite/events?v=N` answers when the version is no longer N (or
 /// after a while, and then the page asks again). If the server restarts, the
 /// page notices the new version and reloads too.
-const DEV_SCRIPT: &str = "<script>(async()=>{let v=null;for(;;){try{const t=await(await fetch('/_wisp/events'+(v===null?'':'?v='+v))).text();if(v!==null&&t!==v){location.reload();return}v=t}catch(e){await new Promise(r=>setTimeout(r,1000))}}})()</script>";
+const DEV_SCRIPT: &str = "<script>(async()=>{let v=null;for(;;){try{const t=await(await fetch('/_lite/events'+(v===null?'':'?v='+v))).text();if(v!==null&&t!==v){location.reload();return}v=t}catch(e){await new Promise(r=>setTimeout(r,1000))}}})()</script>";
 
-/// Answers `/_wisp/events[?v=N]` on a thread of its own, so pages waiting
+/// Answers `/_lite/events[?v=N]` on a thread of its own, so pages waiting
 /// for a change do not hold on to request workers.
 fn serve_events(app: Arc<App>, rq: tiny_http::Request) {
     let seen = rq.url().split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
-    let _ = std::thread::Builder::new().name("wisp-events".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("lite-events".into()).spawn(move || {
         let v = match seen {
             Some(seen) => app.wait_for_change(seen, Duration::from_secs(25)),
             None => app.current().0,
@@ -531,7 +531,7 @@ fn error_page(msg: &str) -> HttpResponse {
         status: 500,
         headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
         body: format!(
-            "<!doctype html><title>Wisp error</title><body style=\"font-family:monospace\"><h1>The program did not load</h1><pre>{}</pre></body>",
+            "<!doctype html><title>Lite error</title><body style=\"font-family:monospace\"><h1>The program did not load</h1><pre>{}</pre></body>",
             crate::interp::escape(msg)
         )
         .into_bytes(),
@@ -581,7 +581,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
     let mut local: Option<Interp> = None;
     let mut program = app.current().1;
     while let Ok(mut rq) = server.recv() {
-        if app.watch && rq.url().split('?').next() == Some("/_wisp/events") {
+        if app.watch && rq.url().split('?').next() == Some("/_lite/events") {
             serve_events(app.clone(), rq);
             continue;
         }
@@ -596,7 +596,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             };
             program = current;
         }
-        let mut resp = if app.watch && req.url == "/_wisp/dev" {
+        let mut resp = if app.watch && req.url == "/_lite/dev" {
             plain(200, &generation.to_string())
         } else {
             match (&mut local, &*program) {
@@ -613,7 +613,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
         if app.watch {
             inject_dev_script(&mut resp);
         }
-        if req.url != "/_wisp/dev" {
+        if req.url != "/_lite/dev" {
             eprintln!(
                 "{} {} -> {} ({:.1}ms)",
                 req.method,
@@ -641,17 +641,17 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.len();
-        eprintln!("wisp: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, addr);
+        eprintln!("lite: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, addr);
     }
     if app.watch {
-        eprintln!("wisp: watching for changes");
+        eprintln!("lite: watching for changes");
     }
     app.shared.gil.release();
     let mut handles = Vec::new();
     for i in 0..workers.max(1) {
         let (app, server) = (app.clone(), server.clone());
         let h = std::thread::Builder::new()
-            .name(format!("wisp-worker-{}", i))
+            .name(format!("lite-worker-{}", i))
             .stack_size(WORKER_STACK)
             .spawn(move || {
                 worker(app, server)
@@ -662,7 +662,7 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     if app.watch {
         let app = app.clone();
         std::thread::Builder::new()
-            .name("wisp-watch".into())
+            .name("lite-watch".into())
             .stack_size(WORKER_STACK)
             .spawn(move || {
                 watch(app)
@@ -675,6 +675,6 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Stack for threads that run Wisp code. Calls grow the stack on demand
+/// Stack for threads that run Lite code. Calls grow the stack on demand
 /// beyond this; it only has to cover deeply nested source and data.
 pub const WORKER_STACK: usize = 16 << 20;

@@ -1,5 +1,5 @@
 // A small server-rendered todo app with a JSON API next to it.
-// wisp run examples/todo.wisp, then open http://localhost:8080
+// lite run examples/todo.lt, then open http://localhost:8080
 
 let todos = []
 let next_id = 1
@@ -43,7 +43,7 @@ view TodoItem(todo: map) =
 
 route GET / {
     let left = todos |> filter(fn(t) = not t.done) |> len
-    <Layout title="Wisp todos">
+    <Layout title="Lite todos">
         <h1>"Todos"</h1>
         <p.muted>"{left} of {len(todos)} left"</p>
         <ul.todos>{for t in todos => <TodoItem todo={t}/>}</ul>

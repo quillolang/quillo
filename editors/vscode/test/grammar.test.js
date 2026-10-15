@@ -1,4 +1,4 @@
-// Tokenizes Wisp with VS Code's TextMate engine and checks key scopes.
+// Tokenizes Lite with VS Code's TextMate engine and checks key scopes.
 // Run: npm test
 const fs = require("fs");
 const path = require("path");
@@ -13,50 +13,50 @@ const onigLib = oniguruma.loadWASM(wasm).then(() => ({
 const registry = new vsctm.Registry({
   onigLib,
   loadGrammar: async () => vsctm.parseRawGrammar(
-    fs.readFileSync(path.join(__dirname, "../syntaxes/wisp.tmLanguage.json"), "utf8"), "wisp.tmLanguage.json"),
+    fs.readFileSync(path.join(__dirname, "../syntaxes/lite.tmLanguage.json"), "utf8"), "lite.tmLanguage.json"),
 });
 
 // [line, token text, scope that token must have]
 const cases = [
-  ['route GET /users/:id(int) = find_user(id)', "route", "keyword.other.route.wisp"],
-  ['route GET /users/:id(int) = find_user(id)', "GET", "constant.language.http-method.wisp"],
-  ['route GET /users/:id(int) = find_user(id)', "id", "variable.parameter.path.wisp"],
-  ['route GET /users/:id(int) = find_user(id)', "int", "support.type.wisp"],
-  ['route GET /users/:id(int) = find_user(id)', "find_user", "entity.name.function.call.wisp"],
-  ['fn add(a: int, b: int = 10) -> int = a + b', "add", "entity.name.function.wisp"],
-  ['fn add(a: int, b: int = 10) -> int = a + b', "10", "constant.numeric.integer.wisp"],
-  ['fn parse(s: str) -> int ! str with db, http = 1', "with", "keyword.other.with.wisp"],
-  ['fn parse(s: str) -> int ! str with db, http = 1', "db, http", "support.constant.effect.wisp"],
-  ['server fn save(text: str) = text', "server", "storage.modifier.server.wisp"],
-  ['server fn save(text: str) = text', "save", "entity.name.function.wisp"],
-  ['component Counter(start: int = 0) {', "Counter", "entity.name.type.component.wisp"],
-  ['    ~count = start', "count", "variable.other.state.wisp"],
-  ['let greeting = "Hello, {name}!"', "greeting", "variable.other.declaration.wisp"],
-  ['let greeting = "Hello, {name}!"', "Hello, ", "string.quoted.double.wisp"],
-  ['let greeting = "Hello, {name}!"', "name", "meta.interpolation.wisp"],
-  ['let e = "a \\{ b"', "\\{", "constant.character.escape.wisp"],
-  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "li", "entity.name.tag.wisp"],
-  ['<li.todo #todo-{t.id} class={x}>"text"</li>', ".todo", "entity.other.attribute-name.class.wisp"],
-  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "class", "entity.other.attribute-name.wisp"],
-  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "text", "string.quoted.double.wisp"],
-  ['<button @click={fn() { count += 1 }}>"+"</button>', "click", "entity.other.attribute-name.event.wisp"],
-  ['<button @click={fn() { count += 1 }}>"+"</button>', "+=", "keyword.operator.assignment.wisp"],
-  ['<input bind:value={draft}/>', "bind", "keyword.other.bind.wisp"],
-  ['<Card title="x"/>', "Card", "entity.name.type.component.wisp"],
-  ['orders |> filter(fn(o) = o.total > 100) ?? []', "|>", "keyword.operator.pipe.wisp"],
-  ['orders |> filter(fn(o) = o.total > 100) ?? []', "??", "keyword.operator.coalesce.wisp"],
-  ['orders |> filter(fn(o) = o.total > 100) ?? []', "filter", "support.function.builtin.wisp"],
-  ['let rows = db.query("select 1")', "db", "support.module.wisp"],
-  ['let rows = db.query("select 1")', "query", "support.function.wisp"],
-  ['if x > 0 then "pos" else nil // done', "if", "keyword.control.wisp"],
-  ['if x > 0 then "pos" else nil // done', "nil", "constant.language.wisp"],
-  ['if x > 0 then "pos" else nil // done', "// done", "comment.line.double-slash.wisp"],
-  ['match e { { type: "click", x: int } => x }', "int", "support.type.pattern.wisp"],
-  ['let v = request.json', "request", "variable.language.request.wisp"],
+  ['route GET /users/:id(int) = find_user(id)', "route", "keyword.other.route.lite"],
+  ['route GET /users/:id(int) = find_user(id)', "GET", "constant.language.http-method.lite"],
+  ['route GET /users/:id(int) = find_user(id)', "id", "variable.parameter.path.lite"],
+  ['route GET /users/:id(int) = find_user(id)', "int", "support.type.lite"],
+  ['route GET /users/:id(int) = find_user(id)', "find_user", "entity.name.function.call.lite"],
+  ['fn add(a: int, b: int = 10) -> int = a + b', "add", "entity.name.function.lite"],
+  ['fn add(a: int, b: int = 10) -> int = a + b', "10", "constant.numeric.integer.lite"],
+  ['fn parse(s: str) -> int ! str with db, http = 1', "with", "keyword.other.with.lite"],
+  ['fn parse(s: str) -> int ! str with db, http = 1', "db, http", "support.constant.effect.lite"],
+  ['server fn save(text: str) = text', "server", "storage.modifier.server.lite"],
+  ['server fn save(text: str) = text', "save", "entity.name.function.lite"],
+  ['component Counter(start: int = 0) {', "Counter", "entity.name.type.component.lite"],
+  ['    ~count = start', "count", "variable.other.state.lite"],
+  ['let greeting = "Hello, {name}!"', "greeting", "variable.other.declaration.lite"],
+  ['let greeting = "Hello, {name}!"', "Hello, ", "string.quoted.double.lite"],
+  ['let greeting = "Hello, {name}!"', "name", "meta.interpolation.lite"],
+  ['let e = "a \\{ b"', "\\{", "constant.character.escape.lite"],
+  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "li", "entity.name.tag.lite"],
+  ['<li.todo #todo-{t.id} class={x}>"text"</li>', ".todo", "entity.other.attribute-name.class.lite"],
+  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "class", "entity.other.attribute-name.lite"],
+  ['<li.todo #todo-{t.id} class={x}>"text"</li>', "text", "string.quoted.double.lite"],
+  ['<button @click={fn() { count += 1 }}>"+"</button>', "click", "entity.other.attribute-name.event.lite"],
+  ['<button @click={fn() { count += 1 }}>"+"</button>', "+=", "keyword.operator.assignment.lite"],
+  ['<input bind:value={draft}/>', "bind", "keyword.other.bind.lite"],
+  ['<Card title="x"/>', "Card", "entity.name.type.component.lite"],
+  ['orders |> filter(fn(o) = o.total > 100) ?? []', "|>", "keyword.operator.pipe.lite"],
+  ['orders |> filter(fn(o) = o.total > 100) ?? []', "??", "keyword.operator.coalesce.lite"],
+  ['orders |> filter(fn(o) = o.total > 100) ?? []', "filter", "support.function.builtin.lite"],
+  ['let rows = db.query("select 1")', "db", "support.module.lite"],
+  ['let rows = db.query("select 1")', "query", "support.function.lite"],
+  ['if x > 0 then "pos" else nil // done', "if", "keyword.control.lite"],
+  ['if x > 0 then "pos" else nil // done', "nil", "constant.language.lite"],
+  ['if x > 0 then "pos" else nil // done', "// done", "comment.line.double-slash.lite"],
+  ['match e { { type: "click", x: int } => x }', "int", "support.type.pattern.lite"],
+  ['let v = request.json', "request", "variable.language.request.lite"],
 ];
 
 (async () => {
-  const grammar = await registry.loadGrammar("source.wisp");
+  const grammar = await registry.loadGrammar("source.lite");
   let failed = 0;
   for (const [line, text, scope] of cases) {
     const { tokens } = grammar.tokenizeLine(line, vsctm.INITIAL);
@@ -70,7 +70,7 @@ const cases = [
   }
   // Every example file tokenizes without leaving a tag or string open.
   const examples = path.join(__dirname, "../../../examples");
-  for (const f of fs.readdirSync(examples).filter((f) => f.endsWith(".wisp"))) {
+  for (const f of fs.readdirSync(examples).filter((f) => f.endsWith(".lt"))) {
     let state = vsctm.INITIAL;
     for (const line of fs.readFileSync(path.join(examples, f), "utf8").split("\n")) {
       state = grammar.tokenizeLine(line, state).ruleStack;

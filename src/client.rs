@@ -1,13 +1,13 @@
 //! Compiles components, and what they use, to JavaScript for the browser.
 //!
-//! The bundle served at `/_wisp/wisp.js` is the runtime (`client/runtime.js`)
+//! The bundle served at `/_lite/lite.js` is the runtime (`client/runtime.js`)
 //! followed by the compiled program: every `component`, the functions,
 //! views and constants they reference, and a stub for each `server fn`.
 //! Code that cannot run in a browser (`request`, `db`, a global the server
 //! changes, ...) is a load-time error that names the component.
 
 use crate::ast::*;
-use crate::error::WispError;
+use crate::error::LiteError;
 use crate::interp::{not_sendable, Interp};
 use crate::value::*;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +26,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "index_of", "repeat",
 ];
 
-pub fn bundle(it: &Interp) -> Result<String, WispError> {
+pub fn bundle(it: &Interp) -> Result<String, LiteError> {
     let mut c = Compiler::new(it);
     let mut names: Vec<(String, Arc<FnDef>)> = Vec::new();
     for (name, v) in scope_vars(&it.globals) {
@@ -50,7 +50,7 @@ pub fn bundle(it: &Interp) -> Result<String, WispError> {
         for name in &it.server_fns {
             let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
         }
-        program.push_str("window.wisp = { server, components: C, rpc };\n");
+        program.push_str("window.lite = { server, components: C, rpc };\n");
     }
     if !names.is_empty() {
         program.push_str(
@@ -62,7 +62,7 @@ pub fn bundle(it: &Interp) -> Result<String, WispError> {
 
 /// A script that runs the runtime, compiles the global function `name`,
 /// calls it and prints the result's repr: for testing against the server.
-pub fn test_script(it: &Interp, name: &str) -> Result<String, WispError> {
+pub fn test_script(it: &Interp, name: &str) -> Result<String, LiteError> {
     let mut c = Compiler::new(it);
     let (js, is_async) = c.global(name, 0)?;
     let mut program = String::new();
@@ -388,10 +388,10 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn err<T>(&self, msg: impl Into<String>) -> Result<T, WispError> {
+    fn err<T>(&self, msg: impl Into<String>) -> Result<T, LiteError> {
         let msg = msg.into();
         let where_ = if self.what.is_empty() { String::new() } else { format!("{} (compiled for the browser): ", self.what) };
-        Err(WispError::new(format!("{}{}", where_, msg), self.line))
+        Err(LiteError::new(format!("{}{}", where_, msg), self.line))
     }
 
     fn fresh(&mut self, name: &str) -> String {
@@ -430,7 +430,7 @@ impl<'a> Compiler<'a> {
         js
     }
 
-    fn resolve(&mut self, name: &str) -> Result<Resolved, WispError> {
+    fn resolve(&mut self, name: &str) -> Result<Resolved, LiteError> {
         for ctx in self.ctxs.iter().rev() {
             for scope in ctx.scopes.iter().rev() {
                 match scope.get(name) {
@@ -445,7 +445,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// A top-level name used by browser code: compiled once, on first use.
-    fn global(&mut self, name: &str, line: u32) -> Result<(String, bool), WispError> {
+    fn global(&mut self, name: &str, line: u32) -> Result<(String, bool), LiteError> {
         if let Some(g) = self.globals.get(name) {
             return Ok(g.clone());
         }
@@ -535,7 +535,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Parameter defaults and checks; returns the JS parameter names.
-    fn params(&mut self, def: &FnDef, out: &mut String, check_arity: bool) -> Result<Vec<String>, WispError> {
+    fn params(&mut self, def: &FnDef, out: &mut String, check_arity: bool) -> Result<Vec<String>, LiteError> {
         let fname = js_str(&def.name);
         if check_arity {
             let _ = writeln!(out, "W.arity(arguments.length, {}, {});", def.params.len(), fname);
@@ -562,7 +562,7 @@ impl<'a> Compiler<'a> {
 
     /// A function or view. Compiled once synchronously; if it turns out to
     /// call the server, again as an `async function`.
-    fn function(&mut self, def: &FnDef) -> Result<(String, bool), WispError> {
+    fn function(&mut self, def: &FnDef) -> Result<(String, bool), LiteError> {
         if def.effects.as_ref().map_or(false, |e| e.iter().any(|x| x != "time" && x != "random")) {
             return self.err(format!(
                 "`{}` declares `with {}`, which the browser cannot do; make it a `server fn`",
@@ -578,12 +578,12 @@ impl<'a> Compiler<'a> {
         Ok((code, true))
     }
 
-    fn function_with(&mut self, def: &FnDef, is_async: bool) -> Result<(String, bool), WispError> {
+    fn function_with(&mut self, def: &FnDef, is_async: bool) -> Result<(String, bool), LiteError> {
         let saved_line = self.line;
         self.line = def.line;
         self.new_ctx(None, is_async);
         let mut pre = String::new();
-        let res = (|| -> Result<(Vec<String>, String), WispError> {
+        let res = (|| -> Result<(Vec<String>, String), LiteError> {
             let names = self.params(def, &mut pre, true)?;
             let body = self.body(&def.body)?;
             Ok((names, body))
@@ -625,10 +625,10 @@ impl<'a> Compiler<'a> {
     }
 
     /// A component's render function: `function ($i, ...props)`.
-    fn component(&mut self, def: &FnDef) -> Result<(String, bool), WispError> {
+    fn component(&mut self, def: &FnDef) -> Result<(String, bool), LiteError> {
         self.new_ctx(Some(def.name.clone()), false);
         let mut pre = String::new();
-        let res = (|| -> Result<(Vec<String>, String), WispError> {
+        let res = (|| -> Result<(Vec<String>, String), LiteError> {
             let names = self.params(def, &mut pre, false)?;
             let body = self.body(&def.body)?;
             Ok((names, body))
@@ -648,7 +648,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// A function body as statements ending in `return`.
-    fn body(&mut self, e: &Expr) -> Result<String, WispError> {
+    fn body(&mut self, e: &Expr) -> Result<String, LiteError> {
         match e {
             Expr::Block(stmts) => self.stmts(stmts),
             other => Ok(format!("return {};\n", self.expr(other)?)),
@@ -656,14 +656,14 @@ impl<'a> Compiler<'a> {
     }
 
     /// Statements of a block, in a new scope, returning the last value.
-    fn stmts(&mut self, stmts: &[Stmt]) -> Result<String, WispError> {
+    fn stmts(&mut self, stmts: &[Stmt]) -> Result<String, LiteError> {
         self.push_scope();
         let res = self.stmts_inner(stmts);
         self.pop_scope();
         res
     }
 
-    fn stmts_inner(&mut self, stmts: &[Stmt]) -> Result<String, WispError> {
+    fn stmts_inner(&mut self, stmts: &[Stmt]) -> Result<String, LiteError> {
         let mut body = String::new();
         let mut decls: Vec<String> = Vec::new();
         let n = stmts.len();
@@ -811,7 +811,7 @@ impl<'a> Compiler<'a> {
 
     /// Whether a function waits on the server (it calls a `server fn`, or a
     /// function that does). Compiles it in a scratch context to find out.
-    fn lambda_is_async(&mut self, def: &FnDef) -> Result<bool, WispError> {
+    fn lambda_is_async(&mut self, def: &FnDef) -> Result<bool, LiteError> {
         let saved_counter = self.counter;
         let saved_defs = self.defs.len();
         let r = self.function_with(def, false).map(|(_, a)| a);
@@ -821,7 +821,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// `{ ... }` in expression position.
-    fn block_expr(&mut self, stmts: &[Stmt]) -> Result<String, WispError> {
+    fn block_expr(&mut self, stmts: &[Stmt]) -> Result<String, LiteError> {
         let inner = self.stmts(stmts)?;
         Ok(self.iife(&inner))
     }
@@ -834,7 +834,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn expr(&mut self, e: &Expr) -> Result<String, WispError> {
+    fn expr(&mut self, e: &Expr) -> Result<String, LiteError> {
         Ok(match e {
             Expr::Lit(l) => lit_js(l),
             Expr::Template(parts) => {
@@ -1031,7 +1031,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// A branch of `if`: blocks become IIFEs, other expressions stay inline.
-    fn branch(&mut self, e: &Expr) -> Result<String, WispError> {
+    fn branch(&mut self, e: &Expr) -> Result<String, LiteError> {
         self.expr(e)
     }
 
@@ -1077,7 +1077,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// The function value an expression names, and whether calling it waits.
-    fn callee_value(&mut self, e: &Expr) -> Result<(String, bool), WispError> {
+    fn callee_value(&mut self, e: &Expr) -> Result<(String, bool), LiteError> {
         if let Expr::Ident(n, line) = e {
             self.line = *line;
             return Ok(match self.resolve(n)? {
@@ -1089,7 +1089,7 @@ impl<'a> Compiler<'a> {
         Ok((self.expr(e)?, false))
     }
 
-    fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, WispError> {
+    fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, LiteError> {
         let mut argv: Vec<String> = pre.into_iter().collect();
         if let Expr::Field(obj, name, _) = callee {
             let recv = self.expr(obj)?;
@@ -1136,7 +1136,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn finish_call(&mut self, name: &str, is_async: bool, call: String) -> Result<String, WispError> {
+    fn finish_call(&mut self, name: &str, is_async: bool, call: String) -> Result<String, LiteError> {
         if is_async && self.ctx().component.is_some() {
             return self.err(format!(
                 "`{}` waits on the server, so a component can only call it from an event handler \
@@ -1147,7 +1147,7 @@ impl<'a> Compiler<'a> {
         Ok(self.await_if(is_async, call))
     }
 
-    fn pattern(&mut self, p: &Pattern) -> Result<String, WispError> {
+    fn pattern(&mut self, p: &Pattern) -> Result<String, LiteError> {
         Ok(match p {
             Pattern::Wild => "{k: \"w\"}".into(),
             Pattern::Bind(n) => format!("{{k: \"b\", n: {}}}", js_str(n)),
@@ -1199,7 +1199,7 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    fn html(&mut self, el: &HtmlEl) -> Result<String, WispError> {
+    fn html(&mut self, el: &HtmlEl) -> Result<String, LiteError> {
         self.line = el.line;
         let mut kids = Vec::new();
         for c in &el.children {

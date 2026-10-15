@@ -1,7 +1,7 @@
 //! Tokenizer. The parser drives it one token at a time, and switches to
 //! reading characters directly for HTML literals and route paths.
 
-use crate::error::WispError;
+use crate::error::LiteError;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -231,7 +231,7 @@ impl Lexer {
         self.peek_char().is_some()
     }
 
-    pub fn next_token(&mut self) -> Result<Token, WispError> {
+    pub fn next_token(&mut self) -> Result<Token, LiteError> {
         loop {
             self.skip_inline_ws();
             if self.peek_char() == Some('\n') {
@@ -319,14 +319,14 @@ impl Lexer {
                 '?' if n == Some('?') => two(self, Tok::QQ),
                 '?' => Tok::Question,
                 '~' => Tok::Tilde,
-                other => return Err(WispError::new(format!("unexpected character `{}`", other), line)),
+                other => return Err(LiteError::new(format!("unexpected character `{}`", other), line)),
             }
         };
         self.last = Some(tok.clone());
         Ok(Token { tok, line })
     }
 
-    fn lex_number(&mut self) -> Result<Tok, WispError> {
+    fn lex_number(&mut self) -> Result<Tok, LiteError> {
         let line = self.line;
         let mut s = String::new();
         let digits = |lx: &mut Lexer, s: &mut String| {
@@ -346,18 +346,18 @@ impl Lexer {
             s.push('.');
             self.bump();
             digits(self, &mut s);
-            return s.parse::<f64>().map(Tok::Float).map_err(|_| WispError::new("bad number", line));
+            return s.parse::<f64>().map(Tok::Float).map_err(|_| LiteError::new("bad number", line));
         }
         s.parse::<i64>()
             .map(Tok::Int)
-            .map_err(|_| WispError::new(format!("number `{}` is too large", s), line))
+            .map_err(|_| LiteError::new(format!("number `{}` is too large", s), line))
     }
 
     /// Lexes a string literal starting at the opening quote. `{expr}` parts
     /// are kept as source and parsed later; `\{` is a literal brace.
-    pub fn lex_string(&mut self) -> Result<Vec<StrPart>, WispError> {
+    pub fn lex_string(&mut self) -> Result<Vec<StrPart>, LiteError> {
         let start = self.line;
-        let unterminated = || WispError::new("unexpected end of input: unterminated string", start);
+        let unterminated = || LiteError::new("unexpected end of input: unterminated string", start);
         self.bump();
         let mut parts = Vec::new();
         let mut buf = String::new();
@@ -374,7 +374,7 @@ impl Lexer {
                         '0' => '\0',
                         '"' | '\\' | '{' | '}' => e,
                         other => {
-                            return Err(WispError::new(format!("unknown escape `\\{}` in string", other), self.line))
+                            return Err(LiteError::new(format!("unknown escape `\\{}` in string", other), self.line))
                         }
                     });
                 }
@@ -384,7 +384,7 @@ impl Lexer {
                     }
                     let line = self.line;
                     let open_brace = || {
-                        WispError::new(
+                        LiteError::new(
                             "unexpected end of input: `{` in a string starts an interpolation that is never closed \
                              (write `\\{` for a literal brace)",
                             line,
@@ -423,7 +423,7 @@ impl Lexer {
                         src.push(c);
                     }
                     if src.trim().is_empty() {
-                        return Err(WispError::new("empty `{}` in string (write `\\{` for a literal brace)", line));
+                        return Err(LiteError::new("empty `{}` in string (write `\\{` for a literal brace)", line));
                     }
                     parts.push(StrPart::Expr(src, line));
                 }

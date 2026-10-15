@@ -1,23 +1,23 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use wisp::ast::Stmt;
-use wisp::interp::Ctrl;
-use wisp::check::SymbolKind;
-use wisp::parser::Parser;
-use wisp::server::{App, Loaded};
-use wisp::{Interp, Value};
+use lite::ast::Stmt;
+use lite::interp::Ctrl;
+use lite::check::SymbolKind;
+use lite::parser::Parser;
+use lite::server::{App, Loaded};
+use lite::{Interp, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
-Wisp — a small web language
+Lite — a small web language
 
 usage:
-  wisp run <file.wisp> [options]               run a program; serve it if it has routes
-  wisp check <file.wisp>                       check a program without running it
-  wisp repl                                    interactive prompt
-  wisp lsp                                     language server for editors (stdio)
-  wisp <file.wisp>                             same as `wisp run`
+  lite run <file.lt> [options]   run a program; serve it if it has routes
+  lite check <file.lt>           check a program without running it
+  lite repl                      interactive prompt
+  lite lsp                       language server for editors (stdio)
+  lite <file.lt>                 same as `lite run`
 
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
@@ -30,7 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Run on a thread with a roomy stack (see WORKER_STACK).
     let child = std::thread::Builder::new()
-        .stack_size(wisp::server::WORKER_STACK)
+        .stack_size(lite::server::WORKER_STACK)
         .spawn(move || {
             real_main(args)
         })
@@ -49,16 +49,16 @@ fn real_main(args: Vec<String>) -> i32 {
             None => usage(),
         },
         Some("repl") | None => repl(),
-        Some("lsp") => wisp::lsp::Server::new().run(),
+        Some("lsp") => lite::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
-            println!("wisp {}", VERSION);
+            println!("lite {}", VERSION);
             0
         }
         Some("help" | "--help" | "-h") => {
             println!("{}", USAGE);
             0
         }
-        Some(f) if f.ends_with(".wisp") => run(f, &args[2..]),
+        Some(f) if f.ends_with(".lt") => run(f, &args[2..]),
         Some(_) => usage(),
     }
 }
@@ -93,12 +93,12 @@ fn run(file: &str, flags: &[String]) -> i32 {
             ("--workers", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => workers = n,
                 _ => {
-                    eprintln!("wisp: --workers needs a positive number");
+                    eprintln!("lite: --workers needs a positive number");
                     return 2;
                 }
             },
             (other, _) => {
-                eprintln!("wisp: unknown option `{}`", other);
+                eprintln!("lite: unknown option `{}`", other);
                 return 2;
             }
         }
@@ -117,7 +117,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
             if !e.is_empty() {
-                eprintln!("wisp: {}", e);
+                eprintln!("lite: {}", e);
             }
             if !watch {
                 return 1;
@@ -132,10 +132,10 @@ fn run(file: &str, flags: &[String]) -> i32 {
     }
     let mut app = App::new(loaded, shared, path, base, watch);
     app.static_check = static_check;
-    match wisp::server::serve(app, &format!("{}:{}", host, port), workers) {
+    match lite::server::serve(app, &format!("{}:{}", host, port), workers) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("wisp: {}", e);
+            eprintln!("lite: {}", e);
             1
         }
     }
@@ -144,7 +144,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
 /// Prints the checker's findings; `Err` when there are errors. The error
 /// text is empty because everything has been printed already.
 fn static_errors(path: &Path) -> Result<(), String> {
-    let analysis = wisp::check::check_file(path);
+    let analysis = lite::check::check_file(path);
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }
@@ -155,14 +155,14 @@ fn static_errors(path: &Path) -> Result<(), String> {
 }
 
 fn check(file: &str) -> i32 {
-    let analysis = wisp::check::check_file(Path::new(file));
+    let analysis = lite::check::check_file(Path::new(file));
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }
     let errors = analysis.errors().count();
     let warnings = analysis.diagnostics.len() - errors;
     if errors > 0 {
-        eprintln!("wisp: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
+        eprintln!("lite: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
         return 1;
     }
     let count = |k: SymbolKind| analysis.symbols.iter().filter(|s| s.kind == k && s.file == file).count();
@@ -189,9 +189,9 @@ fn repl() -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
     let mut buf = String::new();
-    println!("Wisp {} — enter expressions; Ctrl-D exits", VERSION);
+    println!("Lite {} — enter expressions; Ctrl-D exits", VERSION);
     loop {
-        print!("{}", if buf.is_empty() { "wisp> " } else { "....> " });
+        print!("{}", if buf.is_empty() { "lite> " } else { "....> " });
         let _ = io::stdout().flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {

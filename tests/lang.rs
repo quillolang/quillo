@@ -1,4 +1,4 @@
-use wisp::eval_str;
+use lite::eval_str;
 
 fn ev(src: &str) -> String {
     match eval_str(src) {

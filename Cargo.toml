@@ -1,15 +1,15 @@
 [package]
-name = "wisp"
+name = "lite"
 version = "0.2.0"
 edition = "2021"
-description = "Wisp: a small web language where routes, payload patterns, HTML and browser components are part of the syntax"
+description = "Lite: a small web language where routes, payload patterns, HTML and browser components are part of the syntax"
 license = "MIT"
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "wisp"
+name = "lite"
 path = "src/main.rs"
 
 [dependencies]

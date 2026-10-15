@@ -1,10 +1,10 @@
-window.__wispErrors = [];
+window.__liteErrors = [];
 const tick = () => new Promise((r) => setTimeout(r, 20));
 async function waitFor(f) { for (let i = 0; i < 200; i++) { if (f()) return true; await tick(); } return false; }
 async function run() {
   const out = {};
   try {
-    await waitFor(() => window.wisp);
+    await waitFor(() => window.lite);
     await tick();
     const inc = document.querySelector("#counter .inc");
     inc.click(); inc.click();
@@ -24,7 +24,7 @@ async function run() {
     out.sameInput = document.querySelector(".draft") === input;
     out.nestedAfter = document.querySelector("#todos #counter .value").textContent;
   } catch (e) { out.exception = String(e); }
-  out.errors = window.__wispErrors;
+  out.errors = window.__liteErrors;
   document.body.setAttribute("data-result", JSON.stringify(out));
 }
 window.addEventListener("load", run);

@@ -1,4 +1,4 @@
-// Wisp for VS Code: starts `wisp lsp` and adds Run/Check commands.
+// Lite for VS Code: starts `lite lsp` and adds Run/Check commands.
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
@@ -6,28 +6,28 @@ const { LanguageClient } = require("vscode-languageclient/node");
 
 let client = null;
 
-/** The wisp binary: the setting, a build in the workspace, or `wisp` on the PATH. */
-function wispPath() {
-  const configured = vscode.workspace.getConfiguration("wisp").get("path");
+/** The lite binary: the setting, a build in the workspace, or `lite` on the PATH. */
+function litePath() {
+  const configured = vscode.workspace.getConfiguration("lite").get("path");
   if (configured) return configured;
   for (const folder of vscode.workspace.workspaceFolders || []) {
-    for (const p of ["target/release/wisp", "target/debug/wisp"]) {
+    for (const p of ["target/release/lite", "target/debug/lite"]) {
       const full = path.join(folder.uri.fsPath, p);
       if (fs.existsSync(full)) return full;
     }
   }
-  return "wisp";
+  return "lite";
 }
 
 async function startClient() {
-  const command = wispPath();
+  const command = litePath();
   client = new LanguageClient(
-    "wisp",
-    "Wisp",
+    "lite",
+    "Lite",
     { run: { command, args: ["lsp"] }, debug: { command, args: ["lsp"] } },
     {
-      documentSelector: [{ scheme: "file", language: "wisp" }],
-      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.wisp") },
+      documentSelector: [{ scheme: "file", language: "lite" }],
+      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.lt") },
     }
   );
   try {
@@ -35,22 +35,22 @@ async function startClient() {
   } catch (err) {
     client = null;
     const pick = await vscode.window.showWarningMessage(
-      `Wisp: could not start "${command} lsp". Install wisp or set "wisp.path".`,
+      `Lite: could not start "${command} lsp". Install lite or set "lite.path".`,
       "Open settings"
     );
-    if (pick) vscode.commands.executeCommand("workbench.action.openSettings", "wisp.path");
+    if (pick) vscode.commands.executeCommand("workbench.action.openSettings", "lite.path");
   }
 }
 
 function terminal() {
-  const existing = vscode.window.terminals.find((t) => t.name === "Wisp");
-  return existing || vscode.window.createTerminal("Wisp");
+  const existing = vscode.window.terminals.find((t) => t.name === "Lite");
+  return existing || vscode.window.createTerminal("Lite");
 }
 
 function currentFile() {
   const ed = vscode.window.activeTextEditor;
-  if (!ed || ed.document.languageId !== "wisp") {
-    vscode.window.showInformationMessage("Open a .wisp file first.");
+  if (!ed || ed.document.languageId !== "lite") {
+    vscode.window.showInformationMessage("Open a .lite file first.");
     return null;
   }
   return ed.document;
@@ -60,29 +60,29 @@ const quote = (s) => `"${s.replace(/(["\\$`])/g, "\\$1")}"`;
 
 async function activate(context) {
   context.subscriptions.push(
-    vscode.commands.registerCommand("wisp.run", async () => {
+    vscode.commands.registerCommand("lite.run", async () => {
       const doc = currentFile();
       if (!doc) return;
       await doc.save();
-      const port = vscode.workspace.getConfiguration("wisp").get("port") || 8080;
+      const port = vscode.workspace.getConfiguration("lite").get("port") || 8080;
       const t = terminal();
       t.show();
-      t.sendText(`${quote(wispPath())} run ${quote(doc.fileName)} --watch --port ${port}`);
+      t.sendText(`${quote(litePath())} run ${quote(doc.fileName)} --watch --port ${port}`);
     }),
-    vscode.commands.registerCommand("wisp.check", async () => {
+    vscode.commands.registerCommand("lite.check", async () => {
       const doc = currentFile();
       if (!doc) return;
       await doc.save();
       const t = terminal();
       t.show();
-      t.sendText(`${quote(wispPath())} check ${quote(doc.fileName)}`);
+      t.sendText(`${quote(litePath())} check ${quote(doc.fileName)}`);
     }),
-    vscode.commands.registerCommand("wisp.restartServer", async () => {
+    vscode.commands.registerCommand("lite.restartServer", async () => {
       if (client) await client.stop();
       await startClient();
     }),
     vscode.workspace.onDidChangeConfiguration(async (e) => {
-      if (e.affectsConfiguration("wisp.path")) {
+      if (e.affectsConfiguration("lite.path")) {
         if (client) await client.stop();
         await startClient();
       }

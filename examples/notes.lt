@@ -1,6 +1,6 @@
 // Notes: SQLite on the server, a live component in the browser.
 //
-//   wisp run examples/notes.wisp --watch     then open http://localhost:8080
+//   lite run examples/notes.lt --watch     then open http://localhost:8080
 //
 // The page is rendered on the server. <Notes> then runs in the browser:
 // typing, adding, ticking and deleting call the `server fn`s below

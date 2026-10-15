@@ -1,53 +1,53 @@
 {
-  "name": "wisp-lang",
-  "displayName": "Wisp",
-  "description": "Wisp language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `wisp lsp`).",
+  "name": "lite-lang",
+  "displayName": "Lite",
+  "description": "Lite language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `lite lsp`).",
   "version": "0.2.0",
   "publisher": "wisp-one",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/wisp-one/wisp" },
+  "repository": { "type": "git", "url": "https://github.com/wisp-one/lite" },
   "engines": { "vscode": "^1.82.0" },
   "categories": ["Programming Languages", "Linters", "Snippets"],
-  "keywords": ["wisp", "web", "language server"],
+  "keywords": ["lite", "web", "language server"],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:wisp"],
+  "activationEvents": ["onLanguage:lite"],
   "contributes": {
     "languages": [
       {
-        "id": "wisp",
-        "aliases": ["Wisp", "wisp"],
-        "extensions": [".wisp"],
+        "id": "lite",
+        "aliases": ["Lite", "lite"],
+        "extensions": [".lt"],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
-      { "language": "wisp", "scopeName": "source.wisp", "path": "./syntaxes/wisp.tmLanguage.json" }
+      { "language": "lite", "scopeName": "source.lite", "path": "./syntaxes/lite.tmLanguage.json" }
     ],
     "snippets": [
-      { "language": "wisp", "path": "./snippets/wisp.json" }
+      { "language": "lite", "path": "./snippets/lite.json" }
     ],
     "commands": [
-      { "command": "wisp.run", "title": "Run this file (watch mode)", "category": "Wisp" },
-      { "command": "wisp.check", "title": "Check this file", "category": "Wisp" },
-      { "command": "wisp.restartServer", "title": "Restart the language server", "category": "Wisp" }
+      { "command": "lite.run", "title": "Run this file (watch mode)", "category": "Lite" },
+      { "command": "lite.check", "title": "Check this file", "category": "Lite" },
+      { "command": "lite.restartServer", "title": "Restart the language server", "category": "Lite" }
     ],
     "menus": {
       "editor/title/run": [
-        { "command": "wisp.run", "when": "resourceLangId == wisp", "group": "navigation" }
+        { "command": "lite.run", "when": "resourceLangId == lite", "group": "navigation" }
       ]
     },
     "configuration": {
-      "title": "Wisp",
+      "title": "Lite",
       "properties": {
-        "wisp.path": {
+        "lite.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the `wisp` binary. Empty: `wisp` on the PATH, or target/release/wisp or target/debug/wisp in the workspace."
+          "description": "Path to the `lite` binary. Empty: `lite` on the PATH, or target/release/lite or target/debug/lite in the workspace."
         },
-        "wisp.port": {
+        "lite.port": {
           "type": "number",
           "default": 8080,
-          "description": "Port for `Wisp: Run this file`."
+          "description": "Port for `Lite: Run this file`."
         }
       }
     }

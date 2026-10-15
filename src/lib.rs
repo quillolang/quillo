@@ -1,4 +1,4 @@
-//! Wisp: a small web language where routes, payload patterns and HTML are syntax.
+//! Lite: a small web language where routes, payload patterns and HTML are syntax.
 
 pub mod ast;
 pub mod builtins;
@@ -15,11 +15,11 @@ pub mod server;
 pub mod shared;
 pub mod value;
 
-pub use error::WispError;
+pub use error::LiteError;
 pub use interp::Interp;
 pub use value::Value;
 
 /// Runs a snippet and returns the value of its last statement.
-pub fn eval_str(src: &str) -> Result<Value, WispError> {
+pub fn eval_str(src: &str) -> Result<Value, LiteError> {
     Interp::new(".").load_source(src, "<input>")
 }

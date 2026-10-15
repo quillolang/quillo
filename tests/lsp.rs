@@ -1,4 +1,4 @@
-//! `wisp lsp` over stdio, as an editor would use it.
+//! `lite lsp` over stdio, as an editor would use it.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,7 +12,7 @@ struct Client {
 
 impl Client {
     fn start() -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wisp"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lite"))
             .arg("lsp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -69,13 +69,13 @@ impl Client {
 
 #[test]
 fn language_server_round_trip() {
-    let dir = std::env::temp_dir().join(format!("wisp-lsp-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lite-lsp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("lib.wisp"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
-    let main = dir.join("app.wisp");
+    std::fs::write(dir.join("lib.lt"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
+    let main = dir.join("app.lt");
     let uri = format!("file://{}", main.canonicalize().unwrap_or(main.clone()).display()).replace("file:///private/", "file:///private/");
-    let text = "use \"lib.wisp\"\nfn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\nroute GET / = shout(\"hi {totl}\")\n";
+    let text = "use \"lib.lt\"\nfn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\nroute GET / = shout(\"hi {totl}\")\n";
     std::fs::write(&main, text).unwrap();
 
     let mut c = Client::start();
@@ -83,7 +83,7 @@ fn language_server_round_trip() {
     let init = c.request("initialize", json!({ "capabilities": {} }), &mut notes);
     assert_eq!(init["capabilities"]["hoverProvider"], json!(true));
     c.notify("initialized", json!({}));
-    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "wisp", "version": 1, "text": text } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "lite", "version": 1, "text": text } }));
 
     // Diagnostics: the typo, underlined where it is.
     let d = loop {
@@ -102,7 +102,7 @@ fn language_server_round_trip() {
 
     // Definition of `shout`, in the used file.
     let def = c.request("textDocument/definition", json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 15 } }), &mut notes);
-    assert!(def["uri"].as_str().unwrap().ends_with("/lib.wisp"), "{}", def);
+    assert!(def["uri"].as_str().unwrap().ends_with("/lib.lt"), "{}", def);
     assert_eq!(def["range"]["start"], json!({ "line": 0, "character": 3 }));
 
     // Completion after `db.` lists its functions; elsewhere, names and keywords.

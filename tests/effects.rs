@@ -1,9 +1,9 @@
 //! Union types, `! E` error types, `with` effects and the builtins behind them.
 
-use wisp::{Interp, Value};
+use lite::{Interp, Value};
 
 fn ev_in(dir: &std::path::Path, src: &str) -> Result<Value, String> {
-    Interp::new(dir).load_source(src, "test.wisp").map_err(|e| e.to_string())
+    Interp::new(dir).load_source(src, "test.lt").map_err(|e| e.to_string())
 }
 
 fn ev(src: &str) -> String {
@@ -117,7 +117,7 @@ fn sqlite_wrong_parameter_count_is_an_error_value() {
 
 #[test]
 fn files_stay_inside_the_program_folder() {
-    let dir = std::env::temp_dir().join(format!("wisp-files-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lite-files-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let r = ev_in(
