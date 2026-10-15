@@ -191,6 +191,10 @@ pub const BLOCKED_URL: &str = "about:blank#blocked";
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
 pub fn script_url(url: &str) -> bool {
+    // Paths and fragments, the usual case, have no scheme.
+    if matches!(url.as_bytes().first(), Some(b'/' | b'#' | b'?')) {
+        return false;
+    }
     let mut scheme = [0u8; 11];
     let mut n = 0;
     for c in url.trim_start_matches(|c: char| c <= ' ').chars() {
@@ -208,14 +212,31 @@ pub fn script_url(url: &str) -> bool {
     scheme.starts_with(b"javascript:") || scheme.starts_with(b"vbscript:")
 }
 
+/// An integer's digits, appended to `out` (without `fmt`'s machinery).
+fn push_int(out: &mut String, n: i64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        out.push('-');
+    }
+    // SAFETY: ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
 /// A value's text, escaped, appended to `out`.
 fn display_escaped(v: &Value, out: &mut String) {
     match v {
         Value::Str(s) => escape_into(s, out),
-        Value::Int(n) => {
-            use std::fmt::Write;
-            let _ = write!(out, "{}", n);
-        }
+        Value::Int(n) => push_int(out, *n),
         other => escape_into(&other.display(), out),
     }
 }
@@ -242,10 +263,7 @@ fn render_value(v: &Value, out: &mut String) {
             }
         }
         Value::Str(s) => escape_into(s, out),
-        Value::Int(n) => {
-            use std::fmt::Write;
-            let _ = write!(out, "{}", n);
-        }
+        Value::Int(n) => push_int(out, *n),
         other => escape_into(&other.display(), out),
     }
 }
@@ -930,7 +948,9 @@ impl Interp {
         match &v {
             Value::Nil => return Ok(Value::Nil),
             Value::Map(m) => {
-                if let Some(x) = m.get(name) {
+                // A record's few fields are found faster in order than hashed.
+                let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x) } else { m.get(name) };
+                if let Some(x) = found {
                     return Ok(x.clone());
                 }
             }
@@ -1641,10 +1661,7 @@ impl Interp {
                 TPart::Lit(t) => out.push_str(t),
                 TPart::Expr(x) => match self.eval(x, env)? {
                     Value::Str(t) => out.push_str(&t),
-                    Value::Int(n) => {
-                        use std::fmt::Write;
-                        let _ = write!(out, "{}", n);
-                    }
+                    Value::Int(n) => push_int(out, n),
                     v => out.push_str(&v.display()),
                 },
             }
@@ -1725,6 +1742,29 @@ impl Interp {
             for ch in &el.children {
                 self.render_child(ch, env, &mut kids)?;
             }
+        }
+        // A view called without spreads takes its arguments straight from
+        // the attributes, in parameter order.
+        if !c.def.component && !el.attrs.iter().any(|(_, a)| matches!(a, AttrVal::Spread(_))) {
+            let params = &c.def.params;
+            if let Some((n, _)) =
+                el.attrs.iter().find(|(n, _)| n != "key" && (n == "children" || !params.iter().any(|p| p.name == *n)))
+            {
+                return fail(line, format!("<{}> has no parameter `{}`", el.tag, n));
+            }
+            let mut args = Vec::with_capacity(params.len());
+            for p in params {
+                if p.name == "children" {
+                    args.push(Some(Value::html(std::mem::take(&mut kids))));
+                    continue;
+                }
+                args.push(match el.attrs.iter().find(|(n, _)| *n == p.name) {
+                    Some((_, AttrVal::Bool)) => Some(Value::Bool(true)),
+                    Some((_, AttrVal::Expr(e))) => Some(self.eval(e, env)?),
+                    _ => None,
+                });
+            }
+            return self.render_call_into(&c, args, line, out);
         }
         let (spread, explicit) = self.eval_attrs(el, env)?;
         let mut given: Vec<(String, Value)> = explicit.into_iter().filter(|(n, _)| n != "key").collect();
