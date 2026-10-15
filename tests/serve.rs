@@ -144,3 +144,37 @@ fn watch_injects_the_reload_script_into_pages() {
     assert!(page.contains("/_wisp/dev") && page.ends_with("</body></html>"), "{}", page);
     assert_eq!(get(srv.port, "/t").1, "text");
 }
+
+#[test]
+fn http_client_talks_to_another_server() {
+    let d = temp_dir("http-client");
+    let api = d.join("api.wisp");
+    std::fs::write(
+        &api,
+        "route GET /users/:id(int) = { id, name: \"user {id}\" }\n\
+         route POST /echo { json: { n: int } } = reply 201 { doubled: n * 2, agent: request.headers[\"user-agent\"] }\n\
+         route GET /teapot = reply 418 \"short and stout\"\n",
+    )
+    .unwrap();
+    let srv = start(&api, &[]);
+    let client = d.join("client.wisp");
+    std::fs::write(
+        &client,
+        format!(
+            "let base = \"http://127.0.0.1:{}\"\n\
+             fn load(id: int) with http = http.get(\"{{base}}/users/{{id}}\").json\n\
+             let r = http.post(\"{{base}}/echo\", {{ n: 21 }})\n\
+             let t = http.get(\"{{base}}/teapot\")\n\
+             let down = http.get(\"http://127.0.0.1:1/nothing\")\n\
+             print(json.stringify([load(7), r.status, r.json.doubled, starts_with(r.json.agent, \"wisp/\"), t.status, t.ok, t.body, is_err(down)]))\n",
+            srv.port
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_wisp")).arg("run").arg(&client).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"[{"id":7,"name":"user 7"},201,42,true,418,false,"short and stout",true]"#
+    );
+}

@@ -221,6 +221,11 @@ impl Scope {
     }
 }
 
+/// The variables defined directly in a scope (not its parents).
+pub fn scope_vars(env: &Env) -> Vec<(String, Value)> {
+    env.lock().unwrap().vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 pub fn lookup(env: &Env, name: &str) -> Option<Value> {
     let mut cur = env.clone();
     loop {

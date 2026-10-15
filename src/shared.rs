@@ -35,11 +35,13 @@ impl Gil {
 
 pub struct Shared {
     pub gil: Gil,
+    /// The `db` connection, opened on first use.
+    pub db: Mutex<Option<rusqlite::Connection>>,
 }
 
 impl Shared {
     pub fn new() -> Self {
-        Shared { gil: Gil::new_held() }
+        Shared { gil: Gil::new_held(), db: Mutex::new(None) }
     }
 }
 

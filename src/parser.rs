@@ -200,6 +200,18 @@ impl Parser {
                     }
                     self.restore(saved);
                 }
+                "server" => {
+                    // `server fn name(...)`; otherwise `server` is an ordinary name.
+                    let saved = self.save();
+                    self.next()?;
+                    if self.eat_kw("fn")? {
+                        let name = self.expect_ident("a function name after `server fn`")?;
+                        let mut def = self.parse_fn_rest(name, line)?;
+                        def.server = true;
+                        return Ok(Stmt::Fn(Arc::new(def)));
+                    }
+                    self.restore(saved);
+                }
                 "route" => {
                     self.next()?;
                     return Ok(Stmt::Route(Arc::new(self.parse_route(line)?)));
@@ -255,10 +267,28 @@ impl Parser {
         }
         self.expect(&Tok::RParen, "`)`")?;
         let ret = if self.eat(&Tok::Arrow)? { Some(self.parse_type()?) } else { None };
-        if self.eat(&Tok::Bang)? {
-            // The declared error type is documentation for now.
-            self.expect_ident("an error type after `!`")?;
-        }
+        let err = if self.eat(&Tok::Bang)? { Some(self.parse_type()?) } else { None };
+        let effects = if self.eat_kw("with")? {
+            let mut effs = Vec::new();
+            loop {
+                let t = self.next()?;
+                match t.tok {
+                    Tok::Ident(e) if EFFECTS.contains(&e.as_str()) => effs.push(e),
+                    other => {
+                        return Err(WispError::new(
+                            format!("expected an effect after `with` ({}), found {}", EFFECTS.join(", "), other.describe()),
+                            t.line,
+                        ))
+                    }
+                }
+                if !self.eat(&Tok::Comma)? {
+                    break;
+                }
+            }
+            Some(effs)
+        } else {
+            None
+        };
         let body = if self.eat(&Tok::Assign)? {
             self.parse_expr()?
         } else if self.at(&Tok::LBrace)? {
@@ -266,23 +296,42 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, body, line })
+        Ok(FnDef { name, params, ret, err, effects, server: false, body, line })
     }
 
+    /// `int`, `str?`, or a union: `int | str | nil`.
     fn parse_type(&mut self) -> PResult<Ty> {
-        let t = self.next()?;
-        let name = match t.tok {
-            Tok::Ident(s) => s,
-            other => return Err(WispError::new(format!("expected a type, found {}", other.describe()), t.line)),
-        };
-        if !TYPE_NAMES.contains(&name.as_str()) {
-            return Err(WispError::new(
-                format!("unknown type `{}` (known types: {})", name, TYPE_NAMES.join(", ")),
-                t.line,
-            ));
+        let mut names: Vec<String> = Vec::new();
+        let mut optional = false;
+        loop {
+            let t = self.next()?;
+            let name = match t.tok {
+                Tok::Ident(s) => s,
+                other => return Err(WispError::new(format!("expected a type, found {}", other.describe()), t.line)),
+            };
+            if name == "nil" {
+                optional = true;
+            } else if TYPE_NAMES.contains(&name.as_str()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            } else {
+                return Err(WispError::new(
+                    format!("unknown type `{}` (known types: {}, nil)", name, TYPE_NAMES.join(", ")),
+                    t.line,
+                ));
+            }
+            if self.eat(&Tok::Question)? {
+                optional = true;
+            }
+            if !self.eat(&Tok::Bar)? {
+                break;
+            }
         }
-        let optional = self.eat(&Tok::Question)?;
-        Ok(Ty { name, optional })
+        if names.is_empty() {
+            names.push("any".into());
+        }
+        Ok(Ty { names, optional })
     }
 
     fn read_word(&mut self) -> String {

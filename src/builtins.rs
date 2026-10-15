@@ -2,6 +2,7 @@
 
 use crate::interp::{coerce, escape, fail, Ctrl, Interp};
 use crate::value::*;
+use indexmap::IndexMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -60,6 +61,26 @@ pub fn install(env: &Env) {
         ("file", file),
         ("redirect", redirect),
         ("respond", respond),
+        ("read_file", read_file),
+        ("write_file", write_file),
+        ("random", random),
+        ("random_int", random_int),
+        ("uuid", uuid),
+        ("abs", abs),
+        ("round", round),
+        ("floor", floor),
+        ("ceil", ceil),
+        ("sqrt", sqrt),
+        ("pow", pow),
+        ("unique", unique),
+        ("flatten", flatten),
+        ("zip", zip),
+        ("take", take),
+        ("drop", drop_fn),
+        ("count", count),
+        ("group_by", group_by),
+        ("index_of", index_of),
+        ("repeat", repeat),
     ];
     for (name, f) in fns {
         define(env, name, Value::Builtin(name, *f));
@@ -68,6 +89,27 @@ pub fn install(env: &Env) {
     json.insert("parse".into(), Value::Builtin("json.parse", json_parse));
     json.insert("stringify".into(), Value::Builtin("json.stringify", json_stringify));
     define(env, "json", Value::map(json));
+    let mut db = Map::new();
+    crate::db::install(&mut db);
+    define(env, "db", Value::map(db));
+    let mut http = Map::new();
+    crate::fetch::install(&mut http);
+    define(env, "http", Value::map(http));
+}
+
+/// Every builtin name, as programs see it (`db.query`, `len`, ...).
+pub fn names() -> Vec<String> {
+    let env = Scope::root();
+    install(&env);
+    let mut out = Vec::new();
+    for (k, v) in scope_vars(&env) {
+        match v {
+            Value::Map(m) => out.extend(m.keys().map(|f| format!("{}.{}", k, f))),
+            _ => out.push(k),
+        }
+    }
+    out.sort();
+    out
 }
 
 // ---- argument helpers --------------------------------------------------
@@ -610,4 +652,224 @@ fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     let pretty = arg(&args, 1).truthy();
     let s = if pretty { serde_json::to_string_pretty(&j) } else { serde_json::to_string(&j) };
     Ok(Value::str(s.unwrap_or_default()))
+}
+
+// ---- files -------------------------------------------------------------
+
+/// A path under the program's folder; `..` and absolute paths are refused.
+fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
+    let rel = Path::new(p);
+    if p.is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return None;
+    }
+    Some(it.base_dir.join(rel))
+}
+
+/// `read_file(path)`: the file's text, or an error value.
+fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let p = s_arg(&args, 0, "read_file", line)?;
+    let Some(full) = local_path(it, &p) else {
+        return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}", p))));
+    };
+    Ok(match std::fs::read(&full) {
+        Ok(b) => Value::str(String::from_utf8_lossy(&b)),
+        Err(e) => Value::err(Value::str(format!("read_file: {}: {}", p, e))),
+    })
+}
+
+/// `write_file(path, text)`: nil, or an error value. Creates missing folders.
+fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let p = s_arg(&args, 0, "write_file", line)?;
+    let text = arg(&args, 1).display();
+    let Some(full) = local_path(it, &p) else {
+        return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}", p))));
+    };
+    if let Some(dir) = full.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    Ok(match std::fs::write(&full, text) {
+        Ok(()) => Value::Nil,
+        Err(e) => Value::err(Value::str(format!("write_file: {}: {}", p, e))),
+    })
+}
+
+// ---- randomness --------------------------------------------------------
+
+/// `random()`: a float in [0, 1).
+fn random(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Float(fastrand::f64()))
+}
+
+/// `random_int(lo, hi)`: an int from lo to hi, both included.
+fn random_int(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let lo = i_arg(&args, 0, "random_int", line)?;
+    let hi = i_arg(&args, 1, "random_int", line)?;
+    if lo > hi {
+        return fail(line, format!("`random_int` needs lo <= hi, got {} and {}", lo, hi));
+    }
+    Ok(Value::Int(fastrand::i64(lo..=hi)))
+}
+
+/// `uuid()`: a random (version 4) UUID string.
+fn uuid(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    let mut b = [0u8; 16];
+    for x in b.iter_mut() {
+        *x = fastrand::u8(..);
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    Ok(Value::str(format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])))
+}
+
+// ---- math --------------------------------------------------------------
+
+fn num_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<f64, Ctrl> {
+    want(args, i, f, "a number", line, |v| v.as_f64())
+}
+
+fn abs(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    match arg(&args, 0) {
+        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(crate::WispError::new("integer overflow", line))),
+        _ => Ok(Value::Float(num_arg(&args, 0, "abs", line)?.abs())),
+    }
+}
+
+fn to_int_or_float(f: f64) -> Value {
+    if f.is_finite() && f.abs() < 9.0e15 {
+        Value::Int(f as i64)
+    } else {
+        Value::Float(f)
+    }
+}
+
+/// `round(x)` gives an int; `round(x, digits)` a float with that many decimals.
+fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let x = num_arg(&args, 0, "round", line)?;
+    if args.len() > 1 {
+        let d = i_arg(&args, 1, "round", line)?.clamp(0, 15) as i32;
+        let p = 10f64.powi(d);
+        return Ok(Value::Float((x * p).round() / p));
+    }
+    Ok(to_int_or_float(x.round()))
+}
+
+fn floor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(to_int_or_float(num_arg(&args, 0, "floor", line)?.floor()))
+}
+
+fn ceil(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(to_int_or_float(num_arg(&args, 0, "ceil", line)?.ceil()))
+}
+
+fn sqrt(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Float(num_arg(&args, 0, "sqrt", line)?.sqrt()))
+}
+
+/// `pow(x, y)`: an int when both are ints and y >= 0 (and it fits), else a float.
+fn pow(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let (Value::Int(x), Value::Int(y)) = (arg(&args, 0), arg(&args, 1)) {
+        if let Some(r) = u32::try_from(y).ok().and_then(|y| x.checked_pow(y)) {
+            return Ok(Value::Int(r));
+        }
+    }
+    Ok(Value::Float(num_arg(&args, 0, "pow", line)?.powf(num_arg(&args, 1, "pow", line)?)))
+}
+
+// ---- more lists --------------------------------------------------------
+
+fn unique(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let l = l_arg(&args, 0, "unique", line)?;
+    let mut out: Vec<Value> = Vec::new();
+    for x in l.iter() {
+        if !out.iter().any(|y| equal(x, y)) {
+            out.push(x.clone());
+        }
+    }
+    Ok(Value::list(out))
+}
+
+/// `flatten([[1], [2, 3], 4])` is `[1, 2, 3, 4]` (one level).
+fn flatten(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let l = l_arg(&args, 0, "flatten", line)?;
+    let mut out = Vec::new();
+    for x in l.iter() {
+        match x {
+            Value::List(inner) => out.extend(inner.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+    }
+    Ok(Value::list(out))
+}
+
+fn zip(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let a = l_arg(&args, 0, "zip", line)?;
+    let b = l_arg(&args, 1, "zip", line)?;
+    Ok(Value::list(a.iter().zip(b.iter()).map(|(x, y)| Value::list(vec![x.clone(), y.clone()])).collect()))
+}
+
+fn take(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let n = i_arg(&args, 1, "take", line)?.max(0) as usize;
+    match arg(&args, 0) {
+        Value::Str(s) => Ok(Value::str(s.chars().take(n).collect::<String>())),
+        _ => Ok(Value::list(l_arg(&args, 0, "take", line)?.iter().take(n).cloned().collect())),
+    }
+}
+
+fn drop_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let n = i_arg(&args, 1, "drop", line)?.max(0) as usize;
+    match arg(&args, 0) {
+        Value::Str(s) => Ok(Value::str(s.chars().skip(n).collect::<String>())),
+        _ => Ok(Value::list(l_arg(&args, 0, "drop", line)?.iter().skip(n).cloned().collect())),
+    }
+}
+
+/// `count(xs)` is `len(xs)`; `count(xs, f)` counts items where `f` is true.
+fn count(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let l = l_arg(&args, 0, "count", line)?;
+    if args.len() < 2 {
+        return Ok(Value::Int(l.len() as i64));
+    }
+    let f = f_arg(&args, 1, "count", line)?;
+    let mut n = 0;
+    for x in l.iter() {
+        if it.call(&f, vec![x.clone()], line)?.truthy() {
+            n += 1;
+        }
+    }
+    Ok(Value::Int(n))
+}
+
+/// `group_by(xs, f)`: a map from each key `f` gives to the items with that key.
+fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let l = l_arg(&args, 0, "group_by", line)?;
+    let f = f_arg(&args, 1, "group_by", line)?;
+    let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
+    for x in l.iter() {
+        let k = it.call(&f, vec![x.clone()], line)?.display();
+        groups.entry(k).or_default().push(x.clone());
+    }
+    Ok(Value::map(groups.into_iter().map(|(k, v)| (k, Value::list(v))).collect()))
+}
+
+/// `index_of(xs, x)`: the position of `x` in a list or str, or nil.
+fn index_of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let x = arg(&args, 1);
+    Ok(match arg(&args, 0) {
+        Value::List(l) => l.iter().position(|v| equal(v, &x)).map_or(Value::Nil, |i| Value::Int(i as i64)),
+        Value::Str(s) => {
+            let needle = x.display();
+            s.find(&*needle).map_or(Value::Nil, |b| Value::Int(s[..b].chars().count() as i64))
+        }
+        other => return fail(line, format!("`index_of` expects a list or str, got {}", other.type_name())),
+    })
+}
+
+fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let s = s_arg(&args, 0, "repeat", line)?;
+    let n = i_arg(&args, 1, "repeat", line)?;
+    if n < 0 || (s.len() as i64).saturating_mul(n) > 100_000_000 {
+        return fail(line, "`repeat` count is negative or too large");
+    }
+    Ok(Value::str(s.repeat(n as usize)))
 }

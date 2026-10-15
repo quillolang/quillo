@@ -48,6 +48,11 @@ pub struct Interp {
     pub shared: Arc<Shared>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
+    /// Effects the running code may use, and the `with` function that limited them.
+    allowed: u8,
+    restrictor: Option<Arc<FnDef>>,
+    /// Names of `server fn`s, callable from the browser.
+    pub server_fns: Vec<String>,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -80,12 +85,12 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
     }
 }
 
-fn type_matches(ty: &Ty, v: &Value) -> bool {
-    (ty.optional && matches!(v, Value::Nil)) || type_name_matches(&ty.name, v)
+pub fn type_matches(ty: &Ty, v: &Value) -> bool {
+    (ty.optional && matches!(v, Value::Nil)) || ty.names.iter().any(|n| type_name_matches(n, v))
 }
 
 fn ty_text(ty: &Ty) -> String {
-    format!("{}{}", ty.name, if ty.optional { "?" } else { "" })
+    ty.text()
 }
 
 /// Converts request text to the type a pattern asks for.
@@ -242,7 +247,17 @@ impl Interp {
     pub fn with_shared(base_dir: impl Into<PathBuf>, shared: Arc<Shared>) -> Self {
         let globals = Scope::root();
         crate::builtins::install(&globals);
-        Interp { globals, routes: Vec::new(), base_dir: base_dir.into(), loaded: HashSet::new(), shared, depth: 0 }
+        Interp {
+            globals,
+            routes: Vec::new(),
+            base_dir: base_dir.into(),
+            loaded: HashSet::new(),
+            shared,
+            depth: 0,
+            allowed: ALL_EFFECTS,
+            restrictor: None,
+            server_fns: Vec::new(),
+        }
     }
 
     /// Another handle on the same program for a worker thread: globals,
@@ -255,6 +270,9 @@ impl Interp {
             loaded: self.loaded.clone(),
             shared: self.shared.clone(),
             depth: 0,
+            allowed: ALL_EFFECTS,
+            restrictor: None,
+            server_fns: self.server_fns.clone(),
         }
     }
 
@@ -331,6 +349,9 @@ impl Interp {
             }
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
+                if def.server && !self.server_fns.contains(&def.name) {
+                    self.server_fns.push(def.name.clone());
+                }
                 Ok(Value::Nil)
             }
             Stmt::Route(r) => {
@@ -656,11 +677,11 @@ impl Interp {
             Value::Err(e) if name == "error" => return Ok((**e).clone()),
             _ => {}
         }
-        // `xs.len` is `len(xs)`. Maps only fall back to builtins, so a missing
-        // key on a record is simply nil.
+        // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
+        // this way, so any other missing key on a record is simply nil.
         if let Some(f) = lookup(&self.globals, name) {
             let usable = match (&v, &f) {
-                (Value::Map(_), Value::Builtin(..)) => true,
+                (Value::Map(_), Value::Builtin(..)) => matches!(name, "len" | "keys" | "values"),
                 (Value::Map(_), _) => false,
                 (_, Value::Func(_) | Value::Builtin(..)) => true,
                 _ => false,
@@ -677,7 +698,12 @@ impl Interp {
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
         match f {
-            Value::Builtin(_, func) => func(self, args, line),
+            Value::Builtin(name, func) => {
+                if self.allowed != ALL_EFFECTS {
+                    self.check_builtin_effect(name, line)?;
+                }
+                func(self, args, line)
+            }
             Value::Func(c) => {
                 let c = c.clone();
                 self.call_closure(&c, args.into_iter().map(Some).collect(), line)
@@ -704,11 +730,66 @@ impl Interp {
         if self.depth >= MAX_DEPTH {
             return fail(line, format!("too much recursion (more than {} nested calls) in `{}`", MAX_DEPTH, def.name));
         }
+        // `with` narrows what the call may do; it cannot widen it.
+        let saved = match &def.effects {
+            Some(effs) => {
+                let mask = effect_mask(effs);
+                if mask & !self.allowed != 0 {
+                    return fail(line, self.effect_denied(&def.name, mask & !self.allowed));
+                }
+                let prev_mask = std::mem::replace(&mut self.allowed, mask);
+                Some((prev_mask, std::mem::replace(&mut self.restrictor, Some(def.clone()))))
+            }
+            None => None,
+        };
         self.depth += 1;
         // Grow the stack on demand, so deep recursion works on any thread.
         let r = stacker::maybe_grow(128 << 10, 4 << 20, || self.call_closure_inner(c, &def, args, line));
         self.depth -= 1;
-        r
+        if let Some((mask, who)) = saved {
+            self.allowed = mask;
+            self.restrictor = who;
+        }
+        let r = r?;
+        if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
+            if !type_matches(ety, payload) {
+                return fail(
+                    def.line,
+                    format!(
+                        "`{}` declares errors as `! {}`, but returned err({})",
+                        def.name,
+                        ety.text(),
+                        short(payload)
+                    ),
+                );
+            }
+        }
+        Ok(r)
+    }
+
+    /// "`http.get` needs the http effect, but `load` is declared `with db`".
+    fn effect_denied(&self, what: &str, missing: u8) -> String {
+        let names = effect_names(missing);
+        let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
+        match &self.restrictor {
+            Some(f) => format!(
+                "`{}` needs {}, but `{}` is declared `with {}`",
+                what,
+                need,
+                f.name,
+                f.effects.as_deref().unwrap_or_default().join(", ")
+            ),
+            None => format!("`{}` needs {}, which is not allowed here", what, need),
+        }
+    }
+
+    #[cold]
+    fn check_builtin_effect(&self, name: &str, line: u32) -> Result<(), Ctrl> {
+        let need = builtin_effect(name);
+        if need & !self.allowed != 0 {
+            return fail(line, self.effect_denied(name, need));
+        }
+        Ok(())
     }
 
     fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
