@@ -1,0 +1,218 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Wisp",
+  "scopeName": "source.wisp",
+  "fileTypes": ["wisp"],
+  "patterns": [{ "include": "#statements" }],
+  "repository": {
+    "statements": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#route" },
+        { "include": "#definition" },
+        { "include": "#state" },
+        { "include": "#html-close" },
+        { "include": "#html-open" },
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keyword" },
+        { "include": "#constant" },
+        { "include": "#type-annotation" },
+        { "include": "#operator" },
+        { "include": "#module-call" },
+        { "include": "#call" },
+        { "include": "#component-name" },
+        { "include": "#braces" },
+        { "include": "#identifier" }
+      ]
+    },
+    "comment": {
+      "name": "comment.line.double-slash.wisp",
+      "match": "//.*$"
+    },
+    "route": {
+      "match": "\\b(route)\\s+(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|ANY)\\s+(/[^\\s?{=]*)",
+      "captures": {
+        "1": { "name": "keyword.other.route.wisp" },
+        "2": { "name": "constant.language.http-method.wisp" },
+        "3": {
+          "name": "string.unquoted.path.wisp",
+          "patterns": [
+            { "match": "(:)([A-Za-z_]\\w*)(?:(\\()(int|float|num|str)(\\)))?", "captures": {
+              "1": { "name": "punctuation.definition.parameter.wisp" },
+              "2": { "name": "variable.parameter.path.wisp" },
+              "3": { "name": "punctuation.section.parens.wisp" },
+              "4": { "name": "support.type.wisp" },
+              "5": { "name": "punctuation.section.parens.wisp" } } },
+            { "match": "(\\*)([A-Za-z_]\\w*)?", "captures": {
+              "1": { "name": "keyword.operator.wildcard.wisp" },
+              "2": { "name": "variable.parameter.path.wisp" } } }
+          ]
+        }
+      }
+    },
+    "definition": {
+      "patterns": [
+        { "match": "\\b(server)\\s+(fn)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.modifier.server.wisp" },
+          "2": { "name": "storage.type.function.wisp" },
+          "3": { "name": "entity.name.function.wisp" } } },
+        { "match": "\\b(component)\\s+([A-Z]\\w*)", "captures": {
+          "1": { "name": "storage.type.component.wisp" },
+          "2": { "name": "entity.name.type.component.wisp" } } },
+        { "match": "\\b(view)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.type.view.wisp" },
+          "2": { "name": "entity.name.type.view.wisp" } } },
+        { "match": "\\b(fn)\\s+([A-Za-z_]\\w*)(?=\\s*\\()", "captures": {
+          "1": { "name": "storage.type.function.wisp" },
+          "2": { "name": "entity.name.function.wisp" } } },
+        { "match": "\\b(let)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.type.let.wisp" },
+          "2": { "name": "variable.other.declaration.wisp" } } },
+        { "match": "\\b(with)\\s+((?:(?:db|http|fs|env|time|random)\\s*,?\\s*)+)", "captures": {
+          "1": { "name": "keyword.other.with.wisp" },
+          "2": { "name": "support.constant.effect.wisp" } } }
+      ]
+    },
+    "state": {
+      "match": "(~)([A-Za-z_]\\w*)",
+      "captures": {
+        "1": { "name": "keyword.operator.state.wisp" },
+        "2": { "name": "variable.other.state.wisp" }
+      }
+    },
+    "string": {
+      "name": "string.quoted.double.wisp",
+      "begin": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.wisp" } },
+      "end": "\"",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.wisp" } },
+      "patterns": [
+        { "name": "constant.character.escape.wisp", "match": "\\\\[nrt0\"\\\\{}]" },
+        { "include": "#interpolation" }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.interpolation.wisp",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.wisp" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.wisp" } },
+      "contentName": "source.wisp.embedded",
+      "patterns": [{ "include": "#statements" }]
+    },
+    "braces": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.block.begin.wisp" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.block.end.wisp" } },
+      "patterns": [{ "include": "#statements" }]
+    },
+    "html-open": {
+      "name": "meta.tag.wisp",
+      "begin": "(<)([A-Za-z][\\w-]*)((?:[.#](?:[\\w-]|\\{[^}]*\\})+)*)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.wisp" },
+        "2": { "patterns": [
+          { "match": "\\b[A-Z][\\w-]*", "name": "entity.name.type.component.wisp" },
+          { "match": "\\b[a-z][\\w-]*", "name": "entity.name.tag.wisp" } ] },
+        "3": { "patterns": [
+          { "match": "\\.(?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.class.wisp" },
+          { "match": "#(?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.id.wisp" } ] }
+      },
+      "end": "(/?>)",
+      "endCaptures": { "1": { "name": "punctuation.definition.tag.end.wisp" } },
+      "patterns": [
+        { "include": "#comment" },
+        { "match": "(@)([\\w-]+)", "captures": {
+          "1": { "name": "keyword.operator.event.wisp" },
+          "2": { "name": "entity.other.attribute-name.event.wisp" } } },
+        { "match": "(bind)(:)(value|checked)", "captures": {
+          "1": { "name": "keyword.other.bind.wisp" },
+          "2": { "name": "punctuation.separator.wisp" },
+          "3": { "name": "entity.other.attribute-name.wisp" } } },
+        { "match": "[A-Za-z_:][\\w:.-]*", "name": "entity.other.attribute-name.wisp" },
+        { "match": "=", "name": "punctuation.separator.key-value.wisp" },
+        { "include": "#string" },
+        { "include": "#braces" },
+        { "match": "[.#](?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.class.wisp" }
+      ]
+    },
+    "html-close": {
+      "match": "(</)([A-Za-z][\\w-]*)\\s*(>)",
+      "captures": {
+        "1": { "name": "punctuation.definition.tag.begin.wisp" },
+        "2": { "patterns": [
+          { "match": "\\b[A-Z][\\w-]*", "name": "entity.name.type.component.wisp" },
+          { "match": "\\b[a-z][\\w-]*", "name": "entity.name.tag.wisp" } ] },
+        "3": { "name": "punctuation.definition.tag.end.wisp" }
+      }
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.float.wisp", "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*\\b" },
+        { "name": "constant.numeric.integer.wisp", "match": "\\b\\d[\\d_]*\\b" }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.control.wisp", "match": "\\b(if|then|else|match|for|in|return|reply)\\b" },
+        { "name": "keyword.other.wisp", "match": "\\b(use|as|with|route)\\b" },
+        { "name": "keyword.operator.logical.wisp", "match": "\\b(and|or|not)\\b" },
+        { "name": "storage.type.wisp", "match": "\\b(let|fn|view|component|server)\\b" }
+      ]
+    },
+    "constant": {
+      "name": "constant.language.wisp",
+      "match": "\\b(true|false|nil)\\b"
+    },
+    "type-annotation": {
+      "patterns": [
+        { "match": "(->|!)\\s*((?:(?:int|float|num|str|bool|list|map|html|fn|any|response|nil)\\??\\s*\\|?\\s*)+)", "captures": {
+          "1": { "name": "keyword.operator.type.wisp" },
+          "2": { "name": "support.type.wisp" } } },
+        { "match": "(?<=[\\w)])\\s*(:)\\s*((?:(?:int|float|num|str|bool|list|map|html|fn|any|response|nil)\\??\\s*(?:\\|\\s*)?)+)(?=\\s*[,)=]|\\s*$)", "captures": {
+          "1": { "name": "punctuation.separator.type.wisp" },
+          "2": { "name": "support.type.wisp" } } },
+        { "match": "(?<=[:|{,]\\s{0,8})\\b(int|float|num|str|bool|list|map|html|any|response)\\b", "name": "support.type.pattern.wisp" }
+      ]
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.pipe.wisp", "match": "\\|>" },
+        { "name": "keyword.operator.coalesce.wisp", "match": "\\?\\?" },
+        { "name": "keyword.operator.arrow.wisp", "match": "=>|->" },
+        { "name": "keyword.operator.comparison.wisp", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.assignment.wisp", "match": "\\+=|-=|=" },
+        { "name": "keyword.operator.range.wisp", "match": "\\.\\." },
+        { "name": "keyword.operator.try.wisp", "match": "\\?" },
+        { "name": "keyword.operator.arithmetic.wisp", "match": "[+\\-*/%]" },
+        { "name": "keyword.operator.alternative.wisp", "match": "\\|" }
+      ]
+    },
+    "module-call": {
+      "match": "\\b(json|db|http)(\\.)([a-z_]\\w*)",
+      "captures": {
+        "1": { "name": "support.module.wisp" },
+        "2": { "name": "punctuation.accessor.wisp" },
+        "3": { "name": "support.function.wisp" }
+      }
+    },
+    "call": {
+      "patterns": [
+        { "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat)\\b(?=\\s*\\()", "name": "support.function.builtin.wisp" },
+        { "match": "\\b([a-z_]\\w*)(?=\\s*\\()", "name": "entity.name.function.call.wisp" }
+      ]
+    },
+    "component-name": {
+      "match": "\\b[A-Z]\\w*\\b",
+      "name": "entity.name.type.wisp"
+    },
+    "identifier": {
+      "patterns": [
+        { "match": "\\brequest\\b", "name": "variable.language.request.wisp" },
+        { "match": "\\b[a-z_]\\w*\\b", "name": "variable.other.wisp" }
+      ]
+    }
+  }
+}

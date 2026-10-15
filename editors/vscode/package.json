@@ -1,0 +1,67 @@
+{
+  "name": "wisp-lang",
+  "displayName": "Wisp",
+  "description": "Wisp language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `wisp lsp`).",
+  "version": "0.2.0",
+  "publisher": "wisp-one",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/wisp-one/wisp" },
+  "engines": { "vscode": "^1.82.0" },
+  "categories": ["Programming Languages", "Linters", "Snippets"],
+  "keywords": ["wisp", "web", "language server"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:wisp"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "wisp",
+        "aliases": ["Wisp", "wisp"],
+        "extensions": [".wisp"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      { "language": "wisp", "scopeName": "source.wisp", "path": "./syntaxes/wisp.tmLanguage.json" }
+    ],
+    "snippets": [
+      { "language": "wisp", "path": "./snippets/wisp.json" }
+    ],
+    "commands": [
+      { "command": "wisp.run", "title": "Run this file (watch mode)", "category": "Wisp" },
+      { "command": "wisp.check", "title": "Check this file", "category": "Wisp" },
+      { "command": "wisp.restartServer", "title": "Restart the language server", "category": "Wisp" }
+    ],
+    "menus": {
+      "editor/title/run": [
+        { "command": "wisp.run", "when": "resourceLangId == wisp", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "Wisp",
+      "properties": {
+        "wisp.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `wisp` binary. Empty: `wisp` on the PATH, or target/release/wisp or target/debug/wisp in the workspace."
+        },
+        "wisp.port": {
+          "type": "number",
+          "default": 8080,
+          "description": "Port for `Wisp: Run this file`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/grammar.test.js",
+    "package": "vsce package --skip-license"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.2.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.1.0"
+  }
+}

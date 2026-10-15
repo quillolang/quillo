@@ -9,6 +9,7 @@ pub mod error;
 pub mod fetch;
 pub mod interp;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod server;
 pub mod shared;

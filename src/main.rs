@@ -16,6 +16,7 @@ usage:
   wisp run <file.wisp> [options]               run a program; serve it if it has routes
   wisp check <file.wisp>                       check a program without running it
   wisp repl                                    interactive prompt
+  wisp lsp                                     language server for editors (stdio)
   wisp <file.wisp>                             same as `wisp run`
 
 options for `run`:
@@ -48,6 +49,7 @@ fn real_main(args: Vec<String>) -> i32 {
             None => usage(),
         },
         Some("repl") | None => repl(),
+        Some("lsp") => wisp::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
             println!("wisp {}", VERSION);
             0
