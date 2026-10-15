@@ -82,6 +82,8 @@ pub fn install(env: &Env) {
         ("index_of", index_of),
         ("repeat", repeat),
         ("live", live),
+        ("css", tag_text),
+        ("sql", tag_text),
         ("url", url),
         ("navigate", navigate),
         ("publish", publish),
@@ -946,4 +948,10 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     s_arg(&args, 0, "navigate", line)?;
     Ok(Value::Nil)
+}
+
+/// `css` and `sql`: css`...` and sql`...` are the text as written; the tag
+/// tells editors to highlight it as CSS or SQL.
+fn tag_text(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::str(&*s_arg(&args, 0, "css", line)?))
 }

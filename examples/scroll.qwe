@@ -21,7 +21,7 @@ let PAGE = 200      // rows fetched per request
 
 // Keyset paging: "the next rows after this id" stays fast however deep you go.
 server fn load_after(last_id: int, limit: int) -> list with db =
-    db.query("select id, name, score from items where id > ? order by id limit ?", last_id, limit)
+    db.query(sql`select id, name, score from items where id > ? order by id limit ?`, last_id, limit)
 
 fn total() with db = db.one("select count(*) as n from items").n
 
@@ -67,7 +67,7 @@ component Feed(count: int) {
     </section>
 }
 
-let css = "
+let style = css`
 body { font: 15px/1.4 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
 .stats { color: #555; } .stats b { color: #222; }
 .viewport { overflow-y: auto; border: 1px solid #ddd; border-radius: 8px; }
@@ -76,7 +76,7 @@ body { font: 15px/1.4 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto
 .row .id { width: 5rem; color: #999; font-variant-numeric: tabular-nums; }
 .row .name { flex: 1; } .row .score { font-variant-numeric: tabular-nums; }
 .dom { color: #888; font-size: 13px; }
-"
+`
 
 // A plain script, outside Quillo, that counts the row elements actually in
 // the page, to show the windowing at work.
@@ -87,7 +87,7 @@ route GET / =
         <head>
             <meta charset="utf-8"/>
             <title>Infinite scroll</title>
-            <style>{css}</style>
+            <style>{style}</style>
         </head>
         <body>
             <h1>Infinite scroll</h1>

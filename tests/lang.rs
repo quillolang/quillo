@@ -346,3 +346,13 @@ fn style_sheets_are_written_as_is() {
     // Elsewhere, text is still escaped.
     assert_eq!(ev("<p>{\"a > b\"}</p>"), "<p>a &gt; b</p>");
 }
+
+#[test]
+fn tagged_templates() {
+    assert_eq!(ev("let accent = \"red\"\ncss`a > b { color: ${accent}; }`"), "\"a > b { color: red; }\"");
+    assert_eq!(ev("sql`select 1`"), "\"select 1\"");
+    // Any function can tag a template.
+    assert_eq!(ev("fn shout(s) = upper(s)\nlet n = 2\nshout`${n} apples`"), "\"2 APPLES\"");
+    // With a space it is a name followed by a string, as before.
+    assert!(ev_err("let x = 1\nx `a`").contains("expected end of statement"));
+}

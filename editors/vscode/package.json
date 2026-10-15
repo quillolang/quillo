@@ -2,38 +2,85 @@
   "name": "quillo-lang",
   "displayName": "Quillo",
   "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `quillo lsp`).",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "wisp-one",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/wisp-one/quillo" },
-  "engines": { "vscode": "^1.82.0" },
-  "categories": ["Programming Languages", "Linters", "Snippets"],
-  "keywords": ["quillo", "web", "language server"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wisp-one/quillo"
+  },
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "keywords": [
+    "quillo",
+    "web",
+    "language server"
+  ],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:quillo"],
+  "activationEvents": [
+    "onLanguage:quillo"
+  ],
   "contributes": {
     "languages": [
       {
         "id": "quillo",
-        "aliases": ["Quillo", "quillo"],
-        "extensions": [".qwe"],
+        "aliases": [
+          "Quillo",
+          "quillo"
+        ],
+        "extensions": [
+          ".qwe"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
-      { "language": "quillo", "scopeName": "source.quillo", "path": "./syntaxes/quillo.tmLanguage.json" }
+      {
+        "language": "quillo",
+        "scopeName": "source.quillo",
+        "path": "./syntaxes/quillo.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.css": "css",
+          "meta.embedded.block.sql": "sql"
+        }
+      }
     ],
     "snippets": [
-      { "language": "quillo", "path": "./snippets/quillo.json" }
+      {
+        "language": "quillo",
+        "path": "./snippets/quillo.json"
+      }
     ],
     "commands": [
-      { "command": "quillo.run", "title": "Run this file (watch mode)", "category": "Quillo" },
-      { "command": "quillo.check", "title": "Check this file", "category": "Quillo" },
-      { "command": "quillo.restartServer", "title": "Restart the language server", "category": "Quillo" }
+      {
+        "command": "quillo.run",
+        "title": "Run this file (watch mode)",
+        "category": "Quillo"
+      },
+      {
+        "command": "quillo.check",
+        "title": "Check this file",
+        "category": "Quillo"
+      },
+      {
+        "command": "quillo.restartServer",
+        "title": "Restart the language server",
+        "category": "Quillo"
+      }
     ],
     "menus": {
       "editor/title/run": [
-        { "command": "quillo.run", "when": "resourceLangId == quillo", "group": "navigation" }
+        {
+          "command": "quillo.run",
+          "when": "resourceLangId == quillo",
+          "group": "navigation"
+        }
       ]
     },
     "configuration": {

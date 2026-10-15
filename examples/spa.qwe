@@ -105,14 +105,14 @@ component App() {
     </div>
 }
 
-let css = "
+let style = css`
 body { font: 16px/1.5 system-ui, sans-serif; max-width: 38rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
 nav { display: flex; gap: 1rem; align-items: center; padding-bottom: .75rem; border-bottom: 1px solid #eee; }
 nav a { color: #555; text-decoration: none; } nav a.active { color: #000; font-weight: 600; }
 nav .cart { margin-left: auto; color: #555; }
 .products { padding-left: 1.2rem; } .price { color: #666; } .muted { color: #999; }
 button { font: inherit; padding: .35rem .9rem; border-radius: 6px; border: 1px solid #222; background: #222; color: white; cursor: pointer; }
-"
+`
 
 // Every path renders the app; the server answers 404 for unknown ones.
 route GET /*rest {
@@ -122,7 +122,7 @@ route GET /*rest {
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <title>Shop</title>
-                <style>{css}</style>
+                <style>{style}</style>
             </head>
             <body><App/></body>
         </html>

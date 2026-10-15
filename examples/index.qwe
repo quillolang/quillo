@@ -35,7 +35,7 @@ view Example(path: str, name: str, about: str) =
 let accent = "#0b57d0"
 
 // A style sheet is a template string: braces are plain text, ${...} fills in.
-let css = `
+let style = css`
 body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
 ul { list-style: none; padding: 0; }
 li { display: flex; flex-direction: column; padding: .8rem 0; border-bottom: 1px solid #eee; }
@@ -50,7 +50,7 @@ route GET / =
         <head>
             <meta charset="utf-8"/>
             <title>Quillo examples</title>
-            <style>{css}</style>
+            <style>{style}</style>
         </head>
         <body>
             <h1>Quillo examples</h1>

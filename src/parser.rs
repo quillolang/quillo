@@ -873,6 +873,13 @@ impl Parser {
                 )),
                 "reply" => self.parse_reply(line),
                 kw if KEYWORDS.contains(&kw) => Err(QuilloError::new(format!("unexpected keyword `{}`", kw), line)),
+                _ if self.peeked.is_none() && self.lx.peek_char() == Some('`') => {
+                    // A tagged template: css`...` is css(`...`).
+                    let parts = self.lx.lex_template()?;
+                    self.lx.last = Some(Tok::RParen);
+                    let t = self.template(parts)?;
+                    Ok(Expr::Call(Box::new(Expr::Ident(k.clone(), line)), vec![t], line))
+                }
                 _ => {
                     // `x => body`: an arrow function with one parameter.
                     if self.no_bare_arrow == 0 && self.at(&Tok::FatArrow)? {

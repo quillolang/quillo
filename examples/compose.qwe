@@ -63,7 +63,7 @@ component Dashboard() {
     </main>
 }
 
-let css = "
+let style = css`
 body { font: 15px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
 .card { border: 1px solid #e3e3e3; border-radius: 10px; padding: .25rem 1rem 1rem; margin-bottom: 1rem; }
 .card h2 { font-size: 1rem; color: #666; font-weight: 600; }
@@ -80,7 +80,7 @@ body { font: 15px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto
   .counter button { background: #222; color: #ddd; border-color: #444; }
   .panel .header { color: #ddd; }
 }
-"
+`
 
 route GET / =
     <html>
@@ -88,7 +88,7 @@ route GET / =
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>Composition</title>
-            <style>{css}</style>
+            <style>{style}</style>
         </head>
         <body>
             <h1>Composition</h1>

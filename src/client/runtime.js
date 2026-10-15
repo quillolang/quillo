@@ -504,6 +504,8 @@ B.index_of = meta((c, x) => {
 }, "index_of", null);
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
 B.url = meta(() => currentUrl(), "url", null);
+B.css = meta((s) => S(s, "css"), "css", null);
+B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },

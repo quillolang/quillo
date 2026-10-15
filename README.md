@@ -80,6 +80,10 @@ functions, HTML and error values. A map entry `{ id }` is short for `{ id: id }`
 key, or any field of `null` gives `null`. Strings index by character: `"héllo"[1]`
 is `"é"`.
 
+A name right before a template calls it with the text: `` shout`hi ${name}` `` is
+`` shout(`hi ${name}`) ``. The builtins `css` and `sql` return the text as it is, and
+tell editors to highlight it as CSS or SQL.
+
 Only template strings (backticks) interpolate; `"..."` and `'...'` are plain text, so
 JSON is easy to write: `'{"a": 1}'`. Template strings can span lines.
 
@@ -251,8 +255,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
-- `<style>{css}</style>` takes a style sheet as it is (no escaping, so `a > b` works);
-  write it as a template string: braces are plain text and `${...}` fills in values.
+- `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
+  Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
+  values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
 

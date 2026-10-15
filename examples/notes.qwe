@@ -14,7 +14,7 @@ db.exec("create table if not exists notes (
     created integer not null
 )")
 
-fn all_notes() with db = db.query("select id, text, done from notes order by id desc")
+fn all_notes() with db = db.query(sql`select id, text, done from notes order by id desc`)
 
 server fn load_notes() with db = all_notes()
 

@@ -35,6 +35,12 @@
           "include": "#html-element"
         },
         {
+          "include": "#tagged-css"
+        },
+        {
+          "include": "#tagged-sql"
+        },
+        {
           "include": "#template"
         },
         {
@@ -719,6 +725,73 @@
     "arrow-param": {
       "match": "\\b[a-z_]\\w*(?=\\s*=>)",
       "name": "variable.parameter.quillo"
+    },
+    "tagged-css": {
+      "begin": "\\b(css)(`)",
+      "beginCaptures": {
+        "1": {
+          "name": "support.function.tag.quillo"
+        },
+        "2": {
+          "name": "punctuation.definition.string.template.begin.quillo"
+        }
+      },
+      "end": "`",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.template.end.quillo"
+        }
+      },
+      "contentName": "meta.embedded.block.css",
+      "patterns": [
+        {
+          "include": "#interpolation"
+        },
+        {
+          "include": "#escape"
+        },
+        {
+          "include": "source.css"
+        }
+      ]
+    },
+    "tagged-sql": {
+      "begin": "\\b(sql)(`)",
+      "beginCaptures": {
+        "1": {
+          "name": "support.function.tag.quillo"
+        },
+        "2": {
+          "name": "punctuation.definition.string.template.begin.quillo"
+        }
+      },
+      "end": "`",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.template.end.quillo"
+        }
+      },
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [
+        {
+          "include": "#interpolation"
+        },
+        {
+          "include": "#escape"
+        },
+        {
+          "include": "source.sql"
+        }
+      ]
+    }
+  },
+  "injections": {
+    "L:meta.embedded.block.css - meta.template.expression.quillo, L:meta.embedded.block.sql - meta.template.expression.quillo": {
+      "patterns": [
+        {
+          "include": "#interpolation"
+        }
+      ]
     }
   }
 }
