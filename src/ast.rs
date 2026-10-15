@@ -165,6 +165,21 @@ pub enum Pattern {
     Record(Vec<RecField>),
 }
 
+impl Pattern {
+    /// A pattern that only tests the type: `int`, or `int | null`. As a
+    /// record field it binds the field's name: `{ page: int | null }`.
+    pub fn is_type_test(&self) -> bool {
+        match self {
+            Pattern::Type(_) => true,
+            Pattern::Alt(ps) => {
+                ps.iter().all(|p| matches!(p, Pattern::Type(_) | Pattern::Lit(Lit::Nil)))
+                    && ps.iter().any(|p| matches!(p, Pattern::Type(_)))
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecField {
     /// `customer.id` is `["customer", "id"]`.

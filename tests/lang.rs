@@ -356,3 +356,37 @@ fn tagged_templates() {
     // With a space it is a name followed by a string, as before.
     assert!(ev_err("let x = 1\nx `a`").contains("expected end of statement"));
 }
+
+#[test]
+fn map_keys_may_be_keywords() {
+    assert_eq!(ev("let m = { view: \"grid\", if: 1, for: 2 }\n[m.view, m[\"if\"], m]"), "[\"grid\", 1, { view: \"grid\", if: 1, for: 2 }]");
+}
+
+#[test]
+fn a_lone_name_in_braces_after_an_arrow_is_a_block() {
+    // As in JavaScript: `(a) => { a }` gives `a`, not `{ a: a }`.
+    assert_eq!(ev("let h = (a) => { a }\nh(5)"), "5");
+    assert_eq!(ev("let h = a => { a }\nh(6)"), "6");
+    assert_eq!(ev("fn f(x) = { x }\nf(7)"), "7");
+    assert_eq!(ev("match 8 { n => { n } }"), "8");
+    // Two names, or a key with a value, are still maps.
+    assert_eq!(ev("let p = (x, y) => { x, y }\np(1, 2)"), "{ x: 1, y: 2 }");
+    assert_eq!(ev("let p = (x) => { x: x }\np(1)"), "{ x: 1 }");
+    assert_eq!(ev("let x = 1\nlet m = { x }\nm"), "{ x: 1 }");
+}
+
+#[test]
+fn a_line_starting_with_an_operator_continues_the_statement() {
+    assert_eq!(ev("let a = 5\nlet b = 2\nlet total = a\n  - b\ntotal"), "3");
+    assert_eq!(ev("let total = 5\n  + 2\n  * 3\ntotal"), "11");
+    assert_eq!(ev("let same = 1\n  == 1\nsame"), "true");
+    // `-b` without a space starts a new statement.
+    assert_eq!(ev("fn f(x) {\n let y = x * 2\n -y\n}\nf(1)"), "-2");
+}
+
+#[test]
+fn record_fields_with_a_union_type_bind_their_name() {
+    let src = "fn page_of(q) = match q {\n { page: int | null } => [page]\n _ => \"no\"\n}\n[page_of({ page: 3 }), page_of({ page: null }), page_of({ page: \"x\" }), page_of({})]";
+    assert_eq!(ev(src), "[[3], [null], \"no\", \"no\"]");
+    assert_eq!(ev("let { n: int | str } = { n: \"a\" }\nn"), "\"a\"");
+}

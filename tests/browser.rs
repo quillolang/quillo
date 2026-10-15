@@ -98,6 +98,8 @@ fn live_state_follows_changes_made_elsewhere() {
         "after": ["first", "from elsewhere"],
         "hitsArrived": true,
         "hits": "2",
+        "note": "first",
+        "noteFollowsId": true,
         "errors": []
     });
     assert_eq!(result, want);

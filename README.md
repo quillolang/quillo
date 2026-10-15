@@ -91,8 +91,9 @@ JSON is easy to write: `'{"a": 1}'`. Template strings can span lines.
 Operators are as in JavaScript: `+ - * / %`, `== !=` (deep equality, like comparing
 JSON), `< <= > >=`, `!`, `&&`, `||`, `??` and `cond ? a : b`. `null`, `false` and error
 values are falsy; everything else (including `0` and `""`) is truthy. `a && b` and
-`a || b` give back one of their operands, so `name || "anonymous"` and
-`{loading && <Spinner/>}` work. `/` divides exactly, as in JavaScript: `7 / 2` is `3.5`,
+`a || b` give back one of their operands, so `{loading && <Spinner/>}` works. Because
+`""` is truthy, `name || "anonymous"` keeps an empty name: write `name ?? "anonymous"` to
+replace only null, or `name != "" ? name : "anonymous"` (`quillo check` points these out). `/` divides exactly, as in JavaScript: `7 / 2` is `3.5`,
 and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division.
 
 ### Coming from JavaScript
@@ -105,12 +106,16 @@ Most expressions read as they would in JavaScript. The differences:
   ones are arrows. Blocks give back their last expression, so `return` is only for
   leaving early.
 - `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
+- There are no semicolons to forget: a line break ends a statement unless the next
+  line continues it (`|`, `.method`, `&&`, `||`, `??`, `else`, `*`, `==`, or `- b` and
+  `+ b` with a space). A line starting `-b` is a new statement; `quillo check` warns
+  when one does nothing.
 - Only `null`, `false` and error values are falsy: `0` and `""` are truthy. Code
   written by JavaScript habit then runs without failing but means something else:
   `name || "anonymous"` keeps an empty name, and `count && <Badge/>` shows the badge
   for 0. Where a value is known to be a string or a number, the checker warns about
   `||`, `&&`, `!`, `if` and `? :` on it and suggests the explicit form
-  (`name != "" ? name : "anonymous"`, `count > 0 && <Badge/>`).
+  (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`).
 - `match`, `|`, patterns, `route`, `reply`, `~state` and `with` effects have no
   JavaScript equivalent.
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
@@ -128,7 +133,8 @@ fn area(w, h) {                   // block body: the last expression is the resu
 }
 let double = (x) => x * 2          // arrow functions, as in JavaScript
 let triple = x => x * 3
-let point = (x: int, y: int = 0) => { x, y }      // `{ x, y }` here is a map
+let point = (x: int, y: int = 0) => { x, y }      // `{ x, y }` here is a map,
+let same = (x) => { x }                           // but `{ x }` alone is a block
 
 view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
 ```

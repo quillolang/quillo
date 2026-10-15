@@ -5,6 +5,7 @@ let hits = 0
 
 server fn load_notes() = db.query("select text from notes order by id") | map((n) => n.text)
 server fn get_hits() = hits
+server fn note_at(id) = db.one("select text from notes where id = ?", id)?.text
 
 // Changes made elsewhere: plain routes, not the component.
 route POST /api/notes { json: { text: str } } = db.exec("insert into notes (text) values (?)", text)
@@ -16,7 +17,15 @@ component Board() {
     <div #board>
         <ul>{for n in notes => <li key={n}>{n}</li>}</ul>
         <p.hits>{hits}</p>
+        <Note/>
     </div>
+}
+
+// `live(load, id)` loads again when `id` changes.
+component Note() {
+    ~id = 1
+    ~note = live(note_at, id)
+    <p.note @click={() => { id = 2 }}>{note}</p>
 }
 
 let test_js = read_file("live.js")

@@ -145,7 +145,7 @@ fn javascript_truthiness_is_flagged_where_it_differs() {
     // In Quillo only null, false and errors are false: "" and 0 are true.
     one("fn f(name: str) = name || \"anonymous\"", "1 warning: `name` counts as true even when it is \"\" (unlike JavaScript), so `||` keeps it: write `name != \"\" ? name : ...`");
     one("fn f(name: str | null) = name || \"x\"", "or `name ?? ...` to replace only null");
-    one("view Badge(n: int) = <b>{n}</b>\nview V(count: int) = <p>{count && <Badge n={count}/>}</p>", "2 warning: `count` counts as true even when it is 0 (unlike JavaScript), so `&&` always goes on: write `count > 0 && ...`");
+    one("view Badge(n: int) = <b>{n}</b>\nview V(count: int) = <p>{count && <Badge n={count}/>}</p>", "2 warning: `count` counts as true even when it is 0 (unlike JavaScript), so `&&` always goes on: write `count != 0 && ...`");
     one("fn f(s: str) = !s", "so `!s` is false: write `s == \"\"`");
     one("fn f(s: str) = s ? 1 : 2", "so this condition holds: write `s != \"\"`");
     one("fn f(n: float) { if n { 1 } else { 2 } }", "write `n != 0`");
@@ -156,6 +156,33 @@ fn javascript_truthiness_is_flagged_where_it_differs() {
     clean("fn f(u: map) = u.name || \"x\"");
     clean("fn f(xs: list) = xs && len(xs)");
     clean("fn f(s: str) = s != \"\" ? s : \"x\"");
+    // A value that may be null is tested for null first: `null > 0` fails.
+    one("let i = index_of(\"abc\", \"a\")\nif i { print(i) }", "write `i != null && i != 0`, or `i != null` to test only for null");
+    one("fn f(n: int | null) = !n", "write `n == null || n == 0`");
+    one("fn f(n: int | null) = n && 1", "write `n != null && n != 0 && ...`");
+}
+
+#[test]
+fn inferred_returns_count_return_and_try() {
+    // `return 1` makes `f` int | str, so `* 2` is not certainly wrong.
+    clean("fn f(x) { if x { return 1 }; \"a\" }\nprint(f(true) * 2)");
+    // `?` can make `g` give back an error, which has `.error`.
+    clean("fn g(s) { let n = int(s)?; n }\nprint(g(\"x\").error)\nprint(g(\"2\") ?? 0)");
+    clean("let h = (s) => { let n = int(s)?\n n }\nprint(h(\"x\").error)");
+    one("fn f() { return \"a\" }\nprint(f() * 2)", "cannot multiply str and int");
+}
+
+#[test]
+fn a_line_starting_with_minus_is_its_own_statement() {
+    one("let a = 5\nlet b = 2\nlet total = a\n-b\nprint(total)", "4 warning: a line starting with `-` is a statement of its own");
+    clean("let a = 5\nlet b = 2\nlet total = a\n  - b\nprint(total)");
+    clean("fn f(x) {\n let y = x * 2\n -y\n}\nprint(f(1))");
+}
+
+#[test]
+fn record_patterns_with_a_union_bind_the_field() {
+    clean("match { page: 3 } {\n { page: int | null } => print(page + 1)\n _ => print(0)\n}");
+    one("match { page: 3 } {\n { page: int | null } => upper(page)\n _ => print(0)\n}", "argument 1 of `upper` must be str, got int | null");
 }
 
 #[test]

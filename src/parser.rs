@@ -336,7 +336,7 @@ impl Parser {
             None
         };
         let body = if self.eat(&Tok::Assign)? {
-            self.parse_expr()?
+            self.parse_arrow_body()?
         } else if self.at(&Tok::LBrace)? {
             self.parse_block()?
         } else {
@@ -587,8 +587,22 @@ impl Parser {
         }
     }
 
-    /// `=> expr` or `=> { statements }`.
+    /// `=> expr` or `=> { statements }`, also used for match arms and
+    /// `fn f() = ...`. Here `{ x }` is a block giving `x`, as in
+    /// JavaScript, not the map `{ x: x }`; `{ x, y }` and `{ x: 1 }` are maps.
     fn parse_arrow_body(&mut self) -> PResult<Expr> {
+        if self.at(&Tok::LBrace)? {
+            let s = self.save();
+            self.next()?;
+            let lone_name = matches!(self.peek()?, Tok::Ident(_)) && {
+                self.next()?;
+                matches!(self.peek()?, Tok::RBrace)
+            };
+            self.restore(s);
+            if lone_name {
+                return self.no_bare_arrow_off(|p| p.parse_block());
+            }
+        }
         self.parse_expr()
     }
 
@@ -896,14 +910,20 @@ impl Parser {
     }
 
     /// After `{` in expression position: a map if it is empty or starts with
-    /// `key:`, `key,` or `{ key }`; otherwise a block.
+    /// `key:`, `key,` or `{ key }`; otherwise a block. A keyword may be a key
+    /// (`{ view: "grid" }`), but not a shorthand one.
     fn brace_is_map(&mut self) -> PResult<bool> {
         match self.peek()? {
             Tok::RBrace => Ok(true),
-            Tok::Ident(k) if !KEYWORDS.contains(&k.as_str()) => {
+            Tok::Ident(k) => {
+                let keyword = KEYWORDS.contains(&k.as_str());
                 let s = self.save();
                 self.next()?;
-                let r = matches!(self.peek()?, Tok::Colon | Tok::Comma | Tok::RBrace);
+                let r = match self.peek()? {
+                    Tok::Colon => true,
+                    Tok::Comma | Tok::RBrace => !keyword,
+                    _ => false,
+                };
                 self.restore(s);
                 Ok(r)
             }
@@ -1019,7 +1039,7 @@ impl Parser {
                 None
             };
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
-            let body = self.parse_expr()?;
+            let body = self.parse_arrow_body()?;
             arms.push(Arm { pat, guard, body });
         }
         Ok(Expr::Match(Box::new(subj), arms, line))
