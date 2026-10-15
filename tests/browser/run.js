@@ -16,16 +16,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function main() {
   fs.rmSync(profile, { recursive: true, force: true });
   const proc = spawn(chrome, [
-    "--headless=new", "--disable-gpu", "--no-first-run", "--no-sandbox",
+    "--headless=new", "--disable-gpu", "--no-first-run", "--no-sandbox", "--disable-dev-shm-usage",
     "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank",
-  ], { stdio: "ignore" });
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  // Chrome prints "DevTools listening on ws://127.0.0.1:PORT/..." when ready.
+  let log = "";
+  proc.stderr.on("data", (d) => { log += d; });
   const deadline = Date.now() + timeout;
   try {
-    // Chrome writes its debugging port here once it is ready.
     let port = null;
     while (!port) {
-      if (Date.now() > deadline) throw new Error("Chrome did not start");
-      try { port = fs.readFileSync(path.join(profile, "DevToolsActivePort"), "utf8").split("\n")[0]; } catch (_) {}
+      if (Date.now() > deadline) throw new Error("Chrome did not start:\n" + log.slice(-2000));
+      const m = log.match(/DevTools listening on ws:\/\/[^:]+:(\d+)\//);
+      if (m) port = m[1];
+      if (!port) {
+        try { port = fs.readFileSync(path.join(profile, "DevToolsActivePort"), "utf8").split("\n")[0] || null; } catch (_) {}
+      }
       await sleep(50);
     }
     const target = await (await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: "PUT" })).json();
