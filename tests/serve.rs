@@ -141,7 +141,7 @@ fn watch_injects_the_reload_script_into_pages() {
     std::fs::write(&f, "route GET / = <html><body><p>\"hi\"</p></body></html>\nroute GET /t = \"text\"\n").unwrap();
     let srv = start(&f, &["--watch"]);
     let page = get(srv.port, "/").1;
-    assert!(page.contains("/_wisp/dev") && page.ends_with("</body></html>"), "{}", page);
+    assert!(page.contains("/_wisp/events") && page.ends_with("</body></html>"), "{}", page);
     assert_eq!(get(srv.port, "/t").1, "text");
 }
 
@@ -177,4 +177,28 @@ fn http_client_talks_to_another_server() {
         String::from_utf8_lossy(&out.stdout).trim(),
         r#"[{"id":7,"name":"user 7"},201,42,true,418,false,"short and stout",true]"#
     );
+}
+
+#[test]
+fn watch_tells_waiting_pages_about_changes() {
+    let d = temp_dir("events");
+    let f = d.join("app.wisp");
+    std::fs::write(&f, "route GET / = \"one\"\n").unwrap();
+    let srv = start(&f, &["--watch", "--workers", "1"]);
+    assert_eq!(get(srv.port, "/_wisp/events").1, "1");
+    // A page waits for the version to change from 1...
+    let port = srv.port;
+    let waiting = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        (get(port, "/_wisp/events?v=1").1, t0.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    // ...without using up the only worker.
+    assert_eq!(get(srv.port, "/").1, "one");
+    std::thread::sleep(Duration::from_millis(900));
+    std::fs::write(&f, "route GET / = \"two\"\n").unwrap();
+    let (v, took) = waiting.join().unwrap();
+    assert_eq!(v, "2");
+    assert!(took > Duration::from_millis(1000) && took < Duration::from_secs(5), "{:?}", took);
+    assert_eq!(get(srv.port, "/").1, "two");
 }

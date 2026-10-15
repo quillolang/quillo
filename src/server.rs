@@ -5,7 +5,7 @@ use crate::interp::{coerce, Ctrl, Interp, Mode};
 use crate::shared::Shared;
 use crate::value::*;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct HttpRequest {
@@ -375,6 +375,8 @@ pub enum Loaded {
 /// The running program, which `--watch` swaps out when its files change.
 pub struct App {
     slot: Mutex<(u64, Arc<Loaded>)>,
+    /// Signalled when `slot` changes, for `/_wisp/events`.
+    changed: Condvar,
     shared: Arc<Shared>,
     main_file: PathBuf,
     base_dir: PathBuf,
@@ -389,6 +391,7 @@ impl App {
     pub fn new(loaded: Loaded, shared: Arc<Shared>, main_file: &Path, base_dir: &Path, watch: bool) -> Self {
         App {
             slot: Mutex::new((1, Arc::new(loaded))),
+            changed: Condvar::new(),
             shared,
             main_file: main_file.to_path_buf(),
             base_dir: base_dir.to_path_buf(),
@@ -436,6 +439,17 @@ impl App {
                 }
             }
         }
+        self.changed.notify_all();
+    }
+
+    /// Waits up to `timeout` for a version newer than `seen`.
+    fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
+        let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let (slot, _) = self
+            .changed
+            .wait_timeout_while(slot, timeout, |s| s.0 == seen)
+            .unwrap_or_else(|e| e.into_inner());
+        slot.0
     }
 
     fn watched_files(&self) -> Vec<PathBuf> {
@@ -468,7 +482,26 @@ fn watch(app: Arc<App>) {
     }
 }
 
-const DEV_SCRIPT: &str = "<script>(()=>{let v=null;setInterval(async()=>{try{const t=await (await fetch('/_wisp/dev')).text();if(v!==null&&t!==v)location.reload();v=t}catch(e){}},600)})()</script>";
+/// Reloads the page when the program changes. The page keeps one request
+/// open: `/_wisp/events?v=N` answers when the version is no longer N (or
+/// after a while, and then the page asks again). If the server restarts, the
+/// page notices the new version and reloads too.
+const DEV_SCRIPT: &str = "<script>(async()=>{let v=null;for(;;){try{const t=await(await fetch('/_wisp/events'+(v===null?'':'?v='+v))).text();if(v!==null&&t!==v){location.reload();return}v=t}catch(e){await new Promise(r=>setTimeout(r,1000))}}})()</script>";
+
+/// Answers `/_wisp/events[?v=N]` on a thread of its own, so pages waiting
+/// for a change do not hold on to request workers.
+fn serve_events(app: Arc<App>, rq: tiny_http::Request) {
+    let seen = rq.url().split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
+    let _ = std::thread::Builder::new().name("wisp-events".into()).spawn(move || {
+        let v = match seen {
+            Some(seen) => app.wait_for_change(seen, Duration::from_secs(25)),
+            None => app.current().0,
+        };
+        let mut resp = tiny_http::Response::from_string(v.to_string());
+        resp.add_header(tiny_http::Header::from_bytes(&b"cache-control"[..], &b"no-store"[..]).unwrap());
+        let _ = rq.respond(resp);
+    });
+}
 
 /// In watch mode, HTML pages get a script that reloads them after a change.
 fn inject_dev_script(resp: &mut HttpResponse) {
@@ -484,8 +517,8 @@ fn inject_dev_script(resp: &mut HttpResponse) {
     .into_bytes();
 }
 
-fn error_page(msg: &str, dev: bool) -> HttpResponse {
-    let mut r = HttpResponse {
+fn error_page(msg: &str) -> HttpResponse {
+    HttpResponse {
         status: 500,
         headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
         body: format!(
@@ -493,11 +526,7 @@ fn error_page(msg: &str, dev: bool) -> HttpResponse {
             crate::interp::escape(msg)
         )
         .into_bytes(),
-    };
-    if dev {
-        inject_dev_script(&mut r);
     }
-    r
 }
 
 fn to_request(rq: &mut tiny_http::Request) -> HttpRequest {
@@ -517,6 +546,10 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
     let mut local: Option<Interp> = None;
     let mut program = app.current().1;
     while let Ok(mut rq) = server.recv() {
+        if app.watch && rq.url().split('?').next() == Some("/_wisp/events") {
+            serve_events(app.clone(), rq);
+            continue;
+        }
         let start = Instant::now();
         let req = to_request(&mut rq);
         let (g, current) = app.current();
@@ -538,7 +571,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
                     app.shared.gil.release();
                     r
                 }
-                (None, Loaded::Failed(e)) => error_page(e, app.watch),
+                (None, Loaded::Failed(e)) => error_page(e),
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
