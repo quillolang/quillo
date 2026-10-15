@@ -4,11 +4,8 @@
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => [...document.querySelectorAll(s)];
   try {
-    for (let i = 0; i < 100 && !window.__quilloBooted; i++) {
-      if (document.querySelector("quillo-island") && window.performance.getEntriesByName(location.origin + "/_quillo/quillo.js").length) break;
-      await tick(30);
-    }
-    await tick(200);
+    for (let i = 0; i < 200 && !window.quillo && !document.querySelector(".counter button"); i++) await tick(30);
+    await tick(300);
     const [apples, pears] = $$(".counter");
     apples.querySelector("button").click(); await tick();
     apples.querySelector("button").click(); await tick();

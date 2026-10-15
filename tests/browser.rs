@@ -37,6 +37,9 @@ fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) ->
 }
 
 fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>) -> serde_json::Value {
+    // One Chrome at a time: several at once overload small CI machines.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
