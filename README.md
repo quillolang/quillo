@@ -383,20 +383,43 @@ Values are immutable: `push`, `set` and `+` return new lists and maps.
 
 ### Database
 
-`db` is an embedded SQLite database. SQL problems are error values, so `?` and `??`
-work on them.
+`db` talks to SQLite (built in) or PostgreSQL, with the same functions. SQL problems
+are error values, so `?` and `??` work on them.
 
 ```quillo
-db.open("app.db")                                   // next to the program; ":memory:" also works
-db.exec("create table if not exists todos (id integer primary key, text text)")
+db.open("app.db")                                   // SQLite, next to the program; ":memory:" also works
+db.open("postgres://user:pass@host:5432/app")       // PostgreSQL
+db.exec("create table if not exists todos (id serial primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
 db.query("select * from todos where id > ?", 10)           // a list of maps
-db.one("select * from todos where id = :id", { id })       // a map, or nil
-db.transaction(() => { ... })                              // all or nothing
+db.one("select * from todos where id = :id", { id })       // a map, or null
+db.one("insert into todos (text) values (?) returning id", text)
+db.transaction(() => { ... })                              // all or nothing; nests
 ```
 
-Without `db.open`, the database is `$QUILLO_DB`, or else in memory. A transaction rolls
-back if its function fails, returns an error value or replies early.
+Without `db.open`, the database is `$QUILLO_DB` (a path or a `postgres://` URL), or else
+SQLite in memory. A transaction rolls back if its function fails, returns an error
+value or replies early.
+
+**SQLite** runs inside the server process, with foreign keys on and WAL mode.
+
+**PostgreSQL:**
+
+- Placeholders can be `?`, `:name` (with a map) or Postgres's own `$1`; the first two
+  are translated, skipping quotes, comments and `$$` strings. Queries are prepared, so
+  values never become SQL text.
+- Values convert both ways: numbers, text, booleans, `json`/`jsonb` as maps and lists,
+  arrays as lists, `numeric` as numbers, and `uuid`, `date`, `timestamp`/`timestamptz`
+  (ISO 8601, in UTC) and `interval` as strings. For other column types the value is sent
+  as text and Postgres converts it.
+- `last_id` is `null`: use `insert ... returning id` with `db.one`.
+- Connections come from a pool (8 by default; `?pool_size=N` in the URL). A query
+  releases the interpreter lock while it waits, so other requests keep running.
+  A transaction keeps one connection until it ends, so other requests never see its
+  changes early.
+- TLS is used when the server offers it (`?sslmode=require` insists), with certificates
+  checked against the usual public certificate authorities, as hosted Postgres services
+  use.
 
 ### HTTP client
 
@@ -443,7 +466,8 @@ src/lexer.rs      tokens; newline handling
 src/parser.rs     recursive descent: statements, expressions, patterns, HTML, routes, components
 src/interp.rs     evaluator, pattern matching, HTML and component rendering, effects
 src/builtins.rs   standard library
-src/db.rs         db: SQLite
+src/db.rs         db: SQLite, and the shared API
+src/pg.rs         db: PostgreSQL (pool, placeholders, types)
 src/fetch.rs      http: the HTTP client
 src/server.rs     request matching, server fns, responses, worker pool, --watch
 src/shared.rs     the interpreter lock and other state shared between threads
@@ -455,5 +479,6 @@ src/main.rs       CLI: run, check, repl, lsp
 editors/vscode/   the VS Code extension
 examples/         hello, orders, todo, notes
 tests/            language, routing, effects, checker, compiler (in Node), browser
-                  (headless Chrome), server and language server tests
+                  (headless Chrome), PostgreSQL (a throwaway server), server and
+                  language server tests
 ```

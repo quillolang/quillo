@@ -1,0 +1,254 @@
+//! `db` against a real PostgreSQL server. The test starts a throwaway one
+//! (initdb + pg_ctl, on its own port, in a temporary folder) and stops it
+//! afterwards. Skipped when PostgreSQL's server programs are not installed;
+//! set QUILLO_TEST_PG_BIN to the folder holding initdb and pg_ctl.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+struct Pg {
+    bin: PathBuf,
+    dir: PathBuf,
+    url: String,
+}
+
+impl Drop for Pg {
+    fn drop(&mut self) {
+        let _ = Command::new(self.bin.join("pg_ctl")).arg("-D").arg(&self.dir).args(["-m", "immediate", "stop"]).output();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn find_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("QUILLO_TEST_PG_BIN") {
+        return Some(PathBuf::from(p));
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("PATH") {
+        candidates.extend(std::env::split_paths(&path));
+    }
+    for root in ["/usr/lib/postgresql", "/opt/homebrew/opt", "/usr/local/opt"] {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                candidates.push(e.path().join("bin"));
+            }
+        }
+    }
+    candidates.into_iter().find(|d| d.join("initdb").exists() && d.join("pg_ctl").exists())
+}
+
+/// Starts a throwaway server; it is stopped when the value is dropped.
+fn server() -> Option<Pg> {
+    let bin = find_bin()?;
+    let dir = std::env::temp_dir().join(format!("quillo-pg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(bin.join("initdb"))
+        .arg("-D")
+        .arg(&dir)
+        .args(["-U", "quillo", "--auth=trust", "-E", "UTF8", "--no-locale"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "initdb failed: {}", String::from_utf8_lossy(&out.stderr));
+    let port = 25000 + (std::process::id() % 2000) as u16;
+    let opts = format!("-p {} -k {} -c listen_addresses=127.0.0.1 -c fsync=off", port, dir.display());
+    let pg = Pg { bin, dir, url: format!("postgres://quillo@127.0.0.1:{}/postgres", port) };
+    let ok = Command::new(pg.bin.join("pg_ctl"))
+        .arg("-D")
+        .arg(&pg.dir)
+        .args(["-o", &opts, "-l"])
+        .arg(pg.dir.join("log"))
+        .args(["-w", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    assert!(ok.success(), "pg_ctl start failed: {}", std::fs::read_to_string(pg.dir.join("log")).unwrap_or_default());
+    Some(pg)
+}
+
+/// A fresh database for one test, and its URL.
+fn database(pg: &Pg, name: &str) -> String {
+    let out = Command::new(pg.bin.join("psql"))
+        .args([&pg.url, "-q", "-c", &format!("drop database if exists {}", name), "-c", &format!("create database {}", name)])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    pg.url.replace("/postgres", &format!("/{}", name))
+}
+
+/// One server for every scenario; it is stopped even if one fails.
+#[test]
+fn postgres() {
+    let Some(pg) = server() else {
+        eprintln!("skipping: PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    values_round_trip_through_postgres_types(&database(&pg, "types"));
+    placeholders_errors_and_returning(&database(&pg, "places"));
+    transactions_commit_roll_back_and_nest(&database(&pg, "tx"));
+    queries_wait_without_blocking_and_transactions_are_private(&database(&pg, "served"));
+}
+
+fn run(url: &str, src: &str) -> String {
+    let src = format!("db.open(\"{}\")\n{}", url, src);
+    match quillo::Interp::new(".").load_source(&src, "pg.qwe") {
+        Ok(v) => v.repr(),
+        Err(e) => panic!("{}\n--- source ---\n{}", e, src),
+    }
+}
+
+fn values_round_trip_through_postgres_types(url: &str) {
+    let r = run(
+        url,
+        r#"
+db.exec("create extension if not exists pgcrypto")
+db.exec("create table t (
+    id serial primary key, small int2, n int4, big int8, f float8, price numeric(10, 2),
+    ok boolean, name text, code varchar(10), data jsonb, raw json, uid uuid,
+    day date, at timestamptz, plain timestamp, tags text[], nums int4[]
+)")
+let a = db.exec("insert into t (small, n, big, f, price, ok, name, code, data, raw, uid, day, at, plain, tags, nums)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    3, 42, 9000000000, 2.5, 19.99, true, "Ada", "x1", { k: [1, null] }, [1, 2],
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "2024-02-29", "2024-02-29 10:30:00+02", "1999-12-31 23:59:59.5",
+    ["a", "b c", "q\"uote"], [1, 2, 3])
+let row = db.one("select small, n, big, f, price, ok, name, code, data, raw, uid, day, at, plain, tags, nums from t")
+[a, row, db.one("select null::int as nothing, 10.5::numeric as half, 7::numeric as whole")]
+"#,
+    );
+    assert_eq!(
+        r,
+        "[{ changes: 1, last_id: null }, { small: 3, n: 42, big: 9000000000, f: 2.5, price: 19.99, ok: true, name: \"Ada\", \
+         code: \"x1\", data: { k: [1, null] }, raw: [1, 2], uid: \"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\", day: \"2024-02-29\", \
+         at: \"2024-02-29T08:30:00Z\", plain: \"1999-12-31T23:59:59.5\", tags: [\"a\", \"b c\", \"q\\\"uote\"], nums: [1, 2, 3] }, \
+         { nothing: null, half: 10.5, whole: 7 }]"
+    );
+}
+
+fn placeholders_errors_and_returning(url: &str) {
+    let r = run(
+        url,
+        r#"
+db.exec("create table users (id serial primary key, name text not null, age int);
+         create table posts (id serial primary key, user_id int references users(id))")
+let ada = db.one("insert into users (name, age) values (:name, :age) returning id", { name: "Ada", age: 36 })
+db.exec("insert into users (name, age) values ($1, $2)", "Bob", 7)
+let bad = db.query("select * from nope")
+let count = db.query("select ? as a", 1, 2)
+let fk = db.exec("insert into posts (user_id) values (?)", 99)
+let strict = db.exec("insert into users (name, age) values (?, ?)", "C", "not a number")
+[ada, db.query("select name from users where age > ? order by id", 1) |> map(u => u.name),
+ bad.error, count.error, is_err(fk), is_err(strict), db.one("select 1 where false")]
+"#,
+    );
+    assert!(r.starts_with("[{ id: 1 }, [\"Ada\", \"Bob\"], \"db: relation \\\"nope\\\" does not exist\", \"db: the query has 1 parameter, got 2\", true, true, null]"), "{}", r);
+}
+
+fn transactions_commit_roll_back_and_nest(url: &str) {
+    let r = run(
+        url,
+        r#"
+db.exec("create table t (n int)")
+db.transaction(() => db.exec("insert into t values (1)"))
+db.transaction(() => {
+    db.exec("insert into t values (2)")
+    err("changed my mind")
+})
+db.transaction(() => {
+    db.exec("insert into t values (3)")
+    db.transaction(() => {
+        db.exec("insert into t values (4)")
+        err("inner only")
+    })
+    db.exec("insert into t values (5)")
+})
+db.query("select n from t order by n") |> map(r => r.n)
+"#,
+    );
+    assert_eq!(r, "[1, 3, 5]");
+}
+
+// ---- through the server ----------------------------------------------------
+
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start(file: &Path) -> (Running, u16) {
+    let port = 26000 + (std::process::id() % 2000) as u16;
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(file)
+        .args(["--port", &port.to_string(), "--workers", "4"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let child = Running(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, port)
+}
+
+fn get(port: u16, path: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "GET {} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+}
+
+fn queries_wait_without_blocking_and_transactions_are_private(url: &str) {
+    let dir = std::env::temp_dir().join(format!("quillo-pg-app-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = dir.join("app.qwe");
+    std::fs::write(
+        &app,
+        format!(
+            r#"db.open("{url}")
+db.exec("create table if not exists t (n int)")
+route GET /slow = db.one("select true as slept from pg_sleep(0.4)")
+route GET /write = db.transaction(() => {{
+    db.exec("insert into t values (1)")
+    db.query("select pg_sleep(0.6)")
+    "written"
+}})
+route GET /count = db.one("select count(*) as c from t").c
+"#
+        ),
+    )
+    .unwrap();
+    let (_server, port) = start(&app);
+
+    // Four 0.4 s queries at once take about 0.4 s, not 1.6 s.
+    let t0 = Instant::now();
+    let hs: Vec<_> = (0..4).map(|_| std::thread::spawn(move || get(port, "/slow"))).collect();
+    for h in hs {
+        assert_eq!(h.join().unwrap(), r#"{"slept":true}"#);
+    }
+    let took = t0.elapsed();
+    assert!(took < Duration::from_millis(1200), "took {:?}", took);
+
+    // While a transaction is open, other requests do not see its row.
+    let writer = std::thread::spawn(move || get(port, "/write"));
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(get(port, "/count"), "0");
+    assert_eq!(writer.join().unwrap(), "written");
+    assert_eq!(get(port, "/count"), "1");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

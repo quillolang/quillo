@@ -35,8 +35,8 @@ impl Gil {
 
 pub struct Shared {
     pub gil: Gil,
-    /// The `db` connection, opened on first use.
-    pub db: Mutex<Option<rusqlite::Connection>>,
+    /// The program's database (SQLite or a Postgres pool), opened on first use.
+    pub db: Mutex<Option<std::sync::Arc<crate::db::Backend>>>,
 }
 
 impl Shared {

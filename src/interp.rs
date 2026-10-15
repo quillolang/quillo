@@ -61,6 +61,8 @@ pub struct Interp {
     pub current_request: Option<Value>,
     /// State of the components being rendered, innermost last.
     islands: Vec<Map>,
+    /// The Postgres connection this request's `db.transaction` holds.
+    pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -282,6 +284,7 @@ impl Interp {
             client_js: Arc::new(String::new()),
             current_request: None,
             islands: Vec::new(),
+            pg_tx: std::sync::Mutex::new(None),
         }
     }
 
@@ -302,6 +305,7 @@ impl Interp {
             client_js: self.client_js.clone(),
             current_request: None,
             islands: Vec::new(),
+            pg_tx: std::sync::Mutex::new(None),
         }
     }
 

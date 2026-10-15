@@ -11,6 +11,7 @@ pub mod interp;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod pg;
 pub mod server;
 pub mod shared;
 pub mod value;

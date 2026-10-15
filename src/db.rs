@@ -1,22 +1,31 @@
-//! `db`: an embedded SQLite database.
+//! `db`: an embedded SQLite database, or PostgreSQL.
 //!
 //! ```text
-//! db.open("app.db")
+//! db.open("app.db")                          // SQLite, next to the program
+//! db.open("postgres://user:pass@host/app")   // PostgreSQL
 //! db.exec("create table if not exists todos (id integer primary key, text text)")
 //! db.exec("insert into todos (text) values (?)", text)      // { changes, last_id }
 //! db.query("select * from todos where id > ?", 10)           // list of maps
 //! db.one("select * from todos where id = :id", { id })       // a map or null
-//! db.transaction(() => { ... })                               // all or nothing
+//! db.transaction(() => { ... })                              // all or nothing
 //! ```
 //!
 //! SQL problems are returned as error values, so `?` and `??` work on them.
-//! Until `db.open` is called the database is `$QUILLO_DB`, or else in memory.
+//! Until `db.open` is called the database is `$QUILLO_DB` (a path or a
+//! postgres:// URL), or else SQLite in memory.
+//!
+//! SQLite queries run under the interpreter lock; they are fast and local.
+//! Postgres queries release it while they wait on the network, and use a
+//! pool of connections. A transaction keeps its connection to itself until
+//! it ends, so other requests never run inside it.
 
 use crate::interp::{fail, Ctrl, Interp};
+use crate::pg;
 use crate::value::*;
 use rusqlite::types::{Value as Sql, ValueRef};
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 type R = Result<Value, Ctrl>;
 
@@ -33,6 +42,19 @@ pub fn install(m: &mut Map) {
     }
 }
 
+/// The database a program uses.
+pub enum Backend {
+    Sqlite(Mutex<Connection>),
+    Postgres(pg::Pool),
+}
+
+/// A Postgres connection kept by one request for its `db.transaction`.
+pub struct PgTx {
+    backend: Arc<Backend>,
+    conn: Option<pg::Conn>,
+    depth: usize,
+}
+
 fn db_err(e: impl std::fmt::Display) -> Value {
     Value::err(Value::str(format!("db: {}", e)))
 }
@@ -43,14 +65,63 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     Ok(c)
 }
 
-/// Runs `f` with the program's connection, opening the default one if needed.
-fn with_conn<T>(it: &Interp, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-    let mut slot = it.shared.db.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_none() {
-        let path = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
-        *slot = Some(connect(&path).map_err(|e| e.to_string())?);
+/// Opens a path (SQLite) or a postgres:// URL. Connecting to Postgres
+/// waits on the network, so the interpreter lock is released meanwhile.
+fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
+    if pg::is_url(target) {
+        let url = target.to_string();
+        return it.unlocked(move || pg::Pool::open(&url)).map(Backend::Postgres);
     }
-    f(slot.as_ref().unwrap())
+    let full = if target == ":memory:" || Path::new(target).is_absolute() {
+        target.to_string()
+    } else {
+        it.base_dir.join(target).display().to_string()
+    };
+    connect(&full).map(|c| Backend::Sqlite(Mutex::new(c))).map_err(|e| e.to_string())
+}
+
+/// The program's database, opening the default one if needed.
+fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
+    if let Some(b) = it.shared.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(b);
+    }
+    let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
+    let b = Arc::new(open_backend(it, &target)?);
+    let mut slot = it.shared.db.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(slot.get_or_insert(b).clone())
+}
+
+/// Runs `f` on a Postgres connection without holding the interpreter
+/// lock: the request's transaction connection if it has one, else one
+/// from the pool.
+fn pg_run<T: Send>(
+    it: &mut Interp,
+    b: &Arc<Backend>,
+    f: impl FnOnce(&mut pg::Conn) -> Result<T, String> + Send,
+) -> Result<T, String> {
+    let Backend::Postgres(pool) = &**b else { unreachable!("pg_run on SQLite") };
+    let pinned = match &mut *it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(tx) if Arc::ptr_eq(&tx.backend, b) => tx.conn.take(),
+        _ => None,
+    };
+    match pinned {
+        Some(mut c) => {
+            let (c, r) = it.unlocked(move || {
+                let r = f(&mut c);
+                (c, r)
+            });
+            if let Some(tx) = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                tx.conn = Some(c);
+            }
+            r
+        }
+        None => it.unlocked(|| {
+            let mut c = pool.checkout()?;
+            let r = f(&mut c);
+            pool.give_back(c);
+            r
+        }),
+    }
 }
 
 fn to_sql(v: &Value) -> Sql {
@@ -126,17 +197,13 @@ fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
     }
 }
 
-/// `db.open(path)`: a file next to the program, or ":memory:".
+/// `db.open(target)`: a SQLite file next to the program, ":memory:", or a
+/// postgres:// URL.
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let path = sql_arg(&args, "db.open", line)?;
-    let full = if path == ":memory:" || Path::new(&path).is_absolute() {
-        path
-    } else {
-        it.base_dir.join(&path).display().to_string()
-    };
-    match connect(&full) {
-        Ok(c) => {
-            *it.shared.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+    let target = sql_arg(&args, "db.open", line)?;
+    match open_backend(it, &target) {
+        Ok(b) => {
+            *it.shared.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(b));
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),
@@ -147,39 +214,58 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// text may hold several statements (a schema, for example).
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sql = sql_arg(&args, "db.exec", line)?;
-    let params = &args[1..];
-    let res = with_conn(it, |c| {
-        if params.is_empty() {
-            c.execute_batch(&sql).map_err(|e| e.to_string())?;
-        } else {
-            let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
-            bind(&mut stmt, params)?;
-            stmt.raw_execute().map_err(|e| e.to_string())?;
+    let params = args[1..].to_vec();
+    let b = match backend(it) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let res = match &*b {
+        Backend::Sqlite(m) => {
+            let c = m.lock().unwrap_or_else(|e| e.into_inner());
+            (|| {
+                if params.is_empty() {
+                    c.execute_batch(&sql).map_err(|e| e.to_string())?;
+                } else {
+                    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+                    bind(&mut stmt, &params)?;
+                    stmt.raw_execute().map_err(|e| e.to_string())?;
+                }
+                let mut m = Map::new();
+                m.insert("changes".into(), Value::Int(c.changes() as i64));
+                m.insert("last_id".into(), Value::Int(c.last_insert_rowid()));
+                Ok(Value::map(m))
+            })()
         }
-        let mut m = Map::new();
-        m.insert("changes".into(), Value::Int(c.changes() as i64));
-        m.insert("last_id".into(), Value::Int(c.last_insert_rowid()));
-        Ok(Value::map(m))
-    });
+        Backend::Postgres(_) => pg_run(it, &b, move |c| c.exec(&sql, &params)),
+    };
     Ok(res.unwrap_or_else(db_err))
+}
+
+fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let b = backend(it)?;
+    match &*b {
+        Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
+        Backend::Postgres(_) => pg_run(it, &b, move |c| c.query(&sql, &params, limit)),
+    }
 }
 
 /// `db.query(sql, ...params)`: every row, as maps from column to value.
 fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sql = sql_arg(&args, "db.query", line)?;
-    Ok(with_conn(it, |c| rows(c, &sql, &args[1..], None)).map(Value::list).unwrap_or_else(db_err))
+    Ok(select(it, sql, args[1..].to_vec(), None).map(Value::list).unwrap_or_else(db_err))
 }
 
 /// `db.one(sql, ...params)`: the first row, or null.
 fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sql = sql_arg(&args, "db.one", line)?;
-    Ok(with_conn(it, |c| rows(c, &sql, &args[1..], Some(1)))
+    Ok(select(it, sql, args[1..].to_vec(), Some(1))
         .map(|r| r.into_iter().next().unwrap_or(Value::Nil))
         .unwrap_or_else(db_err))
 }
 
 /// `db.transaction(() => { ... })`: commits if the function returns normally,
 /// rolls back if it fails, returns an error value, or replies early.
+/// Transactions nest (as savepoints).
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = match args.first() {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
@@ -187,16 +273,75 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
         }
     };
-    if let Err(e) = with_conn(it, |c| c.execute_batch("savepoint quillo_tx").map_err(|e| e.to_string())) {
-        return Ok(db_err(e));
-    }
-    let r = it.call(&f, Vec::new(), line);
-    let commit = matches!(&r, Ok(v) if !matches!(v, Value::Err(_)));
-    let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
-    if let Err(e) = with_conn(it, |c| c.execute_batch(end).map_err(|e| e.to_string())) {
-        if commit {
-            return Ok(db_err(e));
+    let b = match backend(it) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
+    match &*b {
+        Backend::Sqlite(m) => {
+            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql).map_err(|e| e.to_string());
+            if let Err(e) = run("savepoint quillo_tx") {
+                return Ok(db_err(e));
+            }
+            let r = it.call(&f, Vec::new(), line);
+            let commit = ok(&r);
+            let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
+            if let Err(e) = run(end) {
+                if commit {
+                    return Ok(db_err(e));
+                }
+            }
+            r
+        }
+        Backend::Postgres(pool) => {
+            // Keep one connection for this request until the outermost
+            // transaction ends.
+            let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(false, |t| Arc::ptr_eq(&t.backend, &b));
+            if !pinned {
+                let c = match it.unlocked(|| pool.checkout()) {
+                    Ok(c) => c,
+                    Err(e) => return Ok(db_err(e)),
+                };
+                *it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(PgTx { backend: b.clone(), conn: Some(c), depth: 0 });
+            }
+            let depth = {
+                let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let tx = g.as_mut().expect("pinned");
+                tx.depth += 1;
+                tx.depth
+            };
+            let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
+            let started = pg_run(it, &b, move |c| c.batch(&begin));
+            let r = match started {
+                Ok(()) => it.call(&f, Vec::new(), line),
+                Err(e) => Ok(db_err(e)),
+            };
+            let commit = ok(&r);
+            let end = match (commit, depth == 1) {
+                (true, true) => "commit".to_string(),
+                (false, true) => "rollback".to_string(),
+                (true, false) => format!("release savepoint quillo_tx_{}", depth),
+                (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
+            };
+            let ended = pg_run(it, &b, move |c| c.batch(&end));
+            let done = {
+                let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let tx = g.as_mut().expect("pinned");
+                tx.depth -= 1;
+                if tx.depth == 0 {
+                    g.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(PgTx { conn: Some(c), .. }) = done {
+                pool.give_back(c);
+            }
+            match ended {
+                Err(e) if commit => Ok(db_err(e)),
+                _ => r,
+            }
         }
     }
-    r
 }
