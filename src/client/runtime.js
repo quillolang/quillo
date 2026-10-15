@@ -548,8 +548,12 @@ async function rpc(name, args) {
 
 // ---- live updates --------------------------------------------------------
 // Each `~x = live(load, ...)` is a subscription to the topics `load` read
-// (tables and globals). One request at a time waits at /_quillo/live for any
-// of them to change; then the affected loaders run again.
+// (tables and globals). One WebSocket to /_quillo/live carries changes to any
+// of them; then the affected loaders run again. When the topics change, it
+// is opened again for the new ones. (A WebSocket, because browsers allow a
+// host only six HTTP requests at once across all tabs; waiting requests
+// would leave none for server calls. Where one cannot open, the same URL
+// answers a plain request after the first change.)
 
 const Live = { seq: 0, subs: new Set(), ctrl: null, running: false, key: "" };
 
@@ -584,18 +588,33 @@ async function liveLoop() {
     Live.key = topics.join(",");
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
-    let j;
+    const url = BASE + "/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key);
     try {
-      const r = await fetch(BASE + "/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key), { signal: ctrl.signal });
-      j = await r.json();
+      if (!(await liveSocket(url, ctrl.signal)) && !ctrl.signal.aborted)
+        liveChanged(await (await fetch(url, { signal: ctrl.signal, cache: "no-store" })).json());
     } catch (e) {
       if (!ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 1000));
-      continue;
     }
-    Live.seq = j.seq;
-    const changed = new Set(j.changed || []);
-    if (changed.size) for (const s of [...Live.subs]) if (s.topics.some((t) => changed.has(t))) liveRefresh(s);
   }
+}
+
+// Resolves when the socket closes: true if it had opened.
+function liveSocket(url, signal) {
+  return new Promise((resolve) => {
+    if (typeof WebSocket !== "function") return resolve(false);
+    const ws = new WebSocket(location.origin.replace(/^http/, "ws") + url);
+    let opened = false;
+    ws.onopen = () => { opened = true; };
+    ws.onmessage = (m) => liveChanged(JSON.parse(m.data));
+    ws.onclose = () => resolve(opened);
+    signal.addEventListener("abort", () => ws.close());
+  });
+}
+
+function liveChanged(j) {
+  Live.seq = j.seq;
+  const changed = new Set(j.changed || []);
+  if (changed.size) for (const s of [...Live.subs]) if (s.topics.some((t) => changed.has(t))) liveRefresh(s);
 }
 
 async function liveRefresh(sub) {

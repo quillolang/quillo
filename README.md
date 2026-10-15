@@ -402,9 +402,12 @@ component Notes(initial: list) {
   on rollback.
 - `publish("topic")` announces anything else, and `watch("topic")` inside a loader
   subscribes to it.
-- The server renders the first value; the page keeps one waiting request open
-  (`/_quillo/live`, answered by its own thread) and calls the loader again when one
-  of its topics changes.
+- The server renders the first value; the page keeps one WebSocket open
+  (`/_quillo/live`, served by its own thread), down which the server streams each
+  change to its topics, and calls the loader again. A WebSocket, because browsers
+  allow only six HTTP/1.1 connections to a host across all tabs: requests left
+  waiting would hold them, and server calls would queue behind them. Where a
+  WebSocket cannot open, the page asks the same URL as a plain request instead.
 - Only changes made through this Quillo server are seen: a row changed by another
   program, or by another server process, does not wake pages.
 

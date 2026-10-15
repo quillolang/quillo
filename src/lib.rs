@@ -16,6 +16,7 @@ pub mod server;
 pub mod shared;
 pub mod sqlinfo;
 pub mod value;
+pub mod ws;
 
 pub use error::QuilloError;
 pub use interp::Interp;

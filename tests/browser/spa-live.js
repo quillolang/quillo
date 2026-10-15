@@ -40,6 +40,23 @@
     click($$("main button").find((b) => b.textContent === "Check out"));
     await waitFor(() => $(".thanks"));
     out.checkout = [$(".thanks").textContent, $(".cart b").textContent];
+    // Seven more open pages, each waiting for live changes: more than the six
+    // HTTP connections a browser allows a host. Server calls still answer at
+    // once, and every page hears about a change.
+    const frames = [];
+    for (let i = 0; i < 7; i++) {
+      const f = document.createElement("iframe");
+      f.src = "/products";
+      document.body.append(f);
+      frames.push(f);
+    }
+    const frameStock = (f) => { const li = f.contentDocument && [...f.contentDocument.querySelectorAll(".products li")].find((l) => l.textContent.includes("Desk mat")); return li ? li.querySelector(".stock").textContent : null; };
+    await waitFor(() => frames.every((f) => frameStock(f) === "5 in stock" && f.contentWindow.quillo), 300);
+    await tick(500);
+    const t0 = performance.now();
+    await otherTab("buy", [4]);
+    out.callWhileManyWait = performance.now() - t0 < 2000;
+    out.allFramesLive = await waitFor(() => frames.every((f) => frameStock(f) === "4 in stock"), 300);
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e); }
   document.body.setAttribute("data-result", JSON.stringify(out));

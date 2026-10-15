@@ -3,6 +3,8 @@ window.__quilloErrors = [];
 window.__requests = [];
 const __fetch = window.fetch;
 window.fetch = (u, o) => { window.__requests.push(String(u)); return __fetch(u, o); };
+const __WebSocket = window.WebSocket;
+window.WebSocket = function (u, p) { window.__requests.push(String(u)); return new __WebSocket(u, p); };
 const tick = () => new Promise((r) => setTimeout(r, 20));
 async function waitFor(f) { for (let i = 0; i < 200; i++) { if (f()) return true; await tick(); } return false; }
 async function run() {

@@ -272,8 +272,8 @@ impl Interp {
         if rest == "live" {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.
-            let q = parse_urlencoded(qs);
-            let (seq, changed) = live_answer(&self.shared, &q, std::time::Duration::ZERO);
+            let (since, topics) = live_query(qs);
+            let (seq, changed) = self.shared.wait_live(since, &topics, std::time::Duration::ZERO);
             return json_response(200, serde_json::json!({ "seq": seq, "changed": changed }));
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
@@ -336,25 +336,48 @@ impl Interp {
     }
 }
 
-/// `/_quillo/live?since=N&t=a,b`: the current sequence number, and which of
-/// the topics changed after N (waiting up to `wait` for one to).
-fn live_answer(shared: &Shared, q: &Map, wait: Duration) -> (u64, Vec<String>) {
+/// `/_quillo/live?since=N&t=a,b`: the sequence number the page has seen,
+/// and the topics it is showing.
+fn live_query(qs: &str) -> (u64, Vec<String>) {
+    let q = parse_urlencoded(qs);
     let since = q.get("since").and_then(|v| v.display().parse::<u64>().ok()).unwrap_or(0);
     let topics: Vec<String> = q
         .get("t")
         .map(|v| v.display().split(',').filter(|s| !s.is_empty()).map(String::from).collect())
         .unwrap_or_default();
-    shared.wait_live(since, &topics, wait)
+    (since, topics)
 }
 
-/// Answers `/_quillo/live` on a thread of its own, after waiting for a
-/// change, so open pages do not hold on to request workers.
+fn live_json(seq: u64, changed: &[String]) -> String {
+    serde_json::json!({ "seq": seq, "changed": changed }).to_string()
+}
+
+/// Answers `/_quillo/live` on a thread of its own, so open pages do not hold
+/// on to request workers. Over a WebSocket, each change to the topics is
+/// sent as `{seq, changed}` for as long as the page stays; as a plain
+/// request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, rq: tiny_http::Request) {
-    let qs = rq.url().split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+    let (mut since, topics) = live_query(rq.url().split_once('?').map_or("", |(_, q)| q));
     let _ = std::thread::Builder::new().name("quillo-live".into()).spawn(move || {
-        let (seq, changed) = live_answer(&shared, &parse_urlencoded(&qs), Duration::from_secs(25));
-        let body = serde_json::json!({ "seq": seq, "changed": changed }).to_string();
-        let mut resp = tiny_http::Response::from_string(body);
+        if crate::ws::is_upgrade(&rq) {
+            let Some(mut socket) = crate::ws::Socket::accept(rq) else { return };
+            loop {
+                let (seq, changed) = shared.wait_live(since, &topics, Duration::from_secs(20));
+                // A page that did not know the sequence number, or knew one
+                // from before a restart, is told the current one.
+                let alive = if !changed.is_empty() || since == 0 || since > seq {
+                    socket.send(&live_json(seq, &changed))
+                } else {
+                    socket.ping()
+                };
+                if !alive {
+                    return;
+                }
+                since = seq;
+            }
+        }
+        let (seq, changed) = shared.wait_live(since, &topics, Duration::from_secs(25));
+        let mut resp = tiny_http::Response::from_string(live_json(seq, &changed));
         for (k, v) in [("content-type", "application/json"), ("cache-control", "no-store")] {
             resp.add_header(tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap());
         }
@@ -562,14 +585,16 @@ fn watch(app: Arc<App>) {
 }
 
 /// Reloads the page when the program changes. The page starts out knowing
-/// the version it was rendered from, and keeps one request open:
-/// `/_quillo/events?v=N` answers when the version is no longer N (or after a
-/// while, and then the page asks again). A change made between rendering
-/// and that first request is therefore not missed; and if the server
-/// restarts, the page sees a different version and reloads too.
+/// the version it was rendered from, and waits on a WebSocket to
+/// `/_quillo/events?v=N`, which sends the new version once it is no longer N.
+/// A change made between rendering and connecting is therefore not missed;
+/// and if the server restarts, the page sees a different version and reloads
+/// too. Where the WebSocket cannot open, the page asks the same URL as a
+/// plain request, which answers after a change or a while, and tries the
+/// WebSocket again after that.
 fn dev_script(version: u64) -> String {
     format!(
-        "<script>(async()=>{{const v='{}';for(;;){{try{{const t=await(await fetch('/_quillo/events?v='+v)).text();if(t!==v){{location.reload();return}}}}catch(e){{await new Promise(r=>setTimeout(r,1000))}}}}}})()</script>",
+        "<script>(()=>{{const v='{}',u='/_quillo/events?v='+v,go=()=>{{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u);s.onopen=()=>o=1;s.onmessage=e=>{{if(e.data!==v)location.reload()}};s.onclose=()=>o?setTimeout(go,1000):fetch(u,{{cache:'no-store'}}).then(r=>r.text()).then(t=>t!==v?location.reload():go(),()=>setTimeout(go,1000))}};go()}})()</script>",
         version
     )
 }
@@ -579,6 +604,20 @@ fn dev_script(version: u64) -> String {
 fn serve_events(app: Arc<App>, rq: tiny_http::Request) {
     let seen = rq.url().split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
     let _ = std::thread::Builder::new().name("quillo-events".into()).spawn(move || {
+        if crate::ws::is_upgrade(&rq) {
+            let Some(mut socket) = crate::ws::Socket::accept(rq) else { return };
+            let seen = seen.unwrap_or(0);
+            loop {
+                let v = app.wait_for_change(seen, Duration::from_secs(20));
+                if v != seen {
+                    socket.send(&v.to_string());
+                    return socket.close();
+                }
+                if !socket.ping() {
+                    return;
+                }
+            }
+        }
         let v = match seen {
             Some(seen) => app.wait_for_change(seen, Duration::from_secs(25)),
             None => app.current().0,

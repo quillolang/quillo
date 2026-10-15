@@ -324,6 +324,8 @@ fn shop_stock_updates_live_and_the_cart_reserves_it() {
         "penReturned": 1,
         "penPage": "Only 1 left",
         "checkout": ["Thank you! 1 item ordered.", "0"],
+        "callWhileManyWait": true,
+        "allFramesLive": true,
         "errors": []
     });
     assert_eq!(r, want);
