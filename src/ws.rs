@@ -61,7 +61,7 @@ impl Socket {
     }
 }
 
-fn sha1(data: &[u8]) -> [u8; 20] {
+pub fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -101,6 +101,10 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         out[4 * i..4 * i + 4].copy_from_slice(&x.to_be_bytes());
     }
     out
+}
+
+pub fn hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn base64(data: &[u8]) -> String {

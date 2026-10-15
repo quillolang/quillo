@@ -1351,9 +1351,10 @@ impl Interp {
             String::new()
         } else {
             format!(
-                " data-l=\"{}\" data-v=\"{}\"",
+                " data-l=\"{}\" data-v=\"{}:{}\"",
                 escape(&Value::map(live).to_json().to_string()),
-                self.shared.live_seq()
+                self.shared.live_seq(),
+                self.shared.id
             )
         };
         let mut out = format!(

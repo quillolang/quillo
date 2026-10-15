@@ -272,9 +272,9 @@ impl Interp {
         if rest == "live" {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.
-            let (since, topics) = live_query(qs);
-            let (seq, changed) = self.shared.wait_live(since, &topics, std::time::Duration::ZERO);
-            return json_response(200, serde_json::json!({ "seq": seq, "changed": changed }));
+            let (since, server, topics) = live_query(qs);
+            let (seq, changed) = self.shared.wait_live(since, server.as_deref(), &topics, std::time::Duration::ZERO);
+            return json_response(200, serde_json::json!({ "seq": seq, "server": self.shared.id, "changed": changed }));
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
@@ -318,6 +318,7 @@ impl Interp {
             if let Some(t) = &topics {
                 j["topics"] = serde_json::json!(t);
                 j["seq"] = serde_json::json!(seq);
+                j["server"] = serde_json::json!(self.shared.id);
             }
             j
         };
@@ -336,37 +337,40 @@ impl Interp {
     }
 }
 
-/// `/_quillo/live?since=N&t=a,b`: the sequence number the page has seen,
-/// and the topics it is showing.
-fn live_query(qs: &str) -> (u64, Vec<String>) {
+/// `/_quillo/live?since=N&s=S&t=a,b`: the sequence number the page has
+/// seen, the server it came from, and the topics it is showing.
+fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>) {
     let q = parse_urlencoded(qs);
     let since = q.get("since").and_then(|v| v.display().parse::<u64>().ok()).unwrap_or(0);
+    let server = q.get("s").map(|v| v.display()).filter(|s| !s.is_empty());
     let topics: Vec<String> = q
         .get("t")
         .map(|v| v.display().split(',').filter(|s| !s.is_empty()).map(String::from).collect())
         .unwrap_or_default();
-    (since, topics)
+    (since, server, topics)
 }
 
-fn live_json(seq: u64, changed: &[String]) -> String {
-    serde_json::json!({ "seq": seq, "changed": changed }).to_string()
+fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
+    serde_json::json!({ "seq": seq, "server": shared.id, "changed": changed }).to_string()
 }
 
 /// Answers `/_quillo/live` on a thread of its own, so open pages do not hold
 /// on to request workers. Over a WebSocket, each change to the topics is
-/// sent as `{seq, changed}` for as long as the page stays; as a plain
-/// request, the answer is the first change, or none after a while.
+/// sent as `{seq, server, changed}` for as long as the page stays; as a
+/// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, rq: tiny_http::Request) {
-    let (mut since, topics) = live_query(rq.url().split_once('?').map_or("", |(_, q)| q));
+    let (mut since, server, topics) = live_query(rq.url().split_once('?').map_or("", |(_, q)| q));
     let _ = std::thread::Builder::new().name("quillo-live".into()).spawn(move || {
         if crate::ws::is_upgrade(&rq) {
             let Some(mut socket) = crate::ws::Socket::accept(rq) else { return };
+            let mut server = server;
             loop {
-                let (seq, changed) = shared.wait_live(since, &topics, Duration::from_secs(20));
+                let (seq, changed) = shared.wait_live(since, server.as_deref(), &topics, Duration::from_secs(20));
                 // A page that did not know the sequence number, or knew one
-                // from before a restart, is told the current one.
-                let alive = if !changed.is_empty() || since == 0 || since > seq {
-                    socket.send(&live_json(seq, &changed))
+                // from another server or from before a restart, is told the
+                // current one.
+                let alive = if !changed.is_empty() || since == 0 || since > seq || server.is_some() {
+                    socket.send(&live_json(&shared, seq, &changed))
                 } else {
                     socket.ping()
                 };
@@ -374,10 +378,11 @@ fn serve_live(shared: Arc<Shared>, rq: tiny_http::Request) {
                     return;
                 }
                 since = seq;
+                server = None;
             }
         }
-        let (seq, changed) = shared.wait_live(since, &topics, Duration::from_secs(25));
-        let mut resp = tiny_http::Response::from_string(live_json(seq, &changed));
+        let (seq, changed) = shared.wait_live(since, server.as_deref(), &topics, Duration::from_secs(25));
+        let mut resp = tiny_http::Response::from_string(live_json(&shared, seq, &changed));
         for (k, v) in [("content-type", "application/json"), ("cache-control", "no-store")] {
             resp.add_header(tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap());
         }
@@ -486,6 +491,9 @@ pub struct App {
     pub watch: bool,
     /// Run the static checker before each reload.
     pub static_check: bool,
+    /// One of several servers (`--register`): the key announcements from
+    /// the others must carry.
+    pub cluster_key: Option<String>,
 }
 
 impl App {
@@ -499,6 +507,7 @@ impl App {
             base_dir: base_dir.to_path_buf(),
             watch,
             static_check: true,
+            cluster_key: None,
         }
     }
 
@@ -703,6 +712,13 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
         }
         if rq.url().split('?').next().map_or(false, |p| p.ends_with("/_quillo/live")) {
             serve_live(app.shared.clone(), rq);
+            continue;
+        }
+        if let (Some(key), "/_quillo/announce") = (&app.cluster_key, rq.url()) {
+            let mut body = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(rq.as_reader(), 1 << 16), &mut body);
+            let status = crate::cluster::announced(&app.shared, key, &body);
+            let _ = rq.respond(tiny_http::Response::empty(status));
             continue;
         }
         let start = Instant::now();

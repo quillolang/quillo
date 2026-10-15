@@ -525,7 +525,7 @@ async function rpcRaw(name, args, live) {
   if (live) headers["x-quillo-live"] = "1";
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
-  const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, failed: true });
+  const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
   try {
     r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
@@ -539,7 +539,7 @@ async function rpcRaw(name, args, live) {
   try { body = await r.json(); } catch (_) {}
   if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
   const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
-  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0 };
+  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "" };
 }
 
 async function rpc(name, args) {
@@ -554,11 +554,21 @@ async function rpc(name, args) {
 // host only six HTTP requests at once across all tabs; waiting requests
 // would leave none for server calls. Where one cannot open, the same URL
 // answers a plain request after the first change.)
+//
+// Sequence numbers belong to the server that gave them: with several
+// servers, a page's calls may each go to a different one. The socket's
+// server decides; asked with another server's number, it answers that all
+// the topics changed, and the page loads them again once.
 
-const Live = { seq: 0, subs: new Set(), ctrl: null, running: false, key: "" };
+const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "" };
 
-function liveSeen(seq) {
-  if (seq > 0) Live.seq = Live.seq > 0 ? Math.min(Live.seq, seq) : seq;
+// Also takes data-v="<seq>:<server>" from a server-rendered island, split.
+function liveSeen(seq, server = "") {
+  seq = +seq;
+  if (!(seq > 0)) return;
+  if (!Live.server) Live.server = server;
+  if (server !== Live.server) return;
+  Live.seq = Live.seq > 0 ? Math.min(Live.seq, seq) : seq;
 }
 
 function liveTopics() {
@@ -588,7 +598,7 @@ async function liveLoop() {
     Live.key = topics.join(",");
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
-    const url = BASE + "/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key);
+    const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&t=" + encodeURIComponent(Live.key);
     try {
       if (!(await liveSocket(url, ctrl.signal)) && !ctrl.signal.aborted)
         liveChanged(await (await fetch(url, { signal: ctrl.signal, cache: "no-store" })).json());
@@ -613,16 +623,17 @@ function liveSocket(url, signal) {
 
 function liveChanged(j) {
   Live.seq = j.seq;
+  Live.server = j.server || "";
   const changed = new Set(j.changed || []);
   if (changed.size) for (const s of [...Live.subs]) if (s.topics.some((t) => changed.has(t))) liveRefresh(s);
 }
 
 async function liveRefresh(sub) {
   try {
-    const { value, topics, seq, failed } = await rpcRaw(sub.fname, sub.args, true);
+    const { value, topics, seq, server, failed } = await rpcRaw(sub.fname, sub.args, true);
     // Keep showing the last good data; the next change tries again.
     if (failed) { report(value.error); return; }
-    liveSeen(seq);
+    liveSeen(seq, server);
     sub.topics = topics;
     sub.inst.set(sub.name, value);
     liveRestart();
@@ -973,9 +984,9 @@ function boot() {
         s: islandJSON(inner.dataset.s, {}),
         l: islandJSON(inner.dataset.l, null),
       });
-      liveSeen(+inner.dataset.v || 0);
+      liveSeen(...(inner.dataset.v || "").split(":"));
     }
-    liveSeen(+island.dataset.v || 0);
+    liveSeen(...(island.dataset.v || "").split(":"));
     const inst = new Inst(def, islandJSON(island.dataset.p, {}), islandJSON(island.dataset.s, {}), islandJSON(island.dataset.l, null));
     inst.el = island;
     inst.update();

@@ -4,6 +4,7 @@ pub mod ast;
 pub mod builtins;
 pub mod check;
 pub mod client;
+pub mod cluster;
 pub mod db;
 pub mod error;
 pub mod fetch;

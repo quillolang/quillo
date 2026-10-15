@@ -24,7 +24,11 @@ options for `run`:
   --host H       address to listen on (default 127.0.0.1)
   --workers N    request threads (default 8)
   --watch, -w    reload when the program's files change, and refresh open pages
-  --no-check     skip the static checks before running";
+  --no-check     skip the static checks before running
+  --register URL join limer's `discover` pool through its admin API (such as
+                 http://127.0.0.1:2019), and share live updates with the other
+                 servers there; the secret is read from $LIMER_ADMIN_SECRET
+  --service S    the pool's name (default: the file's name, without .qwe)";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -74,6 +78,8 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let mut workers = 8;
     let mut watch = false;
     let mut static_check = true;
+    let mut register: Option<String> = None;
+    let mut service: Option<String> = None;
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -90,6 +96,8 @@ fn run(file: &str, flags: &[String]) -> i32 {
             }
             ("--host", Some(v)) => host = v.clone(),
             ("--port", Some(v)) => port = v.clone(),
+            ("--register", Some(v)) => register = Some(v.clone()),
+            ("--service", Some(v)) => service = Some(v.clone()),
             ("--workers", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => workers = n,
                 _ => {
@@ -130,8 +138,21 @@ fn run(file: &str, flags: &[String]) -> i32 {
             return 0;
         }
     }
-    let mut app = App::new(loaded, shared, path, base, watch);
+    let mut app = App::new(loaded, shared.clone(), path, base, watch);
     app.static_check = static_check;
+    if let Some(admin) = register {
+        let Ok(port) = port.parse::<u16>() else {
+            eprintln!("quillo: --register needs a numeric --port");
+            return 2;
+        };
+        let service = service.unwrap_or_else(|| {
+            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into())
+        });
+        let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+        let m = quillo::cluster::Membership { admin, service, port, secret };
+        app.cluster_key = Some(m.key());
+        quillo::cluster::join(shared, m);
+    }
     match quillo::server::serve(app, &format!("{}:{}", host, port), workers) {
         Ok(()) => 0,
         Err(e) => {

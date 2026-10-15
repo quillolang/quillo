@@ -52,15 +52,44 @@ pub struct Shared {
     pub gil: Gil,
     pub live: Mutex<Live>,
     live_changed: Condvar,
+    /// This server, among several serving the same app: sequence numbers
+    /// are its own, so pages are told whose they are. New at each start.
+    pub id: String,
+    /// When running with others (`--register`), changes to tell them about.
+    outbox: Mutex<Option<std::sync::mpsc::Sender<Vec<String>>>>,
 }
 
 impl Shared {
     pub fn new() -> Self {
-        Shared { gil: Gil::new_held(), live: Mutex::new(Live::default()), live_changed: Condvar::new() }
+        Shared {
+            gil: Gil::new_held(),
+            live: Mutex::new(Live::default()),
+            live_changed: Condvar::new(),
+            id: format!("{:08x}", fastrand::u32(..)),
+            outbox: Mutex::new(None),
+        }
     }
 
-    /// Marks topics as changed and wakes the pages waiting on them.
+    /// From now on, changes are also sent here, for the other servers.
+    pub fn set_outbox(&self, tx: std::sync::mpsc::Sender<Vec<String>>) {
+        *self.outbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Marks topics as changed and wakes the pages waiting on them; and when
+    /// running with other servers, tells them too. Data kept in variables
+    /// (`var:` topics) belongs to this server alone, so it stays here.
     pub fn publish(&self, topics: &[String]) {
+        self.publish_here(topics);
+        if let Some(tx) = &*self.outbox.lock().unwrap_or_else(|e| e.into_inner()) {
+            let shared: Vec<String> = topics.iter().filter(|t| !t.contains("var:")).cloned().collect();
+            if !shared.is_empty() {
+                let _ = tx.send(shared);
+            }
+        }
+    }
+
+    /// Marks topics as changed here only: for changes another server made.
+    pub fn publish_here(&self, topics: &[String]) {
         if topics.is_empty() {
             return;
         }
@@ -79,12 +108,24 @@ impl Shared {
     }
 
     /// The current sequence number and which of `topics` changed after
-    /// `since`, waiting up to `timeout` for one to change.
-    pub fn wait_live(&self, since: u64, topics: &[String], timeout: std::time::Duration) -> (u64, Vec<String>) {
+    /// `since`, waiting up to `timeout` for one to change. `server` is the
+    /// server `since` came from (`None`: this one); a number from another
+    /// server (or from before a restart) says nothing about this one, so all
+    /// the topics count as changed.
+    pub fn wait_live(
+        &self,
+        since: u64,
+        server: Option<&str>,
+        topics: &[String],
+        timeout: std::time::Duration,
+    ) -> (u64, Vec<String>) {
         let changed = |live: &Live| -> Vec<String> {
             topics.iter().filter(|t| live.versions.get(*t).map_or(false, |v| *v > since)).cloned().collect()
         };
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if since > 0 && server.map_or(false, |s| s != self.id) {
+            return (live.seq, topics.to_vec());
+        }
         if since == 0 || since > live.seq {
             return (live.seq, Vec::new());
         }

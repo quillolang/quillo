@@ -408,8 +408,45 @@ component Notes(initial: list) {
   allow only six HTTP/1.1 connections to a host across all tabs: requests left
   waiting would hold them, and server calls would queue behind them. Where a
   WebSocket cannot open, the page asks the same URL as a plain request instead.
-- Only changes made through this Quillo server are seen: a row changed by another
-  program, or by another server process, does not wake pages.
+- Only changes made through Quillo are seen: a row changed by another program
+  (`psql`, a script) does not wake pages.
+
+#### Several servers
+
+To run an app on several Quillo servers behind [limer](https://limer.sh), let
+them join a `discover` pool with a `broadcast` path; changes made through one
+server then wake pages on all of them, with no message broker:
+
+```
+app.example.com {
+    reverse_proxy {
+        discover shop {
+            allow 10.0.0.0/8
+            broadcast /_quillo/announce
+        }
+    }
+}
+```
+
+```sh
+export LIMER_ADMIN_SECRET=...        # limer's admin secret
+quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each server
+```
+
+- Each server registers (and keeps registering, every 5 seconds; limer drops
+  one that stops for 15) and sends the topics it changes to limer's
+  `/broadcast`, which passes them to every member. The pool's name is the
+  file's (`shop`), or `--service`.
+- What is shared is the database: tables (`db:` topics) and `publish` topics
+  are announced. Data kept in variables belongs to each server and is not.
+- Sequence numbers are per server, and each carries its server's id. A page
+  whose live connection lands on a different server (after a restart, or with
+  round-robin balancing) loads its live data again once, rather than missing a
+  change. `lb_policy sticky_cookie` keeps a browser on one server and avoids
+  even that.
+- Announcements are delivered once, without retries: a server that cannot be
+  reached when one is sent misses it, and its pages show that change only when
+  they next load the data (the next change to it, or a reload).
 
 ### Server functions
 
@@ -625,6 +662,8 @@ src/db.rs         db: SQLite, and the shared API
 src/pg.rs         db: PostgreSQL (pool, placeholders, types)
 src/fetch.rs      http: the HTTP client
 src/server.rs     request matching, server fns, responses, worker pool, --watch
+src/ws.rs         WebSockets, for live updates and --watch reloads
+src/cluster.rs    several servers behind limer: --register, broadcasts
 src/shared.rs     the interpreter lock and other state shared between threads
 src/check.rs      the static checker
 src/client.rs     compiles components to JavaScript
