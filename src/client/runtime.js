@@ -496,6 +496,8 @@ B.index_of = meta((c, x) => {
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
 }, "index_of", null);
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+B.url = meta(() => currentUrl(), "url", null);
+B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   stringify: (v, pretty) => JSON.stringify(toJSON(v), null, truthy(pretty) ? 2 : undefined),
@@ -653,6 +655,55 @@ function hs(tag, spreads, props, on, kids, key) {
   Object.assign(p, props);
   if (classes.length) p.class = [props.class, ...classes].filter((x) => !isNil(x) && x !== false && x !== "").map(display).join(" ");
   return h(tag, p, Object.keys(o).length ? o : null, kids, key);
+}
+
+// ---- client-side navigation ---------------------------------------------
+// Components that call url() re-render when the URL changes. Once one has,
+// clicks on same-site links inside components change the URL without a
+// reload (not with a modifier key, target, download or data-reload).
+
+let rendering = null;
+const Nav = { subs: new Set(), on: false };
+
+function navChanged() {
+  for (const i of [...Nav.subs]) {
+    if (i.kids !== null && !i.el.isConnected) { Nav.subs.delete(i); continue; }
+    i.update();
+  }
+}
+
+function navStart() {
+  if (Nav.on || typeof window === "undefined") return;
+  Nav.on = true;
+  window.addEventListener("popstate", navChanged);
+  document.addEventListener("click", (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a || !a.closest("quillo-island")) return;
+    if ((a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return;
+    const u = new URL(a.href, location.href);
+    if (u.origin !== location.origin || u.pathname.startsWith("/_quillo/")) return;
+    e.preventDefault();
+    navigate(u.pathname + u.search + u.hash);
+  });
+}
+
+function navigate(to) {
+  navStart();
+  if (to !== location.pathname + location.search + location.hash) history.pushState(null, "", to);
+  window.scrollTo(0, 0);
+  navChanged();
+  return null;
+}
+
+function currentUrl() {
+  navStart();
+  if (rendering) Nav.subs.add(rendering);
+  return {
+    path: location.pathname,
+    query: Object.fromEntries(new URLSearchParams(location.search)),
+    hash: location.hash.slice(1),
+  };
 }
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -831,11 +882,15 @@ class Inst {
       const v = this.props[p];
       return p === "children" && typeof v === "string" ? new VRaw(v) : v;
     });
+    const outer = rendering;
+    rendering = this;
     try {
       return norm(this.def(this, ...args), []);
     } catch (e) {
       if (e instanceof Ret) return norm(e.v, []);
       throw e;
+    } finally {
+      rendering = outer;
     }
   }
 
@@ -856,6 +911,12 @@ class Inst {
   }
 }
 
+// Island JSON, with error values (`{"$quillo_err": x}`) restored.
+function islandJSON(text, fallback) {
+  if (!text) return fallback;
+  return JSON.parse(text, (k, v) => (v && typeof v === "object" && !Array.isArray(v) && hasOwn(v, "$quillo_err") && Object.keys(v).length === 1) ? new Err(v.$quillo_err) : v);
+}
+
 function takeHydration(name) {
   const q = hydrating && hydrating[name];
   return q && q.length ? q.shift() : null;
@@ -874,13 +935,13 @@ function boot() {
     hydrating = {};
     for (const inner of island.querySelectorAll("quillo-island")) {
       (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push({
-        s: JSON.parse(inner.dataset.s || "{}"),
-        l: JSON.parse(inner.dataset.l || "null"),
+        s: islandJSON(inner.dataset.s, {}),
+        l: islandJSON(inner.dataset.l, null),
       });
       liveSeen(+inner.dataset.v || 0);
     }
     liveSeen(+island.dataset.v || 0);
-    const inst = new Inst(def, JSON.parse(island.dataset.p || "{}"), JSON.parse(island.dataset.s || "{}"), JSON.parse(island.dataset.l || "null"));
+    const inst = new Inst(def, islandJSON(island.dataset.p, {}), islandJSON(island.dataset.s, {}), islandJSON(island.dataset.l, null));
     inst.el = island;
     inst.update();
     hydrating = null;

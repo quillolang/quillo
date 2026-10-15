@@ -269,6 +269,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("live", "fn, any...", "any"),
+    ("url", "", "map"),
+    ("navigate", "str", "null"),
     ("publish", "any...", "null"),
     ("watch", "any...", "null"),
     ("json.parse", "str", "any"),

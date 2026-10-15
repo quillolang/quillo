@@ -63,7 +63,8 @@ Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders
 app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component),
 [scroll.qwe](examples/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window),
 [compose.qwe](examples/compose.qwe) (views and components built from each other),
-[layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor).
+[layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor),
+[spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s).
 
 ## Language tour
 
@@ -336,6 +337,37 @@ component Dashboard() {
 - A component placed directly in a page gets its props from the server, so they must
   be data (no functions). Inside another component, props can be anything: callbacks,
   HTML, other values.
+
+### Single-page apps
+
+`url()` gives `{ path, query, hash }`: of the request on the server, and of the address
+bar in the browser, where components that call it re-render when it changes. Once a
+component has called it, clicks on same-site links inside components change the page
+without reloading; Back and Forward work. `navigate("/path")` does the same from code.
+(Links with a modifier key, `target`, `download` or `data-reload` work as usual.)
+
+```quillo
+component App() {
+    ~cart = []                                    // survives moving between pages
+    let path = url().path
+    <div>
+        <nav><a href="/">Home</a> <a href="/products">Products</a> Cart: {len(cart)}</nav>
+        {match split(path, "/") | filter((s) => s != "") {
+            [] => <Home/>
+            ["products"] => <ProductList/>                      // loads with ~items = list_products()
+            ["products", id] => <ProductPage key={id} id={int(id)} on_add={(p) => { cart = cart + [p] }}/>
+            _ => <NotFound {path}/>
+        }}
+    </div>
+}
+
+route GET /*rest = <html><body><App/></body></html>       // every path renders on the server
+```
+
+Pages load their data with `server fn`s in `~state` initializers: on the server while
+rendering, in the browser when you navigate to them. Give a page component a `key` from
+its URL (`key={id}`) so a new product starts with fresh state. See
+[spa.qwe](examples/spa.qwe), which also answers 404 on the server for unknown paths.
 
 ### Live data
 

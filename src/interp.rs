@@ -167,6 +167,17 @@ fn render_value(v: &Value, out: &mut String) {
     }
 }
 
+/// JSON for an island's props and state: like `to_json`, but an error value
+/// becomes `{"$quillo_err": payload}`, which the browser turns back into one.
+pub fn island_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Err(e) => serde_json::json!({ "$quillo_err": island_json(e) }),
+        Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
+        Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.clone(), island_json(x))).collect()),
+        other => other.to_json(),
+    }
+}
+
 /// Why a value cannot travel to the browser as JSON, if it cannot.
 pub fn not_sendable(v: &Value) -> Option<&'static str> {
     match v {
@@ -176,7 +187,7 @@ pub fn not_sendable(v: &Value) -> Option<&'static str> {
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
         Value::Html(_) => Some("html"),
         Value::Response(_) => Some("a response"),
-        Value::Err(_) => Some("an error value"),
+        Value::Err(e) => not_sendable(e),
     }
 }
 
@@ -1275,8 +1286,8 @@ impl Interp {
         let mut out = format!(
             "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}>",
             escape(&el.tag),
-            escape(&Value::map(props).to_json().to_string()),
-            escape(&Value::map(state).to_json().to_string()),
+            escape(&island_json(&Value::map(props)).to_string()),
+            escape(&island_json(&Value::map(state)).to_string()),
             live_attrs
         );
         render_value(&v, &mut out);

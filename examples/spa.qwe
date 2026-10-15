@@ -1,0 +1,135 @@
+// A single-page app: one component owns the page.
+//
+//   quillo run examples/spa.qwe --watch     then open http://localhost:8080
+//
+// - Links change the URL without reloading the page; Back and Forward work.
+// - The cart lives in the App component, so it survives moving between pages.
+// - Pages fetch their data from server fns when you navigate to them.
+// - Every URL also renders on the server: deep links and refreshes show the
+//   right page at once, and unknown paths answer 404.
+
+let products = [
+    { id: 1, name: "Desk lamp", price: 39, about: "Warm light, adjustable arm, a dimmer in the base." },
+    { id: 2, name: "Notebook", price: 12, about: "120 dotted pages that lie flat." },
+    { id: 3, name: "Fountain pen", price: 58, about: "Steel nib, converter included, writes from the first stroke." },
+    { id: 4, name: "Desk mat", price: 24, about: "Felt, 80 × 30 cm, keeps everything in its place." },
+]
+
+server fn list_products() = products | map((p) => { id: p.id, name: p.name, price: p.price })
+
+server fn get_product(id: int) = find(products, (p) => p.id == id) ?? err("no such product")
+
+// ---- pages -------------------------------------------------------------
+
+view Home() =
+    <section>
+        <h2>Welcome</h2>
+        <p>A tiny shop, as a single-page app. Open the <a href="/products">products</a>.</p>
+    </section>
+
+view About() =
+    <section>
+        <h2>About</h2>
+        <p>Every page here is also rendered on the server, so links can be shared and
+        pages load with their content even before any JavaScript runs.</p>
+    </section>
+
+view NotFound(path: str) =
+    <section>
+        <h2>Not found</h2>
+        <p>Nothing at <code>{path}</code>. <a href="/">Back home</a>.</p>
+    </section>
+
+component ProductList() {
+    ~items = list_products()
+    <section>
+        <h2>Products</h2>
+        {items == null
+            ? <p.muted>Loading…</p>
+            : <ul.products>{for p in items =>
+                <li key={p.id}><a href={`/products/${p.id}`}>{p.name}</a> <span.price>€{p.price}</span></li>}</ul>}
+    </section>
+}
+
+component ProductPage(id: int, on_add = null) {
+    ~product = get_product(id)
+    <section>
+        {product == null ? <p.muted>Loading…</p>
+            : is_err(product) ? <NotFound path={`/products/${id}`}/>
+            : <article.product>
+                <h2>{product.name}</h2>
+                <p>{product.about}</p>
+                <p.price>€{product.price}</p>
+                <button @click={() => { on_add && on_add(product) }}>Add to cart</button>
+                <p><a href="/products">← All products</a></p>
+            </article>}
+    </section>
+}
+
+// ---- the app -------------------------------------------------------------
+
+// The page for a path: matched on its segments, like the server's routes.
+fn page_of(path: str) = match split(path, "/") | filter((s) => s != "") {
+    [] => "home"
+    ["products"] => "products"
+    ["products", id] => is_err(int(id)) ? "missing" : "product"
+    ["about"] => "about"
+    _ => "missing"
+}
+
+view NavLink(href: str, path: str, children) =
+    <a {href} class={(href == "/" ? path == "/" : starts_with(path, href)) && "active"}>{children}</a>
+
+component App() {
+    ~cart = []
+    let path = url().path
+    let segs = split(path, "/") | filter((s) => s != "")
+    let total = cart | map((p) => p.price) | sum
+
+    <div.app>
+        <nav>
+            <NavLink href="/" {path}>Home</NavLink>
+            <NavLink href="/products" {path}>Products</NavLink>
+            <NavLink href="/about" {path}>About</NavLink>
+            <span.cart>Cart: <b>{len(cart)}</b>{len(cart) > 0 && <span> (€{total})</span>}</span>
+        </nav>
+        <main>
+            {match page_of(path) {
+                "home" => <Home/>
+                "products" => <ProductList/>
+                "product" => <ProductPage key={segs[1]} id={int(segs[1])} on_add={(p) => { cart = cart + [p] }}/>
+                "about" => <About/>
+                _ => <NotFound {path}/>
+            }}
+        </main>
+    </div>
+}
+
+let css = "
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 38rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+nav { display: flex; gap: 1rem; align-items: center; padding-bottom: .75rem; border-bottom: 1px solid #eee; }
+nav a { color: #555; text-decoration: none; } nav a.active { color: #000; font-weight: 600; }
+nav .cart { margin-left: auto; color: #555; }
+.products { padding-left: 1.2rem; } .price { color: #666; } .muted { color: #999; }
+button { font: inherit; padding: .35rem .9rem; border-radius: 6px; border: 1px solid #222; background: #222; color: white; cursor: pointer; }
+"
+
+// Every path renders the app; the server answers 404 for unknown ones.
+route GET /*rest {
+    let page =
+        <html>
+            <head>
+                <meta charset="utf-8"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <title>Shop</title>
+                <style>{raw(css)}</style>
+            </head>
+            <body><App/></body>
+        </html>
+    let found = match page_of(request.path) {
+        "missing" => false
+        "product" => !is_err(get_product(int(last(split(request.path, "/")))))
+        _ => true
+    }
+    found ? page : respond(404, page)
+}

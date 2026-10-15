@@ -214,3 +214,34 @@ fn json_layout_renders_and_follows_edits() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/spa.qwe: links, Back and Forward change pages without reloads,
+/// and state (the cart) survives.
+#[test]
+fn single_page_app_navigates_without_reloading() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(
+        &chrome,
+        &root.join("examples/spa.qwe"),
+        25500 + (std::process::id() % 400) as u16,
+        Some(&root.join("tests/browser/spa.js")),
+    );
+    let want = serde_json::json!({
+        "start": ["/", "Welcome"],
+        "products": ["/products", "Products", "Products"],
+        "product": ["/products/2", "Notebook"],
+        "cart": "Cart: 2 (€24)",
+        "back": ["/products", "Products"],
+        "forward": ["/products/2", "Notebook"],
+        "about": ["/about", "About"],
+        "cartKept": "2",
+        "missing": ["/products/99", "Not found"],
+        "noReload": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

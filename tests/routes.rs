@@ -386,3 +386,22 @@ route GET / = <List p="> "/>
     let js = get(&mut it, "/_quillo/quillo.js").text();
     assert!(js.contains(r#"W.live($i, "xs", "load", [$p_"#), "{}", js);
 }
+
+#[test]
+fn every_path_of_a_single_page_app_renders_on_the_server() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/spa.qwe")).unwrap();
+    let mut it = app(&src);
+    for (path, status, heading) in [
+        ("/", 200, "Welcome"),
+        ("/products", 200, "Products"),
+        ("/products/3", 200, "Fountain pen"),
+        ("/about", 200, "About"),
+        ("/products/99", 404, "Not found"),
+        ("/products/abc", 404, "Not found"),
+        ("/nope", 404, "Not found"),
+    ] {
+        let r = get(&mut it, path);
+        assert_eq!(r.status, status, "{}", path);
+        assert!(r.text().contains(&format!("<h2>{}</h2>", heading)), "{}: {}", path, r.text());
+    }
+}

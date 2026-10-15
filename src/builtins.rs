@@ -82,6 +82,8 @@ pub fn install(env: &Env) {
         ("index_of", index_of),
         ("repeat", repeat),
         ("live", live),
+        ("url", url),
+        ("navigate", navigate),
         ("publish", publish),
         ("watch", watch),
     ];
@@ -634,7 +636,7 @@ fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !(100..=599).contains(&status) {
         return fail(line, format!("`respond` status must be 100-599, got {}", status));
     }
-    let headers = m_arg(&args, 2, "respond", line)?;
+    let headers = if args.len() > 2 { m_arg(&args, 2, "respond", line)? } else { Arc::new(Map::new()) };
     Ok(Value::Response(Arc::new(Response {
         status: status as u16,
         headers: headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect(),
@@ -919,5 +921,29 @@ fn watch(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
     for a in &args {
         it.watch(a.display());
     }
+    Ok(Value::Nil)
+}
+
+// ---- navigation --------------------------------------------------------
+
+/// `url()`: `{ path, query, hash }` of the page. On the server, the request
+/// being handled; in the browser, the address bar (and components that call
+/// it re-render when it changes).
+fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    let (path, query) = match &it.current_request {
+        Some(Value::Map(m)) => (m.get("path").cloned().unwrap_or(Value::str("/")), m.get("query").cloned().unwrap_or(Value::map(Map::new()))),
+        _ => (Value::str("/"), Value::map(Map::new())),
+    };
+    let mut m = Map::new();
+    m.insert("path".into(), path);
+    m.insert("query".into(), query);
+    m.insert("hash".into(), Value::str(""));
+    Ok(Value::map(m))
+}
+
+/// `navigate(path)`: in the browser, goes to another page without reloading.
+/// On the server there is no page to change; use `redirect` there.
+fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    s_arg(&args, 0, "navigate", line)?;
     Ok(Value::Nil)
 }
