@@ -25,6 +25,8 @@ options for `run`:
   --workers N    request threads (default 8)
   --watch, -w    reload when the program's files change, and refresh open pages
   --no-check     skip the static checks before running
+  --no-view-cache  render views every time, instead of reusing their HTML
+                 while their arguments and the globals they read are unchanged
   --max-body N   largest request body to accept, in bytes (default 10 MiB)
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
@@ -93,6 +95,11 @@ fn run(file: &str, flags: &[String]) -> i32 {
             }
             ("--no-check", _) => {
                 static_check = false;
+                i += 1;
+                continue;
+            }
+            ("--no-view-cache", _) => {
+                quillo::viewcache::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }

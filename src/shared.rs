@@ -103,6 +103,15 @@ impl Shared {
         self.live_changed.notify_all();
     }
 
+    /// Whether none of `topics` changed after `seq`.
+    pub fn unchanged_since(&self, topics: &[String], seq: u64) -> bool {
+        if topics.is_empty() {
+            return true;
+        }
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        topics.iter().all(|t| live.versions.get(t).map_or(true, |v| *v <= seq))
+    }
+
     pub fn live_seq(&self) -> u64 {
         self.live.lock().unwrap_or_else(|e| e.into_inner()).seq
     }

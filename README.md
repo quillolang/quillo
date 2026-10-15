@@ -680,6 +680,27 @@ With `--watch`, a change to the program or a `use`d file reloads it (starting it
 state afresh) and refreshes open pages. A version that fails to load or check does not
 replace the one that works; the errors are printed.
 
+## Cached views
+
+A view's HTML depends on its arguments and on the global variables it reads. When a
+view is called again with the same arguments, and none of those globals has been
+assigned since, Quillo reuses the HTML it rendered last time instead of running the
+view again. A page made of views is then served about as fast as a static file (the
+50-row benchmark page goes from about 26,000 to 84,000 pages a second), and is still
+up to date the moment something it shows changes.
+
+- Arguments are compared by value for numbers and text, and by identity for lists and
+  maps: values never change, so the same list is the same data. `<List items={products}/>`
+  is reused until `products` is assigned; `<List items={[1, 2]}/>` builds a new list
+  each time and is rendered each time.
+- A view that reads the clock, randomness, the database, files, the environment, the
+  network or the request (`url()`), prints, writes, or renders a component, runs every
+  time. Database reads are not cached because a row changed outside Quillo would go
+  unnoticed.
+- Views inside views pass on what they read, so a cached page follows the global its
+  innermost view uses.
+- `quillo run --no-view-cache` turns it off (to measure, or to rule it out).
+
 ## Not built yet
 
 - `match` exhaustiveness and record types in the checker
@@ -699,6 +720,7 @@ src/fetch.rs      http: the HTTP client
 src/server.rs     request matching, server fns, responses, worker pool, --watch
 src/ws.rs         WebSockets, for live updates and --watch reloads
 src/cluster.rs    several servers behind limer: --register, broadcasts
+src/viewcache.rs  reusing views' HTML while their inputs are unchanged
 src/shared.rs     the interpreter lock and other state shared between threads
 src/check.rs      the static checker
 src/client.rs     compiles components to JavaScript

@@ -7,7 +7,7 @@ use crate::shared::Shared;
 use crate::value::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Non-local exits: runtime errors, `return` (and `?`), and `reply`.
 pub enum Ctrl {
@@ -86,6 +86,10 @@ pub struct Interp {
     pub rendered_island: bool,
     /// A buffer lent to the renderer for building attribute values.
     spare: String,
+    /// What views rendered, shared by the workers (see `viewcache`).
+    pub view_cache: Option<Arc<Mutex<crate::viewcache::ViewCache>>>,
+    /// The renders being cached, innermost last: what each has read.
+    tracks: Vec<crate::viewcache::Track>,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -421,6 +425,8 @@ impl Interp {
             mounts: Vec::new(),
             rendered_island: false,
             spare: String::new(),
+            view_cache: crate::viewcache::enabled().then(Default::default),
+            tracks: Vec::new(),
         }
     }
 
@@ -452,6 +458,8 @@ impl Interp {
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             rendered_island: false,
             spare: String::new(),
+            view_cache: self.view_cache.clone(),
+            tracks: Vec::new(),
         }
     }
 
@@ -462,6 +470,7 @@ impl Interp {
 
     /// Announces changes to `topics`, after the current transaction commits.
     pub fn publish(&mut self, topics: Vec<String>) {
+        self.mark_impure();
         // Each program has its own topics (two mounted apps may both have
         // a `notes` table).
         let topics: Vec<String> =
@@ -476,8 +485,35 @@ impl Interp {
     /// Notes that the running `live` loader depends on `topic`.
     pub fn watch(&mut self, topic: String) {
         let topic = if self.base.is_empty() { topic } else { format!("{}|{}", self.base, topic) };
+        self.note_dep(topic);
+    }
+
+    /// Records a topic (already prefixed) for the running `live` loader and
+    /// the renders being cached.
+    fn note_dep(&mut self, topic: String) {
+        if let Some(t) = self.tracks.last_mut() {
+            t.deps.push(topic.clone());
+        }
         if let Some(r) = &mut self.reads {
             r.insert(topic);
+        }
+    }
+
+    /// The renders being cached did something that cannot be.
+    fn mark_impure(&mut self) {
+        for t in &mut self.tracks {
+            t.impure = true;
+        }
+    }
+
+    /// Hits and misses of the view cache so far.
+    pub fn view_cache_stats(&self) -> (u64, u64) {
+        match &self.view_cache {
+            Some(c) => {
+                let c = c.lock().unwrap_or_else(|e| e.into_inner());
+                (c.hits, c.misses)
+            }
+            None => (0, 0),
         }
     }
 
@@ -582,6 +618,7 @@ impl Interp {
                         binop(bop, old, rhs, *line)?
                     }
                 };
+                let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
                 match assign_global(env, name, v) {
                     None => fail(
                         *line,
@@ -590,6 +627,13 @@ impl Interp {
                     Some(global) => {
                         if global {
                             self.publish(vec![format!("var:{}", name)]);
+                            // Cached renders do not record the functions
+                            // they called, so a new one starts afresh.
+                            if function {
+                                if let Some(c) = &self.view_cache {
+                                    c.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                }
+                            }
                         }
                         Ok(Value::Nil)
                     }
@@ -673,7 +717,7 @@ impl Interp {
         match e {
             Expr::Lit(l) => Ok(lit_value(l)),
             Expr::Ident(n, line) => {
-                if self.reads.is_some() {
+                if self.reads.is_some() || !self.tracks.is_empty() {
                     self.note_global_read(env, n);
                 }
                 lookup(env, n).ok_or_else(|| undefined(n, *line))
@@ -995,6 +1039,9 @@ impl Interp {
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, line)?;
                 }
+                if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {
+                    self.mark_impure();
+                }
                 func(self, args, line)
             }
             Value::Func(c) => {
@@ -1122,6 +1169,7 @@ impl Interp {
         if def.server {
             if let Some(req) = &self.current_request {
                 define(&scope, "request", req.clone());
+                self.mark_impure();
             }
         }
         let mut it = args.into_iter();
@@ -1156,13 +1204,66 @@ impl Interp {
     /// Calls `c` and renders what it returns into `out`, writing its HTML
     /// as it goes (see `render_expr_into`).
     fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
-        let def = c.def.clone();
         // A declared result type is checked on the value.
-        if def.ret.is_some() || def.err.is_some() {
+        if c.def.ret.is_some() || c.def.err.is_some() {
             let v = self.call_closure(c, args, line)?;
             render_value(&v, out);
             return Ok(());
         }
+        // Views defined at the top level are cached (a nested one would
+        // depend on the variables around it too).
+        if let (Some(cache), false, true) = (&self.view_cache, c.def.component, Arc::ptr_eq(&c.env, &self.globals)) {
+            return self.render_cached(cache.clone(), c, args, line, out);
+        }
+        self.render_call_plain(c, args, line, out)
+    }
+
+    /// A view call through the cache (see `viewcache`).
+    fn render_cached(
+        &mut self,
+        cache: Arc<Mutex<crate::viewcache::ViewCache>>,
+        c: &Closure,
+        args: Vec<Option<Value>>,
+        line: u32,
+        out: &mut String,
+    ) -> Result<(), Ctrl> {
+        use crate::viewcache::Found;
+        let found = cache.lock().unwrap_or_else(|e| e.into_inner()).lookup(&c.def, &args, &self.shared);
+        match found {
+            Found::Hit(entry) => {
+                out.push_str(&entry.html);
+                if self.reads.is_some() || !self.tracks.is_empty() {
+                    for d in &entry.deps {
+                        self.note_dep(d.clone());
+                    }
+                }
+                Ok(())
+            }
+            Found::Uncacheable => self.render_call_plain(c, args, line, out),
+            Found::Miss => {
+                let seq = self.shared.live_seq();
+                self.tracks.push(Default::default());
+                let start = out.len();
+                let r = self.render_call_plain(c, args.clone(), line, out);
+                let track = self.tracks.pop().unwrap_or_default();
+                if let Some(outer) = self.tracks.last_mut() {
+                    outer.deps.extend(track.deps.iter().cloned());
+                    outer.impure |= track.impure;
+                }
+                r?;
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if track.impure {
+                    cache.forbid(&c.def);
+                } else {
+                    cache.store(&c.def, args, &out[start..], track.deps, seq);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn render_call_plain(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
+        let def = c.def.clone();
         self.enter_call(&def, args.len(), line, |this| {
             let scope = this.bind_args(c, &def, args, line)?;
             let start = out.len();
@@ -1807,6 +1908,7 @@ impl Interp {
         // callbacks and HTML included.
         let nested = !self.islands.is_empty();
         self.rendered_island = true;
+        self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
         let mut body = String::new();
         let r = self.render_call_into(&c, args, line, &mut body);
