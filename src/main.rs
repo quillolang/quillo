@@ -25,6 +25,7 @@ options for `run`:
   --workers N    request threads (default 8)
   --watch, -w    reload when the program's files change, and refresh open pages
   --no-check     skip the static checks before running
+  --max-body N   largest request body to accept, in bytes (default 10 MiB)
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
                  servers there; the secret is read from $LIMER_ADMIN_SECRET
@@ -80,6 +81,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let mut static_check = true;
     let mut register: Option<String> = None;
     let mut service: Option<String> = None;
+    let mut max_body = quillo::server::MAX_BODY;
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -98,6 +100,13 @@ fn run(file: &str, flags: &[String]) -> i32 {
             ("--port", Some(v)) => port = v.clone(),
             ("--register", Some(v)) => register = Some(v.clone()),
             ("--service", Some(v)) => service = Some(v.clone()),
+            ("--max-body", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => max_body = n,
+                _ => {
+                    eprintln!("quillo: --max-body needs a positive number of bytes");
+                    return 2;
+                }
+            },
             ("--workers", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => workers = n,
                 _ => {
@@ -140,6 +149,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
     }
     let mut app = App::new(loaded, shared.clone(), path, base, watch);
     app.static_check = static_check;
+    app.max_body = max_body;
     if let Some(admin) = register {
         let Ok(port) = port.parse::<u16>() else {
             eprintln!("quillo: --register needs a numeric --port");
@@ -151,6 +161,13 @@ fn run(file: &str, flags: &[String]) -> i32 {
         let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
         let m = quillo::cluster::Membership { admin, service, port, secret };
         app.cluster_key = Some(m.key());
+        if m.secret.is_none() {
+            eprintln!(
+                "quillo: warning: no LIMER_ADMIN_SECRET; change announcements are accepted only from {}'s host",
+                m.admin
+            );
+            app.cluster_sources = Some(m.admin_addresses());
+        }
         quillo::cluster::join(shared, m);
     }
     match quillo::server::serve(app, &format!("{}:{}", host, port), workers) {

@@ -137,6 +137,9 @@ fn compile_errors_name_what_cannot_run_in_the_browser() {
         ("server fn save(x) = x\ncomponent C() = <p>{save(1)}</p>", "`save` waits on the server"),
         ("component C() { let x = 1\n<button @click={() => { x = 2 }}></button> }", ""),
         ("component C() = <p>{() => reply 404}</p>", "`reply` only works on the server"),
+        ("let key = env(\"HOME\")\ncomponent C() = <p>{key}</p>", "`key` is read from the server's environment"),
+        ("let home = env(\"HOME\") ?? \"\"\nlet shown = upper(home)\ncomponent C() = <p>{shown}</p>", "`shown` is read from"),
+        ("let rows = db.query(\"select 1\")\ncomponent C() = <p>{len(rows)}</p>", "`rows` is read from"),
     ];
     for (src, want) in cases {
         let r = Interp::new(".").load_source(src, "c.qwe");

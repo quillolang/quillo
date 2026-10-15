@@ -624,7 +624,14 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// which is what you want after a form POST.
 fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let url = s_arg(&args, 0, "redirect", line)?;
-    let status = if args.len() > 1 { i_arg(&args, 1, "redirect", line)? as u16 } else { 303 };
+    let status = if args.len() > 1 { i_arg(&args, 1, "redirect", line)? } else { 303 };
+    if !(300..=399).contains(&status) {
+        return fail(line, format!("`redirect` status must be 300-399, got {}", status));
+    }
+    let status = status as u16;
+    if !crate::server::valid_header("location", &url) {
+        return fail(line, "`redirect` URL cannot contain line breaks or other control characters");
+    }
     Ok(Value::Response(Arc::new(Response {
         status,
         headers: vec![("location".into(), url.to_string())],
@@ -639,9 +646,18 @@ fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`respond` status must be 100-599, got {}", status));
     }
     let headers = if args.len() > 2 { m_arg(&args, 2, "respond", line)? } else { Arc::new(Map::new()) };
+    let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect();
+    // Header text often comes from the request; a line break in it would
+    // let the sender add headers (or a whole response) of their own.
+    if let Some((k, _)) = headers.iter().find(|(k, v)| !crate::server::valid_header(k, v)) {
+        return fail(
+            line,
+            format!("`respond` header `{}`: names are letters, digits and -, values cannot contain line breaks", k.escape_debug()),
+        );
+    }
     Ok(Value::Response(Arc::new(Response {
         status: status as u16,
-        headers: headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect(),
+        headers,
         body: Body::Value(arg(&args, 1)),
     })))
 }
@@ -717,11 +733,13 @@ fn random_int(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Int(fastrand::i64(lo..=hi)))
 }
 
-/// `uuid()`: a random (version 4) UUID string.
-fn uuid(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+/// `uuid()`: a random (version 4) UUID string. The bytes come from the
+/// operating system, so a uuid can serve as a session id or token, which
+/// `random()` and `random_int()` cannot.
+fn uuid(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
     let mut b = [0u8; 16];
-    for x in b.iter_mut() {
-        *x = fastrand::u8(..);
+    if getrandom::getrandom(&mut b).is_err() {
+        return fail(line, "`uuid`: the operating system gave no random bytes");
     }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;

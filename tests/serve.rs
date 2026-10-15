@@ -227,3 +227,51 @@ fn text_responses_are_gzipped_when_the_client_accepts_it() {
     assert!(!head(&plain).contains("content-encoding") && plain.len() > 5000);
     assert!(!head(&raw("/small", true)).contains("content-encoding"));
 }
+
+#[test]
+fn large_bodies_are_refused_before_they_are_read() {
+    let d = temp_dir("max-body");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route POST /echo = len(request.body)\n").unwrap();
+    let srv = start(&f, &["--max-body", "100"]);
+    assert_eq!(request(srv.port, "POST", "/echo", &"x".repeat(100)), (200, "100".into()));
+    assert_eq!(request(srv.port, "POST", "/echo", &"x".repeat(101)).0, 413);
+    // Still serving afterwards.
+    assert_eq!(request(srv.port, "POST", "/echo", "abc"), (200, "3".into()));
+}
+
+#[test]
+fn responses_tell_browsers_not_to_guess_their_type() {
+    let d = temp_dir("nosniff");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = \"hi\"\n").unwrap();
+    let srv = start(&f, &[]);
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.to_ascii_lowercase().contains("x-content-type-options: nosniff"), "{}", out);
+}
+
+#[test]
+fn a_sqlite_transaction_is_not_shared_with_other_requests() {
+    // While /a waits inside its transaction, /b must not write into it:
+    // /a rolls back, and /b's row has to survive.
+    let d = temp_dir("sqlite-tx");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        "db.open(\"t.db\")\ndb.exec(\"create table if not exists t (v text)\")\n\
+         route POST /a = db.transaction(() => { db.exec(\"insert into t values ('a')\"); sleep(500); err(\"undo\") })\n\
+         route POST /b { db.exec(\"insert into t values ('b')\"); \"ok\" }\n\
+         route GET /rows = db.query(\"select v from t order by v\") | map((r) => r.v)\n",
+    )
+    .unwrap();
+    let srv = start(&f, &["--workers", "4"]);
+    let port = srv.port;
+    let a = std::thread::spawn(move || request(port, "POST", "/a", ""));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(request(port, "POST", "/b", "").0, 200);
+    assert_eq!(a.join().unwrap().0, 500);
+    assert_eq!(get(port, "/rows").1, r#"["b"]"#);
+}

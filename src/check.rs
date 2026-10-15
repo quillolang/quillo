@@ -1866,7 +1866,15 @@ impl Checker {
                 _ => {}
             }
         }
-        let _ = arg_exprs;
+        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
+            if arg_exprs.first().map_or(false, sql_built_from_values) {
+                self.warn(format!(
+                    "`{}` with SQL built from values: a value containing a quote can change the query \
+                     (SQL injection); write `?` in the SQL and pass the values after it",
+                    name
+                ));
+            }
+        }
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {
             Some(f) => (f.allowed, f.restrictor.clone()),
@@ -2227,6 +2235,21 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
             }
         }
     });
+}
+
+/// Whether SQL text is put together from values: `${x}` in a template,
+/// sql`...${x}...`, or `"..." + x`.
+fn sql_built_from_values(e: &Expr) -> bool {
+    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(_)));
+    match e {
+        Expr::Template(parts) => interpolates(parts),
+        Expr::Call(_, args, _) => matches!(args.as_slice(), [Expr::Template(parts)] if interpolates(parts)),
+        Expr::Binary(BinOp::Add, a, b, _) => {
+            let text = |x: &Expr| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_));
+            (text(a) && !matches!(**b, Expr::Lit(_))) || (text(b) && !matches!(**a, Expr::Lit(_))) || sql_built_from_values(a)
+        }
+        _ => false,
+    }
 }
 
 fn pattern_names(p: &Pattern, out: &mut Vec<String>) {

@@ -52,6 +52,19 @@ impl Membership {
         crate::ws::hex(&crate::ws::sha1(format!("quillo-announce:{}", secret).as_bytes()))
     }
 
+    /// The addresses of limer's admin host, which broadcasts come from.
+    pub fn admin_addresses(&self) -> Vec<std::net::IpAddr> {
+        use std::net::ToSocketAddrs;
+        let rest = self.admin.split_once("://").map_or(self.admin.as_str(), |(_, r)| r);
+        let authority = rest.split('/').next().unwrap_or("");
+        let with_port = if authority.rsplit_once(':').map_or(false, |(_, p)| p.parse::<u16>().is_ok()) {
+            authority.to_string()
+        } else {
+            format!("{}:80", authority)
+        };
+        with_port.to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default()
+    }
+
     fn post(&self, path_and_query: &str, body: Option<&str>) -> Result<(), String> {
         let mut rq = ureq::post(&format!("{}{}", self.admin.trim_end_matches('/'), path_and_query))
             .timeout(Duration::from_secs(5));
@@ -76,7 +89,7 @@ impl Membership {
 pub fn join(shared: Arc<Shared>, m: Membership) {
     let heartbeat = m.clone();
     let _ = std::thread::Builder::new().name("quillo-register".into()).spawn(move || {
-        let path = format!("/register?service={}&port={}&ttl={}", heartbeat.service, heartbeat.port, TTL);
+        let path = format!("/register?service={}&port={}&ttl={}", encode(&heartbeat.service), heartbeat.port, TTL);
         let mut ok = None;
         loop {
             match heartbeat.post(&path, None) {
@@ -98,7 +111,7 @@ pub fn join(shared: Arc<Shared>, m: Membership) {
     shared.set_outbox(tx);
     let from = shared.id.clone();
     let _ = std::thread::Builder::new().name("quillo-broadcast".into()).spawn(move || {
-        let path = format!("/broadcast?service={}", m.service);
+        let path = format!("/broadcast?service={}", encode(&m.service));
         let key = m.key();
         let mut failing = false;
         while let Ok(first) = rx.recv() {
@@ -126,7 +139,7 @@ pub fn join(shared: Arc<Shared>, m: Membership) {
 /// Returns the status to answer with.
 pub fn announced(shared: &Shared, key: &str, body: &[u8]) -> u16 {
     let Ok(j) = serde_json::from_slice::<serde_json::Value>(body) else { return 400 };
-    if j["key"].as_str() != Some(key) {
+    if !same(j["key"].as_str().unwrap_or("").as_bytes(), key.as_bytes()) {
         return 403;
     }
     // Our own changes come back too; they are already known here.
@@ -136,4 +149,20 @@ pub fn announced(shared: &Shared, key: &str, body: &[u8]) -> u16 {
         shared.publish_here(&topics);
     }
     204
+}
+
+/// Compares in time that does not depend on where the texts differ, so the
+/// key cannot be guessed a character at a time.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Percent-encodes a query parameter.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }

@@ -53,6 +53,7 @@ serves them:
 | `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages |
 | `--workers N` | request threads (default 8) |
 | `--no-check` | skip the static checks |
+| `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 
 Editor support: [editors/vscode](editors/vscode) is a VS Code extension (highlighting,
 diagnostics as you type, hover, go to definition, completion, outline, snippets).
@@ -485,8 +486,10 @@ so the page arrives with the data). Calling one while rendering is an error.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types (a 400 otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
-Only `server fn`s can be called, only with `content-type: application/json` (so a form
-on another site cannot), and inside one `request` is the current request. `reply` in a
+Only `server fn`s can be called, only with `content-type: application/json`, and only
+from the program's own pages: a request a browser marks as coming from another site
+(`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
+is the current request. `reply` in a
 server fn becomes the HTTP response, so the usual middleware works:
 
 ```quillo
@@ -572,7 +575,28 @@ prefix. Changes to mounted files are picked up by `--watch`. See
 - **Errors:** `err is_err unwrap`
 - **Web:** `raw escape env now file redirect respond json.parse json.stringify`
 - **Effects:** `sleep(ms)`, `random()`, `random_int(lo, hi)`, `uuid()`, `read_file(path)`,
-  `write_file(path, text)` (paths stay inside the program's folder)
+  `write_file(path, text)` (paths stay inside the program's folder). `uuid()` takes its
+  bytes from the operating system, so it can serve as a session id or token; `random()`
+  and `random_int()` are fast but predictable, and must not.
+
+Safety built in:
+
+- Text in HTML and attribute values is escaped. Keys of a `{...map}` spread on an element
+  become attributes only if they are plain names that run nothing: `onclick`, `srcdoc`
+  and names with quotes or `>` are dropped. `javascript:` URLs in `href`, `src` and the
+  like render as `about:blank#blocked`.
+- `respond` and `redirect` refuse header values with line breaks, which would let text
+  from a request add headers of its own.
+- A failing request answers `internal error`; the message, with file and line, goes to
+  the terminal (and to the page too with `--watch`).
+- A `json:` pattern matches only a body sent as JSON (or with no content type), not a
+  `text/plain` one, which a page on another site could send.
+- Globals read with `env`, `read_file` or the database are never written into the
+  browser bundle; a component that uses one is a load-time error.
+- `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
+  as `?` parameters instead.
+- Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
+  instead of letting them write into the open transaction.
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
 `use "lib.qwe"` runs another file once, into the global scope.

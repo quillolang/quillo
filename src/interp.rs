@@ -69,6 +69,9 @@ pub struct Interp {
     /// Open `db.transaction`s, and changes to announce when they commit.
     pub tx_depth: usize,
     pub pending: Vec<String>,
+    /// Open SQLite transactions. SQLite has one connection, shared by every
+    /// request, so while one is open the lock is kept (see `unlocked`).
+    pub sqlite_tx: usize,
     /// The Postgres connection this request's `db.transaction` holds.
     pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
     /// This program's database (SQLite or a Postgres pool), opened on first use.
@@ -159,6 +162,39 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Attributes whose value the browser may load or run as a URL.
+pub const URL_ATTRS: &[&str] =
+    &["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
+
+/// What a `javascript:` URL in one of `URL_ATTRS` becomes.
+pub const BLOCKED_URL: &str = "about:blank#blocked";
+
+/// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
+/// however browsers would read it (they skip leading spaces and control
+/// characters and ignore tabs and line breaks inside).
+pub fn script_url(url: &str) -> bool {
+    let scheme: String = url
+        .trim_start_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .take(11)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    scheme.starts_with("javascript:") || scheme.starts_with("vbscript:")
+}
+
+/// Whether a name can be written as an HTML attribute as it is.
+pub fn attr_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| !c.is_control() && !matches!(c, ' ' | '"' | '\'' | '>' | '<' | '/' | '=' | '`' | '{' | '}'))
+}
+
+/// Whether a key of a `{...map}` spread may become an attribute.
+fn spread_attr_allowed(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    attr_name_ok(name) && !lower.starts_with("on") && lower != "srcdoc" && !name.starts_with("__")
 }
 
 fn render_value(v: &Value, out: &mut String) {
@@ -321,6 +357,7 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            sqlite_tx: 0,
             db: Arc::new(std::sync::Mutex::new(None)),
             base: String::new(),
             mounts: Vec::new(),
@@ -349,6 +386,7 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            sqlite_tx: 0,
             db: self.db.clone(),
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
@@ -403,10 +441,23 @@ impl Interp {
     /// Runs `f` without holding the interpreter lock, so other requests can
     /// run while this one waits. `f` must not touch Quillo values.
     pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        // Inside a SQLite transaction, another request would run its SQL in
+        // this one's transaction: committed or rolled back with it, and
+        // seeing what it has not committed. So the wait holds everyone up.
+        if self.sqlite_tx > 0 {
+            return f();
+        }
+        // Takes the lock back even if `f` panics, so the worker that
+        // catches the panic gives back a lock it holds.
+        struct Relock<'a>(&'a crate::shared::Gil);
+        impl Drop for Relock<'_> {
+            fn drop(&mut self) {
+                self.0.acquire();
+            }
+        }
         self.shared.gil.release();
-        let r = f();
-        self.shared.gil.acquire();
-        r
+        let _relock = Relock(&self.shared.gil);
+        f()
     }
 
     /// Parses and runs a program's top level, registering its routes.
@@ -1174,6 +1225,10 @@ impl Interp {
         // Written-out attributes win over spread ones, except `class`,
         // where both count.
         let (spread, explicit) = self.eval_attrs(el, env)?;
+        // Spread keys are data, often from outside: only plain attribute
+        // names, and no event handlers (`onclick`) or `srcdoc`, which run
+        // the value as code or as a page.
+        let spread: Vec<(String, Value)> = spread.into_iter().filter(|(n, _)| spread_attr_allowed(n)).collect();
         let written: HashSet<&str> =
             explicit.iter().map(|(n, _)| n.strip_prefix("bind:").unwrap_or(n.as_str())).collect();
         // Written classes first, then the spread's.
@@ -1194,7 +1249,11 @@ impl Interp {
             }
             let name = name.strip_prefix("bind:").unwrap_or(&name).to_string();
             let name = name.as_str();
+            if !attr_name_ok(name) {
+                continue;
+            }
             let v = match (&v, name) {
+                (Value::Str(s), _) if URL_ATTRS.contains(&name) && script_url(s) => Value::str(BLOCKED_URL),
                 (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }

@@ -156,6 +156,8 @@ route GET /users/:id(int) {
 
 #[test]
 fn runtime_errors_become_500() {
+    // The message is shown in development (`--watch`); see tests/security.rs.
+    quillo::server::SHOW_ERRORS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut it = app(
         r#"
 route GET /boom = 1 + null
@@ -235,6 +237,7 @@ route GET /bare = <Counter/>
 
 #[test]
 fn component_props_must_be_sendable() {
+    quillo::server::SHOW_ERRORS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut it = app("component Box(f) = <p>x</p>\nroute GET / = <Box f={() => 1}/>\n");
     let r = get(&mut it, "/");
     assert_eq!(r.status, 500);
@@ -297,7 +300,7 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
-    assert!(js.len() < js2.len() && js.len() < 12_000, "{} vs {}", js.len(), js2.len());
+    assert!(js.len() < js2.len() && js.len() < 12_500, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }

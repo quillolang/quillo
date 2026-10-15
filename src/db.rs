@@ -331,7 +331,9 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 return Ok(db_err(e));
             }
             let mark = tx_begin(it);
+            it.sqlite_tx += 1;
             let r = it.call(&f, Vec::new(), line);
+            it.sqlite_tx -= 1;
             let commit = ok(&r);
             let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
             let ended = run(end);

@@ -496,7 +496,7 @@ B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, 
 B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
 B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; }, "count", null);
-B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); (out[k] = out[k] || []).push(x); } return out; }, "group_by", null);
+B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
@@ -687,6 +687,7 @@ function hs(tag, spreads, props, on, kids, key) {
     for (const k of Object.keys(m)) {
       if (k === "key") continue;
       if (k === "class") { classes.push(m[k]); continue; }
+      if (k[0] !== "@" && !spreadAttrOk(k)) continue;
       if (k[0] === "@") { if (!hasOwn(o, k.slice(1))) o[k.slice(1)] = m[k]; continue; }
       if (!hasOwn(props, k)) p[k] = m[k];
     }
@@ -754,6 +755,21 @@ function currentUrl() {
 const SVG = "http://www.w3.org/2000/svg";
 let hydrating = null;
 
+// Spread keys are data: plain attribute names only, and no event handlers
+// or srcdoc, which would run the value as code (as on the server).
+function spreadAttrOk(k) {
+  const l = k.toLowerCase();
+  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !l.startsWith("on") && l !== "srcdoc" && !k.startsWith("__");
+}
+
+const URL_ATTRS = ["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
+
+// javascript: and vbscript: URLs, read as browsers read them.
+function scriptURL(u) {
+  const s = String(u).replace(/^[\u0000-\u0020]+/, "").replace(/[\t\n\r]/g, "").slice(0, 11).toLowerCase();
+  return s.startsWith("javascript:") || s.startsWith("vbscript:");
+}
+
 function setProp(el, k, v, old) {
   if (k === "value" || k === "checked" || k === "selected") {
     const nv = k === "value" ? (isNil(v) ? "" : display(v)) : truthy(v);
@@ -762,6 +778,7 @@ function setProp(el, k, v, old) {
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
+  if (URL_ATTRS.includes(k) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);

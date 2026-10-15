@@ -223,14 +223,14 @@ impl Scope {
 
 /// The variables defined directly in a scope (not its parents).
 pub fn scope_vars(env: &Env) -> Vec<(String, Value)> {
-    env.lock().unwrap().vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    env.lock().unwrap_or_else(|e| e.into_inner()).vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 pub fn lookup(env: &Env, name: &str) -> Option<Value> {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let s = cur.lock().unwrap();
+            let s = cur.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = s.vars.get(name) {
                 return Some(v.clone());
             }
@@ -241,7 +241,7 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
 }
 
 pub fn define(env: &Env, name: &str, v: Value) {
-    env.lock().unwrap().vars.insert(name.to_string(), v);
+    env.lock().unwrap_or_else(|e| e.into_inner()).vars.insert(name.to_string(), v);
 }
 
 /// Like `lookup`, and whether the variable is a global.
@@ -249,7 +249,7 @@ pub fn lookup_global(env: &Env, name: &str) -> Option<(Value, bool)> {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let s = cur.lock().unwrap();
+            let s = cur.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = s.vars.get(name) {
                 return Some((v.clone(), s.parent.is_none()));
             }
@@ -264,7 +264,7 @@ pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let mut s = cur.lock().unwrap();
+            let mut s = cur.lock().unwrap_or_else(|e| e.into_inner());
             let root = s.parent.is_none();
             if let Some(slot) = s.vars.get_mut(name) {
                 *slot = v;
@@ -281,7 +281,7 @@ pub fn assign(env: &Env, name: &str, v: Value) -> bool {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let mut s = cur.lock().unwrap();
+            let mut s = cur.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = s.vars.get_mut(name) {
                 *slot = v;
                 return true;

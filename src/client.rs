@@ -227,6 +227,8 @@ enum Resolved {
 struct Compiler<'a> {
     it: &'a Interp,
     assigned: HashSet<String>,
+    /// Globals read from the server's environment, files or database.
+    private: HashSet<String>,
     defs: Vec<String>,
     /// Globals compiled (or being compiled): JS name and whether they are async.
     globals: HashMap<String, (String, bool)>,
@@ -318,6 +320,118 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// Calls `f` on `e` and every expression inside it.
+fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    let stmts = |ss: &[Stmt], f: &mut dyn FnMut(&Expr)| {
+        for st in ss {
+            match st {
+                Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) | Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x)) => {
+                    each_expr(x, f)
+                }
+                Stmt::Fn(d) => each_expr(&d.body, f),
+                Stmt::Route(r) => each_expr(&r.body, f),
+                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
+            }
+        }
+    };
+    match e {
+        Expr::Block(ss) => stmts(ss, f),
+        Expr::Lambda(d) => each_expr(&d.body, f),
+        Expr::Lit(_) | Expr::Ident(..) => {}
+        Expr::Template(parts) => parts.iter().for_each(|p| if let TPart::Expr(x) = p { each_expr(x, f) }),
+        Expr::List(xs) => xs.iter().for_each(|x| each_expr(x, f)),
+        Expr::Map(es) => es.iter().for_each(|(_, x)| each_expr(x, f)),
+        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => each_expr(x, f),
+        Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => {
+            each_expr(a, f);
+            each_expr(b, f)
+        }
+        Expr::Call(c, args, _) => {
+            each_expr(c, f);
+            args.iter().for_each(|x| each_expr(x, f))
+        }
+        Expr::If(c, a, b) => {
+            each_expr(c, f);
+            each_expr(a, f);
+            if let Some(b) = b {
+                each_expr(b, f)
+            }
+        }
+        Expr::Match(x, arms, _) => {
+            each_expr(x, f);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    each_expr(g, f)
+                }
+                each_expr(&a.body, f)
+            }
+        }
+        Expr::For(_, i, b, _) => {
+            each_expr(i, f);
+            each_expr(b, f)
+        }
+        Expr::Reply(x, b, _) => {
+            each_expr(x, f);
+            if let Some(b) = b {
+                each_expr(b, f)
+            }
+        }
+        Expr::Html(el, _) => each_html_expr(el, f),
+    }
+}
+
+fn each_html_expr(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
+    for x in el.id.iter().chain(el.classes.iter()) {
+        each_expr(x, f)
+    }
+    for (_, v) in &el.attrs {
+        if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
+            each_expr(x, f)
+        }
+    }
+    for c in &el.children {
+        match c {
+            HtmlChild::El(e) => each_html_expr(e, f),
+            HtmlChild::Expr(x) => each_expr(x, f),
+        }
+    }
+}
+
+/// Builtins whose results may be private to the server: its environment,
+/// its files, its database, other services.
+const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
+
+/// Top-level variables whose value comes, directly or through other such
+/// variables, from `PRIVATE_SOURCES`. Components get other globals' values
+/// written into the browser bundle, which anyone can download; these they
+/// must ask a `server fn` for.
+fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
+    let mut private: HashSet<String> = HashSet::new();
+    loop {
+        let before = private.len();
+        for stmts in program {
+            for st in stmts.iter() {
+                let Stmt::Let(p, e, _) = st else { continue };
+                let mut tainted = false;
+                each_expr(e, &mut |x| {
+                    if let Expr::Ident(n, _) = x {
+                        tainted |= PRIVATE_SOURCES.contains(&n.as_str()) || private.contains(n);
+                    }
+                });
+                if tainted {
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    private.extend(names);
+                }
+            }
+        }
+        if private.len() == before {
+            return private;
+        }
+    }
+}
+
 fn html_assigned(el: &HtmlEl, out: &mut HashSet<String>) {
     for (_, v) in &el.attrs {
         if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
@@ -382,6 +496,7 @@ impl<'a> Compiler<'a> {
         Compiler {
             it,
             assigned,
+            private: collect_private(&it.program),
             defs: Vec::new(),
             globals: HashMap::new(),
             ctxs: Vec::new(),
@@ -512,6 +627,13 @@ impl<'a> Compiler<'a> {
                 if self.assigned.contains(name) {
                     return self.err(format!(
                         "`{}` is a server variable that the program changes; pass it as a prop or read it with a `server fn`",
+                        name
+                    ));
+                }
+                if self.private.contains(name) {
+                    return self.err(format!(
+                        "`{}` is read from the server's environment, files or database, and would be sent to \
+                         every browser; pass what the page needs as a prop or read it with a `server fn`",
                         name
                     ));
                 }

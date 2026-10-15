@@ -102,6 +102,35 @@ fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
     }
 }
 
+/// The media type of a content-type header, without its parameters:
+/// "Application/JSON; charset=utf-8" is "application/json".
+fn essence(ctype: &str) -> String {
+    ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// `application/json`, or a JSON-based type such as `application/ld+json`.
+fn is_json_type(ctype: &str) -> bool {
+    let e = essence(ctype);
+    e == "application/json" || (e.starts_with("application/") && e.ends_with("+json"))
+}
+
+/// Whether a request was sent by a page on another site. Browsers say so in
+/// `Sec-Fetch-Site`; older ones only send `Origin`, which then has to name
+/// the host the request was sent to.
+fn cross_site(req: &HttpRequest) -> bool {
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    if let Some(site) = header("sec-fetch-site") {
+        return !matches!(site.to_ascii_lowercase().as_str(), "same-origin" | "none");
+    }
+    match (header("origin"), header("host")) {
+        (None, _) => false,
+        (Some(origin), host) => {
+            let origin_host = origin.split_once("://").map_or(origin, |(_, h)| h).trim_end_matches('/');
+            host.map_or(true, |h| !origin_host.eq_ignore_ascii_case(h))
+        }
+    }
+}
+
 /// The `request` value a route sees.
 fn build_request(req: &HttpRequest, path: &str, query: &Map) -> Map {
     let mut headers = Map::new();
@@ -118,7 +147,12 @@ fn build_request(req: &HttpRequest, path: &str, query: &Map) -> Map {
     }
     let body = String::from_utf8_lossy(&req.body).into_owned();
     let trimmed = body.trim_start();
-    let json = if ctype.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[') {
+    // A body is JSON when it says so, or says nothing and looks like it
+    // (curl, scripts). Not when it says it is something else: a page on
+    // another site can send `text/plain` without asking first, and must
+    // not reach routes that expect JSON.
+    let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let json = if is_json_type(&ctype) || (ctype.trim().is_empty() && looks_json) {
         serde_json::from_str::<serde_json::Value>(&body).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil)
     } else {
         Value::Nil
@@ -282,9 +316,16 @@ impl Interp {
         if req.method != "POST" {
             return plain(405, "method not allowed\n");
         }
+        // Only the program's own pages may call its server fns. A JSON
+        // content type cannot be sent across sites without the browser
+        // asking first (which nothing here answers), and the browser says
+        // where a request came from.
         let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str());
-        if !ctype.map_or(false, |c| c.contains("application/json")) {
+        if essence(ctype.unwrap_or("")) != "application/json" {
             return rpc_error(415, "server fn calls must send JSON (content-type: application/json)");
+        }
+        if cross_site(req) {
+            return rpc_error(403, "server fns can only be called from the program's own pages");
         }
         if !self.server_fns.iter().any(|n| n == name) {
             return rpc_error(404, &format!("no server fn `{}`", name));
@@ -345,9 +386,68 @@ fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>) {
     let server = q.get("s").map(|v| v.display()).filter(|s| !s.is_empty());
     let topics: Vec<String> = q
         .get("t")
-        .map(|v| v.display().split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+        .map(|v| v.display().split(',').filter(|s| !s.is_empty()).take(MAX_TOPICS).map(String::from).collect())
         .unwrap_or_default();
     (since, server, topics)
+}
+
+/// Most topics one page can wait on; each change looks through them all.
+const MAX_TOPICS: usize = 256;
+
+/// Most pages that can wait for changes at once (live data and `--watch`
+/// reloads). Each has a thread; beyond this, pages are told to try later
+/// rather than let anyone with a browser start threads without end.
+pub const MAX_WAITERS: usize = 4096;
+
+/// Stack for the threads that wait for changes; they run no Quillo code.
+const WAITER_STACK: usize = 256 << 10;
+
+static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A place among the `MAX_WAITERS`, given back when dropped.
+struct Waiter;
+
+impl Waiter {
+    fn take() -> Option<Waiter> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if WAITERS.fetch_add(1, SeqCst) >= MAX_WAITERS {
+            WAITERS.fetch_sub(1, SeqCst);
+            return None;
+        }
+        Some(Waiter)
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Starts `f` on a thread of its own, holding one of the waiting places;
+/// answers 503 when they are all taken.
+fn spawn_waiter(name: &str, rq: tiny_http::Request, f: impl FnOnce(tiny_http::Request) + Send + 'static) {
+    let Some(place) = Waiter::take() else {
+        let mut resp = tiny_http::Response::from_string("too many pages are waiting for changes; try again later\n")
+            .with_status_code(503);
+        resp.add_header(tiny_http::Header::from_bytes(&b"retry-after"[..], &b"5"[..]).unwrap());
+        let _ = rq.respond(resp);
+        return;
+    };
+    // `rq` must come back if the thread cannot start, so it goes through a slot.
+    let slot = Arc::new(Mutex::new(Some(rq)));
+    let inner = slot.clone();
+    let started = std::thread::Builder::new().name(name.into()).stack_size(WAITER_STACK).spawn(move || {
+        let _place = place;
+        if let Some(rq) = inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            f(rq);
+        }
+    });
+    if started.is_err() {
+        if let Some(rq) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = rq.respond(tiny_http::Response::empty(503));
+        }
+    }
 }
 
 fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
@@ -360,7 +460,7 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
 /// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, rq: tiny_http::Request) {
     let (mut since, server, topics) = live_query(rq.url().split_once('?').map_or("", |(_, q)| q));
-    let _ = std::thread::Builder::new().name("quillo-live".into()).spawn(move || {
+    spawn_waiter("quillo-live", rq, move |rq| {
         if crate::ws::is_upgrade(&rq) {
             let Some(mut socket) = crate::ws::Socket::accept(rq) else { return };
             let mut server = server;
@@ -430,10 +530,20 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Err(Ctrl::Reply(r)) => render_response(&r),
         Err(Ctrl::Error(e)) => {
             eprintln!("quillo: error: {}", e);
-            plain(500, &format!("internal error: {}\n", e))
+            // The message names files and lines of the program; it is for
+            // its author (`--watch`), not for whoever sent the request.
+            if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
+                plain(500, &format!("internal error: {}\n", e))
+            } else {
+                plain(500, "internal error\n")
+            }
         }
     }
 }
+
+/// Whether a failed request is answered with the error message (in
+/// development, with `--watch`) or only "internal error".
+pub static SHOW_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn value_response(v: Value) -> HttpResponse {
     match v {
@@ -494,6 +604,11 @@ pub struct App {
     /// One of several servers (`--register`): the key announcements from
     /// the others must carry.
     pub cluster_key: Option<String>,
+    /// When limer has no admin secret: the addresses announcements may come
+    /// from (besides this machine).
+    pub cluster_sources: Option<Vec<std::net::IpAddr>>,
+    /// Largest request body accepted, in bytes.
+    pub max_body: usize,
 }
 
 impl App {
@@ -508,6 +623,8 @@ impl App {
             watch,
             static_check: true,
             cluster_key: None,
+            cluster_sources: None,
+            max_body: MAX_BODY,
         }
     }
 
@@ -612,7 +729,7 @@ fn dev_script(version: u64) -> String {
 /// for a change do not hold on to request workers.
 fn serve_events(app: Arc<App>, rq: tiny_http::Request) {
     let seen = rq.url().split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
-    let _ = std::thread::Builder::new().name("quillo-events".into()).spawn(move || {
+    spawn_waiter("quillo-events", rq, move |rq| {
         if crate::ws::is_upgrade(&rq) {
             let Some(mut socket) = crate::ws::Socket::accept(rq) else { return };
             let seen = seen.unwrap_or(0);
@@ -663,16 +780,47 @@ fn error_page(msg: &str) -> HttpResponse {
     }
 }
 
-fn to_request(rq: &mut tiny_http::Request) -> HttpRequest {
+/// Reads a request, or `None` when its body is larger than `max_body`.
+fn to_request(rq: &mut tiny_http::Request, max_body: usize) -> Option<HttpRequest> {
+    use std::io::Read;
+    if rq.body_length().map_or(false, |n| n > max_body) {
+        return None;
+    }
     let mut body = Vec::new();
-    let _ = rq.as_reader().read_to_end(&mut body);
-    HttpRequest {
+    let _ = Read::take(rq.as_reader(), max_body as u64 + 1).read_to_end(&mut body);
+    if body.len() > max_body {
+        return None;
+    }
+    Some(HttpRequest {
         method: rq.method().as_str().to_ascii_uppercase(),
         url: rq.url().to_string(),
         headers: rq.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect(),
         body,
         remote: rq.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
-    }
+    })
+}
+
+/// Largest request body accepted by default (`--max-body`), in bytes.
+pub const MAX_BODY: usize = 10 << 20;
+
+/// Whether a header can be sent as it is: a name made of token characters,
+/// and a value without line breaks or other control characters, which would
+/// let text from a request add headers of its own.
+pub fn valid_header(name: &str, value: &str) -> bool {
+    let token = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    !name.is_empty()
+        && name.bytes().all(token)
+        && value.bytes().all(|c| c == b'\t' || (c >= 0x20 && c != 0x7f))
+}
+
+/// Runs a request in the program, holding the lock. A panic (a bug in
+/// Quillo itself) answers 500 instead of stopping this worker for good
+/// with the lock still held, which would stop the whole server.
+fn run_program(app: &App, it: &mut Interp, req: &HttpRequest) -> Option<HttpResponse> {
+    app.shared.gil.acquire();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.handle(req)));
+    app.shared.gil.release();
+    r.ok()
 }
 
 /// Gzips text responses of 1 KiB or more for clients that accept it.
@@ -715,6 +863,15 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             continue;
         }
         if let (Some(key), "/_quillo/announce") = (&app.cluster_key, rq.url()) {
+            // Without a secret, the key is no secret either: only limer's
+            // own host may announce.
+            let from = rq.remote_addr().map(|a| a.ip());
+            if let Some(allowed) = &app.cluster_sources {
+                if !from.map_or(false, |ip| ip.is_loopback() || allowed.contains(&ip)) {
+                    let _ = rq.respond(tiny_http::Response::empty(403));
+                    continue;
+                }
+            }
             let mut body = Vec::new();
             let _ = std::io::Read::read_to_end(&mut std::io::Read::take(rq.as_reader(), 1 << 16), &mut body);
             let status = crate::cluster::announced(&app.shared, key, &body);
@@ -722,7 +879,12 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             continue;
         }
         let start = Instant::now();
-        let req = to_request(&mut rq);
+        let Some(req) = to_request(&mut rq, app.max_body) else {
+            eprintln!("{} {} -> 413 (body larger than {} bytes)", rq.method(), rq.url(), app.max_body);
+            let resp = tiny_http::Response::from_string("request body too large\n").with_status_code(413);
+            let _ = rq.respond(resp.with_header(tiny_http::Header::from_bytes(&b"connection"[..], &b"close"[..]).unwrap()));
+            continue;
+        };
         let (g, current) = app.current();
         if g != generation {
             generation = g;
@@ -736,12 +898,16 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             plain(200, &generation.to_string())
         } else {
             match (&mut local, &*program) {
-                (Some(it), _) => {
-                    app.shared.gil.acquire();
-                    let r = it.handle(&req);
-                    app.shared.gil.release();
-                    r
-                }
+                (Some(it), _) => match run_program(&app, it, &req) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("quillo: internal error (a bug in Quillo) while handling {} {}", req.method, req.url);
+                        // Its state may be half-updated; start afresh.
+                        local = None;
+                        generation = 0;
+                        plain(500, "internal error\n")
+                    }
+                },
                 (None, Loaded::Failed(e)) => error_page(e),
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
@@ -762,8 +928,15 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             );
         }
         compress(&req, &mut resp);
+        if resp.header("x-content-type-options").is_none() {
+            resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
+        }
         let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);
         for (k, v) in &resp.headers {
+            if !valid_header(k, v) {
+                eprintln!("quillo: header `{}` not sent: its name or value has characters headers cannot have", k.escape_debug());
+                continue;
+            }
             if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
                 out.add_header(h);
             }
@@ -785,6 +958,7 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     if app.watch {
         eprintln!("quillo: watching for changes");
     }
+    SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     app.shared.gil.release();
     let mut handles = Vec::new();
     for i in 0..workers.max(1) {

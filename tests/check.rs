@@ -199,3 +199,12 @@ fn examples_are_clean() {
         assert!(a.diagnostics.is_empty(), "{}: {:#?}", f, a.diagnostics);
     }
 }
+
+#[test]
+fn sql_built_from_values_is_a_warning() {
+    one("fn f(n: str) with db = db.query(`select * from t where n = '${n}'`)", "1 warning: `db.query` with SQL built from values");
+    one("fn f(n: str) with db = db.exec(\"delete from t where n = '\" + n + \"'\")", "SQL injection");
+    one("fn f(n: str) with db = db.one(sql`select * from t where n = '${n}'`)", "SQL injection");
+    clean("fn f(n: str) with db = db.query(\"select * from t where n = ?\", n)");
+    clean("fn f() with db = db.query(sql`select * from t`)");
+}
