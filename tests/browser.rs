@@ -160,3 +160,28 @@ fn components_compose() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/compose.qwe, clicked through.
+#[test]
+fn composition_example_works() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(
+        &chrome,
+        &root.join("examples/compose.qwe"),
+        24500 + (std::process::id() % 400) as u16,
+        Some(&root.join("tests/browser/compose-example.js")),
+    );
+    let want = serde_json::json!({
+        "counts": ["2", "2", "0", "10"],
+        "sum": "4",
+        "log": ["Crates → 10", "Pears → 2", "Apples → 2", "Apples → 1"],
+        "header": "▾ Recent changes (4)",
+        "collapsed": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
