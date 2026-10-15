@@ -232,13 +232,22 @@ impl Interp {
     /// `/_wisp/...`: the browser bundle and `server fn` calls.
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
         if rest == "wisp.js" {
+            // The browser keeps its copy and asks whether it is still current.
+            let etag = format!("\"{:016x}\"", {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                self.client_js.hash(&mut h);
+                h.finish()
+            });
+            let fresh = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.contains(&etag));
             return HttpResponse {
-                status: 200,
+                status: if fresh { 304 } else { 200 },
                 headers: vec![
                     ("content-type".into(), "text/javascript; charset=utf-8".into()),
                     ("cache-control".into(), "no-cache".into()),
+                    ("etag".into(), etag),
                 ],
-                body: self.client_js.as_bytes().to_vec(),
+                body: if fresh { Vec::new() } else { self.client_js.as_bytes().to_vec() },
             };
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
@@ -541,6 +550,32 @@ fn to_request(rq: &mut tiny_http::Request) -> HttpRequest {
     }
 }
 
+/// Gzips text responses of 1 KiB or more for clients that accept it.
+fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
+    use std::io::Write;
+    if resp.body.len() < 1024 || resp.header("content-encoding").is_some() {
+        return;
+    }
+    let ctype = resp.header("content-type").unwrap_or("");
+    let text = ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("javascript") || ctype.contains("svg");
+    let accepts = req
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v.split(',').any(|e| e.trim().starts_with("gzip")));
+    if !text || !accepts {
+        return;
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(resp.body.len() / 3), flate2::Compression::default());
+    if enc.write_all(&resp.body).is_err() {
+        return;
+    }
+    if let Ok(gz) = enc.finish() {
+        resp.body = gz;
+        resp.headers.push(("content-encoding".into(), "gzip".into()));
+        resp.headers.push(("vary".into(), "accept-encoding".into()));
+    }
+}
+
 fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
     let mut generation = 0;
     let mut local: Option<Interp> = None;
@@ -587,6 +622,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
                 start.elapsed().as_secs_f64() * 1000.0
             );
         }
+        compress(&req, &mut resp);
         let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);
         for (k, v) in &resp.headers {
             if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {

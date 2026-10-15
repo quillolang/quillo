@@ -237,6 +237,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   JavaScript. Code that cannot run in a browser is an error when the program loads
   (and in `wisp check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
   the server changes (pass it as a prop instead).
+- `/_wisp/wisp.js` holds only what the page's components use: their compiled code and
+  the parts of the runtime it reaches, minified (a small component is about 11 KB,
+  under 4 KB gzipped). Text responses are gzipped for browsers that accept it, and
+  the bundle has an ETag, so an unchanged one costs a `304` on reload.
 - In the browser, numbers are JavaScript numbers, so `2.0` prints as `2` and `7.0 / 2`
   is `3`.
 

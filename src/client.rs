@@ -40,24 +40,24 @@ pub fn bundle(it: &Interp) -> Result<String, WispError> {
     for (name, _) in &names {
         c.global(name, 0)?;
     }
-    let mut out = String::with_capacity(RUNTIME.len() + 4096);
-    out.push_str("(function () {\n");
-    out.push_str(RUNTIME);
-    out.push_str("\n// ---- program -----------------------------------------------------------\n");
+    let mut program = String::new();
     for d in &c.defs {
-        out.push_str(d);
-        out.push('\n');
+        program.push_str(d);
+        program.push('\n');
     }
-    out.push_str("const server = {};\n");
-    for name in &it.server_fns {
-        let _ = writeln!(out, "server[{}] = W.server({});", js_str(name), js_str(name));
+    if !it.server_fns.is_empty() {
+        program.push_str("const server = {};\n");
+        for name in &it.server_fns {
+            let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
+        }
+        program.push_str("window.wisp = { server, components: C, rpc };\n");
     }
-    out.push_str(
-        "window.wisp = { server, components: C, rpc };\n\
-         if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n\
-         })();\n",
-    );
-    Ok(out)
+    if !names.is_empty() {
+        program.push_str(
+            "if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n",
+        );
+    }
+    Ok(assemble("(function () {", &program, "})();"))
 }
 
 /// A script that runs the runtime, compiles the global function `name`,
@@ -65,19 +65,135 @@ pub fn bundle(it: &Interp) -> Result<String, WispError> {
 pub fn test_script(it: &Interp, name: &str) -> Result<String, WispError> {
     let mut c = Compiler::new(it);
     let (js, is_async) = c.global(name, 0)?;
-    let mut out = String::from("(async function () {\n");
-    out.push_str(RUNTIME);
+    let mut program = String::new();
     for d in &c.defs {
-        out.push_str(d);
-        out.push('\n');
+        program.push_str(d);
+        program.push('\n');
     }
     let _ = writeln!(
-        out,
-        "try {{ console.log(W.repr({}{}())); }} catch (e) {{ console.log(\"ERROR: \" + (e instanceof Ret ? W.repr(e.v) : e.message)); }}\n}})();",
+        program,
+        "try {{ console.log(W.repr({}{}())); }} catch (e) {{ console.log(\"ERROR: \" + (e instanceof Ret ? W.repr(e.v) : e.message)); }}",
         if is_async { "await " } else { "" },
         js
     );
-    Ok(out)
+    Ok(assemble("(async function () {", &program, "})();"))
+}
+
+/// The parts of the runtime `program` needs, then the program, minified.
+fn assemble(open: &str, program: &str, close: &str) -> String {
+    let rt = runtime_units();
+    let mut keep = vec![false; rt.units.len()];
+    let mut todo: Vec<String> = names_in(program);
+    while let Some(n) = todo.pop() {
+        if let Some(&i) = rt.by_name.get(&n) {
+            if !keep[i] {
+                keep[i] = true;
+                todo.extend(names_in(&rt.units[i].1));
+            }
+        }
+    }
+    let mut out = String::with_capacity(program.len() + 16 * 1024);
+    out.push_str(open);
+    out.push('\n');
+    minify_into(&rt.preamble, &mut out);
+    for (i, (_, text)) in rt.units.iter().enumerate() {
+        if keep[i] {
+            minify_into(text, &mut out);
+        }
+    }
+    minify_into(program, &mut out);
+    out.push_str(close);
+    out.push('\n');
+    out
+}
+
+/// The runtime cut into its top-level declarations (`function f`, `const x`,
+/// `class C`, `B.name = ...`, `W.name = ...`), in order.
+struct Runtime {
+    preamble: String,
+    units: Vec<(String, String)>,
+    by_name: HashMap<String, usize>,
+}
+
+fn runtime_units() -> &'static Runtime {
+    static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        let mut preamble = String::new();
+        let mut units: Vec<(String, String)> = Vec::new();
+        for line in RUNTIME.lines() {
+            let decl = ["async function ", "function ", "class ", "const ", "let "]
+                .iter()
+                .find_map(|p| line.strip_prefix(p))
+                .map(|rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<String>())
+                .or_else(|| {
+                    ["B.", "W."].iter().find_map(|p| {
+                        line.strip_prefix(p).map(|rest| {
+                            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                            format!("{}{}", p, n)
+                        })
+                    })
+                });
+            match decl {
+                Some(name) if !name.is_empty() && !name.ends_with('.') => units.push((name, format!("{}\n", line))),
+                _ => match units.last_mut() {
+                    Some(u) => {
+                        u.1.push_str(line);
+                        u.1.push('\n');
+                    }
+                    None => {
+                        preamble.push_str(line);
+                        preamble.push('\n');
+                    }
+                },
+            }
+        }
+        let by_name = units.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        Runtime { preamble, units, by_name }
+    })
+}
+
+/// The identifiers in some JavaScript, with `B.x` and `W.x` kept whole
+/// (and also giving `B` or `W`). Strings are scanned too: that can only
+/// keep more of the runtime than needed, never less.
+fn names_in(js: &str) -> Vec<String> {
+    let chars: Vec<char> = js.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    while i < chars.len() {
+        let c = chars[i];
+        if ident(c) && (i == 0 || !ident(chars[i - 1]) && chars[i - 1] != '.') {
+            let start = i;
+            while i < chars.len() && ident(chars[i]) {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if (word == "B" || word == "W") && chars.get(i) == Some(&'.') {
+                let s2 = i + 1;
+                let mut j = s2;
+                while j < chars.len() && ident(chars[j]) {
+                    j += 1;
+                }
+                out.push(format!("{}.{}", word, chars[s2..j].iter().collect::<String>()));
+            }
+            out.push(word);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Drops comment lines, blank lines and indentation.
+fn minify_into(js: &str, out: &mut String) {
+    for line in js.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        out.push_str(t);
+        out.push('\n');
+    }
 }
 
 /// What a name refers to inside compiled code.

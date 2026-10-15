@@ -284,3 +284,35 @@ fn not_exposed() = "secret"
     assert_eq!(send(&mut it, "POST", "/_wisp/rpc/add_todo", Some("application/x-www-form-urlencoded"), "x=1").status, 415);
     assert_eq!(get(&mut it, "/_wisp/rpc/add_todo").status, 405);
 }
+
+#[test]
+fn the_browser_bundle_only_carries_what_the_page_uses() {
+    let mut small = app("component Hi(name: str) = <p>\"hi {name}\"</p>\nroute GET / = <Hi name=\"x\"/>\n");
+    let js = get(&mut small, "/_wisp/wisp.js").text();
+    // No server fns: no RPC code. Rendering and booting, of course.
+    assert!(!js.contains("async function rpc"), "{}", js);
+    assert!(js.contains("function boot(") && js.contains("function mount("));
+    // Builtins come along only when used.
+    assert!(!js.contains("B.group_by") && !js.contains("B.sort_by"));
+    let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={fn() { xs = save(xs |> sort_by(fn(x) = x)) }}>\"\"</button> }\nroute GET / = <C/>\n");
+    let js2 = get(&mut big, "/_wisp/wisp.js").text();
+    assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
+    assert!(js.len() < js2.len() && js.len() < 12_000, "{} vs {}", js.len(), js2.len());
+    // No comments or indentation.
+    assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
+}
+
+#[test]
+fn the_browser_bundle_can_be_revalidated() {
+    let mut it = app("component Hi() = <p>\"hi\"</p>\nroute GET / = <Hi/>\n");
+    let r = get(&mut it, "/_wisp/wisp.js");
+    let etag = r.header("etag").unwrap().to_string();
+    let again = it.handle(&HttpRequest {
+        method: "GET".into(),
+        url: "/_wisp/wisp.js".into(),
+        headers: vec![("If-None-Match".into(), etag)],
+        body: Vec::new(),
+        remote: "127.0.0.1".into(),
+    });
+    assert_eq!((again.status, again.body.len()), (304, 0));
+}

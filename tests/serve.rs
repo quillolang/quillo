@@ -202,3 +202,26 @@ fn watch_tells_waiting_pages_about_changes() {
     assert!(took > Duration::from_millis(1000) && took < Duration::from_secs(5), "{:?}", took);
     assert_eq!(get(srv.port, "/").1, "two");
 }
+
+#[test]
+fn text_responses_are_gzipped_when_the_client_accepts_it() {
+    let d = temp_dir("gzip");
+    let f = d.join("app.wisp");
+    std::fs::write(&f, "route GET /big = repeat(\"wisp \", 1000)\nroute GET /small = \"tiny\"\n").unwrap();
+    let srv = start(&f, &[]);
+    let raw = |path: &str, gzip: bool| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        let ae = if gzip { "Accept-Encoding: gzip, br\r\n" } else { "" };
+        write!(s, "GET {} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{}\r\n", path, ae).unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        out
+    };
+    let head = |b: &[u8]| String::from_utf8_lossy(&b[..b.windows(4).position(|w| w == b"\r\n\r\n").unwrap()]).to_lowercase();
+    let gz = raw("/big", true);
+    assert!(head(&gz).contains("content-encoding: gzip"), "{}", head(&gz));
+    assert!(gz.len() < 500, "{} bytes", gz.len());
+    let plain = raw("/big", false);
+    assert!(!head(&plain).contains("content-encoding") && plain.len() > 5000);
+    assert!(!head(&raw("/small", true)).contains("content-encoding"));
+}

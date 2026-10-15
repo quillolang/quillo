@@ -118,14 +118,20 @@ function arith(op, verb) {
     }
   };
 }
-const sub = arith("-", "subtract"), mul = arith("*", "multiply"), div = arith("/", "divide"), mod = arith("%", "take the remainder of");
+const sub = arith("-", "subtract");
+const mul = arith("*", "multiply");
+const div = arith("/", "divide");
+const mod = arith("%", "take the remainder of");
 
 function order(a, b) {
   const c = cmp(a, b);
   if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}`);
   return c;
 }
-const lt = (a, b) => order(a, b) < 0, le = (a, b) => order(a, b) <= 0, gt = (a, b) => order(a, b) > 0, ge = (a, b) => order(a, b) >= 0;
+const lt = (a, b) => order(a, b) < 0;
+const le = (a, b) => order(a, b) <= 0;
+const gt = (a, b) => order(a, b) > 0;
+const ge = (a, b) => order(a, b) >= 0;
 
 function range(a, b) {
   if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
@@ -165,7 +171,9 @@ function field(v, name, fb) {
   if (isNil(v)) return null;
   if (isMap(v)) {
     if (hasOwn(v, name)) return v[name];
-    if (name === "len" || name === "keys" || name === "values") return B[name](v);
+    if (name === "len") return B.len(v);
+    if (name === "keys") return B.keys(v);
+    if (name === "values") return B.values(v);
     return null;
   }
   if (v instanceof Err && name === "error") return v.error;
@@ -373,123 +381,121 @@ function toJSON(v) {
   return v;
 }
 
-const B = {
-  print: (...a) => { console.log(a.map(display).join(" ")); return null; },
-  str: (v) => display(v),
-  int: (v) => {
-    if (isInt(v)) return v;
-    if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
-    if (typeof v === "boolean") return v ? 1 : 0;
-    if (typeof v === "string") { const n = coerce("int", v); return n === null ? new Err(`not an int: ${JSON.stringify(v)}`) : n; }
-    return new Err(`cannot convert ${typeName(v)} to int`);
-  },
-  float: (v) => {
-    if (typeof v === "number") return v;
-    if (typeof v === "string") { const n = coerce("float", v); return n === null ? new Err(`not a number: ${JSON.stringify(v)}`) : n; }
-    return new Err(`cannot convert ${typeName(v)} to float`);
-  },
-  len: (v) => {
-    if (typeof v === "string") return Array.from(v).length;
-    if (Array.isArray(v)) return v.length;
-    if (isMap(v)) return Object.keys(v).length;
-    if (isNil(v)) return 0;
-    fail(`\`len\` expects a str, list or map, got ${typeName(v)}`);
-  },
-  type_of: (v) => typeName(v),
-  upper: (s) => S(s, "upper").toUpperCase(),
-  lower: (s) => S(s, "lower").toLowerCase(),
-  trim: (s) => S(s, "trim").trim(),
-  split: (s, sep = " ") => { S(s, "split"); S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); },
-  join: (l, sep = "") => L(l, "join").map(display).join(S(sep, "join", 2)),
-  contains: (c, x) => {
-    if (typeof c === "string") return c.includes(display(x));
-    if (Array.isArray(c)) return c.some((y) => eq(y, x));
-    if (isMap(c)) return hasOwn(c, display(x));
-    if (isNil(c)) return false;
-    fail(`\`contains\` expects a str, list or map, got ${typeName(c)}`);
-  },
-  starts_with: (s, p) => S(s, "starts_with").startsWith(S(p, "starts_with", 2)),
-  ends_with: (s, p) => S(s, "ends_with").endsWith(S(p, "ends_with", 2)),
-  replace: (s, a, b) => S(s, "replace").split(S(a, "replace", 2)).join(S(b, "replace", 3)),
-  slice: (v, start, end) => {
-    I(start, "slice", 2);
-    if (end !== undefined) I(end, "slice", 3);
-    if (Array.isArray(v)) { const [s, e] = clampRange(v.length, start, end); return v.slice(s, e); }
-    if (typeof v === "string") { const cs = Array.from(v); const [s, e] = clampRange(cs.length, start, end); return cs.slice(s, e).join(""); }
-    fail(`\`slice\` expects a list or str, got ${typeName(v)}`);
-  },
-  map: (l, f) => { F(f, "map"); return L(l, "map").map((x) => cb(f, "map", x)); },
-  filter: (l, f) => { F(f, "filter"); return L(l, "filter").filter((x) => truthy(cb(f, "filter", x))); },
-  find: (l, f) => { F(f, "find"); for (const x of L(l, "find")) if (truthy(cb(f, "find", x))) return x; return null; },
-  any: (l, f) => { F(f, "any"); return L(l, "any").some((x) => truthy(cb(f, "any", x))); },
-  all: (l, f) => { F(f, "all"); return L(l, "all").every((x) => truthy(cb(f, "all", x))); },
-  reduce: (l, acc, f) => { F(f, "reduce", 3); for (const x of L(l, "reduce")) acc = cb(f, "reduce", acc, x); return acc; },
-  sum: (l) => L(l, "sum").reduce((a, x) => add(a, x), 0),
-  min: (l) => extreme(l, "min", -1),
-  max: (l) => extreme(l, "max", 1),
-  sort: (l) => sortValues(L(l, "sort").map((v) => [v, v]), "sort"),
-  sort_by: (l, f) => { F(f, "sort_by"); return sortValues(L(l, "sort_by").map((v) => [cb(f, "sort_by", v), v]), "sort_by"); },
-  reverse: (v) => {
-    if (Array.isArray(v)) return v.slice().reverse();
-    if (typeof v === "string") return Array.from(v).reverse().join("");
-    fail(`\`reverse\` expects a list or str, got ${typeName(v)}`);
-  },
-  first: (l) => { l = L(l, "first"); return l.length ? l[0] : null; },
-  last: (l) => { l = L(l, "last"); return l.length ? l[l.length - 1] : null; },
-  push: (l, x = null) => L(l, "push").concat([x]),
-  range: (a, b) => b === undefined ? range(0, I(a, "range")) : range(I(a, "range"), I(b, "range", 2)),
-  enumerate: (l) => L(l, "enumerate").map((v, i) => [i, v]),
-  keys: (m) => Object.keys(M(m, "keys")),
-  values: (m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); },
-  get: (m, k, d = null) => { m = M(m, "get"); k = display(k); return hasOwn(m, k) ? m[k] : d; },
-  has: (m, k) => hasOwn(M(m, "has"), display(k)),
-  set: (m, k, v = null) => Object.assign({}, M(m, "set"), { [display(k)]: v }),
-  remove: (c, k) => {
-    if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
-    const m = Object.assign({}, M(c, "remove"));
-    delete m[display(k)];
-    return m;
-  },
-  merge: (a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)),
-  err: (v = null) => new Err(v),
-  is_err: (v) => v instanceof Err,
-  unwrap: (v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; },
-  raw: (v) => new VRaw(display(v)),
-  escape: (v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]),
-  now: () => Date.now(),
-  random: () => Math.random(),
-  random_int: (lo, hi) => {
-    I(lo, "random_int"); I(hi, "random_int", 2);
-    if (lo > hi) fail(`\`random_int\` needs lo <= hi, got ${lo} and ${hi}`);
-    return lo + Math.floor(Math.random() * (hi - lo + 1));
-  },
-  uuid: () => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
-    : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }),
-  abs: (x) => Math.abs(N(x, "abs")),
-  round: (x, d) => { N(x, "round"); if (d === undefined) return Math.round(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return Math.round(x * p) / p; },
-  floor: (x) => Math.floor(N(x, "floor")),
-  ceil: (x) => Math.ceil(N(x, "ceil")),
-  sqrt: (x) => Math.sqrt(N(x, "sqrt")),
-  pow: (x, y) => N(x, "pow") ** N(y, "pow", 2),
-  unique: (l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; },
-  flatten: (l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])),
-  zip: (a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); },
-  take: (v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); },
-  drop: (v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); },
-  count: (l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; },
-  group_by: (l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); (out[k] = out[k] || []).push(x); } return out; },
-  index_of: (c, x) => {
-    if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
-    if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
-    fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
-  },
-  repeat: (s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); },
-  json: {
-    parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
-    stringify: (v, pretty) => JSON.stringify(toJSON(v), null, truthy(pretty) ? 2 : undefined),
-  },
+const B = {};
+B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
+B.str = meta((v) => display(v), "str", null);
+B.int = meta((v) => {
+  if (isInt(v)) return v;
+  if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
+  if (typeof v === "boolean") return v ? 1 : 0;
+  if (typeof v === "string") { const n = coerce("int", v); return n === null ? new Err(`not an int: ${JSON.stringify(v)}`) : n; }
+  return new Err(`cannot convert ${typeName(v)} to int`);
+}, "int", null);
+B.float = meta((v) => {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") { const n = coerce("float", v); return n === null ? new Err(`not a number: ${JSON.stringify(v)}`) : n; }
+  return new Err(`cannot convert ${typeName(v)} to float`);
+}, "float", null);
+B.len = meta((v) => {
+  if (typeof v === "string") return Array.from(v).length;
+  if (Array.isArray(v)) return v.length;
+  if (isMap(v)) return Object.keys(v).length;
+  if (isNil(v)) return 0;
+  fail(`\`len\` expects a str, list or map, got ${typeName(v)}`);
+}, "len", null);
+B.type_of = meta((v) => typeName(v), "type_of", null);
+B.upper = meta((s) => S(s, "upper").toUpperCase(), "upper", null);
+B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
+B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
+B.split = meta((s, sep = " ") => { S(s, "split"); S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); }, "split", null);
+B.join = meta((l, sep = "") => L(l, "join").map(display).join(S(sep, "join", 2)), "join", null);
+B.contains = meta((c, x) => {
+  if (typeof c === "string") return c.includes(display(x));
+  if (Array.isArray(c)) return c.some((y) => eq(y, x));
+  if (isMap(c)) return hasOwn(c, display(x));
+  if (isNil(c)) return false;
+  fail(`\`contains\` expects a str, list or map, got ${typeName(c)}`);
+}, "contains", null);
+B.starts_with = meta((s, p) => S(s, "starts_with").startsWith(S(p, "starts_with", 2)), "starts_with", null);
+B.ends_with = meta((s, p) => S(s, "ends_with").endsWith(S(p, "ends_with", 2)), "ends_with", null);
+B.replace = meta((s, a, b) => S(s, "replace").split(S(a, "replace", 2)).join(S(b, "replace", 3)), "replace", null);
+B.slice = meta((v, start, end) => {
+  I(start, "slice", 2);
+  if (end !== undefined) I(end, "slice", 3);
+  if (Array.isArray(v)) { const [s, e] = clampRange(v.length, start, end); return v.slice(s, e); }
+  if (typeof v === "string") { const cs = Array.from(v); const [s, e] = clampRange(cs.length, start, end); return cs.slice(s, e).join(""); }
+  fail(`\`slice\` expects a list or str, got ${typeName(v)}`);
+}, "slice", null);
+B.map = meta((l, f) => { F(f, "map"); return L(l, "map").map((x) => cb(f, "map", x)); }, "map", null);
+B.filter = meta((l, f) => { F(f, "filter"); return L(l, "filter").filter((x) => truthy(cb(f, "filter", x))); }, "filter", null);
+B.find = meta((l, f) => { F(f, "find"); for (const x of L(l, "find")) if (truthy(cb(f, "find", x))) return x; return null; }, "find", null);
+B.any = meta((l, f) => { F(f, "any"); return L(l, "any").some((x) => truthy(cb(f, "any", x))); }, "any", null);
+B.all = meta((l, f) => { F(f, "all"); return L(l, "all").every((x) => truthy(cb(f, "all", x))); }, "all", null);
+B.reduce = meta((l, acc, f) => { F(f, "reduce", 3); for (const x of L(l, "reduce")) acc = cb(f, "reduce", acc, x); return acc; }, "reduce", null);
+B.sum = meta((l) => L(l, "sum").reduce((a, x) => add(a, x), 0), "sum", null);
+B.min = meta((l) => extreme(l, "min", -1), "min", null);
+B.max = meta((l) => extreme(l, "max", 1), "max", null);
+B.sort = meta((l) => sortValues(L(l, "sort").map((v) => [v, v]), "sort"), "sort", null);
+B.sort_by = meta((l, f) => { F(f, "sort_by"); return sortValues(L(l, "sort_by").map((v) => [cb(f, "sort_by", v), v]), "sort_by"); }, "sort_by", null);
+B.reverse = meta((v) => {
+  if (Array.isArray(v)) return v.slice().reverse();
+  if (typeof v === "string") return Array.from(v).reverse().join("");
+  fail(`\`reverse\` expects a list or str, got ${typeName(v)}`);
+}, "reverse", null);
+B.first = meta((l) => { l = L(l, "first"); return l.length ? l[0] : null; }, "first", null);
+B.last = meta((l) => { l = L(l, "last"); return l.length ? l[l.length - 1] : null; }, "last", null);
+B.push = meta((l, x = null) => L(l, "push").concat([x]), "push", null);
+B.range = meta((a, b) => b === undefined ? range(0, I(a, "range")) : range(I(a, "range"), I(b, "range", 2)), "range", null);
+B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
+B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
+B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
+B.get = meta((m, k, d = null) => { m = M(m, "get"); k = display(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
+B.has = meta((m, k) => hasOwn(M(m, "has"), display(k)), "has", null);
+B.set = meta((m, k, v = null) => Object.assign({}, M(m, "set"), { [display(k)]: v }), "set", null);
+B.remove = meta((c, k) => {
+  if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
+  const m = Object.assign({}, M(c, "remove"));
+  delete m[display(k)];
+  return m;
+}, "remove", null);
+B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "merge", null);
+B.err = meta((v = null) => new Err(v), "err", null);
+B.is_err = meta((v) => v instanceof Err, "is_err", null);
+B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
+B.raw = meta((v) => new VRaw(display(v)), "raw", null);
+B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
+B.now = meta(() => Date.now(), "now", null);
+B.random = meta(() => Math.random(), "random", null);
+B.random_int = meta((lo, hi) => {
+  I(lo, "random_int"); I(hi, "random_int", 2);
+  if (lo > hi) fail(`\`random_int\` needs lo <= hi, got ${lo} and ${hi}`);
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}, "random_int", null);
+B.uuid = meta(() => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
+  : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }), "uuid", null);
+B.abs = meta((x) => Math.abs(N(x, "abs")), "abs", null);
+B.round = meta((x, d) => { N(x, "round"); if (d === undefined) return Math.round(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return Math.round(x * p) / p; }, "round", null);
+B.floor = meta((x) => Math.floor(N(x, "floor")), "floor", null);
+B.ceil = meta((x) => Math.ceil(N(x, "ceil")), "ceil", null);
+B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
+B.pow = meta((x, y) => N(x, "pow") ** N(y, "pow", 2), "pow", null);
+B.unique = meta((l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; }, "unique", null);
+B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])), "flatten", null);
+B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
+B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
+B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
+B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; }, "count", null);
+B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); (out[k] = out[k] || []).push(x); } return out; }, "group_by", null);
+B.index_of = meta((c, x) => {
+  if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
+  if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
+  fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
+}, "index_of", null);
+B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+B.json = {
+  parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
+  stringify: (v, pretty) => JSON.stringify(toJSON(v), null, truthy(pretty) ? 2 : undefined),
 };
-for (const k of Object.keys(B)) if (typeof B[k] === "function") meta(B[k], k, null);
 
 function fromJSON(j) {
   if (j === undefined) return null;
@@ -771,18 +777,46 @@ function boot() {
 
 const G = {};
 const C = {};
-const W = {
-  Err, Ret, fail, truthy, eq, add, sub, mul, div, mod, lt, le, gt, ge, range, neg, field, index, call, mcall,
-  tryv, iter, match, arity, missing, argty, retty, meta, rpc, h, comp, display, repr, short,
-  cls: (xs) => xs.filter((x) => !isNil(x) && x !== false).map(display).join(" "),
-  component(name, params, render) {
-    render.$name = name;
-    render.$p = params;
-    render.$comp = true;
-    C[name] = render;
-    return render;
-  },
-  server(name) {
-    return meta((...args) => rpc(name, args), name, null);
-  },
+const W = {};
+W.Err = Err;
+W.Ret = Ret;
+W.fail = fail;
+W.truthy = truthy;
+W.eq = eq;
+W.add = add;
+W.sub = sub;
+W.mul = mul;
+W.div = div;
+W.mod = mod;
+W.lt = lt;
+W.le = le;
+W.gt = gt;
+W.ge = ge;
+W.range = range;
+W.neg = neg;
+W.field = field;
+W.index = index;
+W.call = call;
+W.mcall = mcall;
+W.tryv = tryv;
+W.iter = iter;
+W.match = match;
+W.arity = arity;
+W.missing = missing;
+W.argty = argty;
+W.retty = retty;
+W.meta = meta;
+W.h = h;
+W.comp = comp;
+W.display = display;
+W.repr = repr;
+W.short = short;
+W.cls = (xs) => xs.filter((x) => !isNil(x) && x !== false).map(display).join(" ");
+W.component = (name, params, render) => {
+  render.$name = name;
+  render.$p = params;
+  render.$comp = true;
+  C[name] = render;
+  return render;
 };
+W.server = (name) => meta((...args) => rpc(name, args), name, null);
