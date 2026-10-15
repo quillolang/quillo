@@ -1107,7 +1107,7 @@ impl Interp {
                             // A default is taken as written: `limit: int = null`
                             // binds null when the field is missing.
                             let d = self.eval(d, env)?;
-                            if let Pattern::Type(_) = &f.pat {
+                            if f.pat.is_type_test() {
                                 binds.push((f.path.last().unwrap().clone(), d));
                                 continue;
                             }
@@ -1121,7 +1121,7 @@ impl Interp {
                         return Ok(None);
                     };
                     // `{ limit: int }` binds `limit`.
-                    if binds.len() == mark && matches!(f.pat, Pattern::Type(_)) {
+                    if binds.len() == mark && f.pat.is_type_test() {
                         binds.push((f.path.last().unwrap().clone(), x));
                     }
                 }

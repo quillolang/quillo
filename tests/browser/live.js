@@ -14,6 +14,9 @@ window.addEventListener("load", async () => {
     await post("/api/hit"); await post("/api/hit");
     out.hitsArrived = await waitFor(() => document.querySelector(".hits").textContent === "2");
     out.hits = document.querySelector(".hits").textContent;
+    out.note = document.querySelector(".note").textContent;
+    document.querySelector(".note").click();
+    out.noteFollowsId = await waitFor(() => document.querySelector(".note").textContent === "from elsewhere");
   } catch (e) { out.exception = String(e); }
   out.errors = window.__quilloErrors;
   document.body.setAttribute("data-result", JSON.stringify(out));

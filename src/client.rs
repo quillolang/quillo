@@ -351,7 +351,7 @@ fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
             for f in fs {
                 let before = out.len();
                 pattern_names(&f.pat, out);
-                if out.len() == before && matches!(f.pat, Pattern::Type(_)) {
+                if out.len() == before && f.pat.is_type_test() {
                     out.push(f.path.last().unwrap().clone())
                 }
             }
@@ -485,20 +485,34 @@ impl<'a> Compiler<'a> {
             }
             Value::Func(f) => {
                 let def = f.def.clone();
-                // Recursive references see the function as not async until known.
-                self.globals.insert(name.to_string(), (js.clone(), false));
-                let saved_ctxs = std::mem::take(&mut self.ctxs);
-                let saved_what = std::mem::replace(
-                    &mut self.what,
-                    if def.component { format!("<{}>", def.name) } else { format!("`{}`", def.name) },
-                );
-                let saved_line = self.line;
-                self.line = def.line.max(line);
-                let res = if def.component { self.component(&def) } else { self.function(&def) };
-                self.ctxs = saved_ctxs;
-                self.what = saved_what;
-                self.line = saved_line;
-                let (code, is_async) = res?;
+                // Recursive references see the function as not async until
+                // known. If it turns out async, it is compiled again with
+                // them awaited, and so is what it compiled meanwhile, which
+                // may call it back.
+                let (defs_before, known): (usize, HashSet<String>) = (self.defs.len(), self.globals.keys().cloned().collect());
+                let mut assume_async = false;
+                let (code, is_async) = loop {
+                    self.globals.insert(name.to_string(), (js.clone(), assume_async));
+                    let saved_ctxs = std::mem::take(&mut self.ctxs);
+                    let saved_what = std::mem::replace(
+                        &mut self.what,
+                        if def.component { format!("<{}>", def.name) } else { format!("`{}`", def.name) },
+                    );
+                    let saved_line = self.line;
+                    self.line = def.line.max(line);
+                    let res = if def.component { self.component(&def) } else { self.function(&def) };
+                    self.ctxs = saved_ctxs;
+                    self.what = saved_what;
+                    self.line = saved_line;
+                    let (code, is_async) = res?;
+                    if is_async && !assume_async {
+                        self.defs.truncate(defs_before);
+                        self.globals.retain(|k, _| known.contains(k));
+                        assume_async = true;
+                        continue;
+                    }
+                    break (code, is_async);
+                };
                 let code = if def.component {
                     format!("{} = W.component({}, {});", js, js_str(&def.name), code)
                 } else {
@@ -1236,10 +1250,11 @@ impl<'a> Compiler<'a> {
                         None => "null".into(),
                     };
                     out.push(format!(
-                        "{{path: [{}], p: {}, d: {}}}",
+                        "{{path: [{}], p: {}, d: {}, ty: {}}}",
                         f.path.iter().map(|k| js_str(k)).collect::<Vec<_>>().join(", "),
                         self.pattern(&f.pat)?,
-                        d
+                        d,
+                        f.pat.is_type_test()
                     ));
                 }
                 format!("{{k: \"r\", fs: [{}]}}", out.join(", "))

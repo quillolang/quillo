@@ -201,7 +201,7 @@ impl Lexer {
 
     /// A newline ends a statement only when the previous token could end an
     /// expression and the next line does not obviously continue it
-    /// (`|`, `??`, `.method`, `else`, ...).
+    /// (`|`, `??`, `.method`, `else`, `- x`, ...).
     fn newline_significant(&self) -> bool {
         if matches!(self.stack.last(), Some('(') | Some('[')) {
             return false;
@@ -231,6 +231,14 @@ impl Lexer {
             return false;
         }
         if self.word_ahead() == "else" {
+            return false;
+        }
+        // Operators that cannot start a statement, and `- b` or `+ b` with a
+        // space (`-b` alone starts a new statement, as in `{ x\n -y }`).
+        if ["*", "%", "==", "!="].iter().any(|op| self.starts_with(op)) {
+            return false;
+        }
+        if matches!(self.peek_char(), Some('-' | '+')) && matches!(self.peek_char_at(1), Some(' ' | '\t')) {
             return false;
         }
         self.peek_char().is_some()

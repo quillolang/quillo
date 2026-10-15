@@ -348,7 +348,7 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
     }
     let mut n = 0;
     let out = scan(sql, |c, i, out| {
-        if c[*i] == '?' && !matches!(c.get(*i + 1), Some('|') | Some('&')) {
+        if c[*i] == '?' && !is_question_operator(c, *i) {
             n += 1;
             out.push_str(&format!("${}", n));
         } else {
@@ -357,6 +357,43 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
         *i += 1;
     });
     Ok((out, params.to_vec()))
+}
+
+/// Words after which a `?` is a value, not jsonb's `?` operator.
+const BEFORE_VALUE: &[&str] = &[
+    "select", "where", "and", "or", "not", "limit", "offset", "by", "on", "having", "when", "then", "else", "case",
+    "in", "is", "like", "ilike", "similar", "to", "between", "symmetric", "asymmetric", "values", "set", "returning",
+    "distinct", "all", "any", "some", "escape", "exists", "return", "first", "next", "using", "from", "for", "zone",
+    "overlaps", "placing", "both", "leading", "trailing",
+];
+
+/// Whether the `?` at `i` is one of jsonb's operators (`data ? 'key'`,
+/// `?|`, `?&`) rather than a parameter. A parameter comes after an
+/// operator, a bracket, a comma or a keyword such as `limit`; the operator
+/// comes after a value: a column, `)`, `]` or a quoted string. A query that
+/// numbers its own parameters (`$1`) is never rewritten, so it can use `?`
+/// freely.
+fn is_question_operator(c: &[char], i: usize) -> bool {
+    if matches!(c.get(i + 1), Some('|') | Some('&')) {
+        return true;
+    }
+    let mut j = i;
+    while j > 0 && c[j - 1].is_whitespace() {
+        j -= 1;
+    }
+    let Some(&before) = j.checked_sub(1).and_then(|k| c.get(k)) else { return false };
+    if matches!(before, ')' | ']' | '\'' | '"') {
+        return true;
+    }
+    if !(before.is_alphanumeric() || before == '_') {
+        return false;
+    }
+    let mut k = j;
+    while k > 0 && (c[k - 1].is_alphanumeric() || c[k - 1] == '_') {
+        k -= 1;
+    }
+    let word = c[k..j].iter().collect::<String>().to_ascii_lowercase();
+    !BEFORE_VALUE.contains(&word.as_str())
 }
 
 fn has_numbered(sql: &str) -> bool {
@@ -742,6 +779,12 @@ mod tests {
         assert_eq!(p("select '?', \"q?\", e'\\'?' -- ?\n, $$ ? $$, ? /* ? */", &[Value::Int(1)]), "select '?', \"q?\", e'\\'?' -- ?\n, $$ ? $$, $1 /* ? */");
         assert_eq!(p("select $1, ?", &[]), "select $1, ?");
         assert_eq!(p("select data ?| array['a'] from t where x = ?", &[]), "select data ?| array['a'] from t where x = $1");
+        // jsonb's `?` after a value is the operator; after `=`, `(`, `,` or a keyword it is a parameter.
+        assert_eq!(p("select * from t where data ? 'a' and x = ?", &[]), "select * from t where data ? 'a' and x = $1");
+        assert_eq!(p("select x->'k' ? ?, (data) ? ?", &[]), "select x->'k' ? $1, (data) ? $2");
+        assert_eq!(p("select ? limit ? offset ?", &[]), "select $1 limit $2 offset $3");
+        assert_eq!(p("select * from t where a in (?, ?) and b between ? and ? or c like ?", &[]), "select * from t where a in ($1, $2) and b between $3 and $4 or c like $5");
+        assert_eq!(p("select case when ? then ? else ? end", &[]), "select case when $1 then $2 else $3 end");
         let mut m = Map::new();
         m.insert("id".into(), Value::Int(1));
         m.insert("name".into(), Value::str("x"));

@@ -620,6 +620,9 @@ struct FnCtx {
     component: Option<String>,
     /// Inside a lambda or local fn of a component (event handlers).
     nested: bool,
+    /// What the function gives back other than at the end of its body:
+    /// values of `return`, and the errors `?` passes on.
+    exits: T,
 }
 
 /// One statement of the program, in the order the top level runs them.
@@ -1010,6 +1013,7 @@ impl Checker {
             restrictor: d.effects.as_ref().map(|e| (d.name.clone(), e.clone())),
             component: d.component.then(|| d.name.clone()),
             nested: false,
+            exits: T::NEVER,
         });
         self.push();
         if d.server {
@@ -1097,6 +1101,7 @@ impl Checker {
             restrictor: None,
             component: None,
             nested: false,
+            exits: T::NEVER,
         });
         self.push();
         self.define("request", T::of(MAP), None, Kind::Bound);
@@ -1133,6 +1138,15 @@ impl Checker {
         match s {
             Stmt::Expr(e) => {
                 let t = self.expr(e);
+                // `let total = a` and then `-b` on the next line are two
+                // statements; the second does nothing.
+                if let (false, Expr::Unary(UnOp::Neg, _, line)) = (last, e) {
+                    self.line = *line;
+                    self.warn(
+                        "a line starting with `-` is a statement of its own, and this one does nothing: \
+                         to continue the line above, write `- x` with a space or end that line with `-`",
+                    );
+                }
                 if last {
                     t
                 } else {
@@ -1225,6 +1239,9 @@ impl Checker {
                     Some(e) => self.expr(e),
                     None => T::of(NIL),
                 };
+                if let Some(f) = self.fns.last_mut() {
+                    f.exits = f.exits.union(t);
+                }
                 if let Some(f) = self.fns.last() {
                     let (ret, err, name) = (f.ret, f.err, f.name.clone());
                     if let Some(e) = e {
@@ -1280,6 +1297,7 @@ impl Checker {
             restrictor,
             component,
             nested: true,
+            exits: T::NEVER,
         });
         let saved_seq = self.sequential;
         self.sequential = false;
@@ -1289,7 +1307,7 @@ impl Checker {
         self.check_return_expr(&d.body, t);
         self.pop();
         self.sequential = saved_seq;
-        self.fns.pop();
+        let t = t.union(self.fns.pop().map_or(T::NEVER, |f| f.exits));
         let t = match &d.ret {
             Some(r) => T::of(ty_bits(r)).union(t.without(!ERR)),
             None => t,
@@ -1327,6 +1345,7 @@ impl Checker {
             restrictor: None,
             component: None,
             nested: false,
+            exits: T::NEVER,
         });
         self.push();
         if d.server {
@@ -1334,6 +1353,7 @@ impl Checker {
         }
         self.params(d);
         let body = self.expr(&d.body);
+        let body = body.union(self.fns.last().map_or(T::NEVER, |f| f.exits));
         self.scopes.clear();
         self.quiet -= 1;
         self.fns = saved_fns;
@@ -1409,7 +1429,7 @@ impl Checker {
             Pattern::As(q, n) => {
                 self.bind_pattern(q, t, out);
                 let nt = match &**q {
-                    Pattern::Type(ty) => T::of(name_bits(ty)),
+                    q if q.is_type_test() => type_test_t(q),
                     Pattern::Lit(l) => lit_t(l),
                     _ => t,
                 };
@@ -1429,15 +1449,15 @@ impl Checker {
                     if let Some(d) = &f.default {
                         self.expr(d);
                     }
-                    if let Pattern::Type(ty) = &f.pat {
-                        ft = T::of(name_bits(ty));
+                    if f.pat.is_type_test() {
+                        ft = type_test_t(&f.pat);
                         if f.default.is_some() {
                             ft = ft.union(T::of(NIL));
                         }
                     }
                     let before = out.len();
                     self.bind_pattern(&f.pat, ft, out);
-                    if out.len() == before && matches!(f.pat, Pattern::Type(_)) {
+                    if out.len() == before && f.pat.is_type_test() {
                         out.push((f.path.last().unwrap().clone(), ft, None));
                     }
                 }
@@ -1564,6 +1584,9 @@ impl Checker {
             Expr::Try(x) => {
                 let t = self.expr(x);
                 if t.bits & ERR != 0 {
+                    if let Some(f) = self.fns.last_mut() {
+                        f.exits = f.exits.union(T::error(t.err));
+                    }
                     if let Some(f) = self.fns.last() {
                         if let Some(e) = f.err {
                             let name = f.name.clone();
@@ -1758,12 +1781,22 @@ impl Checker {
             _ => "x".into(),
         };
         let what = if x == "x" { "this value".to_string() } else { format!("`{}`", x) };
-        let (empty, test) = match (t.bits & STR != 0, t.bits & NUM != 0) {
-            (true, false) => ("\"\"", format!("{} != \"\"", x)),
-            (false, true) => ("0", format!("{} != 0", x)),
-            _ => ("\"\" or 0", format!("{} != \"\" && {} != 0", x, x)),
-        };
         let nullable = t.bits & NIL != 0;
+        // What JavaScript would test. A value that may be null is checked
+        // for null first: `null != 0` holds, and `null > 0` is an error.
+        let mut empties = Vec::new();
+        if t.bits & STR != 0 {
+            empties.push("\"\"");
+        }
+        if t.bits & NUM != 0 {
+            empties.push("0");
+        }
+        let empty = empties.join(" or ");
+        let mut tests: Vec<String> = empties.iter().map(|e| format!("{} != {}", x, e)).collect();
+        if nullable {
+            tests.insert(0, format!("{} != null", x));
+        }
+        let test = tests.join(" && ");
         let unless_null = if nullable { " unless it is null" } else { "" };
         let msg = match how {
             Truth::Or => format!(
@@ -1771,15 +1804,15 @@ impl Checker {
                 if nullable { format!(", or `{x} ?? ...` to replace only null") } else { String::new() }
             ),
             Truth::And => format!(
-                "{what} counts as true even when it is {empty} (unlike JavaScript), so `&&` always goes on{unless_null}: write `{} && ...`",
-                if empty == "0" { format!("{x} > 0") } else { test.clone() }
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so `&&` always goes on{unless_null}: write `{test} && ...`"
             ),
             Truth::Not => format!(
                 "{what} counts as true even when it is {empty} (unlike JavaScript), so `!{x}` is false{unless_null}: write `{}`",
                 test.replace("!=", "==").replace("&&", "||")
             ),
             Truth::Cond => format!(
-                "{what} counts as true even when it is {empty} (unlike JavaScript), so this condition holds{unless_null}: write `{test}`"
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so this condition holds{unless_null}: write `{test}`{}",
+                if nullable { format!(", or `{x} != null` to test only for null") } else { String::new() }
             ),
         };
         self.warn(msg);
@@ -2229,6 +2262,16 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
     });
 }
 
+/// The type a type-testing pattern accepts: `int | null` is int or null.
+fn type_test_t(p: &Pattern) -> T {
+    match p {
+        Pattern::Type(ty) => T::of(name_bits(ty)),
+        Pattern::Lit(Lit::Nil) => T::of(NIL),
+        Pattern::Alt(ps) => ps.iter().fold(T::NEVER, |t, q| t.union(type_test_t(q))),
+        _ => T::ANY,
+    }
+}
+
 fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     match p {
         Pattern::Bind(n) => out.push(n.clone()),
@@ -2247,7 +2290,7 @@ fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
             for f in fs {
                 let before = out.len();
                 pattern_names(&f.pat, out);
-                if out.len() == before && matches!(f.pat, Pattern::Type(_)) {
+                if out.len() == before && f.pat.is_type_test() {
                     out.push(f.path.last().unwrap().clone())
                 }
             }

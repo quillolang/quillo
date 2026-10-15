@@ -116,6 +116,32 @@ fn sqlite_wrong_parameter_count_is_an_error_value() {
 }
 
 #[test]
+fn sqlite_booleans_come_back_as_booleans() {
+    // 0 is true in Quillo, so a stored `false` must not come back as 0.
+    let src = r#"
+db.exec("create table t (id integer primary key, done boolean, n integer)")
+db.exec("insert into t (done, n) values (?, ?)", false, 0)
+db.exec("insert into t (done, n) values (?, ?)", true, 1)
+let rows = db.query("select done, n, done = 1 as same from t order by id")
+[rows, db.query("select id from t where done = ?", false) | map(r => r.id), rows[0].done ? "yes" : "no"]
+"#;
+    assert_eq!(
+        ev(src),
+        "[[{ done: false, n: 0, same: 0 }, { done: true, n: 1, same: 1 }], [1], \"no\"]"
+    );
+}
+
+#[test]
+fn sqlite_named_parameters_must_all_be_given() {
+    let r = ev("db.exec(\"create table t (a, b)\")\ndb.exec(\"insert into t values (:a, :b)\", { a: 1 })");
+    assert!(r.contains("err(") && r.contains("no value for :b"), "{}", r);
+    let r = ev("db.exec(\"create table t (a)\")\ndb.exec(\"insert into t values (:a)\", { a: 1, z: 2 })");
+    assert!(r.contains("err(") && r.contains("no parameter :z"), "{}", r);
+    let r = ev("db.exec(\"create table t (a, b)\")\ndb.exec(\"insert into t values (:a, :a)\", { a: 1 })\ndb.query(\"select a, b from t\")");
+    assert_eq!(r, "[{ a: 1, b: 1 }]");
+}
+
+#[test]
 fn files_stay_inside_the_program_folder() {
     let dir = std::env::temp_dir().join(format!("quillo-files-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

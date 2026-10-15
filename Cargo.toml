@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 indexmap = "2"
 stacker = "0.1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 ureq = "2"
 fastrand = "2"
 flate2 = "1"

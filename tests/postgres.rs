@@ -142,11 +142,14 @@ let bad = db.query("select * from nope")
 let count = db.query("select ? as a", 1, 2)
 let fk = db.exec("insert into posts (user_id) values (?)", 99)
 let strict = db.exec("insert into users (name, age) values (?, ?)", "C", "not a number")
+let missing = db.one("select :a::int + :b::int as s", { a: 1 })
+let extra = db.one("select :a::int as s", { a: 1, z: 2 })
+let has = db.query("select k from (values ('{\"a\": 1}'::jsonb)) as v(k) where k ? 'a' and 1 = ?", 1)
 [ada, db.query("select name from users where age > ? order by id", 1) | map(u => u.name),
- bad.error, count.error, is_err(fk), is_err(strict), db.one("select 1 where false")]
+ bad.error, count.error, is_err(fk), is_err(strict), db.one("select 1 where false"), missing.error, extra.error, has]
 "#,
     );
-    assert!(r.starts_with("[{ id: 1 }, [\"Ada\", \"Bob\"], \"db: relation \\\"nope\\\" does not exist\", \"db: the query has 1 parameter, got 2\", true, true, null]"), "{}", r);
+    assert!(r.starts_with("[{ id: 1 }, [\"Ada\", \"Bob\"], \"db: relation \\\"nope\\\" does not exist\", \"db: the query has 1 parameter, got 2\", true, true, null, \"db: no value for :b\", \"db: the query has no parameter :z\", [{ k: { a: 1 } }]]"), "{}", r);
 }
 
 fn transactions_commit_roll_back_and_nest(url: &str) {

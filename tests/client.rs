@@ -10,6 +10,11 @@ fn node_available() -> bool {
 
 /// Runs `body` as the body of a function on the server and in Node.
 fn both(defs: &str, body: &str) -> (String, String) {
+    both_with("", defs, body)
+}
+
+/// Like `both`, with JavaScript run in Node before the program.
+fn both_with(prelude: &str, defs: &str, body: &str) -> (String, String) {
     let src = format!("{}\nfn __t() {{\n{}\n}}\n", defs, body);
     let mut it = Interp::new(".");
     it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
@@ -20,6 +25,7 @@ fn both(defs: &str, body: &str) -> (String, String) {
         Err(quillo::interp::Ctrl::Reply(_)) => "REPLY".into(),
     };
     let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let js = format!("{}\n{}", prelude, js);
     let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
     let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
@@ -157,4 +163,27 @@ fn browser_floats_with_no_fraction_print_as_ints() {
     assert_eq!(b, "7.5");
     let (s, b) = both("", "2.0");
     assert_eq!((s.as_str(), b.as_str()), ("2.0", "2"));
+}
+
+#[test]
+fn rounding_and_union_record_patterns_match_the_server() {
+    if !node_available() {
+        return;
+    }
+    // Halves round away from zero on both sides (JavaScript's Math.round(-2.5) is -2).
+    same("", "[round(-2.5), round(2.5), round(-0.5), round(-1.25, 1), round(1.25, 1), round(-3.7)]");
+    same("fn page_of(q) = match q {\n { page: int | null } => [page]\n _ => \"no\"\n}", "[page_of({ page: 3 }), page_of({ page: null }), page_of({ page: \"x\" })]");
+}
+
+#[test]
+fn recursive_functions_that_wait_on_the_server_are_awaited() {
+    if !node_available() {
+        return;
+    }
+    // A server that echoes the first argument back.
+    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, json: async () => ({ ok: JSON.parse(o.body)[0] }) });";
+    let defs = "server fn echo(x) = x\nfn sum_to(n) = n == 0 ? 0 : echo(n) + sum_to(n - 1)\nfn even(n) = n == 0 ? echo(true) : odd(n - 1)\nfn odd(n) = n == 0 ? false : even(n - 1)";
+    let (server, browser) = both_with(echo, defs, "[sum_to(3), even(4), odd(3)]");
+    assert_eq!(server, "[6, true, true]");
+    assert_eq!(browser, server);
 }

@@ -136,9 +136,13 @@ fn to_sql(v: &Value) -> Sql {
     }
 }
 
-fn from_sql(v: ValueRef) -> Value {
+/// SQLite has no booleans: `true` is stored as 1. In a column declared
+/// `boolean` (or `bool`) 0 and 1 come back as `false` and `true`, since 0
+/// would be true in Quillo; elsewhere, such as `select x = 1`, they are ints.
+fn from_sql(v: ValueRef, is_bool: bool) -> Value {
     match v {
         ValueRef::Null => Value::Nil,
+        ValueRef::Integer(n @ (0 | 1)) if is_bool => Value::Bool(n == 1),
         ValueRef::Integer(n) => Value::Int(n),
         ValueRef::Real(f) => Value::Float(f),
         ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t)),
@@ -147,16 +151,25 @@ fn from_sql(v: ValueRef) -> Value {
 }
 
 /// Binds `?` parameters from the arguments, or `:name` parameters from a
-/// single map argument.
+/// single map argument. As with Postgres, every name needs a value and
+/// every key of the map must be a name in the query.
 fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> {
     if let [Value::Map(m)] = params {
         if stmt.parameter_count() > 0 && stmt.parameter_name(1).is_some() {
+            let mut bound = vec![false; stmt.parameter_count()];
             for (k, v) in m.iter() {
                 let name = if k.starts_with([':', '@', '$']) { k.clone() } else { format!(":{}", k) };
                 match stmt.parameter_index(&name).map_err(|e| e.to_string())? {
-                    Some(i) => stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?,
+                    Some(i) => {
+                        stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?;
+                        bound[i - 1] = true;
+                    }
                     None => return Err(format!("the query has no parameter {}", name)),
                 }
+            }
+            if let Some(i) = bound.iter().position(|b| !b) {
+                let name = stmt.parameter_name(i + 1).unwrap_or("?").to_string();
+                return Err(format!("no value for {}", name));
             }
             return Ok(());
         }
@@ -174,13 +187,17 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
 fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     bind(&mut stmt, params)?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let cols: Vec<(String, bool)> = stmt
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_string(), c.decl_type().map_or(false, |t| t.to_ascii_lowercase().starts_with("bool"))))
+        .collect();
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let mut m = Map::new();
-        for (i, c) in cols.iter().enumerate() {
-            m.insert(c.clone(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?));
+        for (i, (c, is_bool)) in cols.iter().enumerate() {
+            m.insert(c.clone(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *is_bool));
         }
         out.push(Value::map(m));
         if limit.map_or(false, |l| out.len() >= l) {

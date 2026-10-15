@@ -265,7 +265,8 @@ function meta(f, name, params) {
 // ---- patterns ----------------------------------------------------------
 // { k: "w" } wild, { k: "b", n } bind, { k: "l", v } literal, { k: "t", t } type,
 // { k: "a", ps } alternatives, { k: "as", p, n }, { k: "ls", ps, rest },
-// { k: "r", fs: [{ path, p, d }] } record (d: a default thunk or null).
+// { k: "r", fs: [{ path, p, d, ty }] } record (d: a default thunk or null;
+// ty: the field only tests a type, as in `page: int | null`, and binds its name).
 
 function getPath(v, path) {
   let cur = v;
@@ -309,13 +310,13 @@ function matchInto(p, v, b) {
           if (f.d) {
             x = f.d();
             // A default is taken as written, even `int = null`.
-            if (f.p.k === "t") { b[f.path[f.path.length - 1]] = x; continue; }
+            if (f.ty) { b[f.path[f.path.length - 1]] = x; continue; }
           } else if (x === undefined) return false;
           else x = null;
         }
         const before = Object.keys(b).length;
         if (!matchInto(f.p, x, b)) return false;
-        if (f.p.k === "t" && Object.keys(b).length === before) b[f.path[f.path.length - 1]] = x;
+        if (f.ty && Object.keys(b).length === before) b[f.path[f.path.length - 1]] = x;
       }
       return true;
     }
@@ -485,7 +486,9 @@ B.random_int = meta((lo, hi) => {
 B.uuid = meta(() => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
   : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }), "uuid", null);
 B.abs = meta((x) => Math.abs(N(x, "abs")), "abs", null);
-B.round = meta((x, d) => { N(x, "round"); if (d === undefined) return Math.round(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return Math.round(x * p) / p; }, "round", null);
+// Halves round away from zero, as on the server (Math.round(-2.5) is -2).
+const roundHalf = (x) => Math.sign(x) * Math.round(Math.abs(x));
+B.round = meta((x, d) => { N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
 B.floor = meta((x) => Math.floor(N(x, "floor")), "floor", null);
 B.ceil = meta((x) => Math.ceil(N(x, "ceil")), "ceil", null);
 B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
@@ -629,8 +632,11 @@ function liveChanged(j) {
 }
 
 async function liveRefresh(sub) {
+  // Only the latest load counts: an older one may answer last.
+  const n = (sub.loads = (sub.loads || 0) + 1);
   try {
     const { value, topics, seq, server, failed } = await rpcRaw(sub.fname, sub.args, true);
+    if (n !== sub.loads) return;
     // Keep showing the last good data; the next change tries again.
     if (failed) { report(value.error); return; }
     liveSeen(seq, server);
@@ -1041,9 +1047,17 @@ W.component = (name, params, render) => {
   C[name] = render;
   return render;
 };
-// `~name = live(fname, ...args)`: state that follows the server.
+// `~name = live(fname, ...args)`: state that follows the server. Each
+// render passes the arguments again; when they change (`live(load, id)`
+// after `id` changed), it loads again.
 W.live = (inst, name, fname, args) => {
-  if (inst.subs[name]) return;
+  const old = inst.subs[name];
+  if (old) {
+    if (eq(old.args, args)) return;
+    old.args = args;
+    liveRefresh(old);
+    return;
+  }
   const info = inst.liveInfo && inst.liveInfo[name];
   const sub = { inst, name, fname, args, topics: info ? info.t : [] };
   inst.subs[name] = sub;
