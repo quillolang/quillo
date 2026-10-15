@@ -1,0 +1,42 @@
+// Composition: views, components inside components, children, HTML props
+// (named slots), and callbacks from child to parent.
+
+view Card(title: str, children) =
+    <section.card><h2>{title}</h2>{children}</section>
+
+component Counter(label: str, start: int = 0, on_change = null) {
+    ~n = start
+    <p.counter>
+        <span.label>{label}</span>: <span.n>{n}</span>
+        <button @click={() => {
+            n += 1
+            on_change && on_change(n)
+        }}>+</button>
+    </p>
+}
+
+component Panel(header, children) {
+    ~open = true
+    <div.panel>
+        <div.header @click={() => { open = !open }}>{header}</div>
+        {open && <div.body>{children}</div>}
+    </div>
+}
+
+component Dashboard() {
+    ~total = 0
+    ~log = []
+    <Card title="Counters">
+        <Counter label="Apples" on_change={(v) => {
+            total = v
+            log = log + [`apples ${v}`]
+        }}/>
+        <Counter label="Pears" start={3}/>
+        <Panel header={<b>Details</b>}>
+            <p.total>Last change: {total}</p>
+            <ul>{for entry in log => <li>{entry}</li>}</ul>
+        </Panel>
+    </Card>
+}
+
+route GET / = <html><body><Dashboard/></body></html>

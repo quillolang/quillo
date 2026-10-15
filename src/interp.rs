@@ -1196,17 +1196,30 @@ impl Interp {
             return Ok(out);
         }
         // A component renders inside an island that carries its props and
-        // state to the browser, which takes over from there.
+        // state to the browser, which takes over from there. A component
+        // inside another one gets its props from its parent in the browser
+        // too, so only its state travels: its props may be anything,
+        // callbacks and HTML included.
+        let nested = !self.islands.is_empty();
         self.islands.push((Map::new(), Map::new()));
         let v = self.call_closure(&c, args, line);
         let (state, live) = self.islands.pop().unwrap_or_default();
         let v = v?;
+        let props = if nested { Map::new() } else { props };
         for (what, m) in [("prop", &props), ("state", &state)] {
             for (k, x) in m.iter() {
                 if let Some(bad) = not_sendable(x) {
                     return fail(
                         line,
-                        format!("{} `{}` of <{}> is {}, which cannot be sent to the browser", what, k, el.tag, bad),
+                        if what == "prop" {
+                            format!(
+                                "prop `{}` of <{}> is {}, which cannot be sent to the browser; \
+                                 pass it from inside another component, or use a server fn",
+                                k, el.tag, bad
+                            )
+                        } else {
+                            format!("{} `{}` of <{}> is {}, which cannot be sent to the browser", what, k, el.tag, bad)
+                        },
                     );
                 }
             }

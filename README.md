@@ -289,6 +289,47 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
   as `2`. Arithmetic gives the same results on both sides.
 
+### Composition
+
+Views and components nest like HTML: a capitalized tag renders another view or
+component, its attributes are the props, and what is between the tags arrives as the
+`children` parameter.
+
+```quillo
+view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
+
+component Counter(label: str, start: int = 0, on_change = null) {
+    ~n = start
+    <p>{label}: {n} <button @click={() => { n += 1; on_change && on_change(n) }}>+</button></p>
+}
+
+component Panel(header, children) {          // `header` is a named slot: any HTML
+    ~open = true
+    <div>
+        <div @click={() => { open = !open }}>{header}</div>
+        {open && children}
+    </div>
+}
+
+component Dashboard() {
+    ~total = 0
+    <Card title="Counters">
+        <Counter label="Apples" on_change={(v) => { total = v }}/>   // child to parent
+        <Counter label="Pears" start={3}/>
+        <Panel header={<b>Details</b>}><p>Last change: {total}</p></Panel>
+    </Card>
+}
+```
+
+- **Down:** props. **Up:** pass a function (`on_change`) and call it.
+- Each component keeps its own `~state`, also when its parent re-renders; give
+  components in a list a `key={...}` so each keeps its own.
+- Views are plain functions: they have no state and add nothing to the browser bundle
+  unless a component uses them.
+- A component placed directly in a page gets its props from the server, so they must
+  be data (no functions). Inside another component, props can be anything: callbacks,
+  HTML, other values.
+
 ### Live data
 
 `live(load, ...args)` makes component state follow the server: `load` (a `server fn`)

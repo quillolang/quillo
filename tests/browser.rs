@@ -138,3 +138,25 @@ fn infinite_scroll_renders_only_a_window_of_rows() {
     assert_eq!(r["afterFailure"], serde_json::json!({ "failed": true, "stuckLoading": false }), "{}", r);
     assert_eq!(r["recovered"], true, "{}", r);
 }
+
+/// Components inside components: callbacks from child to parent, HTML
+/// props (named slots), `children`, and each component's own state.
+#[test]
+fn components_compose() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("compose.qwe"), 24000 + (std::process::id() % 1000) as u16, Some(&dir.join("compose.js")));
+    let want = serde_json::json!({
+        "counts": ["2", "4"],
+        "total": "Last change: 2",
+        "log": ["apples 1", "apples 2"],
+        "header": "<b>Details</b>",
+        "closed": true,
+        "reopened": "Last change: 2",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
