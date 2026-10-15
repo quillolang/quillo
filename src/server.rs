@@ -2,8 +2,11 @@
 
 use crate::ast::Seg;
 use crate::interp::{coerce, Ctrl, Interp, Mode};
+use crate::shared::Shared;
 use crate::value::*;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub struct HttpRequest {
     pub method: String,
@@ -252,29 +255,179 @@ fn render_response(r: &Response) -> HttpResponse {
     HttpResponse { status: r.status, headers, body }
 }
 
-pub fn serve(interp: &mut Interp, addr: &str) -> Result<(), String> {
-    let server = tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
-    let n = interp.routes.len();
-    eprintln!("wisp: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, addr);
-    for mut rq in server.incoming_requests() {
+/// A program as currently loaded, or the error that stopped it from loading.
+pub enum Loaded {
+    Ready(Interp),
+    Failed(String),
+}
+
+/// The running program, which `--watch` swaps out when its files change.
+pub struct App {
+    slot: Mutex<(u64, Arc<Loaded>)>,
+    shared: Arc<Shared>,
+    main_file: PathBuf,
+    base_dir: PathBuf,
+    /// Development mode: reload on change and refresh open pages.
+    pub watch: bool,
+}
+
+impl App {
+    /// `loaded` must have been loaded with `shared`; the caller holds the lock.
+    pub fn new(loaded: Loaded, shared: Arc<Shared>, main_file: &Path, base_dir: &Path, watch: bool) -> Self {
+        App {
+            slot: Mutex::new((1, Arc::new(loaded))),
+            shared,
+            main_file: main_file.to_path_buf(),
+            base_dir: base_dir.to_path_buf(),
+            watch,
+        }
+    }
+
+    fn current(&self) -> (u64, Arc<Loaded>) {
+        let g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        (g.0, g.1.clone())
+    }
+
+    /// Loads the program again from disk and makes it current. A program that
+    /// fails to load does not replace one that works.
+    pub fn reload(&self) {
+        self.shared.gil.acquire();
+        let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
+        let res = it.load_file(&self.main_file);
+        self.shared.gil.release();
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match res {
+            Ok(_) => {
+                eprintln!("wisp: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
+                *slot = (slot.0 + 1, Arc::new(Loaded::Ready(it)));
+            }
+            Err(e) => {
+                eprintln!("wisp: {}", e);
+                if matches!(*slot.1, Loaded::Failed(_)) {
+                    *slot = (slot.0 + 1, Arc::new(Loaded::Failed(e.to_string())));
+                } else {
+                    eprintln!("wisp: still serving the previous version");
+                }
+            }
+        }
+    }
+
+    fn watched_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![self.main_file.clone()];
+        if let Loaded::Ready(it) = &*self.current().1 {
+            files.extend(it.files());
+        }
+        files
+    }
+}
+
+fn mtimes(files: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
+    files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect()
+}
+
+/// Polls the program's files and reloads it when one changes.
+fn watch(app: Arc<App>) {
+    let mut files = app.watched_files();
+    let mut seen = mtimes(&files);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = mtimes(&files);
+        if now != seen {
+            // Editors often write in several steps; let them finish.
+            std::thread::sleep(Duration::from_millis(50));
+            app.reload();
+            files = app.watched_files();
+            seen = mtimes(&files);
+        }
+    }
+}
+
+const DEV_SCRIPT: &str = "<script>(()=>{let v=null;setInterval(async()=>{try{const t=await (await fetch('/_wisp/dev')).text();if(v!==null&&t!==v)location.reload();v=t}catch(e){}},600)})()</script>";
+
+/// In watch mode, HTML pages get a script that reloads them after a change.
+fn inject_dev_script(resp: &mut HttpResponse) {
+    let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
+    if !html {
+        return;
+    }
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    resp.body = match body.rfind("</body>") {
+        Some(i) => format!("{}{}{}", &body[..i], DEV_SCRIPT, &body[i..]),
+        None => format!("{}{}", body, DEV_SCRIPT),
+    }
+    .into_bytes();
+}
+
+fn error_page(msg: &str, dev: bool) -> HttpResponse {
+    let mut r = HttpResponse {
+        status: 500,
+        headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+        body: format!(
+            "<!doctype html><title>Wisp error</title><body style=\"font-family:monospace\"><h1>The program did not load</h1><pre>{}</pre></body>",
+            crate::interp::escape(msg)
+        )
+        .into_bytes(),
+    };
+    if dev {
+        inject_dev_script(&mut r);
+    }
+    r
+}
+
+fn to_request(rq: &mut tiny_http::Request) -> HttpRequest {
+    let mut body = Vec::new();
+    let _ = rq.as_reader().read_to_end(&mut body);
+    HttpRequest {
+        method: rq.method().as_str().to_ascii_uppercase(),
+        url: rq.url().to_string(),
+        headers: rq.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect(),
+        body,
+        remote: rq.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
+    }
+}
+
+fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
+    let mut generation = 0;
+    let mut local: Option<Interp> = None;
+    let mut program = app.current().1;
+    while let Ok(mut rq) = server.recv() {
         let start = Instant::now();
-        let mut body = Vec::new();
-        let _ = rq.as_reader().read_to_end(&mut body);
-        let req = HttpRequest {
-            method: rq.method().as_str().to_ascii_uppercase(),
-            url: rq.url().to_string(),
-            headers: rq.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect(),
-            body,
-            remote: rq.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
+        let req = to_request(&mut rq);
+        let (g, current) = app.current();
+        if g != generation {
+            generation = g;
+            local = match &*current {
+                Loaded::Ready(it) => Some(it.fork()),
+                Loaded::Failed(_) => None,
+            };
+            program = current;
+        }
+        let mut resp = if app.watch && req.url == "/_wisp/dev" {
+            plain(200, &generation.to_string())
+        } else {
+            match (&mut local, &*program) {
+                (Some(it), _) => {
+                    app.shared.gil.acquire();
+                    let r = it.handle(&req);
+                    app.shared.gil.release();
+                    r
+                }
+                (None, Loaded::Failed(e)) => error_page(e, app.watch),
+                (None, Loaded::Ready(_)) => unreachable!(),
+            }
         };
-        let resp = interp.handle(&req);
-        eprintln!(
-            "{} {} -> {} ({:.1}ms)",
-            req.method,
-            req.url,
-            resp.status,
-            start.elapsed().as_secs_f64() * 1000.0
-        );
+        if app.watch {
+            inject_dev_script(&mut resp);
+        }
+        if req.url != "/_wisp/dev" {
+            eprintln!(
+                "{} {} -> {} ({:.1}ms)",
+                req.method,
+                req.url,
+                resp.status,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);
         for (k, v) in &resp.headers {
             if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
@@ -283,5 +436,50 @@ pub fn serve(interp: &mut Interp, addr: &str) -> Result<(), String> {
         }
         let _ = rq.respond(out);
     }
+}
+
+/// Serves the app with `workers` threads. The calling thread must hold the
+/// interpreter lock; it gives it up here.
+pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
+    let server = tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
+    let server = Arc::new(server);
+    let app = Arc::new(app);
+    if let Loaded::Ready(it) = &*app.current().1 {
+        let n = it.routes.len();
+        eprintln!("wisp: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, addr);
+    }
+    if app.watch {
+        eprintln!("wisp: watching for changes");
+    }
+    app.shared.gil.release();
+    let mut handles = Vec::new();
+    for i in 0..workers.max(1) {
+        let (app, server) = (app.clone(), server.clone());
+        let h = std::thread::Builder::new()
+            .name(format!("wisp-worker-{}", i))
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                worker(app, server)
+            })
+            .map_err(|e| format!("cannot start worker thread: {}", e))?;
+        handles.push(h);
+    }
+    if app.watch {
+        let app = app.clone();
+        std::thread::Builder::new()
+            .name("wisp-watch".into())
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                watch(app)
+            })
+            .map_err(|e| format!("cannot start file watcher: {}", e))?;
+    }
+    for h in handles {
+        let _ = h.join();
+    }
     Ok(())
 }
+
+/// Stack for threads that run Wisp code. Calls grow the stack on demand
+/// beyond this; it only has to cover deeply nested source and data.
+pub const WORKER_STACK: usize = 16 << 20;

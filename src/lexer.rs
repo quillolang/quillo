@@ -2,7 +2,7 @@
 //! reading characters directly for HTML literals and route paths.
 
 use crate::error::WispError;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrPart {
@@ -113,7 +113,7 @@ pub struct Token {
 
 #[derive(Clone)]
 pub struct Lexer {
-    chars: Rc<Vec<char>>,
+    chars: Arc<Vec<char>>,
     pub pos: usize,
     pub line: u32,
     /// Open brackets. Newlines are ignored inside `(` and `[`.
@@ -124,7 +124,7 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(src: &str, line: u32) -> Self {
-        Lexer { chars: Rc::new(src.chars().collect()), pos: 0, line, stack: Vec::new(), last: None }
+        Lexer { chars: Arc::new(src.chars().collect()), pos: 0, line, stack: Vec::new(), last: None }
     }
 
     pub fn peek_char(&self) -> Option<char> {

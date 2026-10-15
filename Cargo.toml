@@ -14,5 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 indexmap = "2"
+stacker = "0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"

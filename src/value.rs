@@ -1,10 +1,10 @@
 use crate::ast::FnDef;
 use crate::interp::{Ctrl, Interp};
 use indexmap::IndexMap;
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub type Map = IndexMap<String, Value>;
 pub type BuiltinFn = fn(&mut Interp, Vec<Value>, u32) -> Result<Value, Ctrl>;
@@ -15,20 +15,20 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(Rc<str>),
-    List(Rc<Vec<Value>>),
-    Map(Rc<Map>),
-    Func(Rc<Closure>),
+    Str(Arc<str>),
+    List(Arc<Vec<Value>>),
+    Map(Arc<Map>),
+    Func(Arc<Closure>),
     Builtin(&'static str, BuiltinFn),
     /// Already-rendered, safe HTML.
-    Html(Rc<str>),
-    Response(Rc<Response>),
+    Html(Arc<str>),
+    Response(Arc<Response>),
     /// An error value: `err(x)`, a failed `int("x")`, ...
-    Err(Rc<Value>),
+    Err(Arc<Value>),
 }
 
 pub struct Closure {
-    pub def: Rc<FnDef>,
+    pub def: Arc<FnDef>,
     pub env: Env,
 }
 
@@ -47,23 +47,23 @@ pub enum Body {
 
 impl Value {
     pub fn str(s: impl AsRef<str>) -> Value {
-        Value::Str(Rc::from(s.as_ref()))
+        Value::Str(Arc::from(s.as_ref()))
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(Rc::new(items))
+        Value::List(Arc::new(items))
     }
 
     pub fn map(m: Map) -> Value {
-        Value::Map(Rc::new(m))
+        Value::Map(Arc::new(m))
     }
 
     pub fn html(s: impl AsRef<str>) -> Value {
-        Value::Html(Rc::from(s.as_ref()))
+        Value::Html(Arc::from(s.as_ref()))
     }
 
     pub fn err(v: Value) -> Value {
-        Value::Err(Rc::new(v))
+        Value::Err(Arc::new(v))
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -189,7 +189,7 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
         (Map(x), Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| equal(v, w))),
         (Err(x), Err(y)) => equal(x, y),
-        (Func(x), Func(y)) => Rc::ptr_eq(x, y),
+        (Func(x), Func(y)) => Arc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -204,7 +204,7 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
 
 // ---- environments ------------------------------------------------------
 
-pub type Env = Rc<RefCell<Scope>>;
+pub type Env = Arc<Mutex<Scope>>;
 
 pub struct Scope {
     vars: HashMap<String, Value>,
@@ -213,11 +213,11 @@ pub struct Scope {
 
 impl Scope {
     pub fn root() -> Env {
-        Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent: None }))
+        Arc::new(Mutex::new(Scope { vars: HashMap::new(), parent: None }))
     }
 
     pub fn child(parent: &Env) -> Env {
-        Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent: Some(parent.clone()) }))
+        Arc::new(Mutex::new(Scope { vars: HashMap::new(), parent: Some(parent.clone()) }))
     }
 }
 
@@ -225,7 +225,7 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let s = cur.borrow();
+            let s = cur.lock().unwrap();
             if let Some(v) = s.vars.get(name) {
                 return Some(v.clone());
             }
@@ -236,7 +236,7 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
 }
 
 pub fn define(env: &Env, name: &str, v: Value) {
-    env.borrow_mut().vars.insert(name.to_string(), v);
+    env.lock().unwrap().vars.insert(name.to_string(), v);
 }
 
 /// Updates an existing variable in the nearest scope that has it.
@@ -244,7 +244,7 @@ pub fn assign(env: &Env, name: &str, v: Value) -> bool {
     let mut cur = env.clone();
     loop {
         let parent = {
-            let mut s = cur.borrow_mut();
+            let mut s = cur.lock().unwrap();
             if let Some(slot) = s.vars.get_mut(name) {
                 *slot = v;
                 return true;

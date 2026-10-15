@@ -3,7 +3,7 @@
 use crate::interp::{coerce, escape, fail, Ctrl, Interp};
 use crate::value::*;
 use std::path::{Component, Path};
-use std::rc::Rc;
+use std::sync::Arc;
 
 type R = Result<Value, Ctrl>;
 
@@ -56,6 +56,7 @@ pub fn install(env: &Env) {
         ("escape", escape_fn),
         ("env", env_var),
         ("now", now),
+        ("sleep", sleep),
         ("file", file),
         ("redirect", redirect),
         ("respond", respond),
@@ -86,14 +87,14 @@ fn want<T>(args: &[Value], i: usize, f: &str, what: &str, line: u32, get: impl F
     }
 }
 
-fn s_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Rc<str>, Ctrl> {
+fn s_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<str>, Ctrl> {
     want(args, i, f, "a str", line, |v| if let Value::Str(s) = v { Some(s.clone()) } else { None })
 }
 
-fn l_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Rc<Vec<Value>>, Ctrl> {
+fn l_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<Vec<Value>>, Ctrl> {
     want(args, i, f, "a list", line, |v| match v {
         Value::List(l) => Some(l.clone()),
-        Value::Nil => Some(Rc::new(Vec::new())),
+        Value::Nil => Some(Arc::new(Vec::new())),
         _ => None,
     })
 }
@@ -102,10 +103,10 @@ fn i_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<i64, Ctrl> {
     want(args, i, f, "an int", line, |v| if let Value::Int(n) = v { Some(*n) } else { None })
 }
 
-fn m_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Rc<Map>, Ctrl> {
+fn m_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<Map>, Ctrl> {
     want(args, i, f, "a map", line, |v| match v {
         Value::Map(m) => Some(m.clone()),
-        Value::Nil => Some(Rc::new(Map::new())),
+        Value::Nil => Some(Arc::new(Map::new())),
         _ => None,
     })
 }
@@ -183,7 +184,7 @@ fn trim(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "split", line)?;
-    let sep = if args.len() > 1 { s_arg(&args, 1, "split", line)? } else { Rc::from(" ") };
+    let sep = if args.len() > 1 { s_arg(&args, 1, "split", line)? } else { Arc::from(" ") };
     let parts: Vec<Value> = if sep.is_empty() {
         s.chars().map(|c| Value::str(c.to_string())).collect()
     } else {
@@ -194,7 +195,7 @@ fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn join(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "join", line)?;
-    let sep = if args.len() > 1 { s_arg(&args, 1, "join", line)? } else { Rc::from("") };
+    let sep = if args.len() > 1 { s_arg(&args, 1, "join", line)? } else { Arc::from("") };
     Ok(Value::str(l.iter().map(|v| v.display()).collect::<Vec<_>>().join(&sep)))
 }
 
@@ -401,7 +402,7 @@ fn push(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let item = if args.len() > 1 { args.remove(1) } else { Value::Nil };
     let l = l_arg(&args, 0, "push", line)?;
     drop(args);
-    let mut v = Rc::unwrap_or_clone(l);
+    let mut v = Arc::unwrap_or_clone(l);
     v.push(item);
     Ok(Value::list(v))
 }
@@ -442,7 +443,7 @@ fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = m_arg(&args, 0, "set", line)?;
-    let mut m = Rc::unwrap_or_clone(m);
+    let mut m = Arc::unwrap_or_clone(m);
     m.insert(arg(&args, 1).display(), arg(&args, 2));
     Ok(Value::map(m))
 }
@@ -454,7 +455,7 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(Value::list(l.iter().filter(|v| !equal(v, &x)).cloned().collect()))
         }
         _ => {
-            let mut m = Rc::unwrap_or_clone(m_arg(&args, 0, "remove", line)?);
+            let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "remove", line)?);
             m.shift_remove(&arg(&args, 1).display());
             Ok(Value::map(m))
         }
@@ -462,7 +463,7 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn merge(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let mut m = Rc::unwrap_or_clone(m_arg(&args, 0, "merge", line)?);
+    let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "merge", line)?);
     for (k, v) in m_arg(&args, 1, "merge", line)?.iter() {
         m.insert(k.clone(), v.clone());
     }
@@ -509,6 +510,21 @@ fn now(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
     Ok(Value::Int(ms))
 }
 
+/// `sleep(ms)`: waits without blocking other requests.
+fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let ms = match arg(&args, 0) {
+        Value::Int(n) if n >= 0 => n as u64,
+        Value::Float(f) if f >= 0.0 => f as u64,
+        other => return fail(line, format!("`sleep` expects milliseconds (a number >= 0), got {}", short_type(&other))),
+    };
+    it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(ms)));
+    Ok(Value::Nil)
+}
+
+fn short_type(v: &Value) -> &'static str {
+    v.type_name()
+}
+
 fn mime(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
@@ -530,7 +546,7 @@ fn mime(path: &Path) -> &'static str {
 }
 
 fn not_found() -> Value {
-    Value::Response(Rc::new(Response { status: 404, headers: Vec::new(), body: Body::Value(Value::str("not found")) }))
+    Value::Response(Arc::new(Response { status: 404, headers: Vec::new(), body: Body::Value(Value::str("not found")) }))
 }
 
 /// `file("public/app.css")`: serves a file relative to the program's folder.
@@ -546,7 +562,7 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(not_found());
     }
     match std::fs::read(&full) {
-        Ok(bytes) => Ok(Value::Response(Rc::new(Response {
+        Ok(bytes) => Ok(Value::Response(Arc::new(Response {
             status: 200,
             headers: vec![("content-type".into(), mime(&full).into())],
             body: Body::Bytes(bytes),
@@ -560,7 +576,7 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let url = s_arg(&args, 0, "redirect", line)?;
     let status = if args.len() > 1 { i_arg(&args, 1, "redirect", line)? as u16 } else { 303 };
-    Ok(Value::Response(Rc::new(Response {
+    Ok(Value::Response(Arc::new(Response {
         status,
         headers: vec![("location".into(), url.to_string())],
         body: Body::Value(Value::Nil),
@@ -574,7 +590,7 @@ fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`respond` status must be 100-599, got {}", status));
     }
     let headers = m_arg(&args, 2, "respond", line)?;
-    Ok(Value::Response(Rc::new(Response {
+    Ok(Value::Response(Arc::new(Response {
         status: status as u16,
         headers: headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect(),
         body: Body::Value(arg(&args, 1)),

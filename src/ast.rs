@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum Lit {
@@ -6,7 +6,7 @@ pub enum Lit {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(Rc<str>),
+    Str(Arc<str>),
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ pub enum Expr {
     Match(Box<Expr>, Vec<Arm>, u32),
     For(Pattern, Box<Expr>, Box<Expr>, u32),
     Block(Vec<Stmt>),
-    Lambda(Rc<FnDef>),
+    Lambda(Arc<FnDef>),
     /// `reply status [body]`: finish the current request immediately.
     Reply(Box<Expr>, Option<Box<Expr>>, u32),
     Html(Box<HtmlEl>, u32),
@@ -171,8 +171,8 @@ pub enum Stmt {
     Let(Pattern, Expr, u32),
     Assign(String, AssignOp, Expr, u32),
     Expr(Expr),
-    Fn(Rc<FnDef>),
-    Route(Rc<RouteDef>),
+    Fn(Arc<FnDef>),
+    Route(Arc<RouteDef>),
     Use(String, u32),
     Return(Option<Expr>),
 }

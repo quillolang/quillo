@@ -213,3 +213,10 @@ fn json_module() {
     assert_eq!(ev(r#"json.stringify({ a: 1, b: [true] })"#), r#""{\"a\":1,\"b\":[true]}""#);
     assert_eq!(ev(r#"is_err(json.parse("\{"))"#), "true");
 }
+
+#[test]
+fn runaway_recursion_is_an_error_not_a_crash() {
+    let e = ev_err("fn down(n) = 1 + down(n - 1)\ndown(1)");
+    assert!(e.contains("too much recursion") && e.contains("`down`"), "{}", e);
+    assert_eq!(ev("fn down(n) = if n == 0 then 0 else 1 + down(n - 1)\ndown(100)"), "100");
+}

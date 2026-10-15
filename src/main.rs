@@ -3,6 +3,7 @@ use std::path::Path;
 use wisp::ast::Stmt;
 use wisp::interp::Ctrl;
 use wisp::parser::Parser;
+use wisp::server::{App, Loaded};
 use wisp::{Interp, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -11,19 +12,25 @@ const USAGE: &str = "\
 Wisp — a small web language
 
 usage:
-  wisp run <file.wisp> [--host H] [--port N]   run a program; serve it if it has routes
+  wisp run <file.wisp> [options]               run a program; serve it if it has routes
   wisp check <file.wisp>                       parse only, report errors
   wisp repl                                    interactive prompt
   wisp <file.wisp>                             same as `wisp run`
 
-The port defaults to $PORT, then 8080. The host defaults to 127.0.0.1.";
+options for `run`:
+  --port N       port to listen on (default $PORT, then 8080)
+  --host H       address to listen on (default 127.0.0.1)
+  --workers N    request threads (default 8)
+  --watch, -w    reload when the program's files change, and refresh open pages";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Deeply recursive programs need more stack than the main thread has.
+    // Run on a thread with a roomy stack (see WORKER_STACK).
     let child = std::thread::Builder::new()
-        .stack_size(256 << 20)
-        .spawn(move || real_main(args))
+        .stack_size(wisp::server::WORKER_STACK)
+        .spawn(move || {
+            real_main(args)
+        })
         .expect("cannot start interpreter thread");
     std::process::exit(child.join().unwrap_or(1));
 }
@@ -60,11 +67,26 @@ fn usage() -> i32 {
 fn run(file: &str, flags: &[String]) -> i32 {
     let mut host = "127.0.0.1".to_string();
     let mut port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
+    let mut workers = 8;
+    let mut watch = false;
     let mut i = 0;
     while i < flags.len() {
-        match (flags[i].as_str(), flags.get(i + 1)) {
+        let value = flags.get(i + 1);
+        match (flags[i].as_str(), value) {
+            ("--watch" | "-w", _) => {
+                watch = true;
+                i += 1;
+                continue;
+            }
             ("--host", Some(v)) => host = v.clone(),
             ("--port", Some(v)) => port = v.clone(),
+            ("--workers", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => workers = n,
+                _ => {
+                    eprintln!("wisp: --workers needs a positive number");
+                    return 2;
+                }
+            },
             (other, _) => {
                 eprintln!("wisp: unknown option `{}`", other);
                 return 2;
@@ -76,14 +98,24 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let path = Path::new(file);
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut interp = Interp::new(base);
-    if let Err(e) = interp.load_file(path) {
-        eprintln!("wisp: {}", e);
-        return 1;
+    let shared = interp.shared.clone();
+    let loaded = match interp.load_file(path) {
+        Ok(_) => Loaded::Ready(interp),
+        Err(e) => {
+            eprintln!("wisp: {}", e);
+            if !watch {
+                return 1;
+            }
+            Loaded::Failed(e.to_string())
+        }
+    };
+    if let Loaded::Ready(it) = &loaded {
+        if it.routes.is_empty() && !watch {
+            return 0;
+        }
     }
-    if interp.routes.is_empty() {
-        return 0;
-    }
-    match wisp::server::serve(&mut interp, &format!("{}:{}", host, port)) {
+    let app = App::new(loaded, shared, path, base, watch);
+    match wisp::server::serve(app, &format!("{}:{}", host, port), workers) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("wisp: {}", e);

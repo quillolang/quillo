@@ -7,6 +7,7 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 pub mod server;
+pub mod shared;
 pub mod value;
 
 pub use error::WispError;

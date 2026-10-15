@@ -5,7 +5,7 @@
 use crate::ast::*;
 use crate::error::WispError;
 use crate::lexer::{Lexer, StrPart, Tok, Token};
-use std::rc::Rc;
+use std::sync::Arc;
 
 type PResult<T> = Result<T, WispError>;
 
@@ -196,13 +196,13 @@ impl Parser {
                     if let Tok::Ident(_) = self.peek()? {
                         let name = self.expect_ident("a function name")?;
                         let def = self.parse_fn_rest(name, line)?;
-                        return Ok(Stmt::Fn(Rc::new(def)));
+                        return Ok(Stmt::Fn(Arc::new(def)));
                     }
                     self.restore(saved);
                 }
                 "route" => {
                     self.next()?;
-                    return Ok(Stmt::Route(Rc::new(self.parse_route(line)?)));
+                    return Ok(Stmt::Route(Arc::new(self.parse_route(line)?)));
                 }
                 "use" => {
                     self.next()?;
@@ -628,7 +628,7 @@ impl Parser {
                 "for" => self.parse_for(line),
                 "fn" => {
                     let def = self.parse_fn_rest("<fn>".into(), line)?;
-                    Ok(Expr::Lambda(Rc::new(def)))
+                    Ok(Expr::Lambda(Arc::new(def)))
                 }
                 "reply" => self.parse_reply(line),
                 kw if KEYWORDS.contains(&kw) => Err(WispError::new(format!("unexpected keyword `{}`", kw), line)),

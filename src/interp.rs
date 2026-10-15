@@ -3,16 +3,17 @@
 use crate::ast::*;
 use crate::error::WispError;
 use crate::parser::{Parser, VOID_TAGS};
+use crate::shared::Shared;
 use crate::value::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Non-local exits: runtime errors, `return` (and `?`), and `reply`.
 pub enum Ctrl {
     Error(WispError),
     Return(Value),
-    Reply(Rc<Response>),
+    Reply(Arc<Response>),
 }
 
 impl From<WispError> for Ctrl {
@@ -41,10 +42,16 @@ pub enum Mode {
 
 pub struct Interp {
     pub globals: Env,
-    pub routes: Vec<Rc<RouteDef>>,
+    pub routes: Vec<Arc<RouteDef>>,
     pub base_dir: PathBuf,
     loaded: HashSet<PathBuf>,
+    pub shared: Arc<Shared>,
+    /// Calls in progress on this thread, to stop runaway recursion cleanly.
+    depth: usize,
 }
+
+/// Deepest call nesting allowed before a "too much recursion" error.
+pub const MAX_DEPTH: usize = 10_000;
 
 pub fn lit_value(l: &Lit) -> Value {
     match l {
@@ -156,12 +163,12 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
             (x, Str(y)) => Ok(Value::str(format!("{}{}", x.display(), y))),
             (Html(x), Html(y)) => Ok(Value::html(format!("{}{}", x, y))),
             (List(x), List(y)) => {
-                let mut v = Rc::unwrap_or_clone(x);
+                let mut v = Arc::unwrap_or_clone(x);
                 v.extend(y.iter().cloned());
                 Ok(Value::list(v))
             }
             (Map(x), Map(y)) => {
-                let mut m = Rc::unwrap_or_clone(x);
+                let mut m = Arc::unwrap_or_clone(x);
                 for (k, v) in y.iter() {
                     m.insert(k.clone(), v.clone());
                 }
@@ -225,10 +232,44 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
 }
 
 impl Interp {
+    /// A new interpreter. The calling thread holds its lock (see `shared`).
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self::with_shared(base_dir, Arc::new(Shared::new()))
+    }
+
+    /// A new interpreter using an existing lock, for reloading a program
+    /// while other threads keep serving. The caller must hold the lock.
+    pub fn with_shared(base_dir: impl Into<PathBuf>, shared: Arc<Shared>) -> Self {
         let globals = Scope::root();
         crate::builtins::install(&globals);
-        Interp { globals, routes: Vec::new(), base_dir: base_dir.into(), loaded: HashSet::new() }
+        Interp { globals, routes: Vec::new(), base_dir: base_dir.into(), loaded: HashSet::new(), shared, depth: 0 }
+    }
+
+    /// Another handle on the same program for a worker thread: globals,
+    /// routes and the lock are shared.
+    pub fn fork(&self) -> Interp {
+        Interp {
+            globals: self.globals.clone(),
+            routes: self.routes.clone(),
+            base_dir: self.base_dir.clone(),
+            loaded: self.loaded.clone(),
+            shared: self.shared.clone(),
+            depth: 0,
+        }
+    }
+
+    /// The source files this program has loaded (the main file and `use`d files).
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.loaded.iter().cloned().collect()
+    }
+
+    /// Runs `f` without holding the interpreter lock, so other requests can
+    /// run while this one waits. `f` must not touch Wisp values.
+    pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        self.shared.gil.release();
+        let r = f();
+        self.shared.gil.acquire();
+        r
     }
 
     /// Parses and runs a program's top level, registering its routes.
@@ -289,7 +330,7 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::Fn(def) => {
-                define(env, &def.name, Value::Func(Rc::new(Closure { def: def.clone(), env: env.clone() })));
+                define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
                 Ok(Value::Nil)
             }
             Stmt::Route(r) => {
@@ -321,48 +362,13 @@ impl Interp {
         }
     }
 
+    /// Evaluates an expression. Only the cheap cases are handled inline; the
+    /// rest live in separate functions so that each nested call uses little
+    /// stack (deep recursion in Wisp is deep recursion here).
     pub fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
         match e {
             Expr::Lit(l) => Ok(lit_value(l)),
-            Expr::Template(parts) => {
-                let mut s = String::new();
-                for p in parts {
-                    match p {
-                        TPart::Lit(t) => s.push_str(t),
-                        TPart::Expr(x) => s.push_str(&self.eval(x, env)?.display()),
-                    }
-                }
-                Ok(Value::str(s))
-            }
             Expr::Ident(n, line) => lookup(env, n).ok_or_else(|| undefined(n, *line)),
-            Expr::List(items) => {
-                let mut v = Vec::with_capacity(items.len());
-                for i in items {
-                    v.push(self.eval(i, env)?);
-                }
-                Ok(Value::list(v))
-            }
-            Expr::Map(entries) => {
-                let mut m = Map::new();
-                for (k, x) in entries {
-                    let v = self.eval(x, env)?;
-                    m.insert(k.clone(), v);
-                }
-                Ok(Value::map(m))
-            }
-            Expr::Unary(op, x, line) => {
-                let v = self.eval(x, env)?;
-                match op {
-                    UnOp::Not => Ok(Value::Bool(!v.truthy())),
-                    UnOp::Neg => match v {
-                        Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
-                            Ctrl::Error(WispError::new("integer overflow", *line))
-                        }),
-                        Value::Float(f) => Ok(Value::Float(-f)),
-                        o => fail(*line, format!("cannot negate {}", o.type_name())),
-                    },
-                }
-            }
             Expr::Binary(BinOp::And, a, b, _) => {
                 if !self.eval(a, env)?.truthy() {
                     return Ok(Value::Bool(false));
@@ -388,42 +394,11 @@ impl Interp {
                     Ok(v)
                 }
             }
-            Expr::Pipe(lhs, rhs, line) => {
-                let v = self.eval(lhs, env)?;
-                match &**rhs {
-                    Expr::Call(callee, args, l) => self.eval_call(callee, args, Some(v), env, *l),
-                    other => {
-                        let f = self.eval(other, env)?;
-                        self.call(&f, vec![v], *line)
-                    }
-                }
-            }
+            Expr::Pipe(lhs, rhs, line) => self.eval_pipe(lhs, rhs, env, *line),
             Expr::Call(callee, args, line) => self.eval_call(callee, args, None, env, *line),
             Expr::Field(obj, name, line) => {
                 let v = self.eval(obj, env)?;
                 self.get_field(v, name, *line)
-            }
-            Expr::Index(obj, idx, line) => {
-                let o = self.eval(obj, env)?;
-                let i = self.eval(idx, env)?;
-                match (&o, &i) {
-                    (Value::List(l), Value::Int(n)) => {
-                        let n = if *n < 0 { l.len() as i64 + n } else { *n };
-                        Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
-                    }
-                    (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
-                    (Value::Str(s), Value::Int(n)) => {
-                        let len = s.chars().count() as i64;
-                        let n = if *n < 0 { len + n } else { *n };
-                        Ok(if n >= 0 {
-                            s.chars().nth(n as usize).map(|c| Value::str(c.to_string())).unwrap_or(Value::Nil)
-                        } else {
-                            Value::Nil
-                        })
-                    }
-                    (Value::Nil, _) => Ok(Value::Nil),
-                    _ => fail(*line, format!("cannot index {} with {}", o.type_name(), i.type_name())),
-                }
             }
             Expr::Try(x) => {
                 let v = self.eval(x, env)?;
@@ -442,77 +417,179 @@ impl Interp {
                     Ok(Value::Nil)
                 }
             }
-            Expr::Match(subj, arms, line) => {
-                let v = self.eval(subj, env)?;
-                for arm in arms {
-                    let mut binds = Vec::new();
-                    if self.match_pat(&arm.pat, &v, Mode::Strict, env, &mut binds)?.is_none() {
-                        continue;
-                    }
-                    let scope = Scope::child(env);
-                    for (n, x) in binds {
-                        define(&scope, &n, x);
-                    }
-                    if let Some(g) = &arm.guard {
-                        if !self.eval(g, &scope)?.truthy() {
-                            continue;
-                        }
-                    }
-                    return self.eval(&arm.body, &scope);
-                }
-                fail(*line, format!("no `match` arm matches {}", short(&v)))
-            }
-            Expr::For(pat, iter, body, line) => {
-                let it = self.eval(iter, env)?;
-                let items: Vec<Value> = match &it {
-                    Value::List(l) => l.to_vec(),
-                    Value::Map(m) => m.iter().map(|(k, v)| Value::list(vec![Value::str(k), v.clone()])).collect(),
-                    Value::Str(s) => s.chars().map(|c| Value::str(c.to_string())).collect(),
-                    Value::Nil => Vec::new(),
-                    other => return fail(*line, format!("cannot loop over {}", other.type_name())),
-                };
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    let scope = Scope::child(env);
-                    let mut binds = Vec::new();
-                    if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
-                        return fail(*line, format!("`for` pattern does not match {}", short(&item)));
-                    }
-                    for (n, x) in binds {
-                        define(&scope, &n, x);
-                    }
-                    out.push(self.eval(body, &scope)?);
-                }
-                Ok(Value::list(out))
-            }
-            Expr::Block(stmts) => {
-                let scope = Scope::child(env);
-                let mut last = Value::Nil;
-                for s in stmts {
-                    last = self.exec_stmt(s, &scope)?;
-                }
-                Ok(last)
-            }
-            Expr::Lambda(def) => Ok(Value::Func(Rc::new(Closure { def: def.clone(), env: env.clone() }))),
-            Expr::Reply(status, body, line) => {
-                let code = match self.eval(status, env)? {
-                    Value::Int(n) if (100..=599).contains(&n) => n as u16,
-                    other => {
-                        return fail(*line, format!("reply status must be an HTTP status code, got {}", short(&other)))
-                    }
-                };
-                let body = match body {
-                    Some(b) => self.eval(b, env)?,
-                    None => Value::Nil,
-                };
-                let resp = match body {
-                    Value::Response(r) => Response { status: code, ..(*r).clone() },
-                    b => Response { status: code, headers: Vec::new(), body: Body::Value(b) },
-                };
-                Err(Ctrl::Reply(Rc::new(resp)))
-            }
-            Expr::Html(el, _) => Ok(Value::html(self.render_el(el, env)?)),
+            Expr::Block(stmts) => self.eval_block(stmts, env),
+            Expr::Lambda(def) => Ok(Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() }))),
+            Expr::Template(parts) => self.eval_template(parts, env),
+            Expr::List(items) => self.eval_list(items, env),
+            Expr::Map(entries) => self.eval_map(entries, env),
+            Expr::Unary(op, x, line) => self.eval_unary(*op, x, env, *line),
+            Expr::Index(obj, idx, line) => self.eval_index(obj, idx, env, *line),
+            Expr::Match(subj, arms, line) => self.eval_match(subj, arms, env, *line),
+            Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line),
+            Expr::Reply(status, body, line) => self.eval_reply(status, body.as_deref(), env, *line),
+            Expr::Html(el, _) => self.eval_html(el, env),
         }
+    }
+
+    #[inline(never)]
+    fn eval_pipe(&mut self, lhs: &Expr, rhs: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let v = self.eval(lhs, env)?;
+        match rhs {
+            Expr::Call(callee, args, l) => self.eval_call(callee, args, Some(v), env, *l),
+            other => {
+                let f = self.eval(other, env)?;
+                self.call(&f, vec![v], line)
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn eval_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Value, Ctrl> {
+        let scope = Scope::child(env);
+        let mut last = Value::Nil;
+        for s in stmts {
+            last = self.exec_stmt(s, &scope)?;
+        }
+        Ok(last)
+    }
+
+    #[inline(never)]
+    fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
+        let mut s = String::new();
+        for p in parts {
+            match p {
+                TPart::Lit(t) => s.push_str(t),
+                TPart::Expr(x) => s.push_str(&self.eval(x, env)?.display()),
+            }
+        }
+        Ok(Value::str(s))
+    }
+
+    #[inline(never)]
+    fn eval_list(&mut self, items: &[Expr], env: &Env) -> Result<Value, Ctrl> {
+        let mut v = Vec::with_capacity(items.len());
+        for i in items {
+            v.push(self.eval(i, env)?);
+        }
+        Ok(Value::list(v))
+    }
+
+    #[inline(never)]
+    fn eval_map(&mut self, entries: &[(String, Expr)], env: &Env) -> Result<Value, Ctrl> {
+        let mut m = Map::new();
+        for (k, x) in entries {
+            let v = self.eval(x, env)?;
+            m.insert(k.clone(), v);
+        }
+        Ok(Value::map(m))
+    }
+
+    #[inline(never)]
+    fn eval_unary(&mut self, op: UnOp, x: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let v = self.eval(x, env)?;
+        match op {
+            UnOp::Not => Ok(Value::Bool(!v.truthy())),
+            UnOp::Neg => match v {
+                Value::Int(n) => {
+                    n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(WispError::new("integer overflow", line)))
+                }
+                Value::Float(f) => Ok(Value::Float(-f)),
+                o => fail(line, format!("cannot negate {}", o.type_name())),
+            },
+        }
+    }
+
+    #[inline(never)]
+    fn eval_index(&mut self, obj: &Expr, idx: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let o = self.eval(obj, env)?;
+        let i = self.eval(idx, env)?;
+        match (&o, &i) {
+            (Value::List(l), Value::Int(n)) => {
+                let n = if *n < 0 { l.len() as i64 + n } else { *n };
+                Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
+            }
+            (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
+            (Value::Str(s), Value::Int(n)) => {
+                let len = s.chars().count() as i64;
+                let n = if *n < 0 { len + n } else { *n };
+                Ok(if n >= 0 {
+                    s.chars().nth(n as usize).map(|c| Value::str(c.to_string())).unwrap_or(Value::Nil)
+                } else {
+                    Value::Nil
+                })
+            }
+            (Value::Nil, _) => Ok(Value::Nil),
+            _ => fail(line, format!("cannot index {} with {}", o.type_name(), i.type_name())),
+        }
+    }
+
+    #[inline(never)]
+    fn eval_match(&mut self, subj: &Expr, arms: &[Arm], env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let v = self.eval(subj, env)?;
+        for arm in arms {
+            let mut binds = Vec::new();
+            if self.match_pat(&arm.pat, &v, Mode::Strict, env, &mut binds)?.is_none() {
+                continue;
+            }
+            let scope = Scope::child(env);
+            for (n, x) in binds {
+                define(&scope, &n, x);
+            }
+            if let Some(g) = &arm.guard {
+                if !self.eval(g, &scope)?.truthy() {
+                    continue;
+                }
+            }
+            return self.eval(&arm.body, &scope);
+        }
+        fail(line, format!("no `match` arm matches {}", short(&v)))
+    }
+
+    #[inline(never)]
+    fn eval_for(&mut self, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let it = self.eval(iter, env)?;
+        let items: Vec<Value> = match &it {
+            Value::List(l) => l.to_vec(),
+            Value::Map(m) => m.iter().map(|(k, v)| Value::list(vec![Value::str(k), v.clone()])).collect(),
+            Value::Str(s) => s.chars().map(|c| Value::str(c.to_string())).collect(),
+            Value::Nil => Vec::new(),
+            other => return fail(line, format!("cannot loop over {}", other.type_name())),
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let scope = Scope::child(env);
+            let mut binds = Vec::new();
+            if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
+                return fail(line, format!("`for` pattern does not match {}", short(&item)));
+            }
+            for (n, x) in binds {
+                define(&scope, &n, x);
+            }
+            out.push(self.eval(body, &scope)?);
+        }
+        Ok(Value::list(out))
+    }
+
+    #[inline(never)]
+    fn eval_reply(&mut self, status: &Expr, body: Option<&Expr>, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let code = match self.eval(status, env)? {
+            Value::Int(n) if (100..=599).contains(&n) => n as u16,
+            other => return fail(line, format!("reply status must be an HTTP status code, got {}", short(&other))),
+        };
+        let body = match body {
+            Some(b) => self.eval(b, env)?,
+            None => Value::Nil,
+        };
+        let resp = match body {
+            Value::Response(r) => Response { status: code, ..(*r).clone() },
+            b => Response { status: code, headers: Vec::new(), body: Body::Value(b) },
+        };
+        Err(Ctrl::Reply(Arc::new(resp)))
+    }
+
+    #[inline(never)]
+    fn eval_html(&mut self, el: &HtmlEl, env: &Env) -> Result<Value, Ctrl> {
+        Ok(Value::html(self.render_el(el, env)?))
     }
 
     /// Calls `callee(args)`, with `pre` (the left side of `|>`) as the first
@@ -624,6 +701,17 @@ impl Interp {
                 ),
             );
         }
+        if self.depth >= MAX_DEPTH {
+            return fail(line, format!("too much recursion (more than {} nested calls) in `{}`", MAX_DEPTH, def.name));
+        }
+        self.depth += 1;
+        // Grow the stack on demand, so deep recursion works on any thread.
+        let r = stacker::maybe_grow(128 << 10, 4 << 20, || self.call_closure_inner(c, &def, args, line));
+        self.depth -= 1;
+        r
+    }
+
+    fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         let scope = Scope::child(&c.env);
         let mut it = args.into_iter();
         for p in &def.params {
