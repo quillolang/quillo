@@ -151,17 +151,28 @@ fn get_path(v: &Value, path: &[String]) -> Option<Value> {
 
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
+    escape_into(s, &mut out);
     out
+}
+
+/// `escape`, appending to `out`: runs without special characters are
+/// copied whole.
+pub fn escape_into(s: &str, out: &mut String) {
+    let mut done = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let entity = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            b'\'' => "&#39;",
+            _ => continue,
+        };
+        out.push_str(&s[done..i]);
+        out.push_str(entity);
+        done = i + 1;
+    }
+    out.push_str(&s[done..]);
 }
 
 /// Attributes whose value the browser may load or run as a URL.
@@ -206,7 +217,12 @@ fn render_value(v: &Value, out: &mut String) {
                 render_value(i, out);
             }
         }
-        other => out.push_str(&escape(&other.display())),
+        Value::Str(s) => escape_into(s, out),
+        Value::Int(n) => {
+            use std::fmt::Write;
+            let _ = write!(out, "{}", n);
+        }
+        other => escape_into(&other.display(), out),
     }
 }
 
@@ -944,7 +960,34 @@ impl Interp {
     /// `args[i] == None` means "not given": the parameter's default is used.
     pub fn call_closure(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
-        if args.len() > def.params.len() {
+        let r = self.enter_call(&def, args.len(), line, |this| this.call_closure_inner(c, &def, args, line))?;
+        if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
+            if !type_matches(ety, payload) {
+                return fail(
+                    def.line,
+                    format!(
+                        "`{}` declares errors as `! {}`, but returned err({})",
+                        def.name,
+                        ety.text(),
+                        short(payload)
+                    ),
+                );
+            }
+        }
+        Ok(r)
+    }
+
+    /// What every call of a Quillo function goes through: the argument
+    /// count, the recursion limit, `with` effects and stack growth, around
+    /// `body`.
+    fn enter_call<R>(
+        &mut self,
+        def: &Arc<FnDef>,
+        nargs: usize,
+        line: u32,
+        body: impl FnOnce(&mut Self) -> Result<R, Ctrl>,
+    ) -> Result<R, Ctrl> {
+        if nargs > def.params.len() {
             return fail(
                 line,
                 format!(
@@ -952,7 +995,7 @@ impl Interp {
                     def.name,
                     def.params.len(),
                     if def.params.len() == 1 { "" } else { "s" },
-                    args.len()
+                    nargs
                 ),
             );
         }
@@ -973,27 +1016,13 @@ impl Interp {
         };
         self.depth += 1;
         // Grow the stack on demand, so deep recursion works on any thread.
-        let r = stacker::maybe_grow(128 << 10, 4 << 20, || self.call_closure_inner(c, &def, args, line));
+        let r = stacker::maybe_grow(128 << 10, 4 << 20, || body(self));
         self.depth -= 1;
         if let Some((mask, who)) = saved {
             self.allowed = mask;
             self.restrictor = who;
         }
-        let r = r?;
-        if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
-            if !type_matches(ety, payload) {
-                return fail(
-                    def.line,
-                    format!(
-                        "`{}` declares errors as `! {}`, but returned err({})",
-                        def.name,
-                        ety.text(),
-                        short(payload)
-                    ),
-                );
-            }
-        }
-        Ok(r)
+        r
     }
 
     /// "`http.get` needs the http effect, but `load` is declared `with db`".
@@ -1022,6 +1051,25 @@ impl Interp {
     }
 
     fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        let scope = self.bind_args(c, def, args, line)?;
+        let r = match self.eval(&def.body, &scope) {
+            Ok(v) | Err(Ctrl::Return(v)) => v,
+            Err(e) => return Err(e),
+        };
+        if let Some(ty) = &def.ret {
+            if !matches!(r, Value::Err(_)) && !type_matches(ty, &r) {
+                return fail(
+                    def.line,
+                    format!("`{}` must return {}, but returned {} {}", def.name, ty_text(ty), r.type_name(), short(&r)),
+                );
+            }
+        }
+        Ok(r)
+    }
+
+    /// A scope for a call of `c` with its parameters set from `args` (and
+    /// defaults), checked against their types.
+    fn bind_args(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
         if def.server {
             if let Some(req) = &self.current_request {
@@ -1054,19 +1102,154 @@ impl Interp {
             }
             define(&scope, &p.name, v);
         }
-        let r = match self.eval(&def.body, &scope) {
-            Ok(v) | Err(Ctrl::Return(v)) => v,
-            Err(e) => return Err(e),
-        };
-        if let Some(ty) = &def.ret {
-            if !matches!(r, Value::Err(_)) && !type_matches(ty, &r) {
-                return fail(
-                    def.line,
-                    format!("`{}` must return {}, but returned {} {}", def.name, ty_text(ty), r.type_name(), short(&r)),
-                );
+        Ok(scope)
+    }
+
+    /// Calls `c` and renders what it returns into `out`, writing its HTML
+    /// as it goes (see `render_expr_into`).
+    fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
+        let def = c.def.clone();
+        // A declared result type is checked on the value.
+        if def.ret.is_some() || def.err.is_some() {
+            let v = self.call_closure(c, args, line)?;
+            render_value(&v, out);
+            return Ok(());
+        }
+        self.enter_call(&def, args.len(), line, |this| {
+            let scope = this.bind_args(c, &def, args, line)?;
+            let start = out.len();
+            match this.render_expr_into(&def.body, &scope, out) {
+                Ok(()) => Ok(()),
+                // `return` (or `?`) part-way: the result is that value alone.
+                Err(Ctrl::Return(v)) => {
+                    out.truncate(start);
+                    render_value(&v, out);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    // ---- rendering straight into the page -----------------------------
+    //
+    // `render_expr_into(e)` writes what `render_value(eval(e))` would, without
+    // building the value first: elements, loops, conditionals and view calls
+    // write their HTML into one buffer as they go, instead of each becoming
+    // a string that is copied into its parent's.
+
+    fn render_expr_into(&mut self, e: &Expr, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        match e {
+            Expr::Html(el, _) => self.render_el_into(el, env, out),
+            Expr::If(c, a, b) => {
+                if self.eval(c, env)?.truthy() {
+                    self.render_expr_into(a, env, out)
+                } else if let Some(b) = b {
+                    self.render_expr_into(b, env, out)
+                } else {
+                    Ok(())
+                }
+            }
+            Expr::Binary(BinOp::And, a, b, _) => {
+                let x = self.eval(a, env)?;
+                if !x.truthy() {
+                    render_value(&x, out);
+                    return Ok(());
+                }
+                self.render_expr_into(b, env, out)
+            }
+            Expr::Binary(BinOp::Or, a, b, _) => {
+                let x = self.eval(a, env)?;
+                if x.truthy() {
+                    render_value(&x, out);
+                    return Ok(());
+                }
+                self.render_expr_into(b, env, out)
+            }
+            Expr::For(pat, iter, body, line) => self.render_for_into(pat, iter, body, env, *line, out),
+            Expr::Match(subj, arms, line) => {
+                let v = self.eval(subj, env)?;
+                for arm in arms {
+                    let mut binds = Vec::new();
+                    if self.match_pat(&arm.pat, &v, Mode::Strict, env, &mut binds)?.is_none() {
+                        continue;
+                    }
+                    let scope = Scope::child(env);
+                    for (n, x) in binds {
+                        define(&scope, &n, x);
+                    }
+                    if let Some(g) = &arm.guard {
+                        if !self.eval(g, &scope)?.truthy() {
+                            continue;
+                        }
+                    }
+                    return self.render_expr_into(&arm.body, &scope, out);
+                }
+                fail(*line, format!("no `match` arm matches {}", short(&v)))
+            }
+            Expr::Block(stmts) => match stmts.split_last() {
+                Some((Stmt::Expr(last), rest)) => {
+                    let scope = Scope::child(env);
+                    for s in rest {
+                        self.exec_stmt(s, &scope)?;
+                    }
+                    self.render_expr_into(last, &scope, out)
+                }
+                _ => {
+                    let v = self.eval_block(stmts, env)?;
+                    render_value(&v, out);
+                    Ok(())
+                }
+            },
+            _ => {
+                let v = self.eval(e, env)?;
+                render_value(&v, out);
+                Ok(())
             }
         }
-        Ok(r)
+    }
+
+    fn render_for_into(
+        &mut self,
+        pat: &Pattern,
+        iter: &Expr,
+        body: &Expr,
+        env: &Env,
+        line: u32,
+        out: &mut String,
+    ) -> Result<(), Ctrl> {
+        let it = self.eval(iter, env)?;
+        let mut each = |this: &mut Self, item: &Value| -> Result<(), Ctrl> {
+            let scope = Scope::child(env);
+            let mut binds = Vec::new();
+            if this.match_pat(pat, item, Mode::Strict, env, &mut binds)?.is_none() {
+                return fail(line, format!("`for` pattern does not match {}", short(item)));
+            }
+            for (n, x) in binds {
+                define(&scope, &n, x);
+            }
+            this.render_expr_into(body, &scope, out)
+        };
+        match &it {
+            Value::List(l) => {
+                for item in l.iter() {
+                    each(self, item)?;
+                }
+            }
+            Value::Map(m) => {
+                for (k, v) in m.iter() {
+                    each(self, &Value::list(vec![Value::str(k), v.clone()]))?;
+                }
+            }
+            Value::Str(s) => {
+                for c in s.chars() {
+                    each(self, &Value::str(c.to_string()))?;
+                }
+            }
+            Value::Nil => {}
+            other => return fail(line, format!("cannot loop over {}", other.type_name())),
+        }
+        Ok(())
     }
 
     // ---- patterns ------------------------------------------------------
@@ -1204,10 +1387,15 @@ impl Interp {
     }
 
     fn render_el(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
-        if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
-            return self.render_component(el, env);
-        }
         let mut out = String::new();
+        self.render_el_into(el, env, &mut out)?;
+        Ok(out)
+    }
+
+    fn render_el_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
+            return self.render_component_into(el, env, out);
+        }
         if el.tag == "html" {
             out.push_str("<!doctype html>");
         }
@@ -1287,7 +1475,7 @@ impl Interp {
         out.push_str(&rest);
         out.push('>');
         if VOID_TAGS.contains(&el.tag.as_str()) {
-            return Ok(out);
+            return Ok(());
         }
         match text_value {
             Some(t) => out.push_str(&escape(&t)),
@@ -1309,30 +1497,26 @@ impl Interp {
             }
             None => {
                 for c in &el.children {
-                    self.render_child(c, env, &mut out)?;
+                    self.render_child(c, env, out)?;
                 }
             }
         }
         out.push_str("</");
         out.push_str(&el.tag);
         out.push('>');
-        Ok(out)
+        Ok(())
     }
 
     fn render_child(&mut self, c: &HtmlChild, env: &Env, out: &mut String) -> Result<(), Ctrl> {
         match c {
-            HtmlChild::El(el) => out.push_str(&self.render_el(el, env)?),
-            HtmlChild::Expr(e) => {
-                let v = self.eval(e, env)?;
-                render_value(&v, out);
-            }
+            HtmlChild::El(el) => self.render_el_into(el, env, out),
+            HtmlChild::Expr(e) => self.render_expr_into(e, env, out),
         }
-        Ok(())
     }
 
     /// `<Card user={u}>"kids"</Card>` calls view `Card` with its parameters
     /// taken from attributes by name; a `children` parameter gets the body.
-    fn render_component(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
+    fn render_component_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
         let line = el.line;
         let Some(f) = lookup(env, &el.tag) else {
             return fail(line, format!("unknown view <{}>", el.tag));
@@ -1340,9 +1524,13 @@ impl Interp {
         let Value::Func(c) = f else {
             return fail(line, format!("<{}> is not a view", el.tag));
         };
+        // The body is only rendered for a view that takes it.
+        let takes_children = c.def.params.iter().any(|p| p.name == "children");
         let mut kids = String::new();
-        for ch in &el.children {
-            self.render_child(ch, env, &mut kids)?;
+        if takes_children {
+            for ch in &el.children {
+                self.render_child(ch, env, &mut kids)?;
+            }
         }
         let (spread, explicit) = self.eval_attrs(el, env)?;
         let mut given: Vec<(String, Value)> = explicit.into_iter().filter(|(n, _)| n != "key").collect();
@@ -1353,17 +1541,21 @@ impl Interp {
                 given.push((k, v));
             }
         }
-        let mut args = Vec::new();
+        let component = c.def.component;
+        let mut args = Vec::with_capacity(c.def.params.len());
+        // Props travel to the browser with a component; a view needs none.
         let mut props = Map::new();
         for p in &c.def.params {
             if p.name == "children" {
-                args.push(Some(Value::html(&kids)));
-                props.insert(p.name.clone(), Value::str(&kids));
+                if component {
+                    props.insert(p.name.clone(), Value::str(&kids));
+                }
+                args.push(Some(Value::html(std::mem::take(&mut kids))));
                 continue;
             }
             let pos = given.iter().position(|(n, _)| n == &p.name);
             let v = pos.map(|i| given.remove(i).1);
-            if let Some(v) = &v {
+            if let (true, Some(v)) = (component, &v) {
                 props.insert(p.name.clone(), v.clone());
             }
             args.push(v);
@@ -1371,11 +1563,8 @@ impl Interp {
         if let Some((n, _)) = given.first() {
             return fail(line, format!("<{}> has no parameter `{}`", el.tag, n));
         }
-        if !c.def.component {
-            let v = self.call_closure(&c, args, line)?;
-            let mut out = String::new();
-            render_value(&v, &mut out);
-            return Ok(out);
+        if !component {
+            return self.render_call_into(&c, args, line, out);
         }
         // A component renders inside an island that carries its props and
         // state to the browser, which takes over from there. A component
@@ -1384,9 +1573,10 @@ impl Interp {
         // callbacks and HTML included.
         let nested = !self.islands.is_empty();
         self.islands.push((Map::new(), Map::new()));
-        let v = self.call_closure(&c, args, line);
+        let mut body = String::new();
+        let r = self.render_call_into(&c, args, line, &mut body);
         let (state, live) = self.islands.pop().unwrap_or_default();
-        let v = v?;
+        r?;
         let props = if nested { Map::new() } else { props };
         for (what, m) in [("prop", &props), ("state", &state)] {
             for (k, x) in m.iter() {
@@ -1416,15 +1606,15 @@ impl Interp {
                 self.shared.id
             )
         };
-        let mut out = format!(
+        out.push_str(&format!(
             "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}>",
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),
             live_attrs
-        );
-        render_value(&v, &mut out);
+        ));
+        out.push_str(&body);
         out.push_str("</quillo-island>");
-        Ok(out)
+        Ok(())
     }
 }
