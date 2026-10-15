@@ -160,7 +160,7 @@ fn symbols_and_references_for_the_editor() {
 
 #[test]
 fn examples_are_clean() {
-    for f in ["examples/hello.wisp", "examples/orders.wisp", "examples/todo.wisp", "tests/browser/app.wisp"] {
+    for f in ["examples/hello.wisp", "examples/orders.wisp", "examples/todo.wisp", "examples/notes.wisp", "tests/browser/app.wisp"] {
         let a = wisp::check::check_file(Path::new(f));
         assert!(a.diagnostics.is_empty(), "{}: {:#?}", f, a.diagnostics);
     }

@@ -1,0 +1,90 @@
+// Notes: SQLite on the server, a live component in the browser.
+//
+//   wisp run examples/notes.wisp --watch     then open http://localhost:8080
+//
+// The page is rendered on the server. <Notes> then runs in the browser:
+// typing, adding, ticking and deleting call the `server fn`s below
+// without reloading the page.
+
+db.open("notes.db")
+db.exec("create table if not exists notes (
+    id integer primary key,
+    text text not null,
+    done integer not null default 0,
+    created integer not null
+)")
+
+fn all_notes() with db = db.query("select id, text, done from notes order by id desc")
+
+server fn add_note(text: str) -> list ! str with db, time {
+    let t = trim(text)
+    if t == "" { return err("a note needs some text") }
+    if len(t) > 200 { return err("keep it under 200 characters") }
+    db.exec("insert into notes (text, created) values (?, ?)", t, now())?
+    all_notes()
+}
+
+server fn toggle(id: int) -> list with db {
+    db.exec("update notes set done = 1 - done where id = ?", id)
+    all_notes()
+}
+
+server fn remove_note(id: int) -> list with db {
+    db.exec("delete from notes where id = ?", id)
+    all_notes()
+}
+
+component Notes(initial: list) {
+    ~notes = initial
+    ~draft = ""
+    ~problem = nil
+    let open = notes |> count(fn(n) = n.done == 0)
+    <section.notes>
+        <form @submit={fn() {
+            let r = add_note(draft)
+            if is_err(r) {
+                problem = r.error
+            } else {
+                notes = r
+                draft = ""
+                problem = nil
+            }
+        }}>
+            <input bind:value={draft} placeholder="Write a note" autofocus/>
+            <button>"Add"</button>
+        </form>
+        {if problem then <p.problem>{problem}</p>}
+        <ul>
+            {for n in notes => <li key={n.id} class={if n.done == 1 then "done"}>
+                <label>
+                    <input type="checkbox" checked={n.done == 1} @change={fn() { notes = toggle(n.id) }}/>
+                    <span>{n.text}</span>
+                </label>
+                <button.remove title="Delete" @click={fn() { notes = remove_note(n.id) }}>"×"</button>
+            </li>}
+        </ul>
+        <p.muted>"{open} of {len(notes)} open"</p>
+    </section>
+}
+
+view Page(title: str, children) =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title}</title>
+            <link rel="stylesheet" href="/static/notes.css"/>
+        </head>
+        <body>{children}</body>
+    </html>
+
+route GET / =
+    <Page title="Notes">
+        <h1>"Notes"</h1>
+        <Notes initial={all_notes()}/>
+    </Page>
+
+route GET /static/*path = file("public/" + path)
+
+// The same data as JSON, for scripts.
+route GET /api/notes = all_notes()

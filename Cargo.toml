@@ -1,8 +1,8 @@
 [package]
 name = "wisp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Wisp: a small web programming language where routes, payload patterns and HTML are part of the syntax"
+description = "Wisp: a small web language where routes, payload patterns, HTML and browser components are part of the syntax"
 license = "MIT"
 
 [lib]
