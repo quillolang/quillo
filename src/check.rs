@@ -1,4 +1,4 @@
-//! Static checking: `lite check`, `lite run` and the language server.
+//! Static checking: `quillo check`, `quillo run` and the language server.
 //!
 //! Types are sets of possible runtime types (`int | nil`, ...); code without
 //! annotations is `any`. An error is reported only when no combination of

@@ -10,7 +10,7 @@
 //! ```
 //!
 //! SQL problems are returned as error values, so `?` and `??` work on them.
-//! Until `db.open` is called the database is `$LITE_DB`, or else in memory.
+//! Until `db.open` is called the database is `$QUILLO_DB`, or else in memory.
 
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
@@ -47,7 +47,7 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
 fn with_conn<T>(it: &Interp, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
     let mut slot = it.shared.db.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() {
-        let path = std::env::var("LITE_DB").unwrap_or_else(|_| ":memory:".into());
+        let path = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
         *slot = Some(connect(&path).map_err(|e| e.to_string())?);
     }
     f(slot.as_ref().unwrap())
@@ -187,12 +187,12 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
         }
     };
-    if let Err(e) = with_conn(it, |c| c.execute_batch("savepoint lite_tx").map_err(|e| e.to_string())) {
+    if let Err(e) = with_conn(it, |c| c.execute_batch("savepoint quillo_tx").map_err(|e| e.to_string())) {
         return Ok(db_err(e));
     }
     let r = it.call(&f, Vec::new(), line);
     let commit = matches!(&r, Ok(v) if !matches!(v, Value::Err(_)));
-    let end = if commit { "release lite_tx" } else { "rollback to lite_tx; release lite_tx" };
+    let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
     if let Err(e) = with_conn(it, |c| c.execute_batch(end).map_err(|e| e.to_string())) {
         if commit {
             return Ok(db_err(e));

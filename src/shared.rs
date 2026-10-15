@@ -1,6 +1,6 @@
 //! State shared by every thread that runs a program.
 //!
-//! Lite code runs under one lock (the GIL). A request handler therefore runs
+//! Quillo code runs under one lock (the GIL). A request handler therefore runs
 //! atomically, except while it waits on I/O: builtins such as `sleep` and
 //! `http.get` let go of the lock while they wait, so other requests can run.
 

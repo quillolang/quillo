@@ -324,20 +324,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lite"
-version = "0.2.0"
-dependencies = [
- "fastrand",
- "flate2",
- "indexmap",
- "rusqlite",
- "serde_json",
- "stacker",
- "tiny_http",
- "ureq",
-]
-
-[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -418,6 +404,20 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "quillo"
+version = "0.2.0"
+dependencies = [
+ "fastrand",
+ "flate2",
+ "indexmap",
+ "rusqlite",
+ "serde_json",
+ "stacker",
+ "tiny_http",
+ "ureq",
 ]
 
 [[package]]

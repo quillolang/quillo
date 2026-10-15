@@ -1,53 +1,53 @@
 {
-  "name": "lite-lang",
-  "displayName": "Lite",
-  "description": "Lite language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `lite lsp`).",
+  "name": "quillo-lang",
+  "displayName": "Quillo",
+  "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `quillo lsp`).",
   "version": "0.2.0",
   "publisher": "wisp-one",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/wisp-one/lite" },
+  "repository": { "type": "git", "url": "https://github.com/wisp-one/quillo" },
   "engines": { "vscode": "^1.82.0" },
   "categories": ["Programming Languages", "Linters", "Snippets"],
-  "keywords": ["lite", "web", "language server"],
+  "keywords": ["quillo", "web", "language server"],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:lite"],
+  "activationEvents": ["onLanguage:quillo"],
   "contributes": {
     "languages": [
       {
-        "id": "lite",
-        "aliases": ["Lite", "lite"],
-        "extensions": [".lt"],
+        "id": "quillo",
+        "aliases": ["Quillo", "quillo"],
+        "extensions": [".qwe"],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
-      { "language": "lite", "scopeName": "source.lite", "path": "./syntaxes/lite.tmLanguage.json" }
+      { "language": "quillo", "scopeName": "source.quillo", "path": "./syntaxes/quillo.tmLanguage.json" }
     ],
     "snippets": [
-      { "language": "lite", "path": "./snippets/lite.json" }
+      { "language": "quillo", "path": "./snippets/quillo.json" }
     ],
     "commands": [
-      { "command": "lite.run", "title": "Run this file (watch mode)", "category": "Lite" },
-      { "command": "lite.check", "title": "Check this file", "category": "Lite" },
-      { "command": "lite.restartServer", "title": "Restart the language server", "category": "Lite" }
+      { "command": "quillo.run", "title": "Run this file (watch mode)", "category": "Quillo" },
+      { "command": "quillo.check", "title": "Check this file", "category": "Quillo" },
+      { "command": "quillo.restartServer", "title": "Restart the language server", "category": "Quillo" }
     ],
     "menus": {
       "editor/title/run": [
-        { "command": "lite.run", "when": "resourceLangId == lite", "group": "navigation" }
+        { "command": "quillo.run", "when": "resourceLangId == quillo", "group": "navigation" }
       ]
     },
     "configuration": {
-      "title": "Lite",
+      "title": "Quillo",
       "properties": {
-        "lite.path": {
+        "quillo.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the `lite` binary. Empty: `lite` on the PATH, or target/release/lite or target/debug/lite in the workspace."
+          "description": "Path to the `quillo` binary. Empty: `quillo` on the PATH, or target/release/quillo or target/debug/quillo in the workspace."
         },
-        "lite.port": {
+        "quillo.port": {
           "type": "number",
           "default": 8080,
-          "description": "Port for `Lite: Run this file`."
+          "description": "Port for `Quillo: Run this file`."
         }
       }
     }

@@ -1,7 +1,7 @@
-// lite run examples/hello.lt
+// quillo run examples/hello.qwe
 // then: curl localhost:8080/add/2/40
 
-route GET / = <h1>"Hello from Lite"</h1>
+route GET / = <h1>"Hello from Quillo"</h1>
 
 // Path parameters are variables. `:a(int)` only matches digits and gives an int.
 route GET /hello/:name = "Hello, {name}!"

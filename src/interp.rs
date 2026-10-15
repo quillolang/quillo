@@ -1,7 +1,7 @@
 //! Tree-walking evaluator: expressions, patterns and HTML rendering.
 
 use crate::ast::*;
-use crate::error::LiteError;
+use crate::error::QuilloError;
 use crate::parser::{Parser, VOID_TAGS};
 use crate::shared::Shared;
 use crate::value::*;
@@ -11,23 +11,23 @@ use std::sync::Arc;
 
 /// Non-local exits: runtime errors, `return` (and `?`), and `reply`.
 pub enum Ctrl {
-    Error(LiteError),
+    Error(QuilloError),
     Return(Value),
     Reply(Arc<Response>),
 }
 
-impl From<LiteError> for Ctrl {
-    fn from(e: LiteError) -> Self {
+impl From<QuilloError> for Ctrl {
+    fn from(e: QuilloError) -> Self {
         Ctrl::Error(e)
     }
 }
 
 pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
-    Err(Ctrl::Error(LiteError::new(msg, line)))
+    Err(Ctrl::Error(QuilloError::new(msg, line)))
 }
 
 fn undefined(name: &str, line: u32) -> Ctrl {
-    Ctrl::Error(LiteError::new(format!("unknown name `{}`", name), line))
+    Ctrl::Error(QuilloError::new(format!("unknown name `{}`", name), line))
 }
 
 /// How strictly a pattern compares values. Query strings, form fields and
@@ -55,7 +55,7 @@ pub struct Interp {
     pub server_fns: Vec<String>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Vec<Arc<Vec<Stmt>>>,
-    /// The browser bundle (`/_lite/lite.js`), built after loading.
+    /// The browser bundle (`/_quillo/quillo.js`), built after loading.
     pub client_js: Arc<String>,
     /// The request being handled, visible as `request` inside `server fn`s.
     pub current_request: Option<Value>,
@@ -181,7 +181,7 @@ fn short(v: &Value) -> String {
 
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
     use Value::*;
-    let overflow = || Ctrl::Error(LiteError::new("integer overflow", line));
+    let overflow = || Ctrl::Error(QuilloError::new("integer overflow", line));
     match op {
         BinOp::Add => match (a, b) {
             (Int(x), Int(y)) => x.checked_add(y).map(Int).ok_or_else(overflow),
@@ -311,7 +311,7 @@ impl Interp {
     }
 
     /// Runs `f` without holding the interpreter lock, so other requests can
-    /// run while this one waits. `f` must not touch Lite values.
+    /// run while this one waits. `f` must not touch Quillo values.
     pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
         self.shared.gil.release();
         let r = f();
@@ -320,7 +320,7 @@ impl Interp {
     }
 
     /// Parses and runs a program's top level, registering its routes.
-    pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, LiteError> {
+    pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
         let stmts = Arc::new(Parser::new(src).parse_program().map_err(|e| e.in_file(file))?);
         self.program.push(stmts.clone());
         let env = self.globals.clone();
@@ -333,7 +333,7 @@ impl Interp {
                     last = v;
                     break;
                 }
-                Err(Ctrl::Reply(_)) => return Err(LiteError::new("`reply` used outside of a route", 0).in_file(file)),
+                Err(Ctrl::Reply(_)) => return Err(QuilloError::new("`reply` used outside of a route", 0).in_file(file)),
             }
         }
         self.build_client().map_err(|e| e.in_file(file))?;
@@ -341,14 +341,14 @@ impl Interp {
     }
 
     /// Compiles the program's components (and what they use) for the browser.
-    pub fn build_client(&mut self) -> Result<(), LiteError> {
+    pub fn build_client(&mut self) -> Result<(), QuilloError> {
         self.client_js = Arc::new(crate::client::bundle(self)?);
         Ok(())
     }
 
-    pub fn load_file(&mut self, path: &Path) -> Result<Value, LiteError> {
+    pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
         let src = std::fs::read_to_string(path)
-            .map_err(|e| LiteError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
+            .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
         if let Ok(p) = path.canonicalize() {
             self.loaded.insert(p);
         }
@@ -405,7 +405,7 @@ impl Interp {
                     return Ok(Value::Nil);
                 }
                 let src = std::fs::read_to_string(&full)
-                    .map_err(|e| LiteError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
+                    .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
                 let stmts = Arc::new(Parser::new(&src).parse_program().map_err(|e| e.in_file(&fname))?);
                 self.program.push(stmts.clone());
@@ -440,7 +440,7 @@ impl Interp {
 
     /// Evaluates an expression. Only the cheap cases are handled inline; the
     /// rest live in separate functions so that each nested call uses little
-    /// stack (deep recursion in Lite is deep recursion here).
+    /// stack (deep recursion in Quillo is deep recursion here).
     pub fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
         match e {
             Expr::Lit(l) => Ok(lit_value(l)),
@@ -567,7 +567,7 @@ impl Interp {
             UnOp::Not => Ok(Value::Bool(!v.truthy())),
             UnOp::Neg => match v {
                 Value::Int(n) => {
-                    n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(LiteError::new("integer overflow", line)))
+                    n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(QuilloError::new("integer overflow", line)))
                 }
                 Value::Float(f) => Ok(Value::Float(-f)),
                 o => fail(line, format!("cannot negate {}", o.type_name())),
@@ -1142,13 +1142,13 @@ impl Interp {
             }
         }
         let mut out = format!(
-            "<lite-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\">",
+            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\">",
             escape(&el.tag),
             escape(&Value::map(props).to_json().to_string()),
             escape(&Value::map(state).to_json().to_string())
         );
         render_value(&v, &mut out);
-        out.push_str("</lite-island>");
+        out.push_str("</quillo-island>");
         Ok(out)
     }
 }

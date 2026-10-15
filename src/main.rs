@@ -1,23 +1,23 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use lite::ast::Stmt;
-use lite::interp::Ctrl;
-use lite::check::SymbolKind;
-use lite::parser::Parser;
-use lite::server::{App, Loaded};
-use lite::{Interp, Value};
+use quillo::ast::Stmt;
+use quillo::interp::Ctrl;
+use quillo::check::SymbolKind;
+use quillo::parser::Parser;
+use quillo::server::{App, Loaded};
+use quillo::{Interp, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
-Lite — a small web language
+Quillo — a small web language
 
 usage:
-  lite run <file.lt> [options]   run a program; serve it if it has routes
-  lite check <file.lt>           check a program without running it
-  lite repl                      interactive prompt
-  lite lsp                       language server for editors (stdio)
-  lite <file.lt>                 same as `lite run`
+  quillo run <file.qwe> [options]   run a program; serve it if it has routes
+  quillo check <file.qwe>           check a program without running it
+  quillo repl                       interactive prompt
+  quillo lsp                        language server for editors (stdio)
+  quillo <file.qwe>                 same as `quillo run`
 
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
@@ -30,7 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Run on a thread with a roomy stack (see WORKER_STACK).
     let child = std::thread::Builder::new()
-        .stack_size(lite::server::WORKER_STACK)
+        .stack_size(quillo::server::WORKER_STACK)
         .spawn(move || {
             real_main(args)
         })
@@ -49,16 +49,16 @@ fn real_main(args: Vec<String>) -> i32 {
             None => usage(),
         },
         Some("repl") | None => repl(),
-        Some("lsp") => lite::lsp::Server::new().run(),
+        Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
-            println!("lite {}", VERSION);
+            println!("quillo {}", VERSION);
             0
         }
         Some("help" | "--help" | "-h") => {
             println!("{}", USAGE);
             0
         }
-        Some(f) if f.ends_with(".lt") => run(f, &args[2..]),
+        Some(f) if f.ends_with(".qwe") => run(f, &args[2..]),
         Some(_) => usage(),
     }
 }
@@ -93,12 +93,12 @@ fn run(file: &str, flags: &[String]) -> i32 {
             ("--workers", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => workers = n,
                 _ => {
-                    eprintln!("lite: --workers needs a positive number");
+                    eprintln!("quillo: --workers needs a positive number");
                     return 2;
                 }
             },
             (other, _) => {
-                eprintln!("lite: unknown option `{}`", other);
+                eprintln!("quillo: unknown option `{}`", other);
                 return 2;
             }
         }
@@ -117,7 +117,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
             if !e.is_empty() {
-                eprintln!("lite: {}", e);
+                eprintln!("quillo: {}", e);
             }
             if !watch {
                 return 1;
@@ -132,10 +132,10 @@ fn run(file: &str, flags: &[String]) -> i32 {
     }
     let mut app = App::new(loaded, shared, path, base, watch);
     app.static_check = static_check;
-    match lite::server::serve(app, &format!("{}:{}", host, port), workers) {
+    match quillo::server::serve(app, &format!("{}:{}", host, port), workers) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("lite: {}", e);
+            eprintln!("quillo: {}", e);
             1
         }
     }
@@ -144,7 +144,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
 /// Prints the checker's findings; `Err` when there are errors. The error
 /// text is empty because everything has been printed already.
 fn static_errors(path: &Path) -> Result<(), String> {
-    let analysis = lite::check::check_file(path);
+    let analysis = quillo::check::check_file(path);
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }
@@ -155,14 +155,14 @@ fn static_errors(path: &Path) -> Result<(), String> {
 }
 
 fn check(file: &str) -> i32 {
-    let analysis = lite::check::check_file(Path::new(file));
+    let analysis = quillo::check::check_file(Path::new(file));
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }
     let errors = analysis.errors().count();
     let warnings = analysis.diagnostics.len() - errors;
     if errors > 0 {
-        eprintln!("lite: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
+        eprintln!("quillo: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
         return 1;
     }
     let count = |k: SymbolKind| analysis.symbols.iter().filter(|s| s.kind == k && s.file == file).count();
@@ -189,9 +189,9 @@ fn repl() -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
     let mut buf = String::new();
-    println!("Lite {} — enter expressions; Ctrl-D exits", VERSION);
+    println!("Quillo {} — enter expressions; Ctrl-D exits", VERSION);
     loop {
-        print!("{}", if buf.is_empty() { "lite> " } else { "....> " });
+        print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
         let _ = io::stdout().flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {

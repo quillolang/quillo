@@ -1,9 +1,9 @@
-# Lite
+# Quillo
 
-Lite is a small web programming language. Routes, request patterns, pipelines and
+Quillo is a small web programming language. Routes, request patterns, pipelines and
 HTML are part of the syntax, so a web app reads like a list of what it answers:
 
-```lite
+```quillo
 route GET /hello/:name = "Hello, {name}!"
 
 route POST /orders { json: { type: "order" | "refund", customer.id: int as id } } {
@@ -16,7 +16,7 @@ route GET /feed ? { page: int = 1 } =
 
 Components run in the browser too, with state, and call the server directly:
 
-```lite
+```quillo
 server fn add_note(text: str) -> list ! str with db { ... }
 
 component Notes(initial: list) {
@@ -29,20 +29,20 @@ component Notes(initial: list) {
 }
 ```
 
-Lite is a tree-walking interpreter in Rust with a built-in HTTP server, a static
+Quillo is a tree-walking interpreter in Rust with a built-in HTTP server, a static
 checker, a compiler from components to JavaScript, an embedded SQLite database and
 a language server for editors.
 
 ```sh
 cargo build --release
-./target/release/lite run examples/notes.lt --watch   # http://127.0.0.1:8080
-./target/release/lite check app.lt                    # find mistakes without running
-./target/release/lite repl
-./target/release/lite lsp                             # language server (for editors)
+./target/release/quillo run examples/notes.qwe --watch   # http://127.0.0.1:8080
+./target/release/quillo check app.qwe                    # find mistakes without running
+./target/release/quillo repl
+./target/release/quillo lsp                              # language server (for editors)
 cargo test
 ```
 
-`lite run` checks the program, executes its top level and, if it declared any routes,
+`quillo run` checks the program, executes its top level and, if it declared any routes,
 serves them:
 
 | Option | |
@@ -54,11 +54,11 @@ serves them:
 
 Editor support: [editors/vscode](editors/vscode) is a VS Code extension (highlighting,
 diagnostics as you type, hover, go to definition, completion, outline, snippets).
-Other editors can run `lite lsp` directly.
+Other editors can run `quillo lsp` directly.
 
-Examples: [hello.lt](examples/hello.lt) (routes), [orders.lt](examples/orders.lt)
-(payload-based routing and middleware), [todo.lt](examples/todo.lt) (server-rendered
-app with a JSON API), [notes.lt](examples/notes.lt) (SQLite and a live component).
+Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders.qwe)
+(payload-based routing and middleware), [todo.qwe](examples/todo.qwe) (server-rendered
+app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component).
 
 ## Language tour
 
@@ -73,7 +73,7 @@ JSON text: `"\{\"a\": 1\}"`).
 
 ### Variables, functions, views
 
-```lite
+```quillo
 let todos = []
 todos = todos |> push("x")        // reassign with =, += or -=
 
@@ -88,7 +88,7 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 ```
 
 Type annotations are checked when the function is called and when it returns, and
-`lite check` checks them before the program runs: `int float num str bool list map html
+`quillo check` checks them before the program runs: `int float num str bool list map html
 fn response any`. Unions are written `int | str`; add `?` or `| nil` to also allow nil
 (`str?`, `int | nil`).
 
@@ -97,7 +97,7 @@ fn response any`. Unions are written `int | str`; add `?` or `| nil` to also all
 `a |> f(b)` is `f(a, b)`. `x.f(y)` calls `f(x, y)` when `x` has no field `f`,
 and `x.len` is `len(x)`:
 
-```lite
+```quillo
 orders
     |> filter(fn(o) = o.total > 100)
     |> sort_by(fn(o) = o.total)
@@ -111,7 +111,7 @@ previous line.
 
 ### Control flow
 
-```lite
+```quillo
 if n > 0 then "pos" else "neg"
 if n > 0 { "pos" } else if n == 0 { "zero" } else { "neg" }
 for x in [1, 2, 3] => x * x                 // a list: [1, 4, 9]
@@ -136,7 +136,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 
 In a map pattern, `key: int` (a bare type) also binds `key`.
 
-```lite
+```quillo
 match event {
     { type: "click", x: int, y: int } => "click at {x},{y}"
     { type: "key", key: "Enter" | "Return" } => "enter"
@@ -152,7 +152,7 @@ return errors instead of crashing. `?` after an expression returns the error fro
 the current function, and `??` falls back when the left side is nil or an error.
 Field access on nil gives nil:
 
-```lite
+```quillo
 fn parse_age(s: str) -> int ! str =
     match int(s) {
         int as n if n >= 0 => n
@@ -163,7 +163,7 @@ let age = int(request.query.age) ?? 18
 ```
 
 `! T` in a signature declares what the function's errors contain. It is checked: a
-function declared `! str` that returns `err(42)` is a runtime error, and `lite check`
+function declared `! str` that returns `err(42)` is a runtime error, and `quillo check`
 reports it, and a `?` that would pass on the wrong kind of error, before the program runs.
 
 Mistakes in the code itself (calling a non-function, adding a map to an int, a
@@ -174,7 +174,7 @@ route they become a 500 response, and the server logs them.
 
 `with` declares what a function may do besides computing a value:
 
-```lite
+```quillo
 fn load_user(id: int) with db = db.one("select * from users where id = ?", id)
 fn fetch_avatar(url: str) with http = http.get(url).body
 fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
@@ -183,7 +183,7 @@ fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(
 The effects are `db`, `http`, `fs` (files), `env` (environment variables), `time` (`now`,
 `sleep`) and `random`. Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
-`lite check` (which also warns when an undeclared helper may use one). The limit holds
+`quillo check` (which also warns when an undeclared helper may use one). The limit holds
 for everything the function calls, including the lambdas it passes to `map`.
 Functions without `with` may do anything.
 
@@ -192,7 +192,7 @@ Functions without `with` may do anything.
 HTML is a value, not a string. Text children are `"quoted"`, expressions go in
 `{...}`, and everything is escaped unless it is already HTML:
 
-```lite
+```quillo
 <li.todo #todo-{t.id} class={if t.done then "done"} data-id={t.id}>
     {if t.done then <s>{t.text}</s> else t.text}
     <button disabled={not editable}>"Edit"</button>
@@ -211,7 +211,7 @@ HTML is a value, not a string. Text children are `"quoted"`, expressions go in
 
 A `component` is a view with state that also runs in the browser:
 
-```lite
+```quillo
 component Counter(start: int = 0) {
     ~count = start                       // state: set once, kept between renders
     let double = count * 2               // recomputed on every render
@@ -224,8 +224,8 @@ component Counter(start: int = 0) {
 route GET / = <html><body><Counter start={5}/></body></html>
 ```
 
-- The server renders it like a view, inside a `<lite-island>` that carries its props
-  and state. The page loads `/_lite/lite.js` automatically, and the browser takes
+- The server renders it like a view, inside a `<quillo-island>` that carries its props
+  and state. The page loads `/_quillo/quillo.js` automatically, and the browser takes
   over from that state.
 - Assigning to a `~` variable re-renders the component. Lists keep their DOM (and
   focus) when items have `key={...}`. Nested components keep their own state.
@@ -235,9 +235,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
-  (and in `lite check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
+  (and in `quillo check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
   the server changes (pass it as a prop instead).
-- `/_lite/lite.js` holds only what the page's components use: their compiled code and
+- `/_quillo/quillo.js` holds only what the page's components use: their compiled code and
   the parts of the runtime it reaches, minified (a small component is about 11 KB,
   under 4 KB gzipped). Text responses are gzipped for browsers that accept it, and
   the bundle has an ETag, so an unchanged one costs a `304` on reload.
@@ -248,7 +248,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
 `server fn` makes a function callable from the browser:
 
-```lite
+```quillo
 server fn add_note(text: str) -> list ! str with db {
     if trim(text) == "" { return err("empty note") }
     db.exec("insert into notes (text) values (?)", text)?
@@ -272,21 +272,21 @@ In component code the call is awaited automatically. It works in event handlers 
 in `~state` initializers (`~todos = load_todos()`: the server runs it while rendering,
 so the page arrives with the data). Calling one while rendering is an error.
 
-Each call is a `POST /_lite/rpc/<name>` with a JSON array of arguments, checked against
+Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types (a 400 otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json` (so a form
 on another site cannot), and inside one `request` is the current request. `reply` in a
 server fn becomes the HTTP response, so the usual middleware works:
 
-```lite
+```quillo
 server fn delete_all() = request |> auth.required |> fn(_) { ... }
 ```
 
-From hand-written JavaScript: `await lite.server.add_note("text")`.
+From hand-written JavaScript: `await quillo.server.add_note("text")`.
 
 ## Routes
 
-```lite
+```quillo
 route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pattern }] = expr
 route METHOD /path { ... block ... }
 ```
@@ -295,7 +295,7 @@ route METHOD /path { ... block ... }
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also `float`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path.
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
 - **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values.
-- **Reserved:** paths under `/_lite/` belong to Lite (the browser bundle, server fn calls, `--watch`).
+- **Reserved:** paths under `/_quillo/` belong to Quillo (the browser bundle, server fn calls, `--watch`).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
@@ -318,7 +318,7 @@ none of its patterns matched.
 `reply status [body]` ends the request right away, from anywhere: inside a
 helper, a pipeline stage or a `??` fallback. This is how middleware works:
 
-```lite
+```quillo
 let auth = {
     required: fn(req) =
         if req.headers.authorization == "Bearer {env("TOKEN")}" then req
@@ -346,14 +346,14 @@ route GET /users/:id(int) {
   `write_file(path, text)` (paths stay inside the program's folder)
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
-`use "lib.lt"` runs another file once, into the global scope.
+`use "lib.qwe"` runs another file once, into the global scope.
 
 ### Database
 
 `db` is an embedded SQLite database. SQL problems are error values, so `?` and `??`
 work on them.
 
-```lite
+```quillo
 db.open("app.db")                                   // next to the program; ":memory:" also works
 db.exec("create table if not exists todos (id integer primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
@@ -362,12 +362,12 @@ db.one("select * from todos where id = :id", { id })       // a map, or nil
 db.transaction(fn() { ... })                               // all or nothing
 ```
 
-Without `db.open`, the database is `$LITE_DB`, or else in memory. A transaction rolls
+Without `db.open`, the database is `$QUILLO_DB`, or else in memory. A transaction rolls
 back if its function fails, returns an error value or replies early.
 
 ### HTTP client
 
-```lite
+```quillo
 let r = http.get("https://api.example.com/users/1")        // { status, ok, headers, body, json }
 http.post(url, { name: "Ada" })                            // maps and lists are sent as JSON
 http.request("PUT", url, body, { authorization: "Bearer {token}" })
@@ -377,7 +377,7 @@ Every HTTP status is a response; failing to connect is an error value.
 
 ## Checking
 
-`lite check app.lt` finds mistakes without running the program, and `lite run`
+`quillo check app.qwe` finds mistakes without running the program, and `quillo run`
 does the same first. Types are sets of possible types, and code without annotations
 is `any`, so only definite mistakes are reported, and annotations make the checks
 stricter. It reports unknown names (with suggestions), names used before they are
@@ -388,7 +388,7 @@ component code that cannot run in a browser, route mistakes, and unused variable
 
 ## Concurrency and reloading
 
-Requests are served by a pool of threads. Lite code runs under one lock, so a handler
+Requests are served by a pool of threads. Quillo code runs under one lock, so a handler
 runs on its own from start to end, except while it waits: `sleep`, `http.*` and
 reading the request let other requests run. Updating shared state such as
 `todos = todos |> push(t)` is therefore safe without locks.

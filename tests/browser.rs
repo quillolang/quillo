@@ -1,6 +1,6 @@
-//! Components in a real browser: headless Chrome loads tests/browser/app.lt,
+//! Components in a real browser: headless Chrome loads tests/browser/app.qwe,
 //! whose page script clicks, types and submits, then records what it saw.
-//! Skipped when no Chrome is found (set LITE_CHROME to point at one).
+//! Skipped when no Chrome is found (set QUILLO_CHROME to point at one).
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn chrome() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("LITE_CHROME") {
+    if let Ok(p) = std::env::var("QUILLO_CHROME") {
         return Some(PathBuf::from(p));
     }
     let candidates = [
@@ -34,8 +34,8 @@ fn components_hydrate_react_and_call_the_server() {
         return;
     };
     let port = 21000 + (std::process::id() % 1000) as u16;
-    let app = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/app.lt");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_lite"))
+    let app = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/app.qwe");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&app)
         .args(["--port", &port.to_string()])
@@ -47,7 +47,7 @@ fn components_hydrate_react_and_call_the_server() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let profile = std::env::temp_dir().join(format!("lite-chrome-{}", std::process::id()));
+    let profile = std::env::temp_dir().join(format!("quillo-chrome-{}", std::process::id()));
     let mut child = Command::new(&chrome)
         .args(["--headless=new", "--disable-gpu", "--no-first-run", "--no-sandbox", "--virtual-time-budget=10000", "--dump-dom"])
         .arg(format!("--user-data-dir={}", profile.display()))

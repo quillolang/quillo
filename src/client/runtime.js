@@ -1,11 +1,11 @@
-// Lite browser runtime: values, the standard library, a small virtual DOM,
+// Quillo browser runtime: values, the standard library, a small virtual DOM,
 // components with ~state, and calls to `server fn`s. The compiled program is
 // appended after this and registers its functions in G.
 "use strict";
 
 // ---- values ------------------------------------------------------------
 
-class LiteError extends Error {}
+class QuilloError extends Error {}
 class Ret { constructor(v) { this.v = v; } }
 class Err { constructor(e) { this.error = e === undefined ? null : e; } }
 class VNode {}
@@ -15,7 +15,7 @@ class VComp extends VNode { constructor(def, props, key) { super(); this.def = d
 class VRaw extends VNode { constructor(html) { super(); this.html = html; } }
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
-const fail = (msg) => { throw new LiteError(msg); };
+const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
 const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v);
@@ -507,7 +507,7 @@ function fromJSON(j) {
 async function rpc(name, args) {
   let r;
   try {
-    r = await fetch("/_lite/rpc/" + encodeURIComponent(name), {
+    r = await fetch("/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(args.map(toJSON)),
@@ -593,14 +593,14 @@ function setEvents(el, on) {
 function mount(v, svg) {
   if (v instanceof VText) return (v.d = document.createTextNode(v.t));
   if (v instanceof VRaw) {
-    const el = document.createElement("lite-raw");
+    const el = document.createElement("quillo-raw");
     el.style.display = "contents";
     el.innerHTML = v.html;
     return (v.d = el);
   }
   if (v instanceof VComp) {
     const inst = new Inst(v.def, v.props, takeHydration(v.def.$name));
-    const el = document.createElement("lite-island");
+    const el = document.createElement("quillo-island");
     el.style.display = "contents";
     inst.el = el;
     inst.update();
@@ -753,17 +753,17 @@ function takeHydration(name) {
 }
 
 function report(e) {
-  console.error("lite:", e instanceof Error ? e.message : e);
-  if (typeof window !== "undefined" && window.__liteErrors) window.__liteErrors.push(String(e && e.message || e));
+  console.error("quillo:", e instanceof Error ? e.message : e);
+  if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
 }
 
 function boot() {
-  for (const island of document.querySelectorAll("lite-island")) {
-    if (island.parentElement && island.parentElement.closest("lite-island")) continue;
+  for (const island of document.querySelectorAll("quillo-island")) {
+    if (island.parentElement && island.parentElement.closest("quillo-island")) continue;
     const def = C[island.dataset.c];
     if (!def) { report(`unknown component <${island.dataset.c}>`); continue; }
     hydrating = {};
-    for (const inner of island.querySelectorAll("lite-island")) {
+    for (const inner of island.querySelectorAll("quillo-island")) {
       (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push(JSON.parse(inner.dataset.s || "{}"));
     }
     const inst = new Inst(def, JSON.parse(island.dataset.p || "{}"), JSON.parse(island.dataset.s || "{}"));

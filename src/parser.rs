@@ -3,11 +3,11 @@
 //! unary `-`, then postfix calls, fields, indexing and `?`.
 
 use crate::ast::*;
-use crate::error::LiteError;
+use crate::error::QuilloError;
 use crate::lexer::{Lexer, StrPart, Tok, Token};
 use std::sync::Arc;
 
-type PResult<T> = Result<T, LiteError>;
+type PResult<T> = Result<T, QuilloError>;
 
 pub const TYPE_NAMES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
@@ -101,7 +101,7 @@ impl Parser {
         if &tok.tok == t {
             Ok(tok)
         } else {
-            Err(LiteError::new(format!("expected {}, found {}", what, tok.tok.describe()), tok.line))
+            Err(QuilloError::new(format!("expected {}, found {}", what, tok.tok.describe()), tok.line))
         }
     }
 
@@ -122,7 +122,7 @@ impl Parser {
         let t = self.next()?;
         match t.tok {
             Tok::Ident(s) if !KEYWORDS.contains(&s.as_str()) => Ok(s),
-            other => Err(LiteError::new(format!("expected {}, found {}", what, other.describe()), t.line)),
+            other => Err(QuilloError::new(format!("expected {}, found {}", what, other.describe()), t.line)),
         }
     }
 
@@ -151,7 +151,7 @@ impl Parser {
 
     fn err_at<T>(&mut self, msg: impl Into<String>) -> PResult<T> {
         let line = self.line()?;
-        Err(LiteError::new(msg, line))
+        Err(QuilloError::new(msg, line))
     }
 
     // ---- statements ----------------------------------------------------
@@ -228,7 +228,7 @@ impl Parser {
                             return Ok(Stmt::Use(path, line));
                         }
                     }
-                    return Err(LiteError::new("`use` expects a file path string, e.g. use \"lib.lt\"", line));
+                    return Err(QuilloError::new("`use` expects a file path string, e.g. use \"lib.qwe\"", line));
                 }
                 "return" => {
                     self.next()?;
@@ -249,7 +249,7 @@ impl Parser {
             self.next()?;
             let name = match e {
                 Expr::Ident(n, _) => n,
-                _ => return Err(LiteError::new("only variables can be assigned to", line)),
+                _ => return Err(QuilloError::new("only variables can be assigned to", line)),
             };
             let rhs = self.parse_expr()?;
             return Ok(Stmt::Assign(name, op, rhs, line));
@@ -279,7 +279,7 @@ impl Parser {
                 match t.tok {
                     Tok::Ident(e) if EFFECTS.contains(&e.as_str()) => effs.push(e),
                     other => {
-                        return Err(LiteError::new(
+                        return Err(QuilloError::new(
                             format!("expected an effect after `with` ({}), found {}", EFFECTS.join(", "), other.describe()),
                             t.line,
                         ))
@@ -309,7 +309,7 @@ impl Parser {
     fn parse_component(&mut self, line: u32) -> PResult<FnDef> {
         let name = self.expect_ident("a component name")?;
         if !name.chars().next().map_or(false, |c| c.is_uppercase()) {
-            return Err(LiteError::new(format!("component names start with a capital letter: `{}`", name), line));
+            return Err(QuilloError::new(format!("component names start with a capital letter: `{}`", name), line));
         }
         self.expect(&Tok::LParen, "`(`")?;
         let mut params = Vec::new();
@@ -360,7 +360,7 @@ impl Parser {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
-                other => return Err(LiteError::new(format!("expected a type, found {}", other.describe()), t.line)),
+                other => return Err(QuilloError::new(format!("expected a type, found {}", other.describe()), t.line)),
             };
             if name == "nil" {
                 optional = true;
@@ -369,7 +369,7 @@ impl Parser {
                     names.push(name);
                 }
             } else {
-                return Err(LiteError::new(
+                return Err(QuilloError::new(
                     format!("unknown type `{}` (known types: {}, nil)", name, TYPE_NAMES.join(", ")),
                     t.line,
                 ));
@@ -403,7 +403,7 @@ impl Parser {
     fn parse_route(&mut self, line: u32) -> PResult<RouteDef> {
         let method = self.expect_ident("an HTTP method")?;
         if !METHODS.contains(&method.as_str()) {
-            return Err(LiteError::new(
+            return Err(QuilloError::new(
                 format!("unknown HTTP method `{}` (use one of {})", method, METHODS.join(", ")),
                 line,
             ));
@@ -411,7 +411,7 @@ impl Parser {
         // The path is read character by character: `/users/:id(int)/*rest`.
         self.lx.skip_inline_ws();
         if self.lx.peek_char() != Some('/') {
-            return Err(LiteError::new("expected a path starting with `/` after the method", self.lx.line));
+            return Err(QuilloError::new("expected a path starting with `/` after the method", self.lx.line));
         }
         let mut path = Vec::new();
         while self.lx.peek_char() == Some('/') {
@@ -421,13 +421,13 @@ impl Parser {
                     self.lx.bump();
                     let name = self.read_word();
                     if name.is_empty() {
-                        return Err(LiteError::new("expected a parameter name after `:` in the path", self.lx.line));
+                        return Err(QuilloError::new("expected a parameter name after `:` in the path", self.lx.line));
                     }
                     let ty = if self.lx.peek_char() == Some('(') {
                         self.lx.bump();
                         let t = self.read_word();
                         if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "num" | "str") {
-                            return Err(LiteError::new(
+                            return Err(QuilloError::new(
                                 "path parameter types are written :name(int), :name(float), :name(num) or :name(str)",
                                 self.lx.line,
                             ));
@@ -661,7 +661,7 @@ impl Parser {
                         Tok::Ident(s) => s,
                         Tok::Int(n) => n.to_string(),
                         other => {
-                            return Err(LiteError::new(
+                            return Err(QuilloError::new(
                                 format!("expected a field name after `.`, found {}", other.describe()),
                                 t.line,
                             ))
@@ -718,7 +718,7 @@ impl Parser {
                 if self.peeked.is_none() && self.lx.peek_char().map_or(false, |c| c.is_alphabetic()) {
                     self.parse_html(line)
                 } else {
-                    Err(LiteError::new("expected an expression, found `<`", line))
+                    Err(QuilloError::new("expected an expression, found `<`", line))
                 }
             }
             Tok::Ident(k) => match k.as_str() {
@@ -733,10 +733,10 @@ impl Parser {
                     Ok(Expr::Lambda(Arc::new(def)))
                 }
                 "reply" => self.parse_reply(line),
-                kw if KEYWORDS.contains(&kw) => Err(LiteError::new(format!("unexpected keyword `{}`", kw), line)),
+                kw if KEYWORDS.contains(&kw) => Err(QuilloError::new(format!("unexpected keyword `{}`", kw), line)),
                 _ => Ok(Expr::Ident(k.clone(), line)),
             },
-            other => Err(LiteError::new(format!("expected an expression, found {}", other.describe()), line)),
+            other => Err(QuilloError::new(format!("expected an expression, found {}", other.describe()), line)),
         }
     }
 
@@ -775,9 +775,9 @@ impl Parser {
                 Tok::Ident(s) => (s, true),
                 Tok::Str(parts) => match lit_string(parts) {
                     Some(s) => (s, false),
-                    None => return Err(LiteError::new("map keys must be plain strings", t.line)),
+                    None => return Err(QuilloError::new("map keys must be plain strings", t.line)),
                 },
-                other => return Err(LiteError::new(format!("expected a map key, found {}", other.describe()), t.line)),
+                other => return Err(QuilloError::new(format!("expected a map key, found {}", other.describe()), t.line)),
             };
             if self.eat(&Tok::Colon)? {
                 let v = self.parse_expr()?;
@@ -785,7 +785,7 @@ impl Parser {
             } else if shorthand_ok {
                 entries.push((key.clone(), Expr::Ident(key, t.line)));
             } else {
-                return Err(LiteError::new(format!("expected `:` after map key \"{}\"", key), t.line));
+                return Err(QuilloError::new(format!("expected `:` after map key \"{}\"", key), t.line));
             }
             match self.peek()? {
                 Tok::Comma | Tok::Newline | Tok::Semi | Tok::RBrace => {}
@@ -804,7 +804,7 @@ impl Parser {
                     let e = sub.parse_expr()?;
                     sub.skip_seps()?;
                     if !sub.at(&Tok::Eof)? {
-                        return Err(LiteError::new("unexpected text inside `{…}` in string", line));
+                        return Err(QuilloError::new("unexpected text inside `{…}` in string", line));
                     }
                     out.push(TPart::Expr(e));
                 }
@@ -907,9 +907,9 @@ impl Parser {
         match t.tok {
             Tok::Ident(s) => Ok(s),
             Tok::Str(parts) => {
-                lit_string(parts).ok_or_else(|| LiteError::new("pattern keys must be plain strings", t.line))
+                lit_string(parts).ok_or_else(|| QuilloError::new("pattern keys must be plain strings", t.line))
             }
-            other => Err(LiteError::new(format!("expected a field name, found {}", other.describe()), t.line)),
+            other => Err(QuilloError::new(format!("expected a field name, found {}", other.describe()), t.line)),
         }
     }
 
@@ -924,12 +924,12 @@ impl Parser {
                 match t.tok {
                     Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(-n))),
                     Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(-f))),
-                    other => Err(LiteError::new(format!("expected a number after `-`, found {}", other.describe()), line)),
+                    other => Err(QuilloError::new(format!("expected a number after `-`, found {}", other.describe()), line)),
                 }
             }
             Tok::Str(parts) => match lit_string(parts) {
                 Some(s) => Ok(Pattern::Lit(Lit::Str(s.into()))),
-                None => Err(LiteError::new("string patterns cannot contain `{…}`", line)),
+                None => Err(QuilloError::new("string patterns cannot contain `{…}`", line)),
             },
             Tok::Ident(k) => Ok(match k.as_str() {
                 "_" => Pattern::Wild,
@@ -938,7 +938,7 @@ impl Parser {
                 "nil" => Pattern::Lit(Lit::Nil),
                 t if TYPE_NAMES.contains(&t) => Pattern::Type(k.clone()),
                 t if KEYWORDS.contains(&t) => {
-                    return Err(LiteError::new(format!("unexpected keyword `{}` in pattern", t), line))
+                    return Err(QuilloError::new(format!("unexpected keyword `{}` in pattern", t), line))
                 }
                 _ => Pattern::Bind(k.clone()),
             }),
@@ -987,7 +987,7 @@ impl Parser {
                 }
                 Ok(Pattern::Record(fields))
             }
-            other => Err(LiteError::new(format!("expected a pattern, found {}", other.describe()), line)),
+            other => Err(QuilloError::new(format!("expected a pattern, found {}", other.describe()), line)),
         }
     }
 
@@ -1004,7 +1004,7 @@ impl Parser {
     }
 
     fn html_err<T>(&self, msg: impl Into<String>) -> PResult<T> {
-        Err(LiteError::new(msg, self.lx.line))
+        Err(QuilloError::new(msg, self.lx.line))
     }
 
     fn read_html_name(&mut self) -> String {

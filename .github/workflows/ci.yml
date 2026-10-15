@@ -18,7 +18,7 @@ jobs:
       - name: Tests (the browser test uses the runner's Chrome)
         run: cargo test
       - name: Check the examples
-        run: for f in examples/*.lt; do ./target/release/lite check "$f"; done
+        run: for f in examples/*.qwe; do ./target/release/quillo check "$f"; done
       - name: VS Code extension
         working-directory: editors/vscode
         run: npm ci && npm test && npx vsce package --skip-license

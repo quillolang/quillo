@@ -1,4 +1,4 @@
-//! Runs the `lite` binary as a server and talks to it over HTTP.
+//! Runs the `quillo` binary as a server and talks to it over HTTP.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -27,7 +27,7 @@ impl Drop for Server {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("lite-test-{}-{}", std::process::id(), name));
+    let d = std::env::temp_dir().join(format!("quillo-test-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -35,14 +35,14 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn start(file: &Path, extra: &[&str]) -> Server {
     let port = port();
-    let child = Command::new(env!("CARGO_BIN_EXE_lite"))
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
         .args(["--port", &port.to_string()])
         .args(extra)
         .stderr(Stdio::null())
         .spawn()
-        .expect("cannot start lite");
+        .expect("cannot start quillo");
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
@@ -77,7 +77,7 @@ fn get(port: u16, path: &str) -> (u16, String) {
 #[test]
 fn requests_waiting_on_io_run_concurrently() {
     let d = temp_dir("concurrent");
-    let f = d.join("app.lt");
+    let f = d.join("app.qwe");
     std::fs::write(
         &f,
         "let hits = 0\nroute GET /slow { sleep(400); hits += 1; { hits } }\nroute GET /count = hits\n",
@@ -99,13 +99,13 @@ fn requests_waiting_on_io_run_concurrently() {
 #[test]
 fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
     let d = temp_dir("watch");
-    let main = d.join("app.lt");
-    let lib = d.join("lib.lt");
+    let main = d.join("app.qwe");
+    let lib = d.join("lib.qwe");
     std::fs::write(&lib, "fn greet() = \"one\"\n").unwrap();
-    std::fs::write(&main, "use \"lib.lt\"\nroute GET / = greet()\n").unwrap();
+    std::fs::write(&main, "use \"lib.qwe\"\nroute GET / = greet()\n").unwrap();
     let srv = start(&main, &["--watch"]);
     assert_eq!(get(srv.port, "/").1, "one");
-    let v1 = get(srv.port, "/_lite/dev").1;
+    let v1 = get(srv.port, "/_quillo/dev").1;
 
     let wait_for = |want: &str| {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -122,7 +122,7 @@ fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::write(&lib, "fn greet() = \"two\"\n").unwrap();
     wait_for("two");
-    assert_ne!(get(srv.port, "/_lite/dev").1, v1);
+    assert_ne!(get(srv.port, "/_quillo/dev").1, v1);
 
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::write(&main, "route GET / = (\n").unwrap();
@@ -137,18 +137,18 @@ fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
 #[test]
 fn watch_injects_the_reload_script_into_pages() {
     let d = temp_dir("inject");
-    let f = d.join("app.lt");
+    let f = d.join("app.qwe");
     std::fs::write(&f, "route GET / = <html><body><p>\"hi\"</p></body></html>\nroute GET /t = \"text\"\n").unwrap();
     let srv = start(&f, &["--watch"]);
     let page = get(srv.port, "/").1;
-    assert!(page.contains("/_lite/events") && page.ends_with("</body></html>"), "{}", page);
+    assert!(page.contains("/_quillo/events") && page.ends_with("</body></html>"), "{}", page);
     assert_eq!(get(srv.port, "/t").1, "text");
 }
 
 #[test]
 fn http_client_talks_to_another_server() {
     let d = temp_dir("http-client");
-    let api = d.join("api.lt");
+    let api = d.join("api.qwe");
     std::fs::write(
         &api,
         "route GET /users/:id(int) = { id, name: \"user {id}\" }\n\
@@ -157,7 +157,7 @@ fn http_client_talks_to_another_server() {
     )
     .unwrap();
     let srv = start(&api, &[]);
-    let client = d.join("client.lt");
+    let client = d.join("client.qwe");
     std::fs::write(
         &client,
         format!(
@@ -166,12 +166,12 @@ fn http_client_talks_to_another_server() {
              let r = http.post(\"{{base}}/echo\", {{ n: 21 }})\n\
              let t = http.get(\"{{base}}/teapot\")\n\
              let down = http.get(\"http://127.0.0.1:1/nothing\")\n\
-             print(json.stringify([load(7), r.status, r.json.doubled, starts_with(r.json.agent, \"lite/\"), t.status, t.ok, t.body, is_err(down)]))\n",
+             print(json.stringify([load(7), r.status, r.json.doubled, starts_with(r.json.agent, \"quillo/\"), t.status, t.ok, t.body, is_err(down)]))\n",
             srv.port
         ),
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_lite")).arg("run").arg(&client).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("run").arg(&client).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
@@ -182,15 +182,15 @@ fn http_client_talks_to_another_server() {
 #[test]
 fn watch_tells_waiting_pages_about_changes() {
     let d = temp_dir("events");
-    let f = d.join("app.lt");
+    let f = d.join("app.qwe");
     std::fs::write(&f, "route GET / = \"one\"\n").unwrap();
     let srv = start(&f, &["--watch", "--workers", "1"]);
-    assert_eq!(get(srv.port, "/_lite/events").1, "1");
+    assert_eq!(get(srv.port, "/_quillo/events").1, "1");
     // A page waits for the version to change from 1...
     let port = srv.port;
     let waiting = std::thread::spawn(move || {
         let t0 = Instant::now();
-        (get(port, "/_lite/events?v=1").1, t0.elapsed())
+        (get(port, "/_quillo/events?v=1").1, t0.elapsed())
     });
     std::thread::sleep(Duration::from_millis(300));
     // ...without using up the only worker.
@@ -206,8 +206,8 @@ fn watch_tells_waiting_pages_about_changes() {
 #[test]
 fn text_responses_are_gzipped_when_the_client_accepts_it() {
     let d = temp_dir("gzip");
-    let f = d.join("app.lt");
-    std::fs::write(&f, "route GET /big = repeat(\"lite \", 1000)\nroute GET /small = \"tiny\"\n").unwrap();
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /big = repeat(\"quillo \", 1000)\nroute GET /small = \"tiny\"\n").unwrap();
     let srv = start(&f, &[]);
     let raw = |path: &str, gzip: bool| {
         let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();

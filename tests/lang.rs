@@ -1,4 +1,4 @@
-use lite::eval_str;
+use quillo::eval_str;
 
 fn ev(src: &str) -> String {
     match eval_str(src) {

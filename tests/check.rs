@@ -1,10 +1,10 @@
 //! The static checker: what it reports, and what it must not.
 
 use std::path::Path;
-use lite::check::{check_source, Severity};
+use quillo::check::{check_source, Severity};
 
 fn diags(src: &str) -> Vec<String> {
-    check_source(src, "t.lt", Path::new("."))
+    check_source(src, "t.qwe", Path::new("."))
         .diagnostics
         .iter()
         .map(|d| format!("{}{} {}", d.line, if d.severity == Severity::Warning { " warning:" } else { "" }, d.message))
@@ -148,20 +148,20 @@ fn parse_errors_are_diagnostics() {
 
 #[test]
 fn symbols_and_references_for_the_editor() {
-    let a = check_source("fn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\ncomponent C() = <p>{total}</p>", "t.lt", Path::new("."));
+    let a = check_source("fn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\ncomponent C() = <p>{total}</p>", "t.qwe", Path::new("."));
     let names: Vec<_> = a.symbols.iter().map(|s| (s.name.as_str(), s.line, s.detail.as_str())).collect();
     assert!(names.contains(&("add", 1, "fn add(a: int, b: int = …) -> int")), "{:#?}", names);
     assert!(names.contains(&("total", 2, "let total: int")), "{:#?}", names);
     let r = a.references.iter().find(|r| r.name == "add" && r.line == 2).unwrap();
-    assert_eq!(r.def, Some(("t.lt".to_string(), 1)));
+    assert_eq!(r.def, Some(("t.qwe".to_string(), 1)));
     let r = a.references.iter().find(|r| r.name == "len" || r.name == "total" && r.line == 3).unwrap();
-    assert_eq!(r.def, Some(("t.lt".to_string(), 2)));
+    assert_eq!(r.def, Some(("t.qwe".to_string(), 2)));
 }
 
 #[test]
 fn examples_are_clean() {
-    for f in ["examples/hello.lt", "examples/orders.lt", "examples/todo.lt", "examples/notes.lt", "tests/browser/app.lt"] {
-        let a = lite::check::check_file(Path::new(f));
+    for f in ["examples/hello.qwe", "examples/orders.qwe", "examples/todo.qwe", "examples/notes.qwe", "tests/browser/app.qwe"] {
+        let a = quillo::check::check_file(Path::new(f));
         assert!(a.diagnostics.is_empty(), "{}: {:#?}", f, a.diagnostics);
     }
 }

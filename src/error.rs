@@ -2,15 +2,15 @@ use std::fmt;
 
 /// A parse or runtime error, with the line it happened on when known.
 #[derive(Debug, Clone)]
-pub struct LiteError {
+pub struct QuilloError {
     pub msg: String,
     pub line: u32,
     pub file: Option<String>,
 }
 
-impl LiteError {
+impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
-        LiteError { msg: msg.into(), line, file: None }
+        QuilloError { msg: msg.into(), line, file: None }
     }
 
     pub fn in_file(mut self, file: &str) -> Self {
@@ -21,7 +21,7 @@ impl LiteError {
     }
 }
 
-impl fmt::Display for LiteError {
+impl fmt::Display for QuilloError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match (&self.file, self.line) {
             (Some(file), l) if l > 0 => write!(f, "{}:{}: {}", file, l, self.msg),
@@ -32,4 +32,4 @@ impl fmt::Display for LiteError {
     }
 }
 
-impl std::error::Error for LiteError {}
+impl std::error::Error for QuilloError {}

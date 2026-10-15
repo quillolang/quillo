@@ -730,7 +730,7 @@ fn num_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<f64, Ctrl> {
 
 fn abs(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
-        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(crate::LiteError::new("integer overflow", line))),
+        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(crate::QuilloError::new("integer overflow", line))),
         _ => Ok(Value::Float(num_arg(&args, 0, "abs", line)?.abs())),
     }
 }

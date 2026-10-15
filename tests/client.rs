@@ -2,7 +2,7 @@
 //! Each case runs on the interpreter and, compiled to JS, in Node.
 
 use std::process::Command;
-use lite::Interp;
+use quillo::Interp;
 
 fn node_available() -> bool {
     Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -12,14 +12,14 @@ fn node_available() -> bool {
 fn both(defs: &str, body: &str) -> (String, String) {
     let src = format!("{}\nfn __t() {{\n{}\n}}\n", defs, body);
     let mut it = Interp::new(".");
-    it.load_source(&src, "case.lt").unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    let server = match it.call(&lite::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+    it.load_source(&src, "case.qwe").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let server = match it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
         Ok(v) => v.repr(),
-        Err(lite::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
-        Err(lite::interp::Ctrl::Return(v)) => v.repr(),
-        Err(lite::interp::Ctrl::Reply(_)) => "REPLY".into(),
+        Err(quillo::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
+        Err(quillo::interp::Ctrl::Return(v)) => v.repr(),
+        Err(quillo::interp::Ctrl::Reply(_)) => "REPLY".into(),
     };
-    let js = lite::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
     let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
     let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
@@ -138,7 +138,7 @@ fn compile_errors_name_what_cannot_run_in_the_browser() {
         ("component C() = <p>{fn() = reply 404}</p>", "`reply` only works on the server"),
     ];
     for (src, want) in cases {
-        let r = Interp::new(".").load_source(src, "c.lt");
+        let r = Interp::new(".").load_source(src, "c.qwe");
         if want.is_empty() {
             assert!(r.is_ok(), "{}: {:?}", src, r.err().map(|e| e.to_string()));
         } else {

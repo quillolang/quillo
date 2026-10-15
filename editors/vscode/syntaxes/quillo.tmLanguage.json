@@ -1,0 +1,218 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Quillo",
+  "scopeName": "source.quillo",
+  "fileTypes": ["qwe"],
+  "patterns": [{ "include": "#statements" }],
+  "repository": {
+    "statements": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#route" },
+        { "include": "#definition" },
+        { "include": "#state" },
+        { "include": "#html-close" },
+        { "include": "#html-open" },
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keyword" },
+        { "include": "#constant" },
+        { "include": "#type-annotation" },
+        { "include": "#operator" },
+        { "include": "#module-call" },
+        { "include": "#call" },
+        { "include": "#component-name" },
+        { "include": "#braces" },
+        { "include": "#identifier" }
+      ]
+    },
+    "comment": {
+      "name": "comment.line.double-slash.quillo",
+      "match": "//.*$"
+    },
+    "route": {
+      "match": "\\b(route)\\s+(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|ANY)\\s+(/[^\\s?{=]*)",
+      "captures": {
+        "1": { "name": "keyword.other.route.quillo" },
+        "2": { "name": "constant.language.http-method.quillo" },
+        "3": {
+          "name": "string.unquoted.path.quillo",
+          "patterns": [
+            { "match": "(:)([A-Za-z_]\\w*)(?:(\\()(int|float|num|str)(\\)))?", "captures": {
+              "1": { "name": "punctuation.definition.parameter.quillo" },
+              "2": { "name": "variable.parameter.path.quillo" },
+              "3": { "name": "punctuation.section.parens.quillo" },
+              "4": { "name": "support.type.quillo" },
+              "5": { "name": "punctuation.section.parens.quillo" } } },
+            { "match": "(\\*)([A-Za-z_]\\w*)?", "captures": {
+              "1": { "name": "keyword.operator.wildcard.quillo" },
+              "2": { "name": "variable.parameter.path.quillo" } } }
+          ]
+        }
+      }
+    },
+    "definition": {
+      "patterns": [
+        { "match": "\\b(server)\\s+(fn)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.modifier.server.quillo" },
+          "2": { "name": "storage.type.function.quillo" },
+          "3": { "name": "entity.name.function.quillo" } } },
+        { "match": "\\b(component)\\s+([A-Z]\\w*)", "captures": {
+          "1": { "name": "storage.type.component.quillo" },
+          "2": { "name": "entity.name.type.component.quillo" } } },
+        { "match": "\\b(view)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.type.view.quillo" },
+          "2": { "name": "entity.name.type.view.quillo" } } },
+        { "match": "\\b(fn)\\s+([A-Za-z_]\\w*)(?=\\s*\\()", "captures": {
+          "1": { "name": "storage.type.function.quillo" },
+          "2": { "name": "entity.name.function.quillo" } } },
+        { "match": "\\b(let)\\s+([A-Za-z_]\\w*)", "captures": {
+          "1": { "name": "storage.type.let.quillo" },
+          "2": { "name": "variable.other.declaration.quillo" } } },
+        { "match": "\\b(with)\\s+((?:(?:db|http|fs|env|time|random)\\s*,?\\s*)+)", "captures": {
+          "1": { "name": "keyword.other.with.quillo" },
+          "2": { "name": "support.constant.effect.quillo" } } }
+      ]
+    },
+    "state": {
+      "match": "(~)([A-Za-z_]\\w*)",
+      "captures": {
+        "1": { "name": "keyword.operator.state.quillo" },
+        "2": { "name": "variable.other.state.quillo" }
+      }
+    },
+    "string": {
+      "name": "string.quoted.double.quillo",
+      "begin": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.quillo" } },
+      "end": "\"",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.quillo" } },
+      "patterns": [
+        { "name": "constant.character.escape.quillo", "match": "\\\\[nrt0\"\\\\{}]" },
+        { "include": "#interpolation" }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.interpolation.quillo",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.quillo" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.quillo" } },
+      "contentName": "source.quillo.embedded",
+      "patterns": [{ "include": "#statements" }]
+    },
+    "braces": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.block.begin.quillo" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.section.block.end.quillo" } },
+      "patterns": [{ "include": "#statements" }]
+    },
+    "html-open": {
+      "name": "meta.tag.quillo",
+      "begin": "(<)([A-Za-z][\\w-]*)((?:[.#](?:[\\w-]|\\{[^}]*\\})+)*)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.quillo" },
+        "2": { "patterns": [
+          { "match": "\\b[A-Z][\\w-]*", "name": "entity.name.type.component.quillo" },
+          { "match": "\\b[a-z][\\w-]*", "name": "entity.name.tag.quillo" } ] },
+        "3": { "patterns": [
+          { "match": "\\.(?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.class.quillo" },
+          { "match": "#(?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.id.quillo" } ] }
+      },
+      "end": "(/?>)",
+      "endCaptures": { "1": { "name": "punctuation.definition.tag.end.quillo" } },
+      "patterns": [
+        { "include": "#comment" },
+        { "match": "(@)([\\w-]+)", "captures": {
+          "1": { "name": "keyword.operator.event.quillo" },
+          "2": { "name": "entity.other.attribute-name.event.quillo" } } },
+        { "match": "(bind)(:)(value|checked)", "captures": {
+          "1": { "name": "keyword.other.bind.quillo" },
+          "2": { "name": "punctuation.separator.quillo" },
+          "3": { "name": "entity.other.attribute-name.quillo" } } },
+        { "match": "[A-Za-z_:][\\w:.-]*", "name": "entity.other.attribute-name.quillo" },
+        { "match": "=", "name": "punctuation.separator.key-value.quillo" },
+        { "include": "#string" },
+        { "include": "#braces" },
+        { "match": "[.#](?:[\\w-]|\\{[^}]*\\})+", "name": "entity.other.attribute-name.class.quillo" }
+      ]
+    },
+    "html-close": {
+      "match": "(</)([A-Za-z][\\w-]*)\\s*(>)",
+      "captures": {
+        "1": { "name": "punctuation.definition.tag.begin.quillo" },
+        "2": { "patterns": [
+          { "match": "\\b[A-Z][\\w-]*", "name": "entity.name.type.component.quillo" },
+          { "match": "\\b[a-z][\\w-]*", "name": "entity.name.tag.quillo" } ] },
+        "3": { "name": "punctuation.definition.tag.end.quillo" }
+      }
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.float.quillo", "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*\\b" },
+        { "name": "constant.numeric.integer.quillo", "match": "\\b\\d[\\d_]*\\b" }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.control.quillo", "match": "\\b(if|then|else|match|for|in|return|reply)\\b" },
+        { "name": "keyword.other.quillo", "match": "\\b(use|as|with|route)\\b" },
+        { "name": "keyword.operator.logical.quillo", "match": "\\b(and|or|not)\\b" },
+        { "name": "storage.type.quillo", "match": "\\b(let|fn|view|component|server)\\b" }
+      ]
+    },
+    "constant": {
+      "name": "constant.language.quillo",
+      "match": "\\b(true|false|nil)\\b"
+    },
+    "type-annotation": {
+      "patterns": [
+        { "match": "(->|!)\\s*((?:(?:int|float|num|str|bool|list|map|html|fn|any|response|nil)\\??\\s*\\|?\\s*)+)", "captures": {
+          "1": { "name": "keyword.operator.type.quillo" },
+          "2": { "name": "support.type.quillo" } } },
+        { "match": "(?<=[\\w)])\\s*(:)\\s*((?:(?:int|float|num|str|bool|list|map|html|fn|any|response|nil)\\??\\s*(?:\\|\\s*)?)+)(?=\\s*[,)=]|\\s*$)", "captures": {
+          "1": { "name": "punctuation.separator.type.quillo" },
+          "2": { "name": "support.type.quillo" } } },
+        { "match": "(?<=[:|{,]\\s{0,8})\\b(int|float|num|str|bool|list|map|html|any|response)\\b", "name": "support.type.pattern.quillo" }
+      ]
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.pipe.quillo", "match": "\\|>" },
+        { "name": "keyword.operator.coalesce.quillo", "match": "\\?\\?" },
+        { "name": "keyword.operator.arrow.quillo", "match": "=>|->" },
+        { "name": "keyword.operator.comparison.quillo", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.assignment.quillo", "match": "\\+=|-=|=" },
+        { "name": "keyword.operator.range.quillo", "match": "\\.\\." },
+        { "name": "keyword.operator.try.quillo", "match": "\\?" },
+        { "name": "keyword.operator.arithmetic.quillo", "match": "[+\\-*/%]" },
+        { "name": "keyword.operator.alternative.quillo", "match": "\\|" }
+      ]
+    },
+    "module-call": {
+      "match": "\\b(json|db|http)(\\.)([a-z_]\\w*)",
+      "captures": {
+        "1": { "name": "support.module.quillo" },
+        "2": { "name": "punctuation.accessor.quillo" },
+        "3": { "name": "support.function.quillo" }
+      }
+    },
+    "call": {
+      "patterns": [
+        { "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat)\\b(?=\\s*\\()", "name": "support.function.builtin.quillo" },
+        { "match": "\\b([a-z_]\\w*)(?=\\s*\\()", "name": "entity.name.function.call.quillo" }
+      ]
+    },
+    "component-name": {
+      "match": "\\b[A-Z]\\w*\\b",
+      "name": "entity.name.type.quillo"
+    },
+    "identifier": {
+      "patterns": [
+        { "match": "\\brequest\\b", "name": "variable.language.request.quillo" },
+        { "match": "\\b[a-z_]\\w*\\b", "name": "variable.other.quillo" }
+      ]
+    }
+  }
+}

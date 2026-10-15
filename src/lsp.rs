@@ -1,4 +1,4 @@
-//! `lite lsp`: a Language Server Protocol server over stdin/stdout.
+//! `quillo lsp`: a Language Server Protocol server over stdin/stdout.
 //!
 //! It checks documents as they change (with `crate::check`) and answers
 //! hover, go-to-definition, completion and document-symbol requests from
@@ -192,7 +192,7 @@ impl Server {
                             "documentSymbolProvider": true,
                             "completionProvider": { "triggerCharacters": [".", "<", "@"] }
                         },
-                        "serverInfo": { "name": "lite", "version": env!("CARGO_PKG_VERSION") }
+                        "serverInfo": { "name": "quillo", "version": env!("CARGO_PKG_VERSION") }
                     });
                     self.reply(id.unwrap_or(J::Null), caps);
                 }
@@ -271,7 +271,7 @@ impl Server {
             by_file.entry(duri).or_default().push(json!({
                 "range": range,
                 "severity": if d.severity == Severity::Error { 1 } else { 2 },
-                "source": "lite",
+                "source": "quillo",
                 "message": d.message,
             }));
         }
@@ -323,7 +323,7 @@ impl Server {
 
     fn hover(&self, params: &J) -> J {
         if let Some((_, r)) = self.reference_at(params) {
-            return json!({ "contents": { "kind": "markdown", "value": format!("```lite\n{}\n```", r.detail) } });
+            return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", r.detail) } });
         }
         let (uri, line, col) = Self::position(params);
         if let Some((w, _)) = self.docs.get(&uri).and_then(|d| word_at(&d.text, line, col)) {
@@ -461,7 +461,7 @@ fn keyword_doc(w: &str) -> Option<String> {
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
         "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
         "match" => "`match value { pattern [if guard] => result ... }`",
-        "use" => "`use \"lib.lt\"` runs another file once, into the global scope.",
+        "use" => "`use \"lib.qwe\"` runs another file once, into the global scope.",
         _ => return None,
     };
     Some(text.to_string())

@@ -1,9 +1,9 @@
-use lite::server::{HttpRequest, HttpResponse};
-use lite::Interp;
+use quillo::server::{HttpRequest, HttpResponse};
+use quillo::Interp;
 
 fn app(src: &str) -> Interp {
     let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
-    if let Err(e) = it.load_source(src, "test.lt") {
+    if let Err(e) = it.load_source(src, "test.qwe") {
         panic!("{}", e);
     }
     it
@@ -70,7 +70,7 @@ route GET /files/*path = path
 #[test]
 fn query_patterns_coerce_and_default() {
     let mut it = app(r#"route GET /search ? { q: str, limit: int = 20 } = { q, limit }"#);
-    assert_eq!(get(&mut it, "/search?q=lite+lang&limit=5").text(), r#"{"q":"lite lang","limit":5}"#);
+    assert_eq!(get(&mut it, "/search?q=quillo+lang&limit=5").text(), r#"{"q":"quillo lang","limit":5}"#);
     assert_eq!(get(&mut it, "/search?q=x").text(), r#"{"q":"x","limit":20}"#);
     assert_eq!(get(&mut it, "/search?q=x&limit=lots").status, 400);
     assert_eq!(get(&mut it, "/search").status, 400);
@@ -173,7 +173,7 @@ route GET /err = err("nope")
 fn headers_cookies_and_respond() {
     let mut it = app(
         r#"
-route GET /who { cookies: { session: str } } = respond(200, "session {session}", { "X-Lite": "1" })
+route GET /who { cookies: { session: str } } = respond(200, "session {session}", { "X-Quillo": "1" })
 route GET /who = reply 401
 "#,
     );
@@ -184,7 +184,7 @@ route GET /who = reply 401
         body: vec![],
         remote: String::new(),
     });
-    assert_eq!((r.status, r.text().as_str(), r.header("x-lite")), (200, "session abc", Some("1")));
+    assert_eq!((r.status, r.text().as_str(), r.header("x-quillo")), (200, "session abc", Some("1")));
     assert_eq!(get(&mut it, "/who").status, 401);
 }
 
@@ -223,12 +223,12 @@ route GET /bare = <Counter/>
     );
     let r = get(&mut it, "/");
     let page = r.text();
-    assert!(page.contains(r#"<lite-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2}">"#), "{}", page);
-    assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></lite-island>"), "{}", page);
-    assert!(page.ends_with("<script src=\"/_lite/lite.js\" defer></script></body></html>"), "{}", page);
+    assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2}">"#), "{}", page);
+    assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></quillo-island>"), "{}", page);
+    assert!(page.ends_with("<script src=\"/_quillo/quillo.js\" defer></script></body></html>"), "{}", page);
     // Without a </body>, the script goes at the end.
-    assert!(get(&mut it, "/bare").text().ends_with("<script src=\"/_lite/lite.js\" defer></script>"));
-    let js = get(&mut it, "/_lite/lite.js");
+    assert!(get(&mut it, "/bare").text().ends_with("<script src=\"/_quillo/quillo.js\" defer></script>"));
+    let js = get(&mut it, "/_quillo/quillo.js");
     assert_eq!(js.header("content-type"), Some("text/javascript; charset=utf-8"));
     assert!(js.text().contains("W.component(\"Counter\""));
 }
@@ -242,7 +242,7 @@ fn component_props_must_be_sendable() {
 }
 
 fn rpc(it: &mut Interp, name: &str, body: &str) -> HttpResponse {
-    send(it, "POST", &format!("/_lite/rpc/{}", name), Some("application/json"), body)
+    send(it, "POST", &format!("/_quillo/rpc/{}", name), Some("application/json"), body)
 }
 
 #[test]
@@ -278,24 +278,24 @@ fn not_exposed() = "secret"
     assert_eq!((r.status, r.text().as_str()), (401, r#"{"error":"who are you?"}"#));
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     headers.push(("X-User".into(), "ada".into()));
-    let r = it.handle(&HttpRequest { method: "POST".into(), url: "/_lite/rpc/whoami".into(), headers, body: b"[]".to_vec(), remote: "1.2.3.4".into() });
+    let r = it.handle(&HttpRequest { method: "POST".into(), url: "/_quillo/rpc/whoami".into(), headers, body: b"[]".to_vec(), remote: "1.2.3.4".into() });
     assert_eq!(r.text(), r#"{"ok":"ada"}"#);
     // Only JSON POSTs: a cross-site form cannot call a server fn.
-    assert_eq!(send(&mut it, "POST", "/_lite/rpc/add_todo", Some("application/x-www-form-urlencoded"), "x=1").status, 415);
-    assert_eq!(get(&mut it, "/_lite/rpc/add_todo").status, 405);
+    assert_eq!(send(&mut it, "POST", "/_quillo/rpc/add_todo", Some("application/x-www-form-urlencoded"), "x=1").status, 415);
+    assert_eq!(get(&mut it, "/_quillo/rpc/add_todo").status, 405);
 }
 
 #[test]
 fn the_browser_bundle_only_carries_what_the_page_uses() {
     let mut small = app("component Hi(name: str) = <p>\"hi {name}\"</p>\nroute GET / = <Hi name=\"x\"/>\n");
-    let js = get(&mut small, "/_lite/lite.js").text();
+    let js = get(&mut small, "/_quillo/quillo.js").text();
     // No server fns: no RPC code. Rendering and booting, of course.
     assert!(!js.contains("async function rpc"), "{}", js);
     assert!(js.contains("function boot(") && js.contains("function mount("));
     // Builtins come along only when used.
     assert!(!js.contains("B.group_by") && !js.contains("B.sort_by"));
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={fn() { xs = save(xs |> sort_by(fn(x) = x)) }}>\"\"</button> }\nroute GET / = <C/>\n");
-    let js2 = get(&mut big, "/_lite/lite.js").text();
+    let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
     assert!(js.len() < js2.len() && js.len() < 12_000, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
@@ -305,11 +305,11 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
 #[test]
 fn the_browser_bundle_can_be_revalidated() {
     let mut it = app("component Hi() = <p>\"hi\"</p>\nroute GET / = <Hi/>\n");
-    let r = get(&mut it, "/_lite/lite.js");
+    let r = get(&mut it, "/_quillo/quillo.js");
     let etag = r.header("etag").unwrap().to_string();
     let again = it.handle(&HttpRequest {
         method: "GET".into(),
-        url: "/_lite/lite.js".into(),
+        url: "/_quillo/quillo.js".into(),
         headers: vec![("If-None-Match".into(), etag)],
         body: Vec::new(),
         remote: "127.0.0.1".into(),
