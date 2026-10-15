@@ -396,6 +396,7 @@ fn every_path_of_a_single_page_app_renders_on_the_server() {
         ("/products", 200, "Products"),
         ("/products/3", 200, "Fountain pen"),
         ("/about", 200, "About"),
+        ("/cart", 200, "Cart"),
         ("/products/99", 404, "Not found"),
         ("/products/abc", 404, "Not found"),
         ("/nope", 404, "Not found"),

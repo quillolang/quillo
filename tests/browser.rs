@@ -305,3 +305,26 @@ fn example_gallery_tabs_switch_without_reloading() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/spa.qwe: stock is live data; the cart reserves and returns it.
+#[test]
+fn shop_stock_updates_live_and_the_cart_reserves_it() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(&chrome, &root.join("examples/spa.qwe"), free_port(), Some(&root.join("tests/browser/spa-live.js")));
+    let want = serde_json::json!({
+        "before": "10 in stock",
+        "liveArrived": true,
+        "penBefore": "Only 1 left",
+        "penAfter": ["Sold out", true, true],
+        "cartLink": "Cart: 1 (€58)",
+        "penReturned": 1,
+        "penPage": "Only 1 left",
+        "checkout": ["Thank you! 1 item ordered.", "0"],
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

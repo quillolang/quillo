@@ -35,10 +35,17 @@ impl Gil {
 }
 
 /// Live updates: each topic remembers the last change that touched it.
-#[derive(Default)]
 pub struct Live {
     pub seq: u64,
     versions: HashMap<String, u64>,
+}
+
+impl Default for Live {
+    /// The count starts at 1: a page that saw 1 knows the state at 1, while
+    /// 0 means "I know nothing yet" (asking returns the current count).
+    fn default() -> Self {
+        Live { seq: 1, versions: HashMap::new() }
+    }
 }
 
 pub struct Shared {
