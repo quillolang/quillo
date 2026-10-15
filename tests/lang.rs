@@ -327,3 +327,12 @@ let node = { type: "card", props: { title: "Stock", size: "l", unrelated: true }
     assert!(ev_err("<p {...5}></p>").contains("`{...}` in <p> needs a map, got int"));
     assert!(ev_err("<p {1 + 1}></p>").contains("write {name} (short for name={name}) or {...map}"));
 }
+
+#[test]
+fn pattern_defaults_are_taken_as_written() {
+    assert_eq!(ev("match {} { { limit: int = null } => limit }"), "null");
+    assert_eq!(ev("match {} { { limit: int = 20 } => limit }"), "20");
+    assert_eq!(ev("match { limit: 5 } { { limit: int = null } => limit }"), "5");
+    // A value that is there must still match.
+    assert!(ev_err("match { limit: \"x\" } { { limit: int = null } => limit }").contains("no `match` arm"));
+}

@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const KEYWORDS: &[&str] = &[
-    "let", "fn", "view", "component", "server", "route", "use", "return", "if", "else", "match", "for", "in",
+    "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "in",
     "true", "false", "null", "reply", "as", "with",
 ];
 const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];

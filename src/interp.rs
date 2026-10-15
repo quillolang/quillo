@@ -71,6 +71,13 @@ pub struct Interp {
     pub pending: Vec<String>,
     /// The Postgres connection this request's `db.transaction` holds.
     pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
+    /// This program's database (SQLite or a Postgres pool), opened on first use.
+    pub db: Arc<std::sync::Mutex<Option<Arc<crate::db::Backend>>>>,
+    /// Where this program is mounted ("" at the root, "/notes" under `mount`).
+    /// Root-relative links, redirects and browser URLs get it as a prefix.
+    pub base: String,
+    /// Programs mounted under a path prefix: `mount /notes = "notes.qwe"`.
+    pub mounts: Vec<(String, Interp)>,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -314,6 +321,9 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            db: Arc::new(std::sync::Mutex::new(None)),
+            base: String::new(),
+            mounts: Vec::new(),
         }
     }
 
@@ -339,6 +349,9 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            db: self.db.clone(),
+            base: self.base.clone(),
+            mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
         }
     }
 
@@ -349,6 +362,10 @@ impl Interp {
 
     /// Announces changes to `topics`, after the current transaction commits.
     pub fn publish(&mut self, topics: Vec<String>) {
+        // Each program has its own topics (two mounted apps may both have
+        // a `notes` table).
+        let topics: Vec<String> =
+            if self.base.is_empty() { topics } else { topics.into_iter().map(|t| format!("{}|{}", self.base, t)).collect() };
         if self.tx_depth > 0 {
             self.pending.extend(topics);
         } else {
@@ -358,8 +375,18 @@ impl Interp {
 
     /// Notes that the running `live` loader depends on `topic`.
     pub fn watch(&mut self, topic: String) {
+        let topic = if self.base.is_empty() { topic } else { format!("{}|{}", self.base, topic) };
         if let Some(r) = &mut self.reads {
             r.insert(topic);
+        }
+    }
+
+    /// A root-relative URL ("/x") as seen from outside this program.
+    pub fn with_base(&self, url: &str) -> String {
+        if !self.base.is_empty() && url.starts_with('/') && !url.starts_with("//") {
+            format!("{}{}", self.base, url)
+        } else {
+            url.to_string()
         }
     }
 
@@ -486,6 +513,21 @@ impl Interp {
                         }
                     }
                 }
+                Ok(Value::Nil)
+            }
+            Stmt::Mount(prefix, file, line) => {
+                if !Arc::ptr_eq(env, &self.globals) {
+                    return fail(*line, "`mount` must be at the top level");
+                }
+                let full = self.base_dir.join(file);
+                let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.clone());
+                let mut sub = Interp::with_shared(dir, self.shared.clone());
+                sub.base = format!("{}{}", self.base, prefix);
+                sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
+                // Watch the mounted program's files too.
+                self.loaded.extend(sub.files());
+                self.mounts.retain(|(p, _)| p != prefix);
+                self.mounts.push((prefix.clone(), sub));
                 Ok(Value::Nil)
             }
             Stmt::State(name, e, _) => {
@@ -1061,7 +1103,16 @@ impl Interp {
                     let found = get_path(v, &f.path);
                     let val = match (found, &f.default) {
                         (Some(x), _) if !matches!(x, Value::Nil) => x,
-                        (_, Some(d)) => self.eval(d, env)?,
+                        (_, Some(d)) => {
+                            // A default is taken as written: `limit: int = null`
+                            // binds null when the field is missing.
+                            let d = self.eval(d, env)?;
+                            if let Pattern::Type(_) = &f.pat {
+                                binds.push((f.path.last().unwrap().clone(), d));
+                                continue;
+                            }
+                            d
+                        }
                         (Some(x), None) => x,
                         (None, None) => return Ok(None),
                     };
@@ -1143,6 +1194,12 @@ impl Interp {
             }
             let name = name.strip_prefix("bind:").unwrap_or(&name).to_string();
             let name = name.as_str();
+            let v = match (&v, name) {
+                (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
+                    Value::str(self.with_base(s))
+                }
+                _ => v,
+            };
             if name == "value" && el.tag == "textarea" {
                 text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
                 continue;

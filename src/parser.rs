@@ -229,6 +229,39 @@ impl Parser {
                     self.next()?;
                     return Ok(Stmt::Fn(Arc::new(self.parse_component(line)?)));
                 }
+                "mount" => {
+                    // `mount /prefix = "file.qwe"`; otherwise `mount` is a name.
+                    let saved = self.save();
+                    self.next()?;
+                    if self.peeked.is_none() {
+                        self.lx.skip_inline_ws();
+                        if self.lx.peek_char() == Some('/') {
+                            let mut prefix = String::new();
+                            while let Some(c) = self.lx.peek_char() {
+                                if c == '/' || is_path_char(c) {
+                                    prefix.push(c);
+                                    self.lx.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let prefix = prefix.trim_end_matches('/').to_string();
+                            if prefix.is_empty() || prefix.contains("//") {
+                                return Err(QuilloError::new("`mount` needs a path such as /notes", line));
+                            }
+                            self.lx.last = Some(Tok::RParen);
+                            self.expect(&Tok::Assign, "`=` after the mount path")?;
+                            let t = self.next()?;
+                            if let Tok::Str(parts) = t.tok {
+                                if let Some(file) = lit_string(parts) {
+                                    return Ok(Stmt::Mount(prefix, file, line));
+                                }
+                            }
+                            return Err(QuilloError::new("`mount` expects a file: mount /notes = \"notes.qwe\"", line));
+                        }
+                    }
+                    self.restore(saved);
+                }
                 "use" => {
                     self.next()?;
                     let t = self.next()?;

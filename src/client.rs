@@ -41,6 +41,9 @@ pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
         c.global(name, 0)?;
     }
     let mut program = String::new();
+    if !it.base.is_empty() {
+        let _ = writeln!(program, "BASE = {};", js_str(&it.base));
+    }
     for d in &c.defs {
         program.push_str(d);
         program.push('\n');
@@ -256,7 +259,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => expr_assigned(e, out),
             Stmt::Fn(d) => expr_assigned(&d.body, out),
             Stmt::Route(r) => expr_assigned(&r.body, out),
-            Stmt::Use(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
         }
     }
 }
@@ -810,6 +813,10 @@ impl<'a> Compiler<'a> {
                 Stmt::Use(_, line) => {
                     self.line = *line;
                     return self.err("`use` must be at the top level");
+                }
+                Stmt::Mount(_, _, line) => {
+                    self.line = *line;
+                    return self.err("`mount` must be at the top level");
                 }
             }
         }

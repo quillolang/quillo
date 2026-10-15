@@ -234,4 +234,6 @@ pub enum Stmt {
     Return(Option<Expr>),
     /// `~name = expr` in a component: state, set once, kept between renders.
     State(String, Expr, u32),
+    /// `mount /prefix = "app.qwe"`: another program, served under the prefix.
+    Mount(String, String, u32),
 }

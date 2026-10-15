@@ -45,13 +45,11 @@ pub struct Shared {
     pub gil: Gil,
     pub live: Mutex<Live>,
     live_changed: Condvar,
-    /// The program's database (SQLite or a Postgres pool), opened on first use.
-    pub db: Mutex<Option<std::sync::Arc<crate::db::Backend>>>,
 }
 
 impl Shared {
     pub fn new() -> Self {
-        Shared { gil: Gil::new_held(), live: Mutex::new(Live::default()), live_changed: Condvar::new(), db: Mutex::new(None) }
+        Shared { gil: Gil::new_held(), live: Mutex::new(Live::default()), live_changed: Condvar::new() }
     }
 
     /// Marks topics as changed and wakes the pages waiting on them.

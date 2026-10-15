@@ -1,0 +1,56 @@
+// Every example in one server: each .qwe program is mounted under a path.
+//
+//   quillo run examples/index.qwe --watch     then open http://localhost:8080
+//
+// A mounted program runs unchanged, with its own globals and database. Its
+// links, redirects, server fn calls and page changes stay under its prefix:
+// "/products" in spa.qwe is /spa/products here.
+
+mount /hello = "hello.qwe"
+mount /orders = "orders.qwe"
+mount /todo = "todo.qwe"
+mount /notes = "notes.qwe"
+mount /scroll = "scroll.qwe"
+mount /compose = "compose.qwe"
+mount /layout = "layout.qwe"
+mount /spa = "spa.qwe"
+
+let examples = [
+    { path: "/todo", name: "Todo", about: "A server-rendered app with forms and a JSON API. No JavaScript." },
+    { path: "/notes", name: "Notes", about: "SQLite and a live component: open it in two tabs." },
+    { path: "/spa", name: "Shop", about: "A single-page app: links without reloads, a cart, deep links." },
+    { path: "/compose", name: "Composition", about: "Views and components built from each other." },
+    { path: "/layout", name: "JSON layout", about: "A page described as JSON, with a live editor." },
+    { path: "/scroll", name: "Infinite scroll", about: "100,000 rows; only what is on screen is rendered." },
+    { path: "/hello/hello/Quillo", name: "Hello", about: "Routes, typed path params, query patterns." },
+    { path: "/orders/orders", name: "Orders API", about: "Routing on what is inside a JSON body." },
+]
+
+view Example(path: str, name: str, about: str) =
+    <li>
+        <a href={path}>{name}</a>
+        <span>{about}</span>
+    </li>
+
+let css = "
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
+ul { list-style: none; padding: 0; }
+li { display: flex; flex-direction: column; padding: .8rem 0; border-bottom: 1px solid #eee; }
+li a { font-weight: 600; color: #0b57d0; text-decoration: none; } li a:hover { text-decoration: underline; }
+li span { color: #555; }
+code { background: #f3f3f3; padding: .1rem .3rem; border-radius: 4px; }
+"
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>Quillo examples</title>
+            <style>{raw(css)}</style>
+        </head>
+        <body>
+            <h1>Quillo examples</h1>
+            <p>Each one is its own <code>.qwe</code> program, mounted here with <code>mount</code>.</p>
+            <ul>{for e in examples => <Example {...e}/>}</ul>
+        </body>
+    </html>

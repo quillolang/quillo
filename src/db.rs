@@ -82,12 +82,12 @@ fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
 
 /// The program's database, opening the default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
-    if let Some(b) = it.shared.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    if let Some(b) = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         return Ok(b);
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
     let b = Arc::new(open_backend(it, &target)?);
-    let mut slot = it.shared.db.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = it.db.lock().unwrap_or_else(|e| e.into_inner());
     Ok(slot.get_or_insert(b).clone())
 }
 
@@ -236,7 +236,7 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let target = sql_arg(&args, "db.open", line)?;
     match open_backend(it, &target) {
         Ok(b) => {
-            *it.shared.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(b));
+            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(b));
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),

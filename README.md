@@ -64,7 +64,8 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 [scroll.qwe](examples/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window),
 [compose.qwe](examples/compose.qwe) (views and components built from each other),
 [layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor),
-[spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s).
+[spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
+and [index.qwe](examples/index.qwe), which mounts all of them in one server.
 
 ## Language tour
 
@@ -491,6 +492,23 @@ route GET /users/:id(int) {
     user
 }
 ```
+
+### Mounting programs
+
+`mount` serves another `.qwe` program under a path prefix:
+
+```quillo
+mount /notes = "notes.qwe"
+mount /shop = "shop/app.qwe"
+route GET / = <a href="/notes">Notes</a>
+```
+
+The mounted program runs unchanged, with its own globals and its own database, and
+sees paths without the prefix (`url().path` is `/products`, not `/shop/products`).
+Its root-relative links and form actions (`href`, `src`, `action`), its redirects, its
+browser bundle, its `server fn` calls, live data and page changes are all moved under the
+prefix. Changes to mounted files are picked up by `--watch`. See
+[index.qwe](examples/index.qwe), which mounts every example.
 
 ## Standard library
 

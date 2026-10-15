@@ -3,6 +3,10 @@
 // appended after this and registers its functions in G.
 "use strict";
 
+// Where the program is mounted ("" at the root); the bundle sets it.
+let BASE = "";
+const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !== "/" ? BASE + u : u);
+
 // ---- values ------------------------------------------------------------
 
 class QuilloError extends Error {}
@@ -302,8 +306,11 @@ function matchInto(p, v, b) {
       for (const f of p.fs) {
         let x = getPath(v, f.path);
         if (isNil(x)) {
-          if (f.d) x = f.d();
-          else if (x === undefined) return false;
+          if (f.d) {
+            x = f.d();
+            // A default is taken as written, even `int = null`.
+            if (f.p.k === "t") { b[f.path[f.path.length - 1]] = x; continue; }
+          } else if (x === undefined) return false;
           else x = null;
         }
         const before = Object.keys(b).length;
@@ -518,7 +525,7 @@ async function rpcRaw(name, args, live) {
   // as with http.* on the server, so `??` and `is_err` handle it.
   const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, failed: true });
   try {
-    r = await fetch("/_quillo/rpc/" + encodeURIComponent(name), {
+    r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
       headers,
       body: JSON.stringify(args.map(toJSON)),
@@ -577,7 +584,7 @@ async function liveLoop() {
     const ctrl = (Live.ctrl = new AbortController());
     let j;
     try {
-      const r = await fetch("/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key), { signal: ctrl.signal });
+      const r = await fetch(BASE + "/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key), { signal: ctrl.signal });
       j = await r.json();
     } catch (e) {
       if (!ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 1000));
@@ -682,15 +689,20 @@ function navStart() {
     if (!a || !a.closest("quillo-island")) return;
     if ((a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return;
     const u = new URL(a.href, location.href);
-    if (u.origin !== location.origin || u.pathname.startsWith("/_quillo/")) return;
+    if (u.origin !== location.origin) return;
+    // Only links into this program; others load normally.
+    if (BASE && u.pathname !== BASE && !u.pathname.startsWith(BASE + "/")) return;
+    const path = u.pathname.slice(BASE.length) || "/";
+    if (path.startsWith("/_quillo/")) return;
     e.preventDefault();
-    navigate(u.pathname + u.search + u.hash);
+    navigate(path + u.search + u.hash);
   });
 }
 
 function navigate(to) {
   navStart();
-  if (to !== location.pathname + location.search + location.hash) history.pushState(null, "", to);
+  const full = withBase(to);
+  if (full !== location.pathname + location.search + location.hash) history.pushState(null, "", full);
   window.scrollTo(0, 0);
   navChanged();
   return null;
@@ -699,8 +711,9 @@ function navigate(to) {
 function currentUrl() {
   navStart();
   if (rendering) Nav.subs.add(rendering);
+  const p = location.pathname;
   return {
-    path: location.pathname,
+    path: BASE && p.startsWith(BASE) ? p.slice(BASE.length) || "/" : p,
     query: Object.fromEntries(new URLSearchParams(location.search)),
     hash: location.hash.slice(1),
   };
@@ -717,6 +730,7 @@ function setProp(el, k, v, old) {
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
+  if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }

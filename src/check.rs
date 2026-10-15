@@ -715,6 +715,22 @@ impl Checker {
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
+            if let Stmt::Mount(prefix, path, line) = s {
+                // A mounted program is a program of its own: check it alone.
+                let full = base.join(path);
+                if !full.is_file() {
+                    self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: no such file", full.display()));
+                } else {
+                    let sub = check_file(&full);
+                    self.out.diagnostics.extend(sub.diagnostics);
+                    self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
+                        s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
+                        s
+                    }));
+                }
+                order.push(Item { stmt: s.clone(), file: file.clone() });
+                continue;
+            }
             if let Stmt::Use(path, line) = s {
                 let full = base.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
@@ -1192,6 +1208,13 @@ impl Checker {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`use` must be at the top level");
+                }
+                T::of(NIL)
+            }
+            Stmt::Mount(_, _, line) => {
+                self.line = *line;
+                if !self.scopes.is_empty() {
+                    self.error("`mount` must be at the top level");
                 }
                 T::of(NIL)
             }
@@ -2093,7 +2116,7 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
             Stmt::Return(Some(e)) => walk_expr(e, f),
             Stmt::Fn(d) => walk_expr(&d.body, f),
             Stmt::Route(r) => walk_expr(&r.body, f),
-            Stmt::Use(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
         }
     }
 }
@@ -2127,7 +2150,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => assigned_in(e, out),
             Stmt::Fn(d) => assigned_in(&d.body, out),
             Stmt::Route(r) => assigned_in(&r.body, out),
-            Stmt::Use(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
         }
     }
 }

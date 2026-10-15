@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -141,13 +142,31 @@ fn build_request(req: &HttpRequest, path: &str, query: &Map) -> Map {
 impl Interp {
     /// Runs the first route whose method, path and patterns all match.
     pub fn handle(&mut self, req: &HttpRequest) -> HttpResponse {
+        // A mounted program answers everything under its prefix, seeing the
+        // path without it.
+        let path = req.url.split('?').next().unwrap_or("");
+        for (prefix, sub) in self.mounts.iter_mut() {
+            if path == prefix.as_str() || path.starts_with(&format!("{}/", prefix)) {
+                let rest = &req.url[prefix.len()..];
+                let mut inner = req.clone();
+                inner.url = if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() };
+                return sub.handle(&inner);
+            }
+        }
         let mut resp = self.handle_inner(req);
+        if !self.base.is_empty() {
+            for (k, v) in resp.headers.iter_mut() {
+                if k.eq_ignore_ascii_case("location") {
+                    *v = self.with_base(v);
+                }
+            }
+        }
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
         if html && req.method != "HEAD" {
             let body = String::from_utf8_lossy(&resp.body);
             if body.contains("<quillo-island") && !body.contains("/_quillo/quillo.js") {
-                let tag = "<script src=\"/_quillo/quillo.js\" defer></script>";
+                let tag = format!("<script src=\"{}/_quillo/quillo.js\" defer></script>", self.base);
                 let body = match body.rfind("</body>") {
                     Some(i) => format!("{}{}{}", &body[..i], tag, &body[i..]),
                     None => format!("{}{}", body, tag),
@@ -643,7 +662,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             serve_events(app.clone(), rq);
             continue;
         }
-        if rq.url().split('?').next() == Some("/_quillo/live") {
+        if rq.url().split('?').next().map_or(false, |p| p.ends_with("/_quillo/live")) {
             serve_live(app.shared.clone(), rq);
             continue;
         }

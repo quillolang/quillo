@@ -405,3 +405,41 @@ fn every_path_of_a_single_page_app_renders_on_the_server() {
         assert!(r.text().contains(&format!("<h2>{}</h2>", heading)), "{}: {}", path, r.text());
     }
 }
+
+#[test]
+fn mounted_programs_live_under_their_prefix() {
+    let dir = std::env::temp_dir().join(format!("quillo-mount-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("shop")).unwrap();
+    std::fs::write(
+        dir.join("shop/app.qwe"),
+        r#"
+db.exec("create table t (n int)")
+server fn add(n: int) = db.exec("insert into t values (?)", n)
+component Box() = <a href="/inside">in</a>
+route GET / = <html><body><a href="/items?x=1">items</a><a href="//cdn.example/x.js">cdn</a><form action="/buy"></form><Box/></body></html>
+route POST /buy = redirect("/thanks")
+route GET /where = url().path
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.qwe"), "mount /shop = \"shop/app.qwe\"\nroute GET / = \"home\"\n").unwrap();
+    let mut it = Interp::new(&dir);
+    it.load_file(&dir.join("main.qwe")).unwrap();
+    assert_eq!(get(&mut it, "/").text(), "home");
+    let page = get(&mut it, "/shop").text();
+    assert!(page.contains(r#"<a href="/shop/items?x=1">"#) && page.contains(r#"href="//cdn.example/x.js""#), "{}", page);
+    assert!(page.contains(r#"action="/shop/buy""#) && page.contains(r#"<a href="/shop/inside">"#), "{}", page);
+    assert!(page.contains(r#"<script src="/shop/_quillo/quillo.js" defer>"#), "{}", page);
+    assert!(get(&mut it, "/shop/_quillo/quillo.js").text().contains("BASE = \"/shop\""));
+    assert_eq!(get(&mut it, "/shop/where").text(), "/where");
+    let r = send(&mut it, "POST", "/shop/buy", None, "");
+    assert_eq!((r.status, r.header("location")), (303, Some("/shop/thanks")));
+    assert_eq!(rpc_at(&mut it, "/shop/_quillo/rpc/add", "[1]").status, 200);
+    assert_eq!(get(&mut it, "/shopping").status, 404);
+    assert_eq!(get(&mut it, "/elsewhere").status, 404);
+}
+
+fn rpc_at(it: &mut Interp, url: &str, body: &str) -> HttpResponse {
+    send(it, "POST", url, Some("application/json"), body)
+}

@@ -33,6 +33,10 @@ fn run_page(chrome: &Path, app: &str, port: u16) -> serde_json::Value {
 /// Like `run_page`, for any program, with an optional test script that
 /// run.js injects into the page.
 fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) -> serde_json::Value {
+    run_page_with_path(chrome, app, port, "/", script)
+}
+
+fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>) -> serde_json::Value {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
@@ -51,7 +55,7 @@ fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) ->
     let out = Command::new("node")
         .arg(dir.join("run.js"))
         .arg(chrome)
-        .arg(format!("http://127.0.0.1:{}/", port))
+        .arg(format!("http://127.0.0.1:{}{}", port, path))
         .arg(&profile)
         .arg("30000")
         .args(script)
@@ -245,6 +249,32 @@ fn single_page_app_navigates_without_reloading() {
         "about": ["/about", "About"],
         "cartKept": "2",
         "missing": ["/products/99", "Not found"],
+        "noReload": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
+/// examples/index.qwe mounts every example; the SPA works under /spa.
+#[test]
+fn mounted_single_page_app_stays_under_its_prefix() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with_path(
+        &chrome,
+        &root.join("examples/index.qwe"),
+        free_port(),
+        "/spa",
+        Some(&root.join("tests/browser/mounted.js")),
+    );
+    let want = serde_json::json!({
+        "list": ["/spa/products", "Products"],
+        "product": ["/spa/products/2", "Notebook"],
+        "cart": "1",
+        "back": "/spa/products",
         "noReload": true,
         "errors": []
     });

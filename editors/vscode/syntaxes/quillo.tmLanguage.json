@@ -337,7 +337,7 @@
         },
         {
           "name": "keyword.other.quillo",
-          "match": "\\b(use|as|with|route)\\b"
+          "match": "\\b(use|as|with|route|mount)\\b"
         },
         {
           "name": "storage.type.quillo",
