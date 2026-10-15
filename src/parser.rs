@@ -14,13 +14,16 @@ pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "route", "use", "return", "if", "then", "else", "match", "for", "in", "and", "or", "not",
-    "true", "false", "nil", "reply", "as", "component",
+    "true", "false", "null", "nil", "reply", "as", "component",
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
 
 pub struct Parser {
     lx: Lexer,
     peeked: Option<Token>,
+    /// While > 0, `name => ...` is not an arrow function: in `for x in xs => body`
+    /// the `=>` belongs to the loop.
+    no_bare_arrow: u32,
 }
 
 fn can_start_expr(t: &Tok) -> bool {
@@ -32,6 +35,7 @@ fn can_start_expr(t: &Tok) -> bool {
         | Tok::LBracket
         | Tok::LBrace
         | Tok::Minus
+        | Tok::Bang
         | Tok::Lt => true,
         Tok::Ident(k) => !matches!(k.as_str(), "else" | "then" | "and" | "or" | "in" | "as"),
         _ => false,
@@ -59,7 +63,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0 }
     }
 
     // ---- token helpers -------------------------------------------------
@@ -175,7 +179,12 @@ impl Parser {
                 Ok(())
             }
             Tok::Eof | Tok::RBrace => Ok(()),
-            other => self.err_at(format!("expected end of statement, found {}", other.describe())),
+            other => {
+                if let Some(h) = old_syntax_hint(&other) {
+                    return self.err_at(h);
+                }
+                self.err_at(format!("expected end of statement, found {}", other.describe()))
+            }
         }
     }
 
@@ -303,7 +312,7 @@ impl Parser {
         Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line })
     }
 
-    /// `int`, `str?`, or a union: `int | str | nil`.
+    /// `int`, `str?`, or a union: `int | str | null`.
     /// `component Name(params) { ~state = init ... <html/> }`. `~` statements
     /// may only appear directly in the body.
     fn parse_component(&mut self, line: u32) -> PResult<FnDef> {
@@ -363,6 +372,9 @@ impl Parser {
                 other => return Err(QuilloError::new(format!("expected a type, found {}", other.describe()), t.line)),
             };
             if name == "nil" {
+                return Err(QuilloError::new("use `null` instead of `nil`", t.line));
+            }
+            if name == "null" {
                 optional = true;
             } else if TYPE_NAMES.contains(&name.as_str()) {
                 if !names.contains(&name) {
@@ -370,7 +382,7 @@ impl Parser {
                 }
             } else {
                 return Err(QuilloError::new(
-                    format!("unknown type `{}` (known types: {}, nil)", name, TYPE_NAMES.join(", ")),
+                    format!("unknown type `{}` (known types: {}, null)", name, TYPE_NAMES.join(", ")),
                     t.line,
                 ));
             }
@@ -494,6 +506,59 @@ impl Parser {
         Ok(RouteDef { method, path, query, body_pat, body, line })
     }
 
+    /// Runs `f` with `name => ...` arrows allowed again (inside brackets).
+    fn no_bare_arrow_off<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let saved = std::mem::replace(&mut self.no_bare_arrow, 0);
+        let r = f(self);
+        self.no_bare_arrow = saved;
+        r
+    }
+
+    /// After `(`: `(a, b: int = 1): T => body` if that is what follows,
+    /// otherwise nothing is consumed.
+    fn try_arrow(&mut self, line: u32) -> PResult<Option<Expr>> {
+        let saved = self.save();
+        let head = (|| -> PResult<Option<(Vec<Param>, Option<Ty>)>> {
+            let mut params = Vec::new();
+            while !self.at(&Tok::RParen)? {
+                let Tok::Ident(name) = self.peek()? else { return Ok(None) };
+                if KEYWORDS.contains(&name.as_str()) {
+                    return Ok(None);
+                }
+                self.next()?;
+                let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
+                let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
+                params.push(Param { name, ty, default });
+                if !self.eat(&Tok::Comma)? {
+                    break;
+                }
+            }
+            if !self.eat(&Tok::RParen)? {
+                return Ok(None);
+            }
+            let ret = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
+            if !self.eat(&Tok::FatArrow)? {
+                return Ok(None);
+            }
+            Ok(Some((params, ret)))
+        })();
+        match head {
+            Ok(Some((params, ret))) => {
+                let body = self.no_bare_arrow_off(|p| p.parse_arrow_body())?;
+                Ok(Some(arrow(params, ret, body, line)))
+            }
+            _ => {
+                self.restore(saved);
+                Ok(None)
+            }
+        }
+    }
+
+    /// `=> expr` or `=> { statements }`.
+    fn parse_arrow_body(&mut self) -> PResult<Expr> {
+        self.parse_expr()
+    }
+
     fn parse_block(&mut self) -> PResult<Expr> {
         self.expect(&Tok::LBrace, "`{`")?;
         self.parse_block_rest()
@@ -517,6 +582,19 @@ impl Parser {
     // ---- expressions ---------------------------------------------------
 
     pub fn parse_expr(&mut self) -> PResult<Expr> {
+        let cond = self.parse_coalesce()?;
+        // `cond ? a : b`
+        if self.at(&Tok::Question)? {
+            self.next()?;
+            let a = self.parse_expr()?;
+            self.expect(&Tok::Colon, "`:` in `cond ? a : b`")?;
+            let b = self.parse_expr()?;
+            return Ok(Expr::If(Box::new(cond), Box::new(a), Some(Box::new(b))));
+        }
+        Ok(cond)
+    }
+
+    fn parse_coalesce(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_pipe()?;
         while self.eat(&Tok::QQ)? {
             let rhs = self.parse_pipe()?;
@@ -541,7 +619,7 @@ impl Parser {
         let mut lhs = self.parse_and()?;
         loop {
             let line = self.line()?;
-            if !self.eat_kw("or")? {
+            if !self.eat(&Tok::OrOr)? {
                 return Ok(lhs);
             }
             let rhs = self.parse_and()?;
@@ -550,24 +628,15 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_not()?;
+        let mut lhs = self.parse_cmp()?;
         loop {
             let line = self.line()?;
-            if !self.eat_kw("and")? {
+            if !self.eat(&Tok::AndAnd)? {
                 return Ok(lhs);
             }
-            let rhs = self.parse_not()?;
+            let rhs = self.parse_cmp()?;
             lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs), line);
         }
-    }
-
-    fn parse_not(&mut self) -> PResult<Expr> {
-        let line = self.line()?;
-        if self.eat_kw("not")? {
-            let e = self.parse_not()?;
-            return Ok(Expr::Unary(UnOp::Not, Box::new(e), line));
-        }
-        self.parse_cmp()
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
@@ -634,7 +703,28 @@ impl Parser {
             let e = self.parse_unary()?;
             return Ok(Expr::Unary(UnOp::Neg, Box::new(e), line));
         }
+        if self.eat(&Tok::Bang)? {
+            let e = self.parse_unary()?;
+            return Ok(Expr::Unary(UnOp::Not, Box::new(e), line));
+        }
         self.parse_postfix()
+    }
+
+    /// After `x`, is `? a : b` coming (a ternary), or is `?` the postfix
+    /// that returns an error? A ternary needs an expression and then `:`.
+    fn ternary_ahead(&mut self) -> bool {
+        let saved = self.save();
+        let ok = (|| -> PResult<bool> {
+            self.expect(&Tok::Question, "`?`")?;
+            if !can_start_expr(&self.peek()?) {
+                return Ok(false);
+            }
+            self.parse_expr()?;
+            Ok(self.at(&Tok::Colon)?)
+        })()
+        .unwrap_or(false);
+        self.restore(saved);
+        ok
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -644,14 +734,17 @@ impl Parser {
             match self.peek()? {
                 Tok::LParen => {
                     self.next()?;
-                    let mut args = Vec::new();
-                    while !self.at(&Tok::RParen)? {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(&Tok::Comma)? {
-                            break;
+                    let args = self.no_bare_arrow_off(|p| {
+                        let mut args = Vec::new();
+                        while !p.at(&Tok::RParen)? {
+                            args.push(p.parse_expr()?);
+                            if !p.eat(&Tok::Comma)? {
+                                break;
+                            }
                         }
-                    }
-                    self.expect(&Tok::RParen, "`)` after arguments")?;
+                        p.expect(&Tok::RParen, "`)` after arguments")?;
+                        Ok(args)
+                    })?;
                     e = Expr::Call(Box::new(e), args, line);
                 }
                 Tok::Dot => {
@@ -671,11 +764,14 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.next()?;
-                    let i = self.parse_expr()?;
+                    let i = self.no_bare_arrow_off(|p| p.parse_expr())?;
                     self.expect(&Tok::RBracket, "`]`")?;
                     e = Expr::Index(Box::new(e), Box::new(i), line);
                 }
                 Tok::Question => {
+                    if self.ternary_ahead() {
+                        return Ok(e);
+                    }
                     self.next()?;
                     e = Expr::Try(Box::new(e));
                 }
@@ -692,28 +788,33 @@ impl Parser {
             Tok::Float(f) => Ok(Expr::Lit(Lit::Float(f))),
             Tok::Str(parts) => self.template(parts),
             Tok::LParen => {
-                let e = self.parse_expr()?;
-                self.expect(&Tok::RParen, "`)`")?;
-                Ok(e)
+                if let Some(f) = self.try_arrow(line)? {
+                    return Ok(f);
+                }
+                self.no_bare_arrow_off(|p| {
+                    let e = p.parse_expr()?;
+                    p.expect(&Tok::RParen, "`)`")?;
+                    Ok(e)
+                })
             }
-            Tok::LBracket => {
+            Tok::LBracket => self.no_bare_arrow_off(|p| {
                 let mut items = Vec::new();
-                while !self.at(&Tok::RBracket)? {
-                    items.push(self.parse_expr()?);
-                    if !self.eat(&Tok::Comma)? {
+                while !p.at(&Tok::RBracket)? {
+                    items.push(p.parse_expr()?);
+                    if !p.eat(&Tok::Comma)? {
                         break;
                     }
                 }
-                self.expect(&Tok::RBracket, "`]` to close the list")?;
+                p.expect(&Tok::RBracket, "`]` to close the list")?;
                 Ok(Expr::List(items))
-            }
-            Tok::LBrace => {
-                if self.brace_is_map()? {
-                    self.parse_map_rest()
+            }),
+            Tok::LBrace => self.no_bare_arrow_off(|p| {
+                if p.brace_is_map()? {
+                    p.parse_map_rest()
                 } else {
-                    self.parse_block_rest()
+                    p.parse_block_rest()
                 }
-            }
+            }),
             Tok::Lt => {
                 if self.peeked.is_none() && self.lx.peek_char().map_or(false, |c| c.is_alphabetic()) {
                     self.parse_html(line)
@@ -724,17 +825,28 @@ impl Parser {
             Tok::Ident(k) => match k.as_str() {
                 "true" => Ok(Expr::Lit(Lit::Bool(true))),
                 "false" => Ok(Expr::Lit(Lit::Bool(false))),
-                "nil" => Ok(Expr::Lit(Lit::Nil)),
+                "null" => Ok(Expr::Lit(Lit::Nil)),
+                "nil" => Err(QuilloError::new("use `null` instead of `nil`", line)),
+                "not" => Err(QuilloError::new("use `!x` instead of `not x`", line)),
                 "if" => self.parse_if(),
                 "match" => self.parse_match(line),
                 "for" => self.parse_for(line),
-                "fn" => {
-                    let def = self.parse_fn_rest("<fn>".into(), line)?;
-                    Ok(Expr::Lambda(Arc::new(def)))
-                }
+                "fn" => Err(QuilloError::new(
+                    "anonymous functions are written `(x) => x * 2` (or `x => x * 2`); `fn` is for named functions",
+                    line,
+                )),
                 "reply" => self.parse_reply(line),
                 kw if KEYWORDS.contains(&kw) => Err(QuilloError::new(format!("unexpected keyword `{}`", kw), line)),
-                _ => Ok(Expr::Ident(k.clone(), line)),
+                _ => {
+                    // `x => body`: an arrow function with one parameter.
+                    if self.no_bare_arrow == 0 && self.at(&Tok::FatArrow)? {
+                        self.next()?;
+                        let body = self.parse_arrow_body()?;
+                        let params = vec![Param { name: k.clone(), ty: None, default: None }];
+                        return Ok(arrow(params, None, body, line));
+                    }
+                    Ok(Expr::Ident(k.clone(), line))
+                }
             },
             other => Err(QuilloError::new(format!("expected an expression, found {}", other.describe()), line)),
         }
@@ -826,13 +938,11 @@ impl Parser {
 
     fn parse_if(&mut self) -> PResult<Expr> {
         let cond = self.parse_expr()?;
-        if self.eat_kw("then")? {
-            let a = self.parse_expr()?;
-            let b = if self.eat_kw("else")? { Some(Box::new(self.parse_expr()?)) } else { None };
-            return Ok(Expr::If(Box::new(cond), Box::new(a), b));
+        if self.at_kw("then")? {
+            return self.err_at("`if c then a else b` is now written `c ? a : b`");
         }
         if !self.at(&Tok::LBrace)? {
-            return self.err_at("expected `then` or `{` after the `if` condition");
+            return self.err_at("expected `{` after the `if` condition (or write `cond ? a : b`)");
         }
         let a = self.parse_block()?;
         let b = if self.eat_kw("else")? {
@@ -857,7 +967,14 @@ impl Parser {
                 break;
             }
             let pat = self.parse_pattern()?;
-            let guard = if self.eat_kw("if")? { Some(self.parse_expr()?) } else { None };
+            let guard = if self.eat_kw("if")? {
+                self.no_bare_arrow += 1;
+                let g = self.parse_expr();
+                self.no_bare_arrow -= 1;
+                Some(g?)
+            } else {
+                None
+            };
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
             let body = self.parse_expr()?;
             arms.push(Arm { pat, guard, body });
@@ -870,7 +987,10 @@ impl Parser {
         if !self.eat_kw("in")? {
             return self.err_at("expected `in` after the `for` pattern");
         }
-        let iter = self.parse_expr()?;
+        self.no_bare_arrow += 1;
+        let iter = self.parse_expr();
+        self.no_bare_arrow -= 1;
+        let iter = iter?;
         let body = if self.eat(&Tok::FatArrow)? {
             self.parse_expr()?
         } else if self.at(&Tok::LBrace)? {
@@ -935,7 +1055,8 @@ impl Parser {
                 "_" => Pattern::Wild,
                 "true" => Pattern::Lit(Lit::Bool(true)),
                 "false" => Pattern::Lit(Lit::Bool(false)),
-                "nil" => Pattern::Lit(Lit::Nil),
+                "null" => Pattern::Lit(Lit::Nil),
+                "nil" => return Err(QuilloError::new("use `null` instead of `nil`", line)),
                 t if TYPE_NAMES.contains(&t) => Pattern::Type(k.clone()),
                 t if KEYWORDS.contains(&t) => {
                     return Err(QuilloError::new(format!("unexpected keyword `{}` in pattern", t), line))
@@ -1099,10 +1220,11 @@ impl Parser {
         };
         let mut children = Vec::new();
         if !self_closing {
+            let mut text = String::new();
             loop {
-                self.lx.skip_all_ws();
                 match (self.lx.peek_char(), self.lx.peek_char_at(1)) {
                     (Some('<'), Some('/')) => {
+                        push_text(&mut children, &mut text);
                         self.lx.bump();
                         self.lx.bump();
                         let close = self.read_html_name();
@@ -1120,23 +1242,25 @@ impl Parser {
                         break;
                     }
                     (Some('<'), Some(c)) if c.is_alphabetic() => {
+                        push_text(&mut children, &mut text);
                         let l = self.lx.line;
                         self.lx.bump();
                         children.push(HtmlChild::El(self.parse_html_el(l)?));
                     }
-                    (Some('"'), _) => {
-                        let parts = self.lx.lex_string()?;
-                        children.push(HtmlChild::Expr(self.template(parts)?));
+                    (Some('{'), _) => {
+                        push_text(&mut children, &mut text);
+                        children.push(HtmlChild::Expr(self.parse_braced_expr()?));
                     }
-                    (Some('{'), _) => children.push(HtmlChild::Expr(self.parse_braced_expr()?)),
+                    (Some('}'), _) => {
+                        return self.html_err(format!("unexpected `}}` inside <{}> (write {{\"}}\"}} for the character)", tag))
+                    }
                     (None, _) => {
                         return self.html_err(format!("unexpected end of input: unclosed <{}> from line {}", tag, line))
                     }
                     (Some(c), _) => {
-                        return self.html_err(format!(
-                            "unexpected `{}` inside <{}>: children are <elements>, \"text\" or {{expressions}}",
-                            c, tag
-                        ))
+                        // Text, as in JSX.
+                        text.push(c);
+                        self.lx.bump();
                     }
                 }
             }
@@ -1180,5 +1304,113 @@ impl Parser {
         let e = self.parse_expr()?;
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(e)
+    }
+}
+
+fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32) -> Expr {
+    Expr::Lambda(Arc::new(FnDef {
+        name: "<fn>".into(),
+        params,
+        ret,
+        err: None,
+        effects: None,
+        server: false,
+        component: false,
+        line,
+        body,
+    }))
+}
+
+/// What to write instead of an old Wisp-era spelling.
+fn old_syntax_hint(t: &Tok) -> Option<&'static str> {
+    match t {
+        Tok::Ident(k) => match k.as_str() {
+            "and" => Some("use `&&` instead of `and`"),
+            "or" => Some("use `||` instead of `or`"),
+            "then" => Some("`if c then a else b` is now written `c ? a : b`"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Text inside an element, with JSX's whitespace rules: lines are trimmed
+/// (except where they touch an element or `{}` on the same line), blank
+/// lines dropped, and the rest joined with single spaces. HTML entities
+/// such as `&amp;` are decoded.
+fn jsx_text(raw: &str) -> String {
+    let lines: Vec<&str> = raw.split('\n').collect();
+    let n = lines.len();
+    let mut kept: Vec<String> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let l = l.trim_end_matches('\r');
+        let mut t: &str = l;
+        if i > 0 {
+            t = t.trim_start();
+        }
+        if i + 1 < n {
+            t = t.trim_end();
+        }
+        if !t.is_empty() {
+            kept.push(t.to_string());
+        }
+    }
+    decode_entities(&kept.join(" "))
+}
+
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let end = rest.find(';').filter(|&e| e <= 10);
+        let decoded = end.and_then(|e| {
+            let name = &rest[1..e];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                "nbsp" => Some('\u{a0}'),
+                "copy" => Some('©'),
+                "mdash" => Some('—'),
+                "ndash" => Some('–'),
+                "hellip" => Some('…'),
+                _ => name
+                    .strip_prefix("#x")
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &rest[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {
+    if text.is_empty() {
+        return;
+    }
+    let t = jsx_text(text);
+    text.clear();
+    if !t.is_empty() {
+        children.push(HtmlChild::Expr(Expr::Lit(Lit::Str(t.into()))));
     }
 }

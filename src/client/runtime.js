@@ -22,7 +22,7 @@ const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v) &&
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
 
 function typeName(v) {
-  if (isNil(v)) return "nil";
+  if (isNil(v)) return "null";
   switch (typeof v) {
     case "boolean": return "bool";
     case "number": return Number.isInteger(v) ? "int" : "float";
@@ -55,7 +55,7 @@ function typeIs(t, v) {
 const fmtKey = (k) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : JSON.stringify(k);
 
 function repr(v) {
-  if (isNil(v)) return "nil";
+  if (isNil(v)) return "null";
   if (typeof v === "string") return JSON.stringify(v);
   if (typeof v === "number") return String(v);
   if (typeof v === "boolean") return String(v);
@@ -224,7 +224,7 @@ function iter(v) {
 }
 
 function tyText(names, opt) {
-  return names.join(" | ") + (opt ? (names.length === 1 ? "?" : " | nil") : "");
+  return names.join(" | ") + (opt ? (names.length === 1 ? "?" : " | null") : "");
 }
 
 function tyOk(v, names, opt) {

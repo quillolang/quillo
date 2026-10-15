@@ -886,8 +886,14 @@ impl<'a> Compiler<'a> {
                 let x = self.expr(a)?;
                 let y = self.expr(b)?;
                 match op {
-                    BinOp::And => format!("(W.truthy({}) ? W.truthy({}) : false)", x, y),
-                    BinOp::Or => format!("(W.truthy({}) ? true : W.truthy({}))", x, y),
+                    BinOp::And => {
+                        let t = self.temp();
+                        format!("(W.truthy({t} = {x}) ? {y} : {t})")
+                    }
+                    BinOp::Or => {
+                        let t = self.temp();
+                        format!("(W.truthy({t} = {x}) ? {t} : {y})")
+                    }
                     BinOp::Eq => format!("W.eq({}, {})", x, y),
                     BinOp::Ne => format!("!W.eq({}, {})", x, y),
                     BinOp::Add => format!("W.add({}, {})", x, y),

@@ -1,6 +1,6 @@
 //! Static checking: `quillo check`, `quillo run` and the language server.
 //!
-//! Types are sets of possible runtime types (`int | nil`, ...); code without
+//! Types are sets of possible runtime types (`int | null`, ...); code without
 //! annotations is `any`. An error is reported only when no combination of
 //! the possible types can work, so the checker has no false alarms on
 //! dynamic code, and annotations make it stricter. It reports:
@@ -39,7 +39,7 @@ const ERR: u16 = 1024;
 const NUM: u16 = INT | FLOAT;
 const ANY: u16 = 2047;
 const BASE: [(u16, &str); 11] = [
-    (NIL, "nil"),
+    (NIL, "null"),
     (BOOL, "bool"),
     (INT, "int"),
     (FLOAT, "float"),
@@ -99,7 +99,7 @@ fn bits_text(bits: u16) -> String {
         }
     }
     if b & NIL != 0 {
-        names.push("nil");
+        names.push("null");
     }
     names.join(" | ")
 }
@@ -116,7 +116,7 @@ fn name_bits(n: &str) -> u16 {
     match n {
         "any" => ANY,
         "num" => NUM,
-        "nil" => NIL,
+        "nil" | "null" => NIL,
         other => BASE.iter().find(|(_, x)| *x == other).map_or(ANY, |(b, _)| *b),
     }
 }
@@ -138,7 +138,9 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
         return Some(T::NEVER);
     }
     match op {
-        BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => return Some(T::of(BOOL)),
+        BinOp::Eq | BinOp::Ne => return Some(T::of(BOOL)),
+        // `a && b` and `a || b` give one of their operands.
+        BinOp::And | BinOp::Or => return Some(a.union(b)),
         _ => {}
     }
     let mut out = 0u16;
@@ -190,46 +192,46 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
 /// `(name, params, returns)`. A parameter is a type, `T=` when it may be left
 /// out, and `T...` for any number. `error(str)` is an error value.
 const BUILTINS: &[(&str, &str, &str)] = &[
-    ("print", "any...", "nil"),
+    ("print", "any...", "null"),
     ("str", "any=", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
-    ("len", "str | list | map | html | nil", "int"),
+    ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
     ("lower", "str", "str"),
     ("trim", "str", "str"),
     ("split", "str, str=", "list"),
-    ("join", "list | nil, str=", "str"),
-    ("contains", "str | list | map | nil, any", "bool"),
+    ("join", "list | null, str=", "str"),
+    ("contains", "str | list | map | null, any", "bool"),
     ("starts_with", "str, str", "bool"),
     ("ends_with", "str, str", "bool"),
     ("replace", "str, str, str", "str"),
     ("slice", "list | str, int, int=", "list | str"),
-    ("map", "list | nil, fn", "list"),
-    ("filter", "list | nil, fn", "list"),
-    ("find", "list | nil, fn", "any"),
-    ("any", "list | nil, fn", "bool"),
-    ("all", "list | nil, fn", "bool"),
-    ("reduce", "list | nil, any, fn", "any"),
-    ("sum", "list | nil", "any"),
-    ("min", "list | nil", "any"),
-    ("max", "list | nil", "any"),
-    ("sort", "list | nil", "list"),
-    ("sort_by", "list | nil, fn", "list"),
+    ("map", "list | null, fn", "list"),
+    ("filter", "list | null, fn", "list"),
+    ("find", "list | null, fn", "any"),
+    ("any", "list | null, fn", "bool"),
+    ("all", "list | null, fn", "bool"),
+    ("reduce", "list | null, any, fn", "any"),
+    ("sum", "list | null", "any"),
+    ("min", "list | null", "any"),
+    ("max", "list | null", "any"),
+    ("sort", "list | null", "list"),
+    ("sort_by", "list | null, fn", "list"),
     ("reverse", "list | str", "list | str"),
-    ("first", "list | nil", "any"),
-    ("last", "list | nil", "any"),
-    ("push", "list | nil, any=", "list"),
+    ("first", "list | null", "any"),
+    ("last", "list | null", "any"),
+    ("push", "list | null, any=", "list"),
     ("range", "int, int=", "list"),
-    ("enumerate", "list | nil", "list"),
-    ("keys", "map | nil", "list"),
-    ("values", "map | nil", "list"),
-    ("get", "map | nil, any, any=", "any"),
-    ("has", "map | nil, any", "bool"),
-    ("set", "map | nil, any, any=", "map"),
-    ("remove", "list | map | nil, any", "list | map"),
-    ("merge", "map | nil, map | nil", "map"),
+    ("enumerate", "list | null", "list"),
+    ("keys", "map | null", "list"),
+    ("values", "map | null", "list"),
+    ("get", "map | null, any, any=", "any"),
+    ("has", "map | null, any", "bool"),
+    ("set", "map | null, any, any=", "map"),
+    ("remove", "list | map | null, any", "list | map"),
+    ("merge", "map | null, map | null", "map"),
     ("err", "any=", "error(any)"),
     ("is_err", "any", "bool"),
     ("unwrap", "any", "any"),
@@ -237,12 +239,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("escape", "any", "str"),
     ("env", "str, any=", "any"),
     ("now", "", "int"),
-    ("sleep", "num", "nil"),
+    ("sleep", "num", "null"),
     ("file", "str", "response"),
     ("redirect", "str, int=", "response"),
-    ("respond", "int, any=, map | nil=", "response"),
+    ("respond", "int, any=, map | null=", "response"),
     ("read_file", "str", "str | error(str)"),
-    ("write_file", "str, any", "nil | error(str)"),
+    ("write_file", "str, any", "null | error(str)"),
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
@@ -252,28 +254,28 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("ceil", "num", "num"),
     ("sqrt", "num", "float"),
     ("pow", "num, num", "num"),
-    ("unique", "list | nil", "list"),
-    ("flatten", "list | nil", "list"),
-    ("zip", "list | nil, list | nil", "list"),
-    ("take", "list | str | nil, int", "list | str"),
-    ("drop", "list | str | nil, int", "list | str"),
-    ("count", "list | nil, fn=", "int"),
-    ("group_by", "list | nil, fn", "map"),
-    ("index_of", "list | str, any", "int | nil"),
+    ("unique", "list | null", "list"),
+    ("flatten", "list | null", "list"),
+    ("zip", "list | null, list | null", "list"),
+    ("take", "list | str | null, int", "list | str"),
+    ("drop", "list | str | null, int", "list | str"),
+    ("count", "list | null, fn=", "int"),
+    ("group_by", "list | null, fn", "map"),
+    ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("json.parse", "str", "any"),
     ("json.stringify", "any, any=", "str"),
-    ("db.open", "str", "nil | error(str)"),
+    ("db.open", "str", "null | error(str)"),
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
-    ("db.one", "str, any...", "map | nil | error(str)"),
+    ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "fn", "any"),
-    ("http.get", "str, map | nil=", "map | error(str)"),
-    ("http.delete", "str, map | nil=", "map | error(str)"),
-    ("http.post", "str, any=, map | nil=", "map | error(str)"),
-    ("http.put", "str, any=, map | nil=", "map | error(str)"),
-    ("http.patch", "str, any=, map | nil=", "map | error(str)"),
-    ("http.request", "str, str, any=, map | nil=", "map | error(str)"),
+    ("http.get", "str, map | null=", "map | error(str)"),
+    ("http.delete", "str, map | null=", "map | error(str)"),
+    ("http.post", "str, any=, map | null=", "map | error(str)"),
+    ("http.put", "str, any=, map | null=", "map | error(str)"),
+    ("http.patch", "str, any=, map | null=", "map | error(str)"),
+    ("http.request", "str, str, any=, map | null=", "map | error(str)"),
 ];
 
 const MODULES: &[&str] = &["json", "db", "http"];

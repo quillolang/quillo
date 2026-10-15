@@ -22,17 +22,31 @@ fn arithmetic_and_precedence() {
     assert_eq!(ev("7.0 / 2"), "3.5");
     assert_eq!(ev("-3 + 1"), "-2");
     assert_eq!(ev("10 % 3"), "1");
-    assert_eq!(ev("1 < 2 and not 3 > 4"), "true");
+    assert_eq!(ev("1 < 2 && !(3 > 4)"), "true");
+    assert_eq!(ev("!true == false"), "true");
     assert_eq!(ev("0..4"), "[0, 1, 2, 3]");
     assert!(ev_err("1 / 0").contains("division by zero"));
 }
 
 #[test]
-fn strings_and_interpolation() {
-    assert_eq!(ev("let name = \"Ada\"\n\"Hi {name}, {1 + 1}\""), "\"Hi Ada, 2\"");
+fn and_or_give_the_deciding_operand() {
+    assert_eq!(ev("[null && 1, 0 && 2, 1 || 2, null || \"anonymous\", false || null, true && \"yes\"]"),
+        "[null, 2, 1, \"anonymous\", null, \"yes\"]");
+    // Errors are falsy, so `||` gives a fallback, like `??`.
+    assert_eq!(ev("int(\"x\") || 0"), "0");
+    assert_eq!(ev("let calls = 0\nfn hit() { calls += 1\n true }\nfalse && hit()\ntrue || hit()\ncalls"), "0");
+}
+
+#[test]
+fn strings_and_templates() {
+    assert_eq!(ev("let name = \"Ada\"\n`Hi ${name}, ${1 + 1}`"), "\"Hi Ada, 2\"");
     assert_eq!(ev(r#""a" + 1"#), "\"a1\"");
-    assert_eq!(ev(r#""literal \{braces\}""#), "\"literal {braces}\"");
-    assert_eq!(ev(r#""{ "nested {1}" }""#), "\"nested 1\"");
+    // Plain strings are plain: braces and `${}` are just text.
+    assert_eq!(ev(r#""{braces} and ${x}""#), "\"{braces} and ${x}\"");
+    assert_eq!(ev(r#"'single "quotes"'"#), "\"single \\\"quotes\\\"\"");
+    assert_eq!(ev(r#"`nested ${ `inner ${1}` } and ${ "q" }`"#), "\"nested inner 1 and q\"");
+    assert_eq!(ev(r#"`literal \${x} and \``"#), "\"literal ${x} and `\"");
+    assert_eq!(ev("`two\nlines`"), "\"two\\nlines\"");
 }
 
 #[test]
@@ -41,8 +55,8 @@ fn lists_and_maps() {
     assert_eq!(ev("let id = 7\n{ id, name: \"x\" }"), "{ id: 7, name: \"x\" }");
     assert_eq!(ev("{ a: 1 } + { b: 2 }"), "{ a: 1, b: 2 }");
     assert_eq!(ev("{ a: { b: 5 } }.a.b"), "5");
-    assert_eq!(ev("{ a: 1 }.missing"), "nil");
-    assert_eq!(ev("nil.anything.at.all"), "nil");
+    assert_eq!(ev("{ a: 1 }.missing"), "null");
+    assert_eq!(ev("null.anything.at.all"), "null");
     assert_eq!(ev("{ \"content-type\": \"x\" }[\"content-type\"]"), "\"x\"");
 }
 
@@ -50,27 +64,66 @@ fn lists_and_maps() {
 fn functions_defaults_and_types() {
     assert_eq!(ev("fn add(a: int, b: int = 10) -> int = a + b\nadd(1)"), "11");
     assert_eq!(ev("fn add(a, b) { let s = a + b\n s * 2 }\nadd(1, 2)"), "6");
-    assert_eq!(ev("let double = fn(x) = x * 2\ndouble(4)"), "8");
     assert!(ev_err("fn f(a: int) = a\nf(\"x\")").contains("argument `a` of `f` must be int"));
     assert!(ev_err("fn f() -> int = \"no\"\nf()").contains("must return int"));
     assert!(ev_err("fn f(a) = a\nf()").contains("missing argument `a`"));
-    assert_eq!(ev("fn f(a: str?) = a ?? \"none\"\nf(nil)"), "\"none\"");
+    assert_eq!(ev("fn f(a: str?) = a ?? \"none\"\nf(null)"), "\"none\"");
+    assert_eq!(ev("fn f(a: int | null) = a\nf(null)"), "null");
+}
+
+#[test]
+fn arrow_functions() {
+    assert_eq!(ev("let double = (x) => x * 2\ndouble(4)"), "8");
+    assert_eq!(ev("let double = x => x * 2\ndouble(4)"), "8");
+    assert_eq!(ev("let add = (a: int, b = 10): int => a + b\n[add(1), add(1, 2)]"), "[11, 3]");
+    assert_eq!(ev("let f = () => {\n let x = 2\n x * 3\n}\nf()"), "6");
+    assert_eq!(ev("let point = () => { x: 1, y: 2 }\npoint().y"), "2");
+    assert!(ev_err("let f = (a: int) => a\nf(\"x\")").contains("must be int"));
+    // Arrows inside `for` and match guards still read as arrows where they can.
+    assert_eq!(ev("for x in [1, 2].map(y => y * 10) => x + 1"), "[11, 21]");
+    assert_eq!(ev("let ok = true\nmatch 1 { n if ok => n + 1 }"), "2");
+}
+
+#[test]
+fn ternary_and_the_try_operator() {
+    assert_eq!(ev("1 > 2 ? \"a\" : \"b\""), "\"b\"");
+    assert_eq!(ev("let n = 0\nn > 0 ? \"pos\" : n == 0 ? \"zero\" : \"neg\""), "\"zero\"");
+    assert_eq!(ev("let x = null\nx ?? 1 ? \"set\" : \"unset\""), "\"set\"");
+    assert_eq!(ev("{ a: true ? 1 : 2, b: 3 }"), "{ a: 1, b: 3 }");
+    // A multi-line ternary, JavaScript style.
+    assert_eq!(ev("let v = 5\nlet size = v > 3\n    ? \"big\"\n    : \"small\"\nsize"), "\"big\"");
+    // `?` with no `:` after it still returns errors early.
+    let src = "fn parse(s) = int(s)\nfn plus1(s) = parse(s)? + 1\nfn minus1(s) = parse(s)? - 1\n[plus1(\"4\"), minus1(\"4\"), plus1(\"x\")]";
+    assert_eq!(ev(src), "[5, 3, err(\"not an int: \\\"x\\\"\")]");
+    assert_eq!(ev("fn f(s) = { v: int(s)?, ok: true }\n[f(\"1\"), f(\"z\")]"), "[{ v: 1, ok: true }, err(\"not an int: \\\"z\\\"\")]");
+}
+
+#[test]
+fn old_syntax_gets_a_hint() {
+    assert!(ev_err("1 and 2").contains("use `&&` instead of `and`"));
+    assert!(ev_err("1 or 2").contains("use `||` instead of `or`"));
+    assert!(ev_err("not true").contains("use `!x` instead of `not x`"));
+    assert!(ev_err("nil").contains("use `null` instead of `nil`"));
+    assert!(ev_err("if true then 1 else 2").contains("`c ? a : b`"));
+    assert!(ev_err("let f = fn(x) = x").contains("`(x) => x * 2`"));
+    assert!(ev_err("fn f(x: int | nil) = x").contains("use `null`"));
 }
 
 #[test]
 fn closures_and_recursion() {
-    assert_eq!(ev("fn fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2)\nfib(20)"), "6765");
-    assert_eq!(ev("fn adder(n) = fn(x) = x + n\nlet add5 = adder(5)\nadd5(1)"), "6");
+    assert_eq!(ev("fn fib(n) = n < 2 ? n : fib(n - 1) + fib(n - 2)\nfib(20)"), "6765");
+    assert_eq!(ev("fn adder(n) = (x) => x + n\nlet add5 = adder(5)\nadd5(1)"), "6");
 }
 
 #[test]
 fn pipelines() {
-    assert_eq!(ev("[1, 2, 3] |> map(fn(x) = x * 2) |> sum"), "12");
+    assert_eq!(ev("[1, 2, 3] |> map((x) => x * 2) |> sum"), "12");
     assert_eq!(ev(r#""a,b,c" |> split(",") |> join("-")"#), "\"a-b-c\"");
     assert_eq!(
-        ev("[5, 3, 8]\n    |> filter(fn(x) = x > 4)\n    |> sort\n    |> first"),
+        ev("[5, 3, 8]\n    |> filter((x) => x > 4)\n    |> sort\n    |> first"),
         "5"
     );
+    assert_eq!(ev("[1, 2, 3]\n    .filter(x => x > 1)\n    .map(x => x * x)"), "[4, 9]");
 }
 
 #[test]
@@ -78,7 +131,7 @@ fn method_call_syntax() {
     assert_eq!(ev("[3, 1, 2].sort().first()"), "1");
     assert_eq!(ev("\"hey\".upper"), "\"HEY\"");
     assert_eq!(ev("[1, 2, 3].len"), "3");
-    assert_eq!(ev("let m = { greet: fn(n) = \"hi {n}\" }\nm.greet(\"bo\")"), "\"hi bo\"");
+    assert_eq!(ev("let m = { greet: (n) => `hi ${n}` }\nm.greet(\"bo\")"), "\"hi bo\"");
     assert_eq!(ev("{ a: 1, b: 2 }.keys"), "[\"a\", \"b\"]");
 }
 
@@ -87,20 +140,21 @@ fn match_patterns() {
     let src = r#"
 fn describe(x) = match x {
     0 => "zero"
-    int as n if n < 0 => "negative {n}"
+    int as n if n < 0 => `negative ${n}`
     int => "positive"
     "a" | "b" => "letter"
-    [first, ..rest] => "list starting {first}, {len(rest)} more"
-    { type: "user", name } => "user {name}"
-    { customer.id: id } => "customer {id}"
+    [first, ..rest] => `list starting ${first}, ${len(rest)} more`
+    { type: "user", name } => `user ${name}`
+    { customer.id: id } => `customer ${id}`
+    null => "nothing"
     _ => "other"
 }
 [describe(0), describe(-2), describe(9), describe("b"), describe([1, 2, 3]),
- describe({ type: "user", name: "Ada" }), describe({ customer: { id: 4 } }), describe(nil)]
+ describe({ type: "user", name: "Ada" }), describe({ customer: { id: 4 } }), describe(null), describe(true)]
 "#;
     assert_eq!(
         ev(src),
-        r#"["zero", "negative -2", "positive", "letter", "list starting 1, 2 more", "user Ada", "customer 4", "other"]"#
+        r#"["zero", "negative -2", "positive", "letter", "list starting 1, 2 more", "user Ada", "customer 4", "nothing", "other"]"#
     );
     assert!(ev_err("match 1 { 2 => 3 }").contains("no `match` arm"));
 }
@@ -113,14 +167,14 @@ fn let_destructuring() {
 
 #[test]
 fn errors_coalesce_and_try() {
-    assert_eq!(ev("nil ?? 5"), "5");
+    assert_eq!(ev("null ?? 5"), "5");
     assert_eq!(ev(r#"int("x") ?? 0"#), "0");
     assert_eq!(ev(r#"int("42")"#), "42");
     let src = r#"
 fn parse_age(s: str) -> int ! str =
     match int(s) {
         int as n if n >= 0 => n
-        _ => err("bad age: {s}")
+        _ => err(`bad age: ${s}`)
     }
 fn next_year(s) = parse_age(s)? + 1
 [next_year("41"), next_year("old")]
@@ -132,9 +186,9 @@ fn next_year(s) = parse_age(s)? + 1
 #[test]
 fn control_flow() {
     assert_eq!(ev("if 1 > 2 { \"a\" } else if 2 > 1 { \"b\" } else { \"c\" }"), "\"b\"");
-    assert_eq!(ev("let x = if false then 1\nx"), "nil");
+    assert_eq!(ev("let x = if false { 1 }\nx"), "null");
     assert_eq!(ev("for x in [1, 2, 3] => x * x"), "[1, 4, 9]");
-    assert_eq!(ev("for [k, v] in { a: 1, b: 2 } => \"{k}={v}\""), "[\"a=1\", \"b=2\"]");
+    assert_eq!(ev("for [k, v] in { a: 1, b: 2 } => `${k}=${v}`"), "[\"a=1\", \"b=2\"]");
     assert_eq!(ev("fn f(x) { if x > 0 { return \"pos\" }\n \"other\" }\n[f(1), f(0)]"), "[\"pos\", \"other\"]");
 }
 
@@ -147,17 +201,40 @@ fn assignment() {
 
 #[test]
 fn html_literals() {
-    assert_eq!(ev(r#"<p.note #n-{1 + 1}>"a < b"</p>"#), r#"<p id="n-2" class="note">a &lt; b</p>"#);
+    assert_eq!(ev(r#"<p.note #n-{1 + 1}>a &lt; b</p>"#), r#"<p id="n-2" class="note">a &lt; b</p>"#);
     assert_eq!(
         ev(r#"let x = "<script>"
-<div title={x} hidden data-n="{1}">{x}<br/><img src="a.png"></div>"#),
+<div title={x} hidden data-n={1}>{x}<br/><img src="a.png"></div>"#),
         r#"<div title="&lt;script&gt;" hidden data-n="1">&lt;script&gt;<br><img src="a.png"></div>"#
     );
+    // Attribute strings are plain text, as in JSX.
+    assert_eq!(ev(r#"<a href="/x/{id}">link</a>"#), r#"<a href="/x/{id}">link</a>"#);
     assert_eq!(ev(r#"<ul>{for i in [1, 2] => <li>{i}</li>}</ul>"#), "<ul><li>1</li><li>2</li></ul>");
     assert_eq!(ev(r#"let ok = false
-<b disabled={ok} class={if ok then "on"}>{if ok then "yes"}</b>"#), "<b></b>");
+<b disabled={ok} class={ok && "on"}>{ok ? "yes" : null}</b>"#), "<b></b>");
     assert_eq!(ev(r#"<div>{raw("<em>trusted</em>")}</div>"#), "<div><em>trusted</em></div>");
-    assert_eq!(ev(r#"<html><body>"x"</body></html>"#), "<!doctype html><html><body>x</body></html>");
+    assert_eq!(ev(r#"<html><body>x</body></html>"#), "<!doctype html><html><body>x</body></html>");
+    // Quotes in text are text, as in JSX.
+    assert_eq!(ev(r#"<q>"hi"</q>"#), "<q>&quot;hi&quot;</q>");
+}
+
+#[test]
+fn html_text_follows_jsx_whitespace_rules() {
+    let src = r#"
+let name = "Ada"
+<p>
+    Hello, {name}!
+    How are
+    you?   Fine.
+    <b>bold</b> and <i>italic</i>, then {name}'s turn
+</p>
+"#;
+    assert_eq!(
+        ev(src),
+        "<p>Hello, Ada! How are you?   Fine.<b>bold</b> and <i>italic</i>, then Ada&#39;s turn</p>"
+    );
+    assert_eq!(ev("<p>Fish &amp; chips &mdash; &#169; &#x263A; &nope;</p>"), "<p>Fish &amp; chips — © ☺ &amp;nope;</p>");
+    assert!(ev_err("<p>a } b</p>").contains("unexpected `}`"));
 }
 
 #[test]
@@ -165,9 +242,8 @@ fn html_multiline_and_nested_conditionals() {
     let src = r##"
 let todo = { id: 3, text: "ship", done: true }
 <li.todo #todo-{todo.id}>
-    {if todo.done then <s>{todo.text}</s> else todo.text}
-    // a comment between children
-    <span.meta>"#{todo.id}"</span>
+    {todo.done ? <s>{todo.text}</s> : todo.text}
+    <span.meta>#{todo.id}</span>
 </li>
 "##;
     assert_eq!(
@@ -180,13 +256,13 @@ let todo = { id: 3, text: "ship", done: true }
 fn components() {
     let src = r#"
 view Card(title: str, highlight = false, children) =
-    <section.card class={if highlight then "hl"}>
+    <section.card class={highlight && "hl"}>
         <h2>{title}</h2>
         {children}
     </section>
 <main>
-    <Card title="One">"first"</Card>
-    <Card title="Two" highlight><p>"second"</p></Card>
+    <Card title="One">first</Card>
+    <Card title="Two" highlight><p>second</p></Card>
 </main>
 "#;
     assert_eq!(
@@ -201,7 +277,7 @@ view Card(title: str, highlight = false, children) =
 fn parse_errors_have_lines() {
     let e = ev_err("let a = 1\nlet b = (2 +\n");
     assert!(e.contains("end of input"), "{}", e);
-    let e = ev_err("let a = 1\n<div>\"x\"</span>");
+    let e = ev_err("let a = 1\n<div>x</span>");
     assert!(e.contains("<input>:2:") && e.contains("expected </div>"), "{}", e);
     let e = ev_err("fn f(x: number) = x");
     assert!(e.contains("unknown type `number`"), "{}", e);
@@ -209,14 +285,14 @@ fn parse_errors_have_lines() {
 
 #[test]
 fn json_module() {
-    assert_eq!(ev(r#"json.parse("\{\"a\": [1, 2.5, null]\}")"#), "{ a: [1, 2.5, nil] }");
+    assert_eq!(ev(r#"json.parse('{"a": [1, 2.5, null]}')"#), "{ a: [1, 2.5, null] }");
     assert_eq!(ev(r#"json.stringify({ a: 1, b: [true] })"#), r#""{\"a\":1,\"b\":[true]}""#);
-    assert_eq!(ev(r#"is_err(json.parse("\{"))"#), "true");
+    assert_eq!(ev(r#"is_err(json.parse("{"))"#), "true");
 }
 
 #[test]
 fn runaway_recursion_is_an_error_not_a_crash() {
     let e = ev_err("fn down(n) = 1 + down(n - 1)\ndown(1)");
     assert!(e.contains("too much recursion") && e.contains("`down`"), "{}", e);
-    assert_eq!(ev("fn down(n) = if n == 0 then 0 else 1 + down(n - 1)\ndown(100)"), "100");
+    assert_eq!(ev("fn down(n) = n == 0 ? 0 : 1 + down(n - 1)\ndown(100)"), "100");
 }

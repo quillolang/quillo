@@ -1,7 +1,7 @@
 {
   "route": {
     "prefix": "route",
-    "body": ["route ${1|GET,POST,PUT,PATCH,DELETE|} /${2:path} = ${0:nil}"],
+    "body": ["route ${1|GET,POST,PUT,PATCH,DELETE|} /${2:path} = ${0:null}"],
     "description": "A route"
   },
   "route with JSON body": {
@@ -11,7 +11,7 @@
   },
   "fn": {
     "prefix": "fn",
-    "body": ["fn ${1:name}(${2}) = ${0:nil}"],
+    "body": ["fn ${1:name}(${2}) = ${0:null}"],
     "description": "A function"
   },
   "fn block": {
@@ -36,7 +36,7 @@
       "\t~${3:count} = ${4:start}",
       "\t<div>",
       "\t\t<span>{${3:count}}</span>",
-      "\t\t<button @click={fn() { ${3:count} += 1 }}>\"+\"</button>",
+      "\t\t<button @click={() => { ${3:count} += 1 }}>+</button>",
       "\t</div>",
       "}"
     ],
@@ -44,8 +44,18 @@
   },
   "match": {
     "prefix": "match",
-    "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result}", "\t_ => ${0:nil}", "}"],
+    "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result}", "\t_ => ${0:null}", "}"],
     "description": "Pattern match"
+  },
+  "arrow": {
+    "prefix": "arrow",
+    "body": ["(${1:x}) => ${0:x}"],
+    "description": "An anonymous function"
+  },
+  "template": {
+    "prefix": "tpl",
+    "body": ["`${1:text} \\${${2:expr}}`"],
+    "description": "A template string with interpolation"
   },
   "for": {
     "prefix": "for",
@@ -57,7 +67,7 @@
     "body": [
       "route GET /${1} =",
       "\t<html>",
-      "\t\t<head><meta charset=\"utf-8\"/><title>\"${2:Title}\"</title></head>",
+      "\t\t<head><meta charset=\"utf-8\"/><title>${2:Title}</title></head>",
       "\t\t<body>",
       "\t\t\t$0",
       "\t\t</body>",

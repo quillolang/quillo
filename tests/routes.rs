@@ -35,10 +35,10 @@ fn post_json(it: &mut Interp, url: &str, body: &str) -> HttpResponse {
 fn values_choose_content_type() {
     let mut it = app(
         r#"
-route GET / = <h1>"Hello"</h1>
+route GET / = <h1>Hello</h1>
 route GET /text = "plain"
 route GET /data = { ok: true, n: [1, 2] }
-route GET /empty = nil
+route GET /empty = null
 "#,
     );
     let r = get(&mut it, "/");
@@ -55,7 +55,7 @@ fn path_params_are_typed() {
     let mut it = app(
         r#"
 route GET /add/:a(int)/:b(int) = { sum: a + b }
-route GET /hello/:name = "Hello, {name}!"
+route GET /hello/:name = `Hello, ${name}!`
 route GET /files/*path = path
 "#,
     );
@@ -119,11 +119,11 @@ fn reply_short_circuits_from_middleware() {
     let mut it = app(
         r#"
 let auth = {
-    required: fn(req) =
-        if req.headers.authorization == "Bearer secret" then req
-        else reply 401 { error: "unauthorized" }
+    required: (req) => req.headers.authorization == "Bearer secret"
+        ? req
+        : reply 401 { error: "unauthorized" }
 }
-route GET /me = request |> auth.required |> fn(r) = { ip: r.ip }
+route GET /me = request |> auth.required |> (r) => { ip: r.ip }
 "#,
     );
     let r = get(&mut it, "/me");
@@ -144,7 +144,7 @@ fn not_found_with_coalesce() {
         r#"
 let users = [{ id: 1, name: "Ada" }]
 route GET /users/:id(int) {
-    let user = users |> find(fn(u) = u.id == id) ?? reply 404 { error: "no user {id}" }
+    let user = users |> find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
     user.name
 }
 "#,
@@ -158,13 +158,13 @@ route GET /users/:id(int) {
 fn runtime_errors_become_500() {
     let mut it = app(
         r#"
-route GET /boom = 1 + nil
+route GET /boom = 1 + null
 route GET /err = err("nope")
 "#,
     );
     let r = get(&mut it, "/boom");
     assert_eq!(r.status, 500);
-    assert!(r.text().contains("cannot add int and nil"), "{}", r.text());
+    assert!(r.text().contains("cannot add int and null"), "{}", r.text());
     let r = get(&mut it, "/err");
     assert_eq!((r.status, r.text().as_str()), (500, r#"{"error":"nope"}"#));
 }
@@ -173,7 +173,7 @@ route GET /err = err("nope")
 fn headers_cookies_and_respond() {
     let mut it = app(
         r#"
-route GET /who { cookies: { session: str } } = respond(200, "session {session}", { "X-Quillo": "1" })
+route GET /who { cookies: { session: str } } = respond(200, `session ${session}`, { "X-Quillo": "1" })
 route GET /who = reply 401
 "#,
     );
@@ -212,8 +212,8 @@ component Counter(start: int = 0, label: str = "n") {
     ~count = start
     let double = count * 2
     <div.counter>
-        <span>"{label}: {count} ({double})"</span>
-        <button @click={fn() { count += 1 }}>"+"</button>
+        <span>{label}: {count} ({double})</span>
+        <button @click={() => { count += 1 }}>+</button>
         <input bind:value={label}/>
     </div>
 }
@@ -235,7 +235,7 @@ route GET /bare = <Counter/>
 
 #[test]
 fn component_props_must_be_sendable() {
-    let mut it = app("component Box(f) = <p>\"x\"</p>\nroute GET / = <Box f={fn() = 1}/>\n");
+    let mut it = app("component Box(f) = <p>x</p>\nroute GET / = <Box f={() => 1}/>\n");
     let r = get(&mut it, "/");
     assert_eq!(r.status, 500);
     assert!(r.text().contains("prop `f` of <Box> is a function, which cannot be sent to the browser"), "{}", r.text());
@@ -254,7 +254,7 @@ server fn add_todo(text: str, done: bool = false) -> list {
     todos = todos |> push({ text, done })
     todos
 }
-server fn check(n: int) ! str = if n > 0 then n else err("must be positive")
+server fn check(n: int) ! str = n > 0 ? n : err("must be positive")
 server fn whoami() = request.headers["x-user"] ?? reply 401 { error: "who are you?" }
 server fn crash() = 1 / 0
 fn not_exposed() = "secret"
@@ -287,14 +287,14 @@ fn not_exposed() = "secret"
 
 #[test]
 fn the_browser_bundle_only_carries_what_the_page_uses() {
-    let mut small = app("component Hi(name: str) = <p>\"hi {name}\"</p>\nroute GET / = <Hi name=\"x\"/>\n");
+    let mut small = app("component Hi(name: str) = <p>hi {name}</p>\nroute GET / = <Hi name=\"x\"/>\n");
     let js = get(&mut small, "/_quillo/quillo.js").text();
     // No server fns: no RPC code. Rendering and booting, of course.
     assert!(!js.contains("async function rpc"), "{}", js);
     assert!(js.contains("function boot(") && js.contains("function mount("));
     // Builtins come along only when used.
     assert!(!js.contains("B.group_by") && !js.contains("B.sort_by"));
-    let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={fn() { xs = save(xs |> sort_by(fn(x) = x)) }}>\"\"</button> }\nroute GET / = <C/>\n");
+    let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs |> sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
     assert!(js.len() < js2.len() && js.len() < 12_000, "{} vs {}", js.len(), js2.len());
@@ -304,7 +304,7 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
 
 #[test]
 fn the_browser_bundle_can_be_revalidated() {
-    let mut it = app("component Hi() = <p>\"hi\"</p>\nroute GET / = <Hi/>\n");
+    let mut it = app("component Hi() = <p>hi</p>\nroute GET / = <Hi/>\n");
     let r = get(&mut it, "/_quillo/quillo.js");
     let etag = r.header("etag").unwrap().to_string();
     let again = it.handle(&HttpRequest {

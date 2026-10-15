@@ -44,13 +44,13 @@ fn calls() {
     one("upper(1)", "argument 1 of `upper` must be str, got int");
     one("let s = \"x\"\ns(1)", "cannot call `s`: it is str, not a function");
     one("[1, 2] |> map(1)", "argument 2 of `map` must be fn, got int");
-    one("5.sort()", "argument 1 of `sort` must be list | nil, got int");
+    one("5.sort()", "argument 1 of `sort` must be list | null, got int");
     one("let n = 5\nn.nonsense", "int has no field `nonsense`");
     one("json.nope(1)", "`json` has no function `nope`");
     one("fn f(x: int = \"a\") = x", "the default of `x` is str, but it must be int");
     clean("fn f(x: int | str) = x\nf(1)\nf(\"a\")\nf(int(\"3\") ?? 0)");
-    clean("let xs = [3, 1]\nxs.sort().first()\nxs.len\n[1, 2] |> map(fn(x) = x * 2) |> sum");
-    clean("let m = { greet: fn(n) = n }\nm.greet(1)\nm.anything");
+    clean("let xs = [3, 1]\nxs.sort().first()\nxs.len\n[1, 2] |> map((x) => x * 2) |> sum");
+    clean("let m = { greet: (n) => n }\nm.greet(1)\nm.anything");
     clean("print(1, 2, 3)\njson.stringify({ a: 1 }, true)\nlet d = db.query(\"select ?\", 1)");
 }
 
@@ -71,19 +71,19 @@ fn operators() {
 #[test]
 fn return_and_error_types() {
     one("fn f() -> int = \"x\"", "`f` must return int, but this returns str");
-    one("fn f(c) -> int = if c then 1 else \"no\"", "`f` must return int, but this returns str");
+    one("fn f(c) -> int = c ? 1 : \"no\"", "`f` must return int, but this returns str");
     one("fn f(c) -> int { if c { return [] }\n1 }", "`f` must return int, but this returns list");
     one("fn f() -> int ! str = err(42)", "`f` declares errors as `! str`, but this returns err(int)");
     one("fn g() ! int = err(1)\nfn f() -> int ! str = g()? + 1", "`?` passes on err(int), but `f` declares errors as `! str`");
-    clean("fn f(s: str) -> int ! str = match int(s) {\n int as n if n >= 0 => n\n _ => err(\"bad: {s}\")\n}");
-    clean("fn f(x) -> int = x\nfn g() -> str? = nil\nfn h() -> int = int(\"4\")?");
+    clean("fn f(s: str) -> int ! str = match int(s) {\n int as n if n >= 0 => n\n _ => err(`bad: ${s}`)\n}");
+    clean("fn f(x) -> int = x\nfn g() -> str? = null\nfn h() -> int = int(\"4\")?");
 }
 
 #[test]
 fn effects() {
     one("fn f() with db = now()", "`now` needs the time effect, but `f` is declared `with db`");
     one("fn load() with http = 1\nfn f() with db = load()", "`load` needs the http effect, but `f` is declared `with db`");
-    one("fn f() with db = [1] |> map(fn(_) = env(\"X\"))", "`env` needs the env effect");
+    one("fn f() with db = [1] |> map((_) => env(\"X\"))", "`env` needs the env effect");
     one("fn f() with db = http.get(\"http://x\")", "`http.get` needs the http effect");
     let d = diags("fn helper() = env(\"HOME\")\nfn f() with db = helper()");
     assert!(d.len() == 1 && d[0].contains("warning: `helper` may use the env effect"), "{:#?}", d);
@@ -99,9 +99,9 @@ fn views_and_components() {
     one("view Card(title: str) = <h1>{title}</h1>\nlet x = <Card/>", "<Card> needs `title`");
     one("view Card(n: int) = <h1>{n}</h1>\nlet x = <Card n=\"x\"/>", "`n` of <Card> must be int, got str");
     one("let x = <Nope/>", "unknown name `Nope`");
-    one("let x = <button @click=\"no\">\"\"</button>", "`@click` needs a function, got str");
-    one("component C() = <p>\"\"</p>\nlet x = C()", "`C` is a component; write <C ... /> instead");
-    clean("view Card(title: str, children) = <div>{title}{children}</div>\nlet x = <Card title=\"a\">\"kids\"</Card>\nprint(x)");
+    one("let x = <button @click=\"no\"></button>", "`@click` needs a function, got str");
+    one("component C() = <p></p>\nlet x = C()", "`C` is a component; write <C ... /> instead");
+    clean("view Card(title: str, children) = <div>{title}{children}</div>\nlet x = <Card title=\"a\">kids</Card>\nprint(x)");
 }
 
 #[test]
@@ -115,8 +115,8 @@ fn components_must_run_in_the_browser() {
     clean(
         "let title = \"Todos\"\nserver fn save(x: str) -> list = [x]\nserver fn load() -> list = []\n\
          component C(start: int = 0) {\n ~n = start\n ~items = load()\n ~draft = \"\"\n\
-         <div>\n <h1>{title}</h1>\n <button @click={fn() { n += 1 }}>\"+\"</button>\n\
-         <input bind:value={draft}/>\n <button @click={fn() { items = save(draft) }}>\"save\"</button>\n\
+         <div>\n <h1>{title}</h1>\n <button @click={() => { n += 1 }}>+</button>\n\
+         <input bind:value={draft}/>\n <button @click={() => { items = save(draft) }}>save</button>\n\
          {for i in items => <p key={i}>{i}</p>}\n </div>\n}",
     );
 }

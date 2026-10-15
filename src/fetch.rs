@@ -128,7 +128,7 @@ fn delete(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     do_request(it, "http.delete", "DELETE", &a(&args, 0), &Value::Nil, &a(&args, 1), line)
 }
 
-/// `http.post(url, body = nil, headers = {})`
+/// `http.post(url, body = null, headers = {})`
 fn post(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     do_request(it, "http.post", "POST", &a(&args, 0), &a(&args, 1), &a(&args, 2), line)
 }
@@ -141,7 +141,7 @@ fn patch(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     do_request(it, "http.patch", "PATCH", &a(&args, 0), &a(&args, 1), &a(&args, 2), line)
 }
 
-/// `http.request(method, url, body = nil, headers = {})`
+/// `http.request(method, url, body = null, headers = {})`
 fn request(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let method = match a(&args, 0) {
         Value::Str(m) => m.to_ascii_uppercase(),

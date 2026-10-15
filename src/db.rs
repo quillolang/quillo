@@ -5,8 +5,8 @@
 //! db.exec("create table if not exists todos (id integer primary key, text text)")
 //! db.exec("insert into todos (text) values (?)", text)      // { changes, last_id }
 //! db.query("select * from todos where id > ?", 10)           // list of maps
-//! db.one("select * from todos where id = :id", { id })       // a map or nil
-//! db.transaction(fn() { ... })                               // all or nothing
+//! db.one("select * from todos where id = :id", { id })       // a map or null
+//! db.transaction(() => { ... })                               // all or nothing
 //! ```
 //!
 //! SQL problems are returned as error values, so `?` and `??` work on them.
@@ -170,7 +170,7 @@ fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(with_conn(it, |c| rows(c, &sql, &args[1..], None)).map(Value::list).unwrap_or_else(db_err))
 }
 
-/// `db.one(sql, ...params)`: the first row, or nil.
+/// `db.one(sql, ...params)`: the first row, or null.
 fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sql = sql_arg(&args, "db.one", line)?;
     Ok(with_conn(it, |c| rows(c, &sql, &args[1..], Some(1)))
@@ -178,7 +178,7 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         .unwrap_or_else(db_err))
 }
 
-/// `db.transaction(fn() { ... })`: commits if the function returns normally,
+/// `db.transaction(() => { ... })`: commits if the function returns normally,
 /// rolls back if it fails, returns an error value, or replies early.
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = match args.first() {

@@ -75,7 +75,7 @@ fn language_server_round_trip() {
     std::fs::write(dir.join("lib.qwe"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
     let main = dir.join("app.qwe");
     let uri = format!("file://{}", main.canonicalize().unwrap_or(main.clone()).display()).replace("file:///private/", "file:///private/");
-    let text = "use \"lib.qwe\"\nfn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\nroute GET / = shout(\"hi {totl}\")\n";
+    let text = "use \"lib.qwe\"\nfn add(a: int, b: int = 10) -> int = a + b\nlet total = add(1)\nroute GET / = shout(`hi ${totl}`)\n";
     std::fs::write(&main, text).unwrap();
 
     let mut c = Client::start();
@@ -94,7 +94,7 @@ fn language_server_round_trip() {
     };
     assert_eq!(d.as_array().unwrap().len(), 1, "{}", d);
     assert!(d[0]["message"].as_str().unwrap().contains("unknown name `totl` (did you mean `total`?)"));
-    assert_eq!(d[0]["range"], json!({ "start": { "line": 3, "character": 25 }, "end": { "line": 3, "character": 29 } }));
+    assert_eq!(d[0]["range"], json!({ "start": { "line": 3, "character": 26 }, "end": { "line": 3, "character": 30 } }));
 
     // Hover on `add` in `add(1)`.
     let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 13 } }), &mut notes);

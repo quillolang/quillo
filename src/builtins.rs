@@ -677,7 +677,7 @@ fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     })
 }
 
-/// `write_file(path, text)`: nil, or an error value. Creates missing folders.
+/// `write_file(path, text)`: null, or an error value. Creates missing folders.
 fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "write_file", line)?;
     let text = arg(&args, 1).display();
@@ -852,7 +852,7 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k, Value::list(v))).collect()))
 }
 
-/// `index_of(xs, x)`: the position of `x` in a list or str, or nil.
+/// `index_of(xs, x)`: the position of `x` in a list or str, or null.
 fn index_of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let x = arg(&args, 1);
     Ok(match arg(&args, 0) {

@@ -48,7 +48,7 @@ pub enum Expr {
     Map(Vec<(String, Expr)>),
     Unary(UnOp, Box<Expr>, u32),
     Binary(BinOp, Box<Expr>, Box<Expr>, u32),
-    /// `a ?? b`: `b` when `a` is nil or an error.
+    /// `a ?? b`: `b` when `a` is null or an error.
     Coalesce(Box<Expr>, Box<Expr>),
     /// `a |> f(b)` calls `f(a, b)`.
     Pipe(Box<Expr>, Box<Expr>, u32),
@@ -75,7 +75,7 @@ pub struct Arm {
 }
 
 /// A type annotation: one type name or a union such as `int | str`.
-/// `optional` (`str?`) also allows nil.
+/// `optional` (`str?`) also allows null.
 #[derive(Debug, Clone)]
 pub struct Ty {
     pub names: Vec<String>,
@@ -86,7 +86,7 @@ impl Ty {
     pub fn text(&self) -> String {
         let mut s = self.names.join(" | ");
         if self.optional {
-            s.push_str(if self.names.len() == 1 { "?" } else { " | nil" });
+            s.push_str(if self.names.len() == 1 { "?" } else { " | null" });
         }
         s
     }

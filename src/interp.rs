@@ -445,17 +445,20 @@ impl Interp {
         match e {
             Expr::Lit(l) => Ok(lit_value(l)),
             Expr::Ident(n, line) => lookup(env, n).ok_or_else(|| undefined(n, *line)),
+            // As in JavaScript: the operand that decided the result.
             Expr::Binary(BinOp::And, a, b, _) => {
-                if !self.eval(a, env)?.truthy() {
-                    return Ok(Value::Bool(false));
+                let x = self.eval(a, env)?;
+                if !x.truthy() {
+                    return Ok(x);
                 }
-                Ok(Value::Bool(self.eval(b, env)?.truthy()))
+                self.eval(b, env)
             }
             Expr::Binary(BinOp::Or, a, b, _) => {
-                if self.eval(a, env)?.truthy() {
-                    return Ok(Value::Bool(true));
+                let x = self.eval(a, env)?;
+                if x.truthy() {
+                    return Ok(x);
                 }
-                Ok(Value::Bool(self.eval(b, env)?.truthy()))
+                self.eval(b, env)
             }
             Expr::Binary(op, a, b, line) => {
                 let x = self.eval(a, env)?;
@@ -733,7 +736,7 @@ impl Interp {
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
-        // this way, so any other missing key on a record is simply nil.
+        // this way, so any other missing key on a record is simply null.
         if let Some(f) = lookup(&self.globals, name) {
             let usable = match (&v, &f) {
                 (Value::Map(_), Value::Builtin(..)) => matches!(name, "len" | "keys" | "values"),

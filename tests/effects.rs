@@ -24,7 +24,7 @@ fn ev_err(src: &str) -> String {
 fn union_and_optional_types() {
     assert_eq!(ev("fn f(x: int | str) = x\n[f(1), f(\"a\")]"), "[1, \"a\"]");
     assert!(ev_err("fn f(x: int | str) = x\nf(1.5)").contains("must be int | str, got float"));
-    assert_eq!(ev("fn f(x: int | nil) = x ?? 0\nf(nil)"), "0");
+    assert_eq!(ev("fn f(x: int | null) = x ?? 0\nf(null)"), "0");
     assert!(ev_err("fn f() -> int | str = [1]\nf()").contains("must return int | str"));
     assert!(ev_err("fn f(x: banana) = x").contains("unknown type `banana`"));
 }
@@ -35,7 +35,7 @@ fn declared_error_types_are_checked() {
 fn parse_age(s: str) -> int ! str =
     match int(s) {
         int as n if n >= 0 => n
-        _ => err("bad age: {s}")
+        _ => err(`bad age: ${s}`)
     }
 [parse_age("41"), parse_age("x")]
 "#;
@@ -56,7 +56,7 @@ fn effects_limit_what_a_function_may_do() {
     let e = ev_err("fn f() with db = now()\nf()");
     assert!(e.contains("`now` needs the time effect, but `f` is declared `with db`"), "{}", e);
     // The limit applies to everything the function calls, including lambdas.
-    let e = ev_err("fn helper() = env(\"HOME\")\nfn f() with db = [1] |> map(fn(_) = helper())\nf()");
+    let e = ev_err("fn helper() = env(\"HOME\")\nfn f() with db = [1] |> map((_) => helper())\nf()");
     assert!(e.contains("`env` needs the env effect"), "{}", e);
     // Calling a function that declares more than the caller allows is an error.
     let e = ev_err("fn load() with http, db = 1\nfn f() with db = load()\nf()");
@@ -65,7 +65,7 @@ fn effects_limit_what_a_function_may_do() {
     assert_eq!(ev("fn pure_part() with db = 2\nfn f() with db, time = pure_part()\nf()"), "2");
     assert!(ev_err("fn f() with teleport = 1").contains("expected an effect after `with`"));
     // Pure builtins are always allowed.
-    assert_eq!(ev("fn f(xs) with db = xs |> map(fn(x) = x * 2) |> sum\nf([1, 2])"), "6");
+    assert_eq!(ev("fn f(xs) with db = xs |> map((x) => x * 2) |> sum\nf([1, 2])"), "6");
 }
 
 #[test]
@@ -84,7 +84,7 @@ let bad = db.query("select * from nope")
     assert_eq!(
         ev(src),
         "[{ changes: 1, last_id: 1 }, [{ id: 1, text: \"write docs\", done: 0 }, { id: 2, text: \"ship\", done: 1 }], \
-         { text: \"ship\" }, nil, true, true]"
+         { text: \"ship\" }, null, true, true]"
     );
 }
 
@@ -93,19 +93,19 @@ fn sqlite_transactions_roll_back_on_failure() {
     let src = r#"
 db.open(":memory:")
 db.exec("create table t (n integer)")
-db.transaction(fn() { db.exec("insert into t values (1)") })
-db.transaction(fn() {
+db.transaction(() => { db.exec("insert into t values (1)") })
+db.transaction(() => {
     db.exec("insert into t values (2)")
     err("changed my mind")
 })
-let r = db.transaction(fn() {
+let r = db.transaction(() => {
     db.exec("insert into t values (3)")
     db.query("select count(*) as c from t")[0].c
 })
-[r, db.query("select n from t order by n") |> map(fn(row) = row.n)]
+[r, db.query("select n from t order by n") |> map((row) => row.n)]
 "#;
     assert_eq!(ev(src), "[2, [1, 3]]");
-    let e = ev_err("db.open(\":memory:\")\ndb.exec(\"create table t (n integer)\")\ndb.transaction(fn() { db.exec(\"insert into t values (1)\")\n 1 / 0 })");
+    let e = ev_err("db.open(\":memory:\")\ndb.exec(\"create table t (n integer)\")\ndb.transaction(() => { db.exec(\"insert into t values (1)\")\n 1 / 0 })");
     assert!(e.contains("division by zero"));
 }
 
@@ -134,8 +134,8 @@ write_file("notes/a.txt", "hello")
 
 #[test]
 fn random_values() {
-    assert_eq!(ev("let r = random()\nr >= 0 and r < 1"), "true");
-    assert_eq!(ev("range(200) |> map(fn(_) = random_int(1, 3)) |> unique |> sort"), "[1, 2, 3]");
+    assert_eq!(ev("let r = random()\nr >= 0 && r < 1"), "true");
+    assert_eq!(ev("range(200) |> map((_) => random_int(1, 3)) |> unique |> sort"), "[1, 2, 3]");
     assert_eq!(ev("let u = uuid()\n[len(u), u[14]]"), "[36, \"4\"]");
     assert!(ev_err("fn roll() with db = random_int(1, 6)\nroll()").contains("the random effect"));
 }
@@ -146,15 +146,15 @@ fn math_and_list_helpers() {
         "[3, 2.5, 3, 3.14, 2, 3, 3.0, 1024, true]");
     assert_eq!(ev("[unique([1, 2, 1, 3]), flatten([[1], [2, 3], 4]), zip([1, 2], [\"a\", \"b\"])]"),
         "[[1, 2, 3], [1, 2, 3, 4], [[1, \"a\"], [2, \"b\"]]]");
-    assert_eq!(ev("[take([1, 2, 3], 2), drop([1, 2, 3], 2), take(\"hello\", 2), count([1, 2, 3, 4], fn(x) = x % 2 == 0)]"),
+    assert_eq!(ev("[take([1, 2, 3], 2), drop([1, 2, 3], 2), take(\"hello\", 2), count([1, 2, 3, 4], (x) => x % 2 == 0)]"),
         "[[1, 2], [3], \"he\", 2]");
-    assert_eq!(ev("group_by([1, 2, 3, 4, 5], fn(x) = if x % 2 == 0 then \"even\" else \"odd\")"),
+    assert_eq!(ev("group_by([1, 2, 3, 4, 5], (x) => x % 2 == 0 ? \"even\" : \"odd\")"),
         "{ odd: [1, 3, 5], even: [2, 4] }");
     assert_eq!(ev("[index_of([5, 6, 7], 7), index_of(\"héllo\", \"l\"), index_of([1], 9), repeat(\"ab\", 3)]"),
-        "[2, 2, nil, \"ababab\"]");
+        "[2, 2, null, \"ababab\"]");
 }
 
 #[test]
 fn missing_record_fields_named_like_builtins_are_nil() {
-    assert_eq!(ev("let order = { id: 1 }\n[order.count, order.first, order.len, { a: 1 }.keys]"), "[nil, nil, 1, [\"a\"]]");
+    assert_eq!(ev("let order = { id: 1 }\n[order.count, order.first, order.len, { a: 1 }.keys]"), "[null, null, 1, [\"a\"]]");
 }

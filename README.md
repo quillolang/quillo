@@ -1,10 +1,12 @@
 # Quillo
 
 Quillo is a small web programming language. Routes, request patterns, pipelines and
-HTML are part of the syntax, so a web app reads like a list of what it answers:
+HTML are part of the syntax, so a web app reads like a list of what it answers. Its
+expressions look like JavaScript: arrow functions, `&&` and `||`, `? :`, `null`,
+template strings, and JSX-style HTML.
 
 ```quillo
-route GET /hello/:name = "Hello, {name}!"
+route GET /hello/:name = `Hello, ${name}!`
 
 route POST /orders { json: { type: "order" | "refund", customer.id: int as id } } {
     reply 201 { accepted: true, customer: id }
@@ -22,7 +24,7 @@ server fn add_note(text: str) -> list ! str with db { ... }
 component Notes(initial: list) {
     ~notes = initial
     ~draft = ""
-    <form @submit={fn() { notes = add_note(draft) ?? notes; draft = "" }}>
+    <form @submit={() => { notes = add_note(draft) ?? notes; draft = "" }}>
         <input bind:value={draft}/>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
     </form>
@@ -64,12 +66,34 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 
 ### Values
 
-`nil`, `true`/`false`, `42`, `3.14`, `"strings with {interpolation}"`,
-lists `[1, 2, 3]`, maps `{ name: "Ada", "content-type": "text/plain" }`,
+`null`, `true`/`false`, `42`, `3.14`, `"strings"` or `'strings'`, template strings
+`` `Hello, ${name}` ``, lists `[1, 2, 3]`, maps `{ name: "Ada", "content-type": "text/plain" }`,
 functions, HTML and error values. A map entry `{ id }` is short for `{ id: id }`.
 
-In strings, `{expr}` interpolates. Write `\{` for a literal brace (for example in
-JSON text: `"\{\"a\": 1\}"`).
+Only template strings (backticks) interpolate; `"..."` and `'...'` are plain text, so
+JSON is easy to write: `'{"a": 1}'`. Template strings can span lines.
+
+Operators are as in JavaScript: `+ - * / %`, `== !=` (deep equality, like comparing
+JSON), `< <= > >=`, `!`, `&&`, `||`, `??` and `cond ? a : b`. `null`, `false` and error
+values are falsy; everything else (including `0` and `""`) is truthy. `a && b` and
+`a || b` give back one of their operands, so `name || "anonymous"` and
+`{loading && <Spinner/>}` work. Integer `/` gives an integer: `7 / 2` is `3`.
+
+### Coming from JavaScript
+
+Most expressions read as they would in JavaScript. The differences:
+
+- `let` declares a variable (there is no `const` or `var`); values are immutable, so
+  `push`, `set` and `+` return new lists and maps.
+- Named functions are `fn name(params) = expr` or `fn name(params) { ... }`; anonymous
+  ones are arrows. Blocks give back their last expression, so `return` is only for
+  leaving early.
+- `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
+- Only `null`, `false` and error values are falsy: `0` and `""` are truthy.
+- `match`, `|>`, patterns, `route`, `reply`, `~state` and `with` effects have no
+  JavaScript equivalent.
+- Integers stay integers: `7 / 2` is `3` (write `7.0 / 2` for `3.5`).
+- Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
 
 ### Variables, functions, views
 
@@ -82,15 +106,17 @@ fn area(w, h) {                   // block body: the last expression is the resu
     let a = w * h
     a
 }
-let double = fn(x) = x * 2         // anonymous function
+let double = (x) => x * 2          // arrow functions, as in JavaScript
+let triple = x => x * 3
+let point = (x: int, y: int = 0) => { x, y }      // `{ x, y }` here is a map
 
 view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
 ```
 
 Type annotations are checked when the function is called and when it returns, and
 `quillo check` checks them before the program runs: `int float num str bool list map html
-fn response any`. Unions are written `int | str`; add `?` or `| nil` to also allow nil
-(`str?`, `int | nil`).
+fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
+(`str?`, `int | null`).
 
 ### Pipelines and method calls
 
@@ -99,23 +125,24 @@ and `x.len` is `len(x)`:
 
 ```quillo
 orders
-    |> filter(fn(o) = o.total > 100)
-    |> sort_by(fn(o) = o.total)
-    |> map(fn(o) = o.id)
+    |> filter((o) => o.total > 100)
+    |> sort_by((o) => o.total)
+    |> map((o) => o.id)
 
+orders.filter(o => o.paid).map(o => o.id)
 [3, 1, 2].sort().first()
 ```
 
-A line starting with `|>`, `??`, `.method`, `else`, `and` or `or` continues the
-previous line.
+A line starting with `|>`, `??`, `&&`, `||`, `?`, `:`, `.method` or `else` continues
+the previous line.
 
 ### Control flow
 
 ```quillo
-if n > 0 then "pos" else "neg"
-if n > 0 { "pos" } else if n == 0 { "zero" } else { "neg" }
+n > 0 ? "pos" : "neg"
+if n > 0 { "pos" } else if n == 0 { "zero" } else { "neg" }   // also a value
 for x in [1, 2, 3] => x * x                 // a list: [1, 4, 9]
-for [key, value] in { a: 1 } => "{key}={value}"
+for [key, value] in { a: 1 } => `${key}=${value}`
 match value { ... }
 return x
 ```
@@ -127,7 +154,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 | Pattern | Matches |
 |---|---|
 | `_`, `name` | anything (`name` binds it) |
-| `42`, `"order"`, `true`, `nil` | that literal |
+| `42`, `"order"`, `true`, `null` | that literal |
 | `int`, `str`, `list`, ... | any value of that type |
 | `"order" \| "refund"` | either alternative |
 | `int as n` | binds what matched |
@@ -138,7 +165,7 @@ In a map pattern, `key: int` (a bare type) also binds `key`.
 
 ```quillo
 match event {
-    { type: "click", x: int, y: int } => "click at {x},{y}"
+    { type: "click", x: int, y: int } => `click at ${x},${y}`
     { type: "key", key: "Enter" | "Return" } => "enter"
     int as n if n < 0 => "negative"
     _ => "other"
@@ -149,14 +176,14 @@ match event {
 
 `err(x)` makes an error value. Builtins such as `int("abc")` and `json.parse`
 return errors instead of crashing. `?` after an expression returns the error from
-the current function, and `??` falls back when the left side is nil or an error.
-Field access on nil gives nil:
+the current function, and `??` falls back when the left side is null or an error.
+Field access on null gives null (so there is no need for `?.`):
 
 ```quillo
 fn parse_age(s: str) -> int ! str =
     match int(s) {
         int as n if n >= 0 => n
-        _ => err("bad age: {s}")
+        _ => err(`bad age: ${s}`)
     }
 fn next_year(s) = parse_age(s)? + 1         // err("bad age: x") for "x"
 let age = int(request.query.age) ?? 18
@@ -189,19 +216,24 @@ Functions without `with` may do anything.
 
 ### HTML literals
 
-HTML is a value, not a string. Text children are `"quoted"`, expressions go in
-`{...}`, and everything is escaped unless it is already HTML:
+HTML is a value, not a string. It is written like JSX: text goes in as it is,
+expressions go in `{...}`, and everything is escaped unless it is already HTML:
 
 ```quillo
-<li.todo #todo-{t.id} class={if t.done then "done"} data-id={t.id}>
-    {if t.done then <s>{t.text}</s> else t.text}
-    <button disabled={not editable}>"Edit"</button>
+<li.todo #todo-{t.id} class={t.done && "done"} data-id={t.id}>
+    {t.done ? <s>{t.text}</s> : t.text}
+    <button disabled={!editable}>Edit</button>
+    Added {t.age} days ago &mdash; {t.owner}
 </li>
 ```
 
-- `.class` and `#id` shorthand, with interpolation.
-- Attributes: `"text {x}"` or `{expr}`. `true` renders a bare attribute; `false`/`nil` leaves it out.
-- `nil`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
+- Text follows JSX's rules: each line is trimmed, blank lines are dropped and the rest
+  are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
+  for a brace.
+- `.class` and `#id` shorthand, with `{}` interpolation in the name.
+- Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example ``href={`/todos/${id}`}``.
+  `true` renders a bare attribute; `false`/`null` leaves it out.
+- `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
 - `raw(s)` marks trusted HTML.
@@ -216,8 +248,8 @@ component Counter(start: int = 0) {
     ~count = start                       // state: set once, kept between renders
     let double = count * 2               // recomputed on every render
     <div>
-        <span>"{count} (x2 = {double})"</span>
-        <button @click={fn() { count += 1 }}>"+"</button>
+        <span>{count} (x2 = {double})</span>
+        <button @click={() => { count += 1 }}>+</button>
     </div>
 }
 
@@ -258,8 +290,8 @@ server fn add_note(text: str) -> list ! str with db {
 component Notes(initial: list) {
     ~notes = initial
     ~draft = ""
-    ~problem = nil
-    <form @submit={fn() {
+    ~problem = null
+    <form @submit={() => {
         let r = add_note(draft)                    // a request to the server
         if is_err(r) { problem = r.error } else { notes = r }
     }}>
@@ -279,7 +311,7 @@ on another site cannot), and inside one `request` is the current request. `reply
 server fn becomes the HTTP response, so the usual middleware works:
 
 ```quillo
-server fn delete_all() = request |> auth.required |> fn(_) { ... }
+server fn delete_all() = request |> auth.required |> (_) => { ... }
 ```
 
 From hand-written JavaScript: `await quillo.server.add_note("text")`.
@@ -309,7 +341,7 @@ none of its patterns matched.
 | html | 200 `text/html` |
 | str | 200 `text/plain` |
 | map, list, number, bool | 200 JSON |
-| nil | 204 |
+| null | 204 |
 | error | 500 `{"error": ...}` |
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
@@ -320,15 +352,16 @@ helper, a pipeline stage or a `??` fallback. This is how middleware works:
 
 ```quillo
 let auth = {
-    required: fn(req) =
-        if req.headers.authorization == "Bearer {env("TOKEN")}" then req
-        else reply 401 { error: "unauthorized" }
+    required: (req) =>
+        req.headers.authorization == `Bearer ${env("TOKEN")}`
+            ? req
+            : reply 401 { error: "unauthorized" },
 }
 
-route GET /me = request |> auth.required |> fn(r) = { ip: r.ip }
+route GET /me = request |> auth.required |> (r) => { ip: r.ip }
 
 route GET /users/:id(int) {
-    let user = users |> find(fn(u) = u.id == id) ?? reply 404 { error: "no user {id}" }
+    let user = users |> find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
     user
 }
 ```
@@ -359,7 +392,7 @@ db.exec("create table if not exists todos (id integer primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
 db.query("select * from todos where id > ?", 10)           // a list of maps
 db.one("select * from todos where id = :id", { id })       // a map, or nil
-db.transaction(fn() { ... })                               // all or nothing
+db.transaction(() => { ... })                              // all or nothing
 ```
 
 Without `db.open`, the database is `$QUILLO_DB`, or else in memory. A transaction rolls
@@ -370,7 +403,7 @@ back if its function fails, returns an error value or replies early.
 ```quillo
 let r = http.get("https://api.example.com/users/1")        // { status, ok, headers, body, json }
 http.post(url, { name: "Ada" })                            // maps and lists are sent as JSON
-http.request("PUT", url, body, { authorization: "Bearer {token}" })
+http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 ```
 
 Every HTTP status is a response; failing to connect is an error value.

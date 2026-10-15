@@ -68,7 +68,7 @@ impl Value {
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Nil => "nil",
+            Value::Nil => "null",
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
             Value::Float(_) => "float",
@@ -106,7 +106,7 @@ impl Value {
     /// Source-like form used by the REPL and error messages.
     pub fn repr(&self) -> String {
         match self {
-            Value::Nil => "nil".into(),
+            Value::Nil => "null".into(),
             Value::Bool(b) => b.to_string(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => fmt_float(*f),

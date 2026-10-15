@@ -12,10 +12,10 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const KEYWORDS: &[&str] = &[
-    "let", "fn", "view", "component", "server", "route", "use", "return", "if", "then", "else", "match", "for", "in",
-    "and", "or", "not", "true", "false", "nil", "reply", "as", "with",
+    "let", "fn", "view", "component", "server", "route", "use", "return", "if", "else", "match", "for", "in",
+    "true", "false", "null", "reply", "as", "with",
 ];
-const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "nil"];
+const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
 const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random"];
 
@@ -455,7 +455,7 @@ impl Default for Server {
 fn keyword_doc(w: &str) -> Option<String> {
     let text = match w {
         "route" => "`route METHOD /path/:param ? { query } { request pattern } = expr`\n\nDeclares an HTTP route. Routes are tried in order; the first whose method, path and patterns match handles the request.",
-        "component" => "`component Name(props) { ~state = init ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to `~state` re-renders it.",
+        "component" => "`component Name(props) { ~state = init ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to `~state` re-renders it. Handlers: `@click={() => { count += 1 }}`.",
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",

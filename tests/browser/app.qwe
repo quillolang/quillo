@@ -8,7 +8,7 @@ component Counter(start: int = 0) {
     ~count = start
     <div #counter>
         <span.value>{count}</span>
-        <button.inc @click={fn() { count += 1 }}>"+"</button>
+        <button.inc @click={() => { count += 1 }}>+</button>
     </div>
 }
 
@@ -17,18 +17,18 @@ component Todos(initial: list) {
     ~draft = ""
     ~status = "idle"
     <div #todos>
-        <form @submit={fn() {
+        <form @submit={() => {
             status = "saving"
             items = save(draft)
             draft = ""
             status = "saved"
         }}>
             <input.draft bind:value={draft}/>
-            <button>"Add"</button>
+            <button>Add</button>
         </form>
         <ul>{for t in items => <li key={t}>{t}</li>}</ul>
         <p.status>{status}</p>
-        <p.count>"{len(items)} items, draft: {draft}"</p>
+        <p.count>{len(items)} items, draft: {draft}</p>
         <Counter start={len(items)}/>
     </div>
 }

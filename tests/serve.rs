@@ -138,7 +138,7 @@ fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
 fn watch_injects_the_reload_script_into_pages() {
     let d = temp_dir("inject");
     let f = d.join("app.qwe");
-    std::fs::write(&f, "route GET / = <html><body><p>\"hi\"</p></body></html>\nroute GET /t = \"text\"\n").unwrap();
+    std::fs::write(&f, "route GET / = <html><body><p>hi</p></body></html>\nroute GET /t = \"text\"\n").unwrap();
     let srv = start(&f, &["--watch"]);
     let page = get(srv.port, "/").1;
     assert!(page.contains("/_quillo/events") && page.ends_with("</body></html>"), "{}", page);
@@ -151,7 +151,7 @@ fn http_client_talks_to_another_server() {
     let api = d.join("api.qwe");
     std::fs::write(
         &api,
-        "route GET /users/:id(int) = { id, name: \"user {id}\" }\n\
+        "route GET /users/:id(int) = { id, name: `user ${id}` }\n\
          route POST /echo { json: { n: int } } = reply 201 { doubled: n * 2, agent: request.headers[\"user-agent\"] }\n\
          route GET /teapot = reply 418 \"short and stout\"\n",
     )
@@ -162,9 +162,9 @@ fn http_client_talks_to_another_server() {
         &client,
         format!(
             "let base = \"http://127.0.0.1:{}\"\n\
-             fn load(id: int) with http = http.get(\"{{base}}/users/{{id}}\").json\n\
-             let r = http.post(\"{{base}}/echo\", {{ n: 21 }})\n\
-             let t = http.get(\"{{base}}/teapot\")\n\
+             fn load(id: int) with http = http.get(`${{base}}/users/${{id}}`).json\n\
+             let r = http.post(`${{base}}/echo`, {{ n: 21 }})\n\
+             let t = http.get(`${{base}}/teapot`)\n\
              let down = http.get(\"http://127.0.0.1:1/nothing\")\n\
              print(json.stringify([load(7), r.status, r.json.doubled, starts_with(r.json.agent, \"quillo/\"), t.status, t.ok, t.body, is_err(down)]))\n",
             srv.port

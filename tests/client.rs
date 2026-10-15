@@ -44,10 +44,10 @@ fn values_and_operators() {
         return;
     }
     same("", "[1 + 2 * 3, 7 / 2, 7 % 3, -4, 2 < 3, \"a\" < \"b\", 1 == 1, [1, 2] == [1, 2], { a: 1 } == { a: 1 }, 1 != 2]");
-    same("", "[\"a\" + 1, 1 + \"b\", [1] + [2], { a: 1 } + { b: 2 }, 0..4, not nil, not 0]");
-    same("", "let name = \"Ada\"\n\"Hi {name}, {1 + 1} {[1, \"x\"]} {nil} {{ k: true }}\"");
-    same("", "[nil ?? 1, err(\"x\") ?? 2, 3 ?? 4, nil and 1, 0 or nil, true and 5]");
-    same("", "let xs = [10, 20, 30]\n[xs[0], xs[-1], xs[9], \"héllo\"[1], { a: 1 }[\"a\"], nil[0], { a: { b: 2 } }.a.b, nil.x]");
+    same("", "[\"a\" + 1, 1 + \"b\", [1] + [2], { a: 1 } + { b: 2 }, 0..4, !null, !0]");
+    same("", "let name = \"Ada\"\n`Hi ${name}, ${1 + 1} ${[1, \"x\"]} ${null} ${{ k: true }}`");
+    same("", "[null ?? 1, err(\"x\") ?? 2, 3 ?? 4, null && 1, 0 || null, true && 5, 0 && 1, false || \"x\"]");
+    same("", "let xs = [10, 20, 30]\n[xs[0], xs[-1], xs[9], \"héllo\"[1], { a: 1 }[\"a\"], null[0], { a: { b: 2 } }.a.b, null.x]");
     same_error("", "1 / 0", "division by zero");
     same_error("", "[1] + 1", "cannot add list and int");
     same_error("", "{} < 1", "cannot compare map with int");
@@ -59,9 +59,9 @@ fn functions_and_closures() {
         return;
     }
     same("fn add(a: int, b: int = 10) -> int = a + b", "[add(1), add(1, 2)]");
-    same("fn make() { let n = 0\nfn() { n += 1\nn } }", "let c = make()\nc()\nc()\nc()");
-    same("fn fact(n) = if n <= 1 then 1 else n * fact(n - 1)", "fact(10)");
-    same("", "let double = fn(x) = x * 2\n[1, 2, 3] |> map(double) |> filter(fn(x) = x > 2)");
+    same("fn make() { let n = 0\n() => { n += 1\nn } }", "let c = make()\nc()\nc()\nc()");
+    same("fn fact(n) = n <= 1 ? 1 : n * fact(n - 1)", "fact(10)");
+    same("", "let double = (x) => x * 2\n[1, 2, 3] |> map(double) |> filter((x) => x > 2)");
     same("fn f(x) { if x > 0 { return \"pos\" }\n\"other\" }", "[f(1), f(-1)]");
     same_error("fn add(a: int, b: int = 10) -> int = a + b", "add(\"x\")", "argument `a` of `add` must be int, got str");
     same_error("fn add(a, b) = a", "add(1, 2, 3)", "`add` takes 2 arguments, got 3");
@@ -78,8 +78,8 @@ fn pipelines_and_methods() {
     same("", "[3, 1, 2].sort().first()");
     same("", "[\"a\", \"b\"].len");
     same("fn total(xs) = xs |> sum", "[[1, 2], [3]] |> map(total)");
-    same("", "let m = { greet: fn(n) = \"hi {n}\" }\nm.greet(\"x\")");
-    same("", "[{ n: 3 }, { n: 1 }] |> sort_by(fn(o) = o.n) |> map(fn(o) = o.n)");
+    same("", "let m = { greet: (n) => `hi ${n}` }\nm.greet(\"x\")");
+    same("", "[{ n: 3 }, { n: 1 }] |> sort_by((o) => o.n) |> map((o) => o.n)");
     same("", "\"a,b,c\" |> split(\",\") |> map(upper) |> join(\"-\")");
 }
 
@@ -88,7 +88,7 @@ fn errors_try_and_coalesce() {
     if !node_available() {
         return;
     }
-    let defs = "fn parse_age(s: str) -> int ! str = match int(s) {\n int as n if n >= 0 => n\n _ => err(\"bad age: {s}\")\n}\nfn next_year(s) = parse_age(s)? + 1";
+    let defs = "fn parse_age(s: str) -> int ! str = match int(s) {\n int as n if n >= 0 => n\n _ => err(`bad age: ${s}`)\n}\nfn next_year(s) = parse_age(s)? + 1";
     same(defs, "[next_year(\"41\"), next_year(\"x\"), int(\"12\"), is_err(int(\"zz\")), float(\"1.5\")]");
     same("", "let e = err({ code: 7 })\n[e.error.code, is_err(e), unwrap(5)]");
     same_error("", "unwrap(err(\"boom\"))", "unwrap of an error: boom");
@@ -100,9 +100,9 @@ fn control_flow_and_patterns() {
         return;
     }
     same("", "for x in [1, 2, 3] => x * x");
-    same("", "for [k, v] in { a: 1, b: 2 } => \"{k}={v}\"");
+    same("", "for [k, v] in { a: 1, b: 2 } => `${k}=${v}`");
     same("", "for c in \"abc\" => upper(c)");
-    let m = "fn kind(e) = match e {\n { type: \"click\", x: int, y: int } => \"click {x},{y}\"\n { type: \"key\", key: \"Enter\" | \"Return\" } => \"enter\"\n [first, ..rest] => \"list {first} {len(rest)}\"\n int as n if n < 0 => \"negative\"\n { limit: int = 20 } => \"limit {limit}\"\n _ => \"other\"\n}";
+    let m = "fn kind(e) = match e {\n { type: \"click\", x: int, y: int } => `click ${x},${y}`\n { type: \"key\", key: \"Enter\" | \"Return\" } => \"enter\"\n [first, ..rest] => `list ${first} ${len(rest)}`\n int as n if n < 0 => \"negative\"\n { limit: int = 20 } => `limit ${limit}`\n _ => \"other\"\n}";
     same(m, "[kind({ type: \"click\", x: 1, y: 2 }), kind({ type: \"key\", key: \"Return\" }), kind([1, 2, 3]), kind(-5), kind({}), kind({ limit: 5 }), kind(\"z\")]");
     same("", "let [a, b] = [1, 2]\nlet { name, age: int as years } = { name: \"Ada\", age: 36 }\n[a, b, name, years]");
     same("", "if 1 > 2 { \"a\" } else if 2 > 1 { \"b\" } else { \"c\" }");
@@ -116,13 +116,13 @@ fn standard_library() {
         return;
     }
     same("", "[upper(\"a\"), lower(\"B\"), trim(\"  x \"), split(\"a b\"), join([1, 2], \",\"), contains(\"abc\", \"b\"), contains([1, 2], 2), starts_with(\"abc\", \"ab\"), ends_with(\"abc\", \"bc\"), replace(\"aXbX\", \"X\", \"-\")]");
-    same("", "[slice([1, 2, 3, 4], 1, -1), slice(\"hello\", -3), len(\"héllo\"), len({ a: 1 }), type_of(1), type_of(\"s\"), type_of([]), type_of(nil), str(42)]");
-    same("", "[reduce([1, 2, 3], 0, fn(a, x) = a + x), sum([1, 2, 3]), min([3, 1, 2]), max([3, 1, 2]), reverse([1, 2]), reverse(\"ab\"), push([1], 2), range(3), range(2, 4), enumerate([\"a\"])]");
+    same("", "[slice([1, 2, 3, 4], 1, -1), slice(\"hello\", -3), len(\"héllo\"), len({ a: 1 }), type_of(1), type_of(\"s\"), type_of([]), type_of(null), str(42)]");
+    same("", "[reduce([1, 2, 3], 0, (a, x) => a + x), sum([1, 2, 3]), min([3, 1, 2]), max([3, 1, 2]), reverse([1, 2]), reverse(\"ab\"), push([1], 2), range(3), range(2, 4), enumerate([\"a\"])]");
     same("", "let m = { a: 1, b: 2 }\n[keys(m), values(m), get(m, \"a\"), get(m, \"z\", 0), has(m, \"b\"), set(m, \"c\", 3), remove(m, \"a\"), merge(m, { a: 9 }), remove([1, 2, 1], 1)]");
-    same("", "[any([1, 2], fn(x) = x > 1), all([1, 2], fn(x) = x > 1), find([1, 2, 3], fn(x) = x > 1), abs(-3), round(2.5), floor(2.7), ceil(2.1), pow(2, 10)]");
-    same("", "[unique([1, 2, 1]), flatten([[1], [2, 3], 4]), zip([1, 2], [\"a\", \"b\"]), take([1, 2, 3], 2), drop(\"hello\", 3), count([1, 2, 3], fn(x) = x > 1), index_of(\"héllo\", \"l\"), repeat(\"ab\", 2)]");
-    same("", "group_by([1, 2, 3, 4], fn(x) = if x % 2 == 0 then \"even\" else \"odd\")");
-    same("", "[json.stringify({ a: [1, nil, true] }), json.parse(\"\\{\\\"x\\\": [1, 2]\\}\"), is_err(json.parse(\"nope\")), escape(\"<a href='x'>\")]");
+    same("", "[any([1, 2], (x) => x > 1), all([1, 2], (x) => x > 1), find([1, 2, 3], (x) => x > 1), abs(-3), round(2.5), floor(2.7), ceil(2.1), pow(2, 10)]");
+    same("", "[unique([1, 2, 1]), flatten([[1], [2, 3], 4]), zip([1, 2], [\"a\", \"b\"]), take([1, 2, 3], 2), drop(\"hello\", 3), count([1, 2, 3], (x) => x > 1), index_of(\"héllo\", \"l\"), repeat(\"ab\", 2)]");
+    same("", "group_by([1, 2, 3, 4], (x) => x % 2 == 0 ? \"even\" : \"odd\")");
+    same("", "[json.stringify({ a: [1, null, true] }), json.parse(\"\\{\\\"x\\\": [1, 2]\\}\"), is_err(json.parse(\"nope\")), escape(\"<a href='x'>\")]");
 }
 
 #[test]
@@ -134,8 +134,8 @@ fn compile_errors_name_what_cannot_run_in_the_browser() {
         ("component C() = <p>{env(\"HOME\")}</p>", "`env` is not available in the browser"),
         ("component C() = <p>{nope}</p>", "unknown name `nope`"),
         ("server fn save(x) = x\ncomponent C() = <p>{save(1)}</p>", "`save` waits on the server"),
-        ("component C() { let x = 1\n<button @click={fn() { x = 2 }}>\"\"</button> }", ""),
-        ("component C() = <p>{fn() = reply 404}</p>", "`reply` only works on the server"),
+        ("component C() { let x = 1\n<button @click={() => { x = 2 }}></button> }", ""),
+        ("component C() = <p>{() => reply 404}</p>", "`reply` only works on the server"),
     ];
     for (src, want) in cases {
         let r = Interp::new(".").load_source(src, "c.qwe");

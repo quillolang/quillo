@@ -44,6 +44,8 @@ pub enum Tok {
     Gt,
     Ge,
     Bar,
+    OrOr,
+    AndAnd,
     PipeGt,
     Question,
     QQ,
@@ -95,6 +97,8 @@ impl Tok {
             Tok::Gt => ">",
             Tok::Ge => ">=",
             Tok::Bar => "|",
+            Tok::OrOr => "||",
+            Tok::AndAnd => "&&",
             Tok::PipeGt => "|>",
             Tok::Question => "?",
             Tok::QQ => "??",
@@ -204,7 +208,7 @@ impl Lexer {
         }
         let value_like = match &self.last {
             None => false,
-            Some(Tok::Ident(k)) => !matches!(k.as_str(), "and" | "or" | "not" | "then" | "else" | "in"),
+            Some(Tok::Ident(k)) => !matches!(k.as_str(), "else" | "in"),
             Some(
                 Tok::Int(_)
                 | Tok::Float(_)
@@ -219,13 +223,14 @@ impl Lexer {
         if !value_like {
             return false;
         }
-        if self.starts_with("|") || self.starts_with("??") {
+        // `|>`, `||`, `&&`, `??`, and `? a : b` split over lines.
+        if self.starts_with("|") || self.starts_with("&&") || self.starts_with("?") || self.starts_with(":") {
             return false;
         }
         if self.starts_with(".") && !self.starts_with("..") {
             return false;
         }
-        if matches!(self.word_ahead().as_str(), "else" | "then" | "and" | "or") {
+        if self.word_ahead() == "else" {
             return false;
         }
         self.peek_char().is_some()
@@ -258,8 +263,10 @@ impl Lexer {
                 self.bump();
             }
             Tok::Ident(w)
-        } else if c == '"' {
+        } else if c == '"' || c == '\'' {
             Tok::Str(self.lex_string()?)
+        } else if c == '`' {
+            Tok::Str(self.lex_template()?)
         } else {
             self.bump();
             let n = self.peek_char();
@@ -315,7 +322,9 @@ impl Lexer {
                 '>' if n == Some('=') => two(self, Tok::Ge),
                 '>' => Tok::Gt,
                 '|' if n == Some('>') => two(self, Tok::PipeGt),
+                '|' if n == Some('|') => two(self, Tok::OrOr),
                 '|' => Tok::Bar,
+                '&' if n == Some('&') => two(self, Tok::AndAnd),
                 '?' if n == Some('?') => two(self, Tok::QQ),
                 '?' => Tok::Question,
                 '~' => Tok::Tilde,
@@ -353,47 +362,60 @@ impl Lexer {
             .map_err(|_| QuilloError::new(format!("number `{}` is too large", s), line))
     }
 
-    /// Lexes a string literal starting at the opening quote. `{expr}` parts
-    /// are kept as source and parsed later; `\{` is a literal brace.
+    fn escape(&mut self, unterminated: &dyn Fn() -> QuilloError) -> Result<char, QuilloError> {
+        let e = self.bump().ok_or_else(unterminated)?;
+        Ok(match e {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => '\0',
+            '"' | '\'' | '`' | '\\' | '{' | '}' | '$' => e,
+            other => return Err(QuilloError::new(format!("unknown escape `\\{}` in string", other), self.line)),
+        })
+    }
+
+    /// Lexes a "..." or '...' string, starting at the opening quote. Its
+    /// text is taken as it is; `${}` interpolation needs a `template`.
     pub fn lex_string(&mut self) -> Result<Vec<StrPart>, QuilloError> {
         let start = self.line;
         let unterminated = || QuilloError::new("unexpected end of input: unterminated string", start);
+        let quote = self.bump().unwrap_or('"');
+        let mut buf = String::new();
+        loop {
+            let c = self.bump().ok_or_else(unterminated)?;
+            match c {
+                c if c == quote => break,
+                '\\' => buf.push(self.escape(&unterminated)?),
+                _ => buf.push(c),
+            }
+        }
+        Ok(vec![StrPart::Lit(buf)])
+    }
+
+    /// Lexes a `template ${with} interpolation`, starting at the backtick.
+    /// `${...}` parts are kept as source and parsed later.
+    pub fn lex_template(&mut self) -> Result<Vec<StrPart>, QuilloError> {
+        let start = self.line;
+        let unterminated = || QuilloError::new("unexpected end of input: unterminated template string", start);
         self.bump();
         let mut parts = Vec::new();
         let mut buf = String::new();
         loop {
             let c = self.bump().ok_or_else(unterminated)?;
             match c {
-                '"' => break,
-                '\\' => {
-                    let e = self.bump().ok_or_else(unterminated)?;
-                    buf.push(match e {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        '0' => '\0',
-                        '"' | '\\' | '{' | '}' => e,
-                        other => {
-                            return Err(QuilloError::new(format!("unknown escape `\\{}` in string", other), self.line))
-                        }
-                    });
-                }
-                '{' => {
+                '`' => break,
+                '\\' => buf.push(self.escape(&unterminated)?),
+                '$' if self.peek_char() == Some('{') => {
+                    self.bump();
                     if !buf.is_empty() {
                         parts.push(StrPart::Lit(std::mem::take(&mut buf)));
                     }
                     let line = self.line;
-                    let open_brace = || {
-                        QuilloError::new(
-                            "unexpected end of input: `{` in a string starts an interpolation that is never closed \
-                             (write `\\{` for a literal brace)",
-                            line,
-                        )
-                    };
+                    let open = || QuilloError::new("unexpected end of input: `${` in a template is never closed", line);
                     let mut depth = 1;
                     let mut src = String::new();
                     loop {
-                        let c = self.bump().ok_or_else(open_brace)?;
+                        let c = self.bump().ok_or_else(open)?;
                         match c {
                             '{' => depth += 1,
                             '}' => {
@@ -402,17 +424,17 @@ impl Lexer {
                                     break;
                                 }
                             }
-                            '"' => {
+                            '"' | '\'' | '`' => {
                                 // A string nested inside the interpolation.
-                                src.push('"');
+                                src.push(c);
                                 loop {
-                                    let d = self.bump().ok_or_else(open_brace)?;
+                                    let d = self.bump().ok_or_else(open)?;
                                     src.push(d);
                                     if d == '\\' {
                                         if let Some(x) = self.bump() {
                                             src.push(x);
                                         }
-                                    } else if d == '"' {
+                                    } else if d == c {
                                         break;
                                     }
                                 }
@@ -423,7 +445,7 @@ impl Lexer {
                         src.push(c);
                     }
                     if src.trim().is_empty() {
-                        return Err(QuilloError::new("empty `{}` in string (write `\\{` for a literal brace)", line));
+                        return Err(QuilloError::new("empty `${}` in template", line));
                     }
                     parts.push(StrPart::Expr(src, line));
                 }

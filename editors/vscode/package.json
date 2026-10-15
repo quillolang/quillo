@@ -2,7 +2,7 @@
   "name": "quillo-lang",
   "displayName": "Quillo",
   "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `quillo lsp`).",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "wisp-one",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/wisp-one/quillo" },

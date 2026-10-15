@@ -352,7 +352,7 @@ fn value_response(v: Value) -> HttpResponse {
 }
 
 /// Body encoding follows the value: html -> text/html, str -> text/plain,
-/// nil -> empty, anything else -> JSON.
+/// null -> empty, anything else -> JSON.
 fn render_response(r: &Response) -> HttpResponse {
     let (ctype, body): (Option<&str>, Vec<u8>) = match &r.body {
         Body::Bytes(b) => (None, b.clone()),
