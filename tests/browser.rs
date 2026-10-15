@@ -55,14 +55,19 @@ fn run_page(chrome: &Path, app: &str, port: u16) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Node 22 or later (run.js uses its built-in WebSocket).
 fn node_available() -> bool {
-    Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("node")
+        .args(["-e", "process.exit(typeof WebSocket === 'function' ? 0 : 1)"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[test]
 fn live_state_follows_changes_made_elsewhere() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
-        eprintln!("skipping: no Chrome (or no Node) found");
+        eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
     let result = run_page(&chrome, "live.qwe", 22000 + (std::process::id() % 1000) as u16);
@@ -80,7 +85,7 @@ fn live_state_follows_changes_made_elsewhere() {
 #[test]
 fn components_hydrate_react_and_call_the_server() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
-        eprintln!("skipping: no Chrome (or no Node) found");
+        eprintln!("skipping: needs Chrome and Node 22 or later");
         return;
     };
     let result = run_page(&chrome, "app.qwe", 21000 + (std::process::id() % 1000) as u16);
