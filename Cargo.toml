@@ -1,0 +1,18 @@
+[package]
+name = "wisp"
+version = "0.1.0"
+edition = "2021"
+description = "Wisp: a small web programming language where routes, payload patterns and HTML are part of the syntax"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wisp"
+path = "src/main.rs"
+
+[dependencies]
+indexmap = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny_http = "0.12"

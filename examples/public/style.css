@@ -1,0 +1,10 @@
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1d1d1f; }
+h1 { font-size: 1.6rem; }
+ul.todos { list-style: none; padding: 0; }
+li.todo { display: flex; gap: .5rem; align-items: center; padding: .4rem 0; border-bottom: 1px solid #ddd; }
+li.todo.done .text { text-decoration: line-through; color: #888; }
+li.todo form { margin: 0; }
+form.add { display: flex; gap: .5rem; margin-top: 1rem; }
+form.add input { flex: 1; padding: .4rem; }
+button { cursor: pointer; }
+.muted { color: #888; }
