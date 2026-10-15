@@ -1,0 +1,41 @@
+let items = ["first"]
+server fn save(text: str) -> list {
+    items = items |> push(text)
+    items
+}
+
+component Counter(start: int = 0) {
+    ~count = start
+    <div #counter>
+        <span.value>{count}</span>
+        <button.inc @click={fn() { count += 1 }}>"+"</button>
+    </div>
+}
+
+component Todos(initial: list) {
+    ~items = initial
+    ~draft = ""
+    ~status = "idle"
+    <div #todos>
+        <form @submit={fn() {
+            status = "saving"
+            items = save(draft)
+            draft = ""
+            status = "saved"
+        }}>
+            <input.draft bind:value={draft}/>
+            <button>"Add"</button>
+        </form>
+        <ul>{for t in items => <li key={t}>{t}</li>}</ul>
+        <p.status>{status}</p>
+        <p.count>"{len(items)} items, draft: {draft}"</p>
+        <Counter start={len(items)}/>
+    </div>
+}
+
+let test_js = read_file("test.js")
+route GET / = <html><body>
+    <Counter start={5}/>
+    <Todos initial={items}/>
+    <script>{raw(test_js)}</script>
+</body></html>

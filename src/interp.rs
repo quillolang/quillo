@@ -53,6 +53,14 @@ pub struct Interp {
     restrictor: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
     pub server_fns: Vec<String>,
+    /// Every statement the program has loaded, for the browser compiler.
+    pub program: Vec<Arc<Vec<Stmt>>>,
+    /// The browser bundle (`/_wisp/wisp.js`), built after loading.
+    pub client_js: Arc<String>,
+    /// The request being handled, visible as `request` inside `server fn`s.
+    pub current_request: Option<Value>,
+    /// State of the components being rendered, innermost last.
+    islands: Vec<Map>,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
@@ -146,6 +154,19 @@ fn render_value(v: &Value, out: &mut String) {
             }
         }
         other => out.push_str(&escape(&other.display())),
+    }
+}
+
+/// Why a value cannot travel to the browser as JSON, if it cannot.
+pub fn not_sendable(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => None,
+        Value::List(l) => l.iter().find_map(not_sendable),
+        Value::Map(m) => m.values().find_map(not_sendable),
+        Value::Func(_) | Value::Builtin(..) => Some("a function"),
+        Value::Html(_) => Some("html"),
+        Value::Response(_) => Some("a response"),
+        Value::Err(_) => Some("an error value"),
     }
 }
 
@@ -257,6 +278,10 @@ impl Interp {
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: Vec::new(),
+            program: Vec::new(),
+            client_js: Arc::new(String::new()),
+            current_request: None,
+            islands: Vec::new(),
         }
     }
 
@@ -273,6 +298,10 @@ impl Interp {
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: self.server_fns.clone(),
+            program: self.program.clone(),
+            client_js: self.client_js.clone(),
+            current_request: None,
+            islands: Vec::new(),
         }
     }
 
@@ -292,18 +321,29 @@ impl Interp {
 
     /// Parses and runs a program's top level, registering its routes.
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, WispError> {
-        let stmts = Parser::new(src).parse_program().map_err(|e| e.in_file(file))?;
+        let stmts = Arc::new(Parser::new(src).parse_program().map_err(|e| e.in_file(file))?);
+        self.program.push(stmts.clone());
         let env = self.globals.clone();
         let mut last = Value::Nil;
-        for s in &stmts {
+        for s in stmts.iter() {
             match self.exec_stmt(s, &env) {
                 Ok(v) => last = v,
                 Err(Ctrl::Error(e)) => return Err(e.in_file(file)),
-                Err(Ctrl::Return(v)) => return Ok(v),
+                Err(Ctrl::Return(v)) => {
+                    last = v;
+                    break;
+                }
                 Err(Ctrl::Reply(_)) => return Err(WispError::new("`reply` used outside of a route", 0).in_file(file)),
             }
         }
+        self.build_client().map_err(|e| e.in_file(file))?;
         Ok(last)
+    }
+
+    /// Compiles the program's components (and what they use) for the browser.
+    pub fn build_client(&mut self) -> Result<(), WispError> {
+        self.client_js = Arc::new(crate::client::bundle(self)?);
+        Ok(())
     }
 
     pub fn load_file(&mut self, path: &Path) -> Result<Value, WispError> {
@@ -366,11 +406,26 @@ impl Interp {
                 }
                 let src = std::fs::read_to_string(&full)
                     .map_err(|e| WispError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
-                let stmts = Parser::new(&src).parse_program().map_err(|e| e.in_file(&full.display().to_string()))?;
+                let fname = full.display().to_string();
+                let stmts = Arc::new(Parser::new(&src).parse_program().map_err(|e| e.in_file(&fname))?);
+                self.program.push(stmts.clone());
                 let g = self.globals.clone();
-                for s in &stmts {
-                    self.exec_stmt(s, &g)?;
+                for s in stmts.iter() {
+                    match self.exec_stmt(s, &g) {
+                        Err(Ctrl::Error(e)) => return Err(Ctrl::Error(e.in_file(&fname))),
+                        other => {
+                            other?;
+                        }
+                    }
                 }
+                Ok(Value::Nil)
+            }
+            Stmt::State(name, e, _) => {
+                let v = self.eval(e, env)?;
+                if let Some(top) = self.islands.last_mut() {
+                    top.insert(name.clone(), v.clone());
+                }
+                define(env, name, v);
                 Ok(Value::Nil)
             }
             Stmt::Return(e) => {
@@ -794,6 +849,11 @@ impl Interp {
 
     fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         let scope = Scope::child(&c.env);
+        if def.server {
+            if let Some(req) = &self.current_request {
+                define(&scope, "request", req.clone());
+            }
+        }
         let mut it = args.into_iter();
         for p in &def.params {
             let v = match it.next().flatten() {
@@ -960,6 +1020,12 @@ impl Interp {
         }
         let mut rest = String::new();
         for (name, val) in &el.attrs {
+            // `@click` handlers only exist in the browser; `bind:value={x}`
+            // renders as `value`.
+            if name.starts_with('@') || name == "key" {
+                continue;
+            }
+            let name = name.strip_prefix("bind:").unwrap_or(name);
             let v = match val {
                 AttrVal::Bool => Value::Bool(true),
                 AttrVal::Expr(e) => self.eval(e, env)?,
@@ -1026,6 +1092,9 @@ impl Interp {
         }
         let mut given = Vec::new();
         for (name, val) in &el.attrs {
+            if name == "key" {
+                continue;
+            }
             let v = match val {
                 AttrVal::Bool => Value::Bool(true),
                 AttrVal::Expr(e) => self.eval(e, env)?,
@@ -1033,20 +1102,53 @@ impl Interp {
             given.push((name.clone(), v));
         }
         let mut args = Vec::new();
+        let mut props = Map::new();
         for p in &c.def.params {
             if p.name == "children" {
                 args.push(Some(Value::html(&kids)));
+                props.insert(p.name.clone(), Value::str(&kids));
                 continue;
             }
             let pos = given.iter().position(|(n, _)| n == &p.name);
-            args.push(pos.map(|i| given.remove(i).1));
+            let v = pos.map(|i| given.remove(i).1);
+            if let Some(v) = &v {
+                props.insert(p.name.clone(), v.clone());
+            }
+            args.push(v);
         }
         if let Some((n, _)) = given.first() {
             return fail(line, format!("<{}> has no parameter `{}`", el.tag, n));
         }
-        let v = self.call_closure(&c, args, line)?;
-        let mut out = String::new();
+        if !c.def.component {
+            let v = self.call_closure(&c, args, line)?;
+            let mut out = String::new();
+            render_value(&v, &mut out);
+            return Ok(out);
+        }
+        // A component renders inside an island that carries its props and
+        // state to the browser, which takes over from there.
+        self.islands.push(Map::new());
+        let v = self.call_closure(&c, args, line);
+        let state = self.islands.pop().unwrap_or_default();
+        let v = v?;
+        for (what, m) in [("prop", &props), ("state", &state)] {
+            for (k, x) in m.iter() {
+                if let Some(bad) = not_sendable(x) {
+                    return fail(
+                        line,
+                        format!("{} `{}` of <{}> is {}, which cannot be sent to the browser", what, k, el.tag, bad),
+                    );
+                }
+            }
+        }
+        let mut out = format!(
+            "<wisp-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\">",
+            escape(&el.tag),
+            escape(&Value::map(props).to_json().to_string()),
+            escape(&Value::map(state).to_json().to_string())
+        );
         render_value(&v, &mut out);
+        out.push_str("</wisp-island>");
         Ok(out)
     }
 }

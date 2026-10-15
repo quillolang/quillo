@@ -1,0 +1,159 @@
+//! The browser compiler: compiled code must compute what the server computes.
+//! Each case runs on the interpreter and, compiled to JS, in Node.
+
+use std::process::Command;
+use wisp::Interp;
+
+fn node_available() -> bool {
+    Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Runs `body` as the body of a function on the server and in Node.
+fn both(defs: &str, body: &str) -> (String, String) {
+    let src = format!("{}\nfn __t() {{\n{}\n}}\n", defs, body);
+    let mut it = Interp::new(".");
+    it.load_source(&src, "case.wisp").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let server = match it.call(&wisp::value::lookup(&it.globals, "__t").unwrap(), vec![], 0) {
+        Ok(v) => v.repr(),
+        Err(wisp::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
+        Err(wisp::interp::Ctrl::Return(v)) => v.repr(),
+        Err(wisp::interp::Ctrl::Reply(_)) => "REPLY".into(),
+    };
+    let js = wisp::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let browser = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(out.status.success(), "node failed: {}\n{}", String::from_utf8_lossy(&out.stderr), js);
+    (server, browser)
+}
+
+fn same(defs: &str, body: &str) {
+    let (s, b) = both(defs, body);
+    assert_eq!(s, b, "\n--- defs ---\n{}\n--- body ---\n{}", defs, body);
+}
+
+/// Both fail, with the same message.
+fn same_error(defs: &str, body: &str, needle: &str) {
+    let (s, b) = both(defs, body);
+    assert!(s.starts_with("ERROR") && s.contains(needle), "server: {}", s);
+    assert!(b.starts_with("ERROR") && b.contains(needle), "browser: {}", b);
+}
+
+#[test]
+fn values_and_operators() {
+    if !node_available() {
+        return;
+    }
+    same("", "[1 + 2 * 3, 7 / 2, 7 % 3, -4, 2 < 3, \"a\" < \"b\", 1 == 1, [1, 2] == [1, 2], { a: 1 } == { a: 1 }, 1 != 2]");
+    same("", "[\"a\" + 1, 1 + \"b\", [1] + [2], { a: 1 } + { b: 2 }, 0..4, not nil, not 0]");
+    same("", "let name = \"Ada\"\n\"Hi {name}, {1 + 1} {[1, \"x\"]} {nil} {{ k: true }}\"");
+    same("", "[nil ?? 1, err(\"x\") ?? 2, 3 ?? 4, nil and 1, 0 or nil, true and 5]");
+    same("", "let xs = [10, 20, 30]\n[xs[0], xs[-1], xs[9], \"héllo\"[1], { a: 1 }[\"a\"], nil[0], { a: { b: 2 } }.a.b, nil.x]");
+    same_error("", "1 / 0", "division by zero");
+    same_error("", "[1] + 1", "cannot add list and int");
+    same_error("", "{} < 1", "cannot compare map with int");
+}
+
+#[test]
+fn functions_and_closures() {
+    if !node_available() {
+        return;
+    }
+    same("fn add(a: int, b: int = 10) -> int = a + b", "[add(1), add(1, 2)]");
+    same("fn make() { let n = 0\nfn() { n += 1\nn } }", "let c = make()\nc()\nc()\nc()");
+    same("fn fact(n) = if n <= 1 then 1 else n * fact(n - 1)", "fact(10)");
+    same("", "let double = fn(x) = x * 2\n[1, 2, 3] |> map(double) |> filter(fn(x) = x > 2)");
+    same("fn f(x) { if x > 0 { return \"pos\" }\n\"other\" }", "[f(1), f(-1)]");
+    same_error("fn add(a: int, b: int = 10) -> int = a + b", "add(\"x\")", "argument `a` of `add` must be int, got str");
+    same_error("fn add(a, b) = a", "add(1, 2, 3)", "`add` takes 2 arguments, got 3");
+    same_error("fn add(a, b) = a", "add()", "missing argument `a` in call to `add`");
+    same_error("fn f() -> str = 1", "f()", "`f` must return str, but returned int 1");
+    same_error("fn f() -> int ! str = err(1)", "f()", "declares errors as `! str`");
+}
+
+#[test]
+fn pipelines_and_methods() {
+    if !node_available() {
+        return;
+    }
+    same("", "[3, 1, 2].sort().first()");
+    same("", "[\"a\", \"b\"].len");
+    same("fn total(xs) = xs |> sum", "[[1, 2], [3]] |> map(total)");
+    same("", "let m = { greet: fn(n) = \"hi {n}\" }\nm.greet(\"x\")");
+    same("", "[{ n: 3 }, { n: 1 }] |> sort_by(fn(o) = o.n) |> map(fn(o) = o.n)");
+    same("", "\"a,b,c\" |> split(\",\") |> map(upper) |> join(\"-\")");
+}
+
+#[test]
+fn errors_try_and_coalesce() {
+    if !node_available() {
+        return;
+    }
+    let defs = "fn parse_age(s: str) -> int ! str = match int(s) {\n int as n if n >= 0 => n\n _ => err(\"bad age: {s}\")\n}\nfn next_year(s) = parse_age(s)? + 1";
+    same(defs, "[next_year(\"41\"), next_year(\"x\"), int(\"12\"), is_err(int(\"zz\")), float(\"1.5\")]");
+    same("", "let e = err({ code: 7 })\n[e.error.code, is_err(e), unwrap(5)]");
+    same_error("", "unwrap(err(\"boom\"))", "unwrap of an error: boom");
+}
+
+#[test]
+fn control_flow_and_patterns() {
+    if !node_available() {
+        return;
+    }
+    same("", "for x in [1, 2, 3] => x * x");
+    same("", "for [k, v] in { a: 1, b: 2 } => \"{k}={v}\"");
+    same("", "for c in \"abc\" => upper(c)");
+    let m = "fn kind(e) = match e {\n { type: \"click\", x: int, y: int } => \"click {x},{y}\"\n { type: \"key\", key: \"Enter\" | \"Return\" } => \"enter\"\n [first, ..rest] => \"list {first} {len(rest)}\"\n int as n if n < 0 => \"negative\"\n { limit: int = 20 } => \"limit {limit}\"\n _ => \"other\"\n}";
+    same(m, "[kind({ type: \"click\", x: 1, y: 2 }), kind({ type: \"key\", key: \"Return\" }), kind([1, 2, 3]), kind(-5), kind({}), kind({ limit: 5 }), kind(\"z\")]");
+    same("", "let [a, b] = [1, 2]\nlet { name, age: int as years } = { name: \"Ada\", age: 36 }\n[a, b, name, years]");
+    same("", "if 1 > 2 { \"a\" } else if 2 > 1 { \"b\" } else { \"c\" }");
+    same_error("", "match 5 { \"x\" => 1 }", "no `match` arm matches 5");
+    same_error("", "let [a] = [1, 2]\na", "`let` pattern does not match");
+}
+
+#[test]
+fn standard_library() {
+    if !node_available() {
+        return;
+    }
+    same("", "[upper(\"a\"), lower(\"B\"), trim(\"  x \"), split(\"a b\"), join([1, 2], \",\"), contains(\"abc\", \"b\"), contains([1, 2], 2), starts_with(\"abc\", \"ab\"), ends_with(\"abc\", \"bc\"), replace(\"aXbX\", \"X\", \"-\")]");
+    same("", "[slice([1, 2, 3, 4], 1, -1), slice(\"hello\", -3), len(\"héllo\"), len({ a: 1 }), type_of(1), type_of(\"s\"), type_of([]), type_of(nil), str(42)]");
+    same("", "[reduce([1, 2, 3], 0, fn(a, x) = a + x), sum([1, 2, 3]), min([3, 1, 2]), max([3, 1, 2]), reverse([1, 2]), reverse(\"ab\"), push([1], 2), range(3), range(2, 4), enumerate([\"a\"])]");
+    same("", "let m = { a: 1, b: 2 }\n[keys(m), values(m), get(m, \"a\"), get(m, \"z\", 0), has(m, \"b\"), set(m, \"c\", 3), remove(m, \"a\"), merge(m, { a: 9 }), remove([1, 2, 1], 1)]");
+    same("", "[any([1, 2], fn(x) = x > 1), all([1, 2], fn(x) = x > 1), find([1, 2, 3], fn(x) = x > 1), abs(-3), round(2.5), floor(2.7), ceil(2.1), pow(2, 10)]");
+    same("", "[unique([1, 2, 1]), flatten([[1], [2, 3], 4]), zip([1, 2], [\"a\", \"b\"]), take([1, 2, 3], 2), drop(\"hello\", 3), count([1, 2, 3], fn(x) = x > 1), index_of(\"héllo\", \"l\"), repeat(\"ab\", 2)]");
+    same("", "group_by([1, 2, 3, 4], fn(x) = if x % 2 == 0 then \"even\" else \"odd\")");
+    same("", "[json.stringify({ a: [1, nil, true] }), json.parse(\"\\{\\\"x\\\": [1, 2]\\}\"), is_err(json.parse(\"nope\")), escape(\"<a href='x'>\")]");
+}
+
+#[test]
+fn compile_errors_name_what_cannot_run_in_the_browser() {
+    let cases = [
+        ("let todos = []\nfn add(t) { todos = todos |> push(t) }\ncomponent C() = <p>{len(todos)}</p>", "`todos` is a server variable"),
+        ("component C() = <p>{request.path}</p>", "`request` is only available on the server"),
+        ("component C() = <p>{db.query(\"select 1\")}</p>", "`db` is not available in the browser"),
+        ("component C() = <p>{env(\"HOME\")}</p>", "`env` is not available in the browser"),
+        ("component C() = <p>{nope}</p>", "unknown name `nope`"),
+        ("server fn save(x) = x\ncomponent C() = <p>{save(1)}</p>", "`save` waits on the server"),
+        ("component C() { let x = 1\n<button @click={fn() { x = 2 }}>\"\"</button> }", ""),
+        ("component C() = <p>{fn() = reply 404}</p>", "`reply` only works on the server"),
+    ];
+    for (src, want) in cases {
+        let r = Interp::new(".").load_source(src, "c.wisp");
+        if want.is_empty() {
+            assert!(r.is_ok(), "{}: {:?}", src, r.err().map(|e| e.to_string()));
+        } else {
+            let e = r.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains(want) && e.contains("<C>"), "{}\n-> {}", src, e);
+        }
+    }
+}
+
+#[test]
+/// The one known difference: JS numbers do not remember being written `2.0`.
+fn browser_floats_with_no_fraction_print_as_ints() {
+    let (s, b) = both("", "7.5");
+    assert_eq!(s, "7.5");
+    assert_eq!(b, "7.5");
+    let (s, b) = both("", "2.0");
+    assert_eq!((s.as_str(), b.as_str()), ("2.0", "2"));
+}

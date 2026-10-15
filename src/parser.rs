@@ -14,7 +14,7 @@ pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "route", "use", "return", "if", "then", "else", "match", "for", "in", "and", "or", "not",
-    "true", "false", "nil", "reply", "as",
+    "true", "false", "nil", "reply", "as", "component",
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
 
@@ -216,6 +216,10 @@ impl Parser {
                     self.next()?;
                     return Ok(Stmt::Route(Arc::new(self.parse_route(line)?)));
                 }
+                "component" => {
+                    self.next()?;
+                    return Ok(Stmt::Fn(Arc::new(self.parse_component(line)?)));
+                }
                 "use" => {
                     self.next()?;
                     let t = self.next()?;
@@ -296,10 +300,59 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, err, effects, server: false, body, line })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line })
     }
 
     /// `int`, `str?`, or a union: `int | str | nil`.
+    /// `component Name(params) { ~state = init ... <html/> }`. `~` statements
+    /// may only appear directly in the body.
+    fn parse_component(&mut self, line: u32) -> PResult<FnDef> {
+        let name = self.expect_ident("a component name")?;
+        if !name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            return Err(WispError::new(format!("component names start with a capital letter: `{}`", name), line));
+        }
+        self.expect(&Tok::LParen, "`(`")?;
+        let mut params = Vec::new();
+        while !self.at(&Tok::RParen)? {
+            let pname = self.expect_ident("a parameter name")?;
+            let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
+            let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
+            params.push(Param { name: pname, ty, default });
+            if !self.eat(&Tok::Comma)? {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, "`)`")?;
+        let body = if self.eat(&Tok::Assign)? {
+            self.parse_expr()?
+        } else if self.eat(&Tok::LBrace)? {
+            let mut stmts = Vec::new();
+            loop {
+                self.skip_seps()?;
+                if self.eat(&Tok::RBrace)? {
+                    break;
+                }
+                if self.at(&Tok::Eof)? {
+                    return self.err_at("unexpected end of input: missing `}`");
+                }
+                let l = self.line()?;
+                if self.eat(&Tok::Tilde)? {
+                    let n = self.expect_ident("a state name after `~`")?;
+                    self.expect(&Tok::Assign, "`=` after the state name")?;
+                    let e = self.parse_expr()?;
+                    stmts.push(Stmt::State(n, e, l));
+                } else {
+                    stmts.push(self.parse_stmt()?);
+                }
+                self.end_stmt()?;
+            }
+            Expr::Block(stmts)
+        } else {
+            return self.err_at(format!("expected `=` or `{{` to start the body of component `{}`", name));
+        };
+        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line })
+    }
+
     fn parse_type(&mut self) -> PResult<Ty> {
         let mut names: Vec<String> = Vec::new();
         let mut optional = false;

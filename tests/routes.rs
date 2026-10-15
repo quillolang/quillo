@@ -203,3 +203,84 @@ fn head_requests_have_no_body() {
     let r = send(&mut it, "HEAD", "/", None, "");
     assert_eq!((r.status, r.body.len()), (200, 0));
 }
+
+#[test]
+fn components_render_on_the_server_inside_islands() {
+    let mut it = app(
+        r#"
+component Counter(start: int = 0, label: str = "n") {
+    ~count = start
+    let double = count * 2
+    <div.counter>
+        <span>"{label}: {count} ({double})"</span>
+        <button @click={fn() { count += 1 }}>"+"</button>
+        <input bind:value={label}/>
+    </div>
+}
+route GET / = <html><body><Counter start={2}/></body></html>
+route GET /bare = <Counter/>
+"#,
+    );
+    let r = get(&mut it, "/");
+    let page = r.text();
+    assert!(page.contains(r#"<wisp-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2}">"#), "{}", page);
+    assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></wisp-island>"), "{}", page);
+    assert!(page.ends_with("<script src=\"/_wisp/wisp.js\" defer></script></body></html>"), "{}", page);
+    // Without a </body>, the script goes at the end.
+    assert!(get(&mut it, "/bare").text().ends_with("<script src=\"/_wisp/wisp.js\" defer></script>"));
+    let js = get(&mut it, "/_wisp/wisp.js");
+    assert_eq!(js.header("content-type"), Some("text/javascript; charset=utf-8"));
+    assert!(js.text().contains("W.component(\"Counter\""));
+}
+
+#[test]
+fn component_props_must_be_sendable() {
+    let mut it = app("component Box(f) = <p>\"x\"</p>\nroute GET / = <Box f={fn() = 1}/>\n");
+    let r = get(&mut it, "/");
+    assert_eq!(r.status, 500);
+    assert!(r.text().contains("prop `f` of <Box> is a function, which cannot be sent to the browser"), "{}", r.text());
+}
+
+fn rpc(it: &mut Interp, name: &str, body: &str) -> HttpResponse {
+    send(it, "POST", &format!("/_wisp/rpc/{}", name), Some("application/json"), body)
+}
+
+#[test]
+fn server_fns_are_called_over_json() {
+    let mut it = app(
+        r#"
+let todos = []
+server fn add_todo(text: str, done: bool = false) -> list {
+    todos = todos |> push({ text, done })
+    todos
+}
+server fn check(n: int) ! str = if n > 0 then n else err("must be positive")
+server fn whoami() = request.headers["x-user"] ?? reply 401 { error: "who are you?" }
+server fn crash() = 1 / 0
+fn not_exposed() = "secret"
+"#,
+    );
+    let r = rpc(&mut it, "add_todo", r#"["write docs"]"#);
+    assert_eq!((r.status, r.text().as_str()), (200, r#"{"ok":[{"text":"write docs","done":false}]}"#));
+    assert_eq!(rpc(&mut it, "check", "[5]").text(), r#"{"ok":5}"#);
+    assert_eq!(rpc(&mut it, "check", "[-1]").text(), r#"{"err":"must be positive"}"#);
+    let r = rpc(&mut it, "add_todo", "[42]");
+    assert_eq!(r.status, 400);
+    assert!(r.text().contains("argument `text` of `add_todo` must be str, got int"), "{}", r.text());
+    assert_eq!(rpc(&mut it, "add_todo", "[]").status, 400);
+    assert_eq!(rpc(&mut it, "add_todo", "[\"a\", true, 3]").status, 400);
+    assert_eq!(rpc(&mut it, "add_todo", "{\"text\": 1}").status, 400);
+    assert_eq!(rpc(&mut it, "not_exposed", "[]").status, 404);
+    assert_eq!(rpc(&mut it, "nope", "[]").status, 404);
+    assert_eq!(rpc(&mut it, "crash", "[]").status, 500);
+    // `reply` inside a server fn becomes the HTTP response.
+    let r = rpc(&mut it, "whoami", "[]");
+    assert_eq!((r.status, r.text().as_str()), (401, r#"{"error":"who are you?"}"#));
+    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    headers.push(("X-User".into(), "ada".into()));
+    let r = it.handle(&HttpRequest { method: "POST".into(), url: "/_wisp/rpc/whoami".into(), headers, body: b"[]".to_vec(), remote: "1.2.3.4".into() });
+    assert_eq!(r.text(), r#"{"ok":"ada"}"#);
+    // Only JSON POSTs: a cross-site form cannot call a server fn.
+    assert_eq!(send(&mut it, "POST", "/_wisp/rpc/add_todo", Some("application/x-www-form-urlencoded"), "x=1").status, 415);
+    assert_eq!(get(&mut it, "/_wisp/rpc/add_todo").status, 405);
+}

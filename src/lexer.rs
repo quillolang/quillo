@@ -50,6 +50,7 @@ pub enum Tok {
     Bang,
     FatArrow,
     Arrow,
+    Tilde,
     Eof,
 }
 
@@ -100,6 +101,7 @@ impl Tok {
             Tok::Bang => "!",
             Tok::FatArrow => "=>",
             Tok::Arrow => "->",
+            Tok::Tilde => "~",
             _ => "?",
         }
     }
@@ -316,6 +318,7 @@ impl Lexer {
                 '|' => Tok::Bar,
                 '?' if n == Some('?') => two(self, Tok::QQ),
                 '?' => Tok::Question,
+                '~' => Tok::Tilde,
                 other => return Err(WispError::new(format!("unexpected character `{}`", other), line)),
             }
         };

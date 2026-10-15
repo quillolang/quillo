@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod client;
 pub mod db;
 pub mod error;
 pub mod fetch;

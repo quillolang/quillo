@@ -144,6 +144,8 @@ pub struct FnDef {
     pub effects: Option<Vec<String>>,
     /// `server fn`: callable from the browser.
     pub server: bool,
+    /// `component`: a view with `~state` that also runs in the browser.
+    pub component: bool,
     pub line: u32,
     pub body: Expr,
 }
@@ -227,4 +229,6 @@ pub enum Stmt {
     Route(Arc<RouteDef>),
     Use(String, u32),
     Return(Option<Expr>),
+    /// `~name = expr` in a component: state, set once, kept between renders.
+    State(String, Expr, u32),
 }

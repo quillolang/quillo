@@ -141,7 +141,28 @@ fn build_request(req: &HttpRequest, path: &str, query: &Map) -> Map {
 impl Interp {
     /// Runs the first route whose method, path and patterns all match.
     pub fn handle(&mut self, req: &HttpRequest) -> HttpResponse {
+        let mut resp = self.handle_inner(req);
+        // Pages with components load the browser bundle.
+        let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
+        if html && req.method != "HEAD" {
+            let body = String::from_utf8_lossy(&resp.body);
+            if body.contains("<wisp-island") && !body.contains("/_wisp/wisp.js") {
+                let tag = "<script src=\"/_wisp/wisp.js\" defer></script>";
+                let body = match body.rfind("</body>") {
+                    Some(i) => format!("{}{}{}", &body[..i], tag, &body[i..]),
+                    None => format!("{}{}", body, tag),
+                };
+                resp.body = body.into_bytes();
+            }
+        }
+        resp
+    }
+
+    fn handle_inner(&mut self, req: &HttpRequest) -> HttpResponse {
         let (path, qs) = req.url.split_once('?').unwrap_or((req.url.as_str(), ""));
+        if let Some(rest) = path.strip_prefix("/_wisp/") {
+            return self.handle_internal(rest, req, path, qs);
+        }
         let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false)).collect();
         let method = if req.method == "HEAD" { "GET" } else { req.method.as_str() };
         let query = parse_urlencoded(qs);
@@ -189,7 +210,9 @@ impl Interp {
                 define(&scope, &k, v);
             }
 
+            self.current_request = Some(reqv);
             let mut resp = finish(self.eval(&r.body, &scope));
+            self.current_request = None;
             if req.method == "HEAD" {
                 resp.body.clear();
             }
@@ -203,6 +226,94 @@ impl Interp {
             plain(404, "not found\n")
         }
     }
+}
+
+impl Interp {
+    /// `/_wisp/...`: the browser bundle and `server fn` calls.
+    fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
+        if rest == "wisp.js" {
+            return HttpResponse {
+                status: 200,
+                headers: vec![
+                    ("content-type".into(), "text/javascript; charset=utf-8".into()),
+                    ("cache-control".into(), "no-cache".into()),
+                ],
+                body: self.client_js.as_bytes().to_vec(),
+            };
+        }
+        let Some(name) = rest.strip_prefix("rpc/") else {
+            return plain(404, "not found\n");
+        };
+        if req.method != "POST" {
+            return plain(405, "method not allowed\n");
+        }
+        let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str());
+        if !ctype.map_or(false, |c| c.contains("application/json")) {
+            return rpc_error(415, "server fn calls must send JSON (content-type: application/json)");
+        }
+        if !self.server_fns.iter().any(|n| n == name) {
+            return rpc_error(404, &format!("no server fn `{}`", name));
+        }
+        let Some(Value::Func(c)) = lookup(&self.globals, name) else {
+            return rpc_error(404, &format!("no server fn `{}`", name));
+        };
+        let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+            Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
+            _ => return rpc_error(400, "the body must be a JSON array of arguments"),
+        };
+        if let Err(msg) = check_args(&c.def, &args) {
+            return rpc_error(400, &msg);
+        }
+        let query = parse_urlencoded(qs);
+        self.current_request = Some(Value::map(build_request(req, path, &query)));
+        let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+        self.current_request = None;
+        match res {
+            Ok(v) | Err(Ctrl::Return(v)) => match v {
+                Value::Response(r) => render_response(&r),
+                Value::Err(e) => json_response(200, serde_json::json!({ "err": e.to_json() })),
+                v => json_response(200, serde_json::json!({ "ok": v.to_json() })),
+            },
+            Err(Ctrl::Reply(r)) => render_response(&r),
+            Err(Ctrl::Error(e)) => {
+                eprintln!("wisp: error in server fn `{}`: {}", name, e);
+                rpc_error(500, &format!("internal error in `{}`", name))
+            }
+        }
+    }
+}
+
+/// Checks a browser's arguments against a `server fn`'s parameters.
+fn check_args(def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+    if args.len() > def.params.len() {
+        return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
+    }
+    for (i, p) in def.params.iter().enumerate() {
+        match args.get(i) {
+            None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
+            Some(v) => {
+                if let Some(ty) = &p.ty {
+                    if !crate::interp::type_matches(ty, v) {
+                        return Err(format!("argument `{}` of `{}` must be {}, got {}", p.name, def.name, ty.text(), v.type_name()));
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
+    HttpResponse {
+        status,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: j.to_string().into_bytes(),
+    }
+}
+
+fn rpc_error(status: u16, msg: &str) -> HttpResponse {
+    json_response(status, serde_json::json!({ "error": msg }))
 }
 
 /// Turns what a route produced into an HTTP response.
