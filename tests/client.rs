@@ -61,7 +61,7 @@ fn functions_and_closures() {
     same("fn add(a: int, b: int = 10) -> int = a + b", "[add(1), add(1, 2)]");
     same("fn make() { let n = 0\n() => { n += 1\nn } }", "let c = make()\nc()\nc()\nc()");
     same("fn fact(n) = n <= 1 ? 1 : n * fact(n - 1)", "fact(10)");
-    same("", "let double = (x) => x * 2\n[1, 2, 3] |> map(double) |> filter((x) => x > 2)");
+    same("", "let double = (x) => x * 2\n[1, 2, 3] | map(double) | filter((x) => x > 2)");
     same("fn f(x) { if x > 0 { return \"pos\" }\n\"other\" }", "[f(1), f(-1)]");
     same_error("fn add(a: int, b: int = 10) -> int = a + b", "add(\"x\")", "argument `a` of `add` must be int, got str");
     same_error("fn add(a, b) = a", "add(1, 2, 3)", "`add` takes 2 arguments, got 3");
@@ -77,10 +77,10 @@ fn pipelines_and_methods() {
     }
     same("", "[3, 1, 2].sort().first()");
     same("", "[\"a\", \"b\"].len");
-    same("fn total(xs) = xs |> sum", "[[1, 2], [3]] |> map(total)");
+    same("fn total(xs) = xs | sum", "[[1, 2], [3]] | map(total)");
     same("", "let m = { greet: (n) => `hi ${n}` }\nm.greet(\"x\")");
-    same("", "[{ n: 3 }, { n: 1 }] |> sort_by((o) => o.n) |> map((o) => o.n)");
-    same("", "\"a,b,c\" |> split(\",\") |> map(upper) |> join(\"-\")");
+    same("", "[{ n: 3 }, { n: 1 }] | sort_by((o) => o.n) | map((o) => o.n)");
+    same("", "\"a,b,c\" | split(\",\") | map(upper) | join(\"-\")");
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn standard_library() {
 #[test]
 fn compile_errors_name_what_cannot_run_in_the_browser() {
     let cases = [
-        ("let todos = []\nfn add(t) { todos = todos |> push(t) }\ncomponent C() = <p>{len(todos)}</p>", "`todos` is a server variable"),
+        ("let todos = []\nfn add(t) { todos = todos | push(t) }\ncomponent C() = <p>{len(todos)}</p>", "`todos` is a server variable"),
         ("component C() = <p>{request.path}</p>", "`request` is only available on the server"),
         ("component C() = <p>{db.query(\"select 1\")}</p>", "`db` is not available in the browser"),
         ("component C() = <p>{env(\"HOME\")}</p>", "`env` is not available in the browser"),

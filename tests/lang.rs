@@ -107,6 +107,7 @@ fn old_syntax_gets_a_hint() {
     assert!(ev_err("if true then 1 else 2").contains("`c ? a : b`"));
     assert!(ev_err("let f = fn(x) = x").contains("`(x) => x * 2`"));
     assert!(ev_err("fn f(x: int | nil) = x").contains("use `null`"));
+    assert!(ev_err("[1] |> len").contains("the pipe is now a single `|`"));
 }
 
 #[test]
@@ -117,10 +118,10 @@ fn closures_and_recursion() {
 
 #[test]
 fn pipelines() {
-    assert_eq!(ev("[1, 2, 3] |> map((x) => x * 2) |> sum"), "12");
-    assert_eq!(ev(r#""a,b,c" |> split(",") |> join("-")"#), "\"a-b-c\"");
+    assert_eq!(ev("[1, 2, 3] | map((x) => x * 2) | sum"), "12");
+    assert_eq!(ev(r#""a,b,c" | split(",") | join("-")"#), "\"a-b-c\"");
     assert_eq!(
-        ev("[5, 3, 8]\n    |> filter((x) => x > 4)\n    |> sort\n    |> first"),
+        ev("[5, 3, 8]\n    | filter((x) => x > 4)\n    | sort\n    | first"),
         "5"
     );
     assert_eq!(ev("[1, 2, 3]\n    .filter(x => x > 1)\n    .map(x => x * x)"), "[4, 9]");
@@ -195,7 +196,7 @@ fn control_flow() {
 #[test]
 fn assignment() {
     assert_eq!(ev("let n = 1\nn += 2\nn"), "3");
-    assert_eq!(ev("let xs = []\nfn add(x) { xs = xs |> push(x) }\nadd(1)\nadd(2)\nxs"), "[1, 2]");
+    assert_eq!(ev("let xs = []\nfn add(x) { xs = xs | push(x) }\nadd(1)\nadd(2)\nxs"), "[1, 2]");
     assert!(ev_err("y = 1").contains("never declared"));
 }
 

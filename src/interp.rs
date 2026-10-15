@@ -732,7 +732,7 @@ impl Interp {
         Ok(Value::html(self.render_el(el, env)?))
     }
 
-    /// Calls `callee(args)`, with `pre` (the left side of `|>`) as the first
+    /// Calls `callee(args)`, with `pre` (the left side of `|`) as the first
     /// argument. `x.name(args)` calls a function stored in map `x` under
     /// `name`, or else the function `name` with `x` first: `xs.sort()`.
     fn eval_call(

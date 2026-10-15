@@ -13,7 +13,7 @@ route POST /orders { json: { type: "order" | "refund", customer.id: int as id } 
 }
 
 route GET /feed ? { page: int = 1 } =
-    request |> auth.required |> load_feed(page) |> render_feed
+    request | auth.required | load_feed(page) | render_feed
 ```
 
 Components run in the browser too, with state, and call the server directly:
@@ -90,7 +90,7 @@ Most expressions read as they would in JavaScript. The differences:
   leaving early.
 - `==` compares values deeply (`[1, 2] == [1, 2]`); there is no `===`.
 - Only `null`, `false` and error values are falsy: `0` and `""` are truthy.
-- `match`, `|>`, patterns, `route`, `reply`, `~state` and `with` effects have no
+- `match`, `|`, patterns, `route`, `reply`, `~state` and `with` effects have no
   JavaScript equivalent.
 - Integers stay integers: `7 / 2` is `3` (write `7.0 / 2` for `3.5`).
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
@@ -99,7 +99,7 @@ Most expressions read as they would in JavaScript. The differences:
 
 ```quillo
 let todos = []
-todos = todos |> push("x")        // reassign with =, += or -=
+todos = todos | push("x")        // reassign with =, += or -=
 
 fn add(a: int, b: int = 10) -> int = a + b
 fn area(w, h) {                   // block body: the last expression is the result
@@ -120,20 +120,20 @@ fn response any`. Unions are written `int | str`; add `?` or `| null` to also al
 
 ### Pipelines and method calls
 
-`a |> f(b)` is `f(a, b)`. `x.f(y)` calls `f(x, y)` when `x` has no field `f`,
+`a | f(b)` is `f(a, b)`. `x.f(y)` calls `f(x, y)` when `x` has no field `f`,
 and `x.len` is `len(x)`:
 
 ```quillo
 orders
-    |> filter((o) => o.total > 100)
-    |> sort_by((o) => o.total)
-    |> map((o) => o.id)
+    | filter((o) => o.total > 100)
+    | sort_by((o) => o.total)
+    | map((o) => o.id)
 
 orders.filter(o => o.paid).map(o => o.id)
 [3, 1, 2].sort().first()
 ```
 
-A line starting with `|>`, `??`, `&&`, `||`, `?`, `:`, `.method` or `else` continues
+A line starting with `|`, `??`, `&&`, `||`, `?`, `:`, `.method` or `else` continues
 the previous line.
 
 ### Control flow
@@ -342,7 +342,7 @@ on another site cannot), and inside one `request` is the current request. `reply
 server fn becomes the HTTP response, so the usual middleware works:
 
 ```quillo
-server fn delete_all() = request |> auth.required |> (_) => { ... }
+server fn delete_all() = request | auth.required | (_) => { ... }
 ```
 
 From hand-written JavaScript: `await quillo.server.add_note("text")`.
@@ -389,10 +389,10 @@ let auth = {
             : reply 401 { error: "unauthorized" },
 }
 
-route GET /me = request |> auth.required |> (r) => { ip: r.ip }
+route GET /me = request | auth.required | (r) => { ip: r.ip }
 
 route GET /users/:id(int) {
-    let user = users |> find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
+    let user = users | find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
     user
 }
 ```
@@ -478,7 +478,7 @@ component code that cannot run in a browser, route mistakes, and unused variable
 Requests are served by a pool of threads. Quillo code runs under one lock, so a handler
 runs on its own from start to end, except while it waits: `sleep`, `http.*` and
 reading the request let other requests run. Updating shared state such as
-`todos = todos |> push(t)` is therefore safe without locks.
+`todos = todos | push(t)` is therefore safe without locks.
 
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. A version that fails to load or check does not

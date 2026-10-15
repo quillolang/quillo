@@ -43,13 +43,13 @@ fn calls() {
     one("fn f(x: int) = x\nf(\"a\")", "argument `x` of `f` must be int, got str");
     one("upper(1)", "argument 1 of `upper` must be str, got int");
     one("let s = \"x\"\ns(1)", "cannot call `s`: it is str, not a function");
-    one("[1, 2] |> map(1)", "argument 2 of `map` must be fn, got int");
+    one("[1, 2] | map(1)", "argument 2 of `map` must be fn, got int");
     one("5.sort()", "argument 1 of `sort` must be list | null, got int");
     one("let n = 5\nn.nonsense", "int has no field `nonsense`");
     one("json.nope(1)", "`json` has no function `nope`");
     one("fn f(x: int = \"a\") = x", "the default of `x` is str, but it must be int");
     clean("fn f(x: int | str) = x\nf(1)\nf(\"a\")\nf(int(\"3\") ?? 0)");
-    clean("let xs = [3, 1]\nxs.sort().first()\nxs.len\n[1, 2] |> map((x) => x * 2) |> sum");
+    clean("let xs = [3, 1]\nxs.sort().first()\nxs.len\n[1, 2] | map((x) => x * 2) | sum");
     clean("let m = { greet: (n) => n }\nm.greet(1)\nm.anything");
     clean("print(1, 2, 3)\njson.stringify({ a: 1 }, true)\nlet d = db.query(\"select ?\", 1)");
 }
@@ -83,7 +83,7 @@ fn return_and_error_types() {
 fn effects() {
     one("fn f() with db = now()", "`now` needs the time effect, but `f` is declared `with db`");
     one("fn load() with http = 1\nfn f() with db = load()", "`load` needs the http effect, but `f` is declared `with db`");
-    one("fn f() with db = [1] |> map((_) => env(\"X\"))", "`env` needs the env effect");
+    one("fn f() with db = [1] | map((_) => env(\"X\"))", "`env` needs the env effect");
     one("fn f() with db = http.get(\"http://x\")", "`http.get` needs the http effect");
     let d = diags("fn helper() = env(\"HOME\")\nfn f() with db = helper()");
     assert!(d.len() == 1 && d[0].contains("warning: `helper` may use the env effect"), "{:#?}", d);
@@ -106,7 +106,7 @@ fn views_and_components() {
 
 #[test]
 fn components_must_run_in_the_browser() {
-    one("let todos = []\nfn add(t) { todos = todos |> push(t) }\ncomponent C() = <p>{len(todos)}</p>", "`todos` is a server variable that changes");
+    one("let todos = []\nfn add(t) { todos = todos | push(t) }\ncomponent C() = <p>{len(todos)}</p>", "`todos` is a server variable that changes");
     one("component C() = <p>{env(\"HOME\")}</p>", "`env` is not available in the browser");
     one("component C() = <p>{db.query(\"x\")}</p>", "`db.query` is not available in the browser");
     one("component C() = <p>{reply 404}</p>", "`reply` only works on the server");

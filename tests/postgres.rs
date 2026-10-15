@@ -142,7 +142,7 @@ let bad = db.query("select * from nope")
 let count = db.query("select ? as a", 1, 2)
 let fk = db.exec("insert into posts (user_id) values (?)", 99)
 let strict = db.exec("insert into users (name, age) values (?, ?)", "C", "not a number")
-[ada, db.query("select name from users where age > ? order by id", 1) |> map(u => u.name),
+[ada, db.query("select name from users where age > ? order by id", 1) | map(u => u.name),
  bad.error, count.error, is_err(fk), is_err(strict), db.one("select 1 where false")]
 "#,
     );
@@ -167,7 +167,7 @@ db.transaction(() => {
     })
     db.exec("insert into t values (5)")
 })
-db.query("select n from t order by n") |> map(r => r.n)
+db.query("select n from t order by n") | map(r => r.n)
 "#,
     );
     assert_eq!(r, "[1, 3, 5]");

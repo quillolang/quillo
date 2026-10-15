@@ -3,7 +3,7 @@ db.exec("create table notes (id integer primary key, text text)")
 db.exec("insert into notes (text) values ('first')")
 let hits = 0
 
-server fn load_notes() = db.query("select text from notes order by id") |> map((n) => n.text)
+server fn load_notes() = db.query("select text from notes order by id") | map((n) => n.text)
 server fn get_hits() = hits
 
 // Changes made elsewhere: plain routes, not the component.

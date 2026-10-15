@@ -11,5 +11,5 @@ route GET /add/:a(int)/:b(int) = { sum: a + b }
 route GET /search ? { q: str, limit: int = 10 } = {
     query: q,
     limit,
-    results: range(limit) |> map((i) => `${q} #${i + 1}`),
+    results: range(limit) | map((i) => `${q} #${i + 1}`),
 }

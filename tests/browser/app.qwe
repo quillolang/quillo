@@ -1,6 +1,6 @@
 let items = ["first"]
 server fn save(text: str) -> list {
-    items = items |> push(text)
+    items = items | push(text)
     items
 }
 

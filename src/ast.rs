@@ -50,7 +50,7 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>, u32),
     /// `a ?? b`: `b` when `a` is null or an error.
     Coalesce(Box<Expr>, Box<Expr>),
-    /// `a |> f(b)` calls `f(a, b)`.
+    /// `a | f(b)` calls `f(a, b)`.
     Pipe(Box<Expr>, Box<Expr>, u32),
     Call(Box<Expr>, Vec<Expr>, u32),
     Field(Box<Expr>, String, u32),

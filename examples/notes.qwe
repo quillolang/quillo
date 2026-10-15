@@ -40,7 +40,7 @@ component Notes() {
     ~notes = live(load_notes)
     ~draft = ""
     ~problem = null
-    let open = notes |> count((n) => n.done == 0)
+    let open = notes | count((n) => n.done == 0)
     <section.notes>
         <form @submit={() => {
             let r = add_note(draft)

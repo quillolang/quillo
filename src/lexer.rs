@@ -201,7 +201,7 @@ impl Lexer {
 
     /// A newline ends a statement only when the previous token could end an
     /// expression and the next line does not obviously continue it
-    /// (`|>`, `??`, `.method`, `else`, ...).
+    /// (`|`, `??`, `.method`, `else`, ...).
     fn newline_significant(&self) -> bool {
         if matches!(self.stack.last(), Some('(') | Some('[')) {
             return false;
@@ -223,7 +223,7 @@ impl Lexer {
         if !value_like {
             return false;
         }
-        // `|>`, `||`, `&&`, `??`, and `? a : b` split over lines.
+        // `|` pipes, `||`, `&&`, `??`, and `? a : b` split over lines.
         if self.starts_with("|") || self.starts_with("&&") || self.starts_with("?") || self.starts_with(":") {
             return false;
         }

@@ -6,15 +6,15 @@ let next_id = 1
 
 fn add_todo(text: str) -> map {
     let todo = { id: next_id, text: trim(text), done: false }
-    todos = todos |> push(todo)
+    todos = todos | push(todo)
     next_id += 1
     todo
 }
 
-fn find_todo(id: int) = todos |> find((t) => t.id == id)
+fn find_todo(id: int) = todos | find((t) => t.id == id)
 
 fn update_todo(id: int, changes: map) {
-    todos = todos |> map((t) => t.id == id ? t + changes : t)
+    todos = todos | map((t) => t.id == id ? t + changes : t)
     find_todo(id)
 }
 
@@ -42,7 +42,7 @@ view TodoItem(todo: map) =
     </li>
 
 route GET / {
-    let left = todos |> filter((t) => !t.done) |> len
+    let left = todos | filter((t) => !t.done) | len
     <Layout title="Quillo todos">
         <h1>Todos</h1>
         <p.muted>{left} of {len(todos)} left</p>
@@ -84,6 +84,6 @@ route PATCH /api/todos/:id(int) { json: { done: bool } } {
 
 route DELETE /api/todos/:id(int) {
     find_todo(id) ?? reply 404 { error: `no todo ${id}` }
-    todos = todos |> filter((t) => t.id != id)
+    todos = todos | filter((t) => t.id != id)
     reply 204
 }

@@ -1,5 +1,5 @@
 //! Recursive-descent parser. Precedence, lowest first:
-//! `??`, `|>`, `or`, `and`, `not`, comparisons, `..`, `+ -`, `* / %`,
+//! `? :`, `??`, `|` (pipe), `||`, `&&`, comparisons, `..`, `+ -`, `* / %`,
 //! unary `-`, then postfix calls, fields, indexing and `?`.
 
 use crate::ast::*;
@@ -607,7 +607,10 @@ impl Parser {
         let mut lhs = self.parse_or()?;
         loop {
             let line = self.line()?;
-            if !self.eat(&Tok::PipeGt)? {
+            if self.at(&Tok::PipeGt)? {
+                return self.err_at("the pipe is now a single `|`: `xs | map(f)`");
+            }
+            if !self.eat(&Tok::Bar)? {
                 return Ok(lhs);
             }
             let rhs = self.parse_or()?;

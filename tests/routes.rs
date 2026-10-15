@@ -102,7 +102,7 @@ fn form_fields_and_redirects() {
         r#"
 let todos = []
 route POST /todos { form: { text: str, urgent: bool = false } } {
-    todos = todos |> push({ text, urgent })
+    todos = todos | push({ text, urgent })
     redirect("/")
 }
 route GET /todos = todos
@@ -123,7 +123,7 @@ let auth = {
         ? req
         : reply 401 { error: "unauthorized" }
 }
-route GET /me = request |> auth.required |> (r) => { ip: r.ip }
+route GET /me = request | auth.required | (r) => { ip: r.ip }
 "#,
     );
     let r = get(&mut it, "/me");
@@ -144,7 +144,7 @@ fn not_found_with_coalesce() {
         r#"
 let users = [{ id: 1, name: "Ada" }]
 route GET /users/:id(int) {
-    let user = users |> find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
+    let user = users | find((u) => u.id == id) ?? reply 404 { error: `no user ${id}` }
     user.name
 }
 "#,
@@ -251,7 +251,7 @@ fn server_fns_are_called_over_json() {
         r#"
 let todos = []
 server fn add_todo(text: str, done: bool = false) -> list {
-    todos = todos |> push({ text, done })
+    todos = todos | push({ text, done })
     todos
 }
 server fn check(n: int) ! str = n > 0 ? n : err("must be positive")
@@ -294,7 +294,7 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     assert!(js.contains("function boot(") && js.contains("function mount("));
     // Builtins come along only when used.
     assert!(!js.contains("B.group_by") && !js.contains("B.sort_by"));
-    let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs |> sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
+    let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
     assert!(js.len() < js2.len() && js.len() < 12_000, "{} vs {}", js.len(), js2.len());
@@ -372,7 +372,7 @@ fn live_state_is_rendered_with_its_subscription() {
     let mut it = app(
         r#"
 let items = ["a"]
-server fn load(prefix: str) = items |> map((i) => prefix + i)
+server fn load(prefix: str) = items | map((i) => prefix + i)
 component List(p: str) {
     ~xs = live(load, p)
     <ul>{for x in xs => <li>{x}</li>}</ul>

@@ -6,11 +6,11 @@
 
 let orders = []
 
-fn price(items: list) -> num = items |> map((i) => i.price ?? 0) |> sum
+fn price(items: list) -> num = items | map((i) => i.price ?? 0) | sum
 
 route POST /orders { json: { type: "order" | "refund", customer.id: int as id, total: num } } {
     let order = { id: len(orders) + 1, type: request.json.type, customer: id, total }
-    orders = orders |> push(order)
+    orders = orders | push(order)
     reply 201 order
 }
 
@@ -21,7 +21,7 @@ route POST /orders = reply 422 { error: "expected type order, refund or quote" }
 route GET /orders ? { customer: int = null } =
     customer == null
         ? orders
-        : orders |> filter((o) => o.customer == customer)
+        : orders | filter((o) => o.customer == customer)
 
 // Middleware is just a function in a pipeline. `reply` stops the request.
 let admin = {
@@ -31,7 +31,7 @@ let admin = {
             : reply 401 { error: "missing or wrong x-api-key" },
 }
 
-route DELETE /orders = request |> admin.only |> (_) => {
+route DELETE /orders = request | admin.only | (_) => {
     let n = len(orders)
     orders = []
     { deleted: n }

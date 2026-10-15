@@ -56,7 +56,7 @@ fn effects_limit_what_a_function_may_do() {
     let e = ev_err("fn f() with db = now()\nf()");
     assert!(e.contains("`now` needs the time effect, but `f` is declared `with db`"), "{}", e);
     // The limit applies to everything the function calls, including lambdas.
-    let e = ev_err("fn helper() = env(\"HOME\")\nfn f() with db = [1] |> map((_) => helper())\nf()");
+    let e = ev_err("fn helper() = env(\"HOME\")\nfn f() with db = [1] | map((_) => helper())\nf()");
     assert!(e.contains("`env` needs the env effect"), "{}", e);
     // Calling a function that declares more than the caller allows is an error.
     let e = ev_err("fn load() with http, db = 1\nfn f() with db = load()\nf()");
@@ -65,7 +65,7 @@ fn effects_limit_what_a_function_may_do() {
     assert_eq!(ev("fn pure_part() with db = 2\nfn f() with db, time = pure_part()\nf()"), "2");
     assert!(ev_err("fn f() with teleport = 1").contains("expected an effect after `with`"));
     // Pure builtins are always allowed.
-    assert_eq!(ev("fn f(xs) with db = xs |> map((x) => x * 2) |> sum\nf([1, 2])"), "6");
+    assert_eq!(ev("fn f(xs) with db = xs | map((x) => x * 2) | sum\nf([1, 2])"), "6");
 }
 
 #[test]
@@ -79,7 +79,7 @@ let all = db.query("select id, text, done from todos order by id")
 let one = db.one("select text from todos where id = ?", 2)
 let none = db.one("select text from todos where id = ?", 99)
 let bad = db.query("select * from nope")
-[a, all, one, none, is_err(bad), bad.error |> contains("no such table")]
+[a, all, one, none, is_err(bad), bad.error | contains("no such table")]
 "#;
     assert_eq!(
         ev(src),
@@ -102,7 +102,7 @@ let r = db.transaction(() => {
     db.exec("insert into t values (3)")
     db.query("select count(*) as c from t")[0].c
 })
-[r, db.query("select n from t order by n") |> map((row) => row.n)]
+[r, db.query("select n from t order by n") | map((row) => row.n)]
 "#;
     assert_eq!(ev(src), "[2, [1, 3]]");
     let e = ev_err("db.open(\":memory:\")\ndb.exec(\"create table t (n integer)\")\ndb.transaction(() => { db.exec(\"insert into t values (1)\")\n 1 / 0 })");
@@ -135,7 +135,7 @@ write_file("notes/a.txt", "hello")
 #[test]
 fn random_values() {
     assert_eq!(ev("let r = random()\nr >= 0 && r < 1"), "true");
-    assert_eq!(ev("range(200) |> map((_) => random_int(1, 3)) |> unique |> sort"), "[1, 2, 3]");
+    assert_eq!(ev("range(200) | map((_) => random_int(1, 3)) | unique | sort"), "[1, 2, 3]");
     assert_eq!(ev("let u = uuid()\n[len(u), u[14]]"), "[36, \"4\"]");
     assert!(ev_err("fn roll() with db = random_int(1, 6)\nroll()").contains("the random effect"));
 }
