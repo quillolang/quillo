@@ -31,13 +31,13 @@ component Feed(count: int) {
     ~loading = false
 
     // The window: visible rows, widened by the buffer on both sides.
-    let first = max([0, floor(top / ROW) - BUFFER])
-    let last = min([len(items), ceil((top + VIEW) / ROW) + BUFFER])
+    let first_row = max([0, floor(top / ROW) - BUFFER])
+    let last_row = min([len(items), ceil((top + VIEW) / ROW) + BUFFER])
 
     <section.feed>
         <p.stats>
-            Rendering <b.rendered>{last - first}</b> of <b.loaded>{len(items)}</b> loaded rows
-            ({count} in all) · rows {first + 1}–{last}
+            Rendering <b.rendered>{last_row - first_row}</b> of <b.loaded>{len(items)}</b> loaded rows
+            ({count} in all) · rows {first_row + 1}–{last_row}
             {loading && <span.loading> · loading…</span>}
         </p>
         <div.viewport style={`height: ${VIEW}px`} @scroll={(e) => {
@@ -46,12 +46,15 @@ component Feed(count: int) {
             let bottom = ceil((e.scrollTop + VIEW) / ROW)
             if !loading && bottom + BUFFER * 4 >= len(items) && len(items) < count {
                 loading = true
-                items = items + load_after(items[-1].id, PAGE)
+                // A failed load is an error value: carry on with what we
+                // have, and the next scroll tries again.
+                let more = load_after(last(items).id, PAGE) ?? []
+                items = items + more
                 loading = false
             }
         }}>
             <div.spacer style={`height: ${len(items) * ROW}px`}>
-                {for i in range(first, last) => {
+                {for i in range(first_row, last_row) => {
                     let item = items[i]
                     <div.row key={item.id} style={`top: ${i * ROW}px; height: ${ROW}px`}>
                         <span.id>#{item.id}</span>

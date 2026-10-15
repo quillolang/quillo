@@ -108,7 +108,6 @@ function arith(op, verb) {
     if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
     if (isInt(a) && isInt(b)) {
       if (b === 0 && (op === "/" || op === "%")) fail("division by zero");
-      if (op === "/") return Math.trunc(a / b);
     }
     switch (op) {
       case "-": return a - b;
@@ -513,6 +512,9 @@ async function rpcRaw(name, args, live) {
   let r;
   const headers = { "content-type": "application/json" };
   if (live) headers["x-quillo-live"] = "1";
+  // A call that fails (no connection, a server error) is an error value,
+  // as with http.* on the server, so `??` and `is_err` handle it.
+  const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, failed: true });
   try {
     r = await fetch("/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
@@ -520,11 +522,11 @@ async function rpcRaw(name, args, live) {
       body: JSON.stringify(args.map(toJSON)),
     });
   } catch (e) {
-    fail(`server fn \`${name}\` could not be reached: ${e.message}`);
+    return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
   }
   let body = null;
   try { body = await r.json(); } catch (_) {}
-  if (!r.ok) fail(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
+  if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
   const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
   return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0 };
 }
@@ -587,7 +589,9 @@ async function liveLoop() {
 
 async function liveRefresh(sub) {
   try {
-    const { value, topics, seq } = await rpcRaw(sub.fname, sub.args, true);
+    const { value, topics, seq, failed } = await rpcRaw(sub.fname, sub.args, true);
+    // Keep showing the last good data; the next change tries again.
+    if (failed) { report(value.error); return; }
     liveSeen(seq);
     sub.topics = topics;
     sub.inst.set(sub.name, value);

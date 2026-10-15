@@ -107,7 +107,8 @@ fn components_hydrate_react_and_call_the_server() {
         "inputCleared": "",
         "sameInput": true,
         "nestedAfter": "1",
-        "errors": []
+        "errors": [],
+        "waiting": []
     });
     assert_eq!(result, want);
 }
@@ -134,4 +135,6 @@ fn infinite_scroll_renders_only_a_window_of_rows() {
     assert_eq!(r["loadedMore"], true);
     assert!(r["deep"]["loaded"].as_u64().unwrap() > 1000, "{}", r);
     assert_eq!(r["mostRowsAtOnce"], 25, "{}", r);
+    assert_eq!(r["afterFailure"], serde_json::json!({ "failed": true, "stuckLoading": false }), "{}", r);
+    assert_eq!(r["recovered"], true, "{}", r);
 }

@@ -141,7 +141,9 @@ fn watch_injects_the_reload_script_into_pages() {
     std::fs::write(&f, "route GET / = <html><body><p>hi</p></body></html>\nroute GET /t = \"text\"\n").unwrap();
     let srv = start(&f, &["--watch"]);
     let page = get(srv.port, "/").1;
-    assert!(page.contains("/_quillo/events") && page.ends_with("</body></html>"), "{}", page);
+    // The page knows the version it was rendered from, so a change made
+    // before its first request is not missed.
+    assert!(page.contains("const v='1'") && page.contains("/_quillo/events?v=") && page.ends_with("</body></html>"), "{}", page);
     assert_eq!(get(srv.port, "/t").1, "text");
 }
 

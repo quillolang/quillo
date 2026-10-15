@@ -18,8 +18,8 @@ fn ev_err(src: &str) -> String {
 fn arithmetic_and_precedence() {
     assert_eq!(ev("1 + 2 * 3"), "7");
     assert_eq!(ev("(1 + 2) * 3"), "9");
-    assert_eq!(ev("7 / 2"), "3");
-    assert_eq!(ev("7.0 / 2"), "3.5");
+    // `/` divides exactly, as in JavaScript; whole results stay ints.
+    assert_eq!(ev("[7 / 2, 6 / 2, -7 / 2, 7.0 / 2, floor(7 / 2), 1 / 4]"), "[3.5, 3, -3.5, 3.5, 3, 0.25]");
     assert_eq!(ev("-3 + 1"), "-2");
     assert_eq!(ev("10 % 3"), "1");
     assert_eq!(ev("1 < 2 && !(3 > 4)"), "true");

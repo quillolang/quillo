@@ -542,11 +542,18 @@ fn watch(app: Arc<App>) {
     }
 }
 
-/// Reloads the page when the program changes. The page keeps one request
-/// open: `/_quillo/events?v=N` answers when the version is no longer N (or
-/// after a while, and then the page asks again). If the server restarts, the
-/// page notices the new version and reloads too.
-const DEV_SCRIPT: &str = "<script>(async()=>{let v=null;for(;;){try{const t=await(await fetch('/_quillo/events'+(v===null?'':'?v='+v))).text();if(v!==null&&t!==v){location.reload();return}v=t}catch(e){await new Promise(r=>setTimeout(r,1000))}}})()</script>";
+/// Reloads the page when the program changes. The page starts out knowing
+/// the version it was rendered from, and keeps one request open:
+/// `/_quillo/events?v=N` answers when the version is no longer N (or after a
+/// while, and then the page asks again). A change made between rendering
+/// and that first request is therefore not missed; and if the server
+/// restarts, the page sees a different version and reloads too.
+fn dev_script(version: u64) -> String {
+    format!(
+        "<script>(async()=>{{const v='{}';for(;;){{try{{const t=await(await fetch('/_quillo/events?v='+v)).text();if(t!==v){{location.reload();return}}}}catch(e){{await new Promise(r=>setTimeout(r,1000))}}}}}})()</script>",
+        version
+    )
+}
 
 /// Answers `/_quillo/events[?v=N]` on a thread of its own, so pages waiting
 /// for a change do not hold on to request workers.
@@ -564,15 +571,15 @@ fn serve_events(app: Arc<App>, rq: tiny_http::Request) {
 }
 
 /// In watch mode, HTML pages get a script that reloads them after a change.
-fn inject_dev_script(resp: &mut HttpResponse) {
+fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
     let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
     if !html {
         return;
     }
     let body = String::from_utf8_lossy(&resp.body).into_owned();
     resp.body = match body.rfind("</body>") {
-        Some(i) => format!("{}{}{}", &body[..i], DEV_SCRIPT, &body[i..]),
-        None => format!("{}{}", body, DEV_SCRIPT),
+        Some(i) => format!("{}{}{}", &body[..i], dev_script(version), &body[i..]),
+        None => format!("{}{}", body, dev_script(version)),
     }
     .into_bytes();
 }
@@ -666,7 +673,7 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
             }
         };
         if app.watch {
-            inject_dev_script(&mut resp);
+            inject_dev_script(&mut resp, generation);
         }
         if req.url != "/_quillo/dev" {
             eprintln!(

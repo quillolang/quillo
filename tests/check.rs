@@ -133,6 +133,14 @@ fn unused_variables_are_warnings() {
 }
 
 #[test]
+fn calling_a_variable_that_shadows_a_builtin_is_flagged() {
+    let d = diags("fn f(xs) {\n let last = min([1, len(xs)])\n last(xs)\n}");
+    assert_eq!(d, vec!["3 warning: `last` here is your variable (line 2), not the builtin `last`; rename the variable to call the builtin"]);
+    // Your own function of the same name is fine.
+    assert!(diags("fn f(xs) {\n let last = (x) => x\n last(xs)\n}").is_empty());
+}
+
+#[test]
 fn routes() {
     one("route GET /a/:id/:id = id", "path parameter `id` appears twice");
     one("route GET /x = reply 999", "reply status must be an HTTP status code (100-599), got 999");

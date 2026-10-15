@@ -71,6 +71,11 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 `` `Hello, ${name}` ``, lists `[1, 2, 3]`, maps `{ name: "Ada", "content-type": "text/plain" }`,
 functions, HTML and error values. A map entry `{ id }` is short for `{ id: id }`.
 
+`xs[0]` is the first item and `xs[-1]` the last (negative indexes count from the end;
+`first(xs)` and `last(xs)` say the same in words). An index past the end, a missing map
+key, or any field of `null` gives `null`. Strings index by character: `"héllo"[1]`
+is `"é"`.
+
 Only template strings (backticks) interpolate; `"..."` and `'...'` are plain text, so
 JSON is easy to write: `'{"a": 1}'`. Template strings can span lines.
 
@@ -78,7 +83,8 @@ Operators are as in JavaScript: `+ - * / %`, `== !=` (deep equality, like compar
 JSON), `< <= > >=`, `!`, `&&`, `||`, `??` and `cond ? a : b`. `null`, `false` and error
 values are falsy; everything else (including `0` and `""`) is truthy. `a && b` and
 `a || b` give back one of their operands, so `name || "anonymous"` and
-`{loading && <Spinner/>}` work. Integer `/` gives an integer: `7 / 2` is `3`.
+`{loading && <Spinner/>}` work. `/` divides exactly, as in JavaScript: `7 / 2` is `3.5`,
+and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division.
 
 ### Coming from JavaScript
 
@@ -93,7 +99,6 @@ Most expressions read as they would in JavaScript. The differences:
 - Only `null`, `false` and error values are falsy: `0` and `""` are truthy.
 - `match`, `|`, patterns, `route`, `reply`, `~state` and `with` effects have no
   JavaScript equivalent.
-- Integers stay integers: `7 / 2` is `3` (write `7.0 / 2` for `3.5`).
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
 
 ### Variables, functions, views
@@ -262,9 +267,16 @@ route GET / = <html><body><Counter start={5}/></body></html>
   over from that state.
 - Assigning to a `~` variable re-renders the component. Lists keep their DOM (and
   focus) when items have `key={...}`. Nested components keep their own state.
-- `@event={fn}` handles DOM events (`@click`, `@input`, `@submit`, ...). The function
-  may take the event: `e.value`, `e.checked`, `e.key`, and `e.form` (the form's fields
-  as a map). `@submit` does not reload the page.
+- `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...).
+  The function may take the event `e`:
+  - `e.value` and `e.checked` of the input, `e.key` of a key press, `e.type`;
+  - `e.form`: the fields of the form, as a map;
+  - `e.target`: the element itself;
+  - any other field of the browser's event (`e.clientX`, `e.deltaY`, `e.shiftKey`,
+    ...), then of the element (`e.scrollTop`, `e.scrollHeight`, `e.clientHeight`,
+    `e.dataset`, ...).
+
+  `@submit` does not reload the page.
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
@@ -274,8 +286,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   the parts of the runtime it reaches, minified (a small component is about 11 KB,
   under 4 KB gzipped). Text responses are gzipped for browsers that accept it, and
   the bundle has an ETag, so an unchanged one costs a `304` on reload.
-- In the browser, numbers are JavaScript numbers, so `2.0` prints as `2` and `7.0 / 2`
-  is `3`.
+- In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
+  as `2`. Arithmetic gives the same results on both sides.
 
 ### Live data
 
@@ -332,7 +344,9 @@ component Notes(initial: list) {
 }
 ```
 
-In component code the call is awaited automatically. It works in event handlers and
+In component code the call is awaited automatically. A call that fails (the
+connection drops, the server errors) returns an error value, like `http.*` on the
+server, so `let more = load_more() ?? []` carries on and can try again later. It works in event handlers and
 in `~state` initializers (`~todos = load_todos()`: the server runs it while rendering,
 so the page arrives with the data). Calling one while rendering is an error.
 
@@ -471,8 +485,9 @@ is `any`, so only definite mistakes are reported, and annotations make the check
 stricter. It reports unknown names (with suggestions), names used before they are
 defined, wrong argument counts and types (for builtins too), operators that can never
 work, division by zero, return and error types, effects, view and component props,
-component code that cannot run in a browser, route mistakes, and unused variables
-(a warning; name a variable `_x` to keep it).
+component code that cannot run in a browser, route mistakes, and, as warnings, unused
+variables (name a variable `_x` to keep it) and calls like `last(xs)` where a variable of
+yours named `last` hides the builtin.
 
 ## Concurrency and reloading
 

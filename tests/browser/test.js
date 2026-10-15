@@ -1,4 +1,8 @@
 window.__quilloErrors = [];
+// Record every request the page makes (this runs before quillo.js loads).
+window.__requests = [];
+const __fetch = window.fetch;
+window.fetch = (u, o) => { window.__requests.push(String(u)); return __fetch(u, o); };
 const tick = () => new Promise((r) => setTimeout(r, 20));
 async function waitFor(f) { for (let i = 0; i < 200; i++) { if (f()) return true; await tick(); } return false; }
 async function run() {
@@ -25,6 +29,8 @@ async function run() {
     out.nestedAfter = document.querySelector("#todos #counter .value").textContent;
   } catch (e) { out.exception = String(e); }
   out.errors = window.__quilloErrors;
+  // No live() state and no --watch: no waiting connections.
+  out.waiting = window.__requests.filter((u) => u.includes("/_quillo/live") || u.includes("/_quillo/events"));
   document.body.setAttribute("data-result", JSON.stringify(out));
 }
 window.addEventListener("load", run);

@@ -29,6 +29,24 @@
       await waitFor(() => !$(".loading"));
     }
     out.deep = { loaded: loaded(), rows: rows(), lastId: ids().at(-1), spacer: $(".spacer").style.height };
+
+    // The next page load fails (a dropped connection): the feed must not
+    // freeze, and the next scroll loads again.
+    const realFetch = window.fetch;
+    let failNext = true;
+    window.fetch = (u, o) => {
+      if (failNext && String(u).includes("/_quillo/rpc/load_after")) {
+        failNext = false;
+        return Promise.reject(new TypeError("network down"));
+      }
+      return realFetch(u, o);
+    };
+    const before = loaded();
+    await scrollTo(vp.scrollHeight);
+    await tick(300);
+    out.afterFailure = { failed: !failNext, stuckLoading: !!$(".loading") };
+    await scrollTo(vp.scrollHeight + 1);
+    out.recovered = await waitFor(() => loaded() > before);
     out.mostRowsAtOnce = most;
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e); }

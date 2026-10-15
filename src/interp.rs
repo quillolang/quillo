@@ -221,6 +221,12 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 if y == 0 && matches!(op, BinOp::Div | BinOp::Mod) {
                     return fail(line, "division by zero");
                 }
+                // `/` divides exactly, as in JavaScript: 6 / 2 is 3, 7 / 2 is 3.5.
+                // (The browser cannot tell 2 from 2.0, so this is also the
+                // only rule that gives the same answer on both sides.)
+                if op == BinOp::Div && x.checked_rem(y) != Some(0) {
+                    return Ok(Float(x as f64 / y as f64));
+                }
                 let r = match op {
                     BinOp::Sub => x.checked_sub(y),
                     BinOp::Mul => x.checked_mul(y),

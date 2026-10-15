@@ -163,7 +163,12 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
                 },
-                BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => match (x, y) {
+                BinOp::Div => match (x, y) {
+                    (INT, INT) => Some(INT | FLOAT),
+                    (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
+                    _ => None,
+                },
+                BinOp::Sub | BinOp::Mul | BinOp::Mod => match (x, y) {
                     (INT, INT) => Some(INT),
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
@@ -1689,6 +1694,9 @@ impl Checker {
                 }
             }
         }
+        if let Expr::Ident(n, _) = callee {
+            self.warn_shadowed_builtin(n);
+        }
         let (ft, sig) = self.callee(callee);
         self.line = line;
         let mut argts: Vec<T> = pre.into_iter().collect();
@@ -1699,7 +1707,23 @@ impl Checker {
         self.apply(ft, sig, argts, args, &callee_name(callee))
     }
 
-    fn is_local(&self, name: &str) -> bool {
+/// `last(items)` where `last` is a local variable: almost always a
+    /// mistake, and invisible when the variable's type is unknown.
+    fn warn_shadowed_builtin(&mut self, name: &str) {
+        let local = self.scopes.iter().rev().find_map(|s| s.get(name).cloned());
+        let Some(v) = local else { return };
+        if v.t.bits & FN != 0 && v.t.bits != ANY || v.sig.is_some() {
+            return;
+        }
+        if BUILTINS.iter().any(|(n, _, _)| *n == name) {
+            self.warn(format!(
+                "`{}` here is your variable (line {}), not the builtin `{}`; rename the variable to call the builtin",
+                name, v.line, name
+            ));
+        }
+    }
+
+        fn is_local(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
     }
 
