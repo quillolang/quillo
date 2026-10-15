@@ -244,6 +244,38 @@ pub fn define(env: &Env, name: &str, v: Value) {
     env.lock().unwrap().vars.insert(name.to_string(), v);
 }
 
+/// Like `lookup`, and whether the variable is a global.
+pub fn lookup_global(env: &Env, name: &str) -> Option<(Value, bool)> {
+    let mut cur = env.clone();
+    loop {
+        let parent = {
+            let s = cur.lock().unwrap();
+            if let Some(v) = s.vars.get(name) {
+                return Some((v.clone(), s.parent.is_none()));
+            }
+            s.parent.clone()
+        };
+        cur = parent?;
+    }
+}
+
+/// Like `assign`; `Some(true)` when the variable was a global.
+pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
+    let mut cur = env.clone();
+    loop {
+        let parent = {
+            let mut s = cur.lock().unwrap();
+            let root = s.parent.is_none();
+            if let Some(slot) = s.vars.get_mut(name) {
+                *slot = v;
+                return Some(root);
+            }
+            s.parent.clone()
+        };
+        cur = parent?;
+    }
+}
+
 /// Updates an existing variable in the nearest scope that has it.
 pub fn assign(env: &Env, name: &str, v: Value) -> bool {
     let mut cur = env.clone();

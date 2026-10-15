@@ -59,8 +59,16 @@ pub struct Interp {
     pub client_js: Arc<String>,
     /// The request being handled, visible as `request` inside `server fn`s.
     pub current_request: Option<Value>,
-    /// State of the components being rendered, innermost last.
-    islands: Vec<Map>,
+    /// State of the components being rendered, innermost last, with the
+    /// `live(...)` subscriptions of each.
+    islands: Vec<(Map, Map)>,
+    /// While a `live` loader runs: the topics (tables, globals) it reads.
+    pub reads: Option<std::collections::HashSet<String>>,
+    /// The subscription the last `live(...)` call set up, for `~state`.
+    pub last_live: Option<Value>,
+    /// Open `db.transaction`s, and changes to announce when they commit.
+    pub tx_depth: usize,
+    pub pending: Vec<String>,
     /// The Postgres connection this request's `db.transaction` holds.
     pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
 }
@@ -285,6 +293,10 @@ impl Interp {
             current_request: None,
             islands: Vec::new(),
             pg_tx: std::sync::Mutex::new(None),
+            reads: None,
+            last_live: None,
+            tx_depth: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -306,12 +318,42 @@ impl Interp {
             current_request: None,
             islands: Vec::new(),
             pg_tx: std::sync::Mutex::new(None),
+            reads: None,
+            last_live: None,
+            tx_depth: 0,
+            pending: Vec::new(),
         }
     }
 
     /// The source files this program has loaded (the main file and `use`d files).
     pub fn files(&self) -> Vec<PathBuf> {
         self.loaded.iter().cloned().collect()
+    }
+
+    /// Announces changes to `topics`, after the current transaction commits.
+    pub fn publish(&mut self, topics: Vec<String>) {
+        if self.tx_depth > 0 {
+            self.pending.extend(topics);
+        } else {
+            self.shared.publish(&topics);
+        }
+    }
+
+    /// Notes that the running `live` loader depends on `topic`.
+    pub fn watch(&mut self, topic: String) {
+        if let Some(r) = &mut self.reads {
+            r.insert(topic);
+        }
+    }
+
+    #[cold]
+    fn note_global_read(&mut self, env: &Env, name: &str) {
+        if let Some((v, true)) = lookup_global(env, name) {
+            let module = matches!(&v, Value::Map(m) if !m.is_empty() && m.values().all(|x| matches!(x, Value::Builtin(..))));
+            if !module && !matches!(v, Value::Func(_) | Value::Builtin(..)) {
+                self.watch(format!("var:{}", name));
+            }
+        }
     }
 
     /// Runs `f` without holding the interpreter lock, so other requests can
@@ -383,13 +425,18 @@ impl Interp {
                         binop(bop, old, rhs, *line)?
                     }
                 };
-                if !assign(env, name, v) {
-                    return fail(
+                match assign_global(env, name, v) {
+                    None => fail(
                         *line,
                         format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name),
-                    );
+                    ),
+                    Some(global) => {
+                        if global {
+                            self.publish(vec![format!("var:{}", name)]);
+                        }
+                        Ok(Value::Nil)
+                    }
                 }
-                Ok(Value::Nil)
             }
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
@@ -425,9 +472,14 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::State(name, e, _) => {
+                self.last_live = None;
                 let v = self.eval(e, env)?;
-                if let Some(top) = self.islands.last_mut() {
-                    top.insert(name.clone(), v.clone());
+                let live = self.last_live.take();
+                if let Some((state, subs)) = self.islands.last_mut() {
+                    state.insert(name.clone(), v.clone());
+                    if let Some(l) = live {
+                        subs.insert(name.clone(), l);
+                    }
                 }
                 define(env, name, v);
                 Ok(Value::Nil)
@@ -448,7 +500,12 @@ impl Interp {
     pub fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
         match e {
             Expr::Lit(l) => Ok(lit_value(l)),
-            Expr::Ident(n, line) => lookup(env, n).ok_or_else(|| undefined(n, *line)),
+            Expr::Ident(n, line) => {
+                if self.reads.is_some() {
+                    self.note_global_read(env, n);
+                }
+                lookup(env, n).ok_or_else(|| undefined(n, *line))
+            }
             // As in JavaScript: the operand that decided the result.
             Expr::Binary(BinOp::And, a, b, _) => {
                 let x = self.eval(a, env)?;
@@ -1134,9 +1191,9 @@ impl Interp {
         }
         // A component renders inside an island that carries its props and
         // state to the browser, which takes over from there.
-        self.islands.push(Map::new());
+        self.islands.push((Map::new(), Map::new()));
         let v = self.call_closure(&c, args, line);
-        let state = self.islands.pop().unwrap_or_default();
+        let (state, live) = self.islands.pop().unwrap_or_default();
         let v = v?;
         for (what, m) in [("prop", &props), ("state", &state)] {
             for (k, x) in m.iter() {
@@ -1148,11 +1205,21 @@ impl Interp {
                 }
             }
         }
+        let live_attrs = if live.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " data-l=\"{}\" data-v=\"{}\"",
+                escape(&Value::map(live).to_json().to_string()),
+                self.shared.live_seq()
+            )
+        };
         let mut out = format!(
-            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\">",
+            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}>",
             escape(&el.tag),
             escape(&Value::map(props).to_json().to_string()),
-            escape(&Value::map(state).to_json().to_string())
+            escape(&Value::map(state).to_json().to_string()),
+            live_attrs
         );
         render_value(&v, &mut out);
         out.push_str("</quillo-island>");

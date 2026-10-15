@@ -316,3 +316,73 @@ fn the_browser_bundle_can_be_revalidated() {
     });
     assert_eq!((again.status, again.body.len()), (304, 0));
 }
+
+fn live_rpc(it: &mut Interp, name: &str, body: &str) -> serde_json::Value {
+    let r = it.handle(&HttpRequest {
+        method: "POST".into(),
+        url: format!("/_quillo/rpc/{}", name),
+        headers: vec![("Content-Type".into(), "application/json".into()), ("X-Quillo-Live".into(), "1".into())],
+        body: body.as_bytes().to_vec(),
+        remote: "127.0.0.1".into(),
+    });
+    serde_json::from_str(&r.text()).unwrap()
+}
+
+fn changed_since(it: &mut Interp, since: u64, topics: &str) -> serde_json::Value {
+    serde_json::from_str(&get(it, &format!("/_quillo/live?since={}&t={}", since, topics)).text()).unwrap()
+}
+
+#[test]
+fn live_loaders_report_what_they_read_and_writes_announce_changes() {
+    let mut it = app(
+        r#"
+db.exec("create table notes (id integer primary key, text text)")
+let visits = 0
+server fn load_notes() = db.query("select n.text from notes n")
+server fn count_visits() = visits
+server fn add_note(text: str) { db.exec("insert into notes (text) values (?)", text) }
+server fn visit() { visits += 1 }
+server fn custom() { watch("prices") }
+server fn tx_fail() = db.transaction(() => {
+    db.exec("insert into notes (text) values ('x')")
+    err("no")
+})
+"#,
+    );
+    let r = live_rpc(&mut it, "load_notes", "[]");
+    assert_eq!((r["ok"].clone(), r["topics"].clone()), (serde_json::json!([]), serde_json::json!(["db:notes"])));
+    assert_eq!(live_rpc(&mut it, "count_visits", "[]")["topics"], serde_json::json!(["var:visits"]));
+    assert_eq!(live_rpc(&mut it, "custom", "[]")["topics"], serde_json::json!(["prices"]));
+    // Without the header, no topics are reported.
+    assert!(rpc(&mut it, "load_notes", "[]").text() == r#"{"ok":[]}"#);
+
+    let seq = changed_since(&mut it, 0, "")["seq"].as_u64().unwrap();
+    rpc(&mut it, "add_note", r#"["hi"]"#);
+    assert_eq!(changed_since(&mut it, seq, "db:notes,var:visits")["changed"], serde_json::json!(["db:notes"]));
+    rpc(&mut it, "visit", "[]");
+    assert_eq!(changed_since(&mut it, seq, "var:visits")["changed"], serde_json::json!(["var:visits"]));
+    // A rolled-back transaction announces nothing.
+    let seq = changed_since(&mut it, 0, "")["seq"].as_u64().unwrap();
+    rpc(&mut it, "tx_fail", "[]");
+    assert_eq!(changed_since(&mut it, seq, "db:notes")["changed"], serde_json::json!([]));
+}
+
+#[test]
+fn live_state_is_rendered_with_its_subscription() {
+    let mut it = app(
+        r#"
+let items = ["a"]
+server fn load(prefix: str) = items |> map((i) => prefix + i)
+component List(p: str) {
+    ~xs = live(load, p)
+    <ul>{for x in xs => <li>{x}</li>}</ul>
+}
+route GET / = <List p="> "/>
+"#,
+    );
+    let page = get(&mut it, "/").text();
+    assert!(page.contains(r#"data-l="{&quot;xs&quot;:{&quot;f&quot;:&quot;load&quot;,&quot;a&quot;:[&quot;&gt; &quot;],&quot;t&quot;:[&quot;var:items&quot;]}}""#), "{}", page);
+    assert!(page.contains("<li>&gt; a</li>"), "{}", page);
+    let js = get(&mut it, "/_quillo/quillo.js").text();
+    assert!(js.contains(r#"W.live($i, "xs", "load", [$p_"#), "{}", js);
+}

@@ -250,6 +250,13 @@ impl Interp {
                 body: if fresh { Vec::new() } else { self.client_js.as_bytes().to_vec() },
             };
         }
+        if rest == "live" {
+            // Without waiting; the server's worker threads answer `live`
+            // requests themselves and wait for a change first.
+            let q = parse_urlencoded(qs);
+            let (seq, changed) = live_answer(&self.shared, &q, std::time::Duration::ZERO);
+            return json_response(200, serde_json::json!({ "seq": seq, "changed": changed }));
+        }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
         };
@@ -275,13 +282,31 @@ impl Interp {
         }
         let query = parse_urlencoded(qs);
         self.current_request = Some(Value::map(build_request(req, path, &query)));
+        // A `live` refresh: also report what the function read.
+        let live = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-live"));
+        let seq = self.shared.live_seq();
+        if live {
+            self.reads = Some(Default::default());
+        }
         let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+        let topics = self.reads.take().map(|r| {
+            let mut t: Vec<String> = r.into_iter().collect();
+            t.sort();
+            t
+        });
         self.current_request = None;
+        let with_topics = |mut j: serde_json::Value| {
+            if let Some(t) = &topics {
+                j["topics"] = serde_json::json!(t);
+                j["seq"] = serde_json::json!(seq);
+            }
+            j
+        };
         match res {
             Ok(v) | Err(Ctrl::Return(v)) => match v {
                 Value::Response(r) => render_response(&r),
-                Value::Err(e) => json_response(200, serde_json::json!({ "err": e.to_json() })),
-                v => json_response(200, serde_json::json!({ "ok": v.to_json() })),
+                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": e.to_json() }))),
+                v => json_response(200, with_topics(serde_json::json!({ "ok": v.to_json() }))),
             },
             Err(Ctrl::Reply(r)) => render_response(&r),
             Err(Ctrl::Error(e)) => {
@@ -290,6 +315,32 @@ impl Interp {
             }
         }
     }
+}
+
+/// `/_quillo/live?since=N&t=a,b`: the current sequence number, and which of
+/// the topics changed after N (waiting up to `wait` for one to).
+fn live_answer(shared: &Shared, q: &Map, wait: Duration) -> (u64, Vec<String>) {
+    let since = q.get("since").and_then(|v| v.display().parse::<u64>().ok()).unwrap_or(0);
+    let topics: Vec<String> = q
+        .get("t")
+        .map(|v| v.display().split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+    shared.wait_live(since, &topics, wait)
+}
+
+/// Answers `/_quillo/live` on a thread of its own, after waiting for a
+/// change, so open pages do not hold on to request workers.
+fn serve_live(shared: Arc<Shared>, rq: tiny_http::Request) {
+    let qs = rq.url().split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+    let _ = std::thread::Builder::new().name("quillo-live".into()).spawn(move || {
+        let (seq, changed) = live_answer(&shared, &parse_urlencoded(&qs), Duration::from_secs(25));
+        let body = serde_json::json!({ "seq": seq, "changed": changed }).to_string();
+        let mut resp = tiny_http::Response::from_string(body);
+        for (k, v) in [("content-type", "application/json"), ("cache-control", "no-store")] {
+            resp.add_header(tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap());
+        }
+        let _ = rq.respond(resp);
+    });
 }
 
 /// Checks a browser's arguments against a `server fn`'s parameters.
@@ -583,6 +634,10 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
     while let Ok(mut rq) = server.recv() {
         if app.watch && rq.url().split('?').next() == Some("/_quillo/events") {
             serve_events(app.clone(), rq);
+            continue;
+        }
+        if rq.url().split('?').next() == Some("/_quillo/live") {
+            serve_live(app.shared.clone(), rq);
             continue;
         }
         let start = Instant::now();

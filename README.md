@@ -276,6 +276,37 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - In the browser, numbers are JavaScript numbers, so `2.0` prints as `2` and `7.0 / 2`
   is `3`.
 
+### Live data
+
+`live(load, ...args)` makes component state follow the server: `load` (a `server fn`)
+runs again, and the component re-renders, whenever something it read changes, for
+anyone, not only when this page acts.
+
+```quillo
+server fn load_notes() = db.query("select * from notes order by id")
+
+server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
+
+component Notes(initial: list) {
+    ~notes = live(load_notes)     // every open page sees new notes
+    ...
+}
+```
+
+- What a loader *reads* is recorded: the tables in its queries (`from notes`,
+  `join users`) and the global variables it uses (`todos`). What any code *writes* is
+  announced: `insert`/`update`/`delete` through `db.*` and assignments to globals.
+  This works the same with SQLite and PostgreSQL, and with data kept in variables.
+- Inside `db.transaction`, the announcement waits for the commit, and is dropped
+  on rollback.
+- `publish("topic")` announces anything else, and `watch("topic")` inside a loader
+  subscribes to it.
+- The server renders the first value; the page keeps one waiting request open
+  (`/_quillo/live`, answered by its own thread) and calls the loader again when one
+  of its topics changes.
+- Only changes made through this Quillo server are seen: a row changed by another
+  program, or by another server process, does not wake pages.
+
 ### Server functions
 
 `server fn` makes a function callable from the browser:

@@ -504,12 +504,14 @@ function fromJSON(j) {
 
 // ---- server fns --------------------------------------------------------
 
-async function rpc(name, args) {
+async function rpcRaw(name, args, live) {
   let r;
+  const headers = { "content-type": "application/json" };
+  if (live) headers["x-quillo-live"] = "1";
   try {
     r = await fetch("/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(args.map(toJSON)),
     });
   } catch (e) {
@@ -518,8 +520,76 @@ async function rpc(name, args) {
   let body = null;
   try { body = await r.json(); } catch (_) {}
   if (!r.ok) fail(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
-  if (body && hasOwn(body, "err")) return new Err(body.err);
-  return body && hasOwn(body, "ok") ? body.ok : null;
+  const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
+  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0 };
+}
+
+async function rpc(name, args) {
+  return (await rpcRaw(name, args, false)).value;
+}
+
+// ---- live updates --------------------------------------------------------
+// Each `~x = live(load, ...)` is a subscription to the topics `load` read
+// (tables and globals). One request at a time waits at /_quillo/live for any
+// of them to change; then the affected loaders run again.
+
+const Live = { seq: 0, subs: new Set(), ctrl: null, running: false, key: "" };
+
+function liveSeen(seq) {
+  if (seq > 0) Live.seq = Live.seq > 0 ? Math.min(Live.seq, seq) : seq;
+}
+
+function liveTopics() {
+  const all = new Set();
+  for (const s of Live.subs) {
+    if (s.inst.kids !== null && !s.inst.el.isConnected) { Live.subs.delete(s); continue; }
+    for (const t of s.topics) all.add(t);
+  }
+  return [...all].sort();
+}
+
+// Starts waiting, or starts again when the set of topics changed.
+function liveRestart() {
+  queueMicrotask(() => {
+    if (!Live.running) {
+      Live.running = true;
+      liveLoop();
+    } else if (liveTopics().join(",") !== Live.key && Live.ctrl) {
+      Live.ctrl.abort();
+    }
+  });
+}
+
+async function liveLoop() {
+  for (;;) {
+    const topics = liveTopics();
+    Live.key = topics.join(",");
+    if (!topics.length) { Live.running = false; return; }
+    const ctrl = (Live.ctrl = new AbortController());
+    let j;
+    try {
+      const r = await fetch("/_quillo/live?since=" + Live.seq + "&t=" + encodeURIComponent(Live.key), { signal: ctrl.signal });
+      j = await r.json();
+    } catch (e) {
+      if (!ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    Live.seq = j.seq;
+    const changed = new Set(j.changed || []);
+    if (changed.size) for (const s of [...Live.subs]) if (s.topics.some((t) => changed.has(t))) liveRefresh(s);
+  }
+}
+
+async function liveRefresh(sub) {
+  try {
+    const { value, topics, seq } = await rpcRaw(sub.fname, sub.args, true);
+    liveSeen(seq);
+    sub.topics = topics;
+    sub.inst.set(sub.name, value);
+    liveRestart();
+  } catch (e) {
+    report(e);
+  }
 }
 
 // ---- virtual DOM -------------------------------------------------------
@@ -599,7 +669,8 @@ function mount(v, svg) {
     return (v.d = el);
   }
   if (v instanceof VComp) {
-    const inst = new Inst(v.def, v.props, takeHydration(v.def.$name));
+    const h = takeHydration(v.def.$name);
+    const inst = new Inst(v.def, v.props, h && h.s, h && h.l);
     const el = document.createElement("quillo-island");
     el.style.display = "contents";
     inst.el = el;
@@ -684,9 +755,11 @@ function unmount(el, v) {
 // ---- components --------------------------------------------------------
 
 class Inst {
-  constructor(def, props, state) {
+  constructor(def, props, state, live) {
     this.def = def;
     this.props = props;
+    this.liveInfo = live || null;
+    this.subs = {};
     this.s = state || {};
     this.ready = new Set(Object.keys(this.s));
     this.kids = null;
@@ -764,9 +837,14 @@ function boot() {
     if (!def) { report(`unknown component <${island.dataset.c}>`); continue; }
     hydrating = {};
     for (const inner of island.querySelectorAll("quillo-island")) {
-      (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push(JSON.parse(inner.dataset.s || "{}"));
+      (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push({
+        s: JSON.parse(inner.dataset.s || "{}"),
+        l: JSON.parse(inner.dataset.l || "null"),
+      });
+      liveSeen(+inner.dataset.v || 0);
     }
-    const inst = new Inst(def, JSON.parse(island.dataset.p || "{}"), JSON.parse(island.dataset.s || "{}"));
+    liveSeen(+island.dataset.v || 0);
+    const inst = new Inst(def, JSON.parse(island.dataset.p || "{}"), JSON.parse(island.dataset.s || "{}"), JSON.parse(island.dataset.l || "null"));
     inst.el = island;
     inst.update();
     hydrating = null;
@@ -818,5 +896,20 @@ W.component = (name, params, render) => {
   render.$comp = true;
   C[name] = render;
   return render;
+};
+// `~name = live(fname, ...args)`: state that follows the server.
+W.live = (inst, name, fname, args) => {
+  if (inst.subs[name]) return;
+  const info = inst.liveInfo && inst.liveInfo[name];
+  const sub = { inst, name, fname, args, topics: info ? info.t : [] };
+  inst.subs[name] = sub;
+  Live.subs.add(sub);
+  if (!inst.ready.has(name)) {
+    inst.ready.add(name);
+    inst.s[name] = null;
+    liveRefresh(sub);
+  } else {
+    liveRestart();
+  }
 };
 W.server = (name) => meta((...args) => rpc(name, args), name, null);

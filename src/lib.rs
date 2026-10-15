@@ -14,6 +14,7 @@ pub mod parser;
 pub mod pg;
 pub mod server;
 pub mod shared;
+pub mod sqlinfo;
 pub mod value;
 
 pub use error::QuilloError;

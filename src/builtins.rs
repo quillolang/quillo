@@ -81,6 +81,9 @@ pub fn install(env: &Env) {
         ("group_by", group_by),
         ("index_of", index_of),
         ("repeat", repeat),
+        ("live", live),
+        ("publish", publish),
+        ("watch", watch),
     ];
     for (name, f) in fns {
         define(env, name, Value::Builtin(name, *f));
@@ -872,4 +875,49 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, "`repeat` count is negative or too large");
     }
     Ok(Value::str(s.repeat(n as usize)))
+}
+
+// ---- live updates ------------------------------------------------------
+
+/// `~items = live(load_items, ...args)` in a component: calls the server fn
+/// now, and the browser calls it again whenever something it read changes.
+fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let f = match args.first() {
+        Some(Value::Func(c)) if c.def.server => Value::Func(c.clone()),
+        Some(other) => {
+            return fail(line, format!("`live` needs a server fn to call, like live(load_notes), got {}", other.type_name()))
+        }
+        None => return fail(line, "`live` needs a server fn to call, like live(load_notes)"),
+    };
+    let Value::Func(c) = &f else { unreachable!() };
+    let name = c.def.name.clone();
+    let rest: Vec<Value> = args[1..].to_vec();
+    let outer = it.reads.replace(std::collections::HashSet::new());
+    let r = it.call(&f, rest.clone(), line);
+    let topics = std::mem::replace(&mut it.reads, outer).unwrap_or_default();
+    if let Some(o) = &mut it.reads {
+        o.extend(topics.iter().cloned());
+    }
+    let mut topics: Vec<String> = topics.into_iter().collect();
+    topics.sort();
+    let mut info = Map::new();
+    info.insert("f".into(), Value::str(&name));
+    info.insert("a".into(), Value::list(rest));
+    info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
+    it.last_live = Some(Value::map(info));
+    r
+}
+
+/// `publish("topic", ...)`: wakes pages whose `live` data watched the topic.
+fn publish(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    it.publish(args.iter().map(|a| a.display()).collect());
+    Ok(Value::Nil)
+}
+
+/// `watch("topic", ...)`: inside a `live` loader, also refresh on `publish("topic")`.
+fn watch(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    for a in &args {
+        it.watch(a.display());
+    }
+    Ok(Value::Nil)
 }

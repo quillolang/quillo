@@ -4,7 +4,7 @@
 //
 // The page is rendered on the server. <Notes> then runs in the browser:
 // typing, adding, ticking and deleting call the `server fn`s below
-// without reloading the page.
+// without reloading the page, and `live` keeps every open tab up to date.
 
 db.open("notes.db")
 db.exec("create table if not exists notes (
@@ -15,6 +15,8 @@ db.exec("create table if not exists notes (
 )")
 
 fn all_notes() with db = db.query("select id, text, done from notes order by id desc")
+
+server fn load_notes() with db = all_notes()
 
 server fn add_note(text: str) -> list ! str with db, time {
     let t = trim(text)
@@ -34,8 +36,8 @@ server fn remove_note(id: int) -> list with db {
     all_notes()
 }
 
-component Notes(initial: list) {
-    ~notes = initial
+component Notes() {
+    ~notes = live(load_notes)
     ~draft = ""
     ~problem = null
     let open = notes |> count((n) => n.done == 0)
@@ -81,7 +83,7 @@ view Page(title: str, children) =
 route GET / =
     <Page title="Notes">
         <h1>Notes</h1>
-        <Notes initial={all_notes()}/>
+        <Notes/>
     </Page>
 
 route GET /static/*path = file("public/" + path)

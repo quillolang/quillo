@@ -444,7 +444,7 @@
     "call": {
       "patterns": [
         {
-          "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat)\\b(?=\\s*\\()",
+          "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat|live|publish|watch)\\b(?=\\s*\\()",
           "name": "support.function.builtin.quillo"
         },
         {

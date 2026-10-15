@@ -4,6 +4,7 @@
 //! atomically, except while it waits on I/O: builtins such as `sleep` and
 //! `http.get` let go of the lock while they wait, so other requests can run.
 
+use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 
 /// A lock that is not tied to a guard's lifetime, so a builtin can release
@@ -33,15 +34,60 @@ impl Gil {
     }
 }
 
+/// Live updates: each topic remembers the last change that touched it.
+#[derive(Default)]
+pub struct Live {
+    pub seq: u64,
+    versions: HashMap<String, u64>,
+}
+
 pub struct Shared {
     pub gil: Gil,
+    pub live: Mutex<Live>,
+    live_changed: Condvar,
     /// The program's database (SQLite or a Postgres pool), opened on first use.
     pub db: Mutex<Option<std::sync::Arc<crate::db::Backend>>>,
 }
 
 impl Shared {
     pub fn new() -> Self {
-        Shared { gil: Gil::new_held(), db: Mutex::new(None) }
+        Shared { gil: Gil::new_held(), live: Mutex::new(Live::default()), live_changed: Condvar::new(), db: Mutex::new(None) }
+    }
+
+    /// Marks topics as changed and wakes the pages waiting on them.
+    pub fn publish(&self, topics: &[String]) {
+        if topics.is_empty() {
+            return;
+        }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.seq += 1;
+        let seq = live.seq;
+        for t in topics {
+            live.versions.insert(t.clone(), seq);
+        }
+        drop(live);
+        self.live_changed.notify_all();
+    }
+
+    pub fn live_seq(&self) -> u64 {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).seq
+    }
+
+    /// The current sequence number and which of `topics` changed after
+    /// `since`, waiting up to `timeout` for one to change.
+    pub fn wait_live(&self, since: u64, topics: &[String], timeout: std::time::Duration) -> (u64, Vec<String>) {
+        let changed = |live: &Live| -> Vec<String> {
+            topics.iter().filter(|t| live.versions.get(*t).map_or(false, |v| *v > since)).cloned().collect()
+        };
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if since == 0 || since > live.seq {
+            return (live.seq, Vec::new());
+        }
+        let (live, _) = self
+            .live_changed
+            .wait_timeout_while(live, timeout, |l| changed(l).is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        (live.seq, changed(&live))
     }
 }
 

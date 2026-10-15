@@ -190,6 +190,39 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
     Ok(out)
 }
 
+/// Live updates: a statement's reads become the running loader's topics,
+/// and its writes are announced (after the transaction, if any, commits).
+fn announce(it: &mut Interp, sql: &str) {
+    let t = crate::sqlinfo::tables(sql);
+    if it.reads.is_some() {
+        for r in t.reads {
+            it.watch(format!("db:{}", r));
+        }
+    }
+    if !t.writes.is_empty() {
+        it.publish(t.writes.into_iter().map(|w| format!("db:{}", w)).collect());
+    }
+}
+
+/// Starts a transaction level; returns where its announcements begin.
+fn tx_begin(it: &mut Interp) -> usize {
+    it.tx_depth += 1;
+    it.pending.len()
+}
+
+/// Ends a level: drops its announcements on rollback, and makes them
+/// once the outermost transaction commits.
+fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
+    if !committed {
+        it.pending.truncate(mark);
+    }
+    it.tx_depth -= 1;
+    if it.tx_depth == 0 {
+        let topics = std::mem::take(&mut it.pending);
+        it.shared.publish(&topics);
+    }
+}
+
 fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
         Some(Value::Str(s)) => Ok(s.to_string()),
@@ -236,17 +269,30 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 Ok(Value::map(m))
             })()
         }
-        Backend::Postgres(_) => pg_run(it, &b, move |c| c.exec(&sql, &params)),
+        Backend::Postgres(_) => {
+            let sql = sql.clone();
+            pg_run(it, &b, move |c| c.exec(&sql, &params))
+        }
     };
+    if res.is_ok() {
+        announce(it, &sql);
+    }
     Ok(res.unwrap_or_else(db_err))
 }
 
 fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
     let b = backend(it)?;
-    match &*b {
+    let res = match &*b {
         Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
-        Backend::Postgres(_) => pg_run(it, &b, move |c| c.query(&sql, &params, limit)),
+        Backend::Postgres(_) => {
+            let sql = sql.clone();
+            pg_run(it, &b, move |c| c.query(&sql, &params, limit))
+        }
+    };
+    if res.is_ok() {
+        announce(it, &sql);
     }
+    res
 }
 
 /// `db.query(sql, ...params)`: every row, as maps from column to value.
@@ -284,15 +330,16 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if let Err(e) = run("savepoint quillo_tx") {
                 return Ok(db_err(e));
             }
+            let mark = tx_begin(it);
             let r = it.call(&f, Vec::new(), line);
             let commit = ok(&r);
             let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
-            if let Err(e) = run(end) {
-                if commit {
-                    return Ok(db_err(e));
-                }
+            let ended = run(end);
+            tx_end(it, mark, commit && ended.is_ok());
+            match ended {
+                Err(e) if commit => Ok(db_err(e)),
+                _ => r,
             }
-            r
         }
         Backend::Postgres(pool) => {
             // Keep one connection for this request until the outermost
@@ -313,6 +360,7 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             };
             let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
             let started = pg_run(it, &b, move |c| c.batch(&begin));
+            let mark = tx_begin(it);
             let r = match started {
                 Ok(()) => it.call(&f, Vec::new(), line),
                 Err(e) => Ok(db_err(e)),
@@ -325,6 +373,7 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
             let ended = pg_run(it, &b, move |c| c.batch(&end));
+            tx_end(it, mark, commit && ended.is_ok());
             let done = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
                 let tx = g.as_mut().expect("pinned");

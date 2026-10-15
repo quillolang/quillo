@@ -263,6 +263,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("group_by", "list | null, fn", "map"),
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
+    ("live", "fn, any...", "any"),
+    ("publish", "any...", "null"),
+    ("watch", "any...", "null"),
     ("json.parse", "str", "any"),
     ("json.stringify", "any, any=", "str"),
     ("db.open", "str", "null | error(str)"),
@@ -281,7 +284,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 const MODULES: &[&str] = &["json", "db", "http"];
 
 /// Builtins the browser has (see client.rs).
-const BROWSER_ONLY_SERVER: &[&str] = &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file"];
+const BROWSER_ONLY_SERVER: &[&str] =
+    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -627,6 +631,8 @@ struct Checker {
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
+    /// Checking the `live(...)` that sets a component's `~state`.
+    live_ok: bool,
     file: Arc<str>,
     line: u32,
     out: Analysis,
@@ -667,6 +673,7 @@ impl Checker {
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
+            live_ok: false,
             file: Arc::from(file),
             line: 0,
             out: Analysis::default(),
@@ -1203,7 +1210,10 @@ impl Checker {
                 if let Some(f) = self.fns.last_mut() {
                     f.nested = true;
                 }
+                let is_live = matches!(e, Expr::Call(c, _, _) if matches!(&**c, Expr::Ident(n, _) if n == "live"));
+                self.live_ok = is_live;
                 let t = self.expr(e);
+                self.live_ok = false;
                 if let (Some(f), Some(n)) = (self.fns.last_mut(), saved) {
                     f.nested = n;
                 }
@@ -1791,6 +1801,24 @@ impl Checker {
                     name, c, name
                 ));
             }
+        }
+        if sig.builtin && sig.name == "live" {
+            match arg_exprs.first() {
+                Some(Expr::Ident(f, _)) => {
+                    let is_server = self.globals.get(f).and_then(|v| v.sig.clone()).map_or(true, |s| s.server || s.def.is_none() && !s.builtin);
+                    if !is_server {
+                        self.error(format!("`live` needs a server fn: `{}` is not one", f));
+                    }
+                }
+                Some(_) => self.error("`live` needs a server fn by name: ~items = live(load_items, ...)"),
+                None => {}
+            }
+            if let Some(c) = self.in_component() {
+                if !self.live_ok {
+                    self.error(format!("in <{}>, `live(...)` sets state: ~items = live(load_items, ...)", c));
+                }
+            }
+            return T::ANY;
         }
         if sig.builtin && sig.name == "err" {
             return T::error(args.first().map_or(NIL, |a| a.bits));

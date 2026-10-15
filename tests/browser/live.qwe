@@ -1,0 +1,23 @@
+db.open(":memory:")
+db.exec("create table notes (id integer primary key, text text)")
+db.exec("insert into notes (text) values ('first')")
+let hits = 0
+
+server fn load_notes() = db.query("select text from notes order by id") |> map((n) => n.text)
+server fn get_hits() = hits
+
+// Changes made elsewhere: plain routes, not the component.
+route POST /api/notes { json: { text: str } } = db.exec("insert into notes (text) values (?)", text)
+route POST /api/hit { hits += 1 }
+
+component Board() {
+    ~notes = live(load_notes)
+    ~hits = live(get_hits)
+    <div #board>
+        <ul>{for n in notes => <li key={n}>{n}</li>}</ul>
+        <p.hits>{hits}</p>
+    </div>
+}
+
+let test_js = read_file("live.js")
+route GET / = <html><body><Board/><script>{raw(test_js)}</script></body></html>

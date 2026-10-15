@@ -2,9 +2,8 @@
 //! whose page script clicks, types and submits, then records what it saw.
 //! Skipped when no Chrome is found (set QUILLO_CHROME to point at one).
 
-use std::io::Read;
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -23,22 +22,16 @@ fn chrome() -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-fn unescape(s: &str) -> String {
-    s.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'").replace("&amp;", "&")
-}
-
-#[test]
-fn components_hydrate_react_and_call_the_server() {
-    let Some(chrome) = chrome() else {
-        eprintln!("skipping: no Chrome found");
-        return;
-    };
-    let port = 21000 + (std::process::id() % 1000) as u16;
-    let app = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/app.qwe");
+/// Serves `tests/browser/<app>`, loads it in headless Chrome (driven by
+/// run.js over the DevTools protocol) and returns what the page script
+/// recorded in `data-result`.
+fn run_page(chrome: &Path, app: &str, port: u16) -> serde_json::Value {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
-        .arg(&app)
+        .arg(dir.join(app))
         .args(["--port", &port.to_string()])
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
@@ -47,24 +40,50 @@ fn components_hydrate_react_and_call_the_server() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let profile = std::env::temp_dir().join(format!("quillo-chrome-{}", std::process::id()));
-    let mut child = Command::new(&chrome)
-        .args(["--headless=new", "--disable-gpu", "--no-first-run", "--no-sandbox", "--virtual-time-budget=10000", "--dump-dom"])
-        .arg(format!("--user-data-dir={}", profile.display()))
+    let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
+    let out = Command::new("node")
+        .arg(dir.join("run.js"))
+        .arg(chrome)
         .arg(format!("http://127.0.0.1:{}/", port))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut dom = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut dom).unwrap();
-    let _ = child.wait();
+        .arg(&profile)
+        .output()
+        .expect("node");
     let _ = server.kill();
+    let _ = server.wait();
     let _ = std::fs::remove_dir_all(&profile);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
 
-    let start = dom.find("data-result=\"").unwrap_or_else(|| panic!("no result in page:\n{}", dom)) + 13;
-    let end = start + dom[start..].find('"').unwrap();
-    let result: serde_json::Value = serde_json::from_str(&unescape(&dom[start..end])).unwrap();
+fn node_available() -> bool {
+    Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn live_state_follows_changes_made_elsewhere() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: no Chrome (or no Node) found");
+        return;
+    };
+    let result = run_page(&chrome, "live.qwe", 22000 + (std::process::id() % 1000) as u16);
+    let want = serde_json::json!({
+        "before": ["first"],
+        "noteArrived": true,
+        "after": ["first", "from elsewhere"],
+        "hitsArrived": true,
+        "hits": "2",
+        "errors": []
+    });
+    assert_eq!(result, want);
+}
+
+#[test]
+fn components_hydrate_react_and_call_the_server() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: no Chrome (or no Node) found");
+        return;
+    };
+    let result = run_page(&chrome, "app.qwe", 21000 + (std::process::id() % 1000) as u16);
     let want = serde_json::json!({
         "count": "7",
         "nestedStart": "1",

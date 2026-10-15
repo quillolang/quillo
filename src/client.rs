@@ -753,6 +753,19 @@ impl<'a> Compiler<'a> {
                     if self.ctxs.len() != 1 || self.ctx().scopes.len() != 2 || self.ctx().component.is_none() {
                         return self.err("`~` state can only be declared directly in a component's body");
                     }
+                    // `~x = live(load, ...args)`: a subscription.
+                    if let Some((fname, args)) = self.live_call(e)? {
+                        let mut argv = Vec::new();
+                        for a in args {
+                            argv.push(self.expr(a)?);
+                        }
+                        let _ = writeln!(body, "W.live($i, {}, {}, [{}]);", js_str(name), js_str(&fname), argv.join(", "));
+                        self.ctx().scopes.last_mut().unwrap().insert(name.clone(), Local::State);
+                        if last {
+                            body.push_str("return null;\n");
+                        }
+                        continue;
+                    }
                     // The initializer may wait on the server; it runs once.
                     self.new_ctx(None, false);
                     // Let the initializer see the component's names.
@@ -807,6 +820,28 @@ impl<'a> Compiler<'a> {
         decls.dedup();
         let head = if decls.is_empty() { String::new() } else { format!("let {};\n", decls.join(", ")) };
         Ok(head + &body)
+    }
+
+    /// `live(server_fn, ...args)`, if `e` is such a call: the function's
+    /// name and the arguments.
+    fn live_call<'e>(&mut self, e: &'e Expr) -> Result<Option<(String, &'e [Expr])>, QuilloError> {
+        let Expr::Call(callee, args, line) = e else { return Ok(None) };
+        let Expr::Ident(n, _) = &**callee else { return Ok(None) };
+        if n != "live" || self.ctxs.iter().any(|c| c.scopes.iter().any(|s| s.contains_key("live"))) {
+            return Ok(None);
+        }
+        if !matches!(lookup(&self.it.globals, "live"), Some(Value::Builtin("live", _))) {
+            return Ok(None);
+        }
+        self.line = *line;
+        let fname = match args.first() {
+            Some(Expr::Ident(f, _)) => match lookup(&self.it.globals, f) {
+                Some(Value::Func(c)) if c.def.server => f.clone(),
+                _ => return self.err(format!("`live` needs a server fn: `{}` is not one", f)),
+            },
+            _ => return self.err("`live` needs a server fn by name: ~items = live(load_items, ...)"),
+        };
+        Ok(Some((fname, &args[1..])))
     }
 
     /// Whether a function waits on the server (it calls a `server fn`, or a
