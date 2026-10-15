@@ -27,9 +27,16 @@ fn chrome() -> Option<PathBuf> {
 /// recorded in `data-result`.
 fn run_page(chrome: &Path, app: &str, port: u16) -> serde_json::Value {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    run_page_with(chrome, &dir.join(app), port, None)
+}
+
+/// Like `run_page`, for any program, with an optional test script that
+/// run.js injects into the page.
+fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) -> serde_json::Value {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
-        .arg(dir.join(app))
+        .arg(app)
         .args(["--port", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -46,6 +53,8 @@ fn run_page(chrome: &Path, app: &str, port: u16) -> serde_json::Value {
         .arg(chrome)
         .arg(format!("http://127.0.0.1:{}/", port))
         .arg(&profile)
+        .arg("30000")
+        .args(script)
         .output()
         .expect("node");
     let _ = server.kill();
@@ -101,4 +110,28 @@ fn components_hydrate_react_and_call_the_server() {
         "errors": []
     });
     assert_eq!(result, want);
+}
+
+/// examples/scroll.qwe: 100,000 rows, loaded 200 at a time, with only the
+/// visible rows and a buffer of 5 on each side in the page.
+#[test]
+fn infinite_scroll_renders_only_a_window_of_rows() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(
+        &chrome,
+        &root.join("examples/scroll.qwe"),
+        23000 + (std::process::id() % 1000) as u16,
+        Some(&root.join("tests/browser/scroll.js")),
+    );
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["start"], serde_json::json!({ "rows": 20, "loaded": 200, "ids": [1, 20] }));
+    assert_eq!(r["atRow100"]["ids"], serde_json::json!([96, 120]));
+    assert_eq!(r["atRow100"]["rows"], 25);
+    assert_eq!(r["loadedMore"], true);
+    assert!(r["deep"]["loaded"].as_u64().unwrap() > 1000, "{}", r);
+    assert_eq!(r["mostRowsAtOnce"], 25, "{}", r);
 }

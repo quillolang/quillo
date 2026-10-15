@@ -162,8 +162,13 @@ function eventField(e, name) {
       return out;
     }
   }
-  const v = e[name];
-  return v === undefined || typeof v === "function" ? null : v;
+  // Then the event's own fields (clientX, deltaY, ...), then the element's
+  // (scrollTop, clientHeight, dataset, ...).
+  for (const src of [e, t]) {
+    const v = src[name];
+    if (v !== undefined && typeof v !== "function") return v === null ? null : v;
+  }
+  return null;
 }
 
 // `x.name`: a map field, `e.value` on events, or a function called on x.

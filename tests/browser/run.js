@@ -3,13 +3,16 @@
 // DevTools protocol (Node's built-in WebSocket), so pages may keep requests
 // open (live updates) without stalling the test.
 //
-//   node run.js <chrome> <url> <profile-dir> [timeout-ms]
+//   node run.js <chrome> <url> <profile-dir> [timeout-ms] [script.js]
+//
+// With a script, it is run in the page once it has loaded; it should set
+// data-result itself.
 
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const [chrome, url, profile, timeoutArg] = process.argv.slice(2);
+const [chrome, url, profile, timeoutArg, scriptFile] = process.argv.slice(2);
 const timeout = Number(timeoutArg || 20000);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -44,6 +47,15 @@ async function main() {
       if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
     };
     const send = (method, params) => new Promise((ok) => { const n = ++id; pending.set(n, ok); ws.send(JSON.stringify({ id: n, method, params })); });
+    if (scriptFile) {
+      for (;;) {
+        if (Date.now() > deadline) throw new Error("the page did not load");
+        const r = await send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true });
+        if (r.result && r.result.result && r.result.result.value === "complete") break;
+        await sleep(50);
+      }
+      await send("Runtime.evaluate", { expression: fs.readFileSync(scriptFile, "utf8") });
+    }
     for (;;) {
       if (Date.now() > deadline) throw new Error("the page did not finish its test in time");
       const r = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-result')", returnByValue: true });

@@ -60,7 +60,8 @@ Other editors can run `quillo lsp` directly.
 
 Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders.qwe)
 (payload-based routing and middleware), [todo.qwe](examples/todo.qwe) (server-rendered
-app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component).
+app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component),
+[scroll.qwe](examples/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window).
 
 ## Language tour
 
