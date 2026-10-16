@@ -20,11 +20,13 @@ mount /scroll = "scroll.qwe"
 mount /compose = "compose.qwe"
 mount /layout = "layout.qwe"
 mount /spa = "spa.qwe"
+mount /life = "life.qwe"
 
 let examples = [
     { id: "todo", path: "/todo", name: "Todo", about: "A server-rendered app with forms and a JSON API. No JavaScript." },
     { id: "notes", path: "/notes", name: "Notes", about: "SQLite and a live component: open it in two tabs." },
     { id: "spa", path: "/spa", name: "Shop", about: "A single-page app with live stock: open it in two tabs and buy something." },
+    { id: "life", path: "/life", name: "Game of Life", about: "Conway's Game of Life, run by a timer in the browser." },
     { id: "compose", path: "/compose", name: "Composition", about: "Views and components built from each other." },
     { id: "layout", path: "/layout", name: "JSON layout", about: "A page described as JSON, with a live editor." },
     { id: "scroll", path: "/scroll", name: "Infinite scroll", about: "100,000 rows; only what is on screen is rendered." },

@@ -66,6 +66,7 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 [compose.qwe](examples/compose.qwe) (views and components built from each other),
 [layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor),
 [spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
+[life.qwe](examples/life.qwe) (Conway's Game of Life, run by a timer in the browser),
 and [index.qwe](examples/index.qwe), which mounts all of them in one server.
 
 ## Language tour
@@ -306,6 +307,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   `@submit` does not reload the page.
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step.
+- `every(ms, f)` in a component's code calls `f` every `ms` milliseconds, in the browser,
+  for as long as its renders keep calling `every`: `if running { every(100, step) }`
+  runs a game while `running` is true, with the latest `step` and speed, and stops when
+  it is false or the component leaves the page. On the server it does nothing.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
   (and in `quillo check`): `request`, `db`, `http`, `env`, files, `reply`, or a global

@@ -270,6 +270,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("repeat", "str, int", "str"),
     ("live", "fn, any...", "any"),
     ("parallel", "fn...", "list"),
+    ("every", "num, fn", "null"),
     ("url", "", "map"),
     ("css", "str", "str"),
     ("sql", "str", "str"),

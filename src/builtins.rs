@@ -83,6 +83,7 @@ pub fn install(env: &Env) {
         ("repeat", repeat),
         ("live", live),
         ("parallel", parallel),
+        ("every", every),
         ("css", tag_text),
         ("sql", tag_text),
         ("url", url),
@@ -929,6 +930,16 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
     it.last_live = Some(Value::map(info));
     r
+}
+
+/// `every(ms, f)` in a component: in the browser, calls `f` every `ms`
+/// milliseconds while the component's renders keep asking for it. Rendering
+/// on the server starts nothing.
+fn every(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
+        _ => fail(line, "`every` takes milliseconds and a function: every(100, step)"),
+    }
 }
 
 /// `parallel(f, g, ...)`: calls the functions at once; their results, in order.

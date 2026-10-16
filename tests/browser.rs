@@ -332,3 +332,27 @@ fn shop_stock_updates_live_and_the_cart_reserves_it() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/life.qwe: the browser computes the same generations as the
+/// server, and `every` runs the game only while it plays.
+#[test]
+fn game_of_life_runs_in_the_browser() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let r = run_page_with(&chrome, &root.join("examples/life.qwe"), free_port(), Some(&root.join("tests/browser/life.js")));
+    let want = serde_json::json!({
+        "start": ["0", "36"],
+        "one": "39",
+        "thirty": ["30", "41"],
+        "played": true,
+        "stopped": true,
+        "flipped": true,
+        "cleared": ["0", true, true],
+        "cells": 1536,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

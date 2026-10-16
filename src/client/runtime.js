@@ -394,6 +394,47 @@ function toJSON(v) {
 }
 
 const B = {};
+// `every(ms, f)` while a component renders: calls f every ms milliseconds for
+// as long as its renders keep asking (with the latest f and ms). A render that
+// does not ask (a paused game: `if running { every(100, step) }`) stops it,
+// and so does the component leaving the page.
+B.every = meta((ms, f) => {
+  const inst = rendering;
+  if (!inst) fail("`every` works while a component renders");
+  N(ms, "every");
+  F(f, "every", 2);
+  if (!inst.timers) {
+    inst.timers = [];
+    inst.timersAsked = 0;
+    // After each render: stop the timers it did not ask for.
+    inst.afterRender = () => {
+      for (const t of inst.timers.splice(inst.timersAsked)) clearInterval(t.id);
+      inst.timersAsked = 0;
+    };
+  }
+  const timers = inst.timers;
+  const i = inst.timersAsked++;
+  let t = timers[i];
+  if (!t || t.ms !== ms) {
+    if (t) clearInterval(t.id);
+    t = timers[i] = { ms, f, id: 0 };
+    t.id = setInterval(() => {
+      if (inst.kids !== null && !inst.el.isConnected) {
+        inst.timersAsked = 0;
+        return inst.afterRender();
+      }
+      try {
+        const r = t.f();
+        if (r instanceof Promise) r.catch(report);
+      } catch (e) {
+        report(e);
+      }
+    }, Math.max(ms, 1));
+  }
+  t.f = f;
+  return null;
+}, "every", null);
+
 // `parallel(f, g, ...)`: calls them at once (server calls overlap); their
 // results, in order.
 B.parallel = meta(async (...fs) => Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)())), "parallel", null);
@@ -963,6 +1004,7 @@ class Inst {
       throw e;
     } finally {
       rendering = outer;
+      if (this.afterRender) this.afterRender();
     }
   }
 
