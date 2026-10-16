@@ -57,7 +57,12 @@ async function main() {
       await send("Runtime.evaluate", { expression: fs.readFileSync(scriptFile, "utf8") });
     }
     for (;;) {
-      if (Date.now() > deadline) throw new Error("the page did not finish its test in time");
+      if (Date.now() > deadline) {
+        // Say where the page was, to tell a slow machine from a stuck page.
+        const r = await send("Runtime.evaluate", { expression: "JSON.stringify({ url: location.href, ready: document.readyState, quillo: !!window.quillo, errors: window.__quilloErrors || null, html: document.body ? document.body.innerHTML.slice(0, 400) : null })", returnByValue: true });
+        const where = r.result && r.result.result && r.result.result.value;
+        throw new Error("the page did not finish its test in time: " + where);
+      }
       const r = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-result')", returnByValue: true });
       const v = r.result && r.result.result && r.result.result.value;
       if (v) { process.stdout.write(v); break; }
