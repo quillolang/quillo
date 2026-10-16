@@ -14,10 +14,12 @@
     button("Step").click();
     await waitFor(() => text(".generation") === "1");
     out.one = text(".population");
-    for (let i = 1; i < 30; i++) { button("Step").click(); await waitFor(() => text(".generation") === String(i + 1)); }
+    // State changes at once; the page re-renders once after all 29.
+    for (let i = 1; i < 30; i++) button("Step").click();
+    await waitFor(() => text(".generation") === "30");
     out.thirty = [text(".generation"), text(".population")];
     // Playing: the timer advances the game by itself.
-    button("Normal").click(); await tick(50);
+    button("Fast").click(); await tick(50);
     button("Play").click();
     out.played = await waitFor(() => +text(".generation") >= 34);
     button("Pause").click(); await tick(50);

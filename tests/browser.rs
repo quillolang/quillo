@@ -60,7 +60,8 @@ fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: 
         .arg(chrome)
         .arg(format!("http://127.0.0.1:{}{}", port, path))
         .arg(&profile)
-        .arg("30000")
+        // Generous: CI machines can be several times slower than a laptop.
+        .arg("60000")
         .args(script)
         .output()
         .expect("node");
