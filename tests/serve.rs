@@ -97,6 +97,29 @@ fn requests_waiting_on_io_run_concurrently() {
 }
 
 #[test]
+fn parallel_calls_wait_at_the_same_time() {
+    let d = temp_dir("parallel");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        "let n = 0
+fn slow(x) { sleep(400); n += 1; x }
+         route GET /both = parallel(() => slow(1), () => slow(2), () => slow(3))
+         route GET /n = n
+",
+    )
+    .unwrap();
+    let srv = start(&f, &[]);
+    let t0 = Instant::now();
+    let (status, body) = get(srv.port, "/both");
+    let took = t0.elapsed();
+    assert_eq!((status, body.as_str()), (200, "[1,2,3]"));
+    assert!(took < Duration::from_millis(900), "three 400 ms waits took {:?}", took);
+    // Each runs alone between waits, so `n += 1` never loses an update.
+    assert_eq!(get(srv.port, "/n").1, "3");
+}
+
+#[test]
 fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
     let d = temp_dir("watch");
     let main = d.join("app.qwe");

@@ -82,6 +82,7 @@ pub fn install(env: &Env) {
         ("index_of", index_of),
         ("repeat", repeat),
         ("live", live),
+        ("parallel", parallel),
         ("css", tag_text),
         ("sql", tag_text),
         ("url", url),
@@ -928,6 +929,11 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
     it.last_live = Some(Value::map(info));
     r
+}
+
+/// `parallel(f, g, ...)`: calls the functions at once; their results, in order.
+fn parallel(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    it.run_parallel(args, line)
 }
 
 /// `publish("topic", ...)`: wakes pages whose `live` data watched the topic.

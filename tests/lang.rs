@@ -15,6 +15,16 @@ fn ev_err(src: &str) -> String {
 }
 
 #[test]
+fn parallel_gives_results_in_order() {
+    assert_eq!(ev("let a = 10\nparallel(() => a + 1, () => a * 2, () => \"x\")"), "[11, 20, \"x\"]");
+    assert_eq!(ev("parallel(() => parallel(() => 1, () => 2), () => 3)"), "[[1, 2], 3]");
+    assert_eq!(ev("parallel(() => err(\"no\"), () => 2)"), "[err(\"no\"), 2]");
+    assert_eq!(ev("parallel()"), "[]");
+    assert!(ev_err("parallel(() => 1, () => 1 / 0)").contains("division by zero"));
+    assert!(ev_err("parallel(() => 1, 2)").contains("argument 2 is int"));
+}
+
+#[test]
 fn arithmetic_and_precedence() {
     assert_eq!(ev("1 + 2 * 3"), "7");
     assert_eq!(ev("(1 + 2) * 3"), "9");

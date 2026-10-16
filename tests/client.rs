@@ -45,6 +45,16 @@ fn same_error(defs: &str, body: &str, needle: &str) {
 }
 
 #[test]
+fn parallel_runs_the_same_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    same("fn a() = 1\nfn b(x) = x * 2", "parallel(() => a(), () => b(21), () => err(\"x\"))");
+    same("", "parallel()");
+    same_error("", "parallel(() => 1, 2)", "parallel");
+}
+
+#[test]
 fn values_and_operators() {
     if !node_available() {
         return;

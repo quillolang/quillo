@@ -23,7 +23,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql",
+    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -577,7 +577,8 @@ impl<'a> Compiler<'a> {
         match &v {
             Value::Builtin(b, _) => {
                 if CLIENT_BUILTINS.contains(b) {
-                    let r = (format!("B.{}", b), false);
+                    // `parallel` waits for what it calls, so it is awaited.
+                    let r = (format!("B.{}", b), *b == "parallel");
                     self.globals.insert(name.to_string(), r.clone());
                     Ok(r)
                 } else {

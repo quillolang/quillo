@@ -394,6 +394,9 @@ function toJSON(v) {
 }
 
 const B = {};
+// `parallel(f, g, ...)`: calls them at once (server calls overlap); their
+// results, in order.
+B.parallel = meta(async (...fs) => Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)())), "parallel", null);
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 B.str = meta((v) => display(v), "str", null);
 B.int = meta((v) => {

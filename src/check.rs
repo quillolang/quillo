@@ -269,6 +269,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("live", "fn, any...", "any"),
+    ("parallel", "fn...", "list"),
     ("url", "", "map"),
     ("css", "str", "str"),
     ("sql", "str", "str"),

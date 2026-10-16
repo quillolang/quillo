@@ -558,6 +558,78 @@ impl Interp {
         f()
     }
 
+    /// `parallel(f, g, ...)`: calls the functions at once and gives back
+    /// their results, in order. Each runs on a thread of its own with its own
+    /// handle on the program; since waiting (for the database, HTTP, `sleep`)
+    /// lets other Quillo code run, their waits overlap. The first failure,
+    /// in order, is the result; error values are results like any other.
+    ///
+    /// Where other threads would change what the code means, the functions
+    /// run one after another instead: inside a transaction (their SQL would
+    /// run outside it), and while what is read is being recorded (a `live`
+    /// loader, a cached view, a component's state).
+    pub fn run_parallel(&mut self, fs: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        for (i, f) in fs.iter().enumerate() {
+            if !matches!(f, Value::Func(_) | Value::Builtin(..)) {
+                return fail(
+                    line,
+                    format!("`parallel` takes functions to call, like parallel(() => a(), () => b()); argument {} is {}", i + 1, f.type_name()),
+                );
+            }
+        }
+        let in_tx = self.tx_depth > 0
+            || self.sqlite_tx > 0
+            || self.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() {
+            let mut out = Vec::with_capacity(fs.len());
+            for f in &fs {
+                out.push(self.call(f, Vec::new(), line)?);
+            }
+            return Ok(Value::list(out));
+        }
+        let tasks: Vec<(Interp, Value)> = fs.into_iter().map(|f| (self.task_fork(), f)).collect();
+        let shared = self.shared.clone();
+        let results: Vec<Result<Value, Ctrl>> = self.unlocked(|| {
+            std::thread::scope(|s| {
+                let running: Vec<_> = tasks
+                    .into_iter()
+                    .map(|(mut it, f)| {
+                        let shared = &shared;
+                        std::thread::Builder::new().name("quillo-parallel".into()).stack_size(8 << 20).spawn_scoped(s, move || {
+                            shared.gil.acquire();
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)));
+                            shared.gil.release();
+                            r.unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"))
+                        })
+                    })
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|t| match t {
+                        Ok(h) => h.join().unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly")),
+                        Err(e) => fail(line, format!("`parallel` could not start a thread: {}", e)),
+                    })
+                    .collect()
+            })
+        });
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            out.push(r?);
+        }
+        Ok(Value::list(out))
+    }
+
+    /// A handle for a `parallel` task: the program, and what the caller may
+    /// do (effects, the request being handled).
+    fn task_fork(&self) -> Interp {
+        let mut it = self.fork();
+        it.depth = self.depth;
+        it.allowed = self.allowed;
+        it.restrictor = self.restrictor.clone();
+        it.current_request = self.current_request.clone();
+        it
+    }
+
     /// Parses and runs a program's top level, registering its routes.
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
         let stmts = Arc::new(Parser::new(src).parse_program().map_err(|e| e.in_file(file))?);

@@ -490,6 +490,20 @@ server, so `let more = load_more() ?? []` carries on and can try again later. It
 in `~state` initializers (`~todos = load_todos()`: the server runs it while rendering,
 so the page arrives with the data). Calling one while rendering is an error.
 
+There is no `async` or `await` to write: on the server a call simply waits (and other
+requests run meanwhile); in the browser the compiler awaits it, and every function that
+calls it. Calls run one after another. To run several at once, give them to
+`parallel`, which returns their results in order:
+
+```quillo
+let [user, orders] = parallel(() => load_user(id), () => load_orders(id))
+```
+
+In the browser that is `Promise.all`. On the server each function runs on a thread of
+its own, so their waits (database, `http.*`, `sleep`) overlap; inside a transaction they
+run one after another, since other threads' SQL would not be part of it. A failure stops
+the whole call; error values are results like any other.
+
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types (a 400 otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json`, and only
