@@ -67,6 +67,7 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 [layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor),
 [spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
 [life.qwe](examples/life.qwe) (Conway's Game of Life, run by a timer in the browser),
+[storm.qwe](examples/storm.qwe) (a dashboard under a storm of random changes, tested for leaks),
 and [index.qwe](examples/index.qwe), which mounts all of them in one server.
 
 ## Language tour

@@ -358,3 +358,29 @@ fn game_of_life_runs_in_the_browser() {
     });
     assert_eq!(r, want);
 }
+
+/// examples/storm.qwe: storms that mount and unmount components with timers,
+/// live data and url() leave nothing behind: no removed component still
+/// referenced, no timer running, the page back to its size.
+#[test]
+fn a_state_storm_leaves_nothing_behind() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut r = run_page_with(&chrome, &root.join("examples/storm.qwe"), free_port(), Some(&root.join("tests/browser/storm.js")));
+    // Reported for information; varies from run to run.
+    r.as_object_mut().unwrap().remove("heapGrowthKB");
+    let want = serde_json::json!({
+        "start": ["12", 12],
+        "stormed": true,
+        "componentsSeen": true,
+        "removedButAlive": 0,
+        "timersRunning": 0,
+        "sameNodes": true,
+        "heapGrowthUnder1MB": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

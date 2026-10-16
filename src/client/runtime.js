@@ -411,6 +411,10 @@ B.every = meta((ms, f) => {
       for (const t of inst.timers.splice(inst.timersAsked)) clearInterval(t.id);
       inst.timersAsked = 0;
     };
+    onGone(inst, () => {
+      inst.timersAsked = 0;
+      inst.afterRender();
+    });
   }
   const timers = inst.timers;
   const i = inst.timersAsked++;
@@ -662,9 +666,14 @@ function liveSocket(url, signal) {
     const ws = new WebSocket(location.origin.replace(/^http/, "ws") + url);
     let opened = false;
     ws.onopen = () => { opened = true; };
-    ws.onmessage = (m) => liveChanged(JSON.parse(m.data));
+    ws.onmessage = (m) => { if (!signal.aborted) liveChanged(JSON.parse(m.data)); };
     ws.onclose = () => resolve(opened);
-    signal.addEventListener("abort", () => ws.close());
+    // Carry on at once: a closing socket finishes closing in its own time
+    // (the browser waits for the server's answer), and says nothing more.
+    signal.addEventListener("abort", () => {
+      ws.close();
+      resolve(true);
+    });
   });
 }
 
@@ -793,7 +802,11 @@ function navigate(to) {
 
 function currentUrl() {
   navStart();
-  if (rendering) Nav.subs.add(rendering);
+  const inst = rendering;
+  if (inst && !Nav.subs.has(inst)) {
+    Nav.subs.add(inst);
+    onGone(inst, () => Nav.subs.delete(inst));
+  }
   const p = location.pathname;
   return {
     path: BASE && p.startsWith(BASE) ? p.slice(BASE.length) || "/" : p,
@@ -897,6 +910,7 @@ function patch(parent, a, b, svg) {
   if (!same(a, b)) {
     const d = mount(b, svg);
     parent.replaceChild(d, a.d);
+    drop(a);
     return;
   }
   const d = (b.d = a.d);
@@ -945,11 +959,27 @@ function patchKeyed(el, old, kids, svg) {
     if (k.d !== anchor) el.insertBefore(k.d, anchor);
     else anchor = anchor.nextSibling;
   }
-  for (const o of old) if (!used.has(o) && o.d && o.d.parentNode === el) el.removeChild(o.d);
+  for (const o of old) {
+    if (used.has(o)) continue;
+    drop(o);
+    if (o.d && o.d.parentNode === el) el.removeChild(o.d);
+  }
 }
 
 function unmount(el, v) {
+  drop(v);
   if (v.d && v.d.parentNode === el) el.removeChild(v.d);
+}
+
+// Part of the page is gone: the components in it stop what they started.
+function drop(v) {
+  if (v instanceof VComp) { if (v.inst) v.inst.destroy(); }
+  else if (v.kids) for (const k of v.kids) drop(k);
+}
+
+// Runs `f` when the component leaves the page (see Inst.destroy).
+function onGone(inst, f) {
+  (inst.cleanup || (inst.cleanup = [])).push(f);
 }
 
 // ---- components --------------------------------------------------------
@@ -1008,7 +1038,17 @@ class Inst {
     }
   }
 
+  // Gone from the page: its timers, live data and url() listening stop
+  // (whatever registered with onGone), and so does every component inside.
+  destroy() {
+    if (this.dead) return;
+    this.dead = true;
+    if (this.cleanup) for (const f of this.cleanup) f();
+    if (this.kids) for (const k of this.kids) drop(k);
+  }
+
   update() {
+    if (this.dead) return;
     let kids;
     try {
       kids = this.render();
@@ -1042,8 +1082,11 @@ function report(e) {
 }
 
 function boot() {
-  for (const island of document.querySelectorAll("quillo-island")) {
-    if (island.parentElement && island.parentElement.closest("quillo-island")) continue;
+  // The outermost islands, found before any is hydrated: hydrating one
+  // replaces its content, and islands inside it, detached, would no longer
+  // look nested.
+  const outer = [...document.querySelectorAll("quillo-island")].filter((i) => !(i.parentElement && i.parentElement.closest("quillo-island")));
+  for (const island of outer) {
     const def = C[island.dataset.c];
     if (!def) { report(`unknown component <${island.dataset.c}>`); continue; }
     hydrating = {};
@@ -1122,6 +1165,12 @@ W.live = (inst, name, fname, args) => {
   }
   const info = inst.liveInfo && inst.liveInfo[name];
   const sub = { inst, name, fname, args, topics: info ? info.t : [] };
+  if (!Object.keys(inst.subs).length) {
+    onGone(inst, () => {
+      for (const s of Object.values(inst.subs)) Live.subs.delete(s);
+      liveRestart();
+    });
+  }
   inst.subs[name] = sub;
   Live.subs.add(sub);
   if (!inst.ready.has(name)) {

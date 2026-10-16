@@ -300,7 +300,8 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
-    assert!(js.len() < js2.len() && js.len() < 12_500, "{} vs {}", js.len(), js2.len());
+    // About 12.9 KB since components clean up when they leave the page.
+    assert!(js.len() < js2.len() && js.len() < 13_000, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }

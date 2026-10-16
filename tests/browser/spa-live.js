@@ -1,5 +1,6 @@
 // examples/spa.qwe: live stock, the cart, and another tab buying.
 (async () => {
+  window.__quilloErrors = [];
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
   const waitFor = async (f, n = 150) => { for (let i = 0; i < n; i++) { if (f()) return true; await tick(30); } return false; };

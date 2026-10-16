@@ -20,7 +20,10 @@ async function main() {
   fs.rmSync(profile, { recursive: true, force: true });
   const proc = spawn(chrome, [
     "--headless=new", "--disable-gpu", "--no-first-run", "--no-sandbox", "--disable-dev-shm-usage",
-    "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank",
+    "--remote-debugging-port=0", `--user-data-dir=${profile}`,
+    // For leak tests: gc() and exact performance.memory figures.
+    "--js-flags=--expose-gc", "--enable-precise-memory-info",
+    "about:blank",
   ], { stdio: ["ignore", "ignore", "pipe"] });
   // Chrome prints "DevTools listening on ws://127.0.0.1:PORT/..." when ready.
   let log = "";
@@ -37,7 +40,8 @@ async function main() {
       }
       await sleep(50);
     }
-    const target = await (await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: "PUT" })).json();
+    // A blank tab first, so the page can be prepared before it loads.
+    const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
     const ws = new WebSocket(target.webSocketDebuggerUrl);
     await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; });
     let id = 0;
@@ -47,6 +51,11 @@ async function main() {
       if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
     };
     const send = (method, params) => new Promise((ok) => { const n = ++id; pending.set(n, ok); ws.send(JSON.stringify({ id: n, method, params })); });
+    // Errors the runtime reports (quillo's `report`) are collected from the
+    // first script on, for the tests' "errors" checks.
+    await send("Page.enable");
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__quilloErrors = [];" });
+    await send("Page.navigate", { url });
     if (scriptFile) {
       for (;;) {
         if (Date.now() > deadline) throw new Error("the page did not load");
