@@ -99,7 +99,7 @@ component Life() {
             <button @click={step} disabled={running}>Step</button>
             <label.speed>
                 Speed
-                <input type="range" min="1" max="30" value={speed}
+                <input type="range" min="1" max="100" value={speed}
                     @input={(e) => { speed = int(e.value) ?? speed }}/>
                 <span.per-second>{speed}/s</span>
             </label>
