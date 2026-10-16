@@ -50,8 +50,13 @@ async function main() {
     if (scriptFile) {
       for (;;) {
         if (Date.now() > deadline) throw new Error("the page did not load");
-        const r = await send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true });
-        if (r.result && r.result.result && r.result.result.value === "complete") break;
+        // A new tab starts as about:blank, which is "complete" too: wait for
+        // our page, or the script would run in the blank one and be lost
+        // when ours replaces it (which slow machines show).
+        const origin = new URL(url).origin;
+        const ready = `location.origin === ${JSON.stringify(origin)} && document.readyState === "complete"`;
+        const r = await send("Runtime.evaluate", { expression: ready, returnByValue: true });
+        if (r.result && r.result.result && r.result.result.value === true) break;
         await sleep(50);
       }
       await send("Runtime.evaluate", { expression: fs.readFileSync(scriptFile, "utf8") });
