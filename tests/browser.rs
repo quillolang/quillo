@@ -348,6 +348,7 @@ fn game_of_life_runs_in_the_browser() {
         "start": ["0", "36"],
         "one": "39",
         "thirty": ["30", "41"],
+        "speed": "25/s",
         "played": true,
         "stopped": true,
         "flipped": true,

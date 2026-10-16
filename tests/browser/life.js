@@ -19,7 +19,12 @@
     await waitFor(() => text(".generation") === "30");
     out.thirty = [text(".generation"), text(".population")];
     // Playing: the timer advances the game by itself.
-    button("Fast").click(); await tick(50);
+    // The slider: 25 generations a second.
+    const slider = $('input[type="range"]');
+    slider.value = "25";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    await waitFor(() => text(".per-second") === "25/s");
+    out.speed = text(".per-second");
     button("Play").click();
     out.played = await waitFor(() => +text(".generation") >= 34);
     button("Pause").click(); await tick(50);

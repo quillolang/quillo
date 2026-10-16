@@ -5,7 +5,7 @@
 // The board is a list of rows of 0s and 1s in a component's state, and
 // `next` makes a generation from the one before: a plain function, which runs
 // the same on the server and in the browser. While the game runs, the render
-// asks for a timer with `every(speed, step)`; pausing stops asking, which
+// asks for a timer with `every(1000 / speed, step)`; pausing stops asking, which
 // stops it. Click a cell to flip it.
 
 let W = 48
@@ -51,7 +51,6 @@ let patterns = [
     ] },
 ]
 
-let speeds = [{ name: "Slow", ms: 400 }, { name: "Normal", ms: 120 }, { name: "Fast", ms: 40 }]
 
 fn empty() = range(0, H) | map((_) => range(0, W) | map((_) => 0))
 
@@ -82,7 +81,7 @@ fn flip(board: list, y: int, x: int) =
 component Life() {
     ~board = board_of(first(patterns))
     ~running = false
-    ~speed = 120
+    ~speed = 8          // generations per second
     ~generation = 0
 
     let step = () => {
@@ -90,7 +89,7 @@ component Life() {
         generation += 1
     }
     if running {
-        every(speed, step)
+        every(1000 / speed, step)
     }
     let population = board | map((row) => sum(row)) | sum
 
@@ -98,10 +97,12 @@ component Life() {
         <div.controls>
             <button.primary @click={() => { running = !running }}>{running ? "Pause" : "Play"}</button>
             <button @click={step} disabled={running}>Step</button>
-            <span.group>
-                {for s in speeds =>
-                    <button key={s.name} class={s.ms == speed && "active"} @click={() => { speed = s.ms }}>{s.name}</button>}
-            </span>
+            <label.speed>
+                Speed
+                <input type="range" min="1" max="30" value={speed}
+                    @input={(e) => { speed = int(e.value) ?? speed }}/>
+                <span.per-second>{speed}/s</span>
+            </label>
             <span.stats>Generation <b.generation>{generation}</b> · <b.population>{population}</b> alive</span>
         </div>
         <div.board style={`grid-template-columns: repeat(${W}, 1fr)`}>
@@ -134,7 +135,9 @@ button { font: inherit; padding: .3rem .8rem; border-radius: 6px; border: 1px so
 button.primary { background: #222; color: white; border-color: #222; min-width: 5rem; }
 button.active { border-color: #222; font-weight: 600; }
 button:disabled { opacity: .4; cursor: default; }
-.group { display: inline-flex; gap: .25rem; }
+.speed { display: inline-flex; align-items: center; gap: .5rem; color: #555; }
+.speed input { width: 9rem; accent-color: #1a7f37; }
+.per-second { min-width: 2.5rem; font-variant-numeric: tabular-nums; }
 .stats { margin-left: auto; color: #666; font-variant-numeric: tabular-nums; }
 .board { display: grid; gap: 1px; background: #e8e8e8; border: 1px solid #e8e8e8; border-radius: 4px; overflow: hidden; }
 .board i { aspect-ratio: 1; background: white; cursor: pointer; }
