@@ -607,6 +607,9 @@ pub struct App {
     pub cluster_sources: Option<Vec<std::net::IpAddr>>,
     /// Largest request body accepted, in bytes.
     pub max_body: usize,
+    /// A desktop app (`quillo app`): only requests that carry this token
+    /// are answered (see `launch_gate`).
+    pub launch_token: Option<String>,
 }
 
 impl App {
@@ -623,7 +626,13 @@ impl App {
             cluster_key: None,
             cluster_sources: None,
             max_body: MAX_BODY,
+            launch_token: None,
         }
+    }
+
+    /// What the program's interpreters share.
+    pub fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 
     fn current(&self) -> (u64, Arc<Loaded>) {
@@ -852,6 +861,12 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
     let mut local: Option<Interp> = None;
     let mut program = app.current().1;
     while let Ok(mut rq) = server.recv() {
+        if let Some(token) = &app.launch_token {
+            if let Some(resp) = launch_gate(&rq, token) {
+                let _ = rq.respond(resp);
+                continue;
+            }
+        }
         if app.watch && rq.url().split('?').next() == Some("/_quillo/events") {
             serve_events(app.clone(), rq);
             continue;
@@ -946,12 +961,20 @@ fn worker(app: Arc<App>, server: Arc<tiny_http::Server>) {
 /// Serves the app with `workers` threads. The calling thread must hold the
 /// interpreter lock; it gives it up here.
 pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
+    serve_with(app, addr, workers, |_| {})
+}
+
+/// `serve`, calling `listening` with the address once it is bound (with
+/// port 0, the port the system chose).
+pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(std::net::SocketAddr)) -> Result<(), String> {
     let server = tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
+    let bound = server.server_addr().to_ip();
+    let shown = bound.map_or_else(|| addr.to_string(), |a| a.to_string());
     let server = Arc::new(server);
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.len();
-        eprintln!("quillo: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, addr);
+        eprintln!("quillo: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, shown);
     }
     if app.watch {
         eprintln!("quillo: watching for changes");
@@ -980,10 +1003,66 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
             })
             .map_err(|e| format!("cannot start file watcher: {}", e))?;
     }
+    if let Some(a) = bound {
+        listening(a);
+    }
     for h in handles {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// The cookie that admits a desktop app's window.
+const LAUNCH_COOKIE: &str = "quillo_launch";
+
+/// For a desktop app's server, which listens on this machine where other
+/// programs and web pages could reach it: `None` lets the request through
+/// when it carries the launch cookie. The window's first request carries the
+/// token in the URL instead (`?_quillo_launch=...`); it is answered with the
+/// cookie and a redirect to the same URL without the token. Anything else is
+/// refused. The cookie is `SameSite=Strict` and bound to 127.0.0.1, so pages
+/// on other sites (even ones whose names resolve to 127.0.0.1) never send it.
+pub fn launch_gate(rq: &tiny_http::Request, token: &str) -> Option<tiny_http::ResponseBox> {
+    let refuse = || Some(tiny_http::Response::from_string("forbidden\n").with_status_code(403).boxed());
+    let cookies = rq.headers().iter().filter(|h| h.field.equiv("cookie")).flat_map(|h| h.value.as_str().split(';'));
+    let mut has_cookie = false;
+    for c in cookies {
+        if let Some((k, v)) = c.trim().split_once('=') {
+            if k == LAUNCH_COOKIE && same_secret(v, token) {
+                has_cookie = true;
+            }
+        }
+    }
+    let (path, query) = rq.url().split_once('?').unwrap_or((rq.url(), ""));
+    let param = "_quillo_launch=";
+    let offered = query.split('&').find_map(|kv| kv.strip_prefix(param));
+    match offered {
+        None if has_cookie => None,
+        None => refuse(),
+        Some(v) if !same_secret(v, token) => refuse(),
+        Some(_) => {
+            let rest: Vec<&str> = query.split('&').filter(|kv| !kv.starts_with(param) && !kv.is_empty()).collect();
+            let location = if rest.is_empty() { path.to_string() } else { format!("{}?{}", path, rest.join("&")) };
+            let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", LAUNCH_COOKIE, token);
+            let resp = tiny_http::Response::empty(303)
+                .with_header(tiny_http::Header::from_bytes(&b"location"[..], location.as_bytes()).ok()?)
+                .with_header(tiny_http::Header::from_bytes(&b"set-cookie"[..], cookie.as_bytes()).ok()?)
+                .with_header(tiny_http::Header::from_bytes(&b"cache-control"[..], &b"no-store"[..]).ok()?);
+            Some(resp.boxed())
+        }
+    }
+}
+
+/// Compares in time that does not depend on where the first difference is.
+fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// A new launch token: 32 random bytes, in hex.
+pub fn launch_token() -> Result<String, String> {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b).map_err(|e| format!("no random numbers for the launch token: {}", e))?;
+    Ok(crate::ws::hex(&b))
 }
 
 /// Stack for threads that run Quillo code. Calls grow the stack on demand

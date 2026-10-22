@@ -22,3 +22,20 @@ jobs:
       - name: VS Code extension
         working-directory: editors/vscode
         run: npm ci && npm test && npx vsce package --skip-license
+
+  # `quillo app` (the native window) builds on each desktop platform.
+  app:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: WebKitGTK
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+      - name: Build with windows
+        run: cargo build --features app
+      - name: Test the window's own code
+        run: cargo test --features app --bin quillo

@@ -298,3 +298,51 @@ fn a_sqlite_transaction_is_not_shared_with_other_requests() {
     assert_eq!(a.join().unwrap().0, 500);
     assert_eq!(get(port, "/rows").1, r#"["b"]"#);
 }
+
+/// Sends `head` (request line and headers, without the blank line) and
+/// returns the whole response.
+fn raw(port: u16, head: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "{}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", head).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn a_desktop_apps_server_answers_only_its_window() {
+    let d = temp_dir("launch");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /hello = `hi`\n").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(quillo::server::WORKER_STACK)
+        .spawn(move || {
+            let mut it = quillo::Interp::new(&d);
+            let shared = it.shared.clone();
+            it.load_file(&f).unwrap();
+            let mut app = quillo::server::App::new(quillo::server::Loaded::Ready(it), shared, &f, &d, false);
+            app.launch_token = Some("t0ken".into());
+            quillo::server::serve_with(app, "127.0.0.1:0", 2, move |a| tx.send(a.port()).unwrap()).unwrap();
+        })
+        .unwrap();
+    let port = rx.recv_timeout(Duration::from_secs(10)).expect("server did not start");
+
+    // Other programs, and pages of other sites, get nothing.
+    assert_eq!(get(port, "/hello").0, 403);
+    assert_eq!(get(port, "/hello?_quillo_launch=t0kem").0, 403);
+    assert_eq!(get(port, "/_quillo/live").0, 403);
+    assert!(raw(port, "GET /hello HTTP/1.1\r\nCookie: quillo_launch=t0ke").starts_with("HTTP/1.1 403"));
+
+    // The window's first request trades the token for a cookie, and is sent
+    // on to the same page without it.
+    let first = raw(port, "GET /hello?a=1&_quillo_launch=t0ken&b=2 HTTP/1.1").to_ascii_lowercase();
+    assert!(first.starts_with("http/1.1 303"), "{}", first);
+    assert!(first.contains("location: /hello?a=1&b=2\r\n"), "{}", first);
+    assert!(first.contains("set-cookie: quillo_launch=t0ken; path=/; httponly; samesite=strict"), "{}", first);
+
+    let page = raw(port, "GET /hello HTTP/1.1\r\nCookie: theme=dark; quillo_launch=t0ken");
+    assert!(page.starts_with("HTTP/1.1 200"), "{}", page);
+    assert!(page.ends_with("hi"), "{}", page);
+}

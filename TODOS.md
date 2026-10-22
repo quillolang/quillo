@@ -5,6 +5,22 @@ hardening (request limits, cross-site checks, connection caps, error messages,
 header checks, cluster announcement checks) is being done in a separate audit
 and is not listed here.
 
+## Native apps
+
+`quillo app` shows a program in a native window on the desktop (see
+`src/desktop.rs`). Next, in order:
+
+- [ ] **Native features as builtins**, for what a page cannot do: file open
+      and save dialogs, notifications, the app's data folder (so SQLite files
+      go there rather than next to the program), window title and menus.
+- [ ] **Packaging: `quillo bundle`**, producing a `.app`, `.msi` or `.AppImage`
+      with the program inside, and an icon.
+- [ ] **Mobile.** The interpreter built as a library for iOS and Android,
+      hosted by a small Xcode and Gradle project in the platform's web view.
+      Check first that every dependency cross-compiles.
+- [ ] **Windows and Linux tried by hand.** CI builds them; only macOS has been
+      run.
+
 ## Reactivity in the browser
 
 Today a component updates as a whole: assigning `~x` re-runs the component's

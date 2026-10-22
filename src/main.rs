@@ -7,6 +7,9 @@ use quillo::parser::Parser;
 use quillo::server::{App, Loaded};
 use quillo::{Interp, Value};
 
+#[cfg(feature = "app")]
+mod desktop;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
@@ -14,6 +17,8 @@ Quillo — a small web language
 
 usage:
   quillo run <file.qwe> [options]   run a program; serve it if it has routes
+  quillo app <file.qwe> [options]   run a program in a native window (needs a
+                                    build with `--features app`)
   quillo check <file.qwe>           check a program without running it
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
@@ -31,10 +36,18 @@ options for `run`:
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
                  servers there; the secret is read from $LIMER_ADMIN_SECRET
-  --service S    the pool's name (default: the file's name, without .qwe)";
+  --service S    the pool's name (default: the file's name, without .qwe)
+
+`app` takes the options of `run` except --host, --register and --service; its
+port, by default one the system picks, answers only the window.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // The window must run on the main thread (macOS requires it); the
+    // program gets a thread of its own.
+    if args.get(1).map(String::as_str) == Some("app") {
+        std::process::exit(app(&args));
+    }
     // Run on a thread with a roomy stack (see WORKER_STACK).
     let child = std::thread::Builder::new()
         .stack_size(quillo::server::WORKER_STACK)
@@ -70,31 +83,59 @@ fn real_main(args: Vec<String>) -> i32 {
     }
 }
 
+#[cfg(feature = "app")]
+fn app(args: &[String]) -> i32 {
+    match args.get(2) {
+        Some(f) => desktop::main(f, &args[3..]),
+        None => usage(),
+    }
+}
+
+#[cfg(not(feature = "app"))]
+fn app(_: &[String]) -> i32 {
+    eprintln!("quillo: this quillo was built without windows; build it with `cargo build --release --features app`");
+    2
+}
+
 fn usage() -> i32 {
     eprintln!("{}", USAGE);
     2
 }
 
-fn run(file: &str, flags: &[String]) -> i32 {
-    let mut host = "127.0.0.1".to_string();
-    let mut port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
-    let mut workers = 8;
-    let mut watch = false;
-    let mut static_check = true;
-    let mut register: Option<String> = None;
-    let mut service: Option<String> = None;
-    let mut max_body = quillo::server::MAX_BODY;
+/// The options of `run` (and of `app`, which takes some of them).
+struct RunOptions {
+    host: Option<String>,
+    port: Option<String>,
+    workers: usize,
+    watch: bool,
+    static_check: bool,
+    register: Option<String>,
+    service: Option<String>,
+    max_body: usize,
+}
+
+fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
+    let mut o = RunOptions {
+        host: None,
+        port: None,
+        workers: 8,
+        watch: false,
+        static_check: true,
+        register: None,
+        service: None,
+        max_body: quillo::server::MAX_BODY,
+    };
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
         match (flags[i].as_str(), value) {
             ("--watch" | "-w", _) => {
-                watch = true;
+                o.watch = true;
                 i += 1;
                 continue;
             }
             ("--no-check", _) => {
-                static_check = false;
+                o.static_check = false;
                 i += 1;
                 continue;
             }
@@ -103,37 +144,41 @@ fn run(file: &str, flags: &[String]) -> i32 {
                 i += 1;
                 continue;
             }
-            ("--host", Some(v)) => host = v.clone(),
-            ("--port", Some(v)) => port = v.clone(),
-            ("--register", Some(v)) => register = Some(v.clone()),
-            ("--service", Some(v)) => service = Some(v.clone()),
+            ("--host", Some(v)) => o.host = Some(v.clone()),
+            ("--port", Some(v)) => o.port = Some(v.clone()),
+            ("--register", Some(v)) => o.register = Some(v.clone()),
+            ("--service", Some(v)) => o.service = Some(v.clone()),
             ("--max-body", Some(v)) => match v.parse::<usize>() {
-                Ok(n) if n > 0 => max_body = n,
+                Ok(n) if n > 0 => o.max_body = n,
                 _ => {
                     eprintln!("quillo: --max-body needs a positive number of bytes");
-                    return 2;
+                    return Err(2);
                 }
             },
             ("--workers", Some(v)) => match v.parse::<usize>() {
-                Ok(n) if n > 0 => workers = n,
+                Ok(n) if n > 0 => o.workers = n,
                 _ => {
                     eprintln!("quillo: --workers needs a positive number");
-                    return 2;
+                    return Err(2);
                 }
             },
             (other, _) => {
                 eprintln!("quillo: unknown option `{}`", other);
-                return 2;
+                return Err(2);
             }
         }
         i += 2;
     }
+    Ok(o)
+}
 
-    let path = Path::new(file);
+/// Checks and loads the program, ready to serve. `Ok(None)`: it ran and
+/// declared no routes, so there is nothing to serve. `Err` is the exit code.
+fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let checked = if static_check { static_errors(path) } else { Ok(()) };
-    if let (Err(_), false) = (&checked, watch) {
-        return 1;
+    let checked = if o.static_check { static_errors(path) } else { Ok(()) };
+    if let (Err(_), false) = (&checked, o.watch) {
+        return Err(1);
     }
     let mut interp = Interp::new(base);
     let shared = interp.shared.clone();
@@ -143,26 +188,42 @@ fn run(file: &str, flags: &[String]) -> i32 {
             if !e.is_empty() {
                 eprintln!("quillo: {}", e);
             }
-            if !watch {
-                return 1;
+            if !o.watch {
+                return Err(1);
             }
             Loaded::Failed(if e.is_empty() { "the program has errors (see the terminal)".into() } else { e })
         }
     };
     if let Loaded::Ready(it) = &loaded {
-        if it.routes.is_empty() && !watch {
-            return 0;
+        if it.routes.is_empty() && !o.watch {
+            return Ok(None);
         }
     }
-    let mut app = App::new(loaded, shared.clone(), path, base, watch);
-    app.static_check = static_check;
-    app.max_body = max_body;
-    if let Some(admin) = register {
+    let mut app = App::new(loaded, shared, path, base, o.watch);
+    app.static_check = o.static_check;
+    app.max_body = o.max_body;
+    Ok(Some(app))
+}
+
+fn run(file: &str, flags: &[String]) -> i32 {
+    let o = match run_options(flags) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+    let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
+    let path = Path::new(file);
+    let mut app = match load(path, &o) {
+        Ok(Some(app)) => app,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    if let Some(admin) = o.register {
         let Ok(port) = port.parse::<u16>() else {
             eprintln!("quillo: --register needs a numeric --port");
             return 2;
         };
-        let service = service.unwrap_or_else(|| {
+        let service = o.service.unwrap_or_else(|| {
             path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into())
         });
         let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
@@ -175,9 +236,9 @@ fn run(file: &str, flags: &[String]) -> i32 {
             );
             app.cluster_sources = Some(m.admin_addresses());
         }
-        quillo::cluster::join(shared, m);
+        quillo::cluster::join(app.shared(), m);
     }
-    match quillo::server::serve(app, &format!("{}:{}", host, port), workers) {
+    match quillo::server::serve(app, &format!("{}:{}", host, port), o.workers) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("quillo: {}", e);

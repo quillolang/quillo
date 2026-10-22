@@ -55,6 +55,23 @@ serves them:
 | `--no-check` | skip the static checks |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 
+### Desktop apps
+
+`quillo app` runs a program in a native window instead of a browser tab: the
+platform's own web view (WebKit on macOS and Linux, WebView2 on Windows) shows
+its pages, and closing the window ends the program. It is built only on request:
+
+```sh
+cargo build --release --features app      # Linux also needs libwebkit2gtk-4.1-dev
+./target/release/quillo app examples/notes.qwe --watch
+```
+
+It takes the options of `run` except `--host`, `--register` and `--service`. The
+program is served on 127.0.0.1, at a port the system picks, to the window alone:
+the window's first request carries a token made for this launch and trades it
+for a cookie, and requests without one (other programs, pages of other sites)
+get 403. Links to other sites open in the system's browser.
+
 Editor support: [editors/vscode](editors/vscode) is a VS Code extension (highlighting,
 diagnostics as you type, hover, go to definition, completion, outline, snippets).
 Other editors can run `quillo lsp` directly.

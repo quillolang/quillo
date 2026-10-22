@@ -27,3 +27,13 @@ webpki-roots = "0.26"
 bytes = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny_http = "0.12"
+# `quillo app`: the program in a native window (see src/desktop.rs).
+wry = { version = "0.57", optional = true, features = ["devtools"] }
+tao = { version = "0.37", optional = true }
+
+# The macOS menu bar, without which copy and paste do not work in the window.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", optional = true }
+
+[features]
+app = ["dep:wry", "dep:tao", "dep:muda"]
