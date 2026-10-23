@@ -37,6 +37,8 @@ const MAX_HEADERS: usize = 100;
 const IDLE: Duration = Duration::from_secs(60);
 /// A request still arriving after this long is given up on.
 const SLOW: Duration = Duration::from_secs(30);
+/// How long a connection being closed may keep sending (see `linger`).
+const LINGER: Duration = Duration::from_secs(2);
 /// A request's stack: address space, used only as needed.
 const STACK: usize = 16 << 20;
 /// Stacks kept for reuse.
@@ -117,6 +119,9 @@ struct Conn {
     continued: bool,
     /// Close once `output` is written.
     closing: bool,
+    /// Written and shut for writing: what still arrives is thrown away
+    /// until the client closes (see `linger`).
+    lingering: bool,
 }
 
 enum Fate {
@@ -584,6 +589,7 @@ impl Loop {
             receiving: None,
             continued: false,
             closing: false,
+            lingering: false,
         }));
         // Its first request has often arrived with it.
         self.ready.push_back(i);
@@ -595,6 +601,7 @@ impl Loop {
         for i in 0..self.slots.len() {
             let Slot::Idle(c) = &self.slots[i] else { continue };
             let stale = match c.receiving {
+                _ if c.lingering => now.duration_since(c.active) > LINGER,
                 Some(since) => now.duration_since(since) > SLOW,
                 None => c.output.is_empty() && now.duration_since(c.active) > IDLE,
             };
@@ -612,6 +619,27 @@ impl Loop {
         self.free.push(i);
     }
 
+    /// Ends a connection whose answers are all written. Closing it at once
+    /// while the client is still sending (a body refused as too large, say)
+    /// makes the system reset the connection, and the client may lose the
+    /// answer; so it is shut for writing and kept until the client closes
+    /// too, throwing away what arrives, for `LINGER` at most.
+    fn linger(&mut self, i: usize, mut c: Box<Conn>) {
+        if c.stream.shutdown(std::net::Shutdown::Write).is_err() {
+            return self.close(i, c);
+        }
+        c.lingering = true;
+        c.active = self.now;
+        c.input = Vec::new();
+        if c.writing {
+            c.writing = false;
+            let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
+        }
+        self.slots[i] = Slot::Idle(c);
+        // What already arrived raises no new event.
+        self.ready.push_back(i);
+    }
+
     /// Something happened on connection `i`: write, read, and start
     /// answering what has arrived.
     fn serve(&mut self, i: usize) {
@@ -626,13 +654,26 @@ impl Loop {
             }
             _ => return,
         };
+        if c.lingering {
+            loop {
+                match c.stream.read(&mut self.chunk) {
+                    Ok(0) => return self.close(i, c),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => return self.close(i, c),
+                }
+            }
+            self.slots[i] = Slot::Idle(c);
+            return;
+        }
         c.active = self.now;
         if !c.output.is_empty() {
             match flush(&mut c) {
                 Err(_) => return self.close(i, c),
                 // The client is not reading: read no more from it either.
                 Ok(false) => return self.park(i, c),
-                Ok(true) if c.closing => return self.close(i, c),
+                Ok(true) if c.closing => return self.linger(i, c),
                 Ok(true) => {}
             }
         }
@@ -824,7 +865,7 @@ impl Loop {
         match flush(&mut c) {
             Err(_) => self.close(i, c),
             Ok(false) => self.park(i, c),
-            Ok(true) if c.closing => self.close(i, c),
+            Ok(true) if c.closing => self.linger(i, c),
             Ok(true) => {
                 if c.writing {
                     c.writing = false;

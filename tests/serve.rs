@@ -318,6 +318,16 @@ fn large_bodies_are_refused_before_they_are_read() {
     let srv = start(&f, &["--max-body", "100"]);
     assert_eq!(request(srv.port, "POST", "/echo", &"x".repeat(100)), (200, "100".into()));
     assert_eq!(request(srv.port, "POST", "/echo", &"x".repeat(101)).0, 413);
+    // The answer comes before the body is sent, and is not lost when the
+    // body arrives after it (closing at once would reset the connection).
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = s.write_all(&[b'x'; 100000]);
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 413"), "{}", out);
     // Still serving afterwards.
     assert_eq!(request(srv.port, "POST", "/echo", "abc"), (200, "3".into()));
 }
