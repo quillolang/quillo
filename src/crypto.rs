@@ -135,13 +135,38 @@ fn token(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
+/// Hashes running at once, each with its 19 MiB, are at most one per core;
+/// more wait their turn (off the event loop), so a flood of logins cannot
+/// take the server's memory.
+fn argon2_turn<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::{Condvar, Mutex};
+    static RUNNING: Mutex<usize> = Mutex::new(0);
+    static FREED: Condvar = Condvar::new();
+    let most = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut n = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    while *n >= most {
+        n = FREED.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    *n += 1;
+    drop(n);
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            FREED.notify_one();
+        }
+    }
+    let _done = Done;
+    f()
+}
+
 fn hash_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     use argon2::password_hash::{PasswordHasher, SaltString};
     let pw = text(&args, 0, "hash_password", line)?;
     let Some(salt) = random_bytes(16) else { return fail(line, "`crypto.hash_password`: the operating system gave no random bytes") };
     let hashed = it.unlocked(move || {
         let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
-        argon2::Argon2::default().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string())
+        argon2_turn(|| argon2::Argon2::default().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string()))
     });
     match hashed {
         Ok(h) => Ok(Value::str(h)),
@@ -164,7 +189,7 @@ fn verify_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         _ => STAND_IN.into(),
     };
     Ok(Value::Bool(it.unlocked(move || {
-        let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw.as_bytes(), h).is_ok();
+        let check = |h: &PasswordHash| argon2_turn(|| argon2::Argon2::default().verify_password(pw.as_bytes(), h).is_ok());
         match PasswordHash::new(&hash) {
             Ok(h) if &*hash != STAND_IN => check(&h),
             _ => {

@@ -570,3 +570,36 @@ route GET /runs = db.query("select server, sec from runs order by sec")
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(get(c.port, "/ticks").1, "0");
 }
+
+#[test]
+fn large_files_are_sent_from_disk() {
+    let d = temp_dir("large-file");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        "route GET /f/*p = file(p)\nroute GET /forged = respond(200, \"\", { \"x-quillo-send\": \"L2V0Yy9wYXNzd2Q.AAAA\" })\n",
+    )
+    .unwrap();
+    let data: Vec<u8> = (0..5_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(d.join("clip.mp4"), &data).unwrap();
+    let srv = start(&f, &[]);
+    let raw = |method: &str, path: &str, extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        write!(s, "{} {} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAccept-Encoding: gzip\r\n{}\r\n", method, path, extra).unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (String::from_utf8_lossy(&out[..at]).to_lowercase(), out[at + 4..].to_vec())
+    };
+    let (h, b) = raw("GET", "/f/clip.mp4", "");
+    assert!(h.starts_with("http/1.1 200") && h.contains("content-length: 5000000") && h.contains("etag: w/"), "{}", h);
+    assert!(!h.contains("x-quillo-send") && !h.contains("content-encoding"), "{}", h);
+    assert!(b == data, "{} bytes", b.len());
+    let (h, b) = raw("GET", "/f/clip.mp4", "Range: bytes=2000000-2000099\r\n");
+    assert!(h.starts_with("http/1.1 206") && h.contains("content-range: bytes 2000000-2000099/5000000"), "{}", h);
+    assert_eq!(b, &data[2_000_000..2_000_100]);
+    let (h, b) = raw("HEAD", "/f/clip.mp4", "");
+    assert!(h.contains("content-length: 5000000") && b.is_empty(), "{}", h);
+    // Only file() can have a file sent.
+    assert_eq!(get(srv.port, "/forged").0, 500);
+}

@@ -26,6 +26,7 @@ const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
 const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
+const HTML_SINKS = ["insertAdjacentHTML", "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln"];
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
 const foreign = (v) => v !== null && typeof v === "object" && v.constructor !== Object && v.constructor !== undefined
@@ -236,7 +237,13 @@ function call(f, args) {
 // `recv.name(args)`: a function stored in the map, or `name(recv, args)`.
 function mcall(recv, name, fb, args) {
   if (isMap(recv) && hasOwn(recv, name)) return call(recv[name], args);
-  if (foreign(recv) && typeof recv[name] === "function") { const r = recv[name](...args); return r === undefined ? null : r; }
+  if (foreign(recv) && typeof recv[name] === "function") {
+    // Text becomes markup or code through these, which markup in the
+    // component does safely.
+    if (HTML_SINKS.includes(name)) fail(`\`${name}\` is not called from Quillo code: it runs text as HTML`);
+    const r = recv[name](...args);
+    return r === undefined ? null : r;
+  }
   if (typeof fb === "function") return fb(recv, ...args);
   fail(`${typeName(recv)} has no method \`${name}\``);
 }

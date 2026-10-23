@@ -410,7 +410,8 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
-  methods as fields: `el.value`, `chart.update()`.
+  methods as fields: `el.value`, `chart.update()`. Methods that make HTML of text
+  (`insertAdjacentHTML`, `document.write`, ...) are refused; markup does that safely.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps
@@ -640,6 +641,9 @@ route POST /logout { end_session(); redirect("/") }
   session and the rest in the database. The signature covers its expiry, its tenant
   and the program's mount point, so it is no session past its time, for another
   tenant, or in another mounted program.
+- `end_session()` removes the cookie from the browser, but a copy someone kept stays
+  valid until it expires. To end sessions on the server (log out everywhere, a stolen
+  laptop), keep an id in the session and check it against the database.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
   when the server stops.
@@ -696,8 +700,9 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
 - `Range: bytes=…` gets a `206` with only those bytes (audio and video seeking); a range
   past the end gets a `416`.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
-  disk; larger ones are read off the event loop. The gzipped copy of a text file is kept
-  too, rather than compressed again for each request.
+  disk. Larger ones are sent from disk as they are written, on a thread of their own
+  with a 64 KiB buffer, so a video costs no more memory than a page. The gzipped copy
+  of a text file is kept too, rather than compressed again for each request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 ### Translations
@@ -772,7 +777,9 @@ prefix. Changes to mounted files are picked up by `--watch`. See
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
   is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets).
-  Password hashing takes tens of milliseconds on purpose and runs off the event loop.
+  Password hashing takes tens of milliseconds and 19 MiB on purpose, runs off the event
+  loop, and at most one per core at a time (others wait their turn), so a flood of
+  logins slows logins down rather than taking the server's memory.
 - **Effects:** `sleep(ms)`, `random()`, `random_int(lo, hi)`, `uuid()`, `read_file(path)`,
   `write_file(path, text)` (paths stay inside the program's folder). `uuid()` takes its
   bytes from the operating system, so it can serve as a session id or token; `random()`

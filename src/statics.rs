@@ -102,6 +102,69 @@ pub fn read_range(full: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// Larger files go out from disk a piece at a time, on a thread of their
+/// own, so they take no more memory than a buffer (see `Worker::answer`).
+/// `file()` marks the response with what to send, signed with a key only
+/// this process has, so that a program's own headers cannot name a file.
+pub const SEND_HEADER: &str = "x-quillo-send";
+
+fn send_key() -> &'static [u8] {
+    static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| crate::crypto::random_bytes(32).unwrap_or_else(|| b"quillo: no random bytes".to_vec()))
+}
+
+/// The mark for bytes `start..start + len` of a file.
+pub fn mark(full: &Path, start: u64, len: u64) -> String {
+    let what = format!("{}:{}:{}", start, len, full.display());
+    let sig = crate::crypto::hmac_sha256(send_key(), what.as_bytes());
+    format!("{}.{}", crate::crypto::b64url(what.as_bytes()), crate::crypto::b64url(&sig))
+}
+
+/// What a mark names, if this process made it.
+pub fn marked(v: &str) -> Option<(PathBuf, u64, u64)> {
+    let (what, sig) = v.split_once('.')?;
+    let what = crate::crypto::unb64url(what)?;
+    if !crate::crypto::same(&crate::crypto::hmac_sha256(send_key(), &what), &crate::crypto::unb64url(sig)?) {
+        return None;
+    }
+    let what = String::from_utf8(what).ok()?;
+    let mut parts = what.splitn(3, ':');
+    let start = parts.next()?.parse().ok()?;
+    let len = parts.next()?.parse().ok()?;
+    Some((PathBuf::from(parts.next()?), start, len))
+}
+
+/// Answers on a connection of its own: `resp`'s head, then `len` bytes of
+/// the file from `start` (none for `HEAD`), and closes it.
+pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse, (path, start, len): (PathBuf, u64, u64), head: bool) {
+    use std::io::Write;
+    // A reader that stopped reading lets the thread go.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    let mut out = Vec::with_capacity(512);
+    let file = std::fs::File::open(&path).and_then(|mut f| f.seek(SeekFrom::Start(start)).map(|_| f));
+    let Ok(f) = file else {
+        crate::httpd::write_response(&mut out, &crate::server::plain_response(404, "not found\n"), head, true);
+        let _ = stream.write_all(&out);
+        return;
+    };
+    crate::httpd::write_head(&mut out, resp, len, true);
+    if stream.write_all(&out).is_err() || head {
+        return;
+    }
+    let mut f = f.take(len);
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// A single `Range: bytes=...` of a file `len` long: `Some(Ok((start,
 /// end)))`, `Some(Err(()))` when it cannot be served (416), or `None` to
 /// send the whole file (no range, several ranges, or not bytes).

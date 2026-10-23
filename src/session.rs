@@ -123,7 +123,8 @@ fn encode(v: &str) -> String {
 fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts: Option<&Map>, f: &str, line: u32) -> Result<String, Ctrl> {
     let opt = |k: &str| opts.and_then(|m| m.get(k)).filter(|v| !matches!(v, Value::Nil)).cloned();
     let path = match opt("path") {
-        Some(Value::Str(p)) if p.starts_with('/') && !p.contains(';') => p.to_string(),
+        // Visible characters only: a line break would start another header.
+        Some(Value::Str(p)) if p.starts_with('/') && p.bytes().all(|b| (b'!'..=b'~').contains(&b) && b != b';') => p.to_string(),
         Some(v) => return fail(line, format!("`{}`'s path starts with /, got {}", f, v.repr())),
         None if it.base.is_empty() => "/".into(),
         None => it.base.clone(),

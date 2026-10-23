@@ -678,9 +678,16 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     headers.push(("content-type".into(), mime(&full).into()));
     headers.push(("accept-ranges".into(), "bytes".into()));
+    // Larger files are sent from disk as they are written (see `statics`).
+    let large = info.len > 1 << 20;
     if let Some(r) = asked("range", it) {
         let same = asked("if-range", it).map_or(true, |v| v == info.etag || v == info.last_modified);
         match crate::statics::range(&r, info.len).filter(|_| same) {
+            Some(Ok((start, end))) if large => {
+                headers.push(("content-range".into(), format!("bytes {}-{}/{}", start, end, info.len)));
+                headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, start, end - start + 1)));
+                return answer(206, headers, Vec::new());
+            }
             Some(Ok((start, end))) => {
                 let from = full.clone();
                 return match it.unlocked(move || crate::statics::read_range(&from, start, end)) {
@@ -698,14 +705,12 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             None => {}
         }
     }
-    // Small files are in memory; larger ones are read off the event loop.
-    let bytes = if info.len <= 1 << 20 {
-        crate::statics::read(&full, &info)
-    } else {
-        let from = full.clone();
-        it.unlocked(move || crate::statics::read(&from, &info))
-    };
-    match bytes {
+    if large {
+        headers.push((crate::statics::SEND_HEADER.into(), crate::statics::mark(&full, 0, info.len)));
+        return answer(200, headers, Vec::new());
+    }
+    // Small files are kept in memory.
+    match crate::statics::read(&full, &info) {
         Ok(b) => answer(200, headers, b.to_vec()),
         Err(_) => Ok(not_found()),
     }

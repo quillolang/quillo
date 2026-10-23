@@ -1077,10 +1077,19 @@ impl Worker {
                 _ => {}
             }
         }
-        compress(&req, &mut resp);
         if resp.header("x-content-type-options").is_none() {
             resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
         }
+        // A large file, sent from disk on a thread of its own.
+        if let Some(i) = resp.headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(crate::statics::SEND_HEADER)) {
+            let (_, mark) = resp.headers.remove(i);
+            let Some(what) = crate::statics::marked(&mark) else {
+                return Answer::Respond(plain(500, "internal error\n"));
+            };
+            let head = req.method == "HEAD";
+            return waiter("quillo-file", move |stream| crate::statics::send(stream, &resp, what, head));
+        }
+        compress(&req, &mut resp);
         Answer::Respond(resp)
     }
 }

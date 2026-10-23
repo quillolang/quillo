@@ -1572,9 +1572,23 @@ impl<'a> Compiler<'a> {
         if !ok {
             return self.err(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", f, path));
         }
-        let banned = ["eval", "Function", "setTimeout", "setInterval", "execScript"];
+        let banned = [
+            "eval",
+            "Function",
+            "setTimeout",
+            "setInterval",
+            "execScript",
+            "insertAdjacentHTML",
+            "setHTMLUnsafe",
+            "parseHTMLUnsafe",
+            "createContextualFragment",
+            "write",
+            "writeln",
+            "constructor",
+            "__proto__",
+        ];
         let last = path.rsplit('.').next().unwrap_or("");
-        if banned.contains(&last) || path.starts_with("document.write") || last == "constructor" || last == "__proto__" {
+        if banned.contains(&last) {
             return self.err(format!("`{}` does not call {}: it runs text as code", f, path));
         }
         Ok(())

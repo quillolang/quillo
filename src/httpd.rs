@@ -1195,6 +1195,15 @@ fn find_crlf(b: &[u8]) -> Option<usize> {
 /// `content-length`, `transfer-encoding`, `connection` and `date` are
 /// replaced by the server's.
 pub(crate) fn write_response(out: &mut Vec<u8>, resp: &HttpResponse, head: bool, close: bool) {
+    let bodyless = write_head(out, resp, resp.body.len() as u64, close);
+    if !head && !bodyless {
+        out.extend_from_slice(&resp.body);
+    }
+}
+
+/// The status line and headers for a body `len` long (written by the
+/// caller, if at all); whether the status has no body.
+pub(crate) fn write_head(out: &mut Vec<u8>, resp: &HttpResponse, len: u64, close: bool) -> bool {
     out.extend_from_slice(b"HTTP/1.1 ");
     push_num(out, resp.status as u64);
     out.push(b' ');
@@ -1219,7 +1228,7 @@ pub(crate) fn write_response(out: &mut Vec<u8>, resp: &HttpResponse, head: bool,
     let bodyless = resp.status < 200 || resp.status == 204 || resp.status == 304;
     if !bodyless {
         out.extend_from_slice(b"content-length: ");
-        push_num(out, resp.body.len() as u64);
+        push_num(out, len);
         out.extend_from_slice(b"\r\n");
     }
     if !server {
@@ -1239,9 +1248,7 @@ pub(crate) fn write_response(out: &mut Vec<u8>, resp: &HttpResponse, head: bool,
         out.extend_from_slice(b"connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    if !head && !bodyless {
-        out.extend_from_slice(&resp.body);
-    }
+    bodyless
 }
 
 thread_local! {

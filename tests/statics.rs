@@ -60,8 +60,6 @@ fn a_current_copy_gets_a_304() {
 #[test]
 fn ranges_are_served_on_their_own() {
     let (d, mut it) = site("range");
-    let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
-    std::fs::write(d.join("public/clip.mp4"), &data).unwrap();
     std::fs::write(d.join("public/b.txt"), "0123456789").unwrap();
 
     let r = get(&mut it, "/f/b.txt", &[("Range", "bytes=2-5")]);
@@ -79,12 +77,6 @@ fn ranges_are_served_on_their_own() {
     assert_eq!((r.status, r.text().as_str()), (200, "0123456789"));
     let etag = r.header("etag").unwrap().to_string();
     assert_eq!(get(&mut it, "/f/b.txt", &[("Range", "bytes=2-5"), ("If-Range", &etag)]).status, 206);
-
-    // A large file: the part asked for, and the whole of it.
-    let r = get(&mut it, "/f/clip.mp4", &[("Range", "bytes=2000000-2000099")]);
-    assert_eq!((r.status, r.header("content-type")), (206, Some("video/mp4")));
-    assert_eq!(r.body, &data[2_000_000..2_000_100]);
-    assert_eq!(get(&mut it, "/f/clip.mp4", &[]).body, data);
     let _ = std::fs::remove_dir_all(&d);
 }
 
