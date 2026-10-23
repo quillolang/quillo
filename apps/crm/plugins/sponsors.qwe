@@ -1,0 +1,30 @@
+// Sponsorships for news outlets and bloggers: deals say where an ad runs
+// and when; a won deal must have its run date.
+
+let PLACEMENTS = ["Newsletter", "Article", "Homepage", "Podcast", "Social"]
+
+let plugin_sponsors = {
+    id: "sponsors",
+    name: "Sponsorships",
+    description: "Deals for ad placements: where it runs and when.",
+    audience: ["news", "blogger"],
+    fields: [
+        { entity: "deal", key: "placement", label: "Placement", type: "select", options: PLACEMENTS },
+        { entity: "deal", key: "run_date", label: "Runs on", type: "date" },
+    ],
+    rules: {
+        deal: [
+            (d, ctx) => {
+                let f = d.fields ?? {}
+                when(ctx.stage_kind == "won" && !blank(f.placement) && blank(f.run_date), problem("fields.run_date", "A won sponsorship needs its run date"))
+            },
+            (d, ctx) => {
+                let run = (d.fields ?? {}).run_date
+                when(!blank(run) && parse_day(run) != null && !blank(ctx.today) && run < ctx.today && ctx.stage_kind == "open",
+                    warning("fields.run_date", "This run date has passed"))
+            },
+        ],
+    },
+}
+
+let runners_sponsors = {}

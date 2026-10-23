@@ -1,0 +1,213 @@
+// Workspaces: signing one up (on the main site), what each kind starts with,
+// and their settings, fields, pipelines and team.
+
+let RESERVED = ["www", "app", "api", "admin", "mail", "help", "status", "static", "assets", "login", "signup"]
+
+let INDUSTRIES = [
+    { id: "merchant", label: "Merchant", about: "Shops and makers: products, orders, loyalty, after-purchase flows." },
+    { id: "blogger", label: "Blogger / creator", about: "Subscribers, memberships, sponsorships, welcome series." },
+    { id: "news", label: "News outlet", about: "Readers, digital subscriptions, advertisers, newsletters." },
+]
+
+// Rules for the signup form: the browser hints, the server decides.
+let workspace_rules = [
+    (w, ctx) => when(blank(w.name), problem("name", "Name your workspace")),
+    (w, ctx) => {
+        let s = w.slug ?? ""
+        blank(s) ? problem("slug", "Choose an address")
+        : slugify(s) != s ? problem("slug", "Lowercase letters, digits and dashes")
+        : len(s) < 3 || len(s) > 30 ? problem("slug", "3 to 30 characters")
+        : contains(RESERVED, s) ? problem("slug", "That address is reserved")
+        : []
+    },
+    (w, ctx) => when(!any(INDUSTRIES, (i) => i.id == w.industry), problem("industry", "What kind of business is this?")),
+    (w, ctx) => when(blank(w.owner_name), problem("owner_name", "Your name")),
+    (w, ctx) => when(!is_email(w.email), problem("email", "Your email address")),
+    (w, ctx) => {
+        let p = w.password ?? ""
+        len(p) < 10 ? problem("password", "At least 10 characters")
+        : contains(["password12", "1234567890", "qwertyuiop"], lower(p)) ? problem("password", "Too easy to guess")
+        : []
+    },
+]
+
+
+fn check_workspace(w: map) = workspace_rules | map((r) => r(w, {})) | flatten
+
+// ---- what each kind of workspace starts with --------------------------------------
+
+fn preset(industry: str) = match industry {
+    "merchant" => {
+        plugins: ["loyalty", "vat", "gdpr", "quality"],
+        pipeline: { name: "Wholesale", stages: [["Lead", 10, "open"], ["Qualified", 30, "open"], ["Proposal", 60, "open"], ["Won", 100, "won"], ["Lost", 0, "lost"]] },
+        products: [
+            { name: "Organic cotton tee", sku: "tee", price_cents: 2500, kind: "one_time", interval: "", stock: 40, description: "Soft, heavy, made to last." },
+            { name: "Gift card", sku: "gift-card", price_cents: 5000, kind: "one_time", interval: "", stock: null, description: "Delivered by email." },
+        ],
+        forms: [{ slug: "newsletter", name: "Newsletter", headline: "New arrivals and offers, twice a month.", fields: ["email", "first_name"], tags: ["newsletter"] }],
+        flows: ["purchase", "welcome"],
+    }
+    "blogger" => {
+        plugins: ["paywall", "sponsors", "gdpr", "quality"],
+        pipeline: { name: "Sponsorships", stages: [["Pitched", 10, "open"], ["Negotiating", 40, "open"], ["Booked", 100, "won"], ["Declined", 0, "lost"]] },
+        products: [{ name: "Supporter membership", sku: "supporter", price_cents: 500, kind: "subscription", interval: "month", stock: null, description: "Members-only posts and my thanks." }],
+        forms: [{ slug: "subscribe", name: "Subscribe", headline: "New posts in your inbox. No spam.", fields: ["email", "first_name"], tags: ["reader"] }],
+        flows: ["welcome", "membership"],
+    }
+    _ => {
+        plugins: ["paywall", "sponsors", "gdpr", "quality"],
+        pipeline: { name: "Advertising", stages: [["Inquiry", 10, "open"], ["Proposal", 40, "open"], ["Insertion order", 80, "open"], ["Booked", 100, "won"], ["Lost", 0, "lost"]] },
+        products: [
+            { name: "Digital subscription", sku: "digital", price_cents: 900, kind: "subscription", interval: "month", stock: null, description: "Every story, every day." },
+            { name: "Digital subscription, annual", sku: "digital-annual", price_cents: 9000, kind: "subscription", interval: "year", stock: null, description: "Two months free." },
+        ],
+        forms: [{ slug: "morning-briefing", name: "Morning briefing", headline: "The day's news in five minutes, at 7am.", fields: ["email"], tags: ["briefing"] }],
+        flows: ["welcome", "membership"],
+    }
+}
+
+// Fills a new workspace's database. Runs inside `with_tenant`.
+fn setup_workspace(w: map, url: str) {
+    let p = preset(w.industry)
+    let t = now()
+    let currency = w.currency ?? "USD"
+    for [k, v] in { name: trim(w.name), slug: w.slug, industry: w.industry, currency, plugins: p.plugins, secret: crypto.token(), url, country: "US", vat_rate: "0" } =>
+        put_setting(k, v)
+    let owner = db.exec("insert into users (email, name, password_hash, role, created_at) values (?, ?, ?, 'owner', ?)",
+        lower(trim(w.email)), trim(w.owner_name), crypto.hash_password(w.password), t).last_id
+    let pipeline = db.exec("insert into pipelines (name, position) values (?, 0)", p.pipeline.name).last_id
+    for [i, s] in enumerate(p.pipeline.stages) =>
+        db.exec("insert into stages (pipeline_id, name, position, probability, kind) values (?, ?, ?, ?, ?)", pipeline, s[0], i, s[1], s[2])
+    for pr in p.products =>
+        db.exec("insert into products (name, sku, price_cents, kind, interval, description, stock, active, created_at) values (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            pr.name, pr.sku, pr.price_cents, pr.kind, pr.interval, pr.description, pr.stock, t)
+    for f in p.forms =>
+        db.exec("insert into forms (slug, name, headline, fields, tags, created_at) values (?, ?, ?, ?, ?, ?)",
+            f.slug, f.name, f.headline, json.stringify(f.fields), json.stringify(f.tags), t)
+    for kind in p.flows => {
+        let tpl = with_product(flow_template(kind))
+        db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 1, ?, ?)", tpl.name, json.stringify(tpl.graph), t, t)
+    }
+    sign_in_token(owner)
+}
+
+fn sign_in_token(user_id: int) {
+    let token = crypto.token()
+    db.exec("insert into sign_in_tokens (token, user_id, expires_at) values (?, ?, ?)", token, user_id, now() + 10 * 60000)
+    token
+}
+
+// On the main site: is this address free?
+server fn slug_free(slug: str) = slugify(slug) == slug && !contains(RESERVED, slug) && !db.tenant_exists(slug)
+
+server fn create_workspace(w: map) {
+    let problems = errors_of(check_workspace(w))
+    if len(problems) > 0 { return err({ problems }) }
+    if db.tenant_exists(w.slug) { return err({ problems: problem("slug", "That address is taken") }) }
+    let url = workspace_url(w.slug, request.headers.host ?? DOMAIN)
+    let token = with_tenant(w.slug, () => setup_workspace(w, url))
+    { url: `${url}/welcome/${token}` }
+}
+
+// ---- settings, fields, pipelines and the team ---------------------------------------
+
+// Everything the app's pages need about the workspace, once, when it loads.
+server fn load_workspace() {
+    let u = need_user()?
+    let s = settings()
+    {
+        user: u,
+        name: s.name ?? "",
+        slug: s.slug ?? "",
+        industry: s.industry ?? "merchant",
+        currency: s.currency ?? "USD",
+        enabled: s.plugins ?? [],
+        fields: custom_fields(),
+        settings: remove(remove(s, "secret"), "mail_webhook"),
+        mail_live: (s.mail_webhook ?? "") != "",
+        today: iso_day(now()),
+        pipelines: db.query("select * from pipelines order by position, id"),
+        stages: db.query("select * from stages order by pipeline_id, position"),
+        users: db.query("select id, name, email, role from users order by name"),
+        forms: db.query("select slug, name from forms order by name"),
+        skus: db.query("select sku, name from products where active = 1 order by name"),
+    }
+}
+
+server fn save_settings(s: map) {
+    need_admin()?
+    let rate = float(str(s.vat_rate ?? "0"))
+    if is_err(rate) || rate < 0 || rate > 50 { return err({ problems: problem("vat_rate", "A rate from 0 to 50 (percent)") }) }
+    if blank(s.name) { return err({ problems: problem("name", "The workspace needs a name") }) }
+    if !blank(s.mail_webhook) && !starts_with(s.mail_webhook, "https://") { return err({ problems: problem("mail_webhook", "An https:// address") }) }
+    for k in ["name", "currency", "country", "vat_rate", "mail_webhook"] => s[k] != null && put_setting(k, trim(str(s[k])))
+    true
+}
+
+server fn mail_webhook_of() {
+    need_admin()?
+    settings().mail_webhook ?? ""
+}
+
+server fn set_plugins(enabled: list) {
+    need_admin()?
+    let known = plugins | map((p) => p.id)
+    put_setting("plugins", enabled | filter((id) => id != "core" && contains(known, id)) | unique)
+    true
+}
+
+server fn save_field(f: map) {
+    need_admin()?
+    let key = replace(slugify(blank(f.key) ? f.label : f.key), "-", "_")
+    if blank(f.label) { return err({ problems: problem("label", "A label") }) }
+    if !contains(["contact", "company", "deal"], f.entity) { return err({ problems: problem("entity", "Contacts, companies or deals") }) }
+    if !contains(["text", "number", "date", "select", "checkbox", "url"], f.type) { return err({ problems: problem("type", "Choose a type") }) }
+    let options = json.stringify((f.options ?? []) | map((o) => trim(str(o))) | filter((o) => o != ""))
+    if f.id == null {
+        let other = db.one("select id from custom_fields where entity = ? and key = ?", f.entity, key)
+        if other != null { return err({ problems: problem("label", "There is a field with this name") }) }
+        db.exec("insert into custom_fields (entity, key, label, type, required, options, position) values (?, ?, ?, ?, ?, ?, (select coalesce(max(position), 0) + 1 from custom_fields))",
+            f.entity, key, trim(f.label), f.type, f.required == true ? 1 : 0, options)
+    } else {
+        db.exec("update custom_fields set label = ?, type = ?, required = ?, options = ? where id = ?", trim(f.label), f.type, f.required == true ? 1 : 0, options, f.id)
+    }
+    true
+}
+
+server fn delete_field(id: int) {
+    need_admin()?
+    db.exec("delete from custom_fields where id = ?", id)
+    true
+}
+
+server fn save_stage(s: map) {
+    need_admin()?
+    if blank(s.name) { return err({ problems: problem("name", "Name the stage") }) }
+    if s.id == null {
+        db.exec("insert into stages (pipeline_id, name, position, probability, kind) values (?, ?, (select coalesce(max(position), 0) + 1 from stages where pipeline_id = ?), ?, ?)",
+            s.pipeline_id, trim(s.name), s.pipeline_id, s.probability ?? 0, s.kind ?? "open")
+    } else {
+        db.exec("update stages set name = ?, probability = ?, kind = ? where id = ?", trim(s.name), s.probability ?? 0, s.kind ?? "open", s.id)
+    }
+    true
+}
+
+server fn add_pipeline(name: str) {
+    need_admin()?
+    if blank(name) { return err("Name the pipeline") }
+    let id = db.exec("insert into pipelines (name, position) values (?, (select coalesce(max(position), 0) + 1 from pipelines))", trim(name)).last_id
+    for [i, s] in enumerate([["New", 10, "open"], ["Won", 100, "won"], ["Lost", 0, "lost"]]) =>
+        db.exec("insert into stages (pipeline_id, name, position, probability, kind) values (?, ?, ?, ?, ?)", id, s[0], i, s[1], s[2])
+    id
+}
+
+server fn add_user(u: map) {
+    need_admin()?
+    if blank(u.name) { return err({ problems: problem("name", "Their name") }) }
+    if !is_email(u.email) { return err({ problems: problem("email", "Their email address") }) }
+    if len(u.password ?? "") < 10 { return err({ problems: problem("password", "At least 10 characters") }) }
+    if db.one("select id from users where email = ?", lower(trim(u.email))) != null { return err({ problems: problem("email", "Already on the team") }) }
+    db.exec("insert into users (email, name, password_hash, role, created_at) values (?, ?, ?, ?, ?)",
+        lower(trim(u.email)), trim(u.name), crypto.hash_password(u.password), u.role == "admin" ? "admin" : "member", now())
+    true
+}

@@ -1,0 +1,182 @@
+// The core plugin: always on. Its rules are the CRM's own; its steps are
+// the flow designer's built-in ones.
+
+let TRIGGERS = [
+    { event: "contact_created", label: "A contact is added" },
+    { event: "form_submitted", label: "A form is submitted" },
+    { event: "order_paid", label: "A product is bought" },
+    { event: "tag_added", label: "A tag is added" },
+    { event: "deal_won", label: "A deal is won" },
+    { event: "manual", label: "Started by hand" },
+]
+
+let STAGES = ["lead", "prospect", "customer", "subscriber", "churned"]
+
+fn flow_node(graph, id) = find(graph.nodes ?? [], (n) => n.id == id)
+
+// The node types flows can use, from the plugins switched on.
+fn step_types(enabled: list) =
+    [{ type: "trigger", label: "Trigger", group: "Start", outputs: ["out"], fields: [] }]
+        + (active_plugins(enabled) | map((p) => p.steps ?? []) | flatten)
+
+fn step_type(enabled: list, type: str) = find(step_types(enabled), (s) => s.type == type)
+
+// Nodes reachable from the trigger, following edges.
+fn reachable(graph: map) {
+    let trigger = find(graph.nodes ?? [], (n) => n.type == "trigger")
+    trigger == null ? [] : reach_from(graph.edges ?? [], [trigger.id])
+}
+
+fn reach_from(edges: list, seen: list) {
+    let next = edges | filter((e) => contains(seen, e.from) && !contains(seen, e.to)) | map((e) => e.to) | unique
+    len(next) == 0 ? seen : reach_from(edges, seen + next)
+}
+
+let flow_rules = [
+    (g, ctx) => {
+        let triggers = (g.nodes ?? []) | filter((n) => n.type == "trigger")
+        when(len(triggers) != 1, problem("graph", "A flow starts with exactly one trigger"))
+    },
+    (g, ctx) => {
+        let seen = reachable(g)
+        (g.nodes ?? []) | filter((n) => !contains(seen, n.id)) | map((n) => problem(`node.${n.id}`, "Nothing leads to this step")) | flatten
+    },
+    (g, ctx) => (g.edges ?? []) | filter((e) => (flow_node(g, e.to) ?? {}).type == "trigger") | map((e) => problem(`node.${e.to}`, "The trigger cannot follow another step")) | flatten,
+    (g, ctx) => (g.nodes ?? []) | map((n) => {
+        let t = step_type(ctx.enabled ?? [], n.type)
+        let c = n.config ?? {}
+        if t == null {
+            problem(`node.${n.id}`, `Unknown step "${n.type}" (is its plugin switched on?)`)
+        } else {
+            let missing = (t.fields ?? []) | filter((f) => f.required == true && blank(c[f.key])) | map((f) => problem(`node.${n.id}`, `${t.label}: ${f.label} is required`)) | flatten
+            let branches = (t.outputs ?? ["out"]) | filter((port) => len(t.outputs ?? ["out"]) > 1 && !any(g.edges ?? [], (e) => e.from == n.id && e.port == port))
+                | map((port) => warning(`node.${n.id}`, `${t.label}: nothing happens on "${port}"`)) | flatten
+            missing + branches
+        }
+    }) | flatten,
+    (g, ctx) => {
+        let t = find(g.nodes ?? [], (n) => n.type == "trigger")
+        let c = t == null ? {} : t.config ?? {}
+        t == null ? []
+        : blank(c.event) ? problem(`node.${t.id}`, "Choose what starts the flow")
+        : c.event == "tag_added" && blank(c.tag) ? problem(`node.${t.id}`, "Choose the tag")
+        : []
+    },
+    (g, ctx) => (g.nodes ?? []) | filter((n) => n.type == "wait") | map((n) => {
+        let amount = int(str((n.config ?? {}).amount ?? ""))
+        when(is_err(amount) || amount <= 0, problem(`node.${n.id}`, "Wait: how long, in whole minutes, hours or days"))
+    }) | flatten,
+    (g, ctx) => (g.nodes ?? []) | filter((n) => n.type == "webhook") | map((n) =>
+        when(!starts_with(str((n.config ?? {}).url ?? ""), "https://"), problem(`node.${n.id}`, "Webhook: the address must start with https://"))) | flatten,
+]
+
+let plugin_core = {
+    id: "core",
+    name: "Core",
+    description: "Contacts, deals, products, forms, campaigns and flows.",
+    audience: ["merchant", "blogger", "news"],
+    rules: {
+        contact: [
+            (c, ctx) => when(blank(c.email) && blank(c.first_name) && blank(c.last_name), problem("email", "Give a name or an email address")),
+            (c, ctx) => when(!blank(c.email) && !is_email(c.email), problem("email", "Not an email address")),
+            (c, ctx) => when(!blank(c.phone) && len(split(str(c.phone), "") | filter((ch) => contains("0123456789", ch))) < 6, problem("phone", "A phone number has at least 6 digits")),
+            (c, ctx) => when(!blank(c.stage) && !contains(STAGES, c.stage), problem("stage", "Unknown stage")),
+            (c, ctx) => when((c.subscribed == true || c.subscribed == 1) && blank(c.email), problem("subscribed", "A subscriber needs an email address")),
+            (c, ctx) => field_rules(c, ctx, "contact"),
+        ],
+        company: [
+            (c, ctx) => when(blank(c.name), problem("name", "A company needs a name")),
+            (c, ctx) => when(!blank(c.domain) && (contains(c.domain, " ") || !contains(c.domain, ".") || contains(c.domain, "/")), problem("domain", "A domain looks like example.com")),
+            (c, ctx) => field_rules(c, ctx, "company"),
+        ],
+        deal: [
+            (d, ctx) => when(blank(d.title), problem("title", "A deal needs a title")),
+            (d, ctx) => when(d.value_cents == null || d.value_cents < 0, problem("value", "The value is an amount, zero or more")),
+            (d, ctx) => when(d.stage_id == null, problem("stage_id", "Choose a stage")),
+            (d, ctx) => when(!blank(d.close_date) && parse_day(d.close_date) == null, problem("close_date", "A date, as YYYY-MM-DD")),
+            (d, ctx) => field_rules(d, ctx, "deal"),
+        ],
+        task: [
+            (t, ctx) => when(blank(t.title), problem("title", "What is to be done?")),
+            (t, ctx) => when(!blank(t.due) && parse_day(t.due) == null, problem("due", "A date, as YYYY-MM-DD")),
+        ],
+        product: [
+            (p, ctx) => when(blank(p.name), problem("name", "A product needs a name")),
+            (p, ctx) => when(blank(p.sku), problem("sku", "A product needs a SKU"))
+                + when(!blank(p.sku) && slugify(p.sku) != lower(p.sku), problem("sku", "A SKU is letters, digits and dashes")),
+            (p, ctx) => when(p.price_cents == null || p.price_cents < 0, problem("price", "A price, zero or more")),
+            (p, ctx) => when(p.kind == "subscription" && !contains(["month", "year"], p.interval ?? ""), problem("interval", "A subscription renews every month or year")),
+            (p, ctx) => when(p.stock != null && p.stock < 0, problem("stock", "Stock cannot be below zero")),
+        ],
+        // A purchase, as the checkout page has it: ctx.product and ctx.today.
+        checkout: [
+            (o, ctx) => when(blank(o.name), problem("name", "Your name, please")),
+            (o, ctx) => when(!is_email(o.email), problem("email", "An email address for the receipt")),
+            (o, ctx) => when(o.qty == null || o.qty < 1 || o.qty > 99, problem("qty", "Between 1 and 99")),
+            (o, ctx) => {
+                let p = ctx.product ?? {}
+                when(p.stock != null && (o.qty ?? 1) > p.stock, problem("qty", p.stock == 0 ? "Sold out" : `Only ${p.stock} left`))
+            },
+            (o, ctx) => {
+                let digits = card_digits(o.card)
+                when(len(digits) < 13 || len(digits) > 19 || !luhn_ok(digits), problem("card", "That card number is not valid"))
+            },
+            (o, ctx) => match split(str(o.expiry ?? ""), "/") | map((p) => int(trim(p))) {
+                [int as m, int as y] if m >= 1 && m <= 12 => {
+                    let year = y < 100 ? 2000 + y : y
+                    let today = split(ctx.today ?? "1970-01-01", "-") | map((p) => int(p))
+                    when(year < today[0] || (year == today[0] && m < today[1]), problem("expiry", "This card has expired"))
+                }
+                _ => problem("expiry", "Expiry as MM/YY")
+            },
+            (o, ctx) => when(len(card_digits(o.cvc)) < 3 || len(card_digits(o.cvc)) > 4, problem("cvc", "3 or 4 digits")),
+        ],
+        // A public form's submission: ctx.form.
+        signup: [
+            (s, ctx) => when(!is_email(s.email), problem("email", "Your email address, please")),
+            (s, ctx) => when(contains((ctx.form ?? {}).fields ?? [], "first_name") && blank(s.first_name), problem("first_name", "Your first name, please")),
+        ],
+        campaign: [
+            (c, ctx) => when(blank(c.name), problem("name", "Name the campaign (only you see it)")),
+            (c, ctx) => when(blank(c.subject), problem("subject", "A subject line")),
+            (c, ctx) => when(blank(c.body), problem("body", "Something to say")),
+        ],
+        flow: flow_rules,
+    },
+    steps: [
+        { type: "send_email", label: "Send email", group: "Message", outputs: ["out"], fields: [
+            { key: "subject", label: "Subject", type: "text", required: true },
+            { key: "body", label: "Message (Markdown; {{first_name}} and the like fill in)", type: "textarea", required: true },
+        ] },
+        { type: "send_offer", label: "Offer a product", group: "Sell", outputs: ["out"], fields: [
+            { key: "product", label: "Product (SKU)", type: "product", required: true },
+            { key: "subject", label: "Subject", type: "text", required: true },
+            { key: "body", label: "Message (a buy link is added)", type: "textarea" },
+        ] },
+        { type: "wait_purchase", label: "Wait for a purchase", group: "Sell", outputs: ["yes", "no"], fields: [
+            { key: "product", label: "Product (SKU; empty for any)", type: "product" },
+            { key: "days", label: "Give up after (days)", type: "number", required: true },
+        ] },
+        { type: "wait", label: "Wait", group: "Timing", outputs: ["out"], fields: [
+            { key: "amount", label: "How long", type: "number", required: true },
+            { key: "unit", label: "Unit", type: "select", options: ["minutes", "hours", "days"] },
+        ] },
+        { type: "condition", label: "If / else", group: "Logic", outputs: ["yes", "no"], fields: [
+            { key: "field", label: "What", type: "select", required: true, options: ["contact.stage", "contact.tags", "contact.email", "contact.subscribed", "order.total", "order.sku", "deal.value"] },
+            { key: "op", label: "Is", type: "select", options: ["equals", "contains", "greater than", "less than", "is set"] },
+            { key: "value", label: "Value", type: "text" },
+        ] },
+        { type: "add_tag", label: "Add tag", group: "Contact", outputs: ["out"], fields: [{ key: "tag", label: "Tag", type: "text", required: true }] },
+        { type: "remove_tag", label: "Remove tag", group: "Contact", outputs: ["out"], fields: [{ key: "tag", label: "Tag", type: "text", required: true }] },
+        { type: "set_stage", label: "Set stage", group: "Contact", outputs: ["out"], fields: [{ key: "stage", label: "Stage", type: "select", required: true, options: STAGES }] },
+        { type: "create_task", label: "Create task", group: "Team", outputs: ["out"], fields: [
+            { key: "title", label: "Task", type: "text", required: true },
+            { key: "due_days", label: "Due in (days)", type: "number" },
+        ] },
+        { type: "create_deal", label: "Create deal", group: "Team", outputs: ["out"], fields: [
+            { key: "title", label: "Title ({{first_name}} fills in)", type: "text", required: true },
+            { key: "value", label: "Value", type: "money" },
+        ] },
+        { type: "webhook", label: "Call a webhook", group: "Connect", outputs: ["out"], fields: [{ key: "url", label: "Address (https://...)", type: "text", required: true }] },
+    ],
+}

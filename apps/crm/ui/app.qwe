@@ -1,0 +1,86 @@
+// The app: one page, its parts chosen by the address (/app/contacts/12).
+// The workspace (settings, plugins switched on, fields, pipelines) loads
+// once; pages load their own data from server functions, live.
+
+view AppPage() =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{settings().name ?? "Relay"}</title>
+            <link rel="stylesheet" href="/assets/app.css"/>
+        </head>
+        <body><App/></body>
+    </html>
+
+let NAV = [
+    { group: "", items: [{ href: "/app", label: "Dashboard", icon: "◧" }, { href: "/app/tasks", label: "Tasks", icon: "☑" }] },
+    { group: "People", items: [{ href: "/app/contacts", label: "Contacts", icon: "☺" }, { href: "/app/companies", label: "Companies", icon: "▦" }] },
+    { group: "Sales", items: [{ href: "/app/deals", label: "Deals", icon: "◫" }, { href: "/app/products", label: "Products", icon: "◈" }, { href: "/app/orders", label: "Orders", icon: "≡" }] },
+    { group: "Marketing", items: [{ href: "/app/forms", label: "Forms", icon: "✎" }, { href: "/app/campaigns", label: "Campaigns", icon: "✉" }, { href: "/app/outbox", label: "Outbox", icon: "⇪" }] },
+    { group: "Automation", items: [{ href: "/app/flows", label: "Flows", icon: "⟶" }] },
+    { group: "Workspace", items: [{ href: "/app/plugins", label: "Plugins", icon: "⧉" }, { href: "/app/settings", label: "Settings", icon: "⚙" }] },
+]
+
+fn nav_active(href: str, path: str) = href == "/app" ? path == "/app" || path == "/app/" : starts_with(path, href)
+
+component App() {
+    ~ws = load_workspace()
+    ~reloads = 0
+    let path = url().path
+    let segs = drop(split(path, "/") | filter((s) => s != ""), 1)
+    if ws == null { return <Loading/> }
+    if is_err(ws) { return <div.center-card><h1>Please sign in again</h1><p><a href="/login" data-reload>Sign in</a></p></div> }
+    // Pages that change the workspace (plugins, fields) ask for it again.
+    let refresh = () => { ws = load_workspace() }
+    <div.shell>
+        <aside.sidebar>
+            <div.brand><span.logo-mark>◆</span><div><b>{ws.name}</b><span>{ws.slug}</span></div></div>
+            <nav>{for g in NAV => <div.nav-group>
+                {g.group != "" && <p.nav-title>{g.group}</p>}
+                {for it in g.items => <a href={it.href} class={nav_active(it.href, path) && "active"}><span.icon>{it.icon}</span>{it.label}</a>}
+            </div>}</nav>
+            <div.me>
+                <Avatar name={ws.user.name}/>
+                <div><b>{ws.user.name}</b><span>{ws.user.role}</span></div>
+                <form method="post" action="/logout"><button.icon title="Sign out">⎋</button></form>
+            </div>
+        </aside>
+        <main.main>
+            <Search/>
+            <div.page>{match segs {
+                [] => <Dashboard {ws}/>
+                ["tasks"] => <TasksPage {ws}/>
+                ["contacts"] => <ContactsPage {ws} query={url().query}/>
+                ["contacts", id] => <ContactPage key={id} id={int(id) ?? 0} {ws}/>
+                ["companies"] => <CompaniesPage {ws}/>
+                ["companies", id] => <CompanyPage key={id} id={int(id) ?? 0} {ws}/>
+                ["deals"] => <DealsPage {ws}/>
+                ["products"] => <ProductsPage {ws}/>
+                ["orders"] => <OrdersPage {ws}/>
+                ["forms"] => <FormsPage {ws}/>
+                ["campaigns"] => <CampaignsPage {ws}/>
+                ["outbox"] => <OutboxPage {ws}/>
+                ["flows"] => <FlowsPage {ws}/>
+                ["flows", id] => <FlowDesigner key={id} id={int(id) ?? 0} {ws}/>
+                ["plugins"] => <PluginsPage {ws} on_change={refresh}/>
+                ["settings"] => <SettingsPage {ws} on_change={refresh}/>
+                _ => <Empty title="Nothing here"><p><a href="/app">Back to the dashboard</a></p></Empty>
+            }}</div>
+        </main>
+    </div>
+}
+
+// Everything, found as you type.
+component Search() {
+    ~q = ""
+    ~found = []
+    <div.search>
+        <input type="search" placeholder="Search contacts, companies, deals, products…" value={q} @input={(e) => {
+            q = e.value
+            found = len(trim(q)) >= 2 ? search(q) ?? [] : []
+        }} @keydown={(e) => { if e.key == "Escape" { q = ""; found = [] } }}/>
+        {len(found) > 0 && <div.search-results>{for f in found =>
+            <a href={f.href} @click={() => { q = ""; found = [] }}><Badge text={f.kind}/><b>{f.label}</b><span.muted>{f.sub}</span></a>}</div>}
+    </div>
+}

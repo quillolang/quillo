@@ -1,0 +1,74 @@
+// Rules: what makes a record acceptable. Each plugin brings rules for the
+// kinds of records it cares about; a rule is a function of the record and
+// its context giving the problems it sees:
+//
+//     (record, ctx) => [{ field: "email", message: "Not an email address" }]
+//
+// A problem with `level: "warning"` is advice; any other is an error. The
+// same functions run in the browser, where they only hint while you type,
+// and on the server, where errors refuse what was submitted. Rules compute
+// and nothing else (no database, no clock: `ctx.today` is the date), so
+// both always agree.
+//
+// `ctx` is { enabled: [plugin ids], fields: [custom field definitions],
+// settings: {...}, today: "YYYY-MM-DD", and whatever the kind adds }.
+
+fn problem(field: str, message: str) = [{ field, message }]
+fn warning(field: str, message: str) = [{ field, message, level: "warning" }]
+fn when(cond, problems: list) = cond ? problems : []
+
+fn blank(v) = v == null || trim(str(v)) == ""
+
+// The plugins switched on: core always, the rest by the workspace's choice.
+fn active_plugins(enabled: list) = plugins | filter((p) => p.id == "core" || contains(enabled, p.id))
+
+fn validate(kind: str, record: map, ctx: map) =
+    active_plugins(ctx.enabled ?? [])
+        | map((p) => p.rules[kind] ?? [])
+        | flatten
+        | map((rule) => rule(record, ctx))
+        | flatten
+
+fn errors_of(problems: list) = problems | filter((p) => p.level != "warning")
+
+// The messages for one field (for the hint under its input).
+fn hints_for(problems: list, field: str) = problems | filter((p) => p.field == field)
+
+// Fields plugins add, and the workspace's own, for one kind of record.
+fn fields_for(entity: str, ctx: map) =
+    (active_plugins(ctx.enabled ?? []) | map((p) => p.fields ?? []) | flatten | filter((f) => f.entity == entity))
+        + ((ctx.fields ?? []) | filter((f) => f.entity == entity))
+
+// The rules every workspace's own custom fields bring: required, numbers,
+// dates, choices.
+fn field_rules(record: map, ctx: map, entity: str) {
+    let values = record.fields ?? {}
+    fields_for(entity, ctx) | map((f) => {
+        let v = values[f.key]
+        let key = `fields.${f.key}`
+        if blank(v) {
+            when(f.required == true || f.required == 1, problem(key, `${f.label} is required`))
+        } else {
+            match f.type {
+                "number" => when(is_err(float(str(v))), problem(key, `${f.label} must be a number`))
+                "date" => when(parse_day(str(v)) == null, problem(key, `${f.label} must be a date (YYYY-MM-DD)`))
+                "select" => when(len(f.options ?? []) > 0 && !contains(f.options, str(v)), problem(key, `${f.label}: choose one of ${join(f.options, ", ")}`))
+                "url" => when(!starts_with(str(v), "https://") && !starts_with(str(v), "http://"), problem(key, `${f.label} must be a web address`))
+                _ => []
+            }
+        }
+    }) | flatten
+}
+
+// Card numbers: digits, the right length, and Luhn's check digit. (Test
+// mode takes 4242 4242 4242 4242; a real provider checks for itself.)
+fn luhn_ok(digits: str) {
+    let ds = split(digits, "") | map((d) => int(d))
+    let total = reverse(ds) | enumerate | map((p) => {
+        let d = p[1]
+        p[0] % 2 == 1 ? (d * 2 > 9 ? d * 2 - 9 : d * 2) : d
+    }) | sum
+    total % 10 == 0
+}
+
+fn card_digits(s) = split(str(s ?? ""), "") | filter((ch) => contains("0123456789", ch)) | join("")

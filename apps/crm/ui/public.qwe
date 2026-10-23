@@ -1,0 +1,252 @@
+// The pages anyone sees: the main site (signing a workspace up), signing
+// in, and a workspace's shop, forms and unsubscribe page.
+
+view Page(title: str, children, wide: bool = false) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title}</title>
+            <link rel="stylesheet" href="/assets/app.css"/>
+        </head>
+        <body class={wide ? "public wide" : "public"}>{children}</body>
+    </html>
+
+view Logo() = <span.logo><span.logo-mark>◆</span> Relay</span>
+
+// ---- the main site --------------------------------------------------------------------
+
+view Landing() =
+    <Page title="Relay — the CRM for merchants, writers and newsrooms" wide={true}>
+        <div.landing>
+            <section.hero>
+                <Logo/>
+                <h1>Know your customers. Grow your audience.</h1>
+                <p.lead>Contacts, deals, a shop, newsletters and flows you draw — for merchants,
+                    bloggers and news outlets. Each workspace is yours alone.</p>
+                <ul.points>
+                    <li><b>Flows you draw:</b> welcome series, after-purchase follow-ups, win-backs.</li>
+                    <li><b>A checkout built in</b>, with tax, receipts and purchase-triggered flows.</li>
+                    <li><b>Plugins with rules</b> that check your data as you type, and again when it is saved.</li>
+                </ul>
+            </section>
+            <section.signup-card><Signup domain={DOMAIN}/></section>
+        </div>
+    </Page>
+
+component Signup(domain: str) {
+    ~w = { name: "", slug: "", industry: "merchant", owner_name: "", email: "", password: "", currency: "USD" }
+    ~touched = []
+    ~server = []
+    ~free = null
+    ~busy = false
+    let all = check_workspace(w) + server
+    // Hints for what you have typed in, not for what you have yet to.
+    let shown = all | filter((p) => contains(touched, p.field))
+    let change = (field) => (v) => {
+        w = set(w, field, v)
+        touched = unique(touched + [field])
+        server = server | filter((p) => p.field != field)
+        if field == "name" && !contains(touched, "slug") { w = set(w, "slug", slugify(v)) }
+    }
+    <form.signup @submit={() => {
+        touched = ["name", "slug", "industry", "owner_name", "email", "password"]
+        if len(errors_of(check_workspace(w))) == 0 {
+            busy = true
+            let r = create_workspace(w)
+            busy = false
+            // The new workspace is on its own address.
+            if is_err(r) { server = refusal_problems(r) } else { js("location.assign", r.url) }
+        }
+    }}>
+        <h2>Create your workspace</h2>
+        <TextField label="Business name" field="name" value={w.name} problems={shown} on_change={change("name")} placeholder="Acme Goods" autofocus={true}/>
+        <label.field>
+            <span.label>Address</span>
+            <div.slug-input>
+                <input name="slug" value={w.slug} class={invalid(shown, "slug") && "invalid"} @input={(e) => {
+                    change("slug")(lower(e.value))
+                    free = null
+                }} @blur={() => { free = slug_free(w.slug) }}/>
+                <span.suffix>.{domain}</span>
+            </div>
+            {free == false && <p.hint>That address is taken</p>}
+            {free == true && <p.hint.ok>Available</p>}
+            <Hints problems={shown} field="slug"/>
+        </label>
+        <label.field>
+            <span.label>What do you do?</span>
+            <div.choices>{for i in INDUSTRIES => <button type="button" class={w.industry == i.id ? "choice on" : "choice"}
+                @click={() => { change("industry")(i.id) }}><b>{i.label}</b><span>{i.about}</span></button>}</div>
+        </label>
+        <TextField label="Your name" field="owner_name" value={w.owner_name} problems={shown} on_change={change("owner_name")}/>
+        <TextField label="Email" field="email" value={w.email} problems={shown} on_change={change("email")} type="email"/>
+        <TextField label="Password" field="password" value={w.password} problems={shown} on_change={change("password")} type="password" help="At least 10 characters"/>
+        <FormProblems problems={server}/>
+        <button.primary.wide disabled={busy}>{busy ? "Creating…" : "Create workspace"}</button>
+    </form>
+}
+
+view NoWorkspace() =
+    <Page title="No workspace here">
+        <div.center-card><Logo/><h1>There is no workspace here</h1><p>Check the address, or <a href="/">create one</a>.</p></div>
+    </Page>
+
+view NotFoundPage(what: str) =
+    <Page title="Not found">
+        <div.center-card><h1>No such {what}</h1><p><a href="/shop">Back to the shop</a></p></div>
+    </Page>
+
+// ---- signing in --------------------------------------------------------------------------
+
+view LoginPage(problem: str, email: str) =
+    <Page title="Sign in">
+        <div.center-card>
+            <Logo/>
+            <h1>Sign in</h1>
+            {problem == "wrong" && <div.alert><p>That email and password do not match.</p></div>}
+            {problem == "expired" && <div.alert><p>That sign-in link has expired. Sign in with your password.</p></div>}
+            <form method="post" action="/login" class="stack">
+                <label.field><span.label>Email</span><input type="email" name="email" value={email} required autofocus/></label>
+                <label.field><span.label>Password</span><input type="password" name="password" required/></label>
+                <button.primary.wide>Sign in</button>
+            </form>
+        </div>
+    </Page>
+
+// ---- the shop ----------------------------------------------------------------------------
+
+view ShopPage(name: str, currency: str, products: list) =
+    <Page title={name}>
+        <div.shop>
+            <header.shop-head><h1>{name}</h1></header>
+            {len(products) == 0 ? <p.muted>Nothing for sale yet.</p>
+            : <div.product-grid>{for p in products =>
+                <a.product-card href={`/shop/${p.sku}`}>
+                    <h3>{p.name}</h3>
+                    <p.muted>{p.description}</p>
+                    <p.price>{fmt_money(p.price_cents, currency)}{p.kind == "subscription" && <span> / {p.interval}</span>}</p>
+                    {p.stock == 0 && <Badge text="Sold out" tone="red"/>}
+                </a>}</div>}
+        </div>
+    </Page>
+
+view CheckoutPage(sku: str, name: str, email: str) =
+    <Page title={`Buy ${name}`}>
+        <div.checkout-wrap><Checkout {sku} {email}/></div>
+    </Page>
+
+// The checkout: the rules (the core's, and the plugins' the shop has on, such
+// as tax) hint as you type and show the total the server will charge.
+component Checkout(sku: str, email: str = "") {
+    ~c = checkout_context(sku)
+    ~o = { sku, name: "", email, qty: 1, card: "", expiry: "", cvc: "", country: "", vat_id: "" }
+    ~touched = []
+    ~server = []
+    ~paid = null
+    ~busy = false
+    if c == null { return <Loading/> }
+    if is_err(c) { return <div.center-card><h1>Not for sale</h1></div> }
+    let ctx = c.ctx
+    let all = validate("checkout", o, ctx) + server
+    let shown = all | filter((p) => contains(touched, p.field))
+    let q = quote(o, c.product, ctx)
+    let cur = c.currency
+    let change = (field) => (v) => {
+        o = set(o, field, field == "qty" ? int(v) ?? 1 : v)
+        touched = unique(touched + [field])
+        server = []
+    }
+    paid != null
+        ? <div.paid>
+            <p.big-check>✓</p>
+            <h1>Thank you!</h1>
+            <p>Order <b>{paid.number}</b> for {paid.total} is paid. A receipt is on its way to {paid.email}.</p>
+            <p><a href="/shop">Back to {c.shop}</a></p>
+        </div>
+        : <form.checkout @submit={() => {
+            touched = ["name", "email", "qty", "card", "expiry", "cvc", "country", "vat_id"]
+            if len(errors_of(validate("checkout", o, ctx))) == 0 {
+                busy = true
+                let r = checkout(o)
+                busy = false
+                if is_err(r) { server = refusal_problems(r) } else { paid = r }
+            }
+        }}>
+            <div.summary>
+                <p.muted>{c.shop}</p>
+                <h1>{c.product.name}</h1>
+                <p>{c.product.description}</p>
+                <div.lines>
+                    <p><span>{q.qty} × {fmt_money(c.product.price_cents, cur)}</span><span>{fmt_money(q.subtotal_cents, cur)}</span></p>
+                    {q.tax_cents > 0 && <p><span>Tax</span><span>{fmt_money(q.tax_cents, cur)}</span></p>}
+                    <p.total><span>Total</span><span>{fmt_money(q.total_cents, cur)}{c.product.kind == "subscription" && ` / ${c.product.interval}`}</span></p>
+                </div>
+            </div>
+            <div.pay>
+                <TextField label="Name" field="name" value={o.name} problems={shown} on_change={change("name")}/>
+                <TextField label="Email" field="email" value={o.email} problems={shown} on_change={change("email")} type="email"/>
+                {c.product.kind != "subscription" && <TextField label="Quantity" field="qty" value={str(o.qty)} problems={shown} on_change={change("qty")} type="number"/>}
+                {contains(c.extra, "country") && <TextField label="Country (2 letters)" field="country" value={o.country} problems={shown} on_change={change("country")} placeholder="US"/>}
+                {contains(c.extra, "vat_id") && <TextField label="VAT number (businesses)" field="vat_id" value={o.vat_id} problems={shown} on_change={change("vat_id")}/>}
+                <TextField label="Card number" field="card" value={o.card} problems={shown} on_change={change("card")} placeholder="4242 4242 4242 4242"/>
+                <div.row2>
+                    <TextField label="Expiry" field="expiry" value={o.expiry} problems={shown} on_change={change("expiry")} placeholder="MM/YY"/>
+                    <TextField label="CVC" field="cvc" value={o.cvc} problems={shown} on_change={change("cvc")} placeholder="123"/>
+                </div>
+                <FormProblems problems={server}/>
+                <button.primary.wide disabled={busy}>{busy ? "Paying…" : `Pay ${fmt_money(q.total_cents, cur)}`}</button>
+                <p.muted.small>Test mode: 4242 4242 4242 4242 pays; 4000 0000 0000 0002 is declined.</p>
+            </div>
+        </form>
+}
+
+// ---- forms -------------------------------------------------------------------------------
+
+view FormPage(slug: str) =
+    <Page title="Sign up">
+        <div.center-card.form-card><PublicForm {slug}/></div>
+    </Page>
+
+component PublicForm(slug: str) {
+    ~c = form_context(slug)
+    ~s = { email: "", first_name: "", last_name: "", consent: false }
+    ~touched = []
+    ~server = []
+    ~done = null
+    if c == null { return <Loading/> }
+    if is_err(c) { return <h1>No such form</h1> }
+    let all = validate("signup", s, c.ctx) + server
+    let shown = all | filter((p) => contains(touched, p.field))
+    let change = (field) => (v) => {
+        s = set(s, field, v)
+        touched = unique(touched + [field])
+        server = []
+    }
+    done != null
+        ? <div><p.big-check>✓</p><h1>You are in!</h1><p>Thanks for signing up to {c.site}.</p></div>
+        : <form.stack @submit={() => {
+            touched = ["email", "first_name", "consent"]
+            if len(errors_of(validate("signup", s, c.ctx))) == 0 {
+                let r = submit_form(slug, s)
+                if is_err(r) { server = refusal_problems(r) } else { done = r }
+            }
+        }}>
+            <p.muted>{c.site}</p>
+            <h1>{c.form.name}</h1>
+            {c.form.headline != "" && <p>{c.form.headline}</p>}
+            {contains(c.form.fields, "first_name") && <TextField label="First name" field="first_name" value={s.first_name} problems={shown} on_change={change("first_name")}/>}
+            {contains(c.form.fields, "last_name") && <TextField label="Last name" field="last_name" value={s.last_name} problems={shown} on_change={change("last_name")}/>}
+            <TextField label="Email" field="email" value={s.email} problems={shown} on_change={change("email")} type="email"/>
+            {contains(c.extra, "consent") && <CheckField label={`I agree to receive email from ${c.site}`} field="consent" value={s.consent} problems={shown} on_change={change("consent")}/>}
+            <FormProblems problems={server}/>
+            <button.primary.wide>Sign up</button>
+        </form>
+}
+
+view UnsubscribedPage(ok: bool, name: str) =
+    <Page title="Unsubscribe">
+        <div.center-card>{ok
+            ? <div><h1>You are unsubscribed</h1><p>{name} will not email you again.</p></div>
+            : <div><h1>That link did not work</h1><p>It may have been copied wrongly.</p></div>}</div>
+    </Page>

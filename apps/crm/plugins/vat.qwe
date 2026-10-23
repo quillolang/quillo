@@ -1,0 +1,34 @@
+// Sales tax for merchants: the checkout asks for the country, adds tax at
+// the workspace's rate, and checks VAT numbers given by businesses.
+
+let EU = ["AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK"]
+
+fn vat_rate(ctx) = float(str((ctx.settings ?? {}).vat_rate ?? "0")) ?? 0
+
+let plugin_vat = {
+    id: "vat",
+    name: "Sales tax / VAT",
+    description: "Adds tax at checkout and checks VAT numbers of businesses.",
+    audience: ["merchant"],
+    checkout_fields: ["country", "vat_id"],
+    rules: {
+        checkout: [
+            (o, ctx) => when(blank(o.country) || len(trim(o.country)) != 2, problem("country", "Your country, as two letters (US, DE, ...)")),
+            (o, ctx) => {
+                let id = upper(replace(str(o.vat_id ?? ""), " ", ""))
+                let ok = len(id) >= 8 && len(id) <= 14 && contains(EU, slice(id, 0, 2))
+                when(!blank(o.vat_id) && !ok, problem("vat_id", "A VAT number starts with the country, like DE123456789"))
+            },
+        ],
+    },
+    // Tax on a purchase, in cents: none for a business with a VAT number in
+    // another EU country (reverse charge), the workspace's rate otherwise.
+    taxes: (o, subtotal_cents, ctx) => {
+        let id = upper(replace(str(o.vat_id ?? ""), " ", ""))
+        let home = upper(str((ctx.settings ?? {}).country ?? ""))
+        let reverse = id != "" && contains(EU, slice(id, 0, 2)) && slice(id, 0, 2) != home
+        reverse ? 0 : round(subtotal_cents * vat_rate(ctx) / 100)
+    },
+}
+
+let runners_vat = {}

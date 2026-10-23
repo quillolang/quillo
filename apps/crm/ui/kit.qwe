@@ -1,0 +1,130 @@
+// Pieces the pages are made of. Inputs take the rules' problems and show
+// the ones for their field under them, as you type.
+
+view Hints(problems: list, field: str) {
+    let mine = hints_for(problems, field)
+    len(mine) == 0 ? null : <div.hints>{for p in mine => <p class={p.level == "warning" ? "hint warn" : "hint"}>{p.message}</p>}</div>
+}
+
+fn invalid(problems: list, field: str) = len(errors_of(hints_for(problems, field))) > 0
+
+view TextField(label: str, field: str, value, problems: list, on_change, type: str = "text", placeholder: str = "", help: str = "", autofocus: bool = false) =
+    <label.field>
+        <span.label>{label}</span>
+        <input {type} name={field} value={value ?? ""} {placeholder} {autofocus} class={invalid(problems, field) && "invalid"}
+            @input={(e) => { on_change(e.value) }}/>
+        {help != "" && <span.help>{help}</span>}
+        <Hints {problems} {field}/>
+    </label>
+
+view AreaField(label: str, field: str, value, problems: list, on_change, rows: int = 5, placeholder: str = "") =
+    <label.field>
+        <span.label>{label}</span>
+        <textarea name={field} {rows} {placeholder} class={invalid(problems, field) && "invalid"} @input={(e) => { on_change(e.value) }}>{value ?? ""}</textarea>
+        <Hints {problems} {field}/>
+    </label>
+
+view SelectField(label: str, field: str, value, options: list, problems: list, on_change, empty: str = "") =
+    <label.field>
+        <span.label>{label}</span>
+        <select name={field} class={invalid(problems, field) && "invalid"} @change={(e) => { on_change(e.value) }}>
+            {empty != "" && <option value="" selected={blank(value)}>{empty}</option>}
+            {for o in options => {
+                let v = type_of(o) == "map" ? str(o.value) : str(o)
+                <option value={v} selected={str(value ?? "") == v}>{type_of(o) == "map" ? o.label : o}</option>
+            }}
+        </select>
+        <Hints {problems} {field}/>
+    </label>
+
+view CheckField(label: str, field: str, value, problems: list, on_change) =
+    <label.field.check>
+        <input type="checkbox" name={field} checked={value == true || value == 1} @change={(e) => { on_change(e.checked) }}/>
+        <span>{label}</span>
+        <Hints {problems} {field}/>
+    </label>
+
+// A field from a definition (a plugin's, or the workspace's own), at
+// `fields.<key>` of the record.
+view DefinedField(f: map, record: map, problems: list, on_change) {
+    let path = `fields.${f.key}`
+    let v = pick(record, path)
+    let set_to = (x) => { on_change(path, x) }
+    let label = f.required == true ? `${f.label} *` : f.label
+    match f.type {
+        "checkbox" => <CheckField {label} field={path} value={v} {problems} on_change={set_to}/>
+        "select" => <SelectField {label} field={path} value={v} options={f.options ?? []} {problems} on_change={set_to} empty="—"/>
+        "number" => <TextField {label} field={path} value={v} {problems} on_change={set_to} type="number"/>
+        "date" => <TextField {label} field={path} value={v} {problems} on_change={set_to} type="date"/>
+        _ => <TextField {label} field={path} value={v} {problems} on_change={set_to}/>
+    }
+}
+
+// What the server refused, for the problems list: its problems, or one
+// general message.
+fn refusal_problems(r) =
+    !is_err(r) ? []
+    : type_of(r.error) == "map" && r.error.problems != null ? r.error.problems
+    : [{ field: "", message: str(r.error) }]
+
+view FormProblems(problems: list) {
+    let general = problems | filter((p) => p.field == "" || p.field == "graph")
+    len(general) == 0 ? null : <div.alert>{for p in general => <p>{p.message}</p>}</div>
+}
+
+view Badge(text: str, tone: str = "") = <span class={`badge ${tone}`}>{text}</span>
+
+fn stage_tone(stage: str) = match stage {
+    "customer" => "green"
+    "prospect" => "blue"
+    "subscriber" => "purple"
+    "churned" => "gray"
+    _ => "amber"
+}
+
+fn status_tone(s: str) = match s {
+    "paid" | "sent" | "done" | "won" => "green"
+    "waiting" | "queued" | "draft" | "running" => "blue"
+    "failed" | "refunded" | "lost" => "red"
+    _ => "gray"
+}
+
+view Avatar(name: str, size: str = "") = <span class={`avatar ${size}`}>{initials(name)}</span>
+
+view Tags(tags: list) = <span.tags>{for t in tags => <span.tag>{t}</span>}</span>
+
+view Empty(title: str, children) = <div.empty><p.empty-title>{title}</p>{children}</div>
+
+view Loading() = <div.loading><span.spinner></span> Loading…</div>
+
+view PageHead(title: str, sub: str = "", children) =
+    <header.page-head>
+        <div><h1>{title}</h1>{sub != "" && <p.sub>{sub}</p>}</div>
+        <div.actions>{children}</div>
+    </header>
+
+view Drawer(title: str, on_close, children) =
+    <div.drawer-wrap>
+        <div.drawer-shade @click={() => { on_close() }}></div>
+        <aside.drawer>
+            <header><h2>{title}</h2><button.icon type="button" @click={() => { on_close() }}>✕</button></header>
+            <div.drawer-body>{children}</div>
+        </aside>
+    </div>
+
+view Stat(label: str, value, sub: str = "", tone: str = "") =
+    <div class={`stat ${tone}`}><p.stat-label>{label}</p><p.stat-value>{value}</p>{sub != "" && <p.stat-sub>{sub}</p>}</div>
+
+// Bars for a series of { label, value }.
+view Bars(points: list, height: int = 120, money: str = "") {
+    let top = max((points | map((p) => p.value)) + [1])
+    let w = 100 / max([len(points), 1])
+    <svg.bars viewBox={`0 0 100 ${height}`} preserveAspectRatio="none" style={`height:${height}px`}>
+        {for [i, p] in enumerate(points) => {
+            let h = p.value * (height - 4) / top
+            <rect x={i * w + w * 0.15} y={height - h} width={w * 0.7} height={h} rx="0.8">
+                <title>{p.label}: {money != "" ? fmt_money(p.value, money) : str(p.value)}</title>
+            </rect>
+        }}
+    </svg>
+}

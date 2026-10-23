@@ -1,0 +1,176 @@
+// Forms people sign up with, campaigns to subscribers, and the outbox all
+// mail goes through. Mail is delivered by a job: to the workspace's mail
+// webhook when it has one (an email API), else kept as sent in test mode.
+
+// ---- the outbox --------------------------------------------------------------
+
+fn queue_mail(to: str, subject: str, body_html: str, kind: str, contact_id, campaign_id) {
+    if !is_email(to) { return null }
+    db.exec("insert into outbox (to_email, subject, body, kind, contact_id, campaign_id, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+        lower(trim(to)), subject, body_html, kind, contact_id, campaign_id, now())
+}
+
+// A contact's values for {{placeholders}}.
+fn mail_values(c) = c == null ? {} : merge(parsed(c.fields ?? "{}", {}), {
+    first_name: c.first_name != "" ? c.first_name : "there",
+    last_name: c.last_name,
+    name: full_name(c),
+    email: c.email,
+})
+
+// Unsubscribe links carry a signature, so no one can unsubscribe others.
+fn unsubscribe_token(contact_id: int) {
+    let secret = settings().secret ?? ""
+    `${contact_id}.${slice(crypto.hmac(secret, `unsubscribe:${contact_id}`), 0, 24)}`
+}
+
+fn unsubscribe_url(contact_id: int) = `${site_url()}/unsubscribe/${unsubscribe_token(contact_id)}`
+
+// Markdown with placeholders filled, and the footer every mail to a
+// subscriber has.
+fn mail_html(markdown_text: str, c, footer: bool = true) {
+    let body = str(markdown(fill(markdown_text, mail_values(c))))
+    let foot = footer && c != null
+        ? `<hr><p style="color:#888;font-size:12px">${escape(settings().name ?? "")} · <a href="${unsubscribe_url(c.id)}">Unsubscribe</a></p>`
+        : ""
+    `${body}${foot}`
+}
+
+server fn list_outbox() {
+    need_user()?
+    db.query("select id, to_email, subject, kind, status, created_at, sent_at from outbox order by id desc limit 200")
+}
+
+server fn get_mail(id: int) {
+    need_user()?
+    db.one("select * from outbox where id = ?", id) ?? err("No such mail")
+}
+
+// Sends what is queued: to the mail webhook (`{ to, subject, html }` as
+// JSON), or in test mode marks it sent.
+fn deliver_mail() {
+    let hook = settings().mail_webhook ?? ""
+    for m in db.query("select * from outbox where status = 'queued' order by id limit 50") => {
+        let ok = hook == "" || post_mail(hook, m)
+        db.exec("update outbox set status = ?, sent_at = ? where id = ?", ok ? "sent" : "failed", now(), m.id)
+    }
+}
+
+fn post_mail(hook: str, m: map) {
+    let r = http.post(hook, { to: m.to_email, subject: m.subject, html: m.body })
+    !is_err(r) && r.ok
+}
+
+// ---- forms ---------------------------------------------------------------------
+
+fn form_out(r) = r == null ? null : merge(r, { fields: parsed(r.fields, ["email"]), tags: parsed(r.tags, []) })
+
+server fn list_forms() {
+    need_user()?
+    db.query("select f.*, (select count(*) from form_submissions s where s.form_id = f.id) as submissions from forms f order by f.name") | map(form_out)
+}
+
+server fn save_form(f: map) {
+    need_admin()?
+    if blank(f.name) { return err({ problems: problem("name", "Name the form") }) }
+    let slug = slugify(blank(f.slug) ? f.name : f.slug)
+    let other = db.one("select id from forms where slug = ? and id != ?", slug, f.id ?? 0)
+    if other != null { return err({ problems: problem("slug", "Another form has this address") }) }
+    let fields = json.stringify(unique(["email"] + (f.fields ?? [])))
+    let tags = json.stringify(clean_tags(f.tags))
+    if f.id == null {
+        db.exec("insert into forms (slug, name, headline, fields, tags, created_at) values (?, ?, ?, ?, ?, ?)", slug, trim(f.name), f.headline ?? "", fields, tags, now())
+    } else {
+        db.exec("update forms set slug = ?, name = ?, headline = ?, fields = ?, tags = ? where id = ?", slug, trim(f.name), f.headline ?? "", fields, tags, f.id)
+    }
+    true
+}
+
+fn public_form(slug: str) = form_out(db.one("select * from forms where slug = ?", slugify(slug)))
+
+// What a public form's page needs: the form, and the rules' context.
+server fn form_context(slug: str) {
+    let f = (public_form(slug) ?? err("No such form"))?
+    let ctx = remove(rule_ctx({ form: { fields: f.fields } }), "fields")
+    let extra = active_plugins(ctx.enabled) | map((p) => p.form_fields ?? []) | flatten | unique
+    { form: f, ctx, extra, site: ctx.settings.name ?? "" }
+}
+
+server fn submit_form(slug: str, s: map) {
+    let f = (public_form(slug) ?? err("No such form"))?
+    let ctx = rule_ctx({ form: { fields: f.fields } })
+    refused("signup", s, ctx)?
+    let fields = s.consent == true ? { consent: true, consent_date: iso_day(now()) } : {}
+    let c = contact_for_email(s.email, { first_name: trim(s.first_name ?? ""), last_name: trim(s.last_name ?? ""), source: `form ${f.slug}`, stage: "subscriber", subscribed: true, fields })
+    let had = parsed(c.fields, {})
+    db.exec("update contacts set subscribed = 1, fields = ?, updated_at = ? where id = ?", json.stringify(merge(had, fields)), now(), c.id)
+    db.exec("insert into form_submissions (form_id, contact_id, data, created_at) values (?, ?, ?, ?)", f.id, c.id, json.stringify(s), now())
+    note_activity("form", c.id, null, `Signed up with ${f.name}`)
+    add_tags(c.id, f.tags)
+    fire("form_submitted", { contact_id: c.id, form: f.slug })
+    drain_runs()
+    { ok: true, headline: f.headline }
+}
+
+// ---- campaigns -------------------------------------------------------------------
+
+fn campaign_out(r) = r == null ? null : set(r, "audience", parsed(r.audience, { tag: "" }))
+
+// Who a campaign goes to: subscribers, all or with a tag.
+fn audience_of(a: map) = db.query(
+    "select * from contacts where subscribed = 1 and email != '' and (? = '' or exists (select 1 from json_each(contacts.tags) where value = ?))",
+    a.tag ?? "", a.tag ?? "")
+
+server fn list_campaigns() {
+    need_user()?
+    db.query("select * from campaigns order by coalesce(sent_at, created_at) desc") | map(campaign_out)
+}
+
+server fn audience_size(a: map) {
+    need_user()?
+    len(audience_of(a))
+}
+
+server fn save_campaign(c: map) {
+    need_user()?
+    refused("campaign", c, rule_ctx())?
+    let audience = json.stringify(c.audience ?? { tag: "" })
+    if c.id == null {
+        let r = db.exec("insert into campaigns (name, subject, body, audience, created_at) values (?, ?, ?, ?, ?)", trim(c.name), trim(c.subject), c.body, audience, now())
+        campaign_out(db.one("select * from campaigns where id = ?", r.last_id))
+    } else {
+        let before = (db.one("select status from campaigns where id = ?", c.id) ?? err("No such campaign"))?
+        if before.status == "sent" { return err("A sent campaign cannot change") }
+        db.exec("update campaigns set name = ?, subject = ?, body = ?, audience = ? where id = ?", trim(c.name), trim(c.subject), c.body, audience, c.id)
+        campaign_out(db.one("select * from campaigns where id = ?", c.id))
+    }
+}
+
+server fn preview_campaign(body: str) {
+    need_user()?
+    mail_html(body, { id: 0, first_name: "Ada", last_name: "Lovelace", email: "ada@example.com", fields: "{}" }, false)
+}
+
+server fn send_campaign(id: int) {
+    need_admin()?
+    let c = (campaign_out(db.one("select * from campaigns where id = ?", id)) ?? err("No such campaign"))?
+    if c.status == "sent" { return err("Already sent") }
+    refused("campaign", c, rule_ctx())?
+    let people = audience_of(c.audience)
+    db.transaction(() => {
+        for p in people => queue_mail(p.email, fill(c.subject, mail_values(p)), mail_html(c.body, p), "campaign", p.id, id)
+        db.exec("update campaigns set status = 'sent', sent_count = ?, sent_at = ? where id = ?", len(people), now(), id)
+        for p in people => note_activity("campaign", p.id, null, `Sent “${c.subject}”`)
+    })
+    len(people)
+}
+
+// From the link in a mail's footer: no login, the signature is the proof.
+fn unsubscribe(token: str) {
+    let parts = split(token, ".")
+    let id = int(parts[0] ?? "")
+    if len(parts) != 2 || is_err(id) || !crypto.equal(token, unsubscribe_token(id)) { return false }
+    db.exec("update contacts set subscribed = 0, updated_at = ? where id = ?", now(), id)
+    note_activity("unsubscribed", id, null, "Unsubscribed")
+    true
+}

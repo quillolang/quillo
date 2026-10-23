@@ -1,0 +1,28 @@
+// Advice on campaigns before they go: subject lines that read as spam,
+// shouting, or are cut off in inboxes. Warnings only: sending is your call.
+
+let SPAMMY = ["free!!!", "act now", "$$$", "100% free", "click here", "limited time!!!", "winner"]
+
+let plugin_quality = {
+    id: "quality",
+    name: "Email quality",
+    description: "Warns about subject lines that look like spam or get cut off.",
+    audience: ["merchant", "blogger", "news"],
+    rules: {
+        campaign: [
+            (c, ctx) => when(len(c.subject ?? "") > 70, warning("subject", `${len(c.subject)} characters: inboxes show about 60`)),
+            (c, ctx) => {
+                let s = c.subject ?? ""
+                let letters = split(s, "") | filter((ch) => lower(ch) != upper(ch))
+                when(len(letters) >= 6 && s == upper(s), warning("subject", "All capitals reads as shouting"))
+            },
+            (c, ctx) => {
+                let s = lower(`${c.subject ?? ""} ${c.body ?? ""}`)
+                let hits = SPAMMY | filter((w) => contains(s, w))
+                when(len(hits) > 0, warning("body", `Spam filters dislike: ${join(hits, ", ")}`))
+            },
+        ],
+    },
+}
+
+let runners_quality = {}

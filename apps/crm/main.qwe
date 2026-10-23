@@ -1,0 +1,189 @@
+// A CRM for merchants, bloggers and news outlets, each workspace its own
+// tenant (acme.example.com) with its own database.
+//
+//   quillo run apps/crm/main.qwe --port 9000 --watch
+//   then open http://localhost:9000 and create a workspace
+//
+// Plugins (plugins/*.qwe) bring fields, rules and flow steps; workspaces
+// switch them on. Rules run in the browser, for hints while typing, and on
+// the server, where they decide.
+
+let DOMAIN = env("CRM_DOMAIN", "localhost")
+let SCHEME = env("CRM_SCHEME", "http")
+
+tenant_from(DOMAIN)
+db.open("data/{tenant}.db")
+db.migrate("migrations")
+
+use "lib/util.qwe"
+use "lib/rules.qwe"
+use "plugins/core.qwe"
+use "plugins/gdpr.qwe"
+use "plugins/loyalty.qwe"
+use "plugins/vat.qwe"
+use "plugins/paywall.qwe"
+use "plugins/sponsors.qwe"
+use "plugins/quality.qwe"
+
+// The plugins there are.
+let plugins = [plugin_core, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality]
+
+use "lib/records.qwe"
+use "lib/commerce.qwe"
+use "lib/marketing.qwe"
+use "lib/flows.qwe"
+
+// The steps flows run, on the server: the core's and the plugins'.
+let step_runners = merge(core_runners, merge(runners_gdpr, merge(runners_loyalty, merge(runners_paywall, merge(runners_vat, merge(runners_sponsors, runners_quality))))))
+
+use "lib/workspace.qwe"
+use "ui/kit.qwe"
+use "ui/public.qwe"
+use "ui/app.qwe"
+use "ui/pages.qwe"
+use "ui/designer.qwe"
+
+// `http://acme.localhost:9000` for a workspace, from the main site's host.
+fn workspace_url(slug: str, host: str) {
+    let port = contains(host, ":") ? `:${split(host, ":")[-1]}` : ""
+    `${SCHEME}://${slug}.${DOMAIN}${port}`
+}
+
+fn site_url() = settings().url ?? ""
+
+// Every few seconds, for each workspace: flows that are due carry on, and
+// queued mail goes out.
+fn tick() {
+    for t in db.tenants() ?? [] => with_tenant(t, () => {
+        resume_due()
+        deliver_mail()
+    })
+}
+schedule("10s", tick)
+
+// ---- pages --------------------------------------------------------------------------
+
+route GET /assets/*path = file("public/" + path)
+
+route GET / {
+    if tenant() == null { return <Landing/> }
+    workspace_here()
+    current_user() == null ? redirect("/login") : redirect("/app")
+}
+
+// A request for a workspace that does not exist answers 404, before any
+// page touches its (absent) database.
+fn workspace_here() = db.tenant_exists(tenant()) || reply 404 <NoWorkspace/>
+
+route GET /login {
+    if tenant() == null { return redirect("/") }
+    workspace_here()
+    <LoginPage problem={request.query.problem ?? ""} email={request.query.email ?? ""}/>
+}
+
+route POST /login { form: { email: str, password: str } } {
+    workspace_here()
+    let u = db.one("select * from users where email = ?", lower(trim(email)))
+    if !crypto.verify_password(password, u.password_hash) {
+        return redirect(`/login?problem=wrong&email=${email}`)
+    }
+    set_session({ user: u.id })
+    put_setting("url", `${SCHEME}://${request.headers.host}`)
+    redirect("/app")
+}
+
+route POST /logout {
+    end_session()
+    redirect("/login")
+}
+
+// The link from signing up: signs the owner in once.
+route GET /welcome/:token {
+    workspace_here()
+    let row = db.one("select * from sign_in_tokens where token = ? and expires_at > ?", token, now())
+    if row == null { return redirect("/login?problem=expired") }
+    db.exec("delete from sign_in_tokens where token = ?", token)
+    set_session({ user: row.user_id })
+    put_setting("url", `${SCHEME}://${request.headers.host}`)
+    redirect("/app")
+}
+
+route GET /app/export/contacts.csv {
+    workspace_here()
+    if current_user() == null { reply 401 "Sign in first" }
+    let fields = custom_fields() | filter((f) => f.entity == "contact")
+    let head = csv_row(["first_name", "last_name", "email", "phone", "stage", "subscribed", "tags"] + (fields | map((f) => f.key)))
+    let rows = db.query("select * from contacts order by id") | map(contact_out) | map((c) =>
+        csv_row([c.first_name, c.last_name, c.email, c.phone, c.stage, c.subscribed ? "yes" : "no", join(c.tags, " ")]
+            + (fields | map((f) => c.fields[f.key]))))
+    respond(200, join([head] + rows, "\n") + "\n", { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=contacts.csv" })
+}
+
+// A CSV of contacts (a header row naming the columns). Each row goes through
+// the contact rules; rows they refuse are reported, not imported.
+route POST /app/import/contacts {
+    workspace_here()
+    let u = current_user() ?? reply 401 "Sign in first"
+    let file = request.files.file ?? reply 400 "Choose a CSV file"
+    let rows = csv_parse(read_upload(file) ?? "")
+    if len(rows) < 2 { return redirect("/app/contacts?imported=0&skipped=0") }
+    let head = rows[0] | map((h) => lower(trim(h)))
+    let ctx = rule_ctx()
+    let results = drop(rows, 1) | map((cells) => {
+        let at = (name) => {
+            let i = index_of(head, name)
+            i == null ? "" : trim(cells[i] ?? "")
+        }
+        let custom = ctx.fields | filter((f) => f.entity == "contact" && index_of(head, f.key) != null) | reduce({}, (m, f) => set(m, f.key, at(f.key)))
+        let c = { first_name: at("first_name"), last_name: at("last_name"), email: at("email"), phone: at("phone"),
+            stage: at("stage") != "" ? at("stage") : "lead", subscribed: contains(["yes", "true", "1"], lower(at("subscribed"))),
+            tags: split(at("tags"), " "), fields: custom }
+        let refusal = refused("contact", c, ctx)
+        if refusal != null || (c.email != "" && db.one("select id from contacts where lower(email) = ?", lower(c.email)) != null) {
+            false
+        } else {
+            let t = now()
+            let id = db.exec("insert into contacts (first_name, last_name, email, phone, stage, subscribed, tags, fields, owner_id, source, created_at, updated_at) values (?, ?, ?, ?, ?, ?, '[]', ?, ?, 'import', ?, ?)",
+                c.first_name, c.last_name, lower(c.email), c.phone, c.stage, c.subscribed ? 1 : 0, json.stringify(custom), u.id, t, t).last_id
+            add_tags(id, c.tags)
+            true
+        }
+    })
+    let ok = results | filter((r) => r) | len
+    drain_runs()
+    redirect(`/app/contacts?imported=${ok}&skipped=${len(results) - ok}`)
+}
+
+route GET /app {
+    workspace_here()
+    current_user() == null ? redirect("/login") : <AppPage/>
+}
+
+route GET /app/*rest {
+    workspace_here()
+    current_user() == null ? redirect("/login") : <AppPage/>
+}
+
+// ---- public pages: the shop, forms, unsubscribing ----------------------------------------
+
+route GET /shop {
+    workspace_here()
+    <ShopPage name={settings().name ?? ""} currency={settings().currency ?? "USD"} products={shop_products()}/>
+}
+
+route GET /shop/:sku {
+    workspace_here()
+    let p = shop_product(sku) ?? reply 404 <NotFoundPage what="product"/>
+    <CheckoutPage sku={p.sku} name={p.name} email={request.query.email ?? ""}/>
+}
+
+route GET /f/:slug {
+    workspace_here()
+    public_form(slug) ?? reply 404 <NotFoundPage what="form"/>
+    <FormPage {slug}/>
+}
+
+route GET /unsubscribe/:token {
+    workspace_here()
+    <UnsubscribedPage ok={unsubscribe(token)} name={settings().name ?? ""}/>
+}
