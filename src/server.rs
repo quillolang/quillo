@@ -131,6 +131,13 @@ fn cross_site(req: &HttpRequest) -> bool {
     }
 }
 
+/// Whether a request's body is one another site's page can send without
+/// the browser asking first: a form, multipart, plain text, or none.
+fn sends_form(req: &HttpRequest) -> bool {
+    let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str()).unwrap_or("");
+    matches!(essence(ctype).as_str(), "" | "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain")
+}
+
 /// The `request` value a route sees.
 /// What `build_request` needs, kept until the request map is wanted.
 pub(crate) struct PendingRequest {
@@ -239,6 +246,18 @@ impl Interp {
         let (path, qs) = req.url.split_once('?').unwrap_or((req.url.as_str(), ""));
         if let Some(rest) = path.strip_prefix("/_quillo/") {
             return self.handle_internal(rest, req, path, qs);
+        }
+        // A page on another site can have the browser send a form (or text)
+        // here, with this site's cookies: refused for anything but reading,
+        // unless the program allows it for the path. Another site's JSON
+        // needs the browser to ask first, which nothing here answers, and
+        // other programs (webhooks, scripts) send no Origin.
+        if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+            && sends_form(req)
+            && cross_site(req)
+            && !self.site.takes_cross_site(path)
+        {
+            return plain(403, "this site does not take form posts from other sites\n");
         }
         let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false)).collect();
         let method = if req.method == "HEAD" { "GET" } else { req.method.as_str() };

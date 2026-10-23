@@ -55,6 +55,8 @@ pub struct Interp {
     restrictor: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
     pub server_fns: Arc<Vec<String>>,
+    /// What the program set about its site (see `site::Site`).
+    pub site: Arc<crate::site::Site>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
@@ -433,6 +435,7 @@ impl Interp {
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
+            site: Arc::new(crate::site::Site::default()),
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
@@ -467,6 +470,7 @@ impl Interp {
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: self.server_fns.clone(),
+            site: self.site.clone(),
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,

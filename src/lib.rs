@@ -17,6 +17,7 @@ pub mod parser;
 pub mod pg;
 pub mod server;
 pub mod shared;
+pub mod site;
 pub mod stack;
 pub mod sqlinfo;
 pub mod value;

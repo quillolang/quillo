@@ -59,6 +59,7 @@ pub fn install(env: &Env) {
         ("now", now),
         ("sleep", sleep),
         ("file", file),
+        ("allow_cross_site", allow_cross_site),
         ("redirect", redirect),
         ("respond", respond),
         ("read_file", read_file),
@@ -620,6 +621,19 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }))),
         Err(_) => Ok(not_found()),
     }
+}
+
+/// `allow_cross_site("/payments/return")`, at the top of a program: routes
+/// under the path take form posts from other sites' pages (a payment
+/// provider's return, a single sign-on callback), which are otherwise
+/// refused.
+fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let p = s_arg(&args, 0, "allow_cross_site", line)?;
+    if !p.starts_with('/') {
+        return fail(line, format!("`allow_cross_site` needs a path that starts with /, got {:?}", &*p));
+    }
+    Arc::make_mut(&mut it.site).cross_site_ok.push(p.to_string());
+    Ok(Value::Nil)
 }
 
 /// `redirect(url, status = 303)`. 303 makes browsers follow with a GET,

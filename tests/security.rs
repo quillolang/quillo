@@ -79,6 +79,40 @@ fn server_fns_answer_only_the_programs_own_pages() {
 }
 
 #[test]
+fn other_sites_cannot_post_forms_here() {
+    let mut it = app(
+        r#"
+allow_cross_site("/sso")
+route POST /notes = "saved"
+route POST /sso/callback = "signed in"
+route GET /notes = "list"
+"#,
+    );
+    let form = ("Content-Type", "application/x-www-form-urlencoded");
+    // Another site's page, by the browser's word or by Origin alone.
+    for from in [[form, ("Sec-Fetch-Site", "cross-site")], [form, ("Origin", "https://evil.example")]] {
+        let r = send(&mut it, "POST", "/notes", &from, "text=hi");
+        assert_eq!(r.status, 403, "{:?}", from);
+    }
+    for ctype in ["multipart/form-data; boundary=x", "text/plain", ""] {
+        let r = send(&mut it, "POST", "/notes", &[("Content-Type", ctype), ("Sec-Fetch-Site", "cross-site")], "x");
+        assert_eq!(r.status, 403, "{}", ctype);
+    }
+    // The site's own pages, and programs that send no Origin.
+    assert_eq!(send(&mut it, "POST", "/notes", &[form, ("Sec-Fetch-Site", "same-origin")], "text=hi").text(), "saved");
+    assert_eq!(send(&mut it, "POST", "/notes", &[form, ("Origin", "http://localhost:8080")], "text=hi").text(), "saved");
+    assert_eq!(send(&mut it, "POST", "/notes", &[form], "text=hi").text(), "saved");
+    // JSON from another site needs the browser to ask first; reading is fine.
+    assert_eq!(send(&mut it, "POST", "/notes", &[("Content-Type", "application/json"), ("Sec-Fetch-Site", "cross-site")], "{}").text(), "saved");
+    assert_eq!(send(&mut it, "GET", "/notes", &[("Sec-Fetch-Site", "cross-site")], "").text(), "list");
+    // A path the program allows.
+    assert_eq!(send(&mut it, "POST", "/sso/callback", &[form, ("Sec-Fetch-Site", "cross-site")], "x=1").text(), "signed in");
+    let mut bad = Interp::new(env!("CARGO_MANIFEST_DIR"));
+    let e = bad.load_source("allow_cross_site(\"sso\")", "t.qwe").err().expect("a path without / is refused");
+    assert!(e.to_string().contains("starts with /"), "{}", e);
+}
+
+#[test]
 fn json_patterns_need_a_json_body() {
     let mut it = app(r#"route POST /order { json: { type: "order" } } = "accepted""#);
     let body = r#"{"type":"order"}"#;
