@@ -53,6 +53,7 @@ pub fn maybe_grow<R>(red_zone: usize, size: usize, f: impl FnOnce() -> R) -> R {
     grow(size, f)
 }
 
+#[cfg(not(windows))]
 fn grow<R>(size: usize, f: impl FnOnce() -> R) -> R {
     let stack = DefaultStack::new(size + MARGIN).expect("cannot allocate a stack");
     let low = limit_of(&stack);
@@ -70,6 +71,24 @@ fn grow<R>(size: usize, f: impl FnOnce() -> R) -> R {
     switch(outer);
     drop(stack);
     match out.expect("ran") {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
+
+/// On Windows, where stacks are switched with fibers, `stacker` does the
+/// growing; meanwhile the end of the stack is whatever it says.
+#[cfg(windows)]
+fn grow<R>(size: usize, f: impl FnOnce() -> R) -> R {
+    let outer = switch(0);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stacker::grow(size, || {
+            switch(0);
+            f()
+        })
+    }));
+    switch(outer);
+    match r {
         Ok(v) => v,
         Err(p) => std::panic::resume_unwind(p),
     }
