@@ -2110,6 +2110,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "serde_json",
+ "sha2 0.10.9",
  "stacker",
  "tao",
  "tokio",

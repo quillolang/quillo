@@ -672,6 +672,20 @@ Without `db.open`, the database is `$QUILLO_DB` (a path or a `postgres://` URL),
 SQLite in memory. A transaction rolls back if its function fails, returns an error
 value or replies early.
 
+**Migrations.** `db.migrate("migrations")` (the folder is optional; that is its default)
+brings the schema up to date from SQL files applied in name order: `001_todos.sql`,
+`002_tags.sql`, and so on. Each file runs once, in its own transaction, and is recorded
+in a table `_quillo_migrations` with its SHA-256. A file that fails is rolled back and
+stops the program from starting, with the file's name and the database's message; a
+recorded file whose text changed later gets a warning, not a second run. Servers that
+start together take turns (an advisory lock on Postgres, an immediate transaction on
+SQLite), so each file still runs once. Call it right after `db.open`:
+
+```quillo
+db.open(env("DATABASE_URL"))
+db.migrate()
+```
+
 **SQLite** runs inside the server process, with foreign keys on and WAL mode.
 
 **PostgreSQL:**

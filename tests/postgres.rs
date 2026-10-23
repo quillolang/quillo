@@ -92,6 +92,28 @@ fn postgres() {
     placeholders_errors_and_returning(&database(&pg, "places"));
     transactions_commit_roll_back_and_nest(&database(&pg, "tx"));
     queries_wait_without_blocking_and_transactions_are_private(&database(&pg, "served"));
+    migrations_apply_once_and_roll_back_on_failure(&database(&pg, "migrated"));
+}
+
+fn migrations_apply_once_and_roll_back_on_failure(url: &str) {
+    let d = std::env::temp_dir().join(format!("quillo-pg-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let m = d.join("migrations");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("001_todos.sql"), "create table todos (id serial primary key, text text not null);").unwrap();
+    std::fs::write(m.join("002_seed.sql"), "insert into todos (text) values ('first');").unwrap();
+    let migrate = format!("db.migrate(\"{}\")", m.display());
+    assert_eq!(run(url, &migrate), "[\"001_todos.sql\", \"002_seed.sql\"]");
+    assert_eq!(run(url, &migrate), "[]");
+    std::fs::write(m.join("003_bad.sql"), "create table tags (id int);\ninsert into nowhere values (1);").unwrap();
+    let src = format!("db.open(\"{}\")\n{}", url, migrate);
+    let e = quillo::Interp::new(".").load_source(&src, "pg.qwe").err().expect("a failing migration stops loading").to_string();
+    assert!(e.contains("003_bad.sql") && e.contains("nowhere"), "{}", e);
+    assert_eq!(
+        run(url, "[db.query(\"select text from todos\"), db.one(\"select to_regclass('tags') as t\").t, len(db.query(\"select * from _quillo_migrations\"))]"),
+        "[[{ text: \"first\" }], null, 2]"
+    );
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 fn run(url: &str, src: &str) -> String {

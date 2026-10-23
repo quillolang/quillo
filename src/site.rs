@@ -7,6 +7,8 @@ pub struct Site {
     /// Path prefixes that take form posts from other sites (a payment
     /// provider's return, a single sign-on callback).
     pub cross_site_ok: Vec<String>,
+    /// The folder `db.migrate` applies, again for each database opened later.
+    pub migrations: Option<std::path::PathBuf>,
 }
 
 impl Site {

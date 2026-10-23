@@ -36,6 +36,7 @@ pub fn install(m: &mut Map) {
         ("db.query", query),
         ("db.one", one),
         ("db.transaction", transaction),
+        ("db.migrate", migrate),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -272,6 +273,33 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),
+    }
+}
+
+/// `db.migrate(dir = "migrations")`: applies the folder's SQL files the
+/// database has not had yet, in name order (see `migrate`); returns their
+/// names. A file that fails is rolled back and stops the program loading.
+fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let dir = match args.first() {
+        None => "migrations".to_string(),
+        Some(Value::Str(s)) => s.to_string(),
+        Some(other) => return fail(line, format!("`db.migrate` expects a folder name, got {}", other.type_name())),
+    };
+    let full = it.base_dir.join(&dir);
+    let b = match backend(it) {
+        Ok(b) => b,
+        Err(e) => return fail(line, format!("db.migrate: {}", e)),
+    };
+    let to = full.clone();
+    match it.unlocked(move || crate::migrate::run(&b, &to)) {
+        Ok(applied) => {
+            std::sync::Arc::make_mut(&mut it.site).migrations = Some(full);
+            for name in &applied {
+                eprintln!("quillo: applied migration {}", name);
+            }
+            Ok(Value::list(applied.into_iter().map(Value::str).collect()))
+        }
+        Err(e) => fail(line, format!("db.migrate: {}", e)),
     }
 }
 
