@@ -109,3 +109,19 @@ route GET /notes = db.query("select text from notes") | map((n) => n.text)
     assert!(e.contains("cannot be a tenant"), "{}", e);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn tenants_can_be_listed_and_looked_up_without_making_them() {
+    let d = dir("listed");
+    let mut it = app(&d, &format!("{}\nroute GET /all = db.tenants()\nroute GET /exists/:n = db.tenant_exists(n)\n", APP));
+    assert_eq!(send(&mut it, "GET", "example.com", "/all", "").text(), "[]");
+    assert_eq!(send(&mut it, "GET", "example.com", "/exists/acme", "").text(), "false");
+    assert!(!d.join("data/acme.db").exists());
+    send(&mut it, "POST", "example.com", "/signup/zeta", "");
+    send(&mut it, "POST", "example.com", "/signup/acme", "");
+    assert_eq!(send(&mut it, "GET", "example.com", "/all", "").text(), r#"["acme","zeta"]"#);
+    assert_eq!(send(&mut it, "GET", "example.com", "/exists/acme", "").text(), "true");
+    assert_eq!(send(&mut it, "GET", "example.com", "/exists/../x", "").status, 404);
+    assert_eq!(send(&mut it, "GET", "example.com", "/exists/Bad", "").text(), "false");
+    let _ = std::fs::remove_dir_all(&d);
+}

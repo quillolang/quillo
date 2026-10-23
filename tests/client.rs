@@ -259,3 +259,20 @@ f("ran = 1")"#).contains("runs text as code"));
     assert_eq!(run(r#"js("lib.el").setAttribute("title", "x")"#), "null");
     assert_eq!(run("js(\"ran\")"), "0");
 }
+
+#[test]
+fn constants_holding_functions_are_made_in_the_browser_too() {
+    if !node_available() {
+        return;
+    }
+    let defs = "let double = (x) => x * 2\n\
+                let rules = { math: [double, (x) => x + 1], text: [(x) => `${x}!`] }\n\
+                let plugins = [{ id: \"a\", rules }, { id: \"b\", rules: { math: [(x) => x - 100] } }]\n\
+                fn run(kind, v) = plugins | map((p) => p.rules[kind] ?? []) | flatten | map((r) => r(v))";
+    same(defs, "[run(\"math\", 5), run(\"text\", \"hi\")]");
+    // One the program changes stays on the server.
+    let mut it = Interp::new(".");
+    let src = "let fs = [(x) => x]\nfn grow() { fs = fs + [(x) => x] }\ncomponent C() { <p>{len(fs)}</p> }\n";
+    let e = it.load_source(src, "case.qwe").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("changes"), "{}", e);
+}

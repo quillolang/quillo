@@ -37,6 +37,8 @@ pub fn install(m: &mut Map) {
         ("db.one", one),
         ("db.transaction", transaction),
         ("db.migrate", migrate),
+        ("db.tenants", tenants),
+        ("db.tenant_exists", tenant_exists),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -347,6 +349,101 @@ fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
 
 /// `db.open(target)`: a SQLite file next to the program, ":memory:", or a
 /// postgres:// URL.
+/// The program's database per tenant, or an error naming `f`.
+fn per_tenant(it: &Interp, f: &str, line: u32) -> Result<Arc<TenantDbs>, Ctrl> {
+    match &*it.db.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(DbSlot::PerTenant(t)) => Ok(t.clone()),
+        _ => fail(line, format!("`{}` needs a database per tenant: db.open(\"data/{{tenant}}.db\")", f)),
+    }
+}
+
+/// `db.tenant_exists(name)`: whether the tenant has a database (made by
+/// `with_tenant`), without making one.
+fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let dbs = per_tenant(it, "db.tenant_exists", line)?;
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        other => return fail(line, format!("`db.tenant_exists` expects a name, got {}", other.map_or("nothing", |v| v.type_name()))),
+    };
+    if !crate::site::tenant_name_ok(&name) {
+        return Ok(Value::Bool(false));
+    }
+    if dbs.open.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&*name) {
+        return Ok(Value::Bool(true));
+    }
+    let target = dbs.template.replace("{tenant}", &name);
+    if pg::is_url(&target) {
+        return Ok(Value::Bool(it.unlocked(move || pg::Pool::open_as(&target, false).is_ok())));
+    }
+    let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+    Ok(Value::Bool(full.is_file()))
+}
+
+/// `db.tenants()`: the names of the tenants that have a database, sorted
+/// (for a job that does something for each). SQLite files, and PostgreSQL
+/// schemas (`?schema=t_{tenant}`).
+fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    let dbs = per_tenant(it, "db.tenants", line)?;
+    let (before, after) = dbs.template.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+    if pg::is_url(&dbs.template) {
+        // The schema's name around {tenant}: `t_{tenant}` in `?schema=t_{tenant}&...`.
+        let Some(q) = before.rsplit_once("schema=").map(|(_, p)| p.to_string()) else {
+            return fail(line, "`db.tenants` lists PostgreSQL schemas (?schema=t_{tenant}), not databases");
+        };
+        let suffix: String = after.chars().take_while(|c| *c != '&').collect();
+        let base = dbs.template.split('?').next().unwrap_or("").to_string();
+        let found = it.unlocked(move || -> Result<Vec<String>, String> {
+            let pool = pg::Pool::open(&base)?;
+            let mut c = pool.checkout()?;
+            let rows = c.query("select nspname from pg_namespace order by 1", &[], None);
+            pool.give_back(c);
+            Ok(rows?
+                .iter()
+                .filter_map(|r| match r {
+                    Value::Map(m) => m.get("nspname").map(|v| v.display().to_string()),
+                    _ => None,
+                })
+                .collect())
+        });
+        match found {
+            Ok(all) => {
+                for s in all {
+                    if let Some(n) = s.strip_prefix(&q).and_then(|r| r.strip_suffix(&suffix)) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+            Err(e) => return Ok(db_err(e)),
+        }
+    } else {
+        let full = it.base_dir.join(&before);
+        let (dir, prefix) = if before.ends_with('/') || before.is_empty() {
+            (full.clone(), String::new())
+        } else {
+            (full.parent().map(Path::to_path_buf).unwrap_or_default(), full.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(Value::list(Vec::new())) };
+        for e in entries.flatten() {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let Some(rest) = file.strip_prefix(&prefix) else { continue };
+            if after.contains('/') {
+                // A folder per tenant (`data/{tenant}/app.db`): its database inside.
+                if dir.join(format!("{}{}", file, after)).is_file() {
+                    names.push(rest.to_string());
+                }
+            } else if let Some(name) = rest.strip_suffix(&after) {
+                if e.path().is_file() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.retain(|n| crate::site::tenant_name_ok(n));
+    names.sort();
+    Ok(Value::list(names.into_iter().map(Value::str).collect()))
+}
+
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let target = sql_arg(&args, "db.open", line)?;
     // One database per tenant: each is opened when its tenant first uses it.

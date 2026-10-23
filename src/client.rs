@@ -771,6 +771,11 @@ impl<'a> Compiler<'a> {
                     ));
                 }
                 if let Some(bad) = not_sendable(other) {
+                    // A constant holding functions (a table of rules, say)
+                    // is made in the browser too, from its definition.
+                    if let Some(e) = self.definition(name) {
+                        return self.global_made(name, &js, e, line);
+                    }
                     return self.err(format!("`{}` is {}, which cannot be sent to the browser", name, bad));
                 }
                 self.defs.push(format!("{} = {};", js, other.to_json()));
@@ -779,6 +784,54 @@ impl<'a> Compiler<'a> {
                 Ok(r)
             }
         }
+    }
+
+    /// What `let name = ...` at the top of the program gave `name`, for a
+    /// name bound once, alone.
+    fn definition(&self, name: &str) -> Option<Expr> {
+        let mut found = None;
+        for stmts in self.it.program.iter() {
+            for st in stmts.iter() {
+                if let Stmt::Let(Pattern::Bind(n), e, _) = st {
+                    if n == name {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some(e.clone());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// A constant compiled from its definition: a function of nothing,
+    /// called once when the bundle loads.
+    fn global_made(&mut self, name: &str, js: &str, e: Expr, line: u32) -> Result<(String, bool), QuilloError> {
+        let def = FnDef {
+            name: name.to_string(),
+            params: Vec::new(),
+            ret: None,
+            err: None,
+            effects: None,
+            server: false,
+            component: false,
+            line,
+            body: e,
+        };
+        // Until made, references to it (from functions it holds) find it.
+        self.globals.insert(name.to_string(), (js.to_string(), false));
+        let saved_ctxs = std::mem::take(&mut self.ctxs);
+        let saved_what = std::mem::replace(&mut self.what, format!("`{}`", name));
+        let res = self.function(&def);
+        self.ctxs = saved_ctxs;
+        self.what = saved_what;
+        let (code, is_async) = res?;
+        if is_async {
+            return self.err(format!("`{}` waits on the server to be made, so the browser cannot make it", name));
+        }
+        self.defs.push(format!("{} = ({})();", js, code));
+        Ok((js.to_string(), false))
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {

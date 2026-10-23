@@ -293,6 +293,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "fn", "any"),
+    ("db.tenants", "", "list | error(str)"),
+    ("db.tenant_exists", "str", "bool"),
     ("http.get", "str, map | null=", "map | error(str)"),
     ("http.delete", "str, map | null=", "map | error(str)"),
     ("http.post", "str, any=, map | null=", "map | error(str)"),
