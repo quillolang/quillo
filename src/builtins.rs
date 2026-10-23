@@ -587,17 +587,30 @@ fn mime(path: &Path) -> &'static str {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
+        "json" | "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "xml" => "application/xml",
         "txt" | "md" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "avif" => "image/avif",
         "ico" => "image/x-icon",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
         "wasm" => "application/wasm",
         "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         "pdf" => "application/pdf",
+        "zip" => "application/zip",
         _ => "application/octet-stream",
     }
 }
@@ -606,8 +619,13 @@ fn not_found() -> Value {
     Value::Response(Arc::new(Response { status: 404, headers: Vec::new(), body: Body::Value(Value::str("not found")) }))
 }
 
-/// `file("public/app.css")`: serves a file relative to the program's folder.
-/// Paths containing `..` or starting at `/` are refused with a 404.
+/// `file("public/app.css")`: serves a file relative to the program's folder
+/// (see `statics`): a browser whose copy is current gets a bodiless 304, a
+/// byte range gets a 206 (audio, video), and small files come from memory
+/// while unchanged. Browsers check back each time; `file(path, { cache:
+/// "1y" })` lets them keep it that long without asking, for names that
+/// change with their content. Paths containing `..` or starting at `/` are
+/// refused with a 404.
 fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "file", line)?;
     let rel = Path::new(&*p);
@@ -615,16 +633,98 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(not_found());
     }
     let full = it.base_dir.join(rel);
-    if !full.is_file() {
-        return Ok(not_found());
+    let Ok(info) = crate::statics::info(&full) else { return Ok(not_found()) };
+    let keep = match args.get(1) {
+        None | Some(Value::Nil) => None,
+        Some(Value::Map(m)) => match m.get("cache") {
+            None | Some(Value::Nil) => None,
+            Some(v) => match cache_seconds(v) {
+                Some(s) => Some(s),
+                None => return fail(line, format!("`file`'s cache is seconds or a duration like \"30d\", got {}", v.repr())),
+            },
+        },
+        Some(other) => return fail(line, format!("`file` expects options as a map, got {}", other.type_name())),
+    };
+    let cache_control = match keep {
+        Some(s) => format!("public, max-age={}, immutable", s),
+        None => "no-cache".into(),
+    };
+    let mut headers: Vec<(String, String)> = vec![
+        ("etag".into(), info.etag.clone()),
+        ("last-modified".into(), info.last_modified.clone()),
+        ("cache-control".into(), cache_control),
+    ];
+    let answer = |status: u16, headers: Vec<(String, String)>, body: Vec<u8>| {
+        Ok(Value::Response(Arc::new(Response { status, headers, body: Body::Bytes(body) })))
+    };
+    // What the browser already has, or wants a part of.
+    let asked = |name: &str, it: &mut Interp| -> Option<String> {
+        let Some(Value::Map(req)) = it.request_value() else { return None };
+        let Some(Value::Map(h)) = req.get("headers") else { return None };
+        h.get(name).map(|v| v.display())
+    };
+    let fresh = match asked("if-none-match", it) {
+        Some(v) => crate::statics::matches(&v, &info.etag),
+        None => asked("if-modified-since", it).map_or(false, |v| v == info.last_modified),
+    };
+    if fresh {
+        return answer(304, headers, Vec::new());
     }
-    match std::fs::read(&full) {
-        Ok(bytes) => Ok(Value::Response(Arc::new(Response {
-            status: 200,
-            headers: vec![("content-type".into(), mime(&full).into())],
-            body: Body::Bytes(bytes),
-        }))),
+    headers.push(("content-type".into(), mime(&full).into()));
+    headers.push(("accept-ranges".into(), "bytes".into()));
+    if let Some(r) = asked("range", it) {
+        let same = asked("if-range", it).map_or(true, |v| v == info.etag || v == info.last_modified);
+        match crate::statics::range(&r, info.len).filter(|_| same) {
+            Some(Ok((start, end))) => {
+                let from = full.clone();
+                return match it.unlocked(move || crate::statics::read_range(&from, start, end)) {
+                    Ok(bytes) => {
+                        headers.push(("content-range".into(), format!("bytes {}-{}/{}", start, end, info.len)));
+                        answer(206, headers, bytes)
+                    }
+                    Err(_) => Ok(not_found()),
+                };
+            }
+            Some(Err(())) => {
+                headers.push(("content-range".into(), format!("bytes */{}", info.len)));
+                return answer(416, headers, Vec::new());
+            }
+            None => {}
+        }
+    }
+    // Small files are in memory; larger ones are read off the event loop.
+    let bytes = if info.len <= 1 << 20 {
+        crate::statics::read(&full, &info)
+    } else {
+        let from = full.clone();
+        it.unlocked(move || crate::statics::read(&from, &info))
+    };
+    match bytes {
+        Ok(b) => answer(200, headers, b.to_vec()),
         Err(_) => Ok(not_found()),
+    }
+}
+
+/// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
+fn cache_seconds(v: &Value) -> Option<u64> {
+    match v {
+        Value::Int(n) if *n >= 0 => Some(*n as u64),
+        Value::Str(s) => {
+            let s = s.trim();
+            let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+            let n: u64 = n.parse().ok()?;
+            let per = match unit {
+                "" | "s" => 1,
+                "m" => 60,
+                "h" => 3600,
+                "d" => 86400,
+                "w" => 7 * 86400,
+                "y" => 365 * 86400,
+                _ => return None,
+            };
+            Some(n * per)
+        }
+        _ => None,
     }
 }
 

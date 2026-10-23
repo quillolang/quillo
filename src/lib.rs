@@ -20,6 +20,7 @@ pub mod pg;
 pub mod server;
 pub mod shared;
 pub mod site;
+pub mod statics;
 pub mod stack;
 pub mod sqlinfo;
 pub mod upload;

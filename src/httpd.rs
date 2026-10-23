@@ -1286,7 +1286,7 @@ fn civil(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + if month <= 2 { 1 } else { 0 }, month, day)
 }
 
-fn http_date(secs: u64) -> String {
+pub(crate) fn http_date(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -1329,6 +1329,7 @@ fn reason(status: u16) -> &'static str {
         411 => "Length Required",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         422 => "Unprocessable Content",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",

@@ -311,6 +311,30 @@ fn text_responses_are_gzipped_when_the_client_accepts_it() {
 }
 
 #[test]
+fn a_files_gzipped_copy_is_kept_and_ranges_are_not_gzipped() {
+    let d = temp_dir("gzip-file");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /a/*p = file(p)\n").unwrap();
+    std::fs::write(d.join("big.css"), "body { color: red }\n".repeat(500)).unwrap();
+    let srv = start(&f, &[]);
+    let raw = |extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        write!(s, "GET /a/big.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAccept-Encoding: gzip\r\n{}\r\n", extra).unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (String::from_utf8_lossy(&out[..at]).to_lowercase(), out[at + 4..].to_vec())
+    };
+    let (h1, b1) = raw("");
+    let (_, b2) = raw("");
+    assert!(h1.contains("content-encoding: gzip") && h1.contains("etag: w/"), "{}", h1);
+    assert_eq!(b1, b2);
+    let (h, b) = raw("Range: bytes=0-3\r\n");
+    assert!(h.starts_with("http/1.1 206") && !h.contains("content-encoding"), "{}", h);
+    assert_eq!(b, b"body");
+}
+
+#[test]
 fn large_bodies_are_refused_before_they_are_read() {
     let d = temp_dir("max-body");
     let f = d.join("app.qwe");

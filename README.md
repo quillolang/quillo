@@ -597,7 +597,7 @@ route POST /avatar {
 | error | 500 `{"error": ...}` |
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
-| `file(path)` | a file under the program's folder (paths with `..` or `/` are refused) |
+| `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
 
 `reply status [body]` ends the request right away, from anywhere: inside a
 helper, a pipeline stage or a `??` fallback. This is how middleware works:
@@ -617,6 +617,25 @@ route GET /users/:id(int) {
     user
 }
 ```
+
+### Static files
+
+```quillo
+route GET /assets/*path = file("public/" + path)
+route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that change with content
+```
+
+- Each file goes out with an `ETag` and `Last-Modified`. A browser asking with a
+  current copy (`If-None-Match`, `If-Modified-Since`) gets a `304` with no body.
+- `Cache-Control` is `no-cache` (keep it, but ask each time) unless `cache` is given:
+  seconds, or `"10m"`, `"12h"`, `"30d"`, `"1y"`, which allows keeping it that long
+  without asking (`immutable`). Use it for files whose name changes with their content.
+- `Range: bytes=…` gets a `206` with only those bytes (audio and video seeking); a range
+  past the end gets a `416`.
+- Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
+  disk; larger ones are read off the event loop. The gzipped copy of a text file is kept
+  too, rather than compressed again for each request.
+- Paths with `..`, or starting at `/`, get a `404`.
 
 ### Mounting programs
 

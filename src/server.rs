@@ -895,7 +895,8 @@ fn run_program(it: &mut Interp, req: &HttpRequest) -> Option<HttpResponse> {
 /// Gzips text responses of 1 KiB or more for clients that accept it.
 fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     use std::io::Write;
-    if resp.body.len() < 1024 || resp.header("content-encoding").is_some() {
+    // A part of a file stays as it is: its byte range is of the file.
+    if resp.status != 200 || resp.body.len() < 1024 || resp.header("content-encoding").is_some() {
         return;
     }
     let ctype = resp.header("content-type").unwrap_or("");
@@ -907,15 +908,26 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     if !text || !accepts {
         return;
     }
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(resp.body.len() / 3), flate2::Compression::default());
-    if enc.write_all(&resp.body).is_err() {
-        return;
-    }
-    if let Ok(gz) = enc.finish() {
-        resp.body = gz;
-        resp.headers.push(("content-encoding".into(), "gzip".into()));
-        resp.headers.push(("vary".into(), "accept-encoding".into()));
-    }
+    // A file's gzipped copy is kept (by its ETag) rather than made again.
+    let etag = resp.header("etag").map(str::to_string);
+    let kept = etag.as_deref().and_then(|e| crate::statics::gzipped(e, &resp.body));
+    let gz = match kept {
+        Some(gz) => gz.to_vec(),
+        None => {
+            let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(resp.body.len() / 3), flate2::Compression::default());
+            if enc.write_all(&resp.body).is_err() {
+                return;
+            }
+            let Ok(gz) = enc.finish() else { return };
+            if let Some(e) = &etag {
+                crate::statics::keep_gzipped(e, &resp.body, Arc::from(gz.as_slice()));
+            }
+            gz
+        }
+    };
+    resp.body = gz;
+    resp.headers.push(("content-encoding".into(), "gzip".into()));
+    resp.headers.push(("vary".into(), "accept-encoding".into()));
 }
 
 /// A server thread's own handle on the program, replaced when `--watch`
