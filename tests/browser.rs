@@ -204,6 +204,20 @@ fn keyed_lists_move_only_what_changed() {
     assert_eq!(r, want);
 }
 
+/// SVG inside other markup: what a component draws is SVG's, also what
+/// loops and conditions add later; a <foreignObject> holds HTML again.
+#[test]
+fn svg_inside_html_draws() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("svg.qwe"), free_port(), Some(&dir.join("svg.js")));
+    let want = serde_json::json!({ "svg": true, "allSvg": true, "rects": 4, "circle": true, "html": true, "cls": "on", "drawn": true, "errors": [] });
+    assert_eq!(r, want);
+}
+
 /// Components with the page's JavaScript: `@mount` and its cleanup, `js`
 /// and `js_new`, and methods of a library's objects.
 #[test]

@@ -1,0 +1,18 @@
+// An <svg> inside other markup, with elements added by a loop and by
+// conditions: every one must be SVG's, or nothing draws. Driven by svg.js.
+
+component Chart() {
+    ~points = [3, 5, 2]
+    ~show = false
+    <div.wrap>
+        <h1>Chart</h1>
+        <svg width="200" height="100" class="chart">
+            <g class={show ? "on" : "off"}>{for [i, p] in enumerate(points) => <rect key={i} x={i * 20} y={100 - p * 10} width="15" height={p * 10}/>}</g>
+            {show && <circle cx="150" cy="50" r="10"/>}
+            <foreignObject x="0" y="0" width="100" height="20"><p>html again</p></foreignObject>
+        </svg>
+        <button id="more" @click={() => { points = points + [4]; show = true }}>More</button>
+    </div>
+}
+
+route GET / = <html><body><Chart/></body></html>

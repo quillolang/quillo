@@ -275,6 +275,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("with_locale", "str, fn", "any"),
     ("t", "str, map | null=", "str"),
     ("schedule", "str | int, fn, map | null=", "null"),
+    ("allow_cross_site", "str", "null"),
+    ("tenant", "", "str | null"),
+    ("tenant_from", "str | fn", "null"),
+    ("with_tenant", "str, fn", "any"),
+    ("save_upload", "map, str", "str | error(str)"),
+    ("read_upload", "map", "str | error(str)"),
     ("js", "str, any...", "any"),
     ("js_new", "str, any...", "any"),
     ("live", "fn, any...", "any"),
@@ -293,6 +299,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "fn", "any"),
+    ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
     ("http.get", "str, map | null=", "map | error(str)"),
@@ -321,7 +328,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
-      "schedule"];
+      "schedule", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

@@ -885,19 +885,26 @@ function b(def, vals, key) {
   return new VBlock(def, vals, isNil(key) ? null : typeof key === "number" || typeof key === "string" ? key : display(key));
 }
 
+// A block's DOM, made once and cloned: elements from <svg> down are SVG's
+// (a block may hold an <svg> inside HTML), and HTML again inside a
+// <foreignObject>.
 function blockTemplate(def, svg) {
-  const make = (t) => {
-    const el = svg ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
+  const make = (t, inSvg) => {
+    const here = inSvg || t[0] === "svg";
+    const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
     for (const [k, v] of t[1]) setProp(el, k, v, undefined);
-    for (const c of t[2]) el.appendChild(typeof c === "string" ? document.createTextNode(c) : make(c));
+    for (const c of t[2]) el.appendChild(typeof c === "string" ? document.createTextNode(c) : make(c, here && t[0] !== "foreignObject"));
     return el;
   };
-  return svg ? (def.svg || (def.svg = make(def.tpl))) : (def.html || (def.html = make(def.tpl)));
+  return svg ? (def.svg || (def.svg = make(def.tpl, true))) : (def.html || (def.html = make(def.tpl, false)));
 }
+
+// Whether what goes inside `el` is SVG.
+const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
 
 function setClass(el, v, svg) {
   if (isNil(v) || v === "") el.removeAttribute("class");
-  else if (svg) el.setAttribute("class", v);
+  else if (svg || el.namespaceURI === SVG) el.setAttribute("class", v);
   else el.className = v;
 }
 
@@ -917,6 +924,7 @@ function mountBlock(v, svg) {
 function showNodes(v, i, el, x, svg) {
   el.textContent = "";
   const ks = nodes(x);
+  svg = svg || inSvg(el);
   for (const k of ks) el.appendChild(mount(k, svg));
   (v.parts || (v.parts = new Array(v.vals.length)))[i] = ks;
   v.els[v.def.at[i]] = el;
@@ -952,7 +960,7 @@ function updateHole(v, i, x, old) {
       v.parts[i] = null;
     } else {
       const ks = nodes(x);
-      patchKids(n, was, ks, v.svg);
+      patchKids(n, was, ks, v.svg || inSvg(n));
       v.parts[i] = ks;
     }
   }
