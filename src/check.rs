@@ -268,6 +268,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("group_by", "list | null, fn", "map"),
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
+    ("markdown", "str, map | null=", "html"),
     ("live", "fn, any...", "any"),
     ("parallel", "any...", "list"),
     ("every", "num, fn", "null"),
@@ -309,7 +310,7 @@ const MODULES: &[&str] = &["json", "db", "http", "crypto"];
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "set_session", "end_session"];
+      "delete_cookie", "session", "set_session", "end_session", "markdown"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

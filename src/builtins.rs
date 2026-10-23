@@ -87,6 +87,7 @@ pub fn install(env: &Env) {
         ("group_by", group_by),
         ("index_of", index_of),
         ("repeat", repeat),
+        ("markdown", markdown),
         ("live", live),
         ("parallel", parallel),
         ("every", every),
@@ -1106,6 +1107,36 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, "`repeat` count is negative or too large");
     }
     Ok(Value::str(s.repeat(n as usize)))
+}
+
+/// `markdown(text)`: Markdown as HTML (CommonMark, with tables,
+/// strikethrough and task lists). HTML written in the text is shown as text,
+/// and `javascript:` links are blocked, so it is safe for what visitors
+/// write; `markdown(text, { html: true })` keeps the HTML, for text you
+/// wrote yourself.
+fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
+    let s = s_arg(&args, 0, "markdown", line)?;
+    let html_ok = match args.get(1) {
+        None | Some(Value::Nil) => false,
+        Some(Value::Map(m)) => m.get("html").map_or(false, |v| v.truthy()),
+        Some(v) => return fail(line, format!("`markdown` expects options as a map, got {}", v.type_name())),
+    };
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let safe = |u: CowStr<'static>| if crate::interp::script_url(&u) { CowStr::Borrowed(crate::interp::BLOCKED_URL) } else { u };
+    let events = Parser::new_ext(&s, opts).map(|e| match e {
+        Event::Html(h) | Event::InlineHtml(h) if !html_ok => Event::Text(h),
+        Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Link { link_type, dest_url: safe(dest_url.into_static()), title, id })
+        }
+        Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Image { link_type, dest_url: safe(dest_url.into_static()), title, id })
+        }
+        e => e,
+    });
+    let mut out = String::with_capacity(s.len() * 3 / 2);
+    pulldown_cmark::html::push_html(&mut out, events);
+    Ok(Value::html(out))
 }
 
 // ---- live updates ------------------------------------------------------

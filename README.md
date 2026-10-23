@@ -692,6 +692,10 @@ prefix. Changes to mounted files are picked up by `--watch`. See
 
 - **General:** `print str int float len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
+- **Markdown:** `markdown(text)` gives HTML (CommonMark with tables, strikethrough and task
+  lists). HTML inside the text is shown as text and `javascript:` links are blocked, so
+  it is safe for what visitors write; `markdown(text, { html: true })` keeps the HTML,
+  for text you wrote.
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`
