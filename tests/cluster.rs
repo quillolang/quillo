@@ -20,6 +20,29 @@ impl Drop for Proc {
     }
 }
 
+/// limer, stopped with `limer stop` so that its workers stop too (killing
+/// the main process would leave them running).
+struct Limer {
+    bin: PathBuf,
+    config: PathBuf,
+    child: Child,
+}
+
+impl Drop for Limer {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.bin).args(["stop", "-c"]).arg(&self.config).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn limer() -> Option<PathBuf> {
     let p = std::env::var_os("LIMER")
         .map(PathBuf::from)
@@ -94,15 +117,17 @@ route GET / = <p>hello</p>
         ),
     )
     .unwrap();
-    let _lb = Proc(
-        Command::new(&limer)
-            .args(["run", "-c"])
+    let _lb = Limer {
+        child: Command::new(&limer)
+            .args(["run", "-w", "1", "-c"])
             .arg(&limerfile)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("cannot start limer"),
-    );
+        bin: limer.clone(),
+        config: limerfile.clone(),
+    };
     wait_tcp(admin);
 
     let start = |port: u16| {
@@ -195,5 +220,7 @@ route GET / = <p>hello</p>
         }
     };
     assert_eq!(through["ok"], 1);
+    // limer stops by its configuration, so before the folder goes.
+    drop(_lb);
     let _ = std::fs::remove_dir_all(&dir);
 }
