@@ -5,6 +5,28 @@ hardening (request limits, cross-site checks, connection caps, error messages,
 header checks, cluster announcement checks) is being done in a separate audit
 and is not listed here.
 
+## Production
+
+Known limits of what is there, from the security review and the soak test:
+
+- [ ] **Live topics are not checked against the tenant.** `/_quillo/live` takes
+      the topic names a page sends, so a page on one tenant could ask to be woken
+      by another's changes. It learns only when they happen, never what changed.
+      Signing the topics a loader returns would close it.
+- [ ] **Schema per tenant uses a pool per tenant.** At most 16 PostgreSQL tenants
+      keep connections open (four each at most); one shared pool that sets the
+      `search_path` per transaction would serve any number.
+- [ ] **A check that a tenant exists.** Requests for a made-up tenant make nothing,
+      but `tenant()` still names it; `tenant_from(rule, { known: (name) => ... })`
+      would let routes treat it as no tenant.
+- [ ] **Large text files go uncompressed.** Files over 1 MiB are sent from disk as
+      they are; compressing them as they are sent, or keeping a `.gz` beside them,
+      would shrink large JSON and CSV.
+- [ ] **Sessions are signed, not encrypted**, so their contents are readable in
+      the browser (documented). Encrypting them would allow keeping more in them.
+- [ ] **Jobs of mounted programs do not run**: only the main program's
+      `schedule` calls are seen by the scheduler.
+
 ## Native apps
 
 `quillo app` shows a program in a native window on the desktop (see
