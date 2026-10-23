@@ -55,6 +55,14 @@ fn parallel_runs_the_same_in_the_browser() {
 }
 
 #[test]
+fn a_proto_key_is_an_ordinary_key() {
+    if !node_available() {
+        return;
+    }
+    same("", "let m = set({ a: 1 }, \"__proto__\", { p: 1 })\n[keys(m), m.a, m[\"__proto__\"]]");
+}
+
+#[test]
 fn values_and_operators() {
     if !node_available() {
         return;

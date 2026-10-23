@@ -24,7 +24,7 @@ const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v);
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
 
 function typeName(v) {
@@ -178,6 +178,16 @@ function eventField(e, name) {
 }
 
 // `x.name`: a map field, `e.value` on events, or a function called on x.
+// `x.name` for a name Object.prototype does not have: a map's key is read
+// directly (a key never holds undefined), anything else as `field` does.
+function fieldp(v, name, fb) {
+  if (v !== null && typeof v === "object" && v.constructor === Object) {
+    const x = v[name];
+    if (x !== undefined) return x;
+  }
+  return field(v, name, fb);
+}
+
 function field(v, name, fb) {
   // A map made by the program (the usual case) first.
   if (v !== null && typeof v === "object" && v.constructor === Object) {
@@ -499,8 +509,18 @@ B.slice = meta((v, start, end) => {
   if (typeof v === "string") { const cs = Array.from(v); const [s, e] = clampRange(cs.length, start, end); return cs.slice(s, e).join(""); }
   fail(`\`slice\` expects a list or str, got ${typeName(v)}`);
 }, "slice", null);
-B.map = meta((l, f) => { F(f, "map"); return L(l, "map").map((x) => cb(f, "map", x)); }, "map", null);
-B.filter = meta((l, f) => { F(f, "filter"); return L(l, "filter").filter((x) => truthy(cb(f, "filter", x))); }, "filter", null);
+B.map = meta((l, f) => {
+  F(f, "map");
+  const a = L(l, "map"), out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = cb(f, "map", a[i]);
+  return out;
+}, "map", null);
+B.filter = meta((l, f) => {
+  F(f, "filter");
+  const a = L(l, "filter"), out = [];
+  for (let i = 0; i < a.length; i++) if (truthy(cb(f, "filter", a[i]))) out.push(a[i]);
+  return out;
+}, "filter", null);
 B.find = meta((l, f) => { F(f, "find"); for (const x of L(l, "find")) if (truthy(cb(f, "find", x))) return x; return null; }, "find", null);
 B.any = meta((l, f) => { F(f, "any"); return L(l, "any").some((x) => truthy(cb(f, "any", x))); }, "any", null);
 B.all = meta((l, f) => { F(f, "all"); return L(l, "all").every((x) => truthy(cb(f, "all", x))); }, "all", null);
@@ -524,7 +544,13 @@ B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
 B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
 B.get = meta((m, k, d = null) => { m = M(m, "get"); k = display(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
 B.has = meta((m, k) => hasOwn(M(m, "has"), display(k)), "has", null);
-B.set = meta((m, k, v = null) => Object.assign({}, M(m, "set"), { [display(k)]: v }), "set", null);
+B.set = meta((m, k, v = null) => {
+  const o = { ...M(m, "set") }, key = display(k);
+  // "__proto__" is a key like any other here, not the object's prototype.
+  if (key === "__proto__") Object.defineProperty(o, key, { value: v, enumerable: true, writable: true, configurable: true });
+  else o[key] = v;
+  return o;
+}, "set", null);
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
   const m = Object.assign({}, M(c, "remove"));
@@ -726,6 +752,9 @@ function norm(x, out) {
   return out;
 }
 
+// `x` as a list of nodes; a memoized loop's rows (see `rows`) are one.
+function nodes(x) { return x !== null && x !== undefined && x.$rows === true ? x : norm(x, []); }
+
 // HTML literal: W.h(tag, props, on, kids, key)
 function h(tag, props, on, kids, key) {
   return new VEl(tag, props, on, norm(kids, []), isNil(key) ? null : display(key));
@@ -738,16 +767,21 @@ function h(tag, props, on, kids, key) {
 // update compares them with the last ones.
 //
 // tpl: [tag, [[name, value], ...], [child, ...]], a child being text or a tpl.
-// paths: the nodes that have holes, as child positions from the root.
 // holes: [kind, node, name]: 0 attribute, 1 class, 2 handler, 3 an element's
 // only child (its node is an empty text node in the template, which text
 // fills), 4 an element's children.
-function block(tpl, paths, holes) {
-  return { tpl, paths, kinds: holes.map((h) => h[0]), at: holes.map((h) => h[1]), names: holes.map((h) => h[2]), html: null, svg: null };
+// mount(v, root, svg): compiled for the block, it finds the nodes with holes
+// in a copy of the template (`v.els`) and fills them from `v.vals`.
+// patch(a, v): compiled too, v takes over a's DOM and updates what changed.
+function block(tpl, holes, mount, patch) {
+  return { tpl, kinds: holes.map((h) => h[0]), at: holes.map((h) => h[1]), names: holes.map((h) => h[2]), mount, patch, html: null, svg: null };
 }
 
-// A use of block `def`: W.b(def, values, key)
-function b(def, vals, key) { return new VBlock(def, vals, isNil(key) ? null : display(key)); }
+// A use of block `def`: W.b(def, values, key). Numbers and strings are
+// keys as they are.
+function b(def, vals, key) {
+  return new VBlock(def, vals, isNil(key) ? null : typeof key === "number" || typeof key === "string" ? key : display(key));
+}
 
 function blockTemplate(def, svg) {
   const make = (t) => {
@@ -771,47 +805,23 @@ function mountBlock(v, svg) {
   const def = v.def;
   svg = svg || def.tpl[0] === "svg";
   const root = blockTemplate(def, svg).cloneNode(true);
-  const paths = def.paths, els = new Array(paths.length);
-  for (let i = 0; i < paths.length; i++) {
-    let n = root;
-    const path = paths[i];
-    for (let p = 0; p < path.length; p++) {
-      n = n.firstChild;
-      for (let k = path[p]; k > 0; k--) n = n.nextSibling;
-    }
-    els[i] = n;
-  }
-  v.els = els;
   v.parts = null;
   v.svg = svg;
-  const kinds = def.kinds, at = def.at, names = def.names, vals = v.vals;
-  for (let i = 0; i < kinds.length; i++) {
-    const kind = kinds[i], x = vals[i];
-    if (kind === 0) setProp(els[at[i]], names[i], x, undefined);
-    else if (kind === 1) { if (!isNil(x) && x !== "") setClass(els[at[i]], x, svg); }
-    else if (kind === 2) listen(els[at[i]], names[i], x);
-    else if (kind === 3 && isText(x)) els[at[i]].nodeValue = display(x);
-    else showNodes(v, i, kind === 3 ? els[at[i]].parentNode : els[at[i]], x, svg);
-  }
+  def.mount(v, root, svg);
   return (v.d = root);
 }
 
 // Hole `i` of block `v` shows virtual DOM: `el`'s children become `x`.
 function showNodes(v, i, el, x, svg) {
   el.textContent = "";
-  const ks = norm(x, []);
+  const ks = nodes(x);
   for (const k of ks) el.appendChild(mount(k, svg));
   (v.parts || (v.parts = new Array(v.vals.length)))[i] = ks;
   v.els[v.def.at[i]] = el;
 }
 
-function patchBlock(a, v, svg) {
-  if (a === v) return;
-  v.els = a.els;
-  v.parts = a.parts;
-  v.svg = a.svg;
-  const vals = v.vals, old = a.vals;
-  for (let i = 0; i < vals.length; i++) updateHole(v, i, vals[i], old[i]);
+function patchBlock(a, v) {
+  if (a !== v) v.def.patch(a, v);
 }
 
 // Hole `i` of mounted block `v` goes from `old` to `x`. A hole of kind 3
@@ -829,7 +839,7 @@ function updateHole(v, i, x, old) {
   else {
     const was = v.parts && v.parts[i];
     if (!was) {
-      if (isText(x)) n.nodeValue = display(x);
+      if (isText(x)) n.data = display(x);
       else showNodes(v, i, n.parentNode, x, v.svg);
     } else if (kind === 3 && isText(x)) {
       for (const k of was) drop(k);
@@ -839,7 +849,7 @@ function updateHole(v, i, x, old) {
       els[at] = t;
       v.parts[i] = null;
     } else {
-      const ks = norm(x, []);
+      const ks = nodes(x);
       patchKids(n, was, ks, v.svg);
       v.parts[i] = ks;
     }
@@ -1078,8 +1088,8 @@ function patch(parent, a, b, svg) {
     return;
   }
   const d = (b.d = a.d);
-  if (b instanceof VBlock) return patchBlock(a, b, svg);
-  if (b instanceof VText) { if (a.t !== b.t) d.nodeValue = b.t; return; }
+  if (b instanceof VBlock) return patchBlock(a, b);
+  if (b instanceof VText) { if (a.t !== b.t) d.data = b.t; return; }
   if (b instanceof VRaw) { if (a.html !== b.html) d.innerHTML = b.html; return; }
   if (b instanceof VComp) {
     b.inst = a.inst;
@@ -1128,8 +1138,8 @@ function sameKey(a, b) {
 // so a swap moves two and a removal none.
 function patchKeyed(el, old, kids, svg) {
   let s = 0, oe = old.length - 1, ne = kids.length - 1;
-  while (s <= oe && s <= ne && sameKey(old[s], kids[s])) { patch(el, old[s], kids[s], svg); s++; }
-  while (s <= oe && s <= ne && sameKey(old[oe], kids[ne])) { patch(el, old[oe], kids[ne], svg); oe--; ne--; }
+  while (s <= oe && s <= ne && (old[s] === kids[s] || sameKey(old[s], kids[s]))) { patch(el, old[s], kids[s], svg); s++; }
+  while (s <= oe && s <= ne && (old[oe] === kids[ne] || sameKey(old[oe], kids[ne]))) { patch(el, old[oe], kids[ne], svg); oe--; ne--; }
   const end = ne + 1 < kids.length ? kids[ne + 1].d : null;
   if (s > oe) {
     for (let i = s; i <= ne; i++) el.insertBefore(mount(kids[i], svg), end);
@@ -1139,19 +1149,42 @@ function patchKeyed(el, old, kids, svg) {
     for (let j = s; j <= oe; j++) unmount(el, old[j]);
     return;
   }
-  const byKey = new Map(), unkeyed = [];
-  for (let j = s; j <= oe; j++) { const k = keyOf(old[j]); if (k === null) unkeyed.push(j); else byKey.set(k, j); }
-  const m = ne - s + 1;
+  // Each new child's old one: at the same place, or at the same place from
+  // the end, else (for the few left) by key.
+  const m = ne - s + 1, shift = oe - ne;
   const from = new Int32Array(m).fill(-1);
   const used = new Uint8Array(oe + 1);
-  let u = 0, last = -1, moved = false, kept = 0;
+  let left = 0;
   for (let i = 0; i < m; i++) {
-    const k = kids[s + i], key = keyOf(k);
-    let j = key === null ? (u < unkeyed.length ? unkeyed[u++] : -1) : (byKey.has(key) ? byKey.get(key) : -1);
-    if (j >= 0 && (used[j] || !same(old[j], k))) j = -1;
+    const k = kids[s + i];
+    let j = s + i;
+    if (!(j <= oe && !used[j] && (old[j] === k || sameKey(old[j], k)))) {
+      j = s + i + shift;
+      if (!(j >= s && j <= oe && !used[j] && (old[j] === k || sameKey(old[j], k)))) j = -1;
+    }
+    if (j >= 0) { used[j] = 1; from[i] = j; } else left++;
+  }
+  if (left > 0) {
+    const byKey = new Map(), unkeyed = [];
+    for (let j = s; j <= oe; j++) {
+      if (used[j]) continue;
+      const k = keyOf(old[j]);
+      if (k === null) unkeyed.push(j);
+      else if (!byKey.has(k)) byKey.set(k, j);
+    }
+    let u = 0;
+    for (let i = 0; i < m && (byKey.size > 0 || u < unkeyed.length); i++) {
+      if (from[i] >= 0) continue;
+      const k = kids[s + i], key = keyOf(k);
+      let j = key === null ? (u < unkeyed.length ? unkeyed[u++] : -1) : (byKey.has(key) ? byKey.get(key) : -1);
+      if (j >= 0 && (used[j] || !same(old[j], k))) j = -1;
+      if (j >= 0) { used[j] = 1; from[i] = j; }
+    }
+  }
+  let last = -1, moved = false, kept = 0;
+  for (let i = 0; i < m; i++) {
+    const j = from[i];
     if (j < 0) continue;
-    used[j] = 1;
-    from[i] = j;
     kept++;
     if (j < last) moved = true;
     else last = j;
@@ -1163,7 +1196,17 @@ function patchKeyed(el, old, kids, svg) {
     return;
   }
   for (let j = s; j <= oe; j++) if (!used[j]) unmount(el, old[j]);
-  const stay = moved ? inOrder(from) : null;
+  // Most children where they were (a swap): those stay and the few others
+  // move, without working out the longest run in order.
+  let stay = null;
+  if (moved) {
+    let displaced = 0;
+    for (let i = 0; i < m && displaced <= 16; i++) if (from[i] >= 0 && from[i] !== s + i) displaced++;
+    if (displaced <= 16) {
+      stay = new Uint8Array(m);
+      for (let i = 0; i < m; i++) stay[i] = from[i] === s + i ? 1 : 0;
+    } else stay = inOrder(from);
+  }
   let after = end;
   for (let i = m - 1; i >= 0; i--) {
     const k = kids[s + i], j = from[i];
@@ -1211,23 +1254,14 @@ function onGone(inst, f) {
 
 // ---- components --------------------------------------------------------
 
-// A loop's rows by item, from one render to the next (see `memo`); each
-// is taken at most once, so a repeated item gets a row of its own.
+// A loop's rows from one render to the next (see `memo`): the list they
+// were made for, and the rows, in order.
 class Memo {
-  constructor() { this.deps = null; this.changed = -1; this.prev = new Map(); this.next = new Map(); this.list = null; this.rows = null; }
-  // A row on the page (one from a render that failed was never shown).
-  get(x) {
-    const v = this.prev.get(x);
-    if (v === undefined) return undefined;
-    this.prev.delete(x);
-    return v.d ? v : undefined;
-  }
-  set(x, v) { if (!this.next.has(x)) this.next.set(x, v); }
-  done() { const p = this.prev; this.prev = this.next; this.next = p; p.clear(); }
+  constructor() { this.deps = null; this.changed = -1; this.list = null; this.rows = null; }
 }
 
 // `for` loop `slot` in component `inst`'s render: its rows from the last
-// render, by item, and which of what else they read (`deps`) changed, as bits.
+// render, and which of what else they read (`deps`) changed, as bits.
 function memo(inst, slot, deps) {
   const ms = inst.memos || (inst.memos = []);
   const m = ms[slot] || (ms[slot] = new Memo());
@@ -1236,35 +1270,72 @@ function memo(inst, slot, deps) {
   else for (let i = 0; i < deps.length; i++) if (m.deps[i] !== deps[i]) changed |= i < 31 ? 1 << i : -1;
   m.changed = changed;
   m.deps = deps;
-  m.next.clear();
   return m;
 }
 
-// A memoized loop's rows (see `memo`): `make(x)` makes the row for item
-// x, and `refresh(row, x, changed)` brings a kept one up to date with what
-// changed (without it, any change makes every row again).
+// A memoized loop's rows: `make(x)` makes the row for item x, and
+// `refresh(row, x, changed)` brings a kept one up to date with what changed
+// (without it, any change makes every row again). A row is kept for the
+// same item (the same value): looked for at the same place first, then at
+// the same place from the end (after rows were added or removed before
+// it), then, for what is left, anywhere.
 function rows(m, list, make, refresh) {
-  const n = list.length, out = new Array(n), c = m.changed;
+  const n = list.length, c = m.changed;
   const keep = c === 0 || (refresh !== null && c !== -1);
-  if (keep && list === m.list) {
-    // The very list of the last render: its rows, in order.
-    const prev = m.rows;
+  const was = keep ? m.list : null, old = m.rows;
+  const w = was === null ? 0 : was.length;
+  if (was === list) {
+    // The very list of the last render: its rows, in order, the same array
+    // when all are still on the page (so what shows them is left alone).
+    let fresh = null;
     for (let k = 0; k < n; k++) {
-      let v = prev[k];
-      if (!v.d) m.prev.set(list[k], (v = make(list[k])));
-      else if (c) refresh(v, list[k], c);
-      out[k] = v;
+      const v = old[k];
+      if (!v.d) {
+        if (fresh === null) { fresh = old.slice(); fresh.$rows = true; }
+        fresh[k] = make(list[k]);
+      } else if (c) refresh(v, list[k], c);
     }
-  } else {
+    if (fresh !== null) m.rows = fresh;
+    return m.rows;
+  }
+  // An array of nodes, none of them null or a list, marked as such for
+  // `nodes` (arrays made from it, by `+`, map or slice, are not).
+  const out = new Array(n);
+  out.$rows = true;
+  if (w === 0) for (let k = 0; k < n; k++) out[k] = make(list[k]);
+  else {
+    const used = new Uint8Array(w), shift = w - n;
+    let left = 0;
     for (let k = 0; k < n; k++) {
       const x = list[k];
-      let v = keep ? m.get(x) : undefined;
-      if (v === undefined) v = make(x);
-      else if (c) refresh(v, x, c);
-      m.set(x, v);
-      out[k] = v;
+      let j = k;
+      if (!(j < w && was[j] === x && !used[j])) {
+        j = k + shift;
+        if (!(j >= 0 && j < w && was[j] === x && !used[j])) j = -1;
+      }
+      // A row from a render that failed was never shown: made again.
+      const v = j >= 0 ? old[j] : undefined;
+      if (v !== undefined && v.d) {
+        used[j] = 1;
+        if (c) refresh(v, x, c);
+        out[k] = v;
+      } else left++;
     }
-    m.done();
+    if (left > 0) {
+      let byItem = null;
+      for (let j = 0; j < w; j++) if (!used[j] && old[j].d && !(byItem || (byItem = new Map())).has(was[j])) byItem.set(was[j], j);
+      for (let k = 0; k < n && left > 0; k++) {
+        if (out[k] !== undefined) continue;
+        const x = list[k], j = byItem === null ? undefined : byItem.get(x);
+        if (j !== undefined && !used[j]) {
+          used[j] = 1;
+          const v = old[j];
+          if (c) refresh(v, x, c);
+          out[k] = v;
+        } else out[k] = make(x);
+        left--;
+      }
+    }
   }
   m.list = list;
   m.rows = out;
@@ -1414,6 +1485,7 @@ W.ge = ge;
 W.range = range;
 W.neg = neg;
 W.field = field;
+W.fieldp = fieldp;
 W.index = index;
 W.call = call;
 W.mcall = mcall;

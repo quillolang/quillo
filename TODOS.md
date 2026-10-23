@@ -36,10 +36,12 @@ Child components still update whenever their parent does.
       each render and will still count as changed.
 - [ ] **Skip assignments that change nothing.** `Inst.set` queues an update
       even when the new value is the old one.
-- [ ] **Keep more than keyed loop rows.** Rows without a `key`, and loops in
-      views (which have no component to remember them in), are made again on
-      each render. So is markup outside loops; its holes could be recomputed
-      only when what they read changed, like kept rows'.
+- [ ] **Keep more than keyed loop rows.** Rows without a `key`, loops in
+      views (which have no component to remember them in) and loops inside
+      other loops (which run once per outer item, so a memo would need a key
+      per run) are made again on each render. So is markup outside loops; its
+      holes could be recomputed only when what they read changed, like kept
+      rows'.
 - [ ] **Cheaper calls in compiled code.** Every function call checks its
       arguments and catches `return`; building 1,000 rows in Quillo code costs
       several times what plain JavaScript does.

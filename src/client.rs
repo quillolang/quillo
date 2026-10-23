@@ -238,6 +238,8 @@ struct FnCtx {
     component: Option<String>,
     /// `for` loops given a memo so far (see `memo` in the runtime).
     memos: usize,
+    /// `for` loops being compiled, around the code being compiled.
+    loops: usize,
 }
 
 /// What a loop's body reads from around it, noted while it is compiled:
@@ -278,6 +280,9 @@ struct Compiler<'a> {
     blocks: Vec<String>,
     /// Loops being compiled, innermost last (see `Reads`).
     reads: Vec<Reads>,
+    /// Holes compiled so far for an input's live `value`, `checked` or
+    /// `selected`, which every render sets afresh.
+    live_holes: usize,
     /// Globals compiled (or being compiled): JS name and whether they are async.
     globals: HashMap<String, (String, bool)>,
     ctxs: Vec<FnCtx>,
@@ -429,6 +434,20 @@ fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// Whether `body` can leave its function early (`return`, or `?` on an
+/// error), which compiled code does by throwing `W.Ret`; a function whose
+/// body cannot needs no catch. (Functions inside count too: it errs on the
+/// side of a catch.)
+fn leaves_early(body: &Expr) -> bool {
+    let mut found = false;
+    each_expr(body, &mut |e| match e {
+        Expr::Try(_) => found = true,
+        Expr::Block(ss) if ss.iter().any(|s| matches!(s, Stmt::Return(_))) => found = true,
+        _ => {}
+    });
+    found
+}
+
 fn each_html_expr(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
     for x in el.id.iter().chain(el.classes.iter()) {
         each_expr(x, f)
@@ -548,6 +567,7 @@ impl<'a> Compiler<'a> {
             defs: Vec::new(),
             blocks: Vec::new(),
             reads: Vec::new(),
+            live_holes: 0,
             globals: HashMap::new(),
             ctxs: Vec::new(),
             counter: 0,
@@ -752,7 +772,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, memos: 0 });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, memos: 0, loops: 0 });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -845,11 +865,15 @@ impl<'a> Compiler<'a> {
         self.line = saved_line;
         let (names, body) = res?;
         let checked = def.ret.is_some() || def.err.is_some();
-        let run = format!(
-            "{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n",
-            Self::temps_decl(ctx.temps),
-            body
-        );
+        let run = if leaves_early(&def.body) {
+            format!(
+                "{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n",
+                Self::temps_decl(ctx.temps),
+                body
+            )
+        } else {
+            format!("{}{}", Self::temps_decl(ctx.temps), body)
+        };
         let inner = if checked {
             let call = if is_async { format!("await (async () => {{\n{}}})()", run) } else { format!("(() => {{\n{}}})()", run) };
             format!(
@@ -1034,7 +1058,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, memos: 0 });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, memos: 0, loops: 0 });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -1233,7 +1257,17 @@ impl<'a> Compiler<'a> {
                 self.line = *line;
                 let o = self.expr(obj)?;
                 let fb = self.fallback(name);
-                format!("W.field({}, {}, {})", o, js_str(name), fb)
+                // Names Object.prototype has need the careful check for a
+                // map's own key; any other is read directly when present.
+                const PROTO: &[&str] = &[
+                    "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString",
+                    "valueOf", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
+                ];
+                if PROTO.contains(&name.as_str()) {
+                    format!("W.field({}, {}, {})", o, js_str(name), fb)
+                } else {
+                    format!("W.fieldp({}, {}, {})", o, js_str(name), fb)
+                }
             }
             Expr::Index(obj, idx, line) => {
                 self.line = *line;
@@ -1287,14 +1321,19 @@ impl<'a> Compiler<'a> {
                 let it = self.expr(iter)?;
                 let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
                 // In a component, rows with keys are remembered by item (see
-                // `memo` in the runtime); keyed, a reused row is matched with itself.
+                // `memo` in the runtime); keyed, a reused row is matched with
+                // itself. Only a loop that runs once per render: one inside
+                // another runs for each of its items, and rows of one run
+                // must not turn up in another.
                 let memo = self.ctx().component.is_some()
+                    && self.ctx().loops == 0
                     && matches!(&**body, Expr::Html(el, _) if el.attrs.iter().any(|(n, _)| n == "key"));
                 if memo {
                     let (ctx, scopes) = (self.ctxs.len() - 1, self.ctx().scopes.len());
                     self.reads.push(Reads { ctx, scopes, deps: Vec::new(), impure: false });
                 }
                 self.push_scope();
+                self.ctx().loops += 1;
                 let mut names = Vec::new();
                 pattern_names(pat, &mut names);
                 let mut binds = String::new();
@@ -1311,6 +1350,7 @@ impl<'a> Compiler<'a> {
                 }
                 // A row that is one block: kept rows have only the holes that
                 // read what changed recomputed (see `hole` in the runtime).
+                let live_before = self.live_holes;
                 let row = match &**body {
                     Expr::Html(el, _) if memo && blockable(el) => Some(self.block_parts(el)),
                     _ => None,
@@ -1319,8 +1359,16 @@ impl<'a> Compiler<'a> {
                     Some(_) => Ok(String::new()),
                     None => self.expr(body),
                 };
+                self.ctx().loops -= 1;
                 self.pop_scope();
-                let reads = if memo { self.reads.pop() } else { None };
+                let mut reads = if memo { self.reads.pop() } else { None };
+                // Rows with inputs are made each time, so the inputs show the
+                // state even after the user typed something else.
+                if let Some(r) = &mut reads {
+                    if self.live_holes > live_before {
+                        r.impure = true;
+                    }
+                }
                 let b = b?;
                 let row = row.transpose()?;
                 let check = match &p {
@@ -1335,14 +1383,28 @@ impl<'a> Compiler<'a> {
                     (Some(r), _) if !r.impure => {
                         let slot = self.ctx().memos;
                         self.ctx().memos += 1;
-                        // Each hole's deps as bits of `$m.changed`.
+                        // Each hole's deps as bits of `$c`, what changed (see `memo`).
                         let refresh = match &row {
                             Some(row) if r.deps.len() <= 31 && row.3.is_empty() => {
                                 let mut out = String::new();
                                 for (k, deps) in row.1.deps.iter().enumerate() {
                                     let mask = deps.iter().filter_map(|d| r.deps.iter().position(|x| x == d)).fold(0u32, |m, i| m | 1 << i);
-                                    if mask != 0 {
-                                        let _ = write!(out, "if ($m.changed & {}) W.hole($v, {}, {}); ", mask as i32, k, row.1.vals[k]);
+                                    if mask == 0 {
+                                        continue;
+                                    }
+                                    // Handlers are new closures; other values are passed on only
+                                    // when they changed.
+                                    if row.1.holes[k].0 == 2 {
+                                        let _ = write!(out, "if ($c & {}) W.hole($v, {}, {}); ", mask as i32, k, row.1.vals[k]);
+                                    } else {
+                                        let _ = write!(
+                                            out,
+                                            "if ($c & {}) {{ const $h = {}; if ($h !== $v.vals[{}]) W.hole($v, {}, $h); }} ",
+                                            mask as i32,
+                                            row.1.vals[k],
+                                            k,
+                                            k
+                                        );
                                     }
                                 }
                                 Some(out)
@@ -1354,7 +1416,7 @@ impl<'a> Compiler<'a> {
                             None => b.clone(),
                         };
                         let refresh = match &refresh {
-                            Some(refresh) => format!("($v, $x, $c) => {{ {}{}{}}}", check, binds, refresh.replace("$m.changed", "$c")),
+                            Some(refresh) => format!("($v, $x, $c) => {{ {}{}{}}}", check, binds, refresh),
                             None => "null".to_string(),
                         };
                         format!(
@@ -1647,6 +1709,7 @@ impl<'a> Compiler<'a> {
                     Resolved::Local(js, _) => format!("({} = {})", js, read),
                     Resolved::Global(..) => return self.err(format!("`bind:{}` needs component state, like ~{}", prop, var)),
                 };
+                self.live_holes += 1;
                 props.push(format!("{}: {}", js_str(prop), val));
                 on.push(format!("{}: (e) => {{ {}; }}", js_str(event), set));
             } else if name == "key" {
@@ -1654,6 +1717,9 @@ impl<'a> Compiler<'a> {
             } else if name == "class" {
                 classes.push(val);
             } else {
+                if matches!(name.as_str(), "value" | "checked" | "selected") {
+                    self.live_holes += 1;
+                }
                 props.push(format!("{}: {}", js_str(name), val));
             }
         }
@@ -1702,10 +1768,10 @@ fn fixed(e: &Expr) -> Option<&Lit> {
 /// What a block is made of while it is compiled.
 #[derive(Default)]
 struct BlockParts {
-    /// Positions of the elements with holes.
-    paths: Vec<String>,
-    /// `[kind, element, name]` per hole.
-    holes: Vec<String>,
+    /// Positions of the nodes with holes, as child indexes from the root.
+    paths: Vec<Vec<usize>>,
+    /// Kind, node and name of each hole (see `block` in the runtime).
+    holes: Vec<(u8, usize, String)>,
     /// The JS for each hole's value, in order.
     vals: Vec<String>,
     /// What each value reads from around the loop it is in (see `Reads`).
@@ -1734,12 +1800,14 @@ impl<'a> Compiler<'a> {
             }
         }
         let name = format!("$b{}", self.blocks.len());
+        let holes: Vec<String> = parts.holes.iter().map(|(k, at, n)| format!("[{}, {}, {}]", k, at, js_str(n))).collect();
         self.blocks.push(format!(
-            "const {} = W.block({}, [{}], [{}]);",
+            "const {} = W.block({}, [{}], {}, {});",
             name,
             tpl,
-            parts.paths.join(", "),
-            parts.holes.join(", ")
+            holes.join(", "),
+            block_mount(&parts),
+            block_patch(&parts)
         ));
         Ok((name, parts, key.0, key.1))
     }
@@ -1763,10 +1831,10 @@ impl<'a> Compiler<'a> {
         let mut at: Option<usize> = None;
         let mut hole = |parts: &mut BlockParts, kind: u8, name: &str, (val, deps): (String, Vec<String>)| {
             let i = *at.get_or_insert_with(|| {
-                parts.paths.push(format!("[{}]", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
+                parts.paths.push(path.clone());
                 parts.paths.len() - 1
             });
-            parts.holes.push(format!("[{}, {}, {}]", kind, i, js_str(name)));
+            parts.holes.push((kind, i, name.to_string()));
             parts.vals.push(val);
             parts.deps.push(deps);
         };
@@ -1825,6 +1893,9 @@ impl<'a> Compiler<'a> {
                         AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
                         _ => ("true".to_string(), Vec::new()),
                     };
+                    if live {
+                        self.live_holes += 1;
+                    }
                     hole(parts, 0, name, val);
                 }
             }
@@ -1857,9 +1928,9 @@ impl<'a> Compiler<'a> {
             kids.push("\"\"".to_string());
             let (v, deps) = self.noted(|c| c.expr(e))?;
             path.push(0);
-            parts.paths.push(format!("[{}]", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
+            parts.paths.push(path.clone());
             path.pop();
-            parts.holes.push(format!("[3, {}, \"\"]", parts.paths.len() - 1));
+            parts.holes.push((3, parts.paths.len() - 1, String::new()));
             parts.vals.push(v);
             parts.deps.push(deps);
         } else {
@@ -1876,4 +1947,79 @@ impl<'a> Compiler<'a> {
         }
         Ok(format!("[{}, [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", ")))
     }
+}
+
+/// A block's mount function, `($v, $r, $s)`: from `$r`, a fresh copy of
+/// the template, it finds the nodes with holes (by `firstChild` and
+/// `nextSibling`, each step taken once) and fills the holes from `$v.vals`;
+/// `$s` says whether it is SVG.
+fn block_mount(parts: &BlockParts) -> String {
+    fn node(p: &[usize], known: &mut HashMap<Vec<usize>, String>, code: &mut String) -> String {
+        if let Some(v) = known.get(p) {
+            return v.clone();
+        }
+        let (parent, last) = (&p[..p.len() - 1], p[p.len() - 1]);
+        // From the nearest sibling already found, else from the parent.
+        let from_sibling = (0..last).rev().find_map(|b| {
+            let mut q = parent.to_vec();
+            q.push(b);
+            known.get(&q).map(|v| format!("{}{}", v, ".nextSibling".repeat(last - b)))
+        });
+        let walk = match from_sibling {
+            Some(w) => w,
+            None => format!("{}.firstChild{}", node(parent, known, code), ".nextSibling".repeat(last)),
+        };
+        let v = format!("$n{}", known.len());
+        let _ = write!(code, "const {} = {}; ", v, walk);
+        known.insert(p.to_vec(), v.clone());
+        v
+    }
+    let mut known = HashMap::new();
+    known.insert(Vec::new(), "$r".to_string());
+    let mut code = String::new();
+    let els: Vec<String> = parts.paths.iter().map(|p| node(p, &mut known, &mut code)).collect();
+    let _ = write!(code, "$v.els = [{}]; const $x = $v.vals; ", els.join(", "));
+    for (i, (kind, at, name)) in parts.holes.iter().enumerate() {
+        let e = &els[*at];
+        let _ = match kind {
+            0 => write!(code, "setProp({}, {}, $x[{}], undefined); ", e, js_str(name), i),
+            1 => write!(code, "if (!isNil($x[{i}]) && $x[{i}] !== \"\") setClass({}, $x[{i}], $s); ", e, i = i),
+            2 => write!(code, "listen({}, {}, $x[{}]); ", e, js_str(name), i),
+            3 => write!(
+                code,
+                "if (typeof $x[{i}] === \"string\" || typeof $x[{i}] === \"number\") {e}.data = $x[{i}]; else showNodes($v, {i}, {e}.parentNode, $x[{i}], $s); ",
+                i = i,
+                e = e
+            ),
+            _ => write!(code, "showNodes($v, {}, {}, $x[{}], $s); ", i, e, i),
+        };
+    }
+    format!("function ($v, $r, $s) {{ {}}}", code)
+}
+
+/// A block's patch function, `($a, $v)`: block `$v` takes over `$a`'s DOM
+/// and updates the holes whose values changed (see `updateHole` in the
+/// runtime, which it calls for anything but the plain cases).
+fn block_patch(parts: &BlockParts) -> String {
+    let mut code = String::from("const $e = ($v.els = $a.els), $x = $v.vals, $o = $a.vals; $v.parts = $a.parts; $v.svg = $a.svg; ");
+    for (i, (kind, at, name)) in parts.holes.iter().enumerate() {
+        let _ = match kind {
+            // Inputs' live value follows the state even when unchanged.
+            0 if matches!(name.as_str(), "value" | "checked" | "selected") => {
+                write!(code, "setProp($e[{}], {}, $x[{}], $o[{}]); ", at, js_str(name), i, i)
+            }
+            0 => write!(code, "if ($x[{i}] !== $o[{i}]) setProp($e[{}], {}, $x[{i}], $o[{i}]); ", at, js_str(name), i = i),
+            1 => write!(code, "if ($x[{i}] !== $o[{i}]) setClass($e[{}], $x[{i}], $v.svg); ", at, i = i),
+            2 if name == "click" => write!(code, "$e[{}].__click = $x[{}]; ", at, i),
+            2 => write!(code, "listen($e[{}], {}, $x[{}]); ", at, js_str(name), i),
+            3 => write!(
+                code,
+                "if ($x[{i}] !== $o[{i}]) {{ if ((typeof $x[{i}] === \"string\" || typeof $x[{i}] === \"number\") && !($v.parts && $v.parts[{i}])) $e[{at}].data = $x[{i}]; else updateHole($v, {i}, $x[{i}], $o[{i}]); }} ",
+                i = i,
+                at = at
+            ),
+            _ => write!(code, "if ($x[{i}] !== $o[{i}]) updateHole($v, {i}, $x[{i}], $o[{i}]); ", i = i),
+        };
+    }
+    format!("function ($a, $v) {{ {}}}", code)
 }

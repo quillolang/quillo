@@ -204,6 +204,39 @@ fn keyed_lists_move_only_what_changed() {
     assert_eq!(r, want);
 }
 
+/// Composition where the fast paths are: a layout with named slots, views
+/// with children around keyed loops, components keeping their state in
+/// kept rows, nested loops, spread attributes and SVG.
+#[test]
+fn composition_survives_kept_rows() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("slots.qwe"), free_port(), Some(&dir.join("slots.js")));
+    let want = serde_json::json!({
+        "layout": ["Groups", "<a href=\"/about\">About</a>"],
+        "start": [
+            { "title": "fruit", "footer": "<em>2 items</em>", "open": "tallies open", "tallies": ["apple=0/1", "pear=0/3"], "badges": ["1", "3!"], "radii": ["1", "3"] },
+            { "title": "veg", "footer": "<em>1 items</em>", "open": "tallies", "tallies": ["leek=0/2"], "badges": ["2"], "radii": ["2"] }
+        ],
+        "after": [
+            { "title": "fruits", "footer": "<em>2 items</em>", "open": "tallies", "tallies": ["apple=0/3", "pear=2/3"], "badges": ["3!", "3!"], "radii": ["3", "3"] },
+            { "title": "veg", "footer": "<em>2 items</em>", "open": "tallies open", "tallies": ["leek=0/2", "kale=0/1"], "badges": ["2", "1"], "radii": ["2", "1"] }
+        ],
+        "summary": ["fruits=0", "veg=1"],
+        "samePear": true,
+        "shared": [["apple=0/3", "pear=2/3"], ["apple=0/3", "pear=0/3"]],
+        "sharedAfter": [[["apple=0/5", "pear=3/3"], ["5!", "3!"]], [["apple=1/5", "pear=0/3"], ["5!", "3!"]]],
+        "unshared": [[["apple=0/5"], ["5!"]], [["leek=0/2"], ["2"]]],
+        "spread": ["extra", "1"],
+        "svg": "http://www.w3.org/2000/svg",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// examples/compose.qwe, clicked through.
 #[test]
 fn composition_example_works() {

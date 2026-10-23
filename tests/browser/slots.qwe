@@ -1,0 +1,85 @@
+// Composition where the browser's fast paths are (blocks, rows kept from
+// one render to the next): a layout view with named slots around the page,
+// views with children wrapping keyed loops, components with state of their
+// own inside kept rows, nested keyed loops, spread attributes and SVG.
+// Driven by slots.js (tests/browser.rs).
+
+view Layout(title: str, nav, children) =
+    <div.layout>
+        <header><h1>{title}</h1><nav>{nav}</nav></header>
+        <main>{children}</main>
+    </div>
+
+view Card(title: str, footer = null, children) =
+    <section.card>
+        <h3>{title}</h3>
+        <div.body>{children}</div>
+        {footer && <footer>{footer}</footer>}
+    </section>
+
+view Badge(n: int) = <span.badge class={n > 2 && "hot"}>{n}</span>
+
+component Tally(label: str) {
+    ~n = 0
+    <span.tally><b>{label}</b> <i>{n}</i> <button.inc @click={() => { n += 1 }}>+</button></span>
+}
+
+fn named(groups: list, id: int, name: str) = groups | map((g) => g.id == id ? set(g, "name", name) : g)
+
+fn bumped(groups: list) =
+    groups | map((g) => set(g, "items", g.items | map((it) => it.id == 11 ? set(it, "n", it.n + 2) : it)))
+
+// Both groups show the very same list of items.
+fn shared(groups: list) = [groups[0], set(groups[1], "items", groups[0].items)]
+
+// Apart again: the first group keeps its first item, the second gets leek.
+fn unshared(groups: list) =
+    [set(groups[0], "items", [groups[0].items[0]]), set(groups[1], "items", [{ id: 21, name: "leek", n: 2 }])]
+
+fn added(groups: list) =
+    groups | map((g) => g.id == 2 ? set(g, "items", g.items + [{ id: 23, name: "kale", n: 1 }]) : g)
+
+component Board() {
+    ~groups = [
+        { id: 1, name: "fruit", items: [{ id: 11, name: "apple", n: 1 }, { id: 12, name: "pear", n: 3 }] },
+        { id: 2, name: "veg", items: [{ id: 21, name: "leek", n: 2 }] },
+    ]
+    ~open = 1
+    ~extra = { title: "extra", "data-x": "1" }
+    <div.board>
+        <button type="button" id="add" @click={() => { groups = added(groups) }}>add</button>
+        <button type="button" id="rename" @click={() => { groups = named(groups, 1, "fruits") }}>rename</button>
+        <button type="button" id="toggle" @click={() => { open = open == 1 ? 2 : 1 }}>toggle</button>
+        <button type="button" id="bump" @click={() => { groups = bumped(groups) }}>bump</button>
+        <button type="button" id="share" @click={() => { groups = shared(groups) }}>share</button>
+        <button type="button" id="unshare" @click={() => { groups = unshared(groups) }}>unshare</button>
+        // A loop that runs once per render: its rows are kept between renders.
+        <ul.summary>{for g in groups => <li key={g.id}><Tally label={g.name}/></li>}</ul>
+        // A loop for each group: inner loops run once per group.
+        {for g in groups =>
+            <Card key={g.id} title={g.name} footer={<em>{len(g.items)} items</em>}>
+                // Rows with components only: kept between renders.
+                <ul.tallies class={g.id == open && "open"}>
+                    {for it in g.items => <li key={it.id}><Tally label={it.name}/> <s>{it.n}</s></li>}
+                </ul>
+                // Rows calling a view, with spread attributes and SVG.
+                <ul.badges>
+                    {for it in g.items =>
+                        <li key={it.id} {...extra}>
+                            <Badge n={it.n}/>
+                            <svg width="10" height="10"><circle cx="5" cy="5" r={it.n}/></svg>
+                        </li>}
+                </ul>
+            </Card>}
+    </div>
+}
+
+route GET / =
+    <html>
+        <head><meta charset="utf-8"/><title>slots</title></head>
+        <body>
+            <Layout title="Groups" nav={<a href="/about">About</a>}>
+                <Board/>
+            </Layout>
+        </body>
+    </html>
