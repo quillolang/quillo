@@ -45,6 +45,11 @@ options for `run`:
 `app` takes the options of `run` except --host, --register and --service; its
 port, by default one the system picks, answers only the window.";
 
+// The system's allocator on the event loops, mimalloc on the threads that
+// wait for them (see quillo::alloc).
+#[global_allocator]
+static ALLOC: quillo::alloc::Split = quillo::alloc::Split;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // The window must run on the main thread (macOS requires it); the

@@ -91,6 +91,8 @@ struct Running {
     owner: Owner,
     /// Children still running (`parallel`).
     children: usize,
+    /// The request it works for (see `request_number`).
+    request: usize,
 }
 
 enum Slot {
@@ -131,6 +133,8 @@ enum Item {
 thread_local! {
     /// The yielder of the request coroutine running on this thread, if any.
     static YIELDER: Cell<usize> = const { Cell::new(0) };
+    /// The number of the request that coroutine works for.
+    static REQUEST: Cell<usize> = const { Cell::new(0) };
 }
 
 /// For `Interp::unlocked`: in a request's coroutine, runs `f` on a pool
@@ -176,6 +180,14 @@ pub fn run_children(fs: Vec<Box<dyn FnOnce()>>) {
 /// Whether this is a request's coroutine.
 pub fn in_task() -> bool {
     YIELDER.with(|c| c.get()) != 0
+}
+
+/// In a request's coroutine: a number for the request, the same in its
+/// `parallel` calls, and different for requests running at the same time
+/// (they count up). The database puts a request's queries on one
+/// connection with it (`pg::Lanes`).
+pub fn request_number() -> usize {
+    REQUEST.with(|c| c.get())
 }
 
 /// In a request's coroutine: runs `fut` on the async runtime while the
@@ -236,7 +248,10 @@ impl Pool {
             self.ready.notify_one();
         } else if self.threads.fetch_add(1, SeqCst) < self.max {
             let pool = self.clone();
-            let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work());
+            let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || {
+                crate::alloc::waiter_thread();
+                pool.work()
+            });
             if started.is_err() {
                 self.threads.fetch_sub(1, SeqCst);
             }
@@ -390,6 +405,7 @@ fn run_loop(
         instances,
         index,
         turn: 0,
+        requests: 0,
         slots: Vec::new(),
         free: Vec::new(),
         ready: VecDeque::new(),
@@ -418,6 +434,8 @@ struct Loop {
     index: usize,
     /// The instance the next connection goes to.
     turn: usize,
+    /// Requests started, for their numbers.
+    requests: usize,
     slots: Vec<Slot>,
     free: Vec<usize>,
     /// Connections with something to do, oldest first.
@@ -444,6 +462,7 @@ impl Loop {
         gil.acquire();
         let mut events = Events::with_capacity(1024);
         let mut swept = Instant::now();
+        crate::value::defer_drops();
         loop {
             let handed = std::mem::take(&mut *lock(&self.inbox.conns));
             for (stream, peer) in handed {
@@ -470,6 +489,10 @@ impl Loop {
                 gil.acquire();
             }
             flush_log();
+            let later = crate::value::deferred_drops();
+            if !later.is_empty() {
+                crate::pg::runtime().spawn(async move { drop(later) });
+            }
             // Sleep only when there is nothing to do.
             self.pool.sleeping.store(true, SeqCst);
             let idle = self.ready.is_empty()
@@ -668,7 +691,8 @@ impl Loop {
             let fate = answer(&app, &mut worker, &mut conn, items);
             End::Request(Done { conn, worker, fate })
         });
-        let id = self.new_task(Running { task, limit, owner: Owner::Conn(i), children: 0 });
+        self.requests = self.requests.wrapping_add(1);
+        let id = self.new_task(Running { task, limit, owner: Owner::Conn(i), children: 0, request: self.requests });
         self.step(id);
     }
 
@@ -701,7 +725,8 @@ impl Loop {
             f();
             End::Child
         });
-        let id = self.new_task(Running { task, limit, owner: Owner::Parent(parent), children: 0 });
+        let request = self.tasks[parent].as_ref().map_or(0, |p| p.request);
+        let id = self.new_task(Running { task, limit, owner: Owner::Parent(parent), children: 0, request });
         self.step(id);
     }
 
@@ -718,6 +743,7 @@ impl Loop {
     fn step(&mut self, id: usize) {
         let Some(r) = self.tasks[id].as_mut() else { return };
         let outer = crate::stack::switch(r.limit);
+        REQUEST.with(|c| c.set(r.request));
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.task.resume(())));
         r.limit = crate::stack::switch(outer);
         YIELDER.with(|c| c.set(0));

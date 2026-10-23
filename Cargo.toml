@@ -24,6 +24,7 @@ stacker = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 ureq = "2"
 fastrand = "2"
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended", "v2"] }
 getrandom = "0.2"
 flate2 = "1"
 postgres = { version = "0.19", features = ["with-serde_json-1"] }

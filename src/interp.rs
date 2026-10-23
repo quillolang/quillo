@@ -156,7 +156,7 @@ fn get_path(v: &Value, path: &[String]) -> Option<Value> {
     let mut cur = v.clone();
     for k in path {
         cur = match &cur {
-            Value::Map(m) => m.get(k)?.clone(),
+            Value::Map(m) => m.get(k.as_str())?.clone(),
             _ => return None,
         };
     }
@@ -283,7 +283,7 @@ pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Err(e) => serde_json::json!({ "$quillo_err": island_json(e) }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
-        Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.clone(), island_json(x))).collect()),
+        Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.to_string(), island_json(x))).collect()),
         other => other.to_json(),
     }
 }
@@ -298,6 +298,24 @@ pub fn not_sendable(v: &Value) -> Option<&'static str> {
         Value::Html(_) => Some("html"),
         Value::Response(_) => Some("a response"),
         Value::Err(e) => not_sendable(e),
+    }
+}
+
+/// The field a function only reads from its one parameter, as in
+/// `(x) => x.name`, when calling it can do nothing else (no types,
+/// defaults or effects to check).
+fn projection(def: &FnDef) -> Option<(&str, u32)> {
+    let [p] = def.params.as_slice() else { return None };
+    if p.ty.is_some() || p.default.is_some() || def.ret.is_some() || def.err.is_some() || def.effects.is_some() || def.server
+    {
+        return None;
+    }
+    match &def.body {
+        Expr::Field(obj, field, at) => match &**obj {
+            Expr::Ident(n, _) if *n == p.name => Some((field, *at)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -813,9 +831,9 @@ impl Interp {
                 let v = self.eval(e, env)?;
                 let live = self.last_live.take();
                 if let Some((state, subs)) = self.islands.last_mut() {
-                    state.insert(name.clone(), v.clone());
+                    state.insert(name.into(), v.clone());
                     if let Some(l) = live {
-                        subs.insert(name.clone(), l);
+                        subs.insert(name.into(), l);
                     }
                 }
                 define(env, name, v);
@@ -927,6 +945,7 @@ impl Interp {
         for s in stmts {
             last = self.exec_stmt(s, &scope)?;
         }
+        Scope::done(scope);
         Ok(last)
     }
 
@@ -951,7 +970,7 @@ impl Interp {
         let mut m = Map::new();
         for (k, x) in entries {
             let v = self.eval(x, env)?;
-            m.insert(k.clone(), v);
+            m.insert(k.into(), v);
         }
         Ok(Value::map(m))
     }
@@ -1033,6 +1052,7 @@ impl Interp {
             if let Pattern::Bind(n) = pat {
                 define(&scope, n, item);
                 out.push(self.eval(body, &scope)?);
+                Scope::done(scope);
                 continue;
             }
             let mut binds = Vec::new();
@@ -1084,7 +1104,7 @@ impl Interp {
         let f = if let Expr::Field(obj, name, _) = callee {
             let recv = self.eval(obj, env)?;
             let method = match &recv {
-                Value::Map(m) => m.get(name).cloned(),
+                Value::Map(m) => m.get(name.as_str()).cloned(),
                 _ => None,
             };
             match method {
@@ -1122,7 +1142,7 @@ impl Interp {
             Value::Response(r) => match name {
                 "status" => return Ok(Value::Int(r.status as i64)),
                 "headers" => {
-                    return Ok(Value::map(r.headers.iter().map(|(k, v)| (k.clone(), Value::str(v))).collect()))
+                    return Ok(Value::map(r.headers.iter().map(|(k, v)| (k.into(), Value::str(v))).collect()))
                 }
                 "body" => {
                     return Ok(match &r.body {
@@ -1175,6 +1195,12 @@ impl Interp {
 
     /// `args[i] == None` means "not given": the parameter's default is used.
     pub fn call_closure(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
+        // field, without a scope for the call.
+        if let (Some((field, at)), [Some(_)]) = (projection(&c.def), args.as_slice()) {
+            let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
+            return self.get_field(v, field, at);
+        }
         let def = c.def.clone();
         let r = self.enter_call(&def, args.len(), line, |this| this.call_closure_inner(c, &def, args, line))?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
@@ -1272,6 +1298,7 @@ impl Interp {
             Ok(v) | Err(Ctrl::Return(v)) => v,
             Err(e) => return Err(e),
         };
+        Scope::done(scope);
         if let Some(ty) = &def.ret {
             if !matches!(r, Value::Err(_)) && !type_matches(ty, &r) {
                 return fail(
@@ -1662,7 +1689,7 @@ impl Interp {
                 AttrVal::Bool => explicit.push((name.clone(), Value::Bool(true))),
                 AttrVal::Expr(e) => explicit.push((name.clone(), self.eval(e, env)?)),
                 AttrVal::Spread(e) => match self.eval(e, env)? {
-                    Value::Map(m) => spread.extend(m.iter().map(|(k, v)| (k.clone(), v.clone()))),
+                    Value::Map(m) => spread.extend(m.iter().map(|(k, v)| (k.to_string(), v.clone()))),
                     Value::Nil => {}
                     other => {
                         return fail(el.line, format!("`{{...}}` in <{}> needs a map, got {}", el.tag, other.type_name()))
@@ -1792,7 +1819,7 @@ impl Interp {
                 }
                 Value::Bool(false) | Value::Nil => {}
                 Value::List(_) | Value::Map(_) => {
-                    rest.push_str(&format!(" {}=\"{}\"", name, escape(&v.to_json().to_string())))
+                    rest.push_str(&format!(" {}=\"{}\"", name, escape(&v.json_text())))
                 }
                 other => rest.push_str(&format!(" {}=\"{}\"", name, escape(&other.display()))),
             }
@@ -1927,7 +1954,7 @@ impl Interp {
                 out.push(' ');
                 out.push_str(name);
                 out.push_str("=\"");
-                escape_into(&v.to_json().to_string(), out);
+                escape_into(&v.json_text(), out);
                 out.push('"');
             }
             other => {
@@ -2004,7 +2031,7 @@ impl Interp {
         for p in &c.def.params {
             if p.name == "children" {
                 if component {
-                    props.insert(p.name.clone(), Value::str(&kids));
+                    props.insert(p.name.as_str().into(), Value::str(&kids));
                 }
                 args.push(Some(Value::html(std::mem::take(&mut kids))));
                 continue;
@@ -2012,7 +2039,7 @@ impl Interp {
             let pos = given.iter().position(|(n, _)| n == &p.name);
             let v = pos.map(|i| given.remove(i).1);
             if let (true, Some(v)) = (component, &v) {
-                props.insert(p.name.clone(), v.clone());
+                props.insert(p.name.as_str().into(), v.clone());
             }
             args.push(v);
         }
@@ -2059,7 +2086,7 @@ impl Interp {
         } else {
             format!(
                 " data-l=\"{}\" data-v=\"{}:{}\"",
-                escape(&Value::map(live).to_json().to_string()),
+                escape(&Value::map(live).json_text()),
                 self.shared.live_seq(),
                 self.shared.id
             )

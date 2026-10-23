@@ -14,8 +14,9 @@ use bytes::{BufMut, BytesMut};
 use postgres::types::{FromSql, IsNull, Kind, ToSql, Type};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 type BoxErr = Box<dyn Error + Sync + Send>;
 
@@ -108,7 +109,6 @@ impl Pool {
                     config,
                     tls: self.tls.clone(),
                     slots: (0..self.max).map(|_| Mutex::new(None)).collect(),
-                    next: AtomicUsize::new(0),
                 })
             })
             .clone()
@@ -233,7 +233,7 @@ fn values(rows: &[postgres::Row], limit: Option<usize>) -> Result<Vec<Value>, St
         let mut m = Map::with_capacity(row.len());
         for (i, col) in row.columns().iter().enumerate() {
             let v: PgValue = row.try_get(i).map_err(|e| describe(&e))?;
-            m.insert(col.name().to_string(), v.0);
+            m.insert(col.name().into(), v.0);
         }
         out.push(Value::map(m));
     }
@@ -254,7 +254,7 @@ fn casts_for(sql: &str, types: &[Type]) -> Option<String> {
 // ---- connections shared by the server's requests --------------------------
 
 /// Threads for the shared connections' runtime (more with `--instances`).
-pub static RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(2);
+pub static RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(1);
 
 /// The runtime the shared connections run on.
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -263,35 +263,98 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(RUNTIME_THREADS.load(Relaxed).max(1))
             .thread_name("quillo-pg")
+            .on_thread_start(crate::alloc::waiter_thread)
             .enable_all()
             .build()
             .expect("a runtime for Postgres")
     })
 }
 
-/// Connections many requests use at once, in the server. Each query goes
-/// to the next one, and what several requests send to the same connection
-/// is pipelined (the next query is sent before the answer to the last one
-/// comes back), so a few connections keep the database busy without a
-/// thread waiting on each query. Transactions keep a connection of their
-/// own instead (`Pool::checkout`).
+/// Connections many requests use at once, in the server. What is sent to
+/// one connection is pipelined (the next query goes out before the answer
+/// to the last one comes back), so a few connections keep the database busy
+/// without a thread waiting on each query. A request's queries (its
+/// `parallel` calls' too) go to the same connection, and requests share a
+/// few: the database then reads many queries at a time rather than waking a
+/// process for each, which takes it less than half the work. While one of
+/// those few is stuck behind a slow query, new requests use others, up to
+/// the pool's size. Transactions keep a connection of their own instead
+/// (`Pool::checkout`).
 pub struct Lanes {
     config: tokio_postgres::Config,
     tls: tokio_postgres_rustls::MakeRustlsConnect,
     slots: Vec<Mutex<Option<Arc<Lane>>>>,
-    next: AtomicUsize,
 }
+
+/// How many connections requests share while none is stuck.
+const USUAL_LANES: usize = 4;
+/// How long a connection may wait for an answer before it counts as stuck.
+const STUCK_MS: u64 = 20;
 
 struct Lane {
     client: tokio_postgres::Client,
     stmts: Mutex<HashMap<String, tokio_postgres::Statement>>,
+    /// Queries sent and not yet answered.
+    waiting: AtomicUsize,
+    /// When it last answered, or was given work while it had none (`clock`).
+    moved: AtomicU64,
+}
+
+/// Milliseconds since the first call.
+fn clock() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+impl Lane {
+    fn stuck(&self, now: u64) -> bool {
+        self.waiting.load(Relaxed) > 0 && now.saturating_sub(self.moved.load(Relaxed)) > STUCK_MS
+    }
+
+    /// Counts a query as waiting until the guard goes.
+    fn send(self: &Arc<Self>) -> Sent {
+        if self.waiting.fetch_add(1, Relaxed) == 0 {
+            self.moved.store(clock(), Relaxed);
+        }
+        Sent(self.clone())
+    }
+}
+
+struct Sent(Arc<Lane>);
+
+impl Drop for Sent {
+    fn drop(&mut self) {
+        self.0.moved.store(clock(), Relaxed);
+        self.0.waiting.fetch_sub(1, Relaxed);
+    }
 }
 
 impl Lanes {
-    /// The next connection, connecting it (again) if needed.
-    async fn lane(&self) -> Result<Arc<Lane>, String> {
-        let i = self.next.fetch_add(1, Relaxed) % self.slots.len();
-        if let Some(l) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    /// The connection for request `n`: the same each time among the usual
+    /// few, unless it is stuck; then the next that is not, the others in the
+    /// pool included. Connects it (again) if needed.
+    async fn lane(&self, n: usize) -> Result<Arc<Lane>, String> {
+        let usual = self.slots.len().min(USUAL_LANES);
+        let first = n % usual;
+        let now = clock();
+        let order = (0..usual).map(|k| (first + k) % usual).chain(usual..self.slots.len());
+        let mut pick = first;
+        for i in order {
+            let l = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match l {
+                Some(l) if l.client.is_closed() => {
+                    pick = i;
+                    break;
+                }
+                Some(l) if !l.stuck(now) => return Ok(l),
+                Some(_) => {}
+                None => {
+                    pick = i;
+                    break;
+                }
+            }
+        }
+        if let Some(l) = self.slots[pick].lock().unwrap_or_else(|e| e.into_inner()).clone() {
             if !l.client.is_closed() {
                 return Ok(l);
             }
@@ -300,8 +363,8 @@ impl Lanes {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()) });
-        *self.slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(l.clone());
+        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0) });
+        *self.slots[pick].lock().unwrap_or_else(|e| e.into_inner()) = Some(l.clone());
         Ok(l)
     }
 
@@ -330,9 +393,11 @@ impl Lanes {
         }
     }
 
-    pub async fn query(self: Arc<Self>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    /// Runs a query for request `n` (see `lane`).
+    pub async fn query(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
         let (sql, params) = translate(&sql, &params)?;
-        let lane = self.lane().await?;
+        let lane = self.lane(n).await?;
+        let _sent = lane.send();
         let stmt = Self::statement(&lane, &sql, &params).await?;
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -340,8 +405,9 @@ impl Lanes {
         values(&rows, limit)
     }
 
-    pub async fn exec(self: Arc<Self>, sql: String, params: Vec<Value>) -> Result<Value, String> {
-        let lane = self.lane().await?;
+    pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>) -> Result<Value, String> {
+        let lane = self.lane(n).await?;
+        let _sent = lane.send();
         let changes = if params.is_empty() && has_several_statements(&sql) {
             lane.client.batch_execute(&sql).await.map_err(|e| describe(&e))?;
             Value::Nil
@@ -476,7 +542,7 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
             }
             let mut values = Vec::new();
             for n in &names {
-                let v = m.get(n).or_else(|| m.get(&format!(":{}", n))).cloned();
+                let v = m.get(n.as_str()).or_else(|| m.get(format!(":{}", n).as_str())).cloned();
                 values.push(v.ok_or_else(|| format!("no value for :{}", n))?);
             }
             return Ok((out, values));

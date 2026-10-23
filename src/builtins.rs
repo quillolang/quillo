@@ -485,17 +485,17 @@ fn values(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = m_arg(&args, 0, "get", line)?;
     let k = arg(&args, 1).display();
-    Ok(m.get(&k).cloned().unwrap_or_else(|| arg(&args, 2)))
+    Ok(m.get(k.as_str()).cloned().unwrap_or_else(|| arg(&args, 2)))
 }
 
 fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::Bool(m_arg(&args, 0, "has", line)?.contains_key(&arg(&args, 1).display())))
+    Ok(Value::Bool(m_arg(&args, 0, "has", line)?.contains_key(arg(&args, 1).display().as_str())))
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = m_arg(&args, 0, "set", line)?;
     let mut m = Arc::unwrap_or_clone(m);
-    m.insert(arg(&args, 1).display(), arg(&args, 2));
+    m.insert(arg(&args, 1).display().into(), arg(&args, 2));
     Ok(Value::map(m))
 }
 
@@ -507,7 +507,7 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => {
             let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "remove", line)?);
-            m.shift_remove(&arg(&args, 1).display());
+            m.shift_remove(arg(&args, 1).display().as_str());
             Ok(Value::map(m))
         }
     }
@@ -876,7 +876,7 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let k = it.call(&f, vec![x.clone()], line)?.display();
         groups.entry(k).or_default().push(x.clone());
     }
-    Ok(Value::map(groups.into_iter().map(|(k, v)| (k, Value::list(v))).collect()))
+    Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
 }
 
 /// `index_of(xs, x)`: the position of `x` in a list or str, or null.

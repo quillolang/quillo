@@ -5,7 +5,132 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub type Map = IndexMap<String, Value>;
+pub type Map = IndexMap<Key, Value>;
+
+/// A map key, kept in place when short (as nearly all are), so a map such as
+/// a database row needs no allocation for its keys. It hashes, compares and
+/// reads as the `str` it holds.
+#[derive(Clone)]
+pub struct Key(KeyText);
+
+#[derive(Clone)]
+enum KeyText {
+    Short(u8, [u8; 22]),
+    Long(Arc<str>),
+}
+
+impl Key {
+    pub fn new(s: &str) -> Key {
+        if s.len() <= 22 {
+            let mut b = [0u8; 22];
+            b[..s.len()].copy_from_slice(s.as_bytes());
+            Key(KeyText::Short(s.len() as u8, b))
+        } else {
+            Key(KeyText::Long(s.into()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            // SAFETY: the bytes were copied from a `str`, whole.
+            KeyText::Short(n, b) => unsafe { std::str::from_utf8_unchecked(&b[..*n as usize]) },
+            KeyText::Long(s) => s,
+        }
+    }
+}
+
+impl std::ops::Deref for Key {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for Key {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for Key {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.as_str().hash(h)
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Key) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Key {}
+
+impl PartialEq<str> for Key {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Key {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Key) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Key) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl From<&str> for Key {
+    fn from(s: &str) -> Key {
+        Key::new(s)
+    }
+}
+
+impl From<String> for Key {
+    fn from(s: String) -> Key {
+        Key::new(&s)
+    }
+}
+
+impl From<&String> for Key {
+    fn from(s: &String) -> Key {
+        Key::new(s)
+    }
+}
+
+impl From<Key> for String {
+    fn from(k: Key) -> String {
+        k.as_str().to_string()
+    }
+}
 pub type BuiltinFn = fn(&mut Interp, Vec<Value>, u32) -> Result<Value, Ctrl>;
 
 #[derive(Clone)]
@@ -134,11 +259,63 @@ impl Value {
             Value::Str(s) => J::String(s.to_string()),
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
-            Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.clone(), v.to_json())).collect()),
+            Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json())).collect()),
             Value::Err(e) => serde_json::json!({ "error": e.to_json() }),
             Value::Response(r) => serde_json::json!({ "status": r.status }),
             Value::Func(_) | Value::Builtin(..) => J::String(self.repr()),
         }
+    }
+
+    /// The JSON text of `to_json`, written straight into `out`.
+    pub fn json_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Nil => out.extend_from_slice(b"null"),
+            Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+            Value::Int(n) => {
+                let _ = serde_json::to_writer(&mut *out, n);
+            }
+            Value::Float(f) => {
+                let _ = serde_json::to_writer(&mut *out, f);
+            }
+            Value::Str(s) | Value::Html(s) => json_str_into(s, out),
+            Value::List(l) => {
+                out.push(b'[');
+                for (i, v) in l.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    v.json_into(out);
+                }
+                out.push(b']');
+            }
+            Value::Map(m) => {
+                out.push(b'{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    json_str_into(k, out);
+                    out.push(b':');
+                    v.json_into(out);
+                }
+                out.push(b'}');
+            }
+            Value::Err(e) => {
+                out.extend_from_slice(b"{\"error\":");
+                e.json_into(out);
+                out.push(b'}');
+            }
+            Value::Response(r) => out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes()),
+            Value::Func(_) | Value::Builtin(..) => json_str_into(&self.repr(), out),
+        }
+    }
+
+    /// `json_into`, as a string.
+    pub fn json_text(&self) -> String {
+        let mut out = Vec::new();
+        self.json_into(&mut out);
+        // SAFETY: only JSON text, which is UTF-8, was written.
+        unsafe { String::from_utf8_unchecked(out) }
     }
 
     pub fn from_json(j: &serde_json::Value) -> Value {
@@ -152,7 +329,7 @@ impl Value {
             },
             J::String(s) => Value::str(s),
             J::Array(a) => Value::list(a.iter().map(Value::from_json).collect()),
-            J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.clone(), Value::from_json(v))).collect()),
+            J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), Value::from_json(v))).collect()),
         }
     }
 }
@@ -201,9 +378,61 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     }
 }
 
+/// A JSON string, escaped as `serde_json` escapes it.
+fn json_str_into(s: &str, out: &mut Vec<u8>) {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.reserve(s.len() + 2);
+        out.push(b'"');
+        out.extend_from_slice(s.as_bytes());
+        out.push(b'"');
+    } else {
+        let _ = serde_json::to_writer(&mut *out, s);
+    }
+}
+
 // ---- environments ------------------------------------------------------
 
 pub type Env = Arc<Scope>;
+
+thread_local! {
+    /// Ended scopes, for reuse (see `Scope::done`).
+    static SPARE: std::cell::RefCell<Vec<Env>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const SPARE_SCOPES: usize = 64;
+
+thread_local! {
+    /// Large values whose scope ended, for the event loop to have freed on
+    /// another thread (`defer_drops`); `None` where they are freed at once.
+    static LATER: std::cell::RefCell<Option<Vec<Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on, large lists and maps that go out of scope on this thread are
+/// kept for `deferred_drops` rather than freed: an event loop has them freed
+/// by a thread with time to spare. (Rows read from the database were made on
+/// such a thread, which also frees them fastest.)
+pub fn defer_drops() {
+    LATER.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// The values kept since the last call, to be dropped elsewhere.
+pub fn deferred_drops() -> Vec<Value> {
+    LATER.with(|l| l.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+fn drop_value(v: Value) {
+    let large = match &v {
+        Value::List(l) => l.len() >= 8 && Arc::strong_count(l) == 1,
+        Value::Map(m) => m.len() >= 16 && Arc::strong_count(m) == 1,
+        _ => false,
+    };
+    if large {
+        LATER.with(|l| match l.borrow_mut().as_mut() {
+            Some(later) => later.push(v),
+            None => drop(v),
+        });
+    }
+}
 
 /// Variables, and the scope around them. The parent link is fixed when the
 /// scope is made, so looking a name up walks the chain without locking it.
@@ -358,6 +587,23 @@ impl Vars {
         }
     }
 
+    /// Empties it, keeping its room, for a scope used again.
+    fn clear(&mut self) {
+        match self {
+            Vars::Few(slots, more) => {
+                for s in slots.iter_mut() {
+                    if let Some((_, v)) = s.take() {
+                        drop_value(v);
+                    }
+                }
+                for (_, v) in more.drain(..) {
+                    drop_value(v);
+                }
+            }
+            Vars::Many(_) => *self = Vars::few(),
+        }
+    }
+
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
             Vars::Few(slots, more) => {
@@ -404,7 +650,28 @@ impl Scope {
     }
 
     pub fn child(parent: &Env) -> Env {
+        if let Some(mut e) = SPARE.with(|s| s.borrow_mut().pop()) {
+            if let Some(s) = Arc::get_mut(&mut e) {
+                s.parent = Some(parent.clone());
+                return e;
+            }
+        }
         Arc::new(Scope { vars: VarsCell::new(Vars::few()), parent: Some(parent.clone()) })
+    }
+
+    /// Ends a scope made with `child`. If nothing else holds it (no
+    /// function made in it is still around), it is emptied and kept for the
+    /// next `child`, saving an allocation per call, block and loop step.
+    pub fn done(mut e: Env) {
+        let Some(s) = Arc::get_mut(&mut e) else { return };
+        s.parent = None;
+        s.vars.vars.get_mut().clear();
+        SPARE.with(|sp| {
+            let mut sp = sp.borrow_mut();
+            if sp.len() < SPARE_SCOPES {
+                sp.push(e);
+            }
+        });
     }
 
     fn vars(&self) -> VarsGuard<'_> {
@@ -457,4 +724,43 @@ pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
 /// Updates an existing variable in the nearest scope that has it.
 pub fn assign(env: &Env, name: &str, v: Value) -> bool {
     assign_global(env, name, v).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_short_and_long_read_as_their_text() {
+        let long = "a key longer than twenty-two bytes";
+        let mut m = Map::new();
+        m.insert("id".into(), Value::Int(1));
+        m.insert(long.into(), Value::Int(2));
+        m.insert(String::from("ünï").into(), Value::Int(3));
+        assert!(matches!(m.get("id"), Some(Value::Int(1))));
+        assert!(matches!(m.get(long), Some(Value::Int(2))));
+        assert!(matches!(m.get("ünï"), Some(Value::Int(3))));
+        assert!(m.get("i").is_none());
+        let keys: Vec<&str> = m.keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["id", long, "ünï"]);
+        assert!(Key::from("a") < Key::from(long) && Key::from(long) == Key::new(long));
+    }
+
+    #[test]
+    fn json_text_is_what_serde_json_writes() {
+        let mut m = Map::new();
+        m.insert("id".into(), Value::Int(-42));
+        m.insert("quote \" and \\".into(), Value::str("tab\t, newline\n, \u{1} and フレームワーク <b>"));
+        m.insert("f".into(), Value::Float(2.5));
+        m.insert("whole".into(), Value::Float(3.0));
+        m.insert("big".into(), Value::Float(1e300));
+        m.insert("nan".into(), Value::Float(f64::NAN));
+        m.insert("none".into(), Value::Nil);
+        m.insert("yes".into(), Value::Bool(true));
+        m.insert("html".into(), Value::html("<p>\"x\"</p>"));
+        m.insert("err".into(), Value::err(Value::str("bad")));
+        m.insert("empty".into(), Value::map(Map::new()));
+        let v = Value::list(vec![Value::map(m), Value::list(vec![]), Value::Int(i64::MIN), Value::str("")]);
+        assert_eq!(v.json_text(), v.to_json().to_string());
+    }
 }

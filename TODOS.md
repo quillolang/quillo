@@ -80,8 +80,6 @@ view cache. Next, by expected gain:
 - [ ] **Variables resolved at load time.** Names are still looked up by text
       at each use; resolving them to (depth, slot) once would remove most
       lookup cost.
-- [ ] **A faster HTTP layer.** With the cache, tiny_http's per-connection
-      threads and queue are the limit (plain text: about 95,000/s).
 - [ ] **Opt-in caching for views that read the database**, with a time limit,
       since rows changed outside Quillo are not seen.
 

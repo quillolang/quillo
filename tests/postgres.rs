@@ -246,6 +246,18 @@ route GET /count = db.one("select count(*) as c from t").c
     let took = t0.elapsed();
     assert!(took < Duration::from_millis(1200), "took {:?}", took);
 
+    // Requests share a few connections; while those wait on slow queries,
+    // a quick one goes to another rather than queueing behind them.
+    let hs: Vec<_> = (0..4).map(|_| std::thread::spawn(move || get(port, "/slow"))).collect();
+    std::thread::sleep(Duration::from_millis(100));
+    let t0 = Instant::now();
+    assert_eq!(get(port, "/count"), "0");
+    let took = t0.elapsed();
+    assert!(took < Duration::from_millis(200), "took {:?}", took);
+    for h in hs {
+        assert_eq!(h.join().unwrap(), r#"{"slept":true}"#);
+    }
+
     // While a transaction is open, other requests do not see its row.
     let writer = std::thread::spawn(move || get(port, "/write"));
     std::thread::sleep(Duration::from_millis(250));

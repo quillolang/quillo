@@ -681,6 +681,10 @@ value or replies early.
   releases the interpreter lock while it waits, so other requests keep running.
   A transaction keeps one connection until it ends, so other requests never see its
   changes early.
+- In the server, other queries share a few connections, pipelined: a request's queries
+  (its `parallel` calls' too) go to the same one, so the database reads them together.
+  While those connections wait on a slow query, new requests use others, up to
+  `pool_size`.
 - TLS is used when the server offers it (`?sslmode=require` insists), with certificates
   checked against the usual public certificate authorities, as hosted Postgres services
   use.

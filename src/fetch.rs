@@ -88,7 +88,7 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         return Ok(Value::err(Value::str(format!("http: not an http(s) URL: {}", url))));
     }
     let hdrs: Vec<(String, String)> = match headers {
-        Value::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.display())).collect(),
+        Value::Map(m) => m.iter().map(|(k, v)| (k.to_string(), v.display())).collect(),
         Value::Nil => Vec::new(),
         other => return fail(line, format!("`{}` expects headers as a map, got {}", fname, other.type_name())),
     };
@@ -96,7 +96,7 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Value::Nil => None,
         Value::Str(s) => Some(("text/plain; charset=utf-8", s.as_bytes().to_vec())),
         Value::Html(h) => Some(("text/html; charset=utf-8", h.as_bytes().to_vec())),
-        other => Some(("application/json", other.to_json().to_string().into_bytes())),
+        other => Some(("application/json", other.json_text().into_bytes())),
     };
     let (method, url) = (method.to_string(), url.to_string());
     let res = it.unlocked(move || send(&method, &url, &hdrs, payload));
@@ -108,7 +108,7 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
     let mut m = Map::new();
     m.insert("status".into(), Value::Int(reply.status as i64));
     m.insert("ok".into(), Value::Bool((200..300).contains(&reply.status)));
-    m.insert("headers".into(), Value::map(reply.headers.into_iter().map(|(k, v)| (k, Value::str(v))).collect()));
+    m.insert("headers".into(), Value::map(reply.headers.into_iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
     m.insert("body".into(), Value::str(reply.body));
     m.insert("json".into(), json);
     Ok(Value::map(m))

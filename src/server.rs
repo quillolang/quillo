@@ -67,7 +67,7 @@ pub fn parse_urlencoded(s: &str) -> Map {
     let mut m = Map::new();
     for pair in s.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        m.insert(percent_decode(k, true), Value::str(percent_decode(v, true)));
+        m.insert(percent_decode(k, true).into(), Value::str(percent_decode(v, true)));
     }
     m
 }
@@ -164,7 +164,7 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let mut cookies = Map::new();
     for part in header("cookie").split(';') {
         if let Some((k, v)) = part.trim().split_once('=') {
-            cookies.insert(k.to_string(), Value::str(percent_decode(v, false)));
+            cookies.insert(k.into(), Value::str(percent_decode(v, false)));
         }
     }
     let body = String::from_utf8_lossy(&req.body).into_owned();
@@ -183,7 +183,7 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
 
     let mut headers = Map::with_capacity(req.headers.len());
     for (k, v) in &req.headers {
-        headers.insert(k.to_ascii_lowercase(), Value::str(v));
+        headers.insert(k.to_ascii_lowercase().into(), Value::str(v));
     }
     let mut m = Map::with_capacity(10);
     m.insert("method".into(), Value::str(&req.method));
@@ -257,7 +257,7 @@ impl Interp {
             }
             method_matched = true;
 
-            let params_v = Value::map(params.iter().cloned().collect());
+            let params_v = Value::map(params.iter().map(|(k, v)| (k.into(), v.clone())).collect());
             let scope = Scope::child(&self.globals);
             // The request map only for a route that can see it; for others
             // it is made if something asks (`url()`, a server fn).
@@ -613,10 +613,11 @@ fn render_response(r: &Response) -> HttpResponse {
             Value::Nil => (None, Vec::new()),
             Value::Html(h) => (Some("text/html; charset=utf-8"), h.as_bytes().to_vec()),
             Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
-            Value::Err(e) => {
-                (Some("application/json"), serde_json::json!({ "error": e.to_json() }).to_string().into_bytes())
+            other => {
+                let mut out = Vec::new();
+                other.json_into(&mut out);
+                (Some("application/json"), out)
             }
-            other => (Some("application/json"), other.to_json().to_string().into_bytes()),
         },
     };
     let mut headers = r.headers.clone();

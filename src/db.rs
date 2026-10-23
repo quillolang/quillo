@@ -173,7 +173,7 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
         if stmt.parameter_count() > 0 && stmt.parameter_name(1).is_some() {
             let mut bound = vec![false; stmt.parameter_count()];
             for (k, v) in m.iter() {
-                let name = if k.starts_with([':', '@', '$']) { k.clone() } else { format!(":{}", k) };
+                let name = if k.starts_with([':', '@', '$']) { k.to_string() } else { format!(":{}", k) };
                 match stmt.parameter_index(&name).map_err(|e| e.to_string())? {
                     Some(i) => {
                         stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?;
@@ -212,7 +212,7 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let mut m = Map::new();
         for (i, (c, is_bool)) in cols.iter().enumerate() {
-            m.insert(c.clone(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *is_bool));
+            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *is_bool));
         }
         out.push(Value::map(m));
         if limit.map_or(false, |l| out.len() >= l) {
@@ -305,7 +305,7 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Some(lanes) => {
                 let sql = sql.clone();
                 // Boxed here, so the (large) future is not moved again.
-                awaited(crate::httpd::await_elsewhere(Box::pin(lanes.exec(sql, params))))
+                awaited(crate::httpd::await_elsewhere(Box::pin(lanes.exec(crate::httpd::request_number(), sql, params))))
             }
             None => {
                 let sql = sql.clone();
@@ -324,7 +324,7 @@ fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>
     let res = match &*b {
         Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
-            Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(sql.clone(), params, limit)))),
+            Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
             None => {
                 let sql = sql.clone();
                 pg_run(it, &b, move |c| c.query(&sql, &params, limit))

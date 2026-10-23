@@ -1,5 +1,6 @@
 //! Quillo: a small web language where routes, payload patterns and HTML are syntax.
 
+pub mod alloc;
 pub mod ast;
 pub mod builtins;
 pub mod check;
