@@ -51,7 +51,8 @@ serves them:
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1) |
 | `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages |
-| `--workers N` | request threads (default 8) |
+| `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency) |
+| `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 
@@ -708,10 +709,22 @@ yours named `last` hides the builtin.
 
 ## Concurrency and reloading
 
-Requests are served by a pool of threads. Quillo code runs under one lock, so a handler
-runs on its own from start to end, except while it waits: `sleep`, `http.*` and
-reading the request let other requests run. Updating shared state such as
-`todos = todos | push(t)` is therefore safe without locks.
+One thread runs an event loop (kqueue on macOS, epoll on Linux) over every connection,
+reads and parses requests, runs the program on them and writes the answers. Each request
+runs as a coroutine with its own stack. A handler runs on its own from start to end,
+except while it waits: a database query, `http.*` or `sleep` pauses it, the waiting is
+done elsewhere (on a pool thread, or for PostgreSQL on connections all requests share,
+with queries pipelined), and the loop answers other requests meanwhile. Code is written
+as if it simply waited; there is no `async` or `await`. Updating shared state such as
+`todos = todos | push(t)` is safe without locks, since only one handler runs at a time.
+
+A request that only computes never leaves the loop's thread, so plain pages and JSON
+cost a few microseconds each. To use more cores, `--instances N` runs the program N times
+over in one process, each with an event loop of its own; the first takes the connections
+and hands them out in turn. Like N processes, each instance has its own variables, while
+the database is shared, and changes to it (and `publish`) reach live pages on every
+instance. SQLite in memory (`:memory:`) is one database per instance, so use a file or
+PostgreSQL to share data between them.
 
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. A version that fails to load or check does not
