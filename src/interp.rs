@@ -59,6 +59,8 @@ pub struct Interp {
     pub site: Arc<crate::site::Site>,
     /// The current request's tenant, once worked out (`None` until then).
     pub tenant: Option<Option<Arc<str>>>,
+    /// The current request's body when it carries files (see `upload`).
+    pub upload_body: Option<Arc<[u8]>>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
@@ -439,6 +441,7 @@ impl Interp {
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
+            upload_body: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
@@ -475,6 +478,7 @@ impl Interp {
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
             tenant: None,
+            upload_body: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,
@@ -702,6 +706,7 @@ impl Interp {
         it.restrictor = self.restrictor.clone();
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it.tenant = self.tenant.clone();
+        it.upload_body = self.upload_body.clone();
         it
     }
 

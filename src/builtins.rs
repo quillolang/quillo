@@ -60,6 +60,8 @@ pub fn install(env: &Env) {
         ("sleep", sleep),
         ("file", file),
         ("allow_cross_site", allow_cross_site),
+        ("save_upload", save_upload),
+        ("read_upload", read_upload),
         ("tenant", tenant),
         ("tenant_from", tenant_from),
         ("with_tenant", with_tenant),
@@ -623,6 +625,46 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             body: Body::Bytes(bytes),
         }))),
         Err(_) => Ok(not_found()),
+    }
+}
+
+/// `save_upload(file, "uploads/avatar.png")`: writes a file from
+/// `request.files` into the program's folder (folders made as needed) and
+/// gives the path back; an error value if it cannot.
+fn save_upload(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let dest = s_arg(&args, 1, "save_upload", line)?;
+    let rel = Path::new(&*dest);
+    if dest.is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return fail(line, format!("`save_upload` needs a path inside the program's folder, got {:?}", &*dest));
+    }
+    let Some(body) = it.upload_body.clone() else {
+        return Ok(Value::err(Value::str("save_upload: the current request has no files")));
+    };
+    let range = match crate::upload::bytes(&arg(&args, 0), &body) {
+        Ok(b) => (b.as_ptr() as usize - body.as_ptr() as usize, b.len()),
+        Err(e) => return Ok(Value::err(Value::str(format!("save_upload: {}", e)))),
+    };
+    let full = it.base_dir.join(rel);
+    let written = it.unlocked(move || {
+        if let Some(dir) = full.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&full, &body[range.0..range.0 + range.1])
+    });
+    match written {
+        Ok(()) => Ok(Value::Str(dest)),
+        Err(e) => Ok(Value::err(Value::str(format!("save_upload: {}", e)))),
+    }
+}
+
+/// `read_upload(file)`: a file from `request.files`, as text.
+fn read_upload(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    let Some(body) = it.upload_body.clone() else {
+        return Ok(Value::err(Value::str("read_upload: the current request has no files")));
+    };
+    match crate::upload::bytes(&arg(&args, 0), &body) {
+        Ok(b) => Ok(Value::str(String::from_utf8_lossy(b))),
+        Err(e) => Ok(Value::err(Value::str(format!("read_upload: {}", e)))),
     }
 }
 

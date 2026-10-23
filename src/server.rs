@@ -174,7 +174,9 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
             cookies.insert(k.into(), Value::str(percent_decode(v, false)));
         }
     }
-    let body = String::from_utf8_lossy(&req.body).into_owned();
+    // Files: their bytes stay in the body (see `upload`), which is no text.
+    let multipart = crate::upload::boundary(&ctype);
+    let body = if multipart.is_some() { String::new() } else { String::from_utf8_lossy(&req.body).into_owned() };
     let trimmed = body.trim_start();
     // A body is JSON when it says so, or says nothing and looks like it
     // (curl, scripts). Not when it says it is something else: a page on
@@ -186,7 +188,11 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     } else {
         Value::Nil
     };
-    let form = if ctype.contains("application/x-www-form-urlencoded") { parse_urlencoded(&body) } else { Map::new() };
+    let (form, files) = match &multipart {
+        Some(b) => crate::upload::parse(b, &req.body),
+        None if ctype.contains("application/x-www-form-urlencoded") => (parse_urlencoded(&body), Map::new()),
+        None => (Map::new(), Map::new()),
+    };
 
     let mut headers = Map::with_capacity(req.headers.len());
     for (k, v) in &req.headers {
@@ -202,6 +208,7 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     m.insert("body".into(), Value::str(body));
     m.insert("json".into(), json);
     m.insert("form".into(), Value::map(form));
+    m.insert("files".into(), Value::map(files));
     m.insert("ip".into(), Value::str(&req.remote));
     m
 }
@@ -222,6 +229,13 @@ impl Interp {
         }
         self.rendered_island = false;
         self.tenant = None;
+        self.upload_body = None;
+        if !req.body.is_empty() {
+            let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
+            if crate::upload::boundary(ctype).is_some() {
+                self.upload_body = Some(Arc::from(req.body.as_slice()));
+            }
+        }
         let mut resp = self.handle_inner(req);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {

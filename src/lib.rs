@@ -22,6 +22,7 @@ pub mod shared;
 pub mod site;
 pub mod stack;
 pub mod sqlinfo;
+pub mod upload;
 pub mod value;
 pub mod viewcache;
 pub mod ws;

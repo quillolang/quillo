@@ -554,13 +554,37 @@ route METHOD /path { ... block ... }
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS HEAD ANY`. A `HEAD` request is served by the `GET` route without a body.
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also `float`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path.
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
-- **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values.
+- **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `files`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values.
 - **Reserved:** paths under `/_quillo/` belong to Quillo (the browser bundle, server fn calls, `--watch`).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method, and 400 when a route matched the path and method but
 none of its patterns matched.
+
+### Uploads
+
+A form with `enctype="multipart/form-data"` sends files. Its text fields are in
+`request.form`, as for any form, and each file is in `request.files` under its field's
+name: `{ field, filename, type, size }` (a field with several files, from `multiple`,
+is a list). The bytes stay with the request until saved:
+
+```quillo
+route POST /avatar {
+    let f = request.files.photo
+    if f.size > 2_000_000 { reply 413 "Photos up to 2 MB" }
+    save_upload(f, `uploads/${uuid()}.png`)?          // into the program's folder
+    redirect("/profile")
+}
+```
+
+- `save_upload(file, path)` writes the file under the program's folder (making folders
+  as needed; a path that leads outside is refused) and gives the path back, or an error
+  value. `read_upload(file)` gives a text file's contents.
+- `filename` is what the browser sent, without any folders; name saved files yourself
+  (as above) rather than trusting it.
+- The whole request counts against `--max-body` (10 MiB by default): raise it for larger
+  files.
 
 ### What a route returns
 
