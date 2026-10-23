@@ -226,6 +226,23 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
 /// `--instances N`: the program N times over, one event loop each, so a
 /// server uses N cores. Each instance has its own variables, as N
 /// processes would; changes to the database and `publish` reach them all.
+/// The first Ctrl-C or SIGTERM stops the server gracefully: it leaves the
+/// pool it joined, finishes the requests in progress and exits; a second
+/// one exits at once.
+fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
+    let again = std::sync::atomic::AtomicBool::new(false);
+    let _ = ctrlc::set_handler(move || {
+        if again.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
+        if let Some(m) = &member {
+            m.leave();
+        }
+        quillo::httpd::stop();
+    });
+}
+
 fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
     if o.watch || o.register.is_some() {
         eprintln!("quillo: --instances does not go with --watch or --register");
@@ -247,6 +264,7 @@ fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
     }
     let shared: Vec<_> = apps.iter().map(|a| a.shared()).collect();
     quillo::shared::Shared::link(&shared);
+    stop_on_signal(None);
     match quillo::server::serve_many(apps, addr, o.workers) {
         Ok(()) => 0,
         Err(e) => {
@@ -272,6 +290,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         Ok(None) => return 0,
         Err(code) => return code,
     };
+    let mut member = None;
     if let Some(admin) = o.register {
         let Ok(port) = port.parse::<u16>() else {
             eprintln!("quillo: --register needs a numeric --port");
@@ -282,6 +301,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         });
         let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
         let m = quillo::cluster::Membership { admin, service, port, secret };
+        member = Some(m.clone());
         app.cluster_key = Some(m.key());
         if m.secret.is_none() {
             eprintln!(
@@ -292,6 +312,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         }
         quillo::cluster::join(app.shared(), m);
     }
+    stop_on_signal(member);
     match quillo::server::serve(app, &format!("{}:{}", host, port), o.workers) {
         Ok(()) => 0,
         Err(e) => {

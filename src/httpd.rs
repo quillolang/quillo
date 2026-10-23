@@ -44,6 +44,27 @@ const STACK: usize = 16 << 20;
 /// Stacks kept for reuse.
 const SPARE_STACKS: usize = 256;
 
+/// Set to stop the server gracefully: no new connections, requests being
+/// answered are finished (for up to `DRAIN`), then the loops end.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// Every event loop's waker, to tell them when `STOPPING` is set.
+static LOOPS: Mutex<Vec<Arc<Waker>>> = Mutex::new(Vec::new());
+/// How long requests in progress get to finish when the server stops.
+const DRAIN: Duration = Duration::from_secs(10);
+
+/// Stops the server gracefully (see `STOPPING`).
+pub fn stop() {
+    STOPPING.store(true, SeqCst);
+    for w in lock(&LOOPS).iter() {
+        let _ = w.wake();
+    }
+}
+
+/// Whether the server is stopping.
+pub fn stopping() -> bool {
+    STOPPING.load(SeqCst)
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -359,24 +380,32 @@ pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max
     }
     let mut apps = apps.into_iter().zip(polls).enumerate();
     let (_, (first_app, first_poll)) = apps.next().ok_or("no instances")?;
+    let mut others = Vec::new();
     for (i, (app, poll)) in apps {
         let inbox = inboxes[i].clone();
-        std::thread::Builder::new()
-            .name("quillo-instance".into())
-            .stack_size(crate::server::WORKER_STACK)
-            .spawn(move || {
-                if let Err(e) = run_loop(app, poll, None, inbox, Vec::new(), i, max_waiting) {
-                    eprintln!("quillo: {}", e);
-                }
-            })
-            .map_err(|e| format!("cannot start an instance: {}", e))?;
+        others.push(
+            std::thread::Builder::new()
+                .name("quillo-instance".into())
+                .stack_size(crate::server::WORKER_STACK)
+                .spawn(move || {
+                    if let Err(e) = run_loop(app, poll, None, inbox, Vec::new(), i, max_waiting) {
+                        eprintln!("quillo: {}", e);
+                    }
+                })
+                .map_err(|e| format!("cannot start an instance: {}", e))?,
+        );
     }
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let mut listener = TcpListener::from_std(listener);
     first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
     let own = inboxes[0].clone();
     let all = if inboxes.len() > 1 { inboxes } else { Vec::new() };
-    run_loop(first_app, first_poll, Some(listener), own, all, 0, max_waiting)
+    let r = run_loop(first_app, first_poll, Some(listener), own, all, 0, max_waiting);
+    // Stopping: the other instances finish their requests too.
+    for t in others {
+        let _ = t.join();
+    }
+    r
 }
 
 fn run_loop(
@@ -389,6 +418,7 @@ fn run_loop(
     max_waiting: usize,
 ) -> Result<(), String> {
     let waker = inbox.waker.clone();
+    lock(&LOOPS).push(waker.clone());
     let pool = Arc::new(Pool {
         jobs: Mutex::new(VecDeque::new()),
         queued: AtomicUsize::new(0),
@@ -467,6 +497,7 @@ impl Loop {
         gil.acquire();
         let mut events = Events::with_capacity(1024);
         let mut swept = Instant::now();
+        let mut draining: Option<Instant> = None;
         crate::value::defer_drops();
         loop {
             let handed = std::mem::take(&mut *lock(&self.inbox.conns));
@@ -506,7 +537,8 @@ impl Loop {
                 && lock(&self.inbox.conns).is_empty();
             let r = if idle {
                 gil.release();
-                let r = self.poll.poll(&mut events, Some(Duration::from_secs(1)));
+                let wait = if draining.is_some() { Duration::from_millis(20) } else { Duration::from_secs(1) };
+                let r = self.poll.poll(&mut events, Some(wait));
                 gil.acquire();
                 r
             } else {
@@ -535,7 +567,42 @@ impl Loop {
                 self.sweep();
                 swept = Instant::now();
             }
+            if STOPPING.load(SeqCst) {
+                let since = *draining.get_or_insert(self.now);
+                if let Some(mut l) = self.listener.take() {
+                    let _ = self.poll.registry().deregister(&mut l);
+                }
+                self.close_idle();
+                if self.quiet() || self.now.duration_since(since) >= DRAIN {
+                    flush_log();
+                    gil.release();
+                    return Ok(());
+                }
+            }
         }
+    }
+
+    /// Stopping: closes the connections with nothing in progress (no
+    /// request arriving, nothing left to write).
+    fn close_idle(&mut self) {
+        for i in 0..self.slots.len() {
+            let Slot::Idle(c) = &self.slots[i] else { continue };
+            if c.receiving.is_none() && c.output.is_empty() {
+                if let Slot::Idle(c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
+                    self.close(i, c);
+                }
+            }
+        }
+    }
+
+    /// Nothing being answered or written any more.
+    fn quiet(&self) -> bool {
+        self.tasks.iter().all(Option::is_none)
+            && self.slots.iter().all(|s| match s {
+                Slot::Free => true,
+                Slot::Busy { .. } => false,
+                Slot::Idle(c) => c.output.is_empty() && c.receiving.is_none(),
+            })
     }
 
     fn accept(&mut self) {

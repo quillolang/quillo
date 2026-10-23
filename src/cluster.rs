@@ -85,13 +85,29 @@ impl Membership {
     }
 }
 
+/// Set once the server leaves the pool: the heartbeat stops.
+static LEAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Membership {
+    /// Leaves the pool, so limer sends no more requests here (when the
+    /// server stops).
+    pub fn leave(&self) {
+        LEAVING.store(true, std::sync::atomic::Ordering::SeqCst);
+        let path = format!("/deregister?service={}&port={}", encode(&self.service), self.port);
+        match self.post(&path, None) {
+            Ok(()) => eprintln!("quillo: left `{}` at {}", self.service, self.admin),
+            Err(e) => eprintln!("quillo: cannot leave `{}` at {}: {} (it drops this server when the heartbeat stops)", self.service, self.admin, e),
+        }
+    }
+}
+
 /// Joins the pool and starts telling the other members about changes.
 pub fn join(shared: Arc<Shared>, m: Membership) {
     let heartbeat = m.clone();
     let _ = std::thread::Builder::new().name("quillo-register".into()).spawn(move || {
         let path = format!("/register?service={}&port={}&ttl={}", encode(&heartbeat.service), heartbeat.port, TTL);
         let mut ok = None;
-        loop {
+        while !LEAVING.load(std::sync::atomic::Ordering::SeqCst) {
             match heartbeat.post(&path, None) {
                 Ok(()) if ok != Some(true) => {
                     eprintln!("quillo: registered with {} as a member of `{}`", heartbeat.admin, heartbeat.service);

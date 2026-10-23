@@ -943,6 +943,11 @@ impl Worker {
             let status = crate::cluster::announced(&app.shared, key, body);
             return Answer::Respond(HttpResponse { status, headers: Vec::new(), body: Vec::new() });
         }
+        // For a load balancer: whether to send requests here.
+        if path == "/_quillo/health" {
+            let ready = matches!(&*app.current().1, Loaded::Ready(_)) && !crate::httpd::stopping();
+            return Answer::Respond(if ready { plain(200, "ok\n") } else { plain(503, "unavailable\n") });
+        }
         let start = Instant::now();
         let (g, current) = app.current();
         if g != self.generation {

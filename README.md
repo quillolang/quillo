@@ -741,6 +741,17 @@ With `--watch`, a change to the program or a `use`d file reloads it (starting it
 state afresh) and refreshes open pages. A version that fails to load or check does not
 replace the one that works; the errors are printed.
 
+### Stopping and health
+
+The first Ctrl-C or `SIGTERM` stops the server gracefully: it takes no new connections,
+closes idle ones, answers the requests in progress (for up to 10 seconds) and exits with
+status 0. A server that joined a pool with `--register` leaves it first, so limer stops
+sending it requests. A second Ctrl-C stops it at once.
+
+`GET /_quillo/health` answers `200 ok` while the server is ready for requests, and `503`
+while it is stopping or its program failed to load: give it to a load balancer's health
+check (limer's `health_uri`).
+
 ## Cached views
 
 A view's HTML depends on its arguments and on the global variables it reads. When a

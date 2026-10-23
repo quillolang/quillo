@@ -64,11 +64,6 @@ Child components still update whenever their parent does.
 
 ## Several servers behind limer
 
-- [ ] **Leave the pool on shutdown.** On SIGTERM/Ctrl-C: `POST /drain`, finish
-      in-flight requests, `POST /deregister`, exit. Today a stopped server
-      stays in the pool until its 15-second TTL lapses.
-- [ ] **A health endpoint** (`/_quillo/health`) for limer's `health_uri`, so a
-      server is admitted only once it has loaded its program.
 - [ ] **Run `tests/cluster.rs` in CI.** It is skipped without a limer binary;
       CI would need to build limer (`$LIMER`).
 - [ ] **An example**: a Limerfile plus a `.qwe` app on PostgreSQL, run as two

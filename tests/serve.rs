@@ -415,3 +415,39 @@ fn a_desktop_apps_server_answers_only_its_window() {
     assert!(page.starts_with("HTTP/1.1 200"), "{}", page);
     assert!(page.ends_with("hi"), "{}", page);
 }
+
+#[test]
+fn health_says_whether_to_send_requests_here() {
+    let d = temp_dir("health");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = \"hi\"\n").unwrap();
+    let srv = start(&f, &[]);
+    assert_eq!(get(srv.port, "/_quillo/health"), (200, "ok\n".into()));
+}
+
+/// On SIGTERM, a request in progress gets its answer, no new connections
+/// are taken, and the server exits cleanly.
+#[cfg(unix)]
+#[test]
+fn stopping_finishes_requests_in_progress() {
+    let d = temp_dir("stop");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /slow { sleep(600); \"done\" }\n").unwrap();
+    let mut srv = start(&f, &[]);
+    let port = srv.port;
+    let slow = std::thread::spawn(move || get(port, "/slow"));
+    std::thread::sleep(Duration::from_millis(150));
+    let ok = Command::new("kill").args(["-TERM", &srv.child.id().to_string()]).status().unwrap();
+    assert!(ok.success());
+    assert_eq!(slow.join().unwrap(), (200, "done".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = srv.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "the server did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{:?}", status);
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
