@@ -10,23 +10,29 @@
 
 use std::io::Write;
 
+use crate::server::HttpRequest;
+
 /// Whether a request asks to become a WebSocket.
-pub fn is_upgrade(rq: &tiny_http::Request) -> bool {
-    rq.headers().iter().any(|h| h.field.equiv("upgrade") && h.value.as_str().eq_ignore_ascii_case("websocket"))
+pub fn is_upgrade(req: &HttpRequest) -> bool {
+    req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket"))
 }
 
 /// A WebSocket the server writes to. Each `send` reports whether the page
 /// is still there.
-pub struct Socket(Box<dyn tiny_http::ReadWrite + Send>);
+pub struct Socket(std::net::TcpStream);
 
 impl Socket {
-    /// Completes the handshake; `None` if the request is not a valid one.
-    pub fn accept(rq: tiny_http::Request) -> Option<Socket> {
-        let key = rq.headers().iter().find(|h| h.field.equiv("sec-websocket-key"))?.value.as_str().trim().to_string();
+    /// Completes the handshake on the request's connection; `None` if the
+    /// request is not a valid one.
+    pub fn accept(req: &HttpRequest, mut stream: std::net::TcpStream) -> Option<Socket> {
+        let key = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))?.1.trim().to_string();
         let accept = base64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
-        let resp = tiny_http::Response::empty(101)
-            .with_header(tiny_http::Header::from_bytes(&b"sec-websocket-accept"[..], accept.as_bytes()).ok()?);
-        Some(Socket(rq.upgrade("websocket", resp)))
+        let handshake = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {}\r\n\r\n",
+            accept
+        );
+        stream.write_all(handshake.as_bytes()).ok()?;
+        Some(Socket(stream))
     }
 
     pub fn send(&mut self, text: &str) -> bool {

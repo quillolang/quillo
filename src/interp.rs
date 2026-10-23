@@ -538,13 +538,19 @@ impl Interp {
 
     /// Runs `f` without holding the interpreter lock, so other requests can
     /// run while this one waits. `f` must not touch Quillo values.
-    pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+    pub fn unlocked<T: Send>(&mut self, f: impl FnOnce() -> T + Send) -> T {
         // Inside a SQLite transaction, another request would run its SQL in
         // this one's transaction: committed or rolled back with it, and
         // seeing what it has not committed. So the wait holds everyone up.
         if self.sqlite_tx > 0 {
             return f();
         }
+        // A request in the server is a coroutine: it pauses, `f` runs on
+        // another thread, and the server answers other requests meanwhile.
+        let f = match crate::httpd::wait_elsewhere(f) {
+            Ok(v) => return v,
+            Err(f) => f,
+        };
         // Takes the lock back even if `f` panics, so the worker that
         // catches the panic gives back a lock it holds.
         struct Relock<'a>(&'a crate::shared::Gil);
@@ -1183,7 +1189,7 @@ impl Interp {
         };
         self.depth += 1;
         // Grow the stack on demand, so deep recursion works on any thread.
-        let r = stacker::maybe_grow(128 << 10, 4 << 20, || body(self));
+        let r = crate::stack::maybe_grow(128 << 10, 4 << 20, || body(self));
         self.depth -= 1;
         if let Some((mask, who)) = saved {
             self.allowed = mask;

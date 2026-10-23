@@ -27,7 +27,11 @@ usage:
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
   --host H       address to listen on (default 127.0.0.1)
-  --workers N    request threads (default 8)
+  --instances N  run the program N times over, each on a core of its own
+                 (separate variables, as N processes would have; the
+                 database and `publish` changes reach them all)
+  --workers N    requests that can wait (for a database, the network) at
+                 once, each on a thread of its own (default 64)
   --watch, -w    reload when the program's files change, and refresh open pages
   --no-check     skip the static checks before running
   --no-view-cache  render views every time, instead of reusing their HTML
@@ -112,18 +116,20 @@ struct RunOptions {
     register: Option<String>,
     service: Option<String>,
     max_body: usize,
+    instances: usize,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     let mut o = RunOptions {
         host: None,
         port: None,
-        workers: 8,
+        workers: 64,
         watch: false,
         static_check: true,
         register: None,
         service: None,
         max_body: quillo::server::MAX_BODY,
+        instances: 1,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -152,6 +158,13 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 Ok(n) if n > 0 => o.max_body = n,
                 _ => {
                     eprintln!("quillo: --max-body needs a positive number of bytes");
+                    return Err(2);
+                }
+            },
+            ("--instances", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => o.instances = n,
+                _ => {
+                    eprintln!("quillo: --instances needs a positive number");
                     return Err(2);
                 }
             },
@@ -205,6 +218,39 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     Ok(Some(app))
 }
 
+/// `--instances N`: the program N times over, one event loop each, so a
+/// server uses N cores. Each instance has its own variables, as N
+/// processes would; changes to the database and `publish` reach them all.
+fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
+    if o.watch || o.register.is_some() {
+        eprintln!("quillo: --instances does not go with --watch or --register");
+        return 2;
+    }
+    let n = o.instances;
+    quillo::pg::RUNTIME_THREADS.store((n / 2).max(2), std::sync::atomic::Ordering::Relaxed);
+    let mut apps = Vec::with_capacity(n);
+    for i in 0..n {
+        match load(path, &o) {
+            Ok(Some(app)) => apps.push(app),
+            Ok(None) => return 0,
+            Err(code) => return code,
+        }
+        // Checked once is enough.
+        if i == 0 {
+            o.static_check = false;
+        }
+    }
+    let shared: Vec<_> = apps.iter().map(|a| a.shared()).collect();
+    quillo::shared::Shared::link(&shared);
+    match quillo::server::serve_many(apps, addr, o.workers) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("quillo: {}", e);
+            1
+        }
+    }
+}
+
 fn run(file: &str, flags: &[String]) -> i32 {
     let o = match run_options(flags) {
         Ok(o) => o,
@@ -213,6 +259,9 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);
+    if o.instances > 1 {
+        return run_instances(path, o, &format!("{}:{}", host, port));
+    }
     let mut app = match load(path, &o) {
         Ok(Some(app)) => app,
         Ok(None) => return 0,

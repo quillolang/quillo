@@ -13,6 +13,12 @@ name = "quillo"
 path = "src/main.rs"
 
 [dependencies]
+mio = { version = "1", features = ["os-poll", "net"] }
+httparse = "1"
+corosensei = "0.3"
+psm = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+tokio-postgres = "0.7"
 indexmap = "2"
 stacker = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
@@ -26,7 +32,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 bytes = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
-tiny_http = "0.12"
 # `quillo app`: the program in a native window (see src/desktop.rs).
 wry = { version = "0.57", optional = true, features = ["devtools"] }
 tao = { version = "0.37", optional = true }

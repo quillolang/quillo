@@ -14,7 +14,8 @@ use bytes::{BufMut, BytesMut};
 use postgres::types::{FromSql, IsNull, Kind, ToSql, Type};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 type BoxErr = Box<dyn Error + Sync + Send>;
 
@@ -39,6 +40,8 @@ pub struct Pool {
     idle: Mutex<(Vec<Conn>, usize)>,
     freed: Condvar,
     max: usize,
+    url: String,
+    lanes: OnceLock<Arc<Lanes>>,
 }
 
 fn tls() -> tokio_postgres_rustls::MakeRustlsConnect {
@@ -58,7 +61,15 @@ impl Pool {
     pub fn open(url: &str) -> Result<Pool, String> {
         let (url, max) = take_pool_size(url)?;
         let config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
-        let pool = Pool { config, tls: tls(), idle: Mutex::new((Vec::new(), 0)), freed: Condvar::new(), max };
+        let pool = Pool {
+            config,
+            tls: tls(),
+            idle: Mutex::new((Vec::new(), 0)),
+            freed: Condvar::new(),
+            max,
+            url: url.clone(),
+            lanes: OnceLock::new(),
+        };
         let first = pool.checkout()?;
         pool.give_back(first);
         Ok(pool)
@@ -86,6 +97,21 @@ impl Pool {
             }
             g = self.freed.wait(g).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// The connections requests in the server share (see `Lanes`).
+    pub fn lanes(&self) -> Arc<Lanes> {
+        self.lanes
+            .get_or_init(|| {
+                let config: tokio_postgres::Config = self.url.parse().expect("parsed before");
+                Arc::new(Lanes {
+                    config,
+                    tls: self.tls.clone(),
+                    slots: (0..self.max).map(|_| Mutex::new(None)).collect(),
+                    next: AtomicUsize::new(0),
+                })
+            })
+            .clone()
     }
 
     pub fn give_back(&self, c: Conn) {
@@ -161,20 +187,10 @@ impl Conn {
         if want != params.len() {
             return Err(format!("the query has {} parameter{}, got {}", want, if want == 1 { "" } else { "s" }, params.len()));
         }
-        let casts: Vec<(usize, String)> = stmt
-            .params()
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !encodes_directly(t))
-            .map(|(i, t)| (i + 1, type_name(t)))
-            .collect();
-        if casts.is_empty() {
-            return Ok(stmt);
+        match casts_for(sql, stmt.params()) {
+            None => Ok(stmt),
+            Some(cast_sql) => self.prepare(&cast_sql),
         }
-        let cast_sql = rewrite_numbered(sql, |n| {
-            casts.iter().find(|(i, _)| *i == n).map(|(_, t)| format!("(${}::text)::{}", n, t))
-        });
-        self.prepare(&cast_sql)
     }
 
     pub fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
@@ -183,16 +199,7 @@ impl Conn {
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         let rows = self.client.query(&stmt, &refs).map_err(|e| describe(&e))?;
-        let mut out = Vec::new();
-        for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
-            let mut m = Map::new();
-            for (i, col) in row.columns().iter().enumerate() {
-                let v: PgValue = row.try_get(i).map_err(|e| describe(&e))?;
-                m.insert(col.name().to_string(), v.0);
-            }
-            out.push(Value::map(m));
-        }
-        Ok(out)
+        values(&rows, limit)
     }
 
     /// `{ changes, last_id }`; Postgres has no last insert id, so use
@@ -216,6 +223,139 @@ impl Conn {
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         self.client.batch_execute(sql).map_err(|e| describe(&e))
+    }
+}
+
+/// Rows as maps of column name to value.
+fn values(rows: &[postgres::Row], limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(rows.len().min(limit.unwrap_or(usize::MAX)));
+    for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
+        let mut m = Map::with_capacity(row.len());
+        for (i, col) in row.columns().iter().enumerate() {
+            let v: PgValue = row.try_get(i).map_err(|e| describe(&e))?;
+            m.insert(col.name().to_string(), v.0);
+        }
+        out.push(Value::map(m));
+    }
+    Ok(out)
+}
+
+/// The cast-from-text rewrite of `sql` that `statement` needs for these
+/// parameter types, if any.
+fn casts_for(sql: &str, types: &[Type]) -> Option<String> {
+    let casts: Vec<(usize, String)> =
+        types.iter().enumerate().filter(|(_, t)| !encodes_directly(t)).map(|(i, t)| (i + 1, type_name(t))).collect();
+    if casts.is_empty() {
+        return None;
+    }
+    Some(rewrite_numbered(sql, |n| casts.iter().find(|(i, _)| *i == n).map(|(_, t)| format!("(${}::text)::{}", n, t))))
+}
+
+// ---- connections shared by the server's requests --------------------------
+
+/// Threads for the shared connections' runtime (more with `--instances`).
+pub static RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(2);
+
+/// The runtime the shared connections run on.
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(RUNTIME_THREADS.load(Relaxed).max(1))
+            .thread_name("quillo-pg")
+            .enable_all()
+            .build()
+            .expect("a runtime for Postgres")
+    })
+}
+
+/// Connections many requests use at once, in the server. Each query goes
+/// to the next one, and what several requests send to the same connection
+/// is pipelined (the next query is sent before the answer to the last one
+/// comes back), so a few connections keep the database busy without a
+/// thread waiting on each query. Transactions keep a connection of their
+/// own instead (`Pool::checkout`).
+pub struct Lanes {
+    config: tokio_postgres::Config,
+    tls: tokio_postgres_rustls::MakeRustlsConnect,
+    slots: Vec<Mutex<Option<Arc<Lane>>>>,
+    next: AtomicUsize,
+}
+
+struct Lane {
+    client: tokio_postgres::Client,
+    stmts: Mutex<HashMap<String, tokio_postgres::Statement>>,
+}
+
+impl Lanes {
+    /// The next connection, connecting it (again) if needed.
+    async fn lane(&self) -> Result<Arc<Lane>, String> {
+        let i = self.next.fetch_add(1, Relaxed) % self.slots.len();
+        if let Some(l) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            if !l.client.is_closed() {
+                return Ok(l);
+            }
+        }
+        let (client, conn) = self.config.connect(self.tls.clone()).await.map_err(|e| describe(&e))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()) });
+        *self.slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(l.clone());
+        Ok(l)
+    }
+
+    async fn prepare(lane: &Lane, sql: &str) -> Result<tokio_postgres::Statement, String> {
+        if let Some(s) = lane.stmts.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+            return Ok(s.clone());
+        }
+        let s = lane.client.prepare(sql).await.map_err(|e| describe(&e))?;
+        let mut g = lane.stmts.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= 256 {
+            g.clear();
+        }
+        g.insert(sql.to_string(), s.clone());
+        Ok(s)
+    }
+
+    async fn statement(lane: &Lane, sql: &str, params: &[Value]) -> Result<tokio_postgres::Statement, String> {
+        let stmt = Self::prepare(lane, sql).await?;
+        let want = stmt.params().len();
+        if want != params.len() {
+            return Err(format!("the query has {} parameter{}, got {}", want, if want == 1 { "" } else { "s" }, params.len()));
+        }
+        match casts_for(sql, stmt.params()) {
+            None => Ok(stmt),
+            Some(cast_sql) => Self::prepare(lane, &cast_sql).await,
+        }
+    }
+
+    pub async fn query(self: Arc<Self>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+        let (sql, params) = translate(&sql, &params)?;
+        let lane = self.lane().await?;
+        let stmt = Self::statement(&lane, &sql, &params).await?;
+        let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+        let rows = lane.client.query(&stmt, &refs).await.map_err(|e| describe(&e))?;
+        values(&rows, limit)
+    }
+
+    pub async fn exec(self: Arc<Self>, sql: String, params: Vec<Value>) -> Result<Value, String> {
+        let lane = self.lane().await?;
+        let changes = if params.is_empty() && has_several_statements(&sql) {
+            lane.client.batch_execute(&sql).await.map_err(|e| describe(&e))?;
+            Value::Nil
+        } else {
+            let (sql, params) = translate(&sql, &params)?;
+            let stmt = Self::statement(&lane, &sql, &params).await?;
+            let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
+            let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+            Value::Int(lane.client.execute(&stmt, &refs).await.map_err(|e| describe(&e))? as i64)
+        };
+        let mut m = Map::new();
+        m.insert("changes".into(), changes);
+        m.insert("last_id".into(), Value::Nil);
+        Ok(Value::map(m))
     }
 }
 
@@ -342,21 +482,39 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
             return Ok((out, values));
         }
     }
-    // `?` placeholders, unless the query already numbers its own.
-    if has_numbered(sql) {
-        return Ok((sql.to_string(), params.to_vec()));
+    Ok((positional(sql), params.to_vec()))
+}
+
+/// `?` placeholders as `$1, $2, ...`, unless the query already numbers its
+/// own. Depends on the SQL alone, so it is worked out once per statement.
+fn positional(sql: &str) -> String {
+    static SEEN: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    if let Some(done) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(sql)) {
+        return done.clone();
     }
-    let mut n = 0;
-    let out = scan(sql, |c, i, out| {
-        if c[*i] == '?' && !is_question_operator(c, *i) {
-            n += 1;
-            out.push_str(&format!("${}", n));
-        } else {
-            out.push(c[*i]);
-        }
-        *i += 1;
-    });
-    Ok((out, params.to_vec()))
+    let out = if has_numbered(sql) {
+        sql.to_string()
+    } else {
+        let mut n = 0;
+        scan(sql, |c, i, out| {
+            if c[*i] == '?' && !is_question_operator(c, *i) {
+                n += 1;
+                out.push_str(&format!("${}", n));
+            } else {
+                out.push(c[*i]);
+            }
+            *i += 1;
+        })
+    };
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    // Statements are usually written in the program, so few; if they are
+    // built from values instead, the cache starts over now and then.
+    if m.len() >= 1024 {
+        m.clear();
+    }
+    m.insert(sql.to_string(), out.clone());
+    out
 }
 
 /// Words after which a `?` is a value, not jsonb's `?` operator.

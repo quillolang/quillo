@@ -148,6 +148,25 @@ fn push(v: &mut Vec<String>, name: String) {
     }
 }
 
+/// `tables`, worked out once per statement (statements are usually
+/// written in the program, so few).
+pub fn tables_of(sql: &str) -> std::sync::Arc<Tables> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    static SEEN: Mutex<Option<HashMap<String, Arc<Tables>>>> = Mutex::new(None);
+    if let Some(t) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(sql)) {
+        return t.clone();
+    }
+    let t = Arc::new(tables(sql));
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= 1024 {
+        m.clear();
+    }
+    m.insert(sql.to_string(), t.clone());
+    t
+}
+
 pub fn tables(sql: &str) -> Tables {
     let t = tokens(sql);
     let mut out = Tables::default();

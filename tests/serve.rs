@@ -120,6 +120,46 @@ fn slow(x) { sleep(400); n += 1; x }
 }
 
 #[test]
+fn instances_take_connections_in_turn_and_share_the_database() {
+    let d = temp_dir("instances");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        format!(
+            "db.open(\"{}\")\ndb.exec(\"create table if not exists notes (t text)\")\nlet hits = 0\n\
+             route GET /hits {{ hits += 1; hits }}\n\
+             route POST /note {{ db.exec(\"insert into notes values (?)\", request.body); \"ok\" }}\n\
+             route GET /notes = db.one(\"select count(*) as n from notes\").n\n\
+             route POST /ping {{ publish(\"ping\"); \"ok\" }}\n",
+            d.join("shared.db").display()
+        ),
+    )
+    .unwrap();
+    let srv = start(&f, &["--instances", "3"]);
+    // Each request is a new connection; they go to the instances in turn,
+    // and each instance has a counter of its own.
+    let hits: Vec<String> = (0..6).map(|_| get(srv.port, "/hits").1).collect();
+    assert_eq!(hits, ["1", "1", "1", "2", "2", "2"]);
+    // The database is one, whichever instance writes or reads.
+    for _ in 0..3 {
+        assert_eq!(request(srv.port, "POST", "/note", "x").1, "ok");
+    }
+    let counts: Vec<String> = (0..3).map(|_| get(srv.port, "/notes").1).collect();
+    assert_eq!(counts, ["3", "3", "3"]);
+    // A page waiting on one instance hears about a change announced by
+    // another: the wait goes to the next instance, the ping to the one after.
+    let port = srv.port;
+    let waiting = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        (get(port, "/_quillo/live?since=1&t=ping").1, t0.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(request(srv.port, "POST", "/ping", "").1, "ok");
+    let (woke, after) = waiting.join().unwrap();
+    assert!(woke.contains("ping") && after >= Duration::from_millis(350), "{} after {:?}", woke, after);
+}
+
+#[test]
 fn watch_reloads_changed_files_and_keeps_the_last_good_version() {
     let d = temp_dir("watch");
     let main = d.join("app.qwe");

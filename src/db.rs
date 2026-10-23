@@ -124,6 +124,21 @@ fn pg_run<T: Send>(
     }
 }
 
+/// In the server, outside a transaction, queries use the connections all
+/// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
+fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
+    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(false, |t| Arc::ptr_eq(&t.backend, b));
+    (!pinned && crate::httpd::in_task()).then(|| pool.lanes())
+}
+
+fn awaited<T>(r: Option<Result<Result<T, String>, String>>) -> Result<T, String> {
+    match r {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => Err(e),
+        None => Err("not in a request".into()),
+    }
+}
+
 fn to_sql(v: &Value) -> Sql {
     match v {
         Value::Nil => Sql::Null,
@@ -210,14 +225,14 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
 /// Live updates: a statement's reads become the running loader's topics,
 /// and its writes are announced (after the transaction, if any, commits).
 fn announce(it: &mut Interp, sql: &str) {
-    let t = crate::sqlinfo::tables(sql);
+    let t = crate::sqlinfo::tables_of(sql);
     if it.reads.is_some() {
-        for r in t.reads {
+        for r in &t.reads {
             it.watch(format!("db:{}", r));
         }
     }
     if !t.writes.is_empty() {
-        it.publish(t.writes.into_iter().map(|w| format!("db:{}", w)).collect());
+        it.publish(t.writes.iter().map(|w| format!("db:{}", w)).collect());
     }
 }
 
@@ -286,10 +301,17 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 Ok(Value::map(m))
             })()
         }
-        Backend::Postgres(_) => {
-            let sql = sql.clone();
-            pg_run(it, &b, move |c| c.exec(&sql, &params))
-        }
+        Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
+            Some(lanes) => {
+                let sql = sql.clone();
+                // Boxed here, so the (large) future is not moved again.
+                awaited(crate::httpd::await_elsewhere(Box::pin(lanes.exec(sql, params))))
+            }
+            None => {
+                let sql = sql.clone();
+                pg_run(it, &b, move |c| c.exec(&sql, &params))
+            }
+        },
     };
     if res.is_ok() {
         announce(it, &sql);
@@ -301,10 +323,13 @@ fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>
     let b = backend(it)?;
     let res = match &*b {
         Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
-        Backend::Postgres(_) => {
-            let sql = sql.clone();
-            pg_run(it, &b, move |c| c.query(&sql, &params, limit))
-        }
+        Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
+            Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(sql.clone(), params, limit)))),
+            None => {
+                let sql = sql.clone();
+                pg_run(it, &b, move |c| c.query(&sql, &params, limit))
+            }
+        },
     };
     if res.is_ok() {
         announce(it, &sql);

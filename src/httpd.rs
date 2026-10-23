@@ -1,0 +1,1123 @@
+//! The HTTP server: one event loop (kqueue, epoll) on one thread, and each
+//! request run as a coroutine.
+//!
+//! The loop thread reads and parses requests and runs the program on them.
+//! A request that only computes runs start to finish without leaving the
+//! thread. One that waits (the database, `http.*`, `sleep`: whatever goes
+//! through `Interp::unlocked`) pauses its coroutine: the waiting is done on a
+//! pool thread, and the loop answers other requests meanwhile, resuming the
+//! coroutine when the wait is over. Quillo code is written as if it simply
+//! waited, and all of it runs on one thread, as before under the interpreter
+//! lock (which the loop holds, and lets go of while it sleeps, or when
+//! another thread asks: a reload, `parallel`).
+//!
+//! Each coroutine has its own stack (16 MB of address space, used as
+//! needed, reused from one request to the next). Deep recursion grows it
+//! further (`stack::maybe_grow`), as on an ordinary thread.
+
+use crate::server::{Answer, App, HttpRequest, HttpResponse, Worker};
+use corosensei::stack::DefaultStack;
+use corosensei::{Coroutine, CoroutineResult, Yielder};
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token, Waker};
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::io::{ErrorKind, Read, Write};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+const LISTENER: Token = Token(usize::MAX);
+const WAKER: Token = Token(usize::MAX - 1);
+/// Largest request line and headers.
+const MAX_HEAD: usize = 64 << 10;
+const MAX_HEADERS: usize = 100;
+/// A kept-alive connection with nothing to do is closed after this long.
+const IDLE: Duration = Duration::from_secs(60);
+/// A request still arriving after this long is given up on.
+const SLOW: Duration = Duration::from_secs(30);
+/// A request's stack: address space, used only as needed.
+const STACK: usize = 16 << 20;
+/// Stacks kept for reuse.
+const SPARE_STACKS: usize = 256;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Work a paused request hands to the pool.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// What a paused request waits for: blocking work for a pool thread, or a
+/// future for the async runtime (the shared Postgres connections).
+enum Wait {
+    Run(Job),
+    Spawn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+}
+
+type Task = Coroutine<(), Wait, Done, DefaultStack>;
+
+/// What a request's coroutine gives back when it ends.
+struct Done {
+    conn: Box<Conn>,
+    worker: Box<Worker>,
+    fate: Fate,
+}
+
+struct Running {
+    task: Task,
+    /// Where its stack ends now (it may have grown).
+    limit: usize,
+    slot: usize,
+}
+
+enum Slot {
+    Free,
+    Idle(Box<Conn>),
+    /// Being answered; `again` when something happened to it meanwhile.
+    Busy { again: bool },
+}
+
+struct Conn {
+    stream: TcpStream,
+    peer: String,
+    input: Vec<u8>,
+    output: Vec<u8>,
+    /// Registered for writability (an answer did not fit at once).
+    writing: bool,
+    /// Last time anything happened.
+    active: Instant,
+    /// When the request now arriving began to.
+    receiving: Option<Instant>,
+    /// `100 Continue` was sent for the request now arriving.
+    continued: bool,
+    /// Close once `output` is written.
+    closing: bool,
+}
+
+enum Fate {
+    Keep,
+    Detach(Box<dyn FnOnce(std::net::TcpStream) + Send>),
+}
+
+/// A complete request, or one that cannot be answered.
+enum Item {
+    Request { req: HttpRequest, keep_alive: bool },
+    Bad(u16, &'static str, String),
+}
+
+thread_local! {
+    /// The yielder of the request coroutine running on this thread, if any.
+    static YIELDER: Cell<usize> = const { Cell::new(0) };
+}
+
+/// For `Interp::unlocked`: in a request's coroutine, runs `f` on a pool
+/// thread while the server answers other requests, and gives back its
+/// result. Elsewhere gives `f` back, for the caller to run.
+pub fn wait_elsewhere<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
+    let y = YIELDER.with(|c| c.get());
+    if y == 0 {
+        return Err(f);
+    }
+    // SAFETY: set by the coroutine itself, whose stack holds the yielder.
+    let yielder = unsafe { &*(y as *const Yielder<(), Wait>) };
+    let mut out: Option<std::thread::Result<T>> = None;
+    let at = &mut out as *mut Option<std::thread::Result<T>> as usize;
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: `out` is on the paused coroutine's stack (below), which is
+        // resumed only after this has run.
+        unsafe { *(at as *mut Option<std::thread::Result<T>>) = Some(r) };
+    });
+    // SAFETY: the coroutine stays paused until the job has run, so what the
+    // job borrows lives long enough.
+    let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) };
+    yielder.suspend(Wait::Run(job));
+    YIELDER.with(|c| c.set(y));
+    match out.take().expect("the job ran") {
+        Ok(v) => Ok(v),
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
+
+/// Whether this is a request's coroutine.
+pub fn in_task() -> bool {
+    YIELDER.with(|c| c.get()) != 0
+}
+
+/// In a request's coroutine: runs `fut` on the async runtime while the
+/// server answers other requests, and gives back its output (`Err` if it
+/// failed unexpectedly). `None` outside a coroutine.
+pub fn await_elsewhere<T: Send + 'static>(
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+) -> Option<Result<T, String>> {
+    let y = YIELDER.with(|c| c.get());
+    if y == 0 {
+        return None;
+    }
+    // SAFETY: as in `wait_elsewhere`.
+    let yielder = unsafe { &*(y as *const Yielder<(), Wait>) };
+    let mut out: Option<T> = None;
+    let at = &mut out as *mut Option<T> as usize;
+    let fut = async move {
+        let v = fut.await;
+        // SAFETY: `out` is on the paused coroutine's stack, resumed only
+        // after this has run (or the future has been dropped).
+        unsafe { *(at as *mut Option<T>) = Some(v) };
+    };
+    yielder.suspend(Wait::Spawn(Box::pin(fut)));
+    YIELDER.with(|c| c.set(y));
+    Some(out.take().ok_or_else(|| "the database call failed unexpectedly".to_string()))
+}
+
+/// Threads that do the waiting for paused requests.
+struct Pool {
+    jobs: Mutex<VecDeque<(usize, Job)>>,
+    /// Jobs waiting, readable without the lock.
+    queued: AtomicUsize,
+    ready: Condvar,
+    /// Idle threads asleep, and idle threads still looking for work.
+    idle: AtomicUsize,
+    spinning: AtomicUsize,
+    threads: AtomicUsize,
+    max: usize,
+    done: Mutex<Vec<usize>>,
+    waker: Arc<Waker>,
+    /// The loop is (about to be) asleep in `poll`: wake it when a job ends.
+    sleeping: AtomicBool,
+    /// Jobs submitted and not yet done.
+    out: AtomicUsize,
+}
+
+impl Pool {
+    fn submit(self: &Arc<Self>, id: usize, job: Job) {
+        self.out.fetch_add(1, SeqCst);
+        lock(&self.jobs).push_back((id, job));
+        self.queued.fetch_add(1, SeqCst);
+        // A thread looking for work takes it without being woken (waking a
+        // sleeping thread costs the loop more than many requests).
+        if self.spinning.load(SeqCst) > 0 {
+            return;
+        }
+        if self.idle.load(SeqCst) > 0 {
+            self.ready.notify_one();
+        } else if self.threads.fetch_add(1, SeqCst) < self.max {
+            let pool = self.clone();
+            let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work());
+            if started.is_err() {
+                self.threads.fetch_sub(1, SeqCst);
+            }
+        } else {
+            self.threads.fetch_sub(1, SeqCst);
+        }
+    }
+
+    /// A job, looking for one a little while before sleeping (at most two
+    /// threads look at once).
+    fn next(&self) -> (usize, Job) {
+        if self.spinning.fetch_add(1, SeqCst) < 2 {
+            let start = Instant::now();
+            let mut i = 0u32;
+            loop {
+                if self.queued.load(SeqCst) > 0 {
+                    if let Some(j) = lock(&self.jobs).pop_front() {
+                        self.queued.fetch_sub(1, SeqCst);
+                        self.spinning.fetch_sub(1, SeqCst);
+                        return j;
+                    }
+                }
+                i += 1;
+                if i % 64 == 0 {
+                    if start.elapsed() > Duration::from_micros(200) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let mut q = lock(&self.jobs);
+        // Counted as idle before it stops spinning, so a job submitted in
+        // between is either seen here or wakes it.
+        self.idle.fetch_add(1, SeqCst);
+        self.spinning.fetch_sub(1, SeqCst);
+        loop {
+            if let Some(j) = q.pop_front() {
+                self.queued.fetch_sub(1, SeqCst);
+                self.idle.fetch_sub(1, SeqCst);
+                return j;
+            }
+            q = self.ready.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn work(&self) {
+        loop {
+            let (id, job) = self.next();
+            job();
+            self.finish(id);
+        }
+    }
+
+    /// Task `id` can carry on.
+    fn finish(&self, id: usize) {
+        lock(&self.done).push(id);
+        self.out.fetch_sub(1, SeqCst);
+        if self.sleeping.load(SeqCst) {
+            let _ = self.waker.wake();
+        }
+    }
+}
+
+/// Connections handed to an instance by the one that accepts them
+/// (`--instances`), so each instance gets its share.
+struct Inbox {
+    conns: Mutex<Vec<(TcpStream, SocketAddr)>>,
+    waker: Arc<Waker>,
+}
+
+/// Marks a task's future done when the future ends, even by panicking.
+struct Finish(Arc<Pool>, usize);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        self.0.finish(self.1);
+    }
+}
+
+/// Serves `app` on `listener`, with up to `max_waiting` requests waiting at
+/// once (each wait takes a pool thread). Does not return.
+pub fn serve(app: Arc<App>, listener: std::net::TcpListener, max_waiting: usize) -> Result<(), String> {
+    serve_instances(vec![app], listener, max_waiting)
+}
+
+/// Serves each app (instances of one program) with an event loop of its
+/// own, on a thread of its own. The first accepts the connections and
+/// hands them to each in turn. Does not return.
+pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max_waiting: usize) -> Result<(), String> {
+    let mut polls = Vec::new();
+    let mut inboxes = Vec::new();
+    for _ in &apps {
+        let poll = Poll::new().map_err(|e| e.to_string())?;
+        let waker = Arc::new(Waker::new(poll.registry(), WAKER).map_err(|e| e.to_string())?);
+        inboxes.push(Arc::new(Inbox { conns: Mutex::new(Vec::new()), waker }));
+        polls.push(poll);
+    }
+    let mut apps = apps.into_iter().zip(polls).enumerate();
+    let (_, (first_app, first_poll)) = apps.next().ok_or("no instances")?;
+    for (i, (app, poll)) in apps {
+        let inbox = inboxes[i].clone();
+        std::thread::Builder::new()
+            .name("quillo-instance".into())
+            .stack_size(crate::server::WORKER_STACK)
+            .spawn(move || {
+                if let Err(e) = run_loop(app, poll, None, inbox, Vec::new(), i, max_waiting) {
+                    eprintln!("quillo: {}", e);
+                }
+            })
+            .map_err(|e| format!("cannot start an instance: {}", e))?;
+    }
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut listener = TcpListener::from_std(listener);
+    first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
+    let own = inboxes[0].clone();
+    let all = if inboxes.len() > 1 { inboxes } else { Vec::new() };
+    run_loop(first_app, first_poll, Some(listener), own, all, 0, max_waiting)
+}
+
+fn run_loop(
+    app: Arc<App>,
+    poll: Poll,
+    listener: Option<TcpListener>,
+    inbox: Arc<Inbox>,
+    instances: Vec<Arc<Inbox>>,
+    index: usize,
+    max_waiting: usize,
+) -> Result<(), String> {
+    let waker = inbox.waker.clone();
+    let pool = Arc::new(Pool {
+        jobs: Mutex::new(VecDeque::new()),
+        queued: AtomicUsize::new(0),
+        ready: Condvar::new(),
+        idle: AtomicUsize::new(0),
+        spinning: AtomicUsize::new(0),
+        threads: AtomicUsize::new(0),
+        max: max_waiting.max(1),
+        done: Mutex::new(Vec::new()),
+        waker,
+        sleeping: AtomicBool::new(false),
+        out: AtomicUsize::new(0),
+    });
+    let mut l = Loop {
+        app,
+        poll,
+        listener,
+        inbox,
+        instances,
+        index,
+        turn: 0,
+        slots: Vec::new(),
+        free: Vec::new(),
+        ready: VecDeque::new(),
+        tasks: Vec::new(),
+        free_tasks: Vec::new(),
+        workers: Vec::new(),
+        stacks: Vec::new(),
+        pool,
+        now: Instant::now(),
+        chunk: vec![0u8; 16 << 10].into_boxed_slice(),
+    };
+    l.run()
+}
+
+struct Loop {
+    app: Arc<App>,
+    poll: Poll,
+    /// Only the first instance listens.
+    listener: Option<TcpListener>,
+    /// Connections handed to this instance.
+    inbox: Arc<Inbox>,
+    /// Every instance's inbox, for the one that listens (empty when alone).
+    instances: Vec<Arc<Inbox>>,
+    index: usize,
+    /// The instance the next connection goes to.
+    turn: usize,
+    slots: Vec<Slot>,
+    free: Vec<usize>,
+    /// Connections with something to do, oldest first.
+    ready: VecDeque<usize>,
+    tasks: Vec<Option<Running>>,
+    free_tasks: Vec<usize>,
+    /// Handles on the program for requests to run with, kept for reuse.
+    workers: Vec<Box<Worker>>,
+    stacks: Vec<DefaultStack>,
+    pool: Arc<Pool>,
+    /// The time, as of the last wait for events.
+    now: Instant,
+    /// Where reads land before they join a connection's input.
+    chunk: Box<[u8]>,
+}
+
+impl Loop {
+    fn run(&mut self) -> Result<(), String> {
+        let app = self.app.clone();
+        let gil = &app.shared_ref().gil;
+        gil.acquire();
+        let mut events = Events::with_capacity(1024);
+        let mut swept = Instant::now();
+        loop {
+            let handed = std::mem::take(&mut *lock(&self.inbox.conns));
+            for (stream, peer) in handed {
+                self.adopt(stream, peer);
+            }
+            let done = std::mem::take(&mut *lock(&self.pool.done));
+            for id in done {
+                self.step(id);
+            }
+            let ready = self.ready.len();
+            for _ in 0..ready {
+                if let Some(i) = self.ready.pop_front() {
+                    self.serve(i);
+                }
+            }
+            // A reload, or threads `parallel` started, are waiting to run.
+            if gil.waiting() > 0 {
+                gil.release();
+                gil.acquire();
+            }
+            flush_log();
+            // Sleep only when there is nothing to do.
+            self.pool.sleeping.store(true, SeqCst);
+            let idle = self.ready.is_empty() && lock(&self.pool.done).is_empty() && lock(&self.inbox.conns).is_empty();
+            let r = if idle {
+                gil.release();
+                let r = self.poll.poll(&mut events, Some(Duration::from_secs(1)));
+                gil.acquire();
+                r
+            } else {
+                self.poll.poll(&mut events, Some(Duration::ZERO))
+            };
+            self.pool.sleeping.store(false, SeqCst);
+            self.now = Instant::now();
+            if let Err(e) = r {
+                if e.kind() != ErrorKind::Interrupted {
+                    eprintln!("quillo: waiting for connections failed: {}", e);
+                }
+                continue;
+            }
+            let mut accept = false;
+            for ev in events.iter() {
+                match ev.token() {
+                    LISTENER => accept = true,
+                    WAKER => {}
+                    Token(i) => self.ready.push_back(i),
+                }
+            }
+            if accept {
+                self.accept();
+            }
+            if swept.elapsed() >= Duration::from_secs(1) {
+                self.sweep();
+                swept = Instant::now();
+            }
+        }
+    }
+
+    fn accept(&mut self) {
+        loop {
+            let Some(listener) = &self.listener else { return };
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    // With several instances, each gets the next one in turn.
+                    if !self.instances.is_empty() {
+                        let to = self.turn % self.instances.len();
+                        self.turn += 1;
+                        if to != self.index {
+                            let inbox = &self.instances[to];
+                            lock(&inbox.conns).push((stream, peer));
+                            let _ = inbox.waker.wake();
+                            continue;
+                        }
+                    }
+                    self.adopt(stream, peer);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Out of file descriptors, for one: try again when the
+                    // next connection arrives.
+                    log(format!("quillo: cannot accept a connection: {}\n", e));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Takes a new connection into this loop.
+    fn adopt(&mut self, mut stream: TcpStream, peer: SocketAddr) {
+        let _ = stream.set_nodelay(true);
+        let i = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(Slot::Free);
+            self.slots.len() - 1
+        });
+        if self.poll.registry().register(&mut stream, Token(i), Interest::READABLE).is_err() {
+            self.free.push(i);
+            return;
+        }
+        self.slots[i] = Slot::Idle(Box::new(Conn {
+            stream,
+            peer: ip_of(&peer),
+            input: Vec::new(),
+            output: Vec::new(),
+            writing: false,
+            active: self.now,
+            receiving: None,
+            continued: false,
+            closing: false,
+        }));
+        // Its first request has often arrived with it.
+        self.ready.push_back(i);
+    }
+
+    /// Closes connections idle too long, or too slow to send a request.
+    fn sweep(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.slots.len() {
+            let Slot::Idle(c) = &self.slots[i] else { continue };
+            let stale = match c.receiving {
+                Some(since) => now.duration_since(since) > SLOW,
+                None => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+            };
+            if stale {
+                if let Slot::Idle(c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
+                    self.close(i, c);
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, i: usize, mut c: Box<Conn>) {
+        let _ = self.poll.registry().deregister(&mut c.stream);
+        self.slots[i] = Slot::Free;
+        self.free.push(i);
+    }
+
+    /// Something happened on connection `i`: write, read, and start
+    /// answering what has arrived.
+    fn serve(&mut self, i: usize) {
+        let mut c = match self.slots.get_mut(i) {
+            Some(slot @ Slot::Idle(_)) => match std::mem::replace(slot, Slot::Busy { again: false }) {
+                Slot::Idle(c) => c,
+                _ => unreachable!(),
+            },
+            Some(Slot::Busy { again }) => {
+                *again = true;
+                return;
+            }
+            _ => return,
+        };
+        c.active = self.now;
+        if !c.output.is_empty() {
+            match flush(&mut c) {
+                Err(_) => return self.close(i, c),
+                // The client is not reading: read no more from it either.
+                Ok(false) => return self.park(i, c),
+                Ok(true) if c.closing => return self.close(i, c),
+                Ok(true) => {}
+            }
+        }
+        let mut ended = false;
+        let chunk = &mut self.chunk;
+        loop {
+            match c.stream.read(chunk) {
+                Ok(0) => {
+                    ended = true;
+                    break;
+                }
+                Ok(n) => {
+                    c.input.extend_from_slice(&chunk[..n]);
+                    // Less than asked for: that was all there was. (What
+                    // arrives later raises a new event, so there is no need
+                    // for another read just to be told so.)
+                    if n < chunk.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return self.close(i, c),
+            }
+        }
+        let items = take_requests(&mut c, self.app.max_body, self.now);
+        if items.is_empty() {
+            if ended {
+                return self.close(i, c);
+            }
+            return self.finish(i, c, Fate::Keep);
+        }
+        if ended {
+            c.closing = true;
+        }
+        self.start(i, c, items);
+    }
+
+    /// Answers `items` in a coroutine of their own.
+    fn start(&mut self, i: usize, mut conn: Box<Conn>, items: Vec<Item>) {
+        let app = self.app.clone();
+        let mut worker = self.workers.pop().unwrap_or_else(|| Box::new(Worker::new(&app)));
+        let stack = match self.stacks.pop() {
+            Some(s) => s,
+            None => match DefaultStack::new(STACK) {
+                Ok(s) => s,
+                Err(e) => {
+                    log(format!("quillo: no stack for a request: {}\n", e));
+                    return self.close(i, conn);
+                }
+            },
+        };
+        let limit = crate::stack::limit_of(&stack);
+        let task = Task::with_stack(stack, move |y: &Yielder<(), Wait>, ()| {
+            YIELDER.with(|c| c.set(y as *const Yielder<(), Wait> as usize));
+            let fate = answer(&app, &mut worker, &mut conn, items);
+            Done { conn, worker, fate }
+        });
+        let id = self.free_tasks.pop().unwrap_or_else(|| {
+            self.tasks.push(None);
+            self.tasks.len() - 1
+        });
+        self.tasks[id] = Some(Running { task, limit, slot: i });
+        self.step(id);
+    }
+
+    /// Runs task `id` until it waits or ends.
+    fn step(&mut self, id: usize) {
+        let Some(r) = self.tasks[id].as_mut() else { return };
+        let outer = crate::stack::switch(r.limit);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.task.resume(())));
+        r.limit = crate::stack::switch(outer);
+        YIELDER.with(|c| c.set(0));
+        match res {
+            Ok(CoroutineResult::Yield(Wait::Run(job))) => self.pool.submit(id, job),
+            Ok(CoroutineResult::Yield(Wait::Spawn(fut))) => {
+                self.pool.out.fetch_add(1, SeqCst);
+                let done = Finish(self.pool.clone(), id);
+                crate::pg::runtime().spawn(async move {
+                    let _done = done;
+                    fut.await;
+                });
+            }
+            Ok(CoroutineResult::Return(done)) => {
+                let r = self.tasks[id].take().expect("running");
+                self.free_tasks.push(id);
+                if self.stacks.len() < SPARE_STACKS {
+                    self.stacks.push(r.task.into_stack());
+                }
+                self.workers.push(done.worker);
+                self.finish(r.slot, done.conn, done.fate);
+            }
+            Err(_) => {
+                // A bug in the server itself: drop the connection, keep serving.
+                let r = self.tasks[id].take().expect("running");
+                self.free_tasks.push(id);
+                eprintln!("quillo: internal error (a bug in Quillo) while answering a request");
+                self.slots[r.slot] = Slot::Free;
+                self.free.push(r.slot);
+            }
+        }
+    }
+
+    /// After answering: write, and wait for what comes next.
+    fn finish(&mut self, i: usize, mut c: Box<Conn>, fate: Fate) {
+        if let Fate::Detach(f) = fate {
+            let _ = self.poll.registry().deregister(&mut c.stream);
+            self.slots[i] = Slot::Free;
+            self.free.push(i);
+            if let Some(mut stream) = into_std(c.stream) {
+                if stream.set_nonblocking(false).is_ok() {
+                    // Earlier answers on this connection go first.
+                    if c.output.is_empty() || stream.write_all(&c.output).is_ok() {
+                        f(stream);
+                    }
+                }
+            }
+            return;
+        }
+        match flush(&mut c) {
+            Err(_) => self.close(i, c),
+            Ok(false) => self.park(i, c),
+            Ok(true) if c.closing => self.close(i, c),
+            Ok(true) => {
+                if c.writing {
+                    c.writing = false;
+                    let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
+                }
+                let again = matches!(self.slots[i], Slot::Busy { again: true });
+                // Requests that arrived whole while it was answered.
+                let more = !c.input.is_empty() && c.receiving.is_none();
+                self.slots[i] = Slot::Idle(c);
+                if again || more {
+                    self.ready.push_back(i);
+                }
+            }
+        }
+    }
+
+    /// The answer did not fit in the socket: carry on when it can take more.
+    fn park(&mut self, i: usize, mut c: Box<Conn>) {
+        if !c.writing {
+            c.writing = true;
+            let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE | Interest::WRITABLE);
+        }
+        let again = matches!(self.slots[i], Slot::Busy { again: true });
+        self.slots[i] = Slot::Idle(c);
+        if again {
+            self.ready.push_back(i);
+        }
+    }
+}
+
+/// Takes the complete requests out of the connection's input.
+fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
+    let mut items = Vec::new();
+    while !c.input.is_empty() {
+        match parse(&c.input, &c.peer, max_body) {
+            Parsed::Need { expects_continue } => {
+                c.receiving.get_or_insert(now);
+                if expects_continue && !c.continued {
+                    c.continued = true;
+                    c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                }
+                break;
+            }
+            Parsed::Bad(status, why) => {
+                let line = c.input.split(|b| *b == b'\r').next().unwrap_or(&[]);
+                let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
+                c.input.clear();
+                items.push(Item::Bad(status, why, line));
+                break;
+            }
+            Parsed::Done { req, len, keep_alive } => {
+                c.input.drain(..len);
+                c.receiving = None;
+                c.continued = false;
+                items.push(Item::Request { req, keep_alive });
+            }
+        }
+    }
+    items
+}
+
+/// In the request's coroutine: answers each item, in order.
+fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -> Fate {
+    for item in items {
+        match item {
+            Item::Bad(status, why, line) => {
+                log(format!("{} -> {} ({})\n", line, status, why));
+                write_response(&mut c.output, &crate::server::plain_response(status, &format!("{}\n", why)), false, true);
+                c.closing = true;
+                return Fate::Keep;
+            }
+            Item::Request { req, keep_alive } => {
+                let head = req.method == "HEAD";
+                match worker.answer(app, req) {
+                    Answer::Respond(resp) => {
+                        let close = !keep_alive || resp.header("connection").map_or(false, |v| v.eq_ignore_ascii_case("close"));
+                        write_response(&mut c.output, &resp, head, close);
+                        if close {
+                            c.closing = true;
+                            return Fate::Keep;
+                        }
+                    }
+                    Answer::Detach(f) => return Fate::Detach(f),
+                }
+            }
+        }
+    }
+    Fate::Keep
+}
+
+/// Writes as much of `output` as the socket takes; `true` when all of it.
+fn flush(c: &mut Conn) -> std::io::Result<bool> {
+    let mut done = 0;
+    while done < c.output.len() {
+        match c.stream.write(&c.output[done..]) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    c.output.drain(..done);
+    Ok(c.output.is_empty())
+}
+
+fn ip_of(a: &SocketAddr) -> String {
+    a.ip().to_string()
+}
+
+#[cfg(unix)]
+fn into_std(s: TcpStream) -> Option<std::net::TcpStream> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // SAFETY: the descriptor comes from a stream that gives it up.
+    Some(unsafe { std::net::TcpStream::from_raw_fd(s.into_raw_fd()) })
+}
+
+#[cfg(windows)]
+fn into_std(s: TcpStream) -> Option<std::net::TcpStream> {
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    // SAFETY: the socket comes from a stream that gives it up.
+    Some(unsafe { std::net::TcpStream::from_raw_socket(s.into_raw_socket()) })
+}
+
+// ---- requests ------------------------------------------------------------
+
+enum Parsed {
+    Need { expects_continue: bool },
+    Bad(u16, &'static str),
+    Done { req: HttpRequest, len: usize, keep_alive: bool },
+}
+
+fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut r = httparse::Request::new(&mut headers);
+    let head = match r.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) if buf.len() > MAX_HEAD => return Parsed::Bad(431, "request headers too large"),
+        Ok(httparse::Status::Partial) => return Parsed::Need { expects_continue: false },
+        Err(httparse::Error::TooManyHeaders) => return Parsed::Bad(431, "too many request headers"),
+        Err(_) => return Parsed::Bad(400, "bad request"),
+    };
+    if head > MAX_HEAD {
+        return Parsed::Bad(431, "request headers too large");
+    }
+    let version = r.version.unwrap_or(1);
+    let mut hs: Vec<(String, String)> = Vec::with_capacity(r.headers.len());
+    let mut length: Option<usize> = None;
+    let mut chunked = false;
+    let mut connection = String::new();
+    let mut expects_continue = false;
+    for h in r.headers.iter() {
+        let value = String::from_utf8_lossy(h.value).into_owned();
+        if h.name.eq_ignore_ascii_case("content-length") {
+            match value.trim().parse::<usize>() {
+                Ok(n) if length.map_or(true, |m| m == n) => length = Some(n),
+                _ => return Parsed::Bad(400, "bad content-length"),
+            }
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            if value.to_ascii_lowercase().split(',').any(|t| t.trim() == "chunked") {
+                chunked = true;
+            } else {
+                return Parsed::Bad(501, "unsupported transfer-encoding");
+            }
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            connection = value.to_ascii_lowercase();
+        } else if h.name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue") {
+            expects_continue = true;
+        }
+        hs.push((h.name.to_string(), value));
+    }
+    let keep_alive = match version {
+        0 => connection.contains("keep-alive"),
+        _ => !connection.contains("close"),
+    };
+    let (body, len) = if chunked {
+        match dechunk(&buf[head..], max_body) {
+            Chunked::Need => return Parsed::Need { expects_continue },
+            Chunked::TooLarge => return Parsed::Bad(413, "request body too large"),
+            Chunked::Bad => return Parsed::Bad(400, "bad chunked body"),
+            Chunked::Done(body, used) => (body, head + used),
+        }
+    } else {
+        let n = length.unwrap_or(0);
+        if n > max_body {
+            return Parsed::Bad(413, "request body too large");
+        }
+        if buf.len() < head + n {
+            return Parsed::Need { expects_continue };
+        }
+        (buf[head..head + n].to_vec(), head + n)
+    };
+    Parsed::Done {
+        req: HttpRequest {
+            method: r.method.unwrap_or("GET").to_ascii_uppercase(),
+            url: r.path.unwrap_or("/").to_string(),
+            headers: hs,
+            body,
+            remote: peer.to_string(),
+        },
+        len,
+        keep_alive,
+    }
+}
+
+enum Chunked {
+    Need,
+    TooLarge,
+    Bad,
+    Done(Vec<u8>, usize),
+}
+
+/// A `transfer-encoding: chunked` body: the data, and how many bytes it took.
+fn dechunk(buf: &[u8], max_body: usize) -> Chunked {
+    let mut body = Vec::new();
+    let mut at = 0;
+    loop {
+        let Some(eol) = find_crlf(&buf[at..]) else { return if buf.len() - at > 1024 { Chunked::Bad } else { Chunked::Need } };
+        let line = &buf[at..at + eol];
+        let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
+        let Some(size) = std::str::from_utf8(size_text).ok().and_then(|s| usize::from_str_radix(s.trim(), 16).ok()) else {
+            return Chunked::Bad;
+        };
+        at += eol + 2;
+        if size == 0 {
+            // Trailers, then an empty line.
+            loop {
+                let Some(eol) = find_crlf(&buf[at..]) else { return Chunked::Need };
+                at += eol + 2;
+                if eol == 0 {
+                    return Chunked::Done(body, at);
+                }
+            }
+        }
+        if body.len() + size > max_body {
+            return Chunked::TooLarge;
+        }
+        if buf.len() < at + size + 2 {
+            return Chunked::Need;
+        }
+        body.extend_from_slice(&buf[at..at + size]);
+        if &buf[at + size..at + size + 2] != b"\r\n" {
+            return Chunked::Bad;
+        }
+        at += size + 2;
+    }
+}
+
+fn find_crlf(b: &[u8]) -> Option<usize> {
+    b.windows(2).position(|w| w == b"\r\n")
+}
+
+// ---- answers -------------------------------------------------------------
+
+/// The answer as HTTP/1.1 bytes, appended to `out`. The program's own
+/// `content-length`, `transfer-encoding`, `connection` and `date` are
+/// replaced by the server's.
+pub(crate) fn write_response(out: &mut Vec<u8>, resp: &HttpResponse, head: bool, close: bool) {
+    out.extend_from_slice(b"HTTP/1.1 ");
+    push_num(out, resp.status as u64);
+    out.push(b' ');
+    out.extend_from_slice(reason(resp.status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    let mut server = false;
+    for (k, v) in &resp.headers {
+        let skip = ["content-length", "transfer-encoding", "connection", "date"].iter().any(|h| k.eq_ignore_ascii_case(h));
+        if skip {
+            continue;
+        }
+        if !crate::server::valid_header(k, v) {
+            log(format!("quillo: header `{}` not sent: its name or value has characters headers cannot have\n", k.escape_debug()));
+            continue;
+        }
+        server |= k.eq_ignore_ascii_case("server");
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    let bodyless = resp.status < 200 || resp.status == 204 || resp.status == 304;
+    if !bodyless {
+        out.extend_from_slice(b"content-length: ");
+        push_num(out, resp.body.len() as u64);
+        out.extend_from_slice(b"\r\n");
+    }
+    if !server {
+        out.extend_from_slice(b"server: Quillo\r\n");
+    }
+    out.extend_from_slice(b"date: ");
+    DATE.with(|d| {
+        let mut d = d.borrow_mut();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if d.0 != now {
+            *d = (now, http_date(now));
+        }
+        out.extend_from_slice(d.1.as_bytes());
+    });
+    out.extend_from_slice(b"\r\n");
+    if close {
+        out.extend_from_slice(b"connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    if !head && !bodyless {
+        out.extend_from_slice(&resp.body);
+    }
+}
+
+thread_local! {
+    static DATE: RefCell<(u64, String)> = const { RefCell::new((u64::MAX, String::new())) };
+}
+
+fn push_num(out: &mut Vec<u8>, mut n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// `Thu, 23 Oct 2026 08:44:04 GMT`.
+fn http_date(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT", weekday, day, months[(month - 1) as usize], year, h, m, s)
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
+// ---- the request log -----------------------------------------------------
+
+static LOG: Mutex<String> = Mutex::new(String::new());
+
+/// Adds a line to the request log, written out in batches (each line a
+/// separate write would cost more than many requests).
+pub(crate) fn log(line: String) {
+    log_fmt(format_args!("{}", line));
+}
+
+/// `log`, writing straight into the log without a string of its own.
+pub(crate) fn log_fmt(line: std::fmt::Arguments) {
+    use std::fmt::Write as _;
+    let mut l = lock(&LOG);
+    let _ = l.write_fmt(line);
+    if l.len() > 32 << 10 {
+        let _ = std::io::stderr().write_all(l.as_bytes());
+        l.clear();
+    }
+}
+
+pub(crate) fn flush_log() {
+    let mut l = lock(&LOG);
+    if !l.is_empty() {
+        let _ = std::io::stderr().write_all(l.as_bytes());
+        l.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dates() {
+        assert_eq!(super::http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(super::http_date(1792716244), "Fri, 23 Oct 2026 00:44:04 GMT");
+    }
+
+    #[test]
+    fn chunked_bodies() {
+        let b = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
+        match super::dechunk(b, 100) {
+            super::Chunked::Done(body, used) => {
+                assert_eq!(body, b"Wikipedia");
+                assert_eq!(&b[used..], b"NEXT");
+            }
+            _ => panic!("not parsed"),
+        }
+        assert!(matches!(super::dechunk(b"4\r\nWi", 100), super::Chunked::Need));
+        assert!(matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::Need) || matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::TooLarge));
+        assert!(matches!(super::dechunk(b"zz\r\n", 100), super::Chunked::Bad));
+    }
+}
