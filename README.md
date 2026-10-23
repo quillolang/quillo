@@ -671,6 +671,41 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   too, rather than compressed again for each request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
+### Translations
+
+```quillo
+translations("locales")          // locales/en.json, locales/fr.json, locales/pt-BR.json
+
+view Header(user) = <header>
+    <a href="/">{t("nav.home")}</a>
+    <span>{t("greeting", { name: user.name })}</span>
+    <span>{t("cart.items", { count: len(user.cart) })}</span>
+</header>
+```
+
+```json
+{ "nav": { "home": "Accueil" },
+  "greeting": "Bonjour, {name} !",
+  "cart": { "items": { "one": "{count} article", "other": "{count} articles" } } }
+```
+
+- A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
+  a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
+  (`fr-CA` is served by `fr`, `pt` by `pt-BR`), else the default:
+  `translations(dir, { default: "en" })`, or `en` when there is one. `locale()` gives it.
+- Nested keys are written with dots. A key missing in a locale comes from the default
+  locale; a key missing there shows as itself.
+- `{name}` is replaced by that value. An entry of plural forms (`zero one two few many
+  other`) picks the form for `count` by the language's rules (English, French, Russian,
+  Polish, Czech, Arabic, Hebrew, Japanese and others).
+- Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
+  wrote in them.
+- `with_locale("de", () => ...)` runs code in another locale (an email in the
+  recipient's language).
+- `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
+- Components call `t` and `locale` too: a page with components carries its locale's
+  text for the browser. Cached views are kept once per locale.
+
 ### Mounting programs
 
 `mount` serves another `.qwe` program under a path prefix:
@@ -692,6 +727,8 @@ prefix. Changes to mounted files are picked up by `--watch`. See
 
 - **General:** `print str int float len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
+- **Translations:** `t(key, vars)`, `locale()`, `translations`, `locale_from` and
+  `with_locale` (see [Translations](#translations)).
 - **Markdown:** `markdown(text)` gives HTML (CommonMark with tables, strikethrough and task
   lists). HTML inside the text is shown as text and `javascript:` links are blocked, so
   it is safe for what visitors write; `markdown(text, { html: true })` keeps the HTML,

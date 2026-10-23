@@ -98,7 +98,7 @@ pub fn install(env: &Env) {
         ("publish", publish),
         ("watch", watch),
     ];
-    for (name, f) in fns.iter().chain(crate::session::BUILTINS) {
+    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
     let mut json = Map::new();

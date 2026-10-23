@@ -22,6 +22,7 @@
 //! - Views containing views: a cached inner view passes what it read on to
 //!   the view around it, so a whole page can be cached and still be
 //!   invalidated by the global its innermost view read.
+//! - A view that translates (`t`, `locale`) is kept once per locale.
 
 use crate::ast::FnDef;
 use crate::shared::Shared;
@@ -57,6 +58,8 @@ pub struct Entry {
     pub deps: Vec<String>,
     /// The sequence number when the render started.
     seq: u64,
+    /// The locale it was rendered in, when it used one.
+    pub locale: Option<Arc<str>>,
 }
 
 /// What a lookup found.
@@ -67,7 +70,7 @@ pub enum Found {
 }
 
 impl ViewCache {
-    pub fn lookup(&mut self, def: &Arc<FnDef>, args: &[Option<Value>], shared: &Shared) -> Found {
+    pub fn lookup(&mut self, def: &Arc<FnDef>, args: &[Option<Value>], shared: &Shared, locale: Option<&Arc<str>>) -> Found {
         let Some(view) = self.views.get_mut(&key(def)) else {
             self.misses += 1;
             return Found::Miss;
@@ -75,7 +78,7 @@ impl ViewCache {
         if view.uncacheable {
             return Found::Uncacheable;
         }
-        let Some(i) = view.entries.iter().position(|e| same_args(&e.args, args)) else {
+        let Some(i) = view.entries.iter().position(|e| same_args(&e.args, args) && e.locale.as_ref().map_or(true, |l| Some(l) == locale)) else {
             self.misses += 1;
             return Found::Miss;
         };
@@ -90,7 +93,7 @@ impl ViewCache {
         }
     }
 
-    pub fn store(&mut self, def: &Arc<FnDef>, args: Vec<Option<Value>>, html: &str, mut deps: Vec<String>, seq: u64) {
+    pub fn store(&mut self, def: &Arc<FnDef>, args: Vec<Option<Value>>, html: &str, mut deps: Vec<String>, seq: u64, locale: Option<Arc<str>>) {
         deps.sort();
         deps.dedup();
         let view = self.view(def);
@@ -100,7 +103,7 @@ impl ViewCache {
         if view.entries.len() >= PER_VIEW {
             view.entries.pop_front();
         }
-        view.entries.push_back(Arc::new(Entry { args, html: html.into(), deps, seq }));
+        view.entries.push_back(Arc::new(Entry { args, html: html.into(), deps, seq, locale }));
     }
 
     /// The view did something that cannot be cached; it runs every time.
@@ -183,6 +186,9 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "with_tenant"
                 | "tenant_from"
                 | "allow_cross_site"
+                | "translations"
+                | "locale_from"
+                | "with_locale"
                 | "set_cookie"
                 | "delete_cookie"
                 | "session"
@@ -196,6 +202,7 @@ pub fn impure_builtin(name: &str) -> bool {
 pub struct Track {
     pub deps: Vec<String>,
     pub impure: bool,
+    pub locale: bool,
 }
 
 pub fn enabled() -> bool {

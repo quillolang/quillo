@@ -232,6 +232,7 @@ impl Interp {
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
+        self.locale = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
             if crate::upload::boundary(ctype).is_some() {
@@ -252,12 +253,18 @@ impl Interp {
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
-            let has = |needle: &[u8]| resp.body.windows(needle.len()).rposition(|w| w == needle);
-            if has(b"/_quillo/quillo.js").is_none() {
-                let tag = format!("<script src=\"{}/_quillo/quillo.js\" defer></script>", self.base);
-                let at = has(b"</body>").unwrap_or(resp.body.len());
-                resp.body.splice(at..at, tag.into_bytes());
+            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            let mut tags = String::new();
+            // Components translate in the browser too: the page carries its
+            // locale's text, read when the (deferred) bundle runs.
+            if let (Some(i18n), Some(l)) = (self.site.i18n.clone(), self.locale()) {
+                tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(&l)));
             }
+            if has(&resp.body, b"/_quillo/quillo.js").is_none() {
+                tags.push_str(&format!("<script src=\"{}/_quillo/quillo.js\" defer></script>", self.base));
+            }
+            let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
+            resp.body.splice(at..at, tags.into_bytes());
         }
         resp
     }
@@ -342,6 +349,10 @@ impl Interp {
 
             self.current_request = r.uses_request.then_some(reqv);
             let mut resp = finish(self.eval(&r.body, &scope));
+            // The page's components will need the locale (see `handle`).
+            if self.rendered_island && self.site.i18n.is_some() {
+                self.locale();
+            }
             self.current_request = None;
             self.pending_request = None;
             if req.method == "HEAD" {

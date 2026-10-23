@@ -269,6 +269,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("markdown", "str, map | null=", "html"),
+    ("translations", "str | map, map | null=", "null"),
+    ("locale_from", "fn", "null"),
+    ("locale", "", "str | null"),
+    ("with_locale", "str, fn", "any"),
+    ("t", "str, map | null=", "str"),
     ("live", "fn, any...", "any"),
     ("parallel", "any...", "list"),
     ("every", "num, fn", "null"),
@@ -310,7 +315,7 @@ const MODULES: &[&str] = &["json", "db", "http", "crypto"];
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "set_session", "end_session", "markdown"];
+      "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -791,15 +796,14 @@ impl Checker {
                     let mut names = Vec::new();
                     pattern_names(p, &mut names);
                     for n in names {
-                        self.globals.entry(n).or_insert(Var {
-                            t: T::ANY,
-                            sig: None,
-                            file: it.file.clone(),
-                            line: *line,
-                            kind: Kind::Global,
-                            used: false,
-                            ready: false,
-                        });
+                        // The program's own `let first = ...` hides the builtin.
+                        if self.globals.get(&n).is_some_and(|g| &*g.file != "<builtin>") {
+                            continue;
+                        }
+                        self.globals.insert(
+                            n,
+                            Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: false, ready: false },
+                        );
                     }
                 }
                 _ => {}

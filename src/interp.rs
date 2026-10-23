@@ -65,6 +65,8 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
+    /// The locale the code runs in, once worked out (see `i18n`).
+    pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
@@ -448,6 +450,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
@@ -487,6 +490,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,
@@ -540,6 +544,13 @@ impl Interp {
         }
         if let Some(r) = &mut self.reads {
             r.insert(topic);
+        }
+    }
+
+    /// The renders being cached used the locale: they are kept per locale.
+    pub fn note_locale(&mut self) {
+        for t in &mut self.tracks {
+            t.locale = true;
         }
     }
 
@@ -715,6 +726,7 @@ impl Interp {
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it.tenant = self.tenant.clone();
         it.upload_body = self.upload_body.clone();
+        it.locale = self.locale.clone();
         it
     }
 
@@ -1445,10 +1457,14 @@ impl Interp {
         out: &mut String,
     ) -> Result<(), Ctrl> {
         use crate::viewcache::Found;
-        let found = cache.lock().unwrap_or_else(|e| e.into_inner()).lookup(&c.def, &args, &self.shared);
+        let locale = if self.site.i18n.is_some() { self.locale() } else { None };
+        let found = cache.lock().unwrap_or_else(|e| e.into_inner()).lookup(&c.def, &args, &self.shared, locale.as_ref());
         match found {
             Found::Hit(entry) => {
                 out.push_str(&entry.html);
+                if entry.locale.is_some() {
+                    self.note_locale();
+                }
                 if self.reads.is_some() || !self.tracks.is_empty() {
                     for d in &entry.deps {
                         self.note_dep(d.clone());
@@ -1466,13 +1482,14 @@ impl Interp {
                 if let Some(outer) = self.tracks.last_mut() {
                     outer.deps.extend(track.deps.iter().cloned());
                     outer.impure |= track.impure;
+                    outer.locale |= track.locale;
                 }
                 r?;
                 let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if track.impure {
                     cache.forbid(&c.def);
                 } else {
-                    cache.store(&c.def, args, &out[start..], track.deps, seq);
+                    cache.store(&c.def, args, &out[start..], track.deps, seq, if track.locale { locale } else { None });
                 }
                 Ok(())
             }

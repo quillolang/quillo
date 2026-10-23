@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod fetch;
 pub mod httpd;
+pub mod i18n;
 pub mod interp;
 pub mod lexer;
 pub mod metrics;

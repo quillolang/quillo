@@ -141,6 +141,12 @@ fn calling_a_variable_that_shadows_a_builtin_is_flagged() {
 }
 
 #[test]
+fn a_global_can_take_a_builtins_name() {
+    assert!(diags("let first = { a: 1 }\nprint(first.a)\nfn f() = first.a").is_empty(), "{:?}", diags("let first = { a: 1 }\nprint(first.a)"));
+    assert!(diags("let t = { status: 200 }\nprint(t.status)").is_empty());
+}
+
+#[test]
 fn javascript_truthiness_is_flagged_where_it_differs() {
     // In Quillo only null, false and errors are false: "" and 0 are true.
     one("fn f(name: str) = name || \"anonymous\"", "1 warning: `name` counts as true even when it is \"\" (unlike JavaScript), so `||` keeps it: write `name != \"\" ? name : ...`");

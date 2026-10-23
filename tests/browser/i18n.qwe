@@ -1,0 +1,20 @@
+// Translations in a component: rendered on the server in the request's
+// locale, then updated in the browser with the same text and plural rules.
+// Driven by i18n.js (tests/browser.rs).
+
+translations({
+    en: { items: { one: "{count} item", other: "{count} items" }, add: "Add" },
+    ru: { items: { one: "{count} товар", few: "{count} товара", many: "{count} товаров", other: "{count} товара" }, add: "Добавить" },
+})
+locale_from((r) => r.query.lang)
+
+component Cart() {
+    ~n = 1
+    <div>
+        <span class="count">{t("items", { count: n })}</span>
+        <button id="add" @click={() => { n += 1 }}>{t("add")}</button>
+        <i class="locale">{locale()}</i>
+    </div>
+}
+
+route GET / = <html><body><Cart/></body></html>

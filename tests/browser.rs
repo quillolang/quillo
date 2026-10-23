@@ -204,6 +204,25 @@ fn keyed_lists_move_only_what_changed() {
     assert_eq!(r, want);
 }
 
+/// A component's translations: the server's locale and text, then the same
+/// plural rules in the browser.
+#[test]
+fn components_translate_in_the_browser() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with_path(&chrome, &dir.join("i18n.qwe"), free_port(), "/?lang=ru", Some(&dir.join("i18n.js")));
+    let want = serde_json::json!({
+        "seen": ["1 товар", "2 товара", "3 товара", "4 товара", "5 товаров"],
+        "button": "Добавить",
+        "locale": "ru",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// Composition where the fast paths are: a layout with named slots, views
 /// with children around keyed loops, components keeping their state in
 /// kept rows, nested loops, spread attributes and SVG.

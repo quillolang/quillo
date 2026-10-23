@@ -593,6 +593,37 @@ B.index_of = meta((c, x) => {
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
 }, "index_of", null);
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+// Translations: the page's locale and its text (see src/i18n.rs).
+const i18n = () => (typeof window !== "undefined" && window.__quillo_i18n) || null;
+// The plural form of n, as on the server (CLDR's rules for whole numbers).
+const plural = (locale, n) => {
+  if (!Number.isInteger(n)) return "other";
+  n = Math.abs(n);
+  const m10 = n % 10, m100 = n % 100, lang = String(locale).split(/[-_]/)[0].toLowerCase();
+  const few = m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14);
+  switch (lang) {
+    case "ja": case "zh": case "ko": case "th": case "vi": case "id": case "ms": case "lo": case "my": case "km": case "yue": return "other";
+    case "fr": case "pt": case "hi": case "bn": case "fa": case "gu": case "kn": case "zu": case "am": return n <= 1 ? "one" : "other";
+    case "ru": case "uk": case "be": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "many";
+    case "sr": case "hr": case "bs": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "other";
+    case "pl": return n === 1 ? "one" : few ? "few" : "many";
+    case "cs": case "sk": return n === 1 ? "one" : n >= 2 && n <= 4 ? "few" : "other";
+    case "ar": return n === 0 ? "zero" : n === 1 ? "one" : n === 2 ? "two" : m100 >= 3 && m100 <= 10 ? "few" : m100 >= 11 ? "many" : "other";
+    case "he": return n === 1 ? "one" : n === 2 ? "two" : "other";
+    default: return n === 1 ? "one" : "other";
+  }
+};
+B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
+B.t = meta((k, vars) => {
+  S(k, "t"); vars = M(vars, "t", 2);
+  const d = i18n();
+  let e = d && hasOwn(d.t, k) ? d.t[k] : k;
+  if (e && typeof e === "object") {
+    const cat = typeof vars.count === "number" ? plural(d.locale, vars.count) : "other";
+    e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
+  }
+  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? display(vars[name]) : m);
+}, "t", null);
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);

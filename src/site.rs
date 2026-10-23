@@ -33,6 +33,10 @@ pub struct Site {
     pub cross_site_ok: Vec<String>,
     /// The folder `db.migrate` applies, again for each database opened later.
     pub migrations: Option<std::path::PathBuf>,
+    /// What `translations` loaded.
+    pub i18n: Option<std::sync::Arc<crate::i18n::I18n>>,
+    /// `locale_from`'s function of the request.
+    pub locale_rule: Option<Value>,
 }
 
 impl Site {
