@@ -171,6 +171,8 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "random"
                 | "random_int"
                 | "uuid"
+                | "crypto.token"
+                | "crypto.hash_password"
                 | "live"
                 | "url"
                 | "navigate"
@@ -181,6 +183,11 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "with_tenant"
                 | "tenant_from"
                 | "allow_cross_site"
+                | "set_cookie"
+                | "delete_cookie"
+                | "session"
+                | "set_session"
+                | "end_session"
         )
 }
 

@@ -119,7 +119,7 @@ pub fn builtin_effect(name: &str) -> u8 {
             "file" | "read_file" | "write_file" => "fs",
             "env" => "env",
             "now" | "sleep" => "time",
-            "random" | "random_int" | "uuid" => "random",
+            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
             _ => return 0,
         }
     };

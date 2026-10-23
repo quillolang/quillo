@@ -230,6 +230,8 @@ impl Interp {
         self.rendered_island = false;
         self.tenant = None;
         self.upload_body = None;
+        self.set_cookies.clear();
+        self.session = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
             if crate::upload::boundary(ctype).is_some() {
@@ -237,6 +239,9 @@ impl Interp {
             }
         }
         let mut resp = self.handle_inner(req);
+        for c in self.set_cookies.drain(..) {
+            resp.headers.push(("set-cookie".into(), c));
+        }
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
                 if k.eq_ignore_ascii_case("location") {

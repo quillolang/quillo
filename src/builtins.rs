@@ -97,7 +97,7 @@ pub fn install(env: &Env) {
         ("publish", publish),
         ("watch", watch),
     ];
-    for (name, f) in fns {
+    for (name, f) in fns.iter().chain(crate::session::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
     let mut json = Map::new();
@@ -110,6 +110,9 @@ pub fn install(env: &Env) {
     let mut http = Map::new();
     crate::fetch::install(&mut http);
     define(env, "http", Value::map(http));
+    let mut crypto = Map::new();
+    crate::crypto::install(&mut crypto);
+    define(env, "crypto", Value::map(crypto));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).
@@ -638,7 +641,7 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None | Some(Value::Nil) => None,
         Some(Value::Map(m)) => match m.get("cache") {
             None | Some(Value::Nil) => None,
-            Some(v) => match cache_seconds(v) {
+            Some(v) => match duration_seconds(v) {
                 Some(s) => Some(s),
                 None => return fail(line, format!("`file`'s cache is seconds or a duration like \"30d\", got {}", v.repr())),
             },
@@ -706,7 +709,7 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
-fn cache_seconds(v: &Value) -> Option<u64> {
+pub(crate) fn duration_seconds(v: &Value) -> Option<u64> {
     match v {
         Value::Int(n) if *n >= 0 => Some(*n as u64),
         Value::Str(s) => {

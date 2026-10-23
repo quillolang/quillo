@@ -586,6 +586,40 @@ route POST /avatar {
 - The whole request counts against `--max-body` (10 MiB by default): raise it for larger
   files.
 
+### Cookies and sessions
+
+```quillo
+route POST /login { form: { email: str, password: str } } {
+    let user = db.one("select * from users where email = ?", email)
+    if !crypto.verify_password(password, user.password_hash) { reply 401 "Wrong email or password" }
+    set_session({ user: user.id })
+    redirect("/")
+}
+
+route GET /me {
+    let id = session().user ?? reply 401 "Log in first"
+    db.one("select name from users where id = ?", id)
+}
+
+route POST /logout { end_session(); redirect("/") }
+```
+
+- `set_session(map, { max_age })` replaces the session (30 days unless given),
+  `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
+- A session is a cookie signed with HMAC-SHA256: the browser can read it but not
+  change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in the
+  session and the rest in the database. The signature covers its expiry, its tenant
+  and the program's mount point, so it is no session past its time, for another
+  tenant, or in another mounted program.
+- Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
+  same one on every server. Without it, a random key is made at start: sessions end
+  when the server stops.
+- `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
+  `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
+  the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
+  default; `Secure` is left out when the request is to `localhost` or `127.0.0.1`,
+  which browsers reach over plain HTTP. `request.cookies` has what the browser sent.
+
 ### What a route returns
 
 | Value | Response |
@@ -662,7 +696,13 @@ prefix. Changes to mounted files are picked up by `--watch`. See
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`
 - **Errors:** `err is_err unwrap`
-- **Web:** `raw escape env now file redirect respond json.parse json.stringify`
+- **Web:** `raw escape env now file redirect respond json.parse json.stringify set_cookie
+  delete_cookie session set_session end_session`
+- **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (hex), `crypto.token(bytes
+  = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
+  `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
+  is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets).
+  Password hashing takes tens of milliseconds on purpose and runs off the event loop.
 - **Effects:** `sleep(ms)`, `random()`, `random_int(lo, hi)`, `uuid()`, `read_file(path)`,
   `write_file(path, text)` (paths stay inside the program's folder). `uuid()` takes its
   bytes from the operating system, so it can serve as a session id or token; `random()`

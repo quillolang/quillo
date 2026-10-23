@@ -245,7 +245,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("env", "str, any=", "any"),
     ("now", "", "int"),
     ("sleep", "num", "null"),
-    ("file", "str", "response"),
+    ("file", "str, map | null=", "response"),
     ("redirect", "str, int=", "response"),
     ("respond", "int, any=, map | null=", "response"),
     ("read_file", "str", "str | error(str)"),
@@ -290,13 +290,26 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("http.put", "str, any=, map | null=", "map | error(str)"),
     ("http.patch", "str, any=, map | null=", "map | error(str)"),
     ("http.request", "str, str, any=, map | null=", "map | error(str)"),
+    ("set_cookie", "str, any=, map | null=", "null"),
+    ("delete_cookie", "str, map | null=", "null"),
+    ("session", "", "map"),
+    ("set_session", "map | null, map | null=", "null"),
+    ("end_session", "", "null"),
+    ("crypto.sha256", "str", "str"),
+    ("crypto.hmac", "str, str", "str"),
+    ("crypto.token", "int=", "str"),
+    ("crypto.hash_password", "str", "str"),
+    ("crypto.verify_password", "str, str | null", "bool"),
+    ("crypto.equal", "str, str", "bool"),
 ];
 
-const MODULES: &[&str] = &["json", "db", "http"];
+const MODULES: &[&str] = &["json", "db", "http", "crypto"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
-    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch"];
+    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
+      "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
+      "delete_cookie", "session", "set_session", "end_session"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

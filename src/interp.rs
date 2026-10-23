@@ -61,6 +61,10 @@ pub struct Interp {
     pub tenant: Option<Option<Arc<str>>>,
     /// The current request's body when it carries files (see `upload`).
     pub upload_body: Option<Arc<[u8]>>,
+    /// `Set-Cookie` lines for the response being made (see `session`).
+    pub set_cookies: Vec<String>,
+    /// The request's session, once read or set.
+    pub session: Option<Value>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
@@ -442,6 +446,8 @@ impl Interp {
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
             upload_body: None,
+            set_cookies: Vec::new(),
+            session: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
@@ -479,6 +485,8 @@ impl Interp {
             site: self.site.clone(),
             tenant: None,
             upload_body: None,
+            set_cookies: Vec::new(),
+            session: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,
