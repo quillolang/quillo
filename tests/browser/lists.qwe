@@ -1,0 +1,35 @@
+// Keyed lists and their rows: what the browser runtime's fast paths (blocks,
+// moving only the rows that must move, rows kept from the last render) must
+// still get right. Driven by lists.js (tests/browser.rs).
+
+component Lists() {
+    ~items = range(1, 7) | map((i) => { id: i, label: `item ${i}` })
+    ~picked = 0
+    ~rich = false
+    ~prefix = ""
+    ~clicks = []
+    // A variable the rows' handlers keep: when it changes, so must they.
+    let note = prefix
+    <div.lists>
+        <button type="button" id="swap" @click={() => { items = [items[4]] + slice(items, 1, 4) + [items[0]] + slice(items, 5) }}>swap</button>
+        <button type="button" id="remove" @click={() => { items = items | filter((x) => x.id != 3) }}>remove</button>
+        <button type="button" id="insert" @click={() => { items = [items[0], { id: 10, label: "item 10" }] + slice(items, 1) }}>insert</button>
+        <button type="button" id="reverse" @click={() => { items = reverse(items) }}>reverse</button>
+        <button type="button" id="rich" @click={() => { rich = !rich }}>rich</button>
+        <button type="button" id="prefix" @click={() => { prefix = "x:" }}>prefix</button>
+        <ul @click={() => { clicks = clicks + ["list"] }}>
+            {for it in items =>
+                <li key={it.id} class={it.id == picked && "picked"} @click={() => { clicks = clicks + [`${note}row ${it.id}`] }}>
+                    <span.label>{rich ? <b>{it.label}</b> : it.label}</span>
+                    <a.pick @click={() => { picked = it.id }}>pick</a>
+                </li>}
+        </ul>
+        <p.clicks>{join(clicks, ",")}</p>
+    </div>
+}
+
+route GET / =
+    <html>
+        <head><meta charset="utf-8"/><title>lists</title></head>
+        <body><Lists/></body>
+    </html>

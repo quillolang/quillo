@@ -176,6 +176,34 @@ fn components_compose() {
     assert_eq!(r, want);
 }
 
+/// Keyed rows moved, removed and inserted in place (the rows kept are the
+/// same elements), classes and content switching, handlers innermost first,
+/// and rows that follow what they read.
+#[test]
+fn keyed_lists_move_only_what_changed() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("lists.qwe"), free_port(), Some(&dir.join("lists.js")));
+    let want = serde_json::json!({
+        "swapped": ["item 5, item 2, item 3, item 4, item 1, item 6", [], true],
+        "swapMoves": [2, 2],
+        "removed": ["item 5, item 2, item 4, item 1, item 6", [], true],
+        "removeMoves": [0, 1],
+        "inserted": ["item 5, item 10, item 2, item 4, item 1, item 6", ["item 10"], true],
+        "reversed": ["item 6, item 1, item 4, item 2, item 10, item 5", ["item 10"], true],
+        "picked": ["", "picked", "", "", "", ""],
+        "clicks": "row 1,list",
+        "rich": ["<b>item 6</b>", "<b>item 1</b>"],
+        "plain": ["item 6", "item 1"],
+        "clicksAfter": "row 1,list,x:row 6,list",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// examples/compose.qwe, clicked through.
 #[test]
 fn composition_example_works() {

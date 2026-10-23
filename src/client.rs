@@ -44,6 +44,10 @@ pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
     if !it.base.is_empty() {
         let _ = writeln!(program, "BASE = {};", js_str(&it.base));
     }
+    for b in &c.blocks {
+        program.push_str(b);
+        program.push('\n');
+    }
     for d in &c.defs {
         program.push_str(d);
         program.push('\n');
@@ -69,6 +73,10 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
     let mut c = Compiler::new(it);
     let (js, is_async) = c.global(name, 0)?;
     let mut program = String::new();
+    for b in &c.blocks {
+        program.push_str(b);
+        program.push('\n');
+    }
     for d in &c.defs {
         program.push_str(d);
         program.push('\n');
@@ -163,8 +171,21 @@ fn names_in(js: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut line_start = true;
     while i < chars.len() {
         let c = chars[i];
+        // A whole-line comment names nothing the code needs.
+        if line_start && c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\n' {
+            line_start = true;
+        } else if !c.is_whitespace() {
+            line_start = false;
+        }
         if ident(c) && (i == 0 || !ident(chars[i - 1]) && chars[i - 1] != '.') {
             let start = i;
             while i < chars.len() && ident(chars[i]) {
@@ -215,7 +236,30 @@ struct FnCtx {
     needs_async: bool,
     /// The component being compiled, for error messages and `~` rules.
     component: Option<String>,
+    /// `for` loops given a memo so far (see `memo` in the runtime).
+    memos: usize,
 }
+
+/// What a loop's body reads from around it, noted while it is compiled:
+/// its rows can be reused while all of it stays the same.
+struct Reads {
+    /// Where the body starts: its function, and the scopes open there.
+    ctx: usize,
+    scopes: usize,
+    /// JS for each value read.
+    deps: Vec<String>,
+    /// It calls something that may answer differently each time.
+    impure: bool,
+}
+
+/// Builtins that give the same answer for the same arguments and take no
+/// function (which could do anything).
+const PURE: &[&str] = &[
+    "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains", "starts_with",
+    "ends_with", "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "range",
+    "enumerate", "keys", "values", "get", "has", "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape",
+    "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "index_of", "repeat",
+];
 
 enum Resolved {
     Local(String, Option<bool>),
@@ -230,6 +274,10 @@ struct Compiler<'a> {
     /// Globals read from the server's environment, files or database.
     private: HashSet<String>,
     defs: Vec<String>,
+    /// Block definitions (see `block`), emitted before everything else.
+    blocks: Vec<String>,
+    /// Loops being compiled, innermost last (see `Reads`).
+    reads: Vec<Reads>,
     /// Globals compiled (or being compiled): JS name and whether they are async.
     globals: HashMap<String, (String, bool)>,
     ctxs: Vec<FnCtx>,
@@ -498,6 +546,8 @@ impl<'a> Compiler<'a> {
             assigned,
             private: collect_private(&it.program),
             defs: Vec::new(),
+            blocks: Vec::new(),
+            reads: Vec::new(),
             globals: HashMap::new(),
             ctxs: Vec::new(),
             counter: 0,
@@ -549,17 +599,55 @@ impl<'a> Compiler<'a> {
     }
 
     fn resolve(&mut self, name: &str) -> Result<Resolved, QuilloError> {
-        for ctx in self.ctxs.iter().rev() {
-            for scope in ctx.scopes.iter().rev() {
+        let mut found = None;
+        'outer: for (ci, ctx) in self.ctxs.iter().enumerate().rev() {
+            for (si, scope) in ctx.scopes.iter().enumerate().rev() {
                 match scope.get(name) {
-                    Some(Local::Var(js, f)) => return Ok(Resolved::Local(js.clone(), *f)),
-                    Some(Local::State) => return Ok(Resolved::State(name.to_string())),
-                    None => {}
+                    Some(Local::Var(js, f)) => found = Some((ci, si, Resolved::Local(js.clone(), *f))),
+                    Some(Local::State) => found = Some((ci, si, Resolved::State(name.to_string()))),
+                    None => continue,
                 }
+                break 'outer;
             }
+        }
+        if let Some((ci, si, r)) = found {
+            self.note_read(ci, si, &r);
+            return Ok(r);
         }
         let (js, is_async) = self.global(name, self.line)?;
         Ok(Resolved::Global(js, is_async))
+    }
+
+    /// For the loops being compiled: a name found in scope `si` of function
+    /// `ci`. A variable from around a loop is something its rows depend on
+    /// (handlers in them keep it), and so is state read while rendering;
+    /// handlers read state afresh when they run.
+    fn note_read(&mut self, ci: usize, si: usize, r: &Resolved) {
+        let here = self.ctxs.len() - 1;
+        for reads in &mut self.reads {
+            if ci > reads.ctx || (ci == reads.ctx && si >= reads.scopes) {
+                continue;
+            }
+            let dep = match r {
+                Resolved::Local(js, _) => js.clone(),
+                Resolved::State(n) if here == reads.ctx => format!("$i.s[{}]", js_str(n)),
+                _ => continue,
+            };
+            if !reads.deps.contains(&dep) {
+                reads.deps.push(dep);
+            }
+        }
+    }
+
+    /// For the loops being compiled: a call while rendering, of something
+    /// `pure` or not.
+    fn note_call(&mut self, pure: bool) {
+        let here = self.ctxs.len() - 1;
+        for reads in &mut self.reads {
+            if here == reads.ctx && !pure {
+                reads.impure = true;
+            }
+        }
     }
 
     /// A top-level name used by browser code: compiled once, on first use.
@@ -664,7 +752,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, memos: 0 });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -678,7 +766,8 @@ impl<'a> Compiler<'a> {
     fn params(&mut self, def: &FnDef, out: &mut String, check_arity: bool) -> Result<Vec<String>, QuilloError> {
         let fname = js_str(&def.name);
         if check_arity {
-            let _ = writeln!(out, "W.arity(arguments.length, {}, {});", def.params.len(), fname);
+            let n = def.params.len();
+            let _ = writeln!(out, "if (arguments.length > {}) W.arity(arguments.length, {}, {});", n, n, fname);
         }
         let mut names = Vec::new();
         for p in &def.params {
@@ -693,7 +782,31 @@ impl<'a> Compiler<'a> {
                 }
             }
             if let Some(ty) = &p.ty {
-                let _ = writeln!(out, "W.argty({}, {}, {}, {});", js, ty_js(&Some(ty.clone())), js_str(&p.name), fname);
+                let call = format!("W.argty({}, {}, {}, {});", js, ty_js(&Some(ty.clone())), js_str(&p.name), fname);
+                // The common types checked in place; `argty` says what is wrong.
+                let checks: Option<Vec<String>> = ty
+                    .names
+                    .iter()
+                    .map(|t| match t.as_str() {
+                        "int" => Some(format!("Number.isInteger({})", js)),
+                        "float" | "num" => Some(format!("typeof {} === \"number\"", js)),
+                        "str" => Some(format!("typeof {} === \"string\"", js)),
+                        "bool" => Some(format!("typeof {} === \"boolean\"", js)),
+                        "list" => Some(format!("Array.isArray({})", js)),
+                        _ => None,
+                    })
+                    .collect();
+                match checks {
+                    Some(mut cs) if ty.names.iter().all(|t| t != "any") => {
+                        if ty.optional {
+                            cs.push(format!("{} == null", js));
+                        }
+                        let _ = writeln!(out, "if (!({})) {}", cs.join(" || "), call);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "{}", call);
+                    }
+                }
             }
             names.push(js);
         }
@@ -752,15 +865,20 @@ impl<'a> Compiler<'a> {
         } else {
             run
         };
-        let code = format!(
-            "W.meta({}function ({}) {{\n{}{}}}, {}, [{}])",
-            if is_async { "async " } else { "" },
-            names.join(", "),
-            pre,
-            inner,
-            js_str(&def.name),
-            def.params.iter().map(|p| js_str(&p.name)).collect::<Vec<_>>().join(", ")
-        );
+        let func = format!("{}function ({}) {{\n{}{}}}", if is_async { "async " } else { "" }, names.join(", "), pre, inner);
+        // Only named functions need their name and parameters at hand (views
+        // are called with props by name); a lambda, made again on each
+        // render, goes without.
+        let code = if def.name == "<fn>" {
+            func
+        } else {
+            format!(
+                "W.meta({}, {}, [{}])",
+                func,
+                js_str(&def.name),
+                def.params.iter().map(|p| js_str(&p.name)).collect::<Vec<_>>().join(", ")
+            )
+        };
         Ok((code, ctx.needs_async))
     }
 
@@ -916,7 +1034,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, memos: 0 });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -1168,6 +1286,14 @@ impl<'a> Compiler<'a> {
                 self.line = *line;
                 let it = self.expr(iter)?;
                 let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
+                // In a component, rows with keys are remembered by item (see
+                // `memo` in the runtime); keyed, a reused row is matched with itself.
+                let memo = self.ctx().component.is_some()
+                    && matches!(&**body, Expr::Html(el, _) if el.attrs.iter().any(|(n, _)| n == "key"));
+                if memo {
+                    let (ctx, scopes) = (self.ctxs.len() - 1, self.ctx().scopes.len());
+                    self.reads.push(Reads { ctx, scopes, deps: Vec::new(), impure: false });
+                }
                 self.push_scope();
                 let mut names = Vec::new();
                 pattern_names(pat, &mut names);
@@ -1183,9 +1309,20 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
-                let b = self.expr(body);
+                // A row that is one block: kept rows have only the holes that
+                // read what changed recomputed (see `hole` in the runtime).
+                let row = match &**body {
+                    Expr::Html(el, _) if memo && blockable(el) => Some(self.block_parts(el)),
+                    _ => None,
+                };
+                let b = match &row {
+                    Some(_) => Ok(String::new()),
+                    None => self.expr(body),
+                };
                 self.pop_scope();
+                let reads = if memo { self.reads.pop() } else { None };
                 let b = b?;
+                let row = row.transpose()?;
                 let check = match &p {
                     Some(p) => format!(
                         "const $b = W.match({}, $x); if ($b === null) W.fail(\"`for` pattern does not match \" + W.short($x)); ",
@@ -1193,10 +1330,55 @@ impl<'a> Compiler<'a> {
                     ),
                     None => String::new(),
                 };
-                let inner = format!(
-                    "const $out = [];\nfor (const $x of W.iter({})) {{ {}{}$out.push({}); }}\nreturn $out;\n",
-                    it, check, binds, b
-                );
+                let made = |row: &(String, BlockParts, String, Vec<String>)| format!("W.b({}, [{}], {})", row.0, row.1.vals.join(", "), row.2);
+                let inner = match (reads, &row) {
+                    (Some(r), _) if !r.impure => {
+                        let slot = self.ctx().memos;
+                        self.ctx().memos += 1;
+                        // Each hole's deps as bits of `$m.changed`.
+                        let refresh = match &row {
+                            Some(row) if r.deps.len() <= 31 && row.3.is_empty() => {
+                                let mut out = String::new();
+                                for (k, deps) in row.1.deps.iter().enumerate() {
+                                    let mask = deps.iter().filter_map(|d| r.deps.iter().position(|x| x == d)).fold(0u32, |m, i| m | 1 << i);
+                                    if mask != 0 {
+                                        let _ = write!(out, "if ($m.changed & {}) W.hole($v, {}, {}); ", mask as i32, k, row.1.vals[k]);
+                                    }
+                                }
+                                Some(out)
+                            }
+                            _ => None,
+                        };
+                        let row_js = match &row {
+                            Some(row) => made(row),
+                            None => b.clone(),
+                        };
+                        let refresh = match &refresh {
+                            Some(refresh) => format!("($v, $x, $c) => {{ {}{}{}}}", check, binds, refresh.replace("$m.changed", "$c")),
+                            None => "null".to_string(),
+                        };
+                        format!(
+                            "return W.rows(W.memo($i, {}, [{}]), W.iter({}), ($x) => {{ {}{}return {}; }}, {});\n",
+                            slot,
+                            r.deps.join(", "),
+                            it,
+                            check,
+                            binds,
+                            row_js,
+                            refresh
+                        )
+                    }
+                    (_, row) => format!(
+                        "const $out = [];\nfor (const $x of W.iter({})) {{ {}{}$out.push({}); }}\nreturn $out;\n",
+                        it,
+                        check,
+                        binds,
+                        match row {
+                            Some(row) => made(row),
+                            None => b.clone(),
+                        }
+                    ),
+                };
                 self.iife(&inner)
             }
             Expr::Block(stmts) => self.block_expr(stmts)?,
@@ -1283,10 +1465,13 @@ impl<'a> Compiler<'a> {
                 argv.push(self.expr(a)?);
             }
             let is_async = self.is_async_name(name);
+            self.note_call(PURE.contains(&name.as_str()));
             let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
             return self.finish_call(name, is_async, call);
         }
         let (f, is_async) = self.callee_value(callee)?;
+        let pure = matches!(callee, Expr::Ident(n, _) if PURE.contains(&n.as_str()) && f == format!("B.{}", n));
+        self.note_call(pure);
         for a in args {
             argv.push(self.expr(a)?);
         }
@@ -1387,6 +1572,9 @@ impl<'a> Compiler<'a> {
 
     fn html(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
         self.line = el.line;
+        if blockable(el) {
+            return self.block(el);
+        }
         let mut kids = Vec::new();
         for c in &el.children {
             kids.push(match c {
@@ -1399,6 +1587,9 @@ impl<'a> Compiler<'a> {
         if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
             self.line = el.line;
             let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone(), el.line))?;
+            // A view is called while rendering; a component renders itself.
+            let component = matches!(lookup(&self.it.globals, &el.tag), Some(Value::Func(c)) if c.def.component);
+            self.note_call(component);
             let mut props = Vec::new();
             let mut spreads = Vec::new();
             for (name, v) in &el.attrs {
@@ -1482,5 +1673,207 @@ impl<'a> Compiler<'a> {
             ));
         }
         Ok(format!("W.h({}, {{{}}}, {}, {}, {})", js_str(&el.tag), props.join(", "), on, kids, key))
+    }
+}
+
+/// Whether `el` can be the root of a block: a plain element (not a
+/// component), without `{...spread}` attributes or `bind:`, which the
+/// virtual DOM handles.
+fn blockable(el: &HtmlEl) -> bool {
+    !el.tag.starts_with(|c: char| c.is_uppercase())
+        && el.tag != "foreignObject"
+        && el.attrs.iter().all(|(name, v)| !matches!(v, AttrVal::Spread(_)) && !name.starts_with("bind:"))
+}
+
+/// Whether `el` can be part of its parent's block: also without a `key`,
+/// which makes an element start afresh when it changes.
+fn inlineable(el: &HtmlEl) -> bool {
+    blockable(el) && el.attrs.iter().all(|(name, _)| name != "key")
+}
+
+/// A value fixed when the program is written: text, a number or a bool.
+fn fixed(e: &Expr) -> Option<&Lit> {
+    match e {
+        Expr::Lit(l) => Some(l),
+        _ => None,
+    }
+}
+
+/// What a block is made of while it is compiled.
+#[derive(Default)]
+struct BlockParts {
+    /// Positions of the elements with holes.
+    paths: Vec<String>,
+    /// `[kind, element, name]` per hole.
+    holes: Vec<String>,
+    /// The JS for each hole's value, in order.
+    vals: Vec<String>,
+    /// What each value reads from around the loop it is in (see `Reads`).
+    deps: Vec<Vec<String>>,
+}
+
+impl<'a> Compiler<'a> {
+    /// Markup of a fixed shape, as a block (see `block` in the runtime): its
+    /// template is defined once, and each render passes the holes' values.
+    fn block(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
+        let (name, parts, key, _) = self.block_parts(el)?;
+        Ok(format!("W.b({}, [{}], {})", name, parts.vals.join(", "), key))
+    }
+
+    /// The block for `el`, defined: its name, holes, key, and what the key
+    /// reads from around the loop it is in.
+    fn block_parts(&mut self, el: &HtmlEl) -> Result<(String, BlockParts, String, Vec<String>), QuilloError> {
+        let mut parts = BlockParts::default();
+        let tpl = self.block_el(el, &mut Vec::new(), &mut parts)?;
+        let mut key = ("null".to_string(), Vec::new());
+        for (name, v) in &el.attrs {
+            if name == "key" {
+                if let AttrVal::Expr(e) = v {
+                    key = self.noted(|c| c.expr(e))?;
+                }
+            }
+        }
+        let name = format!("$b{}", self.blocks.len());
+        self.blocks.push(format!(
+            "const {} = W.block({}, [{}], [{}]);",
+            name,
+            tpl,
+            parts.paths.join(", "),
+            parts.holes.join(", ")
+        ));
+        Ok((name, parts, key.0, key.1))
+    }
+
+    /// Compiles with `f`, noting what is read from around the innermost loop
+    /// being compiled (nothing outside one).
+    fn noted<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, QuilloError>) -> Result<(T, Vec<String>), QuilloError> {
+        let Some(outer) = self.reads.last() else { return Ok((f(self)?, Vec::new())) };
+        let (ctx, scopes) = (outer.ctx, outer.scopes);
+        self.reads.push(Reads { ctx, scopes, deps: Vec::new(), impure: false });
+        let r = f(self);
+        let reads = self.reads.pop().expect("pushed");
+        Ok((r?, reads.deps))
+    }
+
+    /// `el`'s template, `[tag, [[name, value], ...], [child, ...]]`, adding
+    /// its holes to `parts`; `path` is where it is in the block.
+    fn block_el(&mut self, el: &HtmlEl, path: &mut Vec<usize>, parts: &mut BlockParts) -> Result<String, QuilloError> {
+        self.line = el.line;
+        let mut fixed_attrs: Vec<String> = Vec::new();
+        let mut at: Option<usize> = None;
+        let mut hole = |parts: &mut BlockParts, kind: u8, name: &str, (val, deps): (String, Vec<String>)| {
+            let i = *at.get_or_insert_with(|| {
+                parts.paths.push(format!("[{}]", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
+                parts.paths.len() - 1
+            });
+            parts.holes.push(format!("[{}, {}, {}]", kind, i, js_str(name)));
+            parts.vals.push(val);
+            parts.deps.push(deps);
+        };
+        if let Some(id) = &el.id {
+            match fixed(id) {
+                Some(l) => fixed_attrs.push(format!("[\"id\", {}]", lit_js(l))),
+                None => {
+                    let v = self.noted(|c| c.expr(id))?;
+                    hole(parts, 0, "id", v);
+                }
+            }
+        }
+        let mut classes: Vec<&Expr> = el.classes.iter().collect();
+        for (name, v) in &el.attrs {
+            if let ("class", AttrVal::Expr(e)) = (name.as_str(), v) {
+                classes.push(e);
+            }
+        }
+        if classes.iter().all(|e| matches!(fixed(e), Some(Lit::Str(_)))) {
+            let names: Vec<&str> = classes.iter().filter_map(|e| match fixed(e) {
+                Some(Lit::Str(s)) if !s.is_empty() => Some(&**s),
+                _ => None,
+            }).collect();
+            if !names.is_empty() {
+                fixed_attrs.push(format!("[\"class\", {}]", js_str(&names.join(" "))));
+            }
+        } else {
+            let (js, deps) = self.noted(|c| classes.iter().map(|e| c.expr(e)).collect::<Result<Vec<_>, _>>())?;
+            let v = if js.len() == 1 { format!("W.cls1({})", js[0]) } else { format!("W.cls([{}])", js.join(", ")) };
+            hole(parts, 1, "", (v, deps));
+        }
+        for (name, v) in &el.attrs {
+            if name == "key" || name == "class" {
+                continue;
+            }
+            if let Some(ev) = name.strip_prefix('@') {
+                let f = match v {
+                    AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
+                    _ => ("true".to_string(), Vec::new()),
+                };
+                hole(parts, 2, ev, f);
+                continue;
+            }
+            // value, checked and selected are the element's live state,
+            // set on the element itself rather than as attributes.
+            let live = matches!(name.as_str(), "value" | "checked" | "selected");
+            match v {
+                AttrVal::Bool if !live => fixed_attrs.push(format!("[{}, true]", js_str(name))),
+                AttrVal::Expr(e) if !live && fixed(e).is_some() => match fixed(e) {
+                    Some(Lit::Nil | Lit::Bool(false)) => {}
+                    Some(l) => fixed_attrs.push(format!("[{}, {}]", js_str(name), lit_js(l))),
+                    None => unreachable!(),
+                },
+                _ => {
+                    let val = match v {
+                        AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
+                        _ => ("true".to_string(), Vec::new()),
+                    };
+                    hole(parts, 0, name, val);
+                }
+            }
+        }
+        // Children: in the template when they are all fixed text and
+        // elements; otherwise the element's content is a hole.
+        let all_fixed = el.children.iter().all(|c| match c {
+            HtmlChild::El(e) => inlineable(e),
+            HtmlChild::Expr(e) => matches!(fixed(e), Some(Lit::Str(_))),
+        });
+        let mut kids = Vec::new();
+        if all_fixed {
+            for (i, c) in el.children.iter().enumerate() {
+                match c {
+                    HtmlChild::El(e) => {
+                        path.push(i);
+                        kids.push(self.block_el(e, path, parts)?);
+                        path.pop();
+                    }
+                    HtmlChild::Expr(e) => {
+                        if let Some(Lit::Str(s)) = fixed(e) {
+                            kids.push(js_str(s));
+                        }
+                    }
+                }
+            }
+        } else if let [HtmlChild::Expr(e)] = el.children.as_slice() {
+            // The only child: an empty text node in the template, which text
+            // fills (see the runtime's `block`).
+            kids.push("\"\"".to_string());
+            let (v, deps) = self.noted(|c| c.expr(e))?;
+            path.push(0);
+            parts.paths.push(format!("[{}]", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
+            path.pop();
+            parts.holes.push(format!("[3, {}, \"\"]", parts.paths.len() - 1));
+            parts.vals.push(v);
+            parts.deps.push(deps);
+        } else {
+            let (js, deps) = self.noted(|c| {
+                el.children
+                    .iter()
+                    .map(|ch| match ch {
+                        HtmlChild::El(e) => c.html(e),
+                        HtmlChild::Expr(x) => c.expr(x),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            hole(parts, 4, "", (format!("[{}]", js.join(", ")), deps));
+        }
+        Ok(format!("[{}, [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", ")))
     }
 }

@@ -23,9 +23,12 @@ and is not listed here.
 
 ## Reactivity in the browser
 
-Today a component updates as a whole: assigning `~x` re-runs the component's
-function, diffs the virtual DOM and patches what changed; every child
-component updates with it.
+Assigning `~x` re-runs the component's function. Markup of a fixed shape is
+compiled into blocks (a cloned template with holes for what can change), so
+an update compares hole values rather than whole trees; keyed lists move only
+the rows that must move; and the rows of a keyed `for` loop are kept from one
+render to the next, with only the holes that read what changed recomputed.
+Child components still update whenever their parent does.
 
 - [ ] **Skip children whose props did not change.** Values are immutable, so
       "same props" is an identity check per prop (`VComp` in `patch`,
@@ -33,12 +36,13 @@ component updates with it.
       each render and will still count as changed.
 - [ ] **Skip assignments that change nothing.** `Inst.set` queues an update
       even when the new value is the old one.
-- [ ] **Fine-grained updates (later, if profiling asks for it).** The compiler
-      knows which template expressions read which `~state`; it could build the
-      DOM once and update only the nodes that depend on what changed (as
-      Svelte and Solid do), replacing the virtual DOM. Large change to
-      `src/client.rs` and the runtime; the differential tests against Node
-      (`tests/client.rs`) are the safety net.
+- [ ] **Keep more than keyed loop rows.** Rows without a `key`, and loops in
+      views (which have no component to remember them in), are made again on
+      each render. So is markup outside loops; its holes could be recomputed
+      only when what they read changed, like kept rows'.
+- [ ] **Cheaper calls in compiled code.** Every function call checks its
+      arguments and catches `return`; building 1,000 rows in Quillo code costs
+      several times what plain JavaScript does.
 
 ## Live data
 
