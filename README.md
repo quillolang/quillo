@@ -925,6 +925,30 @@ sending it requests. A second Ctrl-C stops it at once.
 while it is stopping or its program failed to load: give it to a load balancer's health
 check (limer's `health_uri`).
 
+### Scheduled jobs
+
+```quillo
+schedule("5m", clean_sessions)                  // every 5 minutes, on the clock
+schedule("0 3 * * *", nightly_report)           // cron: 03:00 UTC
+schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
+```
+
+- The first argument is a duration (seconds, or `"30s"`, `"5m"`, `"1h"`, `"1d"`), counted
+  from 1970 in UTC, so that every server agrees and `"5m"` runs at :00, :05, ...; or a cron line: `minute hour
+  day month weekday` in UTC, with `*`, `1-5`, `*/15` and lists, or `@hourly`, `@daily`,
+  `@weekly`, `@monthly`, `@yearly`.
+- A job runs on the server like a request: waiting for the database lets requests run
+  meanwhile, its errors are printed, and it is logged (`POST /_quillo/job/clean_sessions
+  -> 200`). A job still running when it is due again is skipped that time. Stopping the
+  server lets running jobs finish, and starts no more.
+- Jobs are named after their function (`{ name: "..." }` for a lambda, or to run one
+  function twice); nobody outside the server can start one.
+- Several servers on one database (PostgreSQL, or SQLite shared by processes on one
+  machine) run each job once per due time: the first to record it in `_quillo_jobs`
+  runs it. Without a database, or with one per tenant, each server runs its jobs;
+  `--no-jobs` turns them off on a server. For a database per tenant, loop over your
+  tenants inside the job with `with_tenant(name, () => ...)`.
+
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path -> 200 (0.4ms)`. With `--log json` the

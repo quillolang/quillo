@@ -187,6 +187,7 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "tenant_from"
                 | "allow_cross_site"
                 | "translations"
+                | "schedule"
                 | "locale_from"
                 | "with_locale"
                 | "set_cookie"

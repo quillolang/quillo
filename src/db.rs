@@ -424,6 +424,25 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(res.unwrap_or_else(db_err))
 }
 
+/// Whether this server runs a scheduled job's run due at `at`: with one
+/// database for the program (which other servers may share), only if no
+/// one recorded that run before; otherwise always.
+pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
+    if !matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::One(_))) {
+        return true;
+    }
+    let made = exec(it, vec![Value::str("create table if not exists _quillo_jobs (name text primary key, at bigint not null)")], 0);
+    if !matches!(made, Ok(Value::Map(_))) {
+        return true;
+    }
+    let sql = "insert into _quillo_jobs (name, at) values (?, ?) \
+               on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at";
+    match exec(it, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)], 0) {
+        Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
+        _ => true,
+    }
+}
+
 fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
     let b = backend(it)?;
     let res = match &*b {

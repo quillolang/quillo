@@ -372,6 +372,24 @@ impl Interp {
 
 impl Interp {
     /// `/_quillo/...`: the browser bundle and `server fn` calls.
+    /// A scheduled job, asked for by the scheduler (see `jobs`).
+    fn run_job(&mut self, name: &str, req: &HttpRequest, qs: &str) -> HttpResponse {
+        if req.method != "POST" || !is_job_request(req) {
+            return plain(404, "not found\n");
+        }
+        let Some(job) = self.site.jobs.iter().find(|j| j.name == name).cloned() else {
+            return plain(404, "no such job\n");
+        };
+        let at = qs.split('&').find_map(|kv| kv.strip_prefix("at=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if !crate::db::claim_job(self, name, at) {
+            return plain(200, "run by another server\n");
+        }
+        match finish(self.call(&job.f, Vec::new(), 0)) {
+            r if r.status >= 500 => r,
+            _ => plain(200, "ok\n"),
+        }
+    }
+
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
         if rest == "quillo.js" {
             // The browser keeps its copy and asks whether it is still current.
@@ -398,6 +416,9 @@ impl Interp {
             let (since, server, topics) = live_query(qs);
             let (seq, changed) = self.shared.wait_live(since, server.as_deref(), &topics, std::time::Duration::ZERO);
             return json_response(200, serde_json::json!({ "seq": seq, "server": self.shared.id, "changed": changed }));
+        }
+        if let Some(name) = rest.strip_prefix("job/") {
+            return self.run_job(name, req, qs);
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
@@ -962,7 +983,7 @@ impl Worker {
     /// Answers a request. The caller holds the interpreter lock.
     pub(crate) fn answer(&mut self, app: &Arc<App>, req: HttpRequest) -> Answer {
         if let Some(token) = &app.launch_token {
-            if let Some(resp) = launch_gate(&req, token) {
+            if let Some(resp) = launch_gate(&req, token).filter(|_| !is_job_request(&req)) {
                 return Answer::Respond(resp);
             }
         }
@@ -1102,6 +1123,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
             .map_err(|e| format!("cannot start file watcher: {}", e))?;
     }
     if let Some(a) = bound {
+        start_jobs(&app, a);
         listening(a);
     }
     crate::httpd::serve(app, listener, workers + 1)
@@ -1131,11 +1153,30 @@ pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), Stri
     if apps.is_empty() {
         return Err("no instances".into());
     }
+    if let Ok(a) = listener.local_addr() {
+        start_jobs(&apps[0], a);
+    }
     crate::httpd::serve_instances(apps, listener, workers + 1)
 }
 
 /// The cookie that admits a desktop app's window.
 const LAUNCH_COOKIE: &str = "quillo_launch";
+
+/// Whether a request is the scheduler's (it carries this process's secret).
+fn is_job_request(req: &HttpRequest) -> bool {
+    req.headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-job") && crate::crypto::same(v.as_bytes(), crate::jobs::token().as_bytes()))
+}
+
+/// Starts the job scheduler for the program `app` runs (see `jobs`).
+fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
+    let app = app.clone();
+    crate::jobs::start(addr, move || match &*app.current().1 {
+        Loaded::Ready(it) => it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect(),
+        Loaded::Failed(_) => Vec::new(),
+    });
+}
 
 /// For a desktop app's server, which listens on this machine where other
 /// programs and web pages could reach it: `None` lets the request through

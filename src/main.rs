@@ -36,6 +36,7 @@ options for `run`:
   --no-check     skip the static checks before running
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
+  --no-jobs      run none of the program's `schedule`d jobs on this server
   --max-body N   largest request body to accept, in bytes (default 10 MiB)
   --log F        the request log on stderr: text (the default), json (a JSON
                  object per line: time, method, path, status, ms, ip, tenant)
@@ -157,6 +158,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--no-view-cache", _) => {
                 quillo::viewcache::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            ("--no-jobs", _) => {
+                quillo::jobs::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }

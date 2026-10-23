@@ -34,12 +34,17 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn start(file: &Path, extra: &[&str]) -> Server {
+    start_with_env(file, extra, &[])
+}
+
+fn start_with_env(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Server {
     let port = port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
         .args(["--port", &port.to_string()])
         .args(extra)
+        .envs(env.iter().copied())
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
@@ -524,4 +529,44 @@ fn the_log_can_be_json_lines() {
     assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello?x=1"), Some(200)));
     assert!(v["time"].as_str().map_or(false, |t| t.ends_with('Z') && t.len() == 24), "{}", line);
     assert!(v["ms"].is_number() && v["ip"].is_string(), "{}", line);
+}
+
+#[test]
+fn scheduled_jobs_run_on_time_and_once_across_servers() {
+    let d = temp_dir("jobs");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        r#"db.open("jobs.db")
+db.exec("create table if not exists runs (server text, sec integer)")
+let me = env("WHO", "?")
+let ticks = 0
+fn tick() {
+    ticks += 1
+    db.exec("insert into runs values (?, ?)", me, floor(now() / 1000))
+}
+schedule("1s", tick)
+schedule("0 0 1 1 *", () => print("new year"), { name: "yearly" })
+route GET /ticks = ticks
+route GET /runs = db.query("select server, sec from runs order by sec")
+"#,
+    )
+    .unwrap();
+    let a = start_with_env(&f, &[], &[("WHO", "a")]);
+    let b = start_with_env(&f, &[], &[("WHO", "b")]);
+    std::thread::sleep(Duration::from_millis(4200));
+    let runs: serde_json::Value = serde_json::from_str(&get(a.port, "/runs").1).unwrap();
+    let secs: Vec<i64> = runs.as_array().unwrap().iter().map(|r| r["sec"].as_i64().unwrap()).collect();
+    assert!(secs.len() >= 3, "{}", runs);
+    let mut distinct = secs.clone();
+    distinct.dedup();
+    assert_eq!(secs, distinct, "a second ran twice: {}", runs);
+    let (ta, tb) = (get(a.port, "/ticks").1.parse::<usize>().unwrap(), get(b.port, "/ticks").1.parse::<usize>().unwrap());
+    assert_eq!(ta + tb, secs.len(), "{} {} {}", ta, tb, runs);
+    // Only the scheduler can ask for a job.
+    assert_eq!(request(a.port, "POST", "/_quillo/job/tick", "").0, 404);
+    // Without jobs here, none run.
+    let c = start(&f, &["--no-jobs"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(get(c.port, "/ticks").1, "0");
 }

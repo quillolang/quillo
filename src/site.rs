@@ -37,6 +37,8 @@ pub struct Site {
     pub i18n: Option<std::sync::Arc<crate::i18n::I18n>>,
     /// `locale_from`'s function of the request.
     pub locale_rule: Option<Value>,
+    /// What `schedule` set to run (see `jobs`).
+    pub jobs: Vec<std::sync::Arc<crate::jobs::Job>>,
 }
 
 impl Site {

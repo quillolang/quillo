@@ -1274,7 +1274,7 @@ pub(crate) fn iso_now() -> String {
 
 /// Year, month and day of a day counted from 1970-01-01 (Howard Hinnant's
 /// algorithm).
-fn civil(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil(days: i64) -> (i64, i64, i64) {
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
