@@ -204,6 +204,27 @@ fn keyed_lists_move_only_what_changed() {
     assert_eq!(r, want);
 }
 
+/// Components with the page's JavaScript: `@mount` and its cleanup, `js`
+/// and `js_new`, and methods of a library's objects.
+#[test]
+fn components_call_the_pages_javascript() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("interop.qwe"), free_port(), Some(&dir.join("interop.js")));
+    let want = serde_json::json!({
+        "mounted": ["gauge 1", 1],
+        "called": ["gauge 2", "4"],
+        "again": ["gauge 3", 1],
+        "removed": [false, ["gauge"]],
+        "back": ["gauge 3", 2],
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// A component's translations: the server's locale and text, then the same
 /// plural rules in the browser.
 #[test]

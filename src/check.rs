@@ -275,6 +275,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("with_locale", "str, fn", "any"),
     ("t", "str, map | null=", "str"),
     ("schedule", "str | int, fn, map | null=", "null"),
+    ("js", "str, any...", "any"),
+    ("js_new", "str, any...", "any"),
     ("live", "fn, any...", "any"),
     ("parallel", "any...", "list"),
     ("every", "num, fn", "null"),

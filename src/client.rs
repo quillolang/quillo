@@ -23,7 +23,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "t", "locale",
+    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "t", "locale", "js", "js_new",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -206,6 +206,16 @@ fn names_in(js: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `@mount` is no DOM event: the runtime's `$mount` handles it, and naming
+/// it so in the program brings that part of the runtime into the bundle.
+fn event_name(ev: &str) -> &str {
+    if ev == "mount" {
+        "$mount"
+    } else {
+        ev
+    }
 }
 
 /// Drops comment lines, blank lines and indentation.
@@ -1532,6 +1542,9 @@ impl<'a> Compiler<'a> {
             return self.finish_call(name, is_async, call);
         }
         let (f, is_async) = self.callee_value(callee)?;
+        if f == "B.js" || f == "B.js_new" {
+            self.js_name(&f[2..], args.first())?;
+        }
         let pure = matches!(callee, Expr::Ident(n, _) if PURE.contains(&n.as_str()) && f == format!("B.{}", n));
         self.note_call(pure);
         for a in args {
@@ -1547,6 +1560,24 @@ impl<'a> Compiler<'a> {
             format!("W.call({}, [{}])", f, argv.join(", "))
         };
         self.finish_call(&name, is_async, call)
+    }
+
+    /// `js` and `js_new` name what they call in the code itself: a name
+    /// that came from data could be anything on the page, `eval` included.
+    fn js_name(&mut self, f: &str, name: Option<&Expr>) -> Result<(), QuilloError> {
+        let Some(Expr::Lit(Lit::Str(path))) = name else {
+            return self.err(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", f, f));
+        };
+        let ok = !path.is_empty() && path.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$'));
+        if !ok {
+            return self.err(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", f, path));
+        }
+        let banned = ["eval", "Function", "setTimeout", "setInterval", "execScript"];
+        let last = path.rsplit('.').next().unwrap_or("");
+        if banned.contains(&last) || path.starts_with("document.write") || last == "constructor" || last == "__proto__" {
+            return self.err(format!("`{}` does not call {}: it runs text as code", f, path));
+        }
+        Ok(())
     }
 
     fn is_async_name(&mut self, name: &str) -> bool {
@@ -1694,7 +1725,7 @@ impl<'a> Compiler<'a> {
                 }
             };
             if let Some(ev) = name.strip_prefix('@') {
-                on.push(format!("{}: {}", js_str(ev), val));
+                on.push(format!("{}: {}", js_str(event_name(ev)), val));
             } else if let Some(prop) = name.strip_prefix("bind:") {
                 let AttrVal::Expr(Expr::Ident(var, _)) = v else {
                     return self.err(format!("`bind:{}` needs a variable: bind:{}={{name}}", prop, prop));
@@ -1875,7 +1906,7 @@ impl<'a> Compiler<'a> {
                     AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
                     _ => ("true".to_string(), Vec::new()),
                 };
-                hole(parts, 2, ev, f);
+                hole(parts, 2, event_name(ev), f);
                 continue;
             }
             // value, checked and selected are the element's live state,

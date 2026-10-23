@@ -26,6 +26,10 @@ const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
 const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
+// An object from the page's scripts (an element, a library's), not one the
+// program made: its inherited properties and methods are its fields too.
+const foreign = (v) => v !== null && typeof v === "object" && v.constructor !== Object && v.constructor !== undefined
+  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode);
 
 function typeName(v) {
   if (isNil(v)) return "null";
@@ -196,6 +200,7 @@ function field(v, name, fb) {
   if (isNil(v)) return null;
   if (isMap(v)) {
     if (hasOwn(v, name)) return v[name];
+    if (foreign(v) && name in v) { const x = v[name]; return x === undefined ? null : typeof x === "function" ? x.bind(v) : x; }
     if (name === "len") return B.len(v);
     if (name === "keys") return B.keys(v);
     if (name === "values") return B.values(v);
@@ -231,6 +236,7 @@ function call(f, args) {
 // `recv.name(args)`: a function stored in the map, or `name(recv, args)`.
 function mcall(recv, name, fb, args) {
   if (isMap(recv) && hasOwn(recv, name)) return call(recv[name], args);
+  if (foreign(recv) && typeof recv[name] === "function") { const r = recv[name](...args); return r === undefined ? null : r; }
   if (typeof fb === "function") return fb(recv, ...args);
   fail(`${typeName(recv)} has no method \`${name}\``);
 }
@@ -593,6 +599,33 @@ B.index_of = meta((c, x) => {
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
 }, "index_of", null);
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+// `js("Chart.register", ...)`: a function of the page's scripts, found from
+// the page's globals by its dotted path; `js_new` for a class.
+function jsPath(path, f) {
+  S(path, f);
+  let owner = globalThis, v = globalThis;
+  for (const p of path.split(".")) {
+    if (v === null || v === undefined || !(p in Object(v))) fail(`\`${f}\`: ${path} is not defined on this page`);
+    owner = v;
+    v = v[p];
+  }
+  return [owner, v];
+}
+B.js = meta((path, ...args) => {
+  const [owner, v] = jsPath(path, "js");
+  if (typeof v !== "function") {
+    if (args.length) fail(`\`js\`: ${path} is not a function`);
+    return v === undefined ? null : v;
+  }
+  const r = v.apply(owner, args);
+  return r === undefined ? null : r;
+}, "js", null);
+B.js_new = meta((path, ...args) => {
+  const [, v] = jsPath(path, "js_new");
+  if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
+  return new v(...args);
+}, "js_new", null);
+
 // Translations: the page's locale and its text (see src/i18n.rs).
 const i18n = () => (typeof window !== "undefined" && window.__quillo_i18n) || null;
 // The plural form of n, as on the server (CLDR's rules for whole numbers).
@@ -1040,6 +1073,9 @@ function fire(el, type, ev) {
 // are handled once for the whole page, then passed to each element on
 // their way up, innermost first (as the browser would).
 function listen(el, t, f) {
+  // Events named with a `$` are Quillo's own: `$mount` (not named here, so
+  // that bundles without it leave it out).
+  if (t.charCodeAt(0) === 36) { if (typeof f === "function" && mountHook) mountHook(el, f); return; }
   if (t === "click") {
     el.__click = f;
     if (!delegating) { delegating = true; document.addEventListener("click", delegated); }
@@ -1055,6 +1091,39 @@ function listen(el, t, f) {
 }
 
 let delegating = false;
+
+// The component whose DOM is being made or patched, and `$mount` when a
+// component uses `@mount` (the compiler names the event so, and the bundle
+// carries it only then).
+let updating = null;
+let mountHook = null;
+
+function unhook(g) {
+  try { g(); } catch (e) { report(e); }
+}
+
+// `@mount={(el) => ...}`: called once the element is on the page, once in
+// its life (later renders' closures are not called). A function it returns
+// is called when the element leaves the page, or its component does.
+function $mount(el, f) {
+  if (el.__mounted) return;
+  el.__mounted = true;
+  if ($mount.q.length === 0) queueMicrotask(() => {
+    for (const [el, f, inst] of $mount.q.splice(0)) {
+      if (!el.isConnected || (inst && inst.dead)) continue;
+      const keep = (g) => { if (typeof g === "function" && inst) (inst.hooks || (inst.hooks = [])).push([el, g]); };
+      try {
+        const r = f.length > 0 ? f(el) : f();
+        if (r instanceof Promise) r.then(keep, report); else keep(r);
+      } catch (e) {
+        report(e);
+      }
+    }
+  });
+  $mount.q.push([el, f, updating || rendering]);
+}
+$mount.q = [];
+mountHook = $mount;
 
 function delegated(ev) {
   for (const n of ev.composedPath()) {
@@ -1433,6 +1502,7 @@ class Inst {
     if (this.dead) return;
     this.dead = true;
     if (this.cleanup) for (const f of this.cleanup) f();
+    if (this.hooks) { for (const [, g] of this.hooks) unhook(g); this.hooks = null; }
     if (this.kids) for (const k of this.kids) drop(k);
   }
 
@@ -1445,12 +1515,20 @@ class Inst {
       report(e);
       return;
     }
-    if (this.kids === null) {
-      this.el.replaceChildren(...kids.map((k) => mount(k, false)));
-    } else {
-      patchKids(this.el, this.kids, kids, false);
+    const outer = updating;
+    updating = this;
+    try {
+      if (this.kids === null) {
+        this.el.replaceChildren(...kids.map((k) => mount(k, false)));
+      } else {
+        patchKids(this.el, this.kids, kids, false);
+      }
+    } finally {
+      updating = outer;
     }
     this.kids = kids;
+    // Elements with an @mount cleanup that this render took off the page.
+    if (this.hooks) this.hooks = this.hooks.filter(([el, g]) => el.isConnected || (unhook(g), false));
   }
 }
 

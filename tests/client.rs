@@ -208,3 +208,21 @@ fn recursive_functions_that_wait_on_the_server_are_awaited() {
     assert_eq!(server, "[6, true, true]");
     assert_eq!(browser, server);
 }
+
+#[test]
+fn js_calls_name_what_they_call_in_the_code() {
+    let load = |body: &str| {
+        let mut it = Interp::new(".");
+        let src = format!("component C(name: str) {{\n    <button @click={{() => {{ {} }}}}>x</button>\n}}\n", body);
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    assert_eq!(load(r#"js("lib.go", 1)"#), "");
+    assert_eq!(load(r#"js_new("L.Map", "map")"#), "");
+    assert!(load("js(name, 1)").contains("written out"), "{}", load("js(name, 1)"));
+    assert!(load(r#"js("eval", "1")"#).contains("runs text as code"));
+    assert!(load(r#"js("window.setTimeout", "x")"#).contains("runs text as code"));
+    assert!(load(r#"js("a..b")"#).contains("dotted name"));
+}

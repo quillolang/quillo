@@ -384,6 +384,35 @@ component Dashboard() {
   be data (no functions). Inside another component, props can be anything: callbacks,
   HTML, other values.
 
+### JavaScript libraries
+
+A component can hand an element to a library the page loads (a chart, a map, an editor)
+and call into it:
+
+```quillo
+component Sales(points: list) {
+    ~chart = null
+    <canvas @mount={(el) => {
+        chart = js_new("Chart", el, { type: "line", data: points })
+        () => chart.destroy()                   // when the canvas leaves the page
+    }}></canvas>
+}
+
+route GET / = <html><head><script src="/assets/chart.js"></script></head>
+                    <body><Sales points={load_points()}/></body></html>
+```
+
+- `@mount={(el) => ...}` runs once the element is on the page, once in its life. A
+  function it returns runs when the element leaves the page, or its component does.
+- `js("path.to.fn", args...)` calls a function of the page's scripts, found by its dotted
+  name from the page's globals (`js("L.map", el)`, `js("analytics.track", "signup")`),
+  and gives its result; `js_new("Chart", ...)` makes an object of a class. The name is
+  written in the code: one from data could reach anything on the page, so a variable is
+  an error when the program loads, as are `eval`, `Function` and the like.
+- Objects from the page (elements, a library's objects) have their properties and
+  methods as fields: `el.value`, `chart.update()`.
+- On the server, `@mount` does nothing and `js` gives null.
+
 ### Single-page apps
 
 `url()` gives `{ path, query, hash }`: of the request on the server, and of the address

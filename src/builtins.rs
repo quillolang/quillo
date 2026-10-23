@@ -91,6 +91,8 @@ pub fn install(env: &Env) {
         ("live", live),
         ("parallel", parallel),
         ("every", every),
+        ("js", js),
+        ("js_new", js),
         ("css", tag_text),
         ("sql", tag_text),
         ("url", url),
@@ -1177,6 +1179,15 @@ fn every(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match (args.first(), args.get(1)) {
         (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
         _ => fail(line, "`every` takes milliseconds and a function: every(100, step)"),
+    }
+}
+
+/// `js("Chart", ...)` and `js_new(...)` in a component call the page's
+/// scripts, in the browser; rendering on the server, they give null.
+fn js(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    match args.first() {
+        Some(Value::Str(_)) => Ok(Value::Nil),
+        _ => fail(line, "`js` takes the name of what it calls first: js(\"Chart\", ...)"),
     }
 }
 

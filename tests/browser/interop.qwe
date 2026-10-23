@@ -1,0 +1,22 @@
+// Components and the page's own JavaScript: @mount hands an element to a
+// library once it is on the page, and js / js_new call into it. Driven by
+// interop.js (tests/browser.rs).
+
+component Widget() {
+    ~value = 1
+    ~shown = true
+    ~gauge = null
+    ~doubled = 0
+    <div>
+        {shown && <div class="gauge" @mount={(el) => {
+            gauge = js_new("Gauge", el, value)
+            () => js("lib.gone", el.className)
+        }}></div>}
+        <button id="inc" @click={() => { value += 1; gauge.set(value); doubled = js("lib.double", value) }}>+</button>
+        <button id="toggle" @click={() => { shown = !shown }}>toggle</button>
+        <span class="doubled">{doubled}</span>
+    </div>
+}
+
+route GET /lib.js = file("interop-lib.js")
+route GET / = <html><head><script src="/lib.js"></script></head><body><Widget/></body></html>
