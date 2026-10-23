@@ -177,6 +177,10 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "publish"
                 | "redirect"
                 | "respond"
+                | "tenant"
+                | "with_tenant"
+                | "tenant_from"
+                | "allow_cross_site"
         )
 }
 

@@ -42,6 +42,8 @@ pub struct Pool {
     freed: Condvar,
     max: usize,
     url: String,
+    /// Quillo's `schema=` option: every connection's search_path.
+    schema: Option<String>,
     lanes: OnceLock<Arc<Lanes>>,
 }
 
@@ -60,8 +62,11 @@ impl Pool {
     /// Parses the URL and opens one connection to check it. TLS is used
     /// when the server offers it (`sslmode=require` insists on it).
     pub fn open(url: &str) -> Result<Pool, String> {
-        let (url, max) = take_pool_size(url)?;
-        let config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        let (url, max, schema) = take_options(url)?;
+        let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        if let Some(s) = &schema {
+            config.options(&search_path(s));
+        }
         let pool = Pool {
             config,
             tls: tls(),
@@ -69,9 +74,17 @@ impl Pool {
             freed: Condvar::new(),
             max,
             url: url.clone(),
+            schema: schema.clone(),
             lanes: OnceLock::new(),
         };
-        let first = pool.checkout()?;
+        let mut first = pool.checkout()?;
+        // A tenant's schema is made when it is first used.
+        if let Some(s) = &schema {
+            if let Err(e) = first.batch(&format!("create schema if not exists \"{}\"", s)) {
+                pool.give_back(first);
+                return Err(e);
+            }
+        }
         pool.give_back(first);
         Ok(pool)
     }
@@ -104,7 +117,10 @@ impl Pool {
     pub fn lanes(&self) -> Arc<Lanes> {
         self.lanes
             .get_or_init(|| {
-                let config: tokio_postgres::Config = self.url.parse().expect("parsed before");
+                let mut config: tokio_postgres::Config = self.url.parse().expect("parsed before");
+                if let Some(s) = &self.schema {
+                    config.options(&search_path(s));
+                }
                 Arc::new(Lanes {
                     config,
                     tls: self.tls.clone(),
@@ -126,21 +142,35 @@ impl Pool {
     }
 }
 
-/// Takes Quillo's own `pool_size` option out of the URL.
-fn take_pool_size(url: &str) -> Result<(String, usize), String> {
-    let Some((base, query)) = url.split_once('?') else { return Ok((url.to_string(), DEFAULT_POOL)) };
+/// The connection option that makes `schema` where tables are looked for
+/// and made.
+fn search_path(schema: &str) -> String {
+    format!("-c search_path=\"{}\"", schema)
+}
+
+/// Takes Quillo's own options out of the URL: `pool_size`, and `schema`
+/// (`?schema={tenant}`: a schema per tenant in one database).
+fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
+    let Some((base, query)) = url.split_once('?') else { return Ok((url.to_string(), DEFAULT_POOL, None)) };
     let mut max = DEFAULT_POOL;
+    let mut schema = None;
     let mut rest = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         match pair.split_once('=') {
             Some(("pool_size", v)) => {
                 max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
             }
+            Some(("schema", v)) => {
+                if !crate::site::tenant_name_ok(v) {
+                    return Err(format!("bad schema: {:?} (lowercase letters, digits, - and _)", v));
+                }
+                schema = Some(v.to_string());
+            }
             _ => rest.push(pair),
         }
     }
     let url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
-    Ok((url, max))
+    Ok((url, max, schema))
 }
 
 /// The server's message for a database error, else the error itself.
@@ -1027,6 +1057,8 @@ mod tests {
         assert_eq!(date_text(9131), "2024-12-31");
         assert_eq!(time_text(3_723_000_001), "01:02:03.000001");
         assert_eq!(pg_text(&Value::list(vec![Value::Int(1), Value::str("a\"b"), Value::Nil])), "{\"1\",\"a\\\"b\",NULL}");
-        assert_eq!(take_pool_size("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3));
+        assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
+        assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
+        assert!(take_options("postgres://h/db?schema=a;drop").is_err());
     }
 }

@@ -57,6 +57,8 @@ pub struct Interp {
     pub server_fns: Arc<Vec<String>>,
     /// What the program set about its site (see `site::Site`).
     pub site: Arc<crate::site::Site>,
+    /// The current request's tenant, once worked out (`None` until then).
+    pub tenant: Option<Option<Arc<str>>>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
@@ -82,7 +84,7 @@ pub struct Interp {
     /// The Postgres connection this request's `db.transaction` holds.
     pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
     /// This program's database (SQLite or a Postgres pool), opened on first use.
-    pub db: Arc<std::sync::Mutex<Option<Arc<crate::db::Backend>>>>,
+    pub db: Arc<std::sync::Mutex<Option<crate::db::DbSlot>>>,
     /// Where this program is mounted ("" at the root, "/notes" under `mount`).
     /// Root-relative links, redirects and browser URLs get it as a prefix.
     pub base: String,
@@ -436,6 +438,7 @@ impl Interp {
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
+            tenant: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
@@ -471,6 +474,7 @@ impl Interp {
             restrictor: None,
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
+            tenant: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,
@@ -502,8 +506,7 @@ impl Interp {
         self.mark_impure();
         // Each program has its own topics (two mounted apps may both have
         // a `notes` table).
-        let topics: Vec<String> =
-            if self.base.is_empty() { topics } else { topics.into_iter().map(|t| format!("{}|{}", self.base, t)).collect() };
+        let topics: Vec<String> = topics.into_iter().map(|t| self.scope_topic(t)).collect();
         if self.tx_depth > 0 {
             self.pending.extend(topics);
         } else {
@@ -513,7 +516,7 @@ impl Interp {
 
     /// Notes that the running `live` loader depends on `topic`.
     pub fn watch(&mut self, topic: String) {
-        let topic = if self.base.is_empty() { topic } else { format!("{}|{}", self.base, topic) };
+        let topic = self.scope_topic(topic);
         self.note_dep(topic);
     }
 
@@ -698,7 +701,56 @@ impl Interp {
         it.allowed = self.allowed;
         it.restrictor = self.restrictor.clone();
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
+        it.tenant = self.tenant.clone();
         it
+    }
+
+    /// The tenant the code is running for: the request's (see `tenant_from`),
+    /// or the one `with_tenant` set; none outside a request.
+    pub fn tenant(&mut self) -> Option<Arc<str>> {
+        if let Some(t) = &self.tenant {
+            return t.clone();
+        }
+        let Some(rule) = self.site.tenant_rule.clone() else {
+            self.tenant = Some(None);
+            return None;
+        };
+        let Some(Value::Map(req)) = self.request_value() else { return None };
+        let found = match rule {
+            crate::site::TenantRule::Subdomain(domain) => {
+                let host = match req.get("headers") {
+                    Some(Value::Map(h)) => match h.get("host") {
+                        Some(Value::Str(s)) => s.to_ascii_lowercase(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                let host = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(h, _)| h);
+                host.strip_suffix(domain.as_str()).and_then(|s| s.strip_suffix('.')).map(str::to_string)
+            }
+            crate::site::TenantRule::Function(f) => match self.call(&f, vec![Value::Map(req)], 0) {
+                Ok(Value::Str(s)) => Some(s.to_string()),
+                _ => None,
+            },
+        };
+        // A name that could not be a tenant's is no tenant.
+        let t: Option<Arc<str>> = found.filter(|n| crate::site::tenant_name_ok(n)).map(Arc::from);
+        self.tenant = Some(t.clone());
+        t
+    }
+
+    /// A topic as this program and tenant see it: a tenant's own unless it
+    /// is a global variable's (`var:`), which all tenants share.
+    fn scope_topic(&mut self, topic: String) -> String {
+        let topic = if topic.starts_with("var:") || self.site.tenant_rule.is_none() && self.tenant.is_none() {
+            topic
+        } else {
+            match self.tenant() {
+                Some(t) => format!("{}@{}", t, topic),
+                None => topic,
+            }
+        };
+        if self.base.is_empty() { topic } else { format!("{}|{}", self.base, topic) }
     }
 
     /// Parses and runs a program's top level, registering its routes.

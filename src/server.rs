@@ -221,6 +221,7 @@ impl Interp {
             }
         }
         self.rendered_island = false;
+        self.tenant = None;
         let mut resp = self.handle_inner(req);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {

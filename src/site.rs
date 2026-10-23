@@ -2,8 +2,32 @@
 //! top-level calls such as `allow_cross_site("/payments/return")`. Shared,
 //! unchanged, by every handle on the program (see `Interp::fork`).
 
+use crate::value::Value;
+
+/// How a request's tenant is found (`tenant_from`).
+#[derive(Clone)]
+pub enum TenantRule {
+    /// The part of the host before this domain: `acme.example.com` is `acme`.
+    Subdomain(String),
+    /// What this function gives for the request: a name, or null.
+    Function(Value),
+}
+
+/// Whether `name` can be a tenant's: lowercase letters, digits, `-` and `_`,
+/// starting with a letter or digit, at most 63 characters, so it is safe in
+/// a file name, a database name or a URL.
+pub fn tenant_name_ok(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+}
+
 #[derive(Default, Clone)]
 pub struct Site {
+    /// How each request's tenant is found; none for a single-tenant program.
+    pub tenant_rule: Option<TenantRule>,
     /// Path prefixes that take form posts from other sites (a payment
     /// provider's return, a single sign-on callback).
     pub cross_site_ok: Vec<String>,

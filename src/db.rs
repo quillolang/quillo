@@ -49,6 +49,24 @@ pub enum Backend {
     Postgres(pg::Pool),
 }
 
+/// The program's database: one, or one per tenant when `db.open`'s target
+/// has `{tenant}` in it (`data/{tenant}.db`, `postgres://host/app_{tenant}`).
+#[derive(Clone)]
+pub enum DbSlot {
+    One(Arc<Backend>),
+    PerTenant(Arc<TenantDbs>),
+}
+
+/// Tenants' databases, opened when first used (and migrated, after
+/// `db.migrate`); the least recently used are closed past `OPEN_TENANTS`.
+pub struct TenantDbs {
+    template: String,
+    open: Mutex<indexmap::IndexMap<String, Arc<Backend>>>,
+}
+
+/// Tenant databases kept open at once.
+const OPEN_TENANTS: usize = 1024;
+
 /// A Postgres connection kept by one request for its `db.transaction`.
 pub struct PgTx {
     backend: Arc<Backend>,
@@ -81,15 +99,63 @@ fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
     connect(&full).map(|c| Backend::Sqlite(Mutex::new(c))).map_err(|e| e.to_string())
 }
 
-/// The program's database, opening the default one if needed.
+/// The program's database (the tenant's, for one per tenant), opening the
+/// default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
-    if let Some(b) = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        return Ok(b);
+    let slot = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match slot {
+        Some(DbSlot::One(b)) => return Ok(b),
+        Some(DbSlot::PerTenant(t)) => return tenant_backend(it, &t),
+        None => {}
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
+    if target.contains("{tenant}") {
+        let t = Arc::new(TenantDbs { template: target, open: Mutex::new(Default::default()) });
+        *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::PerTenant(t.clone()));
+        return tenant_backend(it, &t);
+    }
     let b = Arc::new(open_backend(it, &target)?);
     let mut slot = it.db.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(slot.get_or_insert(b).clone())
+    match slot.get_or_insert(DbSlot::One(b)) {
+        DbSlot::One(b) => Ok(b.clone()),
+        DbSlot::PerTenant(_) => unreachable!("set just above"),
+    }
+}
+
+/// The current tenant's database, opened (and migrated) on first use.
+fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>, String> {
+    let Some(name) = it.tenant() else {
+        return Err("the database is one per tenant ({tenant} in its target), and this code runs for none: see tenant_from and with_tenant".into());
+    };
+    {
+        let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = open.get_index_of(&*name) {
+            // The most recently used go last.
+            let last = open.len() - 1;
+            open.move_index(i, last);
+            return Ok(open[last].clone());
+        }
+    }
+    let target = dbs.template.replace("{tenant}", &name);
+    if !pg::is_url(&target) && target != ":memory:" {
+        let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+        if let Some(dir) = full.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    let b = Arc::new(open_backend(it, &target).map_err(|e| format!("tenant {}: {}", name, e))?);
+    if let Some(dir) = it.site.migrations.clone() {
+        let mb = b.clone();
+        let applied = it.unlocked(move || crate::migrate::run(&mb, &dir)).map_err(|e| format!("tenant {}: {}", name, e))?;
+        for m in applied {
+            eprintln!("quillo: applied migration {} for tenant {}", m, name);
+        }
+    }
+    let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
+    if open.len() >= OPEN_TENANTS {
+        open.shift_remove_index(0);
+    }
+    Ok(open.entry(name.to_string()).or_insert(b).clone())
 }
 
 /// Runs `f` on a Postgres connection without holding the interpreter
@@ -267,9 +333,15 @@ fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
 /// postgres:// URL.
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let target = sql_arg(&args, "db.open", line)?;
+    // One database per tenant: each is opened when its tenant first uses it.
+    if target.contains("{tenant}") {
+        let t = TenantDbs { template: target, open: Mutex::new(Default::default()) };
+        *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::PerTenant(Arc::new(t)));
+        return Ok(Value::Nil);
+    }
     match open_backend(it, &target) {
         Ok(b) => {
-            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(b));
+            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::One(Arc::new(b)));
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),
@@ -286,6 +358,12 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(other) => return fail(line, format!("`db.migrate` expects a folder name, got {}", other.type_name())),
     };
     let full = it.base_dir.join(&dir);
+    std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
+    // One database per tenant: each is migrated when first opened.
+    let per_tenant = matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::PerTenant(_)));
+    if per_tenant && it.tenant().is_none() {
+        return Ok(Value::list(Vec::new()));
+    }
     let b = match backend(it) {
         Ok(b) => b,
         Err(e) => return fail(line, format!("db.migrate: {}", e)),
@@ -293,7 +371,6 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let to = full.clone();
     match it.unlocked(move || crate::migrate::run(&b, &to)) {
         Ok(applied) => {
-            std::sync::Arc::make_mut(&mut it.site).migrations = Some(full);
             for name in &applied {
                 eprintln!("quillo: applied migration {}", name);
             }

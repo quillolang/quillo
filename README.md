@@ -710,6 +710,39 @@ db.migrate()
   checked against the usual public certificate authorities, as hosted Postgres services
   use.
 
+### Many tenants
+
+One program can serve many tenants (customers, teams, sites), each with its own data:
+
+```quillo
+tenant_from("example.com")          // acme.example.com is tenant "acme"
+db.open("data/{tenant}.db")         // a SQLite file per tenant
+db.migrate()                        // run for each tenant's database when first opened
+
+route GET / = <h1>Welcome, {tenant()}</h1>
+```
+
+- `tenant_from("example.com")` takes the part of the host before the domain;
+  `tenant_from((request) => ...)` takes what the function gives for the request (a
+  header, a path segment, a lookup), a name or null. `tenant()` is the current one, or
+  null. A tenant's name is lowercase letters, digits, `-` and `_` (at most 63); anything
+  else is no tenant, so a name is always safe in a file name or a database name.
+- A `db.open` target with `{tenant}` in it is a database per tenant, opened the first
+  time the tenant uses it and migrated then: a SQLite file each, a PostgreSQL schema
+  each in one database with `?schema={tenant}` (made when first used), or a database
+  each with `postgres://host/app_{tenant}` (made by you beforehand). Each tenant has
+  its own connections, so give PostgreSQL a small `pool_size`. Code that runs for no
+  tenant, such as a request to the bare domain, gets an error from `db`. At most 1,024
+  tenants' databases are open at once; others are opened again when needed.
+- Live updates stay within a tenant: a change to one tenant's table wakes only that
+  tenant's pages.
+- `with_tenant("acme", () => ...)` runs code for a tenant outside a request, in a script
+  or a scheduled job.
+- What stays shared: global variables, one copy for the whole process, so keep a
+  tenant's data in its database (or in maps keyed by `tenant()`). Views that call
+  `tenant()` or read the database are never served from the view cache. Cookies
+  belong to the host they were set on, so each subdomain has its own.
+
 ### HTTP client
 
 ```quillo

@@ -60,6 +60,9 @@ pub fn install(env: &Env) {
         ("sleep", sleep),
         ("file", file),
         ("allow_cross_site", allow_cross_site),
+        ("tenant", tenant),
+        ("tenant_from", tenant_from),
+        ("with_tenant", with_tenant),
         ("redirect", redirect),
         ("respond", respond),
         ("read_file", read_file),
@@ -634,6 +637,51 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     Arc::make_mut(&mut it.site).cross_site_ok.push(p.to_string());
     Ok(Value::Nil)
+}
+
+/// `tenant()`: the tenant the code runs for (see `tenant_from`), or null.
+fn tenant(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(it.tenant().map_or(Value::Nil, |t| Value::Str(t)))
+}
+
+/// `tenant_from("example.com")`, at the top of a program: each request's
+/// tenant is the part of its host before the domain (`acme.example.com` is
+/// `acme`). `tenant_from((request) => ...)`: what the function gives for the
+/// request, a name or null. Names are lowercase letters, digits, `-` and
+/// `_`; anything else is no tenant.
+fn tenant_from(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let rule = match args.first() {
+        Some(Value::Str(d)) => {
+            let d = d.trim_start_matches('.').to_ascii_lowercase();
+            if d.is_empty() || d.contains('/') || d.contains(':') {
+                return fail(line, format!("`tenant_from` needs a domain such as \"example.com\", got {:?}", d));
+            }
+            crate::site::TenantRule::Subdomain(d)
+        }
+        Some(f @ (Value::Func(_) | Value::Builtin(..))) => crate::site::TenantRule::Function(f.clone()),
+        other => {
+            return fail(line, format!("`tenant_from` expects a domain or a function of the request, got {}", other.map_or("nothing", |v| v.type_name())))
+        }
+    };
+    Arc::make_mut(&mut it.site).tenant_rule = Some(rule);
+    Ok(Value::Nil)
+}
+
+/// `with_tenant("acme", () => ...)`: runs the function for that tenant (a
+/// scheduled job, a script), with its database and live updates.
+fn with_tenant(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let name = s_arg(&args, 0, "with_tenant", line)?;
+    if !crate::site::tenant_name_ok(&name) {
+        return fail(line, format!("`with_tenant`: {:?} cannot be a tenant's name (lowercase letters, digits, - and _)", &*name));
+    }
+    let f = match args.get(1) {
+        Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
+        other => return fail(line, format!("`with_tenant` expects a function second, got {}", other.map_or("nothing", |v| v.type_name()))),
+    };
+    let outer = it.tenant.replace(Some(Arc::from(&*name)));
+    let r = it.call(&f, Vec::new(), line);
+    it.tenant = outer;
+    r
 }
 
 /// `redirect(url, status = 303)`. 303 makes browsers follow with a GET,
