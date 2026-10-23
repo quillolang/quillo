@@ -50,7 +50,7 @@ pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
     }
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
-        for name in &it.server_fns {
+        for name in it.server_fns.iter() {
             let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
@@ -490,7 +490,7 @@ fn lit_js(l: &Lit) -> String {
 impl<'a> Compiler<'a> {
     fn new(it: &'a Interp) -> Self {
         let mut assigned = HashSet::new();
-        for stmts in &it.program {
+        for stmts in it.program.iter() {
             collect_assigned(stmts, &mut assigned);
         }
         Compiler {

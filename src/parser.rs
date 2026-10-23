@@ -536,7 +536,10 @@ impl Parser {
         } else {
             return self.err_at("expected `=` or `{` to start the route body");
         };
-        Ok(RouteDef { method, path, query, body_pat, body, line })
+        let uses_request = body_pat.is_some()
+            || names_request(&body)
+            || query.as_ref().map_or(false, pattern_names_request);
+        Ok(RouteDef { method, path, query, body_pat, body, line, uses_request })
     }
 
     /// Runs `f` with `name => ...` arrows allowed again (inside brackets).
@@ -1504,5 +1507,27 @@ fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {
     text.clear();
     if !t.is_empty() {
         children.push(HtmlChild::Expr(Expr::Lit(Lit::Str(t.into()))));
+    }
+}
+
+/// Whether `e` mentions `request` anywhere (closures included).
+fn names_request(e: &Expr) -> bool {
+    let mut found = false;
+    crate::check::walk_expr(e, &mut |x| {
+        if let Expr::Ident(n, _) = x {
+            found |= n == "request";
+        }
+    });
+    found
+}
+
+fn pattern_names_request(p: &Pattern) -> bool {
+    match p {
+        Pattern::Record(fields) => {
+            fields.iter().any(|f| f.default.as_ref().map_or(false, names_request) || pattern_names_request(&f.pat))
+        }
+        Pattern::List(items, _) | Pattern::Alt(items) => items.iter().any(pattern_names_request),
+        Pattern::As(q, _) => pattern_names_request(q),
+        _ => false,
     }
 }

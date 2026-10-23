@@ -42,9 +42,11 @@ pub enum Mode {
 
 pub struct Interp {
     pub globals: Env,
-    pub routes: Vec<Arc<RouteDef>>,
-    pub base_dir: PathBuf,
-    loaded: HashSet<PathBuf>,
+    // Set while the program loads, then only read: shared by every handle
+    // on the program (`fork`), which is then a few reference counts.
+    pub routes: Arc<Vec<Arc<RouteDef>>>,
+    pub base_dir: Arc<Path>,
+    loaded: Arc<HashSet<PathBuf>>,
     pub shared: Arc<Shared>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
@@ -52,13 +54,16 @@ pub struct Interp {
     allowed: u8,
     restrictor: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
-    pub server_fns: Vec<String>,
+    pub server_fns: Arc<Vec<String>>,
     /// Every statement the program has loaded, for the browser compiler.
-    pub program: Vec<Arc<Vec<Stmt>>>,
+    pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
     /// The browser bundle (`/_quillo/quillo.js`), built after loading.
     pub client_js: Arc<String>,
     /// The request being handled, visible as `request` inside `server fn`s.
     pub current_request: Option<Value>,
+    /// The request being handled, when its map has not been made yet (see
+    /// `RouteDef::uses_request`): made on first use by `request_value`.
+    pub(crate) pending_request: Option<crate::server::PendingRequest>,
     /// State of the components being rendered, innermost last, with the
     /// `live(...)` subscriptions of each.
     islands: Vec<(Map, Map)>,
@@ -402,17 +407,18 @@ impl Interp {
         crate::builtins::install(&globals);
         Interp {
             globals,
-            routes: Vec::new(),
-            base_dir: base_dir.into(),
-            loaded: HashSet::new(),
+            routes: Arc::new(Vec::new()),
+            base_dir: Arc::from(base_dir.into().as_path()),
+            loaded: Arc::new(HashSet::new()),
             shared,
             depth: 0,
             allowed: ALL_EFFECTS,
             restrictor: None,
-            server_fns: Vec::new(),
-            program: Vec::new(),
+            server_fns: Arc::new(Vec::new()),
+            program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             current_request: None,
+            pending_request: None,
             islands: Vec::new(),
             pg_tx: std::sync::Mutex::new(None),
             reads: None,
@@ -446,6 +452,7 @@ impl Interp {
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             current_request: None,
+            pending_request: None,
             islands: Vec::new(),
             pg_tx: std::sync::Mutex::new(None),
             reads: None,
@@ -564,6 +571,16 @@ impl Interp {
         f()
     }
 
+    /// The request being handled, as the `request` map (made now if needed).
+    pub fn request_value(&mut self) -> Option<Value> {
+        if self.current_request.is_none() {
+            if let Some(p) = &self.pending_request {
+                self.current_request = Some(p.make());
+            }
+        }
+        self.current_request.clone()
+    }
+
     /// `parallel(f, g, ...)`: calls the functions at once and gives back
     /// their results, in order. Each runs on a thread of its own with its own
     /// handle on the program; since waiting (for the database, HTTP, `sleep`)
@@ -590,6 +607,32 @@ impl Interp {
             let mut out = Vec::with_capacity(fs.len());
             for f in &fs {
                 out.push(self.call(f, Vec::new(), line)?);
+            }
+            return Ok(Value::list(out));
+        }
+        // In the server: each function as a coroutine on the event loop, so
+        // their waits (queries, `http.*`) overlap without threads.
+        if crate::httpd::in_task() {
+            let mut results: Vec<Option<Result<Value, Ctrl>>> = (0..fs.len()).map(|_| None).collect();
+            let base = results.as_mut_ptr() as usize;
+            let children: Vec<Box<dyn FnOnce()>> = fs
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let mut it = self.task_fork();
+                    Box::new(move || {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)))
+                            .unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"));
+                        // SAFETY: `results` is not touched (or moved) while
+                        // the children run; the request waits for them.
+                        unsafe { *(base as *mut Option<Result<Value, Ctrl>>).add(i) = Some(r) };
+                    }) as Box<dyn FnOnce()>
+                })
+                .collect();
+            crate::httpd::run_children(children);
+            let mut out = Vec::with_capacity(results.len());
+            for r in results {
+                out.push(r.unwrap_or_else(|| fail(line, "a function given to `parallel` failed unexpectedly"))?);
             }
             return Ok(Value::list(out));
         }
@@ -632,14 +675,14 @@ impl Interp {
         it.depth = self.depth;
         it.allowed = self.allowed;
         it.restrictor = self.restrictor.clone();
-        it.current_request = self.current_request.clone();
+        it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it
     }
 
     /// Parses and runs a program's top level, registering its routes.
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
         let stmts = Arc::new(Parser::new(src).parse_program().map_err(|e| e.in_file(file))?);
-        self.program.push(stmts.clone());
+        Arc::make_mut(&mut self.program).push(stmts.clone());
         let env = self.globals.clone();
         let mut last = Value::Nil;
         for s in stmts.iter() {
@@ -667,7 +710,7 @@ impl Interp {
         let src = std::fs::read_to_string(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
         if let Ok(p) = path.canonicalize() {
-            self.loaded.insert(p);
+            Arc::make_mut(&mut self.loaded).insert(p);
         }
         self.load_source(&src, &path.display().to_string())
     }
@@ -720,25 +763,25 @@ impl Interp {
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
                 if def.server && !self.server_fns.contains(&def.name) {
-                    self.server_fns.push(def.name.clone());
+                    Arc::make_mut(&mut self.server_fns).push(def.name.clone());
                 }
                 Ok(Value::Nil)
             }
             Stmt::Route(r) => {
-                self.routes.push(r.clone());
+                Arc::make_mut(&mut self.routes).push(r.clone());
                 Ok(Value::Nil)
             }
             Stmt::Use(path, line) => {
                 let full = self.base_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                if !self.loaded.insert(key) {
+                if !Arc::make_mut(&mut self.loaded).insert(key) {
                     return Ok(Value::Nil);
                 }
                 let src = std::fs::read_to_string(&full)
                     .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
                 let stmts = Arc::new(Parser::new(&src).parse_program().map_err(|e| e.in_file(&fname))?);
-                self.program.push(stmts.clone());
+                Arc::make_mut(&mut self.program).push(stmts.clone());
                 let g = self.globals.clone();
                 for s in stmts.iter() {
                     match self.exec_stmt(s, &g) {
@@ -755,12 +798,12 @@ impl Interp {
                     return fail(*line, "`mount` must be at the top level");
                 }
                 let full = self.base_dir.join(file);
-                let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.clone());
+                let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, self.shared.clone());
                 sub.base = format!("{}{}", self.base, prefix);
                 sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
                 // Watch the mounted program's files too.
-                self.loaded.extend(sub.files());
+                Arc::make_mut(&mut self.loaded).extend(sub.files());
                 self.mounts.retain(|(p, _)| p != prefix);
                 self.mounts.push((prefix.clone(), sub));
                 Ok(Value::Nil)
@@ -1245,7 +1288,7 @@ impl Interp {
     fn bind_args(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
         if def.server {
-            if let Some(req) = &self.current_request {
+            if let Some(req) = self.request_value() {
                 define(&scope, "request", req.clone());
                 self.mark_impure();
             }

@@ -132,6 +132,30 @@ fn cross_site(req: &HttpRequest) -> bool {
 }
 
 /// The `request` value a route sees.
+/// What `build_request` needs, kept until the request map is wanted.
+pub(crate) struct PendingRequest {
+    /// The request being handled; set only while it is handled.
+    req: *const HttpRequest,
+    path: String,
+    query: Value,
+    params: Value,
+}
+
+// SAFETY: it points at the request its handler is answering, and is
+// cleared before the handler returns.
+unsafe impl Send for PendingRequest {}
+unsafe impl Sync for PendingRequest {}
+
+impl PendingRequest {
+    pub(crate) fn make(&self) -> Value {
+        // SAFETY: see above.
+        let req = unsafe { &*self.req };
+        let mut m = build_request(req, &self.path, &self.query);
+        m.insert("params".into(), self.params.clone());
+        Value::map(m)
+    }
+}
+
 fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     let header = |name: &str| {
         req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).unwrap_or("")
@@ -225,7 +249,7 @@ impl Interp {
         let mut path_matched = false;
         let mut method_matched = false;
         let routes = self.routes.clone();
-        for r in &routes {
+        for r in routes.iter() {
             let Some(params) = match_path(&r.path, &segs) else { continue };
             path_matched = true;
             if r.method != "ANY" && r.method != method {
@@ -233,14 +257,24 @@ impl Interp {
             }
             method_matched = true;
 
-            let mut reqmap = match base.take() {
-                Some(m) => m,
-                None => build_request(req, path, &query_v),
-            };
-            reqmap.insert("params".into(), Value::map(params.iter().cloned().collect()));
-            let reqv = Value::map(reqmap);
+            let params_v = Value::map(params.iter().cloned().collect());
             let scope = Scope::child(&self.globals);
-            define(&scope, "request", reqv.clone());
+            // The request map only for a route that can see it; for others
+            // it is made if something asks (`url()`, a server fn).
+            let reqv = if r.uses_request {
+                let mut reqmap = match base.take() {
+                    Some(m) => m,
+                    None => build_request(req, path, &query_v),
+                };
+                reqmap.insert("params".into(), params_v);
+                let reqv = Value::map(reqmap);
+                define(&scope, "request", reqv.clone());
+                reqv
+            } else {
+                self.pending_request =
+                    Some(PendingRequest { req: req as *const HttpRequest, path: path.to_string(), query: query_v.clone(), params: params_v });
+                Value::Nil
+            };
             for (k, v) in params {
                 define(&scope, &k, v);
             }
@@ -260,15 +294,17 @@ impl Interp {
                 }
             }
             if !matched {
+                self.pending_request = None;
                 continue;
             }
             for (k, v) in binds {
                 define(&scope, &k, v);
             }
 
-            self.current_request = Some(reqv);
+            self.current_request = r.uses_request.then_some(reqv);
             let mut resp = finish(self.eval(&r.body, &scope));
             self.current_request = None;
+            self.pending_request = None;
             if req.method == "HEAD" {
                 resp.body.clear();
             }

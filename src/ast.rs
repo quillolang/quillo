@@ -203,6 +203,11 @@ pub struct RouteDef {
     pub body_pat: Option<Pattern>,
     pub body: Expr,
     pub line: u32,
+    /// Whether the route can see `request`: its body (or a default in its
+    /// patterns) names it, or it has a body pattern, which is matched
+    /// against it. Otherwise the request map is made only if something asks
+    /// for it (`url()`, a server fn).
+    pub uses_request: bool,
 }
 
 #[derive(Debug, Clone)]

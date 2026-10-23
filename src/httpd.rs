@@ -54,9 +54,28 @@ type Job = Box<dyn FnOnce() + Send>;
 enum Wait {
     Run(Job),
     Spawn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+    /// Functions to run as coroutines of their own (`parallel`); the
+    /// request carries on when all of them have ended.
+    Children(Vec<Box<dyn FnOnce()>>),
 }
 
-type Task = Coroutine<(), Wait, Done, DefaultStack>;
+/// How a coroutine ends.
+enum End {
+    Request(Done),
+    Child,
+}
+
+type Task = Coroutine<(), Wait, End, DefaultStack>;
+
+/// What a coroutine belongs to.
+enum Owner {
+    Conn(usize),
+    Parent(usize),
+}
+
+/// A child's stack: smaller than a request's (it grows when needed).
+const CHILD_STACK: usize = 512 << 10;
+const SPARE_CHILD_STACKS: usize = 1024;
 
 /// What a request's coroutine gives back when it ends.
 struct Done {
@@ -69,7 +88,9 @@ struct Running {
     task: Task,
     /// Where its stack ends now (it may have grown).
     limit: usize,
-    slot: usize,
+    owner: Owner,
+    /// Children still running (`parallel`).
+    children: usize,
 }
 
 enum Slot {
@@ -139,6 +160,17 @@ pub fn wait_elsewhere<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
         Ok(v) => Ok(v),
         Err(p) => std::panic::resume_unwind(p),
     }
+}
+
+/// In a request's coroutine: runs each function as a coroutine of its own,
+/// so that their waits overlap, and returns when all have ended.
+pub fn run_children(fs: Vec<Box<dyn FnOnce()>>) {
+    let y = YIELDER.with(|c| c.get());
+    assert!(y != 0, "run_children outside a request");
+    // SAFETY: as in `wait_elsewhere`.
+    let yielder = unsafe { &*(y as *const Yielder<(), Wait>) };
+    yielder.suspend(Wait::Children(fs));
+    YIELDER.with(|c| c.set(y));
 }
 
 /// Whether this is a request's coroutine.
@@ -365,6 +397,8 @@ fn run_loop(
         free_tasks: Vec::new(),
         workers: Vec::new(),
         stacks: Vec::new(),
+        child_stacks: Vec::new(),
+        runnable: Vec::new(),
         pool,
         now: Instant::now(),
         chunk: vec![0u8; 16 << 10].into_boxed_slice(),
@@ -393,6 +427,9 @@ struct Loop {
     /// Handles on the program for requests to run with, kept for reuse.
     workers: Vec<Box<Worker>>,
     stacks: Vec<DefaultStack>,
+    child_stacks: Vec<DefaultStack>,
+    /// Tasks whose children have all ended, to resume.
+    runnable: Vec<usize>,
     pool: Arc<Pool>,
     /// The time, as of the last wait for events.
     now: Instant,
@@ -416,6 +453,11 @@ impl Loop {
             for id in done {
                 self.step(id);
             }
+            while !self.runnable.is_empty() {
+                for id in std::mem::take(&mut self.runnable) {
+                    self.step(id);
+                }
+            }
             let ready = self.ready.len();
             for _ in 0..ready {
                 if let Some(i) = self.ready.pop_front() {
@@ -430,7 +472,10 @@ impl Loop {
             flush_log();
             // Sleep only when there is nothing to do.
             self.pool.sleeping.store(true, SeqCst);
-            let idle = self.ready.is_empty() && lock(&self.pool.done).is_empty() && lock(&self.inbox.conns).is_empty();
+            let idle = self.ready.is_empty()
+                && self.runnable.is_empty()
+                && lock(&self.pool.done).is_empty()
+                && lock(&self.inbox.conns).is_empty();
             let r = if idle {
                 gil.release();
                 let r = self.poll.poll(&mut events, Some(Duration::from_secs(1)));
@@ -621,14 +666,52 @@ impl Loop {
         let task = Task::with_stack(stack, move |y: &Yielder<(), Wait>, ()| {
             YIELDER.with(|c| c.set(y as *const Yielder<(), Wait> as usize));
             let fate = answer(&app, &mut worker, &mut conn, items);
-            Done { conn, worker, fate }
+            End::Request(Done { conn, worker, fate })
         });
+        let id = self.new_task(Running { task, limit, owner: Owner::Conn(i), children: 0 });
+        self.step(id);
+    }
+
+    fn new_task(&mut self, r: Running) -> usize {
         let id = self.free_tasks.pop().unwrap_or_else(|| {
             self.tasks.push(None);
             self.tasks.len() - 1
         });
-        self.tasks[id] = Some(Running { task, limit, slot: i });
+        self.tasks[id] = Some(r);
+        id
+    }
+
+    /// Starts `f` as a child of task `parent`.
+    fn start_child(&mut self, parent: usize, f: Box<dyn FnOnce()>) {
+        let stack = match self.child_stacks.pop() {
+            Some(s) => s,
+            None => match DefaultStack::new(CHILD_STACK) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Nothing runs it: its result stays empty, which
+                    // `parallel` reports as a failure.
+                    log(format!("quillo: no stack for a parallel call: {}\n", e));
+                    return self.child_ended(parent);
+                }
+            },
+        };
+        let limit = crate::stack::limit_of(&stack);
+        let task = Task::with_stack(stack, move |y: &Yielder<(), Wait>, ()| {
+            YIELDER.with(|c| c.set(y as *const Yielder<(), Wait> as usize));
+            f();
+            End::Child
+        });
+        let id = self.new_task(Running { task, limit, owner: Owner::Parent(parent), children: 0 });
         self.step(id);
+    }
+
+    fn child_ended(&mut self, parent: usize) {
+        if let Some(p) = self.tasks[parent].as_mut() {
+            p.children -= 1;
+            if p.children == 0 {
+                self.runnable.push(parent);
+            }
+        }
     }
 
     /// Runs task `id` until it waits or ends.
@@ -648,22 +731,50 @@ impl Loop {
                     fut.await;
                 });
             }
-            Ok(CoroutineResult::Return(done)) => {
+            Ok(CoroutineResult::Yield(Wait::Children(fs))) => {
+                if let Some(r) = self.tasks[id].as_mut() {
+                    r.children = fs.len();
+                }
+                if fs.is_empty() {
+                    self.runnable.push(id);
+                }
+                for f in fs {
+                    self.start_child(id, f);
+                }
+            }
+            Ok(CoroutineResult::Return(end)) => {
                 let r = self.tasks[id].take().expect("running");
                 self.free_tasks.push(id);
-                if self.stacks.len() < SPARE_STACKS {
-                    self.stacks.push(r.task.into_stack());
+                match (end, r.owner) {
+                    (End::Request(done), Owner::Conn(slot)) => {
+                        if self.stacks.len() < SPARE_STACKS {
+                            self.stacks.push(r.task.into_stack());
+                        }
+                        self.workers.push(done.worker);
+                        self.finish(slot, done.conn, done.fate);
+                    }
+                    (_, Owner::Parent(parent)) => {
+                        if self.child_stacks.len() < SPARE_CHILD_STACKS {
+                            self.child_stacks.push(r.task.into_stack());
+                        }
+                        self.child_ended(parent);
+                    }
+                    (End::Child, Owner::Conn(_)) => unreachable!("a request ends with its answer"),
                 }
-                self.workers.push(done.worker);
-                self.finish(r.slot, done.conn, done.fate);
             }
             Err(_) => {
-                // A bug in the server itself: drop the connection, keep serving.
+                // A bug in the server itself: drop the connection (or end
+                // the child), keep serving.
                 let r = self.tasks[id].take().expect("running");
                 self.free_tasks.push(id);
                 eprintln!("quillo: internal error (a bug in Quillo) while answering a request");
-                self.slots[r.slot] = Slot::Free;
-                self.free.push(r.slot);
+                match r.owner {
+                    Owner::Conn(slot) => {
+                        self.slots[slot] = Slot::Free;
+                        self.free.push(slot);
+                    }
+                    Owner::Parent(parent) => self.child_ended(parent),
+                }
             }
         }
     }

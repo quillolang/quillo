@@ -441,7 +441,10 @@ B.every = meta((ms, f) => {
 
 // `parallel(f, g, ...)`: calls them at once (server calls overlap); their
 // results, in order.
-B.parallel = meta(async (...fs) => Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)())), "parallel", null);
+B.parallel = meta(async (...fs) => {
+  if (fs.length === 1 && Array.isArray(fs[0])) fs = fs[0];
+  return Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)()));
+}, "parallel", null);
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 B.str = meta((v) => display(v), "str", null);
 B.int = meta((v) => {

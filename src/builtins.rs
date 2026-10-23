@@ -942,9 +942,14 @@ fn every(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
-/// `parallel(f, g, ...)`: calls the functions at once; their results, in order.
+/// `parallel(f, g, ...)` or `parallel([f, g, ...])`: calls the functions at
+/// once; their results, in order.
 fn parallel(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    it.run_parallel(args, line)
+    let fs = match args.as_slice() {
+        [Value::List(l)] => l.to_vec(),
+        _ => args,
+    };
+    it.run_parallel(fs, line)
 }
 
 /// `publish("topic", ...)`: wakes pages whose `live` data watched the topic.
@@ -967,7 +972,8 @@ fn watch(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
 /// being handled; in the browser, the address bar (and components that call
 /// it re-render when it changes).
 fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
-    let (path, query) = match &it.current_request {
+    let current = it.request_value();
+    let (path, query) = match &current {
         Some(Value::Map(m)) => (m.get("path").cloned().unwrap_or(Value::str("/")), m.get("query").cloned().unwrap_or(Value::map(Map::new()))),
         _ => (Value::str("/"), Value::map(Map::new())),
     };

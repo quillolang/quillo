@@ -120,6 +120,25 @@ fn slow(x) { sleep(400); n += 1; x }
 }
 
 #[test]
+fn parallel_takes_a_list_and_nests() {
+    let d = temp_dir("parallel-list");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        "fn slow(x) { sleep(300); x * 10 }\n\
+         route GET /list = parallel(range(0, 8) | map((i) => () => slow(i)))\n\
+         route GET /nested = parallel(() => parallel(() => slow(1), () => slow(2)), () => slow(3))\n",
+    )
+    .unwrap();
+    let srv = start(&f, &[]);
+    let t0 = Instant::now();
+    assert_eq!(get(srv.port, "/list").1, "[0,10,20,30,40,50,60,70]");
+    assert_eq!(get(srv.port, "/nested").1, "[[10,20],30]");
+    // Eight waits of 300 ms at once, then two levels of them.
+    assert!(t0.elapsed() < Duration::from_millis(1100), "took {:?}", t0.elapsed());
+}
+
+#[test]
 fn instances_take_connections_in_turn_and_share_the_database() {
     let d = temp_dir("instances");
     let f = d.join("app.qwe");

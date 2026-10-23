@@ -448,3 +448,19 @@ route GET /where = url().path
 fn rpc_at(it: &mut Interp, url: &str, body: &str) -> HttpResponse {
     send(it, "POST", url, Some("application/json"), body)
 }
+
+#[test]
+fn routes_that_do_not_name_request_still_answer_what_asks_for_it() {
+    // The request map is made only when something asks for it.
+    let mut it = app(
+        "server fn who() = request.path\n\
+         route GET /u/:id = url().path\n\
+         route GET /w = who()\n\
+         route GET /c = (() => request.path)()\n\
+         route GET /p/:id = { id, n: len(keys(request.params)) }\n",
+    );
+    assert_eq!(get(&mut it, "/u/7").text(), "/u/7");
+    assert_eq!(get(&mut it, "/w").text(), "/w");
+    assert_eq!(get(&mut it, "/c").text(), "/c");
+    assert_eq!(get(&mut it, "/p/3").text(), r#"{"id":"3","n":1}"#);
+}
