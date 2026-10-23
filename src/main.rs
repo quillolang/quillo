@@ -37,6 +37,11 @@ options for `run`:
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
   --max-body N   largest request body to accept, in bytes (default 10 MiB)
+  --log F        the request log on stderr: text (the default), json (a JSON
+                 object per line: time, method, path, status, ms, ip, tenant)
+                 or off
+  --metrics      answer GET /_quillo/metrics: request counts and times, open
+                 connections and uptime, in Prometheus's text format
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
                  servers there; the secret is read from $LIMER_ADMIN_SECRET
@@ -154,6 +159,24 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 quillo::viewcache::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
+            }
+            ("--metrics", _) => {
+                quillo::metrics::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                quillo::metrics::start();
+                i += 1;
+                continue;
+            }
+            ("--log", Some(v)) => {
+                let format = match v.as_str() {
+                    "text" => quillo::metrics::TEXT,
+                    "json" => quillo::metrics::JSON,
+                    "off" => quillo::metrics::OFF,
+                    _ => {
+                        eprintln!("quillo: --log is text, json or off");
+                        return Err(2);
+                    }
+                };
+                quillo::metrics::LOG.store(format, std::sync::atomic::Ordering::Relaxed);
             }
             ("--host", Some(v)) => o.host = Some(v.clone()),
             ("--port", Some(v)) => o.port = Some(v.clone()),

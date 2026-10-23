@@ -944,12 +944,18 @@ impl Worker {
             let status = crate::cluster::announced(&app.shared, key, body);
             return Answer::Respond(HttpResponse { status, headers: Vec::new(), body: Vec::new() });
         }
+        if path == "/_quillo/metrics" && crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut r = plain(200, &crate::metrics::render());
+            r.headers = vec![("content-type".into(), "text/plain; version=0.0.4".into())];
+            return Answer::Respond(r);
+        }
         // For a load balancer: whether to send requests here.
         if path == "/_quillo/health" {
             let ready = matches!(&*app.current().1, Loaded::Ready(_)) && !crate::httpd::stopping();
             return Answer::Respond(if ready { plain(200, "ok\n") } else { plain(503, "unavailable\n") });
         }
         let start = Instant::now();
+        let _busy = crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed).then(crate::metrics::InProgress::new);
         let (g, current) = app.current();
         if g != self.generation {
             self.generation = g;
@@ -982,14 +988,31 @@ impl Worker {
         }
         // Chrome asks every site for this while DevTools is open; it is not
         // the program's business, so it is not logged.
+        let took = start.elapsed().as_secs_f64();
+        crate::metrics::answered(resp.status, took);
         if req.url != "/.well-known/appspecific/com.chrome.devtools.json" {
-            crate::httpd::log_fmt(format_args!(
-                "{} {} -> {} ({:.1}ms)\n",
-                req.method,
-                req.url,
-                resp.status,
-                start.elapsed().as_secs_f64() * 1000.0
-            ));
+            match crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::metrics::TEXT => {
+                    crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms)\n", req.method, req.url, resp.status, took * 1000.0))
+                }
+                crate::metrics::JSON => {
+                    let tenant = match self.local.as_ref().and_then(|it| it.tenant.clone().flatten()) {
+                        Some(t) => format!(",\"tenant\":{}", serde_json::Value::from(&*t)),
+                        None => String::new(),
+                    };
+                    crate::httpd::log_fmt(format_args!(
+                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{}}}\n",
+                        crate::httpd::iso_now(),
+                        serde_json::Value::from(req.method.as_str()),
+                        serde_json::Value::from(req.url.as_str()),
+                        resp.status,
+                        took * 1000.0,
+                        serde_json::Value::from(req.remote.as_str()),
+                        tenant
+                    ))
+                }
+                _ => {}
+            }
         }
         compress(&req, &mut resp);
         if resp.header("x-content-type-options").is_none() {

@@ -451,3 +451,53 @@ fn stopping_finishes_requests_in_progress() {
     assert!(status.success(), "{:?}", status);
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
 }
+
+#[test]
+fn metrics_count_answers_when_asked_for() {
+    let d = temp_dir("metrics");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = \"hi\"\nroute GET /missing = respond(404, \"no\")\n").unwrap();
+    let srv = start(&f, &["--metrics"]);
+    for path in ["/", "/", "/missing"] {
+        get(srv.port, path);
+    }
+    let (status, text) = get(srv.port, "/_quillo/metrics");
+    assert_eq!(status, 200);
+    assert!(text.contains("quillo_requests_total{status=\"2xx\"} 2\n"), "{}", text);
+    assert!(text.contains("quillo_requests_total{status=\"4xx\"} 1\n"), "{}", text);
+    assert!(text.contains("quillo_request_duration_seconds_count 3\n"), "{}", text);
+    assert!(text.contains("quillo_requests_in_progress 0\n") && text.contains("quillo_connections "), "{}", text);
+    // Off unless asked for.
+    let plain = start(&f, &[]);
+    assert_eq!(get(plain.port, "/_quillo/metrics").0, 404);
+}
+
+#[test]
+fn the_log_can_be_json_lines() {
+    let d = temp_dir("jsonlog");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
+    let port = port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(&f)
+        .args(["--port", &port.to_string(), "--log", "json"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(get(port, "/hello?x=1").1, "hi");
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    let line = log.lines().find(|l| l.contains("/hello")).unwrap_or_else(|| panic!("no log line in {}", log));
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{}: {}", e, line));
+    assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello?x=1"), Some(200)));
+    assert!(v["time"].as_str().map_or(false, |t| t.ends_with('Z') && t.len() == 24), "{}", line);
+    assert!(v["ms"].is_number() && v["ip"].is_string(), "{}", line);
+}

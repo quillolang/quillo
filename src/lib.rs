@@ -12,6 +12,7 @@ pub mod fetch;
 pub mod httpd;
 pub mod interp;
 pub mod lexer;
+pub mod metrics;
 pub mod migrate;
 pub mod lsp;
 pub mod parser;

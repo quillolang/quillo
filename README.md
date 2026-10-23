@@ -55,6 +55,8 @@ serves them:
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
+| `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` |
+| `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 
 ### Desktop apps
 
@@ -798,6 +800,18 @@ sending it requests. A second Ctrl-C stops it at once.
 `GET /_quillo/health` answers `200 ok` while the server is ready for requests, and `503`
 while it is stopping or its program failed to load: give it to a load balancer's health
 check (limer's `health_uri`).
+
+### Logs and metrics
+
+Each request is logged on stderr as `GET /path -> 200 (0.4ms)`. With `--log json` the
+line is a JSON object instead, for log collectors: `time` (ISO 8601, UTC), `method`,
+`path`, `status`, `ms`, `ip`, and `tenant` when the request had one. `--log off` turns
+the request log off; errors are still printed.
+
+With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format: requests
+answered by status class (`quillo_requests_total`), a histogram of how long they took
+(`quillo_request_duration_seconds`), requests in progress, open connections and uptime.
+It is off by default, since anyone who can reach the server could read it.
 
 ## Cached views
 

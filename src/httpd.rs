@@ -658,6 +658,7 @@ impl Loop {
             closing: false,
             lingering: false,
         }));
+        crate::metrics::CONNECTIONS.fetch_add(1, SeqCst);
         // Its first request has often arrived with it.
         self.ready.push_back(i);
     }
@@ -684,6 +685,7 @@ impl Loop {
         let _ = self.poll.registry().deregister(&mut c.stream);
         self.slots[i] = Slot::Free;
         self.free.push(i);
+        crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
     }
 
     /// Ends a connection whose answers are all written. Closing it at once
@@ -906,6 +908,7 @@ impl Loop {
                     Owner::Conn(slot) => {
                         self.slots[slot] = Slot::Free;
                         self.free.push(slot);
+                        crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
                     }
                     Owner::Parent(parent) => self.child_ended(parent),
                 }
@@ -919,6 +922,7 @@ impl Loop {
             let _ = self.poll.registry().deregister(&mut c.stream);
             self.slots[i] = Slot::Free;
             self.free.push(i);
+            crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
             if let Some(mut stream) = into_std(c.stream) {
                 if stream.set_nonblocking(false).is_ok() {
                     // Earlier answers on this connection go first.
@@ -1259,6 +1263,29 @@ fn push_num(out: &mut Vec<u8>, mut n: u64) {
 }
 
 /// `Thu, 23 Oct 2026 08:44:04 GMT`.
+/// The time now as ISO 8601 in UTC, to the millisecond (for `--log json`).
+pub(crate) fn iso_now() -> String {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = t.as_secs();
+    let (year, month, day) = civil((secs / 86400) as i64);
+    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
+    format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", year, month, day, h, m, s, t.subsec_millis())
+}
+
+/// Year, month and day of a day counted from 1970-01-01 (Howard Hinnant's
+/// algorithm).
+fn civil(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if month <= 2 { 1 } else { 0 }, month, day)
+}
+
 fn http_date(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
