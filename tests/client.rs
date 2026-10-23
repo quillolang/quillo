@@ -226,3 +226,36 @@ fn js_calls_name_what_they_call_in_the_code() {
     assert!(load(r#"js("window.setTimeout", "x")"#).contains("runs text as code"));
     assert!(load(r#"js("a..b")"#).contains("dotted name"));
 }
+
+#[test]
+fn js_cannot_be_passed_around_or_given_its_name_by_data() {
+    let load = |body: &str| {
+        let mut it = Interp::new(".");
+        let src = format!("component C(name: str) {{\n    <button @click={{() => {{ {} }}}}>x</button>\n}}\n", body);
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    assert!(load("let j = js\nj(name, 1)").contains("can only be called"), "{}", load("let j = js\nj(name, 1)"));
+    assert!(load("name.js(1)").contains("written out"), "{}", load("name.js(1)"));
+    assert!(load("name | js(1)").contains("written out"), "{}", load("name | js(1)"));
+    assert_eq!(load("let x = name.js\nx"), "");
+}
+
+#[test]
+fn the_pages_objects_do_not_run_text_as_code() {
+    if !node_available() {
+        return;
+    }
+    let prelude = "globalThis.window = globalThis; globalThis.ran = 0; globalThis.lib = { el: new (class El { setAttribute(k, v) { globalThis.ran++; } })() };";
+    let run = |body: &str| both_with(prelude, "", body).1;
+    assert!(run(r#"js("window").eval("ran = 1")"#).contains("runs text as code"), "{}", run(r#"js("window").eval("ran = 1")"#));
+    assert!(run(r#"let f = js("window").setTimeout
+f("ran = 1")"#).contains("runs text as code"));
+    assert!(run(r#"js("window").constructor"#).contains("runs text as code"));
+    assert!(run(r#"js("lib.el").setAttribute("onclick", "x")"#).contains("runs text as code"));
+    assert!(run(r#"js("lib.el").setAttribute("href", "javascript:x")"#).contains("javascript: URL"));
+    assert_eq!(run(r#"js("lib.el").setAttribute("title", "x")"#), "null");
+    assert_eq!(run("js(\"ran\")"), "0");
+}

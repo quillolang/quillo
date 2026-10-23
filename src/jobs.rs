@@ -44,7 +44,7 @@ pub struct Job {
 /// The secret a job request carries.
 pub fn token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
-    TOKEN.get_or_init(|| crate::crypto::b64url(&crate::crypto::random_bytes(32).unwrap_or_default()))
+    TOKEN.get_or_init(|| crate::crypto::b64url(&crate::crypto::secret_bytes(32)))
 }
 
 fn name_ok(n: &str) -> bool {

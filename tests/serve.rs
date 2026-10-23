@@ -603,3 +603,75 @@ fn large_files_are_sent_from_disk() {
     // Only file() can have a file sent.
     assert_eq!(get(srv.port, "/forged").0, 500);
 }
+
+/// The server's resident memory, in KiB.
+#[cfg(unix)]
+fn rss_kib(srv: &Server) -> u64 {
+    let out = Command::new("ps").args(["-o", "rss=", "-p", &srv.child.id().to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_sends_and_never_reads_holds_no_one_up() {
+    let d = temp_dir("no-reader");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /f/*p = file(p)\nroute GET /json = { ok: true }\n").unwrap();
+    std::fs::write(d.join("small.bin"), vec![7u8; 900_000]).unwrap();
+    std::fs::write(d.join("big.bin"), vec![9u8; 3_000_000]).unwrap();
+    let srv = start(&f, &[]);
+    let before = rss_kib(&srv);
+    // Hundreds of requests for a file kept in memory, then a large one sent
+    // from disk, on one connection whose answers are never read.
+    let mut greedy = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    let mut batch = String::new();
+    for _ in 0..400 {
+        batch.push_str("GET /f/small.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    batch.push_str("GET /f/big.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    greedy.write_all(batch.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    // Everyone else is answered at once.
+    let t0 = Instant::now();
+    for _ in 0..5 {
+        assert_eq!(get(srv.port, "/json"), (200, r#"{"ok":true}"#.into()));
+    }
+    assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+    // Its answers do not pile up: 400 of them would be 360 MB.
+    let grew = rss_kib(&srv).saturating_sub(before);
+    assert!(grew < 64 * 1024, "memory grew by {} KiB", grew);
+    // And once it reads, it gets every answer, in order.
+    greedy.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 1 << 20];
+    let want = 400 * 900_000 + 3_000_000;
+    while got < want {
+        match greedy.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    assert!(got > want, "read {} of at least {} bytes", got, want);
+}
+
+#[test]
+fn passwords_are_hashed_off_the_event_loop() {
+    let d = temp_dir("argon");
+    let f = d.join("app.qwe");
+    std::fs::write(
+        &f,
+        "route GET /check = crypto.verify_password(\"pw\", crypto.hash_password(\"pw\")) && !crypto.verify_password(\"no\", crypto.hash_password(\"pw\"))\n\
+         route GET /json = { ok: true }\n",
+    )
+    .unwrap();
+    let srv = start(&f, &[]);
+    let port = srv.port;
+    let logins: Vec<_> = (0..16).map(|_| std::thread::spawn(move || get(port, "/check"))).collect();
+    // Meanwhile other requests are answered.
+    let t0 = Instant::now();
+    assert_eq!(get(port, "/json").0, 200);
+    assert!(t0.elapsed() < Duration::from_millis(500), "took {:?}", t0.elapsed());
+    for l in logins {
+        assert_eq!(l.join().unwrap(), (200, "true".into()));
+    }
+}

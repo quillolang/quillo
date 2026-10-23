@@ -410,8 +410,10 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
-  methods as fields: `el.value`, `chart.update()`. Methods that make HTML of text
-  (`insertAdjacentHTML`, `document.write`, ...) are refused; markup does that safely.
+  methods as fields: `el.value`, `chart.update()`. What runs text as code or HTML is
+  refused, however it is reached: `eval`, `Function`, `setTimeout` and `setInterval`,
+  `insertAdjacentHTML`, `document.write`, `setAttribute("on...")`, `javascript:` URLs
+  given to the page's functions. Markup in the component does all of that safely.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps
@@ -650,8 +652,9 @@ route POST /logout { end_session(); redirect("/") }
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
-  default; `Secure` is left out when the request is to `localhost` or `127.0.0.1`,
-  which browsers reach over plain HTTP. `request.cookies` has what the browser sent.
+  default. `Secure` is left out with `--watch` and in desktop apps, which are served
+  over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
+  such as limer in front). `request.cookies` has what the browser sent.
 
 ### What a route returns
 
@@ -879,8 +882,12 @@ One program can serve many tenants (customers, teams, sites), each with its own 
 ```quillo
 tenant_from("example.com")          // acme.example.com is tenant "acme"
 db.open("data/{tenant}.db")         // a SQLite file per tenant
-db.migrate()                        // run for each tenant's database when first opened
+db.migrate()                        // run for each tenant's database when it is made
 
+route POST /signup { form: { name: str } } {
+    with_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
+    redirect(`https://${name}.example.com/`)
+}
 route GET / = <h1>Welcome, {tenant()}</h1>
 ```
 
@@ -889,17 +896,23 @@ route GET / = <h1>Welcome, {tenant()}</h1>
   header, a path segment, a lookup), a name or null. `tenant()` is the current one, or
   null. A tenant's name is lowercase letters, digits, `-` and `_` (at most 63); anything
   else is no tenant, so a name is always safe in a file name or a database name.
-- A `db.open` target with `{tenant}` in it is a database per tenant, opened the first
-  time the tenant uses it and migrated then: a SQLite file each, a PostgreSQL schema
-  each in one database with `?schema={tenant}` (made when first used), or a database
-  each with `postgres://host/app_{tenant}` (made by you beforehand). Each tenant has
-  its own connections, so give PostgreSQL a small `pool_size`. Code that runs for no
-  tenant, such as a request to the bare domain, gets an error from `db`. At most 1,024
-  tenants' databases are open at once; others are opened again when needed.
+- A `db.open` target with `{tenant}` in it is a database per tenant: a SQLite file each,
+  a PostgreSQL schema each in one database with `?schema=t_{tenant}`, or a database each
+  with `postgres://host/app_{tenant}` (made by you beforehand). Give schemas a prefix:
+  `public`, `information_schema` and `pg_...` are refused, and a prefix keeps a tenant
+  named like another schema of the database (`auth`, say) out of it.
+- A tenant's database (file or schema) is made, and migrated, the first time code runs
+  `with_tenant(name, ...)` for it, as when signing the tenant up. A request's host can
+  name any tenant, so requests only open databases that exist: `db` calls for a made-up
+  `anything.example.com` give an error, and make no file or schema.
+- Each open tenant has its own connections, so give PostgreSQL a small `pool_size`. At
+  most 1,024 SQLite tenants' databases, and 16 PostgreSQL ones (each keeping up to four
+  connections), are open at once; others are opened again when needed. Code that runs
+  for no tenant, such as a request to the bare domain, gets an error from `db`.
 - Live updates stay within a tenant: a change to one tenant's table wakes only that
   tenant's pages.
-- `with_tenant("acme", () => ...)` runs code for a tenant outside a request, in a script
-  or a scheduled job.
+- `with_tenant("acme", () => ...)` runs code for a tenant: to sign it up, or outside a
+  request, in a script or a scheduled job.
 - What stays shared: global variables, one copy for the whole process, so keep a
   tenant's data in its database (or in maps keyed by `tenant()`). Views that call
   `tenant()` or read the database are never served from the view cache. Cookies

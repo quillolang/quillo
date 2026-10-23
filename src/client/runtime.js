@@ -26,11 +26,39 @@ const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
 const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
-const HTML_SINKS = ["insertAdjacentHTML", "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln"];
+// What Quillo code does not reach on the page's objects: what runs text as
+// code or HTML (markup in components does that safely), and the way to the
+// Function constructor.
+const FOREIGN_DENY = ["eval", "Function", "setTimeout", "setInterval", "execScript", "execCommand", "insertAdjacentHTML",
+  "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln", "constructor", "__proto__", "prototype"];
+function foreignName(name) {
+  if (FOREIGN_DENY.includes(name)) fail(`\`${name}\` is not used from Quillo code: it runs text as code or HTML`);
+}
+// Calls a method of the page's object `o`, unless it would run text as code.
+function foreignCall(o, name, args) {
+  foreignName(name);
+  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`${name}\` is not given a javascript: URL`);
+  if (name === "setAttribute" || name === "setAttributeNS") {
+    const k = String(args[name === "setAttribute" ? 0 : 1]).toLowerCase();
+    if (k.startsWith("on") || k === "srcdoc") fail(`\`${name}\` does not set ${k}: it runs text as code`);
+  }
+  const r = o[name](...args);
+  return r === undefined ? null : r;
+}
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
-const foreign = (v) => v !== null && typeof v === "object" && v.constructor !== Object && v.constructor !== undefined
-  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode);
+const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
+  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode));
+// Functions of the page that run text as code: Quillo code calls none of
+// them, however it came by one.
+let deniedFns = null;
+function denied(f) {
+  if (deniedFns === null) {
+    deniedFns = new Set();
+    for (const n of ["eval", "Function", "setTimeout", "setInterval", "execScript"]) if (typeof globalThis[n] === "function") deniedFns.add(globalThis[n]);
+  }
+  if (deniedFns.has(f)) fail(`\`${f.name}\` is not called from Quillo code: it runs text as code`);
+}
 
 function typeName(v) {
   if (isNil(v)) return "null";
@@ -186,7 +214,7 @@ function eventField(e, name) {
 // `x.name` for a name Object.prototype does not have: a map's key is read
 // directly (a key never holds undefined), anything else as `field` does.
 function fieldp(v, name, fb) {
-  if (v !== null && typeof v === "object" && v.constructor === Object) {
+  if (v !== null && typeof v === "object" && v.constructor === Object && v !== globalThis) {
     const x = v[name];
     if (x !== undefined) return x;
   }
@@ -195,13 +223,18 @@ function fieldp(v, name, fb) {
 
 function field(v, name, fb) {
   // A map made by the program (the usual case) first.
-  if (v !== null && typeof v === "object" && v.constructor === Object) {
+  if (v !== null && typeof v === "object" && v.constructor === Object && v !== globalThis) {
     if (hasOwn(v, name)) return v[name];
   }
   if (isNil(v)) return null;
   if (isMap(v)) {
-    if (hasOwn(v, name)) return v[name];
-    if (foreign(v) && name in v) { const x = v[name]; return x === undefined ? null : typeof x === "function" ? x.bind(v) : x; }
+    if (foreign(v)) {
+      if (name in v) {
+        foreignName(name);
+        const x = v[name];
+        return x === undefined ? null : typeof x === "function" ? (...a) => foreignCall(v, name, a) : x;
+      }
+    } else if (hasOwn(v, name)) return v[name];
     if (name === "len") return B.len(v);
     if (name === "keys") return B.keys(v);
     if (name === "values") return B.values(v);
@@ -219,7 +252,7 @@ function index(o, i) {
     const n = i < 0 ? o.length + i : i;
     return n >= 0 && n < o.length ? o[n] : null;
   }
-  if (isMap(o) && typeof i === "string") return hasOwn(o, i) ? o[i] : null;
+  if (isMap(o) && typeof i === "string") return foreign(o) ? field(o, i, null) : hasOwn(o, i) ? o[i] : null;
   if (typeof o === "string" && isInt(i)) {
     const cs = Array.from(o);
     const n = i < 0 ? cs.length + i : i;
@@ -231,19 +264,14 @@ function index(o, i) {
 
 function call(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
+  denied(f);
   return f(...args);
 }
 
 // `recv.name(args)`: a function stored in the map, or `name(recv, args)`.
 function mcall(recv, name, fb, args) {
+  if (foreign(recv) && typeof recv[name] === "function") return foreignCall(recv, name, args);
   if (isMap(recv) && hasOwn(recv, name)) return call(recv[name], args);
-  if (foreign(recv) && typeof recv[name] === "function") {
-    // Text becomes markup or code through these, which markup in the
-    // component does safely.
-    if (HTML_SINKS.includes(name)) fail(`\`${name}\` is not called from Quillo code: it runs text as HTML`);
-    const r = recv[name](...args);
-    return r === undefined ? null : r;
-  }
   if (typeof fb === "function") return fb(recv, ...args);
   fail(`${typeName(recv)} has no method \`${name}\``);
 }
@@ -368,7 +396,7 @@ const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); retu
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
 const M = (v, f, i = 1) => { if (isNil(v)) return {}; want(isMap(v), f, "a map", i, v); return v; };
-const F = (v, f, i = 2) => { want(typeof v === "function", f, "a function", i, v); return v; };
+const F = (v, f, i = 2) => { want(typeof v === "function", f, "a function", i, v); denied(v); return v; };
 const N = (v, f, i = 1) => { want(typeof v === "number", f, "a number", i, v); return v; };
 
 // Calls a function given to a builtin; it must not wait on the server.
@@ -612,6 +640,7 @@ function jsPath(path, f) {
   S(path, f);
   let owner = globalThis, v = globalThis;
   for (const p of path.split(".")) {
+    foreignName(p);
     if (v === null || v === undefined || !(p in Object(v))) fail(`\`${f}\`: ${path} is not defined on this page`);
     owner = v;
     v = v[p];
@@ -624,12 +653,14 @@ B.js = meta((path, ...args) => {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
   }
+  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js\`: ${path} is not given a javascript: URL`);
   const r = v.apply(owner, args);
   return r === undefined ? null : r;
 }, "js", null);
 B.js_new = meta((path, ...args) => {
   const [, v] = jsPath(path, "js_new");
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
+  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js_new\`: ${path} is not given a javascript: URL`);
   return new v(...args);
 }, "js_new", null);
 
@@ -1058,7 +1089,7 @@ function setProp(el, k, v, old) {
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
-  if (URL_ATTRS.includes(k) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
+  if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);

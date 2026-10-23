@@ -59,6 +59,9 @@ pub struct Interp {
     pub site: Arc<crate::site::Site>,
     /// The current request's tenant, once worked out (`None` until then).
     pub tenant: Option<Option<Arc<str>>>,
+    /// Whether the program named the tenant (`with_tenant`), rather than a
+    /// request's host: only then may its database be made.
+    pub tenant_named: bool,
     /// The current request's body when it carries files (see `upload`).
     pub upload_body: Option<Arc<[u8]>>,
     /// `Set-Cookie` lines for the response being made (see `session`).
@@ -204,6 +207,12 @@ pub fn escape_into(s: &str, out: &mut String) {
 /// Attributes whose value the browser may load or run as a URL.
 pub const URL_ATTRS: &[&str] =
     &["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
+
+/// Whether an attribute is one of `URL_ATTRS`, however it is written
+/// (HTML attribute names ignore case: `HREF` is `href`).
+pub fn url_attr(name: &str) -> bool {
+    URL_ATTRS.iter().any(|a| a.eq_ignore_ascii_case(name))
+}
 
 /// What a `javascript:` URL in one of `URL_ATTRS` becomes.
 pub const BLOCKED_URL: &str = "about:blank#blocked";
@@ -447,6 +456,7 @@ impl Interp {
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
+            tenant_named: false,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -487,6 +497,7 @@ impl Interp {
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
             tenant: None,
+            tenant_named: false,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -725,6 +736,7 @@ impl Interp {
         it.restrictor = self.restrictor.clone();
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it.tenant = self.tenant.clone();
+        it.tenant_named = self.tenant_named;
         it.upload_body = self.upload_body.clone();
         it.locale = self.locale.clone();
         it
@@ -1882,7 +1894,7 @@ impl Interp {
                 continue;
             }
             let v = match (&v, name) {
-                (Value::Str(s), _) if URL_ATTRS.contains(&name) && script_url(s) => Value::str(BLOCKED_URL),
+                (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
                 (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }
@@ -1953,7 +1965,7 @@ impl Interp {
                     out.push_str(name);
                 }
                 // A template outside URL attributes goes straight in, part by part.
-                AttrVal::Expr(Expr::Template(parts)) if !URL_ATTRS.contains(&name) => {
+                AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) => {
                     out.push(' ');
                     out.push_str(name);
                     out.push_str("=\"");
@@ -2024,7 +2036,7 @@ impl Interp {
     /// prefix.
     fn write_attr(&self, name: &str, v: Value, out: &mut String) {
         let v = match (&v, name) {
-            (Value::Str(s), _) if URL_ATTRS.contains(&name) && script_url(s) => Value::str(BLOCKED_URL),
+            (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
             (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                 Value::str(self.with_base(s))
             }

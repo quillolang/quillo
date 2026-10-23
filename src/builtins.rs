@@ -832,8 +832,10 @@ fn with_tenant(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         other => return fail(line, format!("`with_tenant` expects a function second, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let outer = it.tenant.replace(Some(Arc::from(&*name)));
+    let named = std::mem::replace(&mut it.tenant_named, true);
     let r = it.call(&f, Vec::new(), line);
     it.tenant = outer;
+    it.tenant_named = named;
     r
 }
 

@@ -103,8 +103,9 @@ fn each_tenant_gets_a_schema_of_its_own(url: &str) {
     std::fs::write(d.join("migrations/001_notes.sql"), "create table notes (id serial primary key, text text not null);").unwrap();
     let src = format!(
         r#"tenant_from((request) => request.headers["x-tenant"])
-db.open("{url}?schema={{tenant}}&pool_size=2")
+db.open("{url}?schema=t_{{tenant}}&pool_size=2")
 db.migrate()
+route POST /signup/:name = with_tenant(name, () => db.query("select 1 as x") | len)
 route POST /notes {{ json: {{ text: str }} }} {{
     db.exec("insert into notes (text) values (?)", text)
     "ok"
@@ -120,16 +121,22 @@ route GET /notes = db.query("select text from notes") | map((n) => n.text)
             ("X-Tenant".to_string(), tenant.to_string()),
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
-        let req = quillo::server::HttpRequest { method: method.into(), url: "/notes".into(), headers, body: body.as_bytes().to_vec(), remote: "127.0.0.1".into() };
+        let url = if method == "SIGNUP" { format!("/signup/{}", tenant) } else { "/notes".into() };
+        let method = if method == "SIGNUP" { "POST" } else { method };
+        let req = quillo::server::HttpRequest { method: method.into(), url, headers, body: body.as_bytes().to_vec(), remote: "127.0.0.1".into() };
         it.handle(&req).text()
     };
+    // Only the program makes a tenant: a made-up one gets nothing.
+    assert_eq!(send(&mut it, "GET", "ghost", ""), "internal error\n");
+    assert_eq!(send(&mut it, "SIGNUP", "acme", ""), "1");
+    assert_eq!(send(&mut it, "SIGNUP", "beta", ""), "1");
     assert_eq!(send(&mut it, "POST", "acme", r#"{"text":"acme's"}"#), "ok");
     assert_eq!(send(&mut it, "POST", "beta", r#"{"text":"beta's"}"#), "ok");
     assert_eq!(send(&mut it, "GET", "acme", ""), r#"["acme's"]"#);
     assert_eq!(send(&mut it, "GET", "beta", ""), r#"["beta's"]"#);
     assert_eq!(
         run(url, "db.query(\"select table_schema from information_schema.tables where table_name = 'notes' order by 1\") | map((r) => r.table_schema)"),
-        "[\"acme\", \"beta\"]"
+        "[\"t_acme\", \"t_beta\"]"
     );
     let _ = std::fs::remove_dir_all(&d);
 }

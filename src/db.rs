@@ -64,8 +64,10 @@ pub struct TenantDbs {
     open: Mutex<indexmap::IndexMap<String, Arc<Backend>>>,
 }
 
-/// Tenant databases kept open at once.
+/// Tenant databases kept open at once: SQLite files, and Postgres
+/// databases or schemas, whose pools keep up to 4 connections each.
 const OPEN_TENANTS: usize = 1024;
+const OPEN_PG_TENANTS: usize = 16;
 
 /// A Postgres connection kept by one request for its `db.transaction`.
 pub struct PgTx {
@@ -87,9 +89,15 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
 /// Opens a path (SQLite) or a postgres:// URL. Connecting to Postgres
 /// waits on the network, so the interpreter lock is released meanwhile.
 fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
+    open_backend_as(it, target, true)
+}
+
+/// `open_backend`; with `make` false, a Postgres schema (`?schema=`) must
+/// exist already.
+fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend, String> {
     if pg::is_url(target) {
         let url = target.to_string();
-        return it.unlocked(move || pg::Pool::open(&url)).map(Backend::Postgres);
+        return it.unlocked(move || pg::Pool::open_as(&url, make)).map(Backend::Postgres);
     }
     let full = if target == ":memory:" || Path::new(target).is_absolute() {
         target.to_string()
@@ -137,13 +145,19 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         }
     }
     let target = dbs.template.replace("{tenant}", &name);
+    // A request's host can name any tenant, so only the program makes one
+    // (`with_tenant`, when signing a tenant up): made-up names make nothing.
+    let make = it.tenant_named;
     if !pg::is_url(&target) && target != ":memory:" {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+        if !make && !full.exists() {
+            return Err(format!("there is no tenant {:?}: with_tenant({:?}, ...) makes its database", &*name, &*name));
+        }
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
     }
-    let b = Arc::new(open_backend(it, &target).map_err(|e| format!("tenant {}: {}", name, e))?);
+    let b = Arc::new(open_backend_as(it, &target, make).map_err(|e| format!("tenant {}: {}", name, e))?);
     if let Some(dir) = it.site.migrations.clone() {
         let mb = b.clone();
         let applied = it.unlocked(move || crate::migrate::run(&mb, &dir)).map_err(|e| format!("tenant {}: {}", name, e))?;
@@ -152,7 +166,9 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         }
     }
     let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
-    if open.len() >= OPEN_TENANTS {
+    // Each open Postgres tenant keeps connections (a few each).
+    let most = if pg::is_url(&target) { OPEN_PG_TENANTS } else { OPEN_TENANTS };
+    while open.len() >= most {
         open.shift_remove_index(0);
     }
     Ok(open.entry(name.to_string()).or_insert(b).clone())

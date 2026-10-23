@@ -62,6 +62,11 @@ impl Pool {
     /// Parses the URL and opens one connection to check it. TLS is used
     /// when the server offers it (`sslmode=require` insists on it).
     pub fn open(url: &str) -> Result<Pool, String> {
+        Pool::open_as(url, true)
+    }
+
+    /// `open`; with `make` false, the schema (`?schema=`) must exist.
+    pub fn open_as(url: &str, make: bool) -> Result<Pool, String> {
         let (url, max, schema) = take_options(url)?;
         let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
         if let Some(s) = &schema {
@@ -78,9 +83,17 @@ impl Pool {
             lanes: OnceLock::new(),
         };
         let mut first = pool.checkout()?;
-        // A tenant's schema is made when it is first used.
+        // A tenant's schema is made when the program first uses it.
         if let Some(s) = &schema {
-            if let Err(e) = first.batch(&format!("create schema if not exists \"{}\"", s)) {
+            let r = if make {
+                first.batch(&format!("create schema if not exists \"{}\"", s))
+            } else {
+                match first.query("select 1 from pg_namespace where nspname = $1", &[Value::str(s)], Some(1)) {
+                    Ok(rows) if rows.is_empty() => Err(format!("there is no schema {:?}", s)),
+                    other => other.map(|_| ()),
+                }
+            };
+            if let Err(e) = r {
                 pool.give_back(first);
                 return Err(e);
             }
@@ -163,6 +176,11 @@ fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
             Some(("schema", v)) => {
                 if !crate::site::tenant_name_ok(v) {
                     return Err(format!("bad schema: {:?} (lowercase letters, digits, - and _)", v));
+                }
+                // Postgres's own: a tenant named `public` must not get the
+                // schema everyone shares (a prefix, `schema=t_{tenant}`, avoids it).
+                if v == "public" || v == "information_schema" || v.starts_with("pg_") {
+                    return Err(format!("the schema {:?} is Postgres's own; prefix tenants' (schema=t_{{tenant}})", v));
                 }
                 schema = Some(v.to_string());
             }

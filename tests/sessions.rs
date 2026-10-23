@@ -37,12 +37,13 @@ route GET /a {
     redirect("/")
 }
 route GET /b {
-    set_cookie("open", "1", { http_only: false, same_site: "Strict", path: "/b" })
+    set_cookie("open", "1", { http_only: false, same_site: "Strict", path: "/b", secure: false })
     delete_cookie("theme")
     "ok"
 }
 route GET /c = set_cookie("x", "1", { same_site: "None" }) ?? "ok"
 route GET /bad = set_cookie("a b", "1")
+route GET /crlf = set_cookie("a", "1", { path: "/x\r\nSet-Cookie: evil=1" })
 "#,
     );
     let r = send(&mut it, "GET", "example.com", "/a", None);
@@ -54,16 +55,18 @@ route GET /bad = set_cookie("a b", "1")
             "lang=fr; Path=/; HttpOnly; Secure; SameSite=Lax"
         ]
     );
-    // Over plain HTTP to this machine, Secure cookies would not be kept.
+    // Secure whatever the host (behind a proxy, every request is to
+    // 127.0.0.1), unless asked otherwise.
     let r = send(&mut it, "GET", "localhost:9000", "/b", None);
     assert_eq!(
         set_cookies(&r),
-        ["open=1; Path=/b; SameSite=Strict", "theme=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"]
+        ["open=1; Path=/b; SameSite=Strict", "theme=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"]
     );
-    // SameSite=None needs Secure, even here.
+    // SameSite=None needs Secure, always.
     let r = send(&mut it, "GET", "127.0.0.1:9000", "/c", None);
     assert_eq!(set_cookies(&r), ["x=1; Path=/; HttpOnly; Secure; SameSite=None"]);
     assert_eq!(send(&mut it, "GET", "example.com", "/bad", None).status, 500);
+    assert_eq!(send(&mut it, "GET", "example.com", "/crlf", None).status, 500);
     // What the browser sends back is decoded.
     let mut it = app(r#"route GET / = request.cookies.theme"#);
     assert_eq!(send(&mut it, "GET", "example.com", "/", Some("theme=dark%20mode%3B%20yes")).text(), "dark mode; yes");

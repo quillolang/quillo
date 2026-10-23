@@ -9,7 +9,8 @@ use indexmap::IndexMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::collections::HashMap;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Files up to this size are kept in memory.
 const SMALL: u64 = 1 << 20;
@@ -110,7 +111,7 @@ pub const SEND_HEADER: &str = "x-quillo-send";
 
 fn send_key() -> &'static [u8] {
     static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| crate::crypto::random_bytes(32).unwrap_or_else(|| b"quillo: no random bytes".to_vec()))
+    KEY.get_or_init(|| crate::crypto::secret_bytes(32))
 }
 
 /// The mark for bytes `start..start + len` of a file.
@@ -134,6 +135,48 @@ pub fn marked(v: &str) -> Option<(PathBuf, u64, u64)> {
     Some((PathBuf::from(parts.next()?), start, len))
 }
 
+/// Large files being sent at once, in all and to one address: each holds a
+/// thread and a connection for as long as its reader takes.
+const MOST_SENDS: usize = 256;
+const MOST_SENDS_PER_IP: usize = 8;
+
+static SENDING: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// A place among the large-file sends, given back when dropped.
+pub struct SendPlace(String);
+
+impl SendPlace {
+    pub fn take(ip: &str) -> Option<SendPlace> {
+        let mut g = lock(&SENDING);
+        let m = g.get_or_insert_with(HashMap::new);
+        let total: usize = m.values().sum();
+        let mine = m.get(ip).copied().unwrap_or(0);
+        if total >= MOST_SENDS || mine >= MOST_SENDS_PER_IP {
+            return None;
+        }
+        m.insert(ip.to_string(), mine + 1);
+        Some(SendPlace(ip.to_string()))
+    }
+}
+
+impl Drop for SendPlace {
+    fn drop(&mut self) {
+        if let Some(m) = lock(&SENDING).as_mut() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
+/// A reader slower than this (after a grace period) is let go, so that
+/// readers taking a byte now and then cannot hold the places forever.
+const SLOWEST: u64 = 16 << 10;
+const GRACE: Duration = Duration::from_secs(20);
+
 /// Answers on a connection of its own: `resp`'s head, then `len` bytes of
 /// the file from `start` (none for `HEAD`), and closes it.
 pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse, (path, start, len): (PathBuf, u64, u64), head: bool) {
@@ -153,13 +196,25 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
     }
     let mut f = f.take(len);
     let mut buf = vec![0u8; 64 << 10];
+    let began = Instant::now();
+    let mut sent = 0u64;
     loop {
-        match f.read(&mut buf) {
+        let n = match f.read(&mut buf) {
             Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if stream.write_all(&buf[..n]).is_err() {
-                    return;
+            Ok(n) => n,
+        };
+        let mut at = 0;
+        while at < n {
+            match stream.write(&buf[at..n]) {
+                Ok(0) | Err(_) => return,
+                Ok(w) => {
+                    at += w;
+                    sent += w as u64;
                 }
+            }
+            let took = began.elapsed();
+            if took > GRACE && sent < took.as_secs() * SLOWEST {
+                return;
             }
         }
     }

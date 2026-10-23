@@ -143,11 +143,23 @@ struct Conn {
     /// Written and shut for writing: what still arrives is thrown away
     /// until the client closes (see `linger`).
     lingering: bool,
+    /// Requests that arrived (pipelined) but wait to be answered until the
+    /// answers before them are written: a client that sends and never reads
+    /// cannot have its answers pile up in memory.
+    pending: Vec<Item>,
 }
+
+/// Answers waiting to be written past which a connection's other requests
+/// wait (see `Conn::pending`).
+const OUTPUT_HIGH: usize = 256 << 10;
+
+/// A connection given to a thread of its own, with the answers to write on
+/// it before anything else (written there, never on the event loop).
+pub(crate) type Detached = Box<dyn FnOnce(std::net::TcpStream, Vec<u8>) + Send>;
 
 enum Fate {
     Keep,
-    Detach(Box<dyn FnOnce(std::net::TcpStream) + Send>),
+    Detach(Detached),
 }
 
 /// A complete request, or one that cannot be answered.
@@ -657,6 +669,7 @@ impl Loop {
             continued: false,
             closing: false,
             lingering: false,
+            pending: Vec::new(),
         }));
         crate::metrics::CONNECTIONS.fetch_add(1, SeqCst);
         // Its first request has often arrived with it.
@@ -742,9 +755,13 @@ impl Loop {
                 Err(_) => return self.close(i, c),
                 // The client is not reading: read no more from it either.
                 Ok(false) => return self.park(i, c),
-                Ok(true) if c.closing => return self.linger(i, c),
+                Ok(true) if c.closing && c.pending.is_empty() => return self.linger(i, c),
                 Ok(true) => {}
             }
+        }
+        if !c.pending.is_empty() {
+            let items = std::mem::take(&mut c.pending);
+            return self.start(i, c, items);
         }
         let mut ended = false;
         let chunk = &mut self.chunk;
@@ -923,12 +940,11 @@ impl Loop {
             self.slots[i] = Slot::Free;
             self.free.push(i);
             crate::metrics::CONNECTIONS.fetch_sub(1, SeqCst);
-            if let Some(mut stream) = into_std(c.stream) {
+            let before = std::mem::take(&mut c.output);
+            if let Some(stream) = into_std(c.stream) {
                 if stream.set_nonblocking(false).is_ok() {
                     // Earlier answers on this connection go first.
-                    if c.output.is_empty() || stream.write_all(&c.output).is_ok() {
-                        f(stream);
-                    }
+                    f(stream, before);
                 }
             }
             return;
@@ -936,7 +952,7 @@ impl Loop {
         match flush(&mut c) {
             Err(_) => self.close(i, c),
             Ok(false) => self.park(i, c),
-            Ok(true) if c.closing => self.linger(i, c),
+            Ok(true) if c.closing && c.pending.is_empty() => self.linger(i, c),
             Ok(true) => {
                 if c.writing {
                     c.writing = false;
@@ -944,7 +960,7 @@ impl Loop {
                 }
                 let again = matches!(self.slots[i], Slot::Busy { again: true });
                 // Requests that arrived whole while it was answered.
-                let more = !c.input.is_empty() && c.receiving.is_none();
+                let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty();
                 self.slots[i] = Slot::Idle(c);
                 if again || more {
                     self.ready.push_back(i);
@@ -1000,7 +1016,12 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
 
 /// In the request's coroutine: answers each item, in order.
 fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -> Fate {
-    for item in items {
+    let mut items = items.into_iter();
+    while let Some(item) = items.next() {
+        if c.output.len() >= OUTPUT_HIGH {
+            c.pending = std::iter::once(item).chain(items).collect();
+            return Fate::Keep;
+        }
         match item {
             Item::Bad(status, why, line) => {
                 log(format!("{} -> {} ({})\n", line, status, why));

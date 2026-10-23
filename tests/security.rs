@@ -140,3 +140,12 @@ fn uuids_are_version_4() {
         assert!("89ab".contains(&id[19..20]));
     }
 }
+
+#[test]
+fn url_attributes_are_checked_however_they_are_written() {
+    let mut it = app(r#"route GET /a = <a {...request.query} HREF={request.query.u}>x</a>"#);
+    let r = send(&mut it, "GET", "/a?HREF=javascript:alert(1)&FormAction=JavaScript:x&u=javascript:y", &[], "");
+    let body = r.text().to_lowercase();
+    assert!(!body.contains("href=\"javascript:") && !body.contains("formaction=\"javascript:"), "{}", body);
+    assert_eq!(body.matches("about:blank#blocked").count(), 2, "{}", body);
+}

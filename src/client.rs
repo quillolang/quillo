@@ -1187,6 +1187,10 @@ impl<'a> Compiler<'a> {
                 match self.resolve(n)? {
                     Resolved::Local(js, _) => js,
                     Resolved::State(n) => format!("$i.s[{}]", js_str(&n)),
+                    // Passed around, it could be called with any name.
+                    Resolved::Global(js, _) if js == "B.js" || js == "B.js_new" => {
+                        return self.err(format!("`{}` can only be called, with the name of what it calls written out", n));
+                    }
                     Resolved::Global(js, _) => js,
                 }
             }
@@ -1266,7 +1270,11 @@ impl<'a> Compiler<'a> {
             Expr::Field(obj, name, line) => {
                 self.line = *line;
                 let o = self.expr(obj)?;
-                let fb = self.fallback(name);
+                let mut fb = self.fallback(name);
+                // `x.js` is no call of `js` with the name x holds.
+                if fb == "B.js" || fb == "B.js_new" {
+                    fb = "null".into();
+                }
                 // Names Object.prototype has need the careful check for a
                 // map's own key; any other is read directly when present.
                 const PROTO: &[&str] = &[
@@ -1533,6 +1541,9 @@ impl<'a> Compiler<'a> {
         if let Expr::Field(obj, name, _) = callee {
             let recv = self.expr(obj)?;
             let fb = self.fallback(name);
+            if fb == "B.js" || fb == "B.js_new" {
+                return self.err(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", name, name));
+            }
             for a in args {
                 argv.push(self.expr(a)?);
             }
@@ -1543,7 +1554,9 @@ impl<'a> Compiler<'a> {
         }
         let (f, is_async) = self.callee_value(callee)?;
         if f == "B.js" || f == "B.js_new" {
-            self.js_name(&f[2..], args.first())?;
+            // `name | js(...)` would take the name from the pipeline.
+            let name = if argv.is_empty() { args.first() } else { None };
+            self.js_name(&f[2..], name)?;
         }
         let pure = matches!(callee, Expr::Ident(n, _) if PURE.contains(&n.as_str()) && f == format!("B.{}", n));
         self.note_call(pure);

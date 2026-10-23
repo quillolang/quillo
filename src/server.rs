@@ -229,6 +229,7 @@ impl Interp {
         }
         self.rendered_island = false;
         self.tenant = None;
+        self.tenant_named = false;
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
@@ -538,8 +539,39 @@ impl Drop for Waiter {
 pub(crate) enum Answer {
     Respond(HttpResponse),
     /// The connection goes to a thread of its own (pages waiting for live
-    /// data or reloads), which answers on it directly.
-    Detach(Box<dyn FnOnce(std::net::TcpStream) + Send>),
+    /// data or reloads, large files), which answers on it directly.
+    Detach(crate::httpd::Detached),
+}
+
+/// Writes, on a connection a thread now owns, the answers to the requests
+/// before this one; `None` if the client does not take them.
+fn write_first(mut stream: std::net::TcpStream, before: &[u8]) -> Option<std::net::TcpStream> {
+    use std::io::Write;
+    if before.is_empty() {
+        return Some(stream);
+    }
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    stream.write_all(before).ok()?;
+    let _ = stream.set_write_timeout(None);
+    Some(stream)
+}
+
+/// Sends a large file from disk on a thread of its own (see `statics`),
+/// within the places for such sends; 503 when they are taken.
+fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64), head: bool, ip: &str) -> Answer {
+    let Some(place) = crate::statics::SendPlace::take(ip) else {
+        let mut busy = plain(503, "too many downloads at once; try again later\n");
+        busy.headers.push(("retry-after".into(), "5".into()));
+        return Answer::Respond(busy);
+    };
+    Answer::Detach(Box::new(move |stream, before| {
+        let _ = std::thread::Builder::new().name("quillo-file".into()).stack_size(WAITER_STACK).spawn(move || {
+            let _place = place;
+            if let Some(stream) = write_first(stream, &before) {
+                crate::statics::send(stream, &resp, what, head);
+            }
+        });
+    }))
 }
 
 /// Hands the connection to `f` on a thread of its own, holding one of the
@@ -550,12 +582,14 @@ fn waiter(name: &'static str, f: impl FnOnce(std::net::TcpStream) + Send + 'stat
         resp.headers.push(("retry-after".into(), "5".into()));
         return Answer::Respond(resp);
     };
-    Answer::Detach(Box::new(move |stream| {
+    Answer::Detach(Box::new(move |stream, before| {
         // If the thread cannot start, the place and the connection go with
         // the closure.
         let _ = std::thread::Builder::new().name(name.into()).stack_size(WAITER_STACK).spawn(move || {
             let _place = place;
-            f(stream);
+            if let Some(stream) = write_first(stream, &before) {
+                f(stream);
+            }
         });
     }))
 }
@@ -1086,8 +1120,7 @@ impl Worker {
             let Some(what) = crate::statics::marked(&mark) else {
                 return Answer::Respond(plain(500, "internal error\n"));
             };
-            let head = req.method == "HEAD";
-            return waiter("quillo-file", move |stream| crate::statics::send(stream, &resp, what, head));
+            return send_file(resp, what, req.method == "HEAD", &req.remote);
         }
         compress(&req, &mut resp);
         Answer::Respond(resp)
@@ -1120,6 +1153,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
         eprintln!("quillo: watching for changes");
     }
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
+    crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some(), std::sync::atomic::Ordering::Relaxed);
     app.shared.gil.release();
     if app.watch {
         let app = app.clone();

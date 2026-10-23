@@ -104,6 +104,15 @@ pub fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
+/// Random bytes for a secret of this process's (a signing key, a token).
+/// Without them nothing it signs could be trusted, so it stops.
+pub fn secret_bytes(n: usize) -> Vec<u8> {
+    random_bytes(n).unwrap_or_else(|| {
+        eprintln!("quillo: the operating system gave no random bytes; stopping");
+        std::process::exit(1)
+    })
+}
+
 pub fn random_bytes(n: usize) -> Option<Vec<u8>> {
     let mut b = vec![0u8; n];
     getrandom::getrandom(&mut b).ok()?;
@@ -135,16 +144,55 @@ fn token(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
-/// Hashes running at once, each with its 19 MiB, are at most one per core;
-/// more wait their turn (off the event loop), so a flood of logins cannot
-/// take the server's memory.
-fn argon2_turn<T>(f: impl FnOnce() -> T) -> T {
+/// Hashes run at most one per core at a time (each takes 19 MiB), so a
+/// flood of logins cannot take the server's memory; past `MOST_WAITING`
+/// waiting their turn, more are refused. In the server they wait without
+/// holding a thread (queries and `http` calls need those), then run on
+/// threads of their own.
+const MOST_WAITING: usize = 1024;
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+fn hashing<T: Send + 'static>(it: &mut Interp, work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+    if WAITING.fetch_add(1, SeqCst) >= MOST_WAITING {
+        WAITING.fetch_sub(1, SeqCst);
+        return Err("too many passwords are being checked at once; try again shortly".into());
+    }
+    struct Left;
+    impl Drop for Left {
+        fn drop(&mut self) {
+            WAITING.fetch_sub(1, SeqCst);
+        }
+    }
+    let _left = Left;
+    // Outside the server, or inside a SQLite transaction (which no other
+    // request may run in meanwhile): here, in turn.
+    if !crate::httpd::in_task() || it.sqlite_tx > 0 {
+        return Ok(in_turn(work));
+    }
+    static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let fut = Box::pin(async move {
+        let _turn = TURNS.get_or_init(|| tokio::sync::Semaphore::new(cores())).acquire().await;
+        tokio::task::spawn_blocking(work).await.map_err(|e| e.to_string())
+    });
+    match crate::httpd::await_elsewhere(fut) {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => Err(e),
+        None => Err("password hashing failed unexpectedly".into()),
+    }
+}
+
+/// `f` once fewer than one hash per core is running.
+fn in_turn<T>(f: impl FnOnce() -> T) -> T {
     use std::sync::{Condvar, Mutex};
     static RUNNING: Mutex<usize> = Mutex::new(0);
     static FREED: Condvar = Condvar::new();
-    let most = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut n = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-    while *n >= most {
+    while *n >= cores() {
         n = FREED.wait(n).unwrap_or_else(|e| e.into_inner());
     }
     *n += 1;
@@ -164,10 +212,11 @@ fn hash_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     use argon2::password_hash::{PasswordHasher, SaltString};
     let pw = text(&args, 0, "hash_password", line)?;
     let Some(salt) = random_bytes(16) else { return fail(line, "`crypto.hash_password`: the operating system gave no random bytes") };
-    let hashed = it.unlocked(move || {
+    let hashed = hashing(it, move || {
         let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
-        argon2_turn(|| argon2::Argon2::default().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string()))
-    });
+        argon2::Argon2::default().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string())
+    })
+    .and_then(|r| r);
     match hashed {
         Ok(h) => Ok(Value::str(h)),
         Err(e) => fail(line, format!("`crypto.hash_password`: {}", e)),
@@ -188,8 +237,8 @@ fn verify_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Str(h)) => h.clone(),
         _ => STAND_IN.into(),
     };
-    Ok(Value::Bool(it.unlocked(move || {
-        let check = |h: &PasswordHash| argon2_turn(|| argon2::Argon2::default().verify_password(pw.as_bytes(), h).is_ok());
+    let checked = hashing(it, move || {
+        let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw.as_bytes(), h).is_ok();
         match PasswordHash::new(&hash) {
             Ok(h) if &*hash != STAND_IN => check(&h),
             _ => {
@@ -197,7 +246,11 @@ fn verify_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 false
             }
         }
-    })))
+    });
+    match checked {
+        Ok(ok) => Ok(Value::Bool(ok)),
+        Err(e) => fail(line, format!("`crypto.verify_password`: {}", e)),
+    }
 }
 
 fn equal(_: &mut Interp, args: Vec<Value>, line: u32) -> R {

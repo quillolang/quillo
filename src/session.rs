@@ -16,8 +16,10 @@
 //! program is no session in another, and an old cookie is no session after
 //! its time.
 //!
-//! Cookies are `Secure` unless the request is to this machine (`localhost`,
-//! `127.0.0.1`), where browsers are reached over plain HTTP.
+//! Cookies are `Secure`, except in development (`--watch`) and in a desktop
+//! app's window, which are served over plain HTTP on this machine. (The
+//! request's host cannot tell: behind a proxy, every request is to
+//! 127.0.0.1.)
 
 use crate::crypto::{b64url, hmac_sha256, unb64url};
 use crate::interp::{fail, Ctrl, Interp};
@@ -27,6 +29,10 @@ use std::sync::OnceLock;
 type R = Result<Value, Ctrl>;
 
 pub const COOKIE: &str = "quillo_session";
+
+/// Served over plain HTTP on purpose (`--watch`, desktop apps): cookies
+/// are not `Secure`.
+pub static PLAIN_HTTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Browsers keep cookies up to about 4096 bytes, name and attributes included.
 const MAX_COOKIE: usize = 3900;
 const DEFAULT_AGE: u64 = 30 * 86400;
@@ -48,7 +54,7 @@ fn key() -> &'static [u8; 32] {
             Ok(s) if !s.is_empty() => s.into_bytes(),
             _ => {
                 eprintln!("quillo: QUILLO_SECRET is not set; sessions use a random key and end when the server stops");
-                crate::crypto::random_bytes(32).unwrap_or_default()
+                crate::crypto::secret_bytes(32)
             }
         };
         hmac_sha256(&secret, b"quillo session")
@@ -90,17 +96,6 @@ fn header(it: &mut Interp, name: &str) -> Option<String> {
     let Some(Value::Map(req)) = it.request_value() else { return None };
     let Some(Value::Map(h)) = req.get("headers") else { return None };
     h.get(name).map(|v| v.display())
-}
-
-/// Whether the request came to this machine by name or loopback address.
-fn local(it: &mut Interp) -> bool {
-    let host = header(it, "host").unwrap_or_default().to_ascii_lowercase();
-    let name = if host.starts_with('[') {
-        host.split(']').next().map(|h| format!("{}]", h)).unwrap_or_default()
-    } else {
-        host.split(':').next().unwrap_or("").to_string()
-    };
-    name == "localhost" || name.ends_with(".localhost") || name.starts_with("127.") || name == "[::1]"
 }
 
 fn token_ok(name: &str) -> bool {
@@ -163,7 +158,8 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
         Some(v) => return fail(line, format!("`{}`'s same_site is a str, got {}", f, v.type_name())),
     };
     // SameSite=None is only kept by browsers on Secure cookies.
-    let secure = same_site == "None" || opt("secure").map_or_else(|| !local(it), |v| v.truthy());
+    let plain = PLAIN_HTTP.load(std::sync::atomic::Ordering::Relaxed);
+    let secure = same_site == "None" || opt("secure").map_or(!plain, |v| v.truthy());
     if secure {
         s.push_str("; Secure");
     }
