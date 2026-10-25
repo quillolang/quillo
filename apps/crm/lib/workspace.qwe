@@ -100,11 +100,17 @@ fn sign_in_token(user_id: int) {
 // On the main site: is this address free?
 server fn slug_free(slug: str) = slugify(slug) == slug && !contains(RESERVED, slug) && !db.tenant_exists(slug)
 
-server fn create_workspace(w: map) {
+server fn create_workspace(form: map) {
+    // With one workspace, it has no address of its own to choose, and can
+    // be set up once.
+    let w = SINGLE ? set(form, "slug", ONLY) : form
     let problems = errors_of(check_workspace(w))
     if len(problems) > 0 { return err({ problems }) }
-    if db.tenant_exists(w.slug) { return err({ problems: problem("slug", "That address is taken") }) }
-    let url = workspace_url(w.slug, request.headers.host ?? DOMAIN)
+    if db.tenant_exists(w.slug) {
+        return err({ problems: SINGLE ? problem("", "This CRM is set up already: sign in") : problem("slug", "That address is taken") })
+    }
+    let host = request.headers.host ?? DOMAIN
+    let url = SINGLE ? `${SCHEME}://${host}` : workspace_url(w.slug, host)
     let token = with_tenant(w.slug, () => setup_workspace(w, url))
     { url: `${url}/welcome/${token}` }
 }

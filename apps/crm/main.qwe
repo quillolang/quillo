@@ -10,8 +10,15 @@
 
 let DOMAIN = env("CRM_DOMAIN", "localhost")
 let SCHEME = env("CRM_SCHEME", "http")
+// `single`: one workspace on its own domain (crm.example.com), set up on
+// the first visit. `multi` (the default): workspaces sign up on the main
+// site and each gets a subdomain.
+let SINGLE = env("CRM_MODE", "multi") == "single"
+let ONLY = "main"
 
-tenant_from(DOMAIN)
+// With one workspace, every request is its: the rest of the program is the
+// same either way.
+if SINGLE { tenant_from((request) => ONLY) } else { tenant_from(DOMAIN) }
 db.open("data/{tenant}.db")
 db.migrate("migrations")
 
@@ -86,7 +93,14 @@ route GET /p/:slug {
 
 // A request for a workspace that does not exist answers 404, before any
 // page touches its (absent) database.
-fn workspace_here() = db.tenant_exists(tenant()) || reply 404 <NoWorkspace/>
+fn workspace_here() = db.tenant_exists(tenant())
+    || (SINGLE ? reply 303 redirect("/setup") : reply 404 <NoWorkspace/>)
+
+// With one workspace: setting it up, on the first visit.
+route GET /setup {
+    if !SINGLE || db.tenant_exists(ONLY) { return redirect("/") }
+    <SetupPage/>
+}
 
 route GET /login {
     if tenant() == null { return redirect("/") }

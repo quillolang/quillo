@@ -34,13 +34,14 @@ view Landing() =
         </div>
     </Page>
 
-component Signup(domain: str) {
+// `single`: setting up the one workspace, which has no address to choose.
+component Signup(domain: str, single: bool = false) {
     ~w = { name: "", slug: "", industry: "merchant", owner_name: "", email: "", password: "", currency: "USD" }
     ~touched = []
     ~server = []
     ~free = null
     ~busy = false
-    let all = check_workspace(w) + server
+    let all = check_workspace(single ? set(w, "slug", "main") : w) + server
     // Hints for what you have typed in, not for what you have yet to.
     let shown = all | filter((p) => contains(touched, p.field))
     let change = (field) => (v) => {
@@ -51,7 +52,7 @@ component Signup(domain: str) {
     }
     <form.signup @submit={() => {
         touched = ["name", "slug", "industry", "owner_name", "email", "password"]
-        if len(errors_of(check_workspace(w))) == 0 {
+        if len(errors_of(check_workspace(single ? set(w, "slug", "main") : w))) == 0 {
             busy = true
             let r = create_workspace(w)
             busy = false
@@ -59,9 +60,9 @@ component Signup(domain: str) {
             if is_err(r) { server = refusal_problems(r) } else { js("location.assign", r.url) }
         }
     }}>
-        <h2>Create your workspace</h2>
+        <h2>{single ? "Set up your CRM" : "Create your workspace"}</h2>
         <TextField label="Business name" field="name" value={w.name} problems={shown} on_change={change("name")} placeholder="Acme Goods" autofocus={true}/>
-        <label.field>
+        {!single && <label.field>
             <span.label>Address</span>
             <div.slug-input>
                 <input name="slug" value={w.slug} class={invalid(shown, "slug") && "invalid"} @input={(e) => {
@@ -73,7 +74,7 @@ component Signup(domain: str) {
             {free == false && <p.hint>That address is taken</p>}
             {free == true && <p.hint.ok>Available</p>}
             <Hints problems={shown} field="slug"/>
-        </label>
+        </label>}
         <label.field>
             <span.label>What do you do?</span>
             <div.choices>{for i in INDUSTRIES => <button type="button" class={w.industry == i.id ? "choice on" : "choice"}
@@ -86,6 +87,18 @@ component Signup(domain: str) {
         <button.primary.wide disabled={busy}>{busy ? "Creating…" : "Create workspace"}</button>
     </form>
 }
+
+view SetupPage() =
+    <Page title="Set up Relay" wide={true}>
+        <div.landing>
+            <section.hero>
+                <Logo/>
+                <h1>Welcome. Let us set up your CRM.</h1>
+                <p.lead>One workspace, on this address. You will be its owner, and can add your team after.</p>
+            </section>
+            <section.signup-card><Signup domain={DOMAIN} single={true}/></section>
+        </div>
+    </Page>
 
 view NoWorkspace() =
     <Page title="No workspace here">

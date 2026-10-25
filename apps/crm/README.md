@@ -137,9 +137,22 @@ and says which port to leave by; returning `{ waiting_for: "time", until: <ms>,
 resume: "out" }` parks the run instead. Plugins can also bring `checkout_fields`,
 `form_fields` and `taxes: (order, subtotal_cents, ctx) => cents`.
 
+## One workspace, or many
+
+By default the CRM is a service: workspaces sign up on the main site and each gets a
+subdomain. To install it for one business on its own domain instead:
+
+```sh
+CRM_MODE=single quillo run apps/crm/main.qwe --port 9000
+```
+
+The first visit opens a setup page (the business, the owner), and after that the CRM
+is that one workspace, at the domain's own address; no subdomains or wildcard DNS. The
+two modes are the same program: with one workspace, every request belongs to it.
+
 ## Running it for real
 
-- `CRM_DOMAIN=example.com` and a wildcard DNS record (`*.example.com`), behind a proxy
+- Many workspaces: `CRM_DOMAIN=example.com` and a wildcard DNS record (`*.example.com`); one: `CRM_MODE=single`. Either way behind a proxy
   that terminates HTTPS (limer, Caddy, nginx); set `CRM_SCHEME=https`.
 - `QUILLO_SECRET` to a long random string, the same on every server: it signs sessions.
 - `data/` holds every workspace's database: back it up.
