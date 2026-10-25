@@ -317,8 +317,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
 ```
 
 - The server renders it like a view, inside a `<quillo-island>` that carries its props
-  and state. The page loads its bundle automatically, and the browser takes
-  over from that state.
+  and state. The page loads its bundle automatically, and the browser resumes the
+  component from that state, on the server's own elements (see below).
 - Assigning to a `~` variable re-renders the component. Lists keep their DOM (and
   focus) when items have `key={...}`. Nested components keep their own state.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...).
@@ -342,20 +342,27 @@ route GET / = <html><body><Counter start={5}/></body></html>
   the server changes (pass it as a prop instead).
 - Each page loads a bundle of its own, `/_quillo/b/<hash>.js`: the components it was
   rendered with, what they use, and the parts of the runtime they reach, minified (a
-  small component is about 11 KB, under 4 KB gzipped). Its address changes with its
+  small component is about 25 KB, 8 KB gzipped). Its address changes with its
   content, so the browser keeps it for good; a page with no components loads no
   script.
+- And only when it is needed: the server's HTML shows at once, and the bundle comes
+  when someone reaches for a component (hovers, touches or focuses it). What they
+  typed and clicked before it came is kept and done then. A component that runs by
+  itself (`every`, `live`, `js`, `@mount` while it renders) or that is the page (in
+  `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
+  every component, for pages that load it themselves. Text responses are gzipped for
+  browsers that accept it.
+- Components are resumed, not made again: the browser renders a component once, from
+  the state the server sent, and takes the server's elements as its own (checking that
+  they are the same) instead of replacing them, so images do not reload, a scrolled
+  list stays where it is and what someone typed stays typed. Each component is resumed
+  when it is first reached, the others when they are needed. An element whose tag or
+  text differs (a script changed the page) is made again, for that component only.
 - `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
   the answer (`true` or `false`) — a handler goes on after it; `notify(message, { title,
   tone, seconds })` shows a note that goes by itself. Both are markup with `q-` classes
   in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
   and styles: keyboard, focus and screen readers are taken care of.
-- And only when it is needed: the server's HTML shows at once, and the bundle comes
-  when someone reaches for a component (hovers, touches or focuses it). What they
-  typed and clicked before it came is kept and done then. A component that runs by
-  itself (`every`, `live`, `js`, `@mount` while it renders) or that is the page (in
-  `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has every component, for pages that load it themselves.
-  Text responses are gzipped for browsers that accept it.
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
   as `2`. Arithmetic gives the same results on both sides.
 

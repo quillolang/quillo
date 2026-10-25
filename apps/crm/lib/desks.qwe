@@ -32,10 +32,12 @@ fn on_desk(d, u, part: str) {
 // Everyone on a part, for mail.
 fn desk_people(d, part: str) = db.query("select id, email, name, role, role_id from users") | filter((u) => on_desk(d, u, part)) | map((u) => u.id)
 
-// Approvals of the version that went for review.
+// Approvals of the version that went for review: those after its latest
+// submission (by order, not time: an edit in the same second still counts).
 fn approvals_of(p) = p.submitted_at == null ? [] : db.query(
-    "select r.*, u.name from post_reviews r left join users u on u.id = r.user_id where r.post_id = ? and r.decision = 'approved' and r.created_at >= ?",
-    p.id, p.submitted_at)
+    "select r.*, u.name from post_reviews r left join users u on u.id = r.user_id where r.post_id = ? and r.decision = 'approved'
+     and r.id > coalesce((select max(id) from post_reviews where post_id = ? and decision = 'submitted'), 0)",
+    p.id, p.id)
 
 // What `u` may do with the post now, and why not.
 fn post_can(u, p) {

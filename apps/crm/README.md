@@ -27,6 +27,7 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | **Objects** | Kinds of records of your own (vehicles, events, tickets…), designed in the app: fields of every type, links to contacts, companies and other objects' records, lookups (a field of what a link leads to, kept up to date), rules made without code (both sides), rule scripts on fields (on the server), templates to start from; each object's records in the menu, with a list, a page per record, CSV export, and flows that start when one is added or changed. |
 | **Desks** | Each category of posts can have its own editors, reviewers and publishers, and the approvals a post needs: draft → review → approved → published, with changes asked for by note, mail at each step, and a queue of what waits for you. |
 | **Questions and notes** | The app asks before it deletes, and tells you what it did, in dialogs and notes on the page (`ask`, `notify`), in a notice style plugins bring (Standard, Quiet; Glass and Bold from the Notice styles plugin): where they open and how they look. |
+| **Newsroom suite** | A plugin whose model is a newspaper's: Categories (which can depend on one another: Elections, part of Politics) and Articles, with their states (Draft, In review, Changes asked, Approved, Published) and moves for the Writers, Reviewers and Publishers groups, all the workspace's own to design further. Reviewers mark any words or picture and comment; threads are answered and resolved; moves tell the next people. Articles are the site: a front page, a page per section, a page per story. |
 | **Roles and groups** | Roles: what each may do with each object (see, edit, delete), each field (edit, read, hidden), and an access script deciding which records they see. Groups: people who work together, who get the group's roles and are what it is on the team (designers, writers, reviewers, publishers). |
 | **States** | Objects have states and the moves between them: each move for some groups or roles, with a form of the fields it needs; the state changes by a move and nothing else. Flows start when a record moves, ask a group or a role to decide (approved / rejected), and move records. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
@@ -172,6 +173,25 @@ values they are given (`value`, `record`, `user`, `today`, and helpers such as
 clock — and stop after 20,000 steps. A rule script gives `true` (or null) when the value
 is fine, `false` or a message when not; forms show its answer as you type, and saving is
 refused while it has one. An access script gives `true` for the records a role sees.
+
+### Objects on the site, review, and models from plugins
+
+An object can be on the site (in its designer): its records in a chosen state read as
+articles at `/<path>` — a front page, `/<path>/c/<section>` (a section and those that
+depend on it), `/<path>/<id>-<slug>` — with which field is the headline, summary,
+picture, caption, body, section and byline. Its team previews a record before it is
+published (`?preview=1`).
+
+Any record can be reviewed: select a few words of any text field (or click a picture)
+and comment; comments are threads, answered and resolved, and stay with the record as
+it moves. A move tells the people who make the next moves, and the writer.
+
+A plugin can bring a model: `model: { groups, objects }`, made when it is switched on
+where the workspace does not have it yet (the Newsroom suite is one). A move for groups
+no one is in is anyone's who may edit, so one person writing alone needs no groups.
+
+To run the CRM as one newspaper: `CRM_MODE=single quillo run apps/crm/main.qwe`, set it
+up as a news outlet, and the suite is on.
 
 ## Writing a plugin
 

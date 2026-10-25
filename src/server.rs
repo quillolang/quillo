@@ -1338,7 +1338,7 @@ fn island_loader(src: &str) -> String {
             "(()=>{{const d=document,q=window.__quillo_q=[];let go=0;",
             "const load=()=>{{if(go)return;go=1;const t=d.createElement(\"script\");t.src={};t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}};",
             "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island\");",
-            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e))load()}},{{capture:true,passive:true}});",
+            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{window.__quillo_at=e.target;load()}}}},{{capture:true,passive:true}});",
             "for(const v of[\"click\",\"submit\"])d.addEventListener(v,(e)=>{{if(!window.__quillo_booted&&isl(e)){{e.preventDefault();e.stopPropagation();q.push(e);load()}}}},true);",
             "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
             "d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"

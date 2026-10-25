@@ -6,20 +6,22 @@
 // unique index. Names go into SQL with `sql_name`, which takes only
 // letters, digits and `_`.
 
-let LINKS = ["contact", "company", "record"]
+let LINKS = ["contact", "company", "person", "record"]
 
 fn to_col(f: map, v) = v == null ? null
     : f.type == "checkbox" ? (v == true ? 1 : 0)
+    : f.type == "image" ? (type_of(v) == "map" ? json.stringify(v) : null)
     : contains(LINKS, f.type) ? int(str(v)) ?? null
     : v
 
 fn from_col(f: map, v) = v == null ? null
     : f.type == "checkbox" ? v == 1 || v == true
+    : f.type == "image" ? parsed(str(v), null)
     : contains(LINKS, f.type) ? str(v)
     : v
 
 fn row_record(key: str, fields: list, row) = row == null ? null : {
-    id: row.id, object: key, title: row.title, state: row.state ?? "", owner_id: row.owner_id, created_at: row.created_at, updated_at: row.updated_at,
+    id: row.id, object: key, title: row.title, state: row.state ?? "", owner_id: row.owner_id, created_at: row.created_at, updated_at: row.updated_at, moved_at: row.moved_at,
     fields: fields | reduce({}, (m, f) => set(m, f.key, from_col(f, row[`f_${f.key}`]))),
 }
 
@@ -32,6 +34,8 @@ fn sync_table(key: str) {
         id integer primary key, title text not null default '', state text not null default '',
         owner_id integer references users(id) on delete set null, created_at integer not null, updated_at integer not null)`)
     let have = db.query("select name from pragma_table_info(?)", `o_${key}`) | map((r) => r.name)
+    // When the record last moved (its state's time: published on, say).
+    if !contains(have, "moved_at") { db.exec(`alter table ${sql_name(`o_${key}`)} add column moved_at integer`) }
     // Each field a column, typed as the field is.
     for f in fields | filter((f) => !contains(have, `f_${f.key}`)) => db.exec(`alter table ${sql_name(`o_${key}`)} add column ${sql_name(`f_${f.key}`)} ${match f.type {
         "number" => "NUMERIC"
@@ -39,6 +43,7 @@ fn sync_table(key: str) {
         "checkbox" => "INTEGER"
         "contact" => "INTEGER REFERENCES contacts(id) ON DELETE SET NULL"
         "company" => "INTEGER REFERENCES companies(id) ON DELETE SET NULL"
+        "person" => "INTEGER REFERENCES users(id) ON DELETE SET NULL"
         "record" => `INTEGER REFERENCES ${sql_name(`o_${(f.options ?? [])[0] ?? ""}`)}(id) ON DELETE SET NULL`
         "lookup" => ""
         _ => "TEXT"
@@ -111,7 +116,7 @@ fn rec_update(key: str, id: int, values: map) {
 }
 
 fn rec_set(key: str, id: int, what: map) {
-    if what.state != null { db.exec(`update ${sql_name(`o_${key}`)} set state = ?, updated_at = ? where id = ?`, what.state, now(), id) }
+    if what.state != null { db.exec(`update ${sql_name(`o_${key}`)} set state = ?, moved_at = ?, updated_at = ? where id = ?`, what.state, now(), now(), id) }
     if what.title != null { db.exec(`update ${sql_name(`o_${key}`)} set title = ? where id = ?`, what.title, id) }
 }
 
@@ -132,9 +137,15 @@ fn rec_title(key: str, id) = (db.one(`select title from ${sql_name(`o_${key}`)} 
 // Once per workspace: each object's table made, its records copied in (ids
 // kept, so links still lead where they did). The shared table keeps its
 // rows, untouched, as a backup.
+// Tables as this program makes them: 1, records copied in; 2, every table
+// brought up to date (columns the program added since, such as moved_at).
+let TABLES_VERSION = 2
+
 fn objects_ready() {
-    if settings().objects_in_tables == true { return true }
-    let old = db.one("select name from sqlite_master where type = 'table' and name = 'object_records'") != null
+    let s = settings()
+    let v = s.object_tables ?? (s.objects_in_tables == true ? 1 : 0)
+    if v >= TABLES_VERSION { return true }
+    let old = v < 1 && db.one("select name from sqlite_master where type = 'table' and name = 'object_records'") != null
     // Targets before the objects that link to them, so references are made.
     for o in db.query("select key from objects order by id") => sync_table(o.key)
     if old {
@@ -154,6 +165,6 @@ fn objects_ready() {
         // The old rows stay where they were, as they were: a backup (the flag
         // below keeps them from moving twice).
     }
-    put_setting("objects_in_tables", true)
+    put_setting("object_tables", TABLES_VERSION)
     true
 }

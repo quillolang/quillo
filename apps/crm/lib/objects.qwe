@@ -6,7 +6,11 @@
 // type and the server runs again when a record is saved, with any rules
 // plugins bring for "obj.<key>".
 
-let FIELD_TYPES = ["text", "textarea", "number", "money", "date", "select", "checkbox", "url", "email", "contact", "company", "record", "lookup"]
+let FIELD_TYPES = ["text", "textarea", "markdown", "number", "money", "date", "select", "checkbox", "url", "email", "image", "contact", "company", "person", "record", "lookup"]
+
+// Fields that lead to something: a contact, a company, a team member, a record.
+let LINK_TYPES = ["contact", "company", "person", "record"]
+let PERSON_LOOKUPS = [["name", "Name"], ["email", "Email"], ["bio", "About"]]
 
 // A lookup field shows a field of what one of the record's links leads to:
 // options are [the link field, the field there]. These are what a contact's
@@ -18,6 +22,7 @@ let COMPANY_LOOKUPS = [["name", "Name"], ["domain", "Domain"]]
 fn lookup_targets(via: map, all_fields: list) = match via.type {
     "contact" => CONTACT_LOOKUPS
     "company" => COMPANY_LOOKUPS
+    "person" => PERSON_LOOKUPS
     "record" => all_fields | filter((f) => f.entity == `obj.${(via.options ?? [])[0] ?? ""}` && f.type != "lookup") | map((f) => [f.key, f.label])
     _ => []
 }
@@ -28,6 +33,7 @@ fn lookup_value(via: map, target: str, id: int) = match via.type {
         c == null ? null : target == "name" ? trim(`${c.first_name} ${c.last_name}`) : c[target]
     }
     "company" => (db.one("select name, domain from companies where id = ?", id) ?? {})[target]
+    "person" => (db.one("select name, email, bio from users where id = ?", id) ?? {})[target]
     _ => (rec_get((via.options ?? [])[0] ?? "", id) ?? { fields: {} }).fields[target]
 }
 
@@ -44,7 +50,7 @@ fn as_num(v) {
     is_err(n) ? v : n == floor(n) ? int(n) : n
 }
 
-fn object_out(r) = r == null ? null : merge(r, { rules: parsed(r.rules, []), states: parsed(r.states, []), transitions: parsed(r.transitions, []) })
+fn object_out(r) = r == null ? null : merge(r, { rules: parsed(r.rules, []), states: parsed(r.states, []), transitions: parsed(r.transitions, []), site: parsed(r.site ?? "{}", {}) })
 
 fn objects_all() = db.query("select * from objects order by name") | map(object_out)
 
@@ -110,8 +116,9 @@ server fn save_object(o: map) {
         sync_table(key)
         key
     } else {
-        db.exec("update objects set name = ?, plural = ?, icon = ?, description = ?, title_field = ?, rules = ?, states = ?, transitions = ? where id = ?",
-            name, plural, blank(o.icon) ? "◆" : trim(o.icon), trim(o.description ?? ""), o.title_field ?? "", json.stringify(rules), json.stringify(states), json.stringify(transitions), o.id)
+        let site = site_config(o.site ?? {})?
+        db.exec("update objects set name = ?, plural = ?, icon = ?, description = ?, title_field = ?, rules = ?, states = ?, transitions = ?, site = ? where id = ?",
+            name, plural, blank(o.icon) ? "◆" : trim(o.icon), trim(o.description ?? ""), o.title_field ?? "", json.stringify(rules), json.stringify(states), json.stringify(transitions), json.stringify(site), o.id)
         // Records in a state that is gone start over in the first one.
         if len(states) > 0 {
             for r in rec_all(o.key, 100000) | filter((r) => !contains(keys_of, r.state)) => rec_set(o.key, r.id, { state: states[0].key })
@@ -194,6 +201,7 @@ server fn link_choices(key: str) {
     {
         contact: any(fields, (f) => f.type == "contact") ? db.query("select id, first_name, last_name, email from contacts order by first_name, last_name limit 1000")
             | map((c) => { value: str(c.id), label: blank(`${c.first_name}${c.last_name}`) ? c.email : `${trim(`${c.first_name} ${c.last_name}`)} (${c.email})` }) : [],
+        person: any(fields, (f) => f.type == "person") ? db.query("select id, name, email from users order by name") | map((x) => { value: str(x.id), label: x.name }) : [],
         company: any(fields, (f) => f.type == "company") ? db.query("select id, name from companies order by name limit 1000") | map((c) => { value: str(c.id), label: c.name }) : [],
         records: targets | reduce({}, (m, t) => set(m, t, !allows(access_to(u, t).level, "read") ? [] : rec_all(t, 1000)
             | filter((r) => may_see(u, access_to(u, t), r)) | sort_by((r) => lower(r.title)) | map((r) => { value: str(r.id), label: r.title }))),
@@ -223,15 +231,16 @@ server fn get_record(key: str, id: int) {
     let o = need_object(key)?
     let seen = as_seen(a, r)
     merge(seen, { names: link_names(object_fields(key), seen.fields), linked: records_linking(u, "record", id, key), can: a.level,
-        moves: moves_for(u, o, r) | map((t) => remove(remove(t, "groups"), "roles")) })
+        moves: moves_for(u, o, r) | map((t) => remove(remove(t, "groups"), "roles")), comments: open_annotations(key, id) })
 }
 
 // "Ada Lovelace" for a contact field's id, and so on.
-fn link_names(fields: list, values: map) = fields | filter((f) => contains(["contact", "company", "record"], f.type) && !blank(values[f.key])) | reduce({}, (m, f) => {
+fn link_names(fields: list, values: map) = fields | filter((f) => contains(LINK_TYPES, f.type) && !blank(values[f.key])) | reduce({}, (m, f) => {
     let id = int(str(values[f.key])) ?? 0
     let row = match f.type {
         "contact" => db.one("select trim(first_name || ' ' || last_name) as name, id from contacts where id = ?", id)
         "company" => db.one("select name, id from companies where id = ?", id)
+        "person" => db.one("select name, id from users where id = ?", id)
         _ => { let t = rec_title((f.options ?? [])[0] ?? "", id); t == null ? null : { name: t, id } }
     }
     set(m, f.key, row == null ? "(deleted)" : row.name)
@@ -278,6 +287,10 @@ fn typed_values(fields: list, given: map) = fields | filter((f) => f.type != "lo
         "contact" => str(v)
         "company" => str(v)
         "record" => str(v)
+        "person" => str(v)
+        // A picture: the media value (its key, size, crop) as it was chosen.
+        "image" => type_of(v) == "map" ? v : null
+        "markdown" => str(v)
         _ => trim(str(v))
     })
 })
@@ -287,11 +300,12 @@ fn typed_values(fields: list, given: map) = fields | filter((f) => f.type != "lo
 fn record_problems(key: str, fields: list, values: map, state: str, id, u) {
     let ruled = errors_of(validate(`obj.${key}`, { fields: values, state }, object_ctx()))
     if len(ruled) > 0 { return ruled }
-    let missing = fields | filter((f) => contains(["contact", "company", "record"], f.type) && !blank(values[f.key])) | filter((f) => {
+    let missing = fields | filter((f) => contains(LINK_TYPES, f.type) && !blank(values[f.key])) | filter((f) => {
         let lid = int(values[f.key]) ?? 0
         match f.type {
             "contact" => db.one("select id from contacts where id = ?", lid) == null
             "company" => db.one("select id from companies where id = ?", lid) == null
+            "person" => db.one("select id from users where id = ?", lid) == null
             _ => rec_title((f.options ?? [])[0] ?? "", lid) == null
         }
     }) | map((f) => problem(`fields.${f.key}`, `${f.label}: that one no longer exists`)) | flatten
@@ -341,10 +355,14 @@ server fn save_record(key: str, r: map) {
 
 // Who may make a move: the groups and roles it names (none named: anyone
 // who may edit the object's records), and owners and admins.
-fn may_move(u, o: map, t: map) =
-    u.role != "member"
-    || (len(t.groups ?? []) == 0 && len(t.roles ?? []) == 0 ? allows(access_to(u, o.key).level, "edit")
-        : any(t.groups ?? [], (g) => in_group(u, g)) || any(t.roles ?? [], (rid) => has_role(u, rid)))
+// A move for groups no one is in (a writer working alone) is anyone's who
+// may edit.
+fn may_move(u, o: map, t: map) {
+    if u.role != "member" { return true }
+    let staffed = len(t.roles ?? []) > 0 || any(t.groups ?? [], (g) => len(group_out(db.one("select * from groups where id = ?", g) ?? { members: "[]", roles: "[]", capabilities: "[]" }).members) > 0)
+    staffed ? any(t.groups ?? [], (g) => in_group(u, g)) || any(t.roles ?? [], (rid) => has_role(u, rid))
+        : allows(access_to(u, o.key).level, "edit")
+}
 
 // The moves `u` may make with the record now.
 fn moves_for(u, o: map, r: map) = (o.transitions ?? []) | filter((t) => (len(t.from ?? []) == 0 || contains(t.from, r.state)) && may_move(u, o, t))
@@ -369,6 +387,7 @@ server fn move_record(key: str, id: int, move: str, given: map) {
     let w = rec_update(key, id, values)
     if is_err(w) { return err({ problems: store_problems(key, w) }) }
     rec_set(key, id, { state: t.to, title: record_title(o, fields, values, id) })
+    hand_over(o, rec_get(key, id), u, t.label)
     let label = (find(o.states, (st) => st.key == t.to) ?? { label: t.to }).label
     let contact_id = first_contact(fields, values)
     if contact_id != null { note_activity("record", contact_id, null, `${o.name} “${record_title(o, fields, values, id)}”: ${t.label} (now ${label})`) }
@@ -395,3 +414,35 @@ fn records_csv(key: str) {
     respond(200, join([csv_row(["id", "title"] + (fields | map((f) => f.key)))] + rows, "\n") + "\n",
         { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=${key}.csv` })
 }
+
+// ---- models plugins bring --------------------------------------------------------------
+
+// A plugin's model (groups, objects with their fields, states, moves and
+// site), made where the workspace does not have it yet: what it has, it
+// keeps as it designed it.
+fn install_model(model) {
+    if model == null { return true }
+    objects_ready()
+    for g in model.groups ?? [] => {
+        if db.one("select id from groups where lower(name) = ?", lower(g.name)) == null {
+            db.exec("insert into groups (name, members, roles, capabilities, created_at) values (?, '[]', '[]', ?, ?)", g.name, json.stringify(g.capabilities ?? []), now())
+        }
+    }
+    let gid = (name) => (db.one("select id from groups where lower(name) = ?", lower(name)) ?? {}).id
+    for o in model.objects ?? [] => {
+        if db.one("select id from objects where key = ?", o.key) == null {
+            let moves = (o.moves ?? []) | map((t) => { key: t.key, label: t.label, from: t.from ?? [], to: t.to,
+                groups: (t.groups ?? []) | map(gid) | filter((x) => x != null), roles: [], fields: t.fields ?? [] })
+            db.exec("insert into objects (key, name, plural, icon, description, title_field, rules, states, transitions, site, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                o.key, o.name, o.plural, o.icon ?? "◆", o.description ?? "", o.title ?? "", json.stringify(o.rules ?? []), json.stringify(o.states ?? []),
+                json.stringify(moves), json.stringify(o.site ?? {}), now())
+            for [i, f] in enumerate(o.fields ?? []) =>
+                db.exec("insert into custom_fields (entity, key, label, type, required, options, is_unique, position) values (?, ?, ?, ?, ?, ?, ?, ?)",
+                    `obj.${o.key}`, f.key, f.label, f.type, f.required == true ? 1 : 0, json.stringify(f.target != null ? [f.target] : f.options ?? []), f.unique == true ? 1 : 0, i)
+            sync_table(o.key)
+        }
+    }
+    true
+}
+
+fn install_models(ids: list) = plugins | filter((p) => p.model != null && contains(ids, p.id)) | map((p) => install_model(p.model))

@@ -220,7 +220,8 @@ fn svg_inside_html_draws() {
 
 /// A page loads its components' code when it is needed: not before someone
 /// reaches for one (what they typed and clicked meanwhile is kept), and at
-/// once for one that runs by itself.
+/// once for one that runs by itself. It resumes on the server's HTML: the
+/// same elements, not made again.
 #[test]
 fn islands_load_their_code_when_it_is_needed() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -229,7 +230,8 @@ fn islands_load_their_code_when_it_is_needed() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let r = run_page_with(&chrome, &dir.join("lazy.qwe"), free_port(), Some(&dir.join("lazy.js")));
-    let want = serde_json::json!({ "idleLoads": false, "loadedOnFocus": true, "echo": "Ada", "clicked": "Go 1", "value": "Ada", "errors": [] });
+    let want = serde_json::json!({ "idleLoads": false, "loadedOnFocus": true, "echo": "Ada", "clicked": "Go 1", "value": "Ada",
+        "sameNodes": true, "remade": 0, "errors": [] });
     assert_eq!(r, want);
     let r = run_page_with_path(&chrome, &dir.join("lazy.qwe"), free_port(), "/clock", Some(&dir.join("lazy.js")));
     assert_eq!(r, serde_json::json!({ "clockRuns": true, "errors": [] }));

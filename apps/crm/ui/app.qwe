@@ -12,6 +12,7 @@ view AppPage() =
             <meta name="robots" content="noindex, nofollow"/>
             <link rel="stylesheet" href="/assets/app.css"/>
             <style>{notices_css()}</style>
+            <script src="/assets/review.js" defer></script>
         </head>
         <body data-notices={notice_classes(notice_style())}><App/></body>
     </html>

@@ -10,7 +10,10 @@
 //! what they use (`bundle_for`), at `/_quillo/b/<hash>.js`, kept by the
 //! browser for good since its address changes with its content. A page with
 //! no components loads no script, and one with components loads it when it
-//! is needed (`island_loader` in server.rs, `island.rs`).
+//! is needed (`island_loader` in server.rs, `island.rs`). The runtime resumes
+//! each component on the server's elements (`Inst.adopt` in runtime.js):
+//! it renders once from the state the server sent and takes the DOM as it
+//! is, making it again only where it differs.
 
 use crate::ast::*;
 use crate::error::QuilloError;

@@ -33,13 +33,14 @@ use "plugins/paywall.qwe"
 use "plugins/sponsors.qwe"
 use "plugins/quality.qwe"
 use "plugins/notices.qwe"
+use "plugins/newsroom.qwe"
 use "plugins/blog.qwe"
 
 // The plugins there are.
 // The plugin studio's (plugins/studio/), released and drafts.
 use "plugins/studio/index.qwe"
 
-let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality, plugin_notices] + studio_plugins
+let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality, plugin_notices, plugin_newsroom] + studio_plugins
 
 use "lib/records.qwe"
 use "lib/commerce.qwe"
@@ -48,7 +49,7 @@ use "lib/flows.qwe"
 
 // The steps flows run, on the server: the core's and the plugins'.
 // By plugin (and version: "birthday#draft").
-let step_runners = merge({ core: core_runners, blog: runners_blog, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality, notices: runners_notices }, studio_runners)
+let step_runners = merge({ core: core_runners, blog: runners_blog, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality, notices: runners_notices, newsroom: runners_newsroom }, studio_runners)
 
 use "lib/workspace.qwe"
 use "lib/site.qwe"
@@ -58,6 +59,8 @@ use "lib/studio.qwe"
 use "lib/blog.qwe"
 use "lib/store.qwe"
 use "lib/objects.qwe"
+use "lib/news.qwe"
+use "lib/review.qwe"
 use "lib/roles.qwe"
 use "lib/desks.qwe"
 use "plugins/core_blocks.qwe"
@@ -77,6 +80,7 @@ use "ui/shop.qwe"
 use "ui/code.qwe"
 use "ui/site.qwe"
 use "ui/objects.qwe"
+use "ui/review.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -105,7 +109,11 @@ route GET / {
     workspace_here()
     // A published home page, for visitors; else the app.
     let home = home_page()
-    home != null ? show_page(home) : current_user() == null ? redirect("/login") : redirect("/app")
+    if home != null { return show_page(home) }
+    // An object on the site can be its home (a newspaper's front page).
+    objects_ready()
+    let front = find(site_objects(), (o) => o.site.home == true)
+    front != null ? site_front(front) : current_user() == null ? redirect("/login") : redirect("/app")
 }
 
 // An image at one of its sizes (and crops), for pages anyone may see.
@@ -174,7 +182,8 @@ route GET /p/:slug {
 
 // A request for a workspace that does not exist answers 404, before any
 // page touches its (absent) database.
-fn workspace_here() = db.tenant_exists(tenant())
+// (On the main site, with no workspace in the address, there is none.)
+fn workspace_here() = (tenant() != null && db.tenant_exists(tenant()))
     || (SINGLE ? reply 303 redirect("/setup") : reply 404 <NoWorkspace/>)
 
 // With one workspace: setting it up, on the first visit.
@@ -347,4 +356,22 @@ route GET /f/:slug {
 route GET /unsubscribe/:token {
     workspace_here()
     <UnsubscribedPage ok={unsubscribe(token)} name={settings().name ?? ""}/>
+}
+
+// ---- objects on the site (last: what nothing above claims) ----------------------------------
+
+route GET /:section {
+    workspace_here()
+    objects_ready()
+    site_front(site_object(section) ?? reply 404 <NotFoundPage what="page"/>)
+}
+
+route GET /:section/c/:slug {
+    workspace_here()
+    site_section(site_object(section) ?? reply 404 <NotFoundPage what="page"/>, slug)
+}
+
+route GET /:section/:item {
+    workspace_here()
+    site_article(site_object(section) ?? reply 404 <NotFoundPage what="page"/>, item, request.query.preview == "1")
 }

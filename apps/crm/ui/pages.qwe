@@ -447,6 +447,7 @@ component TasksPage(ws: map) {
     ~t = { title: "", due: "" }
     ~problems = []
     <div.stack>
+        <RecordQueue/>
         <FlowDecisions/>
         <PageHead title="Tasks">
             <label.check-inline><input type="checkbox" checked={show_done} @change={(e) => { show_done = e.checked }}/> Show done</label>
@@ -887,6 +888,8 @@ component PluginsPage(ws: map, on_change) {
                     {len(p.steps ?? []) > 0 && <li>Flow steps: {(p.steps ?? []) | map((s) => s.label) | join(", ")}</li>}
                     {len(p.blocks ?? []) > 0 && <li>Page blocks: {(p.blocks ?? []) | map((b) => b.label) | join(", ")}</li>}
                     {len(p.themes ?? []) > 0 && <li>Themes: {(p.themes ?? []) | map((t) => t.name) | join(", ")}</li>}
+                    {p.model != null && <li>Objects: {(p.model.objects ?? []) | map((o) => o.plural) | join(", ")} (theirs to design further)</li>}
+                    {p.model != null && len(p.model.groups ?? []) > 0 && <li>Groups: {p.model.groups | map((g) => g.name) | join(", ")}</li>}
                     {len(p.checkout_fields ?? []) > 0 && <li>Checkout asks for: {p.checkout_fields | join(", ")}</li>}
                     {p.version != null && <li>Version {p.version}, from the plugin studio</li>}
                     {p.taxes != null && <li>Adds tax at checkout</li>}

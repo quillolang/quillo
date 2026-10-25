@@ -817,7 +817,7 @@ fn groups_roles_on_fields_state_machines_and_decisions_in_flows() {
     }
     let role = rpc(&mut crm, &owner, "save_role", serde_json::json!([{ "name": "Newsroom", "access": { "pitch": { "level": "edit", "script": "", "fields": { "budget": "read", "source": "hidden" } } } }]))["ok"].as_i64().unwrap();
     let editors = rpc(&mut crm, &owner, "save_group", serde_json::json!([{ "name": "Editors", "members": [uid("Ed")], "roles": [role], "capabilities": ["designer", "reviewer"] }]))["ok"].as_i64().unwrap();
-    rpc(&mut crm, &owner, "save_group", serde_json::json!([{ "name": "Writers", "members": [uid("Wendy")], "roles": [role], "capabilities": ["writer"] }]));
+    rpc(&mut crm, &owner, "save_group", serde_json::json!([{ "name": "Stringers", "members": [uid("Wendy")], "roles": [role], "capabilities": ["writer"] }]));
     let obj = rpc(&mut crm, &owner, "get_object", serde_json::json!([key]))["ok"].clone();
     let states = serde_json::json!([{ "label": "Pitched" }, { "label": "Assigned", "color": "amber" }, { "label": "Filed", "color": "green" }]);
     let moves = serde_json::json!([
@@ -921,7 +921,7 @@ fn each_object_is_a_table_of_its_own() {
     rpc(&mut crm, "delete_field", serde_json::json!([field("due")["id"]]));
     assert!(!columns(&crm, "o_ticket").iter().any(|(n, _)| n == "f_due"));
     // Records from before (one shared table) move in, once.
-    crm.sql("acme", "insert into object_records (object, title, fields, state, created_at, updated_at) values ('ticket', 'Old one', '{\"subject\": \"Old one\", \"priority\": \"high\", \"status\": \"open\"}', 'new', 1, 1); delete from settings where key = 'objects_in_tables'");
+    crm.sql("acme", "insert into object_records (object, title, fields, state, created_at, updated_at) values ('ticket', 'Old one', '{\"subject\": \"Old one\", \"priority\": \"high\", \"status\": \"open\"}', 'new', 1, 1); delete from settings where key in ('objects_in_tables', 'object_tables')");
     let all = rpc(&mut crm, "list_records", serde_json::json!(["ticket", ""]))["ok"].clone();
     assert!(all.as_array().unwrap().iter().any(|r| r["title"] == "Old one" && r["fields"]["priority"] == "high"), "{}", all);
     // Once: the old rows stay as a backup, and are not copied again.
@@ -934,4 +934,85 @@ fn each_object_is_a_table_of_its_own() {
     rpc(&mut crm, "save_field", serde_json::json!([{ "entity": "obj.ticket", "label": "Where", "type": "record", "options": [venue] }]));
     assert!(rpc(&mut crm, "delete_object", serde_json::json!([venue]))["err"].as_str().unwrap().contains("Ticket's field Where links to it"));
     assert!(columns(&crm, "o_ticket").iter().any(|(n, t)| n == "f_where" && t == "INTEGER"));
+}
+
+#[test]
+fn the_newsroom_suite_writes_reviews_and_publishes_with_its_groups() {
+    let mut crm = Crm::new("newsroom-suite");
+    let owner = signup_as(&mut crm, "metro", "news");
+    let host = "metro.localhost:9000";
+    let rpc = |crm: &mut Crm, c: &str, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(c));
+    // The suite's model is the workspace's: two objects, three groups.
+    let objects = rpc(&mut crm, &owner, "list_objects", serde_json::json!([]))["ok"].clone();
+    let keys: Vec<&str> = objects.as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap()).collect();
+    assert!(keys.contains(&"article") && keys.contains(&"category"), "{:?}", keys);
+    let groups = rpc(&mut crm, &owner, "list_groups", serde_json::json!([]))["ok"].clone();
+    let gid = |n: &str| groups.as_array().unwrap().iter().find(|g| g["name"] == n).unwrap()["id"].as_i64().unwrap();
+    // Sections, one depending on another.
+    let cat = |crm: &mut Crm, name: &str, parent: Option<i64>| crm.rpc(host, "save_record", serde_json::json!(["category", { "fields": { "name": name, "color": "#b42318",
+        "parent": parent.map(|p| p.to_string()) } }]), Some(&owner))["ok"]["id"].as_i64().unwrap();
+    let politics = cat(&mut crm, "Politics", None);
+    let elections = cat(&mut crm, "Elections", Some(politics));
+    // Alone (no one in the groups yet), a member does it all: a blogger.
+    let mut cookies = std::collections::HashMap::new();
+    for (name, email) in [("Ana", "ana@metro.test"), ("Mei", "mei@metro.test"), ("Sam", "sam@metro.test")] {
+        rpc(&mut crm, &owner, "add_user", serde_json::json!([{ "name": name, "email": email, "password": "a-long-password", "role": "member" }]));
+        let r = crm.form(host, "/login", &format!("email={}&password=a-long-password", email.replace('@', "%40")), None);
+        cookies.insert(name, r.header("set-cookie").unwrap().split(';').next().unwrap().to_string());
+    }
+    let story = |headline: &str, cat: i64| serde_json::json!(["article", { "fields": { "headline": headline, "standfirst": "What it means.", "body": "The council voted **seven to two**.\n\nIt starts in May.", "category": cat.to_string() } }]);
+    let solo = rpc(&mut crm, &cookies["Ana"], "save_record", story("A blog post", politics))["ok"]["id"].as_i64().unwrap();
+    for m in ["submit", "approve"] {
+        let r = rpc(&mut crm, &cookies["Ana"], "move_record", serde_json::json!(["article", solo, m, {}]));
+        assert!(r["ok"].is_object() || m == "approve", "{}: {}", m, r);
+    }
+    // ...the cover rule holds there too: an approved story needs its picture.
+    assert!(rpc(&mut crm, &cookies["Ana"], "move_record", serde_json::json!(["article", solo, "approve", {}]))["err"]["problems"][0]["message"].as_str().unwrap().contains("cover"));
+
+    // With a newsroom: Ana writes, Mei reviews, Sam publishes.
+    let ws = rpc(&mut crm, &owner, "load_workspace", serde_json::json!([]))["ok"].clone();
+    let uid = |n: &str| ws["users"].as_array().unwrap().iter().find(|u| u["name"] == n).unwrap()["id"].as_i64().unwrap();
+    for (g, who, caps) in [("Writers", "Ana", vec!["writer"]), ("Reviewers", "Mei", vec!["reviewer"]), ("Publishers", "Sam", vec!["publisher", "reviewer"])] {
+        rpc(&mut crm, &owner, "save_group", serde_json::json!([{ "id": gid(g), "name": g, "members": [uid(who)], "roles": [], "capabilities": caps }]));
+    }
+    let cover = serde_json::json!({ "key": "nope", "w": 960, "h": 600, "alt": "The council" });
+    let mut s = story("Council votes 7-2 for the tram", elections);
+    s[1]["fields"]["cover"] = cover;
+    let id = rpc(&mut crm, &cookies["Ana"], "save_record", s)["ok"]["id"].as_i64().unwrap();
+    assert!(rpc(&mut crm, &cookies["Mei"], "move_record", serde_json::json!(["article", id, "submit", {}]))["err"].is_string(), "only writers submit");
+    assert_eq!(rpc(&mut crm, &cookies["Ana"], "move_record", serde_json::json!(["article", id, "submit", {}]))["ok"]["state"], "review");
+    let mail = rpc(&mut crm, &owner, "list_outbox", serde_json::json!([]))["ok"].clone();
+    assert!(mail.as_array().unwrap().iter().any(|m| m["to_email"] == "mei@metro.test" && m["subject"].as_str().unwrap().contains("In review")), "{}", mail);
+    assert_eq!(rpc(&mut crm, &cookies["Mei"], "my_records_queue", serde_json::json!([]))["ok"][0]["id"], id);
+    // Mei marks a few words of the headline, and the picture; sends it back.
+    let note = rpc(&mut crm, &cookies["Mei"], "add_annotation", serde_json::json!(["article", id, { "field": "headline", "quote": "7-2", "prefix": "Council votes ", "image": "", "body": "Say seven to two" }]));
+    let note = note["ok"].as_i64().unwrap_or_else(|| panic!("{}", note));
+    rpc(&mut crm, &cookies["Mei"], "add_annotation", serde_json::json!(["article", id, { "field": "cover", "quote": "", "prefix": "", "image": "/media/x.jpg", "body": "Crop it tighter" }]));
+    assert_eq!(rpc(&mut crm, &cookies["Mei"], "add_annotation", serde_json::json!(["article", id, { "field": "nope", "quote": "x", "body": "?" }]))["err"]["problems"][0]["field"], "field");
+    assert_eq!(rpc(&mut crm, &cookies["Mei"], "move_record", serde_json::json!(["article", id, "send_back", {}]))["ok"]["state"], "changes");
+    // Ana sees them, answers, resolves, sends it again.
+    let notes = rpc(&mut crm, &cookies["Ana"], "list_annotations", serde_json::json!(["article", id]))["ok"].clone();
+    assert_eq!((notes[0]["quote"].as_str(), notes[1]["image"].as_str()), (Some("7-2"), Some("/media/x.jpg")));
+    rpc(&mut crm, &cookies["Ana"], "reply_annotation", serde_json::json!([note, "Done"]));
+    rpc(&mut crm, &cookies["Ana"], "resolve_annotation", serde_json::json!([note, true]));
+    let notes = rpc(&mut crm, &cookies["Ana"], "list_annotations", serde_json::json!(["article", id]))["ok"].clone();
+    assert_eq!((notes[0]["resolved"].as_bool(), notes[0]["replies"][0]["body"].as_str()), (Some(true), Some("Done")));
+    let view = rpc(&mut crm, &cookies["Mei"], "review_view", serde_json::json!(["article", id]))["ok"].clone();
+    assert_eq!(view[0]["role"], "headline");
+    assert!(view.as_array().unwrap().iter().any(|f| f["key"] == "body" && f["html"].as_str().unwrap().contains("<strong>seven to two</strong>")), "{}", view);
+    rpc(&mut crm, &cookies["Ana"], "move_record", serde_json::json!(["article", id, "submit", {}]));
+    rpc(&mut crm, &cookies["Mei"], "move_record", serde_json::json!(["article", id, "approve", {}]));
+    let slug = format!("/news/{}-council-votes-7-2-for-the-tram", id);
+    assert_eq!(crm.send(host, "GET", &slug, "", None).status, 404, "not published yet");
+    let preview = crm.send(host, "GET", &format!("{}?preview=1", slug), "", Some(&cookies["Mei"])).text();
+    assert!(preview.contains("Preview · Approved"), "{}", &preview[..preview.len().min(400)]);
+    assert!(rpc(&mut crm, &cookies["Mei"], "move_record", serde_json::json!(["article", id, "publish", {}]))["err"].is_string());
+    assert_eq!(rpc(&mut crm, &cookies["Sam"], "move_record", serde_json::json!(["article", id, "publish", {}]))["ok"]["state"], "published");
+    // On the site: the front page (the home), the section (with the one that depends on it), the story.
+    let front = crm.send(host, "GET", "/", "", None).text();
+    assert!(front.contains("Council votes 7-2 for the tram") && front.contains("np-top"), "{}", front);
+    let section = crm.send(host, "GET", "/news/c/politics", "", None).text();
+    assert!(section.contains("Council votes 7-2") && section.contains("href=\"/news/c/elections\""), "{}", section);
+    let page = crm.send(host, "GET", &slug, "", None).text();
+    assert!(page.contains("<strong>seven to two</strong>") && page.contains("By <b>Ana</b>") && page.contains("np-label"), "{}", page);
 }

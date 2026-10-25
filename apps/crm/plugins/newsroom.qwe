@@ -1,0 +1,70 @@
+// The Newsroom suite: a newspaper's model, as data. Switched on, it makes
+// what a workspace does not have yet — the groups (Writers, Reviewers,
+// Publishers), a Category object (sections, which can depend on one
+// another: Elections, part of Politics) and an Article object with its
+// states and the moves between them, each for a group — and puts articles
+// on the site. From then on it is the workspace's own: designed further in
+// Objects, its people put in groups in Settings. A writer alone (a blog)
+// needs no groups: a move for a group no one is in is anyone's.
+
+let NEWSROOM_MODEL = {
+    groups: [
+        { name: "Writers", capabilities: ["writer"] },
+        { name: "Reviewers", capabilities: ["reviewer"] },
+        { name: "Publishers", capabilities: ["publisher", "reviewer"] },
+    ],
+    objects: [
+        {
+            key: "category", name: "Category", plural: "Categories", icon: "▦", title: "name",
+            description: "The sections of the paper. A category can be part of another: Elections, part of Politics.",
+            fields: [
+                { key: "name", label: "Name", type: "text", required: true, unique: true },
+                { key: "description", label: "Description", type: "textarea" },
+                { key: "color", label: "Colour (#rrggbb)", type: "text" },
+                { key: "parent", label: "Part of", type: "record", target: "category" },
+            ],
+        },
+        {
+            key: "article", name: "Article", plural: "Articles", icon: "✎", title: "headline",
+            description: "Stories, from the writer's draft through review to the front page.",
+            fields: [
+                { key: "headline", label: "Headline", type: "text", required: true },
+                { key: "standfirst", label: "Standfirst", type: "textarea" },
+                { key: "cover", label: "Cover picture", type: "image" },
+                { key: "caption", label: "Caption", type: "text" },
+                { key: "body", label: "Story", type: "markdown", required: true },
+                { key: "category", label: "Category", type: "record", target: "category", required: true },
+            ],
+            rules: [
+                { if: null, then: { field: "headline", op: "shorter than", value: "110" }, message: "Headlines read best under 110 characters", warning: true },
+                { if: { field: "state", op: "is", value: "approved" }, then: { field: "cover", op: "is filled", value: "" }, message: "An approved story needs its cover picture", warning: false },
+            ],
+            states: [
+                { key: "draft", label: "Draft", color: "gray" },
+                { key: "review", label: "In review", color: "amber" },
+                { key: "changes", label: "Changes asked", color: "red" },
+                { key: "approved", label: "Approved", color: "purple" },
+                { key: "published", label: "Published", color: "green" },
+            ],
+            moves: [
+                { key: "submit", label: "Submit for review", from: ["draft", "changes"], to: "review", groups: ["Writers"] },
+                { key: "send_back", label: "Send back to the writer", from: ["review", "approved"], to: "changes", groups: ["Reviewers", "Publishers"] },
+                { key: "approve", label: "Approve", from: ["review"], to: "approved", groups: ["Reviewers"] },
+                { key: "publish", label: "Publish", from: ["approved"], to: "published", groups: ["Publishers"] },
+                { key: "unpublish", label: "Unpublish", from: ["published"], to: "draft", groups: ["Publishers"] },
+            ],
+            site: { on: true, path: "news", state: "published", title: "headline", summary: "standfirst", image: "cover", caption: "caption",
+                body: "body", group: "category", byline: "", home: true },
+        },
+    ],
+}
+
+let plugin_newsroom = {
+    id: "newsroom",
+    name: "Newsroom suite",
+    description: "A newspaper: articles in categories (which can depend on one another), written, reviewed (comments on any words or picture) and published by their groups; the front page, sections and stories on the site.",
+    audience: ["news", "blogger"],
+    model: NEWSROOM_MODEL,
+}
+
+let runners_newsroom = {}

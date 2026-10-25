@@ -128,6 +128,7 @@ fn field_rules(record: map, ctx: map, entity: str) {
                 "money" => when(is_err(float(str(v))), problem(key, `${f.label} must be an amount`))
                 "email" => when(!is_email(str(v)), problem(key, `${f.label} must be an email address`))
                 "contact" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a contact`))
+                "person" => when(is_err(int(str(v))), problem(key, `${f.label}: choose someone on the team`))
                 "company" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a company`))
                 "record" => when(is_err(int(str(v))), problem(key, `${f.label}: choose one`))
                 _ => []

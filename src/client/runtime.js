@@ -1114,10 +1114,13 @@ function mountBlock(v, svg) {
 
 // Hole `i` of block `v` shows virtual DOM: `el`'s children become `x`.
 function showNodes(v, i, el, x, svg) {
-  el.textContent = "";
   const ks = nodes(x);
   svg = svg || inSvg(el);
-  for (const k of ks) el.appendChild(mount(k, svg));
+  if (adopting) adoptKids(el, ks, svg);
+  else {
+    el.textContent = "";
+    for (const k of ks) el.appendChild(mount(k, svg));
+  }
   (v.parts || (v.parts = new Array(v.vals.length)))[i] = ks;
   v.els[v.def.at[i]] = el;
 }
@@ -1283,6 +1286,8 @@ function scriptURL(u) {
 
 function setProp(el, k, v, old) {
   if (k === "value" || k === "checked" || k === "selected") {
+    // Taking up the server's HTML: what the page shows (typed, ticked) stays.
+    if (adopting) return;
     const nv = k === "value" ? (isNil(v) ? "" : display(v)) : truthy(v);
     if (el[k] !== nv) el[k] = nv;
     if (k !== "value") { if (nv) el.setAttribute(k, ""); else el.removeAttribute(k); }
@@ -1744,6 +1749,41 @@ class Inst {
     if (this.kids) for (const k of this.kids) drop(k);
   }
 
+  // Takes up the server's HTML as it is: the render's nodes are matched to
+  // the page's (nothing is made again), handlers attached. HTML that is not
+  // what the render gives (changed by hand, say) is made again instead.
+  adopt() {
+    if (this.dead) return;
+    let kids;
+    try {
+      kids = this.render();
+    } catch (e) {
+      report(e);
+      return;
+    }
+    const outer = updating;
+    updating = this;
+    adopting++;
+    let ok = true;
+    try {
+      adoptKids(this.el, kids, false);
+      this.kids = kids;
+      if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
+    } catch (e) {
+      if (!(e instanceof Mismatch)) report(e);
+      ok = false;
+    } finally {
+      adopting--;
+      updating = outer;
+    }
+    if (!ok) {
+      // Counted, so a page (or a test) can tell its HTML was made again.
+      if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+      this.kids = null;
+      this.update();
+    }
+  }
+
   update() {
     if (this.dead) return;
     let kids;
@@ -1786,87 +1826,195 @@ function report(e) {
   if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
 }
 
-// Where a node is in an island: the indexes of its elements on the way.
-function islandPath(island, node) {
-  const path = [];
-  for (let n = node; n && n !== island; n = n.parentElement) path.unshift([...n.parentElement.children].indexOf(n));
-  return path;
-}
-function atPath(island, path) {
-  let n = island;
-  for (const i of path) n = n && n.children[i];
-  return n || null;
+// ---- resuming: the server's HTML, taken up as it is ----------------------
+//
+// A component's HTML from the server is not made again: its render is
+// matched to the nodes on the page (text the browser merged is split where
+// the render has several texts, empty ones are added), handlers attached,
+// and from then on only what changes is patched. Components are taken up
+// when someone first reaches for them; those that run by themselves, or
+// are the page, as soon as the bundle is in.
+
+class Mismatch extends Error {}
+let adopting = 0;
+
+// The page's element `el` given the node shape of block template `t`.
+function tplAlign(t, el) {
+  if (!el || el.nodeType !== 1 || el.localName !== String(t[0]).toLowerCase()) throw new Mismatch("element");
+  const kids = t[2];
+  // A hole for all its children (adopted with the hole), or none.
+  if (kids.length === 0) return;
+  // A hole for its only child: a text node, there even when empty.
+  if (kids.length === 1 && kids[0] === "") {
+    if (!el.firstChild) el.appendChild(document.createTextNode(""));
+    return;
+  }
+  let n = el.firstChild;
+  for (const c of kids) {
+    if (typeof c === "string") {
+      if (!n || n.nodeType !== 3) throw new Mismatch("text");
+      if (n.data !== c) {
+        if (c.length && n.data.startsWith(c)) n.splitText(c.length);
+        else throw new Mismatch("text");
+      }
+    } else {
+      tplAlign(c, n);
+    }
+    n = n.nextSibling;
+  }
+  if (n) throw new Mismatch("extra");
 }
 
-// The bundle may come after people started on the page (the loader in
-// server.rs waits for them to reach for a component): what they typed,
-// where they were, and what they clicked or sent, found before hydrating
-// replaces the islands' content and done again after it.
-function beforeHydrating(outer) {
-  const typed = [], island = (n) => outer.find((i) => i.contains(n));
-  for (const el of document.querySelectorAll("quillo-island input, quillo-island textarea, quillo-island select")) {
+function adoptBlock(v, n, svg) {
+  const def = v.def;
+  svg = svg || def.tpl[0] === "svg";
+  tplAlign(def.tpl, n);
+  v.parts = null;
+  v.svg = svg;
+  def.mount(v, n, svg);
+  return (v.d = n);
+}
+
+// `el`'s children are what `ks` render: matched one by one.
+function adoptKids(el, ks, svg) {
+  let n = el.firstChild;
+  for (const k of ks) n = adoptNode(el, n, k, svg);
+  while (n) {
+    const next = n.nextSibling;
+    if (n.nodeType === 3 && n.data === "") el.removeChild(n);
+    else throw new Mismatch("extra");
+    n = next;
+  }
+}
+
+// Node `k` takes up the page's node `n` (and those after it it needs);
+// what comes after it is returned.
+function adoptNode(el, n, k, svg) {
+  if (k instanceof VText) {
+    const t = String(k.t);
+    if (t === "") {
+      const e = document.createTextNode("");
+      el.insertBefore(e, n);
+      k.d = e;
+      return n;
+    }
+    if (!n || n.nodeType !== 3) throw new Mismatch("text");
+    if (n.data === t) { k.d = n; return n.nextSibling; }
+    if (n.data.startsWith(t)) { const rest = n.splitText(t.length); k.d = n; return rest; }
+    throw new Mismatch("text");
+  }
+  if (!n || n.nodeType !== 1) throw new Mismatch("node");
+  if (k instanceof VBlock) { adoptBlock(k, n, svg); return n.nextSibling; }
+  if (k instanceof VComp) {
+    if (n.localName !== "quillo-island" || n.dataset.c !== k.def.$name) throw new Mismatch("component");
+    const h = takeHydration(k.def.$name);
+    const inst = new Inst(k.def, k.props, h && h.s, h && h.l);
+    inst.el = n;
+    n.__q = true;
+    inst.adopt();
+    k.inst = inst;
+    k.d = n;
+    return n.nextSibling;
+  }
+  if (k instanceof VRaw) {
+    if (n.localName === "quillo-raw") { k.d = n; return n.nextSibling; }
+    // The server writes raw HTML as it is: its nodes go into the wrapper the
+    // browser keeps it in.
+    const t = document.createElement("template");
+    t.innerHTML = k.html;
+    const wrap = document.createElement("quillo-raw");
+    wrap.style.display = "contents";
+    el.insertBefore(wrap, n);
+    for (let i = 0; i < t.content.childNodes.length; i++) {
+      const m = wrap.nextSibling;
+      if (!m) throw new Mismatch("raw");
+      wrap.appendChild(m);
+    }
+    k.d = wrap;
+    return wrap.nextSibling;
+  }
+  const isSvg = svg || k.tag === "svg";
+  if (n.localName !== String(k.tag).toLowerCase()) throw new Mismatch("element");
+  k.d = n;
+  for (const p of Object.keys(k.props)) setProp(n, p, k.props[p], undefined);
+  setEvents(n, k.on);
+  adoptKids(n, k.kids, isSvg && k.tag !== "foreignObject");
+  return n.nextSibling;
+}
+
+// The outermost island a node is in.
+function outerIsland(node) {
+  let i = node && node.nodeType === 1 && node.closest ? node.closest("quillo-island") : null;
+  for (let up = i && i.parentElement && i.parentElement.closest("quillo-island"); up; up = up.parentElement && up.parentElement.closest("quillo-island")) i = up;
+  return i;
+}
+
+// An island taken up: its component (and those inside it) resumed from
+// the state the server wrote, on the HTML it wrote.
+function resume(island) {
+  if (island.__q) return;
+  island.__q = true;
+  const def = C[island.dataset.c];
+  if (!def) { report(`unknown component <${island.dataset.c}>`); return; }
+  hydrating = {};
+  for (const inner of island.querySelectorAll("quillo-island")) {
+    (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push({
+      s: islandJSON(inner.dataset.s, {}),
+      l: islandJSON(inner.dataset.l, null),
+    });
+    liveSeen(...(inner.dataset.v || "").split(":"));
+  }
+  liveSeen(...(island.dataset.v || "").split(":"));
+  const inst = new Inst(def, islandJSON(island.dataset.p, {}), islandJSON(island.dataset.s, {}), islandJSON(island.dataset.l, null));
+  inst.el = island;
+  inst.adopt();
+  hydrating = null;
+  // What was typed before it was taken up: the component hears it now.
+  for (const el of island.querySelectorAll("input, textarea, select")) {
     const changed = el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked
       : el.tagName === "SELECT" ? [...el.options].some((o) => o.selected !== o.defaultSelected)
       : el.value !== el.defaultValue;
-    const at = island(el);
-    if (changed && at) typed.push({ at, path: islandPath(at, el), name: el.name, value: el.value, checked: el.checked });
+    if (changed) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
   }
-  const f = document.activeElement, fat = f && island(f);
-  const focus = fat ? { at: fat, path: islandPath(fat, f), start: f.selectionStart, end: f.selectionEnd } : null;
-  const waiting = (window.__quillo_q || []).map((e) => { const at = island(e.target); return at && { type: e.type, at, path: islandPath(at, e.target) }; }).filter(Boolean);
-  return { typed, focus, waiting };
 }
-function afterHydrating(was) {
-  window.__quillo_booted = true;
-  const find = (x) => {
-    const el = atPath(x.at, x.path);
-    return el && (!x.name || el.name === x.name) ? el : x.name ? x.at.querySelector(`[name="${CSS.escape(x.name)}"]`) : el;
-  };
-  for (const t of was.typed) {
-    const el = find(t);
-    if (!el) continue;
-    if (el.type === "checkbox" || el.type === "radio") { if (el.checked !== t.checked) el.click(); continue; }
-    el.value = t.value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-  if (was.focus) {
-    const el = atPath(was.focus.at, was.focus.path);
-    if (el && el.focus) { el.focus(); try { if (was.focus.start != null) el.setSelectionRange(was.focus.start, was.focus.end); } catch (e) {} }
-  }
-  for (const w of was.waiting) {
-    const el = atPath(w.at, w.path);
-    if (!el) continue;
-    if (w.type === "submit") { const form = el.closest("form") || el; form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); }
-    else el.click();
-  }
-  if (window.__quillo_q) window.__quillo_q.length = 0;
+
+function wake(e) {
+  const i = outerIsland(e.target);
+  if (i && !i.__q) resume(i);
 }
 
 function boot() {
-  // The outermost islands, found before any is hydrated: hydrating one
-  // replaces its content, and islands inside it, detached, would no longer
-  // look nested.
+  // Someone reaching for an island takes it up (before their event is
+  // handled: it reaches the component).
+  for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
   const outer = [...document.querySelectorAll("quillo-island")].filter((i) => !(i.parentElement && i.parentElement.closest("quillo-island")));
-  const was = beforeHydrating(outer);
   for (const island of outer) {
-    const def = C[island.dataset.c];
-    if (!def) { report(`unknown component <${island.dataset.c}>`); continue; }
-    hydrating = {};
-    for (const inner of island.querySelectorAll("quillo-island")) {
-      (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push({
-        s: islandJSON(inner.dataset.s, {}),
-        l: islandJSON(inner.dataset.l, null),
-      });
-      liveSeen(...(inner.dataset.v || "").split(":"));
-    }
-    liveSeen(...(island.dataset.v || "").split(":"));
-    const inst = new Inst(def, islandJSON(island.dataset.p, {}), islandJSON(island.dataset.s, {}), islandJSON(island.dataset.l, null));
-    inst.el = island;
-    inst.update();
-    hydrating = null;
+    if (island.hasAttribute("data-e") || island.hasAttribute("data-l") || island.parentElement === document.body) resume(island);
   }
-  afterHydrating(was);
+  // The island someone reached for, which brought the bundle, and the one
+  // that has the focus.
+  for (const n of [window.__quillo_at, document.activeElement]) {
+    const i = n && n !== document.body ? outerIsland(n) : null;
+    if (i) resume(i);
+  }
+  // What was done before the bundle came (the loader in server.rs kept it):
+  // the same elements are on the page, so it is done again on them.
+  const held = window.__quillo_q || [];
+  window.__quillo_booted = true;
+  for (const e of held.splice(0)) {
+    const i = outerIsland(e.target);
+    if (i) resume(i);
+    if (!e.target.isConnected) continue;
+    if (e.type === "submit") {
+      const form = e.target.closest("form") || e.target;
+      if (form.requestSubmit) form.requestSubmit(); else form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    } else {
+      e.target.click();
+    }
+  }
 }
 
 // ---- what compiled code uses -------------------------------------------

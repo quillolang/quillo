@@ -57,7 +57,7 @@ fn preset(industry: str) = match industry {
         flows: ["welcome", "membership"],
     }
     _ => {
-        plugins: ["blog", "paywall", "sponsors", "gdpr", "quality"],
+        plugins: ["newsroom", "blog", "paywall", "sponsors", "gdpr", "quality"],
         theme: { id: "editorial", color: "#b91c1c", font: "serif" },
         pipeline: { name: "Advertising", stages: [["Inquiry", 10, "open"], ["Proposal", 40, "open"], ["Insertion order", 80, "open"], ["Booked", 100, "won"], ["Lost", 0, "lost"]] },
         products: [
@@ -91,6 +91,7 @@ fn setup_workspace(w: map, url: str) {
         let tpl = with_product(flow_template(kind))
         db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 1, ?, ?)", tpl.name, json.stringify(tpl.graph), t, t)
     }
+    install_models(p.plugins)
     sign_in_token(owner)
 }
 
@@ -193,7 +194,11 @@ server fn plugin_uses(id: str) {
 server fn set_plugins(enabled: list) {
     need_admin()?
     let known = plugins | map((p) => p.id)
-    put_setting("plugins", enabled | filter((id) => id != "core" && contains(known, id)) | unique)
+    let before = enabled_plugins()
+    let now_on = enabled | filter((id) => id != "core" && contains(known, id)) | unique
+    put_setting("plugins", now_on)
+    // A plugin switched on brings its model (what the workspace lacks).
+    install_models(now_on | filter((id) => !contains(before, id)))
     true
 }
 
@@ -211,7 +216,7 @@ server fn save_field(f: map) {
     if f.type == "record" && db.one("select key from objects where key = ?", (f.options ?? [])[0] ?? "") == null { return err({ problems: problem("options", "Choose which object it links to") }) }
     if contains(["select"], f.type) && len((f.options ?? []) | filter((o) => trim(str(o)) != "")) == 0 { return err({ problems: problem("options", "Give the choices") }) }
     if f.type == "lookup" {
-        let via = find(object_fields(slice(f.entity, 4)), (x) => x.key == (f.options ?? [])[0] && contains(["contact", "company", "record"], x.type))
+        let via = find(object_fields(slice(f.entity, 4)), (x) => x.key == (f.options ?? [])[0] && contains(LINK_TYPES, x.type))
         if via == null { return err({ problems: problem("options", "Choose the link it shows a field of") }) }
         if !any(lookup_targets(via, custom_fields() | map((x) => merge(x, { options: type_of(x.options) == "list" ? x.options : parsed(x.options, []) }))), (t) => t[0] == (f.options ?? [])[1]) {
             return err({ problems: problem("options", "Choose which of its fields") })

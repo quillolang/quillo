@@ -5,6 +5,7 @@
 let TYPE_LABELS = {
     text: "Text", textarea: "Long text", number: "Number", money: "Amount", date: "Date", select: "Choice", checkbox: "Yes / no",
     url: "Web address", email: "Email", contact: "Contact", company: "Company", record: "Another object's record",
+    markdown: "Formatted text (Markdown)", image: "Picture", person: "Someone on the team",
     lookup: "A field of a linked record",
 }
 
@@ -139,7 +140,7 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
                         {f.type == "select" && <TextField label="Choices (comma separated)" field="options" value={options_text} {problems} on_change={(v) => { options_text = v }}/>}
                         {f.type == "record" && <SelectField label="Of which object" field="options" value={target} options={(ws.objects ?? []) | map((y) => { value: y.key, label: y.plural })} {problems} on_change={(v) => { target = v }} empty="Choose"/>}
                         {f.type == "lookup" && {
-                            let links = o.fields | filter((x) => contains(["contact", "company", "record"], x.type))
+                            let links = o.fields | filter((x) => contains(LINK_TYPES, x.type))
                             let chosen = find(links, (x) => x.key == via)
                             <div.stack>
                                 {len(links) == 0 && <p.muted.small>Add a link field first (a contact, a company, or another object's record).</p>}
@@ -154,6 +155,7 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
                     </form>
                 </section>
                 <StatesEditor {o} {ws} on_save={(next) => { save(next) }} {problems}/>
+                <ObjectSiteEditor key={`site-${o.id}`} {o} on_save={(next) => { save(next) }} {problems}/>
                 <section.card.stack>
                     <h2>Rules</h2>
                     <p.muted.small>Checked in the browser as people type, and again on the server when a record is saved. A value that starts with @ is another field's: “Ends after @starts”.</p>
@@ -235,6 +237,9 @@ view ObjField(f: map, record: map, problems: list, on_change, choices) {
             <p.lookup-value>{v == null || v == "" ? "—" : str(v)} <span.muted.small>from the link, kept up to date</span></p>
         </div>
         "textarea" => <AreaField {label} field={path} value={v} {problems} on_change={set_to} rows={4}/>
+        "markdown" => <MarkdownField {label} field={path} value={v} {problems} on_change={set_to}/>
+        "image" => <div.field><ImagePicker {label} value={v} on_change={set_to}/><Hints {problems} field={path}/></div>
+        "person" => choices == null ? <TextField label={`${label} (their id)`} field={path} value={v} {problems} on_change={set_to}/> : pick_from(choices.person ?? [], "Choose someone")
         "money" => <TextField {label} field={path} value={v} {problems} on_change={set_to} type="number"/>
         "email" => <TextField {label} field={path} value={v} {problems} on_change={set_to} type="email"/>
         "contact" => choices == null ? <TextField label={`${label} (a contact's id)`} field={path} value={v} {problems} on_change={set_to}/> : pick_from(choices.contact, "Choose a contact")
@@ -247,7 +252,9 @@ view ObjField(f: map, record: map, problems: list, on_change, choices) {
 // A record's value as text, for lists (links by name).
 fn shown_value(f: map, r: map) {
     let v = r.fields[f.key]
-    v == null ? "" : contains(["contact", "company", "record"], f.type) ? (r.names ?? {})[f.key] ?? str(v)
+    v == null ? "" : contains(LINK_TYPES, f.type) ? (r.names ?? {})[f.key] ?? str(v)
+        : f.type == "image" ? "a picture"
+        : f.type == "markdown" ? (len(str(v)) > 80 ? `${slice(str(v), 0, 80)}…` : str(v))
         : f.type == "checkbox" ? (v == true ? "Yes" : "No")
         : str(v)
 }
@@ -261,7 +268,9 @@ component RecordsPage(okey: str, ws: map) {
     ~state = ""
     if o == null { return <Loading/> }
     if is_err(o) { return <Empty title="No such object"><p><a href="/app/objects">Objects</a></p></Empty> }
-    let cols = o.fields | filter((f) => f.key != o.title_field && f.type != "textarea") | take(4)
+    // Short fields read in a list: not pictures, long text, or the site's caption and summary.
+    let cols = o.fields | filter((f) => f.key != o.title_field && !contains(["textarea", "markdown", "image"], f.type)
+        && f.key != (o.site ?? {}).caption && f.key != (o.site ?? {}).summary) | take(4)
     let has_states = len(o.states) > 0
     let shown_rows = rows == null || is_err(rows) ? rows : rows | filter((r) => state == "" || r.state == state)
     <div.stack>
@@ -339,26 +348,30 @@ component RecordPage(okey: str, id: int, ws: map) {
     ~r = get_record(key, id)
     ~message = ""
     ~moving = null
+    ~tab = "fields"
     if o == null || r == null { return <Loading/> }
     if is_err(o) || is_err(r) { return <Empty title="No such record"><p><a href={`/app/o/${key}`}>Back</a></p></Empty> }
     <div.stack>
         <PageHead title={r.title} sub={`${o.icon} ${o.name} · added ${fmt_date(r.created_at)}`}>
             {len(o.states) > 0 && <StateBadge {o} state={r.state}/>}
             {for m in r.moves ?? [] => <button key={m.key} @click={() => { moving = m }}>{m.label} →</button>}
+            {o.site.on == true && <a.button href={`/${o.site.path}/${r.id}-${slugify(blank(o.site.title) ? r.title : str(r.fields[o.site.title] ?? r.title))}?preview=1`} target="_blank" data-reload>{r.state == o.site.state || blank(o.site.state) ? "On the site ↗" : "Preview ↗"}</a>}
             <a.button href={`/app/o/${key}`}>All {lower(o.plural)}</a>
             {r.can == "delete" && <button.danger @click={() => {
                 if ask("It cannot be brought back.", { title: `Delete ${r.title}?`, ok: "Delete", tone: "danger" }) { delete_record(key, id); notify(`${r.title} deleted`); navigate(`/app/o/${key}`) }
             }}>Delete</button>}
         </PageHead>
-        <div.grid2>
+        <nav.tabs>
+            <button type="button" class={tab == "fields" ? "tab on" : "tab"} @click={() => { tab = "fields" }}>Details</button>
+            <button type="button" class={tab == "review" ? "tab on" : "tab"} @click={() => { tab = "review" }}>Review{(r.comments ?? 0) > 0 && ` (${r.comments})`}</button>
+        </nav>
+        {tab == "review" ? <ReviewPanel okey={key} {id} {ws}/> : <div.grid2>
             <section.card>
                 {r.can == "read" ? <dl.record-view>{for f in o.fields => <div key={f.key}><dt>{f.label}</dt><dd>{shown_value(f, r)}</dd></div>}</dl>
                 : <RecordForm {o} record={r} {ws} on_saved={(saved) => { r = get_record(key, id); message = "Saved" }}/>}
                 {message != "" && <p.ok>{message}</p>}
             </section>
-            {moving != null && <Drawer title={moving.label} on_close={() => { moving = null }}>
-                <MoveForm {o} record={r} move={moving} {ws} on_moved={() => { moving = null; r = get_record(key, id); message = "Moved" }}/>
-            </Drawer>}
+
             <div.stack>
                 <section.card.stack>
                     <h2>Links</h2>
@@ -370,7 +383,10 @@ component RecordPage(okey: str, id: int, ws: map) {
                 </section>
                 <LinkedRecords records={r.linked} title="Linked to it"/>
             </div>
-        </div>
+        </div>}
+        {moving != null && <Drawer title={moving.label} on_close={() => { moving = null }}>
+            <MoveForm {o} record={r} move={moving} {ws} on_moved={() => { let done = moving.label; moving = null; r = get_record(key, id); notify(`${done}: done`) }}/>
+        </Drawer>}
     </div>
 }
 
@@ -620,5 +636,43 @@ component FlowDecisions() {
                 <button @click={() => { answer_flow_task(t.id, "rejected", notes[str(t.id)] ?? ""); rows = my_flow_tasks(); message = "Rejected" }}>Reject</button>
             </div>
         </div>}
+    </section>
+}
+
+// Formatted text: written in Markdown, shown as it will read.
+component MarkdownField(label: str, field: str, value, problems: list, on_change) {
+    ~preview = null
+    <div.field.md-field>
+        <div.inline><span.label.grow>{label}</span>
+            <button.tab type="button" class={preview == null ? "on" : ""} @click={() => { preview = null }}>Write</button>
+            <button.tab type="button" class={preview != null ? "on" : ""} @click={() => { preview = preview_markdown(value ?? "") ?? "" }}>Preview</button>
+        </div>
+        {preview == null
+            ? <textarea name={field} rows="12" placeholder="**bold**, _italic_, ## headings, > quotes, [links](https://…)" @input={(e) => { on_change(e.value) }}>{value ?? ""}</textarea>
+            : <div.site.post-preview><section.post-body>{raw(is_err(preview) ? "" : preview)}</section></div>}
+        <Hints {problems} field={field}/>
+    </div>
+}
+
+// Where the object's records show on the site, and which field is what.
+component ObjectSiteEditor(o: map, on_save, problems: list) {
+    ~s = merge(SITE_DEFAULT, o.site ?? {})
+    let pick = (k, label, types) => <SelectField {label} field={k} value={s[k]} options={o.fields | filter((f) => types == null || contains(types, f.type)) | map((f) => { value: f.key, label: f.label })}
+        problems={[]} on_change={(v) => { s = set(s, k, v) }} empty="—"/>
+    <section.card.stack>
+        <h2>On the site</h2>
+        <p.muted.small>Its records as articles: a front page, a page per section, a page per record. Sections are another object's records (Categories, say), and may depend on one another.</p>
+        <CheckField label="Show its records on the site" field="on" value={s.on == true} problems={[]} on_change={(v) => { s = set(s, "on", v) }}/>
+        {s.on == true && <div.stack>
+            <TextField label="At the address" field="path" value={s.path} {problems} on_change={(v) => { s = set(s, "path", lower(v)) }} placeholder="news" help={`/${slugify(s.path)}`}/>
+            <SelectField label="In the state" field="state" value={s.state} options={(o.states ?? []) | map((st) => { value: st.key, label: st.label })} problems={[]} on_change={(v) => { s = set(s, "state", v) }} empty="Every state"/>
+            <div.row2>{pick("title", "Headline", ["text"])}{pick("summary", "Summary", ["text", "textarea"])}</div>
+            <div.row2>{pick("image", "Picture", ["image"])}{pick("caption", "Caption", ["text"])}</div>
+            <div.row2>{pick("body", "Body", ["markdown", "textarea"])}{pick("group", "Section", ["record"])}</div>
+            <div.row2>{pick("byline", "Byline (empty: who wrote it)", ["person"])}<span></span></div>
+            <CheckField label="It is the site's front page" field="home" value={s.home == true} problems={[]} on_change={(v) => { s = set(s, "home", v) }}/>
+        </div>}
+        <Hints {problems} field="site"/>
+        <div><button.primary type="button" @click={() => { on_save(merge(o, { site: s })) }}>Save</button></div>
     </section>
 }
