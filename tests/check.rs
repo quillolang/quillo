@@ -240,4 +240,22 @@ fn sql_built_from_values_is_a_warning() {
     one("fn f(n: str) with db = db.one(sql`select * from t where n = '${n}'`)", "SQL injection");
     clean("fn f(n: str) with db = db.query(\"select * from t where n = ?\", n)");
     clean("fn f() with db = db.query(sql`select * from t`)");
+    // Names put in with sql_name and sql_param are checked as they are made.
+    clean("fn f(t: str, cols: list) with db = db.exec(`insert into ${sql_name(t)} (${sql_name(cols)}) values (${sql_param(cols)})`, {})");
+    clean("fn f(t: str, k: str) with db = db.exec(`alter table ${sql_name(t)} add column ${sql_name(k)} ${k == \"n\" ? \"NUMERIC\" : \"TEXT\"}`)");
+    one("fn f(t: str, k: str) with db = db.exec(`alter table ${sql_name(t)} add column ${k}`)", "SQL injection");
+}
+
+#[test]
+fn names_in_sql_are_checked() {
+    let run = |src: &str| match quillo::eval_str(src) {
+        Ok(v) => v.display().to_string(),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(run(r#"sql_name("o_pitch")"#), "\"o_pitch\"");
+    assert_eq!(run(r#"sql_name(["f_a", "f_b"])"#), "\"f_a\", \"f_b\"");
+    assert_eq!(run(r#"sql_param(["title", "f_a"])"#), ":title, :f_a");
+    for bad in [r#"sql_name("x\"; drop table users; --")"#, r#"sql_name("1x")"#, r#"sql_name("")"#, r#"sql_param("a b")"#] {
+        assert!(run(bad).contains("is not a name SQL can take") || run(bad).contains("takes a name"), "{}: {}", bad, run(bad));
+    }
 }

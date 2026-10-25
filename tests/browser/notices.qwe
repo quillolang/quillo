@@ -1,0 +1,17 @@
+// ask and notify: a dialog that waits for an answer, a note that goes by
+// itself. Driven by notices.js.
+
+component Deleter() {
+    ~n = 3
+    <div>
+        <p id="n">{n}</p>
+        <button id="del" @click={() => {
+            if ask("Delete one?", { title: "Delete", ok: "Delete", tone: "danger" }) {
+                n = n - 1
+                notify("Deleted", { seconds: 0.3 })
+            }
+        }}>Delete</button>
+    </div>
+}
+
+route GET / = <html><body><Deleter/></body></html>

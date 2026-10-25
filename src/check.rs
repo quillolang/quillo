@@ -271,6 +271,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("markdown", "str, map | null=", "html"),
+    ("highlight", "str, str | null=", "html"),
+    ("run_script", "str, map | null=", "any"),
+    ("sql_name", "str | list", "str"),
+    ("sql_param", "str | list", "str"),
+    ("ask", "str, map | null=", "bool"),
+    ("notify", "str, map | null=", "null"),
     ("translations", "str | map, map | null=", "null"),
     ("locale_from", "fn", "null"),
     ("locale", "", "str | null"),
@@ -2326,7 +2332,7 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
 /// Whether SQL text is put together from values: `${x}` in a template,
 /// sql`...${x}...`, or `"..." + x`.
 fn sql_built_from_values(e: &Expr) -> bool {
-    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(_)));
+    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !sql_safe(e)));
     match e {
         Expr::Template(parts) => interpolates(parts),
         Expr::Call(_, args, _) => matches!(args.as_slice(), [Expr::Template(parts)] if interpolates(parts)),
@@ -2334,6 +2340,21 @@ fn sql_built_from_values(e: &Expr) -> bool {
             let text = |x: &Expr| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_));
             (text(a) && !matches!(**b, Expr::Lit(_))) || (text(b) && !matches!(**a, Expr::Lit(_))) || sql_built_from_values(a)
         }
+        _ => false,
+    }
+}
+
+/// SQL text a program may put together: names made with `sql_name` and
+/// `sql_param` (checked as they are made, so they cannot carry SQL of their
+/// own), text as written, and choices (`if`, `match`) and templates of those.
+fn sql_safe(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(Lit::Str(_)) => true,
+        Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param"),
+        Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if sql_safe(e))),
+        Expr::If(_, a, b) => sql_safe(a) && b.as_deref().map_or(true, sql_safe),
+        Expr::Match(_, arms, _) => arms.iter().all(|a| sql_safe(&a.body)),
+        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if sql_safe(e)),
         _ => false,
     }
 }

@@ -50,6 +50,9 @@ pub struct Interp {
     pub shared: Arc<Shared>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
+    /// Calls and loop steps left before a sandboxed script is stopped
+    /// (`run_script`); `u64::MAX` everywhere else.
+    pub(crate) fuel: u64,
     /// Effects the running code may use, and the `with` function that limited them.
     allowed: u8,
     restrictor: Option<Arc<FnDef>>,
@@ -104,6 +107,12 @@ pub struct Interp {
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
+    /// The components this request's page was rendered with: the browser
+    /// loads a bundle of those (and what they use) alone.
+    pub island_names: Vec<String>,
+    /// Bundles for sets of components, by their names: (hash, script).
+    /// Shared by every handle on the program, made again when it loads.
+    pub bundles: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, Arc<String>)>>>,
     /// A buffer lent to the renderer for building attribute values.
     spare: String,
     /// What views rendered, shared by the workers (see `viewcache`).
@@ -451,6 +460,7 @@ impl Interp {
             loaded: Arc::new(HashSet::new()),
             shared,
             depth: 0,
+            fuel: u64::MAX,
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
@@ -463,6 +473,7 @@ impl Interp {
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
+            bundles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
@@ -476,6 +487,7 @@ impl Interp {
             base: String::new(),
             mounts: Vec::new(),
             rendered_island: false,
+            island_names: Vec::new(),
             spare: String::new(),
             view_cache: crate::viewcache::enabled().then(Default::default),
             tracks: Vec::new(),
@@ -492,6 +504,7 @@ impl Interp {
             loaded: self.loaded.clone(),
             shared: self.shared.clone(),
             depth: 0,
+            fuel: u64::MAX,
             allowed: ALL_EFFECTS,
             restrictor: None,
             server_fns: self.server_fns.clone(),
@@ -504,6 +517,7 @@ impl Interp {
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
+            bundles: self.bundles.clone(),
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
@@ -517,6 +531,7 @@ impl Interp {
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             rendered_island: false,
+            island_names: Vec::new(),
             spare: String::new(),
             view_cache: self.view_cache.clone(),
             tracks: Vec::new(),
@@ -814,7 +829,32 @@ impl Interp {
     /// Compiles the program's components (and what they use) for the browser.
     pub fn build_client(&mut self) -> Result<(), QuilloError> {
         self.client_js = Arc::new(crate::client::bundle(self)?);
+        self.bundles = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         Ok(())
+    }
+
+    /// The bundle for a page with these components: its address's hash, made
+    /// once per set. None when it cannot be made (the full bundle serves).
+    pub fn bundle_for_page(&self, names: &[String]) -> Option<String> {
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        let key = sorted.join(",");
+        if let Some((hash, _)) = self.bundles.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Some(hash.clone());
+        }
+        let js = crate::client::bundle_for(self, &sorted).ok()?;
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            js.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (hash.clone(), Arc::new(js)));
+        Some(hash)
+    }
+
+    pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {
+        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).values().find(|(h, _)| h == hash).map(|(_, js)| js.clone())
     }
 
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
@@ -1141,6 +1181,9 @@ impl Interp {
         };
         let mut out = Vec::with_capacity(items.len());
         for item in items {
+            if self.fuel != u64::MAX {
+                self.burn(line)?;
+            }
             let scope = Scope::child(env);
             if let Pattern::Bind(n) = pat {
                 define(&scope, n, item);
@@ -1268,6 +1311,9 @@ impl Interp {
     }
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel != u64::MAX {
+            self.burn(line)?;
+        }
         match f {
             Value::Builtin(name, func) => {
                 if self.allowed != ALL_EFFECTS {
@@ -1288,6 +1334,9 @@ impl Interp {
 
     /// `args[i] == None` means "not given": the parameter's default is used.
     pub fn call_closure(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel != u64::MAX {
+            self.burn(line)?;
+        }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
         if let (Some((field, at)), [Some(_)]) = (projection(&c.def), args.as_slice()) {
@@ -1374,6 +1423,16 @@ impl Interp {
             ),
             None => format!("`{}` needs {}, which is not allowed here", what, need),
         }
+    }
+
+    /// One step of a sandboxed script's budget.
+    #[cold]
+    fn burn(&mut self, line: u32) -> Result<(), Ctrl> {
+        if self.fuel == 0 {
+            return fail(line, "the script took too many steps");
+        }
+        self.fuel -= 1;
+        Ok(())
     }
 
     #[cold]
@@ -2154,6 +2213,9 @@ impl Interp {
         // callbacks and HTML included.
         let nested = !self.islands.is_empty();
         self.rendered_island = true;
+        if !self.island_names.contains(&el.tag) {
+            self.island_names.push(el.tag.clone());
+        }
         self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
         let mut body = String::new();
@@ -2189,12 +2251,17 @@ impl Interp {
                 self.shared.id
             )
         };
+        // A component that runs by itself (timers, live data, `@mount`, the
+        // page's JavaScript) is started as soon as the page is idle; others
+        // when someone reaches for them (see the loader in server.rs).
+        let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
         out.push_str(&format!(
-            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}>",
+            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),
-            live_attrs
+            live_attrs,
+            eager
         ));
         out.push_str(&body);
         out.push_str("</quillo-island>");

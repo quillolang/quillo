@@ -317,7 +317,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
 ```
 
 - The server renders it like a view, inside a `<quillo-island>` that carries its props
-  and state. The page loads `/_quillo/quillo.js` automatically, and the browser takes
+  and state. The page loads its bundle automatically, and the browser takes
   over from that state.
 - Assigning to a `~` variable re-renders the component. Lists keep their DOM (and
   focus) when items have `key={...}`. Nested components keep their own state.
@@ -340,10 +340,22 @@ route GET / = <html><body><Counter start={5}/></body></html>
   JavaScript. Code that cannot run in a browser is an error when the program loads
   (and in `quillo check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
   the server changes (pass it as a prop instead).
-- `/_quillo/quillo.js` holds only what the page's components use: their compiled code and
-  the parts of the runtime it reaches, minified (a small component is about 11 KB,
-  under 4 KB gzipped). Text responses are gzipped for browsers that accept it, and
-  the bundle has an ETag, so an unchanged one costs a `304` on reload.
+- Each page loads a bundle of its own, `/_quillo/b/<hash>.js`: the components it was
+  rendered with, what they use, and the parts of the runtime they reach, minified (a
+  small component is about 11 KB, under 4 KB gzipped). Its address changes with its
+  content, so the browser keeps it for good; a page with no components loads no
+  script.
+- `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
+  the answer (`true` or `false`) — a handler goes on after it; `notify(message, { title,
+  tone, seconds })` shows a note that goes by itself. Both are markup with `q-` classes
+  in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
+  and styles: keyboard, focus and screen readers are taken care of.
+- And only when it is needed: the server's HTML shows at once, and the bundle comes
+  when someone reaches for a component (hovers, touches or focuses it). What they
+  typed and clicked before it came is kept and done then. A component that runs by
+  itself (`every`, `live`, `js`, `@mount` while it renders) or that is the page (in
+  `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has every component, for pages that load it themselves.
+  Text responses are gzipped for browsers that accept it.
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
   as `2`. Arithmetic gives the same results on both sides.
 
@@ -853,7 +865,10 @@ Safety built in:
 - Globals read with `env`, `read_file` or the database are never written into the
   browser bundle; a component that uses one is a load-time error.
 - `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
-  as `?` parameters instead.
+  as `?` parameters instead. Names cannot be parameters: put a table's or a column's
+  name in with `sql_name(name)` (or a list of them), and named parameters with
+  `sql_param(name)` — both take only letters, digits and `_`, and SQL made of them,
+  text as written and choices between those is not warned about.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 

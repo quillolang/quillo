@@ -605,6 +605,184 @@ B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
 B.raw = meta((v) => new VRaw(display(v)), "raw", null);
+// ask(message, options) and notify(message, options): a dialog that waits
+// for an answer, and a note that goes by itself. They are markup with q-
+// classes in a host on the page (#q-notices), laid out and styled by the
+// page's CSS: <body data-notices="..."> adds its classes to the host.
+function noticeHost() {
+  let h = document.getElementById("q-notices");
+  if (!h) {
+    h = document.createElement("div");
+    h.id = "q-notices";
+    h.className = "q-notices " + (document.body.dataset.notices || "dialog-center toasts-top-right");
+    document.body.appendChild(h);
+  }
+  return h;
+}
+function noticeEl(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+B.ask = meta((message, options) => new Promise((resolve) => {
+  const o = options == null ? {} : M(options, "ask", 2);
+  const host = noticeHost(), before = document.activeElement;
+  const back = noticeEl("div", "q-backdrop");
+  const box = noticeEl("div", "q-dialog" + (o.tone ? " q-" + display(o.tone) : ""));
+  box.setAttribute("role", "alertdialog");
+  box.setAttribute("aria-modal", "true");
+  const id = "q-" + Math.random().toString(36).slice(2);
+  if (o.title != null) { const h = noticeEl("h2", "q-title", display(o.title)); h.id = id + "-t"; box.appendChild(h); box.setAttribute("aria-labelledby", h.id); }
+  const p = noticeEl("p", "q-message", display(message)); p.id = id + "-m"; box.appendChild(p); box.setAttribute("aria-describedby", p.id);
+  const row = noticeEl("div", "q-actions");
+  const no = noticeEl("button", "q-cancel", o.cancel != null ? display(o.cancel) : "Cancel");
+  const yes = noticeEl("button", "q-ok", o.ok != null ? display(o.ok) : "OK");
+  no.type = yes.type = "button";
+  row.append(no, yes);
+  box.appendChild(row);
+  back.appendChild(box);
+  host.appendChild(back);
+  requestAnimationFrame(() => back.classList.add("q-open"));
+  const done = (answer) => {
+    document.removeEventListener("keydown", keys, true);
+    back.classList.remove("q-open");
+    setTimeout(() => back.remove(), 160);
+    if (before && before.focus) before.focus();
+    resolve(answer);
+  };
+  const keys = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); done(false); }
+    else if (e.key === "Tab") { e.preventDefault(); (document.activeElement === yes ? no : yes).focus(); }
+  };
+  document.addEventListener("keydown", keys, true);
+  yes.onclick = () => done(true);
+  no.onclick = () => done(false);
+  back.onclick = (e) => { if (e.target === back) done(false); };
+  // A dangerous question starts on "Cancel".
+  (o.tone === "danger" ? no : yes).focus();
+}), "ask", ["message", "options"]);
+B.notify = meta((message, options) => {
+  const o = options == null ? {} : M(options, "notify", 2);
+  const host = noticeHost();
+  let list = host.querySelector(".q-toasts");
+  if (!list) { list = noticeEl("div", "q-toasts"); list.setAttribute("role", "status"); list.setAttribute("aria-live", "polite"); host.appendChild(list); }
+  const t = noticeEl("div", "q-toast" + (o.tone ? " q-" + display(o.tone) : ""));
+  if (o.title != null) t.appendChild(noticeEl("b", "q-title", display(o.title)));
+  t.appendChild(noticeEl("span", "q-message", display(message)));
+  const x = noticeEl("button", "q-close", "×");
+  x.type = "button";
+  x.setAttribute("aria-label", "Close");
+  const close = () => { t.classList.remove("q-open"); setTimeout(() => t.remove(), 160); };
+  x.onclick = close;
+  t.appendChild(x);
+  list.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("q-open"));
+  setTimeout(close, (o.seconds != null ? +o.seconds : 4) * 1000);
+  return null;
+}, "notify", ["message", "options"]);
+
+// highlight(code, lang): the same tokens as the server's (highlight.rs).
+const HL = (() => {
+  const L = (o) => Object.assign({ line: [], block: null, quotes: "", keywords: [], consts: [], types: false, tags: false, css: false, json: false, nocase: false }, o);
+  const qwe = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"`", types: true, tags: true,
+    keywords: ["let", "fn", "view", "component", "server", "route", "use", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
+    consts: ["true", "false", "null", "int", "str", "bool", "float", "map", "list", "any"] });
+  const js = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"'`", types: true,
+    keywords: ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "export", "extends", "finally", "for",
+      "function", "if", "import", "in", "instanceof", "let", "new", "return", "super", "switch", "this", "throw", "try", "typeof", "var", "void",
+      "while", "with", "yield", "async", "await", "of", "static", "from", "interface", "type", "enum", "implements", "as"],
+    consts: ["true", "false", "null", "undefined", "NaN", "Infinity"] });
+  const py = L({ line: ["#"], quotes: "\"'", types: true,
+    keywords: ["and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from",
+      "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield"],
+    consts: ["True", "False", "None", "self"] });
+  const rust = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"", types: true,
+    keywords: ["as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "fn", "for", "if", "impl", "in", "let",
+      "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "super", "trait", "type", "unsafe", "use", "where", "while"],
+    consts: ["true", "false", "self", "Self", "None"] });
+  const sh = L({ line: ["#"], quotes: "\"'",
+    keywords: ["if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "in", "return", "export", "local", "exit", "cd", "echo", "sudo"],
+    consts: ["true", "false"] });
+  const sql = L({ line: ["--"], block: ["/*", "*/"], quotes: "'\"", nocase: true, consts: ["null", "true", "false"],
+    keywords: ["select", "from", "where", "insert", "into", "values", "update", "set", "delete", "create", "table", "alter", "add", "column", "index",
+      "primary", "key", "references", "not", "and", "or", "join", "left", "right", "inner", "outer", "on", "group", "by", "order", "having",
+      "limit", "offset", "as", "distinct", "unique", "default", "integer", "text", "real", "begin", "commit", "drop", "if", "exists", "case",
+      "when", "then", "else", "end", "like", "in", "is", "desc", "asc", "union", "all", "with"] });
+  const css = L({ block: ["/*", "*/"], quotes: "\"'", keywords: ["!important"], css: true });
+  const html = L({ tags: true });
+  const json = L({ quotes: "\"", consts: ["true", "false", "null"], json: true });
+  const plain = L({});
+  const langs = { qwe, quillo: qwe, js, javascript: js, ts: js, typescript: js, jsx: js, tsx: js, mjs: js, py, python: py, rs: rust, rust,
+    sh, bash: sh, shell: sh, zsh: sh, console: sh, sql, css, html, xml: html, svg: html, json };
+  const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const alpha = (c) => c !== undefined && /\p{L}/u.test(c);
+  const alnum = (c) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+  const digit = (c) => c !== undefined && c >= "0" && c <= "9";
+  const identStart = (c) => alpha(c) || c === "_" || c === "$";
+  const identChar = (c, isCss) => alnum(c) || c === "_" || c === "$" || (isCss && c === "-");
+  return (code, name) => {
+    const l = langs[String(name || "").toLowerCase()] || plain;
+    const s = Array.from(code);
+    const n = s.length;
+    const starts = (i, p) => { const ps = Array.from(p); for (let k = 0; k < ps.length; k++) if (s[i + k] !== ps[k]) return false; return true; };
+    let out = "", i = 0, plainAt = 0, depth = 0, inTag = false;
+    const span = (from, to, cls) => { out += esc(s.slice(plainAt, from).join("")) + `<span class="${cls}">` + esc(s.slice(from, to).join("")) + "</span>"; plainAt = to; };
+    const block = l.block || (l.tags ? ["<!--", "-->"] : null);
+    while (i < n) {
+      const c = s[i];
+      if (l.line.some((p) => starts(i, p))) { let j = i; while (j < n && s[j] !== "\n") j++; span(i, j, "hl-c"); i = j; continue; }
+      if (block && starts(i, block[0]) && !(l.tags && block[0] === "/*" && inTag)) {
+        let j = i + Array.from(block[0]).length; while (j < n && !starts(j, block[1])) j++;
+        j = Math.min(j + Array.from(block[1]).length, n); span(i, j, "hl-c"); i = j; continue;
+      }
+      if (l.tags && starts(i, "<!--")) { let j = i + 4; while (j < n && !starts(j, "-->")) j++; j = Math.min(j + 3, n); span(i, j, "hl-c"); i = j; continue; }
+      if (l.tags && c === "<") {
+        let j = i + 1; if (s[j] === "/") j++;
+        if (alpha(s[j])) { const from = j; while (j < n && (alnum(s[j]) || "-_.:".includes(s[j]))) j++; span(from, j, "hl-t"); inTag = l === html; i = j; continue; }
+      }
+      if (inTag) {
+        if (c === ">") inTag = false;
+        else if (c === '"' || c === "'") { let j = i + 1; while (j < n && s[j] !== c) j++; j = Math.min(j + 1, n); span(i, j, "hl-s"); i = j; continue; }
+        else if (alpha(c) || c === "@" || c === ":") { let j = i; while (j < n && (alnum(s[j]) || "-_:@.".includes(s[j]))) j++; span(i, j, "hl-a"); i = j; continue; }
+        i++; continue;
+      }
+      if (l.quotes.includes(c)) {
+        let j = i + 1;
+        while (j < n && s[j] !== c && (c === "`" || s[j] !== "\n")) { if (s[j] === "\\") j++; j++; }
+        j = Math.min(j + 1, n);
+        let k = j; while (k < n && (s[k] === " " || s[k] === "\t")) k++;
+        span(i, j, l.json && s[k] === ":" ? "hl-a" : "hl-s"); i = j; continue;
+      }
+      if (l.css) {
+        if (c === "{") depth++; else if (c === "}") depth = Math.max(depth - 1, 0);
+        if ((c === "#" || c === ".") && identChar(s[i + 1], true) && !(c === "." && digit(s[i + 1]))) {
+          let j = i + 1; while (j < n && identChar(s[j], true)) j++; span(i, j, depth > 0 && c === "#" ? "hl-n" : "hl-f"); i = j; continue;
+        }
+        if (c === "@" || (c === "!" && starts(i, "!important"))) { let j = i + 1; while (j < n && identChar(s[j], true)) j++; span(i, j, "hl-k"); i = j; continue; }
+      }
+      const prevIdent = i > 0 && identChar(s[i - 1], l.css);
+      if (!(i > 0 && identChar(s[i - 1], false)) && (digit(c) || (c === "." && digit(s[i + 1])))) {
+        let j = i; while (j < n && (/[A-Za-z0-9._]/.test(s[j]) || (l.css && s[j] === "%"))) j++; span(i, j, "hl-n"); i = j; continue;
+      }
+      if (identStart(c) && !prevIdent) {
+        let j = i; while (j < n && identChar(s[j], l.css)) j++;
+        const word = s.slice(i, j).join(""), probe = l.nocase ? word.toLowerCase() : word;
+        let k = j; while (k < n && (s[k] === " " || s[k] === "\t")) k++;
+        const next = s[k] === undefined ? " " : s[k];
+        const cls = l.css ? (depth > 0 && next === ":" ? "hl-a" : depth === 0 ? "hl-t" : null)
+          : l.keywords.includes(probe) ? "hl-k" : l.consts.includes(probe) ? "hl-n" : next === "(" ? "hl-f"
+          : l.types && c !== c.toLowerCase() && c === c.toUpperCase() ? "hl-t" : null;
+        if (cls) span(i, j, cls);
+        i = j; continue;
+      }
+      i++;
+    }
+    return out + esc(s.slice(plainAt).join(""));
+  };
+})();
+B.highlight = meta((code, lang) => new VRaw(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
+
 B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
 B.now = meta(() => Date.now(), "now", null);
 B.random = meta(() => Math.random(), "random", null);
@@ -1608,11 +1786,69 @@ function report(e) {
   if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
 }
 
+// Where a node is in an island: the indexes of its elements on the way.
+function islandPath(island, node) {
+  const path = [];
+  for (let n = node; n && n !== island; n = n.parentElement) path.unshift([...n.parentElement.children].indexOf(n));
+  return path;
+}
+function atPath(island, path) {
+  let n = island;
+  for (const i of path) n = n && n.children[i];
+  return n || null;
+}
+
+// The bundle may come after people started on the page (the loader in
+// server.rs waits for them to reach for a component): what they typed,
+// where they were, and what they clicked or sent, found before hydrating
+// replaces the islands' content and done again after it.
+function beforeHydrating(outer) {
+  const typed = [], island = (n) => outer.find((i) => i.contains(n));
+  for (const el of document.querySelectorAll("quillo-island input, quillo-island textarea, quillo-island select")) {
+    const changed = el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked
+      : el.tagName === "SELECT" ? [...el.options].some((o) => o.selected !== o.defaultSelected)
+      : el.value !== el.defaultValue;
+    const at = island(el);
+    if (changed && at) typed.push({ at, path: islandPath(at, el), name: el.name, value: el.value, checked: el.checked });
+  }
+  const f = document.activeElement, fat = f && island(f);
+  const focus = fat ? { at: fat, path: islandPath(fat, f), start: f.selectionStart, end: f.selectionEnd } : null;
+  const waiting = (window.__quillo_q || []).map((e) => { const at = island(e.target); return at && { type: e.type, at, path: islandPath(at, e.target) }; }).filter(Boolean);
+  return { typed, focus, waiting };
+}
+function afterHydrating(was) {
+  window.__quillo_booted = true;
+  const find = (x) => {
+    const el = atPath(x.at, x.path);
+    return el && (!x.name || el.name === x.name) ? el : x.name ? x.at.querySelector(`[name="${CSS.escape(x.name)}"]`) : el;
+  };
+  for (const t of was.typed) {
+    const el = find(t);
+    if (!el) continue;
+    if (el.type === "checkbox" || el.type === "radio") { if (el.checked !== t.checked) el.click(); continue; }
+    el.value = t.value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  if (was.focus) {
+    const el = atPath(was.focus.at, was.focus.path);
+    if (el && el.focus) { el.focus(); try { if (was.focus.start != null) el.setSelectionRange(was.focus.start, was.focus.end); } catch (e) {} }
+  }
+  for (const w of was.waiting) {
+    const el = atPath(w.at, w.path);
+    if (!el) continue;
+    if (w.type === "submit") { const form = el.closest("form") || el; form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); }
+    else el.click();
+  }
+  if (window.__quillo_q) window.__quillo_q.length = 0;
+}
+
 function boot() {
   // The outermost islands, found before any is hydrated: hydrating one
   // replaces its content, and islands inside it, detached, would no longer
   // look nested.
   const outer = [...document.querySelectorAll("quillo-island")].filter((i) => !(i.parentElement && i.parentElement.closest("quillo-island")));
+  const was = beforeHydrating(outer);
   for (const island of outer) {
     const def = C[island.dataset.c];
     if (!def) { report(`unknown component <${island.dataset.c}>`); continue; }
@@ -1630,6 +1866,7 @@ function boot() {
     inst.update();
     hydrating = null;
   }
+  afterHydrating(was);
 }
 
 // ---- what compiled code uses -------------------------------------------

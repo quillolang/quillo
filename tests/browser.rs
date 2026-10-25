@@ -218,6 +218,52 @@ fn svg_inside_html_draws() {
     assert_eq!(r, want);
 }
 
+/// A page loads its components' code when it is needed: not before someone
+/// reaches for one (what they typed and clicked meanwhile is kept), and at
+/// once for one that runs by itself.
+#[test]
+fn islands_load_their_code_when_it_is_needed() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("lazy.qwe"), free_port(), Some(&dir.join("lazy.js")));
+    let want = serde_json::json!({ "idleLoads": false, "loadedOnFocus": true, "echo": "Ada", "clicked": "Go 1", "value": "Ada", "errors": [] });
+    assert_eq!(r, want);
+    let r = run_page_with_path(&chrome, &dir.join("lazy.qwe"), free_port(), "/clock", Some(&dir.join("lazy.js")));
+    assert_eq!(r, serde_json::json!({ "clockRuns": true, "errors": [] }));
+}
+
+/// `ask` waits for an answer in a dialog on the page (a dangerous question
+/// starting on "Cancel", Escape saying no); `notify` shows a note that goes.
+#[test]
+fn ask_waits_for_an_answer_and_notify_goes_by_itself() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("notices.qwe"), free_port(), Some(&dir.join("notices.js")));
+    let want = serde_json::json!({ "dialog": "alertdialog", "title": "Delete", "focus": "q-cancel", "waits": "3", "after": "2", "gone": true,
+        "toast": "Deleted", "toastGone": true, "escaped": "2", "focusBack": "del", "errors": [] });
+    assert_eq!(r, want);
+}
+
+/// `highlight` colours code the same in the browser (as an editor types) as
+/// on the server (posts' code blocks), for every language it knows.
+#[test]
+fn highlight_is_the_same_on_both_sides() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("highlight.qwe"), free_port(), Some(&dir.join("highlight.js")));
+    let want = serde_json::json!({ "samples": 10, "same": true, "differ": [], "coloured": 9, "errors": [] });
+    assert_eq!(r, want);
+}
+
 /// Components with the page's JavaScript: `@mount` and its cleanup, `js`
 /// and `js_new`, and methods of a library's objects.
 #[test]

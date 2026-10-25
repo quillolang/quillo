@@ -228,6 +228,7 @@ impl Interp {
             }
         }
         self.rendered_island = false;
+        self.island_names.clear();
         self.tenant = None;
         self.tenant_named = false;
         self.upload_body = None;
@@ -261,8 +262,15 @@ impl Interp {
             if let (Some(i18n), Some(l)) = (self.site.i18n.clone(), self.locale()) {
                 tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(&l)));
             }
+            // Only the code of the components on the page (and what they
+            // use), at an address that changes when it does.
             if has(&resp.body, b"/_quillo/quillo.js").is_none() {
-                tags.push_str(&format!("<script src=\"{}/_quillo/quillo.js\" defer></script>", self.base));
+                let names = std::mem::take(&mut self.island_names);
+                let src = match self.bundle_for_page(&names) {
+                    Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
+                    None => format!("{}/_quillo/quillo.js", self.base),
+                };
+                tags.push_str(&format!("<script>{}</script>", island_loader(&src)));
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
@@ -392,6 +400,20 @@ impl Interp {
     }
 
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
+        // A page's own bundle: its address names its content, so it is kept.
+        // One this program did not make (a page from before a reload) gets
+        // the whole bundle, which has every component.
+        if let Some(hash) = rest.strip_prefix("b/").and_then(|r| r.strip_suffix(".js")) {
+            let (js, cache) = match self.bundle_by_hash(hash) {
+                Some(js) => (js, "public, max-age=31536000, immutable"),
+                None => (self.client_js.clone(), "no-cache"),
+            };
+            return HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), cache.into())],
+                body: js.as_bytes().to_vec(),
+            };
+        }
         if rest == "quillo.js" {
             // The browser keeps its copy and asks whether it is still current.
             let etag = format!("\"{:016x}\"", {
@@ -1302,3 +1324,25 @@ pub fn launch_token() -> Result<String, String> {
 /// Stack for threads that run Quillo code. Calls grow the stack on demand
 /// beyond this; it only has to cover deeply nested source and data.
 pub const WORKER_STACK: usize = 16 << 20;
+
+/// The script a page with components carries instead of its bundle: it
+/// loads the bundle when it is needed — someone reaches for a component
+/// (hovers, touches or focuses it), or the page is idle and has one that
+/// runs by itself (`data-e`, `data-l`) or is the page (`<body>` holds it).
+/// A click or a form sent before the bundle runs waits for it, and is done
+/// then (see `boot` in runtime.js).
+fn island_loader(src: &str) -> String {
+    let src = serde_json::to_string(src).unwrap_or_default().replace("</", "<\\/");
+    format!(
+        concat!(
+            "(()=>{{const d=document,q=window.__quillo_q=[];let go=0;",
+            "const load=()=>{{if(go)return;go=1;const t=d.createElement(\"script\");t.src={};t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}};",
+            "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island\");",
+            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e))load()}},{{capture:true,passive:true}});",
+            "for(const v of[\"click\",\"submit\"])d.addEventListener(v,(e)=>{{if(!window.__quillo_booted&&isl(e)){{e.preventDefault();e.stopPropagation();q.push(e);load()}}}},true);",
+            "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
+            "d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
+        ),
+        src
+    )
+}

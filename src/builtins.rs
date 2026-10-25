@@ -90,6 +90,10 @@ pub fn install(env: &Env) {
         ("index_of", index_of),
         ("repeat", repeat),
         ("markdown", markdown),
+        ("highlight", highlight),
+        ("run_script", run_script),
+        ("ask", ask),
+        ("notify", ask),
         ("live", live),
         ("parallel", parallel),
         ("every", every),
@@ -97,6 +101,8 @@ pub fn install(env: &Env) {
         ("js_new", js),
         ("css", tag_text),
         ("sql", tag_text),
+        ("sql_name", sql_name),
+        ("sql_param", sql_param),
         ("url", url),
         ("navigate", navigate),
         ("publish", publish),
@@ -1202,9 +1208,55 @@ fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         e => e,
     });
+    // A fenced code block that names its language comes out highlighted
+    // (after the HTML in the text was made text, above).
+    let mut code: Option<(String, String)> = None;
+    let events = events.filter_map(move |e| match (e, code.as_mut()) {
+        (Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))), None) if !lang.trim().is_empty() => {
+            code = Some((lang.split_whitespace().next().unwrap_or("").to_string(), String::new()));
+            None
+        }
+        (Event::Text(t), Some((_, body))) => {
+            body.push_str(&t);
+            None
+        }
+        (Event::End(pulldown_cmark::TagEnd::CodeBlock), Some(_)) => {
+            let (lang, body) = code.take().unwrap();
+            let class: String = lang.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+            Some(Event::Html(CowStr::from(format!("<pre class=\"hl\"><code class=\"language-{}\">{}</code></pre>\n", class, crate::highlight::highlight(&body, &lang)))))
+        }
+        (e, _) => Some(e),
+    });
     let mut out = String::with_capacity(s.len() * 3 / 2);
     pulldown_cmark::html::push_html(&mut out, events);
     Ok(Value::html(out))
+}
+
+/// `highlight(code, lang)`: code as HTML, coloured by the spans of its
+/// keywords, strings, comments and so on (see highlight.rs), escaped.
+fn highlight(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let code = s_arg(&args, 0, "highlight", line)?;
+    let lang = match args.get(1) {
+        None | Some(Value::Nil) => Arc::from(""),
+        Some(_) => s_arg(&args, 1, "highlight", line)?,
+    };
+    Ok(Value::html(crate::highlight::highlight(&code, &lang)))
+}
+
+/// `ask` and `notify` are the browser's (a dialog, a note on the page): on
+/// the server there is no one to ask.
+fn ask(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    fail(line, "`ask` and `notify` speak to someone in the browser: call them from a component (an event handler)")
+}
+
+/// `run_script(source, vars)`: users' code, run in a sandbox (script.rs).
+fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let src = s_arg(&args, 0, "run_script", line)?;
+    let vars = match args.get(1) {
+        None | Some(Value::Nil) => None,
+        Some(_) => Some(m_arg(&args, 1, "run_script", line)?),
+    };
+    Ok(crate::script::run_script(it, &src, vars.as_deref()))
 }
 
 // ---- live updates ------------------------------------------------------
@@ -1304,6 +1356,44 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     s_arg(&args, 0, "navigate", line)?;
     Ok(Value::Nil)
+}
+
+/// A name a program puts in SQL (a table's, a column's): letters, digits
+/// and `_`, not starting with a digit, at most 64 characters. Anything else
+/// is refused, so the name cannot carry SQL of its own.
+fn sql_ident(v: &Value, f: &str, line: u32) -> Result<String, Ctrl> {
+    let Value::Str(s) = v else { return fail(line, format!("`{}` takes a name (a str) or a list of them, got {}", f, v.type_name())) };
+    let ok = !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !s.starts_with(|c: char| c.is_ascii_digit());
+    if !ok {
+        return fail(line, format!("`{}`: {:?} is not a name SQL can take (letters, digits and _)", f, &**s));
+    }
+    Ok(s.to_string())
+}
+
+fn sql_idents(args: &[Value], f: &str, line: u32, each: impl Fn(String) -> String) -> R {
+    match args.first() {
+        Some(Value::List(items)) => {
+            let parts: Result<Vec<String>, Ctrl> = items.iter().map(|v| sql_ident(v, f, line).map(&each)).collect();
+            Ok(Value::str(&parts?.join(", ")))
+        }
+        Some(v) => Ok(Value::str(&each(sql_ident(v, f, line)?))),
+        None => fail(line, format!("`{}` takes a name", f)),
+    }
+}
+
+/// `sql_name("o_pitch")`: a table's or a column's name, checked and quoted,
+/// for SQL that cannot take it as a `?`; a list gives them comma-separated.
+fn sql_name(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    sql_idents(&args, "sql_name", line, |s| format!("\"{}\"", s))
+}
+
+/// `sql_param("title")`: a named parameter, `:title`, checked; a list gives
+/// them comma-separated (for `insert ... values (...)` with a map).
+fn sql_param(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    sql_idents(&args, "sql_param", line, |s| format!(":{}", s))
 }
 
 /// `css` and `sql`: css`...` and sql`...` are the text as written; the tag

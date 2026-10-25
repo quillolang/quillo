@@ -1,0 +1,23 @@
+// `highlight` on both sides: the server's (highlight.rs) and the browser's
+// (runtime.js) must colour the same code the same way. Driven by highlight.js.
+
+let SAMPLES = [
+    ["qwe", "let x = f(\"<a>\") // hi\nview Card(n: int) = <div.card>{n}</div>\n/* block */ `t ${1.5}`"],
+    ["js", "async function go(a) {\n  const b = await fetch('/x?y=1').then((r) => r.json()); // c\n  return new Map([[1, 2e3]]);\n}"],
+    ["css", ".a:hover > #b { color: #fff; margin: -0.5em 2px !important }\n@media (max-width: 760px) { h1 { font: 700 2rem/1 serif } }"],
+    ["html", "<!-- c --><a href=\"/x\" data-k='v'>y &amp; z</a><br/>"],
+    ["sql", "SELECT ward, sum(votes) FROM results -- c\nwhere race = 'mayor' group by ward;"],
+    ["py", "def f(x):\n    return None if x else 'ok'  # c"],
+    ["rust", "pub fn f(x: &str) -> Option<String> { Some(x.to_string()) } // c"],
+    ["json", "{\"a\": [1, true, null], \"b\": \"c\"}"],
+    ["sh", "export A=1 # c\nif [ -f x ]; then echo \"hi\"; fi"],
+    ["nope", "<b> & 'x'"],
+]
+
+component Client() =
+    <div id="client">{for s in SAMPLES => <pre class="sample">{highlight(s[1], s[0])}</pre>}</div>
+
+route GET / = <html><body>
+    <div id="server">{for s in SAMPLES => <pre class="sample">{highlight(s[1], s[0])}</pre>}</div>
+    <Client/>
+</body></html>

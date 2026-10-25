@@ -5,6 +5,12 @@
 //! views and constants they reference, and a stub for each `server fn`.
 //! Code that cannot run in a browser (`request`, `db`, a global the server
 //! changes, ...) is a load-time error that names the component.
+//!
+//! A page gets a bundle of its own: the components it was rendered with and
+//! what they use (`bundle_for`), at `/_quillo/b/<hash>.js`, kept by the
+//! browser for good since its address changes with its content. A page with
+//! no components loads no script, and one with components loads it when it
+//! is needed (`island_loader` in server.rs, `island.rs`).
 
 use crate::ast::*;
 use crate::error::QuilloError;
@@ -23,15 +29,24 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "t", "locale", "js", "js_new",
+    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
+    bundle_of(it, None)
+}
+
+/// The bundle for a page: these components and what they use, no more.
+pub fn bundle_for(it: &Interp, roots: &[String]) -> Result<String, QuilloError> {
+    bundle_of(it, Some(roots))
+}
+
+fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloError> {
     let mut c = Compiler::new(it);
     let mut names: Vec<(String, Arc<FnDef>)> = Vec::new();
     for (name, v) in scope_vars(&it.globals) {
         if let Value::Func(f) = v {
-            if f.def.component {
+            if f.def.component && roots.map_or(true, |r| r.contains(&name)) {
                 names.push((name, f.def.clone()));
             }
         }
@@ -271,6 +286,7 @@ const PURE: &[&str] = &[
     "ends_with", "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "range",
     "enumerate", "keys", "values", "get", "has", "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape",
     "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "index_of", "repeat",
+    "highlight",
 ];
 
 enum Resolved {
@@ -685,6 +701,16 @@ impl<'a> Compiler<'a> {
         if let Some(g) = self.globals.get(name) {
             return Ok(g.clone());
         }
+        // A global compiled while a loop's body is (the first use of a
+        // function, there) reads nothing from around that loop: its own
+        // names are its own.
+        let saved_reads = std::mem::take(&mut self.reads);
+        let r = self.global_inner(name, line);
+        self.reads = saved_reads;
+        r
+    }
+
+    fn global_inner(&mut self, name: &str, line: u32) -> Result<(String, bool), QuilloError> {
         if name == "request" {
             return self.err("`request` is only available on the server; pass what you need as a prop");
         }
@@ -695,8 +721,9 @@ impl<'a> Compiler<'a> {
         match &v {
             Value::Builtin(b, _) => {
                 if CLIENT_BUILTINS.contains(b) {
-                    // `parallel` waits for what it calls, so it is awaited.
-                    let r = (format!("B.{}", b), *b == "parallel");
+                    // `parallel` waits for what it calls, and `ask` for an
+                    // answer: they are awaited.
+                    let r = (format!("B.{}", b), *b == "parallel" || *b == "ask");
                     self.globals.insert(name.to_string(), r.clone());
                     Ok(r)
                 } else {

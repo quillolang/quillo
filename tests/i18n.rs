@@ -128,7 +128,7 @@ route GET /plain = <html><body>{t("hi", { name: "</script>" })}</body></html>
     assert!(page.contains("1 article</button>"), "{}", page);
     let at = page.find("window.__quillo_i18n=").expect("translations for the browser");
     assert!(page[at..].contains(r#""locale":"fr""#) && page[at..].contains(r#""nav.about":"About""#), "{}", &page[at..]);
-    assert!(page.find("/_quillo/quillo.js").unwrap() > at);
+    assert!(page.find("/_quillo/b/").unwrap() > at);
     // Only pages with components, and never a way out of the script.
     assert!(!get(&mut it, "/plain", &[]).text().contains("__quillo_i18n"));
     let mut it = Interp::new(&std::env::temp_dir());

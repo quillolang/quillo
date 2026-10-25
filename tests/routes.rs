@@ -227,9 +227,12 @@ route GET /bare = <Counter/>
     let page = r.text();
     assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2}">"#), "{}", page);
     assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></quillo-island>"), "{}", page);
-    assert!(page.ends_with("<script src=\"/_quillo/quillo.js\" defer></script></body></html>"), "{}", page);
-    // Without a </body>, the script goes at the end.
-    assert!(get(&mut it, "/bare").text().ends_with("<script src=\"/_quillo/quillo.js\" defer></script>"));
+    // The bundle loads when it is needed (a loader, last in the body).
+    let tail = &page[page.rfind("<script").unwrap()..];
+    assert!(tail.contains("t.src=\"/_quillo/b/") && tail.ends_with("</script></body></html>"), "{}", page);
+    // Without a </body>, the loader goes at the end.
+    let bare = get(&mut it, "/bare").text();
+    assert!(bare.contains("t.src=\"/_quillo/b/") && bare.ends_with("})()</script>"), "{}", bare);
     let js = get(&mut it, "/_quillo/quillo.js");
     assert_eq!(js.header("content-type"), Some("text/javascript; charset=utf-8"));
     assert!(js.text().contains("W.component(\"Counter\""));
@@ -300,10 +303,11 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
-    // About 20 KB (6 KB compressed) since markup is compiled into blocks,
+    // About 22 KB (7 KB compressed) since markup is compiled into blocks,
     // keyed lists move only what changed and clicks are handled once; the
-    // checks on the page's own objects (events' elements) are in it too.
-    assert!(js.len() < js2.len() && js.len() < 21_000, "{} vs {}", js.len(), js2.len());
+    // checks on the page's own objects (events' elements) are in it too, and
+    // what keeps typing and clicks from before the bundle came.
+    assert!(js.len() < js2.len() && js.len() < 23_500, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }
@@ -437,7 +441,9 @@ route GET /where = url().path
     let page = get(&mut it, "/shop").text();
     assert!(page.contains(r#"<a href="/shop/items?x=1">"#) && page.contains(r#"href="//cdn.example/x.js""#), "{}", page);
     assert!(page.contains(r#"action="/shop/buy""#) && page.contains(r#"<a href="/shop/inside">"#), "{}", page);
-    assert!(page.contains(r#"<script src="/shop/_quillo/quillo.js" defer>"#), "{}", page);
+    let at = page.find(r#"t.src="/shop/_quillo/b/"#).expect(&page) + r#"t.src=""#.len();
+    let src = page[at..at + page[at..].find('"').unwrap()].to_string();
+    assert!(get(&mut it, &src).text().contains("BASE = \"/shop\""));
     assert!(get(&mut it, "/shop/_quillo/quillo.js").text().contains("BASE = \"/shop\""));
     assert_eq!(get(&mut it, "/shop/where").text(), "/where");
     let r = send(&mut it, "POST", "/shop/buy", None, "");
@@ -465,4 +471,61 @@ fn routes_that_do_not_name_request_still_answer_what_asks_for_it() {
     assert_eq!(get(&mut it, "/w").text(), "/w");
     assert_eq!(get(&mut it, "/c").text(), "/c");
     assert_eq!(get(&mut it, "/p/3").text(), r#"{"id":"3","n":1}"#);
+}
+
+/// A page loads the code of the components on it (and what they use), not
+/// the whole program's; a page without any loads none.
+#[test]
+fn pages_load_only_their_own_components_code() {
+    let mut it = app(r#"
+fn shout(s) = upper(s)
+component Counter() {
+    ~n = 0
+    <button @click={() => { n = n + 1 }}>{shout("count")} {n}</button>
+}
+component Chart() {
+    ~points = [1, 2, 3]
+    <ul>{for p in points => <li>{p}</li>}</ul>
+}
+route GET /counter = <html><body><Counter/></body></html>
+route GET /both = <html><body><Counter/><Chart/></body></html>
+route GET /plain = <html><body><p>No components</p></body></html>
+"#);
+    let page = get(&mut it, "/counter").text();
+    let at = page.find("/_quillo/b/").expect(&page);
+    let src = &page[at..at + page[at..].find('"').unwrap()];
+    let r = get(&mut it, src);
+    assert!(r.header("cache-control").unwrap().contains("immutable"));
+    let js = r.text();
+    assert!(js.contains("Counter") && js.contains("upper") && !js.contains("Chart"), "only Counter and what it uses");
+    // Another set of components, another bundle; the same set, the same one.
+    let both = get(&mut it, "/both").text();
+    assert!(!both.contains(src) && both.contains("/_quillo/b/"));
+    assert!(get(&mut it, "/counter").text().contains(src));
+    assert!(!get(&mut it, "/plain").text().contains("/_quillo/"));
+    // A bundle this program did not make (a page from before a reload): the whole one.
+    let old = get(&mut it, "/_quillo/b/0000000000000000.js");
+    assert!(old.text().contains("Chart") && old.text().contains("Counter") && old.header("cache-control") == Some("no-cache"));
+}
+
+/// A function first compiled inside a loop's body (its first use in the
+/// page's bundle) is not something the loop reads from around it: its own
+/// parameters stay its own.
+#[test]
+fn a_function_first_used_inside_a_loop_keeps_its_names() {
+    let mut it = app(r#"
+fn tidy(zzparam) = upper(zzparam)
+component List() {
+    ~items = ["a", "b"]
+    ~picked = ""
+    let mark = "-"
+    <ul>{for x in items => <li key={x} @click={() => { picked = tidy(x) }}>{mark}{x}</li>}</ul>
+}
+route GET / = <html><body><List/></body></html>
+"#);
+    let page = get(&mut it, "/").text();
+    let at = page.find("/_quillo/b/").expect(&page);
+    let js = get(&mut it, &page[at..at + page[at..].find('"').unwrap()]).text();
+    let memo = js.lines().find(|l| l.contains("W.memo(")).expect("the loop is memoized");
+    assert!(!memo.contains("zzparam"), "{}", memo);
 }

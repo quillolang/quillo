@@ -29,3 +29,15 @@ fn what_visitors_write_cannot_run_scripts() {
     // Text you wrote yourself may keep its HTML.
     assert_eq!(md(r#"markdown("<b>x</b>", { html: true })"#), "<p><b>x</b></p>\n");
 }
+
+#[test]
+fn code_that_names_its_language_is_highlighted_and_stays_escaped() {
+    let t = md(r#"markdown("```js\nlet a = \"<script>\" // hi\n```\n\nafter")"#);
+    assert_eq!(
+        t,
+        "<pre class=\"hl\"><code class=\"language-js\"><span class=\"hl-k\">let</span> a = <span class=\"hl-s\">&quot;&lt;script&gt;&quot;</span> <span class=\"hl-c\">// hi</span>\n</code></pre>\n<p>after</p>\n"
+    );
+    // A block that names no language is as CommonMark has it.
+    assert_eq!(md(r#"markdown("```\n<b>\n```")"#), "<pre><code>&lt;b&gt;\n</code></pre>\n");
+    assert_eq!(md(r#"type_of(highlight("x", "qwe"))"#), "html");
+}

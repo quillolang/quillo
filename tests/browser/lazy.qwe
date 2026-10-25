@@ -1,0 +1,23 @@
+// Islands load their code when it is needed: someone reaching for one, or
+// one that runs by itself. Driven by lazy.js.
+
+component Form() {
+    ~name = ""
+    ~clicks = 0
+    <div>
+        <input id="name" value={name} @input={(e) => { name = e.value }}/>
+        <p id="echo">{name}</p>
+        <button id="go" @click={() => { clicks = clicks + 1 }}>Go {clicks}</button>
+    </div>
+}
+
+component Clock() {
+    ~n = 0
+    every(50, () => { n = n + 1 })
+    <p id="ticks">{n}</p>
+}
+
+view Layout(children) = <html><body><main><h1>Page</h1>{children}</main></body></html>
+
+route GET / = <Layout><Form/></Layout>
+route GET /clock = <Layout><Clock/></Layout>
