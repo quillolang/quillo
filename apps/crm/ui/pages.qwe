@@ -744,6 +744,8 @@ component PluginsPage(ws: map, on_change) {
                     {len(p.fields ?? []) > 0 && <li>Fields: {(p.fields ?? []) | map((f) => f.label) | join(", ")}</li>}
                     {rule_count > 0 && <li>{plural(rule_count, "rule")} for {keys(p.rules) | join(", ")}</li>}
                     {len(p.steps ?? []) > 0 && <li>Flow steps: {(p.steps ?? []) | map((s) => s.label) | join(", ")}</li>}
+                    {len(p.blocks ?? []) > 0 && <li>Page blocks: {(p.blocks ?? []) | map((b) => b.label) | join(", ")}</li>}
+                    {p.version != null && <li>Version {p.version}, from the plugin studio</li>}
                     {p.taxes != null && <li>Adds tax at checkout</li>}
                 </ul>
             </section>

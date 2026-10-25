@@ -8,10 +8,20 @@ use std::path::{Path, PathBuf};
 
 fn copy_app(to: &Path) {
     let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/crm");
-    for dir in ["", "lib", "plugins", "ui", "migrations", "public"] {
+    copy_dirs(&from, to);
+    // As shipped: no plugins from the studio yet.
+    std::fs::write(to.join("plugins/studio/index.qwe"), "let studio_plugins = []\nlet studio_renderers = {}\nlet studio_runners = {}\n").unwrap();
+    std::fs::write(to.join("plugins/studio/registry.json"), "{\"plugins\": []}").unwrap();
+}
+
+fn copy_dirs(from: &Path, to: &Path) {
+    for dir in ["", "lib", "plugins", "plugins/studio", "ui", "migrations", "public"] {
         std::fs::create_dir_all(to.join(dir)).unwrap();
         for e in std::fs::read_dir(from.join(dir)).unwrap().flatten() {
-            if e.path().is_file() {
+            // The studio's own plugins are the installation's, not the app's.
+            let name = e.file_name().to_string_lossy().into_owned();
+            let studio_made = dir == "plugins/studio" && !["index.qwe", "registry.json", "template.txt"].contains(&name.as_str());
+            if e.path().is_file() && !studio_made {
                 std::fs::copy(e.path(), to.join(dir).join(e.file_name())).unwrap();
             }
         }
@@ -50,6 +60,13 @@ impl Crm {
     fn call(&mut self, name: &str) {
         let f = quillo::value::lookup(&self.it.globals, name).unwrap();
         self.it.call(&f, vec![], 0).unwrap_or_else(|_| panic!("{} failed", name));
+    }
+
+    /// Loads the program again from its files (what --watch would do).
+    fn reload(&mut self) {
+        let mut it = Interp::new(&self.dir);
+        it.load_file(&self.dir.join("main.qwe")).unwrap_or_else(|e| panic!("{}", e));
+        self.it = it;
     }
 
     fn sql(&self, tenant: &str, sql: &str) {
@@ -244,4 +261,45 @@ fn images_upload_crop_and_serve_at_their_sizes() {
     crm.rpc(host, "delete_media", serde_json::json!([m["id"]]), Some(&cookie));
     assert_eq!(crm.send(host, "GET", &format!("/media/{}/full/320", key), "", None).status, 404);
     assert!(!crm.dir.join(format!("data/media/acme/cache/{}", key)).exists());
+}
+
+#[test]
+fn developers_write_plugins_try_them_and_release_them() {
+    std::env::set_var("CRM_DEVELOPERS", "ada@acme.test");
+    let mut crm = Crm::new("studio");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let id = crm.rpc(host, "studio_create", serde_json::json!(["events", "Events"]), Some(&cookie));
+    assert_eq!(id["ok"], "events", "{}", id);
+    let src = crm.rpc(host, "studio_get", serde_json::json!(["events"]), Some(&cookie))["ok"]["source"].as_str().unwrap().to_string();
+    assert!(src.contains("let events_plugin = {") && src.contains("\"events.callout\""));
+    // Names that could clash with other plugins, and code that does not check, are refused.
+    let r = crm.rpc(host, "studio_save", serde_json::json!(["events", format!("{}\nlet total = 1\n", src)]), Some(&cookie));
+    assert!(r["err"]["problems"][0]["message"].as_str().unwrap().contains("\"total\" must start with events_"), "{}", r);
+    let broken = src.replace("label: \"Callout\"", "label: nope_undefined");
+    let r = crm.rpc(host, "studio_save", serde_json::json!(["events", broken]), Some(&cookie));
+    assert_eq!(r["err"]["problems"][0]["message"], "unknown name `nope_undefined`", "{}", r);
+    assert!(r["err"]["problems"][0]["line"].as_i64().unwrap() > 0);
+    assert!(!crm.dir.join("plugins/studio/events.draft.qwe").exists(), "nothing is written until it checks");
+    // A good draft: tried in this workspace, its block renders.
+    assert!(crm.rpc(host, "studio_save", serde_json::json!(["events", src]), Some(&cookie))["ok"]["saved"] == true);
+    crm.reload();
+    crm.rpc(host, "set_try_drafts", serde_json::json!([true]), Some(&cookie));
+    let block = serde_json::json!([[{ "id": "b1", "type": "events.callout", "config": { "title": "Open day", "tone": "success" } }]]);
+    let html = crm.rpc(host, "preview_page", block.clone(), Some(&cookie))["ok"][0]["html"].as_str().unwrap().to_string();
+    assert!(html.contains("<b>Open day</b>") && html.contains("#ecfdf3"), "{}", html);
+    // Released: workspaces switch it on as any plugin.
+    assert_eq!(crm.rpc(host, "studio_release", serde_json::json!(["events"]), Some(&cookie))["ok"]["released"], 1);
+    crm.reload();
+    crm.rpc(host, "set_try_drafts", serde_json::json!([false]), Some(&cookie));
+    let off = crm.rpc(host, "preview_page", block.clone(), Some(&cookie))["ok"][0]["html"].as_str().unwrap().to_string();
+    assert!(off.contains("switched off"), "{}", off);
+    crm.rpc(host, "set_plugins", serde_json::json!([["events"]]), Some(&cookie));
+    let on = crm.rpc(host, "preview_page", block, Some(&cookie))["ok"][0]["html"].as_str().unwrap().to_string();
+    assert!(on.contains("<b>Open day</b>"), "{}", on);
+    // Not a developer: no studio.
+    std::env::remove_var("CRM_DEVELOPERS");
+    let mut other = Crm::new("studio-closed");
+    let c2 = signup(&mut other);
+    assert!(other.rpc(host, "studio_list", serde_json::json!([]), Some(&c2))["err"].as_str().unwrap().contains("developers"));
 }

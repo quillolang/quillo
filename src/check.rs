@@ -251,6 +251,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("read_file", "str", "str | error(str)"),
     ("write_file", "str, any", "null | error(str)"),
     ("delete_file", "str", "null | error(str)"),
+    ("check_program", "str, map | null=", "list | error(str)"),
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
@@ -328,7 +329,7 @@ const MODULES: &[&str] = &["json", "db", "http", "crypto", "image"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
-    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "publish", "watch", "crypto.sha256",
+    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
       "schedule", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
@@ -584,10 +585,17 @@ pub fn builtin_signatures() -> Vec<(String, String)> {
 
 /// Checks a program file and the files it `use`s.
 pub fn check_file(path: &Path) -> Analysis {
-    match std::fs::read_to_string(path) {
+    check_file_with(path, HashMap::new())
+}
+
+/// `check_file`, with some files' text given instead of read: how the
+/// program would check if they said that (a tool about to write them).
+pub fn check_file_with(path: &Path, overrides: HashMap<PathBuf, String>) -> Analysis {
+    let main = overrides.get(path).cloned().map_or_else(|| std::fs::read_to_string(path), Ok);
+    match main {
         Ok(src) => {
             let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            check_source(&src, &path.display().to_string(), base)
+            check_source_with(&src, &path.display().to_string(), base, overrides)
         }
         Err(e) => {
             let mut a = Analysis::default();
@@ -605,7 +613,12 @@ pub fn check_file(path: &Path) -> Analysis {
 /// Checks source text (the main file need not be saved); `use`d files are
 /// read from `base_dir`.
 pub fn check_source(src: &str, file: &str, base_dir: &Path) -> Analysis {
+    check_source_with(src, file, base_dir, HashMap::new())
+}
+
+fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>) -> Analysis {
     let mut c = Checker::new(file);
+    c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     match Parser::new(src).parse_program() {
         Ok(stmts) => {
@@ -669,6 +682,8 @@ struct Item {
 }
 
 struct Checker {
+    /// Files' text to use instead of what is on disk.
+    overrides: HashMap<PathBuf, String>,
     globals: HashMap<String, Var>,
     scopes: Vec<HashMap<String, Var>>,
     fns: Vec<FnCtx>,
@@ -713,6 +728,7 @@ impl Checker {
             );
         }
         Checker {
+            overrides: HashMap::new(),
             globals,
             scopes: Vec::new(),
             fns: Vec::new(),
@@ -780,7 +796,8 @@ impl Checker {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
-                match std::fs::read_to_string(&full) {
+                let text = self.overrides.get(&full).cloned().map_or_else(|| std::fs::read_to_string(&full), Ok);
+                match text {
                     Ok(src) => match Parser::new(&src).parse_program() {
                         Ok(sub) => self.expand(Arc::new(sub), fname, base, seen, order),
                         Err(e) => self.diag_at(fname, e.line, Severity::Error, e.msg),

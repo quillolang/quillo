@@ -149,6 +149,31 @@ and says which port to leave by; returning `{ waiting_for: "time", until: <ms>,
 resume: "out" }` parks the run instead. Plugins can also bring `checkout_fields`,
 `form_fields` and `taxes: (order, subtotal_cents, ctx) => cents`.
 
+## The plugin studio
+
+Developers write plugins in the app (Plugin studio, in the menu), try them in real pages
+and flows, and release them to every workspace. Plugin code runs on the server with the
+program's full power, so only the installation's developers may write it:
+
+```sh
+CRM_DEVELOPERS=ada@example.com,linus@example.com quillo run apps/crm/main.qwe --reload
+```
+
+- A new plugin starts from a template (a block, a rule, a renderer) to change into
+  yours. Every top-level name starts with the plugin's id (`events_plugin`,
+  `fn events_count`, views `EventsCard`), so plugins never clash.
+- **Save draft** checks the plugin the way `quillo check` checks the program, with the
+  plugin in it, before writing anything: errors show by line, and a draft that does not
+  check is never saved. A saved draft is loaded beside the released version.
+- **Try drafts in this workspace**: there, drafts take their released versions' place —
+  their blocks in the page designer, their steps in the flow designer, their rules in
+  every form. Other workspaces keep the released version.
+- **Release** makes the draft the plugin's next version for every workspace; they
+  switch it on in Plugins, like the built-in ones.
+- The program takes up what is saved by loading itself again: run it with `--watch`
+  (development) or `--reload` (production). Studio plugins are files in
+  `plugins/studio/`, to keep in version control with the rest.
+
 ## One workspace, or many
 
 By default the CRM is a service: workspaces sign up on the main site and each gets a

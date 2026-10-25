@@ -36,7 +36,7 @@ component App() {
     <div.shell>
         <aside.sidebar>
             <div.brand><span.logo-mark>◆</span><div><b>{ws.name}</b><span>{ws.slug}</span></div></div>
-            <nav>{for g in NAV => <div.nav-group>
+            <nav>{for g in NAV + (ws.developer ? [{ group: "Develop", items: [{ href: "/app/studio", label: "Plugin studio", icon: "⌘" }] }] : []) => <div.nav-group>
                 {g.group != "" && <p.nav-title>{g.group}</p>}
                 {for it in g.items => <a href={it.href} class={nav_active(it.href, path) && "active"}><span.icon>{it.icon}</span>{it.label}</a>}
             </div>}</nav>
@@ -61,6 +61,8 @@ component App() {
                 ["forms"] => <FormsPage {ws}/>
                 ["pages"] => <PagesPage {ws} on_change={refresh}/>
                 ["media"] => <MediaPage {ws}/>
+                ["studio"] => <StudioPage {ws} on_change={refresh}/>
+                ["studio", pid] => <PluginEditor key={pid} id={pid} {ws}/>
                 ["pages", id] => <PageDesigner key={id} id={int(id) ?? 0} {ws}/>
                 ["campaigns"] => <CampaignsPage {ws}/>
                 ["outbox"] => <OutboxPage {ws}/>

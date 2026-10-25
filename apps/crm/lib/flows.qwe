@@ -109,13 +109,11 @@ fn purchased(contact_id: int, sku: str) {
 // ---- the steps -------------------------------------------------------------------------
 
 fn run_step(node: map, run: map) {
-    let runner = step_runners[node.type]
-    if runner == null { return { error: `no step "${node.type}" (is its plugin switched on?)` } }
-    let plugin = find(plugins, (p) => any(p.steps ?? [], (s) => s.type == node.type))
-    if node.type != "trigger" && plugin != null && plugin.id != "core" && !contains(enabled_plugins(), plugin.id) {
-        return { error: `the ${plugin.name} plugin is switched off` }
-    }
-    runner(node.config ?? {}, run)
+    if node.type == "trigger" { return { port: "out" } }
+    let plugin = find(active_plugins(rule_ctx().enabled), (p) => any(p.steps ?? [], (s) => s.type == node.type))
+    if plugin == null { return { error: `no step "${node.type}" (is its plugin switched on?)` } }
+    let runner = (step_runners[plugin_key(plugin)] ?? {})[node.type]
+    runner == null ? { error: `the ${plugin.name} plugin cannot run "${node.type}"` } : runner(node.config ?? {}, run)
 }
 
 fn run_contact(run) = contact_row(run.context.contact_id)

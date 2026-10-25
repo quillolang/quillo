@@ -19,15 +19,14 @@ fn theme_of(s: map) = merge(DEFAULT_THEME, s.theme ?? {})
 // What renderers see.
 fn render_ctx(preview: bool) {
     let s = settings()
-    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: s.plugins ?? [] }
+    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: enabled_plugins() }
 }
 
 // One block's HTML, from the renderer of the plugin that brings it.
 fn render_block(b: map, ctx: map) {
-    let render = block_renderers[b.type]
-    if render == null { return <p.pb-missing>A block from a plugin that is switched off.</p> }
-    let t = find(block_types(ctx.enabled), (t) => t.type == b.type)
-    t == null ? <p.pb-missing>A block from a plugin that is switched off.</p> : render(b.config ?? {}, ctx)
+    let p = find(active_plugins(ctx.enabled), (p) => any(p.blocks ?? [], (t) => t.type == b.type))
+    let render = p == null ? null : (block_renderers[plugin_key(p)] ?? {})[b.type]
+    render == null ? <p.pb-missing>A block from a plugin that is switched off.</p> : render(b.config ?? {}, ctx)
 }
 
 let FONTS = {

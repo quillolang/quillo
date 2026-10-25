@@ -28,7 +28,11 @@ fn put_setting(key: str, value) = db.exec(
     "insert into settings (key, value) values (?, ?) on conflict (key) do update set value = excluded.value",
     key, json.stringify(value))
 
-fn enabled_plugins() = settings().plugins ?? []
+// The plugins switched on, and "@drafts" where the studio's drafts are tried.
+fn enabled_plugins() {
+    let s = settings()
+    (s.plugins ?? []) + (s.try_drafts == true ? ["@drafts"] : [])
+}
 
 fn custom_fields() = db.query("select * from custom_fields order by entity, position, id")
     | map((f) => set(f, "options", parsed(f.options, [])) | set("required", f.required == 1))
@@ -36,7 +40,7 @@ fn custom_fields() = db.query("select * from custom_fields order by entity, posi
 // What rules see, besides the record: the same on both sides.
 fn rule_ctx(extra: map = {}) {
     let s = settings()
-    merge({ enabled: s.plugins ?? [], fields: custom_fields(), settings: s, today: iso_day(now()) }, extra)
+    merge({ enabled: enabled_plugins(), fields: custom_fields(), settings: s, today: iso_day(now()) }, extra)
 }
 
 // The problems that refuse a save, or null.

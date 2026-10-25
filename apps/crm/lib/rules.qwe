@@ -20,7 +20,17 @@ fn when(cond, problems: list) = cond ? problems : []
 fn blank(v) = v == null || trim(str(v)) == ""
 
 // The plugins switched on: core always, the rest by the workspace's choice.
-fn active_plugins(enabled: list) = plugins | filter((p) => p.id == "core" || contains(enabled, p.id))
+// Drafts from the plugin studio take their released version's place in
+// a workspace that tries drafts ("@drafts" among its plugins).
+fn active_plugins(enabled: list) {
+    let drafts = contains(enabled, "@drafts")
+    let on = (p) => p.id == "core" || contains(enabled, p.id) || (drafts && p.status == "draft")
+    let shadowed = (p) => drafts && p.status != "draft" && any(plugins, (q) => q.status == "draft" && q.id == p.id)
+    plugins | filter((p) => (p.status != "draft" || drafts) && on(p) && !shadowed(p))
+}
+
+// Where a plugin's renderers and runners are found: its version's key.
+fn plugin_key(p) = p.status == "draft" ? `${p.id}#draft` : p.id
 
 fn validate(kind: str, record: map, ctx: map) =
     active_plugins(ctx.enabled ?? [])

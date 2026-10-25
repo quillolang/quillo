@@ -638,6 +638,13 @@ component Photo() {
 Such a call is sent as multipart with an `X-Quillo-Rpc` header, which pages of other
 sites cannot add without asking first; a form another site posts is refused.
 
+### Checking code from a program
+
+`check_program("main.qwe", { "plugins/x.qwe": text })` gives what `quillo check` says of
+a program, as `{ file, line, severity, message }` maps, with some files' text given in
+place of what is on disk: a tool that writes Quillo code can check it before writing
+it. `delete_file(path)` removes a file or folder inside the program's folder.
+
 ### Images
 
 ```quillo
@@ -996,7 +1003,9 @@ instance. SQLite in memory (`:memory:`) is one database per instance, so use a f
 PostgreSQL to share data between them.
 
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
-state afresh) and refreshes open pages. A version that fails to load or check does not
+state afresh) and refreshes open pages. `--reload` reloads it the same way without
+`--watch`'s development aids (errors on pages, refreshing them), for production
+programs that change their own files, such as a plugin editor. A version that fails to load or check does not
 replace the one that works; the errors are printed.
 
 ### Stopping and health

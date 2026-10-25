@@ -783,6 +783,9 @@ pub struct App {
     /// A desktop app (`quillo app`): only requests that carry this token
     /// are answered (see `launch_gate`).
     pub launch_token: Option<String>,
+    /// `--reload`: load the program again when its files change, without
+    /// `--watch`'s development aids (errors on pages, page refreshes).
+    pub reload: bool,
 }
 
 impl App {
@@ -800,6 +803,7 @@ impl App {
             cluster_sources: None,
             max_body: MAX_BODY,
             launch_token: None,
+            reload: false,
         }
     }
 
@@ -1175,7 +1179,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some(), std::sync::atomic::Ordering::Relaxed);
     app.shared.gil.release();
-    if app.watch {
+    if app.watch || app.reload {
         let app = app.clone();
         std::thread::Builder::new()
             .name("quillo-watch".into())

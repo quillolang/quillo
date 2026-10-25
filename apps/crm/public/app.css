@@ -379,3 +379,15 @@ body.site { margin: 0; font-size: 16px; line-height: 1.6; }
 .drop-after { box-shadow: 0 4px 0 0 var(--brand); }
 .pb-empty.over { background: var(--brand-soft); }
 .palette-item[draggable=true] { cursor: grab; }
+
+/* ---- the plugin studio ---- */
+.studio-try { display: flex; gap: 16px; align-items: center; }
+.studio { display: flex; flex-direction: column; height: calc(100vh - 110px); margin: -24px -28px -48px; }
+.studio-body { flex: 1; display: grid; grid-template-columns: 1fr 360px; min-height: 0; }
+.code-wrap { display: flex; overflow: auto; background: #0f172a; }
+.gutter { display: flex; flex-direction: column; padding: 14px 8px; color: #475569; font: 13px/20px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; user-select: none; min-width: 44px; }
+.gutter .bad { color: #fff; background: #b42318; border-radius: 3px; padding: 0 3px; }
+textarea.code { flex: 1; border: none; border-radius: 0; resize: none; background: transparent; color: #e2e8f0; font: 13px/20px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 14px; white-space: pre; overflow: hidden; min-height: 100%; tab-size: 4; }
+textarea.code:focus { box-shadow: none; }
+.howto { padding-left: 18px; font-size: 13px; color: #475467; }
+.howto li { margin-bottom: 6px; }

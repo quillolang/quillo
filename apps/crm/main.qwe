@@ -33,7 +33,10 @@ use "plugins/sponsors.qwe"
 use "plugins/quality.qwe"
 
 // The plugins there are.
-let plugins = [plugin_core, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality]
+// The plugin studio's (plugins/studio/), released and drafts.
+use "plugins/studio/index.qwe"
+
+let plugins = [plugin_core, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality] + studio_plugins
 
 use "lib/records.qwe"
 use "lib/commerce.qwe"
@@ -41,15 +44,17 @@ use "lib/marketing.qwe"
 use "lib/flows.qwe"
 
 // The steps flows run, on the server: the core's and the plugins'.
-let step_runners = merge(core_runners, merge(runners_gdpr, merge(runners_loyalty, merge(runners_paywall, merge(runners_vat, merge(runners_sponsors, runners_quality))))))
+// By plugin (and version: "birthday#draft").
+let step_runners = merge({ core: core_runners, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality }, studio_runners)
 
 use "lib/workspace.qwe"
 use "lib/pages.qwe"
 use "lib/media.qwe"
+use "lib/studio.qwe"
 use "plugins/core_blocks.qwe"
 
 // How each plugin's page blocks look (on the server).
-let block_renderers = merge(renderers_core, merge(renderers_sponsors, merge(renderers_paywall, renderers_gdpr)))
+let block_renderers = merge({ core: renderers_core, sponsors: renderers_sponsors, paywall: renderers_paywall, gdpr: renderers_gdpr }, studio_renderers)
 use "ui/kit.qwe"
 use "ui/public.qwe"
 use "ui/app.qwe"
@@ -57,6 +62,7 @@ use "ui/pages.qwe"
 use "ui/designer.qwe"
 use "ui/pagedesigner.qwe"
 use "ui/media.qwe"
+use "ui/studio.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {

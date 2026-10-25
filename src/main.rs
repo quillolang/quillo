@@ -33,6 +33,8 @@ options for `run`:
   --workers N    requests that can wait (for a database, the network) at
                  once, each on a thread of its own (default 64)
   --watch, -w    reload when the program's files change, and refresh open pages
+  --reload       reload when the program's files change (in production: no
+                 errors shown on pages, no page refreshes)
   --no-check     skip the static checks before running
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
@@ -123,6 +125,7 @@ struct RunOptions {
     port: Option<String>,
     workers: usize,
     watch: bool,
+    reload: bool,
     static_check: bool,
     register: Option<String>,
     service: Option<String>,
@@ -136,6 +139,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         port: None,
         workers: 64,
         watch: false,
+        reload: false,
         static_check: true,
         register: None,
         service: None,
@@ -148,6 +152,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         match (flags[i].as_str(), value) {
             ("--watch" | "-w", _) => {
                 o.watch = true;
+                i += 1;
+                continue;
+            }
+            ("--reload", _) => {
+                o.reload = true;
                 i += 1;
                 continue;
             }
@@ -249,6 +258,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     let mut app = App::new(loaded, shared, path, base, o.watch);
     app.static_check = o.static_check;
     app.max_body = o.max_body;
+    app.reload = o.reload;
     Ok(Some(app))
 }
 

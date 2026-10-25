@@ -70,6 +70,7 @@ pub fn install(env: &Env) {
         ("read_file", read_file),
         ("write_file", write_file),
         ("delete_file", delete_file),
+        ("check_program", check_program),
         ("random", random),
         ("random_int", random_int),
         ("uuid", uuid),
@@ -937,6 +938,44 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(()) => Value::Nil,
         Err(e) => Value::err(Value::str(format!("write_file: {}: {}", p, e))),
     })
+}
+
+/// `check_program("main.qwe")`: what `quillo check` says of a program (and
+/// the files it uses), as `{ file, line, severity, message }` maps; for
+/// tools that write Quillo code, such as a plugin editor.
+fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let p = s_arg(&args, 0, "check_program", line)?;
+    let Some(full) = local_path(it, &p) else {
+        return Ok(Value::err(Value::str(format!("check_program: path must stay inside the program's folder: {}", p))));
+    };
+    // `{ "path": "text" }`: check as if those files said that.
+    let mut overrides = std::collections::HashMap::new();
+    if let Some(Value::Map(m)) = args.get(1) {
+        for (k, v) in m.iter() {
+            match local_path(it, k) {
+                Some(p) => {
+                    overrides.insert(p, v.display().to_string());
+                }
+                None => return Ok(Value::err(Value::str(format!("check_program: path must stay inside the program's folder: {}", k)))),
+            }
+        }
+    }
+    let base = it.base_dir.to_string_lossy().into_owned();
+    let found = it.unlocked(move || crate::check::check_file_with(&full, overrides).diagnostics);
+    Ok(Value::list(
+        found
+            .into_iter()
+            .map(|d| {
+                let mut m = Map::new();
+                let file = d.file.strip_prefix(&base).unwrap_or(&d.file).trim_start_matches('/').trim_start_matches("./").to_string();
+                m.insert("file".into(), Value::str(file));
+                m.insert("line".into(), Value::Int(d.line as i64));
+                m.insert("severity".into(), Value::str(if d.severity == crate::check::Severity::Error { "error" } else { "warning" }));
+                m.insert("message".into(), Value::str(d.message));
+                Value::map(m)
+            })
+            .collect(),
+    ))
 }
 
 /// `delete_file(path)`: removes a file, or a folder and what is in it,
