@@ -17,7 +17,7 @@ let NAV = [
     { group: "", items: [{ href: "/app", label: "Dashboard", icon: "◧" }, { href: "/app/tasks", label: "Tasks", icon: "☑" }] },
     { group: "People", items: [{ href: "/app/contacts", label: "Contacts", icon: "☺" }, { href: "/app/companies", label: "Companies", icon: "▦" }] },
     { group: "Sales", items: [{ href: "/app/deals", label: "Deals", icon: "◫" }, { href: "/app/products", label: "Products", icon: "◈" }, { href: "/app/orders", label: "Orders", icon: "≡" }] },
-    { group: "Marketing", items: [{ href: "/app/pages", label: "Pages", icon: "▤" }, { href: "/app/media", label: "Media", icon: "▣" }, { href: "/app/forms", label: "Forms", icon: "✎" }, { href: "/app/campaigns", label: "Campaigns", icon: "✉" }, { href: "/app/outbox", label: "Outbox", icon: "⇪" }] },
+    { group: "Marketing", items: [{ href: "/app/pages", label: "Pages", icon: "▤" }, { href: "/app/posts", label: "Posts", icon: "✍", needs: "blog" }, { href: "/app/media", label: "Media", icon: "▣" }, { href: "/app/forms", label: "Forms", icon: "✎" }, { href: "/app/campaigns", label: "Campaigns", icon: "✉" }, { href: "/app/outbox", label: "Outbox", icon: "⇪" }] },
     { group: "Automation", items: [{ href: "/app/flows", label: "Flows", icon: "⟶" }] },
     { group: "Workspace", items: [{ href: "/app/plugins", label: "Plugins", icon: "⧉" }, { href: "/app/settings", label: "Settings", icon: "⚙" }] },
 ]
@@ -38,7 +38,7 @@ component App() {
             <div.brand><span.logo-mark>◆</span><div><b>{ws.name}</b><span>{ws.slug}</span></div></div>
             <nav>{for g in NAV + (ws.developer ? [{ group: "Develop", items: [{ href: "/app/studio", label: "Plugin studio", icon: "⌘" }] }] : []) => <div.nav-group>
                 {g.group != "" && <p.nav-title>{g.group}</p>}
-                {for it in g.items => <a href={it.href} class={nav_active(it.href, path) && "active"}><span.icon>{it.icon}</span>{it.label}</a>}
+                {for it in g.items | filter((it) => it.needs == null || any(active_plugins(ws.enabled), (p) => p.id == it.needs)) => <a href={it.href} class={nav_active(it.href, path) && "active"}><span.icon>{it.icon}</span>{it.label}</a>}
             </div>}</nav>
             <div.me>
                 <Avatar name={ws.user.name}/>
@@ -61,6 +61,8 @@ component App() {
                 ["forms"] => <FormsPage {ws}/>
                 ["pages"] => <PagesPage {ws} on_change={refresh}/>
                 ["media"] => <MediaPage {ws}/>
+                ["posts"] => <PostsPage {ws}/>
+                ["posts", pid] => <PostEditor key={pid} id={int(pid) ?? 0} {ws}/>
                 ["studio"] => <StudioPage {ws} on_change={refresh}/>
                 ["studio", pid] => <PluginEditor key={pid} id={pid} {ws}/>
                 ["pages", id] => <PageDesigner key={id} id={int(id) ?? 0} {ws}/>

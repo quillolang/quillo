@@ -303,3 +303,57 @@ fn developers_write_plugins_try_them_and_release_them() {
     let c2 = signup(&mut other);
     assert!(other.rpc(host, "studio_list", serde_json::json!([]), Some(&c2))["err"].as_str().unwrap().contains("developers"));
 }
+
+#[test]
+fn a_blog_with_members_only_posts_a_feed_and_latest_posts_on_pages() {
+    let mut crm = Crm::new("blog");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    // Off by default for a merchant; on, /blog answers.
+    assert_eq!(crm.send(host, "GET", "/blog", "", None).status, 404);
+    crm.rpc(host, "set_plugins", serde_json::json!([["blog", "paywall"]]), Some(&cookie));
+    let id = crm.rpc(host, "new_post", serde_json::json!([]), Some(&cookie))["ok"].as_i64().unwrap();
+    // The post rules refuse to publish an empty post.
+    let r = crm.rpc(host, "publish_post", serde_json::json!([id]), Some(&cookie));
+    let fields: Vec<&str> = r["err"]["problems"].as_array().unwrap().iter().map(|p| p["field"].as_str().unwrap()).collect();
+    assert_eq!(fields, ["title", "body"]);
+    let post = serde_json::json!([{ "id": id, "slug": "hello", "title": "Hello <world>", "excerpt": "First words.", "body": "## Inside\n\nFor members.",
+        "tags": ["News", "first post"], "members_only": true }]);
+    assert!(crm.rpc(host, "save_post", post, Some(&cookie))["ok"].is_object());
+    assert_eq!(crm.rpc(host, "publish_post", serde_json::json!([id]), Some(&cookie))["ok"]["status"], "published");
+    // Listed, tagged, and locked for a visitor.
+    let index = crm.send(host, "GET", "/blog", "", None).text();
+    assert!(index.contains("Hello &lt;world&gt;") && index.contains("href=\"/blog/hello\""), "{}", index);
+    assert!(crm.send(host, "GET", "/blog?tag=first-post", "", None).text().contains("Hello &lt;world&gt;"));
+    assert!(!crm.send(host, "GET", "/blog?tag=other", "", None).text().contains("Hello &lt;world&gt;"));
+    let locked = crm.send(host, "GET", "/blog/hello", "", None).text();
+    assert!(locked.contains("class=\"paywall\"") && !locked.contains("<h2>Inside</h2>"), "{}", locked);
+    // A member signs in with the link sent to them, and reads it.
+    crm.rpc(host, "save_contact", serde_json::json!([{ "first_name": "Lois", "email": "lois@planet.test", "stage": "customer", "tags": ["member"] }]), Some(&cookie));
+    let r = crm.send(host, "POST", "/blog/signin", "", None);
+    assert_eq!(r.status, 400, "the form's fields are needed");
+    let form = |email: &str| format!("email={}&back=%2Fblog%2Fhello", email);
+    let mut req = |crm: &mut Crm, body: String| {
+        let headers = vec![("Host".to_string(), host.to_string()), ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())];
+        crm.it.handle(&HttpRequest { method: "POST".into(), url: "/blog/signin".into(), headers, body: body.into_bytes(), remote: "127.0.0.1".into() })
+    };
+    assert!(req(&mut crm, form("lois@planet.test")).text().contains("Check your email"));
+    assert!(req(&mut crm, form("stranger@x.test")).text().contains("Check your email"), "the same answer for anyone");
+    let c = rusqlite::Connection::open(crm.dir.join("data/acme.db")).unwrap();
+    let token: String = c.query_row("select token from reader_links", [], |r| r.get(0)).unwrap();
+    let r = crm.send(host, "GET", &format!("/blog/signin/{}?back=/blog/hello", token), "", None);
+    assert_eq!(r.header("location"), Some("/blog/hello"));
+    let reader = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let open = crm.send(host, "GET", "/blog/hello", "", Some(&reader)).text();
+    assert!(open.contains("<h2>Inside</h2>") && !open.contains("class=\"paywall\""), "{}", open);
+    // Links back only to the blog.
+    let r = crm.send(host, "GET", &format!("/blog/signin/{}?back=https://evil.test", token), "", None);
+    assert_eq!(r.header("location"), Some("/blog"));
+    // The feed, and the latest posts on a page.
+    let feed = crm.send(host, "GET", "/blog/feed.xml", "", None);
+    assert_eq!(feed.header("content-type"), Some("application/rss+xml; charset=utf-8"));
+    assert!(feed.text().contains("<title>Hello &lt;world&gt;</title>"), "{}", feed.text());
+    let block = serde_json::json!([[{ "id": "b1", "type": "blog.latest", "config": { "heading": "Latest", "count": "3" } }]]);
+    let html = crm.rpc(host, "preview_page", block, Some(&cookie))["ok"][0]["html"].as_str().unwrap().to_string();
+    assert!(html.contains("Hello &lt;world&gt;") && html.contains("<h2>Latest</h2>"), "{}", html);
+}

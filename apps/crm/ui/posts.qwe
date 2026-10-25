@@ -1,0 +1,100 @@
+// Posts (the Blog plugin): the list, and the editor. The post rules (the
+// Blog plugin's, and any other plugin's) hint as you write, and decide
+// when you publish.
+
+component PostsPage(ws: map) {
+    ~rows = live(list_posts)
+    <div>
+        <PageHead title="Posts" sub="Your blog, at /blog, with an RSS feed.">
+            <a.button href="/blog" target="_blank" data-reload>View the blog ↗</a>
+            <button.primary @click={() => {
+                let id = new_post()
+                if !is_err(id) { navigate(`/app/posts/${id}`) }
+            }}>New post</button>
+        </PageHead>
+        {rows == null ? <Loading/>
+        : is_err(rows) || len(rows) == 0 ? <Empty title="No posts yet"><p>Write the first one.</p></Empty>
+        : <table.table>
+            <thead><tr><th>Post</th><th>Tags</th><th>Status</th><th>Date</th></tr></thead>
+            <tbody>{for p in rows => <tr key={p.id} class="clickable" @click={() => { navigate(`/app/posts/${p.id}`) }}>
+                <td><b>{p.title != "" ? p.title : "Untitled"}</b>{p.members_only && <Badge text="members" tone="purple"/>}</td>
+                <td><Tags tags={p.tags}/></td>
+                <td><Badge text={p.status} tone={p.status == "published" ? "green" : "gray"}/></td>
+                <td.muted>{p.published_at != null ? fmt_date(p.published_at) : fmt_ago(p.updated_at, now())}</td>
+            </tr>}</tbody>
+        </table>}
+    </div>
+}
+
+component PostEditor(id: int, ws: map) {
+    ~p = get_post(id)
+    ~draft = null
+    ~tag_text = null
+    ~preview = null
+    ~server = []
+    ~saved = ""
+    if p == null { return <Loading/> }
+    if is_err(p) { return <Empty title="No such post"><p><a href="/app/posts">All posts</a></p></Empty> }
+    let d = draft ?? p
+    let tags_now = tag_text ?? join(p.tags, ", ")
+    let record = set(d, "tags", tag_list(tags_now))
+    let problems = validate("post", record, ctx_of(ws)) + server
+    let errors = errors_of(problems)
+    let change = (k) => (v) => { draft = set(d, k, v); saved = ""; server = [] }
+    let save = () => {
+        let r = save_post(record)
+        if is_err(r) { server = refusal_problems(r); false } else { p = r; draft = null; tag_text = null; saved = "Saved"; true }
+    }
+    let published = p.status == "published"
+    <div.post-editor>
+        <header.designer-bar>
+            <a href="/app/posts">← Posts</a>
+            <b.page-title>{d.title != "" ? d.title : "Untitled"}</b>
+            <Badge text={published ? (draft != null || tag_text != null ? "changes not saved" : "published") : "draft"} tone={published ? "green" : "gray"}/>
+            <span.grow></span>
+            {saved != "" && <span.ok>{saved}</span>}
+            {len(errors) > 0 && <span.bad>{plural(len(errors), "problem")}</span>}
+            {published && <a.button href={`/blog/${p.slug}`} target="_blank" data-reload>View ↗</a>}
+            <button @click={() => { save() }}>Save</button>
+            {published
+                ? <button @click={() => { unpublish_post(id); p = set(p, "status", "draft") }}>Unpublish</button>
+                : <button.primary disabled={len(errors) > 0} @click={() => {
+                    if save() {
+                        let r = publish_post(id)
+                        if is_err(r) { server = refusal_problems(r) } else { p = r; saved = "Published" }
+                    }
+                }}>Publish</button>}
+        </header>
+        <div.post-body-grid>
+            <div.post-write>
+                <input.post-title name="title" placeholder="Title" value={d.title} @input={(e) => { change("title")(e.value) }}/>
+                <Hints {problems} field="title"/>
+                <div.write-tabs>
+                    <button type="button" class={preview == null ? "tab on" : "tab"} @click={() => { preview = null }}>Write</button>
+                    <button type="button" class={preview != null ? "tab on" : "tab"} @click={() => { preview = preview_markdown(d.body) ?? "" }}>Preview</button>
+                </div>
+                {preview == null
+                    ? <textarea.post-text name="body" placeholder="Write in Markdown: **bold**, _italic_, ## headings, [links](https://…), lists…" @input={(e) => { change("body")(e.value) }}>{d.body}</textarea>
+                    : <div.site.post-preview><section.post-body>{raw(is_err(preview) ? "" : preview)}</section></div>}
+                <Hints {problems} field="body"/>
+            </div>
+            <aside.inspector>
+                <h3>Post</h3>
+                <TextField label="Address" field="slug" value={d.slug} {problems} on_change={(v) => { change("slug")(lower(v)) }} help={`/blog/${d.slug}`}/>
+                <AreaField label="Excerpt (lists and the newsletter)" field="excerpt" value={d.excerpt} {problems} on_change={change("excerpt")} rows={3}/>
+                <ImagePicker label="Cover" value={d.cover} on_change={change("cover")}/>
+                <Hints {problems} field="cover"/>
+                <label.field><span.label>Tags</span><input name="tags" value={tags_now} placeholder="news, recipes" @input={(e) => { tag_text = e.value; saved = "" }}/></label>
+                <AreaField label="Description (search results)" field="description" value={d.description} {problems} on_change={change("description")} rows={2}/>
+                <CheckField label="Members only (Memberships)" field="members_only" value={d.members_only} {problems} on_change={change("members_only")}/>
+                {published && <button @click={() => {
+                    let c = post_to_campaign(id)
+                    if !is_err(c) { navigate("/app/campaigns") }
+                }}>Send to subscribers…</button>}
+                <h3>Checks</h3>
+                {len(problems) == 0 ? <p.ok>Ready to publish.</p>
+                : <ul.problems>{for x in problems => <li class={x.level == "warning" ? "warn" : ""}>{x.message}</li>}</ul>}
+            </aside>
+        </div>
+    </div>
+}

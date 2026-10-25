@@ -1,0 +1,61 @@
+// The blog: posts (in the app's Posts), their pages at /blog, an RSS feed,
+// members-only posts (with Memberships), and blocks that show the latest
+// posts on any page.
+
+let plugin_blog = {
+    id: "blog",
+    name: "Blog",
+    description: "Posts with covers and tags, at /blog, with an RSS feed; members-only posts with Memberships.",
+    audience: ["blogger", "news", "merchant"],
+    blocks: [
+        { type: "blog.latest", label: "Latest posts", group: "Content", fields: [
+            { key: "heading", label: "Heading", type: "text" },
+            { key: "count", label: "How many", type: "select", options: ["3", "6", "9"] },
+            { key: "tag", label: "Only with tag", type: "text" },
+        ] },
+    ],
+    rules: {
+        post: [
+            (p, ctx) => when(blank(p.title), problem("title", "A post needs a title")),
+            (p, ctx) => when(len(p.title ?? "") > 70, warning("title", "Search results show about 60 characters")),
+            (p, ctx) => blank(p.slug) ? problem("slug", "Choose its address")
+                : slugify(p.slug) != p.slug ? problem("slug", "Lowercase letters, digits and dashes")
+                : [],
+            (p, ctx) => when(blank(p.body), problem("body", "Write the post")),
+            (p, ctx) => when(len(p.excerpt ?? "") > 300, warning("excerpt", "An excerpt over 300 characters is a lot for a list of posts")),
+            (p, ctx) => when(p.members_only == true && !contains(ctx.enabled ?? [], "paywall"), problem("members_only", "Members-only posts need the Memberships plugin")),
+            (p, ctx) => {
+                let c = p.cover
+                when(type_of(c) == "map" && blank(c.alt) && blank(p.cover_alt), warning("cover", "Describe the cover for screen readers (in Media)"))
+            },
+        ],
+        page: [(pg, ctx) => (pg.blocks ?? []) | filter((b) => b.type == "blog.latest" && len(ctx.posts ?? []) == 0)
+            | map((b) => warning(`block.${b.id}`, "Latest posts: there are no published posts yet")) | flatten],
+    },
+}
+
+// A post's card in lists.
+view BlogCard(p: map) =
+    <article.blog-card>
+        <a href={`/blog/${p.slug}`}>
+            {p.cover != null && p.cover != "" && <Picture v={p.cover} alt="" shown={420}/>}
+            <h3>{p.title}</h3>
+        </a>
+        <p.blog-meta>{fmt_date(p.published_at)}{p.members_only && <span.blog-members>Members</span>}</p>
+        {p.excerpt != "" && <p>{p.excerpt}</p>}
+    </article>
+
+let renderers_blog = {
+    "blog.latest": (c, ctx) => {
+        let n = int(str(c.count ?? "3")) ?? 3
+        let tag = slugify(c.tag ?? "")
+        let posts = (ctx.posts ?? []) | filter((p) => tag == "" || contains(p.tags, tag)) | take(n)
+        <section.pb-blog>
+            {!blank(c.heading) && <h2>{c.heading}</h2>}
+            {len(posts) == 0 ? <p.pb-missing>No posts yet.</p> : <div.blog-grid>{for p in posts => <BlogCard {p}/>}</div>}
+            <p.pb-center><a href={tag == "" ? "/blog" : `/blog?tag=${tag}`}>All posts →</a></p>
+        </section>
+    },
+}
+
+let runners_blog = {}

@@ -48,14 +48,14 @@ fn preset(industry: str) = match industry {
         flows: ["purchase", "welcome"],
     }
     "blogger" => {
-        plugins: ["paywall", "sponsors", "gdpr", "quality"],
+        plugins: ["blog", "paywall", "sponsors", "gdpr", "quality"],
         pipeline: { name: "Sponsorships", stages: [["Pitched", 10, "open"], ["Negotiating", 40, "open"], ["Booked", 100, "won"], ["Declined", 0, "lost"]] },
         products: [{ name: "Supporter membership", sku: "supporter", price_cents: 500, kind: "subscription", interval: "month", stock: null, description: "Members-only posts and my thanks." }],
         forms: [{ slug: "subscribe", name: "Subscribe", headline: "New posts in your inbox. No spam.", fields: ["email", "first_name"], tags: ["reader"] }],
         flows: ["welcome", "membership"],
     }
     _ => {
-        plugins: ["paywall", "sponsors", "gdpr", "quality"],
+        plugins: ["blog", "paywall", "sponsors", "gdpr", "quality"],
         pipeline: { name: "Advertising", stages: [["Inquiry", 10, "open"], ["Proposal", 40, "open"], ["Insertion order", 80, "open"], ["Booked", 100, "won"], ["Lost", 0, "lost"]] },
         products: [
             { name: "Digital subscription", sku: "digital", price_cents: 900, kind: "subscription", interval: "month", stock: null, description: "Every story, every day." },

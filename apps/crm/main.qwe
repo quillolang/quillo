@@ -31,12 +31,13 @@ use "plugins/vat.qwe"
 use "plugins/paywall.qwe"
 use "plugins/sponsors.qwe"
 use "plugins/quality.qwe"
+use "plugins/blog.qwe"
 
 // The plugins there are.
 // The plugin studio's (plugins/studio/), released and drafts.
 use "plugins/studio/index.qwe"
 
-let plugins = [plugin_core, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality] + studio_plugins
+let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality] + studio_plugins
 
 use "lib/records.qwe"
 use "lib/commerce.qwe"
@@ -45,16 +46,17 @@ use "lib/flows.qwe"
 
 // The steps flows run, on the server: the core's and the plugins'.
 // By plugin (and version: "birthday#draft").
-let step_runners = merge({ core: core_runners, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality }, studio_runners)
+let step_runners = merge({ core: core_runners, blog: runners_blog, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality }, studio_runners)
 
 use "lib/workspace.qwe"
 use "lib/pages.qwe"
 use "lib/media.qwe"
 use "lib/studio.qwe"
+use "lib/blog.qwe"
 use "plugins/core_blocks.qwe"
 
 // How each plugin's page blocks look (on the server).
-let block_renderers = merge({ core: renderers_core, sponsors: renderers_sponsors, paywall: renderers_paywall, gdpr: renderers_gdpr }, studio_renderers)
+let block_renderers = merge({ core: renderers_core, blog: renderers_blog, sponsors: renderers_sponsors, paywall: renderers_paywall, gdpr: renderers_gdpr }, studio_renderers)
 use "ui/kit.qwe"
 use "ui/public.qwe"
 use "ui/app.qwe"
@@ -63,6 +65,7 @@ use "ui/designer.qwe"
 use "ui/pagedesigner.qwe"
 use "ui/media.qwe"
 use "ui/studio.qwe"
+use "ui/posts.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -98,6 +101,47 @@ route GET / {
 route GET /media/:key/:crop/:width {
     workspace_here()
     media_variant(key, crop, width)
+}
+
+// ---- the blog (the Blog plugin) --------------------------------------------------------
+
+fn blog_here() {
+    workspace_here()
+    blog_on() || reply 404 <NotFoundPage what="blog"/>
+}
+
+route GET /blog {
+    blog_here()
+    blog_index(request.query.tag ?? "", int(request.query.page ?? "1") ?? 1)
+}
+
+route GET /blog/feed.xml {
+    blog_here()
+    blog_feed()
+}
+
+// A reader asks for a sign-in link (to read members-only posts).
+route POST /blog/signin { form: { email: str, back: str } } {
+    blog_here()
+    send_reader_link(email, starts_with(back, "/blog/") ? back : "/blog")
+    <SiteLayout title="Check your email" description="">
+        <section.blog-head><h1>Check your email</h1><p>If {email} is one of our readers, a sign-in link is on its way.</p></section>
+    </SiteLayout>
+}
+
+route GET /blog/signin/:token {
+    blog_here()
+    let link = db.one("select * from reader_links where token = ? and expires_at > ?", token, now())
+    if link == null { return redirect("/blog") }
+    db.exec("delete from reader_links where token = ?", token)
+    set_session(merge(session(), { reader: link.contact_id }))
+    let back = request.query.back ?? "/blog"
+    redirect(starts_with(back, "/blog/") && !contains(back, "//") ? back : "/blog")
+}
+
+route GET /blog/:slug {
+    blog_here()
+    blog_post(slug)
 }
 
 route GET /p/:slug {

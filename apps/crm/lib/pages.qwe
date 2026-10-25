@@ -19,7 +19,7 @@ fn theme_of(s: map) = merge(DEFAULT_THEME, s.theme ?? {})
 // What renderers see.
 fn render_ctx(preview: bool) {
     let s = settings()
-    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: enabled_plugins() }
+    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: enabled_plugins(), posts: recent_posts(12) }
 }
 
 // One block's HTML, from the renderer of the plugin that brings it.
@@ -45,37 +45,20 @@ fn theme_css(t: map) {
     `.site { --brand: ${th.color}; --site-font: ${FONTS[th.font] ?? FONTS.system}; }`
 }
 
-view SitePage(page: map, blocks: list, theme: map, site: str) =
-    <html lang="en">
-        <head>
-            <meta charset="utf-8"/>
-            <meta name="viewport" content="width=device-width, initial-scale=1"/>
-            <title>{page.title} · {site}</title>
-            {page.description != "" && <meta name="description" content={page.description}/>}
-            <link rel="stylesheet" href="/assets/app.css"/>
-            <style>{theme_css(theme)}</style>
-        </head>
-        <body class={theme.dark ? "site dark" : "site"}>
-            <header.site-head>
-                <a.site-brand href="/">{theme.logo != "" ? <img src={theme.logo} alt={site}/> : <b>{site}</b>}</a>
-                <nav><a href="/shop">Shop</a></nav>
-            </header>
-            <main.site-main>{for b in blocks => render_block(b, render_ctx(false))}</main>
-            <footer.site-foot>© {site}</footer>
-        </body>
-    </html>
+view SitePage(page: map, blocks: list) =
+    <SiteLayout title={page.title} description={page.description}>
+        {for b in blocks => render_block(b, render_ctx(false))}
+    </SiteLayout>
 
 fn published_page(slug: str) = page_out(db.one("select * from pages where slug = ? and published is not null", slugify(slug)))
 
 fn home_page() = page_out(db.one("select * from pages where home = 1 and published is not null"))
 
-fn show_page(p: map) {
-    let s = settings()
-    <SitePage page={p} blocks={p.published.blocks ?? []} theme={theme_of(s)} site={s.name ?? ""}/>
-}
+fn show_page(p: map) = <SitePage page={p} blocks={p.published.blocks ?? []}/>
 
 // What page rules see: the products for sale and the forms there are.
 fn page_ctx() = rule_ctx({
+    posts: recent_posts(1),
     skus: db.query("select sku from products where active = 1") | map((r) => r.sku),
     forms: db.query("select slug from forms") | map((r) => r.slug),
 })

@@ -252,7 +252,9 @@ function index(o, i) {
     const n = i < 0 ? o.length + i : i;
     return n >= 0 && n < o.length ? o[n] : null;
   }
-  if (isMap(o) && typeof i === "string") return foreign(o) ? field(o, i, null) : hasOwn(o, i) ? o[i] : null;
+  // The page's objects: by name, or by number for lists of theirs (files, elements).
+  if (foreign(o) && (typeof i === "string" || isInt(i))) return field(o, String(i), null);
+  if (isMap(o) && typeof i === "string") return hasOwn(o, i) ? o[i] : null;
   if (typeof o === "string" && isInt(i)) {
     const cs = Array.from(o);
     const n = i < 0 ? cs.length + i : i;

@@ -1,0 +1,211 @@
+// The blog (the Blog plugin): posts written in the app, read at /blog.
+// Members-only posts show in full to readers who are members (the
+// Memberships plugin's `member` tag, until their date); readers sign in
+// with a link sent to their email.
+
+fn blog_on() = any(active_plugins(enabled_plugins()), (p) => p.id == "blog")
+
+fn post_out(r) = r == null ? null : merge(r, {
+    tags: parsed(r.tags, []),
+    cover: r.cover == "" ? null : parsed(r.cover, null),
+    members_only: r.members_only == 1,
+})
+
+fn recent_posts(n: int) = db.query("select * from posts where status = 'published' order by published_at desc limit ?", n) | map(post_out)
+
+// ---- the editor's server functions -------------------------------------------
+
+server fn list_posts() {
+    need_user()?
+    db.query("select p.*, u.name as author from posts p left join users u on u.id = p.author_id order by coalesce(p.published_at, p.updated_at) desc") | map(post_out)
+}
+
+server fn get_post(id: int) {
+    need_user()?
+    post_out(db.one("select * from posts where id = ?", id)) ?? err("No such post")
+}
+
+server fn new_post() {
+    let u = need_user()?
+    let taken = db.query("select slug from posts") | map((r) => r.slug)
+    let slug = contains(taken, "untitled") ? `untitled-${len(taken) + 1}` : "untitled"
+    db.exec("insert into posts (slug, title, author_id, created_at, updated_at) values (?, '', ?, ?, ?)", slug, u.id, now(), now()).last_id
+}
+
+// Saving keeps what is written; publishing checks it with the post rules.
+server fn save_post(p: map) {
+    need_user()?
+    let slug = slugify(p.slug ?? "")
+    if slug == "" { return err({ problems: problem("slug", "Choose its address") }) }
+    if db.one("select id from posts where slug = ? and id != ?", slug, p.id) != null { return err({ problems: problem("slug", "Another post has this address") }) }
+    db.exec("update posts set slug = ?, title = ?, excerpt = ?, body = ?, cover = ?, tags = ?, description = ?, members_only = ?, updated_at = ? where id = ?",
+        slug, trim(p.title ?? ""), trim(p.excerpt ?? ""), p.body ?? "", p.cover == null ? "" : json.stringify(p.cover),
+        json.stringify(clean_tags(p.tags)), trim(p.description ?? ""), p.members_only == true ? 1 : 0, now(), p.id)
+    post_out(db.one("select * from posts where id = ?", p.id))
+}
+
+server fn publish_post(id: int) {
+    need_user()?
+    let p = (post_out(db.one("select * from posts where id = ?", id)) ?? err("No such post"))?
+    refused("post", p, rule_ctx())?
+    db.exec("update posts set status = 'published', published_at = coalesce(published_at, ?), updated_at = ? where id = ?", now(), now(), id)
+    post_out(db.one("select * from posts where id = ?", id))
+}
+
+server fn unpublish_post(id: int) {
+    need_user()?
+    db.exec("update posts set status = 'draft', updated_at = ? where id = ?", now(), id)
+    true
+}
+
+server fn delete_post(id: int) {
+    need_admin()?
+    db.exec("delete from posts where id = ?", id)
+    true
+}
+
+server fn preview_markdown(text: str) {
+    need_user()?
+    str(markdown(text))
+}
+
+// A campaign to subscribers from a post: its excerpt and a link to it.
+server fn post_to_campaign(id: int) {
+    need_user()?
+    let p = (post_out(db.one("select * from posts where id = ? and status = 'published'", id)) ?? err("Publish the post first"))?
+    let body = `Hi {{first_name}},\n\n${p.excerpt != "" ? p.excerpt : "There is a new post on the blog."}\n\n[Read “${p.title}”](${site_url()}/blog/${p.slug})`
+    db.exec("insert into campaigns (name, subject, body, audience, created_at) values (?, ?, ?, ?, ?)", `Post: ${p.title}`, p.title, body, json.stringify({ tag: "" }), now()).last_id
+}
+
+// ---- readers -----------------------------------------------------------------------
+
+fn reader() {
+    let id = session().reader
+    id == null ? null : contact_row(id)
+}
+
+fn is_member(c) {
+    if c == null { return false }
+    let until = parsed(c.fields, {}).member_until ?? ""
+    contains(parsed(c.tags, []), "member") && (until == "" || until >= iso_day(now()))
+}
+
+// A sign-in link to a reader's email, if they are a contact.
+fn send_reader_link(email: str, back: str) {
+    let c = db.one("select * from contacts where lower(email) = ?", lower(trim(email)))
+    if c == null { return null }
+    let token = crypto.token()
+    db.exec("insert into reader_links (token, contact_id, expires_at) values (?, ?, ?)", token, c.id, now() + 30 * 60000)
+    let url = `${site_url()}/blog/signin/${token}?back=${back}`
+    queue_mail(c.email, `Sign in to ${settings().name ?? ""}`, mail_html(`[Sign in to read](${url})\n\nThe link works for 30 minutes.`, c, false), "system", c.id, null)
+}
+
+// ---- the public pages ----------------------------------------------------------------
+
+fn site_nav() = [["/shop", "Shop"]] + (blog_on() ? [["/blog", "Blog"]] : [])
+
+view SiteLayout(title: str, description: str, children) {
+    let s = settings()
+    let theme = theme_of(s)
+    let site = s.name ?? ""
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title == "" ? site : `${title} · ${site}`}</title>
+            {description != "" && <meta name="description" content={description}/>}
+            {blog_on() && <link rel="alternate" type="application/rss+xml" title={site} href="/blog/feed.xml"/>}
+            <link rel="stylesheet" href="/assets/app.css"/>
+            <style>{theme_css(theme)}</style>
+        </head>
+        <body class={theme.dark ? "site dark" : "site"}>
+            <header.site-head>
+                <a.site-brand href="/">{theme.logo != "" ? <img src={theme.logo} alt={site}/> : <b>{site}</b>}</a>
+                <nav>{for l in site_nav() => <a href={l[0]}>{l[1]}</a>}</nav>
+            </header>
+            <main.site-main>{children}</main>
+            <footer.site-foot>© {site}{blog_on() && <span> · <a href="/blog/feed.xml">RSS</a></span>}</footer>
+        </body>
+    </html>
+}
+
+let POSTS_PER_PAGE = 9
+
+fn blog_index(tag: str, page: int) {
+    let t = slugify(tag)
+    let all = db.query("select * from posts where status = 'published' order by published_at desc") | map(post_out) | filter((p) => t == "" || contains(p.tags, t))
+    let pages = max([1, floor((len(all) + POSTS_PER_PAGE - 1) / POSTS_PER_PAGE)])
+    let n = clamp_int(page, 1, pages)
+    let shown = all | drop((n - 1) * POSTS_PER_PAGE) | take(POSTS_PER_PAGE)
+    let link = (k) => t == "" ? `/blog?page=${k}` : `/blog?tag=${t}&page=${k}`
+    <SiteLayout title={t == "" ? "Blog" : `#${t}`} description="">
+        <section.blog-head>
+            <h1>{t == "" ? "Blog" : `Posts tagged ${t}`}</h1>
+            {t != "" && <p><a href="/blog">All posts</a></p>}
+        </section>
+        {len(shown) == 0 ? <p.pb-missing>No posts yet.</p> : <div.blog-grid.page>{for p in shown => <BlogCard {p}/>}</div>}
+        {pages > 1 && <nav.blog-pages>
+            {n > 1 && <a href={link(n - 1)}>← Newer</a>}
+            <span>Page {n} of {pages}</span>
+            {n < pages && <a href={link(n + 1)}>Older →</a>}
+        </nav>}
+    </SiteLayout>
+}
+
+fn clamp_int(v, lo: int, hi: int) = max([lo, min([hi, int(str(v ?? lo)) ?? lo])])
+
+fn blog_post(slug: str) {
+    let p = post_out(db.one("select * from posts where slug = ? and status = 'published'", slugify(slug))) ?? reply 404 <NotFoundPage what="post"/>
+    let r = reader()
+    let locked = p.members_only && !is_member(r)
+    let author = db.one("select name from users where id = ?", p.author_id)
+    <SiteLayout title={p.title} description={p.description != "" ? p.description : p.excerpt}>
+        <article.post>
+            <header.post-head>
+                <p.blog-meta>{fmt_date(p.published_at)}{author != null && ` · ${author.name}`}{p.members_only && <span.blog-members>Members</span>}</p>
+                <h1>{p.title}</h1>
+                {p.excerpt != "" && <p.pb-lead>{p.excerpt}</p>}
+            </header>
+            {p.cover != null && <figure.post-cover><Picture v={p.cover} alt="" shown={980}/></figure>}
+            {locked
+                ? <section.paywall>
+                    <h2>For members</h2>
+                    <p>This post is for members. Membership keeps this going, and gets you every post.</p>
+                    <p><a.pb-button href="/shop">Become a member</a></p>
+                    <form method="post" action="/blog/signin" class="paywall-signin">
+                        <input type="hidden" name="back" value={`/blog/${p.slug}`}/>
+                        <input type="email" name="email" placeholder="Your email" required/>
+                        <button>Send me a sign-in link</button>
+                    </form>
+                    {r != null && <p.muted>Signed in as {r.email}, who is not a member yet.</p>}
+                </section>
+                : <section.post-body>{markdown(p.body)}</section>}
+            {len(p.tags) > 0 && <p.post-tags>{for t in p.tags => <a href={`/blog?tag=${t}`}>#{t}</a>}</p>}
+        </article>
+    </SiteLayout>
+}
+
+fn xml(s) = replace(replace(replace(replace(str(s ?? ""), "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;")
+
+fn rfc822(ms) {
+    let c = civil(floor(ms / DAY))
+    let days = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
+    let mins = floor((ms % DAY) / 60000)
+    `${days[floor(ms / DAY) % 7]}, ${pad2(c.d)} ${MONTHS[c.m - 1]} ${c.y} ${pad2(floor(mins / 60))}:${pad2(mins % 60)}:00 GMT`
+}
+
+fn blog_feed() {
+    let s = settings()
+    let base = site_url()
+    let items = recent_posts(20) | map((p) => join([
+        "<item>",
+        `<title>${xml(p.title)}</title>`,
+        `<link>${xml(base)}/blog/${p.slug}</link>`,
+        `<guid>${xml(base)}/blog/${p.slug}</guid>`,
+        `<pubDate>${rfc822(p.published_at)}</pubDate>`,
+        `<description>${xml(p.excerpt)}</description>`,
+        "</item>",
+    ], ""))
+    let body = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>${xml(s.name ?? "")}</title><link>${xml(base)}/blog</link><description>${xml(s.name ?? "")}</description>${join(items, "")}</channel></rss>`
+    respond(200, body, { "content-type": "application/rss+xml; charset=utf-8" })
+}

@@ -21,6 +21,7 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | **Sales** | Pipelines with stages, a board you drag deals across; products (one-time and subscriptions), a public shop at `/shop` with a checkout, orders, refunds. |
 | **Marketing** | Public sign-up forms at `/f/<form>`, campaigns written in Markdown to all subscribers or a tag, an outbox, signed unsubscribe links. |
 | **Pages** | Landing pages and a home page, made of blocks in a designer: a palette of the blocks the plugins switched on bring, a live preview rendered as visitors will see it, drag to reorder, settings per block; a theme (colour, font, dark, logo) per workspace; drafts, and publishing when the page rules pass. |
+| **Blog** | Posts with covers, tags and members-only posts at `/blog`, an RSS feed, and the latest posts on any page (the Blog plugin). |
 | **Flows** | A designer: drag steps, connect their ports, branch on conditions, wait, offer a product and wait for the purchase. Runs show step by step, and can be started by hand for a contact. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
 
@@ -42,6 +43,7 @@ lib/flows.qwe       the flow engine: fire, walk, waits, steps, templates
 lib/workspace.qwe   signing up, presets, settings, fields, pipelines, team
 lib/pages.qwe       pages: drafts, publishing, the theme, rendering blocks
 lib/media.qwe       images: uploads, crops, the sizes pages use
+lib/blog.qwe        the blog: posts, /blog, readers, the feed
 plugins/*.qwe       core (always on) and the optional plugins
 plugins/core_blocks.qwe   how the core's page blocks look
 ui/*.qwe            the pages: public ones, the app, the flow and page designers
@@ -84,6 +86,18 @@ server (for the preview and for visitors); what makes it acceptable is the plugi
 products for sale, forms that exist). A draft saves as it is; publishing refuses while
 the rules find errors. Visitors see `/p/<slug>`, or the home page at the workspace's
 own address.
+
+### The blog
+
+The Blog plugin (on for bloggers and news outlets) makes a workspace's site a blog:
+posts written in the app (Posts) in Markdown, with a cover from Media, tags, an excerpt
+and a description for search results; `/blog` lists them (by tag, a page at a time),
+`/blog/<post>` shows one, and `/blog/feed.xml` is the RSS feed. Its post rules hint in
+the editor and decide when a post is published. With Memberships, a post can be for
+members: others see its excerpt and how to become one, and readers sign in with a link
+sent to their email (the same answer for any address, so the form does not tell who is
+a reader). A published post can become a campaign to subscribers. Its "Latest posts"
+block puts the newest posts on any page, such as the home page.
 
 ### Images
 
