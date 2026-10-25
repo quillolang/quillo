@@ -126,3 +126,41 @@ fn language_server_round_trip() {
     c.notify("exit", Value::Null);
     assert!(c.child.wait().unwrap().success());
 }
+
+/// A file another `use`s is part of that program: its names come from the
+/// other files, so it is checked as the program, from its main file.
+#[test]
+fn a_used_file_is_checked_as_part_of_its_program() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-used-{}", std::process::id())).canonicalize().unwrap_or_else(|_| {
+        let d = std::env::temp_dir().join(format!("quillo-lsp-used-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("main.qwe"), "use \"lib/util.qwe\"\nuse \"lib/pages.qwe\"\nroute GET / = home()\n").unwrap();
+    std::fs::write(dir.join("lib/util.qwe"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
+    let pages = dir.join("lib/pages.qwe");
+    std::fs::write(&pages, "fn home() = shout(\"hi\")\n").unwrap();
+    let uri = format!("file://{}", pages.display());
+
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("initialized", json!({}));
+    let diags = |c: &mut Client| loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            break m["params"]["diagnostics"].clone();
+        }
+    };
+    // `shout` is from another file of the program: no error.
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "fn home() = shout(\"hi\")\n" } }));
+    assert_eq!(diags(&mut c), json!([]));
+    // A real mistake still is one, from the text being edited.
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "fn home() = shuot(\"hi\")\n" }] }));
+    let d = diags(&mut c);
+    assert_eq!(d.as_array().unwrap().len(), 1, "{}", d);
+    assert!(d[0]["message"].as_str().unwrap().contains("unknown name `shuot` (did you mean `shout`?)"), "{}", d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

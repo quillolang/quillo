@@ -50,6 +50,56 @@ fn read_message(input: &mut impl BufRead) -> io::Result<Option<J>> {
     Ok(Some(serde_json::from_slice(&buf).unwrap_or(J::Null)))
 }
 
+/// The main file of the program `file` belongs to, when another file
+/// `use`s it (directly, or through files it uses): looked for in the file's
+/// folder and the folders above it, nearest first. `use` paths are from
+/// the main file's folder.
+pub fn program_entry(file: &Path) -> Option<PathBuf> {
+    let target = file.canonicalize().ok()?;
+    let mut dir = target.parent()?.to_path_buf();
+    for _ in 0..4 {
+        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "qwe") && p.as_path() != target.as_path())
+            .collect();
+        candidates.sort();
+        for main in candidates {
+            if uses_transitively(&main, &dir, &target) {
+                return Some(main);
+            }
+        }
+        // Not above the project.
+        if dir.join("Cargo.toml").exists() || dir.join(".git").exists() || !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Whether `main` (in `base`) reaches `target` through its `use`s.
+fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
+    let mut todo = vec![main.to_path_buf()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(f) = todo.pop() {
+        if !seen.insert(f.clone()) || seen.len() > 500 {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&f) else { continue };
+        for line in src.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("use ") else { continue };
+            let Some(path) = rest.trim().strip_prefix('"').and_then(|r| r.split('"').next()) else { continue };
+            let Ok(full) = base.join(path).canonicalize() else { continue };
+            if full == target {
+                return true;
+            }
+            todo.push(full);
+        }
+    }
+    false
+}
+
 pub fn uri_to_path(uri: &str) -> PathBuf {
     let p = uri.strip_prefix("file://").unwrap_or(uri);
     PathBuf::from(crate::server::percent_decode(p, false))
@@ -253,7 +303,16 @@ impl Server {
         let path = uri_to_path(&uri);
         let file = path.display().to_string();
         let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-        let analysis = check::check_source(&text, &file, &base);
+        // A file another one `use`s is part of that program: checked as the
+        // program, from its main file, with what is open in the editor.
+        let analysis = match program_entry(&path) {
+            Some(main) => {
+                let mut open: HashMap<PathBuf, String> = self.docs.iter().map(|(u, d)| (uri_to_path(u), d.text.clone())).collect();
+                open.insert(path.clone(), text.clone());
+                check::check_file_with(&main, open)
+            }
+            None => check::check_source(&text, &file, &base),
+        };
         let mut by_file: HashMap<String, Vec<J>> = HashMap::new();
         by_file.insert(uri.clone(), Vec::new());
         for d in &analysis.diagnostics {
