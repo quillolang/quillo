@@ -175,6 +175,8 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "random_int"
                 | "uuid"
                 | "crypto.token"
+                | "image.info"
+                | "image.convert"
                 | "crypto.hash_password"
                 | "live"
                 | "url"

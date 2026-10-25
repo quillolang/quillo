@@ -313,6 +313,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
     ("end_session", "", "null"),
+    ("image.info", "str", "map | error(str)"),
+    ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),
     ("crypto.hmac", "str, str", "str"),
     ("crypto.token", "int=", "str"),
@@ -321,14 +323,14 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.equal", "str, str", "bool"),
 ];
 
-const MODULES: &[&str] = &["json", "db", "http", "crypto"];
+const MODULES: &[&str] = &["json", "db", "http", "crypto", "image"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
-      "schedule", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

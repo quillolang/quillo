@@ -715,6 +715,18 @@ async function rpcRaw(name, args, live) {
   let r;
   const headers = { "content-type": "application/json" };
   if (live) headers["x-quillo-live"] = "1";
+  // Files (from an <input type=file>) go as parts of a multipart body, the
+  // other arguments as JSON beside them.
+  let body;
+  if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) {
+    body = new FormData();
+    body.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a))));
+    args.forEach((a, i) => { if (a instanceof Blob) body.append("file" + i, a, a.name || "file"); });
+    delete headers["content-type"];
+    headers["x-quillo-rpc"] = "1";
+  } else {
+    body = JSON.stringify(args.map(toJSON));
+  }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
   const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
@@ -722,7 +734,7 @@ async function rpcRaw(name, args, live) {
     r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
       method: "POST",
       headers,
-      body: JSON.stringify(args.map(toJSON)),
+      body,
     });
   } catch (e) {
     return failed(`server fn \`${name}\` could not be reached: ${e.message}`);

@@ -116,6 +116,9 @@ pub fn install(env: &Env) {
     let mut crypto = Map::new();
     crate::crypto::install(&mut crypto);
     define(env, "crypto", Value::map(crypto));
+    let mut image = Map::new();
+    crate::imaging::install(&mut image);
+    define(env, "image", Value::map(image));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).
@@ -899,7 +902,7 @@ fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 // ---- files -------------------------------------------------------------
 
 /// A path under the program's folder; `..` and absolute paths are refused.
-fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     let rel = Path::new(p);
     if p.is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return None;

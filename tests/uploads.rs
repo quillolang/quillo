@@ -81,3 +81,26 @@ fn boundaries_are_read_from_the_content_type() {
     assert_eq!(quillo::upload::boundary("application/json"), None);
     assert_eq!(quillo::upload::boundary("multipart/form-data"), None);
 }
+
+#[test]
+fn server_fns_take_files_from_the_programs_own_pages() {
+    let d = std::env::temp_dir().join(format!("quillo-rpc-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let mut it = Interp::new(&d);
+    it.load_source("server fn keep(file: map, name: str) = { saved: save_upload(file, `in/${name}`), size: file.size, type: file.type }", "app.qwe")
+        .unwrap_or_else(|e| panic!("{}", e));
+    let body = multipart(&[("args", None, br#"[{"$quillo_file": 0}, "pic.bin"]"#), ("file0", Some(("photo.jpg", "image/jpeg")), &[1, 2, 3, 255])]);
+    let send = |it: &mut Interp, extra: &[(&str, &str)]| {
+        let mut headers = vec![("Host".to_string(), "x".to_string()), ("Content-Type".to_string(), "multipart/form-data; boundary=XyZ".to_string())];
+        headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        it.handle(&HttpRequest { method: "POST".into(), url: "/_quillo/rpc/keep".into(), headers, body: body.clone(), remote: "127.0.0.1".into() })
+    };
+    let r = send(&mut it, &[("X-Quillo-Rpc", "1")]);
+    assert_eq!(r.text(), r#"{"ok":{"saved":"in/pic.bin","size":4,"type":"image/jpeg"}}"#);
+    assert_eq!(std::fs::read(d.join("in/pic.bin")).unwrap(), [1, 2, 3, 255]);
+    // A form another site posts has no such header, and is refused.
+    assert_eq!(send(&mut it, &[]).status, 415);
+    assert_eq!(send(&mut it, &[("X-Quillo-Rpc", "1"), ("Sec-Fetch-Site", "cross-site")]).status, 403);
+    let _ = std::fs::remove_dir_all(&d);
+}

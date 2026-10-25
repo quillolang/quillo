@@ -622,6 +622,38 @@ route POST /avatar {
 - The whole request counts against `--max-body` (10 MiB by default): raise it for larger
   files.
 
+From a component, a file goes to a `server fn` as an argument: pass it the input's file,
+and the function gets the same `{ field, filename, type, size }` record a form's upload
+is, for `save_upload`:
+
+```quillo
+server fn add_photo(file: map) = save_upload(file, `photos/${uuid()}.jpg`)
+
+component Photo() {
+    ~saved = null
+    <input type="file" accept="image/*" @change={(e) => { saved = add_photo(e.target.files[0]) }}/>
+}
+```
+
+Such a call is sent as multipart with an `X-Quillo-Rpc` header, which pages of other
+sites cannot add without asking first; a form another site posts is refused.
+
+### Images
+
+```quillo
+image.info("photos/a.jpg")              // { width, height, format, alpha }, or an error
+image.convert("photos/a.jpg", "cache/a-800.jpg", {
+    crop: { x: 100, y: 0, w: 1200, h: 675 },   // in the image's pixels
+    width: 800,                                 // shrunk to it, never enlarged
+    format: "jpeg", quality: 82,                // jpeg, png or webp (lossless)
+})
+```
+
+JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
+check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
+and 512 MiB, so a small file claiming to be enormous is refused before anything is
+allocated; both run off the event loop. Paths stay inside the program's folder.
+
 ### Cookies and sessions
 
 ```quillo

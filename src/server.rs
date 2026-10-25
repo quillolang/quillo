@@ -432,7 +432,12 @@ impl Interp {
         // asking first (which nothing here answers), and the browser says
         // where a request came from.
         let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str());
-        if essence(ctype.unwrap_or("")) != "application/json" {
+        // A call with files is multipart, which a page on another site could
+        // send as a form: it must carry a header only scripts of the page's
+        // own site can add (another site's would make the browser ask first).
+        let boundary = crate::upload::boundary(ctype.unwrap_or(""));
+        let marked = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-rpc") && v == "1");
+        if essence(ctype.unwrap_or("")) != "application/json" && !(boundary.is_some() && marked) {
             return rpc_error(415, "server fn calls must send JSON (content-type: application/json)");
         }
         if cross_site(req) {
@@ -444,8 +449,23 @@ impl Interp {
         let Some(Value::Func(c)) = lookup(&self.globals, name) else {
             return rpc_error(404, &format!("no server fn `{}`", name));
         };
-        let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
-            Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
+        // With files: the arguments are the `args` part, and each file
+        // (`{"$quillo_file": i}` there) is the upload in part `file<i>`.
+        let (json_args, files) = match &boundary {
+            Some(b) => {
+                let (form, files) = crate::upload::parse(b, &req.body);
+                (form.get("args").map(|v| v.display().into_bytes()).unwrap_or_default(), files)
+            }
+            None => (req.body.clone(), Map::new()),
+        };
+        let args = match serde_json::from_slice::<serde_json::Value>(&json_args) {
+            Ok(serde_json::Value::Array(a)) => a
+                .iter()
+                .map(|j| match j.get("$quillo_file").and_then(|i| i.as_u64()) {
+                    Some(i) if j.as_object().map_or(false, |o| o.len() == 1) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
+                    _ => Value::from_json(j),
+                })
+                .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
         if let Err(msg) = check_args(&c.def, &args) {

@@ -12,6 +12,7 @@ pub mod error;
 pub mod fetch;
 pub mod httpd;
 pub mod i18n;
+pub mod imaging;
 pub mod jobs;
 pub mod interp;
 pub mod lexer;
