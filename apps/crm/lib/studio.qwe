@@ -68,9 +68,15 @@ fn naming_problems(id: str, src: str) {
 }
 
 // index.qwe: what the program loads of the studio's plugins.
-fn write_index(entries: list) = write_file(`${STUDIO}/index.qwe`, index_text(entries))
+// `built`: when it was written, so the studio can tell when the program
+// has loaded it (studio_built_at).
+fn write_index(entries: list) {
+    let t = now()
+    write_file(`${STUDIO}/index.qwe`, index_text(entries, t))
+    t
+}
 
-fn index_text(entries: list) {
+fn index_text(entries: list, built: int = 0) {
     let uses = entries | map((e) => (e.released != null ? [`use "${STUDIO}/${e.id}.qwe"`] : []) + (e.draft ? [`use "${STUDIO}/${e.id}.draft.qwe"`] : [])) | flatten
     let listed = entries | map((e) =>
         (e.released != null ? [`set(set(${e.id}_plugin, "status", "released"), "version", ${e.released})`] : [])
@@ -86,6 +92,7 @@ fn index_text(entries: list) {
         `let studio_plugins = [${join(listed, ", ")}]`,
         `let studio_renderers = { ${join(keyed("renderers"), ", ")} }`,
         `let studio_runners = { ${join(keyed("runners"), ", ")} }`,
+        `let studio_built = ${built}`,
         "",
     ], "\n")
     text
@@ -136,6 +143,51 @@ server fn studio_create(id: str, name: str) {
     id
 }
 
+// The problems the code has, as saving would find them, with nothing
+// written: what the editor shows while you type.
+server fn studio_check(id: str, src: str) {
+    need_developer()?
+    (studio_entry(id) ?? err("No such plugin"))?
+    let naming = naming_problems(id, src)
+    if len(naming) > 0 { return naming }
+    let entries = studio_registry().plugins | map((x) => x.id == id ? set(x, "draft", true) : x)
+    check_with(id, {} | set(`${STUDIO}/${id}.draft.qwe`, draft_source(id, src)) | set(`${STUDIO}/index.qwe`, index_text(entries)))
+}
+
+// When the program last loaded the studio's plugins.
+server fn studio_built_at() {
+    need_developer()?
+    studio_built
+}
+
+// The plugin's blocks (its draft's, else its release's) with sample
+// settings, as visitors would see them: the studio's live preview.
+fn studio_preview(id: str) {
+    let p = find(plugins, (x) => x.id == id && x.status == "draft") ?? find(plugins, (x) => x.id == id)
+    if p == null { return <SiteLayout title="Preview" description=""><p.pb-missing>Save the plugin to see it here.</p></SiteLayout> }
+    let renderers = block_renderers[plugin_key(p)] ?? {}
+    let ctx = render_ctx(true)
+    <SiteLayout title={`${p.name} (preview)`} description="">
+        {len(p.blocks ?? []) == 0 && <p.pb-missing>{p.name} has no page blocks: its rules and steps show in the forms and the flow designer.</p>}
+        {for t in p.blocks ?? [] => <section.studio-sample>
+            <p.studio-sample-label>{t.label} · {t.type}{p.status == "draft" && ` · draft v${p.version}`}</p>
+            {renderers[t.type] == null ? <p.pb-missing>No renderer for {t.type} in {id}_renderers.</p> : renderers[t.type](sample_config(t, ctx), ctx)}
+        </section>}
+    </SiteLayout>
+}
+
+// Settings to show a block with: each field's `example`, or one of its kind.
+fn sample_config(t: map, ctx: map) = (t.fields ?? []) | reduce({}, (m, f) => set(m, f.key, f.example ?? match f.type {
+    "textarea" => `Some ${lower(f.label)}, written here.`
+    "select" => (f.options ?? [""])[0]
+    "url" => "https://example.com"
+    "link" => "/"
+    "image" => null
+    "product" => (ctx.products[0] ?? {}).sku
+    "form" => (db.one("select slug from forms limit 1") ?? {}).slug
+    _ => f.label
+}))
+
 // Saves the code as the plugin's draft: checked first (names, then the
 // whole program with it), and kept only if the program still loads.
 server fn studio_save(id: str, src: str) {
@@ -150,9 +202,9 @@ server fn studio_save(id: str, src: str) {
     let found = check_with(id, {} | set(`${STUDIO}/${id}.draft.qwe`, draft) | set(`${STUDIO}/index.qwe`, index_text(entries)))
     if len(found) > 0 { return err({ problems: found }) }
     write_file(`${STUDIO}/${id}.draft.qwe`, draft)
-    write_index(entries)
+    let written = write_index(entries)
     put_registry(set(r, "plugins", r.plugins | map((x) => x.id == id ? merge(x, { draft: true, updated_at: now(), by: u.email }) : x)))
-    { saved: true, version: (e.released ?? 0) + 1 }
+    { saved: true, version: (e.released ?? 0) + 1, written }
 }
 
 // The draft becomes the release, for every workspace.
@@ -167,10 +219,10 @@ server fn studio_release(id: str) {
     let found = check_with(id, {} | set(`${STUDIO}/${id}.qwe`, src) | set(`${STUDIO}/index.qwe`, index_text(entries)))
     if len(found) > 0 { return err({ problems: found }) }
     write_file(`${STUDIO}/${id}.qwe`, src)
-    write_index(entries)
+    let written = write_index(entries)
     delete_file(`${STUDIO}/${id}.draft.qwe`)
     put_registry(set(r, "plugins", entries | map((x) => x.id == id ? merge(x, { released_at: now(), released_by: u.email, updated_at: now() }) : x)))
-    { released: version }
+    { released: version, written }
 }
 
 // Drops the draft; the released version (if any) stays as it is.

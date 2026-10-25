@@ -1,7 +1,8 @@
 // Pages: the list, the theme, and the designer. The designer's palette is
 // the blocks the plugins switched on bring; its preview is each block as
 // the server renders it; the page rules hint as you edit and decide when
-// you publish.
+// you publish. Sections are made in the same designer, and pages put
+// them in with the Section block.
 
 component PagesPage(ws: map, on_change) {
     ~rows = live(list_pages)
@@ -17,57 +18,56 @@ component PagesPage(ws: map, on_change) {
             if !is_err(id) { navigate(`/app/pages/${id}`) }
         }}><b>{t[1]}</b><span>{t[2]}</span></button>}</div>
         <div.grid-pages>
-            <div>{rows == null ? <Loading/>
-                : is_err(rows) || len(rows) == 0 ? <Empty title="No pages yet"><p>Start from a template above.</p></Empty>
-                : <table.table>
-                    <thead><tr><th>Page</th><th>Address</th><th>Status</th><th>Updated</th></tr></thead>
-                    <tbody>{for p in rows => <tr key={p.id} class="clickable" @click={() => { navigate(`/app/pages/${p.id}`) }}>
-                        <td><b>{p.title != "" ? p.title : "Untitled"}</b>{p.home && <Badge text="home" tone="purple"/>}</td>
-                        <td><code>{p.home ? "/" : `/p/${p.slug}`}</code></td>
-                        <td>{p.published == null ? <Badge text="draft"/> : p.changed ? <Badge text="changes not published" tone="amber"/> : <Badge text="published" tone="green"/>}</td>
-                        <td.muted>{fmt_ago(p.updated_at, now())}</td>
-                    </tr>}</tbody>
-                </table>}</div>
-            <ThemeEditor {ws} {on_change}/>
+            <div.stack>{rows == null ? <Loading/>
+                : is_err(rows) ? <Empty title="Pages did not load"><p>{err_text(rows)}</p></Empty>
+                : {
+                    let pages = rows | filter((p) => p.kind != "section")
+                    let sections = rows | filter((p) => p.kind == "section")
+                    <div.stack>
+                        {len(pages) == 0 ? <Empty title="No pages yet"><p>Start from a template above.</p></Empty>
+                        : <table.table>
+                            <thead><tr><th>Page</th><th>Address</th><th>Status</th><th>Updated</th></tr></thead>
+                            <tbody>{for p in pages => <tr key={p.id} class="clickable" @click={() => { navigate(`/app/pages/${p.id}`) }}>
+                                <td><b>{p.title != "" ? p.title : "Untitled"}</b>{p.home && <Badge text="home" tone="purple"/>}</td>
+                                <td><code>{p.home ? "/" : `/p/${p.slug}`}</code></td>
+                                <td><PageStatus {p}/></td>
+                                <td.muted>{fmt_ago(p.updated_at, now())}</td>
+                            </tr>}</tbody>
+                        </table>}
+                        <section.card.stack>
+                            <div.inline>
+                                <div.grow>
+                                    <h2>Sections</h2>
+                                    <p.muted>Pieces you put on many pages with the Section block: a sign-up, a pitch, a footer. Change a section, and every page with it changes.</p>
+                                </div>
+                                <button @click={() => {
+                                    let id = new_page("section")
+                                    if !is_err(id) { navigate(`/app/pages/${id}`) }
+                                }}>New section</button>
+                            </div>
+                            {len(sections) > 0 && <table.table>
+                                <thead><tr><th>Section</th><th>Used on</th><th>Status</th><th>Updated</th></tr></thead>
+                                <tbody>{for p in sections => <tr key={p.id} class="clickable" @click={() => { navigate(`/app/pages/${p.id}`) }}>
+                                    <td><b>{p.title != "" ? p.title : "Untitled"}</b></td>
+                                    <td.muted>{len(p.used_on ?? []) == 0 ? "No pages yet" : plural(len(p.used_on), "page")}</td>
+                                    <td><PageStatus {p}/></td>
+                                    <td.muted>{fmt_ago(p.updated_at, now())}</td>
+                                </tr>}</tbody>
+                            </table>}
+                        </section>
+                    </div>
+                }}</div>
+            <section.card.stack>
+                <h2>Theme</h2>
+                <p.muted>{(merge(DEFAULT_THEME, ws.settings.theme ?? {})).id} · the menu, the footer and how every page looks.</p>
+                <div><a.button href="/app/site">Change the theme →</a></div>
+            </section>
         </div>
     </div>
 }
 
-// The workspace's look: pages, the shop and forms share it.
-component ThemeEditor(ws: map, on_change) {
-    ~t = merge(DEFAULT_THEME, ws.settings.theme ?? {})
-    ~server = []
-    ~saved = false
-    let problems = validate("theme", t, ctx_of(ws)) + server
-    let change = (k) => (v) => { t = set(t, k, v); saved = false; server = [] }
-    <section.card.stack>
-        <h2>Theme</h2>
-        <label.field>
-            <span.label>Brand colour</span>
-            <div.inline>
-                <input type="color" value={t.color} style="width:48px;padding:2px" @input={(e) => { change("color")(e.value) }}/>
-                <input name="color" value={t.color} @input={(e) => { change("color")(e.value) }}/>
-            </div>
-            <Hints {problems} field="color"/>
-        </label>
-        <SelectField label="Font" field="font" value={t.font} options={[{ value: "system", label: "Clean (system)" }, { value: "serif", label: "Classic (serif)" }, { value: "rounded", label: "Friendly (rounded)" }, { value: "mono", label: "Technical (mono)" }]} {problems} on_change={change("font")}/>
-        <ImagePicker label="Logo (optional)" value={t.logo} on_change={(v) => { change("logo")(v == null ? "" : type_of(v) == "str" ? v : media_src(v, crop_text(v), 320)) }}/>
-        <Hints {problems} field="logo"/>
-        <CheckField label="Dark" field="dark" value={t.dark} {problems} on_change={change("dark")}/>
-        <div class={t.dark ? "theme-sample dark" : "theme-sample"} style={`--brand:${t.color}`}>
-            <b style={`font-family:${FONTS[t.font] ?? FONTS.system}`}>{ws.name}</b>
-            <span.pb-button>Button</span>
-        </div>
-        <FormProblems problems={server}/>
-        <div.form-actions>
-            <button.primary disabled={ws.user.role == "member" || len(errors_of(problems)) > 0} @click={() => {
-                let r = save_theme(t)
-                if is_err(r) { server = refusal_problems(r) } else { saved = true; on_change() }
-            }}>Save theme</button>
-            {saved && <span.ok>Saved</span>}
-        </div>
-    </section>
-}
+view PageStatus(p: map) =
+    p.published == null ? <Badge text="draft"/> : p.changed ? <Badge text="changes not published" tone="amber"/> : <Badge text="published" tone="green"/>
 
 component PageDesigner(id: int, ws: map) {
     ~p = get_page(id)
@@ -86,10 +86,12 @@ component PageDesigner(id: int, ws: map) {
     let bs = blocks ?? p.draft.blocks ?? []
     let m = meta ?? { title: p.title, slug: p.slug, description: p.description }
     let theme = merge(DEFAULT_THEME, ws.settings.theme ?? {})
+    let tdef = theme_def(theme.id, ws.enabled)
     let types = block_types(ws.enabled)
     let type_of_block = (b) => find(types, (t) => t.type == b.type) ?? { label: b.type, fields: [] }
     let known = is_err(rctx) || rctx == null ? {} : rctx
-    let problems = validate("page", merge(m, { blocks: bs }), ctx_of(ws, { skus: known.skus ?? [], forms: known.forms ?? [] })) + server
+    let section = p.kind == "section"
+    let problems = validate("page", merge(m, { id: str(id), kind: p.kind, blocks: bs }), ctx_of(ws, { skus: known.skus ?? [], forms: known.forms ?? [], sections: known.sections ?? [] })) + server
     let errors = errors_of(problems)
     let block_problems = (bid) => problems | filter((x) => x.field == `block.${bid}`)
     let sel = selected == null ? null : find(bs, (b) => b.id == selected)
@@ -150,10 +152,17 @@ component PageDesigner(id: int, ws: map) {
             <b.page-title>{m.title != "" ? m.title : "Untitled"}</b>
             <Badge text={status} tone={status == "published" ? "green" : status == "draft" ? "gray" : "amber"}/>
             {p.home && <Badge text="home page" tone="purple"/>}
+            {section && <Badge text="section" tone="purple"/>}
             <span.grow></span>
             {saved != "" && <span.ok>{saved}</span>}
             {len(errors) > 0 && <span.bad>{plural(len(errors), "problem")}</span>}
-            {p.published != null && <a.button href={p.home ? "/" : `/p/${p.slug}`} target="_blank" data-reload>View ↗</a>}
+            {p.published != null && !section && <a.button href={p.home ? "/" : `/p/${p.slug}`} target="_blank" data-reload>View ↗</a>}
+            {ws.user.role != "member" && <button.danger @click={() => {
+                if ask(section ? "Pages that show it will not." : "Visitors will no longer find it.", { title: `Delete “${m.title != "" ? m.title : "Untitled"}”?`, ok: "Delete", tone: "danger" }) {
+                    let r = delete_page(id)
+                    if is_err(r) { notify(err_text(r), { title: "Not deleted", tone: "danger", seconds: 8 }) } else { notify("Deleted"); navigate("/app/pages") }
+                }
+            }}>Delete</button>}
             <button @click={() => { save() }}>Save draft</button>
             <button.primary disabled={len(errors) > 0} title={len(errors) > 0 ? "Fix the problems first" : ""} @click={() => {
                 if save() {
@@ -173,8 +182,9 @@ component PageDesigner(id: int, ws: map) {
                 </div>}
             </aside>
             <div.page-canvas @click={(e) => { if e.target.className == "page-canvas" { selected = null } }}>
-                <div class={theme.dark ? "site site-preview dark" : "site site-preview"} style={`--brand:${theme.color};--site-font:${FONTS[theme.font] ?? FONTS.system}`}>
-                    <header.site-head><b>{theme.logo != "" ? <img src={theme.logo} alt=""/> : ws.name}</b><nav><span>Shop</span></nav></header>
+                <div class={site_classes(theme, tdef) + " site-preview" + (section ? " is-section" : "")}>
+                    <style>{theme_css(theme, tdef)}</style>
+                    {!section && <SiteHeader t={theme} def={tdef} site={ws.name} menu={theme.menu ?? []} cart={0} shop={false}/>}
                     {len(bs) == 0 && <div class={drop_at == 0 ? "pb-empty over" : "pb-empty"} @dragover={(e) => { e.preventDefault(); drop_at = 0 }}
                         @drop={(e) => { e.preventDefault(); dropped(0) }}>Drag a block here, or click one on the left.</div>}
                     {for [i, b] in enumerate(bs) => {
@@ -208,25 +218,35 @@ component PageDesigner(id: int, ws: map) {
                             </div>}
                         </div>
                     }}
-                    <footer.site-foot>© {ws.name}</footer>
+                    {!section && <SiteFooter t={theme} site={ws.name} rss={false} year={slice(ws.today, 0, 4)}/>}
                 </div>
             </div>
             <aside.inspector>
                 {sel != null
                     ? <BlockEditor block={sel} type={type_of_block(sel)} {ws} problems={block_problems(sel.id)}
+                        sections={(known.sections ?? []) | filter((x) => x.id != str(id))}
                         on_change={(config) => { change(bs | map((b) => b.id == sel.id ? set(b, "config", config) : b)) }}/>
                     : <section>
-                        <h3>Page</h3>
+                        <h3>{section ? "Section" : "Page"}</h3>
                         <TextField label="Title" field="title" value={m.title} {problems} on_change={(v) => { meta = set(m, "title", v); saved = "" }}/>
-                        <TextField label="Address" field="slug" value={m.slug} {problems} on_change={(v) => { meta = set(m, "slug", lower(v)); saved = "" }} help={`/p/${m.slug}`}/>
-                        <AreaField label="Description (for search results)" field="description" value={m.description} {problems} on_change={(v) => { meta = set(m, "description", v); saved = "" }} rows={3}/>
-                        {p.published != null && !p.home && ws.user.role != "member" && <button @click={() => {
+                        {section
+                            ? <div.stack>
+                                <p.muted.small>Pages show what is published here, wherever they put this section in.</p>
+                                <b.small>Used on</b>
+                                {len(p.used_on ?? []) == 0 ? <p.muted.small>No pages yet: add a Section block to a page and choose this one.</p>
+                                : <ul.plain>{for u in p.used_on => <li><a href={`/app/pages/${u.id}`}>{u.title != "" ? u.title : "Untitled"}</a>{u.kind == "section" && <span.muted> (section)</span>}</li>}</ul>}
+                            </div>
+                            : <div.stack>
+                                <TextField label="Address" field="slug" value={m.slug} {problems} on_change={(v) => { meta = set(m, "slug", lower(v)); saved = "" }} help={`/p/${m.slug}`}/>
+                                <AreaField label="Description (for search results)" field="description" value={m.description} {problems} on_change={(v) => { meta = set(m, "description", v); saved = "" }} rows={3}/>
+                            </div>}
+                        {p.published != null && !p.home && !section && ws.user.role != "member" && <button @click={() => {
                             set_home(id)
                             p = set(p, "home", true)
                         }}>Make it the home page</button>}
                         {p.published != null && <button.danger @click={() => {
-                            unpublish_page(id)
-                            p = set(set(p, "published", null), "home", false)
+                            let r = unpublish_page(id)
+                            if is_err(r) { server = [{ field: "", message: err_text(r) }] } else { p = set(set(p, "published", null), "home", false) }
                         }}>Unpublish</button>}
                         <h3>Checks</h3>
                         {len(problems) == 0 ? <p.ok>Ready to publish.</p>
@@ -239,7 +259,7 @@ component PageDesigner(id: int, ws: map) {
 }
 
 // The selected block's settings, from its plugin's description of it.
-view BlockEditor(block: map, type: map, ws: map, problems: list, on_change) {
+view BlockEditor(block: map, type: map, ws: map, problems: list, on_change, sections: list = []) {
     let c = block.config ?? {}
     let put_key = (k) => (v) => { on_change(set(c, k, v)) }
     <section>
@@ -251,6 +271,11 @@ view BlockEditor(block: map, type: map, ws: map, problems: list, on_change) {
             "select" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={f.options ?? []} problems={[]} on_change={put_key(f.key)} empty="Choose"/>
             "product" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={ws.skus | map((x) => { value: x.sku, label: x.name })} problems={[]} on_change={put_key(f.key)} empty="Choose a product"/>
             "form" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={ws.forms | map((x) => { value: x.slug, label: x.name })} problems={[]} on_change={put_key(f.key)} empty="Choose a form"/>
+            "section" => <div.stack>
+                <SelectField label={f.label} field={f.key} value={c[f.key]} options={sections | map((x) => { value: x.id, label: x.published ? x.title : `${x.title} (not published)` })} problems={[]} on_change={put_key(f.key)} empty="Choose a section"/>
+                {len(sections) == 0 && <p.muted.small>No sections yet: make one under Pages → Sections.</p>}
+                {!blank(c[f.key]) && <a href={`/app/pages/${c[f.key]}`}>Edit this section →</a>}
+            </div>
             _ => <TextField label={f.label} field={f.key} value={c[f.key]} problems={[]} on_change={put_key(f.key)}
                 placeholder={f.type == "url" ? "https://…" : f.type == "link" ? "/shop, https://…" : ""}/>
         }}</div>

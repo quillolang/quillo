@@ -24,6 +24,7 @@ db.migrate("migrations")
 
 use "lib/util.qwe"
 use "lib/rules.qwe"
+use "plugins/core_themes.qwe"
 use "plugins/core.qwe"
 use "plugins/gdpr.qwe"
 use "plugins/loyalty.qwe"
@@ -31,13 +32,14 @@ use "plugins/vat.qwe"
 use "plugins/paywall.qwe"
 use "plugins/sponsors.qwe"
 use "plugins/quality.qwe"
+use "plugins/notices.qwe"
 use "plugins/blog.qwe"
 
 // The plugins there are.
 // The plugin studio's (plugins/studio/), released and drafts.
 use "plugins/studio/index.qwe"
 
-let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality] + studio_plugins
+let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality, plugin_notices] + studio_plugins
 
 use "lib/records.qwe"
 use "lib/commerce.qwe"
@@ -46,13 +48,18 @@ use "lib/flows.qwe"
 
 // The steps flows run, on the server: the core's and the plugins'.
 // By plugin (and version: "birthday#draft").
-let step_runners = merge({ core: core_runners, blog: runners_blog, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality }, studio_runners)
+let step_runners = merge({ core: core_runners, blog: runners_blog, gdpr: runners_gdpr, loyalty: runners_loyalty, paywall: runners_paywall, vat: runners_vat, sponsors: runners_sponsors, quality: runners_quality, notices: runners_notices }, studio_runners)
 
 use "lib/workspace.qwe"
+use "lib/site.qwe"
 use "lib/pages.qwe"
 use "lib/media.qwe"
 use "lib/studio.qwe"
 use "lib/blog.qwe"
+use "lib/store.qwe"
+use "lib/objects.qwe"
+use "lib/roles.qwe"
+use "lib/desks.qwe"
 use "plugins/core_blocks.qwe"
 
 // How each plugin's page blocks look (on the server).
@@ -66,6 +73,10 @@ use "ui/pagedesigner.qwe"
 use "ui/media.qwe"
 use "ui/studio.qwe"
 use "ui/posts.qwe"
+use "ui/shop.qwe"
+use "ui/code.qwe"
+use "ui/site.qwe"
+use "ui/objects.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -112,7 +123,19 @@ fn blog_here() {
 
 route GET /blog {
     blog_here()
-    blog_index(request.query.tag ?? "", int(request.query.page ?? "1") ?? 1)
+    blog_index(request.query.tag ?? "", int(request.query.page ?? "1") ?? 1, null, "", request.query.q ?? "")
+}
+
+route GET /blog/category/:slug {
+    blog_here()
+    blog_index("", int(request.query.page ?? "1") ?? 1, null, slug)
+}
+
+route GET /blog/author/:id {
+    blog_here()
+    let n = int(id) ?? 0
+    db.one("select id from users where id = ?", n) ?? reply 404 <NotFoundPage what="author"/>
+    blog_index("", int(request.query.page ?? "1") ?? 1, null, "", "", n)
 }
 
 route GET /blog/feed.xml {
@@ -239,6 +262,19 @@ route POST /app/import/contacts {
     redirect(`/app/contacts?imported=${ok}&skipped=${len(results) - ok}`)
 }
 
+// The plugin studio's live preview: a plugin's blocks, rendered.
+route GET /app/studio/:id/preview {
+    workspace_here()
+    if is_err(need_developer()) { reply 403 "Only the installation's developers" }
+    studio_preview(id)
+}
+
+route GET /app/export/objects/:key {
+    workspace_here()
+    if current_user() == null { reply 401 "Sign in first" }
+    records_csv(key)
+}
+
 route GET /app {
     workspace_here()
     current_user() == null ? redirect("/login") : <AppPage/>
@@ -253,13 +289,53 @@ route GET /app/*rest {
 
 route GET /shop {
     workspace_here()
-    <ShopPage name={settings().name ?? ""} currency={settings().currency ?? "USD"} products={shop_products()}/>
+    shop_page(request.query.category ?? "", request.query.q ?? "", null, request.query.sort ?? "featured")
 }
 
 route GET /shop/:sku {
     workspace_here()
-    let p = shop_product(sku) ?? reply 404 <NotFoundPage what="product"/>
-    <CheckoutPage sku={p.sku} name={p.name} email={request.query.email ?? ""}/>
+    product_page(shop_product(sku) ?? reply 404 <NotFoundPage what="product"/>, request.query.choose == "1")
+}
+
+// The cart is in the visitor's session; its forms work without JavaScript.
+route POST /cart/add {
+    workspace_here()
+    let sku = request.form.sku ?? ""
+    let problem = add_to_cart(sku, request.form.qty ?? "1", request.form.variant ?? "")
+    redirect(problem != null ? `/shop/${slugify(sku)}?choose=1` : request.form.then == "checkout" ? "/checkout" : "/cart")
+}
+
+route POST /cart/update {
+    workspace_here()
+    update_cart(request.form.sku ?? "", request.form.qty ?? "0")
+    redirect("/cart")
+}
+
+route POST /cart/discount {
+    workspace_here()
+    let code = upper(trim(request.form.code ?? ""))
+    set_session(merge(session(), { discount: code == "" ? null : code }))
+    redirect("/cart")
+}
+
+route GET /cart {
+    workspace_here()
+    cart_page()
+}
+
+route GET /checkout {
+    workspace_here()
+    <CheckoutPage/>
+}
+
+route GET /sitemap.xml {
+    workspace_here()
+    sitemap()
+}
+
+route GET /robots.txt {
+    workspace_here()
+    robots()
 }
 
 route GET /f/:slug {

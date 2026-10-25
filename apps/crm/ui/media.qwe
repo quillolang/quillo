@@ -62,7 +62,7 @@ component MediaDetails(m: map, on_done) {
             {saved && <span.ok>Saved</span>}
             <span.grow></span>
             <button.danger @click={() => {
-                if js("confirm", "Delete this image? Pages that show it will not.") { delete_media(m.id); on_done() }
+                if ask("Pages that show this image will no longer show it.", { title: "Delete this image?", ok: "Delete", tone: "danger" }) { delete_media(m.id); notify("Image deleted"); on_done() }
             }}>Delete</button>
         </div>
     </div>

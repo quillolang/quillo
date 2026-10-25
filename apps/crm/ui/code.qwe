@@ -1,0 +1,26 @@
+// A code editor: a textarea over the same text highlighted (`highlight`
+// colours it in the browser as you type, as the server colours code in
+// posts), line numbers, and the lines with problems marked. Tab indents.
+
+view CodeEditor(value: str, lang: str, on_change, rows: int = 16, problems: list = [], fill: bool = false) {
+    let lines = split(value ?? "", "\n")
+    let bad = problems | map((x) => x.line ?? 0) | filter((n) => n > 0)
+    let about = (n) => problems | filter((x) => x.line == n) | map((x) => x.message) | join("\n")
+    let shown = max([len(lines), rows])
+    <div class={fill ? "code-editor fill" : "code-editor"} style={fill ? "" : `height:${min([shown, 28]) * 20 + 28}px`}>
+        <div.code-scroll>
+            <div.gutter>{for [i, l] in enumerate(lines) => <span class={contains(bad, i + 1) ? "bad" : ""} title={about(i + 1)}>{i + 1}</span>}</div>
+            <div.code-layers style={`height:${len(lines) * 20 + 28}px`}>
+                <pre class={`code-hl lang-${lang}`} aria-hidden="true">{highlight((value ?? "") + "\n", lang)}</pre>
+                <textarea.code-input spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Code" value={value ?? ""}
+                    @input={(e) => { on_change(e.value) }}
+                    @keydown={(e) => {
+                        if e.key == "Tab" && !e.shiftKey {
+                            e.preventDefault()
+                            js("document.execCommand", "insertText", false, "    ")
+                        }
+                    }}></textarea>
+            </div>
+        </div>
+    </div>
+}

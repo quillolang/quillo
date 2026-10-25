@@ -8,7 +8,7 @@
 fn current_user() {
     let s = session()
     if s.user == null { return null }
-    db.one("select id, email, name, role from users where id = ?", s.user)
+    db.one("select id, email, name, role, bio, role_id from users where id = ?", s.user)
 }
 
 fn need_user() = current_user() ?? err("Please sign in again")

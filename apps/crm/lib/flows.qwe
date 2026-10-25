@@ -21,6 +21,9 @@ fn trigger_matches(c: map, event: str, data: map) =
         "form_submitted" => blank(c.form) || c.form == data.form
         "order_paid" => blank(c.product) || lower(c.product) == data.sku
         "tag_added" => slugify(c.tag ?? "") == data.tag
+        "record_created" => blank(c.object) || c.object == data.object
+        "record_updated" => blank(c.object) || c.object == data.object
+        "record_moved" => (blank(c.object) || c.object == data.object) && (blank(c.to) || c.to == data.to)
         _ => true
     }
 
@@ -237,6 +240,65 @@ fn step_webhook(config, run) {
     is_err(r) ? { port: "out", log: `webhook failed: ${r.error}` } : { port: "out", log: `webhook answered ${r.status}` }
 }
 
+// ---- steps people take: a group's or a role's decision -------------------------------
+
+// The people who answer for a group or a role.
+fn people_for(gid, rid) = db.query("select id, email, name, role, role_id from users")
+    | filter((u) => (gid != null && in_group(u, gid)) || (rid != null && any(roles_of(u), (r) => r.id == rid)))
+
+fn step_ask(config, run) {
+    let gid = blank(config.group) ? null : int(str(config.group)) ?? null
+    let rid = blank(config.role) ? null : int(str(config.role)) ?? null
+    if gid == null && rid == null { return { error: "Ask: choose a group or a role" } }
+    let c = run.context
+    let title = trim(config.title ?? "A decision")
+    db.exec("insert into flow_tasks (run_id, title, details, group_id, role_id, object, record_id, contact_id, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        run.id, title, config.details ?? "", gid, rid, c.object ?? "", c.record_id, c.contact_id, now())
+    tell(people_for(gid, rid) | map((u) => u.id), null, `To decide: ${title}`, blank(config.details) ? title : config.details)
+    let days = int(str(config.days ?? "")) ?? 0
+    let who = gid != null ? `group ${(db.one("select name from groups where id = ?", gid) ?? { name: "?" }).name}` : `role ${(db.one("select name from roles where id = ?", rid) ?? { name: "?" }).name}`
+    { waiting_for: "task", until: days > 0 ? now() + days * DAY : null, resume: "rejected", log: `asked the ${who}: ${title}` }
+}
+
+fn step_move_record(config, run) {
+    let c = run.context
+    if c.record_id == null || blank(c.object) { return { error: "Move the record: this flow did not start from a record" } }
+    let o = object_out(db.one("select * from objects where key = ?", c.object))
+    let st = o == null ? null : find(o.states, (x) => x.key == config.to || lower(x.label) == lower(trim(config.to ?? "")))
+    if st == null { return { error: `Move the record: ${o == null ? "no such object" : `no state “${config.to}”`}` } }
+    rec_set(c.object, c.record_id, { state: st.key })
+    { port: "out", log: `moved the record to ${st.label}` }
+}
+
+// A decision, by someone in the group or with the role: the flow goes on
+// from it, by "approved" or "rejected".
+server fn answer_flow_task(id: int, outcome: str, note: str) {
+    let u = need_user()?
+    let t = (db.one("select * from flow_tasks where id = ? and status = 'open'", id) ?? err("It was answered already"))?
+    let mine = u.role != "member" || (t.group_id != null && in_group(u, t.group_id)) || (t.role_id != null && has_role(u, t.role_id))
+    if !mine { return err("This is for another group or role") }
+    if !contains(["approved", "rejected"], outcome) { return err("Approve or reject") }
+    db.exec("update flow_tasks set status = 'done', outcome = ?, note = ?, done_by = ?, done_at = ? where id = ?", outcome, trim(note ?? ""), u.id, now(), id)
+    let run = db.one("select status, waiting_for from flow_runs where id = ?", t.run_id)
+    if run != null && run.status == "waiting" && run.waiting_for == "task" {
+        advance(t.run_id, outcome)
+        drain_runs()
+    }
+    true
+}
+
+// What waits for this person's decision.
+server fn my_flow_tasks() {
+    let u = need_user()?
+    db.query("select t.*, f.name as flow from flow_tasks t join flow_runs r on r.id = t.run_id join flows f on f.id = r.flow_id where t.status = 'open' order by t.created_at")
+        | filter((t) => u.role != "member" || (t.group_id != null && in_group(u, t.group_id)) || (t.role_id != null && has_role(u, t.role_id)))
+        | map((t) => merge(t, {
+            record: t.record_id == null || blank(t.object) ? null : { title: rec_title(t.object, t.record_id) },
+            contact: t.contact_id == null ? null : db.one("select trim(first_name || ' ' || last_name) as name from contacts where id = ?", t.contact_id),
+            to: t.group_id != null ? (db.one("select name from groups where id = ?", t.group_id) ?? {}).name : (db.one("select name from roles where id = ?", t.role_id) ?? {}).name,
+        }))
+}
+
 let core_runners = {
     trigger: (config, run) => { port: "out" },
     send_email: step_email,
@@ -248,6 +310,8 @@ let core_runners = {
     remove_tag: step_remove_tag,
     set_stage: step_stage,
     create_task: step_task,
+    ask: step_ask,
+    move_record: step_move_record,
     create_deal: step_deal,
     webhook: step_webhook,
 }

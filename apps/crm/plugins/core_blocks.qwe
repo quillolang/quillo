@@ -60,4 +60,5 @@ let renderers_core = {
     form: (c, ctx) => ctx.preview
         ? <PbFormPreview heading={c.heading ?? ""}/>
         : <section.pb-form>{!blank(c.heading) && <h2>{c.heading}</h2>}<PublicForm slug={c.form ?? ""} embedded={true}/></section>,
+    section: (c, ctx) => section_html(c.section, ctx),
 }

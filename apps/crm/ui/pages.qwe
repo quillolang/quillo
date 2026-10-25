@@ -3,7 +3,7 @@
 // for its kind of record as you type, with the same context the server
 // uses when it saves.
 
-fn ctx_of(ws: map, extra: map = {}) = merge({ enabled: ws.enabled, fields: ws.fields, settings: ws.settings, today: ws.today }, extra)
+fn ctx_of(ws: map, extra: map = {}) = merge({ enabled: ws.enabled, fields: ws.fields, settings: ws.settings, today: ws.today, objects: ws.objects ?? [] }, extra)
 
 fn tag_list(text: str) = split(text, ",") | map((t) => slugify(trim(t))) | filter((t) => t != "")
 
@@ -82,12 +82,12 @@ component ContactsPage(ws: map, query: map) {
             <button.primary>Import</button>
         </form>}
         <div.filters>
-            <input type="search" placeholder="Name or email" value={q} @input={(e) => { q = e.value }}/>
-            <select @change={(e) => { stage = e.value }}>
+            <input type="search" aria-label="Search contacts" placeholder="Name or email" value={q} @input={(e) => { q = e.value }}/>
+            <select aria-label="Stage" @change={(e) => { stage = e.value }}>
                 <option value="">All stages</option>
                 {for s in STAGES => <option value={s} selected={stage == s}>{s}</option>}
             </select>
-            <select @change={(e) => { tag = e.value }}>
+            <select aria-label="Tag" @change={(e) => { tag = e.value }}>
                 <option value="">All tags</option>
                 {for t in tags => <option value={t.tag} selected={tag == t.tag}>{t.tag} ({t.n})</option>}
             </select>
@@ -178,6 +178,7 @@ component ContactPage(id: int, ws: map) {
     ~flows = list_flows() ?? []
     ~flow_pick = ""
     ~message = ""
+    ~linked = records_of_contact(id)
     if c == null { return <Loading/> }
     if is_err(c) { return <Empty title="No such contact"><p><a href="/app/contacts">All contacts</a></p></Empty> }
     let cur = ws.currency
@@ -195,7 +196,7 @@ component ContactPage(id: int, ws: map) {
             <div.actions>
                 <button @click={() => { editing = true }}>Edit</button>
                 {ws.user.role != "member" && <button.danger @click={() => {
-                    if js("confirm", `Delete ${c.name}?`) { delete_contact(id); navigate("/app/contacts") }
+                    if ask(`Their timeline, notes and tasks go too.`, { title: `Delete ${c.name}?`, ok: "Delete", tone: "danger" }) { delete_contact(id); notify(`${c.name} deleted`); navigate("/app/contacts") }
                 }}>Delete</button>}
             </div>
         </header>
@@ -249,7 +250,7 @@ component ContactPage(id: int, ws: map) {
                     </div>
                     _ => <div>
                         <div.inline>
-                            <select @change={(e) => { flow_pick = e.value }}>
+                            <select aria-label="Flow to start" @change={(e) => { flow_pick = e.value }}>
                                 <option value="">Start a flow for {c.name}…</option>
                                 {for f in flows => <option value={str(f.id)}>{f.name}</option>}
                             </select>
@@ -263,6 +264,7 @@ component ContactPage(id: int, ws: map) {
                 }}
             </section>
         </div>
+        {linked != null && !is_err(linked) && len(linked) > 0 && <LinkedRecords records={linked}/>}
         {editing && <Drawer title={`Edit ${c.name}`} on_close={() => { editing = false }}>
             <ContactForm contact={c} {ws} on_saved={(saved) => { editing = false }}/>
         </Drawer>}
@@ -278,7 +280,7 @@ component CompaniesPage(ws: map) {
     let cur = ws.currency
     <div>
         <PageHead title="Companies"><button.primary @click={() => { adding = true }}>New company</button></PageHead>
-        <div.filters><input type="search" placeholder="Name or domain" value={q} @input={(e) => {
+        <div.filters><input type="search" aria-label="Search companies" placeholder="Name or domain" value={q} @input={(e) => {
             q = e.value
             rows = list_companies(q)
         }}/></div>
@@ -327,6 +329,7 @@ component CompanyForm(company: map, ws: map, on_saved) {
 component CompanyPage(id: int, ws: map) {
     ~co = live(get_company, id)
     ~editing = false
+    ~linked = records_of_company(id)
     if co == null { return <Loading/> }
     if is_err(co) { return <Empty title="No such company"/> }
     <div>
@@ -337,6 +340,7 @@ component CompanyPage(id: int, ws: map) {
             <section.card><h2>Deals</h2>{len(co.deals) == 0 ? <p.muted>No deals.</p>
                 : <ul.plain>{for d in co.deals => <li><b>{d.title}</b> · {fmt_money(d.value_cents, ws.currency)} · <Badge text={d.stage}/></li>}</ul>}</section>
         </div>
+        {linked != null && !is_err(linked) && len(linked) > 0 && <LinkedRecords records={linked}/>}
         {editing && <Drawer title="Edit company" on_close={() => { editing = false }}>
             <CompanyForm company={co} {ws} on_saved={(saved) => { editing = false }}/>
         </Drawer>}
@@ -349,7 +353,7 @@ component DealsPage(ws: map) {
     ~pipeline = (ws.pipelines[0] ?? {}).id ?? 0
     <div>
         <PageHead title="Deals" sub="Drag a card to move it along.">
-            <select @change={(e) => { pipeline = int(e.value) ?? pipeline }}>
+            <select aria-label="Pipeline" @change={(e) => { pipeline = int(e.value) ?? pipeline }}>
                 {for p in ws.pipelines => <option value={str(p.id)} selected={p.id == pipeline}>{p.name}</option>}
             </select>
         </PageHead>
@@ -442,7 +446,8 @@ component TasksPage(ws: map) {
     ~show_done = false
     ~t = { title: "", due: "" }
     ~problems = []
-    <div>
+    <div.stack>
+        <FlowDecisions/>
         <PageHead title="Tasks">
             <label.check-inline><input type="checkbox" checked={show_done} @change={(e) => { show_done = e.checked }}/> Show done</label>
         </PageHead>
@@ -478,25 +483,39 @@ component TaskList(show_done: bool, today: str) {
 // ---- products and orders ------------------------------------------------------------------------
 
 component ProductsPage(ws: map) {
-    ~rows = live(list_products)
-    ~editing = null
-    let cur = ws.currency
+    ~tab = "products"
     <div>
         <PageHead title="Products" sub="What your shop sells, at /shop.">
             <a.button href="/shop" target="_blank">Open the shop</a>
-            {ws.user.role != "member" && <button.primary @click={() => { editing = { name: "", sku: "", price_cents: 0, kind: "one_time", interval: "", description: "", stock: null, active: true } }}>New product</button>}
         </PageHead>
+        <nav.tabs>{for t in [["products", "Products"], ["discounts", "Discount codes"], ["shipping", "Shipping"]] =>
+            <button type="button" class={tab == t[0] ? "tab on" : "tab"} @click={() => { tab = t[0] }}>{t[1]}</button>}</nav>
+        {match tab {
+            "discounts" => <DiscountsPanel {ws}/>
+            "shipping" => <ShippingPanel {ws}/>
+            _ => <ProductList {ws}/>
+        }}
+    </div>
+}
+
+component ProductList(ws: map) {
+    ~rows = live(list_products)
+    ~editing = null
+    let cur = ws.currency
+    <div.stack>
+        {ws.user.role != "member" && <div><button.primary @click={() => { editing = { name: "", sku: "", price_cents: 0, kind: "one_time", interval: "", description: "", stock: null, active: true, images: [], category: "", compare_at_cents: null, featured: false, digital: false } }}>New product</button></div>}
         {rows == null ? <Loading/>
         : is_err(rows) || len(rows) == 0 ? <Empty title="No products yet"/>
         : <table.table>
-            <thead><tr><th>Product</th><th>SKU</th><th>Price</th><th>Stock</th><th>Sold</th><th></th></tr></thead>
+            <thead><tr><th></th><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th>Sold</th><th></th></tr></thead>
             <tbody>{for p in rows => <tr key={p.id} class={!p.active && "inactive"}>
-                <td><b>{p.name}</b>{p.kind == "subscription" && <Badge text={`every ${p.interval}`} tone="purple"/>}{!p.active && <Badge text="hidden"/>}</td>
-                <td><code>{p.sku}</code></td>
-                <td>{fmt_money(p.price_cents, cur)}</td>
+                <td.thumb-cell>{len(p.images) > 0 ? <Picture v={p.images[0]} alt="" shown={160}/> : <span.thumb-none></span>}</td>
+                <td><b>{p.name}</b> <code.muted>{p.sku}</code>{p.kind == "subscription" && <Badge text={`every ${p.interval}`} tone="purple"/>}{p.featured && <Badge text="featured" tone="green"/>}{!p.active && <Badge text="hidden"/>}</td>
+                <td.muted>{p.category}</td>
+                <td>{fmt_money(p.price_cents, cur)}{p.compare_at_cents != null && <s.muted> {fmt_money(p.compare_at_cents, cur)}</s>}</td>
                 <td>{p.stock == null ? "—" : str(p.stock)}</td>
                 <td>{p.sold}</td>
-                <td>{ws.user.role != "member" && <button.ghost @click={() => { editing = p }}>Edit</button>} <a href={`/shop/${p.sku}`} target="_blank">Checkout ↗</a></td>
+                <td>{ws.user.role != "member" && <button.ghost @click={() => { editing = p }}>Edit</button>} <a href={`/shop/${p.sku}`} target="_blank">View ↗</a></td>
             </tr>}</tbody>
         </table>}
         {editing != null && <Drawer title={editing.id == null ? "New product" : editing.name} on_close={() => { editing = null }}>
@@ -508,13 +527,17 @@ component ProductsPage(ws: map) {
 component ProductForm(product: map, ws: map, on_saved) {
     ~p = product
     ~price_text = str((product.price_cents ?? 0) / 100)
+    ~compare_text = product.compare_at_cents == null ? "" : str(product.compare_at_cents / 100)
     ~stock_text = product.stock == null ? "" : str(product.stock)
     ~touched = product.id != null
     ~server = []
     let ctx = ctx_of(ws)
-    let record = set(p, "price_cents", parse_money(price_text)) | set("stock", stock_text == "" ? null : int(stock_text) ?? -1)
+    let record = set(p, "price_cents", parse_money(price_text))
+        | set("stock", stock_text == "" ? null : int(stock_text) ?? -1)
+        | set("compare_at_cents", compare_text == "" ? null : parse_money(compare_text))
     let problems = touched ? validate("product", record, ctx) + server : server
     let change = (path) => (v) => { p = put(p, path, v); touched = true; server = [] }
+    let images = p.images ?? []
     <form.stack @submit={() => {
         touched = true
         if len(errors_of(validate("product", record, ctx))) == 0 {
@@ -525,26 +548,134 @@ component ProductForm(product: map, ws: map, on_saved) {
         <TextField label="Name" field="name" value={p.name} {problems} on_change={change("name")}/>
         <div.row2>
             <TextField label="SKU" field="sku" value={p.sku} {problems} on_change={change("sku")} help="Its address in the shop"/>
+            <TextField label="Category" field="category" value={p.category} {problems} on_change={change("category")} placeholder="t-shirts"/>
+        </div>
+        <div.row2>
             <TextField label={`Price (${ws.currency})`} field="price" value={price_text} {problems} on_change={(v) => { price_text = v; touched = true }}/>
+            <TextField label="Price before (for a sale)" field="compare_at" value={compare_text} {problems} on_change={(v) => { compare_text = v; touched = true }}/>
         </div>
         <div.row2>
             <SelectField label="Kind" field="kind" value={p.kind} options={[{ value: "one_time", label: "One-time" }, { value: "subscription", label: "Subscription" }]} {problems} on_change={change("kind")}/>
             {p.kind == "subscription"
                 ? <SelectField label="Renews every" field="interval" value={p.interval} options={["month", "year"]} {problems} on_change={change("interval")} empty="Choose"/>
+                : len(p.variants ?? []) > 0 ? <p.muted.small>Stock is counted per variant, below.</p>
                 : <TextField label="Stock (empty: not counted)" field="stock" value={stock_text} {problems} on_change={(v) => { stock_text = v; touched = true }} type="number"/>}
         </div>
-        <AreaField label="Description" field="description" value={p.description} {problems} on_change={change("description")} rows={3}/>
+        <AreaField label="Description (Markdown)" field="description" value={p.description} {problems} on_change={change("description")} rows={5}/>
+        <div.field>
+            <span.label>Variants (sizes, colours…; empty: none)</span>
+            {len(p.variants ?? []) > 0 && <TextField label="What they are" field="variant_label" value={p.variant_label ?? ""} {problems} on_change={change("variant_label")} placeholder="Size"/>}
+            {for [i, v] in enumerate(p.variants ?? []) => <div.variant-row key={i}>
+                <input value={v.name} placeholder="M" aria-label="Variant" @input={(e) => { change("variants")((p.variants ?? []) | enumerate | map((x) => x[0] == i ? set(x[1], "name", e.value) : x[1])) }}/>
+                <input value={v.stock == null ? "" : str(v.stock)} type="number" placeholder="Stock" aria-label="Stock" @input={(e) => { change("variants")((p.variants ?? []) | enumerate | map((x) => x[0] == i ? set(x[1], "stock", e.value == "" ? null : int(e.value) ?? 0) : x[1])) }}/>
+                <input value={v.price_cents == null ? "" : str(v.price_cents / 100)} placeholder="Price (empty: the product's)" aria-label="Price" @input={(e) => { change("variants")((p.variants ?? []) | enumerate | map((x) => x[0] == i ? set(x[1], "price_cents", e.value == "" ? null : parse_money(e.value)) : x[1])) }}/>
+                <button.icon type="button" title="Remove" @click={() => { change("variants")((p.variants ?? []) | enumerate | filter((x) => x[0] != i) | map((x) => x[1])) }}>✕</button>
+            </div>}
+            <div><button type="button" @click={() => { change("variants")((p.variants ?? []) + [{ name: "", stock: null, price_cents: null }]) }}>Add a variant</button></div>
+            <Hints {problems} field="variants"/>
+        </div>
+        <div.field>
+            <span.label>Pictures (the first is the main one)</span>
+            {for [i, im] in enumerate(images) => <div.inline key={`${i}-${im.key}`}>
+                <ImagePicker label="" value={im} on_change={(v) => { change("images")(v == null ? images | enumerate | filter((x) => x[0] != i) | map((x) => x[1]) : images | enumerate | map((x) => x[0] == i ? v : x[1])) }}/>
+                {i > 0 && <button.icon type="button" title="Make it the main one" @click={() => { change("images")([im] + (images | enumerate | filter((x) => x[0] != i) | map((x) => x[1]))) }}>↑</button>}
+            </div>}
+            {len(images) < 8 && <ImagePicker key={`add-${len(images)}`} label="" value={null} on_change={(v) => { if v != null { change("images")(images + [v]) } }}/>}
+            <Hints {problems} field="images"/>
+        </div>
+        {p.kind != "subscription" && <CheckField label="Digital (nothing to ship)" field="digital" value={p.digital} {problems} on_change={change("digital")}/>}
+        <CheckField label="Featured (first in the shop)" field="featured" value={p.featured} {problems} on_change={change("featured")}/>
         <CheckField label="For sale in the shop" field="active" value={p.active} {problems} on_change={change("active")}/>
         <FormProblems problems={server}/>
         <div.form-actions><button.primary>Save product</button></div>
     </form>
 }
 
+component DiscountsPanel(ws: map) {
+    ~rows = live(list_discounts)
+    ~editing = null
+    let cur = ws.currency
+    <div.stack>
+        {ws.user.role != "member" && <div><button.primary @click={() => { editing = { code: "", kind: "percent", value: 10, min_cents: 0, max_uses: null, active: true } }}>New code</button></div>}
+        {rows == null ? <Loading/>
+        : is_err(rows) || len(rows) == 0 ? <Empty title="No discount codes yet"><p>Buyers type a code in their cart.</p></Empty>
+        : <table.table>
+            <thead><tr><th>Code</th><th>Gives</th><th>Needs</th><th>Used</th><th></th></tr></thead>
+            <tbody>{for d in rows => <tr key={d.id} class={!d.active && "inactive"}>
+                <td><code>{d.code}</code>{!d.active && <Badge text="off"/>}</td>
+                <td>{discount_label(d, cur)}</td>
+                <td.muted>{d.min_cents > 0 ? `${fmt_money(d.min_cents, cur)} in the cart` : "—"}</td>
+                <td>{d.uses}{d.max_uses != null && ` of ${d.max_uses}`}</td>
+                <td>{ws.user.role != "member" && <button.ghost @click={() => { editing = d }}>Edit</button>}</td>
+            </tr>}</tbody>
+        </table>}
+        {editing != null && <Drawer title={editing.id == null ? "New discount code" : editing.code} on_close={() => { editing = null }}>
+            <DiscountForm discount={editing} {ws} on_saved={() => { editing = null }}/>
+        </Drawer>}
+    </div>
+}
+
+component DiscountForm(discount: map, ws: map, on_saved) {
+    ~d = discount
+    ~value_text = discount.kind == "amount" ? str(discount.value / 100) : str(discount.value)
+    ~min_text = str((discount.min_cents ?? 0) / 100)
+    ~max_text = discount.max_uses == null ? "" : str(discount.max_uses)
+    ~server = []
+    let record = merge(d, {
+        code: upper(d.code ?? ""),
+        value: d.kind == "amount" ? parse_money(value_text) : int(value_text) ?? 0,
+        min_cents: parse_money(min_text),
+        max_uses: max_text == "" ? null : int(max_text) ?? 0,
+    })
+    let problems = validate("discount", record, ctx_of(ws)) + server
+    let change = (k) => (v) => { d = set(d, k, v); server = [] }
+    <form.stack @submit={() => {
+        if len(errors_of(problems)) == 0 {
+            let r = save_discount(record)
+            if is_err(r) { server = refusal_problems(r) } else { on_saved() }
+        }
+    }}>
+        <TextField label="Code" field="code" value={record.code} {problems} on_change={change("code")} placeholder="SPRING20"/>
+        <SelectField label="Gives" field="kind" value={d.kind} options={[{ value: "percent", label: "A percentage off" }, { value: "amount", label: "An amount off" }, { value: "shipping", label: "Free shipping" }]} {problems} on_change={change("kind")}/>
+        {d.kind != "shipping" && <TextField label={d.kind == "percent" ? "Percent off" : `Amount off (${ws.currency})`} field="value" value={value_text} {problems} on_change={(v) => { value_text = v }}/>}
+        <div.row2>
+            <TextField label={`Needs in the cart (${ws.currency})`} field="min" value={min_text} {problems} on_change={(v) => { min_text = v }}/>
+            <TextField label="Uses (empty: no limit)" field="max_uses" value={max_text} {problems} on_change={(v) => { max_text = v }} type="number"/>
+        </div>
+        <CheckField label="Buyers can use it" field="active" value={d.active} {problems} on_change={change("active")}/>
+        <FormProblems problems={server}/>
+        <div.form-actions>
+            <button.primary disabled={len(errors_of(problems)) > 0}>Save code</button>
+            {d.id != null && <button.danger type="button" @click={() => { delete_discount(d.id); on_saved() }}>Delete</button>}
+        </div>
+    </form>
+}
+
+component ShippingPanel(ws: map) {
+    ~rate = str((int(str(ws.settings.shipping_cents ?? "0")) ?? 0) / 100)
+    ~free = str((int(str(ws.settings.free_shipping_over_cents ?? "0")) ?? 0) / 100)
+    ~saved = false
+    ~server = []
+    <section.card.narrow.stack>
+        <p.muted>One rate for every order with something to ship; digital products and subscriptions ship free.</p>
+        <TextField label={`Shipping (${ws.currency}; 0: free)`} field="shipping" value={rate} problems={server} on_change={(v) => { rate = v; saved = false }}/>
+        <TextField label={`Free over (${ws.currency}; 0: never)`} field="free" value={free} problems={server} on_change={(v) => { free = v; saved = false }}/>
+        <FormProblems problems={server}/>
+        <div.form-actions>
+            <button.primary disabled={ws.user.role == "member"} @click={() => {
+                let r = save_shipping(parse_money(rate), parse_money(free))
+                if is_err(r) { server = refusal_problems(r) } else { saved = true; server = [] }
+            }}>Save</button>
+            {saved && <span.ok>Saved</span>}
+        </div>
+    </section>
+}
+
 component OrdersPage(ws: map) {
     ~status = ""
     <div>
         <PageHead title="Orders">
-            <select @change={(e) => { status = e.value }}>
+            <select aria-label="Status" @change={(e) => { status = e.value }}>
                 {for s in [["", "All"], ["paid", "Paid"], ["refunded", "Refunded"]] => <option value={s[0]} selected={status == s[0]}>{s[1]}</option>}
             </select>
         </PageHead>
@@ -567,7 +698,7 @@ component OrderTable(status: str, ws: map) {
             <td><Badge text={o.status} tone={status_tone(o.status)}/></td>
             <td.muted>{fmt_time(o.created_at)}</td>
             <td>{o.status == "paid" && ws.user.role != "member" && <button.ghost @click={() => {
-                if js("confirm", `Refund ${o.number}?`) { refund_order(o.id) }
+                if ask("What was bought goes back on the shelf.", { title: `Refund ${o.number}?`, ok: "Refund", tone: "danger" }) { refund_order(o.id); notify(`${o.number} refunded`) }
             }}>Refund</button>}</td>
         </tr>}</tbody>
     </table>
@@ -681,7 +812,7 @@ component CampaignEditor(campaign: map, ws: map, on_done) {
                 let saved = save_campaign(c)
                 if is_err(saved) { server = refusal_problems(saved) } else {
                     c = saved
-                    if js("confirm", `Send “${c.subject}” to ${plural(size ?? 0, "subscriber")}?`) {
+                    if ask(`To ${plural(size ?? 0, "subscriber")}.`, { title: `Send “${c.subject}”?`, ok: "Send" }) {
                         sending = true
                         let r = send_campaign(c.id)
                         sending = false
@@ -729,12 +860,22 @@ component PluginsPage(ws: map, on_change) {
             <section key={p.id} class={on ? "card plugin on" : "card plugin"}>
                 <header>
                     <h3>{p.name}</h3>
-                    <label class="switch"><input type="checkbox" checked={on} disabled={!admin || saving} @change={() => {
-                        enabled = on ? enabled | filter((x) => x != p.id) : enabled + [p.id]
-                        saving = true
-                        set_plugins(enabled)
-                        saving = false
-                        on_change()
+                    <label class="switch"><input type="checkbox" checked={on} disabled={!admin || saving} @change={(e) => {
+                        // Switching off: say first what it takes away.
+                        let uses = on ? plugin_uses(p.id) : null
+                        let lost = uses == null || is_err(uses) ? [] :
+                            (len(uses.pages) > 0 ? [`its blocks on ${uses.pages | map((t) => `“${t}”`) | join(", ")}`] : [])
+                            + (len(uses.flows) > 0 ? [`its steps in ${uses.flows | map((t) => `“${t}”`) | join(", ")} (those runs stop at them)`] : [])
+                            + (uses.theme ? ["the site's theme (it goes back to Clean)"] : [])
+                        if len(lost) == 0 || ask(`It takes away ${join(lost, "; ")}.`, { title: `Switch ${p.name} off?`, ok: "Switch off", tone: "danger" }) {
+                            enabled = on ? enabled | filter((x) => x != p.id) : enabled + [p.id]
+                            saving = true
+                            set_plugins(enabled)
+                            saving = false
+                            on_change()
+                        } else {
+                            js("Reflect.set", e.target, "checked", true)
+                        }
                     }}/><span></span></label>
                 </header>
                 <p>{p.description}</p>
@@ -745,6 +886,8 @@ component PluginsPage(ws: map, on_change) {
                     {rule_count > 0 && <li>{plural(rule_count, "rule")} for {keys(p.rules) | join(", ")}</li>}
                     {len(p.steps ?? []) > 0 && <li>Flow steps: {(p.steps ?? []) | map((s) => s.label) | join(", ")}</li>}
                     {len(p.blocks ?? []) > 0 && <li>Page blocks: {(p.blocks ?? []) | map((b) => b.label) | join(", ")}</li>}
+                    {len(p.themes ?? []) > 0 && <li>Themes: {(p.themes ?? []) | map((t) => t.name) | join(", ")}</li>}
+                    {len(p.checkout_fields ?? []) > 0 && <li>Checkout asks for: {p.checkout_fields | join(", ")}</li>}
                     {p.version != null && <li>Version {p.version}, from the plugin studio</li>}
                     {p.taxes != null && <li>Adds tax at checkout</li>}
                 </ul>
@@ -755,17 +898,38 @@ component PluginsPage(ws: map, on_change) {
 
 component SettingsPage(ws: map, on_change) {
     ~tab = "workspace"
-    let tabs = [["workspace", "Workspace"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"]]
+    let tabs = [["workspace", "Workspace"], ["profile", "Your profile"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"], ["groups", "Groups"], ["roles", "Roles"], ["desks", "Desks"]]
     <div>
         <PageHead title="Settings"/>
         <nav.tabs>{for t in tabs => <button type="button" class={tab == t[0] ? "tab on" : "tab"} @click={() => { tab = t[0] }}>{t[1]}</button>}</nav>
         {match tab {
-            "workspace" => <WorkspaceSettings {ws} {on_change}/>
+            "workspace" => <div.stack><WorkspaceSettings {ws} {on_change}/><NoticeSettings {ws}/></div>
+            "profile" => <ProfileSettings {ws} {on_change}/>
+            "roles" => <RolesSettings {ws} {on_change}/>
+            "groups" => <GroupsSettings {ws} {on_change}/>
+            "desks" => <DesksSettings {ws}/>
             "fields" => <FieldSettings {ws} {on_change}/>
             "pipelines" => <PipelineSettings {ws} {on_change}/>
             _ => <TeamSettings {ws} {on_change}/>
         }}
     </div>
+}
+
+// Your name and a line about you: the blog shows them with your posts.
+component ProfileSettings(ws: map, on_change) {
+    ~name = ws.user.name
+    ~bio = ws.user.bio ?? ""
+    ~problems = []
+    ~saved = false
+    <form.card.stack.narrow @submit={() => {
+        let r = save_profile(name, bio)
+        if is_err(r) { problems = refusal_problems(r) } else { saved = true; on_change() }
+    }}>
+        <TextField label="Your name" field="name" value={name} {problems} on_change={(v) => { name = v; saved = false }}/>
+        <AreaField label="About you (shown with your posts, and on your author page)" field="bio" value={bio} {problems} on_change={(v) => { bio = v; saved = false }} rows={3}/>
+        <FormProblems {problems}/>
+        <div.form-actions><button.primary>Save</button>{saved && <span.ok>Saved</span>}</div>
+    </form>
 }
 
 component WorkspaceSettings(ws: map, on_change) {
@@ -795,11 +959,14 @@ component FieldSettings(ws: map, on_change) {
     ~f = { entity: "contact", label: "", type: "text", required: false, options: [] }
     ~options_text = ""
     ~problems = []
+    // Contacts', companies' and deals' own fields; objects' are in their designer.
+    let mine = ws.fields | filter((x) => contains(["contact", "company", "deal"], x.entity))
     <div.grid2>
         <section.card>
             <h2>Your fields</h2>
-            {len(ws.fields) == 0 ? <p.muted>None yet. Fields from plugins are in the Plugins page.</p>
-            : <table.table.compact><tbody>{for x in ws.fields => <tr key={x.id}>
+            <p.muted.small>Fields you add to contacts, companies and deals. Your objects' fields are in <a href="/app/objects">Objects</a>, each in its designer.</p>
+            {len(mine) == 0 ? <p.muted>None yet. Fields from plugins are in the Plugins page.</p>
+            : <table.table.compact><tbody>{for x in mine => <tr key={x.id}>
                 <td><b>{x.label}</b> <code>{x.key}</code></td><td>{x.entity}</td><td>{x.type}{x.required && " · required"}</td>
                 <td><button.ghost @click={() => { delete_field(x.id); on_change() }}>Remove</button></td>
             </tr>}</tbody></table>}
@@ -840,7 +1007,7 @@ component PipelineSettings(ws: map, on_change) {
                 if is_err(r) { problems = refusal_problems(r) } else { stage = set(stage, "name", ""); on_change() }
             }}>
                 <input placeholder="New stage" value={stage.name} @input={(e) => { stage = set(stage, "name", e.value) }}/>
-                <select @change={(e) => { stage = set(stage, "kind", e.value) }}>{for k in ["open", "won", "lost"] => <option value={k}>{k}</option>}</select>
+                <select aria-label="Kind" @change={(e) => { stage = set(stage, "kind", e.value) }}>{for k in ["open", "won", "lost"] => <option value={k}>{k}</option>}</select>
                 <button>Add stage</button>
             </form>
         </section>}
@@ -862,7 +1029,15 @@ component TeamSettings(ws: map, on_change) {
     <div.grid2>
         <section.card>
             <h2>Team</h2>
-            <ul.plain>{for x in ws.users => <li key={x.id}><Avatar name={x.name} size="sm"/> <b>{x.name}</b> <span.muted>{x.email}</span> <Badge text={x.role}/></li>}</ul>
+            <ul.plain>{for x in ws.users => <li key={x.id}><Avatar name={x.name} size="sm"/> <b>{x.name}</b> <span.muted>{x.email}</span> <Badge text={x.role}/>
+                {x.role == "member" && ws.user.role != "member" && len(ws.roles ?? []) > 0 && <select.role-pick aria-label={`${x.name}'s role`} @change={(e) => {
+                    set_user_role(x.id, e.value == "" ? null : int(e.value))
+                    on_change()
+                }}>
+                    <option value="" selected={x.role_id == null}>Every object (no role)</option>
+                    {for r in ws.roles => <option value={str(r.id)} selected={x.role_id == r.id}>{r.name}</option>}
+                </select>}
+            </li>}</ul>
         </section>
         {ws.user.role != "member" && <form.card.stack @submit={() => {
             let r = add_user(u)

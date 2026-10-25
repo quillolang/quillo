@@ -3,23 +3,23 @@
 // offers what the plugins switched on bring), and its HTML comes from the
 // plugin's renderer. A page has a draft, which the designer edits, and a
 // published version, which visitors see at /p/<slug> (or at the
-// workspace's own address, for the home page).
+// workspace's own address, for the home page). A section is made the same
+// way but has no address: pages put it in with the Section block, and
+// show its published version wherever they do.
 
-let DEFAULT_THEME = { color: "#4f46e5", font: "system", dark: false, logo: "" }
 
 fn page_out(r) = r == null ? null : merge(r, {
     draft: parsed(r.draft, { blocks: [] }),
     published: parsed(r.published, null),
     home: r.home == 1,
+    kind: r.kind ?? "page",
     changed: r.published == null || r.published != r.draft,
 })
-
-fn theme_of(s: map) = merge(DEFAULT_THEME, s.theme ?? {})
 
 // What renderers see.
 fn render_ctx(preview: bool) {
     let s = settings()
-    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: enabled_plugins(), posts: recent_posts(12) }
+    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: enabled_plugins(), posts: recent_posts(40) }
 }
 
 // One block's HTML, from the renderer of the plugin that brings it.
@@ -29,38 +29,47 @@ fn render_block(b: map, ctx: map) {
     render == null ? <p.pb-missing>A block from a plugin that is switched off.</p> : render(b.config ?? {}, ctx)
 }
 
-let FONTS = {
-    system: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif",
-    serif: "Georgia, 'Iowan Old Style', 'Times New Roman', serif",
-    rounded: "ui-rounded, 'SF Pro Rounded', 'Nunito', system-ui, sans-serif",
-    mono: "ui-monospace, SFMono-Regular, Menlo, monospace",
+// A section's published blocks, in a page. Sections may hold sections; the
+// page rules refuse loops, and depth stops one made some other way.
+fn section_html(id, ctx: map) {
+    let depth = ctx.depth ?? 0
+    let s = depth >= 5 ? null : page_out(db.one("select * from pages where id = ? and kind = 'section'", int(str(id ?? "")) ?? 0))
+    if s == null || s.published == null {
+        return ctx.preview ? <p.pb-missing>{s == null ? "A section that no longer exists." : `“${s.title}” is not published yet.`}</p> : <div.pb-section></div>
+    }
+    let inner = merge(ctx, { depth: depth + 1 })
+    <div.pb-section>{for b in s.published.blocks ?? [] => render_block(b, inner)}</div>
 }
 
-// The theme as CSS variables. Its values were checked when saved (a colour
-// is #rrggbb, a font one of FONTS), and are checked again here, since they
-// go into a style sheet.
-fn theme_css(t: map) {
-    let ok = len(errors_of(validate("theme", t, { enabled: [] }))) == 0
-    let th = ok ? t : DEFAULT_THEME
-    `.site { --brand: ${th.color}; --site-font: ${FONTS[th.font] ?? FONTS.system}; }`
-}
+// The pages and sections that put a section in, in their draft or their
+// published version.
+fn pages_using(id: int) = db.query("select id, title, kind, draft, published from pages where id != ?", id)
+    | filter((r) => contains(section_ids(parsed(r.draft, {}).blocks) + section_ids(parsed(r.published, {}).blocks), str(id)))
+    | map((r) => { id: r.id, title: r.title, kind: r.kind, live: contains(section_ids(parsed(r.published, {}).blocks), str(id)) })
 
-view SitePage(page: map, blocks: list) =
-    <SiteLayout title={page.title} description={page.description}>
+view SitePage(page: map, blocks: list, theme = null) =
+    <SiteLayout title={page.title} description={page.description != "" ? page.description : page_summary(blocks)} {theme} image={first_image(blocks)}>
         {for b in blocks => render_block(b, render_ctx(false))}
     </SiteLayout>
 
-fn published_page(slug: str) = page_out(db.one("select * from pages where slug = ? and published is not null", slugify(slug)))
+fn published_page(slug: str) = page_out(db.one("select * from pages where slug = ? and kind = 'page' and published is not null", slugify(slug)))
 
-fn home_page() = page_out(db.one("select * from pages where home = 1 and published is not null"))
+fn home_page() = page_out(db.one("select * from pages where home = 1 and kind = 'page' and published is not null"))
 
 fn show_page(p: map) = <SitePage page={p} blocks={p.published.blocks ?? []}/>
 
-// What page rules see: the products for sale and the forms there are.
+// What page rules see: the products for sale, the forms there are, and the
+// sections (with the sections their published versions put in).
 fn page_ctx() = rule_ctx({
-    posts: recent_posts(1),
+    posts: db.query("select id, category from posts where status = 'published' order by published_at desc limit 200"),
     skus: db.query("select sku from products where active = 1") | map((r) => r.sku),
     forms: db.query("select slug from forms") | map((r) => r.slug),
+    sections: db.query("select id, title, published from pages where kind = 'section' order by title") | map((r) => {
+        id: str(r.id),
+        title: r.title != "" ? r.title : "Untitled",
+        published: r.published != null,
+        embeds: section_ids(parsed(r.published, {}).blocks),
+    }),
 })
 
 // ---- the designer's server functions ---------------------------------------------
@@ -68,11 +77,13 @@ fn page_ctx() = rule_ctx({
 server fn list_pages() {
     need_user()?
     db.query("select * from pages order by home desc, updated_at desc") | map(page_out)
+        | map((p) => p.kind == "section" ? merge(p, { used_on: pages_using(p.id) }) : p)
 }
 
 server fn get_page(id: int) {
     need_user()?
-    page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page")
+    let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
+    p.kind == "section" ? merge(p, { used_on: pages_using(id) }) : p
 }
 
 // Each block's HTML as visitors would see it, for the designer's preview.
@@ -105,14 +116,22 @@ server fn save_page(p: map) {
 server fn publish_page(id: int) {
     need_user()?
     let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
-    let record = merge(p.draft, { title: p.title, slug: p.slug })
+    let record = merge(p.draft, { id: str(p.id), kind: p.kind, title: p.title, slug: p.slug, description: p.description })
     refused("page", record, page_ctx())?
     db.exec("update pages set published = draft, published_at = ?, updated_at = ? where id = ?", now(), now(), id)
     page_out(db.one("select * from pages where id = ?", id))
 }
 
+// A section that published pages show stays published, and one that
+// pages put in is not deleted: they would show a gap.
+fn in_use(id: int, live_only: bool) {
+    let users = pages_using(id) | filter((u) => u.live || !live_only)
+    len(users) == 0 ? null : err(`Used on ${join(users | map((u) => u.title != "" ? `“${u.title}”` : "an untitled page"), ", ")}: take the section out of ${len(users) == 1 ? "that page" : "those pages"} first`)
+}
+
 server fn unpublish_page(id: int) {
     need_user()?
+    in_use(id, true)?
     db.exec("update pages set published = null, home = 0, updated_at = ? where id = ?", now(), id)
     true
 }
@@ -121,13 +140,14 @@ server fn set_home(id: int) {
     need_admin()?
     db.transaction(() => {
         db.exec("update pages set home = 0")
-        db.exec("update pages set home = 1 where id = ?", id)
+        db.exec("update pages set home = 1 where id = ? and kind = 'page'", id)
     })
     true
 }
 
 server fn delete_page(id: int) {
     need_admin()?
+    in_use(id, false)?
     db.exec("delete from pages where id = ?", id)
     true
 }
@@ -137,9 +157,28 @@ server fn page_rule_ctx() {
     page_ctx()
 }
 
+// A page's first words, for search results when it has no description.
+fn page_summary(blocks: list) {
+    let b = find(blocks, (b) => !blank((b.config ?? {}).text) || !blank((b.config ?? {}).body) || !blank((b.config ?? {}).headline))
+    let c = b == null ? {} : b.config
+    let text = !blank(c.text) ? c.text : !blank(c.body) ? c.body : c.headline ?? ""
+    let plain = split(replace(replace(replace(str(text), "#", ""), "*", ""), "\n", " "), " ") | filter((w) => w != "") | join(" ")
+    len(plain) > 155 ? `${slice(plain, 0, 152)}…` : plain
+}
+
+// The first picture a page shows, for link previews.
+fn first_image(blocks: list) {
+    let b = find(blocks, (b) => type_of((b.config ?? {}).image) == "map")
+    b == null ? "" : media_src(b.config.image, crop_text(b.config.image), 1280)
+}
+
 server fn save_theme(t: map) {
-    need_admin()?
-    let theme = { color: lower(trim(t.color ?? "")), font: t.font ?? "system", dark: t.dark == true, logo: trim(t.logo ?? "") }
+    need_designer()?
+    let links = (ls) => (ls ?? []) | map((l) => { label: trim(l.label ?? ""), link: trim(l.link ?? "") })
+    let theme = {
+        id: t.id ?? "clean", color: lower(trim(t.color ?? "")), font: t.font ?? "system", dark: t.dark == true, logo: trim(t.logo ?? ""),
+        menu: t.menu == null ? null : links(t.menu), footer: trim(t.footer ?? ""), footer_links: links(t.footer_links), css: t.css ?? "",
+    }
     refused("theme", theme, rule_ctx())?
     put_setting("theme", theme)
     theme
@@ -148,12 +187,13 @@ server fn save_theme(t: map) {
 server fn new_page(template: str) {
     need_user()?
     let t = page_template(template)
-    let base = slugify(t.title)
+    let kind = template == "section" ? "section" : "page"
+    let base = kind == "section" ? "section" : slugify(t.title)
     let taken = db.query("select slug from pages") | map((r) => r.slug)
-    let slug = contains(taken, base) ? `${base}-${len(taken) + 1}` : base
+    let slug = free_slug(taken, base, 1)
     let t0 = now()
-    db.exec("insert into pages (slug, title, description, draft, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
-        slug, t.title, t.description, json.stringify({ blocks: t.blocks }), t0, t0).last_id
+    db.exec("insert into pages (slug, title, description, draft, kind, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)",
+        slug, t.title, t.description, json.stringify({ blocks: t.blocks }), kind, t0, t0).last_id
 }
 
 // ---- templates ----------------------------------------------------------------------
@@ -175,6 +215,14 @@ fn page_template(kind: str) {
                 block("b2", "product", { product, button: "Buy now" }),
                 block("b3", "quote", { quote: "The best thing I bought this year.", name: "A happy customer" }),
                 block("b4", "form", { form, heading: "Be first to know" }),
+            ],
+        }
+        "section" => {
+            title: "Join us",
+            description: "",
+            blocks: [
+                block("b1", "text", { body: `## Stay in the loop\n\nThe best of ${name}, once a week. No spam, leave any time.` }),
+                block("b2", "form", { form, heading: "" }),
             ],
         }
         "membership" => {

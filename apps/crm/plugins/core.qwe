@@ -7,6 +7,9 @@ let TRIGGERS = [
     { event: "order_paid", label: "A product is bought" },
     { event: "tag_added", label: "A tag is added" },
     { event: "deal_won", label: "A deal is won" },
+    { event: "record_created", label: "A record is added (an object's)" },
+    { event: "record_updated", label: "A record is changed (an object's)" },
+    { event: "record_moved", label: "A record moves to another state" },
     { event: "manual", label: "Started by hand" },
 ]
 
@@ -110,6 +113,7 @@ let CORE_BLOCKS = [
         { key: "form", label: "Form", type: "form", required: true },
         { key: "heading", label: "Heading", type: "text" },
     ] },
+    { type: "section", label: "Section", group: "Layout", fields: [{ key: "section", label: "Section", type: "section", required: true }] },
 ]
 
 fn block_types(enabled: list) = active_plugins(enabled) | map((p) => p.blocks ?? []) | flatten
@@ -117,9 +121,17 @@ fn block_types(enabled: list) = active_plugins(enabled) | map((p) => p.blocks ??
 // A link a page may have: a page here, a web address, an email.
 fn link_ok(l) = blank(l) || starts_with(l, "/") || starts_with(l, "https://") || starts_with(l, "http://") || starts_with(l, "mailto:") || starts_with(l, "#")
 
+// The sections a page's blocks put in (their ids, as text).
+fn section_ids(blocks) = (blocks ?? []) | filter((b) => b.type == "section") | map((b) => str((b.config ?? {}).section ?? "")) | filter((x) => x != "")
+
+// Whether the sections `from` put in, or theirs in turn, include `target`.
+fn reaches(sections: list, from: list, target: str, depth: int) =
+    depth < 10 && any(from, (x) => x == target || reaches(sections, (find(sections, (s) => s.id == x) ?? {}).embeds ?? [], target, depth + 1))
+
 let page_rules = [
     (pg, ctx) => when(blank(pg.title), problem("title", "Give the page a title")),
-    (pg, ctx) => when(len(pg.title ?? "") > 60, warning("title", "Search results show about 60 characters")),
+    (pg, ctx) => when(pg.kind != "section" && len(pg.title ?? "") > 60, warning("title", "Search results show about 60 characters")),
+    (pg, ctx) => when(pg.kind != "section" && blank(pg.description), warning("description", "Describe the page for search results (else its first words are used)")),
     (pg, ctx) => blank(pg.slug) ? problem("slug", "Choose its address")
         : slugify(pg.slug) != pg.slug ? problem("slug", "Lowercase letters, digits and dashes")
         : [],
@@ -147,7 +159,17 @@ let page_rules = [
                 when(!inside, problem(key, `${t.label}: the crop is outside the image`))
                     + when(blank(c.alt) && blank(v.alt), b.type == "image" ? problem(key, "Image: describe it for screen readers (here, or in Media)") : warning(key, `${t.label}: describe the image for screen readers`))
             }) | flatten
-            missing + links + urls + products + forms + images
+            // Sections: one that is published, and that does not put this one in.
+            let me = str(pg.id ?? "")
+            let sections = (t.fields ?? []) | filter((f) => f.type == "section" && !blank(c[f.key])) | map((f) => {
+                let s = find(ctx.sections ?? [], (x) => x.id == str(c[f.key]))
+                s == null ? problem(key, `${t.label}: that section no longer exists`)
+                    : s.id == me ? problem(key, `${t.label}: a section cannot be put in itself`)
+                    : reaches(ctx.sections ?? [], s.embeds, me, 0) ? problem(key, `${t.label}: “${s.title}” already has this ${pg.kind == "section" ? "section" : "page"} in it`)
+                    : !s.published ? problem(key, `${t.label}: publish “${s.title}” first`)
+                    : []
+            }) | flatten
+            missing + links + urls + products + forms + images + sections
         }
     }) | flatten,
 ]
@@ -158,6 +180,14 @@ let theme_rules = [
         when(len(hex) != 7 || hex[0] != "#" || !all(drop(hex, 1), (ch) => contains("0123456789abcdef", ch)), problem("color", "A colour like #4f46e5"))
     },
     (t, ctx) => when(!blank(t.logo) && !starts_with(t.logo, "https://") && !starts_with(t.logo, "/"), problem("logo", "An https:// address")),
+    (t, ctx) => when(!blank(t.font) && !contains(["system", "serif", "rounded", "mono"], t.font), problem("font", "Choose a font")),
+    (t, ctx) => ((t.menu ?? []) + (t.footer_links ?? [])) | map((l) =>
+        when(blank(l.label), problem("menu", "Every link needs a label"))
+            + when(blank(l.link) || !link_ok(l.link), problem("menu", `“${l.label}”: a link starts with /, https:// or mailto:`))) | flatten,
+    (t, ctx) => when(len(t.menu ?? []) > 12, warning("menu", "A long menu: visitors read about seven")),
+    (t, ctx) => when(contains(t.css ?? "", "<"), problem("css", "CSS cannot contain <")),
+    (t, ctx) => when(len(t.css ?? "") > 20000, problem("css", "At most 20,000 characters of CSS")),
+    (t, ctx) => when(len(t.footer ?? "") > 300, problem("footer", "At most 300 characters")),
     (t, ctx) => when(!contains(["system", "serif", "rounded", "mono"], t.font ?? "system"), problem("font", "Choose a font")),
 ]
 
@@ -198,16 +228,44 @@ let plugin_core = {
             (p, ctx) => when(p.price_cents == null || p.price_cents < 0, problem("price", "A price, zero or more")),
             (p, ctx) => when(p.kind == "subscription" && !contains(["month", "year"], p.interval ?? ""), problem("interval", "A subscription renews every month or year")),
             (p, ctx) => when(p.stock != null && p.stock < 0, problem("stock", "Stock cannot be below zero")),
+            (p, ctx) => when(p.compare_at_cents != null && p.compare_at_cents <= (p.price_cents ?? 0), problem("compare_at", "The price before is more than the price")),
+            (p, ctx) => when(len(p.images ?? []) > 8, problem("images", "At most 8 pictures")),
+            (p, ctx) => {
+                let vs = p.variants ?? []
+                let names = vs | map((v) => lower(trim(v.name ?? "")))
+                when(any(names, (n) => n == ""), problem("variants", "Every variant needs a name"))
+                    + when(len(unique(names)) != len(names), problem("variants", "Two variants have the same name"))
+                    + when(any(vs, (v) => v.stock != null && v.stock < 0), problem("variants", "Stock cannot be below zero"))
+                    + when(any(vs, (v) => contains(v.name ?? "", "~")), problem("variants", "A variant's name cannot have ~"))
+                    + when(len(vs) > 0 && blank(p.variant_label), warning("variant_label", "Name what they are: Size, Colour…"))
+            },
+            (p, ctx) => when(len(p.images ?? []) == 0 && p.active != false, warning("images", "Products with a picture sell better")),
+            (p, ctx) => blank(p.category) || slugify(p.category) == lower(trim(p.category)) ? [] : warning("category", `Saved as “${slugify(p.category)}”`),
         ],
-        // A purchase, as the checkout page has it: ctx.product and ctx.today.
+        // A discount code.
+        discount: [
+            (d, ctx) => {
+                let code = upper(trim(d.code ?? ""))
+                when(len(code) < 3 || len(code) > 20 || slugify(code) != lower(code) || contains(code, "-"), problem("code", "3 to 20 letters and digits"))
+            },
+            (d, ctx) => when(!contains(["percent", "amount", "shipping"], d.kind ?? ""), problem("kind", "Choose what it gives")),
+            (d, ctx) => when(d.kind == "percent" && (d.value == null || d.value < 1 || d.value > 100), problem("value", "From 1 to 100 percent")),
+            (d, ctx) => when(d.kind == "amount" && (d.value == null || d.value < 1), problem("value", "An amount off")),
+            (d, ctx) => when(d.min_cents != null && d.min_cents < 0, problem("min", "Zero or more")),
+            (d, ctx) => when(d.max_uses != null && d.max_uses < 1, problem("max_uses", "At least once, or empty for no limit")),
+        ],
+        // A purchase, as the checkout page has it: its items ({ sku, name,
+        // qty }), and ctx.stock (by sku), ctx.ships and ctx.today.
         checkout: [
             (o, ctx) => when(blank(o.name), problem("name", "Your name, please")),
             (o, ctx) => when(!is_email(o.email), problem("email", "An email address for the receipt")),
-            (o, ctx) => when(o.qty == null || o.qty < 1 || o.qty > 99, problem("qty", "Between 1 and 99")),
-            (o, ctx) => {
-                let p = ctx.product ?? {}
-                when(p.stock != null && (o.qty ?? 1) > p.stock, problem("qty", p.stock == 0 ? "Sold out" : `Only ${p.stock} left`))
-            },
+            (o, ctx) => when(len(o.items ?? []) == 0, problem("items", "Your cart is empty")),
+            (o, ctx) => (o.items ?? []) | map((i) => {
+                let stock = (ctx.stock ?? {})[i.sku]
+                when(i.qty == null || i.qty < 1 || i.qty > 99, problem("qty", `${i.name}: between 1 and 99`))
+                    + when(stock != null && (i.qty ?? 1) > stock, problem("qty", stock == 0 ? `${i.name} is sold out` : `${i.name}: only ${stock} left`))
+            }) | flatten,
+            (o, ctx) => when(ctx.ships == true && len(trim(o.address ?? "")) < 10, problem("address", "Where should we send it?")),
             (o, ctx) => {
                 let digits = card_digits(o.card)
                 when(len(digits) < 13 || len(digits) > 19 || !luhn_ok(digits), problem("card", "That card number is not valid"))
@@ -237,6 +295,8 @@ let plugin_core = {
         theme: theme_rules,
     },
     blocks: CORE_BLOCKS,
+    themes: CORE_THEMES,
+    notices: CORE_NOTICES,
     steps: [
         { type: "send_email", label: "Send email", group: "Message", outputs: ["out"], fields: [
             { key: "subject", label: "Subject", type: "text", required: true },
@@ -263,6 +323,16 @@ let plugin_core = {
         { type: "add_tag", label: "Add tag", group: "Contact", outputs: ["out"], fields: [{ key: "tag", label: "Tag", type: "text", required: true }] },
         { type: "remove_tag", label: "Remove tag", group: "Contact", outputs: ["out"], fields: [{ key: "tag", label: "Tag", type: "text", required: true }] },
         { type: "set_stage", label: "Set stage", group: "Contact", outputs: ["out"], fields: [{ key: "stage", label: "Stage", type: "select", required: true, options: STAGES }] },
+        { type: "ask", label: "Ask a group or a role", group: "Team", outputs: ["approved", "rejected"], fields: [
+            { key: "title", label: "What they decide", type: "text", required: true },
+            { key: "details", label: "Details", type: "textarea" },
+            { key: "group", label: "Group", type: "group" },
+            { key: "role", label: "Or anyone with the role", type: "role" },
+            { key: "days", label: "With no answer after (days), it leaves by “rejected”", type: "number" },
+        ] },
+        { type: "move_record", label: "Move the record", group: "Team", outputs: ["out"], fields: [
+            { key: "to", label: "To state (its name)", type: "text", required: true },
+        ] },
         { type: "create_task", label: "Create task", group: "Team", outputs: ["out"], fields: [
             { key: "title", label: "Task", type: "text", required: true },
             { key: "due_days", label: "Due in (days)", type: "number" },

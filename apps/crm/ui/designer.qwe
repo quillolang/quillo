@@ -42,6 +42,8 @@ fn trigger_label(c: map) {
         "form_submitted" => blank(c.form) ? base : `${base}: ${c.form}`
         "order_paid" => blank(c.product) ? base : `${base}: ${c.product}`
         "tag_added" => blank(c.tag) ? base : `${base}: #${c.tag}`
+        "record_created" => blank(c.object) ? base : `${base}: ${c.object}`
+        "record_updated" => blank(c.object) ? base : `${base}: ${c.object}`
         _ => base
     }
 }
@@ -268,7 +270,7 @@ component FlowDesigner(id: int, ws: map) {
                         @click={() => { if starts_with(p.field, "node.") { selected = slice(p.field, 5) } }}>{p.message}</li>}</ul>}
                     <h3>Try it</h3>
                     <div.inline>
-                        <select @change={(e) => { run_for = e.value }}>
+                        <select aria-label="Contact to run it for" @change={(e) => { run_for = e.value }}>
                             <option value="">Run for a contact…</option>
                             {for c in contacts => <option value={str(c.id)}>{c.name}</option>}
                         </select>
@@ -302,12 +304,16 @@ view StepEditor(node: map, type: map, ws: map, problems: list, on_change, on_rem
                 {c.event == "form_submitted" && <SelectField label="Form" field="form" value={c.form} options={ws.forms | map((x) => { value: x.slug, label: x.name })} problems={[]} on_change={put_key("form")} empty="Any form"/>}
                 {c.event == "order_paid" && <SelectField label="Product" field="product" value={c.product} options={ws.skus | map((x) => { value: x.sku, label: x.name })} problems={[]} on_change={put_key("product")} empty="Any product"/>}
                 {c.event == "tag_added" && <TextField label="Tag" field="tag" value={c.tag} problems={[]} on_change={put_key("tag")}/>}
+                {(c.event == "record_created" || c.event == "record_updated" || c.event == "record_moved") && <SelectField label="Object" field="object" value={c.object} options={(ws.objects ?? []) | map((o) => { value: o.key, label: o.plural })} problems={[]} on_change={put_key("object")} empty="Any object"/>}
+                {c.event == "record_moved" && <SelectField label="To state" field="to" value={c.to} options={((find(ws.objects ?? [], (o) => o.key == c.object) ?? {}).states ?? []) | map((st) => { value: st.key, label: st.label })} problems={[]} on_change={put_key("to")} empty="Any state"/>}
             </div>
             : <div.stack>{for fd in type.fields ?? [] => match fd.type {
                 "textarea" => <AreaField label={fd.label} field={fd.key} value={c[fd.key]} problems={[]} on_change={put_key(fd.key)} rows={6}/>
                 "select" => <SelectField label={fd.label} field={fd.key} value={c[fd.key]} options={fd.options ?? []} problems={[]} on_change={put_key(fd.key)} empty="Choose"/>
                 "product" => <SelectField label={fd.label} field={fd.key} value={c[fd.key]} options={ws.skus | map((x) => { value: x.sku, label: x.name })} problems={[]} on_change={put_key(fd.key)} empty="Any / choose"/>
                 "number" => <TextField label={fd.label} field={fd.key} value={c[fd.key]} problems={[]} on_change={put_key(fd.key)} type="number"/>
+                "group" => <SelectField label={fd.label} field={fd.key} value={c[fd.key]} options={(ws.groups ?? []) | map((g) => { value: str(g.id), label: g.name })} problems={[]} on_change={put_key(fd.key)} empty="Choose a group"/>
+                "role" => <SelectField label={fd.label} field={fd.key} value={c[fd.key]} options={(ws.roles ?? []) | map((r) => { value: str(r.id), label: r.name })} problems={[]} on_change={put_key(fd.key)} empty="Choose a role"/>
                 _ => <TextField label={fd.label} field={fd.key} value={c[fd.key]} problems={[]} on_change={put_key(fd.key)}/>
             }}</div>}
         {node.type != "trigger" && <button.danger @click={() => { on_remove() }}>Remove step</button>}

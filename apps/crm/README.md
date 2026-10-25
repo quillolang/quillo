@@ -18,11 +18,17 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | | |
 |---|---|
 | **People** | Contacts with stages, tags, consent and custom fields; companies; a timeline of everything that happened to each; notes and tasks; CSV import (each row checked by the rules) and export. |
-| **Sales** | Pipelines with stages, a board you drag deals across; products (one-time and subscriptions), a public shop at `/shop` with a checkout, orders, refunds. |
+| **Sales** | Pipelines with stages, a board you drag deals across; products (one-time and subscriptions) with pictures, categories, sale prices and variants (sizes, colours: each with its stock and price); a shop at `/shop` (by category, searched, sorted), a page per product, a cart, discount codes, shipping, a checkout; orders, refunds that restock. |
 | **Marketing** | Public sign-up forms at `/f/<form>`, campaigns written in Markdown to all subscribers or a tag, an outbox, signed unsubscribe links. |
-| **Pages** | Landing pages and a home page, made of blocks in a designer: a palette of the blocks the plugins switched on bring, a live preview rendered as visitors will see it, drag to reorder, settings per block; a theme (colour, font, dark, logo) per workspace; drafts, and publishing when the page rules pass. |
-| **Blog** | Posts with covers, tags and members-only posts at `/blog`, an RSS feed, and the latest posts on any page (the Blog plugin). |
+| **Pages** | Landing pages and a home page, made of blocks in a designer: a palette of the blocks the plugins switched on bring, a live preview rendered as visitors will see it, drag to reorder, settings per block; sections made once and put on many pages; drafts, and publishing when the page rules pass. |
+| **Theme** | Themes from plugins (Clean, Editorial, Boutique, Journal from the core), each with its header and width; colour, font, dark, logo; the menu and the footer; CSS of your own in a highlighting editor; the site shown as it will look while you change it. Every public page (pages, blog, shop, forms) is in it, with link previews, a sitemap and robots.txt. |
+| **Blog** | Posts with covers, categories, tags and members-only posts at `/blog`; search, author pages, reading time, related posts, sharing, readers' comments (checked by the comment rules, approved by a moderator); code in posts highlighted; an RSS feed; news blocks for any page: top stories, a category's row, most read, breaking news (the Blog plugin). |
 | **Flows** | A designer: drag steps, connect their ports, branch on conditions, wait, offer a product and wait for the purchase. Runs show step by step, and can be started by hand for a contact. |
+| **Objects** | Kinds of records of your own (vehicles, events, tickets…), designed in the app: fields of every type, links to contacts, companies and other objects' records, lookups (a field of what a link leads to, kept up to date), rules made without code (both sides), rule scripts on fields (on the server), templates to start from; each object's records in the menu, with a list, a page per record, CSV export, and flows that start when one is added or changed. |
+| **Desks** | Each category of posts can have its own editors, reviewers and publishers, and the approvals a post needs: draft → review → approved → published, with changes asked for by note, mail at each step, and a queue of what waits for you. |
+| **Questions and notes** | The app asks before it deletes, and tells you what it did, in dialogs and notes on the page (`ask`, `notify`), in a notice style plugins bring (Standard, Quiet; Glass and Bold from the Notice styles plugin): where they open and how they look. |
+| **Roles and groups** | Roles: what each may do with each object (see, edit, delete), each field (edit, read, hidden), and an access script deciding which records they see. Groups: people who work together, who get the group's roles and are what it is on the team (designers, writers, reviewers, publishers). |
+| **States** | Objects have states and the moves between them: each move for some groups or roles, with a form of the fields it needs; the state changes by a move and nothing else. Flows start when a record moves, ask a group or a role to decide (approved / rejected), and move records. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
 
 Payments run in test mode (`4242 4242 4242 4242` pays, `4000 0000 0000 0002` is
@@ -41,11 +47,13 @@ lib/commerce.qwe    products, the price quote, checkout, orders
 lib/marketing.qwe   forms, campaigns, the outbox
 lib/flows.qwe       the flow engine: fire, walk, waits, steps, templates
 lib/workspace.qwe   signing up, presets, settings, fields, pipelines, team
-lib/pages.qwe       pages: drafts, publishing, the theme, rendering blocks
+lib/site.qwe        the frame of public pages: themes, menu, footer, sitemap
+lib/pages.qwe       pages and sections: drafts, publishing, rendering blocks
 lib/media.qwe       images: uploads, crops, the sizes pages use
 lib/blog.qwe        the blog: posts, /blog, readers, the feed
 plugins/*.qwe       core (always on) and the optional plugins
 plugins/core_blocks.qwe   how the core's page blocks look
+plugins/core_themes.qwe   the core's themes
 ui/*.qwe            the pages: public ones, the app, the flow and page designers
 ```
 
@@ -99,6 +107,29 @@ sent to their email (the same answer for any address, so the form does not tell 
 a reader). A published post can become a campaign to subscribers. Its "Latest posts"
 block puts the newest posts on any page, such as the home page.
 
+### Themes
+
+A theme is plugin data, like a block: `{ id, name, description, header, width, color,
+font, css }`. `header` lays out the top of every page (`bar`, `center`, `masthead` with
+the date and a menu bar, `split` with the cart on the right); `css` is scoped to
+`.theme-<id>`. A workspace picks a theme and overrides its colour and font, sets its
+logo, menu and footer, and may add CSS of its own, which is nested in `.site` so it
+styles the site and nothing else (and cannot contain `<`). Switching off the plugin a
+theme came from goes back to Clean; the Plugins page says so first, as it does for the
+pages and flows a plugin's blocks and steps are in.
+
+### The shop
+
+Products have pictures (from Media), a category, a price before (shown struck through)
+and stock; digital products and subscriptions are not shipped. The cart is in the
+visitor's session and its forms work without JavaScript. `quote_lines` computes a cart's
+subtotal, discount (a percentage, an amount, or free shipping, from a code with a minimum
+and a number of uses), shipping (one rate, free over an amount) and tax (from plugins) —
+the cart and the checkout show it, and the server charges it. Paying takes the stock,
+counts the code's use, and starts the purchase flows for each product. A product in
+variants asks which on its page; the cart keeps each variant apart (`sku~variant`), and
+paying and refunding count each one's stock.
+
 ### Images
 
 Media keeps a workspace's images: uploaded from the library or from any image setting
@@ -119,6 +150,28 @@ leaving by a port (`out`, or `yes`/`no`). Steps that wait park the run; the job 
 carries on those waiting for it. A contact is in a flow once at a time, and a run
 stops after 100 steps. A flow can be switched on only when the flow rules find no
 errors — the same rules the designer shows.
+
+### Objects, roles and scripts
+
+Each object's records are a table of their own, `o_<object>`, with a column per field,
+`f_<field>`, typed as the field is: numbers, yes/no as 0 or 1, links as references to
+the contacts, companies or records they lead to (indexed). Designing the object changes
+its table — a field added is a column added, a field removed a column dropped, a unique
+field a unique index the database keeps — and a field's type stays as it was made. Table
+and column names go into SQL with `sql_name`, which takes only letters, digits and `_`.
+Records from before tables (one shared table, values as JSON) are copied in once, ids
+kept; the old rows stay as a backup.
+
+An object's fields are custom fields (`obj.<key>`); a record's values are checked by
+`validate("obj.<key>", record, ctx)`: its fields' types, the rules made in the designer
+(`{ if, then, message, warning }`, data both sides run), and any plugin's rules for that
+kind. A field's **rule script** and a role's **access script** are Quillo that the
+workspace writes and the server runs with `run_script`: in a sandbox, they see only the
+values they are given (`value`, `record`, `user`, `today`, and helpers such as
+`others_with(field, value)`) and builtins that compute — no database, files, network or
+clock — and stop after 20,000 steps. A rule script gives `true` (or null) when the value
+is fine, `false` or a message when not; forms show its answer as you type, and saving is
+refused while it has one. An access script gives `true` for the records a role sees.
 
 ## Writing a plugin
 
@@ -184,6 +237,10 @@ CRM_DEVELOPERS=ada@example.com,linus@example.com quillo run apps/crm/main.qwe --
   every form. Other workspaces keep the released version.
 - **Release** makes the draft the plugin's next version for every workspace; they
   switch it on in Plugins, like the built-in ones.
+- **Live**: the editor highlights the code as you type, checks it when you pause (the
+  problems on their lines), and saves the draft whenever it checks; once the program has
+  loaded it, the preview beside the code shows the plugin's blocks with sample settings
+  (a field's `example`, or one of its kind).
 - The program takes up what is saved by loading itself again: run it with `--watch`
   (development) or `--reload` (production). Studio plugins are files in
   `plugins/studio/`, to keep in version control with the rest.

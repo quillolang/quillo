@@ -32,12 +32,73 @@ fn active_plugins(enabled: list) {
 // Where a plugin's renderers and runners are found: its version's key.
 fn plugin_key(p) = p.status == "draft" ? `${p.id}#draft` : p.id
 
+// A custom object's records (kind "obj.<key>") also get the checks their
+// fields bring and the rules made for them in the object designer.
 fn validate(kind: str, record: map, ctx: map) =
-    active_plugins(ctx.enabled ?? [])
+    (starts_with(kind, "obj.") ? field_rules(record, ctx, kind) + object_rules(kind, record, ctx) : [])
+    + (active_plugins(ctx.enabled ?? [])
         | map((p) => p.rules[kind] ?? [])
         | flatten
         | map((rule) => rule(record, ctx))
-        | flatten
+        | flatten)
+
+// ---- rules made in the object designer ---------------------------------------------
+//
+// A rule is data: `{ if, then, message, warning }`, each condition
+// `{ field, op, value }`. When `if` holds (or there is none) and `then`
+// does not, the record has a problem at `then`'s field. A value that
+// starts with `@` is another field's (`end` after `@start`).
+
+let RULE_OPS = ["is filled", "is empty", "is", "is not", "more than", "at least", "less than", "at most", "after", "before", "longer than", "shorter than"]
+
+fn rule_value(v, values: map) {
+    let s = str(v ?? "")
+    starts_with(s, "@") ? values[slice(s, 1)] : v
+}
+
+fn as_number(v) {
+    let n = float(str(v ?? ""))
+    is_err(n) ? null : n
+}
+
+fn holds(c, values: map) {
+    if c == null || blank(c.field) { return true }
+    let v = values[c.field]
+    let w = rule_value(c.value, values)
+    let n = as_number(v)
+    let m = as_number(w)
+    match c.op {
+        "is filled" => !blank(v)
+        "is empty" => blank(v)
+        "is" => lower(str(v ?? "")) == lower(str(w ?? ""))
+        "is not" => lower(str(v ?? "")) != lower(str(w ?? ""))
+        "more than" => blank(v) || (n != null && m != null && n > m)
+        "at least" => blank(v) || (n != null && m != null && n >= m)
+        "less than" => blank(v) || (n != null && m != null && n < m)
+        "at most" => blank(v) || (n != null && m != null && n <= m)
+        "after" => blank(v) || blank(w) || str(v) > str(w)
+        "before" => blank(v) || blank(w) || str(v) < str(w)
+        "longer than" => len(str(v ?? "")) > (int(str(w ?? "0")) ?? 0)
+        "shorter than" => len(str(v ?? "")) < (int(str(w ?? "0")) ?? 0)
+        _ => true
+    }
+}
+
+fn object_rules(kind: str, record: map, ctx: map) {
+    let o = find(ctx.objects ?? [], (x) => `obj.${x.key}` == kind)
+    // `state` reads as a field: "If State is assigned, then Deadline is filled".
+    let values = merge(record.fields ?? {}, { state: record.state ?? "" })
+    (o == null ? [] : o.rules ?? []) | map((r) =>
+        !holds(r.if, values) || r.then == null || holds(r.then, values) ? []
+        : r.warning == true ? warning(`fields.${r.then.field}`, r.message ?? "Check this")
+        : problem(`fields.${r.then.field}`, r.message ?? "Check this")) | flatten
+}
+
+// A rule in words, for the designer's list.
+fn rule_text(r: map, label_of) {
+    let cond = (c) => c == null || blank(c.field) ? "" : `${label_of(c.field)} ${c.op}${contains(["is filled", "is empty"], c.op) ? "" : ` ${starts_with(str(c.value ?? ""), "@") ? label_of(slice(str(c.value), 1)) : str(c.value ?? "")}`}`
+    `${r.if == null || blank(r.if.field) ? "Always" : `If ${cond(r.if)}`}: ${cond(r.then)}`
+}
 
 fn errors_of(problems: list) = problems | filter((p) => p.level != "warning")
 
@@ -64,6 +125,11 @@ fn field_rules(record: map, ctx: map, entity: str) {
                 "date" => when(parse_day(str(v)) == null, problem(key, `${f.label} must be a date (YYYY-MM-DD)`))
                 "select" => when(len(f.options ?? []) > 0 && !contains(f.options, str(v)), problem(key, `${f.label}: choose one of ${join(f.options, ", ")}`))
                 "url" => when(!starts_with(str(v), "https://") && !starts_with(str(v), "http://"), problem(key, `${f.label} must be a web address`))
+                "money" => when(is_err(float(str(v))), problem(key, `${f.label} must be an amount`))
+                "email" => when(!is_email(str(v)), problem(key, `${f.label} must be an email address`))
+                "contact" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a contact`))
+                "company" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a company`))
+                "record" => when(is_err(int(str(v))), problem(key, `${f.label}: choose one`))
                 _ => []
             }
         }

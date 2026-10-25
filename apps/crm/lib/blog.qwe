@@ -9,6 +9,7 @@ fn post_out(r) = r == null ? null : merge(r, {
     tags: parsed(r.tags, []),
     cover: r.cover == "" ? null : parsed(r.cover, null),
     members_only: r.members_only == 1,
+    featured: r.featured == 1,
 })
 
 fn recent_posts(n: int) = db.query("select * from posts where status = 'published' order by published_at desc limit ?", n) | map(post_out)
@@ -28,33 +29,56 @@ server fn get_post(id: int) {
 server fn new_post() {
     let u = need_user()?
     let taken = db.query("select slug from posts") | map((r) => r.slug)
-    let slug = contains(taken, "untitled") ? `untitled-${len(taken) + 1}` : "untitled"
+    let slug = free_slug(taken, "untitled", 1)
     db.exec("insert into posts (slug, title, author_id, created_at, updated_at) values (?, '', ?, ?, ?)", slug, u.id, now(), now()).last_id
 }
 
 // Saving keeps what is written; publishing checks it with the post rules.
-server fn save_post(p: map) {
+server fn post_categories_all() {
     need_user()?
+    db.query("select distinct category from posts where category != '' order by category") | map((r) => r.category)
+}
+
+server fn save_post(p: map) {
+    let u = need_user()?
+    let before = (post_out(db.one("select * from posts where id = ?", p.id)) ?? err("No such post"))?
+    // The desks: who may edit it, in the category it is in and the one it goes to.
+    if !post_can(u, before).edit { return err({ problems: problem("", `Only the ${desk_name(desk_for(before.category))}'s editors edit this post`) }) }
+    let moved = merge(before, { category: slugify(p.category ?? "") })
+    if !post_can(u, moved).edit { return err({ problems: problem("category", `Only the ${desk_name(desk_for(moved.category))}'s editors write in ${moved.category}`) }) }
     let slug = slugify(p.slug ?? "")
     if slug == "" { return err({ problems: problem("slug", "Choose its address") }) }
     if db.one("select id from posts where slug = ? and id != ?", slug, p.id) != null { return err({ problems: problem("slug", "Another post has this address") }) }
-    db.exec("update posts set slug = ?, title = ?, excerpt = ?, body = ?, cover = ?, tags = ?, description = ?, members_only = ?, updated_at = ? where id = ?",
+    db.exec("update posts set slug = ?, title = ?, excerpt = ?, body = ?, cover = ?, tags = ?, description = ?, members_only = ?, category = ?, featured = ?, updated_at = ? where id = ?",
         slug, trim(p.title ?? ""), trim(p.excerpt ?? ""), p.body ?? "", p.cover == null ? "" : json.stringify(p.cover),
-        json.stringify(clean_tags(p.tags)), trim(p.description ?? ""), p.members_only == true ? 1 : 0, now(), p.id)
+        json.stringify(clean_tags(p.tags)), trim(p.description ?? ""), p.members_only == true ? 1 : 0, slugify(p.category ?? ""), p.featured == true ? 1 : 0, now(), p.id)
+    // A change after it went for review clears its approvals: this version is reviewed again.
+    let after = post_out(db.one("select * from posts where id = ?", p.id))
+    let changed = after.title != before.title || after.body != before.body || after.excerpt != before.excerpt || after.category != before.category || after.cover != before.cover
+    if changed && contains(["review", "approved"], before.stage) {
+        db.exec("update posts set stage = 'review', submitted_at = ? where id = ?", now(), p.id)
+        note_review(p.id, u, "submitted", "changed after it went for review")
+    }
     post_out(db.one("select * from posts where id = ?", p.id))
 }
 
 server fn publish_post(id: int) {
-    need_user()?
+    let u = need_user()?
     let p = (post_out(db.one("select * from posts where id = ?", id)) ?? err("No such post"))?
     refused("post", p, rule_ctx())?
-    db.exec("update posts set status = 'published', published_at = coalesce(published_at, ?), updated_at = ? where id = ?", now(), now(), id)
+    let can = post_can(u, p)
+    if !can.publish { return err({ problems: problem("", can.why != "" ? can.why : "Send it for review first") }) }
+    db.exec("update posts set status = 'published', stage = 'published', published_at = coalesce(published_at, ?), updated_at = ? where id = ?", now(), now(), id)
+    if can.desk != null { note_review(id, u, "published", "") }
     post_out(db.one("select * from posts where id = ?", id))
 }
 
 server fn unpublish_post(id: int) {
-    need_user()?
-    db.exec("update posts set status = 'draft', updated_at = ? where id = ?", now(), id)
+    let u = need_user()?
+    let p = (post_out(db.one("select * from posts where id = ?", id)) ?? err("No such post"))?
+    let d = desk_for(p.category ?? "")
+    if d != null && !on_desk(d, u, "publishers") { return err(`Only the ${desk_name(d)}'s publishers unpublish`) }
+    db.exec("update posts set status = 'draft', stage = 'draft', submitted_at = null, updated_at = ? where id = ?", now(), id)
     true
 }
 
@@ -75,6 +99,37 @@ server fn post_to_campaign(id: int) {
     let p = (post_out(db.one("select * from posts where id = ? and status = 'published'", id)) ?? err("Publish the post first"))?
     let body = `Hi {{first_name}},\n\n${p.excerpt != "" ? p.excerpt : "There is a new post on the blog."}\n\n[Read “${p.title}”](${site_url()}/blog/${p.slug})`
     db.exec("insert into campaigns (name, subject, body, audience, created_at) values (?, ?, ?, ?, ?)", `Post: ${p.title}`, p.title, body, json.stringify({ tag: "" }), now()).last_id
+}
+
+// ---- comments ------------------------------------------------------------------------
+
+fn approved_comments(post_id: int) = db.query("select name, body, created_at from comments where post_id = ? and status = 'approved' order by created_at", post_id)
+
+// A reader's comment: checked by the comment rules, kept for a moderator.
+// `website` is a field people do not see: bots fill it in.
+server fn post_comment(slug: str, c: map) {
+    let p = (db.one("select id, title from posts where slug = ? and status = 'published'", slugify(slug)) ?? err("No such post"))?
+    if !blank(c.website) { return { waiting: true } }
+    let comment = { name: trim(c.name ?? ""), email: lower(trim(c.email ?? "")), body: trim(c.body ?? "") }
+    refused("comment", comment, rule_ctx())?
+    let who = db.one("select id from contacts where lower(email) = ?", comment.email)
+    db.exec("insert into comments (post_id, contact_id, name, email, body, created_at) values (?, ?, ?, ?, ?, ?)",
+        p.id, who == null ? null : who.id, comment.name, comment.email, comment.body, now())
+    if who != null { note_activity("comment", who.id, null, `Commented on “${p.title}”`) }
+    { waiting: true }
+}
+
+server fn list_comments(status: str) {
+    need_user()?
+    db.query("select c.*, p.title as post, p.slug from comments c join posts p on p.id = c.post_id where (? = '' or c.status = ?) order by c.created_at desc limit 300", status, status)
+}
+
+server fn moderate_comment(id: int, status: str) {
+    need_user()?
+    if status == "delete" { db.exec("delete from comments where id = ?", id) }
+    else if contains(["approved", "spam", "pending"], status) { db.exec("update comments set status = ? where id = ?", status, id) }
+    else { return err("Approve, spam or delete") }
+    true
 }
 
 // ---- readers -----------------------------------------------------------------------
@@ -102,48 +157,41 @@ fn send_reader_link(email: str, back: str) {
 
 // ---- the public pages ----------------------------------------------------------------
 
-fn site_nav() = [["/shop", "Shop"]] + (blog_on() ? [["/blog", "Blog"]] : [])
-
-view SiteLayout(title: str, description: str, children) {
-    let s = settings()
-    let theme = theme_of(s)
-    let site = s.name ?? ""
-    <html lang="en">
-        <head>
-            <meta charset="utf-8"/>
-            <meta name="viewport" content="width=device-width, initial-scale=1"/>
-            <title>{title == "" ? site : `${title} · ${site}`}</title>
-            {description != "" && <meta name="description" content={description}/>}
-            {blog_on() && <link rel="alternate" type="application/rss+xml" title={site} href="/blog/feed.xml"/>}
-            <link rel="stylesheet" href="/assets/app.css"/>
-            <style>{theme_css(theme)}</style>
-        </head>
-        <body class={theme.dark ? "site dark" : "site"}>
-            <header.site-head>
-                <a.site-brand href="/">{theme.logo != "" ? <img src={theme.logo} alt={site}/> : <b>{site}</b>}</a>
-                <nav>{for l in site_nav() => <a href={l[0]}>{l[1]}</a>}</nav>
-            </header>
-            <main.site-main>{children}</main>
-            <footer.site-foot>© {site}{blog_on() && <span> · <a href="/blog/feed.xml">RSS</a></span>}</footer>
-        </body>
-    </html>
-}
-
 let POSTS_PER_PAGE = 9
 
-fn blog_index(tag: str, page: int) {
+fn post_categories() = db.query("select category as slug, count(*) as n from posts where status = 'published' and category != '' group by category order by category")
+
+// A list of posts: all of them, or a tag's, a category's, an author's, or
+// those a search finds; a page at a time.
+fn blog_index(tag: str, page: int, theme = null, category: str = "", q: str = "", author: int = 0) {
     let t = slugify(tag)
-    let all = db.query("select * from posts where status = 'published' order by published_at desc") | map(post_out) | filter((p) => t == "" || contains(p.tags, t))
+    let cat = slugify(category)
+    let words = lower(trim(q))
+    let who = author == 0 ? null : db.one("select id, name, bio from users where id = ?", author)
+    let all = db.query("select * from posts where status = 'published' order by published_at desc") | map(post_out)
+        | filter((p) => t == "" || contains(p.tags, t))
+        | filter((p) => cat == "" || p.category == cat)
+        | filter((p) => who == null || p.author_id == who.id)
+        | filter((p) => words == "" || contains(lower(p.title), words) || contains(lower(p.excerpt), words) || contains(lower(p.body), words))
     let pages = max([1, floor((len(all) + POSTS_PER_PAGE - 1) / POSTS_PER_PAGE)])
     let n = clamp_int(page, 1, pages)
     let shown = all | drop((n - 1) * POSTS_PER_PAGE) | take(POSTS_PER_PAGE)
-    let link = (k) => t == "" ? `/blog?page=${k}` : `/blog?tag=${t}&page=${k}`
-    <SiteLayout title={t == "" ? "Blog" : `#${t}`} description="">
+    let base = cat != "" ? `/blog/category/${cat}?` : who != null ? `/blog/author/${who.id}?` : words != "" ? `/blog?q=${words}&` : t != "" ? `/blog?tag=${t}&` : "/blog?"
+    let link = (k) => `${base}page=${k}`
+    let heading = cat != "" ? title_case(cat) : who != null ? who.name : words != "" ? `“${q}”` : t != "" ? `Posts tagged ${t}` : "Blog"
+    let cats = post_categories()
+    <SiteLayout title={heading} description={who != null ? who.bio : ""} {theme}>
         <section.blog-head>
-            <h1>{t == "" ? "Blog" : `Posts tagged ${t}`}</h1>
-            {t != "" && <p><a href="/blog">All posts</a></p>}
+            <h1>{heading}</h1>
+            {who != null && who.bio != "" && <p.pb-lead>{who.bio}</p>}
+            {words != "" && <p.muted>{plural(len(all), "post")} found</p>}
+            <form.blog-search method="get" action="/blog"><input type="search" name="q" value={q} placeholder="Search the blog" aria-label="Search the blog"/></form>
         </section>
-        {len(shown) == 0 ? <p.pb-missing>No posts yet.</p> : <div.blog-grid.page>{for p in shown => <BlogCard {p}/>}</div>}
+        {len(cats) > 0 && <nav.shop-cats>
+            <a href="/blog" class={cat == "" && t == "" && who == null && words == "" ? "on" : ""}>All</a>
+            {for c in cats => <a href={`/blog/category/${c.slug}`} class={cat == c.slug ? "on" : ""}>{title_case(c.slug)}</a>}
+        </nav>}
+        {len(shown) == 0 ? <p.pb-missing>{words != "" ? "Nothing matches." : "No posts yet."}</p> : <div.blog-grid.page>{for p in shown => <BlogCard {p}/>}</div>}
         {pages > 1 && <nav.blog-pages>
             {n > 1 && <a href={link(n - 1)}>← Newer</a>}
             <span>Page {n} of {pages}</span>
@@ -154,17 +202,31 @@ fn blog_index(tag: str, page: int) {
 
 fn clamp_int(v, lo: int, hi: int) = max([lo, min([hi, int(str(v ?? lo)) ?? lo])])
 
+// About 230 words a minute.
+fn reading_minutes(text: str) = max([1, round(len(split(text, " ") | filter((w) => trim(w) != "")) / 230)])
+
 fn blog_post(slug: str) {
     let p = post_out(db.one("select * from posts where slug = ? and status = 'published'", slugify(slug))) ?? reply 404 <NotFoundPage what="post"/>
+    db.exec("update posts set views = views + 1 where id = ?", p.id)
     let r = reader()
     let locked = p.members_only && !is_member(r)
-    let author = db.one("select name from users where id = ?", p.author_id)
-    <SiteLayout title={p.title} description={p.description != "" ? p.description : p.excerpt}>
+    let author = db.one("select id, name, bio from users where id = ?", p.author_id)
+    let related = db.query("select * from posts where status = 'published' and id != ? order by published_at desc limit 60", p.id) | map(post_out)
+        | map((x) => { post: x, score: (x.category != "" && x.category == p.category ? 2 : 0) + len(x.tags | filter((t) => contains(p.tags, t))) })
+        | filter((x) => x.score > 0) | sort_by((x) => -x.score) | take(3) | map((x) => x.post)
+    let url = `${site_url()}/blog/${p.slug}`
+    let comments = approved_comments(p.id)
+    <SiteLayout title={p.title} description={p.description != "" ? p.description : p.excerpt} kind="article"
+        image={p.cover == null ? "" : media_src(p.cover, crop_text(p.cover), 1280)}>
         <article.post>
             <header.post-head>
-                <p.blog-meta>{fmt_date(p.published_at)}{author != null && ` · ${author.name}`}{p.members_only && <span.blog-members>Members</span>}</p>
+                {p.category != "" && <a.post-cat href={`/blog/category/${p.category}`}>{title_case(p.category)}</a>}
                 <h1>{p.title}</h1>
                 {p.excerpt != "" && <p.pb-lead>{p.excerpt}</p>}
+                <p.blog-meta>
+                    {author != null && <span>By <a href={`/blog/author/${author.id}`}>{author.name}</a> · </span>}
+                    {fmt_date(p.published_at)} · {reading_minutes(p.body)} min read{p.members_only && <span.blog-members>Members</span>}
+                </p>
             </header>
             {p.cover != null && <figure.post-cover><Picture v={p.cover} alt="" shown={980}/></figure>}
             {locked
@@ -181,7 +243,29 @@ fn blog_post(slug: str) {
                 </section>
                 : <section.post-body>{markdown(p.body)}</section>}
             {len(p.tags) > 0 && <p.post-tags>{for t in p.tags => <a href={`/blog?tag=${t}`}>#{t}</a>}</p>}
+            <p.post-share>Share:
+                <a href={`https://twitter.com/intent/tweet?url=${url}`} target="_blank" rel="noopener">X</a>
+                <a href={`https://www.facebook.com/sharer/sharer.php?u=${url}`} target="_blank" rel="noopener">Facebook</a>
+                <a href={`https://www.linkedin.com/sharing/share-offsite/?url=${url}`} target="_blank" rel="noopener">LinkedIn</a>
+                <a href={`mailto:?subject=${p.title}&body=${url}`}>Email</a>
+            </p>
+            {author != null && author.bio != "" && <aside.post-author>
+                <Avatar name={author.name}/>
+                <div><b><a href={`/blog/author/${author.id}`}>{author.name}</a></b><p>{author.bio}</p></div>
+            </aside>}
+            {!locked && <section.comments id="comments">
+                <h2>{plural(len(comments), "comment")}</h2>
+                {for c in comments => <div.comment>
+                    <p.comment-who><b>{c.name}</b> <span.muted>{fmt_date(c.created_at)}</span></p>
+                    <p.comment-body>{c.body}</p>
+                </div>}
+                <CommentForm slug={p.slug}/>
+            </section>}
         </article>
+        {len(related) > 0 && <section.post-related>
+            <h2>Read next</h2>
+            <div.blog-grid>{for x in related => <BlogCard p={x}/>}</div>
+        </section>}
     </SiteLayout>
 }
 
@@ -208,4 +292,35 @@ fn blog_feed() {
     ], ""))
     let body = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>${xml(s.name ?? "")}</title><link>${xml(base)}/blog</link><description>${xml(s.name ?? "")}</description>${join(items, "")}</channel></rss>`
     respond(200, body, { "content-type": "application/rss+xml; charset=utf-8" })
+}
+
+// The comment form: the comment rules hint as you type; the server checks
+// again and keeps it for a moderator.
+component CommentForm(slug: str) {
+    ~c = { name: "", email: "", body: "", website: "" }
+    ~touched = []
+    ~server = []
+    ~sent = false
+    let all = validate("comment", c, { enabled: ["blog"] }) + server
+    let shown = all | filter((p) => contains(touched, p.field))
+    let change = (k) => (v) => { c = set(c, k, v); touched = unique(touched + [k]); server = [] }
+    sent
+        ? <p.comment-sent>Thank you: your comment shows once a moderator has read it.</p>
+        : <form.comment-form.stack @submit={() => {
+            touched = ["name", "email", "body"]
+            if len(errors_of(validate("comment", c, { enabled: ["blog"] }))) == 0 {
+                let r = post_comment(slug, c)
+                if is_err(r) { server = refusal_problems(r) } else { sent = true }
+            }
+        }}>
+            <h3>Leave a comment</h3>
+            <div.row2>
+                <TextField label="Name" field="name" value={c.name} problems={shown} on_change={change("name")}/>
+                <TextField label="Email (not shown)" field="email" value={c.email} problems={shown} on_change={change("email")} type="email"/>
+            </div>
+            <AreaField label="Comment" field="body" value={c.body} problems={shown} on_change={change("body")} rows={4}/>
+            <label.hp aria-hidden="true">Website <input name="website" tabindex="-1" autocomplete="off" value={c.website} @input={(e) => { c = set(c, "website", e.value) }}/></label>
+            <FormProblems problems={server}/>
+            <div><button.pb-button>Post comment</button></div>
+        </form>
 }

@@ -115,6 +115,12 @@ fn slugify(s: str) {
     split(join(chars, ""), "-") | filter((p) => p != "") | join("-")
 }
 
+// `base`, or `base-2`, `base-3`, ... : the first not taken.
+fn free_slug(taken: list, base: str, n: int) {
+    let s = n == 1 ? base : `${base}-${n}`
+    contains(taken, s) ? free_slug(taken, base, n + 1) : s
+}
+
 fn is_email(s) {
     let t = trim(s ?? "")
     let parts = split(t, "@")

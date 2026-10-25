@@ -52,12 +52,57 @@ component PluginEditor(id: str, ws: map) {
     ~problems = []
     ~message = ""
     ~busy = false
+    // Live: checked when typing pauses, saved (and so loaded by the
+    // program, and shown in the preview) whenever the checks pass.
+    ~live = true
+    ~typed_at = null
+    ~checking = false
+    ~waiting = null
+    ~frame = 0
+    ~pane = "preview"
     if p == null { return <Loading/> }
     if is_err(p) { return <Empty title={str(p.error)}><p><a href="/app/studio">The studio</a></p></Empty> }
     let code = src ?? p.source
-    let lines = split(code, "\n")
-    let bad_lines = problems | map((x) => x.line) | filter((n) => n > 0)
-    let reload_note = "The program loads the new version in a moment; reload this page to use it here."
+    let reload_note = "The program loads the new version in a moment."
+    let save = () => {
+        busy = true
+        let r = studio_save(id, code)
+        busy = false
+        if is_err(r) { problems = refusal_problems(r); message = "" } else {
+            problems = []
+            message = `Draft v${r.version} saved; loading it…`
+            p = merge(p, { draft: true, source: code })
+            src = null
+            waiting = r.written
+        }
+    }
+    let check = () => {
+        checking = true
+        let r = studio_check(id, code)
+        checking = false
+        problems = is_err(r) ? refusal_problems(r) : r
+        if live && len(problems) == 0 && code != p.source { save() }
+    }
+    // Typing paused: check (and, live, save).
+    if typed_at != null {
+        every(250, () => {
+            if now() - typed_at > 700 {
+                typed_at = null
+                check()
+            }
+        })
+    }
+    // Saved: wait for the program to load it, then show it.
+    if waiting != null {
+        every(400, () => {
+            let b = studio_built_at()
+            if !is_err(b) && b >= waiting {
+                waiting = null
+                frame = frame + 1
+                message = `Draft v${(p.released ?? 0) + 1} is running: the preview shows it`
+            }
+        })
+    }
     <div.studio>
         <header.designer-bar>
             <a href="/app/studio">← Studio</a>
@@ -66,48 +111,49 @@ component PluginEditor(id: str, ws: map) {
             {p.released != null && <Badge text={`released v${p.released}`} tone="green"/>}
             {p.draft && <Badge text={`draft v${(p.released ?? 0) + 1}`} tone="amber"/>}
             <span.grow></span>
-            {message != "" && <span.ok>{message}</span>}
+            {checking ? <span.muted>Checking…</span> : waiting != null ? <span.muted>Loading the draft…</span> : message != "" && <span.ok>{message}</span>}
             {len(problems) > 0 && <span.bad>{plural(len(problems), "problem")}</span>}
-            <button disabled={busy} @click={() => {
-                busy = true
-                let r = studio_save(id, code)
-                busy = false
-                if is_err(r) { problems = refusal_problems(r); message = "" } else {
-                    problems = []
-                    message = `Draft v${r.version} saved. ${reload_note}`
-                    p = merge(p, { draft: true, source: code })
-                    src = null
-                }
-            }}>{busy ? "Checking…" : "Save draft"}</button>
+            <label.inline.small title="Check as you type, and save the draft whenever it checks"><input type="checkbox" checked={live} @change={() => { live = !live }}/> Live</label>
+            <button disabled={busy} @click={() => { save() }}>{busy ? "Checking…" : "Save draft"}</button>
             {p.draft && <button.primary disabled={busy || src != null} title={src != null ? "Save the draft first" : ""} @click={() => {
-                if js("confirm", `Release ${p.name} v${(p.released ?? 0) + 1} to every workspace?`) {
+                if ask("Every workspace can switch it on.", { title: `Release ${p.name} v${(p.released ?? 0) + 1}?`, ok: "Release" }) {
                     busy = true
                     let r = studio_release(id)
                     busy = false
-                    if is_err(r) { problems = refusal_problems(r) } else { message = `Released v${r.released}. ${reload_note}`; p = merge(p, { draft: false, released: r.released }) }
+                    if is_err(r) { problems = refusal_problems(r) } else { message = `Released v${r.released}. ${reload_note}`; p = merge(p, { draft: false, released: r.released }); waiting = r.written }
                 }
             }}>Release</button>}
             {p.draft && <button.ghost @click={() => {
-                if js("confirm", "Throw the draft away?") { studio_discard(id); p = studio_get(id); src = null; problems = [] }
+                if ask("The released version stays as it is.", { title: "Throw the draft away?", ok: "Throw away", tone: "danger" }) { studio_discard(id); p = studio_get(id); src = null; problems = [] }
             }}>Discard draft</button>}
         </header>
         <div.studio-body>
-            <div.code-wrap>
-                <div.gutter>{for [i, l] in enumerate(lines) => <span class={contains(bad_lines, i + 1) ? "bad" : ""}>{i + 1}</span>}</div>
-                <textarea.code spellcheck="false" @input={(e) => { src = e.value; message = "" }}>{code}</textarea>
-            </div>
-            <aside.inspector>
-                <h3>Checks</h3>
-                {len(problems) == 0 ? <p.muted>Saving checks the plugin with the rest of the program: names, types, everything quillo check checks.</p>
-                : <ul.problems>{for x in problems => <li>{x.line > 0 && <b>Line {x.line}: </b>}{x.message ?? str(x)}</li>}</ul>}
-                <h3>How a plugin is made</h3>
-                <ul.howto>
-                    <li><code>{id}_plugin</code>: id, name, description, audience; <code>fields</code>, <code>rules</code> by kind (contact, deal, page, checkout, …), <code>blocks</code> and <code>steps</code> described for the designers.</li>
-                    <li><code>{id}_renderers</code>: each block type's HTML, <code>(config, ctx) =&gt; &lt;section&gt;…</code>.</li>
-                    <li><code>{id}_runners</code>: each step type's work on the server, <code>(config, run) =&gt; {"{"} port: "out" {"}"}</code>.</li>
-                    <li>Rules compute only: they run in the browser too. A problem is <code>problem(field, message)</code>, or <code>warning(...)</code>.</li>
-                    <li>Every top-level name starts with <code>{id}_</code> (views: <code>{pascal(id)}</code>).</li>
-                </ul>
+            <CodeEditor value={code} lang="qwe" fill={true} {problems} on_change={(v) => { src = v; message = ""; typed_at = now() }}/>
+            <aside.studio-side>
+                <nav.preview-bar>
+                    {for t in [["preview", "Preview"], ["checks", len(problems) > 0 ? `Problems (${len(problems)})` : "Checks"], ["help", "How it is made"]] =>
+                        <button type="button" class={pane == t[0] ? "tab on" : "tab"} @click={() => { pane = t[0] }}>{t[1]}</button>}
+                </nav>
+                {match pane {
+                    "preview" => <div.studio-preview>
+                        {len(problems) > 0 && <p.studio-stale>The preview shows the last version that checked.</p>}
+                        <iframe.site-frame key={frame} title="Preview" src={`/app/studio/${id}/preview?v=${frame}`}></iframe>
+                    </div>
+                    "checks" => <div.inspector-body>
+                        {len(problems) == 0 ? <p.ok>No problems: it checks with the rest of the program (names, types, everything quillo check checks).</p>
+                        : <ul.problems>{for x in problems => <li>{x.line > 0 && <b>Line {x.line}: </b>}{x.message ?? str(x)}</li>}</ul>}
+                    </div>
+                    _ => <div.inspector-body>
+                        <ul.howto>
+                            <li><code>{id}_plugin</code>: id, name, description, audience; <code>fields</code>, <code>rules</code> by kind (contact, deal, page, checkout, …), <code>blocks</code>, <code>steps</code> and <code>themes</code> described for the designers.</li>
+                            <li><code>{id}_renderers</code>: each block type's HTML, <code>(config, ctx) =&gt; &lt;section&gt;…</code>. A field's <code>example</code> is what the preview shows.</li>
+                            <li><code>{id}_runners</code>: each step type's work on the server, <code>(config, run) =&gt; {"{"} port: "out" {"}"}</code>.</li>
+                            <li>A theme: <code>{"{"} id, name, description, header: "bar" | "center" | "masthead" | "split", width, color, font, css {"}"}</code>, its CSS under <code>.theme-&lt;id&gt;</code>.</li>
+                            <li>Rules compute only: they run in the browser too. A problem is <code>problem(field, message)</code>, or <code>warning(...)</code>.</li>
+                            <li>Every top-level name starts with <code>{id}_</code> (views: <code>{pascal(id)}</code>).</li>
+                        </ul>
+                    </div>
+                }}
             </aside>
         </div>
     </div>

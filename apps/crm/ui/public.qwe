@@ -106,9 +106,9 @@ view NoWorkspace() =
     </Page>
 
 view NotFoundPage(what: str) =
-    <Page title="Not found">
-        <div.center-card><h1>No such {what}</h1><p><a href="/shop">Back to the shop</a></p></div>
-    </Page>
+    <SiteLayout title="Not found" description="">
+        <div.site-narrow><h1>No such {what}</h1><p><a href="/">Back to the home page</a></p></div>
+    </SiteLayout>
 
 // ---- signing in --------------------------------------------------------------------------
 
@@ -127,99 +127,12 @@ view LoginPage(problem: str, email: str) =
         </div>
     </Page>
 
-// ---- the shop ----------------------------------------------------------------------------
-
-view ShopPage(name: str, currency: str, products: list) =
-    <Page title={name}>
-        <div.shop>
-            <header.shop-head><h1>{name}</h1></header>
-            {len(products) == 0 ? <p.muted>Nothing for sale yet.</p>
-            : <div.product-grid>{for p in products =>
-                <a.product-card href={`/shop/${p.sku}`}>
-                    <h3>{p.name}</h3>
-                    <p.muted>{p.description}</p>
-                    <p.price>{fmt_money(p.price_cents, currency)}{p.kind == "subscription" && <span> / {p.interval}</span>}</p>
-                    {p.stock == 0 && <Badge text="Sold out" tone="red"/>}
-                </a>}</div>}
-        </div>
-    </Page>
-
-view CheckoutPage(sku: str, name: str, email: str) =
-    <Page title={`Buy ${name}`}>
-        <div.checkout-wrap><Checkout {sku} {email}/></div>
-    </Page>
-
-// The checkout: the rules (the core's, and the plugins' the shop has on, such
-// as tax) hint as you type and show the total the server will charge.
-component Checkout(sku: str, email: str = "") {
-    ~c = checkout_context(sku)
-    ~o = { sku, name: "", email, qty: 1, card: "", expiry: "", cvc: "", country: "", vat_id: "" }
-    ~touched = []
-    ~server = []
-    ~paid = null
-    ~busy = false
-    if c == null { return <Loading/> }
-    if is_err(c) { return <div.center-card><h1>Not for sale</h1></div> }
-    let ctx = c.ctx
-    let all = validate("checkout", o, ctx) + server
-    let shown = all | filter((p) => contains(touched, p.field))
-    let q = quote(o, c.product, ctx)
-    let cur = c.currency
-    let change = (field) => (v) => {
-        o = set(o, field, field == "qty" ? int(v) ?? 1 : v)
-        touched = unique(touched + [field])
-        server = []
-    }
-    paid != null
-        ? <div.paid>
-            <p.big-check>✓</p>
-            <h1>Thank you!</h1>
-            <p>Order <b>{paid.number}</b> for {paid.total} is paid. A receipt is on its way to {paid.email}.</p>
-            <p><a href="/shop">Back to {c.shop}</a></p>
-        </div>
-        : <form.checkout @submit={() => {
-            touched = ["name", "email", "qty", "card", "expiry", "cvc", "country", "vat_id"]
-            if len(errors_of(validate("checkout", o, ctx))) == 0 {
-                busy = true
-                let r = checkout(o)
-                busy = false
-                if is_err(r) { server = refusal_problems(r) } else { paid = r }
-            }
-        }}>
-            <div.summary>
-                <p.muted>{c.shop}</p>
-                <h1>{c.product.name}</h1>
-                <p>{c.product.description}</p>
-                <div.lines>
-                    <p><span>{q.qty} × {fmt_money(c.product.price_cents, cur)}</span><span>{fmt_money(q.subtotal_cents, cur)}</span></p>
-                    {q.tax_cents > 0 && <p><span>Tax</span><span>{fmt_money(q.tax_cents, cur)}</span></p>}
-                    <p.total><span>Total</span><span>{fmt_money(q.total_cents, cur)}{c.product.kind == "subscription" && ` / ${c.product.interval}`}</span></p>
-                </div>
-            </div>
-            <div.pay>
-                <TextField label="Name" field="name" value={o.name} problems={shown} on_change={change("name")}/>
-                <TextField label="Email" field="email" value={o.email} problems={shown} on_change={change("email")} type="email"/>
-                {c.product.kind != "subscription" && <TextField label="Quantity" field="qty" value={str(o.qty)} problems={shown} on_change={change("qty")} type="number"/>}
-                {contains(c.extra, "country") && <TextField label="Country (2 letters)" field="country" value={o.country} problems={shown} on_change={change("country")} placeholder="US"/>}
-                {contains(c.extra, "vat_id") && <TextField label="VAT number (businesses)" field="vat_id" value={o.vat_id} problems={shown} on_change={change("vat_id")}/>}
-                <TextField label="Card number" field="card" value={o.card} problems={shown} on_change={change("card")} placeholder="4242 4242 4242 4242"/>
-                <div.row2>
-                    <TextField label="Expiry" field="expiry" value={o.expiry} problems={shown} on_change={change("expiry")} placeholder="MM/YY"/>
-                    <TextField label="CVC" field="cvc" value={o.cvc} problems={shown} on_change={change("cvc")} placeholder="123"/>
-                </div>
-                <FormProblems problems={server}/>
-                <button.primary.wide disabled={busy}>{busy ? "Paying…" : `Pay ${fmt_money(q.total_cents, cur)}`}</button>
-                <p.muted.small>Test mode: 4242 4242 4242 4242 pays; 4000 0000 0000 0002 is declined.</p>
-            </div>
-        </form>
-}
-
 // ---- forms -------------------------------------------------------------------------------
 
 view FormPage(slug: str) =
-    <Page title="Sign up">
-        <div.center-card.form-card><PublicForm {slug}/></div>
-    </Page>
+    <SiteLayout title="Sign up" description="">
+        <div.site-narrow><PublicForm {slug}/></div>
+    </SiteLayout>
 
 // `embedded`: inside a page's block, which has its own heading.
 component PublicForm(slug: str, embedded: bool = false) {
@@ -259,8 +172,8 @@ component PublicForm(slug: str, embedded: bool = false) {
 }
 
 view UnsubscribedPage(ok: bool, name: str) =
-    <Page title="Unsubscribe">
-        <div.center-card>{ok
+    <SiteLayout title="Unsubscribe" description="">
+        <div.site-narrow>{ok
             ? <div><h1>You are unsubscribed</h1><p>{name} will not email you again.</p></div>
             : <div><h1>That link did not work</h1><p>It may have been copied wrongly.</p></div>}</div>
-    </Page>
+    </SiteLayout>

@@ -39,6 +39,7 @@ fn check_workspace(w: map) = workspace_rules | map((r) => r(w, {})) | flatten
 fn preset(industry: str) = match industry {
     "merchant" => {
         plugins: ["loyalty", "vat", "gdpr", "quality"],
+        theme: { id: "boutique", color: "#0f766e", font: "rounded" },
         pipeline: { name: "Wholesale", stages: [["Lead", 10, "open"], ["Qualified", 30, "open"], ["Proposal", 60, "open"], ["Won", 100, "won"], ["Lost", 0, "lost"]] },
         products: [
             { name: "Organic cotton tee", sku: "tee", price_cents: 2500, kind: "one_time", interval: "", stock: 40, description: "Soft, heavy, made to last." },
@@ -49,6 +50,7 @@ fn preset(industry: str) = match industry {
     }
     "blogger" => {
         plugins: ["blog", "paywall", "sponsors", "gdpr", "quality"],
+        theme: { id: "journal", color: "#1d4ed8", font: "serif" },
         pipeline: { name: "Sponsorships", stages: [["Pitched", 10, "open"], ["Negotiating", 40, "open"], ["Booked", 100, "won"], ["Declined", 0, "lost"]] },
         products: [{ name: "Supporter membership", sku: "supporter", price_cents: 500, kind: "subscription", interval: "month", stock: null, description: "Members-only posts and my thanks." }],
         forms: [{ slug: "subscribe", name: "Subscribe", headline: "New posts in your inbox. No spam.", fields: ["email", "first_name"], tags: ["reader"] }],
@@ -56,6 +58,7 @@ fn preset(industry: str) = match industry {
     }
     _ => {
         plugins: ["blog", "paywall", "sponsors", "gdpr", "quality"],
+        theme: { id: "editorial", color: "#b91c1c", font: "serif" },
         pipeline: { name: "Advertising", stages: [["Inquiry", 10, "open"], ["Proposal", 40, "open"], ["Insertion order", 80, "open"], ["Booked", 100, "won"], ["Lost", 0, "lost"]] },
         products: [
             { name: "Digital subscription", sku: "digital", price_cents: 900, kind: "subscription", interval: "month", stock: null, description: "Every story, every day." },
@@ -71,7 +74,7 @@ fn setup_workspace(w: map, url: str) {
     let p = preset(w.industry)
     let t = now()
     let currency = w.currency ?? "USD"
-    for [k, v] in { name: trim(w.name), slug: w.slug, industry: w.industry, currency, plugins: p.plugins, secret: crypto.token(), url, country: "US", vat_rate: "0" } =>
+    for [k, v] in { name: trim(w.name), slug: w.slug, industry: w.industry, currency, plugins: p.plugins, theme: p.theme, secret: crypto.token(), url, country: "US", vat_rate: "0" } =>
         put_setting(k, v)
     let owner = db.exec("insert into users (email, name, password_hash, role, created_at) values (?, ?, ?, 'owner', ?)",
         lower(trim(w.email)), trim(w.owner_name), crypto.hash_password(w.password), t).last_id
@@ -136,10 +139,24 @@ server fn load_workspace() {
         today: iso_day(now()),
         pipelines: db.query("select * from pipelines order by position, id"),
         stages: db.query("select * from stages order by pipeline_id, position"),
-        users: db.query("select id, name, email, role from users order by name"),
+        users: db.query("select id, name, email, role, role_id from users order by name"),
         forms: db.query("select slug, name from forms order by name"),
         skus: db.query("select sku, name from products where active = 1 order by name"),
+        objects: objects_all() | filter((o) => allows(access_to(u, o.key).level, "read")),
+        roles: db.query("select id, name from roles order by name"),
+        groups: db.query("select id, name, members, capabilities from groups order by name") | map((g) => merge(g, { members: parsed(g.members, []), capabilities: parsed(g.capabilities, []) })),
+        designer: can_be(u, "designer"),
+        notice_styles: notices_for(enabled_plugins()) | map((n) => remove(n, "css")),
+        notice: notice_style().id,
     }
+}
+
+server fn save_profile(name: str, bio: str) {
+    let u = need_user()?
+    if blank(name) { return err({ problems: problem("name", "Your name, please") }) }
+    if len(bio) > 400 { return err({ problems: problem("bio", "At most 400 characters") }) }
+    db.exec("update users set name = ?, bio = ? where id = ?", trim(name), trim(bio), u.id)
+    true
 }
 
 server fn save_settings(s: map) {
@@ -157,6 +174,22 @@ server fn mail_webhook_of() {
     settings().mail_webhook ?? ""
 }
 
+// What switching a plugin off takes away here: the pages with its blocks,
+// the flows with its steps, the theme if it is the site's.
+server fn plugin_uses(id: str) {
+    need_user()?
+    let p = (find(plugins, (x) => x.id == id) ?? err("No such plugin"))?
+    let blocks = (p.blocks ?? []) | map((b) => b.type)
+    let steps = (p.steps ?? []) | map((s) => s.type)
+    let themes = (p.themes ?? []) | map((t) => t.id)
+    let page_uses = (r) => any(parsed(r.draft, {}).blocks ?? [], (b) => contains(blocks, b.type)) || any(parsed(r.published, {}).blocks ?? [], (b) => contains(blocks, b.type))
+    {
+        pages: db.query("select title, kind, draft, published from pages") | filter(page_uses) | map((r) => r.title),
+        flows: db.query("select name, graph, active from flows") | filter((f) => any(parsed(f.graph, {}).nodes ?? [], (n) => contains(steps, n.type))) | map((f) => f.name),
+        theme: contains(themes, theme_of(settings()).id),
+    }
+}
+
 server fn set_plugins(enabled: list) {
     need_admin()?
     let known = plugins | map((p) => p.id)
@@ -165,26 +198,63 @@ server fn set_plugins(enabled: list) {
 }
 
 server fn save_field(f: map) {
-    need_admin()?
+    let u = need_user()?
+    // An object's fields are its designers' to change; the others, admins'.
+    if !(starts_with(f.entity ?? "", "obj.") ? can_be(u, "designer") : u.role != "member") { return err("Only admins and designers may change this") }
     let key = replace(slugify(blank(f.key) ? f.label : f.key), "-", "_")
     if blank(f.label) { return err({ problems: problem("label", "A label") }) }
-    if !contains(["contact", "company", "deal"], f.entity) { return err({ problems: problem("entity", "Contacts, companies or deals") }) }
-    if !contains(["text", "number", "date", "select", "checkbox", "url"], f.type) { return err({ problems: problem("type", "Choose a type") }) }
+    let object = starts_with(f.entity ?? "", "obj.") ? db.one("select key from objects where key = ?", slice(f.entity, 4)) : null
+    if !contains(["contact", "company", "deal"], f.entity) && object == null { return err({ problems: problem("entity", "Contacts, companies, deals or one of your objects") }) }
+    // Links to contacts, companies and records are for objects' fields.
+    let types = object != null ? FIELD_TYPES : ["text", "number", "date", "select", "checkbox", "url", "email", "money", "textarea"]
+    if !contains(types, f.type) { return err({ problems: problem("type", "Choose a type") }) }
+    if f.type == "record" && db.one("select key from objects where key = ?", (f.options ?? [])[0] ?? "") == null { return err({ problems: problem("options", "Choose which object it links to") }) }
+    if contains(["select"], f.type) && len((f.options ?? []) | filter((o) => trim(str(o)) != "")) == 0 { return err({ problems: problem("options", "Give the choices") }) }
+    if f.type == "lookup" {
+        let via = find(object_fields(slice(f.entity, 4)), (x) => x.key == (f.options ?? [])[0] && contains(["contact", "company", "record"], x.type))
+        if via == null { return err({ problems: problem("options", "Choose the link it shows a field of") }) }
+        if !any(lookup_targets(via, custom_fields() | map((x) => merge(x, { options: type_of(x.options) == "list" ? x.options : parsed(x.options, []) }))), (t) => t[0] == (f.options ?? [])[1]) {
+            return err({ problems: problem("options", "Choose which of its fields") })
+        }
+    }
     let options = json.stringify((f.options ?? []) | map((o) => trim(str(o))) | filter((o) => o != ""))
-    if f.id == null {
+    let unique = f.is_unique == true || f.is_unique == 1 ? 1 : 0
+    let id = if f.id == null {
         let other = db.one("select id from custom_fields where entity = ? and key = ?", f.entity, key)
         if other != null { return err({ problems: problem("label", "There is a field with this name") }) }
-        db.exec("insert into custom_fields (entity, key, label, type, required, options, position) values (?, ?, ?, ?, ?, ?, (select coalesce(max(position), 0) + 1 from custom_fields))",
-            f.entity, key, trim(f.label), f.type, f.required == true ? 1 : 0, options)
+        if key == "" { return err({ problems: problem("label", "A label with letters in it") }) }
+        db.exec("insert into custom_fields (entity, key, label, type, required, options, is_unique, position) values (?, ?, ?, ?, ?, ?, ?, (select coalesce(max(position), 0) + 1 from custom_fields))",
+            f.entity, key, trim(f.label), f.type, f.required == true ? 1 : 0, options, unique).last_id
     } else {
-        db.exec("update custom_fields set label = ?, type = ?, required = ?, options = ? where id = ?", trim(f.label), f.type, f.required == true ? 1 : 0, options, f.id)
+        // An object's field keeps its type: its column was made for it.
+        let was = db.one("select type, entity from custom_fields where id = ?", f.id)
+        if was != null && starts_with(was.entity, "obj.") && was.type != f.type { return err({ problems: problem("type", "A field's type stays as it was made: add a new field instead") }) }
+        db.exec("update custom_fields set label = ?, type = ?, required = ?, options = ?, is_unique = ? where id = ?", trim(f.label), f.type, f.required == true ? 1 : 0, options, unique, f.id)
+        f.id
+    }
+    // An object's table follows its fields: a column for it, an index if unique.
+    if object != null {
+        let synced = sync_table(object.key)
+        if is_err(synced) {
+            db.exec("update custom_fields set is_unique = 0 where id = ?", id)
+            sync_table(object.key)
+            return err({ problems: problem("is_unique", str(synced.error)) })
+        }
     }
     true
 }
 
 server fn delete_field(id: int) {
-    need_admin()?
+    need_designer()?
+    let f = db.one("select entity, key, label from custom_fields where id = ?", id)
+    if f == null { return true }
+    // A link to an object's records stays while another field shows through it.
+    if starts_with(f.entity, "obj.") {
+        let through = db.query("select label, options from custom_fields where entity = ? and type = 'lookup'", f.entity) | filter((x) => (parsed(x.options, [])[0] ?? "") == f.key)
+        if len(through) > 0 { return err(`${through[0].label} shows a field through ${f.label}: remove it first`) }
+    }
     db.exec("delete from custom_fields where id = ?", id)
+    if starts_with(f.entity, "obj.") { sync_table(slice(f.entity, 4)) }
     true
 }
 

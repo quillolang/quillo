@@ -24,7 +24,7 @@ let __ID___colors = { info: "#eef2ff", success: "#ecfdf3", warning: "#fffaeb" }
 
 let __ID___renderers = {
     "__ID__.callout": (c, ctx) =>
-        <aside style={`margin: 16px 32px; padding: 18px 22px; border-radius: 12px; background: ${__ID___colors[c.tone ?? "info"] ?? "#eef2ff"}`}>
+        <aside style={`margin: 16px 32px; padding: 18px 22px; border-radius: 12px; color: #1c2330; background: ${__ID___colors[c.tone ?? "info"] ?? "#eef2ff"}`}>
             <b>{c.title}</b>
             {!blank(c.text) && <p style="margin: 6px 0 0">{c.text}</p>}
         </aside>,

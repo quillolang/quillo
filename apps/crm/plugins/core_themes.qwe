@@ -1,0 +1,91 @@
+// The themes the core brings. A theme is plugin data: its name, how its
+// header is laid out (`bar`: brand left, menu right; `center`: brand over
+// the menu; `masthead`: a newspaper's, with the date and a menu bar;
+// `split`: menu left, brand in the middle, cart right), how wide its pages
+// are, the colour and font it starts from, and CSS scoped to its class
+// (`.theme-<id>`). Any plugin can bring themes the same way.
+
+let CORE_THEMES = [
+    {
+        id: "clean",
+        name: "Clean",
+        description: "Simple and bright: for any site.",
+        header: "bar",
+        width: 980,
+        color: "#4f46e5",
+        font: "system",
+        css: "",
+    },
+    {
+        id: "editorial",
+        name: "Editorial",
+        description: "A newspaper's front page: a masthead, a menu bar, dense columns.",
+        header: "masthead",
+        width: 1180,
+        color: "#b91c1c",
+        font: "serif",
+        css: "
+.theme-editorial .site-masthead { text-align: center; padding: 18px 24px 8px; }
+.theme-editorial .site-masthead .site-brand { font-size: 52px; font-weight: 800; letter-spacing: -.02em; line-height: 1; }
+.theme-editorial .site-dateline { display: flex; justify-content: space-between; font: 600 12px/1 var(--site-font); text-transform: uppercase; letter-spacing: .08em; color: var(--site-muted); padding: 10px 24px; max-width: var(--site-width); margin: 0 auto; }
+.theme-editorial .site-menu-bar { border-top: 3px double var(--site-ink); border-bottom: 1px solid var(--site-ink); }
+.theme-editorial .site-menu-bar nav { justify-content: center; }
+.theme-editorial .site-menu-bar nav a { text-transform: uppercase; font-size: 13px; letter-spacing: .08em; font-weight: 700; color: var(--site-ink); }
+.theme-editorial .blog-card h3 { font-size: 22px; line-height: 1.2; }
+.theme-editorial .blog-card img { border-radius: 0; }
+.theme-editorial .pb-hero h1, .theme-editorial .post-head h1 { font-weight: 800; }
+.theme-editorial .pb-button { border-radius: 0; }
+.theme-editorial .site-foot { border-top: 3px double var(--site-ink); }
+",
+    },
+    {
+        id: "boutique",
+        name: "Boutique",
+        description: "A shop window: wide, soft, the products up front, the cart always in reach.",
+        header: "split",
+        width: 1200,
+        color: "#0f766e",
+        font: "rounded",
+        css: "
+.theme-boutique { --site-soft: #f4f1ec; }
+.theme-boutique.dark { --site-soft: #1b1d1f; }
+.theme-boutique .site-head { padding: 22px 40px; }
+.theme-boutique .site-brand { font-size: 22px; letter-spacing: .02em; }
+.theme-boutique .pb-button, .theme-boutique .shop-card, .theme-boutique .pb-product-card { border-radius: 999px; }
+.theme-boutique .pb-product-card, .theme-boutique .shop-card { border-radius: 22px; }
+.theme-boutique .shop-card img { border-radius: 18px; }
+.theme-boutique .pb-hero { padding: 96px 40px; }
+",
+    },
+    {
+        id: "journal",
+        name: "Journal",
+        description: "A writer's notebook: one narrow column, quiet, the words first.",
+        header: "center",
+        width: 760,
+        color: "#1d4ed8",
+        font: "serif",
+        css: "
+.theme-journal .site-head { padding: 40px 24px 24px; border-bottom: none; }
+.theme-journal .site-brand { font-size: 30px; font-style: italic; }
+.theme-journal .site-head nav a { font-size: 14px; text-transform: lowercase; }
+.theme-journal .blog-grid { grid-template-columns: 1fr; }
+.theme-journal .blog-card img { display: none; }
+.theme-journal .blog-card h3 { font-size: 26px; }
+.theme-journal .site-foot { border-top: none; }
+",
+    },
+]
+
+// How the app asks and tells (`ask`, `notify`): a notice style is plugin
+// data like a theme — where dialogs open (`center`, `sheet` from the
+// bottom, `side`), where notes stack (`top-right`, `top-center`,
+// `bottom-right`, `bottom-center`), and CSS scoped to `.notice-<id>`.
+let CORE_NOTICES = [
+    { id: "standard", name: "Standard", description: "A card in the middle; notes at the top right.", dialog: "center", toasts: "top-right", css: "" },
+    { id: "quiet", name: "Quiet", description: "A sheet from the bottom; notes along the bottom.", dialog: "sheet", toasts: "bottom-center", css: "
+.notice-quiet .q-dialog { border-radius: 16px 16px 0 0; }
+.notice-quiet .q-toast { background: #1c2330; color: #fff; border: none; }
+.notice-quiet .q-toast .q-close { color: #cbd5e1; }
+" },
+]

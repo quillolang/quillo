@@ -67,6 +67,9 @@ fn refusal_problems(r) =
     : type_of(r.error) == "map" && r.error.problems != null ? r.error.problems
     : [{ field: "", message: str(r.error) }]
 
+// A refusal as one sentence.
+fn err_text(r) = refusal_problems(r) | map((p) => p.message) | join(" ")
+
 view FormProblems(problems: list) {
     let general = problems | filter((p) => p.field == "" || p.field == "graph")
     len(general) == 0 ? null : <div.alert>{for p in general => <p>{p.message}</p>}</div>
