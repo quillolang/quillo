@@ -1,0 +1,98 @@
+// Images: uploaded once, kept as they came, and served at the sizes and
+// crops pages ask for (made on first request, then kept).
+//
+//   /media/<key>/full/960          the whole image, 960 pixels wide
+//   /media/<key>/40,37,1200,675/640  a crop (x, y, w, h in the image's pixels)
+
+let MEDIA_MOST_BYTES = 10 * 1024 * 1024
+let MEDIA_WIDTHS = [160, 320, 640, 960, 1280, 1920]
+
+fn media_dir() = `data/media/${tenant()}`
+fn media_original(m) = `${media_dir()}/originals/${m.key}`
+
+fn media_out(r) = r == null ? null : merge(r, { alpha: r.alpha == 1, url: `/media/${r.key}/full/640` })
+
+// A crop that fits the image, as { x, y, w, h }, or null for the whole.
+fn crop_of(text: str, w: int, h: int) {
+    if text == "full" { return null }
+    match split(text, ",") | map((p) => int(p)) {
+        [int as x, int as y, int as cw, int as ch] if x >= 0 && y >= 0 && cw >= 16 && ch >= 16 && x + cw <= w && y + ch <= h => { x, y, w: cw, h: ch }
+        _ => err("not a crop of this image")
+    }
+}
+
+// An image value a block holds: { key, w, h, crop, alt } from the library.
+fn media_src(v, crop_text: str, width: int) = `/media/${v.key}/${crop_text}/${width}`
+
+fn crop_text(v) = v.crop == null ? "full" : `${v.crop.x},${v.crop.y},${v.crop.w},${v.crop.h}`
+
+// <img> with the sizes a browser may choose from, for the width it is shown at.
+view Picture(v, alt: str = "", shown: int = 980) {
+    if type_of(v) == "str" { return v == "" ? null : <img src={v} {alt}/> }
+    if v == null || v.key == null { return null }
+    let ct = crop_text(v)
+    let full = v.crop == null ? v.w ?? 1920 : v.crop.w
+    let widths = MEDIA_WIDTHS | filter((w) => w <= full)
+    let ws = len(widths) == 0 ? [MEDIA_WIDTHS[0]] : widths
+    let best = find(ws, (w) => w >= shown) ?? ws[-1]
+    <img src={media_src(v, ct, best)} srcset={ws | map((w) => `${media_src(v, ct, w)} ${w}w`) | join(", ")}
+        sizes={`(max-width: ${shown}px) 100vw, ${shown}px`} alt={alt != "" ? alt : v.alt ?? ""} loading="lazy"/>
+}
+
+server fn list_media() {
+    need_user()?
+    db.query("select * from media order by created_at desc, id desc") | map(media_out)
+}
+
+// An upload, from the library or a picker: kept only if it is an image.
+server fn upload_image(file: map) {
+    let u = need_user()?
+    if file == null || file.size == null { return err("Choose an image") }
+    if file.size > MEDIA_MOST_BYTES { return err(`Images up to ${floor(MEDIA_MOST_BYTES / 1048576)} MB`) }
+    let key = crypto.token(12)
+    let path = `${media_dir()}/originals/${key}`
+    save_upload(file, path)?
+    let info = image.info(path)
+    if is_err(info) {
+        delete_file(path)
+        return err("That is not a JPEG, PNG, WebP or GIF image")
+    }
+    let name = trim(file.filename) != "" ? file.filename : "image"
+    let id = db.exec("insert into media (key, name, alt, format, width, height, size, alpha, uploaded_by, created_at) values (?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+        key, name, info.format, info.width, info.height, file.size, info.alpha ? 1 : 0, u.id, now()).last_id
+    media_out(db.one("select * from media where id = ?", id))
+}
+
+server fn update_media(id: int, m: map) {
+    need_user()?
+    db.exec("update media set name = ?, alt = ? where id = ?", trim(m.name ?? ""), trim(m.alt ?? ""), id)
+    media_out(db.one("select * from media where id = ?", id))
+}
+
+server fn delete_media(id: int) {
+    need_user()?
+    let m = (db.one("select * from media where id = ?", id) ?? err("No such image"))?
+    delete_file(media_original(m))
+    delete_file(`${media_dir()}/cache/${m.key}`)
+    db.exec("delete from media where id = ?", id)
+    true
+}
+
+// One size of an image, made the first time it is asked for.
+fn media_variant(key: str, crop: str, width: str) {
+    let m = db.one("select * from media where key = ?", key) ?? reply 404 "No such image"
+    let w = int(width)
+    if is_err(w) || !contains(MEDIA_WIDTHS, w) { reply 404 "No such size" }
+    let c = crop_of(crop, m.width, m.height)
+    if is_err(c) { reply 404 "No such crop" }
+    let ext = m.alpha == 1 ? "png" : "jpg"
+    let out = `${media_dir()}/cache/${m.key}/${crop}-${w}.${ext}`
+    if is_err(read_file_exists(out)) {
+        let made = image.convert(media_original(m), out, { crop: c, width: w, format: m.alpha == 1 ? "png" : "jpeg", quality: 82 })
+        if is_err(made) { reply 500 "Could not make this size" }
+    }
+    file(out, { cache: "1y" })
+}
+
+// Whether a file is there (image.info reads only its header).
+fn read_file_exists(path: str) = image.info(path)

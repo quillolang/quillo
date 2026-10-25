@@ -200,3 +200,48 @@ fn pages_are_made_of_plugin_blocks_and_publish_only_when_the_rules_pass() {
     crm.rpc(host, "set_plugins", serde_json::json!([["loyalty"]]), Some(&cookie));
     assert!(!crm.send(host, "GET", "/p/new-arrivals", "", None).text().contains("privacy@acme.test"));
 }
+
+#[test]
+fn images_upload_crop_and_serve_at_their_sizes() {
+    let mut crm = Crm::new("media");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let png = {
+        let img = image::RgbImage::from_fn(800, 600, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let upload = |crm: &mut Crm, name: &str, bytes: &[u8]| {
+        let mut body = b"--B\r\nContent-Disposition: form-data; name=\"args\"\r\n\r\n[{\"$quillo_file\": 0}]\r\n--B\r\n".to_vec();
+        body.extend_from_slice(format!("Content-Disposition: form-data; name=\"file0\"; filename=\"{}\"\r\nContent-Type: image/png\r\n\r\n", name).as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n--B--\r\n");
+        let headers = vec![
+            ("Host".to_string(), host.to_string()),
+            ("Content-Type".to_string(), "multipart/form-data; boundary=B".to_string()),
+            ("X-Quillo-Rpc".to_string(), "1".to_string()),
+            ("Cookie".to_string(), cookie.clone()),
+        ];
+        let r = crm.it.handle(&HttpRequest { method: "POST".into(), url: "/_quillo/rpc/upload_image".into(), headers, body, remote: "127.0.0.1".into() });
+        serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()
+    };
+    let m = upload(&mut crm, "pattern.png", &png)["ok"].clone();
+    assert_eq!((m["width"].as_i64(), m["height"].as_i64(), m["format"].as_str()), (Some(800), Some(600), Some("png")), "{}", m);
+    // Not an image: refused, and nothing kept.
+    assert!(upload(&mut crm, "fake.png", b"hello")["err"].as_str().unwrap().contains("not a JPEG"));
+    assert_eq!(std::fs::read_dir(crm.dir.join("data/media/acme/originals")).unwrap().count(), 1);
+    // A crop, at a size; sizes and crops that are not allowed are not made.
+    let key = m["key"].as_str().unwrap().to_string();
+    let r = crm.send(host, "GET", &format!("/media/{}/100,50,400,400/320", key), "", None);
+    assert_eq!((r.status, r.header("content-type"), r.header("cache-control")), (200, Some("image/jpeg"), Some("public, max-age=31536000, immutable")));
+    let got = image::load_from_memory(&r.body).unwrap();
+    assert_eq!((got.width(), got.height()), (320, 320));
+    assert_eq!(crm.send(host, "GET", &format!("/media/{}/full/333", key), "", None).status, 404);
+    assert_eq!(crm.send(host, "GET", &format!("/media/{}/600,0,400,400/320", key), "", None).status, 404);
+    assert_eq!(crm.send(host, "GET", "/media/nosuchkey/full/320", "", None).status, 404);
+    // Deleting takes the file and its sizes.
+    crm.rpc(host, "delete_media", serde_json::json!([m["id"]]), Some(&cookie));
+    assert_eq!(crm.send(host, "GET", &format!("/media/{}/full/320", key), "", None).status, 404);
+    assert!(!crm.dir.join(format!("data/media/acme/cache/{}", key)).exists());
+}

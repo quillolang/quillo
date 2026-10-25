@@ -69,6 +69,7 @@ pub fn install(env: &Env) {
         ("respond", respond),
         ("read_file", read_file),
         ("write_file", write_file),
+        ("delete_file", delete_file),
         ("random", random),
         ("random_int", random_int),
         ("uuid", uuid),
@@ -935,6 +936,22 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(match std::fs::write(&full, text) {
         Ok(()) => Value::Nil,
         Err(e) => Value::err(Value::str(format!("write_file: {}: {}", p, e))),
+    })
+}
+
+/// `delete_file(path)`: removes a file, or a folder and what is in it,
+/// inside the program's folder (never the folder itself). Nothing there is
+/// no error.
+fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let p = s_arg(&args, 0, "delete_file", line)?;
+    let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
+        return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}", p))));
+    };
+    let r = if full.is_dir() { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
+    Ok(match r {
+        Ok(()) => Value::Nil,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Nil,
+        Err(e) => Value::err(Value::str(format!("delete_file: {}: {}", p, e))),
     })
 }
 

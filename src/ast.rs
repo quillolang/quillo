@@ -116,7 +116,7 @@ pub fn builtin_effect(name: &str) -> u8 {
         "http"
     } else {
         match name {
-            "file" | "read_file" | "write_file" | "image.info" | "image.convert" => "fs",
+            "file" | "read_file" | "write_file" | "delete_file" | "image.info" | "image.convert" => "fs",
             "env" => "env",
             "now" | "sleep" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",

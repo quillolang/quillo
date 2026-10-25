@@ -250,6 +250,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("respond", "int, any=, map | null=", "response"),
     ("read_file", "str", "str | error(str)"),
     ("write_file", "str, any", "null | error(str)"),
+    ("delete_file", "str", "null | error(str)"),
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
@@ -327,7 +328,7 @@ const MODULES: &[&str] = &["json", "db", "http", "crypto", "image"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
-    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "publish", "watch", "crypto.sha256",
+    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
       "schedule", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];

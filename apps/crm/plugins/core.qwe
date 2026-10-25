@@ -76,15 +76,15 @@ let CORE_BLOCKS = [
     { type: "hero", label: "Hero", group: "Layout", fields: [
         { key: "headline", label: "Headline", type: "text", required: true },
         { key: "text", label: "Text", type: "textarea" },
-        { key: "image", label: "Image address", type: "url" },
-        { key: "alt", label: "Image description (for screen readers)", type: "text" },
+        { key: "image", label: "Image", type: "image" },
+        { key: "alt", label: "Image description (empty: the library's)", type: "text" },
         { key: "button", label: "Button text", type: "text" },
         { key: "link", label: "Button link", type: "link" },
     ] },
     { type: "text", label: "Text", group: "Content", fields: [{ key: "body", label: "Text (Markdown)", type: "textarea", required: true }] },
     { type: "image", label: "Image", group: "Content", fields: [
-        { key: "image", label: "Image address", type: "url", required: true },
-        { key: "alt", label: "Description (for screen readers)", type: "text", required: true },
+        { key: "image", label: "Image", type: "image", required: true },
+        { key: "alt", label: "Description (empty: the library's)", type: "text" },
         { key: "caption", label: "Caption", type: "text" },
     ] },
     { type: "columns", label: "Two columns", group: "Layout", fields: [
@@ -139,8 +139,15 @@ let page_rules = [
                 | map((f) => problem(key, `${t.label}: "${c[f.key]}" is not for sale`)) | flatten
             let forms = (t.fields ?? []) | filter((f) => f.type == "form" && !blank(c[f.key]) && !contains(ctx.forms ?? [], c[f.key]))
                 | map((f) => problem(key, `${t.label}: no form "${c[f.key]}"`)) | flatten
-            let image = when(b.type == "hero" && !blank(c.image) && blank(c.alt), warning(key, "Hero: describe the image for screen readers"))
-            missing + links + urls + products + forms + image
+            // Images: a crop inside the image, and a description somewhere.
+            let images = (t.fields ?? []) | filter((f) => f.type == "image" && type_of(c[f.key]) == "map") | map((f) => {
+                let v = c[f.key]
+                let cr = v.crop
+                let inside = cr == null || (cr.x >= 0 && cr.y >= 0 && cr.w >= 16 && cr.h >= 16 && cr.x + cr.w <= v.w && cr.y + cr.h <= v.h)
+                when(!inside, problem(key, `${t.label}: the crop is outside the image`))
+                    + when(blank(c.alt) && blank(v.alt), b.type == "image" ? problem(key, "Image: describe it for screen readers (here, or in Media)") : warning(key, `${t.label}: describe the image for screen readers`))
+            }) | flatten
+            missing + links + urls + products + forms + images
         }
     }) | flatten,
 ]

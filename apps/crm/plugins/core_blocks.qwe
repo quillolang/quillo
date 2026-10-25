@@ -31,12 +31,12 @@ let renderers_core = {
                 {!blank(c.text) && <p.pb-lead>{c.text}</p>}
                 {!blank(c.button) && <PbButton text={c.button} link={c.link}/>}
             </div>
-            {!blank(c.image) && <img src={c.image} alt={c.alt ?? ""}/>}
+            {!blank(c.image) && <Picture v={c.image} alt={c.alt ?? ""} shown={560}/>}
         </section>,
     text: (c, ctx) => <section.pb-text>{markdown(c.body ?? "")}</section>,
     image: (c, ctx) =>
         <figure.pb-image>
-            <img src={c.image} alt={c.alt ?? ""}/>
+            <Picture v={c.image} alt={c.alt ?? ""} shown={980}/>
             {!blank(c.caption) && <figcaption>{c.caption}</figcaption>}
         </figure>,
     columns: (c, ctx) => <section.pb-columns><div>{markdown(c.left ?? "")}</div><div>{markdown(c.right ?? "")}</div></section>,

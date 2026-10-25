@@ -51,7 +51,8 @@ component ThemeEditor(ws: map, on_change) {
             <Hints {problems} field="color"/>
         </label>
         <SelectField label="Font" field="font" value={t.font} options={[{ value: "system", label: "Clean (system)" }, { value: "serif", label: "Classic (serif)" }, { value: "rounded", label: "Friendly (rounded)" }, { value: "mono", label: "Technical (mono)" }]} {problems} on_change={change("font")}/>
-        <TextField label="Logo address (optional)" field="logo" value={t.logo} {problems} on_change={change("logo")} placeholder="https://…"/>
+        <ImagePicker label="Logo (optional)" value={t.logo} on_change={(v) => { change("logo")(v == null ? "" : type_of(v) == "str" ? v : media_src(v, crop_text(v), 320)) }}/>
+        <Hints {problems} field="logo"/>
         <CheckField label="Dark" field="dark" value={t.dark} {problems} on_change={change("dark")}/>
         <div class={t.dark ? "theme-sample dark" : "theme-sample"} style={`--brand:${t.color}`}>
             <b style={`font-family:${FONTS[t.font] ?? FONTS.system}`}>{ws.name}</b>
@@ -78,6 +79,8 @@ component PageDesigner(id: int, ws: map) {
     ~server = []
     ~saved = ""
     ~rctx = page_rule_ctx()
+    ~adding = null
+    ~drop_at = null
     if p == null { return <Loading/> }
     if is_err(p) { return <Empty title="No such page"><p><a href="/app/pages">All pages</a></p></Empty> }
     let bs = blocks ?? p.draft.blocks ?? []
@@ -101,14 +104,6 @@ component PageDesigner(id: int, ws: map) {
     }
     let next_id = () => `b${max((bs | map((b) => int(slice(b.id, 1)) ?? 0)) + [0]) + 1}`
     let index_of_block = (bid) => index_of(bs | map((b) => b.id), bid) ?? 0
-    let move_to = (from, to) => {
-        if from != null && from != to {
-            let item = find(bs, (b) => b.id == from)
-            let rest = bs | filter((b) => b.id != from)
-            let at = index_of(rest | map((b) => b.id), to) ?? len(rest)
-            change(take(rest, at) + [item] + drop(rest, at))
-        }
-    }
     let shift = (bid, by) => {
         let i = index_of_block(bid)
         let j = i + by
@@ -116,11 +111,33 @@ component PageDesigner(id: int, ws: map) {
             change(bs | enumerate | map((x) => x[0] == i ? bs[j] : x[0] == j ? bs[i] : x[1]))
         }
     }
-    let add = (t) => {
+    let add_at = (t, at) => {
         let b = { id: next_id(), type: t.type, config: {} }
-        let at = sel == null ? len(bs) : index_of_block(sel.id) + 1
         change(take(bs, at) + [b] + drop(bs, at))
         selected = b.id
+    }
+    let add = (t) => { add_at(t, sel == null ? len(bs) : index_of_block(sel.id) + 1) }
+    // Dropping at a gap (0: before the first block): a new block from the
+    // palette, or a block moved.
+    let dropped = (at) => {
+        if adding != null {
+            add_at(adding, at)
+        } else if dragging != null {
+            let item = find(bs, (b) => b.id == dragging)
+            let from = index_of_block(dragging)
+            let rest = bs | filter((b) => b.id != dragging)
+            let to = at > from ? at - 1 : at
+            if to != from { change(take(rest, to) + [item] + drop(rest, to)) }
+        }
+        adding = null
+        dragging = null
+        drop_at = null
+    }
+    // Over a block: the gap above its middle, or below.
+    let over = (e, i) => {
+        e.preventDefault()
+        let r = e.currentTarget.getBoundingClientRect()
+        drop_at = e.clientY < r.top + r.height / 2 ? i : i + 1
     }
     let save = () => {
         let r = save_page(merge(m, { id, blocks: bs }))
@@ -147,28 +164,31 @@ component PageDesigner(id: int, ws: map) {
         </header>
         <div.designer-body.pages>
             <aside.palette>
-                <p.muted.small>Click a block to add it {sel == null ? "at the end" : "after the selected one"}. Drag blocks in the page to reorder them.</p>
+                <p.muted.small>Drag a block into the page, or click it to add it {sel == null ? "at the end" : "after the selected one"}. Drag blocks in the page to move them.</p>
                 {for group in unique(types | map((t) => t.group ?? "Content")) => <div.palette-group>
                     <p.palette-title>{group}</p>
                     {for t in types | filter((t) => (t.group ?? "Content") == group) =>
-                        <button.palette-item style="border-left-color:var(--brand)" @click={() => { add(t) }}>{t.label}</button>}
+                        <button.palette-item style="border-left-color:var(--brand)" draggable="true" data-type={t.type}
+                            @click={() => { add(t) }} @dragstart={() => { adding = t; dragging = null }} @dragend={() => { adding = null; drop_at = null }}>{t.label}</button>}
                 </div>}
             </aside>
             <div.page-canvas @click={(e) => { if e.target.className == "page-canvas" { selected = null } }}>
                 <div class={theme.dark ? "site site-preview dark" : "site site-preview"} style={`--brand:${theme.color};--site-font:${FONTS[theme.font] ?? FONTS.system}`}>
                     <header.site-head><b>{theme.logo != "" ? <img src={theme.logo} alt=""/> : ws.name}</b><nav><span>Shop</span></nav></header>
-                    {len(bs) == 0 && <div.pb-empty>Add a block from the left.</div>}
-                    {for b in bs => {
+                    {len(bs) == 0 && <div class={drop_at == 0 ? "pb-empty over" : "pb-empty"} @dragover={(e) => { e.preventDefault(); drop_at = 0 }}
+                        @drop={(e) => { e.preventDefault(); dropped(0) }}>Drag a block here, or click one on the left.</div>}
+                    {for [i, b] in enumerate(bs) => {
                         let bad = len(errors_of(block_problems(b.id))) > 0
                         let markup = html_of(b.id)
-                        <div key={b.id} class={selected == b.id ? "pb-wrap on" : bad ? "pb-wrap bad" : "pb-wrap"} draggable="true" data-block={b.id}
+                        let line = drop_at == i ? " drop-before" : drop_at == i + 1 && i == len(bs) - 1 ? " drop-after" : ""
+                        <div key={b.id} class={(selected == b.id ? "pb-wrap on" : bad ? "pb-wrap bad" : "pb-wrap") + line} draggable="true" data-block={b.id}
                             @click={() => { selected = b.id }}
-                            @dragstart={() => { dragging = b.id }}
-                            @dragover={(e) => { e.preventDefault() }}
+                            @dragstart={() => { dragging = b.id; adding = null }}
+                            @dragend={() => { dragging = null; drop_at = null }}
+                            @dragover={(e) => { over(e, i) }}
                             @drop={(e) => {
                                 e.preventDefault()
-                                move_to(dragging, b.id)
-                                dragging = null
+                                dropped(drop_at ?? i)
                             }}>
                             <span.pb-tag>{type_of_block(b).label}</span>
                             {markup == null ? <div.pb-missing>Rendering…</div> : <div.pb-html>{raw(markup)}</div>}
@@ -226,6 +246,7 @@ view BlockEditor(block: map, type: map, ws: map, problems: list, on_change) {
         <h3>{type.label}</h3>
         <Hints {problems} field={`block.${block.id}`}/>
         <div.stack>{for f in type.fields ?? [] => match f.type {
+            "image" => <ImagePicker label={f.label} value={c[f.key]} on_change={put_key(f.key)}/>
             "textarea" => <AreaField label={f.label} field={f.key} value={c[f.key]} problems={[]} on_change={put_key(f.key)} rows={6}/>
             "select" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={f.options ?? []} problems={[]} on_change={put_key(f.key)} empty="Choose"/>
             "product" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={ws.skus | map((x) => { value: x.sku, label: x.name })} problems={[]} on_change={put_key(f.key)} empty="Choose a product"/>

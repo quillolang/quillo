@@ -171,6 +171,7 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "file"
                 | "read_file"
                 | "write_file"
+                | "delete_file"
                 | "random"
                 | "random_int"
                 | "uuid"

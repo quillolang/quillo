@@ -41,6 +41,7 @@ lib/marketing.qwe   forms, campaigns, the outbox
 lib/flows.qwe       the flow engine: fire, walk, waits, steps, templates
 lib/workspace.qwe   signing up, presets, settings, fields, pipelines, team
 lib/pages.qwe       pages: drafts, publishing, the theme, rendering blocks
+lib/media.qwe       images: uploads, crops, the sizes pages use
 plugins/*.qwe       core (always on) and the optional plugins
 plugins/core_blocks.qwe   how the core's page blocks look
 ui/*.qwe            the pages: public ones, the app, the flow and page designers
@@ -83,6 +84,17 @@ server (for the preview and for visitors); what makes it acceptable is the plugi
 products for sale, forms that exist). A draft saves as it is; publishing refuses while
 the rules find errors. Visitors see `/p/<slug>`, or the home page at the workspace's
 own address.
+
+### Images
+
+Media keeps a workspace's images: uploaded from the library or from any image setting
+(blocks, the logo), checked to be JPEG, PNG, WebP or GIF up to 10 MB, and kept as they
+came. A block holds the image with its crop (in the image's own pixels, made in the
+crop editor with free or fixed ratios), so the crop can be changed and the image is
+never altered. Pages ask for `/media/<key>/<crop>/<width>`, at fixed widths from 160
+to 1920 with a `srcset` for the browser to choose from; each size is made on first
+request with `image.convert` and kept, sent with a year's cache. Keys are random, so a
+workspace's images cannot be listed by counting.
 
 ### Flows
 
