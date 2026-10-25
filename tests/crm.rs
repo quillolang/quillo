@@ -154,3 +154,49 @@ fn a_purchase_runs_its_flow_and_waiting_flows_carry_on() {
     assert_eq!(c["first_name"], "Lois");
     let _ = id;
 }
+
+#[test]
+fn pages_are_made_of_plugin_blocks_and_publish_only_when_the_rules_pass() {
+    let mut crm = Crm::new("pages");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let id = crm.rpc(host, "new_page", serde_json::json!(["launch"]), Some(&cookie))["ok"].as_i64().unwrap();
+    let page = crm.rpc(host, "get_page", serde_json::json!([id]), Some(&cookie))["ok"].clone();
+    assert_eq!(page["slug"], "new-arrivals");
+    // A draft with a bad link and a privacy note (the Consent plugin's block) with no
+    // address saves, but does not publish: the same rules the designer hints with.
+    let blocks = serde_json::json!([
+        { "id": "b1", "type": "hero", "config": { "headline": "Hi", "button": "Go", "link": "javascript:alert(1)" } },
+        { "id": "b2", "type": "gdpr.privacy", "config": {} },
+    ]);
+    let draft = serde_json::json!([{ "id": id, "title": "New arrivals", "slug": "new-arrivals", "description": "", "blocks": blocks }]);
+    assert!(crm.rpc(host, "save_page", draft, Some(&cookie))["ok"].is_object());
+    let refused = crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&cookie));
+    let msgs: Vec<&str> = refused["err"]["problems"].as_array().unwrap_or_else(|| panic!("{}", refused)).iter().map(|p| p["message"].as_str().unwrap()).collect();
+    assert!(msgs.contains(&"Hero: Button link must start with /, https:// or mailto:"), "{:?}", msgs);
+    assert!(msgs.iter().any(|m| m.starts_with("Privacy note:")), "{:?}", msgs);
+    assert_eq!(crm.send(host, "GET", "/p/new-arrivals", "", None).status, 404);
+    // Fixed, it publishes; visitors see it, and the home page is it.
+    let fixed = serde_json::json!([
+        { "id": "b1", "type": "hero", "config": { "headline": "Organic tees", "button": "Shop", "link": "/shop" } },
+        { "id": "b2", "type": "gdpr.privacy", "config": { "contact": "privacy@acme.test" } },
+        { "id": "b3", "type": "product", "config": { "product": "tee" } },
+    ]);
+    crm.rpc(host, "save_page", serde_json::json!([{ "id": id, "title": "New arrivals", "slug": "new-arrivals", "description": "Tees", "blocks": fixed }]), Some(&cookie));
+    assert!(crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&cookie))["ok"].is_object());
+    let html = crm.send(host, "GET", "/p/new-arrivals", "", None).text();
+    assert!(html.contains("<h1>Organic tees</h1>") && html.contains("privacy@acme.test") && html.contains("href=\"/shop/tee\""), "{}", html);
+    assert!(html.contains("<title>New arrivals · Acme</title>"));
+    assert_eq!(crm.send(host, "GET", "/", "", None).status, 303);
+    crm.rpc(host, "set_home", serde_json::json!([id]), Some(&cookie));
+    assert!(crm.send(host, "GET", "/", "", None).text().contains("<h1>Organic tees</h1>"));
+    // A theme's values go into a style sheet: only a colour is a colour.
+    let bad = crm.rpc(host, "save_theme", serde_json::json!([{ "color": "red;}body{display:none", "font": "serif" }]), Some(&cookie));
+    assert_eq!(bad["err"]["problems"][0]["field"], "color");
+    assert!(crm.rpc(host, "save_theme", serde_json::json!([{ "color": "#B91C1C", "font": "serif", "dark": true }]), Some(&cookie))["ok"].is_object());
+    let themed = crm.send(host, "GET", "/p/new-arrivals", "", None).text();
+    assert!(themed.contains("--brand: #b91c1c") && themed.contains("class=\"site dark\""), "{}", themed);
+    // Switching the Consent plugin off takes its block with it.
+    crm.rpc(host, "set_plugins", serde_json::json!([["loyalty"]]), Some(&cookie));
+    assert!(!crm.send(host, "GET", "/p/new-arrivals", "", None).text().contains("privacy@acme.test"));
+}

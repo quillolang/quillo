@@ -1,0 +1,63 @@
+// What the core's page blocks look like. Renderers run on the server (they
+// use markdown, and read products), for the published page and for the
+// designer's preview; `ctx` has { products, currency, site, preview }.
+
+// A link as written, or nowhere if it is not one a page may have.
+fn safe_link(l) = link_ok(l) && !blank(l) ? l : "#"
+
+view PbButton(text: str, link) = <a.pb-button href={safe_link(link)}>{text}</a>
+
+view PbProduct(p: map, button: str, currency: str) =
+    <article.pb-product-card>
+        <h3>{p.name}</h3>
+        <p>{p.description}</p>
+        <p.pb-price>{fmt_money(p.price_cents, currency)}{p.kind == "subscription" && <span> / {p.interval}</span>}</p>
+        <a.pb-button href={`/shop/${p.sku}`}>{button}</a>
+    </article>
+
+// In the designer, a form is a picture of itself (signing up from the
+// preview would add a contact).
+view PbFormPreview(heading: str) =
+    <section.pb-form>
+        {heading != "" && <h2>{heading}</h2>}
+        <div.pb-form-mock><span>Email address</span><b>Sign up</b></div>
+    </section>
+
+let renderers_core = {
+    hero: (c, ctx) =>
+        <section class={blank(c.image) ? "pb-hero" : "pb-hero with-image"}>
+            <div.pb-hero-text>
+                <h1>{c.headline}</h1>
+                {!blank(c.text) && <p.pb-lead>{c.text}</p>}
+                {!blank(c.button) && <PbButton text={c.button} link={c.link}/>}
+            </div>
+            {!blank(c.image) && <img src={c.image} alt={c.alt ?? ""}/>}
+        </section>,
+    text: (c, ctx) => <section.pb-text>{markdown(c.body ?? "")}</section>,
+    image: (c, ctx) =>
+        <figure.pb-image>
+            <img src={c.image} alt={c.alt ?? ""}/>
+            {!blank(c.caption) && <figcaption>{c.caption}</figcaption>}
+        </figure>,
+    columns: (c, ctx) => <section.pb-columns><div>{markdown(c.left ?? "")}</div><div>{markdown(c.right ?? "")}</div></section>,
+    quote: (c, ctx) =>
+        <blockquote.pb-quote>
+            <p>“{c.quote}”</p>
+            {!blank(c.name) && <footer><b>{c.name}</b>{!blank(c.role) && <span>, {c.role}</span>}</footer>}
+        </blockquote>,
+    button: (c, ctx) => <p.pb-center><PbButton text={c.text ?? ""} link={c.link}/></p>,
+    spacer: (c, ctx) => <div class={`pb-spacer ${c.size ?? "medium"}`}></div>,
+    product: (c, ctx) => {
+        let p = find(ctx.products, (x) => x.sku == c.product)
+        p == null ? <p.pb-missing>This product is not for sale.</p>
+        : <section.pb-product><PbProduct {p} button={blank(c.button) ? "Buy now" : c.button} currency={ctx.currency}/></section>
+    },
+    products: (c, ctx) =>
+        <section.pb-products>
+            {!blank(c.heading) && <h2>{c.heading}</h2>}
+            <div.pb-grid>{for p in ctx.products => <PbProduct {p} button="Buy now" currency={ctx.currency}/>}</div>
+        </section>,
+    form: (c, ctx) => ctx.preview
+        ? <PbFormPreview heading={c.heading ?? ""}/>
+        : <section.pb-form>{!blank(c.heading) && <h2>{c.heading}</h2>}<PublicForm slug={c.form ?? ""} embedded={true}/></section>,
+}

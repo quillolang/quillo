@@ -6,6 +6,10 @@ let plugin_paywall = {
     name: "Memberships",
     description: "Paid subscriptions make readers members; flows grant and end membership.",
     audience: ["blogger", "news"],
+    blocks: [{ type: "paywall.plans", label: "Membership plans", group: "Sell", fields: [
+        { key: "heading", label: "Heading", type: "text" },
+        { key: "perks", label: "What members get (one per line)", type: "textarea" },
+    ] }],
     fields: [{ entity: "contact", key: "member_until", label: "Member until", type: "date" }],
     rules: {
         product: [(p, ctx) => when(p.kind == "subscription" && p.price_cents == 0, warning("price", "A free subscription: members will not pay"))],
@@ -40,6 +44,20 @@ fn paywall_end(config, run) {
     db.exec("update contacts set fields = ?, updated_at = ? where id = ?", json.stringify(remove(parsed(c.fields, {}), "member_until")), now(), c.id)
     remove_tags(c.id, ["member"])
     { port: "out", log: "membership ended" }
+}
+
+// The subscription products, side by side, with what membership brings.
+let renderers_paywall = {
+    "paywall.plans": (c, ctx) => {
+        let plans = ctx.products | filter((p) => p.kind == "subscription")
+        let perks = split(c.perks ?? "", "\n") | map(trim) | filter((x) => x != "")
+        <section.pb-plans id="plans">
+            {!blank(c.heading) && <h2>{c.heading}</h2>}
+            {len(perks) > 0 && <ul.pb-perks>{for x in perks => <li>{x}</li>}</ul>}
+            {len(plans) == 0 ? <p.pb-missing>No subscription products yet.</p>
+            : <div.pb-grid>{for p in plans => <PbProduct {p} button="Become a member" currency={ctx.currency}/>}</div>}
+        </section>
+    },
 }
 
 let runners_paywall = { "paywall.grant": paywall_grant, "paywall.end": paywall_end }

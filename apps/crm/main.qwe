@@ -37,11 +37,17 @@ use "lib/flows.qwe"
 let step_runners = merge(core_runners, merge(runners_gdpr, merge(runners_loyalty, merge(runners_paywall, merge(runners_vat, merge(runners_sponsors, runners_quality))))))
 
 use "lib/workspace.qwe"
+use "lib/pages.qwe"
+use "plugins/core_blocks.qwe"
+
+// How each plugin's page blocks look (on the server).
+let block_renderers = merge(renderers_core, merge(renderers_sponsors, merge(renderers_paywall, renderers_gdpr)))
 use "ui/kit.qwe"
 use "ui/public.qwe"
 use "ui/app.qwe"
 use "ui/pages.qwe"
 use "ui/designer.qwe"
+use "ui/pagedesigner.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -68,7 +74,14 @@ route GET /assets/*path = file("public/" + path)
 route GET / {
     if tenant() == null { return <Landing/> }
     workspace_here()
-    current_user() == null ? redirect("/login") : redirect("/app")
+    // A published home page, for visitors; else the app.
+    let home = home_page()
+    home != null ? show_page(home) : current_user() == null ? redirect("/login") : redirect("/app")
+}
+
+route GET /p/:slug {
+    workspace_here()
+    show_page(published_page(slug) ?? reply 404 <NotFoundPage what="page"/>)
 }
 
 // A request for a workspace that does not exist answers 404, before any

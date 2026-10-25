@@ -17,7 +17,7 @@ let NAV = [
     { group: "", items: [{ href: "/app", label: "Dashboard", icon: "◧" }, { href: "/app/tasks", label: "Tasks", icon: "☑" }] },
     { group: "People", items: [{ href: "/app/contacts", label: "Contacts", icon: "☺" }, { href: "/app/companies", label: "Companies", icon: "▦" }] },
     { group: "Sales", items: [{ href: "/app/deals", label: "Deals", icon: "◫" }, { href: "/app/products", label: "Products", icon: "◈" }, { href: "/app/orders", label: "Orders", icon: "≡" }] },
-    { group: "Marketing", items: [{ href: "/app/forms", label: "Forms", icon: "✎" }, { href: "/app/campaigns", label: "Campaigns", icon: "✉" }, { href: "/app/outbox", label: "Outbox", icon: "⇪" }] },
+    { group: "Marketing", items: [{ href: "/app/pages", label: "Pages", icon: "▤" }, { href: "/app/forms", label: "Forms", icon: "✎" }, { href: "/app/campaigns", label: "Campaigns", icon: "✉" }, { href: "/app/outbox", label: "Outbox", icon: "⇪" }] },
     { group: "Automation", items: [{ href: "/app/flows", label: "Flows", icon: "⟶" }] },
     { group: "Workspace", items: [{ href: "/app/plugins", label: "Plugins", icon: "⧉" }, { href: "/app/settings", label: "Settings", icon: "⚙" }] },
 ]
@@ -59,6 +59,8 @@ component App() {
                 ["products"] => <ProductsPage {ws}/>
                 ["orders"] => <OrdersPage {ws}/>
                 ["forms"] => <FormsPage {ws}/>
+                ["pages"] => <PagesPage {ws} on_change={refresh}/>
+                ["pages", id] => <PageDesigner key={id} id={int(id) ?? 0} {ws}/>
                 ["campaigns"] => <CampaignsPage {ws}/>
                 ["outbox"] => <OutboxPage {ws}/>
                 ["flows"] => <FlowsPage {ws}/>

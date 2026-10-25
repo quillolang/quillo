@@ -289,3 +289,71 @@ body.public { background: linear-gradient(180deg, #eef0ff 0%, var(--bg) 340px); 
 html { background: var(--bg); }
 .zoom { position: sticky; top: 8px; left: 8px; z-index: 2; display: inline-flex; align-items: center; gap: 4px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 2px 6px; margin: 8px; box-shadow: var(--shadow); font-size: 12px; color: var(--muted); }
 .canvas-wrap > .zoom { position: absolute; }
+
+/* ---- pages: the designer ---- */
+.templates.three { grid-template-columns: repeat(3, 1fr); }
+.grid-pages { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+.theme-sample { display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 12px; background: #fff; }
+.theme-sample.dark { background: #0f1115; color: #e8eaee; border-color: #2a2f38; }
+.designer-body.pages { grid-template-columns: 200px 1fr 340px; }
+.page-title { font-size: 15px; }
+.page-canvas { overflow: auto; background: #e9ecf1; padding: 24px; }
+.site-preview { max-width: 980px; margin: 0 auto; border-radius: 12px; overflow: hidden; box-shadow: 0 12px 32px rgba(16,24,40,.12); min-height: 600px; }
+.pb-wrap { position: relative; outline: 2px solid transparent; outline-offset: -2px; cursor: pointer; }
+.pb-wrap:hover { outline-color: rgba(79,70,229,.35); }
+.pb-wrap.on { outline-color: var(--brand); }
+.pb-wrap.bad { outline-color: #f04438; }
+.pb-html, .pb-html * { pointer-events: none; }
+.pb-tag { position: absolute; top: 6px; left: 6px; z-index: 2; font: 600 11px/1 system-ui, sans-serif; background: var(--brand); color: #fff; padding: 3px 6px; border-radius: 4px; opacity: 0; }
+.pb-wrap:hover .pb-tag, .pb-wrap.on .pb-tag { opacity: 1; }
+.pb-tools { position: absolute; top: 6px; right: 6px; z-index: 2; display: flex; gap: 2px; background: #fff; border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
+.pb-empty { padding: 80px 24px; text-align: center; color: var(--muted); }
+
+/* ---- pages: what visitors see (themed by --brand and --site-font) ---- */
+.site { --brand: #4f46e5; --site-font: system-ui, sans-serif; --site-bg: #fff; --site-ink: #1c2330; --site-soft: #f5f6f8; --site-muted: #667085;
+  background: var(--site-bg); color: var(--site-ink); font-family: var(--site-font); }
+body.site { margin: 0; font-size: 16px; line-height: 1.6; }
+.site.dark { --site-bg: #0f1115; --site-ink: #e8eaee; --site-soft: #181b22; --site-muted: #98a2b3; }
+.site-head { display: flex; justify-content: space-between; align-items: center; padding: 18px 32px; border-bottom: 1px solid color-mix(in srgb, var(--site-ink) 10%, transparent); }
+.site-head img { height: 32px; }
+.site-brand { color: inherit; font-size: 18px; }
+.site-head nav a, .site-head nav span { color: var(--site-muted); margin-left: 18px; font-size: 15px; }
+.site-main { max-width: 980px; margin: 0 auto; }
+.site-foot { text-align: center; color: var(--site-muted); padding: 32px; font-size: 14px; border-top: 1px solid color-mix(in srgb, var(--site-ink) 10%, transparent); }
+.site h1, .site h2, .site h3 { font-family: var(--site-font); color: inherit; }
+.site a { color: var(--brand); }
+.pb-button { display: inline-block; background: var(--brand); color: #fff !important; padding: 12px 22px; border-radius: 10px; font-weight: 600; text-decoration: none !important; }
+.pb-hero { padding: 72px 32px; display: grid; gap: 32px; align-items: center; text-align: center; }
+.pb-hero.with-image { grid-template-columns: 1.1fr 1fr; text-align: left; }
+.pb-hero h1 { font-size: 44px; line-height: 1.1; margin: 0 0 16px; letter-spacing: -.02em; }
+.pb-lead { font-size: 19px; color: var(--site-muted); margin: 0 0 24px; }
+.pb-hero img { width: 100%; border-radius: 14px; }
+.pb-text, .pb-columns, .pb-products, .pb-plans, .pb-form, .pb-product, .pb-privacy { padding: 32px; }
+.pb-text { max-width: 680px; margin: 0 auto; font-size: 17px; }
+.pb-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.pb-image { margin: 0; padding: 16px 32px; } .pb-image img { width: 100%; border-radius: 12px; }
+.pb-image figcaption { color: var(--site-muted); font-size: 14px; text-align: center; margin-top: 8px; }
+.pb-quote { margin: 24px 32px; padding: 32px; background: var(--site-soft); border-radius: 14px; border-left: 4px solid var(--brand); }
+.pb-quote p { font-size: 22px; margin: 0 0 12px; } .pb-quote footer { color: var(--site-muted); }
+.pb-center { text-align: center; padding: 16px 32px; }
+.pb-spacer.small { height: 16px; } .pb-spacer.medium { height: 48px; } .pb-spacer.large { height: 96px; }
+.pb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.pb-product { display: flex; justify-content: center; }
+.pb-product-card { background: var(--site-soft); border-radius: 14px; padding: 24px; min-width: 280px; }
+.pb-product-card h3 { margin: 0 0 8px; font-size: 20px; }
+.pb-price { font-size: 22px; font-weight: 700; margin: 8px 0 16px; }
+.pb-form { text-align: center; background: var(--site-soft); margin: 24px 32px; border-radius: 14px; }
+.pb-form .stack { max-width: 380px; margin: 0 auto; text-align: left; }
+.pb-form-mock { display: flex; max-width: 420px; margin: 8px auto; border-radius: 10px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--site-ink) 15%, transparent); }
+.pb-form-mock span { flex: 1; padding: 12px; color: var(--site-muted); text-align: left; background: var(--site-bg); }
+.pb-form-mock b { background: var(--brand); color: #fff; padding: 12px 18px; }
+.pb-sponsor { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 16px 32px; padding: 16px 20px; border: 1px dashed color-mix(in srgb, var(--site-ink) 25%, transparent); border-radius: 12px; }
+.pb-sponsor img { height: 28px; }
+.pb-sponsor-label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--site-muted); }
+.pb-perks { columns: 2; padding-left: 20px; }
+.pb-privacy { font-size: 14px; color: var(--site-muted); max-width: 680px; margin: 0 auto; }
+.pb-missing { padding: 16px 32px; color: var(--site-muted); font-style: italic; }
+@media (max-width: 760px) { .pb-hero.with-image, .pb-columns, .grid-pages { grid-template-columns: 1fr; } .pb-hero h1 { font-size: 32px; } }
+.site h2 { font-size: 28px; margin: 0 0 16px; letter-spacing: -.01em; }
+.site h3 { font-size: 20px; margin: 0 0 8px; }
+.pb-form h2 { font-size: 24px; }

@@ -8,11 +8,19 @@ let plugin_sponsors = {
     name: "Sponsorships",
     description: "Deals for ad placements: where it runs and when.",
     audience: ["news", "blogger"],
+    blocks: [{ type: "sponsors.banner", label: "Sponsor banner", group: "Grow", fields: [
+        { key: "name", label: "Sponsor", type: "text", required: true },
+        { key: "logo", label: "Logo address", type: "url" },
+        { key: "link", label: "Their site", type: "link", required: true },
+        { key: "line", label: "One line about them", type: "text" },
+    ] }],
     fields: [
         { entity: "deal", key: "placement", label: "Placement", type: "select", options: PLACEMENTS },
         { entity: "deal", key: "run_date", label: "Runs on", type: "date" },
     ],
     rules: {
+        page: [(pg, ctx) => (pg.blocks ?? []) | filter((b) => b.type == "sponsors.banner" && starts_with(str((b.config ?? {}).link ?? ""), "/"))
+            | map((b) => problem(`block.${b.id}`, "Sponsor banner: link to the sponsor's own site (https://...)")) | flatten],
         deal: [
             (d, ctx) => {
                 let f = d.fields ?? {}
@@ -28,3 +36,14 @@ let plugin_sponsors = {
 }
 
 let runners_sponsors = {}
+
+// Sponsored content says so, and its link is marked as paid (rel=sponsored).
+let renderers_sponsors = {
+    "sponsors.banner": (c, ctx) =>
+        <aside.pb-sponsor>
+            <span.pb-sponsor-label>Sponsored by</span>
+            {!blank(c.logo) ? <img src={c.logo} alt={c.name}/> : <b>{c.name}</b>}
+            {!blank(c.line) && <span>{c.line}</span>}
+            <a href={safe_link(c.link)} rel="sponsored noopener" target="_blank">Visit {c.name}</a>
+        </aside>,
+}

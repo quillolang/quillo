@@ -1,0 +1,213 @@
+// Pages a workspace designs, made of blocks, all of them from plugins: a
+// block's type, its settings and its rules are plugin data (the designer
+// offers what the plugins switched on bring), and its HTML comes from the
+// plugin's renderer. A page has a draft, which the designer edits, and a
+// published version, which visitors see at /p/<slug> (or at the
+// workspace's own address, for the home page).
+
+let DEFAULT_THEME = { color: "#4f46e5", font: "system", dark: false, logo: "" }
+
+fn page_out(r) = r == null ? null : merge(r, {
+    draft: parsed(r.draft, { blocks: [] }),
+    published: parsed(r.published, null),
+    home: r.home == 1,
+    changed: r.published == null || r.published != r.draft,
+})
+
+fn theme_of(s: map) = merge(DEFAULT_THEME, s.theme ?? {})
+
+// What renderers see.
+fn render_ctx(preview: bool) {
+    let s = settings()
+    { products: shop_products(), currency: s.currency ?? "USD", site: s.name ?? "", preview, enabled: s.plugins ?? [] }
+}
+
+// One block's HTML, from the renderer of the plugin that brings it.
+fn render_block(b: map, ctx: map) {
+    let render = block_renderers[b.type]
+    if render == null { return <p.pb-missing>A block from a plugin that is switched off.</p> }
+    let t = find(block_types(ctx.enabled), (t) => t.type == b.type)
+    t == null ? <p.pb-missing>A block from a plugin that is switched off.</p> : render(b.config ?? {}, ctx)
+}
+
+let FONTS = {
+    system: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif",
+    serif: "Georgia, 'Iowan Old Style', 'Times New Roman', serif",
+    rounded: "ui-rounded, 'SF Pro Rounded', 'Nunito', system-ui, sans-serif",
+    mono: "ui-monospace, SFMono-Regular, Menlo, monospace",
+}
+
+// The theme as CSS variables. Its values were checked when saved (a colour
+// is #rrggbb, a font one of FONTS), and are checked again here, since they
+// go into a style sheet.
+fn theme_css(t: map) {
+    let ok = len(errors_of(validate("theme", t, { enabled: [] }))) == 0
+    let th = ok ? t : DEFAULT_THEME
+    `.site { --brand: ${th.color}; --site-font: ${FONTS[th.font] ?? FONTS.system}; }`
+}
+
+view SitePage(page: map, blocks: list, theme: map, site: str) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{page.title} · {site}</title>
+            {page.description != "" && <meta name="description" content={page.description}/>}
+            <link rel="stylesheet" href="/assets/app.css"/>
+            <style>{theme_css(theme)}</style>
+        </head>
+        <body class={theme.dark ? "site dark" : "site"}>
+            <header.site-head>
+                <a.site-brand href="/">{theme.logo != "" ? <img src={theme.logo} alt={site}/> : <b>{site}</b>}</a>
+                <nav><a href="/shop">Shop</a></nav>
+            </header>
+            <main.site-main>{for b in blocks => render_block(b, render_ctx(false))}</main>
+            <footer.site-foot>© {site}</footer>
+        </body>
+    </html>
+
+fn published_page(slug: str) = page_out(db.one("select * from pages where slug = ? and published is not null", slugify(slug)))
+
+fn home_page() = page_out(db.one("select * from pages where home = 1 and published is not null"))
+
+fn show_page(p: map) {
+    let s = settings()
+    <SitePage page={p} blocks={p.published.blocks ?? []} theme={theme_of(s)} site={s.name ?? ""}/>
+}
+
+// What page rules see: the products for sale and the forms there are.
+fn page_ctx() = rule_ctx({
+    skus: db.query("select sku from products where active = 1") | map((r) => r.sku),
+    forms: db.query("select slug from forms") | map((r) => r.slug),
+})
+
+// ---- the designer's server functions ---------------------------------------------
+
+server fn list_pages() {
+    need_user()?
+    db.query("select * from pages order by home desc, updated_at desc") | map(page_out)
+}
+
+server fn get_page(id: int) {
+    need_user()?
+    page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page")
+}
+
+// Each block's HTML as visitors would see it, for the designer's preview.
+server fn preview_page(blocks: list) {
+    need_user()?
+    let ctx = render_ctx(true)
+    blocks | map((b) => { id: b.id, html: str(render_block(b, ctx)) })
+}
+
+// A saved page's draft, rendered (the designer's first preview).
+server fn preview_of(id: int) {
+    need_user()?
+    let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
+    let ctx = render_ctx(true)
+    (p.draft.blocks ?? []) | map((b) => { id: b.id, html: str(render_block(b, ctx)) })
+}
+
+// A draft may be saved as it is; only the address must be one.
+server fn save_page(p: map) {
+    need_user()?
+    let slug = slugify(p.slug ?? "")
+    if slug == "" { return err({ problems: problem("slug", "Choose its address") }) }
+    if db.one("select id from pages where slug = ? and id != ?", slug, p.id) != null { return err({ problems: problem("slug", "Another page has this address") }) }
+    db.exec("update pages set title = ?, slug = ?, description = ?, draft = ?, updated_at = ? where id = ?",
+        trim(p.title ?? ""), slug, trim(p.description ?? ""), json.stringify({ blocks: p.blocks ?? [] }), now(), p.id)
+    page_out(db.one("select * from pages where id = ?", p.id))
+}
+
+// Publishing checks the draft with the page rules the designer showed.
+server fn publish_page(id: int) {
+    need_user()?
+    let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
+    let record = merge(p.draft, { title: p.title, slug: p.slug })
+    refused("page", record, page_ctx())?
+    db.exec("update pages set published = draft, published_at = ?, updated_at = ? where id = ?", now(), now(), id)
+    page_out(db.one("select * from pages where id = ?", id))
+}
+
+server fn unpublish_page(id: int) {
+    need_user()?
+    db.exec("update pages set published = null, home = 0, updated_at = ? where id = ?", now(), id)
+    true
+}
+
+server fn set_home(id: int) {
+    need_admin()?
+    db.transaction(() => {
+        db.exec("update pages set home = 0")
+        db.exec("update pages set home = 1 where id = ?", id)
+    })
+    true
+}
+
+server fn delete_page(id: int) {
+    need_admin()?
+    db.exec("delete from pages where id = ?", id)
+    true
+}
+
+server fn page_rule_ctx() {
+    need_user()?
+    page_ctx()
+}
+
+server fn save_theme(t: map) {
+    need_admin()?
+    let theme = { color: lower(trim(t.color ?? "")), font: t.font ?? "system", dark: t.dark == true, logo: trim(t.logo ?? "") }
+    refused("theme", theme, rule_ctx())?
+    put_setting("theme", theme)
+    theme
+}
+
+server fn new_page(template: str) {
+    need_user()?
+    let t = page_template(template)
+    let base = slugify(t.title)
+    let taken = db.query("select slug from pages") | map((r) => r.slug)
+    let slug = contains(taken, base) ? `${base}-${len(taken) + 1}` : base
+    let t0 = now()
+    db.exec("insert into pages (slug, title, description, draft, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
+        slug, t.title, t.description, json.stringify({ blocks: t.blocks }), t0, t0).last_id
+}
+
+// ---- templates ----------------------------------------------------------------------
+
+fn block(id: str, type: str, config: map) = { id, type, config }
+
+fn page_template(kind: str) {
+    let s = settings()
+    let product = (db.one("select sku from products where active = 1 order by id limit 1") ?? {}).sku ?? ""
+    let form = (db.one("select slug from forms order by id limit 1") ?? {}).slug ?? ""
+    let name = s.name ?? "Us"
+    let enabled = s.plugins ?? []
+    match kind {
+        "launch" => {
+            title: "New arrivals",
+            description: `What is new at ${name}.`,
+            blocks: [
+                block("b1", "hero", { headline: "Made to last, made with care", text: "Our new collection is here: honest materials, fair prices.", button: "Shop now", link: "/shop" }),
+                block("b2", "product", { product, button: "Buy now" }),
+                block("b3", "quote", { quote: "The best thing I bought this year.", name: "A happy customer" }),
+                block("b4", "form", { form, heading: "Be first to know" }),
+            ],
+        }
+        "membership" => {
+            title: "Become a member",
+            description: `Support ${name}.`,
+            blocks: [
+                block("b1", "hero", { headline: "Independent, because of you", text: "Members keep this going, and get more of it.", button: "See the plans", link: "#plans" }),
+                block("b2", "columns", { left: "### Every story\nNo paywall, no limits.", right: "### First to read\nNewsletters a day early." }),
+            ] + (contains(enabled, "paywall") ? [block("b3", "paywall.plans", { heading: "Plans", perks: "Every story\nThe members' newsletter\nOur thanks" })] : [block("b3", "products", { heading: "Plans" })])
+              + [block("b4", "form", { form, heading: "Not ready? Get the free newsletter" })],
+        }
+        _ => {
+            title: "Welcome",
+            description: "",
+            blocks: [block("b1", "hero", { headline: `Welcome to ${name}`, text: "Say what you do, for whom, in a sentence." }), block("b2", "form", { form, heading: "Stay in touch" })],
+        }
+    }
+}

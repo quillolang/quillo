@@ -11,7 +11,12 @@ let plugin_gdpr = {
         { entity: "contact", key: "consent_date", label: "Agreed on", type: "date" },
     ],
     form_fields: ["consent"],
+    blocks: [{ type: "gdpr.privacy", label: "Privacy note", group: "Grow", fields: [
+        { key: "contact", label: "Who to write to about their data (email)", type: "text", required: true },
+    ] }],
     rules: {
+        page: [(pg, ctx) => (pg.blocks ?? []) | filter((b) => b.type == "gdpr.privacy" && !blank((b.config ?? {}).contact) && !is_email((b.config ?? {}).contact))
+            | map((b) => problem(`block.${b.id}`, "Privacy note: an email address to write to")) | flatten],
         contact: [(c, ctx) => when((c.subscribed == true || c.subscribed == 1) && (c.fields ?? {}).consent != true,
             problem("fields.consent", "Subscribing needs their consent: tick \"Agreed to email\""))],
         signup: [(s, ctx) => when(s.consent != true, problem("consent", "Please agree to receive our email"))],
@@ -30,3 +35,11 @@ fn gdpr_forget(config, run) {
 }
 
 let runners_gdpr = { "gdpr.forget": gdpr_forget }
+
+let renderers_gdpr = {
+    "gdpr.privacy": (c, ctx) =>
+        <section.pb-privacy>
+            <p>We keep your email address only to write to you, and never sell it. Every email has an unsubscribe link.
+                To see or erase what we hold about you, write to <a href={`mailto:${c.contact ?? ""}`}>{c.contact}</a>.</p>
+        </section>,
+}

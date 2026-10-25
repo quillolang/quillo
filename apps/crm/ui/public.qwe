@@ -208,7 +208,8 @@ view FormPage(slug: str) =
         <div.center-card.form-card><PublicForm {slug}/></div>
     </Page>
 
-component PublicForm(slug: str) {
+// `embedded`: inside a page's block, which has its own heading.
+component PublicForm(slug: str, embedded: bool = false) {
     ~c = form_context(slug)
     ~s = { email: "", first_name: "", last_name: "", consent: false }
     ~touched = []
@@ -232,8 +233,8 @@ component PublicForm(slug: str) {
                 if is_err(r) { server = refusal_problems(r) } else { done = r }
             }
         }}>
-            <p.muted>{c.site}</p>
-            <h1>{c.form.name}</h1>
+            {!embedded && <p.muted>{c.site}</p>}
+            {!embedded && <h1>{c.form.name}</h1>}
             {c.form.headline != "" && <p>{c.form.headline}</p>}
             {contains(c.form.fields, "first_name") && <TextField label="First name" field="first_name" value={s.first_name} problems={shown} on_change={change("first_name")}/>}
             {contains(c.form.fields, "last_name") && <TextField label="Last name" field="last_name" value={s.last_name} problems={shown} on_change={change("last_name")}/>}

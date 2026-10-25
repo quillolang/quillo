@@ -20,6 +20,7 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | **People** | Contacts with stages, tags, consent and custom fields; companies; a timeline of everything that happened to each; notes and tasks; CSV import (each row checked by the rules) and export. |
 | **Sales** | Pipelines with stages, a board you drag deals across; products (one-time and subscriptions), a public shop at `/shop` with a checkout, orders, refunds. |
 | **Marketing** | Public sign-up forms at `/f/<form>`, campaigns written in Markdown to all subscribers or a tag, an outbox, signed unsubscribe links. |
+| **Pages** | Landing pages and a home page, made of blocks in a designer: a palette of the blocks the plugins switched on bring, a live preview rendered as visitors will see it, drag to reorder, settings per block; a theme (colour, font, dark, logo) per workspace; drafts, and publishing when the page rules pass. |
 | **Flows** | A designer: drag steps, connect their ports, branch on conditions, wait, offer a product and wait for the purchase. Runs show step by step, and can be started by hand for a contact. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
 
@@ -39,8 +40,10 @@ lib/commerce.qwe    products, the price quote, checkout, orders
 lib/marketing.qwe   forms, campaigns, the outbox
 lib/flows.qwe       the flow engine: fire, walk, waits, steps, templates
 lib/workspace.qwe   signing up, presets, settings, fields, pipelines, team
+lib/pages.qwe       pages: drafts, publishing, the theme, rendering blocks
 plugins/*.qwe       core (always on) and the optional plugins
-ui/*.qwe            the pages: public ones, the app, the flow designer
+plugins/core_blocks.qwe   how the core's page blocks look
+ui/*.qwe            the pages: public ones, the app, the flow and page designers
 ```
 
 ### Tenants
@@ -67,6 +70,19 @@ Rules only compute — no database, no clock (`ctx.today` is the date) — which
 lets the browser run them: Quillo compiles the plugin list, rules included, into the
 page's JavaScript. Kinds: `contact`, `company`, `deal`, `task`, `product`, `checkout`,
 `signup` (public forms), `campaign` and `flow` (the designer's graph).
+
+### Pages
+
+Every block of a page comes from a plugin: the core brings hero, text, image, columns,
+testimonial, button, space, product, product grid and sign-up form; Consent brings a
+privacy note, Memberships the membership plans, Sponsorships a sponsor banner. A
+block's description (its type, label, group and fields) is plugin data the designer
+reads; how it looks is the plugin's renderer, a function of its settings run on the
+server (for the preview and for visitors); what makes it acceptable is the plugin's
+`page` rules, plus the checks every block gets from its fields' types (required, links,
+products for sale, forms that exist). A draft saves as it is; publishing refuses while
+the rules find errors. Visitors see `/p/<slug>`, or the home page at the workspace's
+own address.
 
 ### Flows
 
@@ -108,8 +124,14 @@ fn birthday_wish(config, run) {
 let runners_birthday = { "birthday.wish": birthday_wish }
 ```
 
-Then in `main.qwe`: `use "plugins/birthday.qwe"`, add `plugin_birthday` to `plugins`
-and `runners_birthday` to `step_runners`. Workspaces switch it on in Plugins. A step's
+A plugin can bring page blocks the same way: their descriptions under `blocks` in the
+plugin map (`{ type: "birthday.card", label: "Birthday card", group: "Grow", fields:
+[...] }`, with field types `text`, `textarea`, `url`, `link`, `select`, `product`,
+`form`), their rules under `rules.page`, and their renderers apart, on the server:
+`let renderers_birthday = { "birthday.card": (c, ctx) => <section>...</section> }`.
+
+Then in `main.qwe`: `use "plugins/birthday.qwe"`, add `plugin_birthday` to `plugins`,
+`runners_birthday` to `step_runners` and any renderers to `block_renderers`. Workspaces switch it on in Plugins. A step's
 runner gets its node's settings and the run (`run.context.contact_id`, `order_id`, ...)
 and says which port to leave by; returning `{ waiting_for: "time", until: <ms>,
 resume: "out" }` parks the run instead. Plugins can also bring `checkout_fields`,

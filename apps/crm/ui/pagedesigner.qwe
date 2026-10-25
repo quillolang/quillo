@@ -1,0 +1,237 @@
+// Pages: the list, the theme, and the designer. The designer's palette is
+// the blocks the plugins switched on bring; its preview is each block as
+// the server renders it; the page rules hint as you edit and decide when
+// you publish.
+
+component PagesPage(ws: map, on_change) {
+    ~rows = live(list_pages)
+    let templates = [
+        ["launch", "Product launch", "A hero, a product to buy, a testimonial, a sign-up."],
+        ["membership", "Membership", "Why become a member, the plans, a free newsletter."],
+        ["blank", "Simple page", "A headline and a sign-up form."],
+    ]
+    <div>
+        <PageHead title="Pages" sub="Landing pages and your home page, made of blocks. Plugins bring more blocks."/>
+        <div.templates.three>{for t in templates => <button.template @click={() => {
+            let id = new_page(t[0])
+            if !is_err(id) { navigate(`/app/pages/${id}`) }
+        }}><b>{t[1]}</b><span>{t[2]}</span></button>}</div>
+        <div.grid-pages>
+            <div>{rows == null ? <Loading/>
+                : is_err(rows) || len(rows) == 0 ? <Empty title="No pages yet"><p>Start from a template above.</p></Empty>
+                : <table.table>
+                    <thead><tr><th>Page</th><th>Address</th><th>Status</th><th>Updated</th></tr></thead>
+                    <tbody>{for p in rows => <tr key={p.id} class="clickable" @click={() => { navigate(`/app/pages/${p.id}`) }}>
+                        <td><b>{p.title != "" ? p.title : "Untitled"}</b>{p.home && <Badge text="home" tone="purple"/>}</td>
+                        <td><code>{p.home ? "/" : `/p/${p.slug}`}</code></td>
+                        <td>{p.published == null ? <Badge text="draft"/> : p.changed ? <Badge text="changes not published" tone="amber"/> : <Badge text="published" tone="green"/>}</td>
+                        <td.muted>{fmt_ago(p.updated_at, now())}</td>
+                    </tr>}</tbody>
+                </table>}</div>
+            <ThemeEditor {ws} {on_change}/>
+        </div>
+    </div>
+}
+
+// The workspace's look: pages, the shop and forms share it.
+component ThemeEditor(ws: map, on_change) {
+    ~t = merge(DEFAULT_THEME, ws.settings.theme ?? {})
+    ~server = []
+    ~saved = false
+    let problems = validate("theme", t, ctx_of(ws)) + server
+    let change = (k) => (v) => { t = set(t, k, v); saved = false; server = [] }
+    <section.card.stack>
+        <h2>Theme</h2>
+        <label.field>
+            <span.label>Brand colour</span>
+            <div.inline>
+                <input type="color" value={t.color} style="width:48px;padding:2px" @input={(e) => { change("color")(e.value) }}/>
+                <input name="color" value={t.color} @input={(e) => { change("color")(e.value) }}/>
+            </div>
+            <Hints {problems} field="color"/>
+        </label>
+        <SelectField label="Font" field="font" value={t.font} options={[{ value: "system", label: "Clean (system)" }, { value: "serif", label: "Classic (serif)" }, { value: "rounded", label: "Friendly (rounded)" }, { value: "mono", label: "Technical (mono)" }]} {problems} on_change={change("font")}/>
+        <TextField label="Logo address (optional)" field="logo" value={t.logo} {problems} on_change={change("logo")} placeholder="https://…"/>
+        <CheckField label="Dark" field="dark" value={t.dark} {problems} on_change={change("dark")}/>
+        <div class={t.dark ? "theme-sample dark" : "theme-sample"} style={`--brand:${t.color}`}>
+            <b style={`font-family:${FONTS[t.font] ?? FONTS.system}`}>{ws.name}</b>
+            <span.pb-button>Button</span>
+        </div>
+        <FormProblems problems={server}/>
+        <div.form-actions>
+            <button.primary disabled={ws.user.role == "member" || len(errors_of(problems)) > 0} @click={() => {
+                let r = save_theme(t)
+                if is_err(r) { server = refusal_problems(r) } else { saved = true; on_change() }
+            }}>Save theme</button>
+            {saved && <span.ok>Saved</span>}
+        </div>
+    </section>
+}
+
+component PageDesigner(id: int, ws: map) {
+    ~p = get_page(id)
+    ~preview = preview_of(id)
+    ~blocks = null
+    ~meta = null
+    ~selected = null
+    ~dragging = null
+    ~server = []
+    ~saved = ""
+    ~rctx = page_rule_ctx()
+    if p == null { return <Loading/> }
+    if is_err(p) { return <Empty title="No such page"><p><a href="/app/pages">All pages</a></p></Empty> }
+    let bs = blocks ?? p.draft.blocks ?? []
+    let m = meta ?? { title: p.title, slug: p.slug, description: p.description }
+    let theme = merge(DEFAULT_THEME, ws.settings.theme ?? {})
+    let types = block_types(ws.enabled)
+    let type_of_block = (b) => find(types, (t) => t.type == b.type) ?? { label: b.type, fields: [] }
+    let known = is_err(rctx) || rctx == null ? {} : rctx
+    let problems = validate("page", merge(m, { blocks: bs }), ctx_of(ws, { skus: known.skus ?? [], forms: known.forms ?? [] })) + server
+    let errors = errors_of(problems)
+    let block_problems = (bid) => problems | filter((x) => x.field == `block.${bid}`)
+    let sel = selected == null ? null : find(bs, (b) => b.id == selected)
+    let html_of = (bid) => (find(preview ?? [], (x) => x.id == bid) ?? {}).html
+    // Every change shows at once, rendered by the server as visitors will see it.
+    let change = (next) => {
+        blocks = next
+        saved = ""
+        server = []
+        let r = preview_page(next)
+        if !is_err(r) { preview = r }
+    }
+    let next_id = () => `b${max((bs | map((b) => int(slice(b.id, 1)) ?? 0)) + [0]) + 1}`
+    let index_of_block = (bid) => index_of(bs | map((b) => b.id), bid) ?? 0
+    let move_to = (from, to) => {
+        if from != null && from != to {
+            let item = find(bs, (b) => b.id == from)
+            let rest = bs | filter((b) => b.id != from)
+            let at = index_of(rest | map((b) => b.id), to) ?? len(rest)
+            change(take(rest, at) + [item] + drop(rest, at))
+        }
+    }
+    let shift = (bid, by) => {
+        let i = index_of_block(bid)
+        let j = i + by
+        if j >= 0 && j < len(bs) {
+            change(bs | enumerate | map((x) => x[0] == i ? bs[j] : x[0] == j ? bs[i] : x[1]))
+        }
+    }
+    let add = (t) => {
+        let b = { id: next_id(), type: t.type, config: {} }
+        let at = sel == null ? len(bs) : index_of_block(sel.id) + 1
+        change(take(bs, at) + [b] + drop(bs, at))
+        selected = b.id
+    }
+    let save = () => {
+        let r = save_page(merge(m, { id, blocks: bs }))
+        if is_err(r) { server = refusal_problems(r); false } else { p = r; blocks = null; meta = null; saved = "Saved"; true }
+    }
+    let status = p.published == null ? "draft" : p.changed || blocks != null || meta != null ? "changes not published" : "published"
+    <div.designer>
+        <header.designer-bar>
+            <a href="/app/pages">← Pages</a>
+            <b.page-title>{m.title != "" ? m.title : "Untitled"}</b>
+            <Badge text={status} tone={status == "published" ? "green" : status == "draft" ? "gray" : "amber"}/>
+            {p.home && <Badge text="home page" tone="purple"/>}
+            <span.grow></span>
+            {saved != "" && <span.ok>{saved}</span>}
+            {len(errors) > 0 && <span.bad>{plural(len(errors), "problem")}</span>}
+            {p.published != null && <a.button href={p.home ? "/" : `/p/${p.slug}`} target="_blank" data-reload>View ↗</a>}
+            <button @click={() => { save() }}>Save draft</button>
+            <button.primary disabled={len(errors) > 0} title={len(errors) > 0 ? "Fix the problems first" : ""} @click={() => {
+                if save() {
+                    let r = publish_page(id)
+                    if is_err(r) { server = refusal_problems(r) } else { p = r; saved = "Published" }
+                }
+            }}>Publish</button>
+        </header>
+        <div.designer-body.pages>
+            <aside.palette>
+                <p.muted.small>Click a block to add it {sel == null ? "at the end" : "after the selected one"}. Drag blocks in the page to reorder them.</p>
+                {for group in unique(types | map((t) => t.group ?? "Content")) => <div.palette-group>
+                    <p.palette-title>{group}</p>
+                    {for t in types | filter((t) => (t.group ?? "Content") == group) =>
+                        <button.palette-item style="border-left-color:var(--brand)" @click={() => { add(t) }}>{t.label}</button>}
+                </div>}
+            </aside>
+            <div.page-canvas @click={(e) => { if e.target.className == "page-canvas" { selected = null } }}>
+                <div class={theme.dark ? "site site-preview dark" : "site site-preview"} style={`--brand:${theme.color};--site-font:${FONTS[theme.font] ?? FONTS.system}`}>
+                    <header.site-head><b>{theme.logo != "" ? <img src={theme.logo} alt=""/> : ws.name}</b><nav><span>Shop</span></nav></header>
+                    {len(bs) == 0 && <div.pb-empty>Add a block from the left.</div>}
+                    {for b in bs => {
+                        let bad = len(errors_of(block_problems(b.id))) > 0
+                        let markup = html_of(b.id)
+                        <div key={b.id} class={selected == b.id ? "pb-wrap on" : bad ? "pb-wrap bad" : "pb-wrap"} draggable="true" data-block={b.id}
+                            @click={() => { selected = b.id }}
+                            @dragstart={() => { dragging = b.id }}
+                            @dragover={(e) => { e.preventDefault() }}
+                            @drop={(e) => {
+                                e.preventDefault()
+                                move_to(dragging, b.id)
+                                dragging = null
+                            }}>
+                            <span.pb-tag>{type_of_block(b).label}</span>
+                            {markup == null ? <div.pb-missing>Rendering…</div> : <div.pb-html>{raw(markup)}</div>}
+                            {selected == b.id && <div.pb-tools>
+                                <button.icon title="Up" @click={() => { shift(b.id, -1) }}>↑</button>
+                                <button.icon title="Down" @click={() => { shift(b.id, 1) }}>↓</button>
+                                <button.icon title="Duplicate" @click={() => {
+                                    let copy = set(b, "id", next_id())
+                                    let at = index_of_block(b.id) + 1
+                                    change(take(bs, at) + [copy] + drop(bs, at))
+                                    selected = copy.id
+                                }}>⧉</button>
+                                <button.icon title="Remove" @click={() => {
+                                    change(bs | filter((x) => x.id != b.id))
+                                    selected = null
+                                }}>✕</button>
+                            </div>}
+                        </div>
+                    }}
+                    <footer.site-foot>© {ws.name}</footer>
+                </div>
+            </div>
+            <aside.inspector>
+                {sel != null
+                    ? <BlockEditor block={sel} type={type_of_block(sel)} {ws} problems={block_problems(sel.id)}
+                        on_change={(config) => { change(bs | map((b) => b.id == sel.id ? set(b, "config", config) : b)) }}/>
+                    : <section>
+                        <h3>Page</h3>
+                        <TextField label="Title" field="title" value={m.title} {problems} on_change={(v) => { meta = set(m, "title", v); saved = "" }}/>
+                        <TextField label="Address" field="slug" value={m.slug} {problems} on_change={(v) => { meta = set(m, "slug", lower(v)); saved = "" }} help={`/p/${m.slug}`}/>
+                        <AreaField label="Description (for search results)" field="description" value={m.description} {problems} on_change={(v) => { meta = set(m, "description", v); saved = "" }} rows={3}/>
+                        {p.published != null && !p.home && ws.user.role != "member" && <button @click={() => {
+                            set_home(id)
+                            p = set(p, "home", true)
+                        }}>Make it the home page</button>}
+                        {p.published != null && <button.danger @click={() => {
+                            unpublish_page(id)
+                            p = set(set(p, "published", null), "home", false)
+                        }}>Unpublish</button>}
+                        <h3>Checks</h3>
+                        {len(problems) == 0 ? <p.ok>Ready to publish.</p>
+                        : <ul.problems>{for x in problems => <li class={x.level == "warning" ? "warn" : ""}
+                            @click={() => { if starts_with(x.field, "block.") { selected = slice(x.field, 6) } }}>{x.message}</li>}</ul>}
+                    </section>}
+            </aside>
+        </div>
+    </div>
+}
+
+// The selected block's settings, from its plugin's description of it.
+view BlockEditor(block: map, type: map, ws: map, problems: list, on_change) {
+    let c = block.config ?? {}
+    let put_key = (k) => (v) => { on_change(set(c, k, v)) }
+    <section>
+        <h3>{type.label}</h3>
+        <Hints {problems} field={`block.${block.id}`}/>
+        <div.stack>{for f in type.fields ?? [] => match f.type {
+            "textarea" => <AreaField label={f.label} field={f.key} value={c[f.key]} problems={[]} on_change={put_key(f.key)} rows={6}/>
+            "select" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={f.options ?? []} problems={[]} on_change={put_key(f.key)} empty="Choose"/>
+            "product" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={ws.skus | map((x) => { value: x.sku, label: x.name })} problems={[]} on_change={put_key(f.key)} empty="Choose a product"/>
+            "form" => <SelectField label={f.label} field={f.key} value={c[f.key]} options={ws.forms | map((x) => { value: x.slug, label: x.name })} problems={[]} on_change={put_key(f.key)} empty="Choose a form"/>
+            _ => <TextField label={f.label} field={f.key} value={c[f.key]} problems={[]} on_change={put_key(f.key)}
+                placeholder={f.type == "url" ? "https://…" : f.type == "link" ? "/shop, https://…" : ""}/>
+        }}</div>
+    </section>
+}

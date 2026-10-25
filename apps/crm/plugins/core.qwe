@@ -70,6 +70,90 @@ let flow_rules = [
         when(!starts_with(str((n.config ?? {}).url ?? ""), "https://"), problem(`node.${n.id}`, "Webhook: the address must start with https://"))) | flatten,
 ]
 
+// The blocks pages are made of (see lib/pages.qwe). Each plugin may bring
+// more; their HTML comes from the plugin's renderers, on the server.
+let CORE_BLOCKS = [
+    { type: "hero", label: "Hero", group: "Layout", fields: [
+        { key: "headline", label: "Headline", type: "text", required: true },
+        { key: "text", label: "Text", type: "textarea" },
+        { key: "image", label: "Image address", type: "url" },
+        { key: "alt", label: "Image description (for screen readers)", type: "text" },
+        { key: "button", label: "Button text", type: "text" },
+        { key: "link", label: "Button link", type: "link" },
+    ] },
+    { type: "text", label: "Text", group: "Content", fields: [{ key: "body", label: "Text (Markdown)", type: "textarea", required: true }] },
+    { type: "image", label: "Image", group: "Content", fields: [
+        { key: "image", label: "Image address", type: "url", required: true },
+        { key: "alt", label: "Description (for screen readers)", type: "text", required: true },
+        { key: "caption", label: "Caption", type: "text" },
+    ] },
+    { type: "columns", label: "Two columns", group: "Layout", fields: [
+        { key: "left", label: "Left (Markdown)", type: "textarea", required: true },
+        { key: "right", label: "Right (Markdown)", type: "textarea", required: true },
+    ] },
+    { type: "quote", label: "Testimonial", group: "Content", fields: [
+        { key: "quote", label: "What they said", type: "textarea", required: true },
+        { key: "name", label: "Who", type: "text" },
+        { key: "role", label: "Their role", type: "text" },
+    ] },
+    { type: "button", label: "Button", group: "Content", fields: [
+        { key: "text", label: "Text", type: "text", required: true },
+        { key: "link", label: "Link", type: "link", required: true },
+    ] },
+    { type: "spacer", label: "Space", group: "Layout", fields: [{ key: "size", label: "Size", type: "select", options: ["small", "medium", "large"] }] },
+    { type: "product", label: "Product", group: "Sell", fields: [
+        { key: "product", label: "Product", type: "product", required: true },
+        { key: "button", label: "Button text", type: "text" },
+    ] },
+    { type: "products", label: "Product grid", group: "Sell", fields: [{ key: "heading", label: "Heading", type: "text" }] },
+    { type: "form", label: "Sign-up form", group: "Grow", fields: [
+        { key: "form", label: "Form", type: "form", required: true },
+        { key: "heading", label: "Heading", type: "text" },
+    ] },
+]
+
+fn block_types(enabled: list) = active_plugins(enabled) | map((p) => p.blocks ?? []) | flatten
+
+// A link a page may have: a page here, a web address, an email.
+fn link_ok(l) = blank(l) || starts_with(l, "/") || starts_with(l, "https://") || starts_with(l, "http://") || starts_with(l, "mailto:") || starts_with(l, "#")
+
+let page_rules = [
+    (pg, ctx) => when(blank(pg.title), problem("title", "Give the page a title")),
+    (pg, ctx) => when(len(pg.title ?? "") > 60, warning("title", "Search results show about 60 characters")),
+    (pg, ctx) => blank(pg.slug) ? problem("slug", "Choose its address")
+        : slugify(pg.slug) != pg.slug ? problem("slug", "Lowercase letters, digits and dashes")
+        : [],
+    (pg, ctx) => when(len(pg.blocks ?? []) == 0, warning("blocks", "An empty page: add a block from the left")),
+    (pg, ctx) => (pg.blocks ?? []) | map((b) => {
+        let t = find(block_types(ctx.enabled ?? []), (t) => t.type == b.type)
+        let c = b.config ?? {}
+        let key = `block.${b.id}`
+        if t == null {
+            problem(key, `Unknown block "${b.type}" (is its plugin switched on?)`)
+        } else {
+            let missing = (t.fields ?? []) | filter((f) => f.required == true && blank(c[f.key])) | map((f) => problem(key, `${t.label}: ${f.label} is required`)) | flatten
+            let links = (t.fields ?? []) | filter((f) => f.type == "link" && !link_ok(c[f.key])) | map((f) => problem(key, `${t.label}: ${f.label} must start with /, https:// or mailto:`)) | flatten
+            let urls = (t.fields ?? []) | filter((f) => f.type == "url" && !blank(c[f.key]) && !starts_with(c[f.key], "https://") && !starts_with(c[f.key], "/"))
+                | map((f) => problem(key, `${t.label}: ${f.label} must start with https:// or /`)) | flatten
+            let products = (t.fields ?? []) | filter((f) => f.type == "product" && !blank(c[f.key]) && !contains(ctx.skus ?? [], c[f.key]))
+                | map((f) => problem(key, `${t.label}: "${c[f.key]}" is not for sale`)) | flatten
+            let forms = (t.fields ?? []) | filter((f) => f.type == "form" && !blank(c[f.key]) && !contains(ctx.forms ?? [], c[f.key]))
+                | map((f) => problem(key, `${t.label}: no form "${c[f.key]}"`)) | flatten
+            let image = when(b.type == "hero" && !blank(c.image) && blank(c.alt), warning(key, "Hero: describe the image for screen readers"))
+            missing + links + urls + products + forms + image
+        }
+    }) | flatten,
+]
+
+let theme_rules = [
+    (t, ctx) => {
+        let hex = split(lower(t.color ?? ""), "")
+        when(len(hex) != 7 || hex[0] != "#" || !all(drop(hex, 1), (ch) => contains("0123456789abcdef", ch)), problem("color", "A colour like #4f46e5"))
+    },
+    (t, ctx) => when(!blank(t.logo) && !starts_with(t.logo, "https://") && !starts_with(t.logo, "/"), problem("logo", "An https:// address")),
+    (t, ctx) => when(!contains(["system", "serif", "rounded", "mono"], t.font ?? "system"), problem("font", "Choose a font")),
+]
+
 let plugin_core = {
     id: "core",
     name: "Core",
@@ -142,7 +226,10 @@ let plugin_core = {
             (c, ctx) => when(blank(c.body), problem("body", "Something to say")),
         ],
         flow: flow_rules,
+        page: page_rules,
+        theme: theme_rules,
     },
+    blocks: CORE_BLOCKS,
     steps: [
         { type: "send_email", label: "Send email", group: "Message", outputs: ["out"], fields: [
             { key: "subject", label: "Subject", type: "text", required: true },
