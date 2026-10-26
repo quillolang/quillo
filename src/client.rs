@@ -1524,7 +1524,7 @@ impl<'a> Compiler<'a> {
                     self.line = *line;
                     return self.err("`mount` must be at the top level");
                 }
-                Stmt::Service(_, _, _, line) => {
+                Stmt::Service(_, _, _, _, line) => {
                     self.line = *line;
                     return self.err("`service` must be at the top level");
                 }

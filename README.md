@@ -56,7 +56,7 @@ serves them:
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
-| `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`) |
+| `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
@@ -486,11 +486,22 @@ component Dashboard() {
 - Props are passed live: a child shows its parent's new value without either running
   again. Each component keeps its own state; give components in a list a `key={...}`
   so each keeps its own (a new key makes it afresh).
+- What reads a prop follows it, as what reads state does: a place in the markup that
+  shows it (`{label}`, `class={...}`), a `let` (`let doubled = count * 2`), a statement
+  (`if active { every(1000, tick) }` starts and stops with it), `live(load, id)` (loads
+  again when `id` changes), and a prop passed on to a child. A handler reads its value
+  when it runs.
+- `state x = prop` reads the prop once, when the component starts: state is the
+  component's own. To follow the parent, read the prop (or a `let` of it); to start over
+  when it changes, give the component a `key` that changes with it.
+- A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
+  component) is called again as a whole when what it is given changes.
 - Views are plain functions: they have no state and add nothing to the browser bundle
   unless a component uses them.
 - A component placed directly in a page gets its props from the server, so they must
-  be data (no functions). Inside another component, props can be anything: callbacks,
-  HTML, other values.
+  be data (no functions), and they stay as the page was made: nothing above it changes
+  them. Inside another component, props can be anything (callbacks, HTML, other values),
+  and follow that component's state.
 
 ### JavaScript libraries
 
@@ -1022,6 +1033,44 @@ service /billing = "billing.qwe"
   call a service, and a call needs the `http` effect. Services may use one another.
 - A program with `server fn`s and no routes is served too: a service may be only that.
 
+When a service runs elsewhere, its calls are made to hold up:
+
+- **Several addresses.** `--service-url billing=http://10.0.0.5:8081,http://10.0.0.6:8081`
+  (or the same in `QUILLO_SERVICE_BILLING`): the same service on several servers, called
+  in turn.
+- **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
+  is tried at the next address, a little later each time. A call sent but not answered in
+  time is tried again at the same address, with the same call id: the service remembers
+  the calls it answered (for ten minutes) and gives the same answer, so the function
+  runs once however often the call is sent. A call still running there is waited for.
+- **Left alone when failing.** An address that fails several calls in a row is not
+  called for a while (its circuit is open), then tried with one call; the others take its
+  calls meanwhile. When every address is left alone, a call fails at once: an error
+  value saying so.
+- **Set where it is declared**, after the file: how long a try may take, how often a
+  call is tried again, after how many failures in a row an address is left alone, and
+  for how long (twice as long each time after):
+
+  ```quillo
+  service billing = "billing.qwe" { timeout: "2s", retries: 2, failures: 5, cooldown: "5s" }
+  ```
+
+  Those are the defaults, except `timeout` (10 s). Durations are `"500ms"`, `"2s"`,
+  `"1m"`, or milliseconds.
+- **One id for a request, everywhere.** Each request has an id: the `x-request-id` it came
+  with (a proxy's, a load balancer's), or one made for it. Its answer carries it, the
+  JSON log shows it (`"rid"`), the code sees it (`request.id`), and every call to a
+  service passes it on, so a request is followed across services. With `--log json`,
+  each call to a service is a line of its own: the service, the function, the address,
+  the status, how long it took, the tries and the id.
+- **Made later.** `billing.later.invoice(name, 1200)` does not wait: the call is kept, its
+  id is the result, and it is made in the background, tried every second, then a little
+  later each time (up to five minutes), until it gets through. Since the service
+  remembers call ids, it runs once. The calls are kept with Quillo's own tables
+  (`_quillo_later`: see [Quillo's own tables](#quillos-own-tables)), so they outlive a
+  restart, and servers sharing that database make each once; a program with no database
+  keeps them in `quillo-system.db` next to it. Checked as the call itself is (`quillo check`).
+
 See [examples/services](examples/services): a shop that bills through a billing service.
 
 ## Standard library
@@ -1036,7 +1085,7 @@ See [examples/services](examples/services): a shop that bills through a billing 
   for text you wrote, and `markdown(text, { inline: true })` keeps only what is inside a
   line (bold, italic, code, links) for a headline or a caption: no paragraph around it, and
   no headings or lists (their lines, broken by `<br>`).
-- **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by index_of`
+- **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
   [Numbers and data](#numbers-and-data).
@@ -1049,7 +1098,7 @@ See [examples/services](examples/services): a shop that bills through a billing 
   another server's answer as it arrives, and `listen` and `receive` read streams in a
   page (see [Streaming](#streaming)).
 - **Database:** `db.open db.exec db.query db.one db.transaction db.migrate db.connect
-  db.tenants db.tenant_exists` (see [Database](#database)).
+  db.tenants db.tenant_exists db.shards db.atomic db.system` (see [Database](#database)).
 - **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (hex), `crypto.token(bytes
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
@@ -1272,6 +1321,83 @@ db.transaction(() => {
 Mounted programs and services have their own `db` too, so one Quillo can run programs
 on different databases side by side.
 
+**Read replicas.** A PostgreSQL or MySQL database's replicas take its reads:
+
+```quillo
+db.open(env("DATABASE_URL"), { replicas: [env("REPLICA_1"), env("REPLICA_2")] })
+```
+
+- Reads (`select`, and `with` that writes nothing) go to the replicas in turn. Writes,
+  reads that lock (`for update`, `for share`), anything in a transaction, and every
+  read of a request after it wrote go to the primary: a request reads what it wrote.
+- A replica that fails is left out for ten seconds; its read goes to the primary.
+- Another request may still read from a replica that has not caught up with a write
+  made just before. Reads that cannot wait for that belong in a transaction.
+- `db.connect(url, { replicas: [...] })` too.
+
+**Shards.** Data split over several databases by a key (a customer, an account):
+
+```quillo
+let users = db.shards([env("SHARD_1"), env("SHARD_2"), env("SHARD_3")])
+users.migrate()                                           // each one
+users.on(id).exec("insert into users (id, name) values (?, ?)", id, name)
+users.on(id).one("select * from users where id = ?", id)   // the shard for the key
+users.all("select count(*) as n from users")               // every shard's rows, together
+```
+
+- `.on(key)` is a connection, as `db.connect` gives (its own transactions too). Keys
+  are spread by jump consistent hashing of their text, the same on every server: a
+  shard added at the end takes its share of keys from each of the others and moves
+  no other key (those are the rows to copy over).
+- Shards may be any kind of database, and mixed.
+
+**Joining across databases.** One SQL query cannot join tables of two databases;
+`join_on` puts their rows together in the program:
+
+```quillo
+let orders = db.query("select * from orders where day = ?", today)
+let people = accounts.query("select * from users where id = any(?)", orders | map((o) => o.user_id))
+join_on(orders, people, "user_id", "id")      // each order with `user`: its user, or null
+```
+
+`join_on(rows, others, key, other_key = key, as)` gives each row its first match (same
+value, same type) under `as`, which is `key` without `_id` (`user`), else `joined`;
+`| filter((o) => o.user != null)` keeps those with one.
+
+**One transaction over several databases.** `db.atomic` keeps all of it, or none:
+
+```quillo
+db.atomic([db, ledger], () => {
+    db.exec("update accounts set balance = balance - ? where id = ?", n, from)
+    ledger.exec("insert into entries (account, amount) values (?, ?)", from, -n)
+})
+```
+
+- It commits in two phases: each PostgreSQL and MySQL database prepares its part
+  (prepared transactions, XA), the decision to commit is recorded with Quillo's own
+  tables, a SQLite database (one at most) commits, and the prepared parts commit. A part
+  that cannot prepare (a deferred constraint, a database gone) rolls every part back,
+  as does a function that fails, returns an error value or replies early.
+- A server that stops part way leaves prepared parts, which hold their locks:
+  recovery finishes them a minute later (from any server of the program), committing
+  those decided and rolling back the others. The first to record a decision for a
+  transaction, it or recovery, decides it.
+- PostgreSQL needs `max_prepared_transactions` set above 0 (it is 0 by default).
+- `db.transaction` inside it nests as usual; `db.atomic` cannot begin inside a
+  transaction on one of its databases.
+
+### Quillo's own tables
+
+Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
+made later (`_quillo_later`) and the decisions of `db.atomic` (`_quillo_atomic`) are
+kept in the program's database. When there is a database per tenant they cannot be,
+and go to the system database instead: `db.system(target)` (a database every server of
+the program shares, for several servers), `$QUILLO_SYSTEM_DB`, or else a SQLite file
+`quillo-system.db` next to the program. `db.system` also keeps them apart from the
+program's own tables when there is one database. A program with no database at all
+keeps its calls made later in that file too, so they outlive a restart (its jobs need
+no record: one server runs them).
+
 ### Many tenants
 
 One program can serve many tenants (customers, teams, sites), each with its own data:
@@ -1388,6 +1514,22 @@ state afresh) and refreshes open pages. `--reload` reloads it the same way witho
 `--watch`'s development aids (errors on pages, refreshing them), for production
 programs that change their own files, such as a plugin editor. A version that fails to load or check does not
 replace the one that works; the errors are printed.
+
+What a reload keeps, and what it starts afresh:
+
+- **Requests in progress** finish on the version they started on: its code, its
+  variables, its services in this process and its database connections (a query or a
+  transaction in progress goes on, and commits or rolls back as it would have). Requests
+  that come after are answered by the new version. While the new version loads, Quillo
+  code waits (what waits on a database goes on); no request is dropped.
+- **Sessions** are signed cookies, not server memory: they stay valid. The key is
+  `QUILLO_SECRET`; without it a key made at start, which a reload keeps and a restart
+  does not (everyone is signed out), so set it in production.
+- **Global variables** start afresh: keep in the database what must last.
+- The old version's database connections close once no request uses it (within a second
+  or so of the last one). Calls made later and transactions over several databases left
+  part way are looked after by whichever version is current; a version that is the
+  first to use services or `db.atomic` starts what does that.
 
 ### Stopping and health
 

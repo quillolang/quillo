@@ -48,6 +48,8 @@ pub struct Interp {
     pub base_dir: Arc<Path>,
     pub(crate) loaded: Arc<HashSet<PathBuf>>,
     pub shared: Arc<Shared>,
+    /// The services this version of the program loaded (see `shared::Services`).
+    pub(crate) services: Arc<crate::shared::Services>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
     /// Calls and loop steps left before a sandboxed script is stopped
@@ -62,6 +64,9 @@ pub struct Interp {
     pub site: Arc<crate::site::Site>,
     /// The current request's tenant, once worked out (`None` until then).
     pub tenant: Option<Option<Arc<str>>>,
+    /// The current request's id (`x-request-id`, given or made), which calls
+    /// to services pass on (src/service.rs).
+    pub request_id: Option<Arc<str>>,
     /// Whether the program named the tenant (`with_tenant`), rather than a
     /// request's host: only then may its database be made.
     pub tenant_named: bool,
@@ -105,6 +110,9 @@ pub struct Interp {
     /// The connection a `db` function was just called on (`analytics.query`),
     /// taken by the function as it starts.
     pub(crate) db_on: Option<usize>,
+    /// The request (its number) that last wrote to a database: its reads go
+    /// to the primary, not a replica, so it sees what it wrote.
+    pub(crate) wrote_req: Option<usize>,
     /// Tenant databases whose function (`db.open((tenant) => ...)`) is
     /// running, which may not use them itself.
     pub(crate) db_resolving: Vec<usize>,
@@ -414,7 +422,7 @@ fn projection(def: &FnDef) -> Option<(&str, u32)> {
     }
 }
 
-fn short(v: &Value) -> String {
+pub(crate) fn short(v: &Value) -> String {
     let r = v.repr();
     if r.chars().count() > 40 {
         format!("{}…", r.chars().take(40).collect::<String>())
@@ -535,6 +543,7 @@ impl Interp {
             base_dir: Arc::from(base_dir.into().as_path()),
             loaded: Arc::new(HashSet::new()),
             shared,
+            services: Default::default(),
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
@@ -543,6 +552,7 @@ impl Interp {
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
             tenant_named: false,
+            request_id: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -562,6 +572,7 @@ impl Interp {
             db: Arc::new(std::sync::Mutex::new(None)),
             db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
             db_on: None,
+            wrote_req: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: String::new(),
@@ -588,6 +599,7 @@ impl Interp {
             base_dir: self.base_dir.clone(),
             loaded: self.loaded.clone(),
             shared: self.shared.clone(),
+            services: self.services.clone(),
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
@@ -596,6 +608,7 @@ impl Interp {
             site: self.site.clone(),
             tenant: None,
             tenant_named: false,
+            request_id: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -615,6 +628,7 @@ impl Interp {
             db: self.db.clone(),
             db_conns: self.db_conns.clone(),
             db_on: None,
+            wrote_req: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: self.base.clone(),
@@ -743,7 +757,12 @@ impl Interp {
     pub fn request_value(&mut self) -> Option<Value> {
         if self.current_request.is_none() {
             if let Some(p) = &self.pending_request {
-                self.current_request = Some(p.make());
+                let mut r = p.make();
+                // `request.id`: the id calls to services pass on.
+                if let (Value::Map(m), Some(id)) = (&mut r, &self.request_id) {
+                    Arc::make_mut(m).insert("id".into(), Value::str(&**id));
+                }
+                self.current_request = Some(r);
             }
         }
         self.current_request.clone()
@@ -846,6 +865,7 @@ impl Interp {
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it.tenant = self.tenant.clone();
         it.tenant_named = self.tenant_named;
+        it.request_id = self.request_id.clone();
         it.upload_body = self.upload_body.clone();
         it.locale = self.locale.clone();
         it
@@ -1064,11 +1084,15 @@ impl Interp {
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
             }
-            Stmt::Service(name, prefix, file, line) => {
+            Stmt::Service(name, prefix, file, options, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`service` must be at the top level");
                 }
-                crate::service::declare(self, name, prefix.as_deref(), file, *line)
+                let options = match options {
+                    Some(e) => Some(self.eval(e, env)?),
+                    None => None,
+                };
+                crate::service::declare(self, name, prefix.as_deref(), file, options.as_ref(), *line)
             }
             Stmt::Mount(prefix, file, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {
@@ -1077,6 +1101,7 @@ impl Interp {
                 let full = self.base_dir.join(file);
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, self.shared.clone());
+                sub.services = self.services.clone();
                 sub.base = format!("{}{}", self.base, prefix);
                 sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
                 // Watch the mounted program's files too.

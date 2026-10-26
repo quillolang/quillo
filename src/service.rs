@@ -16,17 +16,30 @@
 //! Either way what crosses is data, as JSON: a program behaves the same
 //! whichever way it runs. `quillo run app.qwe --split` runs each service as
 //! a process of its own, to see it so (see `split`).
+//!
+//! Calls elsewhere are made to hold up (see `remote`): several addresses
+//! (`--service-url billing=http://a,http://b`) taken in turn; an address
+//! that keeps failing left alone for a while (its circuit open); a call that
+//! did not get through tried again, with the same call id, which the service
+//! remembers, so a call is run once however often it is sent; how long a
+//! call may take, how often it is tried and when an address is left alone,
+//! set where the service is declared (`{ timeout: "2s", retries: 2 }`).
+//! Each call carries the request's id (`x-request-id`), which the service's
+//! own calls pass on and the JSON log shows. `billing.later.invoice(...)`
+//! sends a call to be made in the background, until it is made (see
+//! `later`).
 
 use crate::ast::{FnDef, Stmt};
-use crate::interp::{fail, Ctrl, Interp};
+use crate::interp::{fail, short, Ctrl, Interp};
 use crate::parser::Parser;
 use crate::server::{HttpRequest, HttpResponse};
 use crate::value::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 type R = Result<Value, Ctrl>;
 
@@ -43,12 +56,177 @@ pub fn env_name(name: &str) -> String {
     format!("QUILLO_SERVICE_{}", name.to_ascii_uppercase())
 }
 
-/// Where service `name` runs, when not in this process.
+/// Where service `name` runs, when not in this process: its addresses
+/// (`http://a:8081,http://b:8081`, the same service on several servers).
+pub fn urls_of(shared: &crate::shared::Shared, name: &str) -> Vec<String> {
+    let given = match shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        Some(u) => u.clone(),
+        None => std::env::var(env_name(name)).unwrap_or_default(),
+    };
+    given.split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect()
+}
+
+/// One address of service `name`, for passing its routes on: the next that
+/// is not left alone (see `pick`).
 pub fn url_of(shared: &crate::shared::Shared, name: &str) -> Option<String> {
-    if let Some(u) = shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
-        return Some(u.trim_end_matches('/').to_string());
+    let urls = urls_of(shared, name);
+    pick(&urls, &[], &opts(name)).or_else(|| urls.first().cloned())
+}
+
+// ---- how a service is called ----------------------------------------------------------------
+
+/// How calls to a service are made: what its declaration's options say.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Opts {
+    /// How long one try may take.
+    pub timeout: Duration,
+    /// Tries after the first, when a call did not get through.
+    pub retries: u32,
+    /// Failures in a row after which an address is left alone...
+    pub failures: u32,
+    /// ...for this long (twice as long each time after, up to 16 times).
+    pub cooldown: Duration,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts { timeout: Duration::from_secs(10), retries: 2, failures: 5, cooldown: Duration::from_secs(5) }
     }
-    std::env::var(env_name(name)).ok().filter(|u| !u.is_empty()).map(|u| u.trim_end_matches('/').to_string())
+}
+
+fn opts_table() -> &'static Mutex<HashMap<String, Opts>> {
+    static T: OnceLock<Mutex<HashMap<String, Opts>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+/// How service `name` is called.
+pub fn opts(name: &str) -> Opts {
+    opts_table().lock().unwrap_or_else(|e| e.into_inner()).get(name).copied().unwrap_or_default()
+}
+
+/// A duration given as milliseconds (`1500`) or text (`"1.5s"`, `"500ms"`, `"2m"`).
+fn duration(v: &Value) -> Option<Duration> {
+    match v {
+        Value::Int(n) if *n >= 0 => Some(Duration::from_millis(*n as u64)),
+        Value::Float(f) if *f >= 0.0 => Some(Duration::from_secs_f64(f / 1000.0)),
+        Value::Str(s) => {
+            let s = s.trim();
+            let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
+            let n: f64 = num.trim().parse().ok().filter(|n: &f64| *n >= 0.0)?;
+            let ms = match unit {
+                "ms" => n,
+                "s" | "" => n * 1000.0,
+                "m" => n * 60_000.0,
+                _ => return None,
+            };
+            Some(Duration::from_secs_f64(ms / 1000.0))
+        }
+        _ => None,
+    }
+}
+
+/// `service billing = "billing.qwe" { timeout: "2s", retries: 2, failures: 5, cooldown: "5s" }`.
+fn set_opts(name: &str, given: &Value, line: u32) -> Result<(), Ctrl> {
+    let Value::Map(m) = given else {
+        return fail(line, format!("service {}: its options are a map, like {{ timeout: \"2s\", retries: 2 }}", name));
+    };
+    let mut o = Opts::default();
+    for (k, v) in m.iter() {
+        let bad = |what: &str| fail(line, format!("service {}: `{}` is {}, not {}", name, k.as_str(), what, short(v)));
+        match k.as_str() {
+            "timeout" => match duration(v).filter(|d| !d.is_zero()) {
+                Some(d) => o.timeout = d,
+                None => return bad("a duration (\"2s\", \"500ms\", or milliseconds)"),
+            },
+            "cooldown" => match duration(v) {
+                Some(d) => o.cooldown = d,
+                None => return bad("a duration (\"5s\", or milliseconds)"),
+            },
+            "retries" => match v {
+                Value::Int(n) if (0..=10).contains(n) => o.retries = *n as u32,
+                _ => return bad("a number of tries after the first, 0 to 10"),
+            },
+            "failures" => match v {
+                Value::Int(n) if *n >= 1 => o.failures = *n as u32,
+                _ => return bad("how many failures in a row leave an address alone, 1 or more"),
+            },
+            other => {
+                return fail(line, format!("service {}: no option `{}` (timeout, retries, failures, cooldown)", name, other));
+            }
+        }
+    }
+    opts_table().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), o);
+    Ok(())
+}
+
+// ---- addresses that fail: left alone a while ---------------------------------------------
+
+/// An address's recent calls: failures in a row, and until when it is left
+/// alone (its circuit open). When that time comes, one call tries it again
+/// (and the next try after that waits another while, unless it went well).
+#[derive(Default)]
+struct Health {
+    fails: u32,
+    until: Option<Instant>,
+}
+
+fn health() -> &'static Mutex<HashMap<String, Health>> {
+    static H: OnceLock<Mutex<HashMap<String, Health>>> = OnceLock::new();
+    H.get_or_init(Default::default)
+}
+
+/// Whether to call `url` now (taking its one try, when its time has come).
+fn usable(url: &str, o: &Opts) -> bool {
+    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = h.get_mut(url) else { return true };
+    match st.until {
+        None => true,
+        Some(t) if Instant::now() >= t => {
+            st.until = Some(Instant::now() + o.cooldown);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn went_well(url: &str) {
+    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    if h.get(url).map_or(false, |st| st.fails > 0 || st.until.is_some()) {
+        if h.get(url).map_or(false, |st| st.until.is_some()) {
+            eprintln!("quillo: {} answers again", url);
+        }
+        h.remove(url);
+    }
+}
+
+fn went_wrong(url: &str, o: &Opts) {
+    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    let st = h.entry(url.to_string()).or_default();
+    st.fails += 1;
+    if st.fails >= o.failures {
+        let times = 1u32 << (st.fails - o.failures).min(4);
+        let wait = o.cooldown * times;
+        if st.until.is_none() {
+            eprintln!("quillo: {} failed {} times in a row; left alone for {:.1}s", url, st.fails, wait.as_secs_f64());
+        }
+        st.until = Some(Instant::now() + wait);
+    }
+}
+
+/// The next of `urls` to call, in turn: one not left alone, and not among
+/// `tried` when another will do.
+fn pick(urls: &[String], tried: &[String], o: &Opts) -> Option<String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    if urls.is_empty() {
+        return None;
+    }
+    let start = NEXT.fetch_add(1, Ordering::Relaxed);
+    let order: Vec<&String> = (0..urls.len()).map(|i| &urls[(start + i) % urls.len()]).collect();
+    let healthy = |u: &&String| health().lock().unwrap_or_else(|e| e.into_inner()).get(u.as_str()).map_or(true, |st| st.until.map_or(true, |t| Instant::now() >= t));
+    let fresh = order.iter().copied().find(|u| !tried.contains(u) && healthy(u));
+    let any = || order.iter().copied().find(|u| healthy(u));
+    let u = fresh.or_else(any)?;
+    usable(u, o).then(|| u.clone())
 }
 
 // ---- what a service offers ---------------------------------------------------------------
@@ -98,7 +276,7 @@ pub fn declared(path: &Path) -> Result<Vec<(String, Option<String>, PathBuf)>, S
         statements(&p, &mut HashSet::new(), &mut stmts)?;
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
         for s in stmts {
-            if let Stmt::Service(name, prefix, file, _) = s {
+            if let Stmt::Service(name, prefix, file, _, _) = s {
                 let full = dir.join(&file);
                 match found.iter_mut().find(|(n, _, _)| *n == name) {
                     Some((_, pre, _)) => {
@@ -119,15 +297,23 @@ pub fn declared(path: &Path) -> Result<Vec<(String, Option<String>, PathBuf)>, S
 /// `server fn` it offers, each taking that function's parameters.
 pub fn namespace(it: &mut Interp, name: &str, defs: &[Arc<FnDef>], line: u32) -> R {
     let mut m = Map::new();
+    let mut later = Map::new();
     for d in defs {
         let params: Vec<String> = d.params.iter().map(|p| if p.default.is_some() { format!("{} = null", p.name) } else { p.name.clone() }).collect();
         let names: Vec<&str> = d.params.iter().map(|p| p.name.as_str()).collect();
         let required = d.params.iter().filter(|p| p.default.is_none()).count();
-        let src = format!("({}) => __service({:?}, {:?}, [{}], {})", params.join(", "), name, d.name, names.join(", "), required);
-        let lambda = Parser::new(&src).parse_expr().map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e.msg, line)))?;
-        let g = it.globals.clone();
-        let f = it.eval(&lambda, &g)?;
-        m.insert(d.name.as_str().into(), f);
+        let mut made = |builtin: &str| -> R {
+            let src = format!("({}) => {}({:?}, {:?}, [{}], {})", params.join(", "), builtin, name, d.name, names.join(", "), required);
+            let lambda = Parser::new(&src).parse_expr().map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e.msg, line)))?;
+            let g = it.globals.clone();
+            it.eval(&lambda, &g)
+        };
+        m.insert(d.name.as_str().into(), made("__service")?);
+        later.insert(d.name.as_str().into(), made("__service_later")?);
+    }
+    // `billing.later.invoice(...)`: made in the background (see `later`).
+    if !m.contains_key("later") {
+        m.insert("later".into(), Value::map(later));
     }
     Ok(Value::map(m))
 }
@@ -138,8 +324,16 @@ pub fn namespace(it: &mut Interp, name: &str, defs: &[Arc<FnDef>], line: u32) ->
 /// here or where it runs. Optional arguments left out are not sent, so the
 /// service's own defaults apply. A service out of reach is an error value.
 pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (name, f, sent) = call_args(&args, "__service", line)?;
+    let tenant = it.tenant();
+    let rid = it.request_id.clone();
+    Ok(make(it, &name, &f, sent, tenant, rid, None, line).value())
+}
+
+/// The service, the function and the arguments to send, from `__service`'s.
+fn call_args(args: &[Value], who: &str, line: u32) -> Result<(String, String, Vec<Value>), Ctrl> {
     let (Some(Value::Str(name)), Some(Value::Str(f)), Some(Value::List(given))) = (args.first(), args.get(1), args.get(2)) else {
-        return fail(line, "`__service` is Quillo's own: call a service as `billing.invoice(...)`");
+        return fail(line, format!("`{}` is Quillo's own: call a service as `billing.invoice(...)`", who));
     };
     let required = match args.get(3) {
         Some(Value::Int(n)) => *n as usize,
@@ -149,15 +343,49 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     while sent.len() > required && matches!(sent.last(), Some(Value::Nil)) {
         sent.pop();
     }
-    let tenant = it.tenant();
-    match url_of(&it.shared, name) {
-        Some(url) => remote(it, &url, name, f, sent, tenant),
-        None => local(it, name, f, sent, tenant, line),
+    Ok((name.to_string(), f.to_string(), sent))
+}
+
+/// What became of a call.
+enum Outcome {
+    /// The function ran: its value (an error value too).
+    Ran(Value),
+    /// It did not run, or may not have (no answer in time): why.
+    Missed(String),
+}
+
+impl Outcome {
+    fn value(self) -> Value {
+        match self {
+            Outcome::Ran(v) => v,
+            Outcome::Missed(why) => Value::err(Value::str(why)),
+        }
     }
 }
 
-fn error(msg: String) -> R {
-    Ok(Value::err(Value::str(msg)))
+/// A call, here or where the service runs, with call id `call` (made if
+/// not given: the same id for each try, so the call runs once).
+#[allow(clippy::too_many_arguments)]
+fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: Option<String>, line: u32) -> Outcome {
+    let urls = urls_of(&it.shared, name);
+    if urls.is_empty() {
+        return local(it, name, f, args, tenant, rid, line);
+    }
+    remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)))
+}
+
+/// A random id of `n` hex digits.
+pub fn new_id(n: usize) -> String {
+    (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect()
+}
+
+/// A request's id: the `x-request-id` it came with, if it is a plain one,
+/// else a new one.
+pub fn request_id(given: Option<&str>) -> Arc<str> {
+    match given {
+        Some(g) if !g.is_empty() && g.len() <= 64 && g.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)) => Arc::from(g),
+        _ => Arc::from(new_id(16)),
+    }
 }
 
 /// A copy of a value, as the other side of a network would have it (an
@@ -169,29 +397,31 @@ fn crossed(v: &Value) -> Value {
     }
 }
 
-fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, line: u32) -> R {
-    let found = it.shared.services.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(_, s)| s.fork());
+fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, line: u32) -> Outcome {
+    let found = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
-        return error(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
+        return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
     };
     let Some(Value::Func(c)) = lookup(&svc.globals, f).filter(|_| svc.server_fns.iter().any(|n| n == f)) else {
-        return error(format!("service {}: no server fn `{}`", name, f));
+        return Outcome::Ran(Value::err(Value::str(format!("service {}: no server fn `{}`", name, f))));
     };
     let args: Vec<Value> = args.iter().map(crossed).collect();
     if let Err(msg) = crate::server::check_args(&svc.types, &c.def, &args) {
-        return error(format!("service {}: {}", name, msg));
+        return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg))));
     }
     svc.tenant = Some(tenant.clone());
     svc.tenant_named = tenant.is_some();
+    svc.request_id = rid;
+    let err = |msg: String| Outcome::Ran(Value::err(Value::str(msg)));
     match svc.call_closure(&c, args.into_iter().map(Some).collect(), line) {
-        Ok(v) | Err(Ctrl::Return(v)) => Ok(match v {
-            Value::Response(_) => Value::err(Value::str(format!("service {}: `{}` answered with a page, not a value", name, f))),
-            v => crossed(&v),
-        }),
-        Err(Ctrl::Reply(_)) => error(format!("service {}: `{}` replied with a page, not a value", name, f)),
+        Ok(v) | Err(Ctrl::Return(v)) => match v {
+            Value::Response(_) => err(format!("service {}: `{}` answered with a page, not a value", name, f)),
+            v => Outcome::Ran(crossed(&v)),
+        },
+        Err(Ctrl::Reply(_)) => err(format!("service {}: `{}` replied with a page, not a value", name, f)),
         Err(Ctrl::Error(e)) => {
             eprintln!("quillo: service {}: error in `{}`: {}", name, f, e);
-            error(format!("service {}: internal error in `{}`", name, f))
+            err(format!("service {}: internal error in `{}`", name, f))
         }
     }
 }
@@ -220,46 +450,139 @@ fn signature(secret: &str, t: u64, f: &str, tenant: &str, body: &[u8]) -> String
     crate::crypto::hex(&crate::crypto::hmac_sha256(secret.as_bytes(), &msg))
 }
 
-fn remote(it: &mut Interp, url: &str, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>) -> R {
+/// How one try went.
+enum Try {
+    Answer(u16, String),
+    /// No connection: the call was not sent.
+    NotSent(String),
+    /// Sent, but no answer (in time): it may have run.
+    NoAnswer(String),
+}
+
+/// A call to where the service runs: tried at its addresses in turn (one
+/// left alone when it keeps failing) until one answers, as often as its
+/// options say. A try that got no connection, or a busy or missing server
+/// (502, 503, 504), is made again elsewhere; one sent but not answered in
+/// time, again at the same address, with the same call id, which that
+/// server remembers, so the function runs once.
+#[allow(clippy::too_many_arguments)]
+fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String) -> Outcome {
     let Some(secret) = secret() else {
-        return error(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, url));
+        return Outcome::Missed(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, urls.join(",")));
     };
+    let o = opts(name);
     let body = serde_json::Value::Array(args.iter().map(|a| a.to_json()).collect()).to_string().into_bytes();
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
-    let t = now_secs();
-    let sig = signature(&secret, t, f, &tenant, &body);
-    let endpoint = format!("{}/_quillo/service/{}", url, f);
-    let caller = it.base.clone();
-    let res = it.unlocked(move || -> Result<(u16, String), String> {
-        let mut rq = agent()
-            .post(&endpoint)
-            .set("content-type", "application/json")
-            .set("x-quillo-service", &format!("t={},sig={}", t, sig))
-            .set("x-quillo-caller", if caller.is_empty() { "/" } else { &caller });
-        if !tenant.is_empty() {
-            rq = rq.set("x-quillo-tenant", &tenant);
-        }
-        let resp = match rq.send_bytes(&body) {
-            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-            Err(e) => return Err(e.to_string()),
+    let rid = rid.map(|r| r.to_string()).unwrap_or_default();
+    let caller = if it.base.is_empty() { "/".to_string() } else { it.base.clone() };
+    let mut tried: Vec<String> = Vec::new();
+    let mut same: Option<String> = None;
+    let mut why = String::new();
+    let start = Instant::now();
+    for attempt in 0..=o.retries {
+        let url = match same.clone().or_else(|| pick(urls, &tried, &o)) {
+            Some(u) => u,
+            None if why.is_empty() => return Outcome::Missed(format!("service {}: unavailable (every address failed lately: {})", name, urls.join(", "))),
+            None => break,
         };
-        let status = resp.status();
-        let mut text = String::new();
-        resp.into_reader().take(64 << 20).read_to_string(&mut text).map_err(|e| e.to_string())?;
-        Ok((status, text))
-    });
-    match res {
-        Err(e) => error(format!("service {}: unreachable at {} ({})", name, url, e)),
-        Ok((200, text)) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(j) if j.get("ok").is_some() => Ok(Value::from_json(&j["ok"])),
-            Ok(j) if j.get("err").is_some() => Ok(Value::err(Value::from_json(&j["err"]))),
-            _ => error(format!("service {}: an answer that is not one", name)),
-        },
-        Ok((status, text)) => {
-            let why = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|j| j["error"].as_str().map(String::from)).unwrap_or(text);
-            error(format!("service {}: {} {}", name, status, why.trim()))
+        if attempt > 0 {
+            // A little longer each time, not all at once.
+            let wait = Duration::from_millis(100 << (attempt - 1)).mul_f64(1.0 + fastrand::f64() / 2.0);
+            it.unlocked(move || std::thread::sleep(wait));
+        }
+        let t = now_secs();
+        let sig = signature(&secret, t, f, &tenant, &body);
+        let endpoint = format!("{}/_quillo/service/{}", url, f);
+        let (b, tn, r, c, cl) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone());
+        let timeout = o.timeout;
+        let got = it.unlocked(move || -> Try {
+            let mut rq = agent()
+                .post(&endpoint)
+                .timeout(timeout)
+                .set("content-type", "application/json")
+                .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+                .set("x-quillo-call", &c)
+                .set("x-quillo-caller", &cl);
+            if !tn.is_empty() {
+                rq = rq.set("x-quillo-tenant", &tn);
+            }
+            if !r.is_empty() {
+                rq = rq.set("x-request-id", &r);
+            }
+            let resp = match rq.send_bytes(&b) {
+                Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+                Err(ureq::Error::Transport(e)) if matches!(e.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns) => return Try::NotSent(e.to_string()),
+                Err(e) => return Try::NoAnswer(e.to_string()),
+            };
+            let status = resp.status();
+            let mut text = String::new();
+            match resp.into_reader().take(64 << 20).read_to_string(&mut text) {
+                Ok(_) => Try::Answer(status, text),
+                Err(e) => Try::NoAnswer(e.to_string()),
+            }
+        });
+        match got {
+            Try::Answer(status @ (502..=504), text) => {
+                went_wrong(&url, &o);
+                why = format!("service {}: {} at {} ({})", name, status, url, reason(&text));
+                // A call still running there (503) is asked of it again.
+                if status != 503 || same.is_none() {
+                    tried.push(url);
+                    same = None;
+                }
+            }
+            Try::Answer(status, text) => {
+                went_well(&url);
+                log_call(name, f, &url, status, start, attempt + 1, &rid);
+                return Outcome::Ran(match status {
+                    200 => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(j) if j.get("ok").is_some() => Value::from_json(&j["ok"]),
+                        Ok(j) if j.get("err").is_some() => Value::err(Value::from_json(&j["err"])),
+                        _ => Value::err(Value::str(format!("service {}: an answer that is not one", name))),
+                    },
+                    _ => Value::err(Value::str(format!("service {}: {} {}", name, status, reason(&text)))),
+                });
+            }
+            Try::NotSent(e) => {
+                went_wrong(&url, &o);
+                why = format!("service {}: unreachable at {} ({})", name, url, e);
+                tried.push(url);
+            }
+            Try::NoAnswer(e) => {
+                went_wrong(&url, &o);
+                why = format!("service {}: no answer from {} ({})", name, url, e);
+                same = Some(url);
+            }
+        }
+        if attempt < o.retries {
+            eprintln!("quillo: {}; trying again{}", why, if rid.is_empty() { String::new() } else { format!(" (request {})", rid) });
         }
     }
+    log_call(name, f, tried.last().map_or("", |u| u.as_str()), 0, start, o.retries + 1, &rid);
+    Outcome::Missed(why)
+}
+
+/// What an error answer says.
+fn reason(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text).ok().and_then(|j| j["error"].as_str().map(String::from)).unwrap_or_else(|| text.to_string()).trim().to_string()
+}
+
+/// A call to a service, in the JSON log: for following a request across services.
+fn log_call(name: &str, f: &str, url: &str, status: u16, start: Instant, tries: u32, rid: &str) {
+    if crate::metrics::LOG.load(Ordering::Relaxed) != crate::metrics::JSON {
+        return;
+    }
+    crate::httpd::log_fmt(format_args!(
+        "{{\"time\":\"{}\",\"service\":{},\"fn\":{},\"url\":{},\"status\":{},\"ms\":{:.2},\"tries\":{},\"rid\":{}}}\n",
+        crate::httpd::iso_now(),
+        serde_json::Value::from(name),
+        serde_json::Value::from(f),
+        serde_json::Value::from(url),
+        status,
+        start.elapsed().as_secs_f64() * 1000.0,
+        tries,
+        serde_json::Value::from(rid)
+    ));
 }
 
 // ---- answering -------------------------------------------------------------------------
@@ -294,6 +617,47 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     if !tenant.is_empty() && !crate::site::tenant_name_ok(tenant) {
         return refused(400, "not a tenant's name");
     }
+    // A call sent again (it got no answer in time, or is a call made later,
+    // delivered twice): answered as it was, not run again.
+    let call = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric()));
+    if let Some(c) = call {
+        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        match seen.get(c) {
+            Some((_, Some(r))) => return r.clone(),
+            Some((_, None)) => return refused(503, "this call is still running"),
+            None => {
+                if seen.len() >= SEEN_MAX {
+                    let now = Instant::now();
+                    seen.retain(|_, (at, _)| now.duration_since(*at) < SEEN_FOR);
+                }
+                seen.insert(c.to_string(), (Instant::now(), None));
+            }
+        }
+    }
+    let r = run_call(it, f, tenant, req);
+    if let Some(c) = call {
+        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        // A call that did not run (a busy server) may be sent again.
+        if r.status >= 502 {
+            seen.remove(c);
+        } else {
+            seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
+        }
+    }
+    r
+}
+
+/// Calls answered lately, by call id: when, and the answer (none while it runs).
+fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
+    static S: OnceLock<Mutex<HashMap<String, (Instant, Option<HttpResponse>)>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// How long, and how many, calls are remembered.
+const SEEN_FOR: Duration = Duration::from_secs(600);
+const SEEN_MAX: usize = 100_000;
+
+fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpResponse {
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
@@ -306,6 +670,13 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     }
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });
     it.tenant_named = !tenant.is_empty();
+    // Called by another service: `request` is the request it came from, as
+    // far as it goes with the call (its id).
+    if let Some(id) = &it.request_id {
+        let mut m = Map::new();
+        m.insert("id".into(), Value::str(&**id));
+        it.current_request = Some(Value::map(m));
+    }
     match it.call_closure(&c, args.into_iter().map(Some).collect(), 0) {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
@@ -364,7 +735,10 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
 /// the name stands for the service's functions; the service is loaded here
 /// (once per process) unless it runs elsewhere; under its prefix, its
 /// routes are served (here, or passed on to it).
-pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, line: u32) -> R {
+pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, options: Option<&Value>, line: u32) -> R {
+    if let Some(o) = options {
+        set_opts(name, o, line)?;
+    }
     let full = it.base_dir.join(file);
     let defs = offered(&full).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     let ns = namespace(it, name, &defs, line)?;
@@ -375,19 +749,20 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, li
         }
     } else {
         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-        let existing = it.shared.services.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(p, s)| (p.clone(), s.fork()));
+        let existing = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(p, s)| (p.clone(), s.fork()));
         let svc = match existing {
             Some((p, s)) if p == key => Some(s),
             Some((p, _)) => return fail(line, format!("service `{}` is {} elsewhere in this app, and {} here", name, p.display(), key.display())),
-            None if it.shared.services_loading.lock().unwrap_or_else(|e| e.into_inner()).contains(name) => None,
+            None if it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).contains(name) => None,
             None => {
-                it.shared.services_loading.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+                it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
+                sub.services = it.services.clone();
                 let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
-                it.shared.services_loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
                 loaded?;
-                it.shared.services.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (key, sub.fork()));
+                it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (key, sub.fork()));
                 Some(sub)
             }
         };
@@ -403,6 +778,170 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, li
     }
     define(&it.globals, name, ns);
     Ok(Value::Nil)
+}
+
+// ---- calls made later ---------------------------------------------------------------------
+
+/// A call to be made in the background (`billing.later.invoice(...)`).
+#[derive(Clone)]
+pub struct Later {
+    pub id: String,
+    pub service: String,
+    pub f: String,
+    /// The arguments, as JSON.
+    pub args: String,
+    pub tenant: String,
+    pub rid: String,
+    /// When to try it next (milliseconds since 1970), and the tries so far.
+    pub at: i64,
+    pub tries: i64,
+}
+
+/// Calls made later, when the program has no one database to keep them in.
+fn waiting() -> &'static Mutex<Vec<Later>> {
+    static W: OnceLock<Mutex<Vec<Later>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `__service_later(name, fn, [args], required)`: the call is kept (in the
+/// program's database when it has one, so it outlives a restart; in memory
+/// otherwise) and made in the background, again and again until it gets
+/// through; its id is the result. The service remembers the id, so the
+/// function runs once.
+pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (service, f, sent) = call_args(&args, "__service_later", line)?;
+    let call = Later {
+        id: new_id(24),
+        service,
+        f,
+        args: serde_json::Value::Array(sent.iter().map(|a| a.to_json()).collect()).to_string(),
+        tenant: it.tenant().map(|t| t.to_string()).unwrap_or_default(),
+        rid: it.request_id.as_deref().unwrap_or("").to_string(),
+        at: now_ms(),
+        tries: 0,
+    };
+    let id = call.id.clone();
+    if !crate::db::later_put(it, &call) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("quillo: calls made later are kept in memory (no database could keep them): a restart loses those not made yet"));
+        waiting().lock().unwrap_or_else(|e| e.into_inner()).push(call);
+    }
+    Ok(Value::str(id))
+}
+
+/// How long until a call that did not get through is tried again: a second,
+/// then twice as long each time, up to five minutes.
+fn backoff(tries: i64) -> i64 {
+    (1000i64 << tries.clamp(0, 9)).min(300_000)
+}
+
+/// Makes the calls that are due (asked by the server's scheduler, each
+/// second): those that get through are done with; the others wait longer.
+pub fn deliver(it: &mut Interp) -> HttpResponse {
+    // Every half minute: transactions over several databases left part way.
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let due = {
+        let mut l = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let due = l.map_or(true, |t| t.elapsed() >= Duration::from_secs(30));
+        if due {
+            *l = Some(Instant::now());
+        }
+        due
+    };
+    if due {
+        crate::db::recover(it);
+    }
+    let now = now_ms();
+    let due: Vec<Later> = {
+        let mut w = waiting().lock().unwrap_or_else(|e| e.into_inner());
+        let (due, rest): (Vec<Later>, Vec<Later>) = std::mem::take(&mut *w).into_iter().partition(|c| c.at <= now);
+        *w = rest;
+        due
+    };
+    for mut c in due {
+        if let Err(why) = make_later(it, &c) {
+            c.tries += 1;
+            c.at = now_ms() + backoff(c.tries);
+            eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(c.tries) / 1000);
+            waiting().lock().unwrap_or_else(|e| e.into_inner()).push(c);
+        }
+    }
+    // Kept in the database: each taken by one server (others may share it).
+    for c in crate::db::later_due(it, now, 50) {
+        if !crate::db::later_take(it, &c.id, c.at, now_ms() + 60_000) {
+            continue;
+        }
+        match make_later(it, &c) {
+            Ok(()) => crate::db::later_done(it, &c.id),
+            Err(why) => {
+                let tries = c.tries + 1;
+                eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(tries) / 1000);
+                crate::db::later_again(it, &c.id, now_ms() + backoff(tries), tries, &why);
+            }
+        }
+    }
+    HttpResponse { status: 200, headers: Vec::new(), body: b"ok\n".to_vec() }
+}
+
+/// One call made later: Ok when it got through (whatever the function gave).
+fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
+    let args = match serde_json::from_str::<serde_json::Value>(&c.args) {
+        Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect(),
+        _ => Vec::new(),
+    };
+    let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
+    let rid = (!c.rid.is_empty()).then(|| Arc::from(c.rid.as_str()));
+    match make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0) {
+        Outcome::Ran(Value::Err(e)) => {
+            eprintln!("quillo: {}.{} (made later, {}) gave an error: {}", c.service, c.f, c.id, short(&e));
+            Ok(())
+        }
+        Outcome::Ran(_) => Ok(()),
+        Outcome::Missed(why) => Err(why),
+    }
+}
+
+/// Whether a program declares services (then its calls made later are
+/// delivered).
+pub fn uses_services(it: &Interp) -> bool {
+    it.program.iter().any(|stmts| stmts.iter().any(|s| matches!(s, Stmt::Service(..))))
+}
+
+/// Asks the server at `addr`, each second, to make the calls that are due
+/// (see `deliver`), as the scheduler asks it to run jobs.
+pub fn start_deliveries(addr: std::net::SocketAddr) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let addr = match addr.ip() {
+        ip if ip.is_unspecified() && ip.is_ipv4() => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
+        ip if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port())),
+        _ => addr,
+    };
+    let _ = std::thread::Builder::new().name("quillo-later".into()).spawn(move || loop {
+        if crate::httpd::stopping() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let asked = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+            write!(
+                s,
+                "POST /_quillo/later HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                crate::jobs::token()
+            )?;
+            let mut out = Vec::new();
+            s.read_to_end(&mut out)?;
+            Ok(())
+        })();
+        let _ = asked;
+    });
 }
 
 // ---- running split ---------------------------------------------------------------------

@@ -20,6 +20,8 @@ let ONLY = "main"
 // same either way.
 if SINGLE { tenant_from((request) => ONLY) } else { tenant_from(DOMAIN) }
 db.open("data/{tenant}.db")
+// Quillo's own tables (scheduled jobs' runs), with the rest of the data.
+db.system("data/quillo-system.db")
 db.migrate("migrations")
 
 use "lib/util.qwe"

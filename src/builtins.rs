@@ -66,6 +66,7 @@ pub fn install(env: &Env) {
         ("tenant_from", tenant_from),
         ("with_tenant", with_tenant),
         ("__service", crate::service::call),
+        ("__service_later", crate::service::later),
         ("__record", crate::record::construct),
         ("redirect", redirect),
         ("respond", respond),
@@ -89,6 +90,7 @@ pub fn install(env: &Env) {
         ("drop", drop_fn),
         ("count", count),
         ("group_by", group_by),
+        ("join_on", join_on),
         ("index_of", index_of),
         ("repeat", repeat),
         ("markdown", markdown),
@@ -1185,6 +1187,46 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         groups.entry(k).or_default().push(x.clone());
     }
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
+}
+
+/// `join_on(rows, others, key, other_key = key, as)`: each row with its
+/// match among `others` (the first whose `other_key` equals the row's
+/// `key`, value and type) under `as`, or null: rows from two databases put
+/// together, as no single SQL query can. `as` is `key` without `_id`
+/// (`user_id` gives `user`), else "joined".
+fn join_on(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let rows = l_arg(&args, 0, "join_on", line)?;
+    let others = l_arg(&args, 1, "join_on", line)?;
+    let key = s_arg(&args, 2, "join_on", line)?;
+    let other_key: Arc<str> = match arg(&args, 3) {
+        Value::Nil => key.clone(),
+        Value::Str(s) => s,
+        other => return fail(line, format!("`join_on`'s fourth argument is the others' key (a str), got {}", other.type_name())),
+    };
+    let name: String = match arg(&args, 4) {
+        Value::Nil => key.strip_suffix("_id").filter(|s| !s.is_empty()).unwrap_or("joined").to_string(),
+        Value::Str(s) => s.to_string(),
+        other => return fail(line, format!("`join_on`'s fifth argument is the field to put the match in (a str), got {}", other.type_name())),
+    };
+    let mut index: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for o in others.iter() {
+        if let Value::Map(m) = o {
+            if let Some(k) = m.get(&*other_key) {
+                index.entry(k.repr()).or_insert_with(|| o.clone());
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows.iter() {
+        let Value::Map(m) = r else {
+            return fail(line, format!("`join_on` joins maps (rows), got {}", r.type_name()));
+        };
+        let found = m.get(&*key).and_then(|k| index.get(&k.repr())).cloned().unwrap_or(Value::Nil);
+        let mut m = (**m).clone();
+        m.insert(name.as_str().into(), found);
+        out.push(Value::map(m));
+    }
+    Ok(Value::list(out))
 }
 
 /// `index_of(xs, x)`: the position of `x` in a list or str, or null.

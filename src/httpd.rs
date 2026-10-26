@@ -680,6 +680,10 @@ impl Loop {
 
     /// Closes connections idle too long, or too slow to send a request.
     fn sweep(&mut self) {
+        // Handles on a version of the program loaded over: let go, with its
+        // database connections (requests still running on it keep theirs).
+        let app = self.app.clone();
+        self.workers.retain(|w| !w.outdated(&app));
         let now = Instant::now();
         for i in 0..self.slots.len() {
             let Slot::Idle(c) = &self.slots[i] else { continue };

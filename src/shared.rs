@@ -138,13 +138,6 @@ pub struct Shared {
     outbox: Mutex<Option<std::sync::mpsc::Sender<Vec<String>>>>,
     /// The other instances of the program in this process (`--instances`).
     peers: Mutex<Vec<std::sync::Weak<Shared>>>,
-    /// Services loaded in this process (src/service.rs), by name: the file,
-    /// and the program, which callers fork (its variables and database are
-    /// the one copy's). Emptied when the program is loaded again.
-    pub services: Mutex<std::collections::HashMap<String, (std::path::PathBuf, crate::interp::Interp)>>,
-    /// Services being loaded: a service using one being loaded calls it
-    /// when it is there, without loading it twice.
-    pub services_loading: Mutex<std::collections::HashSet<String>>,
     /// Where services run that do not run here (`--service-url name=url`).
     pub service_urls: Mutex<std::collections::HashMap<String, String>>,
 }
@@ -158,8 +151,6 @@ impl Shared {
             id: format!("{:08x}", fastrand::u32(..)),
             outbox: Mutex::new(None),
             peers: Mutex::new(Vec::new()),
-            services: Mutex::new(std::collections::HashMap::new()),
-            services_loading: Mutex::new(std::collections::HashSet::new()),
             service_urls: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -262,4 +253,18 @@ impl Default for Shared {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The services a version of the program loaded in this process
+/// (src/service.rs), shared by it, its mounted programs and its services:
+/// one copy of each. A version loaded again has a table of its own, so
+/// requests still running on the old version call the old services.
+#[derive(Default)]
+pub struct Services {
+    /// By name: the file, and the program, which callers fork (its variables
+    /// and database are the one copy's).
+    pub loaded: Mutex<std::collections::HashMap<String, (std::path::PathBuf, crate::interp::Interp)>>,
+    /// Being loaded: a service using one being loaded calls it when it is
+    /// there, without loading it twice.
+    pub loading: Mutex<std::collections::HashSet<String>>,
 }

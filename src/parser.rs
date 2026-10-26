@@ -296,7 +296,17 @@ impl Parser {
                                     {
                                         return Err(QuilloError::new(format!("a service is named like a variable: `{}` is not one (name the file so)", name), line));
                                     }
-                                    return Ok(Stmt::Service(name, prefix, file, line));
+                                    // How it is called, on the same line: `{ timeout: "2s" }`.
+                                    self.lx.skip_inline_ws();
+                                    let options = if self.peeked.is_none() && self.lx.peek_char() == Some('{') {
+                                        match self.parse_expr()? {
+                                            e @ Expr::Map(_) => Some(e),
+                                            _ => return Err(QuilloError::new("after a service's file, a map of how it is called: { timeout: \"2s\", retries: 2 }", line)),
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    return Ok(Stmt::Service(name, prefix, file, options, line));
                                 }
                             }
                             return Err(QuilloError::new("`service` expects a file: service billing = \"billing.qwe\"", line));

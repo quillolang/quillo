@@ -49,6 +49,9 @@ pub fn install(m: &mut Map) {
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
         ("db.connect", db_connect),
+        ("db.system", system),
+        ("db.shards", shards),
+        ("db.atomic", atomic),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -142,6 +145,59 @@ impl Backend {
 pub enum DbSlot {
     One(Arc<Backend>),
     PerTenant(Arc<TenantDbs>),
+    /// `db.shards([...])`: the connections (by number) of its shards.
+    Shards(Arc<Vec<usize>>),
+}
+
+// ---- replicas -------------------------------------------------------------------------------
+
+/// A database's read replicas (`db.open(primary, { replicas: [...] })`):
+/// reads go to them in turn; one that fails is left out for a while.
+struct Replicas {
+    list: Vec<Arc<Backend>>,
+    next: std::sync::atomic::AtomicUsize,
+    down: Mutex<Vec<Option<std::time::Instant>>>,
+}
+
+/// Each primary's replicas. (Held weakly: a primary dropped is no longer found.)
+fn replica_sets() -> &'static Mutex<Vec<(std::sync::Weak<Backend>, Arc<Replicas>)>> {
+    static R: std::sync::OnceLock<Mutex<Vec<(std::sync::Weak<Backend>, Arc<Replicas>)>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn replicas_of(b: &Arc<Backend>) -> Option<Arc<Replicas>> {
+    let mut sets = replica_sets().lock().unwrap_or_else(|e| e.into_inner());
+    sets.retain(|(w, _)| w.strong_count() > 0);
+    sets.iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(b))).map(|(_, r)| r.clone())
+}
+
+/// Whether a statement only reads: `select` or `with` (writing nothing),
+/// and no `for update` or `for share` (which lock, on the primary).
+fn only_reads(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let first = lower.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    (first == "select" || first == "with")
+        && crate::sqlinfo::tables_of(sql).writes.is_empty()
+        && !["for update", "for share", "for no key update", "for key share", "lock in share mode"].iter().any(|k| lower.contains(k))
+}
+
+/// Where a read goes: a replica of `b`, unless it is in a transaction on
+/// `b`, or this request wrote (it reads what it wrote, on the primary).
+fn reader(it: &Interp, b: &Arc<Backend>, sql: &str) -> Option<(Arc<Replicas>, usize)> {
+    let reps = replicas_of(b)?;
+    if it.wrote_req == Some(crate::httpd::request_number()) || !only_reads(sql) {
+        return None;
+    }
+    if it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b)) {
+        return None;
+    }
+    let n = reps.list.len();
+    let start = reps.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let down = reps.down.lock().unwrap_or_else(|e| e.into_inner());
+    let i = (0..n).map(|k| (start + k) % n).find(|i| down[*i].map_or(true, |t| now >= t))?;
+    drop(down);
+    Some((reps, i))
 }
 
 /// Tenants' databases, opened when first used (and migrated, after
@@ -245,6 +301,7 @@ fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String
     match slot {
         Some(DbSlot::One(b)) => Ok(b),
         Some(DbSlot::PerTenant(t)) => tenant_backend(it, &t),
+        Some(DbSlot::Shards(_)) => Err("these are shards: `.on(key)` is the one for a key, `.all(sql)` asks every one".into()),
         None => Err("this connection is not one of this program's".into()),
     }
 }
@@ -264,6 +321,7 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     match slot {
         Some(DbSlot::One(b)) => return Ok(b),
         Some(DbSlot::PerTenant(t)) => return tenant_backend(it, &t),
+        Some(DbSlot::Shards(_)) => return Err("the program's database cannot be shards".into()),
         None => {}
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
@@ -276,7 +334,7 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     let mut slot = it.db.lock().unwrap_or_else(|e| e.into_inner());
     match slot.get_or_insert(DbSlot::One(b)) {
         DbSlot::One(b) => Ok(b.clone()),
-        DbSlot::PerTenant(_) => unreachable!("set just above"),
+        _ => unreachable!("set just above"),
     }
 }
 
@@ -663,6 +721,44 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
 /// A database slot for `db.open`'s or `db.connect`'s target: one per
 /// tenant (a `{tenant}` template, or a function), or one opened now.
 fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Result<DbSlot, String>, Ctrl> {
+    // `{ replicas: [...] }`: read replicas of a database (one, not one per tenant).
+    if let Some(opts) = args.get(1) {
+        let Value::Map(o) = opts else {
+            return fail(line, format!("`{}`'s options are a map, like {{ replicas: [url, ...] }}", f));
+        };
+        if let Some(k) = o.keys().find(|k| k.as_str() != "replicas") {
+            return fail(line, format!("`{}` has no option `{}` (replicas)", f, k.as_str()));
+        }
+        let urls: Vec<String> = match o.get("replicas") {
+            Some(Value::List(l)) if l.iter().all(|u| matches!(u, Value::Str(_))) => l.iter().map(|u| u.display()).collect(),
+            Some(Value::Nil) | None => Vec::new(),
+            Some(other) => return fail(line, format!("`replicas` is a list of database URLs, got {}", other.type_name())),
+        };
+        let primary = match args.first() {
+            Some(Value::Str(t)) if !t.contains("{tenant}") => t.to_string(),
+            _ => return fail(line, format!("`{}`: replicas are of one database, given by its URL", f)),
+        };
+        if !urls.is_empty() && !is_server_url(&primary) {
+            return fail(line, format!("`{}`: replicas are of a PostgreSQL or MySQL database, not SQLite", f));
+        }
+        let b = match open_backend(it, &primary) {
+            Ok(b) => Arc::new(b),
+            Err(e) => return Ok(Err(e)),
+        };
+        let mut list = Vec::new();
+        for u in &urls {
+            match open_backend(it, u) {
+                Ok(r) => list.push(Arc::new(r)),
+                Err(e) => return Ok(Err(format!("replica {}: {}", u, e))),
+            }
+        }
+        if !list.is_empty() {
+            let n = list.len();
+            let reps = Arc::new(Replicas { list, next: Default::default(), down: Mutex::new(vec![None; n]) });
+            replica_sets().lock().unwrap_or_else(|e| e.into_inner()).push((Arc::downgrade(&b), reps));
+        }
+        return Ok(Ok(DbSlot::One(b)));
+    }
     match args.first() {
         Some(Value::Str(t)) if t.contains("{tenant}") => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string())))))),
         Some(Value::Str(t)) => Ok(open_backend(it, t).map(|b| DbSlot::One(Arc::new(b)))),
@@ -737,6 +833,15 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(other) => return fail(line, format!("`db.migrate` expects a folder name, got {}", other.type_name())),
     };
     let on = it.db_on.take();
+    // Shards: each brought up to date; the names applied to each.
+    if let Some(DbSlot::Shards(list)) = slot_on(it, on) {
+        let mut out = Vec::new();
+        for i in list.iter() {
+            it.db_on = Some(*i);
+            out.push(migrate(it, args.clone(), line)?);
+        }
+        return Ok(Value::list(out));
+    }
     let full = it.base_dir.join(&dir);
     if on.is_none() {
         std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
@@ -769,6 +874,7 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
+    it.wrote_req = Some(crate::httpd::request_number());
     let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
         Ok(b) => b,
@@ -814,21 +920,113 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(res.unwrap_or_else(db_err))
 }
 
-/// Whether this server runs a scheduled job's run due at `at`: with one
-/// database for the program (which other servers may share), only if no
-/// one recorded that run before; otherwise always.
-pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
-    if !matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::One(_))) {
-        return true;
+// ---- Quillo's own tables -----------------------------------------------------------------
+
+/// The label of the system database among the connections.
+const SYSTEM: &str = "$system";
+
+/// Where Quillo keeps its own tables (`_quillo_jobs`, `_quillo_later`,
+/// `_quillo_atomic`), as a connection for `exec_on`: the program's database
+/// when it is one (Some(None)); else the system database (Some(Some(i))):
+/// `db.system(target)`, `$QUILLO_SYSTEM_DB`, or `quillo-system.db` next to
+/// the program, when its databases are one per tenant. None: the program
+/// has no database, and no system database is there (or, with `make`, to
+/// be made: see `system_on_for`). With `make` false, a system database not
+/// there yet is not made.
+pub(crate) fn system_on(it: &mut Interp, make: bool) -> Option<Option<usize>> {
+    system_on_for(it, make, false)
+}
+
+/// `system_on`; with `always`, a program without a database gets the
+/// system database too (made with `make`): for what must outlive a restart,
+/// such as calls made later.
+pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option<Option<usize>> {
+    if let Some(i) = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter().position(|(l, _)| l == SYSTEM) {
+        return Some(Some(i));
     }
-    let mysql = backend(it).map_or(false, |b| b.is_mysql());
+    let slot = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match slot {
+        Some(DbSlot::One(_)) => return Some(None),
+        Some(_) => {}
+        // Not opened yet: the default (`$QUILLO_DB`), if there is one.
+        None => {
+            if std::env::var("QUILLO_DB").map_or(true, |v| v.is_empty()) {
+                // No database: a system database there already (things kept in
+                // it before a restart), or one to make when asked to.
+                let given = std::env::var("QUILLO_SYSTEM_DB").map_or(false, |v| !v.is_empty());
+                if !given && !always && !it.base_dir.join("quillo-system.db").exists() {
+                    return None;
+                }
+            } else {
+                let _ = backend(it);
+                if matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::One(_))) {
+                    return Some(None);
+                }
+            }
+        }
+    }
+    let target = std::env::var("QUILLO_SYSTEM_DB").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "quillo-system.db".into());
+    if !make && !is_server_url(&target) && !it.base_dir.join(&target).exists() {
+        return None;
+    }
+    let b = open_backend(it, &target).map_err(|e| eprintln!("quillo: the system database {}: {}", target, e)).ok()?;
+    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    Some(Some(conns.len() - 1))
+}
+
+/// Whether a program uses `db.atomic` (then transactions it left prepared
+/// are looked after: see `recover`).
+pub fn uses_atomic(it: &Interp) -> bool {
+    format!("{:?}", it.program).contains("\"atomic\"")
+}
+
+/// `db.system(target)`: where Quillo keeps its own tables, when the
+/// program's databases are one per tenant (or to keep them apart).
+fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Some(Value::Str(t)) = args.first() else {
+        return fail(line, "`db.system` expects a path or a database URL");
+    };
+    if t.contains("{tenant}") {
+        return fail(line, "`db.system` is one database for every tenant: no {tenant} in it");
+    }
+    let b = match open_backend(it, t) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    conns.retain(|(l, _)| l != SYSTEM);
+    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    Ok(Value::Nil)
+}
+
+/// `db.exec` / `db.query` on connection `on` (None: the program's).
+fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+    it.db_on = on;
+    exec(it, args, 0)
+}
+
+fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+    it.db_on = on;
+    query(it, args, 0)
+}
+
+fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
+    backend_on(it, on).map_or(false, |b| b.is_mysql())
+}
+
+/// Whether this server runs a scheduled job's run due at `at`: with a
+/// database for Quillo's own tables (which other servers may share), only
+/// if no one recorded that run before; otherwise always.
+pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
+    let Some(on) = system_on(it, true) else { return true };
+    let mysql = kind_on(it, on);
     let table = if mysql {
         "create table if not exists _quillo_jobs (name varchar(255) primary key, at bigint not null)"
     } else {
         "create table if not exists _quillo_jobs (name text primary key, at bigint not null)"
     };
-    let made = exec(it, vec![Value::str(table)], 0);
-    if !matches!(made, Ok(Value::Map(_))) {
+    if !matches!(exec_on(it, on, vec![Value::str(table)]), Ok(Value::Map(_))) {
         return true;
     }
     // A later run claims it (MySQL counts a row it leaves as it was as no change).
@@ -838,14 +1036,121 @@ pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
         "insert into _quillo_jobs (name, at) values (?, ?) \
          on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at"
     };
-    match exec(it, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)], 0) {
+    match exec_on(it, on, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)]) {
         Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
         _ => true,
     }
 }
 
+// ---- calls made later (src/service.rs), kept with Quillo's own tables ----
+
+fn later_table(it: &mut Interp, on: Option<usize>) -> bool {
+    let sql = if kind_on(it, on) {
+        "create table if not exists _quillo_later (id varchar(64) primary key, service varchar(255) not null, fn varchar(255) not null, \
+         args text not null, tenant varchar(255) not null, rid varchar(64) not null, at bigint not null, tries bigint not null, error text)"
+    } else {
+        "create table if not exists _quillo_later (id text primary key, service text not null, fn text not null, \
+         args text not null, tenant text not null, rid text not null, at bigint not null, tries bigint not null, error text)"
+    };
+    matches!(exec_on(it, on, vec![Value::str(sql)]), Ok(Value::Map(_)))
+}
+
+/// Keeps a call made later; false when there is no database to keep it in.
+pub(crate) fn later_put(it: &mut Interp, c: &crate::service::Later) -> bool {
+    let Some(on) = system_on_for(it, true, true) else { return false };
+    if !later_table(it, on) {
+        return false;
+    }
+    let sql = "insert into _quillo_later (id, service, fn, args, tenant, rid, at, tries) values (?, ?, ?, ?, ?, ?, ?, ?)";
+    let args = vec![
+        Value::str(sql),
+        Value::str(&c.id),
+        Value::str(&c.service),
+        Value::str(&c.f),
+        Value::str(&c.args),
+        Value::str(&c.tenant),
+        Value::str(&c.rid),
+        Value::Int(c.at),
+        Value::Int(c.tries),
+    ];
+    matches!(exec_on(it, on, args), Ok(Value::Map(_)))
+}
+
+/// Calls made later that are due.
+pub(crate) fn later_due(it: &mut Interp, now: i64, limit: usize) -> Vec<crate::service::Later> {
+    let Some(on) = system_on(it, false) else { return Vec::new() };
+    let sql = format!("select id, service, fn, args, tenant, rid, at, tries from _quillo_later where at <= ? order by at limit {}", limit);
+    let Ok(Value::List(rows)) = query_on(it, on, vec![Value::str(sql), Value::Int(now)]) else { return Vec::new() };
+    let text = |r: &Map, k: &str| match r.get(k) {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => String::new(),
+    };
+    let int = |r: &Map, k: &str| match r.get(k) {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    rows.iter()
+        .filter_map(|r| match r {
+            Value::Map(r) => Some(crate::service::Later {
+                id: text(r, "id"),
+                service: text(r, "service"),
+                f: text(r, "fn"),
+                args: text(r, "args"),
+                tenant: text(r, "tenant"),
+                rid: text(r, "rid"),
+                at: int(r, "at"),
+                tries: int(r, "tries"),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Takes a due call for this server (others may share the database): only
+/// if it is still due at `was`; it is put off to `until` meanwhile.
+pub(crate) fn later_take(it: &mut Interp, id: &str, was: i64, until: i64) -> bool {
+    let Some(on) = system_on(it, false) else { return false };
+    let sql = "update _quillo_later set at = ? where id = ? and at = ?";
+    match exec_on(it, on, vec![Value::str(sql), Value::Int(until), Value::str(id), Value::Int(was)]) {
+        Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
+        _ => false,
+    }
+}
+
+pub(crate) fn later_done(it: &mut Interp, id: &str) {
+    if let Some(on) = system_on(it, false) {
+        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_later where id = ?"), Value::str(id)]);
+    }
+}
+
+pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &str) {
+    if let Some(on) = system_on(it, false) {
+        let sql = "update _quillo_later set at = ?, tries = ?, error = ? where id = ?";
+        let _ = exec_on(it, on, vec![Value::str(sql), Value::Int(at), Value::Int(tries), Value::str(why), Value::str(id)]);
+    }
+}
+
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
     let b = backend_on(it, on)?;
+    // A read, to a replica: if it fails there, the primary answers (and the
+    // replica is left out for ten seconds).
+    if let Some((reps, i)) = reader(it, &b, &sql) {
+        let r = reps.list[i].clone();
+        let (q, p) = (sql.clone(), params.clone());
+        match pooled_run(it, &r, move |c| c.query(&q, &p, limit)) {
+            Ok(rows) => {
+                announce(it, &sql, on);
+                return Ok(rows);
+            }
+            Err(e) => {
+                eprintln!("quillo: a read replica failed ({}); reading from the primary", e);
+                reps.down.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+            }
+        }
+    }
+    if !only_reads(&sql) {
+        it.wrote_req = Some(crate::httpd::request_number());
+    }
     let res = match &*b {
         Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
@@ -971,4 +1276,475 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
         }
     }
+}
+
+// ---- shards -------------------------------------------------------------------------------
+
+/// `db.shards([target, ...])`: data split over several databases by a key
+/// (a customer's id, say): `.on(key)` is the shard for a key (a connection,
+/// as `db.connect` gives), `.all(sql, ...)` asks every shard and puts the
+/// rows together, `.migrate()` brings each up to date. Keys are spread by
+/// jump consistent hashing, so a shard added later takes its share of keys
+/// from each of the others, and moves no other key.
+fn shards(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Some(Value::List(targets)) = args.first() else {
+        return fail(line, "`db.shards` expects a list of paths or database URLs, one per shard");
+    };
+    if targets.is_empty() {
+        return fail(line, "`db.shards` needs one shard at least");
+    }
+    let mut list = Vec::new();
+    for t in targets.iter() {
+        if let Value::Str(s) = t {
+            if s.contains("{tenant}") {
+                return fail(line, "a shard is one database: no {tenant} in it");
+            }
+        }
+        match db_connect(it, vec![t.clone()], line)? {
+            Value::Map(m) => match m.get(CONN_KEY) {
+                Some(Value::Int(i)) => list.push(*i as usize),
+                _ => return fail(line, "`db.shards`: not a connection"),
+            },
+            err => return Ok(err),
+        }
+    }
+    let n = list.len();
+    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    let label = format!("shards{}", conns.len());
+    conns.push((label, DbSlot::Shards(Arc::new(list))));
+    let mut m = Map::new();
+    m.insert(CONN_KEY.into(), Value::Int(conns.len() as i64 - 1));
+    // `query` and the rest say what to call instead.
+    let fns: &[(&'static str, BuiltinFn)] = &[
+        ("db.on", shard_on),
+        ("db.all", shard_all),
+        ("db.migrate", migrate),
+        ("db.query", query),
+        ("db.one", one),
+        ("db.exec", exec),
+        ("db.transaction", transaction),
+    ];
+    for (name, f) in fns {
+        m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
+    }
+    m.insert("count".into(), Value::Int(n as i64));
+    Ok(Value::map(m))
+}
+
+fn shard_list(it: &mut Interp, f: &str, line: u32) -> Result<Arc<Vec<usize>>, Ctrl> {
+    let on = it.db_on.take();
+    match slot_on(it, on) {
+        Some(DbSlot::Shards(list)) => Ok(list),
+        _ => fail(line, format!("`{}` is a function of shards (`db.shards([...])`)", f)),
+    }
+}
+
+/// Which of `n` shards a key goes to: FNV-1a of its text, then jump
+/// consistent hashing (Lamping and Veach), the same on every server.
+pub fn shard_of(key: &Value, n: usize) -> usize {
+    let text = key.display();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let (mut b, mut j): (i64, i64) = (-1, 0);
+    while j < n as i64 {
+        b = j;
+        h = h.wrapping_mul(2862933555777941757).wrapping_add(1);
+        j = ((b + 1) as f64 * ((1u64 << 31) as f64 / ((h >> 33) + 1) as f64)) as i64;
+    }
+    b as usize
+}
+
+/// `shards.on(key)`: the shard a key's data is on.
+fn shard_on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let list = shard_list(it, "on", line)?;
+    match args.first() {
+        None | Some(Value::Nil) => fail(line, "`.on(key)` needs a key: what the data is split by"),
+        Some(k) => Ok(connection(list[shard_of(k, list.len())])),
+    }
+}
+
+/// `shards.all(sql, ...params)`: the rows every shard gives, together.
+fn shard_all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let list = shard_list(it, "all", line)?;
+    let sql = sql_arg(&args, "all", line)?;
+    let mut rows = Vec::new();
+    for (k, i) in list.iter().enumerate() {
+        match select(it, Some(*i), sql.clone(), args[1..].to_vec(), None) {
+            Ok(r) => rows.extend(r),
+            Err(e) => return Ok(db_err(format!("shard {}: {}", k + 1, e))),
+        }
+    }
+    Ok(Value::list(rows))
+}
+
+// ---- one transaction over several databases ----------------------------------------------
+
+/// A database taking part in `db.atomic`.
+struct Part {
+    b: Arc<Backend>,
+    kind: Kind,
+    prepared: bool,
+    /// Its transaction's id: the whole's, and its number (two databases on
+    /// one server share the server's ids).
+    gid: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Sqlite,
+    Pg,
+    My,
+}
+
+/// How old a transaction prepared and not finished must be for recovery to
+/// finish it (a younger one may still be finishing).
+const IN_DOUBT_AFTER_MS: i64 = 60_000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A statement on a database, on a connection of its own (not a request's
+/// transaction's): for the decisions of `db.atomic`, and for recovery.
+fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    match &**b {
+        Backend::Sqlite(m) => {
+            let c = m.lock().unwrap_or_else(|e| e.into_inner());
+            if sql.trim_start().to_ascii_lowercase().starts_with("select") {
+                rows(&c, &sql, &params, None)
+            } else {
+                let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+                bind(&mut stmt, &params)?;
+                stmt.raw_execute().map_err(|e| e.to_string())?;
+                Ok(Vec::new())
+            }
+        }
+        _ => {
+            let b = b.clone();
+            it.unlocked(move || {
+                let mut c = b.checkout()?;
+                let lower = sql.trim_start().to_ascii_lowercase();
+                let r = if lower.starts_with("select") || lower.starts_with("xa recover") {
+                    c.query(&sql, &params, None)
+                } else if params.is_empty() {
+                    c.batch(&sql).map(|_| Vec::new())
+                } else {
+                    c.exec(&sql, &params).map(|_| Vec::new())
+                };
+                b.give_back(c);
+                r
+            })
+        }
+    }
+}
+
+/// The system database's backend, for `db.atomic`'s decisions.
+fn system_backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
+    match system_on(it, true) {
+        Some(on) => backend_on(it, on),
+        None => backend(it),
+    }
+}
+
+fn decisions_table(it: &mut Interp, b: &Arc<Backend>) -> Result<(), String> {
+    let sql = if b.is_mysql() {
+        "create table if not exists _quillo_atomic (gid varchar(64) primary key, decision varchar(8) not null, at bigint not null)"
+    } else {
+        "create table if not exists _quillo_atomic (gid text primary key, decision text not null, at bigint not null)"
+    };
+    apart(it, b, sql.into(), Vec::new()).map(|_| ())
+}
+
+/// Records what became of a transaction, unless it was decided already: the
+/// first to record it (the transaction, or recovery) decides it.
+fn decide(it: &mut Interp, sys: &Arc<Backend>, gid: &str, decision: &str) -> Result<(), String> {
+    apart(it, sys, "insert into _quillo_atomic (gid, decision, at) values (?, ?, ?)".into(), vec![Value::str(gid), Value::str(decision), Value::Int(now_ms())])
+        .map(|_| ())
+}
+
+fn decided(it: &mut Interp, sys: &Arc<Backend>, gid: &str) -> Option<String> {
+    let rows = apart(it, sys, "select decision from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]).ok()?;
+    match rows.first() {
+        Some(Value::Map(m)) => m.get("decision").map(|d| d.display()),
+        _ => None,
+    }
+}
+
+/// `db.atomic([db, other, ...], () => { ... })`: one transaction over
+/// several databases: all of it is kept, or none. The function's writes go
+/// to each as usual (`db.exec`, `other.exec`); when it returns normally,
+/// each server database prepares its part (PostgreSQL's prepared
+/// transactions, MySQL's XA), the decision to commit is recorded in the
+/// system database, a SQLite database (one at most) commits, and the
+/// prepared parts commit. If any part cannot prepare, or the function fails,
+/// returns an error value or replies early, every part rolls back. A server
+/// that stops between the decision and the end leaves prepared parts, which
+/// recovery finishes as decided (see `recover`). PostgreSQL needs
+/// `max_prepared_transactions` above 0.
+fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (Some(Value::List(dbs)), Some(f @ (Value::Func(_) | Value::Builtin(..)))) = (args.first(), args.get(1)) else {
+        return fail(line, "`db.atomic` expects the databases and a function: db.atomic([db, analytics], () => { ... })");
+    };
+    let f = f.clone();
+    // The databases: `db` itself, connections, and shards (each of them).
+    let mut ons: Vec<Option<usize>> = Vec::new();
+    for d in dbs.iter() {
+        let Value::Map(m) = d else {
+            return fail(line, format!("`db.atomic`: {} is not a database", d.type_name()));
+        };
+        match m.get(CONN_KEY) {
+            Some(Value::Int(i)) => match slot_on(it, Some(*i as usize)) {
+                Some(DbSlot::Shards(list)) => ons.extend(list.iter().map(|i| Some(*i))),
+                _ => ons.push(Some(*i as usize)),
+            },
+            None if matches!(m.get("exec"), Some(Value::Builtin("db.exec", _))) => ons.push(None),
+            None => return fail(line, "`db.atomic`: not a database (`db`, or what `db.connect` gives)"),
+            Some(_) => return fail(line, "`db.atomic`: not a database"),
+        }
+    }
+    let mut parts: Vec<Part> = Vec::new();
+    for on in ons {
+        let b = match backend_on(it, on) {
+            Ok(b) => b,
+            Err(e) => return Ok(db_err(e)),
+        };
+        if parts.iter().any(|p| Arc::ptr_eq(&p.b, &b)) {
+            continue;
+        }
+        let kind = match &*b {
+            Backend::Sqlite(_) => Kind::Sqlite,
+            Backend::Postgres(_) => Kind::Pg,
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(_) => Kind::My,
+        };
+        parts.push(Part { b, kind, prepared: false, gid: String::new() });
+    }
+    if parts.iter().filter(|p| p.kind == Kind::Sqlite).count() > 1 {
+        return fail(line, "`db.atomic`: one SQLite database at most (it commits last; SQLite cannot prepare a transaction)");
+    }
+    if parts.iter().any(|p| it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &p.b))) || it.sqlite_tx > 0 {
+        return fail(line, "`db.atomic` cannot begin inside a transaction already open on one of its databases");
+    }
+    let sys = match system_backend(it) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(format!("db.atomic: no database to record decisions in ({})", e))),
+    };
+    if let Err(e) = decisions_table(it, &sys) {
+        return Ok(db_err(format!("db.atomic: {}", e)));
+    }
+    let gid = format!("quillo_{}_{}", now_ms(), crate::service::new_id(16));
+    for (k, p) in parts.iter_mut().enumerate() {
+        p.gid = format!("{}_{}", gid, k);
+    }
+    // Each part begins.
+    let mut begun: Vec<usize> = Vec::new();
+    let mut failed = None;
+    for (k, p) in parts.iter().enumerate() {
+        let r = match p.kind {
+            Kind::Sqlite => match &*p.b {
+                Backend::Sqlite(m) => m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
+                _ => unreachable!(),
+            },
+            _ => {
+                let b = p.b.clone();
+                match it.unlocked(move || b.checkout()) {
+                    Ok(c) => {
+                        it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
+                        let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
+                        pooled_run(it, &p.b, move |c| c.batch(&begin))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        match r {
+            Ok(()) => begun.push(k),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    let sqlite = parts.iter().enumerate().any(|(k, p)| p.kind == Kind::Sqlite && begun.contains(&k));
+    if sqlite {
+        it.sqlite_tx += 1;
+    }
+    let mark = tx_begin(it);
+    it.wrote_req = Some(crate::httpd::request_number());
+    let r = match &failed {
+        None => it.call(&f, Vec::new(), line),
+        Some(e) => Ok(db_err(e)),
+    };
+    let ok = failed.is_none() && matches!(&r, Ok(v) if !matches!(v, Value::Err(_)));
+    let outcome = if ok { commit_parts(it, &mut parts, &sys, &gid) } else { Err(String::new()) };
+    if outcome.is_err() {
+        abort_parts(it, &mut parts, &begun);
+    }
+    if sqlite {
+        it.sqlite_tx -= 1;
+    }
+    // The connections go back.
+    for p in &parts {
+        let taken = {
+            let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter().position(|t| Arc::ptr_eq(&t.backend, &p.b)).map(|i| g.remove(i))
+        };
+        if let Some(TxConn { conn: Some(c), .. }) = taken {
+            p.b.give_back(c);
+        }
+    }
+    tx_end(it, mark, outcome.is_ok());
+    match outcome {
+        Err(e) if ok => Ok(db_err(format!("db.atomic: {}", e))),
+        _ => r,
+    }
+}
+
+fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &str) -> Result<(), String> {
+    // 1. Every server database prepares its part.
+    for k in 0..parts.len() {
+        let (kind, b, pgid) = (parts[k].kind, parts[k].b.clone(), parts[k].gid.clone());
+        let r = match kind {
+            Kind::Sqlite => continue,
+            Kind::Pg => {
+                let sql = format!("prepare transaction '{}'", pgid);
+                pooled_run(it, &b, move |c| c.batch(&sql))
+            }
+            Kind::My => {
+                let (end, prep) = (format!("xa end '{}'", pgid), format!("xa prepare '{}'", pgid));
+                pooled_run(it, &b, move |c| c.batch(&end).and_then(|_| c.batch(&prep)))
+            }
+        };
+        match r {
+            Ok(()) => parts[k].prepared = true,
+            Err(e) => return Err(format!("a database could not prepare its part: {}", e)),
+        }
+    }
+    // 2. The decision, recorded (first, or not at all: recovery may have
+    // decided for a transaction it took to be abandoned). In a SQLite
+    // database taking part, it is kept with that part, when it commits.
+    let sys_is_part = parts.iter().any(|p| p.kind == Kind::Sqlite && Arc::ptr_eq(&p.b, sys));
+    decide(it, sys, gid, "commit").map_err(|e| format!("the decision could not be recorded: {}", e))?;
+    // 3. SQLite, last: then the decision stands.
+    for p in parts.iter() {
+        if let (Kind::Sqlite, Backend::Sqlite(m)) = (p.kind, &*p.b) {
+            if let Err(e) = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("release quillo_tx") {
+                if !sys_is_part {
+                    let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+    // 4. The prepared parts commit. One that cannot now is committed by
+    // recovery, as decided.
+    for p in parts.iter() {
+        let sql = match p.kind {
+            Kind::Sqlite => continue,
+            Kind::Pg => format!("commit prepared '{}'", p.gid),
+            Kind::My => format!("xa commit '{}'", p.gid),
+        };
+        let b = p.b.clone();
+        if let Err(e) = pooled_run(it, &b, move |c| c.batch(&sql)) {
+            eprintln!("quillo: db.atomic {}: a part did not commit yet ({}); recovery will commit it", gid, e);
+            return Ok(());
+        }
+    }
+    let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
+    Ok(())
+}
+
+fn abort_parts(it: &mut Interp, parts: &mut [Part], begun: &[usize]) {
+    for (k, p) in parts.iter().enumerate() {
+        if !begun.contains(&k) {
+            continue;
+        }
+        match (p.kind, &*p.b) {
+            (Kind::Sqlite, Backend::Sqlite(m)) => {
+                let _ = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("rollback to quillo_tx; release quillo_tx");
+            }
+            (Kind::Pg, _) => {
+                let sql = if p.prepared { format!("rollback prepared '{}'", p.gid) } else { "rollback".to_string() };
+                let b = p.b.clone();
+                let _ = pooled_run(it, &b, move |c| c.batch(&sql));
+            }
+            (Kind::My, _) => {
+                let (prepared, g) = (p.prepared, p.gid.clone());
+                let b = p.b.clone();
+                let _ = pooled_run(it, &b, move |c| {
+                    if !prepared {
+                        let _ = c.batch(&format!("xa end '{}'", g));
+                    }
+                    c.batch(&format!("xa rollback '{}'", g))
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Finishes transactions of `db.atomic` left prepared by a server that
+/// stopped part way (older than a minute): committed if the decision to
+/// commit was recorded, rolled back otherwise (recording that, so that a
+/// late decision cannot commit them after). Also forgets decisions older
+/// than a day.
+pub fn recover(it: &mut Interp) {
+    let Some(on) = system_on(it, false) else { return };
+    let Ok(sys) = backend_on(it, on) else { return };
+    let mut servers: Vec<Arc<Backend>> = Vec::new();
+    if let Some(DbSlot::One(b)) = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        servers.push(b);
+    }
+    for (_, s) in it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if let DbSlot::One(b) = s {
+            if !servers.iter().any(|x| Arc::ptr_eq(x, b)) {
+                servers.push(b.clone());
+            }
+        }
+    }
+    let now = now_ms();
+    for b in servers {
+        let (list, mysql) = match &*b {
+            Backend::Sqlite(_) => continue,
+            Backend::Postgres(_) => ("select gid from pg_prepared_xacts where gid like 'quillo%'", false),
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(_) => ("xa recover", true),
+        };
+        let Ok(rows) = apart(it, &b, list.into(), Vec::new()) else { continue };
+        for row in rows {
+            let Value::Map(m) = row else { continue };
+            // A part's id: quillo_<when made>_<random>_<part>.
+            let Some(part) = m.get(if mysql { "data" } else { "gid" }).map(|v| v.display()) else { continue };
+            let bits: Vec<&str> = part.split('_').collect();
+            let (Some(born), 4) = (bits.get(1).and_then(|t| t.parse::<i64>().ok()), bits.len()) else { continue };
+            if bits[0] != "quillo" || now - born < IN_DOUBT_AFTER_MS {
+                continue;
+            }
+            let whole = bits[..3].join("_");
+            let decision = match decided(it, &sys, &whole) {
+                Some(d) => d,
+                None => match decide(it, &sys, &whole, "abort") {
+                    Ok(()) => "abort".into(),
+                    Err(_) => match decided(it, &sys, &whole) {
+                        Some(d) => d,
+                        None => continue,
+                    },
+                },
+            };
+            let sql = match (decision.as_str(), mysql) {
+                ("commit", false) => format!("commit prepared '{}'", part),
+                ("commit", true) => format!("xa commit '{}'", part),
+                (_, false) => format!("rollback prepared '{}'", part),
+                (_, true) => format!("xa rollback '{}'", part),
+            };
+            match apart(it, &b, sql, Vec::new()) {
+                Ok(_) => eprintln!("quillo: db.atomic {} finished by recovery: {}", part, if decision == "commit" { "committed" } else { "rolled back" }),
+                Err(e) => eprintln!("quillo: db.atomic {}: recovery could not finish it yet: {}", part, e),
+            }
+        }
+    }
+    let _ = apart(it, &sys, "delete from _quillo_atomic where at < ?".into(), vec![Value::Int(now - 86_400_000)]);
 }

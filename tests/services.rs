@@ -246,3 +246,219 @@ fn services_may_use_one_another() {
     it.load_file(&d.join("main.qwe")).unwrap();
     assert_eq!(text(&get(&mut it, "/")), "ping pong from b, which knows a");
 }
+
+// ---- holding up: replicas, retries, request ids, calls made later ----------------------------
+
+/// A raw GET, with its headers: (status, headers in lower case, body).
+fn get_raw(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n", path);
+    for (k, v) in headers {
+        req.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    let status = out.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let (head, body) = out.split_once("\r\n\r\n").map(|(h, b)| (h.to_ascii_lowercase(), b.to_string())).unwrap_or_default();
+    (status, head, body)
+}
+
+/// Waits until `f` gives Some, or fails after `secs`.
+fn eventually<T>(secs: u64, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "{}", what);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const LEDGER: &str = r#"
+let entries = []
+server fn add(x: int) -> int {
+    entries = entries + [x]
+    len(entries)
+}
+route GET /count = str(len(entries))
+"#;
+
+#[test]
+fn calls_go_to_each_address_in_turn_and_past_one_that_is_down() {
+    let d = dir("replicas");
+    std::fs::write(d.join("ledger.qwe"), LEDGER).unwrap();
+    std::fs::write(d.join("front.qwe"), "service ledger = \"ledger.qwe\" { failures: 1, cooldown: \"60s\" }\nroute GET /add/:x = str(ledger.add(int(x)))\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    std::env::set_var("QUILLO_SERVICE_SECRET", secret);
+    let (a, b) = (free_port(), free_port());
+    let _a = start(&d.join("ledger.qwe"), a, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let _b = start(&d.join("ledger.qwe"), b, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let dead = free_port();
+    let mut it = Interp::new(&d);
+    it.shared.service_urls.lock().unwrap().insert("ledger".into(), format!("http://127.0.0.1:{},http://127.0.0.1:{},http://127.0.0.1:{}", dead, a, b));
+    it.load_file(&d.join("front.qwe")).unwrap();
+    let start_at = Instant::now();
+    for i in 0..9 {
+        let got = text(&get(&mut it, &format!("/add/{}", i)));
+        assert!(got.parse::<i64>().is_ok(), "call {}: {}", i, got);
+    }
+    // The address that is down was tried once, then left alone: no waiting on it.
+    assert!(start_at.elapsed() < Duration::from_secs(3), "{:?}", start_at.elapsed());
+    let (na, nb): (i64, i64) = (http(a, "GET", "/count", &[], "").1.parse().unwrap(), http(b, "GET", "/count", &[], "").1.parse().unwrap());
+    assert_eq!(na + nb, 9);
+    assert!(na > 0 && nb > 0, "both addresses take calls: {} and {}", na, nb);
+}
+
+#[test]
+fn a_call_with_no_answer_in_time_is_sent_again_and_runs_once() {
+    let d = dir("retry");
+    std::fs::write(
+        d.join("slowpoke.qwe"),
+        "let runs = 0\nserver fn slow(x: int) -> int {\n    runs += 1\n    sleep(600)\n    x * 2\n}\nroute GET /runs = str(runs)\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("front.qwe"), "service slowpoke = \"slowpoke.qwe\" { timeout: \"250ms\", retries: 5 }\nroute GET /slow = str(slowpoke.slow(21))\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    std::env::set_var("QUILLO_SERVICE_SECRET", secret);
+    let port = free_port();
+    let _s = start(&d.join("slowpoke.qwe"), port, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let mut it = Interp::new(&d);
+    it.shared.service_urls.lock().unwrap().insert("slowpoke".into(), format!("http://127.0.0.1:{}", port));
+    it.load_file(&d.join("front.qwe")).unwrap();
+    // The first try gives up at 250ms; the next ones find the call running,
+    // then its answer, kept by the service: the function ran once.
+    assert_eq!(text(&get(&mut it, "/slow")), "42");
+    assert_eq!(http(port, "GET", "/runs", &[], "").1, "1");
+}
+
+#[test]
+fn a_requests_id_goes_with_the_calls_it_makes() {
+    let d = dir("rid");
+    std::fs::write(d.join("echo.qwe"), "server fn id() = request.id\n").unwrap();
+    std::fs::write(d.join("front.qwe"), "service echo = \"echo.qwe\"\nroute GET /rid = `${request.id} ${echo.id()}`\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let (pe, pf) = (free_port(), free_port());
+    let _e = start(&d.join("echo.qwe"), pe, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let url = format!("http://127.0.0.1:{}", pe);
+    let _f = start(&d.join("front.qwe"), pf, &[], &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_ECHO", &url)]);
+    // Given: the same id here, at the service, and in the answer.
+    let (status, head, body) = get_raw(pf, "/rid", &[("X-Request-Id", "trace-42")]);
+    assert_eq!((status, body.as_str()), (200, "trace-42 trace-42"));
+    assert!(head.contains("x-request-id: trace-42"), "{}", head);
+    // Not given (or not a plain one): one is made, and passed on all the same.
+    let (_, head, body) = get_raw(pf, "/rid", &[("X-Request-Id", "no spaces <here>")]);
+    let (here, there) = body.split_once(' ').unwrap();
+    assert!(here.len() == 16 && here == there, "{}", body);
+    assert!(head.contains(&format!("x-request-id: {}", here)), "{}", head);
+}
+
+#[test]
+fn calls_made_later_are_made_once_the_service_answers() {
+    for with_db in [false, true] {
+        let d = dir(if with_db { "later-db" } else { "later" });
+        std::fs::write(d.join("mailer.qwe"), "let sent = []\nserver fn send(to: str) -> int {\n    sent = sent + [to]\n    len(sent)\n}\nroute GET /sent = sent | join(\",\")\n").unwrap();
+        let db = if with_db { "db.open(\"front.db\")\n" } else { "" };
+        std::fs::write(d.join("front.qwe"), format!("{}service mailer = \"mailer.qwe\"\nroute GET /send/:to = mailer.later.send(to)\n", db)).unwrap();
+        let secret = "a-test-secret-for-services";
+        let (pm, pf) = (free_port(), free_port());
+        let url = format!("http://127.0.0.1:{}", pm);
+        let _f = start(&d.join("front.qwe"), pf, &[], &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_MAILER", &url)]);
+        // The mailer is not running yet: the calls wait, and their ids come back now.
+        let (status, id) = http(pf, "GET", "/send/ana", &[], "");
+        assert_eq!(status, 200);
+        assert!(id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit()), "{}", id);
+        http(pf, "GET", "/send/bo", &[], "");
+        std::thread::sleep(Duration::from_millis(1500));
+        let _m = start(&d.join("mailer.qwe"), pm, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+        let sent = eventually(15, "the calls made later were not made", || {
+            let (_, body) = http(pm, "GET", "/sent", &[], "");
+            (body.split(',').count() == 2).then_some(body)
+        });
+        let mut names: Vec<&str> = sent.split(',').collect();
+        names.sort();
+        assert_eq!(names, ["ana", "bo"]);
+        // Made once each, though tried until they got through.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(http(pm, "GET", "/sent", &[], "").1.split(',').count(), 2);
+    }
+}
+
+#[test]
+fn how_a_service_is_called_is_set_where_it_is_declared() {
+    let d = dir("options");
+    for (opts, want) in [
+        ("{ retries: 99 }", "`retries` is a number of tries after the first, 0 to 10"),
+        ("{ timeout: \"soon\" }", "`timeout` is a duration"),
+        ("{ speed: 2 }", "no option `speed` (timeout, retries, failures, cooldown)"),
+        ("[1]", "expected end of statement"),
+    ] {
+        std::fs::write(d.join("main.qwe"), format!("service billing = \"billing.qwe\" {}\n", opts)).unwrap();
+        let mut it = Interp::new(&d);
+        let e = it.load_file(&d.join("main.qwe")).err().unwrap_or_else(|| panic!("{} loaded", opts));
+        assert!(e.msg.contains(want), "{}: {}", opts, e.msg);
+    }
+    std::fs::write(d.join("main.qwe"), "service billing = \"billing.qwe\" { timeout: \"1.5s\", retries: 0, failures: 3, cooldown: 2000 }\n").unwrap();
+    Interp::new(&d).load_file(&d.join("main.qwe")).unwrap();
+    let o = quillo::service::opts("billing");
+    assert_eq!((o.timeout, o.retries, o.failures, o.cooldown), (Duration::from_millis(1500), 0, 3, Duration::from_secs(2)));
+}
+
+// ---- reloading (--reload) ------------------------------------------------------------------
+
+#[test]
+fn a_request_running_when_the_program_reloads_finishes_on_its_version() {
+    let d = dir("reload");
+    let program = |v: &str| format!("service billing = \"version.qwe\"\nlet V = \"{}\"\nroute GET /slow {{\n    sleep(1500)\n    `${{V}}/${{billing.version()}}`\n}}\nroute GET /now = `${{V}}/${{billing.version()}}`\n", v);
+    std::fs::write(d.join("version.qwe"), "server fn version() = \"one\"\n").unwrap();
+    std::fs::write(d.join("main.qwe"), program("one")).unwrap();
+    let port = free_port();
+    let _s = start(&d.join("main.qwe"), port, &["--reload"], &[]);
+    assert_eq!(http(port, "GET", "/now", &[], "").1, "one/one");
+    let slow = std::thread::spawn(move || http(port, "GET", "/slow", &[], "").1);
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(d.join("version.qwe"), "server fn version() = \"two\"\n").unwrap();
+    std::fs::write(d.join("main.qwe"), program("two")).unwrap();
+    eventually(10, "the program was not loaded again", || (http(port, "GET", "/now", &[], "").1 == "two/two").then_some(()));
+    // Its code, its variables and its services were the old version's to the end.
+    assert_eq!(slow.join().unwrap(), "one/one");
+}
+
+const MAILER: &str = "let sent = []\nserver fn send(to: str) -> int {\n    sent = sent + [to]\n    len(sent)\n}\nroute GET /sent = sent | join(\",\")\n";
+
+#[test]
+fn calls_made_later_outlive_a_restart_without_a_database() {
+    let d = dir("later-restart");
+    std::fs::write(d.join("mailer.qwe"), MAILER).unwrap();
+    std::fs::write(d.join("front.qwe"), "service mailer = \"mailer.qwe\"\nroute GET /send/:to = mailer.later.send(to)\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let (pm, pf) = (free_port(), free_port());
+    let url = format!("http://127.0.0.1:{}", pm);
+    let env = [("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_MAILER", url.as_str())];
+    let front = start(&d.join("front.qwe"), pf, &[], &env);
+    assert_eq!(http(pf, "GET", "/send/ana", &[], "").1.len(), 24);
+    drop(front);
+    // Kept in a file next to the program, made again when it starts again.
+    assert!(d.join("quillo-system.db").exists());
+    let _front = start(&d.join("front.qwe"), pf, &[], &env);
+    let _m = start(&d.join("mailer.qwe"), pm, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    eventually(15, "the call made later was lost", || (http(pm, "GET", "/sent", &[], "").1 == "ana").then_some(()));
+}
+
+#[test]
+fn a_version_that_first_calls_services_has_its_calls_made_later_made() {
+    let d = dir("reload-later");
+    std::fs::write(d.join("mailer.qwe"), MAILER).unwrap();
+    std::fs::write(d.join("front.qwe"), "route GET / = \"no services yet\"\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let (pm, pf) = (free_port(), free_port());
+    let url = format!("http://127.0.0.1:{}", pm);
+    let _front = start(&d.join("front.qwe"), pf, &["--reload"], &[("QUILLO_SERVICE_SECRET", secret), ("QUILLO_SERVICE_MAILER", url.as_str())]);
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(d.join("front.qwe"), "service mailer = \"mailer.qwe\"\nroute GET /send/:to = mailer.later.send(to)\n").unwrap();
+    eventually(10, "the program was not loaded again", || (http(pf, "GET", "/send/bo", &[], "").1.len() == 24).then_some(()));
+    let _m = start(&d.join("mailer.qwe"), pm, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    eventually(15, "the call made later was not made", || (http(pm, "GET", "/sent", &[], "").1 == "bo").then_some(()));
+}

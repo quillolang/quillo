@@ -54,7 +54,8 @@ fn server() -> Option<Pg> {
         .ok()?;
     assert!(out.status.success(), "initdb failed: {}", String::from_utf8_lossy(&out.stderr));
     let port = 25000 + (std::process::id() % 2000) as u16;
-    let opts = format!("-p {} -k {} -c listen_addresses=127.0.0.1 -c fsync=off", port, dir.display());
+    // Prepared transactions, for `db.atomic`.
+    let opts = format!("-p {} -k {} -c listen_addresses=127.0.0.1 -c fsync=off -c max_prepared_transactions=10", port, dir.display());
     let pg = Pg { bin, dir, url: format!("postgres://quillo@127.0.0.1:{}/postgres", port) };
     let ok = Command::new(pg.bin.join("pg_ctl"))
         .arg("-D")
@@ -95,6 +96,92 @@ fn postgres() {
     migrations_apply_once_and_roll_back_on_failure(&database(&pg, "migrated"));
     each_tenant_gets_a_schema_of_its_own(&database(&pg, "tenants"));
     several_databases_of_several_kinds(&database(&pg, "main_db"), &database(&pg, "other_db"), &database(&pg, "beta_db"));
+    replicas_take_reads_and_the_primary_the_rest(&database(&pg, "primary_db"), &database(&pg, "replica_db"));
+    one_transaction_over_several_databases(&pg, &database(&pg, "bank_a"), &database(&pg, "bank_b"));
+}
+
+fn psql(pg: &Pg, url: &str, sql: &[&str]) {
+    let mut cmd = Command::new(pg.bin.join("psql"));
+    cmd.args([url, "-q", "-v", "ON_ERROR_STOP=1"]);
+    for s in sql {
+        cmd.args(["-c", s]);
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Reads go to a replica (here a database of its own, whose rows differ, as
+/// a lagging replica's would), unless they lock, run in a transaction, or
+/// come after this request wrote: those, and writes, go to the primary.
+fn replicas_take_reads_and_the_primary_the_rest(primary: &str, replica: &str) {
+    for (url, x) in [(primary, "primary"), (replica, "replica")] {
+        run(url, &format!("db.exec(\"create table t (x text); insert into t values ('{}')\")", x));
+    }
+    let got = run(
+        primary,
+        &format!(
+            r#"db.open("{}", {{ replicas: ["{}"] }})
+let read = db.one("select x from t").x
+let locked = db.one("select x from t for update").x
+let in_tx = db.transaction(() => db.one("select x from t").x)
+db.exec("insert into t values ('written')")
+let after = db.one("select x from t order by x limit 1").x
+[read, locked, in_tx, after, len(db.query("select * from t"))]"#,
+            primary, replica
+        ),
+    );
+    assert_eq!(got, r#"["replica", "primary", "primary", "primary", 2]"#);
+    let e = quillo::Interp::new(".").load_source(r#"db.open("app.db", { replicas: ["x.db"] })"#, "r.qwe").err().unwrap();
+    assert!(e.msg.contains("not SQLite"), "{}", e.msg);
+}
+
+/// `db.atomic`: two PostgreSQL databases and a SQLite one, all of it or none;
+/// a part that cannot prepare undoes the others; transactions left prepared
+/// by a server that stopped are finished as decided.
+fn one_transaction_over_several_databases(pg: &Pg, a: &str, b: &str) {
+    let d = std::env::temp_dir().join(format!("quillo-pg-atomic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = format!(
+        r#"db.open("{a}")
+let other = db.connect("{b}")
+let local = db.connect("{local}")
+db.exec("create table acct (id int primary key, n int)")
+other.exec("create table acct (id int primary key, n int)")
+other.exec("create table once (k int unique deferrable initially deferred)")
+local.exec("create table moves (n int)")
+db.exec("insert into acct values (1, 100)")
+other.exec("insert into acct values (1, 0)")
+fn move(n) = db.atomic([db, other, local], () => {{
+    db.exec("update acct set n = n - ? where id = 1", n)
+    other.exec("update acct set n = n + ? where id = 1", n)
+    local.exec("insert into moves values (?)", n)
+    if n > 50 {{ err("too much") }} else {{ n }}
+}})
+fn twice() = db.atomic([db, other], () => {{
+    db.exec("update acct set n = 0 where id = 1")
+    other.exec("insert into once values (1), (1)")
+}})
+let ok = move(30)
+let refused = move(60)
+let unprepared = twice()
+[ok, refused, unprepared, db.one("select n from acct").n, other.one("select n from acct").n, len(local.query("select * from moves")), len(db.query("select * from pg_prepared_xacts"))]"#,
+        a = a,
+        b = b,
+        local = d.join("local.db").display()
+    );
+    let mut it = quillo::Interp::new(&d);
+    let got = it.load_source(&src, "atomic.qwe").unwrap_or_else(|e| panic!("{}", e)).repr();
+    assert!(got.starts_with(r#"[30, err("too much"), err("db: db.atomic: a database could not prepare its part:"#), "{}", got);
+    assert!(got.ends_with(", 70, 30, 1, 0]"), "{}", got);
+    // A server stopped part way: one transaction decided (committed), one not (rolled back).
+    let (decided, undecided) = ("quillo_1000_decided", "quillo_1000_undecided");
+    psql(pg, b, &["begin", "insert into acct values (2, 2)", &format!("prepare transaction '{}_1'", decided)]);
+    psql(pg, b, &["begin", "insert into acct values (3, 3)", &format!("prepare transaction '{}_1'", undecided)]);
+    psql(pg, a, &[&format!("insert into _quillo_atomic (gid, decision, at) values ('{}', 'commit', 1000)", decided)]);
+    quillo::db::recover(&mut it);
+    let after = it.load_source("[other.query(\"select id from acct order by id\") | map((r) => r.id), len(other.query(\"select * from pg_prepared_xacts\")), db.one(\"select decision from _quillo_atomic where gid = 'quillo_1000_undecided'\").decision]", "check.qwe").unwrap().repr();
+    assert_eq!(after, r#"[[1, 2], 0, "abort"]"#);
 }
 
 /// `db` on one Postgres database, a connection to another, and tenants

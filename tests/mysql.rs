@@ -150,4 +150,19 @@ fn mysql() {
         "[0, 0]"
     );
     assert_eq!(eval(&mut it, "my.exec(\"insert into n values (3)\")\n[len(db.query(\"select * from n\")), len(my.query(\"select * from n\"))]"), "[0, 1]");
+    // One transaction over two MariaDB databases and SQLite (XA): all, or none.
+    let mut it = program(&work, &format!("db.open(\"{}\")\n", url("mysql")));
+    eval(&mut it, "db.exec(\"create database bank_a\")\ndb.exec(\"create database bank_b\")");
+    let src = format!(
+        "db.open(\"{}\")\nlet b = db.connect(\"{}\")\nlet local = db.connect(\"xa.db\")\n\
+         db.exec(\"create table acct (id int primary key, n int)\")\nb.exec(\"create table acct (id int primary key, n int)\")\n\
+         local.exec(\"create table if not exists moves (n int)\")\n\
+         db.exec(\"insert into acct values (1, 100)\")\nb.exec(\"insert into acct values (1, 0)\")\n\
+         fn move(n) = db.atomic([db, b, local], () => {{\n db.exec(\"update acct set n = n - ? where id = 1\", n)\n b.exec(\"update acct set n = n + ? where id = 1\", n)\n local.exec(\"insert into moves values (?)\", n)\n n > 50 ? err(\"too much\") : n\n}})\n",
+        url("bank_a"),
+        url("bank_b")
+    );
+    let mut it = program(&work, &src);
+    assert_eq!(eval(&mut it, "[move(30), move(60)]"), r#"[30, err("too much")]"#);
+    assert_eq!(eval(&mut it, "[db.one(\"select n from acct\").n, b.one(\"select n from acct\").n, len(local.query(\"select * from moves\")), len(db.query(\"xa recover\"))]"), "[70, 30, 1, 0]");
 }

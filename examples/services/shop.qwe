@@ -1,8 +1,10 @@
 // The shop: a page to buy from, which bills through the billing service.
 // `billing.invoice(...)` reads as a call of a function; where billing runs
-// (this process, or a server of its own) is not the shop's concern.
+// (this process, or a server of its own) is not the shop's concern. When
+// it runs elsewhere, a call may take two seconds, and is tried once more if
+// it did not get through.
 
-service billing = "billing.qwe"
+service billing = "billing.qwe" { timeout: "2s", retries: 1 }
 
 let PRICE = 1200
 

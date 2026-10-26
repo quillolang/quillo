@@ -175,4 +175,92 @@ fn quillo_check_knows_the_new_forms() {
     assert!(a.errors().next().is_none(), "{:?}", a.errors().map(|e| e.message.clone()).collect::<Vec<_>>());
     let a = quillo::check::check_source("db.connect(5)\n", "main.qwe", Path::new("."));
     assert!(a.errors().any(|e| e.message.contains("db.connect")));
+    // Replicas, the system database, shards, one transaction over several, joins.
+    let ok = "db.open(\"postgres://u@h/app\", { replicas: [\"postgres://u@r/app\"] })\ndb.system(\"q.db\")\nlet o = db.connect(\"o.db\")\n\
+              let s = db.shards([\"a.db\", \"b.db\"])\nfn f(k) = s.on(k).one(\"select 1\")\nfn g() = s.all(\"select 1\")\n\
+              fn h() = db.atomic([db, o], () => o.exec(\"select 1\"))\nfn j() = join_on(g(), g(), \"id\")\n";
+    let a = quillo::check::check_source(ok, "main.qwe", Path::new("."));
+    assert!(a.errors().next().is_none(), "{:?}", a.errors().map(|e| e.message.clone()).collect::<Vec<_>>());
+    let a = quillo::check::check_source("fn f() = db.atomic(db, () => 1)\nfn g() = db.shards(\"a.db\")\n", "main.qwe", Path::new("."));
+    assert!(a.errors().any(|e| e.message.contains("db.atomic")) && a.errors().any(|e| e.message.contains("db.shards")), "{:?}", a.errors().map(|e| e.message.clone()).collect::<Vec<_>>());
+}
+
+// ---- shards, joins, Quillo's own tables, one transaction over several --------------------------
+
+#[test]
+fn shards_split_data_by_a_key_and_are_asked_together() {
+    let d = dir("shards");
+    std::fs::create_dir_all(d.join("migrations")).unwrap();
+    std::fs::write(d.join("migrations/001_users.sql"), "create table users (id integer primary key, name text)").unwrap();
+    let mut it = load(&d, "let users = db.shards([\"s1.db\", \"s2.db\", \"s3.db\"])\nusers.migrate()\n");
+    for i in 1..=30 {
+        eval(&mut it, &format!("users.on({}).exec(\"insert into users (id, name) values (?, ?)\", {}, \"u{}\")", i, i, i));
+    }
+    // Every row is on the shard its key gives, and on that one only.
+    assert_eq!(eval(&mut it, "len(users.all(\"select * from users\"))"), "30");
+    assert_eq!(eval(&mut it, "users.on(17).one(\"select name from users where id = ?\", 17).name"), "\"u17\"");
+    let per: Vec<usize> = (1..=3)
+        .map(|k| rusqlite::Connection::open(d.join(format!("s{}.db", k))).unwrap().query_row("select count(*) from users", [], |r| r.get::<_, i64>(0)).unwrap() as usize)
+        .collect();
+    assert_eq!(per.iter().sum::<usize>(), 30);
+    assert!(per.iter().all(|n| *n >= 4), "{:?}", per);
+    assert_eq!(eval(&mut it, "users.count"), "3");
+    // A key keeps its shard; a shard added takes keys from the others and moves no other.
+    let before: Vec<usize> = (0..1000).map(|k| quillo::db::shard_of(&quillo::value::Value::Int(k), 3)).collect();
+    let after: Vec<usize> = (0..1000).map(|k| quillo::db::shard_of(&quillo::value::Value::Int(k), 4)).collect();
+    assert!(before.iter().zip(&after).all(|(b, a)| a == b || *a == 3));
+    let moved = before.iter().zip(&after).filter(|(b, a)| a != b).count();
+    assert!((150..350).contains(&moved), "{}", moved);
+    // Shards are asked through `.on` and `.all`, not as one database.
+    assert!(eval(&mut it, "users.query(\"select 1\")").contains("`.on(key)`"), "{}", eval(&mut it, "users.query(\"select 1\")"));
+    assert!(eval(&mut it, "users.on(null)").contains("needs a key"));
+}
+
+#[test]
+fn rows_from_two_databases_are_joined_on_a_key() {
+    let d = dir("join");
+    let mut it = load(&d, "db.open(\"orders.db\")\nlet people = db.connect(\"people.db\")\n");
+    eval(&mut it, "db.exec(\"create table orders (id integer primary key, user_id int, total int); insert into orders (user_id, total) values (1, 10), (2, 20), (9, 5)\")");
+    eval(&mut it, "people.exec(\"create table users (id integer primary key, name text); insert into users (id, name) values (1, 'ana'), (2, 'bo')\")");
+    let got = eval(&mut it, "join_on(db.query(\"select * from orders order by id\"), people.query(\"select * from users\"), \"user_id\", \"id\") | map((o) => [o.total, o.user?.name])");
+    assert_eq!(got, "[[10, \"ana\"], [20, \"bo\"], [5, null]]");
+    assert_eq!(eval(&mut it, "join_on([{ k: \"1\" }], [{ k: 1, v: 2 }], \"k\", \"k\", \"m\")[0].m"), "null");
+    assert_eq!(eval(&mut it, "join_on([{ k: 1 }], [{ k: 1, v: 2 }], \"k\")[0].joined.v"), "2");
+}
+
+#[test]
+fn quillos_own_tables_go_to_the_system_database_with_one_per_tenant() {
+    let d = dir("system");
+    let src = "db.open(\"data/{tenant}.db\")\nservice mailer = \"mailer.qwe\"\nfn send() = with_tenant(\"acme\", () => mailer.later.send(\"ana\"))\n";
+    std::fs::write(d.join("mailer.qwe"), "server fn send(to: str) = to\n").unwrap();
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let mut it = load(&d, src);
+    std::env::set_var("QUILLO_SERVICE_MAILER", "http://127.0.0.1:9");
+    let id = eval(&mut it, "send()");
+    std::env::remove_var("QUILLO_SERVICE_MAILER");
+    // Kept, not in a tenant's database, but next to the program.
+    let sys = rusqlite::Connection::open(d.join("quillo-system.db")).unwrap();
+    let kept: String = sys.query_row("select id from _quillo_later", [], |r| r.get(0)).unwrap();
+    assert_eq!(format!("\"{}\"", kept), id);
+    // Or where `db.system` says.
+    let d2 = dir("system2");
+    std::fs::write(d2.join("mailer.qwe"), "server fn send(to: str) = to\n").unwrap();
+    let mut it = load(&d2, &format!("{}db.system(\"ours.db\")\n", src));
+    std::env::set_var("QUILLO_SERVICE_MAILER", "http://127.0.0.1:9");
+    eval(&mut it, "send()");
+    std::env::remove_var("QUILLO_SERVICE_MAILER");
+    assert!(d2.join("ours.db").exists() && !d2.join("quillo-system.db").exists());
+    assert!(eval(&mut it, "db.system(\"x/{tenant}.db\")").contains("no {tenant}"));
+}
+
+#[test]
+fn one_transaction_over_several_databases_with_sqlite() {
+    let d = dir("atomic");
+    let mut it = load(&d, "db.open(\"main.db\")\nlet other = db.connect(\"other.db\")\ndb.exec(\"create table t (x int)\")\nother.exec(\"create table t (x int)\")\n");
+    // SQLite can take part once: it commits last.
+    assert_eq!(eval(&mut it, "db.atomic([db], () => db.exec(\"insert into t values (1)\"))").contains("changes"), true);
+    assert_eq!(eval(&mut it, "db.atomic([db], () => { db.exec(\"insert into t values (2)\")\n err(\"no\") })"), "err(\"no\")");
+    assert_eq!(eval(&mut it, "db.query(\"select x from t\") | map((r) => r.x)"), "[1]");
+    assert!(eval(&mut it, "db.atomic([db, other], () => 1)").contains("one SQLite database at most"));
+    assert!(eval(&mut it, "db.transaction(() => db.atomic([db], () => 1))").contains("inside a transaction"));
 }

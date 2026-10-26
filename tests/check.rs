@@ -373,6 +373,13 @@ fn service_calls_are_checked_against_what_the_service_offers() {
     // The browser does not call services; a function limited to the database neither.
     assert!(diags(&format!("{}component C() {{ ~x = billing.invoice(\"a\", 1)\n <p>{{x}}</p> }}", pre)).iter().any(|m| m.contains("calls another service, which only the server does")));
     assert!(diags(&format!("{}fn f() with db = billing.invoice(\"a\", 1)", pre)).iter().any(|m| m.contains("needs the http effect")));
+    // Made later: the same call, checked the same; its result is the call's id.
+    assert!(diags(&format!("{}fn f() -> str = billing.later.invoice(\"ana\", 1200)", pre)).is_empty());
+    let d3 = diags(&format!("{}fn f() = billing.later.invoice(\"ana\", \"lots\")", pre));
+    assert!(d3.len() == 1 && d3[0].contains("argument `cents` of `billing.invoice` must be int, got str"), "{:?}", d3);
+    assert!(diags(&format!("{}fn f() = billing.later.nope()", pre))[0].contains("has no server fn `nope`"));
+    // How it is called, after the file.
+    assert!(diags("service billing = \"billing.qwe\" { timeout: \"2s\", retries: 1 }\nfn f() = billing.invoice(\"a\", 1)").is_empty());
     // A file that is not there.
     assert!(diags("service gone = \"gone.qwe\"\n")[0].contains("cannot read"));
     // Services using one another are each checked once.

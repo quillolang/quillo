@@ -128,7 +128,7 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 pub fn builtin_effect(name: &str) -> u8 {
     let e = if name.starts_with("db.") {
         "db"
-    } else if name.starts_with("http.") || name == "__service" {
+    } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
         "http"
     } else {
         match name {
@@ -379,7 +379,8 @@ pub enum Stmt {
     /// `billing.invoice(...)`), or `service /shop = "shop.qwe"` (the same,
     /// named after the file, and its routes served under /shop): a part
     /// that runs in this process or as a server of its own (src/service.rs).
-    Service(String, Option<String>, String, u32),
+    /// After the file, a map of how it is called: `{ timeout: "2s", retries: 2 }`.
+    Service(String, Option<String>, String, Option<Expr>, u32),
     /// `type User = { name: str, role: "admin" | "member" = "member" }`: a
     /// record (src/record.rs), or another name for a type.
     Type(Arc<TypeDef>),

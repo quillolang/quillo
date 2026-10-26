@@ -558,6 +558,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("drop", "list | str | null, int", "list | str"),
     ("count", "list | null, fn=", "int"),
     ("group_by", "list | null, fn", "map"),
+    ("join_on", "list | null, list | null, str, str | null=, str | null=", "list"),
     ("index_of", "list | str, any", "int | null"),
     ("repeat", "str, int", "str"),
     ("markdown", "str, map | null=", "html"),
@@ -596,8 +597,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("watch", "any...", "null"),
     ("json.parse", "str", "any"),
     ("json.stringify", "any, any=", "str"),
-    ("db.open", "str | fn", "null | error(str)"),
-    ("db.connect", "str | fn", "map | error(str)"),
+    ("db.open", "str | fn, map=", "null | error(str)"),
+    ("db.connect", "str | fn, map=", "map | error(str)"),
+    ("db.system", "str", "null | error(str)"),
+    ("db.shards", "list", "map | error(str)"),
+    ("db.atomic", "list, fn", "any"),
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
@@ -1240,7 +1244,7 @@ impl Checker {
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
-            if let Stmt::Service(name, prefix, path, line) = s {
+            if let Stmt::Service(name, prefix, path, _, line) = s {
                 let full = base.join(path);
                 match crate::service::offered(&full) {
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
@@ -1334,7 +1338,7 @@ impl Checker {
                         Var { t: T::of(FN), sig: Some(sig), file: it.file.clone(), line: d.line, kind: Kind::Global, used: false, ready: false },
                     );
                 }
-                Stmt::Service(name, _, _, line) => {
+                Stmt::Service(name, _, _, _, line) => {
                     self.globals.insert(
                         name.clone(),
                         Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false },
@@ -1389,7 +1393,7 @@ impl Checker {
                     };
                     self.out.symbols.push(Symbol { name: d.name.clone(), kind, file: it.file.to_string(), line: d.line, detail: def_text(d) });
                 }
-                Stmt::Service(name, _, _, _) => {
+                Stmt::Service(name, _, _, _, _) => {
                     if let Some(g) = self.globals.get_mut(name) {
                         g.ready = true;
                     }
@@ -1831,7 +1835,7 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Service(_, _, _, line) => {
+            Stmt::Service(_, _, _, _, line) => {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`service` must be at the top level");
@@ -2408,6 +2412,15 @@ impl Checker {
         }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
+            // `billing.later.invoice(args)`: the same call, made later; its id.
+            if let Expr::Field(inner, later, _) = &**obj {
+                if let (Expr::Ident(m, _), "later") = (&**inner, later.as_str()) {
+                    if self.services.contains_key(m) && !self.is_local(m) {
+                        self.service_call(m, name, args, pre);
+                        return T::of(STR);
+                    }
+                }
+            }
             if let Expr::Ident(m, _) = &**obj {
                 if self.services.contains_key(m) && !self.is_local(m) {
                     return self.service_call(m, name, args, pre);

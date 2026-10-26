@@ -17,6 +17,7 @@ pub struct HttpRequest {
     pub remote: String,
 }
 
+#[derive(Clone)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -350,6 +351,9 @@ impl Interp {
                     None => build_request(req, path, &query_v),
                 };
                 reqmap.insert("params".into(), params_v);
+                if let Some(id) = &self.request_id {
+                    reqmap.insert("id".into(), Value::str(&**id));
+                }
                 let reqv = Value::map(reqmap);
                 define(&scope, "request", reqv.clone());
                 reqv
@@ -471,6 +475,13 @@ impl Interp {
         if let Some(name) = rest.strip_prefix("job/") {
             return self.run_job(name, req, qs);
         }
+        // The scheduler, asking that the calls made later that are due be made.
+        if rest == "later" {
+            if req.method != "POST" || !is_job_request(req) {
+                return plain(404, "not found\n");
+            }
+            return crate::service::deliver(self);
+        }
         if let Some(name) = rest.strip_prefix("service/") {
             return crate::service::answer(self, name, req);
         }
@@ -525,7 +536,11 @@ impl Interp {
             return rpc_error(400, &msg);
         }
         let query = Value::map(parse_urlencoded(qs));
-        self.current_request = Some(Value::map(build_request(req, path, &query)));
+        let mut reqmap = build_request(req, path, &query);
+        if let Some(id) = &self.request_id {
+            reqmap.insert("id".into(), Value::str(&**id));
+        }
+        self.current_request = Some(Value::map(reqmap));
         // A `live` refresh: also report what the function read.
         let live = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-live"));
         let seq = self.shared.live_seq();
@@ -851,6 +866,9 @@ pub struct App {
     /// `--reload`: load the program again when its files change, without
     /// `--watch`'s development aids (errors on pages, page refreshes).
     pub reload: bool,
+    /// Where the server listens, once it does: for background work a
+    /// version loaded later may need (see `start_background`).
+    addr: Mutex<Option<std::net::SocketAddr>>,
 }
 
 impl App {
@@ -870,6 +888,7 @@ impl App {
             base: String::new(),
             launch_token: None,
             reload: false,
+            addr: Mutex::new(None),
         }
     }
 
@@ -899,8 +918,8 @@ impl App {
             problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
         }
         self.shared.gil.acquire();
-        // Services are loaded again with it.
-        self.shared.services.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Services are loaded again with it (into a table of its own: see
+        // `shared::Services`).
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
         it.base = self.base.clone();
         let res = if problems.is_empty() {
@@ -913,6 +932,12 @@ impl App {
         match res {
             Ok(_) => {
                 eprintln!("quillo: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
+                // A version that is the first to use services or `db.atomic`
+                // needs what delivers and recovers in the background.
+                let addr = *self.addr.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(addr) = addr {
+                    start_background(&it, addr);
+                }
                 *slot = (slot.0 + 1, Arc::new(Loaded::Ready(it)));
             }
             Err(e) => {
@@ -1107,6 +1132,12 @@ impl Worker {
         Worker { generation: 0, local: None, program: app.current().1 }
     }
 
+    /// Whether it holds a version of the program no longer current (and,
+    /// idle, should go, so that the old version's database connections close).
+    pub(crate) fn outdated(&self, app: &App) -> bool {
+        !Arc::ptr_eq(&self.program, &app.current().1)
+    }
+
     /// Answers a request, a streamed answer on `sink` (the connection) as it
     /// is made. The caller holds the interpreter lock.
     pub(crate) fn answer(&mut self, app: &Arc<App>, req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
@@ -1156,12 +1187,15 @@ impl Worker {
             };
             self.program = current;
         }
+        // The request's id: given (another service calling, a proxy), or made.
+        let rid = crate::service::request_id(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-request-id")).map(|(_, v)| v.as_str()));
         let mut resp = if app.watch && req.url == "/_quillo/dev" {
             plain(200, &self.generation.to_string())
         } else {
             match (&mut self.local, &*self.program) {
                 (Some(it), _) => match {
                     it.streams_direct = sink.is_some();
+                    it.request_id = Some(rid.clone());
                     run_program(it, &req)
                 } {
                     Some(r) => r,
@@ -1177,6 +1211,9 @@ impl Worker {
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
+        if !resp.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-request-id")) {
+            resp.headers.push(("x-request-id".into(), rid.to_string()));
+        }
         // Streamed: the head now, then what the function sends.
         let mut streamed = None;
         if let Some(i) = resp.headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(crate::stream::MARK)) {
@@ -1217,14 +1254,15 @@ impl Worker {
                         None => String::new(),
                     };
                     crate::httpd::log_fmt(format_args!(
-                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{}}}\n",
+                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{},\"rid\":{}}}\n",
                         crate::httpd::iso_now(),
                         serde_json::Value::from(req.method.as_str()),
                         serde_json::Value::from(req.url.as_str()),
                         resp.status,
                         took * 1000.0,
                         serde_json::Value::from(req.remote.as_str()),
-                        tenant
+                        tenant,
+                        serde_json::Value::from(&*rid)
                     ))
                 }
                 _ => {}
@@ -1334,8 +1372,21 @@ fn is_job_request(req: &HttpRequest) -> bool {
         .any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-job") && crate::crypto::same(v.as_bytes(), crate::jobs::token().as_bytes()))
 }
 
+/// Calls made later (`billing.later.invoice(...)`) delivered, and
+/// transactions over several databases recovered, for a program that may
+/// have them (started once; see `service::start_deliveries`).
+fn start_background(it: &Interp, addr: std::net::SocketAddr) {
+    if crate::service::uses_services(it) || crate::db::uses_atomic(it) {
+        crate::service::start_deliveries(addr);
+    }
+}
+
 /// Starts the job scheduler for the program `app` runs (see `jobs`).
 fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
+    *app.addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
+    if let Loaded::Ready(it) = &*app.current().1 {
+        start_background(it, addr);
+    }
     let app = app.clone();
     crate::jobs::start(addr, move || match &*app.current().1 {
         Loaded::Ready(it) => it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect(),
