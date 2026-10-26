@@ -219,6 +219,10 @@ impl Interp {
         // A mounted program answers everything under its prefix, seeing the
         // path without it.
         let path = req.url.split('?').next().unwrap_or("");
+        // A service with a prefix that runs elsewhere: passed on to it.
+        if let Some((prefix, url)) = self.remote_mounts.iter().find(|(p, _)| path == p.as_str() || path.starts_with(&format!("{}/", p))).cloned() {
+            return crate::service::pass_on(self, &url, &prefix, req);
+        }
         for (prefix, sub) in self.mounts.iter_mut() {
             if path == prefix.as_str() || path.starts_with(&format!("{}/", prefix)) {
                 let rest = &req.url[prefix.len()..];
@@ -442,6 +446,9 @@ impl Interp {
         }
         if let Some(name) = rest.strip_prefix("job/") {
             return self.run_job(name, req, qs);
+        }
+        if let Some(name) = rest.strip_prefix("service/") {
+            return crate::service::answer(self, name, req);
         }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
@@ -683,7 +690,7 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
 }
 
 /// Checks a browser's arguments against a `server fn`'s parameters.
-fn check_args(def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+pub(crate) fn check_args(def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
     }
@@ -802,6 +809,8 @@ pub struct App {
     pub cluster_sources: Option<Vec<std::net::IpAddr>>,
     /// Largest request body accepted, in bytes.
     pub max_body: usize,
+    /// The path the program is served under (`--base`), kept when it is loaded again.
+    pub base: String,
     /// A desktop app (`quillo app`): only requests that carry this token
     /// are answered (see `launch_gate`).
     pub launch_token: Option<String>,
@@ -824,6 +833,7 @@ impl App {
             cluster_key: None,
             cluster_sources: None,
             max_body: MAX_BODY,
+            base: String::new(),
             launch_token: None,
             reload: false,
         }
@@ -855,7 +865,10 @@ impl App {
             problems = analysis.errors().map(|d| d.to_string()).collect::<Vec<_>>().join("\n");
         }
         self.shared.gil.acquire();
+        // Services are loaded again with it.
+        self.shared.services.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
+        it.base = self.base.clone();
         let res = if problems.is_empty() {
             it.load_file(&self.main_file)
         } else {

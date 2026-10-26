@@ -130,6 +130,8 @@ struct Tables {
 }
 
 thread_local! {
+    /// Service programs being checked: one using another that uses it is not checked twice over.
+    static SERVICE_CHECKS: std::cell::RefCell<HashSet<PathBuf>> = std::cell::RefCell::new(HashSet::new());
     static TABLES: std::cell::RefCell<Tables> = std::cell::RefCell::new(Tables::default());
     /// Checks in progress on this thread (a mounted program is checked
     /// inside its parent's check): the tables are emptied by the outermost.
@@ -521,9 +523,123 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.hash_password", "str", "str"),
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
+    // src/numeric.rs
+    ("math.sqrt", "num", "float"),
+    ("math.cbrt", "num", "float"),
+    ("math.exp", "num", "float"),
+    ("math.exp2", "num", "float"),
+    ("math.expm1", "num", "float"),
+    ("math.log", "num, num=", "float"),
+    ("math.log2", "num", "float"),
+    ("math.log10", "num", "float"),
+    ("math.log1p", "num", "float"),
+    ("math.pow", "num, num", "float"),
+    ("math.sin", "num", "float"),
+    ("math.cos", "num", "float"),
+    ("math.tan", "num", "float"),
+    ("math.asin", "num", "float"),
+    ("math.acos", "num", "float"),
+    ("math.atan", "num", "float"),
+    ("math.atan2", "num, num", "float"),
+    ("math.sinh", "num", "float"),
+    ("math.cosh", "num", "float"),
+    ("math.tanh", "num", "float"),
+    ("math.asinh", "num", "float"),
+    ("math.acosh", "num", "float"),
+    ("math.atanh", "num", "float"),
+    ("math.degrees", "num", "float"),
+    ("math.radians", "num", "float"),
+    ("math.hypot", "num...", "float"),
+    ("math.dist", "list, list", "float"),
+    ("math.floor", "num", "int"),
+    ("math.ceil", "num", "int"),
+    ("math.trunc", "num", "int"),
+    ("math.fabs", "num", "float"),
+    ("math.copysign", "num, num", "float"),
+    ("math.fmod", "num, num", "float"),
+    ("math.remainder", "num, num", "float"),
+    ("math.modf", "num", "list"),
+    ("math.frexp", "num", "list"),
+    ("math.ldexp", "num, int", "float"),
+    ("math.factorial", "int", "int"),
+    ("math.gcd", "int | list...", "int"),
+    ("math.lcm", "int | list...", "int"),
+    ("math.comb", "int, int", "int"),
+    ("math.perm", "int, int | null=", "int"),
+    ("math.isqrt", "int", "int"),
+    ("math.isclose", "num, num, num=, num=", "bool"),
+    ("math.isfinite", "num", "bool"),
+    ("math.isinf", "num", "bool"),
+    ("math.isnan", "num", "bool"),
+    ("math.prod", "list | null, num=", "num"),
+    ("math.fsum", "list | null", "float"),
+    ("math.sumprod", "list, list", "num"),
+    ("math.erf", "num", "float"),
+    ("math.erfc", "num", "float"),
+    ("math.gamma", "num", "float"),
+    ("math.lgamma", "num", "float"),
+    ("stats.mean", "list", "float"),
+    ("stats.fmean", "list, list | null=", "float"),
+    ("stats.geometric_mean", "list", "float"),
+    ("stats.harmonic_mean", "list", "float"),
+    ("stats.median", "list", "num"),
+    ("stats.median_low", "list", "num"),
+    ("stats.median_high", "list", "num"),
+    ("stats.mode", "list", "any"),
+    ("stats.multimode", "list | null", "list"),
+    ("stats.pvariance", "list, num | null=", "float"),
+    ("stats.variance", "list, num | null=", "float"),
+    ("stats.pstdev", "list, num | null=", "float"),
+    ("stats.stdev", "list, num | null=", "float"),
+    ("stats.quantiles", "list, int=, str=", "list"),
+    ("stats.percentile", "list, num | list", "any"),
+    ("stats.covariance", "list, list", "float"),
+    ("stats.correlation", "list, list, str=", "float"),
+    ("stats.linear_regression", "list, list, bool=", "map"),
+    ("stats.describe", "list | null", "map"),
+    ("stats.histogram", "list | null, int | list=", "map"),
+    ("stats.zscore", "list | null", "list"),
+    ("stats.normalize", "list | null", "list"),
+    ("stats.rank", "list | null", "list"),
+    ("stats.normal_pdf", "num, num=, num=", "float"),
+    ("stats.normal_cdf", "num, num=, num=", "float"),
+    ("stats.normal_inv", "num, num=, num=", "float"),
+    ("vec.add", "list | num, list | num", "any"),
+    ("vec.sub", "list | num, list | num", "any"),
+    ("vec.mul", "list | num, list | num", "any"),
+    ("vec.div", "list | num, list | num", "any"),
+    ("vec.mod", "list | num, list | num", "any"),
+    ("vec.pow", "list, num", "list"),
+    ("vec.dot", "list, list", "num"),
+    ("vec.norm", "list, num=", "float"),
+    ("vec.cumsum", "list | null", "list"),
+    ("vec.cumprod", "list | null", "list"),
+    ("vec.diff", "list | null", "list"),
+    ("vec.argmin", "list | null", "int | null"),
+    ("vec.argmax", "list | null", "int | null"),
+    ("vec.argsort", "list | null, bool=", "list"),
+    ("vec.clip", "list, num | null, num | null=", "list"),
+    ("vec.abs", "list", "list"),
+    ("vec.sqrt", "list", "list"),
+    ("vec.exp", "list", "list"),
+    ("vec.log", "list", "list"),
+    ("vec.round", "list, int=", "list"),
+    ("vec.linspace", "num, num, int=, bool=", "list"),
+    ("vec.arange", "num, num=, num=", "list"),
+    ("vec.zeros", "int", "list"),
+    ("vec.ones", "int", "list"),
+    ("vec.full", "int, any", "list"),
+    ("vec.rolling_mean", "list, int", "list"),
+    ("vec.rolling_sum", "list, int", "list"),
+    ("vec.matmul", "list, list", "list"),
+    ("vec.transpose", "list | null", "list"),
+    ("vec.column", "list | null, str | int", "list"),
 ];
 
-const MODULES: &[&str] = &["json", "db", "http", "crypto", "image"];
+/// Modules the browser has too (src/client/runtime.js).
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
+
+const MODULES: &[&str] = &["json", "db", "http", "crypto", "image", "math", "stats", "vec"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -932,6 +1048,9 @@ struct Checker {
     effect_cache: HashMap<usize, u8>,
     /// Checking the `live(...)` that sets a component's `~state`.
     live_ok: bool,
+    /// The services a program calls (`service billing = "billing.qwe"`): the
+    /// server fns each offers, by name.
+    services: HashMap<String, HashMap<String, Arc<Sig>>>,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
     hint: Option<Vec<T>>,
@@ -979,6 +1098,7 @@ impl Checker {
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
             live_ok: false,
+            services: HashMap::new(),
             hint: None,
             strict_null: false,
             file: Arc::from(file),
@@ -1015,6 +1135,42 @@ impl Checker {
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
+            if let Stmt::Service(name, prefix, path, line) = s {
+                let full = base.join(path);
+                match crate::service::offered(&full) {
+                    Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
+                    Ok(defs) => {
+                        // Called from here: what it takes and gives, as declared.
+                        let sigs = defs
+                            .iter()
+                            .map(|d| {
+                                let mut sig = Sig::of_def(d);
+                                sig.def = None;
+                                sig.server = false;
+                                sig.effects = Some(crate::ast::effect_bit("http"));
+                                (d.name.clone(), Arc::new(sig))
+                            })
+                            .collect();
+                        self.services.insert(name.clone(), sigs);
+                        // A program of its own: checked alone (once, as services may use each other).
+                        let key = full.canonicalize().unwrap_or_else(|_| full.clone());
+                        let first = SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
+                        if first {
+                            let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
+                            SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
+                            self.out.diagnostics.extend(sub.diagnostics);
+                            if let Some(prefix) = prefix {
+                                self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
+                                    s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
+                                    s
+                                }));
+                            }
+                        }
+                    }
+                }
+                order.push(Item { stmt: s.clone(), file: file.clone() });
+                continue;
+            }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
                 let full = base.join(path);
@@ -1067,6 +1223,12 @@ impl Checker {
                         Var { t: T::of(FN), sig: Some(sig), file: it.file.clone(), line: d.line, kind: Kind::Global, used: false, ready: false },
                     );
                 }
+                Stmt::Service(name, _, _, line) => {
+                    self.globals.insert(
+                        name.clone(),
+                        Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false },
+                    );
+                }
                 Stmt::Let(p, _, line) => {
                     let mut names = Vec::new();
                     pattern_names(p, &mut names);
@@ -1101,6 +1263,11 @@ impl Checker {
                         SymbolKind::Function
                     };
                     self.out.symbols.push(Symbol { name: d.name.clone(), kind, file: it.file.to_string(), line: d.line, detail: def_text(d) });
+                }
+                Stmt::Service(name, _, _, _) => {
+                    if let Some(g) = self.globals.get_mut(name) {
+                        g.ready = true;
+                    }
                 }
                 Stmt::Route(r) => {
                     self.out.symbols.push(Symbol {
@@ -1539,6 +1706,13 @@ impl Checker {
                 }
                 T::of(NIL)
             }
+            Stmt::Service(_, _, _, line) => {
+                self.line = *line;
+                if !self.scopes.is_empty() {
+                    self.error("`service` must be at the top level");
+                }
+                T::of(NIL)
+            }
             Stmt::Return(e) => {
                 let t = match e {
                     Some(e) => self.expr(e),
@@ -1706,6 +1880,8 @@ impl Checker {
             } else if let Some((m, f)) = n.split_once('.') {
                 if MODULES.contains(&m) {
                     mask |= builtin_effect(&format!("{}.{}", m, f));
+                } else if self.services.contains_key(m) {
+                    mask |= crate::ast::effect_bit("http");
                 }
             }
         }
@@ -2078,6 +2254,9 @@ impl Checker {
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
             if let Expr::Ident(m, _) = &**obj {
+                if self.services.contains_key(m) && !self.is_local(m) {
+                    return self.service_call(m, name, args, pre);
+                }
                 if MODULES.contains(&m.as_str()) && !self.is_local(m) {
                     return self.module_call(m, name, args, pre);
                 }
@@ -2333,6 +2512,33 @@ impl Checker {
     }
 
     /// `json.parse(s)`, `db.query(...)`, `http.get(...)`.
+    /// `billing.invoice(...)`: a service's server fn, as it declares it; it
+    /// may also fail on the way (an error value), and the browser cannot call it.
+    fn service_call(&mut self, svc: &str, f: &str, args: &[Expr], pre: Option<T>) -> T {
+        let line = self.line;
+        if let Some(v) = self.globals.get(svc).cloned() {
+            self.record(svc, &v);
+        }
+        if let Some(c) = self.in_component() {
+            self.error(format!("`{}.{}` calls another service, which only the server does; <{}> also runs in the browser: call it from a `server fn`", svc, f, c));
+        }
+        let sig = self.services.get(svc).and_then(|m| m.get(f).cloned());
+        let mut argts: Vec<T> = pre.into_iter().collect();
+        for a in args {
+            argts.push(self.expr(a));
+        }
+        self.line = line;
+        let Some(sig) = sig else {
+            let mut names: Vec<String> = self.services.get(svc).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            names.sort();
+            let hint = names.iter().min_by_key(|n| edit_distance(f, n)).filter(|n| edit_distance(f, n) <= 2).map(|n| format!(" (did you mean `{}`?)", n))
+                .unwrap_or_else(|| if names.is_empty() { " (it has none)".into() } else { format!(" (it has {})", names.join(", ")) });
+            self.error(format!("service `{}` has no server fn `{}`{}", svc, f, hint));
+            return T::ANY;
+        };
+        self.apply(T::of(FN), Some(sig), argts, args, &format!("{}.{}", svc, f)).union(T::error(STR))
+    }
+
     fn module_call(&mut self, m: &str, f: &str, args: &[Expr], pre: Option<T>) -> T {
         let line = self.line;
         let full = format!("{}.{}", m, f);
@@ -2354,7 +2560,7 @@ impl Checker {
                 detail: Sig::builtin(&full, p, r).text(),
             });
         }
-        if m != "json" {
+        if !BROWSER_MODULES.contains(&m) {
             self.browser_forbidden(&format!("`{}`", full));
         }
         let sig = Arc::new(Sig::builtin(&full, p, r));
@@ -2813,7 +3019,7 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
             Stmt::Return(Some(e)) => walk_expr(e, f),
             Stmt::Fn(d) => walk_expr(&d.body, f),
             Stmt::Route(r) => walk_expr(&r.body, f),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
         }
     }
 }
@@ -2847,7 +3053,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => assigned_in(e, out),
             Stmt::Fn(d) => assigned_in(&d.body, out),
             Stmt::Route(r) => assigned_in(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
         }
     }
 }

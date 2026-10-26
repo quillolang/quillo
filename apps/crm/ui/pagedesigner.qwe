@@ -157,7 +157,7 @@ let COLUMN_SUGGESTS = ["text", "image", "button", "quote"]
 
 // The page designer, as Gutenberg is: the page is edited where it shows —
 // text typed into in place, a block added with + between blocks or / in an
-// empty one, Enter for the next block, a toolbar on the chosen one; blocks
+// empty one, a toolbar on the chosen one; blocks
 // in columns, each column suggesting what to add; the blocks' library and
 // the outline on the left, the page's or the block's settings on the right.
 component PageDesigner(id: int, ws: map) {
@@ -308,13 +308,6 @@ component PageDesigner(id: int, ws: map) {
         enter(b.id, "start")
     }
     let add = (t) => { add_at(t, sel == null ? { parent: null, col: 0, at: len(bs) } : after(sel.id)) }
-    // Enter: what followed the caret goes on in a new text block after.
-    let split_block = (b, d) => {
-        let kept = map_block(bs, b.id, (x) => set(x, "config", set(x.config ?? {}, d.key, d.before)))
-        let nb = { id: next_id(), type: "text", config: { body: d.rest ?? "" } }
-        change(insert_into(kept, after(b.id), nb))
-        enter(nb.id, "start")
-    }
     // Backspace in an empty block: it goes, and the caret to the end of the one before.
     let back = (b) => {
         let pl = place(b.id)
@@ -462,7 +455,6 @@ component PageDesigner(id: int, ws: map) {
             @focusin={(e) => { if e.target == e.currentTarget { selected = b.id } }}
             @input={(e) => { if mine(e, b) && e.target.dataset != null && e.target.dataset.edit != null { typed(b.id, e.target.dataset.edit, js("pbEditor.value", e.target)) } }}
             @focusout={(e) => { if mine(e, b) && e.target.dataset != null && e.target.dataset.edit != null && (e.relatedTarget == null || e.relatedTarget.closest(".pb-format") == null) { commit() } }}
-            @pbenter={(e) => { if mine(e, b) { split_block(b, e.detail) } }}
             @pbback={(e) => { if mine(e, b) { back(b) } }}
             @pbslash={(e) => { if mine(e, b) { open_inserter({ replace: b.id }) } }}
             @dragover={(e) => { if mine(e, b) && (b.type != "columns" || e.target.closest(".pb-col") == null) { over(e, pl) } }}>
@@ -575,7 +567,7 @@ component PageDesigner(id: int, ws: map) {
                             <span.pb-ins-icon>{block_icon(t.type)}</span>{t.label}</button>}</div>
                     </div>
                 }}
-                <p.muted.small.pb-keys><kbd>/</kbd> adds a block · <kbd>Enter</kbd> types into the chosen one, and at the end of a text starts the next · <kbd>Delete</kbd> removes it, <kbd>⌘Z</kbd> brings it back · <kbd>↑</kbd> <kbd>↓</kbd> choose, with <kbd>⌥</kbd> move · <kbd>⌘D</kbd> copies.</p>
+                <p.muted.small.pb-keys><kbd>/</kbd> adds a block · <kbd>Enter</kbd> types into the chosen one (in a text, the next paragraph) · <kbd>Delete</kbd> removes it, <kbd>⌘Z</kbd> brings it back · <kbd>↑</kbd> <kbd>↓</kbd> choose, with <kbd>⌥</kbd> move · <kbd>⌘D</kbd> copies.</p>
             </aside>}
             {left == "outline" && <aside.palette.outline>
                 <p.palette-title>{plural(len(all), "block")}</p>

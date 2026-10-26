@@ -34,6 +34,7 @@ fn forbidden_stmt(s: &Stmt) -> Option<&'static str> {
         Stmt::Return(None) => None,
         Stmt::Fn(_) => Some("a script cannot define functions (use `(x) => ...`)"),
         Stmt::Route(_) | Stmt::Mount(..) => Some("a script cannot define routes"),
+        Stmt::Service(..) => Some("a script cannot call services"),
         Stmt::Use(..) => Some("a script cannot `use` files"),
         Stmt::State(..) => Some("a script cannot keep state"),
     }

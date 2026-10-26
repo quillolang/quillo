@@ -229,6 +229,64 @@ impl Parser {
                     self.next()?;
                     return Ok(Stmt::Fn(Arc::new(self.parse_component(line)?)));
                 }
+                "service" => {
+                    // `service name = "file.qwe"` or `service /prefix = "file.qwe"`;
+                    // otherwise `service` is a name.
+                    let saved = self.save();
+                    self.next()?;
+                    if self.peeked.is_none() {
+                        self.lx.skip_inline_ws();
+                        let prefix = if self.lx.peek_char() == Some('/') {
+                            let mut p = String::new();
+                            while let Some(c) = self.lx.peek_char() {
+                                if c == '/' || is_path_char(c) {
+                                    p.push(c);
+                                    self.lx.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let p = p.trim_end_matches('/').to_string();
+                            if p.is_empty() || p.contains("//") {
+                                return Err(QuilloError::new("`service` needs a name or a path: service billing = \"billing.qwe\"", line));
+                            }
+                            self.lx.last = Some(Tok::RParen);
+                            Some(p)
+                        } else {
+                            None
+                        };
+                        let name = match &prefix {
+                            Some(_) => Some(String::new()),
+                            None => match self.peek()? {
+                                Tok::Ident(n) if !KEYWORDS.contains(&n.as_str()) => {
+                                    self.next()?;
+                                    Some(n)
+                                }
+                                _ => None,
+                            },
+                        };
+                        if let (Some(name), true) = (name, prefix.is_some() || self.at(&Tok::Assign)?) {
+                            self.expect(&Tok::Assign, "`=` after the service")?;
+                            let t = self.next()?;
+                            if let Tok::Str(parts) = t.tok {
+                                if let Some(file) = lit_string(parts) {
+                                    let name = match &prefix {
+                                        Some(_) => std::path::Path::new(&file).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
+                                        None => name,
+                                    };
+                                    if !name.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    {
+                                        return Err(QuilloError::new(format!("a service is named like a variable: `{}` is not one (name the file so)", name), line));
+                                    }
+                                    return Ok(Stmt::Service(name, prefix, file, line));
+                                }
+                            }
+                            return Err(QuilloError::new("`service` expects a file: service billing = \"billing.qwe\"", line));
+                        }
+                    }
+                    self.restore(saved);
+                }
                 "mount" => {
                     // `mount /prefix = "file.qwe"`; otherwise `mount` is a name.
                     let saved = self.save();

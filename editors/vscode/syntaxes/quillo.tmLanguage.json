@@ -327,7 +327,7 @@
       "patterns": [
         {
           "name": "constant.numeric.float.quillo",
-          "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*\\b"
+          "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?[eE][+-]?\\d+\\b|\\b\\d[\\d_]*\\.\\d[\\d_]*\\b"
         },
         {
           "name": "constant.numeric.integer.quillo",
@@ -343,7 +343,7 @@
         },
         {
           "name": "keyword.other.quillo",
-          "match": "\\b(use|as|with|route|mount)\\b"
+          "match": "\\b(use|as|with|route|mount|service)\\b"
         },
         {
           "name": "storage.type.quillo",

@@ -1,0 +1,29 @@
+// The shop: a page to buy from, which bills through the billing service.
+// `billing.invoice(...)` reads as a call of a function; where billing runs
+// (this process, or a server of its own) is not the shop's concern.
+
+service billing = "billing.qwe"
+
+let PRICE = 1200
+
+route GET / = <html>
+    <head><title>Shop</title></head>
+    <body>
+        <h1>A mug, {PRICE} cents</h1>
+        <form method="post" action="/buy">
+            <input name="name" placeholder="Your name"/>
+            <button>Buy</button>
+        </form>
+    </body>
+</html>
+
+route POST /buy {
+    let inv = billing.invoice(request.form.name ?? "", PRICE, "a mug")
+    if is_err(inv) { reply 400 <p>Not bought: {inv.error}</p> }
+    let mine = billing.invoices_of(inv.customer) ?? []
+    <html><body>
+        <h1>Thank you, {inv.customer}</h1>
+        <p>Invoice #{inv.id}: {inv.cents} cents. You have {len(mine)} with us.</p>
+        <p><a href="/">Buy another</a></p>
+    </body></html>
+}

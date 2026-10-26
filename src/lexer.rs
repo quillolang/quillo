@@ -359,10 +359,27 @@ impl Lexer {
             }
         };
         digits(self, &mut s);
+        let mut float = false;
         if self.peek_char() == Some('.') && self.peek_char_at(1).map_or(false, |c| c.is_ascii_digit()) {
             s.push('.');
             self.bump();
             digits(self, &mut s);
+            float = true;
+        }
+        // An exponent: 1e9, 2.5e-3, 6E+23.
+        if matches!(self.peek_char(), Some('e' | 'E')) {
+            let signed = matches!(self.peek_char_at(1), Some('+' | '-'));
+            if self.peek_char_at(if signed { 2 } else { 1 }).map_or(false, |c| c.is_ascii_digit()) {
+                s.push('e');
+                self.bump();
+                if signed {
+                    s.push(self.bump().unwrap());
+                }
+                digits(self, &mut s);
+                float = true;
+            }
+        }
+        if float {
             return s.parse::<f64>().map(Tok::Float).map_err(|_| QuilloError::new("bad number", line));
         }
         s.parse::<i64>()

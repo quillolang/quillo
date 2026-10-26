@@ -23,7 +23,7 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | **Pages** | Landing pages and a home page, made of blocks in a designer that works as Gutenberg does: the page, rendered as visitors will see it, is edited where it shows — text typed into in place (Markdown kept) and formatted from a toolbar over it — bold, italic,
 code, links (⌘B, ⌘I, ⌘K; a link's address is checked), headings, quotes and lists, "## ", "- ",
 "1. " or "> " typed at the start of a line turning it, Enter on an empty last list item leaving
-the list — + between blocks or `/` to add one, Enter at the end of a text for the next block and Backspace in an empty one to remove it, a toolbar on the chosen block (move, add before or after, copy, remove), ⌘Z and ⌘⇧Z;
+the list for a paragraph — + between blocks or `/` to add one (Enter in a text is its next paragraph; Backspace in an empty one removes it), a toolbar on the chosen block (move, add before or after, copy, remove), ⌘Z and ⌘⇧Z;
 Columns (2 to 4) hold blocks of their own — an empty column suggests Text, Image, Testimonial,
 Button or any block, and blocks are dragged into a column, from the library or by their handle
 (a columns block stays in the page, not in a column; columns from before, Markdown left and

@@ -1,0 +1,26 @@
+// Billing: invoices, as a service of its own. Other programs call its
+// `server fn`s (`billing.invoice(...)`); its page lists what it billed.
+// See app.qwe for running it in one process or as a server of its own.
+
+let invoices = []
+
+server fn invoice(customer: str, cents: int, note: str = "") -> map ! str {
+    if trim(customer) == "" { return err("An invoice is for someone") }
+    if cents <= 0 { return err("An invoice is for something") }
+    let inv = { id: len(invoices) + 1, customer: trim(customer), cents, note }
+    invoices = invoices + [inv]
+    inv
+}
+
+server fn invoices_of(customer: str) -> list = invoices | filter((i) => i.customer == customer)
+
+server fn total() -> int = invoices | reduce(0, (sum, i) => sum + i.cents)
+
+route GET / = <html>
+    <head><title>Billing</title></head>
+    <body>
+        <h1>Billing</h1>
+        <p>{len(invoices)} invoices, {total()} cents in all.</p>
+        <ul>{for i in invoices => <li>#{i.id} · {i.customer} · {i.cents} cents {i.note}</li>}</ul>
+    </body>
+</html>

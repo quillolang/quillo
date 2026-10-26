@@ -98,7 +98,7 @@ the browser and on the server.
 
 ### Values
 
-`null`, `true`/`false`, `42`, `3.14`, `"strings"` or `'strings'`, template strings
+`null`, `true`/`false`, `42`, `3.14`, `1e-9` and `6.02e23`, `"strings"` or `'strings'`, template strings
 `` `Hello, ${name}` ``, lists `[1, 2, 3]`, maps `{ name: "Ada", "content-type": "text/plain" }`,
 functions, HTML and error values. A map entry `{ id }` is short for `{ id: id }`.
 
@@ -829,6 +829,50 @@ browser bundle, its `server fn` calls, live data and page changes are all moved 
 prefix. Changes to mounted files are picked up by `--watch`. See
 [index.qwe](examples/index.qwe), which mounts every example.
 
+### Services
+
+A part of an app can run in the same process or as a server of its own, without its
+code changing. `service` names a program whose `server fn`s the others call:
+
+```quillo
+// shop.qwe
+service billing = "billing.qwe"
+
+route POST /buy {
+    let inv = billing.invoice(request.form.name, 1200)?    // billing's `server fn invoice`
+    <p>Invoice #{inv.id}</p>
+}
+
+// app.qwe: the app, made of both
+service /shop = "shop.qwe"          // named after the file; its routes under /shop
+service /billing = "billing.qwe"
+```
+
+- **In one process** (the default) a service is loaded once and shared by every program
+  in the process that names it: one copy of its variables and its database. A call
+  goes straight to it.
+- **Split**, a service runs elsewhere: `--service-url billing=http://10.0.0.5:8081` (or
+  `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
+  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service)
+  and the time (a call more than five minutes old is refused); the tenant goes with
+  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it.
+  Run alone, a service is an ordinary program: `quillo run billing.qwe --base /billing`
+  (`--base`: the path it is served under, which its links and redirects carry).
+- `quillo run app.qwe --split` runs each service the app declares (and those they
+  declare) as a process of its own, on a port of its own, its log lines marked with its
+  name, all signed with one secret; they stop with it.
+- Either way, what crosses is data, as JSON: arguments and results are copied (a
+  function arrives as `null`), so a program behaves the same whichever way it runs.
+  Optional arguments left out are not sent, so the service's own defaults apply. A
+  call that cannot be made (the service not answering) is an error value: `?` passes
+  it on, `??` replaces it.
+- `quillo check` checks each call against the service's `server fn`s (their names,
+  arguments and types; it may fail, so the result may be an error), the browser cannot
+  call a service, and a call needs the `http` effect. Services may use one another.
+- A program with `server fn`s and no routes is served too: a service may be only that.
+
+See [examples/services](examples/services): a shop that bills through a billing service.
+
 ## Standard library
 
 - **General:** `print str int float len type_of`
@@ -843,7 +887,8 @@ prefix. Changes to mounted files are picked up by `--watch`. See
   no headings or lists (their lines, broken by `<br>`).
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by index_of`
 - **Maps:** `keys values get has set remove merge`
-- **Math:** `abs round floor ceil sqrt pow`
+- **Math:** `abs round floor ceil sqrt pow`, and the three modules under
+  [Numbers and data](#numbers-and-data).
 - **Errors:** `err is_err unwrap`
 - **Web:** `raw escape env now file redirect respond json.parse json.stringify set_cookie
   delete_cookie session set_session end_session`
@@ -890,6 +935,80 @@ Safety built in:
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
 `use "lib.qwe"` runs another file once, into the global scope.
+
+### Numbers and data
+
+`math` is Python's math module, `stats` its statistics module with what a data frame's
+`describe` adds, and `vec` numpy's operations on lists of numbers. They are on the server
+and in the browser alike, so a component can chart what a route computed:
+
+```quillo
+let totals = vec.column(orders, "total")          // [12.5, 30, 7.5, ...]
+stats.describe(totals)        // { count, sum, mean, std, min, q1, median, q3, max }
+stats.quantiles(totals, 10)   // deciles, as Python computes them
+stats.correlation(ads, sales) // Pearson; "ranked" for Spearman
+stats.linear_regression(ads, sales)   // { slope, intercept }
+stats.histogram(totals, 20)   // { counts, edges }, as numpy's
+vec.rolling_mean(daily, 7)    // a week's moving average
+math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
+```
+
+- **`math`:** `sqrt cbrt exp exp2 expm1 log(x, base) log2 log10 log1p pow`, `sin cos tan
+  asin acos atan atan2` and their hyperbolic forms, `degrees radians hypot dist`, `floor
+  ceil trunc` (ints) `fabs copysign fmod remainder modf frexp ldexp`, `factorial gcd lcm
+  comb perm isqrt` (ints), `isclose isfinite isinf isnan`, `prod fsum sumprod`, `erf erfc
+  gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
+  domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
+  past 64 bits (`math.factorial(21)`).
+- **`stats`:** `mean fmean(data, weights) geometric_mean harmonic_mean`, `median
+  median_low median_high mode multimode`, `pvariance variance pstdev stdev` (each with an
+  optional known mean), `quantiles(data, n = 4, method = "exclusive")`, `covariance
+  correlation(x, y, method = "linear") linear_regression(x, y, proportional = false)`,
+  `normal_pdf normal_cdf normal_inv` (x, mu = 0, sigma = 1); and, beyond Python's,
+  `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
+  `describe`, `histogram(data, bins = 10)` (or the edges as a list), `zscore`,
+  `normalize` (to 0..1) and `rank` (ties share their average rank). Statistics of no
+  data, or of too little, is an error, as in Python.
+- **`vec`:** `add sub mul div mod` (two lists of one length, or a list and a number; ints stay
+  ints, as with the operators), `pow dot norm(xs, p = 2)`, `cumsum cumprod diff`,
+  `argmin argmax argsort(xs, descending = false) clip(xs, lo, hi)`, `abs sqrt exp log
+  round(xs, digits)`, `linspace(start, stop, n = 50) arange(start, stop, step) zeros ones
+  full(n, x)`, `rolling_mean rolling_sum(xs, window)` (one per full window),
+  `matmul(a, b)` (rows times rows, or times a list), `transpose`, and `column(rows, key)`
+  (a field of each map, or an item of each list).
+
+Answers are Python's: sums are compensated and rounded once, so `stats.mean`,
+`stats.variance` and `math.fsum` give Python's exact results (its statistics module
+uses fractions; this gets the same float without them), and the rest agree to the last
+digit or one or two places from it. None of it runs in the interpreter: a list is read
+once into floats, and a long one (over 128K items) is worked on by all the cores, in
+chunks of 32K whatever the machine, so the answer does not depend on how many cores
+it has. A median, a percentile or a quantile sorts only the part of the list where it
+falls (cut points from a sample split the list into ranges of about equal size), and
+`sort` and `vec.argsort` sort those ranges side by side. On a million floats, against
+Python 3.9 (no numpy) on the same 10-core machine:
+
+| | Quillo | Python |
+|---|---:|---:|
+| `stats.mean` | 0.35 ms | 214 ms |
+| `stats.stdev` | 0.65 ms | 674 ms |
+| `stats.median` | 1.3 ms | 44 ms |
+| `stats.quantiles(xs, 100)` | 2.0 ms | 45 ms |
+| `stats.correlation` | 1.4 ms | 246 ms (3.10's algorithm) |
+| `stats.linear_regression` | 1.3 ms | 182 ms (3.10's algorithm) |
+| `stats.describe` | 1.7 ms | 764 ms (by hand) |
+| `stats.histogram(xs, 50)` | 0.6 ms | 126 ms (a loop) |
+| `math.fsum` | 1.6 ms | 20 ms |
+| `vec.dot` | 0.9 ms | 11 ms (`sum(map(mul, x, y))`) |
+| `vec.add` | 1.9 ms | 20 ms (`list(map(add, x, y))`) |
+| `vec.rolling_mean(xs, 30)` | 2.0 ms | 69 ms (a running sum) |
+| `vec.argsort` | 5.4 ms | 75 ms (`sorted(range(n), key=...)`) |
+| `sort` | 4.6 ms | 46 ms |
+
+Making a list one item at a time is the interpreter's work, though: `map(range(n), (i)
+=> ...)` over a million takes about 1.4 times Python's list comprehension. Built with
+`vec` instead (`vec.div(vec.mod(vec.mul(vec.arange(n), k), m), 1000.0)`), the same list
+takes a fifteenth of the comprehension's time.
 
 ### Database
 
@@ -1141,6 +1260,9 @@ src/db.rs         db: SQLite, and the shared API
 src/pg.rs         db: PostgreSQL (pool, placeholders, types)
 src/fetch.rs      http: the HTTP client
 src/server.rs     request matching, server fns, responses, worker pool, --watch
+src/service.rs    services: in this process or elsewhere, signed calls, --split
+src/numeric.rs    math, stats and vec: Python's math and statistics, numpy's operations
+src/par.rs        a pool of threads for long lists, in chunks of a fixed size
 src/ws.rs         WebSockets, for live updates and --watch reloads
 src/cluster.rs    several servers behind limer: --register, broadcasts
 src/viewcache.rs  reusing views' HTML while their inputs are unchanged

@@ -65,6 +65,7 @@ pub fn install(env: &Env) {
         ("tenant", tenant),
         ("tenant_from", tenant_from),
         ("with_tenant", with_tenant),
+        ("__service", crate::service::call),
         ("redirect", redirect),
         ("respond", respond),
         ("read_file", read_file),
@@ -127,6 +128,15 @@ pub fn install(env: &Env) {
     let mut image = Map::new();
     crate::imaging::install(&mut image);
     define(env, "image", Value::map(image));
+    let mut math = Map::new();
+    crate::numeric::install_math(&mut math);
+    define(env, "math", Value::map(math));
+    let mut stats = Map::new();
+    crate::numeric::install_stats(&mut stats);
+    define(env, "stats", Value::map(stats));
+    let mut vec = Map::new();
+    crate::numeric::install_vec(&mut vec);
+    define(env, "vec", Value::map(vec));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).
@@ -333,7 +343,7 @@ fn map(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "map", line)?;
     let mut out = Vec::with_capacity(l.len());
     for x in l.iter() {
-        out.push(it.call(&f, vec![x.clone()], line)?);
+        out.push(it.call1(&f, x.clone(), line)?);
     }
     Ok(Value::list(out))
 }
@@ -343,7 +353,7 @@ fn filter(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "filter", line)?;
     let mut out = Vec::new();
     for x in l.iter() {
-        if it.call(&f, vec![x.clone()], line)?.truthy() {
+        if it.call1(&f, x.clone(), line)?.truthy() {
             out.push(x.clone());
         }
     }
@@ -354,7 +364,7 @@ fn find(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "find", line)?;
     let f = f_arg(&args, 1, "find", line)?;
     for x in l.iter() {
-        if it.call(&f, vec![x.clone()], line)?.truthy() {
+        if it.call1(&f, x.clone(), line)?.truthy() {
             return Ok(x.clone());
         }
     }
@@ -365,7 +375,7 @@ fn any(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "any", line)?;
     let f = f_arg(&args, 1, "any", line)?;
     for x in l.iter() {
-        if it.call(&f, vec![x.clone()], line)?.truthy() {
+        if it.call1(&f, x.clone(), line)?.truthy() {
             return Ok(Value::Bool(true));
         }
     }
@@ -376,7 +386,7 @@ fn all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "all", line)?;
     let f = f_arg(&args, 1, "all", line)?;
     for x in l.iter() {
-        if !it.call(&f, vec![x.clone()], line)?.truthy() {
+        if !it.call1(&f, x.clone(), line)?.truthy() {
             return Ok(Value::Bool(false));
         }
     }
@@ -397,7 +407,18 @@ fn sum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "sum", line)?;
     let mut acc = Value::Int(0);
     for x in l.iter() {
-        acc = crate::interp::binop(crate::ast::BinOp::Add, acc, x.clone(), line)?;
+        // Numbers as `+` adds them, without its general case for each.
+        let next = match (&acc, x) {
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
+            (Value::Int(a), Value::Int(b)) => a.checked_add(*b).map(Value::Int),
+            (Value::Float(a), Value::Int(b)) => Some(Value::Float(a + *b as f64)),
+            (Value::Int(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
+            _ => None,
+        };
+        acc = match next {
+            Some(v) => v,
+            None => crate::interp::binop(crate::ast::BinOp::Add, acc, x.clone(), line)?,
+        };
     }
     Ok(acc)
 }
@@ -442,6 +463,10 @@ fn sort_values(mut items: Vec<(Value, Value)>, name: &str, line: u32) -> R {
 
 fn sort(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "sort", line)?;
+    // Numbers, compared as numbers, on all the cores (the order is the same: stable).
+    if let Some(v) = crate::numeric::sort_numbers(&l) {
+        return Ok(v);
+    }
     sort_values(l.iter().map(|v| (v.clone(), v.clone())).collect(), "sort", line)
 }
 
@@ -450,7 +475,7 @@ fn sort_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "sort_by", line)?;
     let mut items = Vec::with_capacity(l.len());
     for x in l.iter() {
-        items.push((it.call(&f, vec![x.clone()], line)?, x.clone()));
+        items.push((it.call1(&f, x.clone(), line)?, x.clone()));
     }
     sort_values(items, "sort_by", line)
 }
@@ -1142,7 +1167,7 @@ fn count(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "count", line)?;
     let mut n = 0;
     for x in l.iter() {
-        if it.call(&f, vec![x.clone()], line)?.truthy() {
+        if it.call1(&f, x.clone(), line)?.truthy() {
             n += 1;
         }
     }
@@ -1155,7 +1180,7 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "group_by", line)?;
     let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
     for x in l.iter() {
-        let k = it.call(&f, vec![x.clone()], line)?.display();
+        let k = it.call1(&f, x.clone(), line)?.display();
         groups.entry(k).or_default().push(x.clone());
     }
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
@@ -1193,7 +1218,8 @@ fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "markdown", line)?;
     // `{ html: true }` keeps the HTML in the text; `{ inline: true }` keeps
     // only what is inside a line (bold, italic, code, links): no paragraphs,
-    // headings or lists, lines broken by <br> (a headline, a caption).
+    // headings or lists, lines broken by <br>, a list's items with their
+    // marks as text ("• ", "1. ") (a headline, a caption).
     let (html_ok, inline) = match args.get(1) {
         None | Some(Value::Nil) => (false, false),
         Some(Value::Map(m)) => (m.get("html").map_or(false, |v| v.truthy()), m.get("inline").map_or(false, |v| v.truthy())),
@@ -1231,22 +1257,46 @@ fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         (e, _) => Some(e),
     });
     let mut lines = 0;
-    let events = events.filter_map(move |e| {
+    // The lists being read: the next number of each (None: bullets).
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let events = events.flat_map(move |e| {
         use pulldown_cmark::TagEnd;
         if !inline {
-            return Some(e);
+            return vec![e];
         }
-        match e {
-            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Item | Tag::CodeBlock(_)) => {
-                lines += 1;
-                (lines > 1).then(|| Event::Html(CowStr::Borrowed("<br>")))
+        let mut line = |out: &mut Vec<Event>| {
+            lines += 1;
+            if lines > 1 {
+                out.push(Event::Html(CowStr::Borrowed("<br>")));
             }
-            Event::Start(Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell) => None,
-            Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::CodeBlock | TagEnd::List(_) | TagEnd::BlockQuote(_)
-                | TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell) => None,
-            Event::Rule | Event::TaskListMarker(_) => None,
-            e => Some(e),
+        };
+        let mut out = Vec::new();
+        match e {
+            Event::Start(Tag::Item) => {
+                line(&mut out);
+                let mark = match lists.last_mut() {
+                    Some(Some(n)) => {
+                        *n += 1;
+                        format!("{}. ", *n - 1)
+                    }
+                    _ => "• ".to_string(),
+                };
+                out.push(Event::Text(CowStr::from(mark)));
+            }
+            // An item's paragraph (a loose list) starts no line of its own.
+            Event::Start(Tag::Paragraph) if !lists.is_empty() => {}
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::CodeBlock(_)) => line(&mut out),
+            Event::Start(Tag::List(first)) => lists.push(first),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::BlockQuote(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell) => {}
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::CodeBlock | TagEnd::BlockQuote(_)
+                | TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell) => {}
+            Event::Rule | Event::TaskListMarker(_) => {}
+            e => out.push(e),
         }
+        out
     });
     let mut out = String::with_capacity(s.len() * 3 / 2);
     pulldown_cmark::html::push_html(&mut out, events);

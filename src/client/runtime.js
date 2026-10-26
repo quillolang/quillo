@@ -889,6 +889,528 @@ function fromJSON(j) {
   return j;
 }
 
+// ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
+// The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
+
+const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}`); }); return l; };
+const given = (v) => !isNil(v);
+const csum2 = (xs) => {
+  let s = 0, c = 0;
+  for (const x of xs) { const t = s + x; c += Math.abs(s) >= Math.abs(x) ? (s - t) + x : (x - t) + s; s = t; }
+  if (!Number.isFinite(s)) return [s, 0];
+  const t = s + c;
+  return [t, c - (t - s)];
+};
+const csum = (xs) => { const [s, c] = csum2(xs); return s + c; };
+// Products' errors kept without fma: Dekker's split.
+const twoProd = (a, b) => {
+  const p = a * b, sp = (x) => { const c = 134217729 * x, h = c - (c - x); return [h, x - h]; };
+  const [ah, al] = sp(a), [bh, bl] = sp(b);
+  return [p, ((ah * bh - p) + ah * bl + al * bh) + al * bl];
+};
+const cdot2 = (a, b) => {
+  let s = 0, c = 0;
+  for (let i = 0; i < a.length; i++) {
+    const [p, e] = twoProd(a[i], b[i]);
+    const t = s + p, z = t - s;
+    c += (s - (t - z)) + (p - z) + (Number.isFinite(e) ? e : 0);
+    s = t;
+  }
+  if (!Number.isFinite(s)) return [s, 0];
+  const t = s + c;
+  return [t, c - (t - s)];
+};
+const cdot = (a, b) => { const [s, c] = cdot2(a, b); return s + c; };
+const div2 = ([hi, lo], n) => {
+  const q = hi / n;
+  if (!Number.isFinite(q)) return q;
+  const [p, e] = twoProd(q, n);
+  return q + (((hi - p) - e) + lo) / n;
+};
+const fsum = (xs) => {
+  const partials = [];
+  let special = 0, seen = false;
+  for (let x of xs) {
+    if (!Number.isFinite(x)) { special += x; seen = true; continue; }
+    let i = 0;
+    for (let j = 0; j < partials.length; j++) {
+      let y = partials[j];
+      if (Math.abs(x) < Math.abs(y)) [x, y] = [y, x];
+      const hi = x + y, lo = y - (hi - x);
+      if (lo !== 0) partials[i++] = lo;
+      x = hi;
+    }
+    partials.length = i;
+    partials.push(x);
+  }
+  if (seen) return special;
+  let n = partials.length;
+  if (!n) return 0;
+  let hi = partials[--n], lo = 0;
+  while (n > 0) { const x = hi, y = partials[--n]; hi = x + y; lo = y - (hi - x); if (lo !== 0) break; }
+  if (n > 0 && ((lo < 0 && partials[n - 1] < 0) || (lo > 0 && partials[n - 1] > 0))) { const y = lo * 2, x = hi + y; if (y === x - hi) hi = x; }
+  return hi;
+};
+const meanOf = (x) => div2(csum2(x), x.length);
+const ssOf = (x, m) => {
+  const d = x.map((v) => v - m), c = csum(d), [hi, lo] = cdot2(d, d), fix = c * c / x.length, t = hi - fix;
+  return t <= 0 ? [0, 0] : [t, lo - ((t - hi) + fix)];
+};
+const sortedOf = (x) => Float64Array.from(x).sort();
+const overflowed = (n) => { if (!Number.isSafeInteger(n)) fail("integer overflow"); return n; };
+
+const domain = (f, x) => fail(`\`math.${f}\`: math domain error (${display(x)})`);
+const checked = (f, x, y, ok) => {
+  if (!ok || (Number.isNaN(y) && !Number.isNaN(x))) domain(f, x);
+  if (!Number.isFinite(y) && !Number.isNaN(y) && Number.isFinite(x)) fail(`\`math.${f}\`: math range error (${display(x)})`);
+  return y;
+};
+const checked2 = (f, x, y, r, ok) => {
+  const nanIn = Number.isNaN(x) || Number.isNaN(y);
+  if (!ok || (Number.isNaN(r) && !nanIn)) fail(`\`math.${f}\`: math domain error (${display(x)}, ${display(y)})`);
+  if (!Number.isFinite(r) && !Number.isNaN(r) && Number.isFinite(x) && Number.isFinite(y)) fail(`\`math.${f}\`: math range error (${display(x)}, ${display(y)})`);
+  return r;
+};
+const unary = (f, g, dom = () => true) => (x) => { N(x, "math." + f); return checked(f, x, g(x), Number.isNaN(x) || dom(x)); };
+
+// erf: a series below 2, else from erfc's continued fraction.
+const erfc = (x) => {
+  if (Number.isNaN(x)) return x;
+  if (x < 2) return 1 - erf(x);
+  if (x > 27) return 0;
+  // Lentz's method for x + 1/2 / (x + 1 / (x + 3/2 / (x + ...))).
+  let f = x, C = x, D = 0;
+  for (let n = 1; n < 500; n++) {
+    const a = n / 2;
+    D = x + a * D; D = D === 0 ? 1e-300 : 1 / D;
+    C = x + a / C; if (C === 0) C = 1e-300;
+    const d = C * D; f *= d;
+    if (Math.abs(d - 1) < 1e-16) break;
+  }
+  return Math.exp(-x * x) / Math.sqrt(Math.PI) / f;
+};
+const erf = (x) => {
+  if (Number.isNaN(x)) return x;
+  if (x < 0) return -erf(-x);
+  if (x >= 2) return 1 - erfc(x);
+  // 2/√π e^(-x²) Σ 2^n x^(2n+1) / (1·3·…·(2n+1)): terms all positive.
+  let term = x, s = x;
+  for (let n = 1; n < 200; n++) { term *= 2 * x * x / (2 * n + 1); s += term; if (term < s * 1e-17) break; }
+  return 2 / Math.sqrt(Math.PI) * Math.exp(-x * x) * s;
+};
+const LANCZOS = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+const lanczos = (x) => { x -= 1; let a = LANCZOS[0]; for (let i = 1; i < 9; i++) a += LANCZOS[i] / (x + i); return [a, x + 7.5, x]; };
+const pole = (x) => !(x <= 0 && Number.isInteger(x)) && x !== -Infinity;
+const gamma = (x) => {
+  if (x === Infinity || Number.isNaN(x)) return x;
+  if (Number.isInteger(x) && x > 0 && x <= 23) { let r = 1; for (let k = 2; k < x; k++) r *= k; return r; }
+  if (x < 0.5) return Math.PI / (Math.sin(Math.PI * x) * gamma(1 - x));
+  const [a, t, z] = lanczos(x), h = Math.pow(t, (z + 0.5) / 2);
+  return Math.sqrt(2 * Math.PI) * h * (h * Math.exp(-t)) * a;
+};
+const lgamma = (x) => {
+  if (!Number.isFinite(x)) return Math.abs(x);
+  if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+  if (x === 1 || x === 2) return 0;
+  const [a, t, z] = lanczos(x);
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(a);
+};
+const norm2 = (v) => {
+  if (v.some((x) => x === Infinity || x === -Infinity)) return Infinity;
+  const big = v.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  if (big === 0 || Number.isNaN(big)) return big;
+  return big * Math.sqrt(csum(v.map((x) => (x / big) * (x / big))));
+};
+const toInt = (f, g) => (x) => { N(x, f); if (!Number.isFinite(x)) fail(`\`${f}\`: cannot convert ${display(x)} to an int`); return overflowed(g(x) + 0); };
+const natural = (n, f, i = 1) => { I(n, f, i); if (n < 0) fail(`\`${f}\` is not defined for negative numbers (${n})`); return n; };
+const gcd2 = (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a; };
+const intsOf = (args, f) => (args.length === 1 && Array.isArray(args[0]) ? args[0] : args).map((v, i) => I(v, f, i + 1));
+const pairOf = (a, b, f) => { a = NS(a, f); b = NS(b, f, 2); if (a.length !== b.length) fail(`\`${f}\` needs lists of the same length (${a.length} and ${b.length})`); return [a, b]; };
+const dotOf = (a, b, f) => {
+  [a, b] = pairOf(a, b, f);
+  if (a.every(isInt) && b.every(isInt)) { let s = 0; for (let i = 0; i < a.length; i++) s = overflowed(s + overflowed(a[i] * b[i])); return s; }
+  return cdot(a, b);
+};
+
+B.math = {
+  pi: Math.PI, e: Math.E, tau: 2 * Math.PI, inf: Infinity, nan: NaN,
+  sqrt: unary("sqrt", Math.sqrt, (x) => x >= 0),
+  cbrt: unary("cbrt", Math.cbrt),
+  exp: unary("exp", Math.exp),
+  exp2: unary("exp2", (x) => 2 ** x),
+  expm1: unary("expm1", Math.expm1),
+  log: (x, b) => {
+    N(x, "math.log");
+    if (!given(b)) return checked("log", x, Math.log(x), Number.isNaN(x) || x > 0);
+    N(b, "math.log", 2);
+    if (b <= 0 || b === 1) fail(`\`math.log\`: math domain error (base ${display(b)})`);
+    return checked("log", x, Math.log(x) / Math.log(b), Number.isNaN(x) || x > 0);
+  },
+  log2: unary("log2", Math.log2, (x) => x > 0),
+  log10: unary("log10", Math.log10, (x) => x > 0),
+  log1p: unary("log1p", Math.log1p, (x) => x > -1),
+  pow: (x, y) => { N(x, "math.pow"); N(y, "math.pow", 2); return checked2("pow", x, y, Math.pow(x, y), !(x === 0 && y < 0)); },
+  sin: unary("sin", Math.sin, Number.isFinite),
+  cos: unary("cos", Math.cos, Number.isFinite),
+  tan: unary("tan", Math.tan, Number.isFinite),
+  asin: unary("asin", Math.asin, (x) => Math.abs(x) <= 1),
+  acos: unary("acos", Math.acos, (x) => Math.abs(x) <= 1),
+  atan: unary("atan", Math.atan),
+  atan2: (y, x) => Math.atan2(N(y, "math.atan2"), N(x, "math.atan2", 2)),
+  sinh: unary("sinh", Math.sinh),
+  cosh: unary("cosh", Math.cosh),
+  tanh: unary("tanh", Math.tanh),
+  asinh: unary("asinh", Math.asinh),
+  acosh: unary("acosh", Math.acosh, (x) => x >= 1),
+  atanh: unary("atanh", Math.atanh, (x) => Math.abs(x) < 1),
+  degrees: unary("degrees", (x) => x * (180 / Math.PI)),
+  radians: unary("radians", (x) => x * (Math.PI / 180)),
+  hypot: (...v) => norm2(v.map((x, i) => N(x, "math.hypot", i + 1))),
+  dist: (p, q) => {
+    p = NS(p, "math.dist"); q = NS(q, "math.dist", 2);
+    if (p.length !== q.length) fail(`\`math.dist\`: both points must have the same number of dimensions (${p.length} and ${q.length})`);
+    return norm2(p.map((x, i) => x - q[i]));
+  },
+  floor: toInt("math.floor", Math.floor),
+  ceil: toInt("math.ceil", Math.ceil),
+  trunc: toInt("math.trunc", Math.trunc),
+  fabs: unary("fabs", Math.abs),
+  copysign: (x, y) => { N(x, "math.copysign"); N(y, "math.copysign", 2); return (y < 0 || Object.is(y, -0)) ? -Math.abs(x) : Math.abs(x); },
+  fmod: (x, y) => { N(x, "math.fmod"); N(y, "math.fmod", 2); return checked2("fmod", x, y, x % y, !(y === 0 || !Number.isFinite(x)) || Number.isNaN(x) || Number.isNaN(y)); },
+  remainder: (x, y) => {
+    N(x, "math.remainder"); N(y, "math.remainder", 2);
+    const ok = !(y === 0 || !Number.isFinite(x)) || Number.isNaN(x) || Number.isNaN(y);
+    if (!Number.isFinite(y)) return checked2("remainder", x, y, x, ok);
+    let n = Math.round(x / y);
+    if (Math.abs(x / y - Math.trunc(x / y)) === 0.5 && n % 2) n -= 1;
+    return checked2("remainder", x, y, x - n * y, ok);
+  },
+  modf: (x) => { N(x, "math.modf"); if (!Number.isFinite(x) && !Number.isNaN(x)) return [x < 0 ? -0 : 0, x]; return [x % 1, Math.trunc(x)]; },
+  frexp: (x) => {
+    N(x, "math.frexp");
+    if (x === 0 || !Number.isFinite(x)) return [x, 0];
+    let e = Math.max(-1073, Math.floor(Math.log2(Math.abs(x))) + 1), m = x * 2 ** -e;
+    while (Math.abs(m) < 0.5) { m *= 2; e -= 1; }
+    while (Math.abs(m) >= 1) { m /= 2; e += 1; }
+    return [m, e];
+  },
+  ldexp: (x, e) => { N(x, "math.ldexp"); I(e, "math.ldexp", 2); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return checked("ldexp", x, r * 2 ** e, true); },
+  factorial: (n) => { natural(n, "math.factorial"); let r = 1; for (let k = 2; k <= n; k++) r = overflowed(r * k); return r; },
+  gcd: (...args) => intsOf(args, "math.gcd").reduce(gcd2, 0),
+  lcm: (...args) => { let acc = 1; for (const n of intsOf(args, "math.lcm")) { if (n === 0) return 0; acc = overflowed(acc / gcd2(acc, n) * Math.abs(n)); } return acc; },
+  comb: (n, k) => {
+    natural(n, "math.comb"); natural(k, "math.comb", 2);
+    if (k > n) return 0;
+    k = Math.min(k, n - k);
+    let r = 1;
+    for (let i = 0; i < k; i++) { const g = gcd2(r, i + 1); r = overflowed((r / g) * ((n - i) / ((i + 1) / g))); }
+    return r;
+  },
+  perm: (n, k) => { natural(n, "math.perm"); k = given(k) ? natural(k, "math.perm", 2) : n; if (k > n) return 0; let r = 1; for (let x = n - k + 1; x <= n; x++) r = overflowed(r * x); return r; },
+  isqrt: (n) => { natural(n, "math.isqrt"); let s = Math.floor(Math.sqrt(n)); while (s * s > n) s--; while ((s + 1) * (s + 1) <= n) s++; return s; },
+  isclose: (a, b, rel, abs) => {
+    N(a, "math.isclose"); N(b, "math.isclose", 2);
+    rel = given(rel) ? N(rel, "math.isclose", 3) : 1e-9; abs = given(abs) ? N(abs, "math.isclose", 4) : 0;
+    if (rel < 0 || abs < 0) fail("`math.isclose`: tolerances must be non-negative");
+    if (a === b) return true;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    const d = Math.abs(a - b);
+    return d <= Math.abs(rel * b) || d <= Math.abs(rel * a) || d <= abs;
+  },
+  isfinite: (x) => Number.isFinite(N(x, "math.isfinite")),
+  isinf: (x) => { N(x, "math.isinf"); return x === Infinity || x === -Infinity; },
+  isnan: (x) => Number.isNaN(N(x, "math.isnan")),
+  prod: (l, start) => {
+    let acc = given(start) ? N(start, "math.prod", 2) : 1;
+    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
+    return acc;
+  },
+  fsum: (l) => fsum(NS(l, "math.fsum")),
+  sumprod: (p, q) => dotOf(p, q, "math.sumprod"),
+  erf: unary("erf", erf),
+  erfc: unary("erfc", erfc),
+  gamma: unary("gamma", gamma, pole),
+  lgamma: unary("lgamma", lgamma, pole),
+};
+
+const dataOf = (l, f, least) => {
+  l = NS(l, f);
+  if (l.length < least) fail(`\`${f}\` requires ${least === 1 ? "at least one data point" : `at least ${least} data points`}`);
+  return l;
+};
+const kth = (x, k) => sortedOf(x)[k];
+const atPercent = (d, p) => { const h = p / 100 * (d.length - 1), lo = Math.floor(h), hi = Math.min(lo + 1, d.length - 1); return d[lo] + (d[hi] - d[lo]) * (h - lo); };
+const ranksOf = (x) => {
+  const idx = x.map((_, i) => i).sort((a, b) => x[a] - x[b] || a - b), r = new Array(x.length);
+  for (let i = 0; i < idx.length;) {
+    let j = i;
+    while (j + 1 < idx.length && x[idx[j + 1]] === x[idx[i]]) j++;
+    for (let k = i; k <= j; k++) r[idx[k]] = (i + j) / 2 + 1;
+    i = j + 1;
+  }
+  return r;
+};
+const momentsOf = (x, y) => {
+  const mx = meanOf(x), my = meanOf(y), dx = x.map((v) => v - mx), dy = y.map((v) => v - my);
+  return [mx, my, cdot(dx, dx), cdot(dy, dy), cdot(dx, dy)];
+};
+const pairedOf = (x, y, f) => { [x, y] = pairOf(x, y, f); if (x.length < 2) fail(`\`${f}\` requires at least two data points`); return [x, y]; };
+const varianceOf = (l, mu, f, sample) => { const x = dataOf(l, f, sample ? 2 : 1); return div2(ssOf(x, given(mu) ? N(mu, f, 2) : meanOf(x)), x.length - (sample ? 1 : 0)); };
+const tallyKey = (v) => typeof v === "number" ? "n" + (v + 0) : typeof v === "string" ? "s" + v : "v" + repr(v);
+const tallyOf = (l) => { const at = new Map(), out = []; l.forEach((v, i) => { const k = tallyKey(v); if (at.has(k)) out[at.get(k)][1]++; else { at.set(k, out.length); out.push([i, 1]); } }); return out; };
+const normalArgs = (x, mu, sigma, f) => { N(x, f); mu = given(mu) ? N(mu, f, 2) : 0; sigma = given(sigma) ? N(sigma, f, 3) : 1; if (!(sigma > 0)) fail(`\`${f}\`: sigma must be positive, got ${display(sigma)}`); return [x, mu, sigma]; };
+const poly = (c, r) => c.reduce((acc, k) => acc * r + k, 0);
+const invCdf = (p) => {
+  const q = p - 0.5;
+  if (Math.abs(q) <= 0.425) {
+    const r = 0.180625 - q * q;
+    return poly([2509.0809287301226727, 33430.575583588128105, 67265.770927008700853, 45921.953931549871457, 13731.693765509461125, 1971.5909503065514427, 133.14166789178437745, 3.387132872796366608], r) * q
+      / poly([5226.495278852545561, 28729.085735721942674, 39307.89580009271061, 21213.794301586595867, 5394.1960214247511077, 687.1870074920579083, 42.313330701600911252, 1], r);
+  }
+  let r = Math.sqrt(-Math.log(q <= 0 ? p : 1 - p)), x;
+  if (r <= 5) {
+    r -= 1.6;
+    x = poly([7.7454501427834140764e-4, 0.0227238449892691845833, 0.24178072517745061177, 1.27045825245236838258, 3.64784832476320460504, 5.7694972214606914055, 4.6303378461565452959, 1.42343711074968357734], r)
+      / poly([1.05075007164441684324e-9, 5.475938084995344946e-4, 0.0151986665636164571966, 0.14810397642748007459, 0.68976733498510000455, 1.6763848301838038494, 2.05319162663775882187, 1], r);
+  } else {
+    r -= 5;
+    x = poly([2.01033439929228813265e-7, 2.71155556874348757815e-5, 0.0012426609473880784386, 0.026532189526576123093, 0.29656057182850489123, 1.7848265399172913358, 5.4637849111641143699, 6.6579046435011037772], r)
+      / poly([2.04426310338993978564e-15, 1.4215117583164458887e-7, 1.8463183175100546818e-5, 7.868691311456132591e-4, 0.0148753612908506148525, 0.13692988092273580531, 0.59983220655588793769, 1], r);
+  }
+  return q < 0 ? -x : x;
+};
+const linspaceOf = (a, b, n, endpoint) => {
+  if (n === 0) return [];
+  const step = (b - a) / (endpoint ? Math.max(n - 1, 1) : n), out = [];
+  for (let i = 0; i < n; i++) out.push(a + i * step);
+  if (endpoint && n > 1) out[n - 1] = b;
+  return out;
+};
+const countOf = (n, f) => { I(n, f); if (n < 0 || n > 1e7) fail(`\`${f}\`: ${n} is not a count from 0 to 10000000`); return n; };
+
+B.stats = {
+  mean: (l) => meanOf(dataOf(l, "stats.mean", 1)),
+  fmean: (l, w) => {
+    const x = dataOf(l, "stats.fmean", 1);
+    if (!given(w)) return meanOf(x);
+    w = NS(w, "stats.fmean", 2);
+    if (w.length !== x.length) fail("`stats.fmean`: data and weights must be the same length");
+    const total = csum(w);
+    if (total === 0) fail("`stats.fmean`: the sum of the weights must be non-zero");
+    return cdot(x, w) / total;
+  },
+  geometric_mean: (l) => { const x = dataOf(l, "stats.geometric_mean", 1); if (x.some((v) => v <= 0)) fail("`stats.geometric_mean` requires positive numbers"); return Math.exp(csum(x.map(Math.log)) / x.length); },
+  harmonic_mean: (l) => {
+    const x = dataOf(l, "stats.harmonic_mean", 1);
+    if (x.some((v) => v < 0)) fail("`stats.harmonic_mean` does not support negative values");
+    if (x.some((v) => v === 0)) return 0;
+    const r = x.map((v) => 1 / v), e = x.map((v, i) => { const [p, pe] = twoProd(r[i], v); return ((1 - p) - pe) / v; });
+    return x.length / csum(r.concat(e));
+  },
+  median: (l) => { const d = sortedOf(dataOf(l, "stats.median", 1)), n = d.length; return n % 2 ? d[n >> 1] : (d[n / 2 - 1] + d[n / 2]) / 2; },
+  median_low: (l) => { const d = sortedOf(dataOf(l, "stats.median_low", 1)), n = d.length; return d[n % 2 ? n >> 1 : n / 2 - 1]; },
+  median_high: (l) => { const x = dataOf(l, "stats.median_high", 1); return kth(x, x.length >> 1); },
+  mode: (l) => { l = L(l, "stats.mode"); const t = tallyOf(l); if (!t.length) fail("`stats.mode`: no mode for empty data"); const most = Math.max(...t.map((x) => x[1])); return l[t.find((x) => x[1] === most)[0]]; },
+  multimode: (l) => { l = L(l, "stats.multimode"); const t = tallyOf(l), most = Math.max(0, ...t.map((x) => x[1])); return t.filter((x) => x[1] === most).map((x) => l[x[0]]); },
+  pvariance: (l, mu) => varianceOf(l, mu, "stats.pvariance", false),
+  variance: (l, mu) => varianceOf(l, mu, "stats.variance", true),
+  pstdev: (l, mu) => Math.sqrt(varianceOf(l, mu, "stats.pstdev", false)),
+  stdev: (l, mu) => Math.sqrt(varianceOf(l, mu, "stats.stdev", true)),
+  quantiles: (l, n, method) => {
+    const f = "stats.quantiles", d = sortedOf(dataOf(l, f, 1)), ld = d.length;
+    n = given(n) ? I(n, f, 2) : 4;
+    if (n < 1) fail(`\`${f}\`: n must be at least 1`);
+    method = given(method) ? S(method, f, 3) : "exclusive";
+    if (ld === 1) return new Array(n - 1).fill(d[0]);
+    const out = [];
+    if (method === "inclusive") {
+      const m = ld - 1;
+      for (let i = 1; i < n; i++) { const j = Math.floor(i * m / n), delta = i * m - j * n; out.push((d[j] * (n - delta) + d[j + 1] * delta) / n); }
+    } else if (method === "exclusive") {
+      const m = ld + 1;
+      for (let i = 1; i < n; i++) { const j = Math.min(Math.max(Math.floor(i * m / n), 1), ld - 1), delta = i * m - j * n; out.push((d[j - 1] * (n - delta) + d[j] * delta) / n); }
+    } else fail(`\`${f}\`: unknown method ${JSON.stringify(method)} (exclusive or inclusive)`);
+    return out;
+  },
+  percentile: (l, p) => {
+    const f = "stats.percentile", d = sortedOf(dataOf(l, f, 1));
+    const check = (p) => { if (!(p >= 0 && p <= 100)) fail(`\`${f}\`: percentiles are from 0 to 100, got ${display(p)}`); return p; };
+    if (Array.isArray(p)) return NS(p, f, 2).map((q) => atPercent(d, check(q)));
+    return atPercent(d, check(N(p, f, 2)));
+  },
+  covariance: (x, y) => { [x, y] = pairedOf(x, y, "stats.covariance"); return momentsOf(x, y)[4] / (x.length - 1); },
+  correlation: (x, y, method) => {
+    const f = "stats.correlation";
+    [x, y] = pairedOf(x, y, f);
+    method = given(method) ? S(method, f, 3) : "linear";
+    if (method === "ranked") { x = ranksOf(x); y = ranksOf(y); } else if (method !== "linear") fail(`\`${f}\`: unknown method ${JSON.stringify(method)} (linear or ranked)`);
+    const [, , sxx, syy, sxy] = momentsOf(x, y);
+    if (sxx === 0 || syy === 0) fail(`\`${f}\`: at least one of the inputs is constant`);
+    return Math.min(1, Math.max(-1, sxy / Math.sqrt(sxx * syy)));
+  },
+  linear_regression: (x, y, proportional) => {
+    const f = "stats.linear_regression";
+    [x, y] = pairedOf(x, y, f);
+    if (truthy(proportional)) { const sxx = cdot(x, x); if (sxx === 0) fail(`\`${f}\`: x is all zeros`); return { slope: cdot(x, y) / sxx, intercept: 0 }; }
+    const [mx, my, sxx, , sxy] = momentsOf(x, y);
+    if (sxx === 0) fail(`\`${f}\`: x is constant`);
+    const slope = sxy / sxx;
+    return { slope, intercept: my - slope * mx };
+  },
+  describe: (l) => {
+    const x = NS(l, "stats.describe"), n = x.length, total = csum(x), d = sortedOf(x), q = (p) => n ? atPercent(d, p) : null;
+    const mean = n ? total / n : null;
+    return { count: n, sum: total, mean, std: n > 1 ? Math.sqrt(div2(ssOf(x, mean), n - 1)) : null, min: n ? d[0] : null, q1: q(25), median: q(50), q3: q(75), max: n ? d[n - 1] : null };
+  },
+  histogram: (l, bins) => {
+    const f = "stats.histogram", x = NS(l, f);
+    let edges;
+    if (Array.isArray(bins)) {
+      edges = NS(bins, f, 2);
+      if (edges.length < 2 || edges.some((e, i) => i && e < edges[i - 1])) fail(`\`${f}\`: edges must be at least two, increasing`);
+    } else {
+      bins = given(bins) ? I(bins, f, 2) : 10;
+      if (bins < 1 || bins > 1e6) fail(`\`${f}\`: bins must be from 1 to 1000000, got ${bins}`);
+      let lo = Infinity, hi = -Infinity;
+      for (const v of x) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      if (!x.length) [lo, hi] = [0, 1];
+      if (lo === hi) [lo, hi] = [lo - 0.5, hi + 0.5];
+      edges = linspaceOf(lo, hi, bins + 1, true);
+    }
+    const nb = edges.length - 1, lo = edges[0], hi = edges[nb], counts = new Array(nb).fill(0);
+    for (const v of x) {
+      if (!(v >= lo && v <= hi)) continue;
+      let a = 0, b = nb;
+      while (a < b) { const m = (a + b) >> 1; if (edges[m + 1] <= v) a = m + 1; else b = m; }
+      counts[Math.min(a, nb - 1)]++;
+    }
+    return { counts, edges };
+  },
+  zscore: (l) => { const x = NS(l, "stats.zscore"); if (!x.length) return []; const m = meanOf(x), sd = Math.sqrt(div2(ssOf(x, m), x.length)); return x.map((v) => sd === 0 ? 0 : (v - m) / sd); },
+  normalize: (l) => { const x = NS(l, "stats.normalize"); let lo = Infinity, hi = -Infinity; for (const v of x) { lo = Math.min(lo, v); hi = Math.max(hi, v); } const w = hi - lo; return x.map((v) => w > 0 ? (v - lo) / w : 0); },
+  rank: (l) => ranksOf(NS(l, "stats.rank")),
+  normal_pdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_pdf"); const z = (x - mu) / sigma; return Math.exp(-0.5 * z * z) / (sigma * Math.sqrt(2 * Math.PI)); },
+  normal_cdf: (x, mu, sigma) => { [x, mu, sigma] = normalArgs(x, mu, sigma, "stats.normal_cdf"); return 0.5 * (1 + erf((x - mu) / (sigma * Math.SQRT2))); },
+  normal_inv: (p, mu, sigma) => {
+    [p, mu, sigma] = normalArgs(p, mu, sigma, "stats.normal_inv");
+    if (!(p > 0 && p < 1)) fail(`\`stats.normal_inv\`: p must be between 0 and 1 (exclusive), got ${display(p)}`);
+    return mu + invCdf(p) * sigma;
+  },
+};
+
+const vecArith = (op, f) => (a, b) => {
+  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}`);
+  if ((op === "/" || op === "%") && b === 0 && isInt(a) && isInt(b)) fail(`\`${f}\`: division by zero`);
+  const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "%" ? a % b : a / b;
+  return isInt(a) && isInt(b) && Number.isInteger(r) ? overflowed(r) : r;
+};
+const elementwise = (op, f) => (a, b) => {
+  const g = vecArith(op, f);
+  if (Array.isArray(a) && Array.isArray(b)) { if (a.length !== b.length) fail(`\`${f}\` needs lists of the same length (${a.length} and ${b.length})`); return a.map((x, i) => g(x, b[i])); }
+  if (Array.isArray(a)) return a.map((x) => g(x, b));
+  if (Array.isArray(b)) return b.map((y) => g(a, y));
+  return g(a, b);
+};
+const accumulate = (op, f) => (l) => { const g = vecArith(op, f), out = []; for (const x of L(l, f)) out.push(out.length ? g(out[out.length - 1], x) : (typeof x === "number" ? x : g(x, 0))); return out; };
+const argExtreme = (f, better) => (l) => { const x = NS(l, f); let best = null; x.forEach((v, i) => { if (!Number.isNaN(v) && (best === null || better(v, x[best]))) best = i; }); return best; };
+const rollingOf = (l, w, f) => {
+  const x = NS(l, f);
+  I(w, f, 2);
+  if (w < 1) fail(`\`${f}\`: the window must be at least 1, got ${w}`);
+  const out = [];
+  for (let i = 0; i + w <= x.length; i++) out.push(csum(x.slice(i, i + w)));
+  return out;
+};
+const matrixOf = (rows, f, i = 1) => {
+  rows = L(rows, f, i);
+  const cols = rows.length ? (Array.isArray(rows[0]) ? rows[0].length : fail(`\`${f}\` expects a list of rows, but row 0 is ${typeName(rows[0])}`)) : 0;
+  rows.forEach((r, k) => {
+    if (!Array.isArray(r)) fail(`\`${f}\` expects a list of rows, but row ${k} is ${typeName(r)}`);
+    if (r.length !== cols) fail(`\`${f}\`: row ${k} has ${r.length} numbers, row 0 has ${cols}`);
+    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}`); });
+  });
+  return [rows, cols];
+};
+
+B.vec = {
+  add: elementwise("+", "vec.add"),
+  sub: elementwise("-", "vec.sub"),
+  mul: elementwise("*", "vec.mul"),
+  div: elementwise("/", "vec.div"),
+  mod: elementwise("%", "vec.mod"),
+  pow: (l, p) => { const x = NS(l, "vec.pow"); N(p, "vec.pow", 2); return x.map((v) => v ** p); },
+  dot: (a, b) => dotOf(a, b, "vec.dot"),
+  norm: (l, p) => {
+    const x = NS(l, "vec.norm");
+    p = given(p) ? N(p, "vec.norm", 2) : 2;
+    if (p === 2) return norm2(x);
+    if (p === 1) return csum(x.map(Math.abs));
+    if (p === Infinity) return x.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    return csum(x.map((v) => Math.abs(v) ** p)) ** (1 / p);
+  },
+  cumsum: accumulate("+", "vec.cumsum"),
+  cumprod: accumulate("*", "vec.cumprod"),
+  diff: (l) => { l = L(l, "vec.diff"); const g = vecArith("-", "vec.diff"), out = []; for (let i = 1; i < l.length; i++) out.push(g(l[i], l[i - 1])); return out; },
+  argmin: argExtreme("vec.argmin", (a, b) => a < b),
+  argmax: argExtreme("vec.argmax", (a, b) => a > b),
+  argsort: (l, desc) => { const x = NS(l, "vec.argsort"), d = truthy(desc); return x.map((_, i) => i).sort((a, b) => (d ? x[b] - x[a] : x[a] - x[b]) || a - b); },
+  clip: (l, lo, hi) => {
+    const x = NS(l, "vec.clip");
+    if (given(lo)) N(lo, "vec.clip", 2);
+    if (given(hi)) N(hi, "vec.clip", 3);
+    return x.map((v) => given(lo) && v < lo ? lo : given(hi) && v > hi ? hi : v);
+  },
+  abs: (l) => NS(l, "vec.abs").map(Math.abs),
+  sqrt: (l) => NS(l, "vec.sqrt").map(Math.sqrt),
+  exp: (l) => NS(l, "vec.exp").map(Math.exp),
+  log: (l) => NS(l, "vec.log").map(Math.log),
+  round: (l, d) => {
+    const x = NS(l, "vec.round");
+    if (!given(d)) return x.map(roundHalf);
+    const p = 10 ** Math.min(Math.max(I(d, "vec.round", 2), 0), 15);
+    return x.map((v) => roundHalf(v * p) / p);
+  },
+  linspace: (a, b, n, endpoint) => { N(a, "vec.linspace"); N(b, "vec.linspace", 2); return linspaceOf(a, b, countOf(given(n) ? n : 50, "vec.linspace"), given(endpoint) ? truthy(endpoint) : true); },
+  arange: (start, stop, step) => {
+    const f = "vec.arange";
+    if (!given(stop)) [start, stop] = [0, start];
+    N(start, f); N(stop, f, 2);
+    step = given(step) ? N(step, f, 3) : 1;
+    if (step === 0 || !Number.isFinite(step)) fail(`\`${f}\`: step must be a non-zero number`);
+    const n = countOf(Math.max(0, Math.ceil((stop - start) / step)), f), out = [];
+    for (let i = 0; i < n; i++) out.push(start + i * step);
+    return out;
+  },
+  zeros: (n) => new Array(countOf(n, "vec.zeros")).fill(0),
+  ones: (n) => new Array(countOf(n, "vec.ones")).fill(1),
+  full: (n, v) => new Array(countOf(n, "vec.full")).fill(v === undefined ? null : v),
+  rolling_mean: (l, w) => rollingOf(l, w, "vec.rolling_mean").map((s) => s / w),
+  rolling_sum: (l, w) => rollingOf(l, w, "vec.rolling_sum"),
+  matmul: (a, b) => {
+    const f = "vec.matmul", [A, k] = matrixOf(a, f);
+    if (Array.isArray(b) && b.length && !Array.isArray(b[0])) {
+      const v = NS(b, f, 2);
+      if (v.length !== k) fail(`\`${f}\`: a has ${k} columns, b has ${v.length} numbers`);
+      return A.map((r) => cdot(r, v));
+    }
+    const [Bm, m] = matrixOf(b, f, 2);
+    if (Bm.length !== k) fail(`\`${f}\`: a has ${k} columns, b has ${Bm.length} rows`);
+    return A.map((r) => { const out = new Array(m).fill(0); r.forEach((x, p) => { for (let j = 0; j < m; j++) out[j] += x * Bm[p][j]; }); return out; });
+  },
+  transpose: (l) => {
+    const rows = L(l, "vec.transpose");
+    if (!rows.length) return [];
+    rows.forEach((r, k) => { if (!Array.isArray(r)) fail(`\`vec.transpose\` expects a list of rows, but row ${k} is ${typeName(r)}`); if (r.length !== rows[0].length) fail(`\`vec.transpose\`: row ${k} has ${r.length} items, row 0 has ${rows[0].length}`); });
+    return rows[0].map((_, j) => rows.map((r) => r[j]));
+  },
+  column: (l, key) => {
+    const rows = L(l, "vec.column");
+    if (typeof key === "string") return rows.map((r) => isMap(r) && hasOwn(r, key) ? r[key] : null);
+    if (isInt(key)) return rows.map((r) => Array.isArray(r) && key >= 0 && key < r.length ? r[key] : null);
+    fail(`\`vec.column\` expects a str or int key as argument 2, got ${typeName(key)}`);
+  },
+};
+
 // ---- server fns --------------------------------------------------------
 
 async function rpcRaw(name, args, live) {

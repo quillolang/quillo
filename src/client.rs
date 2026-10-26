@@ -343,7 +343,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => expr_assigned(e, out),
             Stmt::Fn(d) => expr_assigned(&d.body, out),
             Stmt::Route(r) => expr_assigned(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
         }
     }
 }
@@ -413,7 +413,7 @@ fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 }
                 Stmt::Fn(d) => each_expr(&d.body, f),
                 Stmt::Route(r) => each_expr(&r.body, f),
-                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Return(None) => {}
+                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
             }
         }
     };
@@ -733,8 +733,12 @@ impl<'a> Compiler<'a> {
                     self.err(format!("`{}` is not available in the browser; call it from a `server fn`", b))
                 }
             }
-            Value::Map(m) if name == "json" && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
-                let r = ("B.json".to_string(), false);
+            // The module, not a map of the program's own by its name.
+            Value::Map(m)
+                if matches!(name, "json" | "math" | "stats" | "vec")
+                    && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
+            {
+                let r = (format!("B.{}", name), false);
                 self.globals.insert(name.to_string(), r.clone());
                 Ok(r)
             }
@@ -1189,6 +1193,10 @@ impl<'a> Compiler<'a> {
                 Stmt::Mount(_, _, line) => {
                     self.line = *line;
                     return self.err("`mount` must be at the top level");
+                }
+                Stmt::Service(_, _, _, line) => {
+                    self.line = *line;
+                    return self.err("`service` must be at the top level");
                 }
             }
         }

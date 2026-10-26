@@ -349,3 +349,34 @@ fn strict_null_warns_where_null_does_not_work() {
     // Without the option, none of this is reported.
     assert!(diags(&format!("{}fn f() = shout(maybe(2))", pre)).is_empty());
 }
+
+#[test]
+fn service_calls_are_checked_against_what_the_service_offers() {
+    let d = std::env::temp_dir().join(format!("quillo-check-services-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("billing.qwe"), "server fn invoice(customer: str, cents: int, note: str = \"\") -> map = { customer, cents }\nfn inner() = 1\n").unwrap();
+    let diags = |src: &str| -> Vec<String> {
+        quillo::check::check_source(src, "main.qwe", &d).diagnostics.iter().map(|x| format!("{} {}", x.line, x.message)).collect()
+    };
+    let pre = "service billing = \"billing.qwe\"\n";
+    assert!(diags(&format!("{}fn f() = billing.invoice(\"ana\", 1200)", pre)).is_empty());
+    assert!(diags(&format!("{}fn f() = billing.invoice(\"ana\", 1200, \"a mug\")", pre)).is_empty());
+    let d1 = diags(&format!("{}fn f() = billing.invoce(\"ana\", 1)", pre));
+    assert!(d1.len() == 1 && d1[0].contains("service `billing` has no server fn `invoce` (did you mean `invoice`?)"), "{:?}", d1);
+    // Only server fns are offered.
+    assert!(diags(&format!("{}fn f() = billing.inner()", pre))[0].contains("has no server fn `inner`"));
+    let d2 = diags(&format!("{}fn f() = billing.invoice(\"ana\", \"lots\")", pre));
+    assert!(d2.len() == 1 && d2[0].contains("argument `cents` of `billing.invoice` must be int, got str"), "{:?}", d2);
+    assert!(diags(&format!("{}fn f() = billing.invoice(\"ana\")", pre))[0].contains("missing argument `cents`"));
+    // It may fail on the way: an error value.
+    assert!(diags(&format!("{}fn f() -> map = billing.invoice(\"ana\", 1)?", pre)).is_empty());
+    // The browser does not call services; a function limited to the database neither.
+    assert!(diags(&format!("{}component C() {{ ~x = billing.invoice(\"a\", 1)\n <p>{{x}}</p> }}", pre)).iter().any(|m| m.contains("calls another service, which only the server does")));
+    assert!(diags(&format!("{}fn f() with db = billing.invoice(\"a\", 1)", pre)).iter().any(|m| m.contains("needs the http effect")));
+    // A file that is not there.
+    assert!(diags("service gone = \"gone.qwe\"\n")[0].contains("cannot read"));
+    // Services using one another are each checked once.
+    std::fs::write(d.join("a.qwe"), "service b = \"b.qwe\"\nserver fn ping() = b.pong()\n").unwrap();
+    std::fs::write(d.join("b.qwe"), "service a = \"a.qwe\"\nserver fn pong() = 1\n").unwrap();
+    assert!(diags("service a = \"a.qwe\"\nfn f() = a.ping()").is_empty());
+}

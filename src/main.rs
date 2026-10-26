@@ -38,6 +38,14 @@ options for `run`:
   --reload       reload when the program's files change (in production: no
                  errors shown on pages, no page refreshes)
   --no-check     skip the static checks before running
+  --split        run each `service` the program declares as a process of
+                 its own, on a port of its own (one process: the default)
+  --service-url NAME=URL
+                 where service NAME runs, when not here (also
+                 QUILLO_SERVICE_NAME); calls are signed with
+                 QUILLO_SERVICE_SECRET, the same on every service
+  --base PATH    the path the program is served under (/shop), as a mounted
+                 program is: its links and redirects carry it
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
   --no-jobs      run none of the program's `schedule`d jobs on this server
@@ -136,6 +144,12 @@ struct RunOptions {
     service: Option<String>,
     max_body: usize,
     instances: usize,
+    /// Where services run that do not run here (`--service-url name=url`).
+    service_urls: Vec<(String, String)>,
+    /// The path the program is served under (`--base /shop`), as a mounted one is.
+    base: Option<String>,
+    /// Each service its own process (`--split`).
+    split: bool,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -150,6 +164,9 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         service: None,
         max_body: quillo::server::MAX_BODY,
         instances: 1,
+        service_urls: Vec::new(),
+        base: None,
+        split: false,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -169,6 +186,28 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 o.static_check = false;
                 i += 1;
                 continue;
+            }
+            ("--split", _) => {
+                o.split = true;
+                i += 1;
+                continue;
+            }
+            ("--service-url", Some(v)) => match v.split_once('=') {
+                Some((name, url)) if !name.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) => {
+                    o.service_urls.push((name.to_string(), url.to_string()))
+                }
+                _ => {
+                    eprintln!("quillo: --service-url is name=http://host:port (billing=http://10.0.0.5:8081)");
+                    return Err(2);
+                }
+            },
+            ("--base", Some(v)) => {
+                let b = v.trim_end_matches('/');
+                if !b.starts_with('/') || b.contains("//") || b.contains('?') {
+                    eprintln!("quillo: --base is a path such as /shop");
+                    return Err(2);
+                }
+                o.base = Some(b.to_string());
             }
             ("--no-view-cache", _) => {
                 quillo::viewcache::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -243,6 +282,8 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     }
     let mut interp = Interp::new(base);
     let shared = interp.shared.clone();
+    shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).extend(o.service_urls.iter().cloned());
+    interp.base = o.base.clone().unwrap_or_default();
     let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| e.to_string())) {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
@@ -256,7 +297,8 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         }
     };
     if let Loaded::Ready(it) = &loaded {
-        if it.routes.is_empty() && !o.watch {
+        // A program with server fns and no routes may be a service: served.
+        if it.routes.is_empty() && it.server_fns.is_empty() && !o.watch {
             return Ok(None);
         }
     }
@@ -264,6 +306,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     app.static_check = o.static_check;
     app.max_body = o.max_body;
     app.reload = o.reload;
+    app.base = o.base.clone().unwrap_or_default();
     Ok(Some(app))
 }
 
@@ -326,6 +369,22 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);
+    // Each service its own process: started first, told where the others are.
+    let _split = if o.split {
+        if o.instances > 1 || o.register.is_some() {
+            eprintln!("quillo: --split does not go with --instances or --register");
+            return 2;
+        }
+        match quillo::service::split(path, o.watch, o.static_check) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     if o.instances > 1 {
         return run_instances(path, o, &format!("{}:{}", host, port));
     }

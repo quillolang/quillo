@@ -1,10 +1,10 @@
 // The page designer's editing in place, as in Gutenberg: what a block's HTML
 // marks with data-edit (a field's key; data-md="1": Markdown, "inline": a
 // line of it, bold to links but no headings or lists) is typed into where
-// it shows. The designer (ui/pagedesigner.qwe) hears it from the element:
+// it shows; Enter is the next paragraph of the same block. The designer
+// (ui/pagedesigner.qwe) hears it from the element:
 // `input` (a value changed: pbEditor.value(el) reads it), `focusout` (done:
 // draw it again), and events of its own, each with { key, before, rest }:
-//   pbenter  Enter (not in a list): a new block after, with what follows the caret
 //   pbback   Backspace in an empty one: remove it
 //   pbslash  "/" in an empty one: choose a block for it
 // In Markdown, a toolbar formats what is chosen: bold, italic, code, links,
@@ -58,16 +58,26 @@
     }
   };
   const BLOCKS = /^(P|DIV|H[1-6]|UL|OL|LI|BLOCKQUOTE|PRE|HR|SECTION)$/;
+  const LISTS = /^(UL|OL)$/;
+  // An element holding blocks (a list in a paragraph, as browsers make): its blocks.
+  const holdsBlocks = (n) => [...n.children].some((c) => BLOCKS.test(c.tagName));
+  // A list, its items' own text, and the lists in them indented below.
+  const listMd = (list, depth) => [...list.children].filter((li) => li.tagName === "LI").map((li, i) => {
+    const own = [...li.childNodes].filter((c) => !(c.nodeType === 1 && LISTS.test(c.tagName))).map(inline).join("").trim();
+    const subs = [...li.children].filter((c) => LISTS.test(c.tagName)).map((sub) => listMd(sub, depth + 1));
+    return "   ".repeat(depth) + (list.tagName === "OL" ? `${i + 1}. ` : "- ") + own + subs.map((x) => "\n" + x).join("");
+  }).join("\n");
   const blocks = (root) => [...root.childNodes].flatMap((n) => {
     if (n.nodeType === 3) { const s = n.data.trim(); return s ? [s] : []; }
     if (n.nodeType !== 1) return [];
     const t = n.tagName;
-    if (/^H[1-6]$/.test(t)) return ["#".repeat(+t[1]) + " " + inline(n).trim()];
-    if (t === "UL" || t === "OL") return [[...n.children].map((li, i) => (t === "OL" ? `${i + 1}. ` : "- ") + inline(li).trim()).join("\n")];
+    if (LISTS.test(t)) return [listMd(n, 0)];
+    if (/^H[1-6]$/.test(t)) return holdsBlocks(n) ? blocks(n) : ["#".repeat(+t[1]) + " " + inline(n).trim()];
     if (t === "BLOCKQUOTE") return [blocks(n).join("\n\n").split("\n").map((l) => "> " + l).join("\n")];
     if (t === "PRE") return ["```\n" + n.textContent.replace(/\n$/, "") + "\n```"];
     if (t === "HR") return ["---"];
-    if ((t === "DIV" || t === "SECTION") && [...n.children].some((c) => BLOCKS.test(c.tagName))) return blocks(n);
+    if (t === "LI") return [listMd({ tagName: "UL", children: [n] }, 0)];
+    if (holdsBlocks(n)) return blocks(n);
     const s = inline(n).trim();
     return s ? [s] : [];
   });
@@ -83,21 +93,6 @@
 
   // ---- the keys that make and remove blocks -------------------------------------
 
-  // The element's content before and after the caret, as values.
-  const halves = (el) => {
-    const sel = getSelection();
-    if (!sel.rangeCount) return { before: value(el), rest: "" };
-    const r = sel.getRangeAt(0);
-    const head = document.createRange();
-    head.selectNodeContents(el);
-    head.setEnd(r.startContainer, r.startOffset);
-    const tail = document.createRange();
-    tail.selectNodeContents(el);
-    tail.setStart(r.endContainer, r.endOffset);
-    const box = (range) => { const d = document.createElement("div"); d.dataset.md = el.dataset.md || ""; d.appendChild(range.cloneContents()); return d; };
-    const read = (d) => (el.dataset.md === "inline" ? lineMd(d) : el.dataset.md ? markdown(d) : d.textContent);
-    return { before: read(box(head)), rest: read(box(tail)) };
-  };
   const tell = (el, type, detail) => el.dispatchEvent(new CustomEvent(type, { bubbles: true, detail: { key: el.dataset.edit, ...detail } }));
 
   document.addEventListener("keydown", (e) => {
@@ -112,24 +107,10 @@
     }
     const empty = value(el).trim() === "";
     if (e.key === "Enter" && !e.shiftKey) {
-      // In a list, Enter is a new item, and on an empty last one leaves the
-      // list for a new block; elsewhere, a new block.
-      const s = getSelection();
-      const node = s.anchorNode && (s.anchorNode.nodeType === 1 ? s.anchorNode : s.anchorNode.parentElement);
-      const li = el.dataset.md === "1" && node ? node.closest("li") : null;
-      if (li && (li.textContent.trim() !== "" || li.nextElementSibling)) return;
-      if (li) {
-        e.preventDefault();
-        const list = li.parentElement;
-        li.remove();
-        if (!list.children.length) list.remove();
-        tell(el, "pbenter", { before: value(el), rest: "" });
-        return;
-      }
-      // The designer keeps what was typed as it makes the block: told
-      // first, before the focus leaves.
       e.preventDefault();
-      tell(el, "pbenter", halves(el));
+      // A line of its own (a headline, a caption, a label): Enter is done.
+      if (el.dataset.md !== "1") { el.blur(); return; }
+      newLine(el);
     } else if (e.key === "Backspace" && empty && el.dataset.md === "1") {
       e.preventDefault();
       tell(el, "pbback", {});
@@ -149,6 +130,44 @@
     const text = (e.clipboardData || window.clipboardData).getData("text/plain");
     document.execCommand("insertText", false, text);
   }, true);
+
+  // Enter in Markdown: the next paragraph, in the same block. In a list,
+  // the next item; on an empty last one, a paragraph after the list. In a
+  // quote, the next line of it; after a heading, a paragraph.
+  const newLine = (el) => {
+    cur = el;
+    tidy(el);
+    const s = getSelection();
+    if (!s.rangeCount) return;
+    const r = s.getRangeAt(0);
+    if (!r.collapsed) r.deleteContents();
+    const line = lineOf(el);
+    if (!line) return;
+    const empty = (n) => !n.textContent.replace(/\u00a0/g, " ").trim() && !n.querySelector("img");
+    if (line.tagName === "LI" && empty(line) && !line.nextElementSibling) {
+      const list = line.parentElement;
+      const p = document.createElement("p");
+      p.appendChild(document.createElement("br"));
+      (list.parentElement.closest("li") || list).after(p);
+      line.remove();
+      if (!list.children.length) list.remove();
+      caretTo(p, 0);
+      changed();
+      return;
+    }
+    const tail = document.createRange();
+    tail.selectNodeContents(line);
+    tail.setStart(r.endContainer, r.endOffset);
+    const rest = tail.extractContents();
+    const next = document.createElement(line.tagName === "LI" ? "li" : line.tagName === "BLOCKQUOTE" ? "blockquote" : "p");
+    next.appendChild(rest);
+    // An empty side keeps a line break, so the caret has a place in it.
+    for (const n of [line, next]) if (!n.textContent && !n.querySelector("br, img")) n.appendChild(document.createElement("br"));
+    line.after(next);
+    caretTo(next, 0);
+    next.scrollIntoView({ block: "nearest" });
+    changed();
+  };
 
   // ---- formatting -------------------------------------------------------------------
 
@@ -194,7 +213,104 @@
   const anchor = () => { const s = getSelection(); return s.rangeCount ? s.getRangeAt(0).commonAncestorContainer : null; };
   const is = (sel) => !!within(anchor(), sel);
   const changed = () => cur && cur.dispatchEvent(new Event("input", { bubbles: true }));
-  const block = (tag) => document.execCommand("formatBlock", false, `<${tag}>`);
+
+  // ---- lines made headings, quotes and lists (by hand: the browser's own
+  // commands nest them in paragraphs inside a field) ---------------------------
+  // Text lying loose in the field: in a paragraph, so each line is one.
+  const tidy = (el) => {
+    let run = [];
+    const wrap = () => {
+      if (run.length && run.some((n) => n.nodeType !== 3 || n.data.trim())) { const p = document.createElement("p"); run[0].before(p); p.append(...run); }
+      run = [];
+    };
+    for (const n of [...el.childNodes]) { if (n.nodeType === 1 && BLOCKS.test(n.tagName)) wrap(); else run.push(n); }
+    wrap();
+    // A list or a heading in a paragraph: taken out of it.
+    for (const p of [...el.querySelectorAll(":scope > p, :scope > h2, :scope > h3, :scope > blockquote")]) {
+      if (![...p.children].some((c) => LISTS.test(c.tagName))) continue;
+      for (const c of [...p.childNodes]) p.before(c.nodeType === 3 && c.data.trim() ? Object.assign(document.createElement("p"), { textContent: c.data }) : c);
+      p.remove();
+    }
+  };
+  // The line the caret is in: an item, or a block of the field.
+  const lineOf = (el) => {
+    const n = editable(anchor()) === el ? anchor() : null;
+    const e = n && (n.nodeType === 1 ? n : n.parentElement);
+    if (!e) return null;
+    const li = e.closest("li");
+    if (li && el.contains(li)) return li;
+    let x = e;
+    while (x && x.parentElement !== el) x = x.parentElement;
+    return x && x !== el ? x : null;
+  };
+  // Where the caret is in a line, as a count of characters, and put back.
+  const caretAt = (line) => {
+    const s = getSelection();
+    if (!s.rangeCount) return 0;
+    const r = document.createRange();
+    r.selectNodeContents(line);
+    r.setEnd(s.getRangeAt(0).endContainer, s.getRangeAt(0).endOffset);
+    return r.toString().length;
+  };
+  const caretTo = (line, at) => {
+    const w = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let n, left = at;
+    const r = document.createRange();
+    while ((n = w.nextNode())) { if (left <= n.data.length) { r.setStart(n, left); break; } left -= n.data.length; }
+    if (!n) { r.selectNodeContents(line); r.collapse(false); } else r.collapse(true);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  };
+  const ownNodes = (li) => [...li.childNodes].filter((c) => !(c.nodeType === 1 && LISTS.test(c.tagName)));
+  // An item out of its list, as a block of `tag` (the list split around it).
+  const liftItem = (li, tag) => {
+    const list = li.parentElement;
+    const after = [...list.children].slice([...list.children].indexOf(li) + 1);
+    const out = document.createElement(tag);
+    out.append(...ownNodes(li));
+    list.after(out);
+    if (after.length) { const rest = document.createElement(list.tagName); rest.append(...after); out.after(rest); }
+    li.remove();
+    if (!list.children.length) list.remove();
+    return out;
+  };
+  const block = (tag) => {
+    tidy(cur);
+    const line = lineOf(cur);
+    if (!line) return;
+    const at = caretAt(line);
+    let out;
+    if (line.tagName === "LI") out = liftItem(line, tag);
+    else if (line.tagName.toLowerCase() === tag) return;
+    else { out = document.createElement(tag); out.append(...line.childNodes); line.replaceWith(out); }
+    if (!out.firstChild) out.appendChild(document.createElement("br"));
+    caretTo(out, at);
+  };
+  const listOf = (kind) => {
+    tidy(cur);
+    const line = lineOf(cur);
+    if (!line) return;
+    const at = caretAt(line);
+    const tag = kind.toUpperCase();
+    if (line.tagName === "LI") {
+      const list = line.parentElement;
+      if (list.tagName === tag) { caretTo(liftItem(line, "p"), at); return; }
+      const other = document.createElement(kind);
+      other.append(...list.childNodes);
+      list.replaceWith(other);
+      caretTo(line, at);
+      return;
+    }
+    const li = document.createElement("li");
+    li.append(...line.childNodes);
+    if (!li.firstChild) li.appendChild(document.createElement("br"));
+    const prev = line.previousElementSibling, next = line.nextElementSibling;
+    if (prev && prev.tagName === tag) { prev.appendChild(li); line.remove(); }
+    else { const list = document.createElement(kind); list.appendChild(li); line.replaceWith(list); }
+    // Joined with the list after it, if it is the same kind.
+    const list = li.parentElement;
+    if (next && next.tagName === tag && next !== list) { list.append(...next.childNodes); next.remove(); }
+    caretTo(li, at);
+  };
 
   const hide = () => { bar.hidden = true; closeLink(false); };
   // Beside the block's own toolbar (or just under it, when there is no room
@@ -281,10 +397,10 @@
       case "code": toggleCode(); break;
       case "link": openLink(); return;
       case "h2": case "h3": block(is(cmd) ? "p" : cmd); break;
-      case "p": if (is("ul")) document.execCommand("insertUnorderedList"); else if (is("ol")) document.execCommand("insertOrderedList"); else block("p"); break;
+      case "p": block("p"); break;
       case "quote": block(is("blockquote") ? "p" : "blockquote"); break;
-      case "ul": document.execCommand("insertUnorderedList"); break;
-      case "ol": document.execCommand("insertOrderedList"); break;
+      case "ul": listOf("ul"); break;
+      case "ol": listOf("ol"); break;
       case "clear": document.execCommand("removeFormat"); document.execCommand("unlink"); break;
     }
     changed();
@@ -349,25 +465,6 @@
   // "## " makes the line a heading ("### " a small one), "- " or "* " a
   // list, "1. " a numbered one, "> " a quote: the marks go, the line turns.
   const SHORTCUTS = [[/^###\s$/, "h3"], [/^##\s$/, "h2"], [/^[-*]\s$/, "ul"], [/^1\.\s$/, "ol"], [/^>\s$/, "blockquote"]];
-  const turn = (el, line, node, offset, kind) => {
-    node.data = node.data.slice(offset);
-    const list = kind === "ul" || kind === "ol";
-    const inner = document.createElement(list ? "li" : kind);
-    const from = line === el ? [...el.childNodes] : [...line.childNodes];
-    // What the browser left empty (a heading carried over) stays out.
-    for (const n of from) { if (n.nodeType === 1 && n.tagName !== "BR" && !n.textContent) n.remove(); else inner.appendChild(n); }
-    if (!inner.textContent) { inner.textContent = ""; inner.appendChild(document.createElement("br")); }
-    let out = inner;
-    if (list) { out = document.createElement(kind); out.appendChild(inner); }
-    if (line === el) el.appendChild(out); else line.replaceWith(out);
-    const r = document.createRange();
-    const first = inner.firstChild && inner.firstChild.nodeType === 3 ? inner.firstChild : inner;
-    r.setStart(first, 0);
-    r.collapse(true);
-    const s = getSelection();
-    s.removeAllRanges();
-    s.addRange(r);
-  };
   document.addEventListener("input", (e) => {
     const el = editable(e.target);
     if (!el || el.dataset.md !== "1" || !String(e.inputType || "").startsWith("insert")) return;
@@ -375,18 +472,31 @@
     if (!s.rangeCount || !s.isCollapsed) return;
     const node = s.anchorNode;
     if (!node || node.nodeType !== 3) return;
-    const line = node.parentElement === el ? el : node.parentElement.closest("p, div");
-    if (!line || !el.contains(line) || (line !== el && line.parentElement !== el)) return;
-    // Only at the very start of the line.
-    const head = document.createRange();
-    head.selectNodeContents(line);
-    head.setEnd(node, s.anchorOffset);
-    const before = head.toString().replace(/\u00a0/g, " ");
-    if (before !== node.data.slice(0, s.anchorOffset).replace(/\u00a0/g, " ")) return;
+    // What is before the caret on its line: from the line's start, or from a line break.
+    let start = node.previousSibling;
+    while (start && !(start.nodeType === 1 && start.tagName === "BR") && start.nodeType === 3 && !start.data) start = start.previousSibling;
+    const afterBreak = start && start.nodeType === 1 && start.tagName === "BR";
+    if (!afterBreak && start) return;
+    const before = node.data.slice(0, s.anchorOffset).replace(/\u00a0/g, " ");
     const hit = SHORTCUTS.find(([re]) => re.test(before));
     if (!hit) return;
-    turn(el, line, node, s.anchorOffset, hit[1]);
     cur = el;
+    // The marks go; after a line break, what follows it is a line of its own.
+    node.data = node.data.slice(s.anchorOffset);
+    if (afterBreak) {
+      const holder = start.parentElement;
+      if (holder.tagName === "LI") return;
+      const rest = document.createElement("p");
+      let n = start.nextSibling;
+      while (n) { const nx = n.nextSibling; rest.appendChild(n); n = nx; }
+      if (holder === el) start.replaceWith(rest); else { holder.after(rest); start.remove(); }
+    }
+    const r = document.createRange();
+    r.setStart(node, 0);
+    r.collapse(true);
+    s.removeAllRanges();
+    s.addRange(r);
+    if (hit[1] === "ul" || hit[1] === "ol") listOf(hit[1]); else block(hit[1]);
     changed();
   }, true);
 

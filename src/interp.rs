@@ -46,7 +46,7 @@ pub struct Interp {
     // on the program (`fork`), which is then a few reference counts.
     pub routes: Arc<Vec<Arc<RouteDef>>>,
     pub base_dir: Arc<Path>,
-    loaded: Arc<HashSet<PathBuf>>,
+    pub(crate) loaded: Arc<HashSet<PathBuf>>,
     pub shared: Arc<Shared>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
@@ -104,6 +104,9 @@ pub struct Interp {
     pub base: String,
     /// Programs mounted under a path prefix: `mount /notes = "notes.qwe"`.
     pub mounts: Vec<(String, Interp)>,
+    /// Services with a prefix that run elsewhere: their routes are passed
+    /// on to them (`service /shop = "shop.qwe"`, src/service.rs).
+    pub remote_mounts: Vec<(String, String)>,
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
@@ -486,6 +489,7 @@ impl Interp {
             db: Arc::new(std::sync::Mutex::new(None)),
             base: String::new(),
             mounts: Vec::new(),
+            remote_mounts: Vec::new(),
             rendered_island: false,
             island_names: Vec::new(),
             spare: String::new(),
@@ -530,6 +534,7 @@ impl Interp {
             db: self.db.clone(),
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
+            remote_mounts: self.remote_mounts.clone(),
             rendered_island: false,
             island_names: Vec::new(),
             spare: String::new(),
@@ -944,6 +949,12 @@ impl Interp {
                 }
                 Ok(Value::Nil)
             }
+            Stmt::Service(name, prefix, file, line) => {
+                if !Arc::ptr_eq(env, &self.globals) {
+                    return fail(*line, "`service` must be at the top level");
+                }
+                crate::service::declare(self, name, prefix.as_deref(), file, *line)
+            }
             Stmt::Mount(prefix, file, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`mount` must be at the top level");
@@ -1343,8 +1354,30 @@ impl Interp {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
             return self.get_field(v, field, at);
         }
+        let n = args.len();
+        self.call_closure_with(c, args, n, line)
+    }
+
+    /// `f(x)`, as `call` but without making a list of the one argument: for
+    /// `map`, `filter` and the like, which call f for each item.
+    pub fn call1(&mut self, f: &Value, x: Value, line: u32) -> Result<Value, Ctrl> {
+        let Value::Func(c) = f else {
+            return self.call(f, vec![x], line);
+        };
+        if self.fuel != u64::MAX {
+            self.burn(line)?;
+            self.burn(line)?;
+        }
+        if let Some((field, at)) = projection(&c.def) {
+            return self.get_field(x, field, at);
+        }
+        let c = c.clone();
+        self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
+    }
+
+    fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
-        let r = self.enter_call(&def, args.len(), line, |this| this.call_closure_inner(c, &def, args, line))?;
+        let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line))?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
             if !type_matches(ety, payload) {
                 return fail(
@@ -1444,7 +1477,7 @@ impl Interp {
         Ok(())
     }
 
-    fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+    fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         let scope = self.bind_args(c, def, args, line)?;
         let r = match self.eval(&def.body, &scope) {
             Ok(v) | Err(Ctrl::Return(v)) => v,
@@ -1464,7 +1497,7 @@ impl Interp {
 
     /// A scope for a call of `c` with its parameters set from `args` (and
     /// defaults), checked against their types.
-    fn bind_args(&mut self, c: &Closure, def: &FnDef, args: Vec<Option<Value>>, line: u32) -> Result<Env, Ctrl> {
+    fn bind_args(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
         if def.server {
             if let Some(req) = self.request_value() {
