@@ -603,6 +603,12 @@ component Notes(initial: list) {
   allow only six HTTP/1.1 connections to a host across all tabs: requests left
   waiting would hold them, and server calls would queue behind them. Where a
   WebSocket cannot open, the page asks the same URL as a plain request instead.
+- A server keeps at most 4096 such connections open (live data, channels, `--watch`
+  reloads), and at most 256 for one client: an IPv4 address, or an IPv6 /64 network.
+  Past that, a page is answered `503` and tries again later. Behind a proxy that does
+  not pass the client's own connection through, every visitor is the proxy's address,
+  so put the proxy's own per-client limits in front (Quillo does not read
+  `X-Forwarded-For`, which a client can write).
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
 
@@ -1139,8 +1145,13 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   past the end gets a `416`.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
   disk. Larger ones are sent from disk as they are written, on a thread of their own
-  with a 64 KiB buffer, so a video costs no more memory than a page. The gzipped copy
-  of a text file is kept too, rather than compressed again for each request.
+  with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
+  sends run at once, 8 for one client (an IPv4 address, or an IPv6 /64 network; past
+  that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
+  seconds, and any send stops after an hour: a browser or player goes on from there
+  with a `Range` request. Behind a proxy every visitor shares the proxy's address and so
+  its 8 places; limit clients at the proxy instead. The gzipped copy of a text file is
+  kept too, rather than compressed again for each request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 ### Translations

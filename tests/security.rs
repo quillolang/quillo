@@ -285,6 +285,37 @@ fn a_chunk_size_that_overflows_does_not_stop_the_server() {
     assert!(r.starts_with("HTTP/1.1 200") && r.contains("\r\n\r\n9") && r.ends_with("up"), "{}", r);
 }
 
+#[test]
+fn request_bodies_are_framed_one_way_only() {
+    let srv = serve("framing", ECHO, &[]);
+    // What the review sent, each accepted then: a signed length, sizes with
+    // a sign or spaces, both a length and chunked (on a kept connection),
+    // chunked not last, and chunked on HTTP/1.0. Each is refused, and the
+    // request after it is not taken from the same connection.
+    let next = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    for (head, body) in [
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\n", "hello"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", "+5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", " 5 \r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, identity\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+    ] {
+        let r = exchange(srv.port, format!("{}{}{}", head, body, next).as_bytes());
+        assert!(r.starts_with("HTTP/1.1 400"), "{:?} -> {}", head, r);
+        assert_eq!(r.matches("HTTP/1.1 ").count(), 1, "{:?} -> {}", head, r);
+    }
+    // gzip, then chunked: framed right, but not decoded here.
+    let r = exchange(srv.port, b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 501"), "{}", r);
+    // Written as allowed: still taken.
+    let r = exchange(srv.port, format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length:  5 \r\n\r\nhello{}", next).as_bytes());
+    assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("up"), "{}", r);
+    let r = exchange(srv.port, format!("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n5 ;a=b\r\nhello\r\n0\r\n\r\n{}", next).as_bytes());
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("\r\n\r\n5") && r.ends_with("up"), "{}", r);
+}
+
 #[cfg(unix)]
 #[test]
 fn endless_chunk_trailers_and_extensions_are_refused() {
