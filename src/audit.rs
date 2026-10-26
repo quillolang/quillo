@@ -145,12 +145,46 @@ fn ensure(it: &mut Interp, b: &Arc<Backend>) -> Result<(), String> {
                 if r.is_err() {
                     r = c.batch(sql);
                 }
+                // A user who may not create tables (as it should be, once
+                // they are made): there it is.
+                if r.is_err() && c.query("select seq from _quillo_audit where seq < 0", &[], None).is_ok() {
+                    r = Ok(());
+                }
                 pool.give_back(c);
                 r
             })?
         }
     }
     made().lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+    Ok(())
+}
+
+/// Makes a tenant's row in `_quillo_audit_lock` (PostgreSQL's way, then
+/// MySQL's).
+const LOCK_ROW: [&str; 2] =
+    ["insert into _quillo_audit_lock (tenant) values (?) on conflict do nothing", "insert ignore into _quillo_audit_lock (tenant) values (?)"];
+
+/// Makes sure the tenant's lock row is there, on a connection of its own
+/// that commits at once. Made inside the appends' transactions instead,
+/// two first appends at once could each wait for the other on MySQL.
+fn lock_row(it: &mut Interp, b: &Arc<Backend>, tenant: &str) -> Result<(), String> {
+    static DONE: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+    let key = (Arc::as_ptr(b) as usize, tenant.to_string());
+    if matches!(&**b, Backend::Sqlite(_)) || DONE.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+        return Ok(());
+    }
+    let (pool, t, sql) = (b.clone(), tenant.to_string(), LOCK_ROW[b.is_mysql() as usize]);
+    it.unlocked(move || {
+        let mut c = pool.checkout()?;
+        let r = c.exec(sql, &[Value::str(t)]).map(|_| ());
+        pool.give_back(c);
+        r
+    })?;
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if done.len() > 10_000 {
+        done.clear();
+    }
+    done.push(key);
     Ok(())
 }
 
@@ -194,14 +228,14 @@ fn opt_val(s: &Option<String>) -> Value {
 fn append(c: &mut dyn Conn, kind: &str, row: &Row) -> Result<(i64, String), String> {
     let tenant = Value::str(&row.tenant);
     // Appends for a tenant take turns: a lock on its row in
-    // `_quillo_audit_lock`, held until the transaction ends.
-    match kind {
-        "pg" => c.run("insert into _quillo_audit_lock (tenant) values (?) on conflict do nothing", std::slice::from_ref(&tenant))?,
-        "mysql" => c.run("insert ignore into _quillo_audit_lock (tenant) values (?)", std::slice::from_ref(&tenant))?,
-        _ => {}
-    }
+    // `_quillo_audit_lock` (made beforehand: see `lock_row`), held until the
+    // transaction ends.
     if kind != "sqlite" {
-        c.rows("select tenant from _quillo_audit_lock where tenant = ? for update", std::slice::from_ref(&tenant))?;
+        let lock = "select tenant from _quillo_audit_lock where tenant = ? for update";
+        if c.rows(lock, std::slice::from_ref(&tenant))?.is_empty() {
+            c.run(LOCK_ROW[(kind == "mysql") as usize], std::slice::from_ref(&tenant))?;
+            c.rows(lock, std::slice::from_ref(&tenant))?;
+        }
     }
     // MySQL reads a transaction's first snapshot again unless the read
     // locks; a shared lock reads the latest row (and needs no more than
@@ -377,6 +411,9 @@ fn log(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    if let Err(e) = lock_row(it, &b, &row.tenant) {
+        return Ok(db_err(e));
+    }
     it.wrote_req = Some(crate::httpd::request_number());
     let at = row.at.clone();
     match in_tx(it, &b, move |c, kind| append(c, kind, &row)) {

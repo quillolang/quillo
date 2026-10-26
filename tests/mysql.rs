@@ -82,6 +82,31 @@ fn program(dir: &std::path::Path, src: &str) -> Interp {
     it
 }
 
+/// `audit`: rows in the change's transaction, and appends from several
+/// connections at once in one chain.
+fn the_audit_log_takes_turns(dir: &std::path::Path, url: &str) {
+    let mut it = program(dir, &format!(r#"db.open("{}")
+db.exec("create table if not exists notes (n int)")
+fn add(n) = db.transaction(() => {{
+    db.exec("insert into notes values (?)", n)
+    audit("note.add", {{ n }})?
+    n < 0 ? err("no") : n
+}})
+"#, url));
+    assert_eq!(eval(&mut it, "[add(1), add(-1), audit(\"outside\").seq]"), r#"[1, err("no"), 2]"#);
+    assert_eq!(eval(&mut it, "audit.query({ action: \"note.*\" }) | map((r) => r.details.n)"), "[1]");
+    std::thread::scope(|s| {
+        for w in 0..4 {
+            s.spawn(move || {
+                let mut it = program(dir, &format!("db.open(\"{}\")\n", url));
+                assert_eq!(eval(&mut it, &format!("for i in range(0, 25) {{ audit(\"tick\", {{ w: {}, i }})? }}\n1", w)), "1");
+            });
+        }
+    });
+    assert_eq!(eval(&mut it, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 102]");
+    assert!(eval(&mut it, "db.exec(\"delete from _quillo_audit\")").contains("append-only"));
+}
+
 /// One server for every scenario.
 #[test]
 fn mysql() {
@@ -96,6 +121,8 @@ fn mysql() {
     // A database of its own, made when the program makes a tenant: here, by hand.
     let mut it = program(&work, &format!("db.open(\"{}\")\n", url("mysql")));
     assert_eq!(eval(&mut it, "db.exec(\"create database app\").changes"), "1");
+    assert_eq!(eval(&mut it, "db.exec(\"create database audited\").changes"), "1");
+    the_audit_log_takes_turns(&work, &url("audited"));
 
     let mut it = program(&work, &format!("db.open(\"{}\")\n", url("app")));
     // Values and types, both ways.
