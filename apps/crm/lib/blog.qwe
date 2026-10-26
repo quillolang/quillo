@@ -200,7 +200,7 @@ fn blog_index(tag: str, page: int, theme = null, category: str = "", q: str = ""
     </SiteLayout>
 }
 
-fn clamp_int(v, lo: int, hi: int) = max([lo, min([hi, int(str(v ?? lo)) ?? lo])])
+fn clamp_int(v, lo: int, hi: int) = max([lo, min([hi, int(v) ?? lo])])
 
 // About 230 words a minute.
 fn reading_minutes(text: str) = max([1, round(len(split(text, " ") | filter((w) => trim(w) != "")) / 230)])

@@ -13,7 +13,15 @@
 //! - effects: a `with` function using builtins or functions it does not allow;
 //! - views and components: unknown tags and attributes, missing props;
 //! - code in components that cannot run in the browser;
+//! - fields a map whose fields are known does not have (`{ title }.titel`);
 //! - unused `let` variables (a warning).
+//!
+//! Lists know what they hold and maps their fields where something says so
+//! (a literal, an annotation such as `list<{ id: int }>`, a builtin like
+//! `split` or `merge`), and a lambda given to `map`, `filter`, ... takes the
+//! list's items. With `Options::strict_null`, values that may be null where
+//! null does not work are warnings too, after narrowing (`x != null`, an
+//! early `return`, `match` arms after `null`).
 //!
 //! It also records every definition and reference for the language server.
 
@@ -53,31 +61,215 @@ const BASE: [(u16, &str); 11] = [
 ];
 
 /// A set of possible types; `err` is what an error value may contain.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// What a list holds (`elem`) and a map's fields (`shape`) are indexes into
+/// the tables below, 0 when unknown: they say something only while `bits`
+/// has `LIST` (or `MAP`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct T {
     bits: u16,
     err: u16,
+    elem: u32,
+    shape: u32,
 }
 
 impl T {
     const fn of(bits: u16) -> T {
-        T { bits, err: if bits & ERR != 0 { ANY } else { 0 } }
+        T { bits, err: if bits & ERR != 0 { ANY } else { 0 }, elem: 0, shape: 0 }
     }
-    const ANY: T = T { bits: ANY, err: ANY };
-    const NEVER: T = T { bits: 0, err: 0 };
+    const ANY: T = T { bits: ANY, err: ANY, elem: 0, shape: 0 };
+    const NEVER: T = T { bits: 0, err: 0, elem: 0, shape: 0 };
     fn error(payload: u16) -> T {
-        T { bits: ERR, err: payload }
+        T { bits: ERR, err: payload, elem: 0, shape: 0 }
     }
     fn union(self, o: T) -> T {
-        T { bits: self.bits | o.bits, err: self.err | o.err }
+        T {
+            bits: self.bits | o.bits,
+            err: self.err | o.err,
+            elem: join_part(self.bits & LIST != 0, self.elem, o.bits & LIST != 0, o.elem, union_elems),
+            shape: join_part(self.bits & MAP != 0, self.shape, o.bits & MAP != 0, o.shape, union_shapes),
+        }
     }
     fn without(self, bits: u16) -> T {
         let b = self.bits & !bits;
-        T { bits: b, err: if b & ERR != 0 { self.err } else { 0 } }
+        T {
+            bits: b,
+            err: if b & ERR != 0 { self.err } else { 0 },
+            elem: if b & LIST != 0 { self.elem } else { 0 },
+            shape: if b & MAP != 0 { self.shape } else { 0 },
+        }
     }
     fn is_any(self) -> bool {
         self.bits == ANY
     }
+    /// Anything, give or take null and errors (`x?` and `x ?? y` of `any`):
+    /// nothing to warn about.
+    fn vague(self) -> bool {
+        self.bits | NIL | ERR == ANY
+    }
+    /// What the list holds, if this is a list (or null) and that is known.
+    fn items(self) -> Option<T> {
+        (self.bits & LIST != 0 && self.bits & !(LIST | NIL) == 0 && self.elem != 0).then(|| elem_of(self.elem))
+    }
+    /// The map's fields, if this is a map (or null) and they are known.
+    fn fields(self) -> Option<Shape> {
+        if self.bits & MAP != 0 && self.bits & !(MAP | NIL) == 0 { shape_of(self.shape) } else { None }
+    }
+}
+
+// ---- lists' elements and maps' fields ------------------------------------
+
+/// A map's fields, by name.
+type Shape = Arc<[(Arc<str>, T)]>;
+
+#[derive(Default)]
+struct Tables {
+    elems: Vec<T>,
+    elem_ids: HashMap<T, u32>,
+    shapes: Vec<Shape>,
+    shape_ids: HashMap<Shape, u32>,
+}
+
+thread_local! {
+    static TABLES: std::cell::RefCell<Tables> = std::cell::RefCell::new(Tables::default());
+    /// Checks in progress on this thread (a mounted program is checked
+    /// inside its parent's check): the tables are emptied by the outermost.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn elem_id(e: T) -> u32 {
+    if e.is_any() {
+        return 0;
+    }
+    TABLES.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(i) = t.elem_ids.get(&e) {
+            return *i;
+        }
+        t.elems.push(e);
+        let i = t.elems.len() as u32;
+        t.elem_ids.insert(e, i);
+        i
+    })
+}
+
+fn elem_of(id: u32) -> T {
+    if id == 0 {
+        return T::ANY;
+    }
+    TABLES.with(|t| t.borrow().elems[id as usize - 1])
+}
+
+fn shape_id(mut fields: Vec<(Arc<str>, T)>) -> u32 {
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    fields.dedup_by(|a, b| a.0 == b.0);
+    let shape: Shape = fields.into();
+    TABLES.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(i) = t.shape_ids.get(&shape) {
+            return *i;
+        }
+        t.shapes.push(shape.clone());
+        let i = t.shapes.len() as u32;
+        t.shape_ids.insert(shape, i);
+        i
+    })
+}
+
+fn shape_of(id: u32) -> Option<Shape> {
+    if id == 0 {
+        return None;
+    }
+    TABLES.with(|t| Some(t.borrow().shapes[id as usize - 1].clone()))
+}
+
+fn list_of(e: T) -> T {
+    T { bits: LIST, err: 0, elem: elem_id(e), shape: 0 }
+}
+
+fn map_of(fields: Vec<(Arc<str>, T)>) -> T {
+    T { bits: MAP, err: 0, elem: 0, shape: shape_id(fields) }
+}
+
+/// The part (element or fields) of a union: unknown if either side's is.
+fn join_part(a_has: bool, a: u32, b_has: bool, b: u32, join: fn(u32, u32) -> u32) -> u32 {
+    match (a_has, b_has) {
+        (true, true) if a == b => a,
+        (true, true) if a == 0 || b == 0 => 0,
+        (true, true) => join(a, b),
+        (true, false) => a,
+        (false, true) => b,
+        (false, false) => 0,
+    }
+}
+
+fn union_elems(a: u32, b: u32) -> u32 {
+    elem_id(elem_of(a).union(elem_of(b)))
+}
+
+/// One map or the other: every field either has, null where one has none.
+fn union_shapes(a: u32, b: u32) -> u32 {
+    let (Some(x), Some(y)) = (shape_of(a), shape_of(b)) else { return 0 };
+    let find = |s: &Shape, k: &str| s.iter().find(|(n, _)| &**n == k).map(|(_, t)| *t);
+    let mut out: Vec<(Arc<str>, T)> = Vec::new();
+    for (k, t) in x.iter() {
+        out.push((k.clone(), t.union(find(&y, k).unwrap_or(T::of(NIL)))));
+    }
+    for (k, t) in y.iter() {
+        if find(&x, k).is_none() {
+            out.push((k.clone(), t.union(T::of(NIL))));
+        }
+    }
+    shape_id(out)
+}
+
+/// `merge(a, b)` and `a + b` on maps: b's fields over a's.
+fn merge_maps(a: T, b: T) -> T {
+    match (a.fields(), b.fields()) {
+        (Some(x), Some(y)) if a.bits & NIL == 0 && b.bits & NIL == 0 => {
+            let mut out: Vec<(Arc<str>, T)> = y.iter().cloned().collect();
+            out.extend(x.iter().filter(|(k, _)| !y.iter().any(|(n, _)| n == k)).cloned());
+            map_of(out)
+        }
+        _ => T::of(MAP),
+    }
+}
+
+/// A type as the checker knows it: `list<int>`, `{ id: int, title: str } | null`.
+fn t_text(t: T) -> String {
+    if t.is_any() || (t.elem == 0 && t.shape == 0) {
+        return bits_text(t.bits);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let rest = t.bits & !(NIL | if t.elem != 0 { LIST } else { 0 } | if t.shape != 0 { MAP } else { 0 });
+    if rest != 0 {
+        parts.push(bits_text(rest));
+    }
+    if t.elem != 0 && t.bits & LIST != 0 {
+        parts.push(format!("list<{}>", t_text(elem_of(t.elem))));
+    }
+    if let Some(s) = shape_of(t.shape).filter(|_| t.bits & MAP != 0) {
+        let mut fs: Vec<String> = s.iter().take(6).map(|(k, ft)| format!("{}: {}", k, t_text(*ft))).collect();
+        if s.len() > 6 {
+            fs.push("…".into());
+        }
+        parts.push(format!("{{ {} }}", fs.join(", ")));
+    }
+    if t.bits & NIL != 0 {
+        parts.push("null".into());
+    }
+    parts.join(" | ")
+}
+
+/// An annotation's type, with what its lists hold and its maps' fields.
+fn ty_t(t: &Ty) -> T {
+    let mut out = T::of(ty_bits(t));
+    if let (Some(e), true) = (&t.elem, out.bits & LIST != 0) {
+        out.elem = elem_id(ty_t(e));
+    }
+    if let (Some(fs), true) = (&t.fields, out.bits & MAP != 0) {
+        out.shape = shape_id(fs.iter().map(|(k, ft)| (Arc::from(k.as_str()), ty_t(ft))).collect());
+    }
+    out
 }
 
 fn bits_text(bits: u16) -> String {
@@ -356,6 +548,8 @@ fn parse_t(s: &str) -> T {
 struct PSig {
     name: String,
     ty: u16,
+    /// The annotation with lists' elements and maps' fields.
+    full: T,
     optional: bool,
     annotated: bool,
 }
@@ -392,7 +586,8 @@ impl Sig {
                 }
                 None => p,
             };
-            ps.push(PSig { name: format!("arg{}", i + 1), ty: parse_t(p).bits, optional: optional || variadic, annotated: true });
+            let t = parse_t(p);
+            ps.push(PSig { name: format!("arg{}", i + 1), ty: t.bits, full: t, optional: optional || variadic, annotated: true });
         }
         let effects = Some(builtin_effect(name));
         Sig {
@@ -418,12 +613,13 @@ impl Sig {
                 .map(|p| PSig {
                     name: p.name.clone(),
                     ty: p.ty.as_ref().map_or(ANY, ty_bits),
+                    full: p.ty.as_ref().map_or(T::ANY, ty_t),
                     optional: p.default.is_some(),
                     annotated: p.ty.is_some(),
                 })
                 .collect(),
             variadic: false,
-            ret: def.ret.as_ref().map(|t| T::of(ty_bits(t))),
+            ret: def.ret.as_ref().map(ty_t),
             err: def.err.as_ref().map(ty_bits),
             effects: def.effects.as_ref().map(|e| effect_mask(e)),
             server: def.server,
@@ -589,6 +785,15 @@ pub fn builtin_signatures() -> Vec<(String, String)> {
     BUILTINS.iter().map(|(n, p, r)| (n.to_string(), Sig::builtin(n, p, r).text())).collect()
 }
 
+/// How strict a check is.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Options {
+    /// Also warn where a value may be null and null does not work: an
+    /// argument `str | null` for a `str` parameter, `count + 1` with
+    /// `count: int | null`. Checks such as `x != null` narrow the type.
+    pub strict_null: bool,
+}
+
 /// Checks a program file and the files it `use`s.
 pub fn check_file(path: &Path) -> Analysis {
     check_file_with(path, HashMap::new())
@@ -597,11 +802,16 @@ pub fn check_file(path: &Path) -> Analysis {
 /// `check_file`, with some files' text given instead of read: how the
 /// program would check if they said that (a tool about to write them).
 pub fn check_file_with(path: &Path, overrides: HashMap<PathBuf, String>) -> Analysis {
+    check_file_opts(path, overrides, Options::default())
+}
+
+/// `check_file_with`, with options.
+pub fn check_file_opts(path: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let main = overrides.get(path).cloned().map_or_else(|| std::fs::read_to_string(path), Ok);
     match main {
         Ok(src) => {
             let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            check_source_with(&src, &path.display().to_string(), base, overrides)
+            check_source_with(&src, &path.display().to_string(), base, overrides, opts)
         }
         Err(e) => {
             let mut a = Analysis::default();
@@ -619,11 +829,30 @@ pub fn check_file_with(path: &Path, overrides: HashMap<PathBuf, String>) -> Anal
 /// Checks source text (the main file need not be saved); `use`d files are
 /// read from `base_dir`.
 pub fn check_source(src: &str, file: &str, base_dir: &Path) -> Analysis {
-    check_source_with(src, file, base_dir, HashMap::new())
+    check_source_opts(src, file, base_dir, Options::default())
 }
 
-fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>) -> Analysis {
+/// `check_source`, with options.
+pub fn check_source_opts(src: &str, file: &str, base_dir: &Path, opts: Options) -> Analysis {
+    check_source_with(src, file, base_dir, HashMap::new(), opts)
+}
+
+fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
+    let outermost = DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get() == 1
+    });
+    if outermost {
+        TABLES.with(|t| *t.borrow_mut() = Tables::default());
+    }
+    let a = check_source_in(src, file, base_dir, overrides, opts);
+    DEPTH.with(|d| d.set(d.get() - 1));
+    a
+}
+
+fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let mut c = Checker::new(file);
+    c.strict_null = opts.strict_null;
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     match Parser::new(src).parse_program() {
@@ -703,6 +932,11 @@ struct Checker {
     effect_cache: HashMap<usize, u8>,
     /// Checking the `live(...)` that sets a component's `~state`.
     live_ok: bool,
+    /// The parameters' types of the lambda about to be checked, from the
+    /// list a builtin gives it: `xs | map((x) => ...)`.
+    hint: Option<Vec<T>>,
+    /// Warn where a value may be null and null does not work (`--strict-null`).
+    strict_null: bool,
     file: Arc<str>,
     line: u32,
     out: Analysis,
@@ -745,6 +979,8 @@ impl Checker {
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
             live_ok: false,
+            hint: None,
+            strict_null: false,
             file: Arc::from(file),
             line: 0,
             out: Analysis::default(),
@@ -785,7 +1021,7 @@ impl Checker {
                 if !full.is_file() {
                     self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: no such file", full.display()));
                 } else {
-                    let sub = check_file(&full);
+                    let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
                     self.out.diagnostics.extend(sub.diagnostics);
                     self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
                         s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
@@ -890,7 +1126,7 @@ impl Checker {
                                 g.sig = if reassigned { None } else { sig };
                             }
                         }
-                        let detail = format!("let {}: {}", n, bits_text(if reassigned { ANY } else { t.bits }));
+                        let detail = format!("let {}: {}", n, if reassigned { "any".to_string() } else { t_text(t) });
                         self.out.symbols.push(Symbol { name: n, kind: SymbolKind::Variable, file: it.file.to_string(), line: *line, detail });
                     }
                 }
@@ -960,7 +1196,7 @@ impl Checker {
                 if MODULES.contains(&name) && v.kind == Kind::Global && def.is_none() {
                     format!("module {}", name)
                 } else {
-                    format!("{}{}: {}", kw, name, bits_text(v.t.bits))
+                    format!("{}{}: {}", kw, name, t_text(v.t))
                 }
             }
         };
@@ -1066,7 +1302,7 @@ impl Checker {
         }
         self.fns.push(FnCtx {
             name: d.name.clone(),
-            ret: d.ret.as_ref().map(|t| T::of(ty_bits(t))),
+            ret: d.ret.as_ref().map(ty_t),
             err: d.err.as_ref().map(ty_bits),
             allowed: effects.unwrap_or(ALL_EFFECTS),
             restrictor: d.effects.as_ref().map(|e| (d.name.clone(), e.clone())),
@@ -1086,8 +1322,16 @@ impl Checker {
     }
 
     fn params(&mut self, d: &FnDef) {
-        for p in &d.params {
-            let mut t = p.ty.as_ref().map_or(T::ANY, |t| T::of(ty_bits(t)));
+        self.params_hinted(d, None)
+    }
+
+    /// Parameters, those without an annotation typed by `hint` if given.
+    fn params_hinted(&mut self, d: &FnDef, hint: Option<Vec<T>>) {
+        for (i, p) in d.params.iter().enumerate() {
+            let mut t = p.ty.as_ref().map_or(T::ANY, ty_t);
+            if let (None, None, Some(h)) = (&p.ty, &p.default, hint.as_ref().and_then(|h| h.get(i))) {
+                t = *h;
+            }
             if let Some(def) = &p.default {
                 let dt = self.expr(def);
                 if p.ty.is_none() {
@@ -1141,6 +1385,8 @@ impl Checker {
         if let Some(r) = ret {
             if vals != 0 && t.bits & ERR == 0 && vals & r.bits == 0 {
                 self.error(format!("`{}` must return {}, but this returns {}", name, bits_text(r.bits), bits_text(vals)));
+            } else if self.strict_null && !t.vague() && vals & NIL != 0 && vals != NIL && r.bits & NIL == 0 {
+                self.warn(format!("`{}` must return {}, but this may be null (it is {})", name, bits_text(r.bits), t_text(t)));
             }
         }
         if let Some(e) = err {
@@ -1333,6 +1579,10 @@ impl Checker {
 
     /// The body of a lambda or local fn, checked where it is written.
     fn lambda_body(&mut self, d: &Arc<FnDef>) -> T {
+        self.lambda_body_hinted(d, None)
+    }
+
+    fn lambda_body_hinted(&mut self, d: &Arc<FnDef>, hint: Option<Vec<T>>) -> T {
         let (outer_allowed, outer_restrictor, component) = match self.fns.last() {
             Some(f) => (f.allowed, f.restrictor.clone(), f.component.clone()),
             None => (ALL_EFFECTS, None, None),
@@ -1350,7 +1600,7 @@ impl Checker {
         }
         self.fns.push(FnCtx {
             name: d.name.clone(),
-            ret: d.ret.as_ref().map(|t| T::of(ty_bits(t))),
+            ret: d.ret.as_ref().map(ty_t),
             err: d.err.as_ref().map(ty_bits),
             allowed,
             restrictor,
@@ -1361,14 +1611,14 @@ impl Checker {
         let saved_seq = self.sequential;
         self.sequential = false;
         self.push();
-        self.params(d);
+        self.params_hinted(d, hint);
         let t = self.expr(&d.body);
         self.check_return_expr(&d.body, t);
         self.pop();
         self.sequential = saved_seq;
         let t = t.union(self.fns.pop().map_or(T::NEVER, |f| f.exits));
         let t = match &d.ret {
-            Some(r) => T::of(ty_bits(r)).union(t.without(!ERR)),
+            Some(r) => ty_t(r).union(t.without(!ERR)),
             None => t,
         };
         self.ret_cache.insert(def_key(d), t);
@@ -1543,16 +1793,21 @@ impl Checker {
                 t
             }
             Expr::List(items) => {
+                let mut elem = T::NEVER;
                 for i in items {
-                    self.expr(i);
+                    elem = elem.union(self.expr(i));
                 }
-                T::of(LIST)
+                if elem.bits == 0 { T::of(LIST) } else { list_of(elem) }
             }
             Expr::Map(entries) => {
-                for (_, v) in entries {
-                    self.expr(v);
+                let mut fields: Vec<(Arc<str>, T)> = Vec::new();
+                for (k, v) in entries {
+                    let t = self.expr(v);
+                    fields.retain(|(n, _)| &**n != k);
+                    fields.push((Arc::from(k.as_str()), t));
                 }
-                T::of(MAP)
+                // `{}` is a map things are added to: what it holds is not known.
+                if fields.is_empty() { T::of(MAP) } else { map_of(fields) }
             }
             Expr::Unary(op, x, line) => {
                 let t = self.expr(x);
@@ -1572,7 +1827,14 @@ impl Checker {
             }
             Expr::Binary(op, a, b, line) => {
                 let x = self.expr(a);
-                let y = self.expr(b);
+                // `x != null && f(x)`: the right side runs only if the left holds.
+                let mut facts = Vec::new();
+                match op {
+                    BinOp::And => self.facts(a, true, &mut facts),
+                    BinOp::Or => self.facts(a, false, &mut facts),
+                    _ => {}
+                }
+                let y = self.under(facts, |c| c.expr(b));
                 self.line = *line;
                 match op {
                     BinOp::Or => self.js_truthiness(x, a, Truth::Or),
@@ -1583,7 +1845,17 @@ impl Checker {
                     self.error("division by zero");
                 }
                 match binop_t(*op, x, y) {
-                    Some(t) => t,
+                    Some(t) => {
+                        if self.strict_null {
+                            self.null_operands(*op, x, y);
+                        }
+                        match op {
+                            BinOp::Add if x.bits == LIST && y.bits == LIST => x.union(y),
+                            BinOp::Add if x.bits == MAP && y.bits == MAP => merge_maps(x, y),
+                            BinOp::Range => list_of(T::of(INT)),
+                            _ => t,
+                        }
+                    }
                     None => {
                         let verb = match op {
                             BinOp::Add => "add",
@@ -1638,6 +1910,14 @@ impl Checker {
                 if !ok && o.bits != 0 && i.bits != 0 {
                     self.error(format!("cannot index {} with {}", bits_text(o.bits), bits_text(i.bits)));
                 }
+                // An item (as in TypeScript: not "or null" past the end, which
+                // would make every `parts[1]` a warning under --strict-null).
+                if let Some(e) = o.items().filter(|_| i.bits & !NUM == 0) {
+                    return e.union(T::of(o.bits & NIL));
+                }
+                if let (Some(fs), Expr::Lit(Lit::Str(k))) = (o.fields(), &**idx) {
+                    return fs.iter().find(|(n, _)| **n == **k).map_or(T::of(NIL), |(_, t)| t.union(T::of(o.bits & NIL)));
+                }
                 T::ANY
             }
             Expr::Try(x) => {
@@ -1665,21 +1945,28 @@ impl Checker {
             Expr::If(c, a, b) => {
                 let ct = self.expr(c);
                 self.js_truthiness(ct, c, Truth::Cond);
-                let x = self.expr(a);
+                let (mut yes, mut no) = (Vec::new(), Vec::new());
+                self.facts(c, true, &mut yes);
+                self.facts(c, false, &mut no);
+                let x = self.under(yes, |s| s.expr(a));
                 let y = match b {
-                    Some(b) => self.expr(b),
+                    Some(b) => self.under(no, |s| s.expr(b)),
                     None => T::of(NIL),
                 };
                 x.union(y)
             }
             Expr::Match(subj, arms, line) => {
-                let st = self.expr(subj);
+                let mut st = self.expr(subj);
                 self.line = *line;
                 let mut t = T::NEVER;
                 for arm in arms {
                     self.push();
                     let mut binds = Vec::new();
                     self.bind_pattern(&arm.pat, st, &mut binds);
+                    // `null => ...` first: the arms after it never see null.
+                    if matches!(arm.pat, Pattern::Lit(Lit::Nil)) && arm.guard.is_none() {
+                        st = st.without(NIL);
+                    }
                     for (n, bt, sig) in binds {
                         self.define(&n, bt, sig, Kind::Bound);
                     }
@@ -1698,7 +1985,11 @@ impl Checker {
                     self.error(format!("cannot loop over {}", bits_text(it.bits)));
                 }
                 self.push();
-                let item = if it.bits & !(STR | NIL) == 0 && it.bits & STR != 0 { T::of(STR) } else { T::ANY };
+                let item = match it.items() {
+                    Some(e) => e,
+                    None if it.bits & !(STR | NIL) == 0 && it.bits & STR != 0 => T::of(STR),
+                    None => T::ANY,
+                };
                 let mut binds = Vec::new();
                 self.bind_pattern(pat, item, &mut binds);
                 for (n, bt, sig) in binds {
@@ -1717,6 +2008,14 @@ impl Checker {
                     if matches!(s, Stmt::Return(_)) || (st.bits == 0 && matches!(s, Stmt::Expr(_))) {
                         never = true;
                     }
+                    // `if x == null { return ... }`: after it, `x` is not null.
+                    if let Stmt::Expr(Expr::If(c, a, None)) = s {
+                        if exits(a) {
+                            let mut no = Vec::new();
+                            self.facts(c, false, &mut no);
+                            self.assume(no);
+                        }
+                    }
                     if i + 1 == stmts.len() {
                         t = st;
                     }
@@ -1730,7 +2029,8 @@ impl Checker {
             }
             Expr::Lambda(d) => {
                 self.line = d.line;
-                self.lambda_body(d);
+                let hint = self.hint.take();
+                self.lambda_body_hinted(d, hint);
                 T::of(FN)
             }
             Expr::Reply(status, body, line) => {
@@ -1784,24 +2084,26 @@ impl Checker {
             }
             let recv = self.expr(obj);
             self.line = line;
-            let mut argts: Vec<T> = pre.into_iter().collect();
-            let arg_types: Vec<T> = args.iter().map(|a| self.expr(a)).collect();
+            let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
+            let sig = found.as_ref().and_then(|v| v.sig.clone()).filter(|_| recv.bits & MAP == 0);
+            let mut all = vec![recv];
+            all.extend(pre);
+            for a in args {
+                self.hint = lambda_hint(sig.as_deref(), &all, a);
+                all.push(self.expr(a));
+                self.hint = None;
+            }
             self.line = line;
             if recv.bits & MAP != 0 {
                 // May be a function stored in the map: nothing more to know.
-                let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
                 if let Some(v) = found {
                     self.record(name, &v);
                 }
                 return T::ANY;
             }
-            let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
             match found {
                 Some(v) if v.t.bits & FN != 0 => {
                     self.record(name, &v);
-                    let mut all = vec![recv];
-                    all.append(&mut argts);
-                    all.extend(arg_types);
                     return self.apply(v.t, v.sig.clone(), all, args, name);
                 }
                 _ => {
@@ -1819,10 +2121,143 @@ impl Checker {
         self.line = line;
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
+            self.hint = lambda_hint(sig.as_deref(), &argts, a);
             argts.push(self.expr(a));
+            self.hint = None;
         }
         self.line = line;
         self.apply(ft, sig, argts, args, &callee_name(callee))
+    }
+
+    // ---- narrowing --------------------------------------------------------
+
+    /// What a condition says about variables where it holds (`yes`) or
+    /// does not: `x != null` takes null out of `x`, `x == null` leaves only
+    /// null, `x` alone takes out null and errors. Only variables whose type
+    /// is known and never reassigned.
+    fn facts(&self, c: &Expr, yes: bool, out: &mut Vec<(String, T)>) {
+        let known = |n: &str| {
+            let v = self.scopes.iter().rev().find_map(|s| s.get(n)).or_else(|| self.globals.get(n))?;
+            (!v.t.vague() && v.t.bits & NIL != 0 && !self.assigned.contains(n)).then_some(v.t)
+        };
+        match c {
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b, _) => {
+                let name = match (&**a, &**b) {
+                    (Expr::Ident(n, _), Expr::Lit(Lit::Nil)) | (Expr::Lit(Lit::Nil), Expr::Ident(n, _)) => n,
+                    _ => return,
+                };
+                if let Some(t) = known(name) {
+                    let null = matches!(op, BinOp::Eq) == yes;
+                    out.push((name.clone(), if null { T::of(NIL) } else { t.without(NIL) }));
+                }
+            }
+            Expr::Ident(n, _) if yes => {
+                if let Some(t) = known(n) {
+                    out.push((n.clone(), t.without(NIL | ERR)));
+                }
+            }
+            Expr::Unary(UnOp::Not, x, _) => self.facts(x, !yes, out),
+            Expr::Binary(BinOp::And, a, b, _) if yes => {
+                self.facts(a, true, out);
+                self.facts(b, true, out);
+            }
+            Expr::Binary(BinOp::Or, a, b, _) if !yes => {
+                self.facts(a, false, out);
+                self.facts(b, false, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes facts as true in the innermost scope: a variable there changes
+    /// type, one further out is copied in (the same definition, for the
+    /// language server).
+    fn assume(&mut self, facts: Vec<(String, T)>) {
+        for (n, t) in facts {
+            let found = self.scopes.iter().rev().find_map(|s| s.get(&n).cloned()).or_else(|| self.globals.get(&n).cloned());
+            let (Some(v), Some(scope)) = (found, self.scopes.last_mut()) else { continue };
+            match scope.get_mut(&n) {
+                Some(x) => x.t = t,
+                None => {
+                    scope.insert(n, Var { t, used: true, ..v });
+                }
+            }
+        }
+    }
+
+    /// Checks `f` where the facts hold.
+    fn under(&mut self, facts: Vec<(String, T)>, f: impl FnOnce(&mut Self) -> T) -> T {
+        if facts.is_empty() {
+            return f(self);
+        }
+        self.push();
+        self.assume(facts);
+        let t = f(self);
+        self.pop();
+        t
+    }
+
+    /// `--strict-null`: an operand that may be null where null does not work
+    /// (`count + 1` with `count: int | null`).
+    fn null_operands(&mut self, op: BinOp, x: T, y: T) {
+        if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or) {
+            return;
+        }
+        let maybe = |t: T| !t.vague() && t.bits & NIL != 0 && t.bits != NIL;
+        if maybe(x) && binop_t(op, T::of(NIL), y.without(NIL)).is_none() {
+            self.warn(format!("the left side may be null here (it is {})", t_text(x)));
+        } else if maybe(y) && binop_t(op, x.without(NIL), T::of(NIL)).is_none() {
+            self.warn(format!("the right side may be null here (it is {})", t_text(y)));
+        }
+    }
+
+    /// What some builtins give back, from what they are given: `map` a list
+    /// of what its function returns, `filter` a list like the one it got,
+    /// `first` one of its items or null.
+    fn builtin_ret(&mut self, name: &str, args: &[T], arg_exprs: &[Expr]) -> Option<T> {
+        let a0 = *args.first()?;
+        // A piped value is an argument without an expression of its own.
+        let expr_at = |i: usize| arg_exprs.get(i.checked_sub(args.len() - arg_exprs.len())?);
+        let lit_key = |i: usize| match expr_at(i) {
+            Some(Expr::Lit(Lit::Str(k))) => Some(k.clone()),
+            _ => None,
+        };
+        match name {
+            "map" => {
+                let r = match expr_at(1)? {
+                    Expr::Lambda(d) => *self.ret_cache.get(&def_key(d))?,
+                    _ => return None,
+                };
+                Some(list_of(r))
+            }
+            "filter" | "sort" | "sort_by" | "reverse" | "unique" | "take" | "drop" | "slice" => a0.items().map(|_| a0.without(!LIST)),
+            "first" | "last" if expr_at(0).is_some_and(never_empty) => a0.items(),
+            "find" | "first" | "last" => a0.items().map(|e| e.union(T::of(NIL))),
+            "push" => Some(list_of(a0.items()?.union(*args.get(1)?))),
+            "flatten" => a0.items()?.items().map(list_of),
+            "split" | "keys" => Some(list_of(T::of(STR))),
+            "range" => Some(list_of(T::of(INT))),
+            "sum" => a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0).map(|e| T::of(e.bits)),
+            "min" | "max" => {
+                let e = a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0)?;
+                Some(T::of(if expr_at(0).is_some_and(never_empty) { e.bits } else { e.bits | NIL }))
+            }
+            "merge" => Some(merge_maps(a0, *args.get(1)?)),
+            "set" if args.len() == 3 => {
+                let fs = a0.fields().filter(|_| a0.bits & NIL == 0)?;
+                let k = lit_key(1)?;
+                let mut out: Vec<(Arc<str>, T)> = fs.iter().filter(|(n, _)| **n != *k).cloned().collect();
+                out.push((Arc::from(&*k), args[2]));
+                Some(map_of(out))
+            }
+            "remove" => {
+                let fs = a0.fields().filter(|_| a0.bits & NIL == 0)?;
+                let k = lit_key(1)?;
+                let out: Vec<(Arc<str>, T)> = fs.iter().filter(|(n, _)| **n != *k).cloned().collect();
+                Some(if out.is_empty() { T::of(MAP) } else { map_of(out) })
+            }
+            _ => None,
+        }
     }
 
     /// Strings and numbers are always true in Quillo, where only `null`,
@@ -1946,14 +2381,21 @@ impl Checker {
             self.error(format!("`{}` takes {} argument{}, got {}", name, n, if n == 1 { "" } else { "s" }, args.len()));
         }
         for (i, p) in sig.params.iter().enumerate() {
+            let what = || if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
             match args.get(i) {
                 None if !p.optional => {
                     self.error(format!("missing argument `{}` in call to `{}`", p.name, name));
                     break;
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 => {
-                    let what = if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
-                    self.error(format!("{} of `{}` must be {}, got {}", what, name, bits_text(p.ty), bits_text(a.bits)));
+                    self.error(format!("{} of `{}` must be {}, got {}", what(), name, bits_text(p.ty), bits_text(a.bits)));
+                }
+                Some(a) if p.annotated => {
+                    if let Some(why) = mismatch(*a, p.full) {
+                        self.error(format!("{} of `{}` {}", what(), name, why));
+                    } else if self.strict_null && !a.vague() && a.bits & NIL != 0 && a.bits != NIL && p.ty & NIL == 0 {
+                        self.warn(format!("{} of `{}` may be null here (it is {}), but it must be {}", what(), name, t_text(*a), bits_text(p.ty)));
+                    }
                 }
                 _ => {}
             }
@@ -2028,11 +2470,27 @@ impl Checker {
         if sig.builtin && sig.name == "unwrap" {
             return args.first().map_or(T::ANY, |a| a.without(ERR));
         }
+        if sig.builtin {
+            if let Some(t) = self.builtin_ret(&sig.name, &args, arg_exprs) {
+                return t;
+            }
+        }
         self.fn_ret(&sig)
     }
 
     fn field(&mut self, t: T, obj: &Expr, name: &str) -> T {
         let _ = obj;
+        // A map whose fields are known: one it has, or a mistake (a missing
+        // key reads as null, so nothing would fail).
+        if let Some(fs) = t.fields() {
+            if let Some((_, ft)) = fs.iter().find(|(k, _)| &**k == name) {
+                return ft.union(T::of(t.bits & NIL));
+            }
+            if !matches!(name, "len" | "keys" | "values") {
+                self.error(format!("this map has no field `{}`{}", name, field_hint(name, &fs)));
+                return T::of(NIL);
+            }
+        }
         if t.bits & (MAP | NIL) != 0 || t.is_any() {
             if t.bits & MAP == 0 && t.bits & ERR != 0 && name == "error" {
                 return T::of(t.err);
@@ -2154,6 +2612,83 @@ impl Checker {
                 self.error(format!("<{}> is a server fn, not a view (in <{}>)", el.tag, c));
             }
         }
+    }
+}
+
+/// Why a value can never be what an annotation says, past its kind: a
+/// list of something else, a map without a field it must have.
+fn mismatch(a: T, want: T) -> Option<String> {
+    if let (Some(ae), Some(we)) = (a.items(), want.items()) {
+        if ae.bits != 0 && ae.bits & we.bits == 0 {
+            return Some(format!("must be {}, got {}", t_text(want), t_text(a)));
+        }
+        return mismatch(ae, we).map(|why| format!("holds an item that {}", why));
+    }
+    if let (Some(af), Some(wf)) = (a.fields(), want.fields()) {
+        for (k, wt) in wf.iter() {
+            match af.iter().find(|(n, _)| n == k) {
+                None if wt.bits & NIL == 0 => return Some(format!("has no field `{}`, which {} needs", k, t_text(want))),
+                Some((_, at)) if at.bits != 0 && at.bits & wt.bits == 0 => {
+                    return Some(format!("has `{}` as {}, but it must be {}", k, t_text(*at), t_text(*wt)))
+                }
+                Some((_, at)) => {
+                    if let Some(why) = mismatch(*at, *wt) {
+                        return Some(format!("has `{}` that {}", k, why));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// `(did you mean `title`?)`, or the fields the map has.
+fn field_hint(name: &str, fs: &Shape) -> String {
+    let close = fs.iter().map(|(k, _)| (edit_distance(name, k), k)).filter(|(d, _)| *d <= 2).min_by_key(|(d, _)| *d);
+    match close {
+        Some((_, k)) => format!(" (did you mean `{}`?)", k),
+        None => {
+            let ks: Vec<&str> = fs.iter().map(|(k, _)| &**k).take(8).collect();
+            format!(" (it has {})", ks.join(", "))
+        }
+    }
+}
+
+/// What an unannotated lambda given to a builtin takes: `xs | map((x) => ...)`
+/// gives `x` what `xs` holds. `before` are the arguments ahead of it.
+fn lambda_hint(sig: Option<&Sig>, before: &[T], arg: &Expr) -> Option<Vec<T>> {
+    let sig = sig.filter(|s| s.builtin)?;
+    if !matches!(arg, Expr::Lambda(_)) {
+        return None;
+    }
+    let items = before.first()?.items()?;
+    match (sig.name.as_str(), before.len()) {
+        ("map" | "filter" | "find" | "any" | "all" | "sort_by" | "count" | "group_by", 1) => Some(vec![items]),
+        ("reduce", 2) => Some(vec![T::ANY, items]),
+        _ => None,
+    }
+}
+
+/// A list that has items whatever happens: `[a, b]`, `xs + [0]`.
+fn never_empty(e: &Expr) -> bool {
+    match e {
+        Expr::List(items) => !items.is_empty(),
+        Expr::Binary(BinOp::Add, a, b, _) => never_empty(a) || never_empty(b),
+        _ => false,
+    }
+}
+
+/// A branch that never ends normally: it returns or replies.
+fn exits(e: &Expr) -> bool {
+    match e {
+        Expr::Reply(..) => true,
+        Expr::Block(stmts) => match stmts.last() {
+            Some(Stmt::Return(_)) => true,
+            Some(Stmt::Expr(x)) => exits(x),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

@@ -41,3 +41,12 @@ fn code_that_names_its_language_is_highlighted_and_stays_escaped() {
     assert_eq!(md(r#"markdown("```\n<b>\n```")"#), "<pre><code>&lt;b&gt;\n</code></pre>\n");
     assert_eq!(md(r#"type_of(highlight("x", "qwe"))"#), "html");
 }
+
+#[test]
+fn inline_markdown_keeps_the_line_and_drops_the_blocks() {
+    assert_eq!(md(r#"markdown("A **bold** line, a [link](/x)", { inline: true })"#), r#"A <strong>bold</strong> line, a <a href="/x">link</a>"#);
+    // No headings, lists or paragraphs: their lines, broken.
+    assert_eq!(md(r##"markdown("# Not a heading\n\n- nor a list", { inline: true })"##), "Not a heading<br>nor a list");
+    // As safe as the rest.
+    assert_eq!(md(r#"markdown("<b>x</b> [y](javascript:alert(1))", { inline: true })"#), r#"&lt;b&gt;x&lt;/b&gt; <a href="about:blank#blocked">y</a>"#);
+}

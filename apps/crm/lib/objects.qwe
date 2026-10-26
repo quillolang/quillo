@@ -40,7 +40,7 @@ fn lookup_value(via: map, target: str, id: int) = match via.type {
 // The record's values with its lookup fields filled in from what it links to.
 fn fill_lookups(fields: list, values: map) = fields | filter((f) => f.type == "lookup") | reduce(values, (m, f) => {
     let via = find(fields, (x) => x.key == (f.options ?? [])[0])
-    let id = via == null ? 0 : int(str(m[via.key] ?? "")) ?? 0
+    let id = via == null ? 0 : int(m[via.key]) ?? 0
     set(m, f.key, id == 0 ? null : lookup_value(via, (f.options ?? [])[1] ?? "", id))
 })
 
@@ -50,7 +50,8 @@ fn as_num(v) {
     is_err(n) ? v : n == floor(n) ? int(n) : n
 }
 
-fn object_out(r) = r == null ? null : merge(r, { rules: parsed(r.rules, []), states: parsed(r.states, []), transitions: parsed(r.transitions, []), site: parsed(r.site ?? "{}", {}) })
+fn object_out(r) = r == null ? null : merge(r, { rules: parsed(r.rules, []), states: parsed(r.states, []), transitions: parsed(r.transitions, []), site: parsed(r.site ?? "{}", {}),
+    table: blank(r.table_name) ? `o_${r.key}` : r.table_name, list_fields: parsed(r.list_fields ?? "[]", []) })
 
 fn objects_all() = db.query("select * from objects order by name") | map(object_out)
 
@@ -73,19 +74,54 @@ fn need_object(key: str) {
 
 // ---- designing objects ---------------------------------------------------------------
 
+// The objects as their page lists them: how many fields, rules and records,
+// and when a record last changed (in one query over every table).
 server fn list_objects() {
     let u = need_user()?
     objects_ready()
-    objects_all() | filter((o) => allows(access_to(u, o.key).level, "read")) | map((o) => merge(o, {
-        fields: object_fields(o.key),
-        count: rec_count(o.key),
-    }))
+    let objs = readable_objects(u)
+    let stats = object_stats(objs)
+    let nfields = db.query("select entity, count(*) as n from custom_fields where entity like 'obj.%' group by entity") | reduce({}, (m, r) => set(m, r.entity, r.n))
+    let opened = recent_refs(u, "object")
+    objs | map((o) => {
+        key: o.key, name: o.name, plural: o.plural, icon: o.icon, description: o.description, folder: o.folder ?? "", pinned: o.pinned == 1,
+        table: o.table, fields: nfields[`obj.${o.key}`] ?? 0, rules: len(o.rules), states: len(o.states),
+        count: (stats[o.key] ?? {}).n ?? 0, changed_at: (stats[o.key] ?? {}).at, opened_at: opened[o.key],
+    })
+}
+
+// Each object's records: how many, and the last change, by key.
+fn object_stats(objs: list) {
+    if len(objs) == 0 { return {} }
+    let parts = enumerate(objs) | map((x) => `select ${sql_param(`k${x[0]}`)} as k, count(*) as n, max(updated_at) as at from ${sql_name(x[1].table)}`)
+    let params = enumerate(objs) | reduce({}, (m, x) => set(m, `k${x[0]}`, x[1].key))
+    let rows = db.query(join(parts, " union all "), params)
+    // A table not made yet (an object from before): each on its own.
+    is_err(rows) ? objs | reduce({}, (m, o) => set(m, o.key, { n: rec_count(o.key), at: null }))
+        : rows | reduce({}, (m, r) => set(m, r.k, r))
+}
+
+// Every object's fields, by key: for the roles' editor (in one query).
+server fn objects_fields() {
+    need_user()?
+    db.query("select entity, key, label, type from custom_fields where entity like 'obj.%' order by position, id")
+        | reduce({}, (m, f) => set(m, slice(f.entity, 4), (m[slice(f.entity, 4)] ?? []) + [f]))
+}
+
+// Pinned: in everyone's sidebar. A folder: where the Objects page groups it.
+server fn set_object_place(key: str, place: map) {
+    need_designer()?
+    need_object(key)?
+    if place.pinned != null { db.exec("update objects set pinned = ? where key = ?", place.pinned == true ? 1 : 0, key) }
+    if place.folder != null { db.exec("update objects set folder = ? where key = ?", folder_name(place.folder), key) }
+    true
 }
 
 server fn get_object(key: str) {
     let u = need_user()?
     let a = need_access(u, key, "read", null)?
     let o = need_object(key)?
+    note_recent(u, "object", key)
     let fields = object_fields(key)
     merge(o, { fields: fields | filter((f) => field_level(a, f.key) != "hidden"), can: a.level,
         levels: fields | reduce({}, (m, f) => set(m, f.key, field_level(a, f.key))) })
@@ -110,8 +146,12 @@ server fn save_object(o: map) {
         let key = replace(slugify(name), "-", "_")
         if key == "" || contains(["contact", "company", "deal"], key) { return err({ problems: problem("name", "Choose another name") }) }
         if db.one("select id from objects where key = ?", key) != null { return err({ problems: problem("name", "There is an object with this name") }) }
-        db.exec("insert into objects (key, name, plural, icon, description, title_field, rules, states, transitions, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            key, name, plural, blank(o.icon) ? "◆" : trim(o.icon), trim(o.description ?? ""), o.title_field ?? "", json.stringify(rules), json.stringify(states), json.stringify(transitions), now())
+        // Its table: as named, or after the object.
+        let table = blank(o.table) ? `o_${key}` : table_name(o.table)
+        let tp = table_problem(table, key)
+        if tp != null { return err({ problems: tp }) }
+        db.exec("insert into objects (key, name, plural, icon, description, title_field, rules, states, transitions, table_name, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            key, name, plural, blank(o.icon) ? "◆" : trim(o.icon), trim(o.description ?? ""), o.title_field ?? "", json.stringify(rules), json.stringify(states), json.stringify(transitions), table, now())
         objects_ready()
         sync_table(key)
         key
@@ -236,7 +276,7 @@ server fn get_record(key: str, id: int) {
 
 // "Ada Lovelace" for a contact field's id, and so on.
 fn link_names(fields: list, values: map) = fields | filter((f) => contains(LINK_TYPES, f.type) && !blank(values[f.key])) | reduce({}, (m, f) => {
-    let id = int(str(values[f.key])) ?? 0
+    let id = int(values[f.key]) ?? 0
     let row = match f.type {
         "contact" => db.one("select trim(first_name || ' ' || last_name) as name, id from contacts where id = ?", id)
         "company" => db.one("select name, id from companies where id = ?", id)
@@ -258,7 +298,7 @@ fn records_linking(u, kind: str, id: int, target: str = "") {
         let key = slice(f.entity, 4)
         let o = find(objects, (x) => x.key == key)
         let a = access_to(u, key)
-        !allows(a.level, "read") ? [] : rec_where(key, f.key, str(id))
+        !allows(a.level, "read") ? [] : rec_where(key, f.key, id)
             | filter((r) => may_see(u, a, r))
             | map((r) => { id: r.id, title: r.title, object: key, name: o == null ? key : o.name, icon: o == null ? "◆" : o.icon, via: f.label })
     }) | flatten
@@ -284,10 +324,12 @@ fn typed_values(fields: list, given: map) = fields | filter((f) => f.type != "lo
         "number" => as_num(v)
         "money" => as_num(v)
         "checkbox" => v == true
-        "contact" => str(v)
-        "company" => str(v)
-        "record" => str(v)
-        "person" => str(v)
+        // Links are ids; what is not one stays as it was given, for the
+        // rules to refuse ("choose a contact").
+        "contact" => int(v) ?? v
+        "company" => int(v) ?? v
+        "record" => int(v) ?? v
+        "person" => int(v) ?? v
         // A picture: the media value (its key, size, crop) as it was chosen.
         "image" => type_of(v) == "map" ? v : null
         "markdown" => str(v)
@@ -348,7 +390,8 @@ server fn save_record(key: str, r: map) {
     if contact_id != null { note_activity("record", contact_id, null, `${o.name} ${r.id == null ? "added" : "changed"}: ${record_title(o, fields, values, id)}`) }
     fire(r.id == null ? "record_created" : "record_updated", { object: key, record_id: id, contact_id })
     drain_runs()
-    as_seen(a, rec_get(key, id))
+    // A flow may have removed it meanwhile.
+    as_seen(a, (rec_get(key, id) ?? err("It was removed as it was saved"))?)
 }
 
 // ---- states, and the moves between them ----------------------------------------------------
@@ -366,6 +409,36 @@ fn may_move(u, o: map, t: map) {
 
 // The moves `u` may make with the record now.
 fn moves_for(u, o: map, r: map) = (o.transitions ?? []) | filter((t) => (len(t.from ?? []) == 0 || contains(t.from, r.state)) && may_move(u, o, t))
+
+// The fields its list shows, in the order of its fields (none: the first
+// few short ones).
+server fn set_list_fields(key: str, keys: list) {
+    need_designer()?
+    need_object(key)?
+    let known = object_fields(key) | map((f) => f.key)
+    let kept = known | filter((k) => contains(keys, k))
+    db.exec("update objects set list_fields = ? where key = ?", json.stringify(kept), key)
+    kept
+}
+
+// Renames an object's table. Its records, links to it (the database
+// changes those) and everything that names the object by its key stay as
+// they are; SQL of your own (reports, scripts) that names the table does not.
+server fn rename_object_table(key: str, name: str) {
+    need_designer()?
+    need_object(key)?
+    let from = tbl(key)
+    let to = table_name(name)
+    let p = table_problem(to, key)
+    if p != null { return err({ problems: p }) }
+    if to == from { return to }
+    let done = db.transaction(() => {
+        db.exec(`alter table ${sql_name(from)} rename to ${sql_name(to)}`)?
+        db.exec("update objects set table_name = ? where key = ?", to, key)?
+        to
+    })
+    is_err(done) ? err({ problems: problem("table", `It was not renamed: ${done.error}`) }) : to
+}
 
 // A move: the only way a record's state changes. Its form gives the
 // fields it asks for (each one needed); the record's rules then hold in
@@ -387,13 +460,13 @@ server fn move_record(key: str, id: int, move: str, given: map) {
     let w = rec_update(key, id, values)
     if is_err(w) { return err({ problems: store_problems(key, w) }) }
     rec_set(key, id, { state: t.to, title: record_title(o, fields, values, id) })
-    hand_over(o, rec_get(key, id), u, t.label)
+    hand_over(o, (rec_get(key, id) ?? err("No such record"))?, u, t.label)
     let label = (find(o.states, (st) => st.key == t.to) ?? { label: t.to }).label
     let contact_id = first_contact(fields, values)
     if contact_id != null { note_activity("record", contact_id, null, `${o.name} “${record_title(o, fields, values, id)}”: ${t.label} (now ${label})`) }
     fire("record_moved", { object: key, record_id: id, from: before.state, to: t.to, move: t.key, contact_id })
     drain_runs()
-    as_seen(a, rec_get(key, id))
+    as_seen(a, (rec_get(key, id) ?? err("It was removed as it moved"))?)
 }
 
 server fn delete_record(key: str, id: int) {

@@ -75,16 +75,32 @@ pub struct Arm {
 }
 
 /// A type annotation: one type name or a union such as `int | str`.
-/// `optional` (`str?`) also allows null.
-#[derive(Debug, Clone)]
+/// `optional` (`str?`) also allows null. `list<int>` says what a list
+/// holds (`elem`) and `{ title: str, tags: list<str> }` a map's fields;
+/// only the checker reads these: at run time they are `list` and `map`.
+#[derive(Debug, Clone, Default)]
 pub struct Ty {
     pub names: Vec<String>,
     pub optional: bool,
+    pub elem: Option<Box<Ty>>,
+    pub fields: Option<Vec<(String, Ty)>>,
 }
 
 impl Ty {
     pub fn text(&self) -> String {
-        let mut s = self.names.join(" | ");
+        let mut s = self
+            .names
+            .iter()
+            .map(|n| match (n.as_str(), &self.elem, &self.fields) {
+                ("list", Some(e), _) => format!("list<{}>", e.text()),
+                ("map", _, Some(fs)) => {
+                    let fs: Vec<String> = fs.iter().map(|(k, t)| format!("{}: {}", k, t.text())).collect();
+                    format!("{{ {} }}", fs.join(", "))
+                }
+                _ => n.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
         if self.optional {
             s.push_str(if self.names.len() == 1 { "?" } else { " | null" });
         }

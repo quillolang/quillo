@@ -375,5 +375,33 @@ server fn search(q: str) {
         | map((d) => { kind: "Deal", label: d.title, sub: "", href: "/app/deals" })
     let products = db.query("select id, name, sku from products where lower(name || ' ' || sku) like ? limit 4", like)
         | map((p) => { kind: "Product", label: p.name, sub: p.sku, href: "/app/products" })
-    people + companies + deals + products
+    let words = lower(trim(q))
+    let u = current_user()
+    let objs = readable_objects(u)
+    // Its name first (the start of it best), then its folder.
+    let rank = (o) => starts_with(lower(o.plural), words) || starts_with(lower(o.name), words) ? 0
+        : contains(lower(`${o.plural} ${o.name}`), words) ? 1 : contains(lower(o.folder ?? ""), words) ? 2 : 9
+    let objects = objs | filter((o) => rank(o) < 9) | sort_by(rank) | take(5)
+        | map((o) => { kind: "Object", label: o.plural, sub: o.folder ?? "", href: `/app/o/${o.key}` })
+    let pages = db.query("select id, title, slug, kind from pages where lower(title || ' ' || slug) like ? limit 5", like)
+        | map((p) => { kind: p.kind == "section" ? "Section" : "Page", label: blank(p.title) ? "Untitled" : p.title, sub: `/p/${p.slug}`, href: `/app/pages/${p.id}` })
+    objects + pages + people + companies + deals + products + object_records_like(u, objs, like)
+}
+
+// Records of every object whose title matches, in one query; an object
+// whose access scripts choose the records someone sees is asked about each.
+fn object_records_like(u, objs: list, like: str) {
+    if len(objs) == 0 { return [] }
+    let parts = enumerate(objs) | map((x) => `select * from (select ${sql_param(`k${x[0]}`)} as k, id, title from ${sql_name(x[1].table)} where lower(title) like :like limit 5)`)
+    let params = enumerate(objs) | reduce({ like }, (m, x) => set(m, `k${x[0]}`, x[1].key))
+    let rows = db.query(join(parts, " union all "), params)
+    if is_err(rows) { return [] }
+    let rs = u == null || u.role != "member" ? [] : roles_of(u)
+    rows | filter((r) => {
+        let a = access_in(u, rs, r.k)
+        len(a.scripts) == 0 || may_see(u, a, rec_get(r.k, r.id) ?? { fields: {} })
+    }) | take(8) | map((r) => {
+        let o = find(objs, (x) => x.key == r.k)
+        { kind: o.name, label: r.title, sub: o.folder ?? "", href: `/app/o/${r.k}/${r.id}` }
+    })
 }

@@ -50,7 +50,9 @@ fn calls() {
     one("fn f(x: int = \"a\") = x", "the default of `x` is str, but it must be int");
     clean("fn f(x: int | str) = x\nf(1)\nf(\"a\")\nf(int(\"3\") ?? 0)");
     clean("let xs = [3, 1]\nxs.sort().first()\nxs.len\n[1, 2] | map((x) => x * 2) | sum");
-    clean("let m = { greet: (n) => n }\nm.greet(1)\nm.anything");
+    clean("let m = { greet: (n) => n }\nm.greet(1)\nm.greet");
+    // A map whose fields are known has no others: a misspelled key would read as null.
+    one("let m = { greet: (n) => n }\nm.anything", "this map has no field `anything` (it has greet)");
     clean("print(1, 2, 3)\njson.stringify({ a: 1 }, true)\nlet d = db.query(\"select ?\", 1)");
 }
 
@@ -135,7 +137,10 @@ fn unused_variables_are_warnings() {
 #[test]
 fn calling_a_variable_that_shadows_a_builtin_is_flagged() {
     let d = diags("fn f(xs) {\n let last = min([1, len(xs)])\n last(xs)\n}");
-    assert_eq!(d, vec!["3 warning: `last` here is your variable (line 2), not the builtin `last`; rename the variable to call the builtin"]);
+    assert_eq!(d, vec![
+        "3 warning: `last` here is your variable (line 2), not the builtin `last`; rename the variable to call the builtin",
+        "3 cannot call `last`: it is int, not a function",
+    ]);
     // Your own function of the same name is fine.
     assert!(diags("fn f(xs) {\n let last = (x) => x\n last(xs)\n}").is_empty());
 }
@@ -258,4 +263,89 @@ fn names_in_sql_are_checked() {
     for bad in [r#"sql_name("x\"; drop table users; --")"#, r#"sql_name("1x")"#, r#"sql_name("")"#, r#"sql_param("a b")"#] {
         assert!(run(bad).contains("is not a name SQL can take") || run(bad).contains("takes a name"), "{}: {}", bad, run(bad));
     }
+}
+
+#[test]
+fn lists_know_what_they_hold() {
+    // A lambda given to a builtin takes what the list holds.
+    one("fn f() = [1, 2] | map((x) => x.name)", "int has no field `name`");
+    one("fn f() = [\"a\"] | filter((s) => s > 1)", "cannot compare str with int");
+    one("fn f(xs: list<int>) = xs | reduce(0, (acc, x) => acc + x.size)", "int has no field `size`");
+    one("fn f() { for x in [1, 2] => x.name }", "int has no field `name`");
+    // What builtins give back: an item, the same list, a list of results.
+    one("fn f() = first([1]).name", "int has no field `name`");
+    one("fn f() = [1, 2] | map((x) => str(x)) | map((s) => s.size)", "str has no field `size`");
+    one("fn f() = split(\"a b\", \" \") | map((w) => w + 1 - 1)", "cannot subtract str and int");
+    // Unknown lists stay unknown; mixed ones are either.
+    clean("fn f(xs) = xs | map((x) => x.name)");
+    clean("fn f() = [1, \"a\"] | map((x) => x + 1)");
+    clean("fn f(xs) = ([1] + xs) | map((x) => x.name)");
+}
+
+#[test]
+fn maps_know_their_fields() {
+    one("fn f() {\n let p = { title: \"x\" }\n p.titel\n}", "3 this map has no field `titel` (did you mean `title`?)");
+    one("fn f() = merge({ a: 1 }, { b: 2 }).c", "has no field `c`");
+    one("fn f() = set({ a: 1 }, \"b\", 2).c", "has no field `c`");
+    one("fn f() = [{ id: 1 }] | map((r) => r.idd)", "did you mean `id`?");
+    // A field one branch has is there; maps that grow, or come from elsewhere, are open.
+    clean("fn f(c) {\n let m = c ? { a: 1 } : { b: 2 }\n [m.a, m.b]\n}");
+    clean("fn f(x) = merge({ a: 1 }, x).anything");
+    clean("fn f() {\n let m = {}\n m.anything\n}");
+    clean("fn f() = { a: [1] }.len");
+    clean("fn f(rows) = rows | map((r) => r.anything)");
+}
+
+#[test]
+fn annotations_say_what_lists_and_maps_hold() {
+    one("fn total(xs: list<int>) = sum(xs)\nfn f() = total([\"a\"])", "argument `xs` of `total` must be list<int>, got list<str>");
+    one("fn t(p: { title: str }) = p.title\nfn f() = t({ name: \"x\" })", "argument `p` of `t` has no field `title`");
+    one("fn t(p: { title: str }) = p.title\nfn f() = t({ title: 1 })", "has `title` as int, but it must be str");
+    one("fn t(p: { title: str }) = p.titel", "this map has no field `titel`");
+    one("fn t(ps: list<{ id: int }>) = ps | map((p) => p.di)", "this map has no field `di`");
+    // Optional fields may be missing; extra ones are fine.
+    clean("fn t(p: { title: str, note: str? }) = p.title\nfn f() = t({ title: \"x\", extra: 1 })");
+    clean("fn t(p: { title: str }) -> { title: str, n: int } = merge(p, { n: 1 })");
+    let prog = quillo::parser::Parser::new("fn t(p: { title: str, tags: list<str> }) = 1").parse_program().unwrap();
+    let quillo::ast::Stmt::Fn(d) = &prog[0] else { unreachable!() };
+    assert!(quillo::check::def_text(d).contains("p: { title: str, tags: list<str> }"), "{}", quillo::check::def_text(d));
+}
+
+fn strict(src: &str) -> Vec<String> {
+    let opts = quillo::check::Options { strict_null: true };
+    quillo::check::check_source_opts(src, "t.qwe", Path::new("."), opts)
+        .diagnostics
+        .iter()
+        .map(|d| format!("{}{} {}", d.line, if d.severity == Severity::Warning { " warning:" } else { "" }, d.message))
+        .collect()
+}
+
+#[test]
+fn strict_null_warns_where_null_does_not_work() {
+    let pre = "fn shout(s: str) = upper(s)\nfn maybe(x: int) = x > 1 ? \"a\" : null\n";
+    let warn = |body: &str, want: &str| {
+        let d = strict(&format!("{}{}", pre, body));
+        assert!(d.len() == 1 && d[0].contains(want), "{:?}, wanted {:?} for {}", d, want, body);
+    };
+    let ok = |body: &str| {
+        let d = strict(&format!("{}{}", pre, body));
+        assert!(d.is_empty(), "{:?} for {}", d, body);
+    };
+    warn("fn f() = shout(maybe(2))", "argument `s` of `shout` may be null here (it is str | null), but it must be str");
+    warn("fn f(n: int?) = n + 1", "the left side may be null here (it is int | null)");
+    warn("fn f(x: int) -> str = maybe(x)", "`f` must return str, but this may be null");
+    // Checks narrow the type.
+    ok("fn f() {\n let m = maybe(2)\n m != null ? shout(m) : \"\"\n}");
+    ok("fn f() {\n let m = maybe(2)\n if m == null { return \"\" }\n shout(m)\n}");
+    ok("fn f() {\n let m = maybe(2)\n m != null && shout(m) != \"\"\n}");
+    ok("fn f() {\n let m = maybe(2)\n m == null || shout(m) != \"\"\n}");
+    ok("fn ks(m: map) = keys(m)\nfn f(m: map?) = if m { ks(m) } else { [] }");
+    ok("fn f(n: int?) = match n {\n null => 0\n k => k + 1\n}");
+    ok("fn f() = shout(maybe(2) ?? \"\")");
+    // Values of unknown type, and lists that are never empty, are fine.
+    ok("fn f(x) = shout(x)");
+    ok("fn f(a: int) = max([a, 1]) + 1");
+    ok("fn f() = shout(split(\"a b\", \" \")[1])");
+    // Without the option, none of this is reported.
+    assert!(diags(&format!("{}fn f() = shout(maybe(2))", pre)).is_empty());
 }

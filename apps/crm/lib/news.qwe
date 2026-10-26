@@ -13,7 +13,7 @@ fn site_config(s: map) {
     if c.on != true { return merge(c, { on: false }) }
     let path = slugify(c.path ?? "")
     if path == "" { return err({ problems: problem("site", "Give it an address: news, say") }) }
-    if contains(["app", "p", "blog", "shop", "cart", "checkout", "login", "logout", "setup", "media", "assets", "f", "unsubscribe", "welcome", "sitemap.xml", "robots.txt"], path) {
+    if contains(["app", "p", "blog", "shop", "cart", "checkout", "login", "logout", "setup", "media", "assets", "f", "unsubscribe", "welcome", "preview", "sitemap.xml", "robots.txt"], path) {
         return err({ problems: problem("site", `/${path} is the site's own: choose another address`) })
     }
     merge(c, { on: true, path })
@@ -41,7 +41,7 @@ fn sections_of(o: map) {
     // In the order the newsroom made them.
     rec_all(so.key, 500) | sort_by((r) => r.id) | map((r) => merge(r, {
         slug: slugify(r.title),
-        parent: pf == null ? null : int(str(r.fields[pf.key] ?? "")) ?? null,
+        parent: pf == null ? null : r.fields[pf.key],
     }))
 }
 
@@ -55,7 +55,7 @@ fn section_family(all: list, id: int) {
 fn site_item(o: map, r: map, sections: list, people: map) {
     let s = o.site
     let title = blank(s.title) ? r.title : str(r.fields[s.title] ?? r.title)
-    let sid = blank(s.group) ? null : int(str(r.fields[s.group] ?? "")) ?? null
+    let sid = blank(s.group) ? null : r.fields[s.group]
     let byline = blank(s.byline) ? people[str(r.owner_id)] : people[str(r.fields[s.byline] ?? "")]
     {
         id: r.id, state: r.state,

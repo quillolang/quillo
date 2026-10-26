@@ -9,46 +9,118 @@ let TYPE_LABELS = {
     lookup: "A field of a linked record",
 }
 
+// Many objects: searched, sorted, grouped in folders (folded as you like),
+// as cards or a table; the pinned ones first, and in everyone's sidebar.
 component ObjectsPage(ws: map, on_change) {
     ~rows = list_objects()
-    ~templates = object_templates()
-    ~o = { name: "", plural: "", icon: "◆" }
+    ~templates = null
+    ~o = { name: "", plural: "", icon: "◆", table: "" }
+    // The table's name follows the plural until it is typed.
+    ~table_typed = false
     ~problems = []
-    let admin = ws.user.role != "member"
+    ~making = false
+    ~q = ""
+    ~layout = ""
+    ~sort = "name"
+    ~folded = []
+    let admin = ws.designer == true
     let open = (key) => { on_change(); navigate(`/app/objects/${key}`) }
+    let table = table_typed ? o.table : table_name(blank(o.plural) ? (blank(o.name) ? "" : `${o.name}s`) : o.plural)
+    let reload = () => { rows = list_objects() }
+    let place = (key, m) => { set_object_place(key, m); reload() }
+    if rows == null { return <Loading/> }
+    if is_err(rows) { return <Empty title="Objects did not load"/> }
+    let words = lower(trim(q))
+    let found = rows | filter((x) => words == "" || contains(lower(`${x.plural} ${x.name} ${x.folder} ${x.description}`), words))
+    let sorted = match sort {
+        "records" => found | sort_by((x) => -x.count)
+        "changed" => found | sort_by((x) => -(x.changed_at ?? 0))
+        "opened" => found | sort_by((x) => -(x.opened_at ?? 0))
+        _ => found | sort_by((x) => lower(x.plural))
+    }
+    let shown = layout != "" ? layout : len(rows) > 12 ? "table" : "cards"
+    let folders = unique(rows | map((x) => x.folder) | filter((f) => f != "")) | sort_by(lower)
+    let grouped = len(folders) > 0
+    let groups = (words == "" && any(sorted, (x) => x.pinned) ? [{ id: "★", name: "Pinned", items: sorted | filter((x) => x.pinned) }] : [])
+        + (grouped ? (folders + [""]) | map((f) => { id: f, name: f == "" ? "No folder" : f, items: sorted | filter((x) => x.folder == f) }) | filter((g) => len(g.items) > 0)
+           : [{ id: "", name: "", items: sorted }])
+    let star = (x) => admin ? <button type="button" class={x.pinned ? "pin on" : "pin"} aria-pressed={x.pinned} title={x.pinned ? "Unpin from the sidebar" : "Pin to the sidebar"}
+        @click={() => { place(x.key, { pinned: !x.pinned }) }}>{x.pinned ? "★" : "☆"}</button> : null
+    let folder_cell = (x) => admin
+        ? <input.folder-input list="object-folders" aria-label={`${x.plural}: folder`} placeholder="No folder" value={x.folder} @change={(e) => { place(x.key, { folder: e.value }) }}/>
+        : <span.muted>{x.folder}</span>
     <div.stack>
-        <PageHead title="Objects" sub="Kinds of records of your own — vehicles, events, tickets — with their fields, links to contacts and companies, and rules that check them as you type and again when they are saved."/>
-        {rows == null ? <Loading/> : is_err(rows) ? <Empty title="Objects did not load"/> : len(rows) == 0 ? null
-        : <div.object-grid>{for x in rows => <section.card.object-card key={x.key}>
-            <header><span.object-icon>{x.icon}</span><div><h3>{x.plural}</h3><p.muted.small>{plural(len(x.fields), "field")} · {plural(len(x.rules), "rule")} · {plural(x.count, "record")}</p></div></header>
-            {x.description != "" && <p.muted>{x.description}</p>}
-            <div.inline>
-                <a.button href={`/app/o/${x.key}`}>Open {lower(x.plural)}</a>
-                {admin && <a.button.ghost href={`/app/objects/${x.key}`}>Design</a>}
+        <PageHead title="Objects" sub="Kinds of records of your own — vehicles, events, tickets — with their fields, links to contacts and companies, and rules that check them as you type and again when they are saved.">
+            {admin && <button.primary @click={() => { making = true; problems = []; if templates == null { templates = object_templates() } }}>New object</button>}
+        </PageHead>
+        {len(rows) == 0 ? <Empty title="No objects yet"><p>{admin ? "Make the first: New object, or start from a template." : "Your workspace has none yet."}</p></Empty>
+        : <div.stack>
+            <div.toolbar>
+                <input type="search" aria-label="Find an object" placeholder={`Find one of ${len(rows)} objects`} value={q} @input={(e) => { q = e.value }}/>
+                <select aria-label="Sort" @change={(e) => { sort = e.value }}>
+                    {for x in [["name", "By name"], ["records", "Most records"], ["changed", "Changed lately"], ["opened", "Opened lately"]] => <option value={x[0]} selected={sort == x[0]}>{x[1]}</option>}
+                </select>
+                <div.seg role="group" aria-label="View">
+                    <button type="button" class={shown == "cards" ? "on" : ""} aria-pressed={shown == "cards"} @click={() => { layout = "cards" }}>Cards</button>
+                    <button type="button" class={shown == "table" ? "on" : ""} aria-pressed={shown == "table"} @click={() => { layout = "table" }}>Table</button>
+                </div>
             </div>
-        </section>}</div>}
-        {admin && <div.grid2>
-            <section.card.stack>
-                <h2>Start from a template</h2>
+            <datalist id="object-folders">{for f in folders => <option value={f}></option>}</datalist>
+            {len(found) == 0 && <p.muted>No object matches “{q}”.</p>}
+            {for g in groups => <section.obj-group key={g.id}>
+                {g.name != "" && <button type="button" class="group-head" aria-expanded={!contains(folded, g.id)}
+                    @click={() => { folded = contains(folded, g.id) ? folded | filter((x) => x != g.id) : folded + [g.id] }}>
+                    <span.chev aria-hidden="true">{contains(folded, g.id) ? "▸" : "▾"}</span>{g.name}<span.group-count>{len(g.items)}</span>
+                </button>}
+                {!contains(folded, g.id) && (shown == "table"
+                    ? <div.table-scroll><table.table.objects-table>
+                        <thead><tr>{admin && <th.pin-col><span.sr>Pinned</span></th>}<th>Object</th><th>Folder</th><th.num>Records</th><th.num>Fields</th><th>Last change</th><th></th></tr></thead>
+                        <tbody>{for x in g.items => <tr key={x.key}>
+                            {admin && <td.pin-col>{star(x)}</td>}
+                            <td><a.obj-name href={`/app/o/${x.key}`}><span.object-icon.small>{x.icon}</span><span><b>{x.plural}</b><span.muted.small>{x.description}</span></span></a></td>
+                            <td>{folder_cell(x)}</td>
+                            <td.num>{x.count}</td>
+                            <td.num>{x.fields}</td>
+                            <td.muted>{x.changed_at == null ? "—" : fmt_ago(x.changed_at, now())}</td>
+                            <td.actions>{admin && <a.button.ghost.small href={`/app/objects/${x.key}`}>Design</a>}</td>
+                        </tr>}</tbody>
+                    </table></div>
+                    : <div.object-grid>{for x in g.items => <section.card.object-card key={x.key}>
+                        <header><span.object-icon>{x.icon}</span><div.grow><h3><a href={`/app/o/${x.key}`}>{x.plural}</a></h3><p.muted.small>{plural(x.fields, "field")} · {plural(x.rules, "rule")} · {plural(x.count, "record")}</p></div>{star(x)}</header>
+                        {x.description != "" && <p.muted>{x.description}</p>}
+                        <div.inline>
+                            <a.button href={`/app/o/${x.key}`}>Open</a>
+                            {admin && <a.button.ghost href={`/app/objects/${x.key}`}>Design</a>}
+                            {x.folder != "" && <span.folder-chip>{x.folder}</span>}
+                        </div>
+                    </section>}</div>)}
+            </section>}
+        </div>}
+        {making && <Drawer title="New object" on_close={() => { making = false }}>
+            <div.stack>
+                <form.stack @submit={() => {
+                    let r = save_object(set(o, "table", table))
+                    if is_err(r) { problems = refusal_problems(r) } else { making = false; open(r) }
+                }}>
+                    <div.row2>
+                        <TextField label="One of them" field="name" value={o.name} {problems} on_change={(v) => { o = set(o, "name", v) }} placeholder="Vehicle" autofocus={true}/>
+                        <TextField label="Many" field="plural" value={o.plural} {problems} on_change={(v) => { o = set(o, "plural", v) }} placeholder="Vehicles"/>
+                    </div>
+                    <div.row2>
+                        <TextField label="Icon (a character)" field="icon" value={o.icon} {problems} on_change={(v) => { o = set(o, "icon", v) }}/>
+                        <TextField label="Its table" field="table" value={table} {problems} placeholder="o_vehicles"
+                            help="Letters, digits and _, after o_; a column per field (f_…)" on_change={(v) => { o = set(o, "table", v); table_typed = true }}/>
+                    </div>
+                    <FormProblems {problems}/>
+                    <div.form-actions><button.primary>Create and design it</button></div>
+                </form>
+                <h3>Or start from a template</h3>
                 {templates == null || is_err(templates) ? <Loading/> : <div.templates.two>{for t in templates => <button.template key={t.name} @click={() => {
                     let r = create_from_template(t.name)
-                    if is_err(r) { problems = refusal_problems(r) } else { open(r) }
+                    if is_err(r) { problems = refusal_problems(r) } else { making = false; open(r) }
                 }}><b>{t.icon} {t.name}</b><span>{t.description}</span><span.muted.small>{join(t.fields, ", ")}</span></button>}</div>}
-            </section>
-            <form.card.stack @submit={() => {
-                let r = save_object(o)
-                if is_err(r) { problems = refusal_problems(r) } else { open(r) }
-            }}>
-                <h2>Or a new object</h2>
-                <div.row2>
-                    <TextField label="One of them" field="name" value={o.name} {problems} on_change={(v) => { o = set(o, "name", v) }} placeholder="Vehicle"/>
-                    <TextField label="Many" field="plural" value={o.plural} {problems} on_change={(v) => { o = set(o, "plural", v) }} placeholder="Vehicles"/>
-                </div>
-                <TextField label="Icon (a character)" field="icon" value={o.icon} {problems} on_change={(v) => { o = set(o, "icon", v) }}/>
-                <FormProblems {problems}/>
-                <div.form-actions><button.primary>Create and design it</button></div>
-            </form>
-        </div>}
+            </div>
+        </Drawer>}
     </div>
 }
 
@@ -69,6 +141,7 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
     ~scripting = null
     ~sample_scripts = []
     ~typed_at = null
+    ~renaming = null
     if o == null { return <Loading/> }
     if is_err(o) { return <Empty title="No such object"><p><a href="/app/objects">Objects</a></p></Empty> }
     let reload = () => { o = get_object(key); on_change() }
@@ -80,7 +153,7 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
     let field_options = o.fields | map((x) => { value: x.key, label: x.label })
     let no_value = (op) => contains(["is filled", "is empty"], op)
     // The rules as they are now, on the sample record: the designer's own try.
-    let ctx = ctx_of(ws, { objects: (ws.objects ?? []) | map((x) => x.key == key ? merge(x, { rules: o.rules }) : x), fields: ws.fields })
+    let ctx = ctx_of(ws, { objects: (ws.objects ?? []) | map((x) => x.key == key ? merge(x, { rules: o.rules }) : x), fields: ws.fields + o.fields })
     <div.stack>
         <PageHead title={`${o.icon} ${o.plural}`} sub="Its fields, the rules its records follow, and a form to try them on.">
             <a.button href={`/app/o/${key}`}>Open {lower(o.plural)}</a>
@@ -101,7 +174,40 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
                         <SelectField label="Each record is named by" field="title_field" value={o.title_field} options={o.fields | filter((x) => contains(["text", "email", "date", "select", "number"], x.type)) | map((x) => { value: x.key, label: x.label })} {problems} on_change={(v) => { o = set(o, "title_field", v); saved = "" }} empty="The first text field"/>
                     </div>
                     <AreaField label="What it is for" field="description" value={o.description} {problems} on_change={(v) => { o = set(o, "description", v); saved = "" }} rows={2}/>
+                    <div.row2>
+                        <label.field>
+                            <span.label>Folder</span>
+                            <input list="designer-folders" name="folder" value={o.folder ?? ""} placeholder="No folder"
+                                @change={(e) => { set_object_place(key, { folder: e.value }); o = set(o, "folder", e.value); on_change() }}/>
+                            <datalist id="designer-folders">{for f in unique((ws.objects ?? []) | map((x) => x.folder ?? "") | filter((f) => f != "")) => <option value={f}></option>}</datalist>
+                            <span.help>Where the Objects page groups it</span>
+                        </label>
+                        <label.field.check>
+                            <span.switch><input type="checkbox" checked={o.pinned == 1} @change={(e) => { set_object_place(key, { pinned: e.checked }); o = set(o, "pinned", e.checked ? 1 : 0) }}/><span></span></span>
+                            Pinned to the sidebar, for everyone
+                        </label>
+                    </div>
                     <div.form-actions><button.primary @click={() => { save(o) }}>Save</button>{saved != "" && <span.ok>{saved}</span>}</div>
+                    <div.table-name>
+                        <span.label>Its table</span>
+                        {renaming == null ? <div.inline>
+                            <code>{o.table}</code>
+                            <button.ghost.small type="button" @click={() => { js("navigator.clipboard.writeText", o.table); notify(`${o.table} copied`) }}>Copy</button>
+                            <button.ghost.small type="button" @click={() => { renaming = o.table }}>Rename</button>
+                        </div>
+                        : <form.inline @submit={() => {
+                            if ask("Its records and links stay. SQL of your own that names the table (reports, scripts) needs the new name.", { title: `Rename ${o.table} to ${table_name(renaming)}?`, ok: "Rename" }) {
+                                let r = rename_object_table(key, renaming)
+                                if is_err(r) { problems = refusal_problems(r) } else { problems = []; renaming = null; notify(`The table is ${r} now`); reload() }
+                            }
+                        }}>
+                            <input name="table" value={renaming} @input={(e) => { renaming = e.value }} class={invalid(problems, "table") && "invalid"}/>
+                            <button.primary.small>Rename</button>
+                            <button.ghost.small type="button" @click={() => { renaming = null; problems = [] }}>Cancel</button>
+                        </form>}
+                        <span.help>A column per field: {o.fields | take(3) | map((x) => `f_${x.key}`) | join(", ")}{len(o.fields) > 3 ? ", …" : ""}</span>
+                        <Hints {problems} field="table"/>
+                    </div>
                 </section>
                 <section.card.stack>
                     <h2>Fields</h2>
@@ -138,7 +244,7 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
                         <TextField label="New field" field="label" value={f.label} {problems} on_change={(v) => { f = set(f, "label", v) }} placeholder="Licence plate"/>
                         <SelectField label="Type" field="type" value={f.type} options={FIELD_TYPES | map((t) => { value: t, label: TYPE_LABELS[t] })} {problems} on_change={(v) => { f = set(f, "type", v) }}/>
                         {f.type == "select" && <TextField label="Choices (comma separated)" field="options" value={options_text} {problems} on_change={(v) => { options_text = v }}/>}
-                        {f.type == "record" && <SelectField label="Of which object" field="options" value={target} options={(ws.objects ?? []) | map((y) => { value: y.key, label: y.plural })} {problems} on_change={(v) => { target = v }} empty="Choose"/>}
+                        {f.type == "record" && <PickOne label="Of which object" field="options" value={target} options={(ws.objects ?? []) | map((y) => { value: y.key, label: y.plural })} {problems} on_change={(v) => { target = v }}/>}
                         {f.type == "lookup" && {
                             let links = o.fields | filter((x) => contains(LINK_TYPES, x.type))
                             let chosen = find(links, (x) => x.key == via)
@@ -161,39 +267,57 @@ component ObjectDesigner(okey: str, ws: map, on_change) {
                     <p.muted.small>Checked in the browser as people type, and again on the server when a record is saved. A value that starts with @ is another field's: “Ends after @starts”.</p>
                     {len(o.rules) == 0 ? <p.muted>No rules yet.</p>
                     : <ul.rule-list>{for [i, r] in enumerate(o.rules) => <li key={i}>
-                        <div><b>{rule_text(r, label_of)}</b><span.muted> — “{r.message}”{r.warning && " (a warning)"}</span></div>
+                        <div.rule-say>
+                            <b>{rule_text(r, label_of)}</b>
+                            <span.muted>“{r.message}”</span>
+                        </div>
+                        {r.warning && <Badge text="warning" tone="amber"/>}
                         <button.ghost @click={() => { save(set(o, "rules", o.rules | enumerate | filter((x) => x[0] != i) | map((x) => x[1]))) }}>Remove</button>
                     </li>}</ul>}
-                    {len(o.fields) > 0 && <div.rule-builder.stack>
+                    {len(o.fields) > 0 && <div.rule-builder>
+                        <h3>New rule</h3>
                         <div.rule-row>
                             <span.rule-word>If</span>
-                            <select aria-label="If field" @change={(e) => { rule = set(rule, "if", set(rule.if, "field", e.value)) }}>
-                                <option value="" selected={rule.if.field == ""}>(always)</option>
-                                {for x in field_options => <option value={x.value} selected={rule.if.field == x.value}>{x.label}</option>}
-                            </select>
-                            {rule.if.field != "" && <select aria-label="If test" @change={(e) => { rule = set(rule, "if", set(rule.if, "op", e.value)) }}>{for op in RULE_OPS => <option value={op} selected={rule.if.op == op}>{op}</option>}</select>}
-                            {rule.if.field != "" && !no_value(rule.if.op) && <input aria-label="If value" value={rule.if.value} placeholder="value or @field" @input={(e) => { rule = set(rule, "if", set(rule.if, "value", e.value)) }}/>}
+                            <div.rule-controls>
+                                <select aria-label="If field" @change={(e) => { rule = set(rule, "if", set(rule.if, "field", e.value)) }}>
+                                    <option value="" selected={rule.if.field == ""}>Always</option>
+                                    {for x in field_options => <option value={x.value} selected={rule.if.field == x.value}>{x.label}</option>}
+                                </select>
+                                {rule.if.field != "" && <select aria-label="If test" @change={(e) => { rule = set(rule, "if", set(rule.if, "op", e.value)) }}>{for op in RULE_OPS => <option value={op} selected={rule.if.op == op}>{op}</option>}</select>}
+                                {rule.if.field != "" && !no_value(rule.if.op) && <input aria-label="If value" value={rule.if.value} placeholder="a value, or @field" @input={(e) => { rule = set(rule, "if", set(rule.if, "value", e.value)) }}/>}
+                            </div>
                         </div>
                         <div.rule-row>
-                            <span.rule-word>then</span>
-                            <select aria-label="Then field" @change={(e) => { rule = set(rule, "then", set(rule.then, "field", e.value)) }}>
-                                <option value="" selected={rule.then.field == ""}>Choose a field</option>
-                                {for x in field_options => <option value={x.value} selected={rule.then.field == x.value}>{x.label}</option>}
-                            </select>
-                            <select aria-label="Then test" @change={(e) => { rule = set(rule, "then", set(rule.then, "op", e.value)) }}>{for op in RULE_OPS => <option value={op} selected={rule.then.op == op}>{op}</option>}</select>
-                            {!no_value(rule.then.op) && <input aria-label="Then value" value={rule.then.value} placeholder="value or @field" @input={(e) => { rule = set(rule, "then", set(rule.then, "value", e.value)) }}/>}
+                            <span.rule-word>Then</span>
+                            <div.rule-controls>
+                                <select aria-label="Then field" @change={(e) => { rule = set(rule, "then", set(rule.then, "field", e.value)) }}>
+                                    <option value="" selected={rule.then.field == ""}>Choose a field</option>
+                                    {for x in field_options => <option value={x.value} selected={rule.then.field == x.value}>{x.label}</option>}
+                                </select>
+                                <select aria-label="Then test" @change={(e) => { rule = set(rule, "then", set(rule.then, "op", e.value)) }}>{for op in RULE_OPS => <option value={op} selected={rule.then.op == op}>{op}</option>}</select>
+                                {!no_value(rule.then.op) && <input aria-label="Then value" value={rule.then.value} placeholder="a value, or @field" @input={(e) => { rule = set(rule, "then", set(rule.then, "value", e.value)) }}/>}
+                            </div>
                         </div>
                         <div.rule-row>
-                            <span.rule-word>or say</span>
-                            <input.grow aria-label="Message" value={rule.message} placeholder="It ends after it starts" @input={(e) => { rule = set(rule, "message", e.value) }}/>
-                            <label.inline.small><input type="checkbox" checked={rule.warning} @change={() => { rule = set(rule, "warning", !rule.warning) }}/> only warn</label>
+                            <span.rule-word>Else say</span>
+                            <div.rule-controls>
+                                <input aria-label="Message" value={rule.message} placeholder="It ends after it starts" @input={(e) => { rule = set(rule, "message", e.value) }}/>
+                                <label.rule-warn>
+                                    <span.switch><input type="checkbox" checked={rule.warning} @change={() => { rule = set(rule, "warning", !rule.warning) }}/><span></span></span>
+                                    Only warn
+                                </label>
+                            </div>
                         </div>
                         <Hints {problems} field="rules"/>
-                        <div><button.primary disabled={rule.then.field == "" || blank(rule.message)} @click={() => {
-                            let r = merge(rule, { if: rule.if.field == "" ? null : rule.if })
-                            save(set(o, "rules", o.rules + [r]))
-                            rule = { if: { field: "", op: "is", value: "" }, then: { field: "", op: "is filled", value: "" }, message: "", warning: false }
-                        }}>Add rule</button></div>
+                        <div.rule-foot>
+                            <button.primary disabled={rule.then.field == "" || blank(rule.message)} @click={() => {
+                                let r = merge(rule, { if: rule.if.field == "" ? null : rule.if })
+                                save(set(o, "rules", o.rules + [r]))
+                                rule = { if: { field: "", op: "is", value: "" }, then: { field: "", op: "is filled", value: "" }, message: "", warning: false }
+                            }}>Add rule</button>
+                            <span.muted.small>{rule.then.field == "" ? "Choose the field it checks, and what to say."
+                                : `${rule_text(merge(rule, { if: rule.if.field == "" ? null : rule.if }), label_of)}${blank(rule.message) ? " — and what to say?" : ""}`}</span>
+                        </div>
                     </div>}
                 </section>
             </div>
@@ -259,6 +383,43 @@ fn shown_value(f: map, r: map) {
         : str(v)
 }
 
+// Numbers line up on the right; text is cut short in a cell.
+fn cell_class(f: map) = contains(["number", "money"], f.type) ? "num" : "cut"
+
+// How much of a form's row a field takes: long text and pictures all of it.
+fn field_span(f: map) = contains(["textarea", "markdown", "image"], f.type) ? "wide" : f.type == "checkbox" ? "low" : ""
+
+let FIELD_GLYPHS = { text: "Aa", textarea: "¶", markdown: "M", number: "#", money: "¤", date: "◷", select: "▾", checkbox: "✓",
+    url: "↗", email: "@", image: "▣", contact: "☺", person: "☺", company: "▦", record: "◆", lookup: "⤷" }
+
+// The list's columns, for everyone, in a menu by its button: a switch per
+// field, the shown ones first; Escape or a click outside closes it.
+component ColumnsMenu(o: map, shown: list, on_set) {
+    ~open = false
+    ~q = ""
+    let found = (f) => q == "" || contains(lower(f.label), lower(q))
+    let on = o.fields | filter((f) => contains(shown, f.key) && found(f))
+    let off = o.fields | filter((f) => !contains(shown, f.key) && found(f))
+    let row = (f, is_on) => <label.col-row key={f.key}>
+        <span.col-glyph aria-hidden="true">{FIELD_GLYPHS[f.type] ?? "·"}</span>
+        <span.col-label>{f.label}</span>
+        <span.switch><input type="checkbox" checked={is_on} @change={(e) => { on_set(e.checked ? shown + [f.key] : shown | filter((x) => x != f.key)) }}/><span></span></span>
+    </label>
+    <div.col-menu @keydown={(e) => { if e.key == "Escape" { open = false } }}>
+        <button type="button" class={open ? "col-button on" : "col-button"} aria-expanded={open} aria-haspopup="dialog" @click={() => { open = !open }}>
+            <span.col-icon aria-hidden="true"></span>Columns<span.col-count>{len(shown)}/{len(o.fields)}</span>
+        </button>
+        {open && <div.col-backdrop @click={() => { open = false }}></div>}
+        {open && <div.col-pop role="dialog" aria-label="Columns">
+            <input.col-find type="search" aria-label="Find a field" placeholder="Find a field" value={q} @input={(e) => { q = e.value }}/>
+            <div.col-head><span>Shown in the list</span><button type="button" @click={() => { on_set([]) }}>Default</button></div>
+            {len(on) == 0 ? <p.col-none>None</p> : <div>{for f in on => row(f, true)}</div>}
+            <div.col-head><span>Hidden</span>{len(off) > 0 && <button type="button" @click={() => { on_set(shown + (off | map((f) => f.key))) }}>Show all</button>}</div>
+            {len(off) == 0 ? <p.col-none>None</p> : <div>{for f in off => row(f, false)}</div>}
+        </div>}
+    </div>
+}
+
 component RecordsPage(okey: str, ws: map) {
     let key = okey
     ~o = get_object(key)
@@ -268,9 +429,17 @@ component RecordsPage(okey: str, ws: map) {
     ~state = ""
     if o == null { return <Loading/> }
     if is_err(o) { return <Empty title="No such object"><p><a href="/app/objects">Objects</a></p></Empty> }
-    // Short fields read in a list: not pictures, long text, or the site's caption and summary.
-    let cols = o.fields | filter((f) => f.key != o.title_field && !contains(["textarea", "markdown", "image"], f.type)
-        && f.key != (o.site ?? {}).caption && f.key != (o.site ?? {}).summary) | take(4)
+    // The columns its designer chose; else the first short fields: not pictures,
+    // long text, or the site's caption and summary.
+    let chosen = o.list_fields ?? []
+    let cols = len(chosen) > 0 ? o.fields | filter((f) => contains(chosen, f.key))
+        : o.fields | filter((f) => f.key != o.title_field && !contains(["textarea", "markdown", "image"], f.type)
+            && f.key != (o.site ?? {}).caption && f.key != (o.site ?? {}).summary) | take(8)
+    let shown_keys = cols | map((f) => f.key)
+    let choose = (keys) => {
+        let next = set_list_fields(key, keys)
+        if !is_err(next) { o = set(o, "list_fields", next) }
+    }
     let has_states = len(o.states) > 0
     let shown_rows = rows == null || is_err(rows) ? rows : rows | filter((r) => state == "" || r.state == state)
     <div.stack>
@@ -285,18 +454,19 @@ component RecordsPage(okey: str, ws: map) {
                 <option value="">Every state</option>
                 {for st in o.states => <option value={st.key} selected={state == st.key}>{st.label}</option>}
             </select>}
+            {ws.designer && <ColumnsMenu {o} shown={shown_keys} on_set={choose}/>}
         </div>
         {shown_rows == null ? <Loading/>
         : is_err(shown_rows) || len(shown_rows) == 0 ? <Empty title={`No ${lower(o.plural)} here`}><p>{state == "" ? "Add the first one." : "None in this state."}</p></Empty>
-        : <table.table>
-            <thead><tr><th>{o.name}</th>{has_states && <th>State</th>}{for f in cols => <th>{f.label}</th>}<th>Updated</th></tr></thead>
+        : <div.table-scroll><table.table.records>
+            <thead><tr><th>{o.name}</th>{has_states && <th>State</th>}{for f in cols => <th class={cell_class(f)}>{f.label}</th>}<th>Updated</th></tr></thead>
             <tbody>{for r in shown_rows => <tr key={r.id} class="clickable" @click={() => { navigate(`/app/o/${key}/${r.id}`) }}>
                 <td><b>{r.title}</b></td>
                 {has_states && <td><StateBadge {o} state={r.state}/></td>}
-                {for f in cols => <td>{shown_value(f, r)}</td>}
+                {for f in cols => <td class={cell_class(f)} title={shown_value(f, r)}>{shown_value(f, r)}</td>}
                 <td.muted>{fmt_ago(r.updated_at, now())}</td>
             </tr>}</tbody>
-        </table>}
+        </table></div>}
         {editing != null && <Drawer title={`New ${lower(o.name)}`} on_close={() => { editing = null }}>
             <RecordForm {o} record={editing} {ws} on_saved={(r) => { editing = null; navigate(`/app/o/${key}/${r.id}`) }}/>
         </Drawer>}
@@ -312,7 +482,7 @@ component RecordForm(o: map, record: map, ws: map, on_saved) {
     ~choices = link_choices(o.key)
     ~scripted = []
     ~typed_at = null
-    let ctx = ctx_of(ws)
+    let ctx = ctx_of(ws, { fields: ws.fields + o.fields })
     // The fields' rule scripts run on the server: asked when typing pauses.
     if typed_at != null {
         every(250, () => {
@@ -332,13 +502,13 @@ component RecordForm(o: map, record: map, ws: map, on_saved) {
             if is_err(saved) { server = refusal_problems(saved) } else { server = []; on_saved(saved) }
         }
     }}>
-        {choices == null ? <Loading/> : <div.stack>{for f in o.fields => (o.levels ?? {})[f.key] == "read"
-            ? <div.field key={f.key}><span.label>{f.label}</span><p.lookup-value>{shown_value(f, r) == "" ? "—" : shown_value(f, r)} <span.muted.small>(your role may read it)</span></p></div>
-            : <ObjField key={f.key} {f} record={r} problems={shown} choices={is_err(choices) ? null : choices}
-                on_change={(path, v) => { r = put(r, path, v); touched = true; server = []; typed_at = now() }}/>}</div>}
+        {choices == null ? <Loading/> : <div.record-fields>{for f in o.fields => <div key={f.key} class={field_span(f)}>{(o.levels ?? {})[f.key] == "read"
+            ? <div.field><span.label>{f.label}</span><p.lookup-value>{shown_value(f, r) == "" ? "—" : shown_value(f, r)} <span.muted.small>(your role may read it)</span></p></div>
+            : <ObjField {f} record={r} problems={shown} choices={is_err(choices) ? null : choices}
+                on_change={(path, v) => { r = put(r, path, v); touched = true; server = []; typed_at = now() }}/>}</div>}</div>}
         {touched && len(found) > 0 && <ul.problems>{for x in found => <li class={x.level == "warning" ? "warn" : ""}>{x.message}</li>}</ul>}
         <FormProblems problems={server | filter((x) => x.field == "")}/>
-        <div.form-actions><button.primary>Save {lower(o.name)}</button></div>
+        <div.form-actions.stuck><button.primary>Save {lower(o.name)}</button></div>
     </form>
 }
 
@@ -365,7 +535,7 @@ component RecordPage(okey: str, id: int, ws: map) {
             <button type="button" class={tab == "fields" ? "tab on" : "tab"} @click={() => { tab = "fields" }}>Details</button>
             <button type="button" class={tab == "review" ? "tab on" : "tab"} @click={() => { tab = "review" }}>Review{(r.comments ?? 0) > 0 && ` (${r.comments})`}</button>
         </nav>
-        {tab == "review" ? <ReviewPanel okey={key} {id} {ws}/> : <div.grid2>
+        {tab == "review" ? <ReviewPanel okey={key} {id} {ws}/> : <div.record-layout>
             <section.card>
                 {r.can == "read" ? <dl.record-view>{for f in o.fields => <div key={f.key}><dt>{f.label}</dt><dd>{shown_value(f, r)}</dd></div>}</dl>
                 : <RecordForm {o} record={r} {ws} on_saved={(saved) => { r = get_record(key, id); message = "Saved" }}/>}
@@ -409,23 +579,34 @@ component RolesSettings(ws: map, on_change) {
     ~editing = null
     ~problems = []
     ~tried = {}
+    ~ofields = null
+    ~find = ""
     let admin = ws.user.role != "member"
     let objects = ws.objects ?? []
+    let level_of = (r, o) => (r.access[o.key] ?? {}).level ?? "none"
+    let edit_role = (r) => { editing = r; problems = []; find = ""; if ofields == null { ofields = objects_fields() } }
     <div.stack>
         <p.muted>Owners and admins may do anything. A member with a role may do with each object what the role allows, and sees the records its access script lets through; a member with no role edits every object.</p>
         {rows == null ? <Loading/> : is_err(rows) ? <Empty title="Roles did not load"/>
         : <div.object-grid>{for r in rows => <section.card.stack key={r.id}>
             <h3>{r.name}</h3>
             <p.muted.small>{plural(r.members, "member")}</p>
-            <ul.plain>{for o in objects => <li key={o.key}><span>{o.icon} {o.plural}</span><Badge text={(r.access[o.key] ?? {}).level ?? "none"}/>{!blank((r.access[o.key] ?? {}).script) && <code.small>script</code>}</li>}</ul>
+            {{
+                let granted = objects | filter((o) => level_of(r, o) != "none")
+                <div.stack>
+                    <p.small>Sees {plural(len(granted), "object")} of {len(objects)} · edits {len(granted | filter((o) => allows(level_of(r, o), "edit")))}</p>
+                    {len(granted) > 0 && <ul.plain>{for o in granted | take(6) => <li key={o.key}><span>{o.icon} {o.plural}</span><Badge text={level_of(r, o)}/>{!blank((r.access[o.key] ?? {}).script) && <code.small>script</code>}</li>}</ul>}
+                    {len(granted) > 6 && <p.muted.small>and {len(granted) - 6} more</p>}
+                </div>
+            }}
             {admin && <div.inline>
-                <button @click={() => { editing = r; problems = [] }}>Edit</button>
+                <button @click={() => { edit_role(r) }}>Edit</button>
                 <button.ghost @click={() => {
                     if ask("Its members then edit every object.", { title: `Delete the role ${r.name}?`, ok: "Delete", tone: "danger" }) { delete_role(r.id); rows = list_roles(); on_change() }
                 }}>Delete</button>
             </div>}
         </section>}</div>}
-        {admin && <div><button.primary @click={() => { editing = { name: "", access: {} }; problems = [] }}>New role</button></div>}
+        {admin && <div><button.primary @click={() => { edit_role({ name: "", access: {} }) }}>New role</button></div>}
         {editing != null && <Drawer title={editing.id == null ? "New role" : editing.name} on_close={() => { editing = null }}>
             <form.stack @submit={() => {
                 let r = save_role(editing)
@@ -433,7 +614,8 @@ component RolesSettings(ws: map, on_change) {
             }}>
                 <TextField label="Name" field="name" value={editing.name} {problems} on_change={(v) => { editing = set(editing, "name", v) }} placeholder="Support"/>
                 {len(objects) == 0 && <p.muted>Make an object first (Objects): roles say what members may do with each.</p>}
-                {for o in objects => {
+                {len(objects) > 8 && <input type="search" aria-label="Find an object" placeholder={`Find one of ${len(objects)} objects`} value={find} @input={(e) => { find = e.value }}/>}
+                {for o in objects | filter((o) => find == "" || contains(lower(`${o.plural} ${o.folder ?? ""}`), lower(find))) | sort_by((o) => level_of(editing, o) == "none" ? 1 : 0) => {
                     let a = merge({ level: "none", script: "" }, editing.access[o.key] ?? {})
                     let put_a = (k, v) => { editing = set(editing, "access", set(editing.access, o.key, set(a, k, v))) }
                     <section.role-object key={o.key}>
@@ -443,9 +625,9 @@ component RolesSettings(ws: map, on_change) {
                             </select>
                         </div>
                         {a.level != "none" && <div.stack>
-                            {len(ws.fields | filter((f) => f.entity == `obj.${o.key}`)) > 0 && <div.field-levels>
+                            {len((ofields ?? {})[o.key] ?? []) > 0 && <div.field-levels>
                                 <span.label.small>Its fields</span>
-                                {for f in ws.fields | filter((f) => f.entity == `obj.${o.key}`) => <label.inline.small key={f.key}>
+                                {for f in (ofields ?? {})[o.key] ?? [] => <label.inline.small key={f.key}>
                                     <span.grow>{f.label}</span>
                                     <select aria-label={`${f.label}: what they may do`} @change={(e) => { put_a("fields", set(a.fields ?? {}, f.key, e.value)) }}>
                                         {for l in [["edit", "Edit"], ["read", "Read"], ["hidden", "Hidden"]] => <option value={l[0]} selected={((a.fields ?? {})[f.key] ?? (allows(a.level, "edit") ? "edit" : "read")) == l[0]}>{l[1]}</option>}
@@ -534,20 +716,20 @@ component StatesEditor(o: map, ws: map, on_save, problems: list) {
     <section.card.stack>
         <h2>States and moves</h2>
         <p.muted.small>A record starts in the first state, and changes state only by a move: its form, the people it is for, the rules in the state it goes to.</p>
-        {for [i, st] in enumerate(states) => <div.inline key={i}>
+        {len(states) > 0 && <div.state-rows>{for [i, st] in enumerate(states) => <div.state-row key={i}>
             <input aria-label="State" value={st.label} placeholder="Pitched" @input={(e) => { states = states | enumerate | map((x) => x[0] == i ? set(x[1], "label", e.value) : x[1]) }}/>
             <select aria-label="Colour" @change={(e) => { states = states | enumerate | map((x) => x[0] == i ? set(x[1], "color", e.value) : x[1]) }}>
                 {for c in STATE_COLORS => <option value={c} selected={(st.color ?? "gray") == c}>{c}</option>}
             </select>
-            {i == 0 && <span.muted.small>start</span>}
+            <span.start>{i == 0 ? "start" : ""}</span>
             <button.icon type="button" title="Remove" @click={() => { states = states | enumerate | filter((x) => x[0] != i) | map((x) => x[1]) }}>✕</button>
-        </div>}
+        </div>}</div>}
         <div.inline>
             <button type="button" @click={() => { states = states + [{ key: "", label: "", color: "gray" }] }}>Add a state</button>
             <button.primary type="button" @click={() => { on_save(merge(o, { states })) }}>Save states</button>
         </div>
         <Hints {problems} field="states"/>
-        {len(o.states ?? []) > 0 && <div.stack>
+        {len(o.states ?? []) > 0 && <div.stack.moves>
             <h3>Moves</h3>
             {len(o.transitions ?? []) == 0 ? <p.muted>No moves yet: records stay where they start.</p>
             : <ul.rule-list>{for [i, t] in enumerate(o.transitions) => <li key={i}>

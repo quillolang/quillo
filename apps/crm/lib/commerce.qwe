@@ -25,7 +25,7 @@ fn as_variant(p: map, v) = v == null ? merge(p, { key: p.sku, variant: "" }) : m
 fn price_from(p: map) = len(p.variants) == 0 ? p.price_cents : min(p.variants | map((v) => v.price_cents ?? p.price_cents))
 fn sold_out(p: map) = len(p.variants) == 0 ? p.stock == 0 : all(p.variants, (v) => v.stock == 0)
 
-fn clamp_qty(q) = max([1, min([99, int(str(q ?? 1)) ?? 1])])
+fn clamp_qty(q) = max([1, min([99, int(q) ?? 1])])
 
 // The quote for lines ({ product, qty }) with a discount (or null), as the
 // buyer filled the checkout in: subtotal, discount, shipping (from the
@@ -42,8 +42,8 @@ fn quote_lines(o: map, lines: list, discount, ctx: map) {
         : discount.kind == "amount" ? min([subtotal, discount.value])
         : 0
     let s = ctx.settings ?? {}
-    let rate = int(str(s.shipping_cents ?? "0")) ?? 0
-    let free_over = int(str(s.free_shipping_over_cents ?? "0")) ?? 0
+    let rate = int(s.shipping_cents) ?? 0
+    let free_over = int(s.free_shipping_over_cents) ?? 0
     let ships = any(lines, (l) => !(l.product.digital == true) && l.product.kind != "subscription")
     let shipping = !ships || (usable && discount.kind == "shipping") || (free_over > 0 && subtotal - off >= free_over) ? 0 : rate
     let tax = active_plugins(ctx.enabled ?? [])
@@ -201,7 +201,7 @@ fn add_to_cart(sku: str, qty, variant: str = "") {
 fn item_key(i: map) = blank(i.variant) ? i.sku : `${i.sku}~${i.variant}`
 
 fn update_cart(key: str, qty) {
-    let n = int(str(qty ?? 0)) ?? 0
+    let n = int(qty) ?? 0
     set_cart(cart() | map((i) => item_key(i) == key ? set(i, "qty", n <= 0 ? 0 : clamp_qty(n)) : i))
 }
 

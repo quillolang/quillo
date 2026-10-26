@@ -398,12 +398,24 @@ impl Parser {
     fn parse_type(&mut self) -> PResult<Ty> {
         let mut names: Vec<String> = Vec::new();
         let mut optional = false;
+        let mut elem = None;
+        let mut fields = None;
         loop {
             let t = self.next()?;
             let name = match t.tok {
                 Tok::Ident(s) => s,
+                // `{ title: str, tags: list<str> }`: a map and its fields.
+                Tok::LBrace => {
+                    fields = Some(self.parse_shape()?);
+                    "map".to_string()
+                }
                 other => return Err(QuilloError::new(format!("expected a type, found {}", other.describe()), t.line)),
             };
+            // `list<int>`: what the list holds.
+            if name == "list" && self.eat(&Tok::Lt)? {
+                elem = Some(Box::new(self.parse_type()?));
+                self.expect(&Tok::Gt, "`>` after the list's type")?;
+            }
             if name == "nil" {
                 return Err(QuilloError::new("use `null` instead of `nil`", t.line));
             }
@@ -429,7 +441,35 @@ impl Parser {
         if names.is_empty() {
             names.push("any".into());
         }
-        Ok(Ty { names, optional })
+        Ok(Ty { names, optional, elem, fields })
+    }
+
+    /// The fields of a map type, after its `{`.
+    fn parse_shape(&mut self) -> PResult<Vec<(String, Ty)>> {
+        let mut fields: Vec<(String, Ty)> = Vec::new();
+        loop {
+            self.skip_list_seps()?;
+            if self.eat(&Tok::RBrace)? {
+                return Ok(fields);
+            }
+            let t = self.next()?;
+            let key = match t.tok {
+                Tok::Ident(s) => s,
+                Tok::Str(parts) => match lit_string(parts) {
+                    Some(s) => s,
+                    None => return Err(QuilloError::new("map keys must be plain strings", t.line)),
+                },
+                other => return Err(QuilloError::new(format!("expected a field name, found {}", other.describe()), t.line)),
+            };
+            self.expect(&Tok::Colon, &format!("`:` and a type after `{}`", key))?;
+            let ty = self.parse_type()?;
+            fields.retain(|(k, _)| *k != key);
+            fields.push((key, ty));
+            match self.peek()? {
+                Tok::Comma | Tok::Newline | Tok::Semi | Tok::RBrace => {}
+                other => return self.err_at(format!("expected `,` or `}}` in a map type, found {}", other.describe())),
+            }
+        }
     }
 
     fn read_word(&mut self) -> String {

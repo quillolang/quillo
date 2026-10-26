@@ -61,6 +61,7 @@ use "lib/store.qwe"
 use "lib/objects.qwe"
 use "lib/news.qwe"
 use "lib/review.qwe"
+use "lib/feedback.qwe"
 use "lib/roles.qwe"
 use "lib/desks.qwe"
 use "plugins/core_blocks.qwe"
@@ -175,6 +176,14 @@ route GET /blog/:slug {
     blog_post(slug)
 }
 
+// A page as its designer has it on screen, following each change, by its
+// secret link (any browser, no sign-in).
+route GET /preview/:token {
+    workspace_here()
+    let p = page_out(db.one("select * from pages where preview_token = ? and preview_token != ''", token)) ?? reply 404 <NotFoundPage what="preview"/>
+    <SiteLayout title={p.title} description="" live={true}><LivePreview {token}/></SiteLayout>
+}
+
 route GET /p/:slug {
     workspace_here()
     show_page(published_page(slug) ?? reply 404 <NotFoundPage what="page"/>)
@@ -183,8 +192,10 @@ route GET /p/:slug {
 // A request for a workspace that does not exist answers 404, before any
 // page touches its (absent) database.
 // (On the main site, with no workspace in the address, there is none.)
-fn workspace_here() = (tenant() != null && db.tenant_exists(tenant()))
-    || (SINGLE ? reply 303 redirect("/setup") : reply 404 <NoWorkspace/>)
+fn workspace_here() {
+    let t = tenant()
+    (t != null && db.tenant_exists(t)) || (SINGLE ? reply 303 redirect("/setup") : reply 404 <NoWorkspace/>)
+}
 
 // With one workspace: setting it up, on the first visit.
 route GET /setup {

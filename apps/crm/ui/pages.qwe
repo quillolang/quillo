@@ -653,8 +653,8 @@ component DiscountForm(discount: map, ws: map, on_saved) {
 }
 
 component ShippingPanel(ws: map) {
-    ~rate = str((int(str(ws.settings.shipping_cents ?? "0")) ?? 0) / 100)
-    ~free = str((int(str(ws.settings.free_shipping_over_cents ?? "0")) ?? 0) / 100)
+    ~rate = str((int(ws.settings.shipping_cents) ?? 0) / 100)
+    ~free = str((int(ws.settings.free_shipping_over_cents) ?? 0) / 100)
     ~saved = false
     ~server = []
     <section.card.narrow.stack>

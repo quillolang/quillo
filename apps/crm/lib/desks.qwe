@@ -143,9 +143,9 @@ server fn save_desk(d: map) {
     if db.one("select id from desks where category = ? and id != ?", category, d.id ?? 0) != null {
         return err({ problems: problem("category", category == "" ? "There is a default desk" : "This category has a desk") })
     }
-    let n = int(str(d.approvals ?? "1")) ?? 1
+    let n = int(d.approvals) ?? 1
     if n < 0 || n > 5 { return err({ problems: problem("approvals", "From 0 to 5 approvals") }) }
-    let ids = (xs) => json.stringify((xs ?? []) | map((x) => int(str(x)) ?? 0) | filter((x) => x > 0) | unique)
+    let ids = (xs) => json.stringify((xs ?? []) | map((x) => int(x) ?? 0) | filter((x) => x > 0) | unique)
     let reviewers = len(d.reviewers ?? []) + len(d.reviewer_groups ?? [])
     if reviewers > 0 && len(d.reviewer_groups ?? []) == 0 && len(d.reviewers ?? []) < n { return err({ problems: problem("reviewers", `${plural(n, "approval")} need at least as many reviewers`) }) }
     let vals = { category, editors: ids(d.editors), reviewers: ids(d.reviewers), publishers: ids(d.publishers), eg: ids(d.editor_groups), rg: ids(d.reviewer_groups), pg: ids(d.publisher_groups), n }

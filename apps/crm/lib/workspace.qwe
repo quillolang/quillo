@@ -125,6 +125,7 @@ server fn create_workspace(form: map) {
 server fn load_workspace() {
     let u = need_user()?
     let s = settings()
+    let objects = readable_objects(u) | map((o) => remove(o, "site"))
     {
         user: u,
         name: s.name ?? "",
@@ -134,7 +135,9 @@ server fn load_workspace() {
         enabled: enabled_plugins(),
         developer: is_developer(u.email),
         try_drafts: s.try_drafts == true,
-        fields: custom_fields(),
+        // Objects' fields come with each object (get_object): a hundred objects
+        // would be thousands of fields on every page.
+        fields: custom_fields() | filter((f) => !starts_with(f.entity, "obj.")),
         settings: remove(remove(s, "secret"), "mail_webhook"),
         mail_live: (s.mail_webhook ?? "") != "",
         today: iso_day(now()),
@@ -143,12 +146,35 @@ server fn load_workspace() {
         users: db.query("select id, name, email, role, role_id from users order by name"),
         forms: db.query("select slug, name from forms order by name"),
         skus: db.query("select sku, name from products where active = 1 order by name"),
-        objects: objects_all() | filter((o) => allows(access_to(u, o.key).level, "read")),
+        objects: objects,
         roles: db.query("select id, name from roles order by name"),
         groups: db.query("select id, name, members, capabilities from groups order by name") | map((g) => merge(g, { members: parsed(g.members, []), capabilities: parsed(g.capabilities, []) })),
         designer: can_be(u, "designer"),
         notice_styles: notices_for(enabled_plugins()) | map((n) => remove(n, "css")),
         notice: notice_style().id,
+    }
+}
+
+// The sidebar's objects and pages: the pinned ones, then what this person
+// opened last, eight of each at most. Live: it follows what they open.
+server fn sidebar_nav() {
+    let u = need_user()?
+    sidebar_lists(u, readable_objects(u))
+}
+
+fn sidebar_lists(u, objects: list) {
+    let seen = recent_refs(u, "object")
+    let pinned = objects | filter((o) => o.pinned == 1)
+    let recent = objects | filter((o) => o.pinned != 1 && seen[o.key] != null) | sort_by((o) => -seen[o.key])
+    let pages = db.query("select id, title, kind, pinned from pages")
+    let pseen = recent_refs(u, "page")
+    let ppinned = pages | filter((p) => p.pinned == 1)
+    let precent = pages | filter((p) => p.pinned != 1 && pseen[str(p.id)] != null) | sort_by((p) => -pseen[str(p.id)])
+    {
+        objects: (pinned + recent) | take(8) | map((o) => { href: `/app/o/${o.key}`, label: o.plural, icon: o.icon, pinned: o.pinned == 1 }),
+        pages: (ppinned + precent) | take(8) | map((p) => { href: `/app/pages/${p.id}`, label: blank(p.title) ? "Untitled" : p.title, icon: p.kind == "section" ? "▭" : "▤", pinned: p.pinned == 1 }),
+        object_count: len(objects),
+        page_count: len(pages),
     }
 }
 
@@ -183,7 +209,7 @@ server fn plugin_uses(id: str) {
     let blocks = (p.blocks ?? []) | map((b) => b.type)
     let steps = (p.steps ?? []) | map((s) => s.type)
     let themes = (p.themes ?? []) | map((t) => t.id)
-    let page_uses = (r) => any(parsed(r.draft, {}).blocks ?? [], (b) => contains(blocks, b.type)) || any(parsed(r.published, {}).blocks ?? [], (b) => contains(blocks, b.type))
+    let page_uses = (r) => any(flat_blocks(parsed(r.draft, {}).blocks), (b) => contains(blocks, b.type)) || any(flat_blocks(parsed(r.published, {}).blocks), (b) => contains(blocks, b.type))
     {
         pages: db.query("select title, kind, draft, published from pages") | filter(page_uses) | map((r) => r.title),
         flows: db.query("select name, graph, active from flows") | filter((f) => any(parsed(f.graph, {}).nodes ?? [], (n) => contains(steps, n.type))) | map((f) => f.name),

@@ -48,10 +48,18 @@ fn need_designer() {
 // allows, the access scripts that decide which records (none: all), and
 // each field's level. Owners and admins may do anything; a member with no
 // roles edits everything.
-fn access_to(u, key: str) {
+fn access_to(u, key: str) = access_in(u, u == null || u.role != "member" ? [] : roles_of(u), key)
+
+// The objects `u` may read, their roles read once (not once an object).
+fn readable_objects(u) {
+    let rs = u == null || u.role != "member" ? [] : roles_of(u)
+    objects_all() | filter((o) => allows(access_in(u, rs, o.key).level, "read"))
+}
+
+// `access_to`, given `u`'s roles.
+fn access_in(u, rs: list, key: str) {
     if u == null { return { level: "none", scripts: [], fields: {} } }
     if u.role != "member" { return { level: "delete", scripts: [], fields: {} } }
-    let rs = roles_of(u)
     if len(rs) == 0 { return { level: "edit", scripts: [], fields: {} } }
     let grants = rs | map((r) => merge({ level: "none", script: "", fields: {} }, r.access[key] ?? {})) | filter((a) => a.level != "none")
     if len(grants) == 0 { return { level: "none", scripts: [], fields: {} } }
@@ -102,7 +110,7 @@ fn script_vars(key: str, values: map, id, u, f: map) = {
     today: iso_day(now()),
     others_with: (field, v) => len(rec_where(key, str(field), v) | filter((r) => r.id != (id ?? 0))),
     contact: (cid) => {
-        let c = db.one("select first_name, last_name, email, stage, tags from contacts where id = ?", int(str(cid ?? "")) ?? 0)
+        let c = db.one("select first_name, last_name, email, stage, tags from contacts where id = ?", int(cid) ?? 0)
         c == null ? null : { name: trim(`${c.first_name} ${c.last_name}`), email: c.email, stage: c.stage, tags: parsed(c.tags, []) }
     },
 }
@@ -205,7 +213,7 @@ server fn save_group(g: map) {
     need_admin()?
     if blank(g.name) { return err({ problems: problem("name", "Name the group") }) }
     if db.one("select id from groups where lower(name) = ? and id != ?", lower(trim(g.name)), g.id ?? 0) != null { return err({ problems: problem("name", "There is a group with this name") }) }
-    let ids = (xs) => json.stringify((xs ?? []) | map((x) => int(str(x)) ?? 0) | filter((x) => x > 0) | unique)
+    let ids = (xs) => json.stringify((xs ?? []) | map((x) => int(x) ?? 0) | filter((x) => x > 0) | unique)
     let caps = json.stringify((g.capabilities ?? []) | filter((c) => any(CAPABILITIES, (k) => k[0] == c)) | unique)
     if g.id == null {
         db.exec("insert into groups (name, members, roles, capabilities, created_at) values (?, ?, ?, ?, ?)", trim(g.name), ids(g.members), ids(g.roles), caps, now()).last_id

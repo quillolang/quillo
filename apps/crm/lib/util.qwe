@@ -110,6 +110,20 @@ fn initials(name: str) =
 let SLUG_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 // "Hello, World!" is "hello-world".
+// A folder's name as kept: trimmed, at most 40 characters.
+fn folder_name(v) = slice(trim(str(v ?? "")), 0, 40)
+
+// What `u` opened: kept for their sidebar, the latest 40.
+fn note_recent(u, kind: str, ref) {
+    if u == null { return null }
+    db.exec("insert into recents (user_id, kind, ref, at) values (?, ?, ?, ?) on conflict (user_id, kind, ref) do update set at = excluded.at", u.id, kind, str(ref), now())
+    db.exec("delete from recents where user_id = ? and kind = ? and ref not in (select ref from recents where user_id = ? and kind = ? order by at desc limit 40)", u.id, kind, u.id, kind)
+}
+
+// When `u` last opened each, by ref.
+fn recent_refs(u, kind: str) = u == null ? {}
+    : db.query("select ref, at from recents where user_id = ? and kind = ?", u.id, kind) | reduce({}, (m, r) => set(m, r.ref, r.at))
+
 fn slugify(s: str) {
     let chars = split(lower(trim(s)), "") | map((ch) => contains(SLUG_CHARS, ch) ? ch : "-")
     split(join(chars, ""), "-") | filter((p) => p != "") | join("-")

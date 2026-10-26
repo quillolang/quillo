@@ -20,6 +20,8 @@ usage:
   quillo app <file.qwe> [options]   run a program in a native window (needs a
                                     build with `--features app`)
   quillo check <file.qwe>           check a program without running it
+               [--strict-null]      and warn where a value may be null and
+                                    null does not work
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
   quillo <file.qwe>                 same as `quillo run`
@@ -81,10 +83,13 @@ fn real_main(args: Vec<String>) -> i32 {
             Some(f) => run(f, &args[3..]),
             None => usage(),
         },
-        Some("check") => match args.get(2) {
-            Some(f) => check(f),
-            None => usage(),
-        },
+        Some("check") => {
+            let strict_null = args.iter().any(|a| a == "--strict-null");
+            match args.iter().skip(2).find(|a| !a.starts_with("--")) {
+                Some(f) => check(f, quillo::check::Options { strict_null }),
+                None => usage(),
+            }
+        }
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
@@ -374,8 +379,8 @@ fn static_errors(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check(file: &str) -> i32 {
-    let analysis = quillo::check::check_file(Path::new(file));
+fn check(file: &str, opts: quillo::check::Options) -> i32 {
+    let analysis = quillo::check::check_file_opts(Path::new(file), Default::default(), opts);
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }

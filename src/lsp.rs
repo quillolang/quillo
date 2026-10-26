@@ -27,6 +27,8 @@ struct Doc {
 pub struct Server {
     docs: HashMap<String, Doc>,
     out: io::Stdout,
+    /// From the editor's `initializationOptions` (`{ "strictNull": true }`).
+    opts: check::Options,
 }
 
 fn read_message(input: &mut impl BufRead) -> io::Result<Option<J>> {
@@ -206,7 +208,7 @@ fn symbol_kind(k: SymbolKind) -> u32 {
 
 impl Server {
     pub fn new() -> Self {
-        Server { docs: HashMap::new(), out: io::stdout() }
+        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options::default() }
     }
 
     fn send(&mut self, msg: J) {
@@ -234,6 +236,7 @@ impl Server {
             let params = &msg["params"];
             match method.as_str() {
                 "initialize" => {
+                    self.opts.strict_null = params["initializationOptions"]["strictNull"].as_bool().unwrap_or(false);
                     let caps = json!({
                         "capabilities": {
                             "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
@@ -309,9 +312,9 @@ impl Server {
             Some(main) => {
                 let mut open: HashMap<PathBuf, String> = self.docs.iter().map(|(u, d)| (uri_to_path(u), d.text.clone())).collect();
                 open.insert(path.clone(), text.clone());
-                check::check_file_with(&main, open)
+                check::check_file_opts(&main, open, self.opts)
             }
-            None => check::check_source(&text, &file, &base),
+            None => check::check_source_opts(&text, &file, &base, self.opts),
         };
         let mut by_file: HashMap<String, Vec<J>> = HashMap::new();
         by_file.insert(uri.clone(), Vec::new());

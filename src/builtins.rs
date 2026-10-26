@@ -1191,9 +1191,12 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
     let s = s_arg(&args, 0, "markdown", line)?;
-    let html_ok = match args.get(1) {
-        None | Some(Value::Nil) => false,
-        Some(Value::Map(m)) => m.get("html").map_or(false, |v| v.truthy()),
+    // `{ html: true }` keeps the HTML in the text; `{ inline: true }` keeps
+    // only what is inside a line (bold, italic, code, links): no paragraphs,
+    // headings or lists, lines broken by <br> (a headline, a caption).
+    let (html_ok, inline) = match args.get(1) {
+        None | Some(Value::Nil) => (false, false),
+        Some(Value::Map(m)) => (m.get("html").map_or(false, |v| v.truthy()), m.get("inline").map_or(false, |v| v.truthy())),
         Some(v) => return fail(line, format!("`markdown` expects options as a map, got {}", v.type_name())),
     };
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
@@ -1227,8 +1230,29 @@ fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         (e, _) => Some(e),
     });
+    let mut lines = 0;
+    let events = events.filter_map(move |e| {
+        use pulldown_cmark::TagEnd;
+        if !inline {
+            return Some(e);
+        }
+        match e {
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Item | Tag::CodeBlock(_)) => {
+                lines += 1;
+                (lines > 1).then(|| Event::Html(CowStr::Borrowed("<br>")))
+            }
+            Event::Start(Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell) => None,
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::CodeBlock | TagEnd::List(_) | TagEnd::BlockQuote(_)
+                | TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell) => None,
+            Event::Rule | Event::TaskListMarker(_) => None,
+            e => Some(e),
+        }
+    });
     let mut out = String::with_capacity(s.len() * 3 / 2);
     pulldown_cmark::html::push_html(&mut out, events);
+    if inline {
+        out = out.trim_end().to_string();
+    }
     Ok(Value::html(out))
 }
 

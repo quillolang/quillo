@@ -98,8 +98,8 @@ fn product_page(p: map, choose: bool = false) {
 }
 
 fn shipping_note(s: map, cur: str) {
-    let rate = int(str(s.shipping_cents ?? "0")) ?? 0
-    let free = int(str(s.free_shipping_over_cents ?? "0")) ?? 0
+    let rate = int(s.shipping_cents) ?? 0
+    let free = int(s.free_shipping_over_cents) ?? 0
     rate == 0 ? "Free shipping" : free > 0 ? `Shipping ${fmt_money(rate, cur)}, free over ${fmt_money(free, cur)}` : `Shipping ${fmt_money(rate, cur)}`
 }
 

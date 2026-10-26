@@ -178,14 +178,14 @@ fn step_offer(config, run) {
 }
 
 fn step_wait(config, run) {
-    let n = int(str(config.amount ?? "1")) ?? 1
+    let n = int(config.amount) ?? 1
     let unit = config.unit ?? "days"
     let ms = n * (unit == "minutes" ? 60000 : unit == "hours" ? 3600000 : DAY)
     { waiting_for: "time", until: now() + ms, resume: "out", log: `waiting ${n} ${unit}` }
 }
 
 fn step_wait_purchase(config, run) {
-    let days = int(str(config.days ?? "7")) ?? 7
+    let days = int(config.days) ?? 7
     let sku = lower(trim(config.product ?? ""))
     { waiting_for: "purchase", until: now() + days * DAY, resume: "no", sku, log: `waiting up to ${days} days for ${sku == "" ? "a purchase" : sku}` }
 }
@@ -216,7 +216,7 @@ fn step_stage(config, run) {
 
 fn step_task(config, run) {
     let c = run_contact(run)
-    let days = int(str(config.due_days ?? "0")) ?? 0
+    let days = int(config.due_days) ?? 0
     let title = fill(config.title ?? "Follow up", mail_values(c))
     db.exec("insert into tasks (title, due, contact_id, created_at) values (?, ?, ?, ?)", title, iso_day(now() + days * DAY), run.context.contact_id, now())
     { port: "out", log: `task: ${title}` }
@@ -247,15 +247,15 @@ fn people_for(gid, rid) = db.query("select id, email, name, role, role_id from u
     | filter((u) => (gid != null && in_group(u, gid)) || (rid != null && any(roles_of(u), (r) => r.id == rid)))
 
 fn step_ask(config, run) {
-    let gid = blank(config.group) ? null : int(str(config.group)) ?? null
-    let rid = blank(config.role) ? null : int(str(config.role)) ?? null
+    let gid = blank(config.group) ? null : int(config.group) ?? null
+    let rid = blank(config.role) ? null : int(config.role) ?? null
     if gid == null && rid == null { return { error: "Ask: choose a group or a role" } }
     let c = run.context
     let title = trim(config.title ?? "A decision")
     db.exec("insert into flow_tasks (run_id, title, details, group_id, role_id, object, record_id, contact_id, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         run.id, title, config.details ?? "", gid, rid, c.object ?? "", c.record_id, c.contact_id, now())
     tell(people_for(gid, rid) | map((u) => u.id), null, `To decide: ${title}`, blank(config.details) ? title : config.details)
-    let days = int(str(config.days ?? "")) ?? 0
+    let days = int(config.days) ?? 0
     let who = gid != null ? `group ${(db.one("select name from groups where id = ?", gid) ?? { name: "?" }).name}` : `role ${(db.one("select name from roles where id = ?", rid) ?? { name: "?" }).name}`
     { waiting_for: "task", until: days > 0 ? now() + days * DAY : null, resume: "rejected", log: `asked the ${who}: ${title}` }
 }

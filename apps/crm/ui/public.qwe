@@ -177,3 +177,115 @@ view UnsubscribedPage(ok: bool, name: str) =
             ? <div><h1>You are unsubscribed</h1><p>{name} will not email you again.</p></div>
             : <div><h1>That link did not work</h1><p>It may have been copied wrongly.</p></div>}</div>
     </SiteLayout>
+
+// A page's live preview: what its designer has on screen, as it changes;
+// and feedback on it. Whoever has the link chooses a block, takes a
+// snapshot of it to draw on and say what they think; everyone's feedback,
+// and the team's answers, as they come; the viewer resolves it.
+component LivePreview(token: str) {
+    ~v = live(live_view, token)
+    ~fb = live(preview_feedback, token)
+    ~choosing = false
+    ~chosen = null
+    ~shot = null
+    ~color = "#e11d48"
+    ~author = ""
+    ~body = ""
+    ~problems = []
+    ~panel = false
+    ~drafts = {}
+    ~sent = ""
+    if v == null { return <p.pb-missing>Loading…</p> }
+    if is_err(v) { return <section.np-empty><h1>This preview is not available</h1><p>{err_text(v)}</p></section> }
+    let items = fb == null || is_err(fb) ? [] : fb
+    let open_items = items | filter((f) => f.status != "resolved")
+    let counts = open_items | reduce({}, (m, f) => set(m, f.block_id, (m[f.block_id] ?? 0) + 1))
+    let snapshot = () => {
+        shot = { block: chosen }
+        author = js("pbFeedback.name") ?? ""
+        body = ""
+        problems = []
+        js("pbFeedback.mount", chosen, "#fb-frame")
+    }
+    let send = () => {
+        let t = js("pbFeedback.take")
+        let r = give_feedback(token, { block: shot.block, width: t.width, height: t.height, strokes: t.strokes, body, author })
+        if is_err(r) { problems = refusal_problems(r) } else {
+            js("pbFeedback.remember", author)
+            shot = null
+            chosen = null
+            choosing = false
+            panel = true
+            sent = "Sent: the team sees it now"
+        }
+    }
+    let answer = (f) => {
+        let text = drafts[str(f.id)] ?? ""
+        if blank(author) { author = js("pbFeedback.name") ?? "" }
+        let r = viewer_reply(token, f.id, blank(author) ? "A viewer" : author, text)
+        if !is_err(r) { drafts = set(drafts, str(f.id), "") }
+    }
+    <div class={choosing ? "live-page fb-choosing" : "live-page"}>
+        <style>{join(keys(counts) | map((k) => `[data-live-block=${k}]::after { content: "${counts[k]}"; }`), "\n")}{chosen == null ? "" : `\n[data-live-block=${chosen}] { outline: 3px solid #e11d48; outline-offset: -3px; }`}</style>
+        <div.live-blocks @click={(e) => {
+            if choosing {
+                e.preventDefault()
+                let el = e.target.closest("[data-live-block]")
+                if el != null { chosen = el.dataset.liveBlock }
+            }
+        }}>{raw(v.html)}</div>
+        {choosing && <div.fb-choose role="status">
+            {chosen == null ? <span>Click the part of the page your feedback is about</span>
+            : <span>Block chosen</span>}
+            <button.primary type="button" disabled={chosen == null} @click={() => { snapshot() }}>📷 Snapshot and comment</button>
+            <button type="button" @click={() => { choosing = false; chosen = null }}>Cancel</button>
+        </div>}
+        <div.live-bar role="status">
+            <span class={v.saved ? "live-dot saved" : "live-dot"}></span>
+            <b>Live preview</b>
+            <span>{v.saved ? "the saved draft" : `${blank(v.by) ? "someone" : v.by} is editing`}</span>
+            <span.live-sep></span>
+            <button type="button" class={choosing ? "on" : ""} @click={() => { choosing = !choosing; chosen = null; panel = false }}>Give feedback</button>
+            <button type="button" class={panel ? "on" : ""} @click={() => { panel = !panel; choosing = false }}>Feedback{len(open_items) > 0 && ` (${len(open_items)})`}</button>
+        </div>
+        {shot != null && <div.fb-modal role="dialog" aria-modal="true" aria-label="Feedback on a block" @keydown={(e) => { if e.key == "Escape" { shot = null } }}>
+            <div.fb-card>
+                <header.fb-head><h2>Your feedback</h2><button.icon type="button" aria-label="Close" @click={() => { shot = null }}>✕</button></header>
+                <div.fb-tools>
+                    <span.muted>Draw on it to point things out</span>
+                    {for c in FEEDBACK_COLORS => <button type="button" class={color == c ? "fb-color on" : "fb-color"} style={`--c:${c}`} aria-label={`Draw in ${c}`} aria-pressed={color == c}
+                        @click={() => { color = c; js("pbFeedback.color", c) }}></button>}
+                    <button type="button" @click={() => { js("pbFeedback.undo") }}>Undo</button>
+                    <button type="button" @click={() => { js("pbFeedback.clear") }}>Clear</button>
+                </div>
+                <div.fb-frame id="fb-frame"></div>
+                <label.fb-field><span>What should change?</span>
+                    <textarea rows="3" value={body} placeholder="The price should be bigger; this photo is old…" @input={(e) => { body = e.value }}></textarea></label>
+                <label.fb-field><span>Your name</span>
+                    <input value={author} placeholder="So they know who said it" @input={(e) => { author = e.value }}/></label>
+                {len(problems) > 0 && <ul.fb-problems>{for x in problems => <li>{x.message}</li>}</ul>}
+                <div.fb-actions>
+                    <button.primary type="button" @click={() => { send() }}>Send feedback</button>
+                    <button type="button" @click={() => { shot = null }}>Cancel</button>
+                </div>
+            </div>
+        </div>}
+        {panel && <aside.fb-panel aria-label="Feedback">
+            <header.fb-head><h2>Feedback</h2><button.icon type="button" aria-label="Close" @click={() => { panel = false }}>✕</button></header>
+            {sent != "" && <p.fb-sent>{sent}</p>}
+            {len(items) == 0 ? <p.muted>None yet: “Give feedback”, then click the part of the page it is about.</p>
+            : <div.fb-list>{for f in items => <FeedbackThread key={f.id} {f} shown={340}>
+                <div.fb-reply>
+                    <input placeholder="Reply…" aria-label="Reply" value={drafts[str(f.id)] ?? ""} @input={(e) => { drafts = set(drafts, str(f.id), e.value) }}
+                        @keydown={(e) => { if e.key == "Enter" { answer(f) } }}/>
+                    <button type="button" @click={() => { answer(f) }}>Send</button>
+                </div>
+                <div.fb-actions>
+                    {f.status == "resolved"
+                        ? <button type="button" @click={() => { resolve_feedback(token, f.id, false) }}>Reopen</button>
+                        : <button.primary type="button" @click={() => { resolve_feedback(token, f.id, true) }}>Mark resolved</button>}
+                </div>
+            </FeedbackThread>}</div>}
+        </aside>}
+    </div>
+}

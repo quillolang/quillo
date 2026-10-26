@@ -5,7 +5,23 @@
 // A link as written, or nowhere if it is not one a page may have.
 fn safe_link(l) = link_ok(l) && !blank(l) ? l : "#"
 
-view PbButton(text: str, link) = <a.pb-button href={safe_link(link)}>{text}</a>
+// In the designer (ctx.preview), what shows a field is marked to be typed
+// into where it is (public/editor.js): data-edit is the field's key; data-md
+// says how it is formatted: "1" Markdown (paragraphs, headings, lists),
+// "inline" a line of it (bold, italic, code, links: `line`), "lines" a
+// list, one item a line; none, plain text. data-hint shows in it while it is empty. An optional
+// field shows empty only on the chosen block (data-optional). Plugins'
+// blocks may do the same; unmarked fields are edited in the sidebar.
+fn ed(ctx, key: str) = ctx.preview == true ? key : null
+fn hint(ctx, text: str) = ctx.preview == true ? text : null
+fn md_mark(ctx) = ctx.preview == true ? "1" : null
+// A line's text (a headline, a caption): bold, italic, code and links, no paragraphs.
+fn line_mark(ctx) = ctx.preview == true ? "inline" : null
+fn line(text) = markdown(str(text ?? ""), { inline: true })
+fn opt_mark(ctx) = ctx.preview == true ? "1" : null
+
+view PbButton(text: str, link, edit = null) =
+    <a.pb-button href={safe_link(link)} data-edit={edit} data-hint={edit == null ? null : "Button text"} data-optional={edit == null ? null : "1"}>{text}</a>
 
 view PbProduct(p: map, button: str, currency: str) =
     <article.pb-product-card>
@@ -19,7 +35,7 @@ view PbProduct(p: map, button: str, currency: str) =
 // preview would add a contact).
 view PbFormPreview(heading: str) =
     <section.pb-form>
-        {heading != "" && <h2>{heading}</h2>}
+        <h2 data-edit="heading" data-md="inline" data-hint="A heading" data-optional="1">{line(heading)}</h2>
         <div.pb-form-mock><span>Email address</span><b>Sign up</b></div>
     </section>
 
@@ -27,25 +43,31 @@ let renderers_core = {
     hero: (c, ctx) =>
         <section class={blank(c.image) ? "pb-hero" : "pb-hero with-image"}>
             <div.pb-hero-text>
-                <h1>{c.headline}</h1>
-                {!blank(c.text) && <p.pb-lead>{c.text}</p>}
-                {!blank(c.button) && <PbButton text={c.button} link={c.link}/>}
+                <h1 data-edit={ed(ctx, "headline")} data-md={line_mark(ctx)} data-hint={hint(ctx, "Headline")}>{line(c.headline)}</h1>
+                {(!blank(c.text) || ctx.preview) && <p.pb-lead data-edit={ed(ctx, "text")} data-md={line_mark(ctx)} data-hint={hint(ctx, "A line under it")} data-optional={opt_mark(ctx)}>{line(c.text)}</p>}
+                {(!blank(c.button) || ctx.preview) && <PbButton text={c.button ?? ""} link={c.link} edit={ed(ctx, "button")}/>}
             </div>
             {!blank(c.image) && <Picture v={c.image} alt={c.alt ?? ""} shown={560}/>}
         </section>,
-    text: (c, ctx) => <section.pb-text>{markdown(c.body ?? "")}</section>,
+    text: (c, ctx) => <section.pb-text data-edit={ed(ctx, "body")} data-md={md_mark(ctx)} data-hint={hint(ctx, "Type, or / to choose a block")}>{markdown(c.body ?? "")}</section>,
     image: (c, ctx) =>
         <figure.pb-image>
             <Picture v={c.image} alt={c.alt ?? ""} shown={980}/>
-            {!blank(c.caption) && <figcaption>{c.caption}</figcaption>}
+            {(!blank(c.caption) || ctx.preview) && <figcaption data-edit={ed(ctx, "caption")} data-md={line_mark(ctx)} data-hint={hint(ctx, "A caption")} data-optional={opt_mark(ctx)}>{line(c.caption)}</figcaption>}
         </figure>,
-    columns: (c, ctx) => <section.pb-columns><div>{markdown(c.left ?? "")}</div><div>{markdown(c.right ?? "")}</div></section>,
+    // Each column, its blocks; one from before, its Markdown.
+    columns: (c, ctx) => c.columns != null
+        ? <section.pb-columns style={`--cols:${max([1, len(c.columns)])}`}>{for col in c.columns => <div.pb-column>{for b in col => render_block(b, ctx)}</div>}</section>
+        : <section.pb-columns><div>{markdown(c.left ?? "")}</div><div>{markdown(c.right ?? "")}</div></section>,
     quote: (c, ctx) =>
         <blockquote.pb-quote>
-            <p>“{c.quote}”</p>
-            {!blank(c.name) && <footer><b>{c.name}</b>{!blank(c.role) && <span>, {c.role}</span>}</footer>}
+            <p>“<span data-edit={ed(ctx, "quote")} data-md={line_mark(ctx)} data-hint={hint(ctx, "What they said")}>{line(c.quote)}</span>”</p>
+            {(!blank(c.name) || ctx.preview) && <footer>
+                <b data-edit={ed(ctx, "name")} data-hint={hint(ctx, "Who")} data-optional={opt_mark(ctx)}>{c.name}</b>
+                {(!blank(c.role) || ctx.preview) && <span>{!blank(c.role) && ", "}<span data-edit={ed(ctx, "role")} data-hint={hint(ctx, ", their role")} data-optional={opt_mark(ctx)}>{c.role}</span></span>}
+            </footer>}
         </blockquote>,
-    button: (c, ctx) => <p.pb-center><PbButton text={c.text ?? ""} link={c.link}/></p>,
+    button: (c, ctx) => <p.pb-center><PbButton text={c.text ?? ""} link={c.link} edit={ed(ctx, "text")}/></p>,
     spacer: (c, ctx) => <div class={`pb-spacer ${c.size ?? "medium"}`}></div>,
     product: (c, ctx) => {
         let p = find(ctx.products, (x) => x.sku == c.product)
@@ -54,11 +76,12 @@ let renderers_core = {
     },
     products: (c, ctx) =>
         <section.pb-products>
-            {!blank(c.heading) && <h2>{c.heading}</h2>}
+            {(!blank(c.heading) || ctx.preview) && <h2 data-edit={ed(ctx, "heading")} data-md={line_mark(ctx)} data-hint={hint(ctx, "A heading")} data-optional={opt_mark(ctx)}>{line(c.heading)}</h2>}
             <div.pb-grid>{for p in ctx.products => <PbProduct {p} button="Buy now" currency={ctx.currency}/>}</div>
         </section>,
-    form: (c, ctx) => ctx.preview
+    // In the designer and the live preview, a picture of the form: signing up from there would add a contact.
+    form: (c, ctx) => ctx.preview || ctx.live == true
         ? <PbFormPreview heading={c.heading ?? ""}/>
-        : <section.pb-form>{!blank(c.heading) && <h2>{c.heading}</h2>}<PublicForm slug={c.form ?? ""} embedded={true}/></section>,
+        : <section.pb-form>{!blank(c.heading) && <h2>{line(c.heading)}</h2>}<PublicForm slug={c.form ?? ""} embedded={true}/></section>,
     section: (c, ctx) => section_html(c.section, ctx),
 }

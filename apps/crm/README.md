@@ -20,7 +20,18 @@ Open <http://localhost:9000>, create a workspace, and you land in it at
 | **People** | Contacts with stages, tags, consent and custom fields; companies; a timeline of everything that happened to each; notes and tasks; CSV import (each row checked by the rules) and export. |
 | **Sales** | Pipelines with stages, a board you drag deals across; products (one-time and subscriptions) with pictures, categories, sale prices and variants (sizes, colours: each with its stock and price); a shop at `/shop` (by category, searched, sorted), a page per product, a cart, discount codes, shipping, a checkout; orders, refunds that restock. |
 | **Marketing** | Public sign-up forms at `/f/<form>`, campaigns written in Markdown to all subscribers or a tag, an outbox, signed unsubscribe links. |
-| **Pages** | Landing pages and a home page, made of blocks in a designer: a palette of the blocks the plugins switched on bring, a live preview rendered as visitors will see it, drag to reorder, settings per block; sections made once and put on many pages; drafts, and publishing when the page rules pass. |
+| **Pages** | Landing pages and a home page, made of blocks in a designer that works as Gutenberg does: the page, rendered as visitors will see it, is edited where it shows — text typed into in place (Markdown kept) and formatted from a toolbar over it — bold, italic,
+code, links (⌘B, ⌘I, ⌘K; a link's address is checked), headings, quotes and lists, "## ", "- ",
+"1. " or "> " typed at the start of a line turning it, Enter on an empty last list item leaving
+the list — + between blocks or `/` to add one, Enter at the end of a text for the next block and Backspace in an empty one to remove it, a toolbar on the chosen block (move, add before or after, copy, remove), ⌘Z and ⌘⇧Z;
+Columns (2 to 4) hold blocks of their own — an empty column suggests Text, Image, Testimonial,
+Button or any block, and blocks are dragged into a column, from the library or by their handle
+(a columns block stays in the page, not in a column; columns from before, Markdown left and
+right, become a text block in each); the rules, the outline and the sections a page uses see
+the blocks in columns too; a live preview, at a secret link (/preview/<token>, no sign-in: another
+browser, a phone, a client), shows the page as the designer has it on screen, saved or not, as
+visitors would see it, following each change as it is typed (`live`) and the block being edited
+(a new link stops the old one; not for search engines, the link not passed on). Whoever has the link — a customer — gives feedback there: Give feedback, a click on the block it is about, Snapshot and comment; they draw on the block (three colours, undo, clear) and say what they think, under their name (kept in their browser). The snapshot is the block as the server renders it then, and the strokes in its own pixels, so it shows where it was drawn at any size (zoomed to the marks). The team sees each as a to-do in the designer's Feedback tab (a count on it and on the block), acknowledges it, answers; both sides see the talk as it goes (`live`), and the viewer marks it resolved, or opens it again. Those who opened the page lately (else the owners) are told by mail; the blocks' library or the outline on the left, the page's or the block's settings on the right. A block's renderer marks what can be typed into in the designer's preview only — `data-edit="field"`, and how it is formatted: `data-md="1"` Markdown (paragraphs, headings, lists, quotes), `data-md="inline"` a line of it (bold, italic, code, links: headlines, quotes, captions, headings; rendered with `markdown(text, { inline: true })`), `data-md="lines"` a list, one item a line, none plain text (labels, names). The core blocks and the plugins' (blog, sponsors, membership plans) are marked; other fields are set in the sidebar. Saving sends the progress, not the page (`save_changes`: the blocks that changed, the order, the settings that changed; the others kept as saved, so what someone else saved meanwhile stays), and the designer stays as it is — the block chosen, the caret, the undo history; the button says how many changes wait, ⌘S saves them. Sections made once and put on many pages; drafts, and publishing when the page rules pass. |
 | **Theme** | Themes from plugins (Clean, Editorial, Boutique, Journal from the core), each with its header and width; colour, font, dark, logo; the menu and the footer; CSS of your own in a highlighting editor; the site shown as it will look while you change it. Every public page (pages, blog, shop, forms) is in it, with link previews, a sitemap and robots.txt. |
 | **Blog** | Posts with covers, categories, tags and members-only posts at `/blog`; search, author pages, reading time, related posts, sharing, readers' comments (checked by the comment rules, approved by a moderator); code in posts highlighted; an RSS feed; news blocks for any page: top stories, a category's row, most read, breaking news (the Blog plugin). |
 | **Flows** | A designer: drag steps, connect their ports, branch on conditions, wait, offer a product and wait for the purchase. Runs show step by step, and can be started by hand for a contact. |
@@ -154,14 +165,35 @@ errors — the same rules the designer shows.
 
 ### Objects, roles and scripts
 
-Each object's records are a table of their own, `o_<object>`, with a column per field,
-`f_<field>`, typed as the field is: numbers, yes/no as 0 or 1, links as references to
-the contacts, companies or records they lead to (indexed). Designing the object changes
+Each object's records are a table of their own, with a column per field, `f_<field>`,
+typed as the field is: numbers, yes/no as 0 or 1, links as references to the contacts,
+companies or records they lead to (indexed; read back as their ids). The table is named
+when the object is made (`o_` and letters, digits and `_`: "Its table", after the plural
+until it is typed; objects from before are `o_<key>`), and the designer shows, copies
+and renames it. A rename moves the table only: the object keeps its key, so its address,
+roles, flows, comments and the links to it (the database rewrites those) stay as they
+are; SQL of your own that names the table needs the new name. Designing the object changes
 its table — a field added is a column added, a field removed a column dropped, a unique
 field a unique index the database keeps — and a field's type stays as it was made. Table
 and column names go into SQL with `sql_name`, which takes only letters, digits and `_`.
 Records from before tables (one shared table, values as JSON) are copied in once, ids
 kept; the old rows stay as a backup.
+
+Many objects and pages: the Objects and Pages pages find, sort (name, records, changed
+or opened lately) and group by folder, each group folding; objects show as cards or a
+table (a table past twelve). Pinned objects and pages (a star, for everyone) come first,
+and the sidebar's Workspace group has them under Objects and Pages, then what each person
+opened lately (eight at most, live). The search at the top (⌘K) finds objects, pages
+and the records of every object (only those someone may see), with the arrows and Enter;
+choosing an object (a link field's, a flow's) is typed to narrow. The workspace no longer
+carries every object's fields (each object brings its own), record counts come in one
+query over every table, and a member's roles are read once, not once an object; with 100
+objects, `load_workspace` went from 208 to 28 KB and the sidebar from 4,288 to 776 px.
+
+Objects with many fields: a record's form lays its fields out in a grid (two or three
+across; long text, Markdown and pictures take a row), with Save kept in view; its list
+scrolls sideways under its first column, and shows the columns its designer picks
+("Columns", the same for everyone) or else the first eight short fields.
 
 An object's fields are custom fields (`obj.<key>`); a record's values are checked by
 `validate("obj.<key>", record, ctx)`: its fields' types, the rules made in the designer

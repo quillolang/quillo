@@ -78,8 +78,8 @@ fn holds(c, values: map) {
         "at most" => blank(v) || (n != null && m != null && n <= m)
         "after" => blank(v) || blank(w) || str(v) > str(w)
         "before" => blank(v) || blank(w) || str(v) < str(w)
-        "longer than" => len(str(v ?? "")) > (int(str(w ?? "0")) ?? 0)
-        "shorter than" => len(str(v ?? "")) < (int(str(w ?? "0")) ?? 0)
+        "longer than" => len(str(v ?? "")) > (int(w) ?? 0)
+        "shorter than" => len(str(v ?? "")) < (int(w) ?? 0)
         _ => true
     }
 }
@@ -127,10 +127,10 @@ fn field_rules(record: map, ctx: map, entity: str) {
                 "url" => when(!starts_with(str(v), "https://") && !starts_with(str(v), "http://"), problem(key, `${f.label} must be a web address`))
                 "money" => when(is_err(float(str(v))), problem(key, `${f.label} must be an amount`))
                 "email" => when(!is_email(str(v)), problem(key, `${f.label} must be an email address`))
-                "contact" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a contact`))
-                "person" => when(is_err(int(str(v))), problem(key, `${f.label}: choose someone on the team`))
-                "company" => when(is_err(int(str(v))), problem(key, `${f.label}: choose a company`))
-                "record" => when(is_err(int(str(v))), problem(key, `${f.label}: choose one`))
+                "contact" => when(is_err(int(v)), problem(key, `${f.label}: choose a contact`))
+                "person" => when(is_err(int(v)), problem(key, `${f.label}: choose someone on the team`))
+                "company" => when(is_err(int(v)), problem(key, `${f.label}: choose a company`))
+                "record" => when(is_err(int(v)), problem(key, `${f.label}: choose one`))
                 _ => []
             }
         }

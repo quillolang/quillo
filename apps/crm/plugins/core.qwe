@@ -66,7 +66,7 @@ let flow_rules = [
         : []
     },
     (g, ctx) => (g.nodes ?? []) | filter((n) => n.type == "wait") | map((n) => {
-        let amount = int(str((n.config ?? {}).amount ?? ""))
+        let amount = int((n.config ?? {}).amount)
         when(is_err(amount) || amount <= 0, problem(`node.${n.id}`, "Wait: how long, in whole minutes, hours or days"))
     }) | flatten,
     (g, ctx) => (g.nodes ?? []) | filter((n) => n.type == "webhook") | map((n) =>
@@ -90,9 +90,9 @@ let CORE_BLOCKS = [
         { key: "alt", label: "Description (empty: the library's)", type: "text" },
         { key: "caption", label: "Caption", type: "text" },
     ] },
-    { type: "columns", label: "Two columns", group: "Layout", fields: [
-        { key: "left", label: "Left (Markdown)", type: "textarea", required: true },
-        { key: "right", label: "Right (Markdown)", type: "textarea", required: true },
+    // Its blocks are in config.columns, a list of blocks per column.
+    { type: "columns", label: "Columns", group: "Layout", fields: [
+        { key: "count", label: "Columns", type: "select", options: ["2", "3", "4"] },
     ] },
     { type: "quote", label: "Testimonial", group: "Content", fields: [
         { key: "quote", label: "What they said", type: "textarea", required: true },
@@ -121,8 +121,33 @@ fn block_types(enabled: list) = active_plugins(enabled) | map((p) => p.blocks ??
 // A link a page may have: a page here, a web address, an email.
 fn link_ok(l) = blank(l) || starts_with(l, "/") || starts_with(l, "https://") || starts_with(l, "http://") || starts_with(l, "mailto:") || starts_with(l, "#")
 
+// Blocks in blocks: a columns block holds a list of blocks per column
+// (config.columns). One from before holds Markdown, left and right.
+fn inner_lists(b) = b != null && b.type == "columns" ? ((b.config ?? {}).columns ?? []) : []
+
+fn set_columns(b: map, cols: list) = set(b, "config", set(b.config ?? {}, "columns", cols))
+
+// Columns from before (Markdown left and right): a text block in each.
+fn upgrade_blocks(bs: list) = bs | map((b) => b.type == "columns" && (b.config ?? {}).columns == null
+    ? set_columns(set(b, "config", merge(b.config ?? {}, { count: "2" })), ["left", "right"] | map((side) =>
+        blank((b.config ?? {})[side]) ? [] : [{ id: `${b.id}${slice(side, 0, 1)}`, type: "text", config: { body: b.config[side] } }]))
+    : b)
+
+// Every block, those in columns too, in reading order.
+fn flat_blocks(bs) = (bs ?? []) | map((b) => [b] + flat_blocks(inner_lists(b) | flatten)) | flatten
+
+// A columns block's settings with as many columns as it says: added
+// empty, or the blocks of those taken away moved into the last one kept.
+fn fit_columns(c: map) {
+    let n = min([4, max([1, int(c.count) ?? 2])])
+    let cols = c.columns ?? []
+    let fitted = len(cols) < n ? cols + (range(n - len(cols)) | map((_) => []))
+        : len(cols) > n ? take(cols, n - 1) + [flatten(drop(cols, n - 1))] : cols
+    set(c, "columns", fitted)
+}
+
 // The sections a page's blocks put in (their ids, as text).
-fn section_ids(blocks) = (blocks ?? []) | filter((b) => b.type == "section") | map((b) => str((b.config ?? {}).section ?? "")) | filter((x) => x != "")
+fn section_ids(blocks) = flat_blocks(blocks) | filter((b) => b.type == "section") | map((b) => str((b.config ?? {}).section ?? "")) | filter((x) => x != "")
 
 // Whether the sections `from` put in, or theirs in turn, include `target`.
 fn reaches(sections: list, from: list, target: str, depth: int) =

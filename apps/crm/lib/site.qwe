@@ -94,7 +94,9 @@ view SiteFooter(t: map, site: str, rss: bool, year: str) =
 
 // `theme`: a theme to show instead of the workspace's (the theme picker's
 // preview). `image`: the picture link previews show.
-view SiteLayout(title: str, description: str, children, theme = null, image: str = "", kind: str = "website") {
+// `live`: a page's live preview (its secret link): not for search engines,
+// its link not passed on to the sites it links to, the block being edited followed.
+view SiteLayout(title: str, description: str, children, theme = null, image: str = "", kind: str = "website", live: bool = false) {
     let s = settings()
     let t = theme ?? theme_of(s)
     let def = theme_def(t.id, s.plugins ?? [])
@@ -115,6 +117,10 @@ view SiteLayout(title: str, description: str, children, theme = null, image: str
             {blog_on() && <link rel="alternate" type="application/rss+xml" title={site} href="/blog/feed.xml"/>}
             <link rel="stylesheet" href="/assets/app.css"/>
             <style>{theme_css(t, def)}</style>
+            {live && <meta name="robots" content="noindex, nofollow"/>}
+            {live && <meta name="referrer" content="no-referrer"/>}
+            {live && <script src="/assets/live.js" defer></script>}
+            {live && <script src="/assets/feedback.js" defer></script>}
         </head>
         <body class={site_classes(t, def)}>
             <SiteHeader {t} {def} {site} menu={site_menu(t)} cart={cart_count()} shop={len(site_menu(t) | filter((l) => l.link == "/shop")) > 0}/>

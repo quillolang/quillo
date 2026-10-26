@@ -426,7 +426,7 @@ fn a_blog_with_members_only_posts_a_feed_and_latest_posts_on_pages() {
     assert!(feed.text().contains("<title>Hello &lt;world&gt;</title>"), "{}", feed.text());
     let block = serde_json::json!([[{ "id": "b1", "type": "blog.latest", "config": { "heading": "Latest", "count": "3" } }]]);
     let html = crm.rpc(host, "preview_page", block, Some(&cookie))["ok"][0]["html"].as_str().unwrap().to_string();
-    assert!(html.contains("Hello &lt;world&gt;") && html.contains("<h2>Latest</h2>"), "{}", html);
+    assert!(html.contains("Hello &lt;world&gt;") && html.contains(">Latest</h2>"), "{}", html);
 }
 
 #[test]
@@ -679,6 +679,10 @@ fn custom_objects_with_designer_rules_field_scripts_and_roles() {
     let seen = rpc(&mut crm, &sam_cookie, "list_records", serde_json::json!(["ticket", ""]))["ok"].clone();
     let titles: Vec<&str> = seen.as_array().unwrap().iter().map(|r| r["title"].as_str().unwrap()).collect();
     assert_eq!(titles, vec!["Broken zip"]);
+    // Search finds records by title, only those the role lets them see.
+    let hits = |c: &str, crm: &mut Crm| crm.rpc(host, "search", serde_json::json!(["site"]), Some(c))["ok"].to_string();
+    assert!(!hits(&sam_cookie, &mut crm).contains("Site down"));
+    assert!(hits(&cookie, &mut crm).contains("Site down"));
     assert!(rpc(&mut crm, &sam_cookie, "get_record", serde_json::json!(["ticket", urgent]))["err"].as_str().unwrap().contains("may not see this record"));
     assert!(rpc(&mut crm, &sam_cookie, "save_record", ticket("Mine", "low", "", grace))["err"].as_str().unwrap().contains("may not edit"));
     assert!(rpc(&mut crm, &sam_cookie, "delete_record", serde_json::json!(["ticket", id]))["err"].as_str().unwrap().contains("may not delete"));
@@ -934,6 +938,35 @@ fn each_object_is_a_table_of_its_own() {
     rpc(&mut crm, "save_field", serde_json::json!([{ "entity": "obj.ticket", "label": "Where", "type": "record", "options": [venue] }]));
     assert!(rpc(&mut crm, "delete_object", serde_json::json!([venue]))["err"].as_str().unwrap().contains("Ticket's field Where links to it"));
     assert!(columns(&crm, "o_ticket").iter().any(|(n, t)| n == "f_where" && t == "INTEGER"));
+
+    // A table is named when its object is made, and renamed later.
+    let pr = rpc(&mut crm, "save_object", serde_json::json!([{ "name": "Press release", "table": "Press releases!" }]))["ok"].as_str().unwrap().to_string();
+    assert_eq!(rpc(&mut crm, "get_object", serde_json::json!([pr]))["ok"]["table"], "o_press_releases");
+    assert!(columns(&crm, "o_press_releases").iter().any(|(n, _)| n == "title"));
+    let taken = rpc(&mut crm, "save_object", serde_json::json!([{ "name": "Release", "table": "o_press_releases" }]));
+    assert_eq!(taken["err"]["problems"][0]["field"], "table", "{}", taken);
+    // Renamed: its records stay, and so do the links to it.
+    let hall = rpc(&mut crm, "save_record", serde_json::json!([venue, { "fields": {} }]))["ok"]["id"].as_i64().unwrap();
+    let booking = rpc(&mut crm, "save_object", serde_json::json!([{ "name": "Booking" }]))["ok"].as_str().unwrap().to_string();
+    rpc(&mut crm, "save_field", serde_json::json!([{ "entity": format!("obj.{}", booking), "label": "At", "type": "record", "options": [venue] }]));
+    let saved = rpc(&mut crm, "save_record", serde_json::json!([booking, { "fields": { "at": hall.to_string() } }]));
+    let t = saved["ok"]["id"].as_i64().unwrap_or_else(|| panic!("{}", saved));
+    let clash = rpc(&mut crm, "rename_object_table", serde_json::json!([venue, "o_press_releases"]));
+    assert!(clash["err"]["problems"][0]["message"].as_str().is_some_and(|m| m.contains("already")), "{}", clash);
+    assert_eq!(rpc(&mut crm, "rename_object_table", serde_json::json!([venue, "places"]))["ok"], "o_places");
+    assert!(columns(&crm, "o_venue").is_empty() && !columns(&crm, "o_places").is_empty());
+    assert!(rpc(&mut crm, "get_record", serde_json::json!([venue, hall]))["ok"].is_object());
+    let c = rusqlite::Connection::open(crm.dir.join("data/acme.db")).unwrap();
+    let ddl: String = c.query_row("select sql from sqlite_master where name = 'o_booking'", [], |r| r.get(0)).unwrap();
+    assert!(ddl.contains("o_places") && !ddl.contains("o_venue"), "{}", ddl);
+    assert_eq!(rpc(&mut crm, "get_record", serde_json::json!([booking, t]))["ok"]["fields"]["at"], hall);
+    // New links to it, and new fields, use the new name.
+    rpc(&mut crm, "save_field", serde_json::json!([{ "entity": format!("obj.{}", venue), "label": "Seats", "type": "number" }]));
+    assert!(columns(&crm, "o_places").iter().any(|(n, _)| n == "f_seats"));
+    // The list's columns: chosen fields, in the fields' order; unknown ones dropped.
+    rpc(&mut crm, "save_field", serde_json::json!([{ "entity": format!("obj.{}", venue), "label": "City", "type": "text" }]));
+    assert_eq!(rpc(&mut crm, "set_list_fields", serde_json::json!([venue, ["city", "nope", "seats"]]))["ok"], serde_json::json!(["seats", "city"]));
+    assert_eq!(rpc(&mut crm, "get_object", serde_json::json!([venue]))["ok"]["list_fields"], serde_json::json!(["seats", "city"]));
 }
 
 #[test]
@@ -953,6 +986,11 @@ fn the_newsroom_suite_writes_reviews_and_publishes_with_its_groups() {
         "parent": parent.map(|p| p.to_string()) } }]), Some(&owner))["ok"]["id"].as_i64().unwrap();
     let politics = cat(&mut crm, "Politics", None);
     let elections = cat(&mut crm, "Elections", Some(politics));
+    // A link is the id of what it leads to, sent as text from a form or not.
+    let e = rpc(&mut crm, &owner, "get_record", serde_json::json!(["category", elections]))["ok"].clone();
+    assert_eq!(e["fields"]["parent"], politics, "{}", e);
+    let bad = rpc(&mut crm, &owner, "save_record", serde_json::json!(["category", { "fields": { "name": "Odd", "parent": "abc" } }]));
+    assert_eq!(bad["err"]["problems"][0]["field"], "fields.parent", "{}", bad);
     // Alone (no one in the groups yet), a member does it all: a blogger.
     let mut cookies = std::collections::HashMap::new();
     for (name, email) in [("Ana", "ana@metro.test"), ("Mei", "mei@metro.test"), ("Sam", "sam@metro.test")] {
@@ -1015,4 +1053,239 @@ fn the_newsroom_suite_writes_reviews_and_publishes_with_its_groups() {
     assert!(section.contains("Council votes 7-2") && section.contains("href=\"/news/c/elections\""), "{}", section);
     let page = crm.send(host, "GET", &slug, "", None).text();
     assert!(page.contains("<strong>seven to two</strong>") && page.contains("By <b>Ana</b>") && page.contains("np-label"), "{}", page);
+}
+
+#[test]
+fn many_objects_and_pages_in_folders_pinned_searched() {
+    let mut crm = Crm::new("many");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(&owner));
+    let mut keys = vec![];
+    for i in 0..15 {
+        let k = rpc(&mut crm, "save_object", serde_json::json!([{ "name": format!("Thing {}", i) }]))["ok"].as_str().unwrap().to_string();
+        rpc(&mut crm, "save_field", serde_json::json!([{ "entity": format!("obj.{}", k), "label": "Code", "type": "text" }]));
+        keys.push(k);
+    }
+    for n in 0..3 { rpc(&mut crm, "save_record", serde_json::json!([keys[4], { "fields": { "code": format!("Lantern {}", n) } }])); }
+    // The list: counts, fields and the last change of each, in one go.
+    let list = rpc(&mut crm, "list_objects", serde_json::json!([]))["ok"].clone();
+    let four = list.as_array().unwrap().iter().find(|o| o["key"] == keys[4].as_str()).unwrap().clone();
+    assert_eq!((four["count"].as_i64(), four["fields"].as_i64(), four["changed_at"].is_number()), (Some(3), Some(1), true), "{}", four);
+    // Folders and pins; the sidebar has the pinned, then what was opened.
+    rpc(&mut crm, "set_object_place", serde_json::json!([keys[2], { "folder": "  Fleet  ", "pinned": true }]));
+    rpc(&mut crm, "get_object", serde_json::json!([keys[7]]));
+    let o = rpc(&mut crm, "get_object", serde_json::json!([keys[2]]))["ok"].clone();
+    assert_eq!((o["folder"].as_str(), o["pinned"].as_i64()), (Some("Fleet"), Some(1)));
+    let nav = rpc(&mut crm, "sidebar_nav", serde_json::json!([]))["ok"].clone();
+    let hrefs: Vec<&str> = nav["objects"].as_array().unwrap().iter().map(|x| x["href"].as_str().unwrap()).collect();
+    assert_eq!(hrefs, vec![format!("/app/o/{}", keys[2]), format!("/app/o/{}", keys[7])], "{}", nav);
+    assert_eq!(nav["object_count"], 15);
+    // The workspace carries no object's fields: each object brings its own.
+    let ws = rpc(&mut crm, "load_workspace", serde_json::json!([]))["ok"].clone();
+    assert!(!ws["fields"].as_array().unwrap().iter().any(|f| f["entity"].as_str().unwrap().starts_with("obj.")));
+    assert_eq!(rpc(&mut crm, "objects_fields", serde_json::json!([]))["ok"][&keys[4]][0]["key"], "code");
+    // Pages: the list carries no blocks; a section knows where it is used.
+    let section = rpc(&mut crm, "new_page", serde_json::json!(["section"]))["ok"].as_i64().unwrap();
+    let page = rpc(&mut crm, "new_page", serde_json::json!(["blank"]))["ok"].as_i64().unwrap();
+    let blocks = serde_json::json!([{ "id": "s", "type": "section", "config": { "section": section.to_string() } }]);
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": page, "title": "Lanterns", "slug": "lanterns", "description": "", "blocks": blocks }]));
+    rpc(&mut crm, "set_page_place", serde_json::json!([page, { "folder": "Shop", "pinned": true }]));
+    let pages = rpc(&mut crm, "list_pages", serde_json::json!([]))["ok"].clone();
+    let p = pages.as_array().unwrap().iter().find(|p| p["id"] == page).unwrap().clone();
+    assert!(p.get("draft").is_none() && p["folder"] == "Shop" && p["pinned"] == true && p["changed"] == true, "{}", p);
+    let s = pages.as_array().unwrap().iter().find(|p| p["id"] == section).unwrap().clone();
+    assert_eq!(s["used_on"][0]["title"], "Lanterns", "{}", s);
+    assert_eq!(rpc(&mut crm, "sidebar_nav", serde_json::json!([]))["ok"]["pages"][0]["href"], format!("/app/pages/{}", page));
+    // One search: objects by name, pages, and records of any object.
+    let found = rpc(&mut crm, "search", serde_json::json!(["lantern"]))["ok"].clone();
+    let kinds: Vec<&str> = found.as_array().unwrap().iter().map(|f| f["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"Page") && kinds.iter().filter(|k| **k == "Thing 4").count() == 3, "{}", found);
+    let things = rpc(&mut crm, "search", serde_json::json!(["thing 1"]))["ok"].clone();
+    assert_eq!(things[0]["kind"], "Object", "{}", things);
+}
+
+#[test]
+fn the_designer_marks_what_is_typed_into_in_place() {
+    let mut crm = Crm::new("in-place");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let blocks = serde_json::json!([
+        { "id": "b1", "type": "hero", "config": { "headline": "Spring **sale**" } },
+        { "id": "b2", "type": "text", "config": { "body": "Some **words**." } },
+        { "id": "b3", "type": "quote", "config": { "quote": "# Not a *heading*" } },
+    ]);
+    // In the designer: each field marked, Markdown said to be, empty optional ones shown as hints.
+    let preview = crm.rpc(host, "preview_page", serde_json::json!([blocks.clone()]), Some(&owner))["ok"].clone();
+    let hero = preview[0]["html"].as_str().unwrap();
+    let text = preview[1]["html"].as_str().unwrap();
+    assert!(hero.contains(r#"data-edit="headline""#) && hero.contains(r#"data-edit="text""#) && hero.contains(r#"data-optional="1""#), "{}", hero);
+    // A headline is a line: bold, italic and links, marked so.
+    assert!(hero.contains(r#"data-md="inline""#) && hero.contains("Spring <strong>sale</strong></h1>"), "{}", hero);
+    assert!(text.contains(r#"data-edit="body""#) && text.contains(r#"data-md="1""#) && text.contains("<strong>words</strong>"), "{}", text);
+    // Published: none of it.
+    let id = crm.rpc(host, "new_page", serde_json::json!(["blank"]), Some(&owner))["ok"].as_i64().unwrap();
+    crm.rpc(host, "save_page", serde_json::json!([{ "id": id, "title": "Spring", "slug": "spring", "description": "", "blocks": blocks }]), Some(&owner));
+    assert!(crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&owner))["ok"].is_object());
+    let page = crm.send(host, "GET", "/p/spring", "", None).text();
+    assert!(page.contains("Spring <strong>sale</strong></h1>") && page.contains("<strong>words</strong>"), "{}", page);
+    // A line holds no heading: what starts with # is its text.
+    assert!(page.contains("Not a <em>heading</em>") && !page.contains("<h1>Not"), "{}", page);
+    assert!(!page.contains("data-edit") && !page.contains("data-hint") && !page.contains("pb-lead"), "{}", page);
+}
+
+#[test]
+fn columns_hold_blocks_of_their_own() {
+    let mut crm = Crm::new("columns");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(&owner));
+    let id = rpc(&mut crm, "new_page", serde_json::json!(["blank"]))["ok"].as_i64().unwrap();
+    let section = rpc(&mut crm, "new_page", serde_json::json!(["section"]))["ok"].as_i64().unwrap();
+    rpc(&mut crm, "publish_page", serde_json::json!([section]));
+    let page = |button: serde_json::Value| serde_json::json!([{ "id": id, "title": "Cols", "slug": "cols", "description": "Two columns", "blocks": [
+        { "id": "b1", "type": "columns", "config": { "count": "2", "columns": [
+            [{ "id": "b2", "type": "text", "config": { "body": "Left **side**" } }, { "id": "b3", "type": "button", "config": button }],
+            [{ "id": "b4", "type": "section", "config": { "section": section.to_string() } }],
+        ] } },
+    ] }]);
+    // The rules check the blocks in columns: a button with no text is refused.
+    rpc(&mut crm, "save_page", page(serde_json::json!({ "link": "/p/x" })));
+    let refused = rpc(&mut crm, "publish_page", serde_json::json!([id]));
+    assert!(refused["err"].to_string().contains("block.b3"), "{}", refused);
+    rpc(&mut crm, "save_page", page(serde_json::json!({ "text": "Go", "link": "/p/x" })));
+    let published = rpc(&mut crm, "publish_page", serde_json::json!([id]));
+    assert!(published["ok"].is_object(), "{}", published);
+    let html = crm.send(host, "GET", "/p/cols", "", None).text();
+    assert!(html.contains("--cols:2") && html.matches(r#"class="pb-column""#).count() == 2 && html.contains("<strong>side</strong>") && html.contains(">Go</a>"), "{}", html);
+    // The designer's preview has each block, those in columns too; the section's use is seen in them.
+    let preview = rpc(&mut crm, "preview_of", serde_json::json!([id]))["ok"].clone();
+    let ids: Vec<&str> = preview.as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["b1", "b2", "b3", "b4"]);
+    let s = rpc(&mut crm, "list_pages", serde_json::json!([]))["ok"].as_array().unwrap().iter().find(|p| p["id"] == section).unwrap().clone();
+    assert_eq!(s["used_on"][0]["title"], "Cols", "{}", s);
+    // Columns from before (Markdown left and right) still show.
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": id, "title": "Cols", "slug": "cols", "description": "Old", "blocks": [
+        { "id": "b1", "type": "columns", "config": { "left": "Old *left*", "right": "Old right" } }] }]));
+    rpc(&mut crm, "publish_page", serde_json::json!([id]));
+    let old = crm.send(host, "GET", "/p/cols", "", None).text();
+    assert!(old.contains("<em>left</em>") && old.contains("Old right"), "{}", old);
+    assert_eq!(rpc(&mut crm, "preview_of", serde_json::json!([id]))["ok"][1]["id"], "b1l");
+}
+
+#[test]
+fn a_live_preview_follows_the_designer_at_a_secret_link() {
+    let mut crm = Crm::new("live-preview");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(&owner));
+    let id = rpc(&mut crm, "new_page", serde_json::json!(["blank"]))["ok"].as_i64().unwrap();
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": id, "title": "Spring", "slug": "spring", "description": "", "blocks": [
+        { "id": "b1", "type": "text", "config": { "body": "Saved words." } }] }]));
+    let token = rpc(&mut crm, "get_page", serde_json::json!([id]))["ok"]["preview_token"].as_str().unwrap().to_string();
+    assert!(token.len() >= 20);
+    // No sign-in: the draft, not for search engines.
+    let page = crm.send(host, "GET", &format!("/preview/{}", token), "", None);
+    assert_eq!(page.status, 200);
+    let html = page.text();
+    assert!(html.contains("Saved words.") && html.contains(r#"content="noindex, nofollow""#) && html.contains(r#"name="referrer" content="no-referrer""#), "{}", html);
+    // What the designer has on screen, unsaved, with the block being edited.
+    let blocks = serde_json::json!([{ "id": "b1", "type": "text", "config": { "body": "Typed, not saved." } }, { "id": "b2", "type": "form", "config": { "heading": "Join" } }]);
+    let shown = rpc(&mut crm, "preview_live", serde_json::json!([id, blocks, "b1"]))["ok"].clone();
+    assert!(shown[0]["html"].as_str().unwrap().contains("Typed, not saved."));
+    let v = crm.rpc(host, "live_view", serde_json::json!([token]), None)["ok"].clone();
+    let vh = v["html"].as_str().unwrap();
+    assert!(vh.contains("Typed, not saved.") && vh.contains("live-focus") && v["saved"] == false && v["by"] == "Ada", "{}", v);
+    // A form is a picture of itself there: no signing up from a preview.
+    assert!(vh.contains("pb-form-mock") && !vh.contains("<form"), "{}", vh);
+    // Saved: the draft again.
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": id, "title": "Spring", "slug": "spring", "description": "", "blocks": [
+        { "id": "b1", "type": "text", "config": { "body": "Saved again." } }] }]));
+    let v = crm.rpc(host, "live_view", serde_json::json!([token]), None)["ok"].clone();
+    assert!(v["html"].as_str().unwrap().contains("Saved again.") && v["saved"] == true, "{}", v);
+    // A new link: the old one stops working.
+    let fresh = rpc(&mut crm, "new_preview_link", serde_json::json!([id]))["ok"].as_str().unwrap().to_string();
+    assert_ne!(fresh, token);
+    assert_eq!(crm.send(host, "GET", &format!("/preview/{}", token), "", None).status, 404);
+    assert!(crm.rpc(host, "live_view", serde_json::json!([token]), None)["err"].is_string());
+    assert_eq!(crm.send(host, "GET", &format!("/preview/{}", fresh), "", None).status, 200);
+    // Only the team writes to it.
+    assert!(crm.rpc(host, "live_draft", serde_json::json!([id, [], ""]), None)["err"].is_string());
+}
+
+#[test]
+fn saving_a_page_sends_its_progress_not_the_page() {
+    let mut crm = Crm::new("progress");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(&owner));
+    let id = rpc(&mut crm, "new_page", serde_json::json!(["blank"]))["ok"].as_i64().unwrap();
+    let text = |id: &str, body: &str| serde_json::json!({ "id": id, "type": "text", "config": { "body": body } });
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": id, "title": "P", "slug": "p", "description": "", "blocks": [text("b1", "One"), text("b2", "Two"), text("b3", "Three")] }]));
+    let bodies = |crm: &mut Crm| -> Vec<String> {
+        crm.rpc(host, "get_page", serde_json::json!([id]), Some(&owner))["ok"]["draft"]["blocks"].as_array().unwrap().iter()
+            .map(|b| b["config"]["body"].as_str().unwrap().to_string()).collect()
+    };
+    // One block sent: the others kept as they are saved.
+    let r = rpc(&mut crm, "save_changes", serde_json::json!([id, { "order": ["b1", "b2", "b3"], "blocks": { "b2": text("b2", "Two, changed") } }]));
+    assert!(r["ok"].is_object(), "{}", r);
+    assert_eq!(bodies(&mut crm), vec!["One", "Two, changed", "Three"]);
+    // The order moves and removes them; a new block comes with it.
+    rpc(&mut crm, "save_changes", serde_json::json!([id, { "order": ["b3", "b4", "b1"], "blocks": { "b4": text("b4", "Four") } }]));
+    assert_eq!(bodies(&mut crm), vec!["Three", "Four", "One"]);
+    // A block neither sent nor saved: stale (the designer then saves the whole page).
+    let stale = rpc(&mut crm, "save_changes", serde_json::json!([id, { "order": ["b1", "b9"], "blocks": {} }]));
+    assert_eq!(stale["err"]["stale"], true, "{}", stale);
+    assert_eq!(bodies(&mut crm), vec!["Three", "Four", "One"]);
+    // The page's settings that changed.
+    rpc(&mut crm, "save_changes", serde_json::json!([id, { "order": ["b3", "b4", "b1"], "blocks": {}, "meta": { "title": "Renamed", "slug": "renamed", "description": "" } }]));
+    let p = rpc(&mut crm, "get_page", serde_json::json!([id]))["ok"].clone();
+    assert_eq!((p["title"].as_str(), p["slug"].as_str()), (Some("Renamed"), Some("renamed")));
+    assert!(crm.rpc(host, "save_changes", serde_json::json!([id, { "order": [] }]), None)["err"].is_string());
+}
+
+#[test]
+fn feedback_from_the_live_preview_is_the_teams_to_do() {
+    let mut crm = Crm::new("feedback");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(&owner));
+    let anon = |crm: &mut Crm, name: &str, args: serde_json::Value| crm.rpc(host, name, args, None);
+    let id = rpc(&mut crm, "new_page", serde_json::json!(["blank"]))["ok"].as_i64().unwrap();
+    rpc(&mut crm, "save_page", serde_json::json!([{ "id": id, "title": "Spring", "slug": "spring", "description": "", "blocks": [
+        { "id": "b1", "type": "text", "config": { "body": "Our prices are **low**." } }] }]));
+    let token = rpc(&mut crm, "get_page", serde_json::json!([id]))["ok"]["preview_token"].as_str().unwrap().to_string();
+    // A viewer, by the link: a name and a word needed.
+    let shot = |body: &str, author: &str| serde_json::json!([token, { "block": "b1", "width": 800, "height": 100, "body": body, "author": author,
+        "strokes": [{ "color": "<script>", "points": [[10, 20], [900, -5]] }] }]);
+    assert_eq!(anon(&mut crm, "give_feedback", shot("Bigger", ""))["err"]["problems"][0]["field"], "author");
+    assert_eq!(anon(&mut crm, "give_feedback", shot("", "Carla"))["err"]["problems"][0]["field"], "body");
+    let fid = anon(&mut crm, "give_feedback", shot("Make the prices bigger", "Carla"))["ok"].as_i64().unwrap();
+    // The snapshot is the block as the server renders it; the drawing, cleaned.
+    let list = anon(&mut crm, "preview_feedback", serde_json::json!([token]))["ok"].clone();
+    let f = &list[0];
+    assert!(f["block_html"].as_str().unwrap().contains("<strong>low</strong>") && !f["block_html"].as_str().unwrap().contains("data-edit"), "{}", f);
+    assert_eq!(f["strokes"][0]["color"], "#e11d48");
+    assert_eq!(f["strokes"][0]["points"], serde_json::json!([[10, 20], [800, 0]]));
+    assert_eq!(f["status"], "open");
+    // The team was told; the to-do is theirs: acknowledged, answered.
+    let mail = rpc(&mut crm, "list_outbox", serde_json::json!([]))["ok"].clone();
+    assert!(mail.to_string().contains("Feedback on “Spring” from Carla"), "{}", mail);
+    assert!(anon(&mut crm, "page_feedback", serde_json::json!([id]))["err"].is_string());
+    assert!(anon(&mut crm, "acknowledge_feedback", serde_json::json!([fid]))["err"].is_string());
+    rpc(&mut crm, "acknowledge_feedback", serde_json::json!([fid]));
+    rpc(&mut crm, "team_reply", serde_json::json!([fid, "On it"]));
+    anon(&mut crm, "viewer_reply", serde_json::json!([token, fid, "Carla", "Thanks"]));
+    let f = rpc(&mut crm, "page_feedback", serde_json::json!([id]))["ok"][0].clone();
+    assert_eq!((f["status"].as_str(), f["acknowledger"].as_str()), (Some("acknowledged"), Some("Ada")));
+    assert_eq!((f["replies"][0]["team"].as_bool(), f["replies"][1]["team"].as_bool()), (Some(true), Some(false)));
+    // The viewer resolves it, and may open it again.
+    anon(&mut crm, "resolve_feedback", serde_json::json!([token, fid, true]));
+    assert_eq!(anon(&mut crm, "preview_feedback", serde_json::json!([token]))["ok"][0]["status"], "resolved");
+    anon(&mut crm, "resolve_feedback", serde_json::json!([token, fid, false]));
+    assert_eq!(anon(&mut crm, "preview_feedback", serde_json::json!([token]))["ok"][0]["status"], "acknowledged");
+    // A link no longer in use does nothing.
+    rpc(&mut crm, "new_preview_link", serde_json::json!([id]));
+    assert!(anon(&mut crm, "resolve_feedback", serde_json::json!([token, fid, true]))["err"].is_string());
+    assert!(anon(&mut crm, "give_feedback", shot("Again", "Carla"))["err"].is_string());
 }

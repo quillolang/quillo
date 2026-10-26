@@ -168,7 +168,14 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 Type annotations are checked when the function is called and when it returns, and
 `quillo check` checks them before the program runs: `int float num str bool list map html
 fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
-(`str?`, `int | null`).
+(`str?`, `int | null`). `list<int>` says what a list holds, and `{ title: str, tags:
+list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
+call with a map missing `title`, a list of strings for `list<int>`), and at run time
+they are `list` and `map`.
+
+```
+fn titles(posts: list<{ id: int, title: str }>) = posts | map((p) => p.title)
+```
 
 ### Pipelines and method calls
 
@@ -831,7 +838,9 @@ prefix. Changes to mounted files are picked up by `--watch`. See
 - **Markdown:** `markdown(text)` gives HTML (CommonMark with tables, strikethrough and task
   lists). HTML inside the text is shown as text and `javascript:` links are blocked, so
   it is safe for what visitors write; `markdown(text, { html: true })` keeps the HTML,
-  for text you wrote.
+  for text you wrote, and `markdown(text, { inline: true })` keeps only what is inside a
+  line (bold, italic, code, links) for a headline or a caption: no paragraph around it, and
+  no headings or lists (their lines, broken by `<br>`).
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`
@@ -1004,6 +1013,23 @@ work, division by zero, return and error types, effects, view and component prop
 component code that cannot run in a browser, route mistakes, and, as warnings, unused
 variables (name a variable `_x` to keep it) and calls like `last(xs)` where a variable of
 yours named `last` hides the builtin.
+
+It also knows what lists hold and which fields maps have, from what made them: a list
+or map literal, an annotation, `split`, `range`, `merge`, `set`. A lambda given to
+`map`, `filter`, `find`, `sort_by`, `reduce` and the like takes what the list holds, and
+`for x in xs` too, so `[1, 2] | map((x) => x.name)` is an error; `map` gives a list of
+what its function returns, `first` an item or null. A map whose fields are known has no
+others: `{ title: "Hi" }.titel` is an error (`did you mean title?`), since a missing key
+would read as null and nothing would fail. Maps that come from elsewhere (the database,
+JSON, a parameter without an annotation) and `{}` are open: any field may be there.
+
+`quillo check --strict-null app.qwe` also warns where a value may be null and null does
+not work: an argument `str | null` for a `str` parameter, `count + 1` with `count: int |
+null`, a `-> str` function that may return null. Checks narrow the type, as in
+TypeScript: after `if x == null { return ... }`, in `x != null ? f(x) : ""`, `x != null &&
+f(x)`, `if x { ... }`, and in the arms of a `match` after `null =>`. As in TypeScript,
+`xs[i]` is an item, not "or null" past the end. Editors get the same warnings with the
+language server's `initializationOptions: { "strictNull": true }`.
 
 ## Concurrency and reloading
 

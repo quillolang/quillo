@@ -42,8 +42,8 @@ let renderers_sponsors = {
     "sponsors.banner": (c, ctx) =>
         <aside.pb-sponsor>
             <span.pb-sponsor-label>Sponsored by</span>
-            {!blank(c.logo) ? <img src={c.logo} alt={c.name}/> : <b>{c.name}</b>}
-            {!blank(c.line) && <span>{c.line}</span>}
+            {!blank(c.logo) ? <img src={c.logo} alt={c.name}/> : <b data-edit={ed(ctx, "name")} data-hint={hint(ctx, "The sponsor")}>{c.name}</b>}
+            {(!blank(c.line) || ctx.preview) && <span data-edit={ed(ctx, "line")} data-md={line_mark(ctx)} data-hint={hint(ctx, "One line about them")} data-optional={opt_mark(ctx)}>{line(c.line)}</span>}
             <a href={safe_link(c.link)} rel="sponsored noopener" target="_blank">Visit {c.name}</a>
         </aside>,
 }
