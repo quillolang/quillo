@@ -245,6 +245,7 @@ impl Interp {
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
+        self.access = Default::default();
         self.locale = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
@@ -278,6 +279,8 @@ impl Interp {
         for c in self.set_cookies.drain(..) {
             resp.headers.push(("set-cookie".into(), c));
         }
+        crate::access::apply(self, req, &mut resp);
+        let nonce = crate::access::nonce_attr(self);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
                 if k.eq_ignore_ascii_case("location") {
@@ -302,7 +305,7 @@ impl Interp {
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, b"__quillo_pf")) {
-                resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
+                resp.body.splice(at..at, format!("<script{}>{}</script>", nonce, PREFETCH_JS).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
@@ -319,7 +322,7 @@ impl Interp {
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
             if let (Some(i18n), Some(l)) = (self.site.i18n.clone(), self.locale()) {
-                tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(&l)));
+                tags.push_str(&format!("<script{}>window.__quillo_i18n={}</script>", nonce, i18n.browser_json(&l)));
             }
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
@@ -329,10 +332,16 @@ impl Interp {
                     Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
                     None => format!("{}/_quillo/quillo.js", self.base),
                 };
-                tags.push_str(&format!("<script>{}</script>", island_loader(&src)));
+                tags.push_str(&format!("<script{}>{}</script>", nonce, island_loader(&src)));
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
+            // Under a policy, components are laid out by a style element
+            // carrying the nonce, not by style attributes (see `island`).
+            let first = resp.body.windows(22).position(|w| w == b"<quillo-island data-c=");
+            if let Some(at) = first {
+                resp.body.splice(at..at, format!("<style{}>quillo-island{{display:contents}}</style>", nonce).into_bytes());
+            }
         }
         resp
     }
@@ -875,7 +884,7 @@ pub static PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `download`, to this same page, inside `data-no-prefetch`, those a page's
 /// components follow themselves, or on a connection saving data.
 pub const PREFETCH_JS: &str = concat!(
-    "(()=>{const d=document,w=window,seen=new Set();if(w.__quillo_pf)return;w.__quillo_pf=1;",
+    "(()=>{const d=document,w=window,seen=new Set(),nn=d.currentScript&&d.currentScript.nonce;if(w.__quillo_pf)return;w.__quillo_pf=1;",
     "const c=navigator.connection;if(c&&(c.saveData||/2g/.test(c.effectiveType||\"\")))return;",
     "const spec=HTMLScriptElement.supports&&HTMLScriptElement.supports(\"speculationrules\");",
     "const link=(e)=>e.target&&e.target.closest&&e.target.closest(\"a[href]\");",
@@ -884,7 +893,7 @@ pub const PREFETCH_JS: &str = concat!(
     "const u=new URL(a.href,location.href);if(u.origin!==location.origin||!/^https?:$/.test(u.protocol))return null;",
     "if(u.pathname===location.pathname&&u.search===location.search)return null;u.hash=\"\";return u.href};",
     "const go=(a)=>{const u=a&&want(a);if(!u||seen.has(u))return;seen.add(u);",
-    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
+    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";if(nn)s.nonce=nn;s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
     "else fetch(u,{credentials:\"same-origin\",headers:{\"x-quillo-prefetch\":\"1\"}}).catch(()=>{})};",
     "let t=0;const o={capture:true,passive:true};",
     "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
@@ -1158,9 +1167,13 @@ fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
         return;
     }
     let body = String::from_utf8_lossy(&resp.body).into_owned();
+    let mut script = dev_script(version);
+    if let Some(n) = crate::access::nonce_in(resp) {
+        script = script.replacen("<script>", &format!("<script nonce=\"{}\">", n), 1);
+    }
     resp.body = match body.rfind("</body>") {
-        Some(i) => format!("{}{}{}", &body[..i], dev_script(version), &body[i..]),
-        None => format!("{}{}", body, dev_script(version)),
+        Some(i) => format!("{}{}{}", &body[..i], script, &body[i..]),
+        None => format!("{}{}", body, script),
     }
     .into_bytes();
 }

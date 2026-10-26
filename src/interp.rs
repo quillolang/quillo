@@ -99,6 +99,8 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
+    /// What the request set about its answer's headers, and its session's row (see `access`).
+    pub access: crate::access::PerRequest,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -583,6 +585,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            access: Default::default(),
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -640,6 +643,7 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            access: Default::default(),
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
@@ -2686,8 +2690,12 @@ impl Interp {
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
         let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
+        // Under a Content-Security-Policy, a style element lays it out instead
+        // (see `Interp::handle`): style attributes carry no nonce.
+        let csp = self.access.csp.as_ref().map_or(self.site.csp.is_some(), |c| c.is_some());
         out.push_str(&format!(
-            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
+            "<quillo-island{} data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
+            if csp { "" } else { " style=\"display:contents\"" },
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),

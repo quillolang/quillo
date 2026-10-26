@@ -6,6 +6,7 @@
 //! set_session({ user: user.id })                   // signed; 30 days unless { max_age }
 //! session().user                                   // {} when there is none
 //! end_session()
+//! renew_session()                                  // a new id (see session_store)
 //! ```
 //!
 //! A session is a map kept in a cookie, signed (HMAC-SHA256) with the
@@ -19,7 +20,13 @@
 //! Cookies are `Secure`, except in development (`--watch`) and in a desktop
 //! app's window, which are served over plain HTTP on this machine. (The
 //! request's host cannot tell: behind a proxy, every request is to
-//! 127.0.0.1.)
+//! 127.0.0.1.) A `Secure` session cookie for the whole site is named
+//! `__Host-quillo_session`, which browsers only take from this very host,
+//! over HTTPS: a sibling subdomain (another tenant's) cannot plant one. Two
+//! session cookies that are both valid here are no session.
+//!
+//! `sessions({ store: "db" })` keeps sessions in the database instead, where
+//! they can be ended (see `session_store`).
 
 use crate::crypto::{b64url, hmac_sha256, unb64url};
 use crate::interp::{fail, Ctrl, Interp};
@@ -29,6 +36,8 @@ use std::sync::OnceLock;
 type R = Result<Value, Ctrl>;
 
 pub const COOKIE: &str = "quillo_session";
+/// The session cookie's name when it is `Secure` with `Path=/`.
+pub const HOST_COOKIE: &str = "__Host-quillo_session";
 
 /// Served over plain HTTP on purpose (`--watch`, desktop apps): cookies
 /// are not `Secure`.
@@ -238,21 +247,45 @@ fn delete_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Nil)
 }
 
+/// The session cookie's name here: `__Host-` when the cookie is `Secure`
+/// and for the whole site, as browsers require of that prefix.
+fn cookie_name(it: &Interp) -> &'static str {
+    if it.base.is_empty() && !PLAIN_HTTP.load(std::sync::atomic::Ordering::Relaxed) {
+        HOST_COOKIE
+    } else {
+        COOKIE
+    }
+}
+
+/// Every value the request has for the session cookie: a program mounted
+/// under a path gets its own and its parent's.
+pub(crate) fn cookies(it: &mut Interp) -> Vec<String> {
+    let name = cookie_name(it);
+    let raw = header(it, "cookie").unwrap_or_default();
+    raw.split(';').filter_map(|c| c.trim().split_once('=')).filter(|(k, _)| *k == name).map(|(_, v)| v.to_string()).collect()
+}
+
+/// Queues the session cookie (empty with age 0: removes it).
+pub(crate) fn send_cookie(it: &mut Interp, value: &str, age: Option<u64>, line: u32) -> Result<(), Ctrl> {
+    let name = cookie_name(it);
+    let l = cookie_line(it, name, value, age, None, "set_session", line)?;
+    queue(it, name, l);
+    Ok(())
+}
+
 /// `session()`: the map `set_session` stored, or `{}`.
 fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    if it.site.sessions.is_some() {
+        return Ok(crate::session_store::read(it));
+    }
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }
     let ctx = context(it);
-    // Every cookie of that name: a program mounted under a path gets its
-    // own and its parent's.
-    let raw = header(it, "cookie").unwrap_or_default();
-    let found = raw
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .filter(|(k, _)| *k == COOKIE)
-        .find_map(|(_, v)| open(&ctx, v))
-        .unwrap_or_else(|| Value::map(Map::new()));
+    let mut valid: Vec<Value> = cookies(it).iter().filter_map(|v| open(&ctx, v)).collect();
+    // One valid among others is the session; two are none, since one of
+    // them was planted (by a sibling subdomain, say).
+    let found = if valid.len() == 1 { valid.remove(0) } else { Value::map(Map::new()) };
     it.session = Some(found.clone());
     Ok(found)
 }
@@ -266,12 +299,21 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let o = opts(&args, 1, "set_session", line)?;
     let age = match o.as_ref().and_then(|m| m.get("max_age")) {
-        None | Some(Value::Nil) => DEFAULT_AGE,
+        None | Some(Value::Nil) => None,
         Some(v) => match crate::builtins::duration_seconds(v) {
-            Some(n) if n > 0 => n,
+            Some(n) if n > 0 => Some(n),
             _ => return fail(line, format!("`set_session`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
         },
     };
+    if it.site.sessions.is_some() {
+        return crate::session_store::write(it, data, age, line);
+    }
+    sign_in(it, data, age, line)
+}
+
+/// The session `data`, signed into the cookie.
+pub(crate) fn sign_in(it: &mut Interp, data: Value, age: Option<u64>, line: u32) -> R {
+    let age = age.unwrap_or(DEFAULT_AGE);
     let mut json = Vec::new();
     serde_json::to_writer(&mut json, &serde_json::json!({ "e": now() + age, "d": data.to_json() })).ok();
     let payload = b64url(&json);
@@ -283,16 +325,17 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             format!("the session is {} bytes signed, more than a cookie holds ({}); keep an id in it and the rest in the database", value.len(), MAX_COOKIE),
         );
     }
-    let l = cookie_line(it, COOKIE, &value, Some(age), None, "set_session", line)?;
-    queue(it, COOKIE, l);
+    send_cookie(it, &value, Some(age), line)?;
     it.session = Some(data);
     Ok(Value::Nil)
 }
 
 /// `end_session()`: forgets the session (logging out).
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
-    let l = cookie_line(it, COOKIE, "", Some(0), None, "end_session", line)?;
-    queue(it, COOKIE, l);
+    if it.site.sessions.is_some() {
+        return crate::session_store::end(it, line);
+    }
+    send_cookie(it, "", Some(0), line)?;
     it.session = Some(Value::map(Map::new()));
     Ok(Value::Nil)
 }

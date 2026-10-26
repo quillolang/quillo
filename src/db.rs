@@ -975,6 +975,18 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
     Some(Some(conns.len() - 1))
 }
 
+/// Runs `sql(mysql)` on the database of Quillo's own tables (made if
+/// needed, as for calls made later), apart from the program's transactions
+/// and live updates: for sessions and rate limits. Rows for a `select`.
+pub(crate) fn own_sql(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    let b = match system_on_for(it, true, true) {
+        Some(on) => backend_on(it, on)?,
+        None => backend(it)?,
+    };
+    let text = sql(b.is_mysql());
+    apart(it, &b, text, params)
+}
+
 /// Whether a program uses `db.atomic` (then transactions it left prepared
 /// are looked after: see `recover`).
 pub fn uses_atomic(it: &Interp) -> bool {
