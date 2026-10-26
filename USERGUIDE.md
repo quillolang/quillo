@@ -1246,7 +1246,8 @@ See [examples/services](examples/services): a shop that bills through a billing 
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
-  [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals).
+  [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals) and
+  [Money](#money); `format_number(x, locale, digits)` writes a number as a locale does.
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
   (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
@@ -1374,6 +1375,59 @@ column `decimal_text` (TEXT affinity: SQLite keeps the digits as written, and Qu
 still reads them as decimals), or keep whole minor units (`amount_cents integer`; see
 `money.to_minor`). SQL's own sums and ordering do not work on text: add up and sort in
 Quillo, or keep minor units.
+
+### Money
+
+`money` keeps amounts of a currency: a map `{ amount: dec, currency: "USD" }`, the
+amount always with the currency's minor units (ISO 4217: JPY 0, USD 2, BHD 3). It is a
+plain map, so JSON, the database and the browser take it as it is, and `money` checks
+it each time it is given one. On the server and in the browser alike:
+
+```quillo
+let price = money.of(19.99m, "USD")             // { amount: 19.99m, currency: "USD" }
+money.of(form.amount, "EUR") ?? reply 400       // text from a form; an error value if bad
+money.of("12.345", "USD")                       // err: more decimals than USD has
+money.of("12.345", "USD", "half_up")            // 12.35
+money.from_minor(1250, "USD")                   // 12.50, from cents
+money.to_minor(price)                           // 1999
+money.add(a, b)  money.sub(a, b)  money.neg(a)  money.compare(a, b)   // -1, 0, 1
+money.mul(price, 3)  money.mul(price, 0.075m, "half_up")              // rounded to cents
+money.allocate(money.of(100, "USD"), [1, 1, 1])  // 33.34, 33.33, 33.33
+money.format(price, "de-DE")                    // "19,99 $"
+```
+
+- `money.of(amount, currency, mode)` takes a decimal, an int or numeric text (a float
+  is an error: `dec(x)` it first). An amount with more decimals than the currency has,
+  bad text and an unknown currency give error values, as `int("x")` does; with a
+  rounding mode (those of `round`), the amount is rounded instead. Codes are ISO 4217's
+  active ones (`money.minor_units("JPY")` is 0); codes without minor units, such as XAU,
+  are not money.
+- `add`, `sub` and `compare` take two amounts of one currency: two currencies are an
+  error, never a sum. `mul(m, factor, mode = "half_even")` multiplies by a decimal or an
+  int and rounds to the currency; `round(m, mode)` rounds an amount made by hand.
+  `zero(currency)`, `is_zero(m)`.
+- `money.allocate(m, ratios)` splits an amount by ratios (ints or decimals; a number n
+  for n equal parts) without losing or making a minor unit: each share gets its part,
+  rounded down, and the units left over go one each to the first shares (Martin
+  Fowler's allocation). The shares always add up to the amount.
+- `money.format(m, locale)` writes it as CLDR has it for the locale, the same as
+  `Intl.NumberFormat` in a browser: `$1,234.50` (en-US), `1.234,50 €` (de-DE),
+  `1 234,50 €` (fr-FR, a narrow no-break space between thousands), `￥1,235` (ja-JP),
+  `₹12,34,567.00` (en-IN). Without a locale it uses the program's (`locale()`, with
+  [Translations](#translations)), else en-US. Covered: en-US, en-GB, en-CA, en-AU,
+  en-NZ, en-IE, en-IN, en-SG, en-ZA, de-DE, de-AT, de-CH, fr-FR, fr-BE, fr-CA, fr-CH,
+  it-IT, it-CH, es-ES, es-MX, es-AR, pt-BR, pt-PT, nl-NL, nl-BE, sv-SE, nb-NO, da-DK,
+  fi-FI, pl-PL, cs-CZ, hu-HU, ro-RO, el-GR, tr-TR, ru-RU, uk-UA, ja-JP, zh-CN, zh-TW,
+  zh-HK, ko-KR, hi-IN, id-ID, th-TH, vi-VN, ms-MY and fil-PH. Another locale is written
+  as the first of its language (`de-LU` as de-DE, `fr` as fr-FR), else as en-US. The
+  common currencies have their symbols (`$`, `€`, `£`, `¥`, `₹`, `CA$`, ...); others
+  are written with their code (`XOF 1,235`).
+- `format_number(x, locale, digits)` writes any number the same way: `format_number(
+  1234567.5, "en-IN", 2)` is `"12,34,567.50"`.
+
+To hold the program to the shape, name it: `type Money = { amount: dec, currency: str }`
+makes `Money(request.json)` check what a client sends, and `quillo check` knows what the
+`money` functions give.
 
 ### Numbers and data
 

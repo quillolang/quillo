@@ -433,6 +433,11 @@ fn name_bits(n: &str) -> u16 {
     }
 }
 
+/// A money value's type (src/money.rs).
+fn money_t() -> T {
+    map_of(vec![(Arc::from("amount"), T::of(DEC)), (Arc::from("currency"), T::of(STR))])
+}
+
 /// After an error about a decimal and a float: what to do about it.
 fn dec_hint(x: T, y: T) -> &'static str {
     let mixed = |a: T, b: T| a.bits & DEC != 0 && b.bits & FLOAT != 0;
@@ -528,6 +533,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
     ("dec", "any", "dec | error(str)"),
+    ("format_number", "num | dec, str | null=, int=", "str"),
     ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
@@ -676,6 +682,21 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.open", "str, fn, map | null=", "map"),
     ("media.rtp", "str, map", "null"),
     ("media.streams", "", "list"),
+    // src/money.rs
+    ("money.of", "dec | int | str, str, str=", "map | error(str)"),
+    ("money.from_minor", "int, str", "map | error(str)"),
+    ("money.to_minor", "map", "int"),
+    ("money.add", "map, map", "map"),
+    ("money.sub", "map, map", "map"),
+    ("money.mul", "map, dec | int, str=", "map"),
+    ("money.neg", "map", "map"),
+    ("money.compare", "map, map", "int"),
+    ("money.zero", "str", "map | error(str)"),
+    ("money.is_zero", "map", "bool"),
+    ("money.allocate", "map, list | int", "list"),
+    ("money.round", "map, str=", "map"),
+    ("money.minor_units", "str", "int | error(str)"),
+    ("money.format", "map, str | null=", "str"),
     // src/numeric.rs
     ("math.sqrt", "num", "float"),
     ("math.cbrt", "num", "float"),
@@ -790,9 +811,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "money"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "money"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -2669,6 +2690,10 @@ impl Checker {
                 let e = a0.items().filter(|e| e.bits != 0 && e.bits & !(NUM | DEC) == 0)?;
                 Some(T::of(if expr_at(0).is_some_and(never_empty) { e.bits } else { e.bits | NIL }))
             }
+            // Money is `{ amount: dec, currency: str }`.
+            "money.add" | "money.sub" | "money.mul" | "money.neg" | "money.round" => Some(money_t()),
+            "money.of" | "money.from_minor" | "money.zero" => Some(money_t().union(T::error(STR))),
+            "money.allocate" => Some(list_of(money_t())),
             // A decimal gives a decimal; ints and floats as before.
             "abs" | "floor" | "ceil" | "round" if a0.bits == DEC => Some(T::of(DEC)),
             "abs" | "floor" | "ceil" | "round" if a0.bits & DEC == 0 && a0.bits != 0 => Some(T::of(NUM)),

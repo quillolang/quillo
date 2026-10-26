@@ -15,6 +15,7 @@ pub fn install(env: &Env) {
         ("int", to_int),
         ("float", to_float),
         ("dec", to_dec),
+        ("format_number", crate::money::format_number_fn),
         ("len", len),
         ("type_of", type_of),
         ("upper", upper),
@@ -141,6 +142,9 @@ pub fn install(env: &Env) {
     let mut image = Map::new();
     crate::imaging::install(&mut image);
     define(env, "image", Value::map(image));
+    let mut money = Map::new();
+    crate::money::install(&mut money);
+    define(env, "money", Value::map(money));
     let mut math = Map::new();
     crate::numeric::install_math(&mut math);
     define(env, "math", Value::map(math));

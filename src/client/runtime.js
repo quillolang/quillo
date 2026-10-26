@@ -1350,6 +1350,227 @@ B.__record = meta((name, v) => {
   return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`);
 }, "__record", null);
 
+// ---- money (src/money.rs, the same answers) ------------------------------
+// An amount of a currency, as a map { amount: dec, currency: "USD" }, with
+// the currency's ISO 4217 minor units; written as CLDR has it for a locale.
+
+const MONEY_CURRENCIES = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2 BDT2 BHD3 BIF0 BMD2 BND2 BOB2 BOV2 BRL2 BSD2 " +
+  "BTN2 BWP2 BYN2 BZD2 CAD2 CDF2 CHE2 CHF2 CHW2 CLF4 CLP0 CNY2 COP2 COU2 CRC2 CUC2 CUP2 CVE2 CZK2 DJF0 " +
+  "DKK2 DOP2 DZD2 EGP2 ERN2 ETB2 EUR2 FJD2 FKP2 GBP2 GEL2 GHS2 GIP2 GMD2 GNF0 GTQ2 GYD2 HKD2 HNL2 HTG2 " +
+  "HUF2 IDR2 ILS2 INR2 IQD3 IRR2 ISK0 JMD2 JOD3 JPY0 KES2 KGS2 KHR2 KMF0 KPW2 KRW0 KWD3 KYD2 KZT2 LAK2 " +
+  "LBP2 LKR2 LRD2 LSL2 LYD3 MAD2 MDL2 MGA2 MKD2 MMK2 MNT2 MOP2 MRU2 MUR2 MVR2 MWK2 MXN2 MXV2 MYR2 MZN2 " +
+  "NAD2 NGN2 NIO2 NOK2 NPR2 NZD2 OMR3 PAB2 PEN2 PGK2 PHP2 PKR2 PLN2 PYG0 QAR2 RON2 RSD2 RUB2 RWF0 SAR2 " +
+  "SBD2 SCR2 SDG2 SEK2 SGD2 SHP2 SLE2 SOS2 SRD2 SSP2 STN2 SVC2 SYP2 SZL2 THB2 TJS2 TMT2 TND3 TOP2 TRY2 " +
+  "TTD2 TWD2 TZS2 UAH2 UGX0 USD2 USN2 UYI0 UYU2 UYW4 UZS2 VED2 VES2 VND0 VUV0 WST2 XAF0 XCD2 XCG2 XOF0 " +
+  "XPF0 YER2 ZAR2 ZMW2 ZWG2";
+const MONEY_SYMBOLS = "USD=US$,EUR=\u20ac,GBP=\u00a3,JPY=JP\u00a5,CNY=CN\u00a5,INR=\u20b9,CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u20a9,TWD=NT$,HKD=HK$,VND=\u20ab,ILS=\u20aa";
+const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,PHP=\u20b1\n" +
+  "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-CA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-AU\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=$,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "en-NZ\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,NZD=$,PHP=\u20b1\n" +
+  "en-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,SGD=$,PHP=\u20b1\n" +
+  "en-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1,ZAR=R\n" +
+  "de-DE\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-AT\t,\t.\t\t\u00a0\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-CH\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=$,EUR=EUR,JPY=\u00a5,THB=\u0e3f\n" +
+  "fr-FR\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-BE\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-CA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$\u00a0US,JPY=\u00a5,INR=INR,CAD=$,AUD=$\u00a0AU,NZD=$\u00a0NZ,MXN=MXN,KRW=KRW,TWD=TWD,HKD=$\u00a0HK,SGD=$\u00a0SG,VND=VND,ILS=ILS\n" +
+  "fr-CH\t.\t\u202f\t,\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "it-IT\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "it-CH\t.\t\u2019\t\t\t-\t2\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "es-ES\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,ILS=ILS\n" +
+  "es-MX\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "es-AR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tEUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,ARS=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pt-BR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
+  "pt-PT\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f\n" +
+  "nl-NL\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "nl-BE\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "sv-SE\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,AUD=AUD,NZD=NZD,SEK=kr,NOK=Nkr,DKK=Dkr,BRL=BR$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,EGP=EG\u00a3\n" +
+  "nb-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,NOK=kr,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "da-DK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tDKK=kr.,THB=\u0e3f\n" +
+  "fi-FI\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pl-PL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,PLN=z\u0142,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "cs-CZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tINR=INR,CZK=K\u010d,VND=VND,ILS=ILS\n" +
+  "hu-HU\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,HUF=Ft,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ro-RO\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "el-GR\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "tr-TR\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,TRY=\u20ba,THB=\u0e3f\n" +
+  "ru-RU\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,AUD=A$,RUB=\u20bd,UAH=\u20b4,THB=\u0e3f\n" +
+  "uk-UA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,UAH=\u20b4,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ja-JP\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\uffe5,CNY=\u5143,AUD=A$\n" +
+  "zh-CN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCNY=\u00a5\n" +
+  "zh-TW\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,KRW=\uffe6,TWD=$\n" +
+  "zh-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5\n" +
+  "ko-KR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\n" +
+  "hi-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "id-ID\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tINR=Rs,THB=\u0e3f,IDR=Rp\n" +
+  "th-TH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f\n" +
+  "vi-VN\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tJPY=\u00a5,THB=\u0e3f\n" +
+  "ms-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,CAD=CAD,AUD=A$,MXN=MXN,MYR=RM\n" +
+  "fil-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,THB=\u0e3f,PHP=\u20b1";
+let moneyT = null;
+function moneyTables() {
+  if (moneyT) return moneyT;
+  const pairs = (s) => { const o = Object.create(null); for (const p of s.split(",")) { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i)] = p.slice(i + 1); } return o; };
+  const units = Object.create(null);
+  for (const c of MONEY_CURRENCIES.split(" ")) units[c.slice(0, 3)] = +c.slice(3);
+  const locales = MONEY_LOCALES.split("\n").map((l) => {
+    const f = l.split("\t");
+    return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
+  });
+  return (moneyT = { units, locales, symbols: pairs(MONEY_SYMBOLS) });
+}
+const unitsOf = (code) => { const u = moneyTables().units[code]; return u === undefined ? null : u; };
+function localeData(name) {
+  const all = moneyTables().locales;
+  name = String(name).replace(/_/g, "-").toLowerCase();
+  const lang = name.split("-")[0];
+  return all.find((l) => l.name.toLowerCase() === name) || all.find((l) => l.name.split("-")[0].toLowerCase() === lang) || all[0];
+}
+function moneyDigits(loc, [decimal, group], d) {
+  const t = decText(new Dec(babs(d.m), d.s));
+  const dot = t.indexOf(".");
+  const whole = dot < 0 ? t : t.slice(0, dot), frac = dot < 0 ? "" : t.slice(dot + 1);
+  const n = whole.length, grouped = !(loc.min2 && n < 5);
+  let out = "";
+  for (let i = 0; i < n; i++) {
+    const left = n - i;
+    if (i > 0 && grouped && (loc.indian ? left === 3 || (left > 3 && (left - 3) % 2 === 0) : left % 3 === 0)) out += group;
+    out += whole[i];
+  }
+  return frac ? out + decimal + frac : out;
+}
+function formatAmount(d, code, places, locName) {
+  const loc = localeData(locName);
+  d = decRound(d, places, "half_even");
+  const sym = loc.symbols[code] ?? moneyTables().symbols[code] ?? code;
+  const before = loc.pats[0].indexOf("¤") < loc.pats[0].indexOf("#");
+  const side = before ? Array.from(sym).pop() : Array.from(sym)[0];
+  const letters = side !== undefined && /\p{L}/u.test(side);
+  const pat = loc.pats[(letters ? 2 : 0) + (d.m < 0n ? 1 : 0)];
+  const num = moneyDigits(loc, [loc.decimal, loc.group], d);
+  return pat.replace("-", loc.minus).replace("¤", sym).replace("#", num);
+}
+const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short(v)}`);
+function moneyCurrency(c, f, i) {
+  if (typeof c !== "string") fail(`\`${f}\` expects a currency code (a str) as argument ${i}, got ${moneyShort(c)}`);
+  const code = c.trim().toUpperCase(), u = unitsOf(code);
+  return u === null ? new Err(`unknown currency ${JSON.stringify(c)}`) : { code, units: u };
+}
+function moneyArg(v, f, i) {
+  const bad = (why) => fail(`\`${f}\` expects money ({ amount, currency }) as argument ${i}, got ${moneyShort(v)}${why}`);
+  if (!isMap(v)) bad("");
+  const c = hasOwn(v, "currency") ? v.currency : null;
+  if (typeof c !== "string") bad(": no currency");
+  const code = c.toUpperCase(), units = unitsOf(code);
+  if (units === null) bad(": unknown currency");
+  const a = hasOwn(v, "amount") ? v.amount : null;
+  const amount = a instanceof Dec || isInt(a) || typeof a === "bigint" || typeof a === "string" ? asDec(a) : null;
+  if (amount === null) bad(": its amount must be a dec");
+  return { amount, code, units };
+}
+function moneyMode(m, f) {
+  if (isNil(m)) return "half_even";
+  if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${f === "money.round" ? 2 : 3}, got ${moneyShort(m)}`);
+  if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(m)) fail(`\`${f}\`: unknown rounding ${JSON.stringify(m)} (one of ${ROUNDINGS})`);
+  return m;
+}
+const moneyOf = (amount, code) => ({ amount, currency: code });
+function moneySame(a, b, verb) {
+  if (a.code !== b.code) fail(`cannot ${verb} ${a.code} and ${b.code}: convert one currency to the other first`);
+}
+// The locale to write in: the one given, else the page's, else en-US.
+function moneyLocale(l, f, i) {
+  if (isNil(l)) { const d = i18n(); return d ? d.locale : "en-US"; }
+  if (typeof l !== "string") fail(`\`${f}\` expects a locale (a str) as argument ${i}, got ${moneyShort(l)}`);
+  return l;
+}
+B.money = {
+  of: (amount, currency, mode) => {
+    const c = moneyCurrency(currency, "money.of", 2);
+    if (c instanceof Err) return c;
+    let d;
+    if (amount instanceof Dec) d = amount;
+    else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
+    else if (typeof amount === "string") { d = decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
+    else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
+    else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
+    if (isNil(mode)) {
+      const exact = decRound(d, c.units, "down");
+      if (decCmp(exact, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
+      return moneyOf(exact, c.code);
+    }
+    return moneyOf(decRound(d, c.units, moneyMode(mode, "money.of")), c.code);
+  },
+  from_minor: (n, currency) => {
+    const c = moneyCurrency(currency, "money.from_minor", 2);
+    if (c instanceof Err) return c;
+    if (!isInt(n) && typeof n !== "bigint") fail(`\`money.from_minor\` expects an int as argument 1, got ${moneyShort(n)}`);
+    return moneyOf(new Dec(BigInt(n), c.units), c.code);
+  },
+  to_minor: (m) => {
+    const a = moneyArg(m, "money.to_minor", 1), d = decRound(a.amount, a.units, "half_even");
+    return d.s === a.units ? bigChecked(d.m) : fail("integer overflow");
+  },
+  add: (x, y) => { const a = moneyArg(x, "money.add", 1), b = moneyArg(y, "money.add", 2); moneySame(a, b, "add"); return moneyOf(decRound(decAdd(a.amount, b.amount), a.units, "half_even"), a.code); },
+  sub: (x, y) => { const a = moneyArg(x, "money.sub", 1), b = moneyArg(y, "money.sub", 2); moneySame(a, b, "subtract"); return moneyOf(decRound(decAdd(a.amount, new Dec(-b.amount.m, b.amount.s)), a.units, "half_even"), a.code); },
+  mul: (x, factor, mode) => {
+    const a = moneyArg(x, "money.mul", 1);
+    let f;
+    if (factor instanceof Dec) f = factor;
+    else if (isInt(factor) || typeof factor === "bigint") f = new Dec(BigInt(factor), 0);
+    else if (typeof factor === "number") fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
+    else fail(`\`money.mul\` expects a dec or an int as argument 2, got ${moneyShort(factor)}`);
+    return moneyOf(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
+  },
+  neg: (x) => { const a = moneyArg(x, "money.neg", 1); return moneyOf(new Dec(-a.amount.m, a.amount.s), a.code); },
+  compare: (x, y) => { const a = moneyArg(x, "money.compare", 1), b = moneyArg(y, "money.compare", 2); moneySame(a, b, "compare"); return decCmp(a.amount, b.amount); },
+  zero: (currency) => { const c = moneyCurrency(currency, "money.zero", 1); return c instanceof Err ? c : moneyOf(new Dec(0n, c.units), c.code); },
+  is_zero: (x) => moneyArg(x, "money.is_zero", 1).amount.m === 0n,
+  round: (x, mode) => { const a = moneyArg(x, "money.round", 1); return moneyOf(decRound(a.amount, a.units, moneyMode(mode, "money.round")), a.code); },
+  minor_units: (currency) => { const c = moneyCurrency(currency, "money.minor_units", 1); return c instanceof Err ? c : c.units; },
+  // Split by ratios without losing or making a minor unit: each share its
+  // part rounded down, the units left one each to the first shares with a
+  // ratio (Fowler's allocation).
+  allocate: (x, ratios) => {
+    const F = "money.allocate", a = moneyArg(x, F, 1);
+    let rs;
+    if (isInt(ratios) && ratios >= 1 && ratios <= 100000) rs = new Array(ratios).fill(new Dec(1n, 0));
+    else if (Array.isArray(ratios) && ratios.length > 0) {
+      rs = ratios.map((v, k) => {
+        if ((isInt(v) || typeof v === "bigint") && v >= 0) return new Dec(BigInt(v), 0);
+        if (v instanceof Dec && v.m >= 0n) return v;
+        fail(`\`${F}\`: ratio ${k} must be an int or a dec, 0 or more, got ${moneyShort(v)}`);
+      });
+    } else fail(`\`${F}\` expects a list of ratios or a number of parts as argument 2, got ${moneyShort(ratios)}`);
+    const s = Math.max(...rs.map((r) => r.s));
+    const whole = rs.map((r) => r.m * p10(s - r.s));
+    const total = whole.reduce((t, r) => t + r, 0n);
+    if (total <= 0n) fail(`\`${F}\`: the ratios must add up to more than 0`);
+    const minor = decRound(a.amount, a.units, "half_even").m, neg = minor < 0n, units = babs(minor);
+    const shares = whole.map((r) => (units * r) / total);
+    let left = units - shares.reduce((t, x) => t + x, 0n);
+    for (let i = 0; i < shares.length && left > 0n; i++) if (whole[i] > 0n) { shares[i] += 1n; left -= 1n; }
+    return shares.map((x) => moneyOf(new Dec(neg ? -x : x, a.units), a.code));
+  },
+  format: (x, locale) => { const a = moneyArg(x, "money.format", 1); return formatAmount(a.amount, a.code, a.units, moneyLocale(locale, "money.format", 2)); },
+};
+// format_number(x, locale, digits): a number as the locale writes one.
+B.format_number = meta((x, locale, digits) => {
+  let d;
+  if (x instanceof Dec) d = x;
+  else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
+  else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
+  else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
+  const loc = localeData(moneyLocale(locale, "format_number", 2));
+  if (!isNil(digits)) d = decRound(d, Math.min(Math.max(I(digits, "format_number", 3), 0), 28), "half_even");
+  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d);
+}, "format_number", null);
+
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
 

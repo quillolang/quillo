@@ -52,7 +52,7 @@ js-framework-benchmark's operations, against plain JavaScript (1.00, the fastest
 |---:|---:|---:|---:|---:|---:|
 | **1.07** | 1.04 | 1.15 | 1.78 | 1.94 | 2.08 |
 
-A page loads only what it uses, when someone reaches for it: 8 KB compressed for a
+A page loads only what it uses, when someone reaches for it: 9 KB compressed for a
 simple component, 13 KB for the benchmark's table.
 
 **A server faster than Node and Bun.** One process each, requests a second:
@@ -71,6 +71,17 @@ is written as if it simply waited.
 Cranelift the second time it is called, for the types it gets. `fib(32)` takes 11 ms
 (as in Node; Bun 21), and a ten-million-step loop 29 ms (Node and Bun: about 280),
 with the interpreter's exact answers and errors.
+
+**Exact money.** `0.1m + 0.2m == 0.3m`: decimals are a type of their own, exact from
+PostgreSQL's `numeric` to the page, never mixed with floats by accident; `money` keeps
+amounts in their currency's minor units, splits them without losing a cent, and
+writes them as each locale does.
+
+```quillo
+let total = money.mul(money.of(19.99m, "USD"), 3)       // 59.97
+money.allocate(total, [1, 1, 1]) | map((m) => money.format(m, "de-DE"))
+// ["19,99 $", "19,99 $", "19,99 $"]
+```
 
 **Databases, all of them, at once.** SQLite built in, PostgreSQL and MySQL with the same
 functions; migrations; pages that follow the data live as it changes, for everyone.

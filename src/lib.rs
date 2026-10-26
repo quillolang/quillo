@@ -27,6 +27,7 @@ pub mod jit;
 pub mod lexer;
 pub mod metrics;
 pub mod migrate;
+pub mod money;
 #[cfg(feature = "mysql")]
 pub mod my;
 pub mod lsp;

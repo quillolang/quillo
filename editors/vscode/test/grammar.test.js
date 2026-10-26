@@ -40,6 +40,7 @@ const cases = [
   ['let price = 12.50m * 3 + 5m', "5m", "constant.numeric.decimal.quillo"],
   ['let price = 12.50m * 3 + 5m', "3", "constant.numeric.integer.quillo"],
   ['fn fee(a: dec) -> dec = a', "dec", "support.type.quillo"],
+  ['let m = money.of(12.50m, "USD")', "money", "support.module.quillo"],
   ['let style = css`a > b { color: ${accent}; }`', "css", "support.function.tag.quillo"],
   ['let style = css`a > b { color: ${accent}; }`', "a > b { color: ", "meta.embedded.block.css"],
   ['let style = css`a > b { color: ${accent}; }`', "accent", "meta.template.expression.quillo"],
