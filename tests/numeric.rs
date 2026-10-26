@@ -332,3 +332,11 @@ fn the_browser_gives_the_same_answers() {
         assert!(((s - b) / s).abs() < 1e-13, "{}: server {}, browser {}", e, s, b);
     }
 }
+
+#[test]
+fn quantiles_are_cut_into_a_bounded_number_of_parts() {
+    // What the review ran: 20 million parts took 1.4 GB.
+    let e = run("stats.quantiles([1, 2, 3], 20000000)").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("n must be from 1 to 10000"), "{}", e);
+    assert_eq!(eval("len(stats.quantiles(range(100), 10000))"), "9999");
+}

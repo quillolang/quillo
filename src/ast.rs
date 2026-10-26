@@ -339,6 +339,7 @@ impl ElFacts {
             && plain_attrs
             && tag != "html"
             && tag != "style"
+            && tag != "script"
             && id.as_ref().map_or(true, lit)
             && classes.iter().all(lit)
             && attrs.iter().all(|(n, v)| match v {

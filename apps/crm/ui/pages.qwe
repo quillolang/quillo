@@ -696,7 +696,7 @@ component OrderTable(status: str, ws: map) {
             <td>{o.contact_id != null ? <a href={`/app/contacts/${o.contact_id}`}>{full_name(o)}</a> : "—"}</td>
             <td>{o.items | map((i) => `${i.qty} × ${i.name}`) | join(", ")}</td>
             <td>{fmt_money(o.total_cents, cur)}{o.tax_cents > 0 && <span.muted.small> incl. {fmt_money(o.tax_cents, cur)} tax</span>}</td>
-            <td><Badge text={o.status} tone={status_tone(o.status)}/></td>
+            <td><Badge text={o.status} tone={status_tone(o.status)}/>{len(o.review) > 0 && <span title={o.review | join("\n")}> <Badge text="check" tone="amber"/></span>}</td>
             <td.muted>{fmt_time(o.created_at)}</td>
             <td>{o.status == "paid" && ws.user.role != "member" && <button.ghost @click={() => {
                 if ask("What was bought goes back on the shelf.", { title: `Refund ${o.number}?`, ok: "Refund", tone: "danger" }) { refund_order(o.id); notify(`${o.number} refunded`) }

@@ -349,6 +349,17 @@ pub fn url_attr(name: &str) -> bool {
 /// What a `javascript:` URL in one of `URL_ATTRS` becomes.
 pub const BLOCKED_URL: &str = "about:blank#blocked";
 
+/// Whether a value written in a URL attribute would be a `javascript:` URL:
+/// its text is what the attribute says, whatever its type (an `html`
+/// value from `markdown(u, { inline: true })` too).
+fn shows_script_url(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => script_url(s),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::List(_) | Value::Map(_) => false,
+        other => script_url(&other.display()),
+    }
+}
+
 /// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
@@ -444,6 +455,21 @@ fn render_value(v: &Value, out: &mut String) {
         Value::Int(n) => push_int(out, *n),
         other => escape_into(&other.display(), out),
     }
+}
+
+/// A value placed in a `<script>` (see `render_tag_into`).
+fn script_value(v: &Value, out: &mut String) {
+    match v {
+        Value::Nil | Value::Bool(false) => {}
+        Value::Html(h) => out.push_str(&h.replace("</", "<\\/").replace("<!--", "<\\!--")),
+        other => out.push_str(&script_json(&other.to_json())),
+    }
+}
+
+/// JSON that is safe inside `<script>`: no `</script>`, `<!--` or line
+/// separators (which end a string in older JavaScript).
+pub fn script_json(j: &serde_json::Value) -> String {
+    serde_json::to_string(j).unwrap_or_default().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
 }
 
 /// JSON for an island's props and state, and for what server fns take and
@@ -1721,6 +1747,17 @@ impl Interp {
         } else {
             self.eval(callee, env)?
         };
+        // `raw(t(key, vars))`: the translation's markup, but the values put
+        // in it are text, escaped (see `i18n::t_html`).
+        if let (Value::Builtin("raw", _), None, [Expr::Call(inner, targs, l)]) = (&f, &pre, args) {
+            if matches!(&**inner, Expr::Ident(n, _) if n == "t") && matches!(self.eval(inner, env)?, Value::Builtin("t", _)) {
+                let mut tv = Vec::with_capacity(targs.len());
+                for a in targs {
+                    tv.push(self.eval(a, env)?);
+                }
+                return crate::i18n::t_html(self, tv, *l);
+            }
+        }
         if let Some(p) = pre {
             argv.push(p);
         }
@@ -2510,6 +2547,21 @@ impl Interp {
         }
         match text_value {
             Some(t) => out.push_str(&escape(&t)),
+            // A script is code to the browser, where HTML escaping means
+            // nothing: a value goes in as JSON (a JS value, `<` escaped), and
+            // HTML (`raw(...)`) as it is, but without `</` or `<!--`, so
+            // neither can end the element early.
+            None if el.tag == "script" => {
+                for c in &el.children {
+                    match c {
+                        HtmlChild::Expr(e) if !matches!(e, Expr::Lit(Lit::Str(_))) => {
+                            let v = self.eval(e, env)?;
+                            script_value(&v, out);
+                        }
+                        c => self.render_child(c, env, out)?,
+                    }
+                }
+            }
             // A style sheet is raw text to the browser: `.a > b` must stay
             // as written. Only `</` is changed, so the text cannot end the
             // element early.
@@ -2585,7 +2637,7 @@ impl Interp {
                 continue;
             }
             let v = match (&v, name) {
-                (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
+                _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
                 (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }
@@ -2733,7 +2785,7 @@ impl Interp {
     /// prefix.
     fn write_attr(&self, name: &str, v: Value, out: &mut String) {
         let v = match (&v, name) {
-            (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
+            _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
             (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                 Value::str(self.with_base(s))
             }

@@ -1224,28 +1224,46 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
     let version = r.version.unwrap_or(1);
     let mut hs: Vec<(String, String)> = Vec::with_capacity(r.headers.len());
     let mut length: Option<usize> = None;
-    let mut chunked = false;
+    let mut codings: Vec<String> = Vec::new();
     let mut connection = String::new();
     let mut expects_continue = false;
     for h in r.headers.iter() {
         let value = String::from_utf8_lossy(h.value).into_owned();
         if h.name.eq_ignore_ascii_case("content-length") {
-            match value.trim().parse::<usize>() {
-                Ok(n) if length.map_or(true, |m| m == n) => length = Some(n),
+            // Digits only: a proxy in front may read `+5` or `5 5` otherwise
+            // than this server does, and then the two disagree on where the
+            // next request starts.
+            let digits = value.trim_matches([' ', '\t']);
+            match digits.parse::<usize>() {
+                Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) && length.map_or(true, |m| m == n) => length = Some(n),
                 _ => return Parsed::Bad(400, "bad content-length"),
             }
         } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            if value.to_ascii_lowercase().split(',').any(|t| t.trim() == "chunked") {
-                chunked = true;
-            } else {
-                return Parsed::Bad(501, "unsupported transfer-encoding");
-            }
+            codings.extend(value.to_ascii_lowercase().split(',').map(|t| t.trim_matches([' ', '\t']).to_string()).filter(|t| !t.is_empty()));
         } else if h.name.eq_ignore_ascii_case("connection") {
             connection = value.to_ascii_lowercase();
         } else if h.name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue") {
             expects_continue = true;
         }
         hs.push((h.name.to_string(), value));
+    }
+    // A body is framed one way only, and only the way both ends of a proxy
+    // read alike: `chunked` (last, and alone, since nothing else is decoded)
+    // over HTTP/1.1, or a length.
+    let chunked = !codings.is_empty();
+    if chunked {
+        if version == 0 {
+            return Parsed::Bad(400, "transfer-encoding is not HTTP/1.0");
+        }
+        if length.is_some() {
+            return Parsed::Bad(400, "both content-length and transfer-encoding");
+        }
+        if codings.last().map(String::as_str) != Some("chunked") {
+            return Parsed::Bad(400, "transfer-encoding does not end with chunked");
+        }
+        if codings.len() > 1 {
+            return Parsed::Bad(501, "unsupported transfer-encoding");
+        }
     }
     let keep_alive = match version {
         0 => connection.contains("keep-alive"),
@@ -1347,11 +1365,19 @@ fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
                 if eol > MAX_CHUNK_LINE || d.extra > MAX_CHUNK_EXTRA {
                     return Chunked::Bad;
                 }
-                // At most 16 hex digits: a size that fits, however large.
-                let size_text = std::str::from_utf8(size_text).map(str::trim).unwrap_or("");
-                if size_text.is_empty() || size_text.len() > 16 {
+                // Hex digits only (spaces or tabs only before a `;`), at
+                // most 16: a size that fits, however large, and that a proxy
+                // in front reads as this server does.
+                let size_text = if size_text.len() < line.len() {
+                    let end = size_text.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(0, |i| i + 1);
+                    &size_text[..end]
+                } else {
+                    size_text
+                };
+                if size_text.is_empty() || size_text.len() > 16 || !size_text.iter().all(u8::is_ascii_hexdigit) {
                     return Chunked::Bad;
                 }
+                let size_text = std::str::from_utf8(size_text).unwrap_or("");
                 let Ok(size) = usize::from_str_radix(size_text, 16) else { return Chunked::Bad };
                 d.used += eol + 2;
                 d.step = if size == 0 {
@@ -1635,6 +1661,11 @@ mod tests {
         // Sizes that would overflow, or are longer than any size can be.
         assert!(matches!(whole(b"1\r\nA\r\nffffffffffffffff\r\nBB", 100), Chunked::TooLarge));
         assert!(matches!(whole(b"00000000000000001\r\nA\r\n", 100), Chunked::Bad));
+        // Sizes as the review sent them: a sign, or spaces around.
+        for b in [&b"+5\r\nhello\r\n0\r\n\r\n"[..], b" 5 \r\nhello\r\n0\r\n\r\n", b"5 \r\nhello\r\n0\r\n\r\n", b"0x5\r\nhello\r\n0\r\n\r\n"] {
+            assert!(matches!(whole(b, 100), Chunked::Bad), "{}", String::from_utf8_lossy(b));
+        }
+        assert!(matches!(whole(b"5 ;x=1\r\nhello\r\n0\r\n\r\n", 100), Chunked::Done(..)));
     }
 
     #[test]

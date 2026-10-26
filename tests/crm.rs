@@ -1374,3 +1374,48 @@ fn flow_webhooks_reach_only_the_public_internet() {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
     }
 }
+
+#[test]
+fn a_vat_number_that_takes_the_tax_off_is_flagged_for_review() {
+    let mut crm = Crm::new("vat");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let s = serde_json::json!([{ "name": "Acme", "currency": "EUR", "country": "FR", "vat_rate": "20" }]);
+    assert_eq!(crm.rpc(host, "save_settings", s, Some(&cookie))["ok"], true);
+    let buy = |vat: &str| serde_json::json!([{ "sku": "tee", "name": "Bea Buyer", "email": "bea@shop.test", "qty": 1, "card": "4242424242424242", "expiry": "12/30", "cvc": "123", "country": "DE", "vat_id": vat, "address": "1 Hauptstrasse, Berlin" }]);
+    // What the review saw: any number of the right shape takes the tax off.
+    let paid = crm.rpc(host, "checkout", buy("DE 123456789"), None);
+    assert_eq!(paid["ok"]["total"], "€25.00", "{}", paid);
+    // It still does, but the order says to check it, and the team has a task.
+    let orders = crm.rpc(host, "list_orders", serde_json::json!([""]), Some(&cookie));
+    let why = orders["ok"][0]["review"][0].as_str().unwrap_or_else(|| panic!("{}", orders)).to_string();
+    assert!(why.contains("DE123456789") && why.contains("VIES"), "{}", why);
+    let tasks = crm.rpc(host, "list_tasks", serde_json::json!([false]), Some(&cookie));
+    assert!(tasks["ok"].as_array().unwrap().iter().any(|t| t["title"].as_str().unwrap_or("").contains("DE123456789")), "{}", tasks);
+    // Tax charged: nothing to check.
+    let taxed = crm.rpc(host, "checkout", buy(""), None);
+    assert_eq!(taxed["ok"]["total"], "€30.00", "{}", taxed);
+    let orders = crm.rpc(host, "list_orders", serde_json::json!([""]), Some(&cookie));
+    assert_eq!(orders["ok"][0]["review"], serde_json::json!([]), "{}", orders);
+}
+
+#[test]
+fn a_discount_code_is_used_no_more_than_its_uses() {
+    let mut crm = Crm::new("uses");
+    let cookie = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let code = serde_json::json!([{ "code": "ONCE", "kind": "percent", "value": 10, "min_cents": 0, "max_uses": 1, "active": true }]);
+    assert_eq!(crm.rpc(host, "save_discount", code, Some(&cookie))["ok"], true);
+    // What the review saw: the count is checked before the order's
+    // transaction, so two checkouts at once could both take the last use.
+    // Inside it, a use is taken only while one is left: the second fails.
+    crm.it
+        .load_source("fn __take_twice() = with_tenant(\"acme\", () => [take_discount_use(\"ONCE\"), take_discount_use(\"ONCE\")])", "race.qwe")
+        .unwrap();
+    let f = quillo::value::lookup(&crm.it.globals, "__take_twice").unwrap();
+    let got = crm.it.call(&f, vec![], 0).unwrap_or_else(|_| panic!("failed"));
+    let got = got.repr();
+    assert!(got.starts_with("[true, err(") && got.contains("That code has been used up"), "{}", got);
+    let codes = crm.rpc(host, "list_discounts", serde_json::json!([]), Some(&cookie));
+    assert_eq!(codes["ok"][0]["uses"], 1, "{}", codes);
+}

@@ -298,10 +298,39 @@ fn parsed(text: &str) -> Value {
     serde_json::from_str::<serde_json::Value>(text).map(|j| Value::from_json(&j)).unwrap_or_else(|_| Value::str(text))
 }
 
-/// The whole pieces at the front of `buf` (all of it at the end), as the
-/// arguments the function gets.
-fn pieces(buf: &mut Vec<u8>, kind: Kind, end: bool) -> Vec<Vec<Value>> {
+/// Longest line or event `http.stream` waits for the end of: a server that
+/// never ends one cannot fill the program's memory.
+const MAX_PIECE: usize = 16 << 20;
+
+/// What has arrived of a stream and is not handed over yet. `scanned`:
+/// how much of `buf` is known to hold no end of a line or event, so each
+/// byte is looked at about once however the stream is cut up.
+#[derive(Default)]
+struct Pending {
+    buf: Vec<u8>,
+    scanned: usize,
+}
+
+/// Where the first event in `b` ends at a blank line (`\n\n`, `\r\n\r\n`
+/// or a mix), looking from `from`: its end, and where the next one starts.
+fn event_end(b: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(j) = b[i..].iter().position(|x| *x == b'\n').map(|j| j + i) {
+        match (b.get(j + 1), b.get(j + 2)) {
+            (Some(b'\n'), _) => return Some((j, j + 2)),
+            (Some(b'\r'), Some(b'\n')) => return Some((j, j + 3)),
+            _ => i = j + 1,
+        }
+    }
+    None
+}
+
+/// The whole pieces at the front of what arrived (all of it at the end), as
+/// the arguments the function gets; an error when one is longer than
+/// `MAX_PIECE`.
+fn pieces(p: &mut Pending, kind: Kind, end: bool) -> Result<Vec<Vec<Value>>, String> {
     let mut out = Vec::new();
+    let buf = &mut p.buf;
     match kind {
         Kind::Text => {
             // Whole characters only: the rest of one comes with the next piece.
@@ -317,43 +346,62 @@ fn pieces(buf: &mut Vec<u8>, kind: Kind, end: bool) -> Vec<Vec<Value>> {
             }
         }
         Kind::Lines => {
-            while let Some(i) = buf.iter().position(|b| *b == b'\n').or(if end && !buf.is_empty() { Some(buf.len()) } else { None }) {
-                let line: Vec<u8> = buf.drain(..i.min(buf.len())).collect();
-                if !buf.is_empty() {
-                    buf.remove(0);
-                }
-                let line = String::from_utf8_lossy(&line);
+            let mut start = 0;
+            let mut at = p.scanned;
+            loop {
+                let i = match buf[at..].iter().position(|b| *b == b'\n') {
+                    Some(i) => at + i,
+                    None if end && start < buf.len() => buf.len(),
+                    None => break,
+                };
+                let line = String::from_utf8_lossy(&buf[start..i]);
                 let line = line.trim_end_matches('\r');
                 if !line.trim().is_empty() {
                     out.push(vec![parsed(line)]);
                 }
+                start = (i + 1).min(buf.len());
+                at = start;
             }
+            buf.drain(..start);
+            p.scanned = buf.len();
         }
-        Kind::Events => loop {
-            // An event ends at a blank line.
-            let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
-            let Some(at) = text.find("\n\n").or(if end && !text.trim().is_empty() { Some(text.len()) } else { None }) else { break };
-            let block = text[..at].to_string();
-            let rest = text[(at + 2).min(text.len())..].to_string();
-            *buf = rest.into_bytes();
-            let (mut data, mut name): (Vec<&str>, Option<&str>) = (Vec::new(), None);
-            for l in block.lines() {
-                let (field, value) = l.split_once(':').map_or((l, ""), |(f, v)| (f, v.strip_prefix(' ').unwrap_or(v)));
-                match field {
-                    "data" => data.push(value),
-                    "event" => name = Some(value),
-                    _ => {}
+        Kind::Events => {
+            let mut start = 0;
+            // A blank line may have begun in what was looked at before.
+            let mut from = p.scanned.saturating_sub(2);
+            loop {
+                let (stop, next) = match event_end(buf, from.max(start)) {
+                    Some(e) => e,
+                    None if end && !String::from_utf8_lossy(&buf[start..]).trim().is_empty() => (buf.len(), buf.len()),
+                    None => break,
+                };
+                let block = String::from_utf8_lossy(&buf[start..stop]).replace("\r\n", "\n");
+                let (mut data, mut name): (Vec<&str>, Option<&str>) = (Vec::new(), None);
+                for l in block.lines() {
+                    let (field, value) = l.split_once(':').map_or((l, ""), |(f, v)| (f, v.strip_prefix(' ').unwrap_or(v)));
+                    match field {
+                        "data" => data.push(value),
+                        "event" => name = Some(value),
+                        _ => {}
+                    }
+                }
+                if !data.is_empty() {
+                    out.push(vec![parsed(&data.join("\n")), name.map_or(Value::Nil, Value::str)]);
+                }
+                start = next;
+                from = next;
+                if start >= buf.len() {
+                    break;
                 }
             }
-            if !data.is_empty() {
-                out.push(vec![parsed(&data.join("\n")), name.map_or(Value::Nil, Value::str)]);
-            }
-            if buf.is_empty() {
-                break;
-            }
-        },
+            buf.drain(..start.min(buf.len()));
+            p.scanned = buf.len();
+        }
     }
-    out
+    if buf.len() > MAX_PIECE {
+        return Err(format!("http: a {} longer than {} bytes", if matches!(kind, Kind::Events) { "event" } else { "line" }, MAX_PIECE));
+    }
+    Ok(out)
 }
 
 /// `http.stream(url, f, { method = "GET", body, headers })`: `{ status, ok,
@@ -422,7 +470,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Value::Func(c) => c.def.params.len(),
         _ => usize::MAX,
     };
-    let mut buf = Vec::new();
+    let mut pending = Pending::default();
     loop {
         // Read while other requests run; hand over what came, here.
         let (r, got) = it.unlocked(move || {
@@ -437,12 +485,16 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let end = match got {
             Ok(c) if c.is_empty() => true,
             Ok(c) => {
-                buf.extend_from_slice(&c);
+                pending.buf.extend_from_slice(&c);
                 false
             }
             Err(e) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
         };
-        for mut piece in pieces(&mut buf, kind, end) {
+        let got = match pieces(&mut pending, kind, end) {
+            Ok(g) => g,
+            Err(e) => return Ok(Value::err(Value::str(e))),
+        };
+        for mut piece in got {
             piece.truncate(params);
             if matches!(it.call(&f, piece, line)?, Value::Bool(false)) {
                 return Ok(Value::map(m));
@@ -451,5 +503,55 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if end {
             return Ok(Value::map(m));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(kind: Kind, input: &[u8], step: usize) -> Result<Vec<String>, String> {
+        let mut p = Pending::default();
+        let mut got = Vec::new();
+        for c in input.chunks(step) {
+            p.buf.extend_from_slice(c);
+            got.extend(pieces(&mut p, kind, false)?);
+        }
+        got.extend(pieces(&mut p, kind, true)?);
+        Ok(got.iter().map(|a| a.iter().map(|v| v.repr()).collect::<Vec<_>>().join(" ")).collect())
+    }
+
+    #[test]
+    fn stream_pieces_however_they_arrive() {
+        let events = b"data: 1\n\nevent: tick\ndata: {\"a\": 2}\r\n\r\n: comment\ndata: x\ndata: y\n\r\ndata: last";
+        let want = vec!["1 null", "{ a: 2 } \"tick\"", "\"x\\ny\" null", "\"last\" null"];
+        let lines = b"{\"n\": 1}\n\n2\r\nthree\n4";
+        for step in [1, 2, 3, 7, 1000] {
+            assert_eq!(feed(Kind::Events, events, step).unwrap(), want, "{}", step);
+            assert_eq!(feed(Kind::Lines, lines, step).unwrap(), vec!["{ n: 1 }", "2", "\"three\"", "4"], "{}", step);
+        }
+    }
+
+    #[test]
+    fn a_line_or_event_without_end_is_refused_at_a_limit() {
+        // What the review saw: a server that never ends a line fills memory,
+        // and each piece that came was decoded again from the start.
+        let long = vec![b'x'; MAX_PIECE + 1];
+        for kind in [Kind::Lines, Kind::Events] {
+            let e = feed(kind, &long, 64 << 10).unwrap_err();
+            assert!(e.contains("longer than"), "{}", e);
+        }
+        // Many events in one go, or one in many pieces: looked at once.
+        let mut many = Vec::new();
+        for i in 0..20_000 {
+            many.extend_from_slice(format!("data: {}\n\n", i).as_bytes());
+        }
+        let t = std::time::Instant::now();
+        assert_eq!(feed(Kind::Events, &many, many.len()).unwrap().len(), 20_000);
+        let mut one = b"data: ".to_vec();
+        one.extend(vec![b'y'; 4 << 20]);
+        one.extend_from_slice(b"\n\n");
+        assert_eq!(feed(Kind::Events, &one, 1024).unwrap().len(), 1);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     }
 }

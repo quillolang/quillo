@@ -93,7 +93,7 @@ server fn list_orders(status: str) {
     need_user()?
     db.query("select o.*, c.first_name, c.last_name, c.email from orders o left join contacts c on c.id = o.contact_id
               where (? = '' or o.status = ?) order by o.created_at desc limit 300", status, status)
-        | map((o) => set(o, "items", parsed(o.items, [])))
+        | map((o) => merge(o, { items: parsed(o.items, []), review: parsed(o.fields, {}).review ?? [] }))
 }
 
 server fn refund_order(id: int) {
@@ -153,6 +153,14 @@ fn usable_discount(code: str) {
         : d.ends_at != null && d.ends_at < now() ? err("That code has ended")
         : d.max_uses != null && d.uses >= d.max_uses ? err("That code has been used up")
         : { code: d.code, kind: d.kind, value: d.value, min_cents: d.min_cents }
+}
+
+// One use of a code, taken only while it has uses left (and is on), in
+// the order's transaction: two checkouts at once cannot both take the
+// last one, as they could between `usable_discount` and paying.
+fn take_discount_use(code: str) {
+    let r = db.exec("update discounts set uses = uses + 1 where code = ? and active = 1 and (max_uses is null or uses < max_uses)", code)?
+    r.changes == 1 ? true : err({ problems: problem("discount", "That code has been used up") })
 }
 
 fn discount_label(d, currency: str) =
@@ -269,14 +277,18 @@ server fn checkout(o: map) {
         let number = `${upper(slice(settings.slug ?? "ord", 0, 3))}-${1000 + ((db.one("select count(*) as n from orders") ?? {}).n ?? 0) + 1}`
         let items = lines | map((l) => { product_id: l.product.id, name: l.product.name, sku: l.product.sku, variant: l.product.variant, price_cents: l.product.price_cents,
             qty: clamp_qty(l.qty), kind: l.product.kind, interval: l.product.interval })
-        let fields = { country: upper(trim(o.country ?? "")), vat_id: upper(trim(o.vat_id ?? "")), address: trim(o.address ?? "") }
+        // What plugins ask the team to check by hand (a VAT number that took
+        // the tax off): kept with the order, and a task for each.
+        let review = active_plugins(ctx.enabled ?? []) | filter((p) => p.review != null) | map((p) => p.review(order, ctx)) | filter((r) => !blank(r))
+        let fields = { country: upper(trim(o.country ?? "")), vat_id: upper(trim(o.vat_id ?? "")), address: trim(o.address ?? ""), review }
         let used = q.discount_ok ? discount.code : ""
+        if used != "" { take_discount_use(used)? }
         let r = db.exec(
             "insert into orders (number, contact_id, status, subtotal_cents, tax_cents, total_cents, items, payment_ref, fields, discount_code, discount_cents, shipping_cents, created_at, paid_at) values (?, ?, 'paid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             number, c.id, q.subtotal_cents, q.tax_cents, q.total_cents, json.stringify(items), `test_${crypto.token(9)}`, json.stringify(fields),
             used, q.discount_cents, q.shipping_cents, t, t)
         for l in items => take_stock(l.product_id, l.variant, l.qty)
-        if used != "" { db.exec("update discounts set uses = uses + 1 where code = ?", used) }
+        for why in review => db.exec("insert into tasks (title, due, contact_id, created_at) values (?, ?, ?, ?)", `Order ${number}: ${why}`, iso_day(t), c.id, t)
         if c.stage != "customer" { db.exec("update contacts set stage = 'customer', updated_at = ? where id = ?", t, c.id) }
         let money = fmt_money(q.total_cents, cur)
         note_activity("order", c.id, null, `Bought ${items | map((l) => `${l.qty} × ${l.name}`) | join(", ")} (${money}), order ${number}`)
@@ -285,6 +297,7 @@ server fn checkout(o: map) {
         for l in items => fire("order_paid", { contact_id: c.id, order_id: r.last_id, sku: l.sku, total_cents: q.total_cents })
         { number, total: money, email: c.email, contact_id: c.id, skus: items | map((l) => l.sku) }
     })
+    if is_err(done) { return done }
     if o.sku == null { set_session(merge(session(), { cart: [], discount: null })) }
     // After the commit: the flows the purchase started, and the ones that
     // were waiting for it.

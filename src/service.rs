@@ -55,6 +55,17 @@ fn secret() -> Option<String> {
     std::env::var("QUILLO_SERVICE_SECRET").ok().filter(|s| !s.is_empty())
 }
 
+/// The service this process serves as (`--service-name`, or the program's
+/// file name): a signed call names the service it is for, and one for
+/// another is refused here. Not set (a program run by a test, or embedded),
+/// a call for any service is taken.
+static SERVED_AS: OnceLock<String> = OnceLock::new();
+
+/// Says which service this process is (see `SERVED_AS`); the first one set holds.
+pub fn serve_as(name: &str) {
+    let _ = SERVED_AS.set(name.to_string());
+}
+
 /// `QUILLO_SERVICE_BILLING` for `billing`.
 pub fn env_name(name: &str) -> String {
     format!("QUILLO_SERVICE_{}", name.to_ascii_uppercase())
@@ -378,9 +389,13 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
     remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)))
 }
 
-/// A random id of `n` hex digits.
+/// A random id of `n` hex digits. Call ids are the nonces of signed calls,
+/// so they come from the system's random bytes when it gives them.
 pub fn new_id(n: usize) -> String {
-    (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect()
+    match crate::crypto::random_bytes(n.div_ceil(2)) {
+        Some(b) => crate::crypto::hex(&b)[..n].to_string(),
+        None => (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect(),
+    }
 }
 
 /// A request's id: the `x-request-id` it came with, if it is a plain one,
@@ -410,9 +425,10 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
         return Outcome::Ran(Value::err(Value::str(format!("service {}: no server fn `{}`", name, f))));
     };
     let args: Vec<Value> = args.iter().map(crossed).collect();
-    if let Err(msg) = crate::server::check_args(&svc.types, &c.def, &args) {
-        return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg))));
-    }
+    let args = match crate::server::take_args(&mut svc, &c.def, args) {
+        Ok(a) => a,
+        Err(msg) => return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg)))),
+    };
     svc.tenant = Some(tenant.clone());
     svc.tenant_named = tenant.is_some();
     svc.request_id = rid;
@@ -446,10 +462,11 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The signature of a call: the time, the function, the tenant and the
-/// arguments, under the shared secret.
-fn signature(secret: &str, t: u64, f: &str, tenant: &str, body: &[u8]) -> String {
-    let mut msg = format!("{}\n{}\n{}\n", t, f, tenant).into_bytes();
+/// The signature of a call: the time, the service it is for, the function,
+/// the tenant, the call id (which the service remembers, so the same call
+/// sent again is not run again) and the arguments, under the shared secret.
+pub fn signature(secret: &str, t: u64, to: &str, f: &str, tenant: &str, call: &str, body: &[u8]) -> String {
+    let mut msg = format!("quillo-service-2\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call).into_bytes();
     msg.extend_from_slice(body);
     crate::crypto::hex(&crate::crypto::hmac_sha256(secret.as_bytes(), &msg))
 }
@@ -495,9 +512,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             it.unlocked(move || std::thread::sleep(wait));
         }
         let t = now_secs();
-        let sig = signature(&secret, t, f, &tenant, &body);
+        let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
-        let (b, tn, r, c, cl) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone());
+        let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
         let timeout = o.timeout;
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
@@ -505,6 +522,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 .timeout(timeout)
                 .set("content-type", "application/json")
                 .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+                .set("x-quillo-to", &to)
                 .set("x-quillo-call", &c)
                 .set("x-quillo-caller", &cl);
             if !tn.is_empty() {
@@ -601,7 +619,9 @@ fn refused(status: u16, msg: &str) -> HttpResponse {
 
 /// `POST /_quillo/service/<fn>`: another service calling one of this
 /// program's server fns. Only a call signed with the shared secret, made
-/// in the last few minutes, is answered; it runs in the tenant it names.
+/// in the last few minutes, for this service, is answered, and only once
+/// (its call id is remembered for longer than a signature lasts); it runs
+/// in the tenant it names.
 pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     if req.method != "POST" {
         return refused(405, "a service call is a POST");
@@ -614,17 +634,24 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
     let tenant = header("x-quillo-tenant").unwrap_or("");
-    let expected = signature(&secret, t, f, tenant, &req.body);
+    let to = header("x-quillo-to").unwrap_or("");
+    let Some(c) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
+        return refused(401, "a service call carries its call id (x-quillo-call)");
+    };
+    let expected = signature(&secret, t, to, f, tenant, c, &req.body);
     if now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
         return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
+    }
+    if let Some(me) = SERVED_AS.get().filter(|me| *me != to) {
+        return refused(401, &format!("this call is for service `{}`; this is `{}` (see --service-name)", to, me));
     }
     if !tenant.is_empty() && !crate::site::tenant_name_ok(tenant) {
         return refused(400, "not a tenant's name");
     }
-    // A call sent again (it got no answer in time, or is a call made later,
-    // delivered twice): answered as it was, not run again.
-    let call = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric()));
-    if let Some(c) = call {
+    // A call sent again (it got no answer in time, is a call made later
+    // delivered twice, or was replayed by someone who saw it): answered as
+    // it was, not run again.
+    {
         let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
         match seen.get(c) {
             Some((_, Some(r))) => return r.clone(),
@@ -639,14 +666,12 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         }
     }
     let r = run_call(it, f, tenant, req);
-    if let Some(c) = call {
-        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
-        // A call that did not run (a busy server) may be sent again.
-        if r.status >= 502 {
-            seen.remove(c);
-        } else {
-            seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
-        }
+    let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+    // A call that did not run (a busy server) may be sent again.
+    if r.status >= 502 {
+        seen.remove(c);
+    } else {
+        seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
     }
     r
 }
@@ -657,8 +682,10 @@ fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
     S.get_or_init(Default::default)
 }
 
-/// How long, and how many, calls are remembered.
-const SEEN_FOR: Duration = Duration::from_secs(600);
+/// How long, and how many, calls are remembered: as long as a signature
+/// lasts either way (`WINDOW`), so a call cannot be sent again once
+/// forgotten.
+const SEEN_FOR: Duration = Duration::from_secs(2 * WINDOW + 60);
 const SEEN_MAX: usize = 100_000;
 
 fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpResponse {
@@ -669,9 +696,10 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
         Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
-    if let Err(msg) = crate::server::check_args(&it.types, &c.def, &args) {
-        return refused(400, &msg);
-    }
+    let args = match crate::server::take_args(it, &c.def, args) {
+        Ok(a) => a,
+        Err(msg) => return refused(400, &msg),
+    };
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });
     it.tenant_named = !tenant.is_empty();
     // Called by another service: `request` is the request it came from, as
@@ -987,11 +1015,7 @@ fn free_port() -> std::io::Result<u16> {
 pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, String> {
     let services = declared(path)?;
     if std::env::var("QUILLO_SERVICE_SECRET").map_or(true, |s| s.is_empty()) {
-        let mut b = [0u8; 24];
-        for x in b.iter_mut() {
-            *x = fastrand::u8(..);
-        }
-        std::env::set_var("QUILLO_SERVICE_SECRET", crate::crypto::hex(&b));
+        std::env::set_var("QUILLO_SERVICE_SECRET", crate::crypto::hex(&crate::crypto::secret_bytes(32)));
     }
     let mut ports = Vec::new();
     for (name, _, _) in &services {
@@ -1003,7 +1027,7 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
     let mut split = Split { children: Vec::new() };
     for ((name, prefix, file), port) in services.iter().zip(&ports) {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("run").arg(file).args(["--port", &port.to_string(), "--as-service"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd.arg("run").arg(file).args(["--port", &port.to_string(), "--as-service", "--service-name", name]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         if let Some(p) = prefix {
             cmd.args(["--base", p]);
         }

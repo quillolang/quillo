@@ -1585,7 +1585,11 @@ fn sql_idents(args: &[Value], f: &str, line: u32, each: impl Fn(String) -> Strin
 
 /// `sql_name("o_pitch")`: a table's or a column's name, checked and quoted,
 /// for SQL that cannot take it as a `?`; a list gives them comma-separated.
-fn sql_name(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn sql_name(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // MySQL reads "x" as text (unless in ANSI_QUOTES mode): a name there is `x`.
+    if crate::db::program_db_is_mysql(it) {
+        return sql_idents(&args, "sql_name", line, |s| format!("`{}`", s));
+    }
     sql_idents(&args, "sql_name", line, |s| format!("\"{}\"", s))
 }
 

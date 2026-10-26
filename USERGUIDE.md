@@ -31,6 +31,7 @@ serves them:
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
 | `--as-service` | serve the program as a service: its `server fn`s answer other services' signed calls, not pages (see [Services](#services)) |
+| `--service-name NAME` | the name other programs call this service by, when it is not the program's file name; calls signed for another service are refused |
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
@@ -225,7 +226,9 @@ match v {
   returns: `greet({ name: "Ada" })` fails with `` argument `u` of `greet` must be User,
   got map { name: "Ada" } (`email` is missing) ``. A field with a default must be
   there too; `User(...)` is what puts it in. A `server fn`'s arguments from the browser
-  are checked the same way.
+  (or another service) are made as `User(v)` makes them: checked the same way, with
+  defaults put in and fields the record does not have left out, so a page cannot add
+  `is_admin` to the profile it saves.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are.
@@ -373,6 +376,13 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+- `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
+  so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
+  (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
+  `<\!--`, which mean the same inside JavaScript strings and cannot end the element
+  early, so `raw(json.stringify(x))` there is safe too. A component's `<script>` (made
+  in the browser, which runs it) takes only text written in the program. Script built
+  as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
 
@@ -601,6 +611,12 @@ component Notes(initial: list) {
   allow only six HTTP/1.1 connections to a host across all tabs: requests left
   waiting would hold them, and server calls would queue behind them. Where a
   WebSocket cannot open, the page asks the same URL as a plain request instead.
+- A server keeps at most 4096 such connections open (live data, channels, `--watch`
+  reloads), and at most 256 for one client: an IPv4 address, or an IPv6 /64 network.
+  Past that, a page is answered `503` and tries again later. Behind a proxy that does
+  not pass the client's own connection through, every visitor is the proxy's address,
+  so put the proxy's own per-client limits in front (Quillo does not read
+  `X-Forwarded-For`, which a client can write).
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
 
@@ -693,7 +709,7 @@ the whole call; error values are results like any other.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
-otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
+otherwise), and records made as `User(v)` makes them (other fields left out); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json`, and only
 from the program's own pages: a request a browser marks as coming from another site
 (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
@@ -812,7 +828,10 @@ image.convert("photos/a.jpg", "cache/a-800.jpg", {
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
-allocated; both run off the event loop. Paths stay inside the program's folder.
+allocated; both run off the event loop. At most four conversions run at once (fewer on
+a machine with fewer cores), so many uploads together cannot each take 512 MiB; the rest
+wait their turn, and past 64 waiting `image.convert` gives an error value at once. Paths
+stay inside the program's folder.
 
 ### Cookies and sessions
 
@@ -950,7 +969,8 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   name), each line of newline-delimited JSON, or each piece of text, and may stop
   it by returning `false`. Given `send`, what arrives goes straight on. It gives
   `{ status, ok, headers }` once the answer has ended (with the `body` when it is
-  not a success), or an error value when it could not be had. The map also takes
+  not a success), or an error value when it could not be had (also when one event or
+  line goes past 16 MiB without ending). The map also takes
   `redirects` and `public_only` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request and calls `f` with what the answer streams, until it ends; `listen(url,
@@ -1137,8 +1157,13 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   past the end gets a `416`.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
   disk. Larger ones are sent from disk as they are written, on a thread of their own
-  with a 64 KiB buffer, so a video costs no more memory than a page. The gzipped copy
-  of a text file is kept too, rather than compressed again for each request.
+  with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
+  sends run at once, 8 for one client (an IPv4 address, or an IPv6 /64 network; past
+  that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
+  seconds, and any send stops after an hour: a browser or player goes on from there
+  with a `Range` request. Behind a proxy every visitor shares the proxy's address and so
+  its 8 places; limit clients at the proxy instead. The gzipped copy of a text file is
+  kept too, rather than compressed again for each request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 ### Translations
@@ -1169,7 +1194,10 @@ view Header(user) = <header>
   other`) picks the form for `count` by the language's rules (English, French, Russian,
   Polish, Czech, Arabic, Hebrew, Japanese and others).
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
-  wrote in them.
+  wrote in them. In that form the values put in (`{name}`) are still escaped, on the
+  server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
+  translation's `<b>` and shows the name as text. (Only that form: `raw` of a variable
+  holding `t(...)`'s text makes all of it HTML.)
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
@@ -1217,16 +1245,24 @@ service /billing = "billing.qwe"
   goes straight to it.
 - **Split**, a service runs elsewhere: `--service-url billing=http://10.0.0.5:8081` (or
   `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
-  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service)
-  and the time (a call more than five minutes old is refused); the tenant goes with
-  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
+  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service).
+  The signature covers the time (a call more than five minutes old is refused), the
+  service it is for, the function, the tenant, the arguments and the call's id. A
+  service takes only calls for itself: its name is the program's file name
+  (`billing.qwe` is `billing`), or `--service-name billing` when the file is named
+  otherwise. It remembers each call's id for longer than a signature lasts, so a call
+  sent again, by a retry or by someone who saw it on the network, is answered as it
+  was and not run again. That memory is each process's own: when a service runs at
+  several addresses, use HTTPS (or a private network) between services so calls cannot
+  be seen and sent to another of them. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
   but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
   `.../job/...`). Run alone, a service is a program served as one:
   `quillo run billing.qwe --base /billing --as-service` (`--base`: the path it is
   served under, which its links and redirects carry; `--as-service`: see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they
   declare) as a process of its own, on a port of its own, its log lines marked with its
-  name, all signed with one secret; they stop with it.
+  name, all signed with one secret (32 random bytes from the system, unless
+  `QUILLO_SERVICE_SECRET` is set); they stop with it.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`), so a program behaves the same whichever way it runs.
   Optional arguments left out are not sent, so the service's own defaults apply. A
@@ -1249,7 +1285,7 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
   is tried at the next address, a little later each time. A call sent but not answered in
   time is tried again at the same address, with the same call id: the service remembers
-  the calls it answered (for ten minutes) and gives the same answer, so the function
+  the calls it answered (for eleven minutes) and gives the same answer, so the function
   runs once however often the call is sent. A call still running there is waited for.
 - **Left alone when failing.** An address that fails several calls in a row is not
   called for a while (its circuit is open), then tried with one call; the others take its
@@ -1330,7 +1366,8 @@ Safety built in:
   quotes or `>` are dropped, and a key cannot replace an attribute written out, in
   another case either. Event handler attributes and `srcdoc` take only text written in
   the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
-  and the like render as `about:blank#blocked`.
+  and the like render as `about:blank#blocked`, whatever the value's type: the text the
+  attribute would say is checked, so `href={markdown(u, { inline: true })}` too.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
@@ -1349,11 +1386,17 @@ Safety built in:
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error.
-- `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
+- `quillo check` warns about SQL put together from values (`${x}`, `+`, or
+  `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
+  connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
+  db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
-  name in with `sql_name(name)` (or a list of them), and named parameters with
+  name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
+  the program's database is MySQL), and named parameters with
   `sql_param(name)` — both take only letters, digits and `_`, and SQL made of them,
-  text as written and choices between those is not warned about.
+  text as written (also kept in a variable) and choices between those is not warned
+  about. It is a warning, not a proof: SQL built in another function, or in a list made
+  with `map`, is not followed.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 
@@ -1514,7 +1557,7 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   past 64 bits (`math.factorial(21)`).
 - **`stats`:** `mean fmean(data, weights) geometric_mean harmonic_mean`, `median
   median_low median_high mode multimode`, `pvariance variance pstdev stdev` (each with an
-  optional known mean), `quantiles(data, n = 4, method = "exclusive")`, `covariance
+  optional known mean), `quantiles(data, n = 4, method = "exclusive")` (n up to 10,000), `covariance
   correlation(x, y, method = "linear") linear_regression(x, y, proportional = false)`,
   `normal_pdf normal_cdf normal_inv` (x, mu = 0, sigma = 1); and, beyond Python's,
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
@@ -1700,9 +1743,14 @@ db.migrate()
   (its `parallel` calls' too) go to the same one, so the database reads them together.
   While those connections wait on a slow query, new requests use others, up to
   `pool_size`.
-- TLS is used when the server offers it (`?sslmode=require` insists), with certificates
-  checked against the usual public certificate authorities, as hosted Postgres services
-  use.
+- TLS is required for a server on another machine, with its certificate checked
+  against the usual public certificate authorities, as hosted Postgres services use. On
+  this machine (`localhost`, `127.0.0.1`, `::1`, a Unix socket) it is used when the
+  server offers it. `?sslmode=` in the URL decides instead: `require`, `prefer` (TLS if
+  offered, which someone on the network can refuse in the server's name) or `disable`
+  (for a database on a private network without TLS, such as a container next to the
+  app). Before, TLS was only preferred everywhere: a URL to another machine whose server
+  has no TLS now needs `?sslmode=disable` to connect.
 
 **MySQL and MariaDB** (the `mysql` feature, built in by default; `cargo build
 --no-default-features` leaves it out):
@@ -1720,6 +1768,12 @@ db.migrate()
   keeps what it did before the failure: put one change in each file.
 - A database per tenant: `mysql://host/app_{tenant}`, made when the program makes the
   tenant, and listed by `db.tenants()`.
+- TLS is required for a server on another machine, with its certificate and name
+  checked; on this machine (`localhost`, `127.0.0.1`, `::1`, `?socket=...`) it is not
+  used. `?require_ssl=true` asks for it here too, and `?require_ssl=false` turns it off
+  (a database on a private network without TLS). Further options, as the driver takes
+  them: `verify_ca=false` and `verify_identity=false` (a certificate of your own,
+  checked less), `built_in_roots=false`. Before, TLS was off unless `require_ssl=true`.
 
 ### Several databases
 

@@ -120,6 +120,9 @@ fn mysql() {
     // Placeholders: `?`, and `:name` with a map.
     assert_eq!(eval(&mut it, r#"db.one("select name from things where id = :id and name = :name", { id: 1, name: "Ada" }).name"#), r#""Ada""#);
     assert_eq!(eval(&mut it, r#"db.one("select ':no' as s, ? + ? as sum", 2, 3)"#), r#"{ s: ":no", sum: 5 }"#);
+    // A name from sql_name is a name here, not text (MySQL reads "name" as text).
+    assert_eq!(eval(&mut it, "sql_name(\"name\")"), "\"`name`\"");
+    assert_eq!(eval(&mut it, "db.one(`select ${sql_name(\"name\")} as v from things`).v"), r#""Ada""#);
     // Errors are values.
     assert!(eval(&mut it, "db.query(\"select * from nowhere\")").starts_with("err(\"db: "));
     // Several statements without parameters, as a schema has.

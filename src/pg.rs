@@ -60,8 +60,10 @@ fn tls() -> tokio_postgres_rustls::MakeRustlsConnect {
 }
 
 impl Pool {
-    /// Parses the URL and opens one connection to check it. TLS is used
-    /// when the server offers it (`sslmode=require` insists on it).
+    /// Parses the URL and opens one connection to check it. TLS is required
+    /// for a server on another machine, and used on this one when it offers
+    /// it, unless the URL says otherwise (`sslmode=disable`, `prefer` or
+    /// `require`); see `tls_unless_local`.
     pub fn open(url: &str) -> Result<Pool, String> {
         Pool::open_as(url, true)
     }
@@ -70,6 +72,7 @@ impl Pool {
     pub fn open_as(url: &str, make: bool) -> Result<Pool, String> {
         let (url, max, schema) = take_options(url)?;
         let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        tls_unless_local(&url, &mut config);
         if let Some(s) = &schema {
             config.options(&search_path(s));
         }
@@ -158,6 +161,33 @@ impl Pool {
 
 /// The connection option that makes `schema` where tables are looked for
 /// and made.
+/// Whether a database host is this machine: the password and the data then
+/// cross no network that someone else could be on.
+pub(crate) fn local_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.is_empty()
+        || h.starts_with('/')
+        || h.eq_ignore_ascii_case("localhost")
+        || h.to_ascii_lowercase().ends_with(".localhost")
+        || h.parse::<std::net::IpAddr>().map_or(false, |a| a.is_loopback())
+}
+
+/// Postgres's own default, `sslmode=prefer`, sends the password in the
+/// clear to anyone in the middle who says it has no TLS. So for a server
+/// on another machine TLS is required (and its certificate checked, as
+/// rustls always does), unless the URL names an `sslmode` itself.
+fn tls_unless_local(url: &str, config: &mut postgres::Config) {
+    use postgres::config::Host;
+    let remote = config.get_hosts().iter().any(|h| match h {
+        Host::Tcp(name) => !local_host(name),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    });
+    if remote && !url.contains("sslmode=") {
+        config.ssl_mode(postgres::config::SslMode::Require);
+    }
+}
+
 fn search_path(schema: &str) -> String {
     format!("-c search_path=\"{}\"", schema)
 }
@@ -937,10 +967,10 @@ fn json(raw: &[u8]) -> Result<Value, BoxErr> {
 /// the infinities are floats.
 fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndigits = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndigits = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     let weight = i16::from_be_bytes(take(raw, &mut at)?) as i64;
     let sign = u16::from_be_bytes(take(raw, &mut at)?);
-    let dscale = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let dscale = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     match sign {
         0xC000 => return Ok(Value::Float(f64::NAN)),
         0xD000 => return Ok(Value::Float(f64::INFINITY)),
@@ -983,18 +1013,27 @@ fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     Ok(crate::decimal::Dec::parse(&text).map_or_else(|| Value::str(text), Value::Dec))
 }
 
-/// A one- or more-dimensional array as (nested) lists.
+/// Most dimensions a Postgres array has (its MAXDIM).
+const MAX_DIMS: usize = 6;
+
+/// A one- or more-dimensional array as (nested) lists. The sizes it states
+/// are checked against what came: a server (or someone in the middle) that
+/// says -1 or 2^31 cannot make this take all the memory there is.
 fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndim = i32::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndim = usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).ok().filter(|n| *n <= MAX_DIMS).ok_or("bad array dimensions")?;
     let _has_null = i32::from_be_bytes(take(raw, &mut at)?);
     let _oid = u32::from_be_bytes(take(raw, &mut at)?);
     let mut dims = Vec::with_capacity(ndim);
     for _ in 0..ndim {
-        dims.push(i32::from_be_bytes(take(raw, &mut at)?) as usize);
+        dims.push(usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad array size")?);
         let _lower = i32::from_be_bytes(take(raw, &mut at)?);
     }
-    let total: usize = if ndim == 0 { 0 } else { dims.iter().product() };
+    let total: usize = if ndim == 0 { 0 } else { dims.iter().try_fold(1usize, |t, d| t.checked_mul(*d)).ok_or("bad array size")? };
+    // Each item is at least its 4-byte length.
+    if total > (raw.len() - at) / 4 {
+        return Err("array too short".into());
+    }
     let mut items = Vec::with_capacity(total);
     for _ in 0..total {
         let len = i32::from_be_bytes(take(raw, &mut at)?);
@@ -1002,7 +1041,7 @@ fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
             items.push(Value::Nil);
         } else {
             let len = len as usize;
-            let bytes = raw.get(at..at + len).ok_or("array too short")?;
+            let bytes = raw.get(at..at.saturating_add(len)).ok_or("array too short")?;
             at += len;
             items.push(decode(elem, bytes)?);
         }
@@ -1083,5 +1122,41 @@ mod tests {
         assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
         assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
+    }
+
+    #[test]
+    fn lengths_a_server_sends_are_checked() {
+        let be = |xs: &[i32]| xs.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        // What the review saw: negative sizes cast to huge ones.
+        assert!(array(&Type::INT4, &be(&[-1, 0, 23])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, -1, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, i32::MAX, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[2, 0, 23, 65536, 1, 65536, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[7, 0, 23])).is_err());
+        let ok = array(&Type::INT4, &be(&[1, 0, 23, 2, 1, 4, 7, -1])).unwrap();
+        assert_eq!(ok.repr(), "[7, null]");
+        let n = |h: [i16; 4]| h.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        assert!(numeric(&n([-1, 0, 0, 0])).is_err());
+        assert!(numeric(&n([0, 0, 0, -1])).is_err());
+        assert_eq!(numeric(&n([0, 0, 0, 2])).unwrap().repr(), "0.00m");
+    }
+
+    #[test]
+    fn tls_is_required_for_a_server_on_another_machine() {
+        use postgres::config::SslMode;
+        let mode = |url: &str| {
+            let mut c: postgres::Config = url.parse().unwrap();
+            tls_unless_local(url, &mut c);
+            c.get_ssl_mode()
+        };
+        // What the review saw: `prefer`, which someone in the middle can turn off.
+        assert_eq!(mode("postgres://u:p@db.example.com/app"), SslMode::Require);
+        assert_eq!(mode("postgres://u:p@10.0.0.5:5432/app"), SslMode::Require);
+        assert_eq!(mode("host=db.example.com user=u dbname=app"), SslMode::Require);
+        // Said in the URL: as it says. On this machine: Postgres's default.
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=disable"), SslMode::Disable);
+        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app", "host=/tmp user=u"] {
+            assert_eq!(mode(local), SslMode::Prefer, "{}", local);
+        }
     }
 }

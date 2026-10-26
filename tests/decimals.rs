@@ -181,6 +181,8 @@ route POST /orders { json: Order } = { total: total(json), lines: len(json.lines
 route POST /orders = respond(422, "not an order")
 server fn add(a: dec, b: dec) -> dec = a + b
 server fn price() = { amount: 12.50m, big: 9007199254740993, list: [0.1m, 0.2m] }
+server fn order_total(o: Order) -> dec = total(o)
+server fn line(l: Line) = l
 "#;
 
 fn shop() -> quillo::Interp {
@@ -231,7 +233,14 @@ fn server_fns_keep_decimals_both_ways() {
     assert_eq!(
         rpc(&mut it, "price", "[]"),
         r#"{"ok":{"amount":{"$dec":"12.50"},"big":{"$int":"9007199254740993"},"list":[{"$dec":"0.1"},{"$dec":"0.2"}]}}"#
+    );    // A record argument: its `dec` fields made decimals, tagged or not, as
+    // `Line(v)` makes them (a default put in, other fields left out).
+    assert_eq!(
+        rpc(&mut it, "order_total", r#"[{"lines": [{"sku": "a", "price": {"$dec": "0.10"}, "qty": 3}, {"sku": "b", "price": "0.20"}], "tip": 1}]"#),
+        r#"{"ok":{"$dec":"1.50"}}"#
     );
+    assert_eq!(rpc(&mut it, "line", r#"[{"sku": "a", "price": "1.5", "is_admin": true}]"#), r#"{"ok":{"sku":"a","price":{"$dec":"1.5"},"qty":1}}"#);
+    assert!(rpc(&mut it, "order_total", r#"[{"lines": [{"sku": "a", "price": "free"}]}]"#).contains("must be Order"));
 }
 
 #[test]

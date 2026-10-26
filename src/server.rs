@@ -301,14 +301,14 @@ impl Interp {
         // Every page prefetches the links pointed at.
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, b"__quillo_pf")) {
+            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, format!("<script>{}", &PREFETCH_JS[..40]).as_bytes())) {
                 resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(_), None) = (has(&resp.body, b"<quillo-media"), has(&resp.body, b"/_quillo/media.js")) {
+            if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
             }
@@ -323,7 +323,7 @@ impl Interp {
             }
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
-            if has(&resp.body, b"/_quillo/quillo.js").is_none() {
+            if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
                 let names = std::mem::take(&mut self.island_names);
                 let src = match self.bundle_for_page(&names) {
                     Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
@@ -602,10 +602,10 @@ impl Interp {
                 .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
-        let args = dec_args(&c.def, args);
-        if let Err(msg) = check_args(&self.types, &c.def, &args) {
-            return rpc_error(400, &msg);
-        }
+        let args = match take_args(self, &c.def, args) {
+            Ok(a) => a,
+            Err(msg) => return rpc_error(400, &msg),
+        };
         let query = Value::map(parse_urlencoded(qs));
         let mut reqmap = build_request(req, path, &query);
         if let Some(id) = &self.request_id {
@@ -675,25 +675,46 @@ pub const MAX_WAITERS: usize = 4096;
 /// Stack for the threads that wait for changes; they run no Quillo code.
 const WAITER_STACK: usize = 256 << 10;
 
+/// Most of those one client can hold (an address, or an IPv6 /64), so that
+/// one cannot take them all and leave the others' pages without updates.
+pub const MAX_WAITERS_PER_CLIENT: usize = 256;
+
 static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The places taken, by client.
+static WAITING: Mutex<Option<std::collections::HashMap<String, usize>>> = Mutex::new(None);
 
 /// A place among the `MAX_WAITERS`, given back when dropped.
-struct Waiter;
+struct Waiter(String);
 
 impl Waiter {
-    fn take() -> Option<Waiter> {
+    fn take(ip: &str) -> Option<Waiter> {
         use std::sync::atomic::Ordering::SeqCst;
+        let who = crate::statics::client_of(ip);
+        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let mine = m.get(&who).copied().unwrap_or(0);
+        if mine >= MAX_WAITERS_PER_CLIENT {
+            return None;
+        }
         if WAITERS.fetch_add(1, SeqCst) >= MAX_WAITERS {
             WAITERS.fetch_sub(1, SeqCst);
             return None;
         }
-        Some(Waiter)
+        m.insert(who.clone(), mine + 1);
+        Some(Waiter(who))
     }
 }
 
 impl Drop for Waiter {
     fn drop(&mut self) {
         WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.as_mut().and_then(|m| m.get_mut(&self.0)) {
+            *n -= 1;
+            if *n == 0 {
+                g.as_mut().map(|m| m.remove(&self.0));
+            }
+        }
     }
 }
 
@@ -740,9 +761,10 @@ fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64), head: boo
 }
 
 /// Hands the connection to `f` on a thread of its own, holding one of the
-/// waiting places; answers 503 when they are all taken.
-fn waiter(name: &'static str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
-    let Some(place) = Waiter::take() else {
+/// waiting places; answers 503 when they are all taken, or the client at
+/// `ip` holds its share of them.
+fn waiter(name: &'static str, ip: &str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
+    let Some(place) = Waiter::take(ip) else {
         let mut resp = plain(503, "too many pages are waiting for changes; try again later\n");
         resp.headers.push(("retry-after".into(), "5".into()));
         return Answer::Respond(resp);
@@ -777,7 +799,7 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
 /// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
     let (mut since, server, topics) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
-    waiter("quillo-live", move |stream| {
+    waiter("quillo-live", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let mut server = server;
@@ -811,47 +833,41 @@ fn serve_channels(req: HttpRequest) -> Answer {
     let Some(ticket) = crate::wt::ticket_of(req.url.split_once('?').map_or("", |(_, q)| q)) else {
         return Answer::Respond(plain(403, "no ticket, or an old one\n"));
     };
-    waiter("quillo-ch", move |stream| {
+    waiter("quillo-ch", &req.remote.clone(), move |stream| {
         if let Some(socket) = crate::ws::Socket::accept(&req, stream) {
             crate::wt::over_websocket(socket, ticket);
         }
     })
 }
 
-/// Arguments for parameters typed `dec` made decimals: what a page sends
-/// as a number or as text ("12.50") is taken, as a `dec` pattern takes it.
-fn dec_args(def: &crate::ast::FnDef, mut args: Vec<Value>) -> Vec<Value> {
-    for (p, a) in def.params.iter().zip(args.iter_mut()) {
-        if p.ty.as_ref().map_or(false, |t| t.names.iter().any(|n| n == "dec")) && !matches!(a, Value::Dec(_) | Value::Nil) {
-            if let Some(d) = crate::interp::as_dec(a) {
-                *a = Value::Dec(d);
-            }
-        }
-    }
-    args
-}
-
-/// Checks a browser's (or another service's) arguments against a `server
-/// fn`'s parameters, all the way in: list items, map values and record
-/// fields too, since the function trusts its types.
-pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+/// The arguments a browser (or another service) calls a `server fn` with,
+/// checked all the way in (list items, map values and record fields, since
+/// the function trusts its types) and made into its parameters' types as
+/// `Type(v)` makes them: a record keeps only its own fields, so what is
+/// sent cannot add `is_admin` to one, and fields left out get their defaults.
+/// A `dec` (a parameter or a record's field) takes a decimal, an int, a
+/// number or numeric text ("12.50"), as a `dec` pattern takes it.
+pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Vec<Value>, String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
     }
-    for (i, p) in def.params.iter().enumerate() {
-        match args.get(i) {
-            None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
-            Some(v) => {
-                if let Some(ty) = &p.ty {
-                    if let Err(why) = crate::record::fits(types, ty, v, true) {
-                        return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)));
-                    }
-                }
-            }
-            None => {}
+    if let Some(p) = def.params.get(args.len()..).and_then(|rest| rest.iter().find(|p| p.default.is_none())) {
+        return Err(format!("missing argument `{}` for `{}`", p.name, def.name));
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (v, p) in args.into_iter().zip(&def.params) {
+        let Some(ty) = &p.ty else {
+            out.push(v);
+            continue;
+        };
+        match crate::record::make(it, ty, &v, false) {
+            Ok(Ok(x)) => out.push(x),
+            Ok(Err(why)) => return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why))),
+            Err(Ctrl::Error(e)) => return Err(format!("argument `{}` of `{}`: {}", p.name, def.name, e)),
+            Err(_) => return Err(format!("argument `{}` of `{}` could not be made", p.name, def.name)),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
@@ -864,6 +880,27 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
 
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
+}
+
+/// Whether a page has a `<script>` element whose `src` ends with `path`
+/// (the program wrote it, or a mounted program's page already has it).
+/// Only an element counts: text, which is escaped, cannot start one, nor
+/// can `markdown` (whose `<img src=...>` could name the same path), so a
+/// comment saying `/_quillo/quillo.js` does not stop the page loading it.
+fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = body[from..].windows(path.len()).position(|w| w == path).map(|i| i + from) {
+        from = i + path.len();
+        if !matches!(body.get(from), Some(b'"' | b'\'' | b'?' | b'#')) {
+            continue;
+        }
+        let Some(lt) = body[..i].iter().rposition(|b| *b == b'<') else { continue };
+        let tag = &body[lt..i];
+        if tag.len() > 7 && tag[..7].eq_ignore_ascii_case(b"<script") && matches!(tag[7], b' ' | b'\t' | b'\n' | b'/') && !tag.contains(&b'>') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Turns what a route produced into an HTTP response.
@@ -1151,7 +1188,7 @@ fn dev_script(version: u64) -> String {
 /// for a change do not hold on to the server's threads.
 fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
     let seen = req.url.split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
-    waiter("quillo-events", move |stream| {
+    waiter("quillo-events", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let seen = seen.unwrap_or(0);
@@ -1624,4 +1661,24 @@ fn island_loader(src: &str) -> String {
         ),
         src
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_client_cannot_take_every_waiting_place() {
+        // What the review saw: one address holding all of `MAX_WAITERS`.
+        let mine: Vec<Waiter> = (0..MAX_WAITERS_PER_CLIENT).map(|_| Waiter::take("192.0.2.7").expect("a place")).collect();
+        assert!(Waiter::take("192.0.2.7").is_none());
+        assert!(Waiter::take("::ffff:192.0.2.7").is_none());
+        // Its IPv6 neighbours in the same /64 are the same client.
+        let six: Vec<Waiter> = (0..MAX_WAITERS_PER_CLIENT).map(|i| Waiter::take(&format!("2001:db8::{:x}", i + 1)).expect("a place")).collect();
+        assert!(Waiter::take("2001:db8::ffff").is_none());
+        assert!(Waiter::take("192.0.2.8").is_some());
+        drop(mine);
+        drop(six);
+        assert!(Waiter::take("192.0.2.7").is_some());
+    }
 }

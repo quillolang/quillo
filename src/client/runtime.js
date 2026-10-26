@@ -1316,7 +1316,7 @@ const plural = (locale, n) => {
   }
 };
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
-B.t = meta((k, vars) => {
+const translate = (k, vars, esc) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
   let e = d && hasOwn(d.t, k) ? d.t[k] : k;
@@ -1324,8 +1324,11 @@ B.t = meta((k, vars) => {
     const cat = typeof vars.count === "number" ? plural(d.locale, vars.count) : "other";
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
-  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? display(vars[name]) : m);
-}, "t", null);
+  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(display(vars[name])) : m);
+};
+B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
+// raw(t(key, vars)): the translation's markup, with the values put in escaped.
+B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
@@ -1903,7 +1906,7 @@ B.stats = {
   quantiles: (l, n, method) => {
     const f = "stats.quantiles", d = sortedOf(dataOf(l, f, 1)), ld = d.length;
     n = given(n) ? I(n, f, 2) : 4;
-    if (n < 1) fail(`\`${f}\`: n must be at least 1`);
+    if (n < 1 || n > 10000) fail(`\`${f}\`: n must be from 1 to 10000, got ${n}`);
     method = given(method) ? S(method, f, 3) : "exclusive";
     if (ld === 1) return new Array(n - 1).fill(d[0]);
     const out = [];
@@ -3999,9 +4002,10 @@ function setProp(el, k, v, old) {
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
-  if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
+  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
+  // The text the attribute will say, whatever the value's type (html too).
+  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 

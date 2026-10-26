@@ -296,6 +296,17 @@ fn with_locale(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `t(key, vars)`: the key's text in the current locale, with `{name}`
 /// replaced by `vars.name`; plural forms are chosen by `vars.count`.
 fn t(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    translate(it, args, line, false)
+}
+
+/// `raw(t(key, vars))`, for markup written in a translation: the text as
+/// HTML, but each value put in it escaped, since those come from data
+/// (a user's name), not from whoever wrote the translations.
+pub fn t_html(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    translate(it, args, line, true)
+}
+
+fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
     let key = match args.first() {
         Some(Value::Str(s)) => s.clone(),
         other => return fail(line, format!("`t` expects a key, got {}", other.map_or("nothing", |v| v.type_name()))),
@@ -317,6 +328,10 @@ fn t(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => key.to_string(),
     };
+    if html {
+        let escaped = vars.map(|m| m.iter().map(|(k, v)| (k.clone(), Value::str(crate::interp::escape(&v.display())))).collect::<Map>());
+        return Ok(Value::html(interpolate(&text, escaped.as_ref())));
+    }
     Ok(Value::str(interpolate(&text, vars.as_deref())))
 }
 

@@ -20,13 +20,22 @@ pub fn is_url(s: &str) -> bool {
     s.starts_with("mysql://") || s.starts_with("mariadb://")
 }
 
+/// The connection options of a URL. TLS is required (the server's
+/// certificate checked) for a server on another machine, as the driver
+/// would otherwise send the password in the clear, unless the URL says
+/// `require_ssl=false`.
 fn opts_of(url: &str) -> Result<Opts, String> {
     // `mariadb://` is the same protocol.
     let url = match url.strip_prefix("mariadb://") {
         Some(rest) => format!("mysql://{}", rest),
         None => url.to_string(),
     };
-    Opts::from_url(&url).map_err(|e| e.to_string())
+    let opts = Opts::from_url(&url).map_err(|e| e.to_string())?;
+    let remote = opts.socket().is_none() && !crate::pg::local_host(opts.ip_or_hostname());
+    if remote && opts.ssl_opts().is_none() && !url.contains("require_ssl=") {
+        return Ok(OptsBuilder::from_opts(opts).ssl_opts(mysql_async::SslOpts::default()).into());
+    }
+    Ok(opts)
 }
 
 fn run<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -281,6 +290,17 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Params), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_is_required_for_a_server_on_another_machine() {
+        // What the review saw: TLS off unless `require_ssl=true`.
+        for url in ["mysql://u:p@db.example.com/app", "mariadb://u:p@10.0.0.5:3306/app"] {
+            assert!(opts_of(url).unwrap().ssl_opts().is_some(), "{}", url);
+        }
+        for url in ["mysql://u:p@db.internal/app?require_ssl=false", "mysql://u@localhost/app", "mysql://u@127.0.0.1:3306/app"] {
+            assert!(opts_of(url).unwrap().ssl_opts().is_none(), "{}", url);
+        }
+    }
 
     #[test]
     fn placeholders() {

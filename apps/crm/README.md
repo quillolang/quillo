@@ -141,7 +141,16 @@ visitor's session and its forms work without JavaScript. `quote_lines` computes 
 subtotal, discount (a percentage, an amount, or free shipping, from a code with a minimum
 and a number of uses), shipping (one rate, free over an amount) and tax (from plugins) —
 the cart and the checkout show it, and the server charges it. Paying takes the stock,
-counts the code's use, and starts the purchase flows for each product. A product in
+counts the code's use, and starts the purchase flows for each product. A code's use is
+taken in the order's transaction only while it has uses left (`take_discount_use`), so
+two checkouts at once cannot both take its last one; the second is refused and nothing
+of it is kept.
+
+A plugin can ask the team to check an order by hand (its `review`): the reason is kept
+with the order (a "check" badge on Orders) and becomes a task. The VAT plugin does so
+when a business's VAT number from another EU country took the tax off (reverse charge):
+only the number's shape is checked at the checkout, so the team checks it with the EU's
+VIES service before shipping, and charges the tax if it is not valid. A product in
 variants asks which on its page; the cart keeps each variant apart (`sku~variant`), and
 paying and refunding count each one's stock.
 

@@ -71,6 +71,20 @@ pub fn is_mysql_url(s: &str) -> bool {
     s.starts_with("mysql://") || s.starts_with("mariadb://")
 }
 
+/// Whether the program's database is MySQL (or will be, once opened):
+/// `sql_name` quotes names as it reads them.
+pub(crate) fn program_db_is_mysql(it: &Interp) -> bool {
+    match slot_on(it, None) {
+        Some(DbSlot::One(b)) => b.is_mysql(),
+        Some(DbSlot::PerTenant(t)) => match &t.target {
+            Target::Text(s) => is_mysql_url(s),
+            Target::Fn(_) => t.open.lock().unwrap_or_else(|e| e.into_inner()).values().next().map_or(false, |b| b.is_mysql()),
+        },
+        Some(DbSlot::Shards(_)) => false,
+        None => std::env::var("QUILLO_DB").map_or(false, |t| is_mysql_url(&t)),
+    }
+}
+
 /// A database on a server (not a SQLite file).
 fn is_server_url(s: &str) -> bool {
     pg::is_url(s) || is_mysql_url(s)

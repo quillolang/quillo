@@ -151,6 +151,24 @@ fn url_attributes_are_checked_however_they_are_written() {
 }
 
 #[test]
+fn html_values_in_url_attributes_are_checked_too() {
+    // What the review sent: an `html` value, which was not looked at.
+    let mut it = app(
+        r#"
+route GET /m ? { u: str } = <a href={markdown(u, { inline: true })}>x</a>
+route GET /r ? { u: str } = <a {...{ href: raw(u) }} src={raw(u)}>x</a>
+"#,
+    );
+    for path in ["/m", "/r"] {
+        let body = send(&mut it, "GET", &format!("{}?u=javascript:alert(1)", path), &[], "").text();
+        assert!(!body.to_lowercase().contains("javascript:"), "{} -> {}", path, body);
+        assert!(body.contains("about:blank#blocked"), "{} -> {}", path, body);
+        let body = send(&mut it, "GET", &format!("{}?u=/notes", path), &[], "").text();
+        assert!(body.contains("/notes") && !body.contains("blocked"), "{} -> {}", path, body);
+    }
+}
+
+#[test]
 fn server_fn_arguments_are_checked_all_the_way_in() {
     let mut it = app(
         r#"
@@ -174,6 +192,72 @@ server fn tagged(m: { tags: list<str> }) -> int = len(m.tags)
         let r = call(&mut it, f, body);
         assert_eq!((r.status, r.text()), (200, format!(r#"{{"ok":{}}}"#, want)), "{} {}", f, body);
     }
+}
+
+#[test]
+fn server_fn_record_arguments_keep_only_their_own_fields() {
+    let mut it = app(
+        r#"
+type Profile = { name: str, role: str = "member" }
+server fn save(p: Profile) = json.stringify(p)
+server fn many(ps: list<Profile>) = json.stringify(ps)
+"#,
+    );
+    let call = |it: &mut Interp, f: &str, body: &str| send(it, "POST", &format!("/_quillo/rpc/{}", f), &[("Content-Type", "application/json")], body);
+    // What the review sent: a field the record does not have, as a
+    // `{ json: Profile }` route pattern would leave out.
+    let r = call(&mut it, "save", r#"[{"name":"ada","is_admin":true}]"#);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(!r.text().contains("is_admin") && r.text().contains("member"), "{}", r.text());
+    let r = call(&mut it, "many", r#"[[{"name":"ada","role":"x","is_admin":true}]]"#);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(!r.text().contains("is_admin") && r.text().contains("ada"), "{}", r.text());
+}
+
+#[test]
+fn values_in_a_script_cannot_end_it() {
+    let mut it = app(
+        r#"
+route GET /s ? { x: str } = <html><body><script>const d = {x}; const n = {[1, x]}; const r = {raw(json.stringify({ a: x }))};</script><p>after</p></body></html>
+"#,
+    );
+    // What the review sent: text that ends the script and starts another.
+    let x = "%3C/script%3E%3Cscript%3Ealert(1)%3C/script%3E%3C!--%E2%80%A8";
+    let html = send(&mut it, "GET", &format!("/s?x={}", x), &[], "").text();
+    let script = html.split_once("<script>").map(|(_, s)| s).unwrap_or("");
+    let (code, rest) = script.split_once("</script>").expect("one script");
+    assert!(rest.starts_with("<p>after</p>"), "{}", html);
+    assert!(!code.contains("<!--"), "{}", code);
+    // A value is JSON, so a JS string; raw text keeps what it says, with `</` as `<\/`.
+    assert!(code.starts_with(r#"const d = "\u003c/script>\u003cscript>alert(1)\u003c/script>\u003c!--\u2028";"#), "{}", code);
+    assert!(code.contains(r#"const n = [1,"\u003c/script>"#), "{}", code);
+    assert!(code.contains(r#"const r = {"a":"<\/script><script>alert(1)<\/script><\!--"#), "{}", code);
+    // A component's script, filled in the browser, would run what fills it.
+    let e = Interp::new(env!("CARGO_MANIFEST_DIR")).load_source("component C(x: str) = <div><script>{x}</script></div>", "t.qwe").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("<script> takes only text written in the program"), "{}", e);
+}
+
+#[test]
+fn text_naming_the_bundle_does_not_stop_components_loading() {
+    let mut it = app(
+        r#"
+component Counter() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+route GET /c ? { note: str } = <html><body><p>{note}</p>{markdown(note)}<Counter/></body></html>
+route GET /own = <html><head><script src="/_quillo/quillo.js" defer></script></head><body><Counter/></body></html>
+"#,
+    );
+    // What the review sent: a comment saying where the bundle is, which
+    // stopped the page loading it. Markdown cannot write the element either.
+    for note in ["see%20/_quillo/quillo.js", "![x](/_quillo/quillo.js)", "%3Cscript%20src=%22/_quillo/quillo.js%22%3E"] {
+        let page = send(&mut it, "GET", &format!("/c?note={}", note), &[], "").text();
+        assert!(page.contains("t.src=\"/_quillo/b/"), "{} -> {}", note, page);
+    }
+    // A page that loads it itself is left as it is.
+    let page = send(&mut it, "GET", "/own", &[], "").text();
+    assert!(!page.contains("t.src="), "{}", page);
 }
 
 // ---- the server itself, over a socket ------------------------------------------------------
@@ -263,6 +347,37 @@ fn a_chunk_size_that_overflows_does_not_stop_the_server() {
         b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     );
     assert!(r.starts_with("HTTP/1.1 200") && r.contains("\r\n\r\n9") && r.ends_with("up"), "{}", r);
+}
+
+#[test]
+fn request_bodies_are_framed_one_way_only() {
+    let srv = serve("framing", ECHO, &[]);
+    // What the review sent, each accepted then: a signed length, sizes with
+    // a sign or spaces, both a length and chunked (on a kept connection),
+    // chunked not last, and chunked on HTTP/1.0. Each is refused, and the
+    // request after it is not taken from the same connection.
+    let next = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    for (head, body) in [
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\n", "hello"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", "+5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", " 5 \r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, identity\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+        ("POST /echo HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+    ] {
+        let r = exchange(srv.port, format!("{}{}{}", head, body, next).as_bytes());
+        assert!(r.starts_with("HTTP/1.1 400"), "{:?} -> {}", head, r);
+        assert_eq!(r.matches("HTTP/1.1 ").count(), 1, "{:?} -> {}", head, r);
+    }
+    // gzip, then chunked: framed right, but not decoded here.
+    let r = exchange(srv.port, b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 501"), "{}", r);
+    // Written as allowed: still taken.
+    let r = exchange(srv.port, format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length:  5 \r\n\r\nhello{}", next).as_bytes());
+    assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("up"), "{}", r);
+    let r = exchange(srv.port, format!("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: Chunked\r\n\r\n5 ;a=b\r\nhello\r\n0\r\n\r\n{}", next).as_bytes());
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("\r\n\r\n5") && r.ends_with("up"), "{}", r);
 }
 
 #[cfg(unix)]
