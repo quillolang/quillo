@@ -30,10 +30,11 @@ serves them:
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
+| `--as-service` | serve the program as a service: its `server fn`s answer other services' signed calls, not pages (see [Services](#services)) |
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
-| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers (see [Concurrency](#concurrency-and-reloading)) |
+| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Concurrency](#concurrency-and-reloading)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 | `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
 | `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own |
@@ -620,6 +621,12 @@ quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each serv
   one that stops for 15) and sends the topics it changes to limer's
   `/broadcast`, which passes them to every member. The pool's name is the
   file's (`shop`), or `--service`.
+- limer's admin secret is required: `--register` does not start without
+  `LIMER_ADMIN_SECRET`. Each announcement is signed (HMAC-SHA256, with a key made
+  from the secret) together with the time and a random nonce; one that is not
+  signed so, more than a minute old, or seen before is refused. A server takes
+  only the topics it already knows (changed there, or shown on its pages), at most
+  256 a message.
 - What is shared is the database: tables (`db:` topics) and `publish` topics
   are announced. Data kept in variables belongs to each server and is not.
 - Sequence numbers are per server, and each carries its server's id. A page
@@ -676,7 +683,8 @@ run one after another, since other threads' SQL would not be part of it. A failu
 the whole call; error values are results like any other.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
-the parameter types (a 400 otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
+the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
+otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json`, and only
 from the program's own pages: a request a browser marks as coming from another site
 (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
@@ -1174,9 +1182,11 @@ service /billing = "billing.qwe"
   `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
   signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service)
   and the time (a call more than five minutes old is refused); the tenant goes with
-  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it.
-  Run alone, a service is an ordinary program: `quillo run billing.qwe --base /billing`
-  (`--base`: the path it is served under, which its links and redirects carry).
+  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
+  but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
+  `.../job/...`). Run alone, a service is a program served as one:
+  `quillo run billing.qwe --base /billing --as-service` (`--base`: the path it is
+  served under, which its links and redirects carry; `--as-service`: see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they
   declare) as a process of its own, on a port of its own, its log lines marked with its
   name, all signed with one secret; they stop with it.
@@ -1188,6 +1198,10 @@ service /billing = "billing.qwe"
 - `quillo check` checks each call against the service's `server fn`s (their names,
   arguments and types; it may fail, so the result may be an error), the browser cannot
   call a service, and a call needs the `http` effect. Services may use one another.
+- A service's `server fn`s are for other services: pages cannot call them. A service
+  does not answer `/_quillo/rpc/...` (in one process, under its prefix; split, `--split`
+  starts it with `--as-service`), only signed calls at `/_quillo/service/...`, whose
+  arguments are checked against the parameter types all the way in, as pages' calls are.
 - A program with `server fn`s and no routes is served too: a service may be only that.
 
 When a service runs elsewhere, its calls are made to hold up:
@@ -1287,8 +1301,9 @@ Safety built in:
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.
-- Globals read with `env`, `read_file` or the database are never written into the
-  browser bundle; a component that uses one is a load-time error.
+- Globals read with `env`, `read_file`, the database or a service are never written
+  into the browser bundle, nor are those made by a function that reads them
+  (`let CONFIG = load_config()`); a component that uses one is a load-time error.
 - `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them), and named parameters with

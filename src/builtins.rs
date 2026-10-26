@@ -1408,6 +1408,7 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let mut topics: Vec<String> = topics.into_iter().collect();
     topics.sort();
+    it.shared.track(&topics);
     let mut info = Map::new();
     info.insert("f".into(), Value::str(&name));
     info.insert("a".into(), Value::list(rest));

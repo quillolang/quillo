@@ -78,6 +78,10 @@ fn get(url: &str) -> serde_json::Value {
     json(ureq::get(url).call().unwrap())
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
 #[test]
 fn a_change_through_one_server_reaches_pages_on_the_other() {
     let Some(limer) = limer() else {
@@ -204,9 +208,12 @@ route GET / = <p>hello</p>
     let now = post(&rpc(b, "seen"), "[]", true);
     assert_eq!((now["ok"].as_i64(), now["seq"].as_u64()), (Some(0), Some(seq)), "B's numbers moved: {}", now);
 
-    // Announcements without the key are refused.
+    // Announcements not signed with the key are refused.
     let forged = ureq::post(&format!("http://127.0.0.1:{}/_quillo/announce", b))
         .send_string(r#"{"from":"x","key":"guess","topics":["db:orders"]}"#);
+    assert!(matches!(forged, Err(ureq::Error::Status(400 | 403, _))), "{:?}", forged.map(|r| r.status()));
+    let forged = quillo::cluster::announcement(&quillo::cluster::announce_key("guess"), "x", now_secs(), &["db:orders".to_string()]);
+    let forged = ureq::post(&format!("http://127.0.0.1:{}/_quillo/announce", b)).send_string(&forged);
     assert!(matches!(forged, Err(ureq::Error::Status(403, _))), "{:?}", forged.map(|r| r.status()));
 
     // And through limer, the app works as one.
@@ -222,5 +229,108 @@ route GET / = <p>hello</p>
     assert_eq!(through["ok"], 1);
     // limer stops by its configuration, so before the folder goes.
     drop(_lb);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- announcements, without limer ------------------------------------------------------------
+
+/// Stands in for limer's admin API: says yes to everything.
+fn fake_admin() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let mut r = BufReader::new(s);
+            let mut len = 0;
+            let mut line = String::new();
+            while r.read_line(&mut line).map_or(false, |n| n > 0) && line != "\r\n" {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let _ = r.by_ref().take(len).read_to_end(&mut Vec::new());
+            let _ = r.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    port
+}
+
+fn announce(port: u16, body: &str) -> u16 {
+    match ureq::post(&format!("http://127.0.0.1:{}/_quillo/announce", port)).send_string(body) {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("{}", e),
+    }
+}
+
+#[test]
+fn announcements_are_signed_fresh_once_and_about_known_topics() {
+    let dir = std::env::temp_dir().join(format!("quillo-announce-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = dir.join("app.qwe");
+    std::fs::write(&app, "server fn orders() { watch(\"orders\"); 1 }\nroute GET / = \"up\"\n").unwrap();
+    let admin = format!("http://127.0.0.1:{}", fake_admin());
+
+    // Without limer's secret, a server does not join.
+    let refused = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(&app)
+        .args(["--port", &free_port().to_string(), "--register", &admin])
+        .env_remove("LIMER_ADMIN_SECRET")
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("LIMER_ADMIN_SECRET"));
+
+    let port = free_port();
+    let _server = Proc(
+        Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(&app)
+            .args(["--port", &port.to_string(), "--register", &admin])
+            .env("LIMER_ADMIN_SECRET", SECRET)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_tcp(port);
+    // A page shows the orders: the server now knows the topic.
+    let rpc = format!("http://127.0.0.1:{}/_quillo/rpc/orders", port);
+    let seq = || post(&rpc, "[]", true)["seq"].as_u64().unwrap();
+    let start = seq();
+    let key = quillo::cluster::announce_key(SECRET);
+    let now = now_secs();
+    let topics = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // The old form: no signature, and a key that was the same for everyone
+    // without a secret (the review's attack).
+    let constant = quillo::crypto::hex(&quillo::ws::sha1(b"quillo-announce:"));
+    assert_eq!(announce(port, &format!(r#"{{"from":"x","key":"{}","topics":["orders"]}}"#, constant)), 400);
+    // Signed with another secret, or too old.
+    let other = quillo::cluster::announce_key("not-the-secret");
+    assert_eq!(announce(port, &quillo::cluster::announcement(&other, "x", now, &topics(&["orders"]))), 403);
+    assert_eq!(announce(port, &quillo::cluster::announcement(&key, "x", now - 3600, &topics(&["orders"]))), 403);
+    // Tampered with: the topics changed after signing.
+    let good = quillo::cluster::announcement(&key, "x", now, &topics(&["orders"]));
+    assert_eq!(announce(port, &good.replace("\"orders\"", "\"other\"")), 403);
+    assert_eq!(seq(), start);
+
+    // Signed: taken, once.
+    assert_eq!(announce(port, &good), 204);
+    let after = seq();
+    assert_eq!(after, start + 1);
+    assert_eq!(announce(port, &good), 403, "a message sent again is refused");
+
+    // Topics the server does not know are dropped, not remembered.
+    let unknown: Vec<String> = (0..200).map(|i| format!("junk-{}", i)).collect();
+    assert_eq!(announce(port, &quillo::cluster::announcement(&key, "x", now, &unknown)), 204);
+    assert_eq!(seq(), after);
+    // At most so many topics in one message.
+    let many: Vec<String> = (0..quillo::cluster::MAX_TOPICS + 1).map(|i| format!("t{}", i)).collect();
+    assert_eq!(announce(port, &quillo::cluster::announcement(&key, "x", now, &many)), 413);
     let _ = std::fs::remove_dir_all(&dir);
 }

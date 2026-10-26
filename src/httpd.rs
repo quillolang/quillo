@@ -147,6 +147,24 @@ struct Conn {
     /// answers before them are written: a client that sends and never reads
     /// cannot have its answers pile up in memory.
     pending: Vec<Item>,
+    /// Output has waited to be written since then, the client taking none
+    /// of it (`None`: nothing waits). See `sweep`.
+    stalled: Option<Instant>,
+    /// Reading stopped at `input_cap` with more perhaps waiting: read
+    /// again without waiting for a new event.
+    full: bool,
+    /// A chunked body being received: what is decoded so far (see `dechunk`).
+    chunked: Option<Dechunk>,
+}
+
+/// Room in a connection's input past the head and the body, for chunk
+/// framing and the start of a next request.
+const FRAMING: usize = 64 << 10;
+
+/// The most a connection's input holds before it stops reading (until
+/// the requests there are taken out).
+fn input_cap(max_body: usize) -> usize {
+    MAX_HEAD.saturating_add(max_body).saturating_add(FRAMING)
 }
 
 /// Answers waiting to be written past which a connection's other requests
@@ -672,13 +690,17 @@ impl Loop {
             closing: false,
             lingering: false,
             pending: Vec::new(),
+            stalled: None,
+            full: false,
+            chunked: None,
         }));
         crate::metrics::CONNECTIONS.fetch_add(1, SeqCst);
         // Its first request has often arrived with it.
         self.ready.push_back(i);
     }
 
-    /// Closes connections idle too long, or too slow to send a request.
+    /// Closes connections idle too long, too slow to send a request, or
+    /// not reading their answers.
     fn sweep(&mut self) {
         // Handles on a version of the program loaded over: let go, with its
         // database connections (requests still running on it keep theirs).
@@ -690,7 +712,12 @@ impl Loop {
             let stale = match c.receiving {
                 _ if c.lingering => now.duration_since(c.active) > LINGER,
                 Some(since) => now.duration_since(since) > SLOW,
-                None => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+                // A client that takes none of its answer for this long
+                // would hold the connection and the answer forever.
+                None => match c.stalled {
+                    Some(since) if !c.output.is_empty() => now.duration_since(since) > SLOW,
+                    _ => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+                },
             };
             if stale {
                 if let Slot::Idle(c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
@@ -719,6 +746,8 @@ impl Loop {
         c.lingering = true;
         c.active = self.now;
         c.input = Vec::new();
+        c.chunked = None;
+        c.full = false;
         if c.writing {
             c.writing = false;
             let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
@@ -771,7 +800,15 @@ impl Loop {
         }
         let mut ended = false;
         let chunk = &mut self.chunk;
+        let cap = input_cap(self.app.max_body);
+        c.full = false;
         loop {
+            // No more than a request can take: the rest waits in the socket
+            // until the requests read so far are taken out.
+            if c.input.len() >= cap {
+                c.full = true;
+                break;
+            }
             match c.stream.read(chunk) {
                 Ok(0) => {
                     ended = true;
@@ -791,9 +828,18 @@ impl Loop {
                 Err(_) => return self.close(i, c),
             }
         }
-        let items = take_requests(&mut c, self.app.max_body, self.now);
+        // A bug in parsing costs this connection, not the server.
+        let (max_body, now) = (self.app.max_body, self.now);
+        let items = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_requests(&mut c, max_body, now))) {
+            Ok(items) => items,
+            Err(_) => {
+                eprintln!("quillo: internal error (a bug in Quillo) while reading a request");
+                return self.close(i, c);
+            }
+        };
         if items.is_empty() {
-            if ended {
+            // Full, and still no whole request: nothing more can arrive.
+            if ended || c.input.len() >= cap {
                 return self.close(i, c);
             }
             return self.finish(i, c, Fate::Keep);
@@ -965,8 +1011,9 @@ impl Loop {
                     let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
                 }
                 let again = matches!(self.slots[i], Slot::Busy { again: true });
-                // Requests that arrived whole while it was answered.
-                let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty();
+                // Requests that arrived whole while it was answered, or
+                // input left unread when there was no room for it.
+                let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty() || c.full;
                 self.slots[i] = Slot::Idle(c);
                 if again || more {
                     self.ready.push_back(i);
@@ -993,12 +1040,18 @@ impl Loop {
 fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
     let mut items = Vec::new();
     while !c.input.is_empty() {
-        match parse(&c.input, &c.peer, max_body) {
+        match parse(&c.input, &c.peer, max_body, &mut c.chunked) {
             Parsed::Need { expects_continue } => {
                 c.receiving.get_or_insert(now);
                 if expects_continue && !c.continued {
                     c.continued = true;
                     c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                }
+                // A chunked body's bytes already decoded are not kept twice,
+                // nor read again.
+                if let Some(d) = &mut c.chunked {
+                    c.input.drain(d.head..d.head + d.used);
+                    d.used = 0;
                 }
                 break;
             }
@@ -1006,10 +1059,12 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
                 let line = c.input.split(|b| *b == b'\r').next().unwrap_or(&[]);
                 let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
                 c.input.clear();
+                c.chunked = None;
                 items.push(Item::Bad(status, why, line));
                 break;
             }
             Parsed::Done { req, len, keep_alive } => {
+                c.chunked = None;
                 c.input.drain(..len);
                 c.receiving = None;
                 c.continued = false;
@@ -1116,6 +1171,12 @@ fn flush(c: &mut Conn) -> std::io::Result<bool> {
         }
     }
     c.output.drain(..done);
+    // When the client last took some of what waits (see `sweep`).
+    c.stalled = match c.stalled {
+        _ if c.output.is_empty() => None,
+        Some(since) if done == 0 => Some(since),
+        _ => Some(Instant::now()),
+    };
     Ok(c.output.is_empty())
 }
 
@@ -1145,7 +1206,9 @@ enum Parsed {
     Done { req: HttpRequest, len: usize, keep_alive: bool },
 }
 
-fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
+/// `chunked_so_far` is what is decoded of a chunked body arriving in `buf`
+/// (made here when it starts).
+fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<Dechunk>) -> Parsed {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut r = httparse::Request::new(&mut headers);
     let head = match r.parse(buf) {
@@ -1189,7 +1252,11 @@ fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
         _ => !connection.contains("close"),
     };
     let (body, len) = if chunked {
-        match dechunk(&buf[head..], max_body) {
+        let d = chunked_so_far.get_or_insert_with(|| Dechunk::new(head));
+        if d.head != head {
+            *d = Dechunk::new(head);
+        }
+        match dechunk(d, &buf[head..], max_body) {
             Chunked::Need => return Parsed::Need { expects_continue },
             Chunked::TooLarge => return Parsed::Bad(413, "request body too large"),
             Chunked::Bad => return Parsed::Bad(400, "bad chunked body"),
@@ -1225,39 +1292,108 @@ enum Chunked {
     Done(Vec<u8>, usize),
 }
 
-/// A `transfer-encoding: chunked` body: the data, and how many bytes it took.
-fn dechunk(buf: &[u8], max_body: usize) -> Chunked {
-    let mut body = Vec::new();
-    let mut at = 0;
+/// Longest chunk-size line.
+const MAX_CHUNK_LINE: usize = 1024;
+/// Most bytes of chunk extensions and trailers in one body, together.
+const MAX_CHUNK_EXTRA: usize = 8 << 10;
+
+/// A chunked body as it arrives: what is decoded so far, and where the
+/// decoding is. Kept with the connection between reads, so each byte is
+/// looked at once.
+struct Dechunk {
+    /// Where the body starts in the connection's input (the head's length).
+    head: usize,
+    /// The body so far.
+    body: Vec<u8>,
+    /// Bytes after the head already decoded. They are dropped from the
+    /// input when it waits for more (see `take_requests`).
+    used: usize,
+    step: Step,
+    /// Bytes of chunk extensions and trailers so far.
+    extra: usize,
+}
+
+enum Step {
+    /// A chunk-size line.
+    Size,
+    /// The data of a chunk: this many bytes still to come.
+    Data(usize),
+    /// The line end after a chunk's data.
+    DataEnd,
+    /// After the last chunk: trailer lines, then an empty line.
+    Trailers,
+}
+
+impl Dechunk {
+    fn new(head: usize) -> Self {
+        Dechunk { head, body: Vec::new(), used: 0, step: Step::Size, extra: 0 }
+    }
+}
+
+/// Goes on decoding a `transfer-encoding: chunked` body from `buf` (all of
+/// the input after the head). Done: the data, and how many bytes of `buf` it
+/// took.
+fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
     loop {
-        let Some(eol) = find_crlf(&buf[at..]) else { return if buf.len() - at > 1024 { Chunked::Bad } else { Chunked::Need } };
-        let line = &buf[at..at + eol];
-        let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
-        let Some(size) = std::str::from_utf8(size_text).ok().and_then(|s| usize::from_str_radix(s.trim(), 16).ok()) else {
-            return Chunked::Bad;
-        };
-        at += eol + 2;
-        if size == 0 {
-            // Trailers, then an empty line.
-            loop {
-                let Some(eol) = find_crlf(&buf[at..]) else { return Chunked::Need };
-                at += eol + 2;
+        let Some(rest) = buf.get(d.used..) else { return Chunked::Bad };
+        match d.step {
+            Step::Size => {
+                let Some(eol) = find_crlf(rest) else {
+                    return if rest.len() > MAX_CHUNK_LINE { Chunked::Bad } else { Chunked::Need };
+                };
+                let line = &rest[..eol];
+                let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
+                d.extra += line.len() - size_text.len();
+                if eol > MAX_CHUNK_LINE || d.extra > MAX_CHUNK_EXTRA {
+                    return Chunked::Bad;
+                }
+                // At most 16 hex digits: a size that fits, however large.
+                let size_text = std::str::from_utf8(size_text).map(str::trim).unwrap_or("");
+                if size_text.is_empty() || size_text.len() > 16 {
+                    return Chunked::Bad;
+                }
+                let Ok(size) = usize::from_str_radix(size_text, 16) else { return Chunked::Bad };
+                d.used += eol + 2;
+                d.step = if size == 0 {
+                    Step::Trailers
+                } else if size > max_body.saturating_sub(d.body.len()) {
+                    return Chunked::TooLarge;
+                } else {
+                    Step::Data(size)
+                };
+            }
+            Step::Data(left) => {
+                let n = left.min(rest.len());
+                d.body.extend_from_slice(&rest[..n]);
+                d.used += n;
+                if n < left {
+                    d.step = Step::Data(left - n);
+                    return Chunked::Need;
+                }
+                d.step = Step::DataEnd;
+            }
+            Step::DataEnd => match rest.get(..2) {
+                None => return Chunked::Need,
+                Some(b"\r\n") => {
+                    d.used += 2;
+                    d.step = Step::Size;
+                }
+                Some(_) => return Chunked::Bad,
+            },
+            Step::Trailers => {
+                let Some(eol) = find_crlf(rest) else {
+                    return if d.extra + rest.len() > MAX_CHUNK_EXTRA { Chunked::Bad } else { Chunked::Need };
+                };
+                d.used += eol + 2;
                 if eol == 0 {
-                    return Chunked::Done(body, at);
+                    return Chunked::Done(std::mem::take(&mut d.body), d.used);
+                }
+                d.extra += eol + 2;
+                if d.extra > MAX_CHUNK_EXTRA {
+                    return Chunked::Bad;
                 }
             }
         }
-        if body.len() + size > max_body {
-            return Chunked::TooLarge;
-        }
-        if buf.len() < at + size + 2 {
-            return Chunked::Need;
-        }
-        body.extend_from_slice(&buf[at..at + size]);
-        if &buf[at + size..at + size + 2] != b"\r\n" {
-            return Chunked::Bad;
-        }
-        at += size + 2;
     }
 }
 
@@ -1477,18 +1613,59 @@ mod tests {
         assert_eq!(super::http_date(1792716244), "Fri, 23 Oct 2026 00:44:04 GMT");
     }
 
+    use super::{dechunk, Chunked, Dechunk};
+
+    fn whole(b: &[u8], max: usize) -> Chunked {
+        dechunk(&mut Dechunk::new(0), b, max)
+    }
+
     #[test]
     fn chunked_bodies() {
         let b = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
-        match super::dechunk(b, 100) {
-            super::Chunked::Done(body, used) => {
+        match whole(b, 100) {
+            Chunked::Done(body, used) => {
                 assert_eq!(body, b"Wikipedia");
                 assert_eq!(&b[used..], b"NEXT");
             }
             _ => panic!("not parsed"),
         }
-        assert!(matches!(super::dechunk(b"4\r\nWi", 100), super::Chunked::Need));
-        assert!(matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::Need) || matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::TooLarge));
-        assert!(matches!(super::dechunk(b"zz\r\n", 100), super::Chunked::Bad));
+        assert!(matches!(whole(b"4\r\nWi", 100), Chunked::Need));
+        assert!(matches!(whole(b"ff\r\n", 10), Chunked::TooLarge));
+        assert!(matches!(whole(b"zz\r\n", 100), Chunked::Bad));
+        // Sizes that would overflow, or are longer than any size can be.
+        assert!(matches!(whole(b"1\r\nA\r\nffffffffffffffff\r\nBB", 100), Chunked::TooLarge));
+        assert!(matches!(whole(b"00000000000000001\r\nA\r\n", 100), Chunked::Bad));
+    }
+
+    #[test]
+    fn chunked_bodies_arriving_a_byte_at_a_time() {
+        let b = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
+        let mut d = Dechunk::new(0);
+        for n in 1..=b.len() {
+            match dechunk(&mut d, &b[..n], 100) {
+                Chunked::Need => {}
+                Chunked::Done(body, used) => {
+                    assert_eq!(body, b"Wikipedia");
+                    assert_eq!(used, b.len() - 4);
+                    return;
+                }
+                _ => panic!("refused at {}", n),
+            }
+        }
+        panic!("never done");
+    }
+
+    #[test]
+    fn chunk_extensions_and_trailers_are_limited() {
+        let mut long = b"1\r\nA\r\n0\r\n".to_vec();
+        for _ in 0..100 {
+            long.extend_from_slice(format!("X-T: {}\r\n", "y".repeat(200)).as_bytes());
+        }
+        assert!(matches!(whole(&long, 100), Chunked::Bad));
+        let mut ext = Vec::new();
+        for _ in 0..100 {
+            ext.extend_from_slice(format!("1;{}\r\nA\r\n", "e".repeat(200)).as_bytes());
+        }
+        assert!(matches!(whole(&ext, 1000), Chunked::Bad));
     }
 }

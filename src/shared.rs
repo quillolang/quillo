@@ -206,6 +206,42 @@ impl Shared {
         self.live_changed.notify_all();
     }
 
+    /// Notes that pages (or cached views) here depend on `topics`, so that
+    /// other servers' changes to them are taken (see `publish_known`).
+    pub fn track(&self, topics: &[String]) {
+        if topics.is_empty() {
+            return;
+        }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        for t in topics {
+            if !live.versions.contains_key(t) {
+                // Version 0 is older than any a page has seen: no change yet.
+                live.versions.insert(t.clone(), 0);
+            }
+        }
+    }
+
+    /// Another server's changes: marks those of `topics` that this server
+    /// already knows (changed here, or depended on), and drops the rest.
+    /// Nothing here waits on a topic it has never heard of, and a message
+    /// cannot make this server remember topics without end.
+    pub fn publish_known(&self, topics: &[String]) {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let known: Vec<&String> = topics.iter().filter(|t| live.versions.contains_key(*t)).collect();
+        if known.is_empty() {
+            return;
+        }
+        live.seq += 1;
+        let seq = live.seq;
+        for t in known {
+            if let Some(v) = live.versions.get_mut(t) {
+                *v = seq;
+            }
+        }
+        drop(live);
+        self.live_changed.notify_all();
+    }
+
     /// Whether none of `topics` changed after `seq`.
     pub fn unchanged_since(&self, topics: &[String], seq: u64) -> bool {
         if topics.is_empty() {

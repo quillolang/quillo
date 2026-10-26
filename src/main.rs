@@ -49,6 +49,8 @@ options for `run`:
                  QUILLO_SERVICE_SECRET, the same on every service
   --base PATH    the path the program is served under (/shop), as a mounted
                  program is: its links and redirects carry it
+  --as-service   serve the program as a service: its server fns answer only
+                 other services' signed calls, not pages (--split sets it)
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
   --no-jobs      run none of the program's `schedule`d jobs on this server
@@ -68,7 +70,8 @@ options for `run`:
                  connections and uptime, in Prometheus's text format
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
-                 servers there; the secret is read from $LIMER_ADMIN_SECRET
+                 servers there; limer's admin secret must be in
+                 $LIMER_ADMIN_SECRET
   --service S    the pool's name (default: the file's name, without .qwe)
 
 `app` takes the options of `run` except --host, --register and --service; its
@@ -180,6 +183,8 @@ struct RunOptions {
     base: Option<String>,
     /// Each service its own process (`--split`).
     split: bool,
+    /// Run as a service (`--as-service`): server fns only for other services.
+    as_service: bool,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -197,6 +202,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         service_urls: Vec::new(),
         base: None,
         split: false,
+        as_service: false,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -219,6 +225,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--split", _) => {
                 o.split = true;
+                i += 1;
+                continue;
+            }
+            ("--as-service", _) => {
+                o.as_service = true;
                 i += 1;
                 continue;
             }
@@ -343,6 +354,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     let shared = interp.shared.clone();
     shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
+    interp.is_service = o.as_service;
     let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| e.to_string())) {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
@@ -366,6 +378,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     app.max_body = o.max_body;
     app.reload = o.reload;
     app.base = o.base.clone().unwrap_or_default();
+    app.is_service = o.as_service;
     Ok(Some(app))
 }
 
@@ -428,6 +441,13 @@ fn run(file: &str, flags: &[String]) -> i32 {
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);
+    // Announcements are signed with a key made from limer's secret: without
+    // one, anyone who can reach a server could make its pages reload.
+    let limer_secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+    if o.register.is_some() && limer_secret.is_none() {
+        eprintln!("quillo: --register needs limer's admin secret in $LIMER_ADMIN_SECRET (and limer configured with it)");
+        return 2;
+    }
     // Each service its own process: started first, told where the others are.
     let _split = if o.split {
         if o.instances > 1 || o.register.is_some() {
@@ -461,17 +481,10 @@ fn run(file: &str, flags: &[String]) -> i32 {
         let service = o.service.unwrap_or_else(|| {
             path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into())
         });
-        let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+        let Some(secret) = limer_secret else { return 2 };
         let m = quillo::cluster::Membership { admin, service, port, secret };
         member = Some(m.clone());
         app.cluster_key = Some(m.key());
-        if m.secret.is_none() {
-            eprintln!(
-                "quillo: warning: no LIMER_ADMIN_SECRET; change announcements are accepted only from {}'s host",
-                m.admin
-            );
-            app.cluster_sources = Some(m.admin_addresses());
-        }
         quillo::cluster::join(app.shared(), m);
     }
     stop_on_signal(member);

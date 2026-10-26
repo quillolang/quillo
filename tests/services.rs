@@ -67,6 +67,16 @@ fn get(it: &mut Interp, url: &str) -> HttpResponse {
     })
 }
 
+fn post_json(it: &mut Interp, url: &str, body: &str) -> HttpResponse {
+    it.handle(&HttpRequest {
+        method: "POST".into(),
+        url: url.into(),
+        headers: vec![("Host".into(), "localhost".into()), ("Content-Type".into(), "application/json".into())],
+        body: body.as_bytes().to_vec(),
+        remote: "127.0.0.1".into(),
+    })
+}
+
 fn text(r: &HttpResponse) -> String {
     String::from_utf8_lossy(&r.body).into_owned()
 }
@@ -87,6 +97,26 @@ fn in_one_process_a_service_is_one_and_called_directly() {
     assert_eq!(text(&get(&mut it, "/shop/count")), "2");
     // The tenant goes along.
     assert_eq!(text(&get(&mut it, "/shop/as/acme")), "acme");
+}
+
+#[test]
+fn pages_cannot_call_a_services_server_fns() {
+    let d = dir("no-rpc");
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("app.qwe")).unwrap();
+    // The review's call: an invoice for 1 cent, past the shop's price.
+    let r = post_json(&mut it, "/billing/_quillo/rpc/invoice", r#"["mallory",1,"free"]"#);
+    assert_eq!(r.status, 404, "{}", text(&r));
+    assert_eq!(text(&get(&mut it, "/billing")), "<p>0 invoices</p>");
+    // Unsigned at its own address too.
+    assert_eq!(post_json(&mut it, "/billing/_quillo/service/invoice", r#"["mallory",1]"#).status, 401);
+    // The shop still calls it.
+    assert_eq!(text(&get(&mut it, "/shop/buy/ana")), "#1 ana none");
+    // A program's own server fns are still the pages' to call.
+    std::fs::write(d.join("main.qwe"), "service /billing = \"billing.qwe\"\nserver fn hello() = \"hi\"\n").unwrap();
+    let mut main = Interp::new(&d);
+    main.load_file(&d.join("main.qwe")).unwrap();
+    assert_eq!(text(&post_json(&mut main, "/_quillo/rpc/hello", "[]")), r#"{"ok":"hi"}"#);
 }
 
 #[test]
@@ -210,6 +240,28 @@ fn split_a_service_is_called_over_http_signed() {
     app.load_file(&d.join("app.qwe")).unwrap();
     assert_eq!(text(&get(&mut app, "/billing")), "<p>2 invoices</p>");
     assert_eq!(text(&get(&mut app, "/")), "billed 2");
+    // But not calls of its functions, nor Quillo's other addresses.
+    for path in ["/billing/_quillo/rpc/invoice", "/billing//_quillo/rpc/invoice", "/billing/_quillo/service/invoice", "/billing/_quillo/job/x", "/billing/_quillo/later"] {
+        let r = post_json(&mut app, path, r#"["mallory",1,"free"]"#);
+        assert_eq!(r.status, 404, "{}: {}", path, text(&r));
+    }
+    assert_eq!(text(&get(&mut app, "/billing")), "<p>2 invoices</p>");
+}
+
+#[test]
+fn a_service_run_alone_answers_only_signed_calls() {
+    let d = dir("alone");
+    std::fs::write(d.join("ledger.qwe"), "server fn add(amounts: list<int>) -> int = sum(amounts)\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let port = free_port();
+    let _ledger = start(&d.join("ledger.qwe"), port, &["--as-service"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let json = ("Content-Type", "application/json".to_string());
+    assert_eq!(http(port, "POST", "/_quillo/rpc/add", &[json.clone()], "[[1, 2]]").0, 404);
+    // Signed calls are checked all the way in, as pages' calls are.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let call = |body: &str| http(port, "POST", "/_quillo/service/add", &[json.clone(), ("X-Quillo-Service", format!("t={},sig={}", now, sign(secret, now, "add", "", body)))], body);
+    assert_eq!(call(r#"[["1) or 1=1 --", 2]]"#).0, 400);
+    assert_eq!(call("[[1, 2]]"), (200, r#"{"ok":3}"#.to_string()));
 }
 
 #[test]
@@ -229,6 +281,10 @@ fn split_runs_each_service_as_a_process_of_its_own() {
     }
     assert_eq!(http(port, "GET", "/billing", &[], "").1, "<p>1 invoices</p>");
     assert_eq!(http(port, "GET", "/", &[], "").1, "billed 1");
+    // Pages cannot call billing's functions, through the app or otherwise.
+    let json = ("Content-Type", "application/json".to_string());
+    assert_eq!(http(port, "POST", "/billing/_quillo/rpc/invoice", &[json], r#"["mallory",1,"free"]"#).0, 404);
+    assert_eq!(http(port, "GET", "/billing", &[], "").1, "<p>1 invoices</p>");
     // Stopped with the app: no service left behind.
     drop(app);
     std::thread::sleep(Duration::from_millis(500));

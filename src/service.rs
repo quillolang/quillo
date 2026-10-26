@@ -13,6 +13,10 @@
 //!   shared `QUILLO_SERVICE_SECRET` and carrying the tenant; its routes, if
 //!   it has a prefix, are passed on to it.
 //!
+//! A service's server fns are for other services: it answers no page's call
+//! of them (`/_quillo/rpc`), here or run alone (`--as-service`), and Quillo's
+//! own addresses under its prefix are not passed on.
+//!
 //! Either way what crosses is data, as JSON: a program behaves the same
 //! whichever way it runs. `quillo run app.qwe --split` runs each service as
 //! a process of its own, to see it so (see `split`).
@@ -691,10 +695,21 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     }
 }
 
+/// Quillo's own addresses that are not passed on to a service under its
+/// prefix: calls of its functions, and what only its own server or other
+/// services ask of it.
+const NOT_PASSED_ON: &[&str] = &["rpc", "service", "job", "later", "channel", "udp", "wt-ticket", "announce", "metrics"];
+
 /// A request under a service's prefix, when the service runs elsewhere:
 /// passed on to it, without the prefix (as a mounted program sees it).
 pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> HttpResponse {
     let rest = &req.url[prefix.len()..];
+    let path = rest.split('?').next().unwrap_or("");
+    if let Some(inner) = path.trim_start_matches('/').strip_prefix("_quillo/") {
+        if NOT_PASSED_ON.contains(&inner.split('/').next().unwrap_or("")) {
+            return crate::server::plain_response(404, "not found\n");
+        }
+    }
     let target = format!("{}{}", url, if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() });
     const HOP: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization"];
     let headers: Vec<(String, String)> = req.headers.iter().filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h))).cloned().collect();
@@ -759,6 +774,7 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
                 sub.services = it.services.clone();
+                sub.is_service = true;
                 let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
                 it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
                 loaded?;
@@ -987,7 +1003,7 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
     let mut split = Split { children: Vec::new() };
     for ((name, prefix, file), port) in services.iter().zip(&ports) {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("run").arg(file).args(["--port", &port.to_string()]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd.arg("run").arg(file).args(["--port", &port.to_string(), "--as-service"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         if let Some(p) = prefix {
             cmd.args(["--base", p]);
         }

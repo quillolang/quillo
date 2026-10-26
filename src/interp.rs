@@ -154,6 +154,9 @@ pub struct Interp {
     /// Services with a prefix that run elsewhere: their routes are passed
     /// on to them (`service /shop = "shop.qwe"`, src/service.rs).
     pub remote_mounts: Vec<(String, String)>,
+    /// Loaded as a service (src/service.rs): its server fns are called by
+    /// other services, signed, never by browsers (`/_quillo/rpc`).
+    pub is_service: bool,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -606,6 +609,7 @@ impl Interp {
             base: String::new(),
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
+            is_service: false,
             types: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
@@ -663,6 +667,7 @@ impl Interp {
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
+            is_service: self.is_service,
             types: self.types.clone(),
             stream_out: None,
             pending_stream: None,
@@ -1158,6 +1163,8 @@ impl Interp {
                 let mut sub = Interp::with_shared(dir, self.shared.clone());
                 sub.services = self.services.clone();
                 sub.base = format!("{}{}", self.base, prefix);
+                // What a service mounts is part of the service.
+                sub.is_service = self.is_service;
                 sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
                 // Watch the mounted program's files too.
                 Arc::make_mut(&mut self.loaded).extend(sub.files());
@@ -1904,6 +1911,9 @@ impl Interp {
                     outer.locale |= track.locale;
                 }
                 r?;
+                if !track.impure {
+                    self.shared.track(&track.deps);
+                }
                 let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if track.impure {
                     cache.forbid(&c.def);
