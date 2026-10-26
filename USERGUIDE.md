@@ -827,7 +827,10 @@ image.convert("photos/a.jpg", "cache/a-800.jpg", {
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
-allocated; both run off the event loop. Paths stay inside the program's folder.
+allocated; both run off the event loop. At most four conversions run at once (fewer on
+a machine with fewer cores), so many uploads together cannot each take 512 MiB; the rest
+wait their turn, and past 64 waiting `image.convert` gives an error value at once. Paths
+stay inside the program's folder.
 
 ### Cookies and sessions
 
@@ -1386,7 +1389,8 @@ Safety built in:
   connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
   db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
-  name in with `sql_name(name)` (or a list of them), and named parameters with
+  name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
+  the program's database is MySQL), and named parameters with
   `sql_param(name)` — both take only letters, digits and `_`, and SQL made of them,
   text as written (also kept in a variable) and choices between those is not warned
   about. It is a warning, not a proof: SQL built in another function, or in a list made
