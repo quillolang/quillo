@@ -85,6 +85,8 @@ const cases = [
   ['media.rtp("cam", { video: 5004, audio: 5006 })', "media", "support.module.quillo"],
   ['media.rtp("cam", { video: 5004, audio: 5006 })', "rtp", "support.function.quillo"],
   ['let r = math.sqrt(2)', "math", "support.module.quillo"],
+  ['let due = date.add_business_days(d, 2, cal)', "date", "support.module.quillo"],
+  ['let due = date.add_business_days(d, 2, cal)', "add_business_days", "support.function.quillo"],
   ['fn ping(h: str) with net = udp.send(h, 9, "x")', "net", "support.constant.effect.quillo"],
   ['<quillo-media stream="cam" controls/>', "quillo-media", "entity.name.tag.quillo"],
   ['<quillo-media stream="cam" controls/>', "stream", "entity.other.attribute-name.quillo"],

@@ -134,7 +134,7 @@ pub fn builtin_effect(name: &str) -> u8 {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
             "env" => "env",
-            "now" | "sleep" => "time",
+            "now" | "sleep" | "date.today" | "date.now" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,

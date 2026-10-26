@@ -34,6 +34,7 @@ pub mod script;
 pub mod pg;
 pub mod server;
 pub mod numeric;
+pub mod dates;
 pub mod record;
 pub mod par;
 pub mod service;

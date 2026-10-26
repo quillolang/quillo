@@ -1609,6 +1609,562 @@ B.vec = {
   },
 };
 
+// ---- date (src/dates.rs, the same answers) --------------------------------
+// A date is "2026-10-27" and a date-time "2026-10-27T14:30:00Z": text, as on
+// the server. The work is on day numbers (days from 1970-01-01) with the
+// server's integer algorithms; time zones come from Intl.DateTimeFormat.
+// Only the clock (date.today, date.now) differs from the server.
+
+const dtMod = (a, b) => a - Math.floor(a / b) * b;
+function dtDays(y, m, d) {
+  y = m <= 2 ? y - 1 : y;
+  const era = Math.floor(y / 400), yoe = y - era * 400;
+  const doy = Math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+function dtCivil(z) {
+  z += 719468;
+  const era = Math.floor(z / 146097), doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  return [yoe + era * 400 + (m <= 2 ? 1 : 0), m, d];
+}
+// 1 is Monday, 7 Sunday (ISO).
+const dtWeekday = (z) => dtMod(z + 3, 7) + 1;
+const dtLeap = (y) => y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+const dtMonthLen = (y, m) => m === 2 ? (dtLeap(y) ? 29 : 28) : (m === 4 || m === 6 || m === 9 || m === 11) ? 30 : 31;
+const dtInRange = (y) => y >= 1 && y <= 9999;
+const dtPad = (n, w = 2) => String(n).padStart(w, "0");
+const dtText = (z) => { const [y, m, d] = dtCivil(z); return `${dtPad(y, 4)}-${dtPad(m)}-${dtPad(d)}`; };
+function dtAddMonths(z, n) {
+  const [y, m, d] = dtCivil(z);
+  if (Math.abs(n) > 120000) return null;
+  const total = y * 12 + (m - 1) + n, ny = Math.floor(total / 12), nm = dtMod(total, 12) + 1;
+  return dtInRange(ny) ? dtDays(ny, nm, Math.min(d, dtMonthLen(ny, nm))) : null;
+}
+const dtNum = (s) => /^[0-9]+$/.test(s) ? Number(s) : null;
+const dtYmd = (y, m, d) => y !== null && m !== null && d !== null && dtInRange(y) && m >= 1 && m <= 12 && d >= 1 && d <= dtMonthLen(y, m) ? dtDays(y, m, d) : null;
+function dtDate(s) {
+  if (typeof s !== "string" || s.length !== 10 || s[4] !== "-" || s[7] !== "-") return null;
+  return dtYmd(dtNum(s.slice(0, 4)), dtNum(s.slice(5, 7)), dtNum(s.slice(8)));
+}
+function dtHms(s) {
+  const h = dtNum(s.slice(0, 2)), m = dtNum(s.slice(3, 5)), x = dtNum(s.slice(6, 8));
+  return h === null || m === null || x === null || s[2] !== ":" || s[5] !== ":" || h >= 24 || m >= 60 || x >= 60 ? null : h * 3600 + m * 60 + x;
+}
+// "Z", "+01:00", "-04:00" (and "+00:09:21", the old local mean times).
+function dtOffset(s) {
+  if (s === "Z") return 0;
+  const sign = s[0] === "+" ? 1 : s[0] === "-" ? -1 : 0;
+  if (!sign || (s.length !== 6 && !(s.length === 9 && s[6] === ":")) || s[3] !== ":") return null;
+  const h = dtNum(s.slice(1, 3)), m = dtNum(s.slice(4, 6)), x = s.length === 9 ? dtNum(s.slice(7, 9)) : 0;
+  return h === null || m === null || x === null || h >= 24 || m >= 60 || x >= 60 ? null : sign * (h * 3600 + m * 60 + x);
+}
+const dtAscii = (s) => /^[\x00-\x7f]*$/.test(s);
+// { day, sec, frac, off }: the local date and time as written, the fraction
+// of a second as written, and the offset in seconds east of UTC.
+function dtStamp(s) {
+  if (typeof s !== "string" || s.length < 20 || !dtAscii(s) || s[10] !== "T") return null;
+  const day = dtDate(s.slice(0, 10)), sec = dtHms(s.slice(11, 19));
+  if (day === null || sec === null) return null;
+  let i = 19;
+  if (s[i] === ".") {
+    i++;
+    while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+    if (i === 20 || i > 29) return null;
+  }
+  const off = dtOffset(s.slice(i));
+  return off === null ? null : { day, sec, frac: s.slice(19, i), off };
+}
+const dtInstant = (t) => t.day * 86400 + t.sec - t.off;
+function dtOffsetText(off) {
+  if (off === 0) return "Z";
+  const a = Math.abs(off), hm = (off < 0 ? "-" : "+") + dtPad(Math.floor(a / 3600)) + ":" + dtPad(Math.floor(a % 3600 / 60));
+  return a % 60 ? hm + ":" + dtPad(a % 60) : hm;
+}
+function dtStampText(instant, frac, off) {
+  const local = instant + off, day = Math.floor(local / 86400), sec = dtMod(local, 86400);
+  if (!dtInRange(dtCivil(day)[0])) return null;
+  return `${dtText(day)}T${dtPad(Math.floor(sec / 3600))}:${dtPad(Math.floor(sec % 3600 / 60))}:${dtPad(sec % 60)}${frac}${dtOffsetText(off)}`;
+}
+
+const dtGot = (v) => v === undefined ? "nothing" : typeof v === "string" ? JSON.stringify(v) : typeName(v);
+function dtDateArg(v, f, i) {
+  const z = dtDate(v);
+  if (z !== null) return z;
+  if (dtStamp(v)) fail(`\`${f}\` expects a date (YYYY-MM-DD) as argument ${i}, got the date-time ${dtGot(v)} (\`date.date_in\` gives its date)`);
+  fail(`\`${f}\` expects a date (YYYY-MM-DD) as argument ${i}, got ${dtGot(v)}`);
+}
+function dtStampArg(v, f, i) {
+  const t = dtStamp(v);
+  if (!t) fail(`\`${f}\` expects a date-time (like 2026-10-27T14:30:00Z) as argument ${i}, got ${dtGot(v)}`);
+  return t;
+}
+// [day, stamp or null]
+function dtEitherArg(v, f, i) {
+  const z = dtDate(v);
+  if (z !== null) return [z, null];
+  const t = dtStamp(v);
+  if (t) return [t.day, t];
+  fail(`\`${f}\` expects a date or a date-time as argument ${i}, got ${dtGot(v)}`);
+}
+const dtInt = (v, f, i) => { if (!isInt(v)) fail(`\`${f}\` expects an int as argument ${i}, got ${dtGot(v)}`); return v; };
+const dtStr = (v, f, i) => { if (typeof v !== "string") fail(`\`${f}\` expects a str as argument ${i}, got ${dtGot(v)}`); return v; };
+const dtOutOfRange = (f) => fail(`\`${f}\`: the date is out of range (years 1 to 9999)`);
+const dtDay = (z, f) => z !== null && dtInRange(dtCivil(z)[0]) ? dtText(z) : dtOutOfRange(f);
+
+// A zone: a fixed offset (seconds), or a formatter that tells its local time.
+const dtZones = new Map();
+function dtZone(v, f, i) {
+  if (isNil(v)) return 0;
+  if (typeof v !== "string") fail(`\`${f}\` expects a time zone (like "Europe/Paris") as argument ${i}, got ${dtGot(v)}`);
+  if (v.toUpperCase() === "UTC" || v === "Z") return 0;
+  if (v[0] === "+" || v[0] === "-") { const o = dtOffset(v); if (o !== null) return o; }
+  let fmt = dtZones.get(v);
+  if (!fmt) {
+    try {
+      fmt = new Intl.DateTimeFormat("en-US", { timeZone: v, hourCycle: "h23", era: "short", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+    } catch (e) {
+      fail(`\`${f}\`: unknown time zone ${dtGot(v)}`);
+    }
+    dtZones.set(v, fmt);
+  }
+  return fmt;
+}
+// The zone's offset at an instant (seconds since 1970, UTC).
+function dtOffsetAt(zone, instant) {
+  if (typeof zone === "number") return zone;
+  const p = {};
+  for (const x of zone.formatToParts(new Date(instant * 1000))) p[x.type] = x.value;
+  const y = p.era === "BC" || p.era === "B" ? 1 - Number(p.year) : Number(p.year);
+  const local = dtDays(y, Number(p.month), Number(p.day)) * 86400 + (Number(p.hour) % 24) * 3600 + Number(p.minute) * 60 + Number(p.second);
+  return local - instant;
+}
+// The instant a local time names: in a gap, that far after it; in an
+// overlap, the earlier ("compatible", as on the server).
+function dtLocalInstant(zone, local) {
+  const before = dtOffsetAt(zone, local - 86400), after = dtOffsetAt(zone, local + 86400);
+  const fits = (o) => dtOffsetAt(zone, local - o) === o;
+  const a = fits(before), b = fits(after);
+  if (a && b) return local - Math.max(before, after);
+  if (b) return local - after;
+  return local - before;
+}
+const dtClock = () => Math.floor(Date.now() / 1000);
+
+// { weekend: [6, 7], holidays: ["2026-12-25"] }
+function dtCalendar(v, f, i) {
+  const cal = { weekend: [false, false, false, false, false, false, true, true], holidays: new Set() };
+  if (isNil(v)) return cal;
+  if (!isMap(v)) fail(`\`${f}\` expects a calendar ({ weekend, holidays }) as argument ${i}, got ${dtGot(v)}`);
+  for (const k of Object.keys(v)) {
+    const x = v[k];
+    if (k !== "weekend" && k !== "holidays") fail(`\`${f}\`: a calendar has \`weekend\` and \`holidays\`, not \`${k}\``);
+    if (isNil(x)) continue;
+    if (!Array.isArray(x)) fail(`\`${f}\`: a calendar's ${k} is a list, got ${dtGot(x)}`);
+    if (k === "weekend") {
+      cal.weekend = [false, false, false, false, false, false, false, false];
+      for (const d of x) {
+        if (!isInt(d) || d < 1 || d > 7) fail(`\`${f}\`: a calendar's weekend is days 1 (Monday) to 7 (Sunday), got ${dtGot(d)}`);
+        cal.weekend[d] = true;
+      }
+      if (cal.weekend.slice(1).every((w) => w)) fail(`\`${f}\`: a calendar's weekend cannot be the whole week`);
+    } else {
+      for (const h of x) {
+        const z = dtDate(h);
+        if (z === null) fail(`\`${f}\`: a calendar's holidays are dates (YYYY-MM-DD), got ${dtGot(h)}`);
+        cal.holidays.add(z);
+      }
+    }
+  }
+  return cal;
+}
+const dtOpen = (cal, z) => !cal.weekend[dtWeekday(z)] && !cal.holidays.has(z);
+const dtStep = (z, by) => z === null || !dtInRange(dtCivil(z + by)[0]) ? null : z + by;
+function dtRoll(cal, z, by) {
+  while (z !== null && !dtOpen(cal, z)) z = dtStep(z, by);
+  return z;
+}
+// The business day conventions (ISDA 2006, section 4.12); undefined for an unknown one.
+function dtAdjust(cal, z, how) {
+  const month = (x) => dtCivil(x)[1];
+  const modified = (by) => { const x = dtRoll(cal, z, by); return x !== null && month(x) === month(z) ? x : dtRoll(cal, z, -by); };
+  switch (how) {
+    case "unadjusted": return z;
+    case "following": return dtRoll(cal, z, 1);
+    case "modified_following": return modified(1);
+    case "preceding": return dtRoll(cal, z, -1);
+    case "modified_preceding": return modified(-1);
+  }
+  return undefined;
+}
+
+// Day counts: [days as the convention counts them, the year fraction].
+function dtBasis(v, f) {
+  const n = dtStr(v, f, 3).trim().toUpperCase().replaceAll("ACTUAL", "ACT");
+  switch (n) {
+    case "ACT/360": return "act360";
+    case "ACT/365": case "ACT/365F": case "ACT/365 FIXED": return "act365";
+    case "ACT/ACT": case "ACT/ACT ISDA": return "actact";
+    case "30/360": case "30/360 ISDA": case "360/360": case "BOND BASIS": return "bond";
+    case "30U/360": case "30/360 US": return "us";
+    case "30E/360": case "EUROBOND BASIS": return "euro";
+  }
+  fail(`\`${f}\`: unknown day count convention ${dtGot(v)} (ACT/360, ACT/365, ACT/ACT, 30/360, 30U/360 or 30E/360)`);
+}
+function dtCount(c, a, b) {
+  const [y1, m1, d1] = dtCivil(a), [y2, m2, d2] = dtCivil(b), act = b - a;
+  const thirty = (e1, e2) => { const n = 360 * (y2 - y1) + 30 * (m2 - m1) + (e2 - e1); return [n, n / 360]; };
+  switch (c) {
+    case "act360": return [act, act / 360];
+    case "act365": return [act, act / 365];
+    case "actact": {
+      const base = (y) => dtLeap(y) ? 366 : 365;
+      if (y1 === y2) return [act, act / base(y1)];
+      return [act, (dtDays(y1 + 1, 1, 1) - a) / base(y1) + (y2 - y1 - 1) + (b - dtDays(y2, 1, 1)) / base(y2)];
+    }
+    case "bond": { const e1 = d1 === 31 ? 30 : d1; return thirty(e1, d2 === 31 && e1 === 30 ? 30 : d2); }
+    case "us": {
+      const febEnd = (y, m, d) => m === 2 && d === dtMonthLen(y, 2);
+      const f1 = febEnd(y1, m1, d1), f2 = febEnd(y2, m2, d2);
+      let e2 = f1 && f2 ? 30 : d2;
+      const e1 = f1 || d1 === 31 ? 30 : d1;
+      if (e2 === 31 && e1 === 30) e2 = 30;
+      return thirty(e1, e2);
+    }
+    case "euro": return thirty(Math.min(d1, 30), Math.min(d2, 30));
+  }
+}
+function dtCounted(a, b, c, f) {
+  a = dtDateArg(a, f, 1); b = dtDateArg(b, f, 2); c = dtBasis(c, f);
+  if (b < a) { const [n, x] = dtCount(c, b, a); return [-n, -x]; }
+  return dtCount(c, a, b);
+}
+
+// A language's names and date styles (pattern tokens), after CLDR; the
+// server has the same table.
+const dtEn = {
+  tags: ["en", "en-us"],
+  months: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+  mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+  days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+  dy: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+  styles: ["M/D/YY", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"],
+};
+const dtLocales = [dtEn, {
+  tags: ["en-gb", "en-ie", "en-au", "en-nz", "en-in", "en-za"],
+  months: dtEn.months,
+  mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"],
+  days: dtEn.days, dy: dtEn.dy,
+  styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
+}, {
+  tags: ["de"],
+  months: ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
+  mon: ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."],
+  days: ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
+  dy: ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."],
+  styles: ["DD.MM.YY", "DD.MM.YYYY", "D. MMMM YYYY", "dddd, D. MMMM YYYY"],
+}, {
+  tags: ["fr"],
+  months: ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
+  mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."],
+  days: ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
+  dy: ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."],
+  styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["es"],
+  months: ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+  mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"],
+  days: ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
+  dy: ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"],
+  styles: ["D/M/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
+}, {
+  tags: ["it"],
+  months: ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+  mon: ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"],
+  days: ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
+  dy: ["lun", "mar", "mer", "gio", "ven", "sab", "dom"],
+  styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["nl"],
+  months: ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"],
+  mon: ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"],
+  days: ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
+  dy: ["ma", "di", "wo", "do", "vr", "za", "zo"],
+  styles: ["DD-MM-YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["pt"],
+  months: ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
+  mon: ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."],
+  days: ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"],
+  dy: ["seg.", "ter.", "qua.", "qui.", "sex.", "sáb.", "dom."],
+  styles: ["DD/MM/YYYY", "D [de] MMM [de] YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
+}];
+function dtNames(locale) {
+  const tag = locale.trim().toLowerCase().replaceAll("_", "-"), lang = tag.split("-")[0];
+  return dtLocales.find((n) => n.tags.includes(tag)) || dtLocales.find((n) => n.tags.includes(lang)) || dtEn;
+}
+// Longest first, so "MMMM" is not read as "MM" twice.
+const dtTokens = ["YYYY", "YY", "MMMM", "MMM", "MM", "M", "DD", "D", "dddd", "ddd", "HH", "H", "hh", "h", "mm", "ss", "A", "Z"];
+const dtTimeTokens = ["HH", "H", "hh", "h", "mm", "ss", "A", "Z"];
+// A pattern's tokens: a token's text, or { lit } for text as it is ([brackets] and the rest).
+function dtTokenize(p) {
+  const out = [];
+  let i = 0;
+  next: while (i < p.length) {
+    if (p[i] === "[") {
+      let end = p.indexOf("]", i + 1);
+      if (end < 0) end = p.length;
+      out.push({ lit: p.slice(i + 1, end).join("") });
+      i = Math.min(end + 1, p.length);
+      continue;
+    }
+    for (const t of dtTokens) {
+      if (p.slice(i, i + t.length).join("") === t) { out.push(t); i += t.length; continue next; }
+    }
+    out.push({ lit: p[i] });
+    i++;
+  }
+  return out;
+}
+function dtRender(toks, n, z, t) {
+  const [y, m, d] = dtCivil(z), sec = t ? t.sec : 0, off = t ? t.off : 0;
+  const h = Math.floor(sec / 3600), mi = Math.floor(sec % 3600 / 60), s = sec % 60, h12 = (h + 11) % 12 + 1;
+  const v = { YYYY: dtPad(y, 4), YY: dtPad(y % 100), MMMM: n.months[m - 1], MMM: n.mon[m - 1], MM: dtPad(m), M: String(m), DD: dtPad(d), D: String(d),
+    dddd: n.days[dtWeekday(z) - 1], ddd: n.dy[dtWeekday(z) - 1], HH: dtPad(h), H: String(h), hh: dtPad(h12), h: String(h12), mm: dtPad(mi), ss: dtPad(s),
+    A: h < 12 ? "AM" : "PM", Z: dtOffsetText(off) };
+  return toks.map((x) => typeof x === "string" ? v[x] : x.lit).join("");
+}
+// Up to `max` digits at p.i (at least `min`).
+function dtDigits(s, p, min, max) {
+  const start = p.i;
+  while (p.i < s.length && p.i - start < max && s[p.i] >= "0" && s[p.i] <= "9") p.i++;
+  return p.i - start < min ? null : Number(s.slice(start, p.i).join(""));
+}
+// One of `words` at p.i, ignoring case, the longest that fits; its index.
+function dtWord(s, p, words) {
+  let best = null;
+  words.forEach((w, k) => {
+    const ws = Array.from(w);
+    if (p.i + ws.length <= s.length && s.slice(p.i, p.i + ws.length).join("").toLowerCase() === w.toLowerCase() && (!best || ws.length > best[1])) best = [k, ws.length];
+  });
+  if (!best) return null;
+  p.i += best[1];
+  return best[0];
+}
+// Text read by a pattern: a date, or a date-time when the pattern has a time.
+function dtRead(s, pattern) {
+  let y = null, mo = null, d = null, h = null, mi = 0, se = 0, pm = null, twelve = false, off = 0, timed = false;
+  const p = { i: 0 };
+  for (const tok of dtTokenize(pattern)) {
+    if (typeof tok !== "string") {
+      for (const c of Array.from(tok.lit)) { if (s[p.i] !== c) return null; p.i++; }
+      continue;
+    }
+    timed = timed || dtTimeTokens.includes(tok);
+    let x;
+    switch (tok) {
+      case "YYYY": x = y = dtDigits(s, p, 4, 4); break;
+      case "YY": x = dtDigits(s, p, 2, 2); y = x === null ? null : 2000 + x; break;
+      case "MMMM": x = dtWord(s, p, dtEn.months); mo = x === null ? null : x + 1; break;
+      case "MMM": x = dtWord(s, p, dtEn.mon); mo = x === null ? null : x + 1; break;
+      case "MM": x = mo = dtDigits(s, p, 2, 2); break;
+      case "M": x = mo = dtDigits(s, p, 1, 2); break;
+      case "DD": x = d = dtDigits(s, p, 2, 2); break;
+      case "D": x = d = dtDigits(s, p, 1, 2); break;
+      case "dddd": x = dtWord(s, p, dtEn.days); break;
+      case "ddd": x = dtWord(s, p, dtEn.dy); break;
+      case "HH": x = h = dtDigits(s, p, 2, 2); break;
+      case "H": x = h = dtDigits(s, p, 1, 2); break;
+      case "hh": case "h":
+        x = h = dtDigits(s, p, tok === "h" ? 1 : 2, 2);
+        if (x !== null && (x < 1 || x > 12)) return null;
+        twelve = true;
+        break;
+      case "mm": x = mi = dtDigits(s, p, 2, 2); break;
+      case "ss": x = se = dtDigits(s, p, 2, 2); break;
+      case "A": x = dtWord(s, p, ["AM", "PM"]); pm = x === 1; break;
+      // "Z", "+01:00" or "+0100".
+      case "Z": {
+        const len = s[p.i] === "Z" || s[p.i] === "z" ? 1 : s[p.i + 3] === ":" ? 6 : 5;
+        if (p.i + len > s.length) return null;
+        let o = s.slice(p.i, p.i + len).join("");
+        if (!dtAscii(o)) return null;
+        if (len === 5) o = o.slice(0, 3) + ":" + o.slice(3);
+        x = off = dtOffset(o.toUpperCase());
+        p.i += len;
+        break;
+      }
+    }
+    if (x === null) return null;
+  }
+  if (p.i !== s.length) return null;
+  const day = dtYmd(y, mo, d);
+  if (day === null) return null;
+  if (!timed) return dtText(day);
+  // "12:30 AM" is 00:30, "12:30 PM" 12:30.
+  let hour = h === null ? 0 : h;
+  if (twelve && pm !== null) hour = hour % 12 + (pm ? 12 : 0);
+  if (hour > 23 || mi > 59 || se > 59) return null;
+  return dtStampText(day * 86400 + hour * 3600 + mi * 60 + se - off, "", off);
+}
+// A date, or a date-time with "T", "t" or a space, seconds or not, and an
+// offset ("Z", "+01:00", "+0100", "+01"), as this module writes them.
+function dtReadIso(s) {
+  const z = dtDate(s);
+  if (z !== null) return dtText(z);
+  if (s.length < 16 || !dtAscii(s) || !"Tt ".includes(s[10])) return null;
+  const day = dtDate(s.slice(0, 10));
+  let sec = dtHms(s.slice(11, 16) + ":00");
+  if (day === null || sec === null) return null;
+  let i = 16;
+  if (s[16] === ":") {
+    const x = s.length >= 19 ? dtNum(s.slice(17, 19)) : null;
+    if (x === null || x > 59) return null;
+    sec += x;
+    i = 19;
+  }
+  const fs = i;
+  if (s[i] === "." || s[i] === ",") {
+    i++;
+    while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+    if (i === fs + 1 || i > fs + 10) return null;
+  }
+  const frac = i > fs ? "." + s.slice(fs + 1, i) : "", o = s.slice(i);
+  const off = o.length === 1 ? dtOffset(o.toUpperCase()) : o.length === 3 ? dtOffset(o + ":00")
+    : o.length === 5 && !o.includes(":") ? dtOffset(o.slice(0, 3) + ":" + o.slice(3)) : dtOffset(o);
+  return off === null ? null : dtStampText(day * 86400 + sec - off, frac, off);
+}
+
+B.date = {
+  today: (tz) => { const z = dtZone(tz, "date.today", 1), t = dtClock(); return dtText(Math.floor((t + dtOffsetAt(z, t)) / 86400)); },
+  now: (tz) => { const z = dtZone(tz, "date.now", 1), t = dtClock(); return dtStampText(t, "", dtOffsetAt(z, t)) || ""; },
+  parse: (s, pattern) => {
+    dtStr(s, "date.parse", 1);
+    if (isNil(pattern)) { const r = dtReadIso(s.trim()); return r === null ? new Err(`not a date or a date-time: ${dtGot(s)}`) : r; }
+    if (typeof pattern !== "string") fail(`\`date.parse\` expects a pattern (like "DD/MM/YYYY") as argument 2, got ${dtGot(pattern)}`);
+    const r = dtRead(Array.from(s.trim()), Array.from(pattern));
+    return r === null ? new Err(`${dtGot(s)} is not a date in the form ${dtGot(pattern)}`) : r;
+  },
+  valid: (s) => dtDate(s) !== null || dtStamp(s) !== null,
+  of: (y, m, d) => {
+    dtInt(y, "date.of", 1); dtInt(m, "date.of", 2); dtInt(d, "date.of", 3);
+    const z = dtYmd(y, m, d);
+    if (z === null) fail(`\`date.of\`: there is no date ${y}-${m}-${d}`);
+    return dtText(z);
+  },
+  parts: (v) => {
+    const [z, t] = dtEitherArg(v, "date.parts", 1), [year, month, day] = dtCivil(z);
+    const out = { year, month, day, weekday: dtWeekday(z) };
+    if (t) Object.assign(out, { hour: Math.floor(t.sec / 3600), minute: Math.floor(t.sec % 3600 / 60), second: t.sec % 60, offset: dtOffsetText(t.off) });
+    return out;
+  },
+  weekday: (v) => dtWeekday(dtEitherArg(v, "date.weekday", 1)[0]),
+  is_leap_year: (v) => dtLeap(typeof v === "string" ? dtCivil(dtEitherArg(v, "date.is_leap_year", 1)[0])[0] : dtInt(v, "date.is_leap_year", 1)),
+  days_in_month: (a, b) => {
+    const f = "date.days_in_month";
+    let y, m;
+    if (typeof a === "string") [y, m] = dtCivil(dtEitherArg(a, f, 1)[0]);
+    else { y = dtInt(a, f, 1); m = dtInt(b, f, 2); }
+    if (m < 1 || m > 12) fail(`\`${f}\`: there is no month ${m}`);
+    return dtMonthLen(y, m);
+  },
+  add_days: (v, n) => { const z = dtDateArg(v, "date.add_days", 1); dtInt(n, "date.add_days", 2); return dtDay(Math.abs(n) <= 4000000 ? z + n : null, "date.add_days"); },
+  add_months: (v, n) => { const z = dtDateArg(v, "date.add_months", 1); dtInt(n, "date.add_months", 2); return dtDay(dtAddMonths(z, n), "date.add_months"); },
+  add_years: (v, n) => { const z = dtDateArg(v, "date.add_years", 1); dtInt(n, "date.add_years", 2); return dtDay(Math.abs(n) <= 10000 ? dtAddMonths(z, n * 12) : null, "date.add_years"); },
+  days_between: (a, b) => { const x = dtDateArg(a, "date.days_between", 1); return dtDateArg(b, "date.days_between", 2) - x; },
+  months_between: (a, b) => {
+    a = dtDateArg(a, "date.months_between", 1); b = dtDateArg(b, "date.months_between", 2);
+    const from = (a, b) => {
+      if (b < a) return -from(b, a);
+      const [y1, m1] = dtCivil(a), [y2, m2] = dtCivil(b), n = (y2 * 12 + m2) - (y1 * 12 + m1), x = dtAddMonths(a, n);
+      return x === null || x > b ? n - 1 : n;
+    };
+    return from(a, b);
+  },
+  start_of_month: (v) => { const [y, m] = dtCivil(dtDateArg(v, "date.start_of_month", 1)); return dtText(dtDays(y, m, 1)); },
+  end_of_month: (v) => { const [y, m] = dtCivil(dtDateArg(v, "date.end_of_month", 1)); return dtText(dtDays(y, m, dtMonthLen(y, m))); },
+  to_zone: (v, tz) => {
+    const t = dtStampArg(v, "date.to_zone", 1), z = dtZone(tz, "date.to_zone", 2), i = dtInstant(t);
+    return dtStampText(i, t.frac, dtOffsetAt(z, i)) ?? dtOutOfRange("date.to_zone");
+  },
+  date_in: (v, tz) => {
+    const t = dtStampArg(v, "date.date_in", 1), z = dtZone(tz, "date.date_in", 2), i = dtInstant(t);
+    return dtDay(Math.floor((i + dtOffsetAt(z, i)) / 86400), "date.date_in");
+  },
+  at: (v, time, tz) => {
+    const f = "date.at", day = dtDateArg(v, f, 1);
+    let sec = 0;
+    if (!isNil(time)) {
+      sec = typeof time === "string" && time.length === 5 ? dtHms(time + ":00") : typeof time === "string" && time.length === 8 ? dtHms(time) : null;
+      if (sec === null) fail(`\`${f}\` expects a time (HH:MM or HH:MM:SS) as argument 2, got ${dtGot(time)}`);
+    }
+    const z = dtZone(tz, f, 3), i = dtLocalInstant(z, day * 86400 + sec);
+    return dtStampText(i, "", dtOffsetAt(z, i)) ?? dtOutOfRange(f);
+  },
+  is_business_day: (v, cal) => { const z = dtDateArg(v, "date.is_business_day", 1); return dtOpen(dtCalendar(cal, "date.is_business_day", 2), z); },
+  add_business_days: (v, n, cal) => {
+    const f = "date.add_business_days";
+    let z = dtDateArg(v, f, 1);
+    dtInt(n, f, 2);
+    cal = dtCalendar(cal, f, 3);
+    if (Math.abs(n) > 4000000) dtOutOfRange(f);
+    const by = n < 0 ? -1 : 1;
+    for (let k = 0; k < Math.abs(n); k++) z = dtRoll(cal, dtStep(z, by), by);
+    return dtDay(dtRoll(cal, z, 1), f);
+  },
+  business_days_between: (a, b, cal) => {
+    const f = "date.business_days_between";
+    a = dtDateArg(a, f, 1); b = dtDateArg(b, f, 2); cal = dtCalendar(cal, f, 3);
+    let n = 0;
+    for (let z = Math.min(a, b); z < Math.max(a, b); z++) if (dtOpen(cal, z)) n++;
+    return b < a ? -n : n;
+  },
+  adjust: (v, how, cal) => {
+    const f = "date.adjust", z = dtDateArg(v, f, 1);
+    if (!isNil(how) && typeof how !== "string") fail(`\`${f}\` expects a convention as argument 2, got ${dtGot(how)}`);
+    const r = dtAdjust(dtCalendar(cal, f, 3), z, isNil(how) ? "following" : how);
+    if (r === undefined) fail(`\`${f}\`: unknown convention ${dtGot(how)} (following, modified_following, preceding, modified_preceding or unadjusted)`);
+    return dtDay(r, f);
+  },
+  easter: (y) => {
+    dtInt(y, "date.easter", 1);
+    if (y < 1583 || y > 9999) fail(`\`date.easter\` is for Gregorian years (1583 to 9999), got ${y}`);
+    const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+    const g = Math.floor((b - Math.floor((b + 8) / 25) + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+    const l = (32 + 2 * e + 2 * Math.floor(c / 4) - h - c % 4) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451), n = h + l - 7 * m + 114;
+    return dtText(dtDays(y, Math.floor(n / 31), n % 31 + 1));
+  },
+  day_count: (a, b, c) => dtCounted(a, b, c, "date.day_count")[0],
+  year_fraction: (a, b, c) => dtCounted(a, b, c, "date.year_fraction")[1],
+  format: (v, how) => {
+    const f = "date.format", [z, t] = dtEitherArg(v, f, 1);
+    let pattern, n = dtEn;
+    if (typeof how === "string") pattern = how;
+    else if (isMap(how)) {
+      const has = (k) => hasOwn(how, k), loc = has("locale") ? how.locale : null;
+      if (!isNil(loc)) { if (typeof loc !== "string") fail(`\`${f}\`: locale is a str, like "de-DE", got ${dtGot(loc)}`); n = dtNames(loc); }
+      const k = Object.keys(how).find((k) => k !== "locale" && k !== "style" && k !== "pattern");
+      if (k !== undefined) fail(`\`${f}\`: the options are locale, style and pattern, not \`${k}\``);
+      const P = has("pattern") ? how.pattern : undefined, St = has("style") ? how.style : undefined;
+      if (typeof P === "string") pattern = P;
+      else if (isNil(P) && isNil(St)) pattern = n.styles[1];
+      else if (isNil(P) && typeof St === "string") {
+        const k = ["short", "medium", "long", "full"].indexOf(St);
+        if (k < 0) fail(`\`${f}\`: style is short, medium, long or full, got ${dtGot(St)}`);
+        pattern = n.styles[k];
+      } else fail(`\`${f}\`: pattern and style are strs, got ${dtGot(P !== undefined ? P : St)}`);
+    } else fail(`\`${f}\` expects a pattern (like "DD/MM/YYYY") or options as argument 2, got ${dtGot(how)}`);
+    const toks = dtTokenize(Array.from(pattern));
+    if (!t) { const x = toks.find((x) => dtTimeTokens.includes(x)); if (x) fail(`\`${f}\`: the pattern has a time (${x}), but ${dtGot(v)} is a date`); }
+    return dtRender(toks, n, z, t);
+  },
+};
+
 // ---- channels -------------------------------------------------------------
 // `channel.open(name, f)` in a component: `f` hears what the server sends on
 // the channel for as long as the code that opened it stands, and `.send(v)`

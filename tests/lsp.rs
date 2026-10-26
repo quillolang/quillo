@@ -117,7 +117,7 @@ fn language_server_round_trip() {
     let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
     assert!(["add", "total", "shout", "len", "route", "component", "str"].iter().all(|l| labels.contains(l)), "{:?}", labels);
     // Every module, and their functions after the dot.
-    assert!(["udp", "channel", "media", "math", "vec"].iter().all(|l| labels.contains(l)), "{:?}", labels);
+    assert!(["udp", "channel", "media", "math", "vec", "date"].iter().all(|l| labels.contains(l)), "{:?}", labels);
     for (line, want) in [("let x = udp.", ["listen", "send", "reply"]), ("let x = channel.", ["open", "broadcast", "peers"]), ("let x = media.", ["rtp", "streams", "rtp"])] {
         let changed = format!("{}{}", text, line);
         c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": changed }] }));

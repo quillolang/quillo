@@ -169,6 +169,8 @@ pub fn impure_builtin(name: &str) -> bool {
             "print"
                 | "env"
                 | "now"
+                | "date.today"
+                | "date.now"
                 | "sleep"
                 | "file"
                 | "read_file"

@@ -9,8 +9,8 @@ Language support for [Quillo](https://github.com/wisp-one/quillo), the small web
   component props, code that cannot run in the browser, unused variables.
 - **Hover** shows types and signatures; **Go to Definition** works across `use`d files.
 - **Completion** for your functions and variables, builtins (with signatures), the members of
-  `db.`, `http.`, `json.`, `udp.`, `channel.`, `media.`, `crypto.`, `image.`, `math.`, `stats.`
-  and `vec.`, keywords, types, HTTP methods and effects (`net` among them).
+  `db.`, `http.`, `json.`, `udp.`, `channel.`, `media.`, `crypto.`, `image.`, `math.`, `stats.`,
+  `vec.` and `date.`, keywords, types, HTTP methods and effects (`net` among them).
 - **Outline** of functions, views, components, variables and routes.
 - **Snippets**: `route`, `routejson`, `fn`, `fnb`, `server fn`, `view`, `component`, `match`, `for`, `page`,
   and for real time: `udplisten`, `channelon`, `channelopen`, `mediartp`, `quillo-media`.

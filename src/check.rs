@@ -770,12 +770,40 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("vec.matmul", "list, list", "list"),
     ("vec.transpose", "list | null", "list"),
     ("vec.column", "list | null, str | int", "list"),
+    // src/dates.rs
+    ("date.today", "str | null=", "str"),
+    ("date.now", "str | null=", "str"),
+    ("date.parse", "str, str | null=", "str | error(str)"),
+    ("date.valid", "any", "bool"),
+    ("date.of", "int, int, int", "str"),
+    ("date.parts", "str", "map"),
+    ("date.weekday", "str", "int"),
+    ("date.is_leap_year", "int | str", "bool"),
+    ("date.days_in_month", "int | str, int=", "int"),
+    ("date.add_days", "str, int", "str"),
+    ("date.add_months", "str, int", "str"),
+    ("date.add_years", "str, int", "str"),
+    ("date.days_between", "str, str", "int"),
+    ("date.months_between", "str, str", "int"),
+    ("date.start_of_month", "str", "str"),
+    ("date.end_of_month", "str", "str"),
+    ("date.to_zone", "str, str | null=", "str"),
+    ("date.date_in", "str, str | null=", "str"),
+    ("date.at", "str, str | null=, str | null=", "str"),
+    ("date.is_business_day", "str, map | null=", "bool"),
+    ("date.add_business_days", "str, int, map | null=", "str"),
+    ("date.business_days_between", "str, str, map | null=", "int"),
+    ("date.adjust", "str, str | null=, map | null=", "str"),
+    ("date.easter", "int", "str"),
+    ("date.day_count", "str, str, str", "int"),
+    ("date.year_fraction", "str, str, str", "float"),
+    ("date.format", "str, str | map", "str"),
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =

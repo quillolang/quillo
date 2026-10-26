@@ -445,7 +445,7 @@
       ]
     },
     "module-call": {
-      "match": "\\b(json|db|http|udp|channel|media|crypto|image|math|stats|vec)(\\.)([a-z_]\\w*)",
+      "match": "\\b(json|db|http|udp|channel|media|crypto|image|math|stats|vec|date)(\\.)([a-z_]\\w*)",
       "captures": {
         "1": {
           "name": "support.module.quillo"
