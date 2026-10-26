@@ -22,6 +22,29 @@ impl From<QuilloError> for Ctrl {
     }
 }
 
+/// Builtins that change something: a page prefetched does not call them
+/// (see `Interp::no_writes`).
+const CHANGES: &[&str] = &[
+    "db.exec",
+    "db.migrate",
+    "db.atomic",
+    "set_cookie",
+    "delete_cookie",
+    "set_session",
+    "end_session",
+    "write_file",
+    "delete_file",
+    "save_upload",
+    "publish",
+    "http.post",
+    "http.put",
+    "http.patch",
+    "http.delete",
+    "image.convert",
+    "__service",
+    "__service_later",
+];
+
 pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
     Err(Ctrl::Error(QuilloError::new(msg, line)))
 }
@@ -113,6 +136,10 @@ pub struct Interp {
     /// The request (its number) that last wrote to a database: its reads go
     /// to the primary, not a replica, so it sees what it wrote.
     pub(crate) wrote_req: Option<usize>,
+    /// While a page is prefetched (a link pointed at, before it is clicked):
+    /// set when the code tried to change something, which stopped it (see
+    /// `no_writes`). Shared with what it runs in parallel.
+    pub(crate) prefetching: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Tenant databases whose function (`db.open((tenant) => ...)`) is
     /// running, which may not use them itself.
     pub(crate) db_resolving: Vec<usize>,
@@ -573,6 +600,7 @@ impl Interp {
             db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
             db_on: None,
             wrote_req: None,
+            prefetching: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: String::new(),
@@ -629,6 +657,7 @@ impl Interp {
             db_conns: self.db_conns.clone(),
             db_on: None,
             wrote_req: None,
+            prefetching: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: self.base.clone(),
@@ -768,6 +797,20 @@ impl Interp {
         self.current_request.clone()
     }
 
+    /// While a page is prefetched, the code may read but not change
+    /// anything (a database, a global, a cookie, a file, another server):
+    /// what would stops it here, and the prefetch is answered "not
+    /// prefetched" (the page is made when the link is followed).
+    pub(crate) fn no_writes(&mut self, what: &str, line: u32) -> Result<(), Ctrl> {
+        match &self.prefetching {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                fail(line, format!("not while the page is prefetched: {}", what))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// `parallel(f, g, ...)`: calls the functions at once and gives back
     /// their results, in order. Each runs on a thread of its own with its own
     /// handle on the program; since waiting (for the database, HTTP, `sleep`)
@@ -866,6 +909,7 @@ impl Interp {
         it.tenant = self.tenant.clone();
         it.tenant_named = self.tenant_named;
         it.request_id = self.request_id.clone();
+        it.prefetching = self.prefetching.clone();
         it.upload_body = self.upload_body.clone();
         it.locale = self.locale.clone();
         it
@@ -995,6 +1039,9 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::Assign(name, op, e, line) => {
+                if self.prefetching.is_some() && lookup_global(env, name).map_or(false, |(_, global)| global) {
+                    self.no_writes(&format!("assigning `{}`", name), *line)?;
+                }
                 let rhs = self.eval(e, env)?;
                 let v = match op {
                     AssignOp::Set => rhs,
@@ -1573,6 +1620,9 @@ impl Interp {
             Value::Builtin(name, func) => {
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, line)?;
+                }
+                if self.prefetching.is_some() && CHANGES.contains(name) {
+                    self.no_writes(name, line)?;
                 }
                 if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {
                     self.mark_impure();

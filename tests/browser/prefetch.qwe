@@ -1,0 +1,12 @@
+// A link pointed at is asked for ahead of the click (see PREFETCH_JS in
+// src/server.rs); the page it leads to takes 600 ms to make, and reports how
+// long its navigation took. Driven by prefetch.js (tests/browser.rs).
+
+let REPORT = "addEventListener('load', () => { const n = performance.getEntriesByType('navigation')[0]; document.body.setAttribute('data-result', JSON.stringify({ fast: n.responseEnd - n.startTime < 400, kept: n.deliveryType === 'navigational-prefetch' || n.transferSize === 0, errors: window.__quilloErrors || [] })) })"
+
+route GET / = <html><body><a id="slow" href="/slow">a slow page</a></body></html>
+
+route GET /slow {
+    sleep(600)
+    <html><body><p>made slowly</p><script>{raw(REPORT)}</script></body></html>
+}

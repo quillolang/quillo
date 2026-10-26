@@ -68,7 +68,7 @@ Requests a second (p99 latency in ms), one process each, same machine:
 | compute (10,000-step loop) | **26.4k** (2.5) | 24.4k (4.9) | 23.4k (5.1) |
 
 Each keeps about one core busy. The compute loop is plain arithmetic, which Quillo
-compiles to machine code (README, "Compiled numbers"): it is then as fast as the
+compiles to machine code ([user guide](../USERGUIDE.md#compiled-numbers)): it is then as fast as the
 JavaScript JITs' (the rest of each request, HTTP and JSON, is faster in Quillo). With 6
 processes (`--instances 6`, Node's cluster), compute goes to 132k for Quillo and 103k
 for Node; macOS does not spread connections across Bun's `reusePort` sockets, so Bun

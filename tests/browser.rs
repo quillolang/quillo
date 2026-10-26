@@ -315,6 +315,19 @@ fn changes_touch_only_what_shows_them() {
     assert_eq!(r, want);
 }
 
+/// Links pointed at are prefetched: the page they lead to, slow to make, is
+/// there when the link is followed.
+#[test]
+fn a_link_pointed_at_is_there_when_followed() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("prefetch.qwe"), free_port(), Some(&dir.join("prefetch.js")));
+    assert_eq!(r, serde_json::json!({ "fast": true, "kept": true, "errors": [] }));
+}
+
 /// A component's translations: the server's locale and text, then the same
 /// plural rules in the browser.
 #[test]

@@ -136,7 +136,8 @@ route GET /plain = <html><body>{t("hi", { name: "</script>" })}</body></html>
 component C() { <p>{t("x")}</p> }
 route GET / = <html><body><C/></body></html>"#, "app.qwe").unwrap();
     let page = get(&mut it, "/", &[]).text();
-    assert_eq!(page.matches("</script>").count(), 2, "{}", page);
+    // Each script ends where it was made to: the text closes none.
+    assert_eq!(page.matches("</script>").count(), page.matches("<script>").count(), "{}", page);
 }
 
 #[test]

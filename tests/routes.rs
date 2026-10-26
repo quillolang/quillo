@@ -531,3 +531,61 @@ route GET / = <html><body><List/></body></html>
     let rows = js.lines().find(|l| l.contains("W.each(")).expect("the loop follows its list");
     assert!(!rows.contains("zzparam"), "{}", rows);
 }
+
+/// Prefetching (src/server.rs, `PREFETCH_JS`): every page carries what asks
+/// for the pages it links to, and a page asked for ahead of a click is made
+/// without changing anything: one that would is not prefetched.
+#[test]
+fn pages_are_prefetched_without_changing_anything() {
+    let mut it = app(r#"
+db.open(":memory:")
+db.exec("create table hits (n int)")
+let views = 0
+route GET / = <html><body><a href="/read">read</a></body></html>
+route GET /fragment = <p>no page</p>
+route GET /read = <html><body>{len(db.query("select * from hits"))} {views}</body></html>
+route GET /write {
+    db.exec("insert into hits values (1)")
+    <html><body>written</body></html>
+}
+route GET /returning = str(db.one("insert into hits values (2) returning n") ?? "none")
+route GET /count {
+    views += 1
+    str(views)
+}
+route GET /login {
+    set_session({ user: 1 })
+    "in"
+}
+route GET /cached = respond(200, "mine", { "cache-control": "no-store" })
+"#);
+    let prefetch = |it: &mut Interp, url: &str, header: (&str, &str)| {
+        it.handle(&HttpRequest {
+            method: "GET".into(),
+            url: url.into(),
+            headers: vec![("Host".into(), "localhost".into()), (header.0.into(), header.1.into())],
+            body: Vec::new(),
+            remote: "127.0.0.1".into(),
+        })
+    };
+    // Pages carry it (once); a fragment of HTML does not.
+    assert_eq!(get(&mut it, "/").text().matches("__quillo_pf=1").count(), 1);
+    assert!(!get(&mut it, "/fragment").text().contains("__quillo_pf"));
+    // Reading: prefetched, and kept by the browser for the click.
+    let r = prefetch(&mut it, "/read", ("X-Quillo-Prefetch", "1"));
+    assert_eq!((r.status, r.header("cache-control")), (200, Some("private, max-age=30")));
+    // Writing (a database, SQL that writes, a global, a session): not prefetched.
+    for url in ["/write", "/returning", "/count", "/login"] {
+        for h in [("X-Quillo-Prefetch", "1"), ("Sec-Purpose", "prefetch;prerender")] {
+            let r = prefetch(&mut it, url, h);
+            assert_eq!((r.status, r.header("cache-control")), (204, Some("no-store")), "{} {:?}", url, h);
+        }
+    }
+    assert!(get(&mut it, "/read").text().starts_with("<!doctype html><html><body>0 0"), "nothing changed");
+    // Followed, they do what they do.
+    assert!(get(&mut it, "/write").text().contains("written"));
+    assert_eq!(get(&mut it, "/count").text(), "1");
+    assert!(get(&mut it, "/login").header("set-cookie").is_some());
+    // What the program says of caching stays as it says.
+    assert_eq!(prefetch(&mut it, "/cached", ("X-Quillo-Prefetch", "1")).header("cache-control"), Some("no-store"));
+}

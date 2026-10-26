@@ -2465,6 +2465,8 @@ function navChanged() {
 function navStart() {
   if (Nav.on || typeof window === "undefined") return;
   Nav.on = true;
+  // Links in components are followed here: not prefetched as pages.
+  window.__quillo_nav = true;
   window.addEventListener("popstate", navChanged);
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;

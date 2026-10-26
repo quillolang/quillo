@@ -1131,6 +1131,9 @@ pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
+        return Err("not while the page is prefetched".into());
+    }
     let b = backend_on(it, on)?;
     // A read, to a replica: if it fails there, the primary answers (and the
     // replica is left out for ten seconds).

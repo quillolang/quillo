@@ -252,7 +252,11 @@ impl Interp {
                 self.upload_body = Some(Arc::from(req.body.as_slice()));
             }
         }
+        // A page asked for ahead of a click: made without changing anything.
+        let prefetch = is_prefetch(req).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.prefetching = prefetch.clone();
         let mut resp = self.handle_inner(req);
+        self.prefetching = None;
         // A streamed answer: its function, for the server to run after the
         // head; or, with no server to, run now into the body.
         if resp.header(crate::stream::MARK).is_some() {
@@ -281,8 +285,26 @@ impl Interp {
                 }
             }
         }
+        // A prefetch that would have changed something (or sets a cookie):
+        // not prefetched; the page is made when the link is followed. One
+        // that went well is kept by the browser for the click.
+        if let Some(refused) = prefetch {
+            if refused.load(std::sync::atomic::Ordering::Relaxed) || resp.header("set-cookie").is_some() {
+                return HttpResponse { status: 204, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
+            }
+            if resp.status == 200 && resp.header("cache-control").is_none() {
+                resp.headers.push(("cache-control".into(), "private, max-age=30".into()));
+            }
+        }
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
+        // Every page prefetches the links pointed at.
+        if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
+            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, b"__quillo_pf")) {
+                resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
+            }
+        }
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             let mut tags = String::new();
@@ -785,6 +807,44 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
 /// Whether a failed request is answered with the error message (in
 /// development, with `--watch`) or only "internal error".
 pub static SHOW_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pages prefetch the links pointed at (cleared by `--no-prefetch`; see `PREFETCH_JS`).
+pub static PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// What every page carries to prefetch the pages it links to: a link of
+/// this site pointed at (for 65 ms), pressed, touched or tabbed to is asked
+/// for ahead of the click. Browsers with speculation rules (Chrome, Edge)
+/// keep it for the navigation themselves; others get it with `fetch`, made
+/// cacheable for 30 s for this (see `Interp::handle`), so the click is
+/// answered from their cache. Not: links to other sites, with `target` or
+/// `download`, to this same page, inside `data-no-prefetch`, those a page's
+/// components follow themselves, or on a connection saving data.
+pub const PREFETCH_JS: &str = concat!(
+    "(()=>{const d=document,w=window,seen=new Set();if(w.__quillo_pf)return;w.__quillo_pf=1;",
+    "const c=navigator.connection;if(c&&(c.saveData||/2g/.test(c.effectiveType||\"\")))return;",
+    "const spec=HTMLScriptElement.supports&&HTMLScriptElement.supports(\"speculationrules\");",
+    "const link=(e)=>e.target&&e.target.closest&&e.target.closest(\"a[href]\");",
+    "const want=(a)=>{if(a.target&&a.target!==\"_self\"||a.hasAttribute(\"download\")||a.closest(\"[data-no-prefetch]\"))return null;",
+    "if(w.__quillo_nav&&a.closest(\"quillo-island\"))return null;",
+    "const u=new URL(a.href,location.href);if(u.origin!==location.origin||!/^https?:$/.test(u.protocol))return null;",
+    "if(u.pathname===location.pathname&&u.search===location.search)return null;u.hash=\"\";return u.href};",
+    "const go=(a)=>{const u=a&&want(a);if(!u||seen.has(u))return;seen.add(u);",
+    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
+    "else fetch(u,{credentials:\"same-origin\",headers:{\"x-quillo-prefetch\":\"1\"}}).catch(()=>{})};",
+    "let t=0;const o={capture:true,passive:true};",
+    "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
+    "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])d.addEventListener(v,(e)=>go(link(e)),o)})()"
+);
+
+/// Whether a request is a prefetch: this page's (`PREFETCH_JS`) or the
+/// browser's own (speculation rules, `<link rel=prefetch>`).
+pub fn is_prefetch(req: &HttpRequest) -> bool {
+    req.method == "GET"
+        && PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
+        && req.headers.iter().any(|(k, v)| {
+            (k.eq_ignore_ascii_case("x-quillo-prefetch") && v == "1") || (k.eq_ignore_ascii_case("sec-purpose") && v.contains("prefetch"))
+        })
+}
 
 fn value_response(v: Value) -> HttpResponse {
     match v {

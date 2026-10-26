@@ -1,8 +1,8 @@
-// The docs, made from the README so they never drift from it: each `## `
+// The docs, made from the user guide (USERGUIDE.md) so they never drift from it: each `## `
 // section is a page, and its `### ` and `#### ` headings are the page's
 // contents. Code fences marked `quillo` are highlighted like the home page's.
 // The Examples pages show each program in examples/, whole. Both are read
-// through content/, links to the repository's README.md and examples/.
+// through content/, links to the repository's USERGUIDE.md and examples/.
 
 let GROUPS = [
     { name: "Guide", pages: ["introduction", "language-tour", "components", "routes"] },
@@ -119,7 +119,7 @@ fn blocks(lines: list) =
 
 fn quillo_like(b: map) = b.lang == "quillo" || (b.lang == "" && any(b.lines, (l) => contains(l, "fn ") || contains(l, "route ")))
 
-let sources = (cut_pages(read_file("content/README.md")) | map((p) => { slug: slug(p.title), title: p.title, blocks: blocks(p.lines) }))
+let sources = (cut_pages(read_file("content/USERGUIDE.md")) | map((p) => { slug: slug(p.title), title: p.title, blocks: blocks(p.lines) }))
     + [merge(overview, { slug: "examples" })]
     + (EXAMPLES | map((e) => merge(example_page(e), { slug: `examples/${e.name}` })))
 
@@ -220,7 +220,7 @@ view DocsPage(page: map) {
                 {prev ? <a.prev href={prev.url}><small>Previous</small>{prev.title}</a> : <span></span>}
                 {next ? <a.next href={next.url}><small>Next</small>{next.title}</a> : <span></span>}
             </nav>
-            <p.edit><a href={`${REPO}/blob/main/README.md`}>Edit this page on GitHub</a> · made from the README</p>
+            <p.edit><a href={`${REPO}/blob/main/USERGUIDE.md`}>Edit this page on GitHub</a> · made from the user guide</p>
         </article>
         {len(page.toc) > 0 ? <OnThisPage items={page.toc}/> : <div></div>}
     </div>
