@@ -2606,6 +2606,12 @@ impl<'a> Compiler<'a> {
         // else is a value shown in its place.
         let mut kids = Vec::new();
         for c in &el.children {
+            // The browser runs a script the page puts in: what fills one
+            // would be code. (A view's, made on the server, takes values as
+            // JSON.)
+            if el.tag == "script" && !matches!(c, HtmlChild::Expr(Expr::Lit(Lit::Str(_)))) {
+                return self.err("a component's <script> takes only text written in the program; pass data in a `data-` attribute, or use a view");
+            }
             match c {
                 HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => kids.push(js_str(s)),
                 HtmlChild::El(e) if inlineable(e) => kids.push(self.tpl_el(e, vals)?),

@@ -151,6 +151,24 @@ fn url_attributes_are_checked_however_they_are_written() {
 }
 
 #[test]
+fn html_values_in_url_attributes_are_checked_too() {
+    // What the review sent: an `html` value, which was not looked at.
+    let mut it = app(
+        r#"
+route GET /m ? { u: str } = <a href={markdown(u, { inline: true })}>x</a>
+route GET /r ? { u: str } = <a {...{ href: raw(u) }} src={raw(u)}>x</a>
+"#,
+    );
+    for path in ["/m", "/r"] {
+        let body = send(&mut it, "GET", &format!("{}?u=javascript:alert(1)", path), &[], "").text();
+        assert!(!body.to_lowercase().contains("javascript:"), "{} -> {}", path, body);
+        assert!(body.contains("about:blank#blocked"), "{} -> {}", path, body);
+        let body = send(&mut it, "GET", &format!("{}?u=/notes", path), &[], "").text();
+        assert!(body.contains("/notes") && !body.contains("blocked"), "{} -> {}", path, body);
+    }
+}
+
+#[test]
 fn server_fn_arguments_are_checked_all_the_way_in() {
     let mut it = app(
         r#"
@@ -194,6 +212,52 @@ server fn many(ps: list<Profile>) = json.stringify(ps)
     let r = call(&mut it, "many", r#"[[{"name":"ada","role":"x","is_admin":true}]]"#);
     assert_eq!(r.status, 200, "{}", r.text());
     assert!(!r.text().contains("is_admin") && r.text().contains("ada"), "{}", r.text());
+}
+
+#[test]
+fn values_in_a_script_cannot_end_it() {
+    let mut it = app(
+        r#"
+route GET /s ? { x: str } = <html><body><script>const d = {x}; const n = {[1, x]}; const r = {raw(json.stringify({ a: x }))};</script><p>after</p></body></html>
+"#,
+    );
+    // What the review sent: text that ends the script and starts another.
+    let x = "%3C/script%3E%3Cscript%3Ealert(1)%3C/script%3E%3C!--%E2%80%A8";
+    let html = send(&mut it, "GET", &format!("/s?x={}", x), &[], "").text();
+    let script = html.split_once("<script>").map(|(_, s)| s).unwrap_or("");
+    let (code, rest) = script.split_once("</script>").expect("one script");
+    assert!(rest.starts_with("<p>after</p>"), "{}", html);
+    assert!(!code.contains("<!--"), "{}", code);
+    // A value is JSON, so a JS string; raw text keeps what it says, with `</` as `<\/`.
+    assert!(code.starts_with(r#"const d = "\u003c/script>\u003cscript>alert(1)\u003c/script>\u003c!--\u2028";"#), "{}", code);
+    assert!(code.contains(r#"const n = [1,"\u003c/script>"#), "{}", code);
+    assert!(code.contains(r#"const r = {"a":"<\/script><script>alert(1)<\/script><\!--"#), "{}", code);
+    // A component's script, filled in the browser, would run what fills it.
+    let e = Interp::new(env!("CARGO_MANIFEST_DIR")).load_source("component C(x: str) = <div><script>{x}</script></div>", "t.qwe").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("<script> takes only text written in the program"), "{}", e);
+}
+
+#[test]
+fn text_naming_the_bundle_does_not_stop_components_loading() {
+    let mut it = app(
+        r#"
+component Counter() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+route GET /c ? { note: str } = <html><body><p>{note}</p>{markdown(note)}<Counter/></body></html>
+route GET /own = <html><head><script src="/_quillo/quillo.js" defer></script></head><body><Counter/></body></html>
+"#,
+    );
+    // What the review sent: a comment saying where the bundle is, which
+    // stopped the page loading it. Markdown cannot write the element either.
+    for note in ["see%20/_quillo/quillo.js", "![x](/_quillo/quillo.js)", "%3Cscript%20src=%22/_quillo/quillo.js%22%3E"] {
+        let page = send(&mut it, "GET", &format!("/c?note={}", note), &[], "").text();
+        assert!(page.contains("t.src=\"/_quillo/b/"), "{} -> {}", note, page);
+    }
+    // A page that loads it itself is left as it is.
+    let page = send(&mut it, "GET", "/own", &[], "").text();
+    assert!(!page.contains("t.src="), "{}", page);
 }
 
 // ---- the server itself, over a socket ------------------------------------------------------

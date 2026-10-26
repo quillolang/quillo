@@ -375,6 +375,13 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+- `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
+  so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
+  (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
+  `<\!--`, which mean the same inside JavaScript strings and cannot end the element
+  early, so `raw(json.stringify(x))` there is safe too. A component's `<script>` (made
+  in the browser, which runs it) takes only text written in the program. Script built
+  as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
 
@@ -1350,7 +1357,8 @@ Safety built in:
   quotes or `>` are dropped, and a key cannot replace an attribute written out, in
   another case either. Event handler attributes and `srcdoc` take only text written in
   the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
-  and the like render as `about:blank#blocked`.
+  and the like render as `about:blank#blocked`, whatever the value's type: the text the
+  attribute would say is checked, so `href={markdown(u, { inline: true })}` too.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text

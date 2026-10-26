@@ -301,14 +301,14 @@ impl Interp {
         // Every page prefetches the links pointed at.
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, b"__quillo_pf")) {
+            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, format!("<script>{}", &PREFETCH_JS[..40]).as_bytes())) {
                 resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(_), None) = (has(&resp.body, b"<quillo-media"), has(&resp.body, b"/_quillo/media.js")) {
+            if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
             }
@@ -323,7 +323,7 @@ impl Interp {
             }
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
-            if has(&resp.body, b"/_quillo/quillo.js").is_none() {
+            if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
                 let names = std::mem::take(&mut self.island_names);
                 let src = match self.bundle_for_page(&names) {
                     Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
@@ -877,6 +877,27 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
 
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
+}
+
+/// Whether a page has a `<script>` element whose `src` ends with `path`
+/// (the program wrote it, or a mounted program's page already has it).
+/// Only an element counts: text, which is escaped, cannot start one, nor
+/// can `markdown` (whose `<img src=...>` could name the same path), so a
+/// comment saying `/_quillo/quillo.js` does not stop the page loading it.
+fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = body[from..].windows(path.len()).position(|w| w == path).map(|i| i + from) {
+        from = i + path.len();
+        if !matches!(body.get(from), Some(b'"' | b'\'' | b'?' | b'#')) {
+            continue;
+        }
+        let Some(lt) = body[..i].iter().rposition(|b| *b == b'<') else { continue };
+        let tag = &body[lt..i];
+        if tag.len() > 7 && tag[..7].eq_ignore_ascii_case(b"<script") && matches!(tag[7], b' ' | b'\t' | b'\n' | b'/') && !tag.contains(&b'>') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Turns what a route produced into an HTTP response.

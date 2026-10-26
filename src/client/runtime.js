@@ -3513,9 +3513,10 @@ function setProp(el, k, v, old) {
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
-  if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
+  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
+  // The text the attribute will say, whatever the value's type (html too).
+  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
