@@ -901,13 +901,14 @@ component PluginsPage(ws: map, on_change) {
 
 component SettingsPage(ws: map, on_change) {
     state tab = "workspace"
-    let tabs = [["workspace", "Workspace"], ["profile", "Your profile"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"], ["groups", "Groups"], ["roles", "Roles"], ["desks", "Desks"]]
+    let tabs = [["workspace", "Workspace"], ["profile", "Your profile"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"], ["security", "Security"], ["groups", "Groups"], ["roles", "Roles"], ["desks", "Desks"]]
     <div>
         <PageHead title="Settings"/>
         <nav.tabs>{for t in tabs => <button type="button" class={tab == t[0] ? "tab on" : "tab"} @click={() => { tab = t[0] }}>{t[1]}</button>}</nav>
         {match tab {
             "workspace" => <div.stack><WorkspaceSettings {ws} {on_change}/><NoticeSettings {ws}/></div>
             "profile" => <ProfileSettings {ws} {on_change}/>
+            "security" => <SecuritySettings {ws}/>
             "roles" => <RolesSettings {ws} {on_change}/>
             "groups" => <GroupsSettings {ws} {on_change}/>
             "desks" => <DesksSettings {ws}/>

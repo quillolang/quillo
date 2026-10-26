@@ -136,8 +136,9 @@ pub fn builtin_effect(name: &str) -> u8 {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
             "env" => "env",
-            "now" | "sleep" | "date.today" | "date.now" => "time",
-            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
+            "now" | "sleep" | "date.today" | "date.now" | "crypto.totp_verify" | "rate_limit" | "rate_limit_reset" => "time",
+            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" | "crypto.totp_secret" | "crypto.recovery_codes" => "random",
+            "end_sessions" | "user_sessions" => "db",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }

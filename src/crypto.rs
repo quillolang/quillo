@@ -7,6 +7,7 @@
 //! let h = crypto.hash_password(password)   // Argon2id, salted: store this
 //! crypto.verify_password(password, h)      // true or false
 //! crypto.equal(a, b)                       // compares in constant time
+//! crypto.totp_secret()                     // a second factor (see totp.rs)
 //! ```
 //!
 //! Password hashing takes tens of milliseconds and some memory on purpose
@@ -26,6 +27,11 @@ pub fn install(m: &mut Map) {
         ("crypto.hash_password", hash_password),
         ("crypto.verify_password", verify_password),
         ("crypto.equal", equal),
+        ("crypto.totp_secret", crate::totp::totp_secret),
+        ("crypto.totp_uri", crate::totp::totp_uri),
+        ("crypto.totp_verify", crate::totp::totp_verify),
+        ("crypto.recovery_codes", crate::totp::recovery_codes),
+        ("crypto.verify_recovery_code", crate::totp::verify_recovery_code),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("crypto.").into(), Value::Builtin(name, *f));
@@ -155,7 +161,7 @@ fn cores() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
-fn hashing<T: Send + 'static>(it: &mut Interp, work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+pub(crate) fn hashing<T: Send + 'static>(it: &mut Interp, work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static WAITING: AtomicUsize = AtomicUsize::new(0);
     if WAITING.fetch_add(1, SeqCst) >= MOST_WAITING {
@@ -208,16 +214,31 @@ fn in_turn<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn hash_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+/// An Argon2id hash of `pw`, salted.
+pub(crate) fn argon_hash(pw: &[u8]) -> Result<String, String> {
     use argon2::password_hash::{PasswordHasher, SaltString};
+    let salt = random_bytes(16).ok_or("the operating system gave no random bytes")?;
+    let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
+    argon2::Argon2::default().hash_password(pw, &salt).map(|h| h.to_string()).map_err(|e| e.to_string())
+}
+
+/// Whether `pw` is what `hash` was made from. Anything that is not such a
+/// hash is checked against a stand-in, taking as long, and is false.
+pub(crate) fn argon_check(pw: &[u8], hash: Option<&str>) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw, h).is_ok();
+    match hash.map(PasswordHash::new) {
+        Some(Ok(h)) if hash != Some(STAND_IN) => check(&h),
+        _ => {
+            let _ = check(&PasswordHash::new(STAND_IN).expect("the stand-in hash parses"));
+            false
+        }
+    }
+}
+
+fn hash_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let pw = text(&args, 0, "hash_password", line)?;
-    let Some(salt) = random_bytes(16) else { return fail(line, "`crypto.hash_password`: the operating system gave no random bytes") };
-    let hashed = hashing(it, move || {
-        let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
-        argon2::Argon2::default().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string())
-    })
-    .and_then(|r| r);
-    match hashed {
+    match hashing(it, move || argon_hash(pw.as_bytes())).and_then(|r| r) {
         Ok(h) => Ok(Value::str(h)),
         Err(e) => fail(line, format!("`crypto.hash_password`: {}", e)),
     }
@@ -231,23 +252,12 @@ const STAND_IN: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3RhbmQtaW4tc2FsdA$DhLSbt
 /// either way: an unknown user's login answers no sooner than a known one's,
 /// which would tell who has an account.
 fn verify_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
     let pw = text(&args, 0, "verify_password", line)?;
     let hash = match args.get(1) {
-        Some(Value::Str(h)) => h.clone(),
-        _ => STAND_IN.into(),
+        Some(Value::Str(h)) => Some(h.clone()),
+        _ => None,
     };
-    let checked = hashing(it, move || {
-        let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw.as_bytes(), h).is_ok();
-        match PasswordHash::new(&hash) {
-            Ok(h) if &*hash != STAND_IN => check(&h),
-            _ => {
-                let _ = check(&PasswordHash::new(STAND_IN).expect("the stand-in hash parses"));
-                false
-            }
-        }
-    });
-    match checked {
+    match hashing(it, move || argon_check(pw.as_bytes(), hash.as_deref())) {
         Ok(ok) => Ok(Value::Bool(ok)),
         Err(e) => fail(line, format!("`crypto.verify_password`: {}", e)),
     }

@@ -119,6 +119,7 @@ view LoginPage(problem: str, email: str) =
             <h1>Sign in</h1>
             {problem == "wrong" && <div.alert><p>That email and password do not match.</p></div>}
             {problem == "expired" && <div.alert><p>That sign-in link has expired. Sign in with your password.</p></div>}
+            {problem == "locked" && <div.alert><p>Too many tries. Wait a quarter of an hour, then sign in again.</p></div>}
             <form method="post" action="/login" class="stack">
                 <label.field><span.label>Email</span><input type="email" name="email" value={email} required autofocus/></label>
                 <label.field><span.label>Password</span><input type="password" name="password" required/></label>

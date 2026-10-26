@@ -205,6 +205,19 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "session"
                 | "set_session"
                 | "end_session"
+                | "sessions"
+                | "renew_session"
+                | "end_sessions"
+                | "user_sessions"
+                | "security_headers"
+                | "csp"
+                | "csp_nonce"
+                | "rate_limit"
+                | "rate_limit_reset"
+                | "crypto.totp_secret"
+                | "crypto.totp_verify"
+                | "crypto.recovery_codes"
+                | "crypto.verify_recovery_code"
         )
 }
 

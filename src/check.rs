@@ -663,6 +663,16 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
     ("end_session", "", "null"),
+    // src/session_store.rs, src/access.rs, src/limits.rs
+    ("sessions", "map", "null"),
+    ("renew_session", "", "null"),
+    ("end_sessions", "any, map | null=", "int"),
+    ("user_sessions", "any", "list | error(str)"),
+    ("security_headers", "map | bool | null=", "null"),
+    ("csp", "map | bool | null=", "null"),
+    ("csp_nonce", "", "str"),
+    ("rate_limit", "str, int, str | int, map | null=", "bool"),
+    ("rate_limit_reset", "str, map | null=", "null"),
     ("image.info", "str", "map | error(str)"),
     ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),
@@ -671,6 +681,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.hash_password", "str", "str"),
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
+    ("crypto.totp_secret", "int=", "str"),
+    ("crypto.totp_uri", "str, str, str | null=", "str"),
+    ("crypto.totp_verify", "str, str | int | null, map | null=", "int | null"),
+    ("crypto.recovery_codes", "int=", "list"),
+    ("crypto.verify_recovery_code", "str, list | null", "int | null"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
@@ -848,7 +863,9 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload",
+      "sessions", "renew_session", "end_sessions", "user_sessions", "security_headers", "csp", "csp_nonce", "rate_limit", "rate_limit_reset",
+      "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

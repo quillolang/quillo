@@ -46,3 +46,62 @@ fn passwords_are_salted_and_checked() {
         (&true.into(), &true.into(), &false.into(), &false.into(), &false.into())
     );
 }
+
+#[test]
+fn one_time_codes_from_an_authenticator_app() {
+    // RFC 6238's SHA-1 key, "12345678901234567890", in base32; its codes
+    // (appendix B) as the 6 digits apps show.
+    let key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    let v = eval(&format!(
+        r#"{{
+    let k = "{key}"
+    [
+        crypto.totp_verify(k, "287082", {{ at: 59 }}),
+        crypto.totp_verify(k, "081804", {{ at: 1111111109 }}),
+        crypto.totp_verify(k, "005924", {{ at: 1234567890 }}),
+        crypto.totp_verify(k, "279037", {{ at: 2000000000 }}),
+        crypto.totp_verify(k, "353130", {{ at: 20000000000 }}),
+        crypto.totp_verify(k, "287 082", {{ at: 59 + 30 }}),
+        crypto.totp_verify(k, "287082", {{ at: 59 + 30, window: 0 }}),
+        crypto.totp_verify(k, "287082", {{ at: 59, after: 1 }}),
+        crypto.totp_verify(k, "287082", {{ at: 59 + 90 }}),
+        crypto.totp_verify(k, "287083", {{ at: 59 }}),
+        crypto.totp_verify(k, "", {{ at: 59 }}),
+    ]
+}}"#
+    ));
+    assert_eq!(v, serde_json::json!([1, 37037036, 41152263, 66666666, 666666666, 1, null, null, null, null, null]));
+    let s = eval("crypto.totp_secret()");
+    let s = s.as_str().unwrap();
+    assert_eq!(s.len(), 32);
+    assert!(s.bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)), "{}", s);
+    assert_eq!(
+        eval(&format!(r#"crypto.totp_uri("{}", "ada@acme.test", "Acme & Co")"#, key)),
+        format!("otpauth://totp/Acme%20%26%20Co:ada%40acme.test?secret={}&issuer=Acme%20%26%20Co&algorithm=SHA1&digits=6&period=30", key)
+    );
+}
+
+#[test]
+fn recovery_codes_are_kept_as_hashes_and_work_once_each() {
+    let v = eval(
+        r#"{
+    let codes = crypto.recovery_codes(3)
+    let hashes = codes | map((c) => c.hash)
+    {
+        codes: codes | map((c) => c.code),
+        hashes: hashes,
+        second: crypto.verify_recovery_code(upper(replace(codes[1].code, "-", " ")), hashes),
+        wrong: crypto.verify_recovery_code("0000-0000-0000", hashes),
+        none: crypto.verify_recovery_code(codes[0].code, []),
+    }
+}"#,
+    );
+    let codes = v["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 3);
+    for c in codes {
+        let c = c.as_str().unwrap();
+        assert_eq!((c.len(), &c[4..5], &c[9..10]), (14, "-", "-"), "{}", c);
+    }
+    assert!(v["hashes"][0].as_str().unwrap().starts_with("$argon2id$"));
+    assert_eq!((&v["second"], &v["wrong"], &v["none"]), (&1.into(), &serde_json::Value::Null, &serde_json::Value::Null));
+}
