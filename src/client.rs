@@ -27,12 +27,12 @@ const RUNTIME: &str = include_str!("client/runtime.js");
 
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
-    "print", "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
+    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "navigate", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -686,8 +686,11 @@ fn lit_js(l: &Lit) -> String {
     match l {
         Lit::Nil => "null".into(),
         Lit::Bool(b) => b.to_string(),
+        // Past 2^53 a JS number is not whole: a BigInt, as the runtime has them.
+        Lit::Int(n) if n.unsigned_abs() > (1 << 53) - 1 => format!("{}n", n),
         Lit::Int(n) => n.to_string(),
         Lit::Float(f) if f.is_finite() => format!("{:?}", f),
+        Lit::Dec(d) => format!("new W.Dec({}n, {})", d.mantissa(), d.scale()),
         Lit::Float(_) => "null".into(),
         Lit::Str(s) => js_str(s),
     }
@@ -926,7 +929,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "date" | "channel")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "date" | "money" | "channel")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);

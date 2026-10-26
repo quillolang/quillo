@@ -88,6 +88,7 @@ the browser and on the server.
 |---|---|
 | Null and booleans | `null`, `true`, `false` |
 | Numbers | `42`, `3.14`, `1e-9`, `6.02e23` |
+| Decimals | `12.50m`, `5m`: exact, for money (see [Decimals](#decimals)) |
 | Strings | `"strings"` or `'strings'`: plain text, so JSON is easy to write: `'{"a": 1}'` |
 | Template strings | `` `Hello, ${name}` ``: the only strings that interpolate; they can span lines |
 | Lists | `[1, 2, 3]` |
@@ -169,8 +170,8 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 ```
 
 Type annotations are checked when the function is called and when it returns, and
-`quillo check` checks them before the program runs: `int float num str bool list map html
-fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
+`quillo check` checks them before the program runs: `int float dec num str bool list map
+html fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
 (`str?`, `int | null`). `list<int>` says what a list holds, and `{ title: str, tags:
 list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
 call with a map missing `title`, a list of strings for `list<int>`), and at run time
@@ -274,7 +275,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 |---|---|
 | `_`, `name` | anything (`name` binds it) |
 | `42`, `"order"`, `true`, `null` | that literal |
-| `int`, `str`, `list`, ... | any value of that type |
+| `int`, `str`, `list`, ... | any value of that type (`dec` also takes an int, numeric text or a JSON number, made a decimal) |
 | `"order" \| "refund"` | either alternative |
 | `int as n` | binds what matched |
 | `[first, second, ..rest]` | lists |
@@ -1282,7 +1283,7 @@ See [examples/services](examples/services): a shop that bills through a billing 
 
 ## Standard library
 
-- **General:** `print str int float len type_of`
+- **General:** `print str int float dec len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
 - **Translations:** `t(key, vars)`, `locale()`, `translations`, `locale_from` and
   `with_locale` (see [Translations](#translations)).
@@ -1295,7 +1296,8 @@ See [examples/services](examples/services): a shop that bills through a billing 
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
-  [Numbers and data](#numbers-and-data).
+  [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals) and
+  [Money](#money); `format_number(x, locale, digits)` writes a number as a locale does.
 - **Dates:** the `date` module: calendars, time zones, business days and day counts (see
   [Dates and times](#dates-and-times)).
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
@@ -1357,6 +1359,134 @@ Safety built in:
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
 `use "lib.qwe"` runs another file once, into the global scope.
+
+### Decimals
+
+A `dec` is an exact decimal number, for money and whatever else is counted in cents:
+`12.50m`, `5m`, `-0.01m` (the `m` is C#'s). A float is a binary fraction, so `0.1 + 0.2`
+is `0.30000000000000004`; decimals are exact, so `0.1m + 0.2m == 0.3m`.
+
+```quillo
+let price = 19.99m
+let total = price * 3 + 4.50m          // 64.47m
+let vat = round(total * 0.21m, 2)      // 13.54m (half to even)
+let each = total / 3                   // 21.49m
+dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
+```
+
+- A decimal keeps its digits: `12.50m` shows as "12.50", and `1.10m * 3` is `3.30m`.
+  Equality and order do not see zeros at the end (`12.5m == 12.50m`), and neither do
+  map keys (`set`, `get`, `group_by`).
+- It holds 28 or 29 significant digits: a 96-bit whole number and up to 28 decimals, as
+  C#'s `decimal`. `+`, `-` and `*` are exact; an answer with more decimals than fit keeps
+  its whole part and rounds the rest half to even, and a whole part too big is an error
+  (`decimal overflow`), as with ints. `/` is exact when the answer has 28 decimals or
+  fewer, else rounded half to even to 28 or 29 digits (`1m / 3` is
+  `0.3333333333333333333333333333m`). Dividing by zero is an error, and `%` is the
+  remainder as for ints.
+- With an int, a decimal stays exact and gives a decimal. With a float it is an error,
+  never a silent float: `1.5m + 0.5` says to convert one with `dec(x)` or `float(x)`.
+  `==` compares a decimal and a float through the float's shortest text (`0.1m == 0.1`).
+- `dec(x)` makes one from text (exactly: `dec("abc")` is an error value, as `int("abc")`
+  is), an int, or a float through its shortest text (`dec(0.1)` is `0.1m`, not
+  `0.1000000000000000055…`). `int(d)` keeps the whole part, `float(d)` gives the
+  nearest float, `str(d)` its digits.
+- `round(d, digits = 0, mode = "half_even")` gives exactly that many decimals
+  (`round(12.5m, 2)` is `12.50m`; negative digits round to tens, hundreds, ...). The
+  modes: `half_even` (banker's rounding, the default), `half_up` (a half away from
+  zero, as taught at school), `half_down`, `up` (away from zero), `down` (toward zero),
+  `ceiling` and `floor`. `floor`, `ceil` and `abs` give decimals; `sum`, `min`, `max`
+  and `sort` take lists of them, and a sum stays exact.
+- `math`, `stats` and `vec` work on floats: a decimal there is an error that says to
+  use `float(x)`.
+- `json.stringify`, and a route answering a map, write a decimal as a string
+  (`"12.50"`), so nothing that reads it rounds it. `json.parse` makes no decimals:
+  numbers stay numbers.
+- In a pattern or a record's field, `dec` takes a decimal, an int, numeric text
+  (`"12.50"`, from a query, a form or JSON) or a JSON number (through its shortest
+  text), and gives a decimal: `route GET /quote ? { amount: dec }`, `type Line = {
+  price: dec }`, `/pay/:amount(dec)`. A `server fn`'s `dec` parameter takes the same
+  from a page. In an annotation (`fn f(x: dec)`) it takes only a decimal.
+- In the browser decimals are the same, and compiled components give the server's
+  answers: arithmetic, comparison, rounding, display. They cross between the server
+  and the page (props, state, server fns' arguments and answers) as decimals. Ints too
+  large for a JavaScript number (past 2^53) reach the page whole, as BigInts, and show
+  as on the server. The browser cannot tell `2.0` from `2`, so there a whole float
+  added to a decimal counts as an int.
+- `quillo check` knows them: `12.5m + 1` is a `dec`, `12.5m + 0.5` an error, and `round`,
+  `abs`, `floor`, `ceil`, `sum`, `min` and `max` keep the type they are given. `num` is
+  still `int | float`.
+- [Compiled numbers](#compiled-numbers) leave decimals to the interpreter.
+
+**In databases.** PostgreSQL's `numeric` and MySQL's `decimal` come back as decimals with
+their scale (`numeric(10, 2)` gives `19.99m`, and `12.50` stays `12.50m`), and decimals
+are sent exactly. A value without a scale (as `sum` of ints gives) is an int, and one
+past 28 decimals or 29 digits is its exact text. In MySQL a decimal parameter arrives
+as text, which MySQL turns exactly into a `decimal` column, but into a double inside an
+expression: write `cast(? as decimal(12, 2))` there.
+
+SQLite has no decimals. A decimal is stored as its text, and a column declared
+`decimal(12, 2)`, `numeric(12, 2)` or `money` is read back as decimals (a bare `numeric`,
+SQLite's name for any number, gives numbers as before). But such a column has
+NUMERIC affinity: SQLite turns "0.10" into the real 0.1 (and rounds past 15 digits), so
+the scale is lost and large amounts are not exact. For exact amounts, declare the
+column `decimal_text` (TEXT affinity: SQLite keeps the digits as written, and Quillo
+still reads them as decimals), or keep whole minor units (`amount_cents integer`; see
+`money.to_minor`). SQL's own sums and ordering do not work on text: add up and sort in
+Quillo, or keep minor units.
+
+### Money
+
+`money` keeps amounts of a currency: a map `{ amount: dec, currency: "USD" }`, the
+amount always with the currency's minor units (ISO 4217: JPY 0, USD 2, BHD 3). It is a
+plain map, so JSON, the database and the browser take it as it is, and `money` checks
+it each time it is given one. On the server and in the browser alike:
+
+```quillo
+let price = money.of(19.99m, "USD")             // { amount: 19.99m, currency: "USD" }
+money.of(form.amount, "EUR") ?? reply 400       // text from a form; an error value if bad
+money.of("12.345", "USD")                       // err: more decimals than USD has
+money.of("12.345", "USD", "half_up")            // 12.35
+money.from_minor(1250, "USD")                   // 12.50, from cents
+money.to_minor(price)                           // 1999
+money.add(a, b)  money.sub(a, b)  money.neg(a)  money.compare(a, b)   // -1, 0, 1
+money.mul(price, 3)  money.mul(price, 0.075m, "half_up")              // rounded to cents
+money.allocate(money.of(100, "USD"), [1, 1, 1])  // 33.34, 33.33, 33.33
+money.format(price, "de-DE")                    // "19,99 $"
+```
+
+- `money.of(amount, currency, mode)` takes a decimal, an int or numeric text (a float
+  is an error: `dec(x)` it first). An amount with more decimals than the currency has,
+  bad text and an unknown currency give error values, as `int("x")` does; with a
+  rounding mode (those of `round`), the amount is rounded instead. Codes are ISO 4217's
+  active ones (`money.minor_units("JPY")` is 0); codes without minor units, such as XAU,
+  are not money.
+- `add`, `sub` and `compare` take two amounts of one currency: two currencies are an
+  error, never a sum. `mul(m, factor, mode = "half_even")` multiplies by a decimal or an
+  int and rounds to the currency; `round(m, mode)` rounds an amount made by hand.
+  `zero(currency)`, `is_zero(m)`.
+- `money.allocate(m, ratios)` splits an amount by ratios (ints or decimals; a number n
+  for n equal parts) without losing or making a minor unit: each share gets its part,
+  rounded down, and the units left over go one each to the first shares (Martin
+  Fowler's allocation). The shares always add up to the amount.
+- `money.format(m, locale)` writes it as CLDR has it for the locale, the same as
+  `Intl.NumberFormat` in a browser: `$1,234.50` (en-US), `1.234,50 €` (de-DE),
+  `1 234,50 €` (fr-FR, a narrow no-break space between thousands), `￥1,235` (ja-JP),
+  `₹12,34,567.00` (en-IN). Without a locale it uses the program's (`locale()`, with
+  [Translations](#translations)), else en-US. Covered: en-US, en-GB, en-CA, en-AU,
+  en-NZ, en-IE, en-IN, en-SG, en-ZA, de-DE, de-AT, de-CH, fr-FR, fr-BE, fr-CA, fr-CH,
+  it-IT, it-CH, es-ES, es-MX, es-AR, pt-BR, pt-PT, nl-NL, nl-BE, sv-SE, nb-NO, da-DK,
+  fi-FI, pl-PL, cs-CZ, hu-HU, ro-RO, el-GR, tr-TR, ru-RU, uk-UA, ja-JP, zh-CN, zh-TW,
+  zh-HK, ko-KR, hi-IN, id-ID, th-TH, vi-VN, ms-MY and fil-PH. Another locale is written
+  as the first of its language (`de-LU` as de-DE, `fr` as fr-FR), else as en-US. The
+  common currencies have their symbols (`$`, `€`, `£`, `¥`, `₹`, `CA$`, ...); others
+  are written with their code (`XOF 1,235`).
+- `format_number(x, locale, digits)` writes any number the same way: `format_number(
+  1234567.5, "en-IN", 2)` is `"12,34,567.50"`.
+
+To hold the program to the shape, name it: `type Money = { amount: dec, currency: str }`
+makes `Money(request.json)` check what a client sends, and `quillo check` knows what the
+`money` functions give.
 
 ### Numbers and data
 
@@ -1558,7 +1688,7 @@ db.migrate()
   are translated, skipping quotes, comments and `$$` strings. Queries are prepared, so
   values never become SQL text.
 - Values convert both ways: numbers, text, booleans, `json`/`jsonb` as maps and lists,
-  arrays as lists, `numeric` as numbers, and `uuid`, `date`, `timestamp`/`timestamptz`
+  arrays as lists, `numeric` as [decimals](#decimals), and `uuid`, `date`, `timestamp`/`timestamptz`
   (ISO 8601, in UTC) and `interval` as strings. For other column types the value is sent
   as text and Postgres converts it.
 - `last_id` is `null`: use `insert ... returning id` with `db.one`.
@@ -1580,7 +1710,7 @@ db.migrate()
 - Placeholders are `?`, or `:name` with a map (translated, skipping quotes, backticks
   and comments). Statements are prepared, so values never become SQL text.
 - Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
-  numbers, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
+  [decimals](#decimals), MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
   and dates and times as ISO text. `last_id` is the new row's `auto_increment` id.
 - Connections come from a pool, and a query releases the interpreter lock while it
   waits, as with Postgres. A transaction keeps one connection until it ends; nested
@@ -1932,7 +2062,7 @@ loop, on doubles).
   machine code gives up and the call is run again by the interpreter, which fails as
   always (the function changed nothing, so running it twice is running it once).
 - What it does not take runs in the interpreter as before: strings, lists, maps,
-  builtins, globals that are not functions, functions inside functions, a variable that
+  decimals, builtins, globals that are not functions, functions inside functions, a variable that
   changes type, and `/` of two ints, whose answer is an int or a float depending on the
   numbers (`6 / 3` is 2, `7 / 2` is 3.5).
 - A function it calls that is assigned something else is not called by the old code.

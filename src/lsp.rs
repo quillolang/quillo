@@ -16,7 +16,7 @@ const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "in",
     "true", "false", "null", "reply", "as", "with", "state", "type", "service",
 ];
-const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
+const TYPES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
 
 struct Doc {

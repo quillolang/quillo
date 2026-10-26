@@ -341,7 +341,28 @@ let row = db.one("select small, n, big, f, price, ok, name, code, data, raw, uid
         "[{ changes: 1, last_id: null }, { small: 3, n: 42, big: 9000000000, f: 2.5, price: 19.99, ok: true, name: \"Ada\", \
          code: \"x1\", data: { k: [1, null] }, raw: [1, 2], uid: \"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\", day: \"2024-02-29\", \
          at: \"2024-02-29T08:30:00Z\", plain: \"1999-12-31T23:59:59.5\", tags: [\"a\", \"b c\", \"q\\\"uote\"], nums: [1, 2, 3] }, \
-         { nothing: null, half: 10.5, whole: 7 }]"
+         { nothing: null, half: 10.5m, whole: 7 }]"
+            .replace("price: 19.99,", "price: 19.99m,")
+    );
+    // `numeric` is exact: decimals both ways, the scale kept; an int when it
+    // has none (`sum` of ints); text past what a decimal holds.
+    let r = run(
+        url,
+        r#"
+db.exec("create table money (id serial primary key, amount numeric(20, 4), f float8, n int8)")
+db.exec("insert into money (amount, f, n) values (?, ?, ?), (?, ?, ?)", 0.1m, 0.5m, 3m, 1234567890123.4567m, 2.25m, -4m)
+let rows = db.query("select amount, f, n from money order by id")
+let sums = db.one("select sum(amount) as s, sum(n) as n, avg(n) as a from money")
+let wide = db.one("select 12345678901234567890.123456789012345678901234567890::numeric as x, 'NaN'::numeric as nan")
+let back = db.one("select ?::numeric * 3 as t, ? = 0.30::numeric as same", 0.10m, 0.1m + 0.2m)
+[rows, sums, wide.x, wide.nan, back]
+"#,
+    );
+    assert_eq!(
+        r,
+        "[[{ amount: 0.1000m, f: 0.5, n: 3 }, { amount: 1234567890123.4567m, f: 2.25, n: -4 }], \
+         { s: 1234567890123.5567m, n: -1, a: -0.50000000000000000000m }, \
+         \"12345678901234567890.123456789012345678901234567890\", NaN, { t: 0.30m, same: true }]"
     );
 }
 

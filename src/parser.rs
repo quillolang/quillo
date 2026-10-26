@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 type PResult<T> = Result<T, QuilloError>;
 
-pub const TYPE_NAMES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
+pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
@@ -43,6 +43,7 @@ fn can_start_expr(t: &Tok) -> bool {
     match t {
         Tok::Int(_)
         | Tok::Float(_)
+        | Tok::Dec(_)
         | Tok::Str(_)
         | Tok::LParen
         | Tok::LBracket
@@ -696,9 +697,9 @@ impl Parser {
                     let ty = if self.lx.peek_char() == Some('(') {
                         self.lx.bump();
                         let t = self.read_word();
-                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "num" | "str") {
+                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "dec" | "num" | "str") {
                             return Err(QuilloError::new(
-                                "path parameter types are written :name(int), :name(float), :name(num) or :name(str)",
+                                "path parameter types are written :name(int), :name(float), :name(dec), :name(num) or :name(str)",
                                 self.lx.line,
                             ));
                         }
@@ -1109,6 +1110,7 @@ impl Parser {
         match t.tok {
             Tok::Int(n) => Ok(Expr::Lit(Lit::Int(n))),
             Tok::Float(f) => Ok(Expr::Lit(Lit::Float(f))),
+            Tok::Dec(d) => Ok(Expr::Lit(Lit::Dec(d))),
             Tok::Str(parts) => self.template(parts),
             Tok::LParen => {
                 if let Some(f) = self.try_arrow(line)? {
@@ -1382,11 +1384,13 @@ impl Parser {
         match t.tok {
             Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(n))),
             Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(f))),
+            Tok::Dec(d) => Ok(Pattern::Lit(Lit::Dec(d))),
             Tok::Minus => {
                 let t = self.next()?;
                 match t.tok {
                     Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(-n))),
                     Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(-f))),
+                    Tok::Dec(d) => Ok(Pattern::Lit(Lit::Dec(d.neg()))),
                     other => Err(QuilloError::new(format!("expected a number after `-`, found {}", other.describe()), line)),
                 }
             }

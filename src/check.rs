@@ -44,13 +44,15 @@ const FN: u16 = 128;
 const HTML: u16 = 256;
 const RESP: u16 = 512;
 const ERR: u16 = 1024;
+const DEC: u16 = 2048;
 const NUM: u16 = INT | FLOAT;
-const ANY: u16 = 2047;
-const BASE: [(u16, &str); 11] = [
+const ANY: u16 = 4095;
+const BASE: [(u16, &str); 12] = [
     (NIL, "null"),
     (BOOL, "bool"),
     (INT, "int"),
     (FLOAT, "float"),
+    (DEC, "dec"),
     (STR, "str"),
     (LIST, "list"),
     (MAP, "map"),
@@ -431,12 +433,28 @@ fn name_bits(n: &str) -> u16 {
     }
 }
 
+/// A money value's type (src/money.rs).
+fn money_t() -> T {
+    map_of(vec![(Arc::from("amount"), T::of(DEC)), (Arc::from("currency"), T::of(STR))])
+}
+
+/// After an error about a decimal and a float: what to do about it.
+fn dec_hint(x: T, y: T) -> &'static str {
+    let mixed = |a: T, b: T| a.bits & DEC != 0 && b.bits & FLOAT != 0;
+    if mixed(x, y) || mixed(y, x) {
+        ": a dec is exact and a float is not, so convert one with dec(x) or float(x)"
+    } else {
+        ""
+    }
+}
+
 fn lit_t(l: &Lit) -> T {
     T::of(match l {
         Lit::Nil => NIL,
         Lit::Bool(_) => BOOL,
         Lit::Int(_) => INT,
         Lit::Float(_) => FLOAT,
+        Lit::Dec(_) => DEC,
         Lit::Str(_) => STR,
     })
 }
@@ -467,6 +485,7 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                 BinOp::Add => match (x, y) {
                     (INT, INT) => Some(INT),
                     (STR, _) | (_, STR) => Some(STR),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (HTML, HTML) => Some(HTML),
                     (LIST, LIST) => Some(LIST),
                     (MAP, MAP) => Some(MAP),
@@ -475,16 +494,18 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                 },
                 BinOp::Div => match (x, y) {
                     (INT, INT) => Some(INT | FLOAT),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
                 },
                 BinOp::Sub | BinOp::Mul | BinOp::Mod => match (x, y) {
                     (INT, INT) => Some(INT),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
                 },
                 BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match (x, y) {
-                    (INT | FLOAT, INT | FLOAT) | (STR, STR) => Some(BOOL),
+                    (INT | FLOAT, INT | FLOAT) | (STR, STR) | (DEC, DEC | INT) | (INT, DEC) => Some(BOOL),
                     _ => None,
                 },
                 BinOp::Range => match (x, y) {
@@ -511,6 +532,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("str", "any=", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
+    ("dec", "any", "dec | error(str)"),
+    ("format_number", "num | dec, str | null=, int=", "str"),
     ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
@@ -565,10 +588,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
-    ("abs", "num", "num"),
-    ("round", "num, int=", "num"),
-    ("floor", "num", "num"),
-    ("ceil", "num", "num"),
+    ("abs", "num | dec", "num | dec"),
+    ("round", "num | dec, int=, str=", "num | dec"),
+    ("floor", "num | dec", "num | dec"),
+    ("ceil", "num | dec", "num | dec"),
     ("sqrt", "num", "float"),
     ("pow", "num, num", "num"),
     ("unique", "list | null", "list"),
@@ -659,6 +682,21 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.open", "str, fn, map | null=", "map"),
     ("media.rtp", "str, map", "null"),
     ("media.streams", "", "list"),
+    // src/money.rs
+    ("money.of", "dec | int | str, str, str=", "map | error(str)"),
+    ("money.from_minor", "int, str", "map | error(str)"),
+    ("money.to_minor", "map", "int"),
+    ("money.add", "map, map", "map"),
+    ("money.sub", "map, map", "map"),
+    ("money.mul", "map, dec | int, str=", "map"),
+    ("money.neg", "map", "map"),
+    ("money.compare", "map, map", "int"),
+    ("money.zero", "str", "map | error(str)"),
+    ("money.is_zero", "map", "bool"),
+    ("money.allocate", "map, list | int", "list"),
+    ("money.round", "map, str=", "map"),
+    ("money.minor_units", "str", "int | error(str)"),
+    ("money.format", "map, str | null=", "str"),
     // src/numeric.rs
     ("math.sqrt", "num", "float"),
     ("math.cbrt", "num", "float"),
@@ -801,9 +839,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -2293,10 +2331,10 @@ impl Checker {
                         T::of(BOOL)
                     }
                     UnOp::Neg => {
-                        if t.bits != 0 && t.bits & NUM == 0 {
+                        if t.bits != 0 && t.bits & (NUM | DEC) == 0 {
                             self.error(format!("cannot negate {}", bits_text(t.bits)));
                         }
-                        T::of(t.bits & NUM)
+                        T::of(t.bits & (NUM | DEC))
                     }
                 }
             }
@@ -2342,7 +2380,7 @@ impl Checker {
                             _ => "compare",
                         };
                         let join = if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) { "with" } else { "and" };
-                        self.error(format!("cannot {} {} {} {}", verb, bits_text(x.bits), join, bits_text(y.bits)));
+                        self.error(format!("cannot {} {} {} {}{}", verb, bits_text(x.bits), join, bits_text(y.bits), dec_hint(x, y)));
                         T::ANY
                     }
                 }
@@ -2736,11 +2774,18 @@ impl Checker {
             "flatten" => a0.items()?.items().map(list_of),
             "split" | "keys" => Some(list_of(T::of(STR))),
             "range" => Some(list_of(T::of(INT))),
-            "sum" => a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0).map(|e| T::of(e.bits)),
+            "sum" => a0.items().filter(|e| e.bits != 0 && e.bits & !(NUM | DEC) == 0).map(|e| T::of(e.bits)),
             "min" | "max" => {
-                let e = a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0)?;
+                let e = a0.items().filter(|e| e.bits != 0 && e.bits & !(NUM | DEC) == 0)?;
                 Some(T::of(if expr_at(0).is_some_and(never_empty) { e.bits } else { e.bits | NIL }))
             }
+            // Money is `{ amount: dec, currency: str }`.
+            "money.add" | "money.sub" | "money.mul" | "money.neg" | "money.round" => Some(money_t()),
+            "money.of" | "money.from_minor" | "money.zero" => Some(money_t().union(T::error(STR))),
+            "money.allocate" => Some(list_of(money_t())),
+            // A decimal gives a decimal; ints and floats as before.
+            "abs" | "floor" | "ceil" | "round" if a0.bits == DEC => Some(T::of(DEC)),
+            "abs" | "floor" | "ceil" | "round" if a0.bits & DEC == 0 && a0.bits != 0 => Some(T::of(NUM)),
             "merge" => Some(merge_maps(a0, *args.get(1)?)),
             "set" if args.len() == 3 => {
                 let fs = a0.fields().filter(|_| a0.bits & NIL == 0)?;
@@ -2765,7 +2810,7 @@ impl Checker {
     /// nothing fails: `name || "anonymous"` keeps an empty name. Warned only
     /// where the value is known to be a string or a number (or null).
     fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
-        if t.bits & (STR | NUM) == 0 || t.bits & !(STR | NUM | NIL) != 0 {
+        if t.bits & (STR | NUM | DEC) == 0 || t.bits & !(STR | NUM | DEC | NIL) != 0 {
             return;
         }
         let x = match e {
@@ -2781,7 +2826,7 @@ impl Checker {
         if t.bits & STR != 0 {
             empties.push("\"\"");
         }
-        if t.bits & NUM != 0 {
+        if t.bits & (NUM | DEC) != 0 {
             empties.push("0");
         }
         let empty = empties.join(" or ");

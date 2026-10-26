@@ -17,8 +17,198 @@ const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !isEvent(v)));
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
+
+// ---- decimals (src/decimal.rs, the same answers) -------------------------
+// A decimal is a whole number (a BigInt, at most 2^96 - 1 either way) and
+// how many of its digits come after the point (0 to 28). Ints past what a
+// JS number holds whole (2^53) are BigInts; smaller ones stay numbers, so
+// the usual arithmetic never meets either.
+
+class Dec { constructor(m, s) { this.m = m; this.s = s; } }
+const DEC_MAX = (1n << 96n) - 1n;
+const DEC_SCALE = 28;
+const P10 = [1n];
+const p10 = (k) => { while (P10.length <= k) P10.push(P10[P10.length - 1] * 10n); return P10[k]; };
+const babs = (x) => (x < 0n ? -x : x);
+const ROUNDINGS = "half_even, half_up, half_down, up, down, ceiling or floor";
+const DEC_FLOAT = ": a dec is exact and a float is not, so convert one with dec(x) or float(x)";
+const FLOAT_ONLY = " (this works on floats: convert a dec with float(x))";
+const isFloatV = (v) => typeof v === "number" && !Number.isInteger(v);
+const decHint = (a, b) => ((a instanceof Dec && isFloatV(b)) || (b instanceof Dec && isFloatV(a)) ? DEC_FLOAT : "");
+
+// Whether to add one to what is kept, given the first digit dropped,
+// whether any after it are not zero, and whether what is kept is odd.
+function decBump(mode, digit, rest, odd, neg) {
+  const any = digit !== 0 || rest;
+  switch (mode) {
+    case "half_even": return digit > 5 || (digit === 5 && (rest || odd));
+    case "half_up": return digit >= 5;
+    case "half_down": return digit > 5 || (digit === 5 && rest);
+    case "up": return any;
+    case "down": return false;
+    case "ceiling": return any && !neg;
+    case "floor": return any && neg;
+  }
+  return false;
+}
+
+// mag at scale made to fit (`fit` in src/decimal.rs): digits past the
+// 28th decimal or past 96 bits dropped and the rest rounded; null when the
+// whole part alone does not fit.
+function decFit(neg, mag, scale, sticky, mode) {
+  let digit = 0, rest = sticky, dropped = sticky;
+  for (;;) {
+    while (scale > DEC_SCALE || mag > DEC_MAX) {
+      if (scale === 0) return null;
+      rest = rest || digit !== 0;
+      digit = Number(mag % 10n);
+      mag /= 10n;
+      scale--;
+      dropped = true;
+    }
+    if (dropped && decBump(mode, digit, rest, (mag & 1n) === 1n, neg)) {
+      mag += 1n;
+      digit = 0; rest = false; dropped = false;
+      continue;
+    }
+    return new Dec(neg ? -mag : mag, scale);
+  }
+}
+const decOk = (d) => (d === null ? fail("decimal overflow") : d);
+
+function decAdd(a, b) {
+  if (a.s === b.s) { const m = a.m + b.m; if (babs(m) <= DEC_MAX) return new Dec(m, a.s); }
+  const s = Math.max(a.s, b.s);
+  const m = a.m * p10(s - a.s) + b.m * p10(s - b.s);
+  return decOk(decFit(m < 0n, babs(m), s, false, "half_even"));
+}
+function decMul(a, b) {
+  const m = a.m * b.m, s = a.s + b.s;
+  if (s <= DEC_SCALE && babs(m) <= DEC_MAX) return new Dec(m, s);
+  return decOk(decFit((a.m < 0n) !== (b.m < 0n), babs(m), s, false, "half_even"));
+}
+// Long division, a digit at a time, while there is a remainder and room.
+function decDiv(a, b) {
+  if (b.m === 0n) fail("division by zero");
+  const bm = babs(b.m);
+  let scale = a.s - b.s, q = babs(a.m) / bm, r = babs(a.m) % bm;
+  while (r !== 0n && (scale < 0 || (scale <= DEC_SCALE && q <= DEC_MAX))) {
+    r *= 10n;
+    q = q * 10n + r / bm;
+    r %= bm;
+    scale++;
+  }
+  if (scale < 0) { q *= p10(-scale); scale = 0; }
+  return decOk(decFit((a.m < 0n) !== (b.m < 0n), q, scale, r !== 0n, "half_even"));
+}
+function decRem(a, b) {
+  if (b.m === 0n) fail("division by zero");
+  const s = Math.max(a.s, b.s);
+  const r = (babs(a.m) * p10(s - a.s)) % (babs(b.m) * p10(s - b.s));
+  return decOk(decFit(a.m < 0n, r, s, false, "half_even"));
+}
+// Rounded to `digits` decimals, padded with zeros when it has fewer.
+function decRound(d, digits, mode) {
+  digits = Math.min(Math.max(digits, -DEC_SCALE), DEC_SCALE);
+  if (digits >= d.s) {
+    const m = d.m * p10(digits - d.s);
+    return babs(m) <= DEC_MAX ? new Dec(m, digits) : d;
+  }
+  const neg = d.m < 0n, mag = babs(d.m), p = p10(d.s - digits), unit = p / 10n;
+  let kept = mag / p;
+  const gone = mag % p;
+  if (decBump(mode, Number(gone / unit), gone % unit !== 0n, (kept & 1n) === 1n, neg)) kept += 1n;
+  return decOk(digits >= 0 ? decFit(neg, kept, digits, false, mode) : decFit(neg, kept * p10(-digits), 0, false, mode));
+}
+function decCmp(a, b) {
+  const s = Math.max(a.s, b.s);
+  const x = a.m * p10(s - a.s), y = b.m * p10(s - b.s);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+function decText(d) {
+  let t = babs(d.m).toString();
+  if (d.s > 0) {
+    if (t.length <= d.s) t = "0".repeat(d.s - t.length + 1) + t;
+    t = t.slice(0, t.length - d.s) + "." + t.slice(t.length - d.s);
+  }
+  return d.m < 0n ? "-" + t : t;
+}
+// Its text with no zeros at the end of the fraction: as a map key.
+function decKey(d) {
+  let m = d.m, s = d.s;
+  while (s > 0 && m % 10n === 0n) { m /= 10n; s--; }
+  return decText(new Dec(m, s));
+}
+const DEC_RE = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE](\+?\d{1,6}|-\d{1,5}))?$/;
+// Text as a program writes a number, exactly (null if digits past what a
+// decimal holds are not zeros), or rounded half to even.
+function decParse(s, rounded) {
+  if (typeof s !== "string" || s.length === 0 || s.length > 400) return null;
+  const r = DEC_RE.exec(s);
+  if (!r) return null;
+  const whole = r[2], frac = r[3] || "";
+  if (whole.length + frac.length === 0) return null;
+  const neg = r[1] === "-";
+  let mag = BigInt(whole + frac);
+  let scale = frac.length - (r[4] ? parseInt(r[4], 10) : 0);
+  if (scale < 0) {
+    if (mag !== 0n && -scale > 80) return null;
+    if (mag !== 0n) mag *= p10(-scale);
+    scale = 0;
+  }
+  if (scale > 400) return null;
+  if (rounded) return decFit(neg, mag, scale, false, "half_even");
+  while (scale > DEC_SCALE || mag > DEC_MAX) {
+    if (scale === 0 || mag % 10n !== 0n) return null;
+    mag /= 10n;
+    scale--;
+  }
+  return new Dec(neg ? -mag : mag, scale);
+}
+// A float through its shortest text, so 0.1 is 0.1.
+const decFromFloat = (f) => (Number.isFinite(f) ? decParse(f.toExponential(), true) : null);
+// A value as a decimal, for a `dec` pattern or record field.
+function asDec(v) {
+  if (v instanceof Dec) return v;
+  if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
+  if (typeof v === "number") return decFromFloat(v);
+  if (typeof v === "string") return decParse(v.trim(), false);
+  return null;
+}
+function decArith(a, b, op, verb) {
+  const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
+  const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
+  if (x === null || y === null) fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}${decHint(a, b)}`);
+  switch (op) {
+    case "+": return decAdd(x, y);
+    case "-": return decAdd(x, new Dec(-y.m, y.s));
+    case "*": return decMul(x, y);
+    case "/": return decDiv(x, y);
+  }
+  return decRem(x, y);
+}
+
+// An int as the page keeps it: a number while it is whole as one.
+const I64_MIN = -(1n << 63n), I64_MAX = (1n << 63n) - 1n;
+const intOf = (b) => (b >= -9007199254740991n && b <= 9007199254740991n ? Number(b) : b);
+const bigChecked = (b) => (b < I64_MIN || b > I64_MAX ? fail("integer overflow") : intOf(b));
+// Arithmetic with an int past 2^53: exact, 64-bit as on the server.
+function bigArith(a, b, op, verb) {
+  const ai = isInt(a) || typeof a === "bigint", bi = isInt(b) || typeof b === "bigint";
+  if (ai && bi) {
+    const x = BigInt(a), y = BigInt(b);
+    if ((op === "/" || op === "%") && y === 0n) fail("division by zero");
+    if (op === "/") return x % y === 0n ? bigChecked(x / y) : Number(x) / Number(y);
+    return bigChecked(op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : x % y);
+  }
+  if ((ai || typeof a === "number") && (bi || typeof b === "number")) {
+    const x = Number(a), y = Number(b);
+    return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
+  }
+  fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
+}
 // What Quillo code does not reach on the page's objects: what runs text as
 // code or HTML (markup in components does that safely), and the way to the
 // Function constructor.
@@ -41,7 +231,7 @@ function foreignCall(o, name, args) {
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
 const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
-  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html));
+  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec));
 // Functions of the page that run text as code: Quillo code calls none of
 // them, however it came by one.
 let deniedFns = null;
@@ -60,7 +250,9 @@ function typeName(v) {
     case "number": return Number.isInteger(v) ? "int" : "float";
     case "string": return "str";
     case "function": return "fn";
+    case "bigint": return "int";
   }
+  if (v instanceof Dec) return "dec";
   if (Array.isArray(v)) return "list";
   if (v instanceof Err) return "error";
   if (v instanceof Html) return "html";
@@ -70,10 +262,11 @@ function typeName(v) {
 function typeIs(t, v) {
   switch (t) {
     case "any": return true;
-    case "int": return isInt(v);
+    case "int": return isInt(v) || typeof v === "bigint";
     // JS numbers do not remember whether they were written 2 or 2.0.
     case "float": return typeof v === "number";
-    case "num": return typeof v === "number";
+    case "num": return typeof v === "number" || typeof v === "bigint";
+    case "dec": return v instanceof Dec;
     case "str": return typeof v === "string";
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
@@ -133,6 +326,7 @@ function ownFitsName(n, t, v, deep, depth) {
     if (td.a) return ownFits(td.a, v, deep, depth + 1);
     return isMap(v) ? ownFieldsFit(td.r, v, depth) : OWN_PLAIN;
   }
+  if (n === "dec") return asDec(v) === null ? OWN_PLAIN : null;
   if (/^[A-Z]/.test(n) || !typeIs(n, v)) return OWN_PLAIN;
   if (deep && n === "list" && t.e) {
     for (let i = 0; i < v.length; i++) {
@@ -186,6 +380,8 @@ function ownMakeName(n, t, v, depth) {
     }
     return { ok: true, v: out };
   }
+  // A decimal field takes an int, numeric text or a JSON number.
+  if (n === "dec") { const d = asDec(v); return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
   const w = ownFits({ n: [n], o: false, e: t.e, f: t.f, t: t.t }, v, true, depth);
   return w ? { ok: false, w } : { ok: true, v };
 }
@@ -199,6 +395,8 @@ function repr(v) {
   if (typeof v === "string") return JSON.stringify(v);
   if (typeof v === "number") return String(v);
   if (typeof v === "boolean") return String(v);
+  if (typeof v === "bigint") return String(v);
+  if (v instanceof Dec) return decText(v) + "m";
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
   if (v instanceof Err) return "err(" + repr(v.error) + ")";
@@ -208,14 +406,20 @@ function repr(v) {
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? String(v) : v instanceof Dec ? decText(v) : repr(v);
+// A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
+const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
 const truthy = (v) => !(isNil(v) || v === false || v instanceof Err);
 
 function eq(a, b) {
   if (a === b) return true;
   // Different numbers, strings, bools and functions; null and undefined match.
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return isNil(a) && isNil(b);
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    // Two numbers (the usual case) test only their types here.
+    return (typeof a === "object" || typeof b === "object") && (a instanceof Dec || b instanceof Dec) ? decEq(a, b) : isNil(a) && isNil(b);
+  }
+  if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
   if (isMap(a) && isMap(b)) {
@@ -225,8 +429,24 @@ function eq(a, b) {
   return false;
 }
 
+// A decimal and a number, compared as decimals (a float through its text).
+function decEq(a, b) {
+  const x = a instanceof Dec ? a : typeof a === "number" || typeof a === "bigint" ? asDec(a) : null;
+  const y = b instanceof Dec ? b : typeof b === "number" || typeof b === "bigint" ? asDec(b) : null;
+  return x !== null && y !== null && decCmp(x, y) === 0;
+}
+
 function cmp(a, b) {
   if ((typeof a === "number" && typeof b === "number") || (typeof a === "string" && typeof b === "string")) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  // A decimal with a decimal or an int; not with a float.
+  if (a instanceof Dec || b instanceof Dec) {
+    const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
+    const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
+    return x === null || y === null ? null : decCmp(x, y);
+  }
+  if ((typeof a === "bigint" || typeof a === "number") && (typeof b === "bigint" || typeof b === "number")) {
     return a < b ? -1 : a > b ? 1 : 0;
   }
   return null;
@@ -238,6 +458,8 @@ function add(a, b) {
   if (typeof a === "number" && typeof b === "number") return a + b;
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
+  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
+  if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
   if (isMap(a) && isMap(b)) return Object.assign({}, a, b);
@@ -246,6 +468,8 @@ function add(a, b) {
 
 // Numbers: the usual case first; anything else says what is wrong.
 function arith(a, b, op, verb) {
+  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, op, verb);
+  if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, op, verb);
   if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
   if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
   return op === "/" ? a / b : a % b;
@@ -257,7 +481,7 @@ const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0
 
 function order(a, b) {
   const c = cmp(a, b);
-  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}`);
+  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}${decHint(a, b)}`);
   return c;
 }
 const lt = (a, b) => order(a, b) < 0;
@@ -274,7 +498,11 @@ function intRange(a, b) {
 }
 
 function neg(v) {
-  if (typeof v !== "number") fail(`cannot negate ${typeName(v)}`);
+  if (typeof v !== "number") {
+    if (v instanceof Dec) return new Dec(-v.m, v.s);
+    if (typeof v === "bigint") return bigChecked(-v);
+    fail(`cannot negate ${typeName(v)}`);
+  }
   return -v;
 }
 
@@ -444,6 +672,8 @@ function matchInto(p, v, b) {
     case "l": return eq(p.v, v);
     case "t": {
       madeLast = undefined;
+      // A decimal from an int, numeric text or a JSON number.
+      if (p.t === "dec") { const d = asDec(v); if (d === null) return false; madeLast = d; return true; }
       // A record: the value made as `User(v)` makes it.
       const r = ownTypes && ownTypes.make(p.t, v);
       if (r) {
@@ -500,7 +730,7 @@ function match(p, v) {
 
 // ---- the standard library (the parts that make sense in a browser) -----
 
-const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as argument ${i}, got ${isNil(v) && v === undefined ? "nothing" : typeName(v)}`); };
+const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as argument ${i}, got ${isNil(v) && v === undefined ? "nothing" : typeName(v)}${v instanceof Dec && what === "a number" ? FLOAT_ONLY : ""}`); };
 const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); return v; };
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
@@ -527,10 +757,10 @@ function sortValues(items, name) {
   let bad = null;
   const sorted = items.slice().sort((a, b) => {
     const c = cmp(a[0], b[0]);
-    if (c === null) { bad = [typeName(a[0]), typeName(b[0])]; return 0; }
+    if (c === null) { bad = [typeName(a[0]), typeName(b[0]), decHint(a[0], b[0])]; return 0; }
     return c;
   });
-  if (bad) fail(`\`${name}\` cannot compare ${bad[0]} with ${bad[1]}`);
+  if (bad) fail(`\`${name}\` cannot compare ${bad[0]} with ${bad[1]}${bad[2]}`);
   return sorted.map((x) => x[1]);
 }
 
@@ -539,7 +769,7 @@ function extreme(l, name, want) {
   for (const x of L(l, name)) {
     if (best === null) { best = x; continue; }
     const c = cmp(x, best);
-    if (c === null) fail(`\`${name}\` cannot compare ${typeName(x)} with ${typeName(best)}`);
+    if (c === null) fail(`\`${name}\` cannot compare ${typeName(x)} with ${typeName(best)}${decHint(x, best)}`);
     if (c === want) best = x;
   }
   return best;
@@ -549,19 +779,28 @@ function coerce(t, s) {
   s = s.trim();
   if (t === "int") return /^[+-]?\d+$/.test(s) ? parseInt(s, 10) : null;
   if (t === "float" || t === "num") return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
+  if (t === "dec") return decParse(s, false);
   return null;
 }
 
-function toJSON(v) {
+// A value as JSON data. `wire`: for the program's own server (a server
+// fn's arguments), decimals and large ints tagged ({"$dec": "12.50"}) so
+// they arrive as they are; else a decimal is its text, as the server
+// writes it, and a large int its digits (`jsonText` writes them).
+function toJSON(v, wire) {
   if (isNil(v)) return null;
-  if (v instanceof Err) return { error: toJSON(v.error) };
-  if (Array.isArray(v)) return v.map(toJSON);
+  if (v instanceof Err) return { error: toJSON(v.error, wire) };
+  if (Array.isArray(v)) return v.map((x) => toJSON(x, wire));
   if (v instanceof Html) return "";
   if (typeof v === "function") return repr(v);
-  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = toJSON(v[k]); return o; }
+  if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
+  if (typeof v === "bigint") return wire ? { $int: String(v) } : "\u0000int:" + v;
+  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = toJSON(v[k], wire); return o; }
   if (typeof v === "number" && !isFinite(v)) return null;
   return v;
 }
+// JSON text of a value, a large int written as its digits.
+const jsonText = (v, indent) => JSON.stringify(toJSON(v), null, indent).replace(/"\\u0000int:(-?\d+)"/g, "$1");
 
 const B = {};
 
@@ -629,7 +868,7 @@ B.receive = meta(async (url, f, opts) => {
   if (isMap(opts.headers)) for (const k of Object.keys(opts.headers)) init.headers[k] = display(opts.headers[k]);
   if (!isNil(opts.body)) {
     if (typeof opts.body === "string") init.body = opts.body;
-    else { init.body = JSON.stringify(toJSON(opts.body)); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
+    else { init.body = jsonText(opts.body); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
   }
   let res;
   try { res = await fetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
@@ -698,7 +937,9 @@ B.parallel = meta(async (...fs) => {
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 B.str = meta((v) => display(v), "str", null);
 B.int = meta((v) => {
-  if (isInt(v)) return v;
+  if (isInt(v) || typeof v === "bigint") return v;
+  // The whole part (toward zero).
+  if (v instanceof Dec) { const w = v.m / p10(v.s); return w < I64_MIN || w > I64_MAX ? new Err(`${decText(v)} is too large for an int`) : intOf(w); }
   if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
   if (typeof v === "boolean") return v ? 1 : 0;
   if (typeof v === "string") { const n = coerce("int", v); return n === null ? new Err(`not an int: ${JSON.stringify(v)}`) : n; }
@@ -706,6 +947,8 @@ B.int = meta((v) => {
 }, "int", null);
 B.float = meta((v) => {
   if (typeof v === "number") return v;
+  if (v instanceof Dec) return Number(decText(v));
+  if (typeof v === "bigint") return Number(v);
   if (typeof v === "string") { const n = coerce("float", v); return n === null ? new Err(`not a number: ${JSON.stringify(v)}`) : n; }
   return new Err(`cannot convert ${typeName(v)} to float`);
 }, "float", null);
@@ -717,6 +960,15 @@ B.len = meta((v) => {
   fail(`\`len\` expects a str, list or map, got ${typeName(v)}`);
 }, "len", null);
 B.type_of = meta((v) => typeName(v), "type_of", null);
+// `dec(x)`: a decimal from text (exactly), an int, or a float (through its
+// shortest text, so dec(0.1) is 0.1m).
+B.dec = meta((v) => {
+  if (v instanceof Dec) return v;
+  if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
+  if (typeof v === "number") return decFromFloat(v) ?? new Err("cannot convert float to dec: it is too large, or not a number");
+  if (typeof v === "string") return decParse(v.trim(), false) ?? new Err(`not a decimal: ${JSON.stringify(v)}`);
+  return new Err(`cannot convert ${typeName(v)} to dec`);
+}, "dec", null);
 B.upper = meta((s) => S(s, "upper").toUpperCase(), "upper", null);
 B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
 B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
@@ -772,10 +1024,10 @@ B.range = meta((a, b) => b === undefined ? intRange(0, I(a, "range")) : intRange
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
 B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
 B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
-B.get = meta((m, k, d = null) => { m = M(m, "get"); k = display(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
-B.has = meta((m, k) => hasOwn(M(m, "has"), display(k)), "has", null);
+B.get = meta((m, k, d = null) => { m = M(m, "get"); k = keyText(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
+B.has = meta((m, k) => hasOwn(M(m, "has"), keyText(k)), "has", null);
 B.set = meta((m, k, v = null) => {
-  const o = { ...M(m, "set") }, key = display(k);
+  const o = { ...M(m, "set") }, key = keyText(k);
   // "__proto__" is a key like any other here, not the object's prototype.
   if (key === "__proto__") Object.defineProperty(o, key, { value: v, enumerable: true, writable: true, configurable: true });
   else o[key] = v;
@@ -784,7 +1036,7 @@ B.set = meta((m, k, v = null) => {
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
   const m = Object.assign({}, M(c, "remove"));
-  delete m[display(k)];
+  delete m[keyText(k)];
   return m;
 }, "remove", null);
 B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "merge", null);
@@ -874,7 +1126,7 @@ const HL = (() => {
   const L = (o) => Object.assign({ line: [], block: null, quotes: "", keywords: [], consts: [], types: false, tags: false, css: false, json: false, nocase: false }, o);
   const qwe = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"`", types: true, tags: true,
     keywords: ["let", "fn", "view", "component", "server", "route", "use", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
-    consts: ["true", "false", "null", "int", "str", "bool", "float", "map", "list", "any"] });
+    consts: ["true", "false", "null", "int", "str", "bool", "float", "dec", "map", "list", "any"] });
   const js = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"'`", types: true,
     keywords: ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "export", "extends", "finally", "for",
       "function", "if", "import", "in", "instanceof", "let", "new", "return", "super", "switch", "this", "throw", "try", "typeof", "var", "void",
@@ -980,12 +1232,24 @@ B.random_int = meta((lo, hi) => {
 }, "random_int", null);
 B.uuid = meta(() => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
   : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }), "uuid", null);
-B.abs = meta((x) => Math.abs(N(x, "abs")), "abs", null);
+B.abs = meta((x) => x instanceof Dec ? new Dec(babs(x.m), x.s) : typeof x === "bigint" ? bigChecked(babs(x)) : Math.abs(N(x, "abs")), "abs", null);
 // Halves round away from zero, as on the server (Math.round(-2.5) is -2).
 const roundHalf = (x) => Math.sign(x) * Math.round(Math.abs(x));
-B.round = meta((x, d) => { N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
-B.floor = meta((x) => Math.floor(N(x, "floor")), "floor", null);
-B.ceil = meta((x) => Math.ceil(N(x, "ceil")), "ceil", null);
+// A decimal rounded: round(d, digits = 0, mode = "half_even"), keeping
+// exactly `digits` decimals.
+function roundDec(x, d, mode) {
+  if (!isNil(d)) I(d, "round", 2);
+  if (isNil(mode)) mode = "half_even";
+  else if (typeof mode !== "string") fail(`\`round\` expects a str as argument 3, got ${typeName(mode)}`);
+  else if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(mode)) fail(`\`round\`: unknown rounding ${JSON.stringify(mode)} (one of ${ROUNDINGS})`);
+  return decRound(x, isNil(d) ? 0 : d, mode);
+}
+B.round = meta((x, d, mode) => {
+  if (x instanceof Dec) return roundDec(x, d, mode);
+  if (!isNil(mode)) fail("`round` takes a rounding mode for a dec only: convert with dec(x)");
+  N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
+B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : Math.floor(N(x, "floor")), "floor", null);
+B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : Math.ceil(N(x, "ceil")), "ceil", null);
 B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
 B.pow = meta((x, y) => N(x, "pow") ** N(y, "pow", 2), "pow", null);
 B.unique = meta((l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; }, "unique", null);
@@ -994,7 +1258,7 @@ B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, 
 B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
 B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; }, "count", null);
-B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
+B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = keyText(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
@@ -1068,7 +1332,7 @@ B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
-  stringify: (v, pretty) => JSON.stringify(toJSON(v), null, truthy(pretty) ? 2 : undefined),
+  stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
 };
 
 function fromJSON(j) {
@@ -1087,10 +1351,232 @@ B.__record = meta((name, v) => {
   return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`);
 }, "__record", null);
 
+// ---- money (src/money.rs, the same answers) ------------------------------
+// An amount of a currency, as a map { amount: dec, currency: "USD" }, with
+// the currency's ISO 4217 minor units; written as CLDR has it for a locale.
+
+const MONEY_CURRENCIES = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2 BDT2 BHD3 BIF0 BMD2 BND2 BOB2 BOV2 BRL2 BSD2 " +
+  "BTN2 BWP2 BYN2 BZD2 CAD2 CDF2 CHE2 CHF2 CHW2 CLF4 CLP0 CNY2 COP2 COU2 CRC2 CUC2 CUP2 CVE2 CZK2 DJF0 " +
+  "DKK2 DOP2 DZD2 EGP2 ERN2 ETB2 EUR2 FJD2 FKP2 GBP2 GEL2 GHS2 GIP2 GMD2 GNF0 GTQ2 GYD2 HKD2 HNL2 HTG2 " +
+  "HUF2 IDR2 ILS2 INR2 IQD3 IRR2 ISK0 JMD2 JOD3 JPY0 KES2 KGS2 KHR2 KMF0 KPW2 KRW0 KWD3 KYD2 KZT2 LAK2 " +
+  "LBP2 LKR2 LRD2 LSL2 LYD3 MAD2 MDL2 MGA2 MKD2 MMK2 MNT2 MOP2 MRU2 MUR2 MVR2 MWK2 MXN2 MXV2 MYR2 MZN2 " +
+  "NAD2 NGN2 NIO2 NOK2 NPR2 NZD2 OMR3 PAB2 PEN2 PGK2 PHP2 PKR2 PLN2 PYG0 QAR2 RON2 RSD2 RUB2 RWF0 SAR2 " +
+  "SBD2 SCR2 SDG2 SEK2 SGD2 SHP2 SLE2 SOS2 SRD2 SSP2 STN2 SVC2 SYP2 SZL2 THB2 TJS2 TMT2 TND3 TOP2 TRY2 " +
+  "TTD2 TWD2 TZS2 UAH2 UGX0 USD2 USN2 UYI0 UYU2 UYW4 UZS2 VED2 VES2 VND0 VUV0 WST2 XAF0 XCD2 XCG2 XOF0 " +
+  "XPF0 YER2 ZAR2 ZMW2 ZWG2";
+const MONEY_SYMBOLS = "USD=US$,EUR=\u20ac,GBP=\u00a3,JPY=JP\u00a5,CNY=CN\u00a5,INR=\u20b9,CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u20a9,TWD=NT$,HKD=HK$,VND=\u20ab,ILS=\u20aa";
+const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,PHP=\u20b1\n" +
+  "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-CA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-AU\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=$,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "en-NZ\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,NZD=$,PHP=\u20b1\n" +
+  "en-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,SGD=$,PHP=\u20b1\n" +
+  "en-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1,ZAR=R\n" +
+  "de-DE\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-AT\t,\t.\t\t\u00a0\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-CH\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=$,EUR=EUR,JPY=\u00a5,THB=\u0e3f\n" +
+  "fr-FR\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-BE\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-CA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$\u00a0US,JPY=\u00a5,INR=INR,CAD=$,AUD=$\u00a0AU,NZD=$\u00a0NZ,MXN=MXN,KRW=KRW,TWD=TWD,HKD=$\u00a0HK,SGD=$\u00a0SG,VND=VND,ILS=ILS\n" +
+  "fr-CH\t.\t\u202f\t,\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "it-IT\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "it-CH\t.\t\u2019\t\t\t-\t2\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "es-ES\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,ILS=ILS\n" +
+  "es-MX\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "es-AR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tEUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,ARS=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pt-BR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
+  "pt-PT\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f\n" +
+  "nl-NL\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "nl-BE\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "sv-SE\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,AUD=AUD,NZD=NZD,SEK=kr,NOK=Nkr,DKK=Dkr,BRL=BR$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,EGP=EG\u00a3\n" +
+  "nb-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,NOK=kr,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "da-DK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tDKK=kr.,THB=\u0e3f\n" +
+  "fi-FI\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pl-PL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,PLN=z\u0142,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "cs-CZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tINR=INR,CZK=K\u010d,VND=VND,ILS=ILS\n" +
+  "hu-HU\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,HUF=Ft,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ro-RO\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "el-GR\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "tr-TR\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,TRY=\u20ba,THB=\u0e3f\n" +
+  "ru-RU\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,AUD=A$,RUB=\u20bd,UAH=\u20b4,THB=\u0e3f\n" +
+  "uk-UA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,UAH=\u20b4,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ja-JP\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\uffe5,CNY=\u5143,AUD=A$\n" +
+  "zh-CN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCNY=\u00a5\n" +
+  "zh-TW\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,KRW=\uffe6,TWD=$\n" +
+  "zh-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5\n" +
+  "ko-KR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\n" +
+  "hi-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "id-ID\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tINR=Rs,THB=\u0e3f,IDR=Rp\n" +
+  "th-TH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f\n" +
+  "vi-VN\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tJPY=\u00a5,THB=\u0e3f\n" +
+  "ms-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,CAD=CAD,AUD=A$,MXN=MXN,MYR=RM\n" +
+  "fil-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,THB=\u0e3f,PHP=\u20b1";
+let moneyT = null;
+function moneyTables() {
+  if (moneyT) return moneyT;
+  const pairs = (s) => { const o = Object.create(null); for (const p of s.split(",")) { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i)] = p.slice(i + 1); } return o; };
+  const units = Object.create(null);
+  for (const c of MONEY_CURRENCIES.split(" ")) units[c.slice(0, 3)] = +c.slice(3);
+  const locales = MONEY_LOCALES.split("\n").map((l) => {
+    const f = l.split("\t");
+    return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
+  });
+  return (moneyT = { units, locales, symbols: pairs(MONEY_SYMBOLS) });
+}
+const unitsOf = (code) => { const u = moneyTables().units[code]; return u === undefined ? null : u; };
+function localeData(name) {
+  const all = moneyTables().locales;
+  name = String(name).replace(/_/g, "-").toLowerCase();
+  const lang = name.split("-")[0];
+  return all.find((l) => l.name.toLowerCase() === name) || all.find((l) => l.name.split("-")[0].toLowerCase() === lang) || all[0];
+}
+function moneyDigits(loc, [decimal, group], d) {
+  const t = decText(new Dec(babs(d.m), d.s));
+  const dot = t.indexOf(".");
+  const whole = dot < 0 ? t : t.slice(0, dot), frac = dot < 0 ? "" : t.slice(dot + 1);
+  const n = whole.length, grouped = !(loc.min2 && n < 5);
+  let out = "";
+  for (let i = 0; i < n; i++) {
+    const left = n - i;
+    if (i > 0 && grouped && (loc.indian ? left === 3 || (left > 3 && (left - 3) % 2 === 0) : left % 3 === 0)) out += group;
+    out += whole[i];
+  }
+  return frac ? out + decimal + frac : out;
+}
+function formatAmount(d, code, places, locName) {
+  const loc = localeData(locName);
+  d = decRound(d, places, "half_even");
+  const sym = loc.symbols[code] ?? moneyTables().symbols[code] ?? code;
+  const before = loc.pats[0].indexOf("¤") < loc.pats[0].indexOf("#");
+  const side = before ? Array.from(sym).pop() : Array.from(sym)[0];
+  const letters = side !== undefined && /\p{L}/u.test(side);
+  const pat = loc.pats[(letters ? 2 : 0) + (d.m < 0n ? 1 : 0)];
+  const num = moneyDigits(loc, [loc.decimal, loc.group], d);
+  return pat.replace("-", loc.minus).replace("¤", sym).replace("#", num);
+}
+const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short(v)}`);
+function moneyCurrency(c, f, i) {
+  if (typeof c !== "string") fail(`\`${f}\` expects a currency code (a str) as argument ${i}, got ${moneyShort(c)}`);
+  const code = c.trim().toUpperCase(), u = unitsOf(code);
+  return u === null ? new Err(`unknown currency ${JSON.stringify(c)}`) : { code, units: u };
+}
+function moneyArg(v, f, i) {
+  const bad = (why) => fail(`\`${f}\` expects money ({ amount, currency }) as argument ${i}, got ${moneyShort(v)}${why}`);
+  if (!isMap(v)) bad("");
+  const c = hasOwn(v, "currency") ? v.currency : null;
+  if (typeof c !== "string") bad(": no currency");
+  const code = c.toUpperCase(), units = unitsOf(code);
+  if (units === null) bad(": unknown currency");
+  const a = hasOwn(v, "amount") ? v.amount : null;
+  const amount = a instanceof Dec || isInt(a) || typeof a === "bigint" || typeof a === "string" ? asDec(a) : null;
+  if (amount === null) bad(": its amount must be a dec");
+  return { amount, code, units };
+}
+function moneyMode(m, f) {
+  if (isNil(m)) return "half_even";
+  if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${f === "money.round" ? 2 : 3}, got ${moneyShort(m)}`);
+  if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(m)) fail(`\`${f}\`: unknown rounding ${JSON.stringify(m)} (one of ${ROUNDINGS})`);
+  return m;
+}
+const moneyOf = (amount, code) => ({ amount, currency: code });
+function moneySame(a, b, verb) {
+  if (a.code !== b.code) fail(`cannot ${verb} ${a.code} and ${b.code}: convert one currency to the other first`);
+}
+// The locale to write in: the one given, else the page's, else en-US.
+function moneyLocale(l, f, i) {
+  if (isNil(l)) { const d = i18n(); return d ? d.locale : "en-US"; }
+  if (typeof l !== "string") fail(`\`${f}\` expects a locale (a str) as argument ${i}, got ${moneyShort(l)}`);
+  return l;
+}
+B.money = {
+  of: (amount, currency, mode) => {
+    const c = moneyCurrency(currency, "money.of", 2);
+    if (c instanceof Err) return c;
+    let d;
+    if (amount instanceof Dec) d = amount;
+    else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
+    else if (typeof amount === "string") { d = decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
+    else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
+    else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
+    if (isNil(mode)) {
+      const exact = decRound(d, c.units, "down");
+      if (decCmp(exact, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
+      return moneyOf(exact, c.code);
+    }
+    return moneyOf(decRound(d, c.units, moneyMode(mode, "money.of")), c.code);
+  },
+  from_minor: (n, currency) => {
+    const c = moneyCurrency(currency, "money.from_minor", 2);
+    if (c instanceof Err) return c;
+    if (!isInt(n) && typeof n !== "bigint") fail(`\`money.from_minor\` expects an int as argument 1, got ${moneyShort(n)}`);
+    return moneyOf(new Dec(BigInt(n), c.units), c.code);
+  },
+  to_minor: (m) => {
+    const a = moneyArg(m, "money.to_minor", 1), d = decRound(a.amount, a.units, "half_even");
+    return d.s === a.units ? bigChecked(d.m) : fail("integer overflow");
+  },
+  add: (x, y) => { const a = moneyArg(x, "money.add", 1), b = moneyArg(y, "money.add", 2); moneySame(a, b, "add"); return moneyOf(decRound(decAdd(a.amount, b.amount), a.units, "half_even"), a.code); },
+  sub: (x, y) => { const a = moneyArg(x, "money.sub", 1), b = moneyArg(y, "money.sub", 2); moneySame(a, b, "subtract"); return moneyOf(decRound(decAdd(a.amount, new Dec(-b.amount.m, b.amount.s)), a.units, "half_even"), a.code); },
+  mul: (x, factor, mode) => {
+    const a = moneyArg(x, "money.mul", 1);
+    let f;
+    if (factor instanceof Dec) f = factor;
+    else if (isInt(factor) || typeof factor === "bigint") f = new Dec(BigInt(factor), 0);
+    else if (typeof factor === "number") fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
+    else fail(`\`money.mul\` expects a dec or an int as argument 2, got ${moneyShort(factor)}`);
+    return moneyOf(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
+  },
+  neg: (x) => { const a = moneyArg(x, "money.neg", 1); return moneyOf(new Dec(-a.amount.m, a.amount.s), a.code); },
+  compare: (x, y) => { const a = moneyArg(x, "money.compare", 1), b = moneyArg(y, "money.compare", 2); moneySame(a, b, "compare"); return decCmp(a.amount, b.amount); },
+  zero: (currency) => { const c = moneyCurrency(currency, "money.zero", 1); return c instanceof Err ? c : moneyOf(new Dec(0n, c.units), c.code); },
+  is_zero: (x) => moneyArg(x, "money.is_zero", 1).amount.m === 0n,
+  round: (x, mode) => { const a = moneyArg(x, "money.round", 1); return moneyOf(decRound(a.amount, a.units, moneyMode(mode, "money.round")), a.code); },
+  minor_units: (currency) => { const c = moneyCurrency(currency, "money.minor_units", 1); return c instanceof Err ? c : c.units; },
+  // Split by ratios without losing or making a minor unit: each share its
+  // part rounded down, the units left one each to the first shares with a
+  // ratio (Fowler's allocation).
+  allocate: (x, ratios) => {
+    const F = "money.allocate", a = moneyArg(x, F, 1);
+    let rs;
+    if (isInt(ratios) && ratios >= 1 && ratios <= 100000) rs = new Array(ratios).fill(new Dec(1n, 0));
+    else if (Array.isArray(ratios) && ratios.length > 0) {
+      rs = ratios.map((v, k) => {
+        if ((isInt(v) || typeof v === "bigint") && v >= 0) return new Dec(BigInt(v), 0);
+        if (v instanceof Dec && v.m >= 0n) return v;
+        fail(`\`${F}\`: ratio ${k} must be an int or a dec, 0 or more, got ${moneyShort(v)}`);
+      });
+    } else fail(`\`${F}\` expects a list of ratios or a number of parts as argument 2, got ${moneyShort(ratios)}`);
+    const s = Math.max(...rs.map((r) => r.s));
+    const whole = rs.map((r) => r.m * p10(s - r.s));
+    const total = whole.reduce((t, r) => t + r, 0n);
+    if (total <= 0n) fail(`\`${F}\`: the ratios must add up to more than 0`);
+    const minor = decRound(a.amount, a.units, "half_even").m, neg = minor < 0n, units = babs(minor);
+    const shares = whole.map((r) => (units * r) / total);
+    let left = units - shares.reduce((t, x) => t + x, 0n);
+    for (let i = 0; i < shares.length && left > 0n; i++) if (whole[i] > 0n) { shares[i] += 1n; left -= 1n; }
+    return shares.map((x) => moneyOf(new Dec(neg ? -x : x, a.units), a.code));
+  },
+  format: (x, locale) => { const a = moneyArg(x, "money.format", 1); return formatAmount(a.amount, a.code, a.units, moneyLocale(locale, "money.format", 2)); },
+};
+// format_number(x, locale, digits): a number as the locale writes one.
+B.format_number = meta((x, locale, digits) => {
+  let d;
+  if (x instanceof Dec) d = x;
+  else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
+  else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
+  else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
+  const loc = localeData(moneyLocale(locale, "format_number", 2));
+  if (!isNil(digits)) d = decRound(d, Math.min(Math.max(I(digits, "format_number", 3), 0), 28), "half_even");
+  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d);
+}, "format_number", null);
+
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
 
-const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}`); }); return l; };
+const decNote = (v) => (v instanceof Dec ? FLOAT_ONLY : "");
+const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}${decNote(v)}`); }); return l; };
 const given = (v) => !isNil(v);
 const csum2 = (xs) => {
   let s = 0, c = 0;
@@ -1320,7 +1806,7 @@ B.math = {
   isnan: (x) => Number.isNaN(N(x, "math.isnan")),
   prod: (l, start) => {
     let acc = given(start) ? N(start, "math.prod", 2) : 1;
-    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
+    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}${decNote(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
     return acc;
   },
   fsum: (l) => fsum(NS(l, "math.fsum")),
@@ -1497,7 +1983,7 @@ B.stats = {
 };
 
 const vecArith = (op, f) => (a, b) => {
-  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}`);
+  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}${decNote(b) || decNote(a)}`);
   if ((op === "/" || op === "%") && b === 0 && isInt(a) && isInt(b)) fail(`\`${f}\`: division by zero`);
   const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "%" ? a % b : a / b;
   return isInt(a) && isInt(b) && Number.isInteger(r) ? overflowed(r) : r;
@@ -1525,7 +2011,7 @@ const matrixOf = (rows, f, i = 1) => {
   rows.forEach((r, k) => {
     if (!Array.isArray(r)) fail(`\`${f}\` expects a list of rows, but row ${k} is ${typeName(r)}`);
     if (r.length !== cols) fail(`\`${f}\`: row ${k} has ${r.length} numbers, row 0 has ${cols}`);
-    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}`); });
+    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}${decNote(v)}`); });
   });
   return [rows, cols];
 };
@@ -2206,7 +2692,7 @@ B.channel = {
 // Sent once the server has let the page in; until then (and while the
 // connection is down) kept, up to a point.
 function chanSend(name, v, o) {
-  const text = JSON.stringify(["m", name, toJSON(v)]);
+  const text = jsonText(["m", name, v]);
   const reliable = isMap(o) && truthy(o.reliable);
   if (Chan.conn && Chan.joined.has(name)) {
     Chan.conn.put(text, reliable);
@@ -2582,12 +3068,12 @@ async function rpcRaw(name, args, live) {
   let payload;
   if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) {
     payload = new FormData();
-    payload.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a))));
+    payload.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a, true))));
     args.forEach((a, i) => { if (a instanceof Blob) payload.append("file" + i, a, a.name || "file"); });
     delete headers["content-type"];
     headers["x-quillo-rpc"] = "1";
   } else {
-    payload = JSON.stringify(args.map(toJSON));
+    payload = JSON.stringify(args.map((a) => toJSON(a, true)));
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
@@ -2602,7 +3088,7 @@ async function rpcRaw(name, args, live) {
     return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
   }
   let body = null;
-  try { body = await r.json(); } catch (_) {}
+  try { body = untagDeep(await r.json()); } catch (_) {}
   if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
   const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
   return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "" };
@@ -3015,7 +3501,7 @@ class Html { constructor(make) { if (make) this.make = make; } }
 
 const SVG = "http://www.w3.org/2000/svg";
 const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
-const isText = (x) => typeof x === "string" || typeof x === "number";
+const isText = (x) => typeof x === "string" || typeof x === "number" || x instanceof Dec || typeof x === "bigint";
 // Taking up the server's page: inputs keep what was typed (see setProp).
 let claiming = 0;
 
@@ -3515,7 +4001,7 @@ function setProp(el, k, v, old) {
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
   if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
+  const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
@@ -3943,10 +4429,31 @@ function run(inst, el, claim) {
   });
 }
 
-// Island JSON, with error values (`{"$quillo_err": x}`) restored.
+// Island JSON (and a server fn's answer), with error values
+// (`{"$quillo_err": x}`), decimals (`{"$dec": "12.50"}`) and large ints
+// (`{"$int": "9007199254740993"}`) restored.
 function islandJSON(text, fallback) {
   if (!text) return fallback;
-  return JSON.parse(text, (k, v) => (v && typeof v === "object" && !Array.isArray(v) && hasOwn(v, "$quillo_err") && Object.keys(v).length === 1) ? new Err(v.$quillo_err) : v);
+  return JSON.parse(text, (k, v) => untag(v));
+}
+function untag(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+  const ks = Object.keys(v);
+  if (ks.length !== 1) return v;
+  if (ks[0] === "$quillo_err") return new Err(v.$quillo_err);
+  if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
+  if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
+  return v;
+}
+// `untag` throughout JSON already parsed, from the inside out.
+function untagDeep(v) {
+  if (v === null || typeof v !== "object") return v;
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = untagDeep(v[i]); return v; }
+  for (const k of Object.keys(v)) {
+    const x = v[k], y = untagDeep(x);
+    if (y !== x) Object.defineProperty(v, k, { value: y, enumerable: true, writable: true, configurable: true });
+  }
+  return untag(v);
 }
 
 let hydrating = null;
@@ -4073,6 +4580,7 @@ const G = {};
 const C = {};
 const W = {};
 W.Err = Err;
+W.Dec = Dec;
 W.Ret = Ret;
 W.fail = fail;
 W.truthy = truthy;

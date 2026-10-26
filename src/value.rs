@@ -139,6 +139,8 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// An exact decimal: `12.50m` (src/decimal.rs).
+    Dec(crate::decimal::Dec),
     Str(Arc<str>),
     List(Arc<Vec<Value>>),
     Map(Arc<Map>),
@@ -198,6 +200,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
             Value::Float(_) => "float",
+            Value::Dec(_) => "dec",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Map(_) => "map",
@@ -225,7 +228,18 @@ impl Value {
         match self {
             Value::Str(s) => s.to_string(),
             Value::Html(h) => h.to_string(),
+            Value::Dec(d) => d.to_string(),
             _ => self.repr(),
+        }
+    }
+
+    /// The text of a map key made from this value (`set`, `get`,
+    /// `group_by`): its display, with a decimal's zeros at the end left
+    /// out, so 12.5 and 12.50 are one key.
+    pub fn key_text(&self) -> String {
+        match self {
+            Value::Dec(d) => d.normalized().to_string(),
+            _ => self.display(),
         }
     }
 
@@ -236,6 +250,7 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => fmt_float(*f),
+            Value::Dec(d) => format!("{}m", d),
             Value::Str(s) => serde_json::to_string(&**s).unwrap_or_default(),
             Value::List(l) => format!("[{}]", l.iter().map(|v| v.repr()).collect::<Vec<_>>().join(", ")),
             Value::Map(m) if m.is_empty() => "{}".into(),
@@ -259,6 +274,8 @@ impl Value {
             Value::Bool(b) => J::Bool(*b),
             Value::Int(n) => J::from(*n),
             Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null),
+            // As text, so nothing that reads it rounds it to a float.
+            Value::Dec(d) => J::String(d.to_string()),
             Value::Str(s) => J::String(s.to_string()),
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
@@ -280,6 +297,7 @@ impl Value {
             Value::Float(f) => {
                 let _ = serde_json::to_writer(&mut *out, f);
             }
+            Value::Dec(d) => json_str_into(&d.to_string(), out),
             Value::Str(s) | Value::Html(s) => json_str_into(s, out),
             Value::List(l) => {
                 out.push(b'[');
@@ -363,6 +381,9 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (Int(x), Int(y)) => x == y,
         (Int(_) | Float(_), Int(_) | Float(_)) => a.as_f64() == b.as_f64(),
+        (Dec(_), Int(_) | Float(_) | Dec(_)) | (Int(_) | Float(_), Dec(_)) => {
+            dec_pair(a, b).map_or(false, |(x, y)| x == y)
+        }
         (Str(x), Str(y)) => x == y,
         (Html(x), Html(y)) => x == y,
         (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
@@ -374,12 +395,29 @@ pub fn equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Ordered values; None for those that are not (a decimal and a float
+/// are not: one is exact, the other not).
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Dec(x), Value::Dec(y)) => Some(x.cmp(*y)),
+        (Value::Dec(x), Value::Int(y)) => Some(x.cmp(crate::decimal::Dec::from_i64(*y))),
+        (Value::Int(x), Value::Dec(y)) => Some(crate::decimal::Dec::from_i64(*x).cmp(*y)),
         _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
+}
+
+/// Two numbers as decimals, one at least a decimal: a float through its
+/// shortest text, so `0.1m == 0.1` (as `dec(0.1) == 0.1m`).
+fn dec_pair(a: &Value, b: &Value) -> Option<(crate::decimal::Dec, crate::decimal::Dec)> {
+    let one = |v: &Value| match v {
+        Value::Dec(d) => Some(*d),
+        Value::Int(n) => Some(crate::decimal::Dec::from_i64(*n)),
+        Value::Float(f) => crate::decimal::Dec::from_f64(*f),
+        _ => None,
+    };
+    Some((one(a)?, one(b)?))
 }
 
 /// A JSON string, escaped as `serde_json` escapes it.

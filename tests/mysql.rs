@@ -105,7 +105,15 @@ fn mysql() {
         "{ changes: 1, last_id: 1 }"
     );
     let row = eval(&mut it, "db.one(\"select name, n, price, whole, ok, score, born, at, note from things\")");
-    assert_eq!(row, r#"{ name: "Ada", n: 9007199254740993, price: 12.5, whole: 7, ok: true, score: 0.25, born: "1815-12-10", at: "2026-10-26 17:00:01", note: null }"#);
+    assert_eq!(row, r#"{ name: "Ada", n: 9007199254740993, price: 12.50m, whole: 7, ok: true, score: 0.25, born: "1815-12-10", at: "2026-10-26 17:00:01", note: null }"#);
+    // DECIMAL is exact: decimals both ways, the scale kept; an int when it
+    // has none (`sum` of ints).
+    eval(&mut it, "db.exec(\"create table money (id int auto_increment primary key, amount decimal(30,4), n int)\")");
+    eval(&mut it, "db.exec(\"insert into money (amount, n) values (?, ?), (?, ?)\", 0.1m, 3, 12345678901234567890.1234m, -4)");
+    assert_eq!(
+        eval(&mut it, "[db.query(\"select amount from money order by id\") | map((r) => r.amount), db.one(\"select sum(amount) as s, sum(n) as n from money\"), db.one(\"select cast(? as decimal(10,2)) * 3 as t\", 0.10m).t]"),
+        "[[0.1000m, 12345678901234567890.1234m], { s: 12345678901234567890.2234m, n: -1 }, 0.30m]"
+    );
     // MariaDB keeps JSON as text; MySQL gives it back as a value.
     let data = eval(&mut it, "db.one(\"select data from things\").data");
     assert!(data == r#""{\"tags\":[\"x\"]}""# || data == r#"{ tags: ["x"] }"#, "{}", data);

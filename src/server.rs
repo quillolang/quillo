@@ -596,11 +596,13 @@ impl Interp {
                 .iter()
                 .map(|j| match j.get("$quillo_file").and_then(|i| i.as_u64()) {
                     Some(i) if j.as_object().map_or(false, |o| o.len() == 1) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
-                    _ => Value::from_json(j),
+                    // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
+                    _ => crate::interp::from_island_json(j),
                 })
                 .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
+        let args = dec_args(&c.def, args);
         if let Err(msg) = check_args(&self.types, &c.def, &args) {
             return rpc_error(400, &msg);
         }
@@ -637,8 +639,8 @@ impl Interp {
         match res {
             Ok(v) | Err(Ctrl::Return(v)) => match v {
                 Value::Response(r) => render_response(&r),
-                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": e.to_json() }))),
-                v => json_response(200, with_topics(serde_json::json!({ "ok": v.to_json() }))),
+                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": crate::interp::island_json(&e) }))),
+                v => json_response(200, with_topics(serde_json::json!({ "ok": crate::interp::island_json(&v) }))),
             },
             Err(Ctrl::Reply(r)) => render_response(&r),
             Err(Ctrl::Error(e)) => {
@@ -814,6 +816,19 @@ fn serve_channels(req: HttpRequest) -> Answer {
             crate::wt::over_websocket(socket, ticket);
         }
     })
+}
+
+/// Arguments for parameters typed `dec` made decimals: what a page sends
+/// as a number or as text ("12.50") is taken, as a `dec` pattern takes it.
+fn dec_args(def: &crate::ast::FnDef, mut args: Vec<Value>) -> Vec<Value> {
+    for (p, a) in def.params.iter().zip(args.iter_mut()) {
+        if p.ty.as_ref().map_or(false, |t| t.names.iter().any(|n| n == "dec")) && !matches!(a, Value::Dec(_) | Value::Nil) {
+            if let Some(d) = crate::interp::as_dec(a) {
+                *a = Value::Dec(d);
+            }
+        }
+    }
+    args
 }
 
 /// Checks a browser's (or another service's) arguments against a `server

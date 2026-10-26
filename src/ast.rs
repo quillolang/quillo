@@ -6,6 +6,8 @@ pub enum Lit {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// `12.50m`
+    Dec(crate::decimal::Dec),
     Str(Arc<str>),
 }
 

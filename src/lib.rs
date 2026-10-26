@@ -8,6 +8,7 @@ pub mod client;
 pub mod cluster;
 pub mod crypto;
 pub mod db;
+pub mod decimal;
 pub mod error;
 pub mod fetch;
 pub mod highlight;
@@ -26,6 +27,7 @@ pub mod jit;
 pub mod lexer;
 pub mod metrics;
 pub mod migrate;
+pub mod money;
 #[cfg(feature = "mysql")]
 pub mod my;
 pub mod lsp;
