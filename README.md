@@ -378,7 +378,7 @@ A `component` is a view with state that also runs in the browser:
 
 ```quillo
 component Counter(start: int = 0) {
-    state count = start                  // state: set once, kept between renders
+    state count = start                  // state: set once; assigning it updates what shows it
     let double = count * 2               // recomputed on every render
     <div>
         <span>{count} (x2 = {double})</span>
@@ -392,10 +392,17 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - The server renders it like a view, inside a `<quillo-island>` that carries its props
   and state. The page loads its bundle automatically, and the browser resumes the
   component from that state, on the server's own elements (see below).
-- `state count = start` declares state: set once, on the first render, and kept
-  between renders (`~count = start` is the short form). After that it is just `count`:
-  assigning to it (`count += 1`) re-renders the component. Lists keep their DOM (and
-  focus) when items have `key={...}`. Nested components keep their own state.
+- `state count = start` declares state, set once (`~count = start` is the short form).
+  After that it is just `count`, and assigning to it (`count += 1`) updates what reads
+  it, and nothing else. A component's code runs once. A `let` that reads state or props
+  (`let double = count * 2`) is worked out again when they change. So is a statement
+  that reads them (`if running { every(...) }`). Each place in the markup that shows a
+  value follows only that value: changing one row's text changes that text. Assigning
+  the value a state already has does nothing.
+- `for` in markup keeps a row for each item: by its `key={...}`, else by its place.
+  A row whose item changed is updated where it shows what changed, and moved rows keep
+  their DOM (and focus). `if`, `? :` and `match` in markup make a branch again only
+  when another one is chosen. Nested components keep their own state.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...).
   The function may take the event `e`:
   - `e.value` and `e.checked` of the input, `e.key` of a key press, `e.type`;
@@ -408,9 +415,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `@submit` does not reload the page.
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step.
 - `every(ms, f)` in a component's code calls `f` every `ms` milliseconds, in the browser,
-  for as long as its renders keep calling `every`: `if running { every(100, step) }`
-  runs a game while `running` is true, with the latest `step` and speed, and stops when
-  it is false or the component leaves the page. On the server it does nothing.
+  for as long as the code that called it stands: `if running { every(100, step) }`
+  runs a game while `running` is true, starts again with the new speed when that changes,
+  and stops when `running` is false or the component leaves the page. On the server it
+  does nothing.
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)).
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
@@ -424,12 +432,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
   when someone reaches for a component (hovers, touches or focuses it). What they
   typed and clicked before it came is kept and done then. A component that runs by
-  itself (`every`, `live`, `js`, `@mount` while it renders) or that is the page (in
+  itself (`every`, `live`, `js`, `@mount` in its code or markup) or that is the page (in
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
   every component, for pages that load it themselves. Text responses are gzipped for
   browsers that accept it.
-- Components are resumed, not made again: the browser renders a component once, from
-  the state the server sent, and takes the server's elements as its own (checking that
+- Components are resumed, not made again: the browser runs a component's code once,
+  from the state the server sent, and takes the server's elements as its own (checking that
   they are the same) instead of replacing them, so images do not reload, a scrolled
   list stays where it is and what someone typed stays typed. Each component is resumed
   when it is first reached, the others when they are needed. An element whose tag or
@@ -475,8 +483,9 @@ component Dashboard() {
 ```
 
 - **Down:** props. **Up:** pass a function (`on_change`) and call it.
-- Each component keeps its own state, also when its parent re-renders; give
-  components in a list a `key={...}` so each keeps its own.
+- Props are passed live: a child shows its parent's new value without either running
+  again. Each component keeps its own state; give components in a list a `key={...}`
+  so each keeps its own (a new key makes it afresh).
 - Views are plain functions: they have no state and add nothing to the browser bundle
   unless a component uses them.
 - A component placed directly in a page gets its props from the server, so they must
@@ -518,7 +527,7 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 ### Single-page apps
 
 `url()` gives `{ path, query, hash }`: of the request on the server, and of the address
-bar in the browser, where components that call it re-render when it changes. Once a
+bar in the browser, where what reads it follows it when it changes. Once a
 component has called it, clicks on same-site links inside components change the page
 without reloading; Back and Forward work. `navigate("/path")` does the same from code.
 (Links with a modifier key, `target`, `download` or `data-reload` work as usual.)
@@ -549,7 +558,7 @@ its URL (`key={id}`) so a new product starts with fresh state. See
 ### Live data
 
 `live(load, ...args)` makes component state follow the server: `load` (a `server fn`)
-runs again, and the component re-renders, whenever something it read changes, for
+runs again, and what shows the state follows it, whenever something it read changes, for
 anyone, not only when this page acts.
 
 ```quillo
@@ -874,8 +883,8 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   not a success), or an error value when it could not be had.
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request and calls `f` with what the answer streams, until it ends; `listen(url,
-  f)` while a component renders follows a stream for as long as its renders keep
-  asking (and opens it again if the connection drops):
+  f)` in a component's code follows a stream for as long as the code that called it
+  stands (and opens it again if the connection drops):
 
 ```quillo
 component Chat() {
@@ -1509,7 +1518,7 @@ src/desktop.rs     quillo app: the program in a native window
 
 The browser and editors
 src/client.rs      compiles components to JavaScript
-src/client/runtime.js  the browser runtime: values, standard library, virtual DOM
+src/client/runtime.js  the browser runtime: values, standard library, signals and markup
 src/island.rs      when a page loads its components' code
 src/lsp.rs         the language server
 editors/vscode/    the VS Code extension

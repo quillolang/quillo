@@ -66,7 +66,7 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
         program.push_str(b);
         program.push('\n');
     }
-    for d in &c.defs {
+    for d in c.defs.iter().chain(c.view_defs.iter()) {
         program.push_str(d);
         program.push('\n');
     }
@@ -95,7 +95,7 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
         program.push_str(b);
         program.push('\n');
     }
-    for d in &c.defs {
+    for d in c.defs.iter().chain(c.view_defs.iter()) {
         program.push_str(d);
         program.push('\n');
     }
@@ -204,7 +204,9 @@ fn names_in(js: &str) -> Vec<String> {
         } else if !c.is_whitespace() {
             line_start = false;
         }
-        if ident(c) && (i == 0 || !ident(chars[i - 1]) && chars[i - 1] != '.') {
+        // (After `.` a property, except after `...`, a spread.)
+        let spread = i >= 3 && chars[i - 3..i] == ['.', '.', '.'];
+        if ident(c) && (i == 0 || !ident(chars[i - 1]) && (chars[i - 1] != '.' || spread)) {
             let start = i;
             while i < chars.len() && ident(chars[i]) {
                 i += 1;
@@ -253,8 +255,12 @@ fn minify_into(js: &str, out: &mut String) {
 enum Local {
     /// A variable, with its JS name; `Some(async)` when it holds a known function.
     Var(String, Option<bool>),
-    /// Component state: read as `$i.s.name`.
-    State,
+    /// Component state: a signal, read `x.v` and set with `x.set(v)`.
+    State(String),
+    /// What follows state (a memo, a row's item): read `x.v`.
+    Reactive(String),
+    /// A component's or view's parameter, read from its props: `$p.name`.
+    Prop(String),
 }
 
 struct FnCtx {
@@ -262,39 +268,19 @@ struct FnCtx {
     temps: usize,
     is_async: bool,
     needs_async: bool,
-    /// The component being compiled, for error messages and `state` rules.
+    /// The component or view being compiled, for error messages and `state` rules.
     component: Option<String>,
-    /// `for` loops given a memo so far (see `memo` in the runtime).
-    memos: usize,
-    /// `for` loops being compiled, around the code being compiled.
-    loops: usize,
+    /// A view's code (props, no state).
+    view: bool,
+    /// `state` was declared ahead of the code (a body made again whole).
+    hoisted: bool,
 }
-
-/// What a loop's body reads from around it, noted while it is compiled:
-/// its rows can be reused while all of it stays the same.
-struct Reads {
-    /// Where the body starts: its function, and the scopes open there.
-    ctx: usize,
-    scopes: usize,
-    /// JS for each value read.
-    deps: Vec<String>,
-    /// It calls something that may answer differently each time.
-    impure: bool,
-}
-
-/// Builtins that give the same answer for the same arguments and take no
-/// function (which could do anything).
-const PURE: &[&str] = &[
-    "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains", "starts_with",
-    "ends_with", "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "range",
-    "enumerate", "keys", "values", "get", "has", "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape",
-    "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "index_of", "repeat",
-    "highlight",
-];
 
 enum Resolved {
     Local(String, Option<bool>),
     State(String),
+    Reactive(String),
+    Prop(String),
     /// JS expression and whether calling it waits on the server.
     Global(String, bool),
 }
@@ -305,13 +291,30 @@ struct Compiler<'a> {
     /// Globals read from the server's environment, files or database.
     private: HashSet<String>,
     defs: Vec<String>,
-    /// Block definitions (see `block`), emitted before everything else.
+    /// Templates (see `block` in the runtime), emitted before everything else.
     blocks: Vec<String>,
-    /// Loops being compiled, innermost last (see `Reads`).
-    reads: Vec<Reads>,
-    /// Holes compiled so far for an input's live `value`, `checked` or
-    /// `selected`, which every render sets afresh.
-    live_holes: usize,
+    /// Names the component being compiled assigns somewhere: its `let`s of
+    /// them stay variables.
+    mutable: HashSet<String>,
+    /// Whether what was just compiled reads something that can change
+    /// (state, a memo, a prop, a row's item, `url()`, the component's own
+    /// functions): then it is made a memo, an effect or a hole that follows.
+    reactive: bool,
+    /// The row signal of the `for` row whose template is being compiled
+    /// (`row` until that template takes it, `cur_row` while it is
+    /// compiled), what the hole being compiled read (`read_log`: signals'
+    /// JS, "*" for what may read anything), and which of the template's
+    /// values read nothing but the row (`row_mask`): those the row updates
+    /// itself, without an effect each (see `direct` in the runtime).
+    row: Option<String>,
+    cur_row: Option<String>,
+    read_log: Option<Vec<String>>,
+    row_mask: u32,
+    /// Whether the name just resolved belongs to a component's (or view's) code.
+    last_here: bool,
+    /// Views whose `<Name/>` form (code once, props as getters) is made.
+    views: HashSet<String>,
+    view_defs: Vec<String>,
     /// Globals compiled (or being compiled): JS name and whether they are async.
     globals: HashMap<String, (String, bool)>,
     ctxs: Vec<FnCtx>,
@@ -406,62 +409,69 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
 
 /// Calls `f` on `e` and every expression inside it.
 fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    each_expr_in(e, f, true)
+}
+
+/// The same; with `fns` false, not inside the functions in it.
+fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
     f(e);
     let stmts = |ss: &[Stmt], f: &mut dyn FnMut(&Expr)| {
         for st in ss {
             match st {
                 Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) | Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x)) => {
-                    each_expr(x, f)
+                    each_expr_in(x, f, fns)
                 }
-                Stmt::Fn(d) => each_expr(&d.body, f),
-                Stmt::Route(r) => each_expr(&r.body, f),
+                Stmt::Fn(d) if fns => each_expr_in(&d.body, f, fns),
+                Stmt::Fn(_) => {}
+                Stmt::Route(r) => each_expr_in(&r.body, f, fns),
                 Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
             }
         }
     };
     match e {
         Expr::Block(ss) => stmts(ss, f),
-        Expr::Lambda(d) => each_expr(&d.body, f),
+        Expr::Lambda(d) if fns => each_expr_in(&d.body, f, fns),
+        Expr::Lambda(_) => {}
         Expr::Lit(_) | Expr::Ident(..) => {}
-        Expr::Template(parts) => parts.iter().for_each(|p| if let TPart::Expr(x) = p { each_expr(x, f) }),
-        Expr::List(xs) => xs.iter().for_each(|x| each_expr(x, f)),
-        Expr::Map(es) => es.iter().for_each(|(_, x)| each_expr(x, f)),
-        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => each_expr(x, f),
+        Expr::Template(parts) => parts.iter().for_each(|p| if let TPart::Expr(x) = p { each_expr_in(x, f, fns) }),
+        Expr::List(xs) => xs.iter().for_each(|x| each_expr_in(x, f, fns)),
+        Expr::Map(es) => es.iter().for_each(|(_, x)| each_expr_in(x, f, fns)),
+        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => each_expr_in(x, f, fns),
         Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => {
-            each_expr(a, f);
-            each_expr(b, f)
+            each_expr_in(a, f, fns);
+            each_expr_in(b, f, fns)
         }
         Expr::Call(c, args, _) => {
-            each_expr(c, f);
-            args.iter().for_each(|x| each_expr(x, f))
+            each_expr_in(c, f, fns);
+            args.iter().for_each(|x| each_expr_in(x, f, fns))
         }
         Expr::If(c, a, b) => {
-            each_expr(c, f);
-            each_expr(a, f);
+            each_expr_in(c, f, fns);
+            each_expr_in(a, f, fns);
             if let Some(b) = b {
-                each_expr(b, f)
+                each_expr_in(b, f, fns)
             }
         }
         Expr::Match(x, arms, _) => {
-            each_expr(x, f);
+            each_expr_in(x, f, fns);
             for a in arms {
                 if let Some(g) = &a.guard {
-                    each_expr(g, f)
+                    each_expr_in(g, f, fns)
                 }
-                each_expr(&a.body, f)
+                each_expr_in(&a.body, f, fns)
             }
         }
         Expr::For(_, i, b, _) => {
-            each_expr(i, f);
-            each_expr(b, f)
+            each_expr_in(i, f, fns);
+            each_expr_in(b, f, fns)
         }
         Expr::Reply(x, b, _) => {
-            each_expr(x, f);
+            each_expr_in(x, f, fns);
             if let Some(b) = b {
-                each_expr(b, f)
+                each_expr_in(b, f, fns)
             }
         }
-        Expr::Html(el, _) => each_html_expr(el, f),
+        Expr::Html(el, _) => each_html_expr(el, f, fns),
     }
 }
 
@@ -479,20 +489,31 @@ fn leaves_early(body: &Expr) -> bool {
     found
 }
 
-fn each_html_expr(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
+fn each_html_expr(el: &HtmlEl, f: &mut dyn FnMut(&Expr), fns: bool) {
     for x in el.id.iter().chain(el.classes.iter()) {
-        each_expr(x, f)
+        each_expr_in(x, f, fns)
     }
     for (_, v) in &el.attrs {
         if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
-            each_expr(x, f)
+            each_expr_in(x, f, fns)
         }
     }
     for c in &el.children {
         match c {
-            HtmlChild::El(e) => each_html_expr(e, f),
-            HtmlChild::Expr(x) => each_expr(x, f),
+            HtmlChild::El(e) => each_html_expr(e, f, fns),
+            HtmlChild::Expr(x) => each_expr_in(x, f, fns),
         }
+    }
+}
+
+/// Whether `e` is markup, or may give markup (a loop, a branch).
+fn has_markup(e: &Expr) -> bool {
+    match e {
+        Expr::Html(..) | Expr::For(..) => true,
+        Expr::If(_, a, b) => has_markup(a) || b.as_deref().map_or(false, has_markup),
+        Expr::Match(_, arms, _) => arms.iter().any(|a| has_markup(&a.body)),
+        Expr::Block(ss) => matches!(ss.last(), Some(Stmt::Expr(x)) if has_markup(x)),
+        _ => false,
     }
 }
 
@@ -541,6 +562,41 @@ fn html_assigned(el: &HtmlEl, out: &mut HashSet<String>) {
             HtmlChild::El(e) => html_assigned(e, out),
             HtmlChild::Expr(e) => expr_assigned(e, out),
         }
+    }
+}
+
+/// A pattern as JS testing `v` (a JS variable or path) directly, for the
+/// simple kinds: names, `_`, literals and lists of them. The test ("" for
+/// none) and each name's JS; None for the others, which `W.match` does.
+fn simple_pattern(p: &Pattern, v: &str, out: &mut Vec<(String, String)>) -> Option<String> {
+    match p {
+        Pattern::Wild => Some(String::new()),
+        Pattern::Bind(n) => {
+            if out.iter().any(|(m, _)| m == n) {
+                return None;
+            }
+            out.push((n.clone(), v.to_string()));
+            Some(String::new())
+        }
+        Pattern::Lit(l) => Some(format!("W.eq({}, {})", lit_js(l), v)),
+        Pattern::List(ps, rest) => {
+            let k = ps.len();
+            let mut conds = vec![format!("Array.isArray({})", v), format!("{}.length {} {}", v, if rest.is_none() { "===" } else { ">=" }, k)];
+            for (i, q) in ps.iter().enumerate() {
+                let c = simple_pattern(q, &format!("{}[{}]", v, i), out)?;
+                if !c.is_empty() {
+                    conds.push(c);
+                }
+            }
+            if let Some(Some(n)) = rest {
+                if out.iter().any(|(m, _)| m == n) {
+                    return None;
+                }
+                out.push((n.clone(), format!("{}.slice({})", v, k)));
+            }
+            Some(conds.join(" && "))
+        }
+        _ => None,
     }
 }
 
@@ -597,8 +653,15 @@ impl<'a> Compiler<'a> {
             private: collect_private(&it.program),
             defs: Vec::new(),
             blocks: Vec::new(),
-            reads: Vec::new(),
-            live_holes: 0,
+            mutable: HashSet::new(),
+            reactive: false,
+            row: None,
+            cur_row: None,
+            read_log: None,
+            row_mask: 0,
+            last_here: false,
+            views: HashSet::new(),
+            view_defs: Vec::new(),
             globals: HashMap::new(),
             ctxs: Vec::new(),
             counter: 0,
@@ -728,56 +791,45 @@ impl<'a> Compiler<'a> {
         js
     }
 
+    /// Declares `name` as `local` in the innermost scope.
+    fn declare_as(&mut self, name: &str, local: Local) {
+        self.ctx().scopes.last_mut().unwrap().insert(name.to_string(), local);
+    }
+
     fn resolve(&mut self, name: &str) -> Result<Resolved, QuilloError> {
         let mut found = None;
         'outer: for (ci, ctx) in self.ctxs.iter().enumerate().rev() {
-            for (si, scope) in ctx.scopes.iter().enumerate().rev() {
+            for scope in ctx.scopes.iter().rev() {
                 match scope.get(name) {
-                    Some(Local::Var(js, f)) => found = Some((ci, si, Resolved::Local(js.clone(), *f))),
-                    Some(Local::State) => found = Some((ci, si, Resolved::State(name.to_string()))),
+                    Some(Local::Var(js, f)) => found = Some((ci, Resolved::Local(js.clone(), *f))),
+                    Some(Local::State(js)) => found = Some((ci, Resolved::State(js.clone()))),
+                    Some(Local::Reactive(js)) => found = Some((ci, Resolved::Reactive(js.clone()))),
+                    Some(Local::Prop(n)) => found = Some((ci, Resolved::Prop(n.clone()))),
                     None => continue,
                 }
                 break 'outer;
             }
         }
-        if let Some((ci, si, r)) = found {
-            self.note_read(ci, si, &r);
+        if let Some((ci, r)) = found {
+            // What it gives can change, and so can what a function reading
+            // it gives (`find(xs, (x) => x.id == wanted)`), or a function of
+            // the component's own.
+            self.last_here = self.ctxs[ci].component.is_some();
+            if matches!(r, Resolved::State(_) | Resolved::Reactive(_) | Resolved::Prop(_)) {
+                self.reactive = true;
+            }
+            if let Some(log) = &mut self.read_log {
+                match &r {
+                    Resolved::State(js) | Resolved::Reactive(js) => log.push(js.clone()),
+                    Resolved::Prop(_) => log.push("*".into()),
+                    _ => {}
+                }
+            }
             return Ok(r);
         }
+        self.last_here = false;
         let (js, is_async) = self.global(name, self.line)?;
         Ok(Resolved::Global(js, is_async))
-    }
-
-    /// For the loops being compiled: a name found in scope `si` of function
-    /// `ci`. A variable from around a loop is something its rows depend on
-    /// (handlers in them keep it), and so is state read while rendering;
-    /// handlers read state afresh when they run.
-    fn note_read(&mut self, ci: usize, si: usize, r: &Resolved) {
-        let here = self.ctxs.len() - 1;
-        for reads in &mut self.reads {
-            if ci > reads.ctx || (ci == reads.ctx && si >= reads.scopes) {
-                continue;
-            }
-            let dep = match r {
-                Resolved::Local(js, _) => js.clone(),
-                Resolved::State(n) if here == reads.ctx => format!("$i.s[{}]", js_str(n)),
-                _ => continue,
-            };
-            if !reads.deps.contains(&dep) {
-                reads.deps.push(dep);
-            }
-        }
-    }
-
-    /// For the loops being compiled: a call while rendering, of something
-    /// `pure` or not.
-    fn note_call(&mut self, pure: bool) {
-        let here = self.ctxs.len() - 1;
-        for reads in &mut self.reads {
-            if here == reads.ctx && !pure {
-                reads.impure = true;
-            }
-        }
     }
 
     /// A top-level name used by browser code: compiled once, on first use.
@@ -785,12 +837,14 @@ impl<'a> Compiler<'a> {
         if let Some(g) = self.globals.get(name) {
             return Ok(g.clone());
         }
-        // A global compiled while a loop's body is (the first use of a
-        // function, there) reads nothing from around that loop: its own
-        // names are its own.
-        let saved_reads = std::mem::take(&mut self.reads);
+        // What a global reads is its own, not the code that first used it.
+        let saved = std::mem::replace(&mut self.reactive, false);
+        let log = self.read_log.take();
+        let rows = (self.row.take(), self.cur_row.take(), std::mem::replace(&mut self.row_mask, 0));
         let r = self.global_inner(name, line);
-        self.reads = saved_reads;
+        self.reactive = saved;
+        self.read_log = log;
+        (self.row, self.cur_row, self.row_mask) = rows;
         r
     }
 
@@ -843,6 +897,7 @@ impl<'a> Compiler<'a> {
                 // them awaited, and so is what it compiled meanwhile, which
                 // may call it back.
                 let (defs_before, known): (usize, HashSet<String>) = (self.defs.len(), self.globals.keys().cloned().collect());
+                let (views_before, view_defs_before) = (self.views.clone(), self.view_defs.len());
                 let mut assume_async = false;
                 let (code, is_async) = loop {
                     self.globals.insert(name.to_string(), (js.clone(), assume_async));
@@ -861,6 +916,8 @@ impl<'a> Compiler<'a> {
                     if is_async && !assume_async {
                         self.defs.truncate(defs_before);
                         self.globals.retain(|k, _| known.contains(k));
+                        self.views = views_before.clone();
+                        self.view_defs.truncate(view_defs_before);
                         assume_async = true;
                         continue;
                     }
@@ -954,7 +1011,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, memos: 0, loops: 0 });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -1092,27 +1149,172 @@ impl<'a> Compiler<'a> {
         Ok((code, ctx.needs_async))
     }
 
-    /// A component's render function: `function ($i, ...props)`.
+    /// A component: its parameters' names and its code.
     fn component(&mut self, def: &FnDef) -> Result<(String, bool), QuilloError> {
+        let code = self.setup(def, false)?;
+        Ok((format!("[{}], {}", def.params.iter().map(|p| js_str(&p.name)).collect::<Vec<_>>().join(", "), code), false))
+    }
+
+    /// A component's code, or (with `view`) a view's for `<Name .../>`: it
+    /// runs once, with its props as getters: `function ($i, $p)`, a view's
+    /// `function ($p)`.
+    fn setup(&mut self, def: &FnDef, view: bool) -> Result<String, QuilloError> {
         self.new_ctx(Some(def.name.clone()), false);
-        let mut pre = String::new();
-        let res = (|| -> Result<(Vec<String>, String), QuilloError> {
-            let names = self.params(def, &mut pre, false)?;
-            let body = self.body(&def.body)?;
-            Ok((names, body))
-        })();
+        self.ctx().view = view;
+        let saved = (std::mem::take(&mut self.mutable), std::mem::replace(&mut self.reactive, false));
+        let res = self.setup_inner(def);
         let ctx = self.ctxs.pop().unwrap();
-        let (names, body) = res?;
-        let code = format!(
-            "[{}], function ($i{}{}) {{\n{}{}{}}}",
-            def.params.iter().map(|p| js_str(&p.name)).collect::<Vec<_>>().join(", "),
-            if names.is_empty() { "" } else { ", " },
-            names.join(", "),
-            pre,
-            Self::temps_decl(ctx.temps),
-            body
+        self.mutable = saved.0;
+        self.reactive = saved.1;
+        let body = res?;
+        Ok(format!("function ({}) {{\n{}{}}}", if view { "$p" } else { "$i, $p" }, Self::temps_decl(ctx.temps), body))
+    }
+
+    fn setup_inner(&mut self, def: &FnDef) -> Result<String, QuilloError> {
+        let fname = js_str(&def.name);
+        let mut out = String::new();
+        let mut defaults = Vec::new();
+        for p in &def.params {
+            if let Some(d) = &p.default {
+                let (v, _) = self.reactive_expr(d)?;
+                defaults.push(format!("{}: () => ({})", js_str(&p.name), v));
+            }
+            self.declare_as(&p.name, Local::Prop(p.name.clone()));
+        }
+        if !defaults.is_empty() {
+            let _ = writeln!(out, "$p = W.props($p, {{{}}});", defaults.join(", "));
+        }
+        for p in &def.params {
+            if p.default.is_none() {
+                let _ = writeln!(out, "if ($p.{} === undefined) W.missing({}, {});", p.name, js_str(&p.name), fname);
+            }
+            if let Some(ty) = &p.ty {
+                self.need_types_in(ty)?;
+                let _ = writeln!(out, "W.argty($p.{}, {}, {}, {});", p.name, ty_js(&Some(ty.clone())), js_str(&p.name), fname);
+            }
+        }
+        // A body that can return early, or changes its own variables as it
+        // runs, is made again whole when what it read changes (its state
+        // stays).
+        let mut exits = false;
+        let mut changed = HashSet::new();
+        each_expr_in(
+            &def.body,
+            &mut |e| match e {
+                Expr::Try(_) => exits = true,
+                Expr::Block(ss) => {
+                    for st in ss {
+                        match st {
+                            Stmt::Return(_) => exits = true,
+                            Stmt::Assign(n, ..) => {
+                                changed.insert(n.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            false,
         );
-        Ok((code, false))
+        let states: HashSet<&String> = match &def.body {
+            Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n) } else { None }).collect(),
+            _ => HashSet::new(),
+        };
+        expr_assigned(&def.body, &mut self.mutable);
+        if exits || changed.iter().any(|n| !states.contains(n)) {
+            self.ctx().hoisted = true;
+            let mut copy = String::new();
+            for p in &def.params {
+                let js = self.declare(&p.name, None);
+                let _ = writeln!(copy, "let {} = $p.{};", js, p.name);
+            }
+            let body = self.body(&def.body)?;
+            let _ = writeln!(
+                out,
+                "return W.frag([() => {{\n{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n}}]);",
+                copy, body
+            );
+            return Ok(out);
+        }
+        match &def.body {
+            Expr::Block(ss) => {
+                self.push_scope();
+                let r = self.setup_stmts(ss);
+                self.pop_scope();
+                out.push_str(&r?);
+            }
+            e => {
+                let v = self.markup(e)?;
+                let _ = writeln!(out, "return {};", v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Statements of code that runs once: a `let` that reads what changes
+    /// is a memo, a statement that does an effect, and the last value is
+    /// markup.
+    fn setup_stmts(&mut self, stmts: &[Stmt]) -> Result<String, QuilloError> {
+        let mut body = String::new();
+        let mut decls: Vec<String> = Vec::new();
+        let n = stmts.len();
+        for (i, st) in stmts.iter().enumerate() {
+            let last = i + 1 == n;
+            match st {
+                Stmt::Expr(e) if last => {
+                    let v = self.markup(e)?;
+                    let _ = writeln!(body, "return {};", v);
+                }
+                Stmt::Expr(e) => {
+                    let (v, r) = self.reactive_expr(e)?;
+                    if r {
+                        let _ = writeln!(body, "W.effect(() => {{ {}; }});", v);
+                    } else {
+                        let _ = writeln!(body, "{};", v);
+                    }
+                }
+                Stmt::Let(p, e, line) if !matches!(e, Expr::Lambda(_)) && !matches!(p, Pattern::Bind(n) if self.mutable.contains(n)) => {
+                    self.line = *line;
+                    let (v, r) = self.reactive_expr(e)?;
+                    if !r {
+                        self.stmt(st, last, &mut body, &mut decls)?;
+                        continue;
+                    }
+                    if let Pattern::Bind(name) = p {
+                        let m = self.fresh(name);
+                        let _ = writeln!(body, "const {} = W.memo(() => ({}));", m, v);
+                        self.declare_as(name, Local::Reactive(m));
+                    } else {
+                        let pat = self.pattern(p)?;
+                        let b = self.fresh("b");
+                        let _ = writeln!(
+                            body,
+                            "const {} = W.memo(() => {{ const $v = {}, $b = W.match({}, $v); if ($b === null) W.fail(\"`let` pattern does not match \" + W.short($v)); return $b; }});",
+                            b, v, pat
+                        );
+                        let mut names = Vec::new();
+                        pattern_names(p, &mut names);
+                        for n in names {
+                            let m = self.fresh(&n);
+                            let _ = writeln!(body, "const {} = W.memo(() => {}.v[{}]);", m, b, js_str(&n));
+                            self.declare_as(&n, Local::Reactive(m));
+                        }
+                    }
+                    if last {
+                        body.push_str("return null;\n");
+                    }
+                }
+                _ => self.stmt(st, last, &mut body, &mut decls)?,
+            }
+        }
+        if stmts.is_empty() {
+            body.push_str("return null;\n");
+        }
+        decls.sort();
+        decls.dedup();
+        let head = if decls.is_empty() { String::new() } else { format!("let {};\n", decls.join(", ")) };
+        Ok(head + &body)
     }
 
     /// A function body as statements ending in `return`.
@@ -1136,7 +1338,21 @@ impl<'a> Compiler<'a> {
         let mut decls: Vec<String> = Vec::new();
         let n = stmts.len();
         for (i, s) in stmts.iter().enumerate() {
-            let last = i + 1 == n;
+            self.stmt(s, i + 1 == n, &mut body, &mut decls)?;
+        }
+        if stmts.is_empty() {
+            body.push_str("return null;\n");
+        }
+        decls.sort();
+        decls.dedup();
+        let head = if decls.is_empty() { String::new() } else { format!("let {};\n", decls.join(", ")) };
+        Ok(head + &body)
+    }
+
+    /// One statement into `body` (the last returns its value); variables it
+    /// declares into `decls`.
+    fn stmt(&mut self, s: &Stmt, last: bool, body: &mut String, decls: &mut Vec<String>) -> Result<(), QuilloError> {
+        {
             match s {
                 Stmt::Expr(e) => {
                     let v = self.expr(e)?;
@@ -1155,16 +1371,29 @@ impl<'a> Compiler<'a> {
                         decls.push(js.clone());
                         let _ = writeln!(body, "{} = {};", js, v);
                     } else {
-                        let pat = self.pattern(p)?;
                         let t = self.temp();
-                        let _ = writeln!(body, "{} = W.match({}, {});", t, pat, v);
-                        let _ = writeln!(body, "if ({} === null) W.fail(\"`let` pattern does not match \" + W.short({}));", t, v);
                         let mut names = Vec::new();
-                        pattern_names(p, &mut names);
-                        for n in names {
-                            let js = self.declare(&n, None);
-                            decls.push(js.clone());
-                            let _ = writeln!(body, "{} = {}[{}];", js, t, js_str(&n));
+                        if let Some(cond) = simple_pattern(p, &t, &mut names) {
+                            let _ = writeln!(body, "{} = {};", t, v);
+                            if !cond.is_empty() {
+                                let _ = writeln!(body, "if (!({})) W.fail(\"`let` pattern does not match \" + W.short({}));", cond, t);
+                            }
+                            for (n, at) in names {
+                                let js = self.declare(&n, None);
+                                decls.push(js.clone());
+                                let _ = writeln!(body, "{} = {};", js, at);
+                            }
+                        } else {
+                            let pat = self.pattern(p)?;
+                            let _ = writeln!(body, "{} = W.match({}, {});", t, pat, v);
+                            let _ = writeln!(body, "if ({} === null) W.fail(\"`let` pattern does not match \" + W.short({}));", t, v);
+                            let mut all = Vec::new();
+                            pattern_names(p, &mut all);
+                            for n in all {
+                                let js = self.declare(&n, None);
+                                decls.push(js.clone());
+                                let _ = writeln!(body, "{} = {}[{}];", js, t, js_str(&n));
+                            }
                         }
                     }
                     if last {
@@ -1177,7 +1406,13 @@ impl<'a> Compiler<'a> {
                     let target = self.resolve(name)?;
                     let cur = match &target {
                         Resolved::Local(js, _) => js.clone(),
-                        Resolved::State(n) => format!("$i.s[{}]", js_str(n)),
+                        Resolved::State(js) => format!("{}.v", js),
+                        Resolved::Reactive(_) | Resolved::Prop(_) => {
+                            return self.err(format!(
+                                "cannot assign to `{}`: it follows other values (a prop, a loop's item, a `let` of state); keep it in state: state {} = ...",
+                                name, name
+                            ))
+                        }
                         Resolved::Global(..) => {
                             return self.err(format!(
                                 "cannot assign to `{}` in the browser: it is a server variable (use `state {}` in the component, or a `server fn`)",
@@ -1191,8 +1426,8 @@ impl<'a> Compiler<'a> {
                         AssignOp::Sub => format!("W.sub({}, {})", cur, rhs),
                     };
                     match target {
-                        Resolved::State(n) => {
-                            let _ = writeln!(body, "$i.set({}, {});", js_str(&n), v);
+                        Resolved::State(js) => {
+                            let _ = writeln!(body, "{}.set({});", js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
@@ -1218,22 +1453,24 @@ impl<'a> Compiler<'a> {
                 }
                 Stmt::State(name, e, line) => {
                     self.line = *line;
-                    if self.ctxs.len() != 1 || self.ctx().scopes.len() != 2 || self.ctx().component.is_none() {
+                    if self.ctxs.len() != 1 || self.ctx().scopes.len() != 2 || self.ctx().component.is_none() || self.ctx().view {
                         return self.err("`state` can only be declared directly in a component's body");
                     }
+                    let sig = self.fresh(name);
                     // `state x = live(load, ...args)`: a subscription.
                     if let Some((fname, args)) = self.live_call(e)? {
                         let mut argv = Vec::new();
                         for a in args {
-                            argv.push(self.expr(a)?);
+                            argv.push(self.reactive_expr(a)?.0);
                         }
-                        let _ = writeln!(body, "W.live($i, {}, {}, [{}]);", js_str(name), js_str(&fname), argv.join(", "));
-                        self.ctx().scopes.last_mut().unwrap().insert(name.clone(), Local::State);
+                        let _ = writeln!(body, "const {} = W.live($i, {}, {}, () => [{}]);", sig, js_str(name), js_str(&fname), argv.join(", "));
+                        self.declare_as(name, Local::State(sig));
                         if last {
                             body.push_str("return null;\n");
                         }
-                        continue;
+                        return Ok(());
                     }
+                    let saved_reactive = self.reactive;
                     // The initializer may wait on the server; it runs once.
                     self.new_ctx(None, false);
                     // Let the initializer see the component's names.
@@ -1244,22 +1481,24 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, memos: 0, loops: 0 });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
                         init = again?;
                     }
                     self.ctxs[0].scopes = outer;
+                    self.reactive = saved_reactive;
                     let _ = writeln!(
                         body,
-                        "$i.state({}, {}() => {{ {}return {}; }});",
+                        "const {} = $i.sig({}, {}() => {{ {}return {}; }});",
+                        sig,
                         js_str(name),
                         if init_ctx.is_async { "async " } else { "" },
                         Self::temps_decl(init_ctx.temps),
                         init
                     );
-                    self.ctx().scopes.last_mut().unwrap().insert(name.clone(), Local::State);
+                    self.declare_as(name, Local::State(sig));
                     if last {
                         body.push_str("return null;\n");
                     }
@@ -1293,13 +1532,7 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        if stmts.is_empty() {
-            body.push_str("return null;\n");
-        }
-        decls.sort();
-        decls.dedup();
-        let head = if decls.is_empty() { String::new() } else { format!("let {};\n", decls.join(", ")) };
-        Ok(head + &body)
+        Ok(())
     }
 
     /// `live(server_fn, ...args)`, if `e` is such a call: the function's
@@ -1370,7 +1603,8 @@ impl<'a> Compiler<'a> {
                 self.line = *line;
                 match self.resolve(n)? {
                     Resolved::Local(js, _) => js,
-                    Resolved::State(n) => format!("$i.s[{}]", js_str(&n)),
+                    Resolved::State(js) | Resolved::Reactive(js) => format!("{}.v", js),
+                    Resolved::Prop(n) => format!("$p.{}", n),
                     // Passed around, it could be called with any name.
                     Resolved::Global(js, _) if js == "B.js" || js == "B.js_new" => {
                         return self.err(format!("`{}` can only be called, with the name of what it calls written out", n));
@@ -1399,6 +1633,23 @@ impl<'a> Compiler<'a> {
                     UnOp::Not => format!("!W.truthy({})", v),
                     UnOp::Neg => format!("W.neg({})", v),
                 }
+            }
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b, line) if self.state_of(a).is_some() || self.state_of(b).is_some() => {
+                self.line = *line;
+                // `x == state`: what reads it hears only when the state
+                // becomes x or stops being it (see `is` in the runtime).
+                let (s, other) = match self.state_of(a) {
+                    Some(s) => {
+                        let _ = self.resolve(match &**a { Expr::Ident(n, _) => n, _ => unreachable!() })?;
+                        (s, self.expr(b)?)
+                    }
+                    None => {
+                        let x = self.expr(a)?;
+                        let _ = self.resolve(match &**b { Expr::Ident(n, _) => n, _ => unreachable!() })?;
+                        (self.state_of(b).unwrap(), x)
+                    }
+                };
+                format!("{}W.is({}, {})", if matches!(op, BinOp::Ne) { "!" } else { "" }, s, other)
             }
             Expr::Binary(op, a, b, line) => {
                 self.line = *line;
@@ -1520,129 +1771,14 @@ impl<'a> Compiler<'a> {
             }
             Expr::For(pat, iter, body, line) => {
                 self.line = *line;
-                let it = self.expr(iter)?;
-                let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
-                // In a component, rows with keys are remembered by item (see
-                // `memo` in the runtime); keyed, a reused row is matched with
-                // itself. Only a loop that runs once per render: one inside
-                // another runs for each of its items, and rows of one run
-                // must not turn up in another.
-                let memo = self.ctx().component.is_some()
-                    && self.ctx().loops == 0
-                    && matches!(&**body, Expr::Html(el, _) if el.attrs.iter().any(|(n, _)| n == "key"));
-                if memo {
-                    let (ctx, scopes) = (self.ctxs.len() - 1, self.ctx().scopes.len());
-                    self.reads.push(Reads { ctx, scopes, deps: Vec::new(), impure: false });
-                }
                 self.push_scope();
-                self.ctx().loops += 1;
-                let mut names = Vec::new();
-                pattern_names(pat, &mut names);
-                let mut binds = String::new();
-                for n in &names {
-                    let js = self.declare(n, None);
-                    match &p {
-                        None => {
-                            let _ = write!(binds, "const {} = $x; ", js);
-                        }
-                        Some(_) => {
-                            let _ = write!(binds, "const {} = $b[{}]; ", js, js_str(n));
-                        }
-                    }
-                }
-                // A row that is one block: kept rows have only the holes that
-                // read what changed recomputed (see `hole` in the runtime).
-                let live_before = self.live_holes;
-                let row = match &**body {
-                    Expr::Html(el, _) if memo && blockable(el) => Some(self.block_parts(el)),
-                    _ => None,
-                };
-                let b = match &row {
-                    Some(_) => Ok(String::new()),
-                    None => self.expr(body),
-                };
-                self.ctx().loops -= 1;
+                let r = self.loop_head(pat, iter).and_then(|(head, pre, pat, elem)| {
+                    let binds = self.bind_pattern(pat, &elem, "`for` pattern does not match ")?;
+                    Ok((head, pre + &binds, self.expr(body)?))
+                });
                 self.pop_scope();
-                let mut reads = if memo { self.reads.pop() } else { None };
-                // Rows with inputs are made each time, so the inputs show the
-                // state even after the user typed something else.
-                if let Some(r) = &mut reads {
-                    if self.live_holes > live_before {
-                        r.impure = true;
-                    }
-                }
-                let b = b?;
-                let row = row.transpose()?;
-                let check = match &p {
-                    Some(p) => format!(
-                        "const $b = W.match({}, $x); if ($b === null) W.fail(\"`for` pattern does not match \" + W.short($x)); ",
-                        p
-                    ),
-                    None => String::new(),
-                };
-                let made = |row: &(String, BlockParts, String, Vec<String>)| format!("W.b({}, [{}], {})", row.0, row.1.vals.join(", "), row.2);
-                let inner = match (reads, &row) {
-                    (Some(r), _) if !r.impure => {
-                        let slot = self.ctx().memos;
-                        self.ctx().memos += 1;
-                        // Each hole's deps as bits of `$c`, what changed (see `memo`).
-                        let refresh = match &row {
-                            Some(row) if r.deps.len() <= 31 && row.3.is_empty() => {
-                                let mut out = String::new();
-                                for (k, deps) in row.1.deps.iter().enumerate() {
-                                    let mask = deps.iter().filter_map(|d| r.deps.iter().position(|x| x == d)).fold(0u32, |m, i| m | 1 << i);
-                                    if mask == 0 {
-                                        continue;
-                                    }
-                                    // Handlers are new closures; other values are passed on only
-                                    // when they changed.
-                                    if row.1.holes[k].0 == 2 {
-                                        let _ = write!(out, "if ($c & {}) W.hole($v, {}, {}); ", mask as i32, k, row.1.vals[k]);
-                                    } else {
-                                        let _ = write!(
-                                            out,
-                                            "if ($c & {}) {{ const $h = {}; if ($h !== $v.vals[{}]) W.hole($v, {}, $h); }} ",
-                                            mask as i32,
-                                            row.1.vals[k],
-                                            k,
-                                            k
-                                        );
-                                    }
-                                }
-                                Some(out)
-                            }
-                            _ => None,
-                        };
-                        let row_js = match &row {
-                            Some(row) => made(row),
-                            None => b.clone(),
-                        };
-                        let refresh = match &refresh {
-                            Some(refresh) => format!("($v, $x, $c) => {{ {}{}{}}}", check, binds, refresh),
-                            None => "null".to_string(),
-                        };
-                        format!(
-                            "return W.rows(W.memo($i, {}, [{}]), W.iter({}), ($x) => {{ {}{}return {}; }}, {});\n",
-                            slot,
-                            r.deps.join(", "),
-                            it,
-                            check,
-                            binds,
-                            row_js,
-                            refresh
-                        )
-                    }
-                    (_, row) => format!(
-                        "const $out = [];\nfor (const $x of W.iter({})) {{ {}{}$out.push({}); }}\nreturn $out;\n",
-                        it,
-                        check,
-                        binds,
-                        match row {
-                            Some(row) => made(row),
-                            None => b.clone(),
-                        }
-                    ),
-                };
+                let (head, binds, b) = r?;
+                let inner = format!("const $out = [];\n{} {{ {}$out.push({}); }}\nreturn $out;\n", head, binds, b);
                 self.iife(&inner)
             }
             Expr::Block(stmts) => self.block_expr(stmts)?,
@@ -1659,6 +1795,88 @@ impl<'a> Compiler<'a> {
             }
             Expr::Html(el, _) => self.html(el)?,
         })
+    }
+
+    /// The signal of the state `e` names, if it is a component's state.
+    fn state_of(&self, e: &Expr) -> Option<String> {
+        let Expr::Ident(n, _) = e else { return None };
+        for ctx in self.ctxs.iter().rev() {
+            for scope in ctx.scopes.iter().rev() {
+                if let Some(l) = scope.get(n) {
+                    return if let Local::State(js) = l { Some(js.clone()) } else { None };
+                }
+            }
+        }
+        None
+    }
+
+    /// The head of a loop over `iter` (in the loop's scope), what its body
+    /// starts with, the pattern each item is matched with, and the item's
+    /// JS. `enumerate(xs)` and `range(a, b)` (or `a..b`) are looped over by
+    /// number, without making the list.
+    fn loop_head<'p>(&mut self, pat: &'p Pattern, iter: &Expr) -> Result<(String, String, &'p Pattern, String), QuilloError> {
+        let builtin = |c: &mut Self, callee: &Expr, name: &str| -> Result<bool, QuilloError> {
+            Ok(matches!(callee, Expr::Ident(n, _) if n == name) && matches!(c.resolve(name)?, Resolved::Global(js, _) if js == format!("B.{}", name)))
+        };
+        let plain = |c: &mut Self| -> Result<(String, String, &'p Pattern, String), QuilloError> {
+            let l = c.expr(iter)?;
+            Ok((format!("for (const $x of W.iter({}))", l), String::new(), pat, "$x".into()))
+        };
+        match iter {
+            Expr::Call(callee, args, _) if args.len() == 1 && builtin(self, callee, "enumerate")? => {
+                let Pattern::List(ps, None) = pat else { return plain(self) };
+                let [i, x] = ps.as_slice() else { return plain(self) };
+                let mut names = Vec::new();
+                if simple_pattern(i, "$k", &mut names).map_or(true, |c| !c.is_empty()) {
+                    return plain(self);
+                }
+                let l = self.expr(&args[0])?;
+                let mut pre = String::new();
+                for (n, at) in names {
+                    let js = self.declare(&n, None);
+                    let _ = write!(pre, "const {} = {}; ", js, at);
+                }
+                let _ = write!(pre, "const $x = $l[$k]; ");
+                Ok((format!("const $l = W.enumlist({});\nfor (let $k = 0; $k < $l.length; $k++)", l), pre, x, "$x".into()))
+            }
+            Expr::Call(callee, args, _) if (args.len() == 1 || args.len() == 2) && builtin(self, callee, "range")? => {
+                let a = self.expr(&args[0])?;
+                let b = if args.len() == 2 { self.expr(&args[1])? } else { "undefined".into() };
+                Ok((format!("const $r = W.span({}, {}, false);\nfor (let $x = $r[0]; $x < $r[1]; $x++)", a, b), String::new(), pat, "$x".into()))
+            }
+            Expr::Binary(BinOp::Range, a, b, _) => {
+                let a = self.expr(a)?;
+                let b = self.expr(b)?;
+                Ok((format!("const $r = W.span({}, {}, true);\nfor (let $x = $r[0]; $x < $r[1]; $x++)", a, b), String::new(), pat, "$x".into()))
+            }
+            _ => plain(self),
+        }
+    }
+
+    /// Binds `p`'s names to what `v` (a JS variable) holds, failing with
+    /// `what` when it does not match.
+    fn bind_pattern(&mut self, p: &Pattern, v: &str, what: &str) -> Result<String, QuilloError> {
+        let mut names = Vec::new();
+        let mut out = String::new();
+        if let Some(cond) = simple_pattern(p, v, &mut names) {
+            if !cond.is_empty() {
+                let _ = write!(out, "if (!({})) W.fail({} + W.short({})); ", cond, js_str(what), v);
+            }
+            for (n, at) in names {
+                let js = self.declare(&n, None);
+                let _ = write!(out, "const {} = {}; ", js, at);
+            }
+            return Ok(out);
+        }
+        let pj = self.pattern(p)?;
+        let _ = write!(out, "const $b = W.match({}, {}); if ($b === null) W.fail({} + W.short({})); ", pj, v, js_str(what), v);
+        let mut all = Vec::new();
+        pattern_names(p, &mut all);
+        for n in all {
+            let js = self.declare(&n, None);
+            let _ = write!(out, "const {} = $b[{}]; ", js, js_str(&n));
+        }
+        Ok(out)
     }
 
     /// A branch of `if`: blocks become IIFEs, other expressions stay inline.
@@ -1689,7 +1907,8 @@ impl<'a> Compiler<'a> {
             for scope in ctx.scopes.iter().rev() {
                 match scope.get(name) {
                     Some(Local::Var(js, _)) => return js.clone(),
-                    Some(Local::State) => return format!("$i.s[{}]", js_str(name)),
+                    Some(Local::State(js) | Local::Reactive(js)) => return format!("{}.v", js),
+                    Some(Local::Prop(n)) => return format!("$p.{}", n),
                     None => {}
                 }
             }
@@ -1713,7 +1932,8 @@ impl<'a> Compiler<'a> {
             self.line = *line;
             return Ok(match self.resolve(n)? {
                 Resolved::Local(js, f) => (js, f.unwrap_or(false)),
-                Resolved::State(n) => (format!("$i.s[{}]", js_str(&n)), false),
+                Resolved::State(js) | Resolved::Reactive(js) => (format!("{}.v", js), false),
+                Resolved::Prop(n) => (format!("$p.{}", n), false),
                 Resolved::Global(js, a) => (js, a),
             });
         }
@@ -1732,18 +1952,23 @@ impl<'a> Compiler<'a> {
                 argv.push(self.expr(a)?);
             }
             let is_async = self.is_async_name(name);
-            self.note_call(PURE.contains(&name.as_str()));
             let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
             return self.finish_call(name, is_async, call);
         }
         let (f, is_async) = self.callee_value(callee)?;
+        // The component's own functions, the program's and url() may read
+        // what changes: what calls them follows it.
+        if matches!(callee, Expr::Ident(..)) && (self.last_here || f.starts_with("G[") || f == "B.url") {
+            self.reactive = true;
+            if let Some(log) = &mut self.read_log {
+                log.push("*".into());
+            }
+        }
         if f == "B.js" || f == "B.js_new" {
             // `name | js(...)` would take the name from the pipeline.
             let name = if argv.is_empty() { args.first() } else { None };
             self.js_name(&f[2..], name)?;
         }
-        let pure = matches!(callee, Expr::Ident(n, _) if PURE.contains(&n.as_str()) && f == format!("B.{}", n));
-        self.note_call(pure);
         for a in args {
             argv.push(self.expr(a)?);
         }
@@ -1796,7 +2021,7 @@ impl<'a> Compiler<'a> {
             for scope in ctx.scopes.iter().rev() {
                 match scope.get(name) {
                     Some(Local::Var(_, f)) => return f.unwrap_or(false),
-                    Some(Local::State) => return false,
+                    Some(_) => return false,
                     None => {}
                 }
             }
@@ -1877,218 +2102,330 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// What `e` gives, and whether it reads what changes (see `reactive`).
+    fn reactive_expr(&mut self, e: &Expr) -> Result<(String, bool), QuilloError> {
+        let saved = std::mem::replace(&mut self.reactive, false);
+        let v = self.expr(e);
+        let r = std::mem::replace(&mut self.reactive, saved);
+        Ok((v?, r))
+    }
+
+    /// A value for markup: as it is when fixed, else a function giving it,
+    /// which the part of the page showing it follows.
+    fn dyn_value(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        let (v, r) = self.reactive_expr(e)?;
+        Ok(if r { format!("() => ({})", v) } else { v })
+    }
+
+    /// What is shown where `e` is in markup. `for` is a list of rows that
+    /// each follow their item; `if` and `match` choose a branch, made again
+    /// only when another is chosen; anything else is a value (`dyn_value`).
+    fn markup(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        let saved = self.reactive;
+        let r = self.markup_inner(e);
+        self.reactive = saved;
+        r
+    }
+
+    fn markup_inner(&mut self, e: &Expr) -> Result<String, QuilloError> {
+        match e {
+            Expr::Html(el, _) => self.html(el),
+            Expr::For(pat, iter, body, line) => {
+                self.line = *line;
+                self.each(pat, iter, body)
+            }
+            Expr::If(c, a, b) if has_markup(e) => {
+                let (cv, r) = self.reactive_expr(c)?;
+                let av = self.markup(a)?;
+                let bv = match b {
+                    Some(b) => self.markup(b)?,
+                    None => "null".into(),
+                };
+                Ok(if r {
+                    format!("W.choose(() => (W.truthy({}) ? 0 : 1), [() => {}, () => {}])", cv, av, bv)
+                } else {
+                    format!("W.frag([W.truthy({}) ? {} : {}])", cv, av, bv)
+                })
+            }
+            Expr::Match(subj, arms, line) if has_markup(e) => self.choose_match(subj, arms, *line),
+            Expr::Block(ss) if has_markup(e) => {
+                if let [Stmt::Expr(x)] = ss.as_slice() {
+                    return self.markup(x);
+                }
+                self.push_scope();
+                let r = self.setup_stmts(ss);
+                self.pop_scope();
+                Ok(format!("(() => {{\n{}}})()", r?))
+            }
+            _ => self.dyn_value(e),
+        }
+    }
+
+    /// `for` in markup: `W.each(list, key, row)`. A row is made once for
+    /// its key (the `key` of its element, else its place) and gets its item
+    /// as a signal, so a row whose item changed changes only where it shows
+    /// what changed.
+    fn each(&mut self, pat: &Pattern, iter: &Expr, body: &Expr) -> Result<String, QuilloError> {
+        let (list, _) = self.reactive_expr(iter)?;
+        let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
+        let mut names = Vec::new();
+        pattern_names(pat, &mut names);
+        let (root, key) = match body {
+            Expr::Html(el, _) => (
+                Some(el),
+                el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
+                    ("key", AttrVal::Expr(k)) => Some(k),
+                    _ => None,
+                }),
+            ),
+            _ => (None, None),
+        };
+        let key_js = match key {
+            Some(k) => {
+                self.push_scope();
+                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?.0)));
+                self.pop_scope();
+                let (binds, k) = k?;
+                format!("($x) => {{ {}return {}; }}", binds, k)
+            }
+            None => "null".into(),
+        };
+        let x = self.fresh("row");
+        self.push_scope();
+        let mut binds = String::new();
+        match &p {
+            None => self.declare_as(&names[0], Local::Reactive(x.clone())),
+            Some(pj) => {
+                let b = self.fresh("b");
+                let _ = write!(
+                    binds,
+                    "const {} = W.memo(() => {{ const $v = {}.v, $b = W.match({}, $v); if ($b === null) W.fail(\"`for` pattern does not match \" + W.short($v)); return $b; }}); ",
+                    b, x, pj
+                );
+                for n in &names {
+                    let m = self.fresh(n);
+                    let _ = write!(binds, "const {} = W.memo(() => {}.v[{}]); ", m, b, js_str(n));
+                    self.declare_as(n, Local::Reactive(m));
+                }
+            }
+        }
+        // The row's own template: what in it reads only the row, the row
+        // updates itself.
+        if root.is_some() {
+            self.row = Some(x.clone());
+        }
+        let row = match root {
+            Some(el) if key.is_some() => self.html_unkeyed(el),
+            _ => self.markup(body),
+        };
+        self.row = None;
+        self.pop_scope();
+        Ok(format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }})", list, key_js, x, binds, row?))
+    }
+
+    /// `match` in markup: the arm is chosen by the subject (a memo), and
+    /// an arm's names follow the subject while it stays chosen.
+    fn choose_match(&mut self, subj: &Expr, arms: &[Arm], line: u32) -> Result<String, QuilloError> {
+        self.line = line;
+        let (s, _) = self.reactive_expr(subj)?;
+        let v = self.fresh("v");
+        let mut which = format!("const $v = {}.v;\nlet $b;\n", v);
+        let mut branches = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
+            let pat = self.pattern(&arm.pat)?;
+            let mut names = Vec::new();
+            pattern_names(&arm.pat, &mut names);
+            self.push_scope();
+            let mut binds = String::new();
+            for n in &names {
+                let js = self.declare(n, None);
+                let _ = write!(binds, "const {} = $b[{}]; ", js, js_str(n));
+            }
+            let guard = arm.guard.as_ref().map(|g| self.reactive_expr(g));
+            self.pop_scope();
+            match guard {
+                Some(g) => {
+                    let _ = writeln!(which, "if (($b = W.match({}, $v)) !== null) {{ {}if (W.truthy({})) return {}; }}", pat, binds, g?.0, i);
+                }
+                None => {
+                    let _ = writeln!(which, "if (W.match({}, $v) !== null) return {};", pat, i);
+                }
+            }
+            self.push_scope();
+            let mut pre = String::new();
+            if !names.is_empty() {
+                let b = self.fresh("b");
+                let _ = write!(pre, "const {} = W.memo(() => W.match({}, {}.v) || {{}}); ", b, pat, v);
+                for n in &names {
+                    let m = self.fresh(n);
+                    let _ = write!(pre, "const {} = W.memo(() => {}.v[{}]); ", m, b, js_str(n));
+                    self.declare_as(n, Local::Reactive(m));
+                }
+            }
+            let body = self.markup(&arm.body);
+            self.pop_scope();
+            branches.push(format!("() => {{ {}return {}; }}", pre, body?));
+        }
+        which.push_str("W.fail(\"no `match` arm matches \" + W.short($v));\n");
+        Ok(format!(
+            "(() => {{ const {} = W.memo(() => ({})); return W.choose(() => {{\n{}}}, [{}]); }})()",
+            v,
+            s,
+            which,
+            branches.join(", ")
+        ))
+    }
+
+    /// An element or component; with a `key` that changes, made afresh.
     fn html(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
         self.line = el.line;
-        if blockable(el) {
-            return self.block(el);
+        let key = el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
+            ("key", AttrVal::Expr(k)) => Some(k),
+            _ => None,
+        });
+        let Some(key) = key else { return self.html_unkeyed(el) };
+        let (k, r) = self.reactive_expr(key)?;
+        let made = self.html_unkeyed(el)?;
+        Ok(if r { format!("W.keyed(() => ({}), () => {})", k, made) } else { made })
+    }
+
+    fn html_unkeyed(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
+        let saved = self.reactive;
+        let r = if el.tag.starts_with(|c: char| c.is_uppercase()) { self.comp_call(el) } else { self.template(el) };
+        self.reactive = saved;
+        r
+    }
+
+    /// Markup of a fixed shape: its template is defined once (see `tmpl`
+    /// in the runtime), and each use gives the values of its holes.
+    fn template(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
+        let row = self.row.take();
+        let saved = (std::mem::replace(&mut self.cur_row, row.clone()), std::mem::replace(&mut self.row_mask, 0));
+        let mut vals = Vec::new();
+        let tpl = self.tpl_el(el, &mut vals);
+        let mask = self.row_mask;
+        (self.cur_row, self.row_mask) = saved;
+        let tpl = tpl?;
+        let name = format!("$b{}", self.blocks.len());
+        self.blocks.push(format!("const {} = W.block({});", name, tpl));
+        Ok(match row {
+            Some(row) if mask != 0 => format!("W.t({}, [{}], {}, {})", name, vals.join(", "), row, mask),
+            _ => format!("W.t({}, [{}])", name, vals.join(", ")),
+        })
+    }
+
+    /// A hole's value in the template being compiled (see `dyn_value`),
+    /// noting in `row_mask` whether it reads nothing but its row.
+    fn hole_value(&mut self, e: &Expr, at: usize) -> Result<String, QuilloError> {
+        let Some(row) = self.cur_row.clone() else { return self.dyn_value(e) };
+        let saved = self.read_log.replace(Vec::new());
+        let r = self.reactive_expr(e);
+        let log = std::mem::replace(&mut self.read_log, saved).unwrap_or_default();
+        if let Some(outer) = &mut self.read_log {
+            outer.extend(log.iter().cloned());
         }
-        let mut kids = Vec::new();
-        for c in &el.children {
-            kids.push(match c {
-                HtmlChild::El(e) => self.html(e)?,
-                HtmlChild::Expr(x) => self.expr(x)?,
-            });
+        let (v, reactive) = r?;
+        if !reactive {
+            return Ok(v);
         }
-        let kids = format!("[{}]", kids.join(", "));
-        let mut key = "null".to_string();
-        if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
-            self.line = el.line;
-            let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone(), el.line))?;
-            // A view is called while rendering; a component renders itself.
-            let component = matches!(lookup(&self.it.globals, &el.tag), Some(Value::Func(c)) if c.def.component);
-            self.note_call(component);
-            let mut props = Vec::new();
-            let mut spreads = Vec::new();
-            for (name, v) in &el.attrs {
-                let v = match v {
-                    AttrVal::Bool => "true".to_string(),
-                    AttrVal::Expr(e) => self.expr(e)?,
-                    AttrVal::Spread(e) => {
-                        spreads.push(self.expr(e)?);
-                        continue;
-                    }
-                };
-                if name == "key" {
-                    key = v;
-                } else {
-                    props.push(format!("{}: {}", js_str(name), v));
-                }
-            }
-            if spreads.is_empty() {
-                return Ok(format!("W.comp({}, {{{}}}, {}, {})", f, props.join(", "), kids, key));
-            }
-            return Ok(format!("W.comp({}, {{{}}}, {}, {}, [{}])", f, props.join(", "), kids, key, spreads.join(", ")));
+        if !log.is_empty() && log.iter().all(|s| *s == row) && at < 31 {
+            self.row_mask |= 1 << at;
+        }
+        Ok(format!("() => ({})", v))
+    }
+
+    /// `<Name .../>`: a component, a view or a function, with its props as
+    /// getters where they read what changes, and its children as markup.
+    fn comp_call(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
+        self.line = el.line;
+        let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone(), el.line))?;
+        if f.starts_with("G[") && matches!(lookup(&self.it.globals, &el.tag), Some(Value::Func(c)) if !c.def.component && !c.def.server) {
+            self.need_view(&el.tag)?;
         }
         let mut props = Vec::new();
-        let mut on: Vec<String> = Vec::new();
-        if let Some(id) = &el.id {
-            props.push(format!("id: {}", self.expr(id)?));
-        }
-        let mut classes = Vec::new();
-        for c in &el.classes {
-            classes.push(self.expr(c)?);
-        }
         let mut spreads = Vec::new();
         for (name, v) in &el.attrs {
-            let val = match v {
-                AttrVal::Bool => "true".to_string(),
-                AttrVal::Expr(e) => self.expr(e)?,
-                AttrVal::Spread(e) => {
-                    spreads.push(self.expr(e)?);
-                    continue;
-                }
-            };
-            if let Some(ev) = name.strip_prefix('@') {
-                on.push(format!("{}: {}", js_str(event_name(ev)), val));
-            } else if let Some(prop) = name.strip_prefix("bind:") {
-                let AttrVal::Expr(Expr::Ident(var, _)) = v else {
-                    return self.err(format!("`bind:{}` needs a variable: bind:{}={{name}}", prop, prop));
-                };
-                let (event, read) = match prop {
-                    "value" => ("input", "e.target.value"),
-                    "checked" => ("change", "e.target.checked"),
-                    other => return self.err(format!("`bind:{}` is not supported (use bind:value or bind:checked)", other)),
-                };
-                let set = match self.resolve(var)? {
-                    Resolved::State(n) => format!("$i.set({}, {})", js_str(&n), read),
-                    Resolved::Local(js, _) => format!("({} = {})", js, read),
-                    Resolved::Global(..) => return self.err(format!("`bind:{}` needs component state, like ~{}", prop, var)),
-                };
-                self.live_holes += 1;
-                props.push(format!("{}: {}", js_str(prop), val));
-                on.push(format!("{}: (e) => {{ {}; }}", js_str(event), set));
-            } else if name == "key" {
-                key = val;
-            } else if name == "class" {
-                classes.push(val);
-            } else {
-                if matches!(name.as_str(), "value" | "checked" | "selected") {
-                    self.live_holes += 1;
-                }
-                props.push(format!("{}: {}", js_str(name), val));
-            }
-        }
-        if !classes.is_empty() {
-            props.push(format!("class: W.cls([{}])", classes.join(", ")));
-        }
-        let on = if on.is_empty() { "null".to_string() } else { format!("{{{}}}", on.join(", ")) };
-        if !spreads.is_empty() {
-            return Ok(format!(
-                "W.hs({}, [{}], {{{}}}, {}, {}, {})",
-                js_str(&el.tag),
-                spreads.join(", "),
-                props.join(", "),
-                on,
-                kids,
-                key
-            ));
-        }
-        Ok(format!("W.h({}, {{{}}}, {}, {}, {})", js_str(&el.tag), props.join(", "), on, kids, key))
-    }
-}
-
-/// Whether `el` can be the root of a block: a plain element (not a
-/// component), without `{...spread}` attributes or `bind:`, which the
-/// virtual DOM handles.
-fn blockable(el: &HtmlEl) -> bool {
-    !el.tag.starts_with(|c: char| c.is_uppercase())
-        && el.tag != "foreignObject"
-        && el.attrs.iter().all(|(name, v)| !matches!(v, AttrVal::Spread(_)) && !name.starts_with("bind:"))
-}
-
-/// Whether `el` can be part of its parent's block: also without a `key`,
-/// which makes an element start afresh when it changes.
-fn inlineable(el: &HtmlEl) -> bool {
-    blockable(el) && el.attrs.iter().all(|(name, _)| name != "key")
-}
-
-/// A value fixed when the program is written: text, a number or a bool.
-fn fixed(e: &Expr) -> Option<&Lit> {
-    match e {
-        Expr::Lit(l) => Some(l),
-        _ => None,
-    }
-}
-
-/// What a block is made of while it is compiled.
-#[derive(Default)]
-struct BlockParts {
-    /// Positions of the nodes with holes, as child indexes from the root.
-    paths: Vec<Vec<usize>>,
-    /// Kind, node and name of each hole (see `block` in the runtime).
-    holes: Vec<(u8, usize, String)>,
-    /// The JS for each hole's value, in order.
-    vals: Vec<String>,
-    /// What each value reads from around the loop it is in (see `Reads`).
-    deps: Vec<Vec<String>>,
-}
-
-impl<'a> Compiler<'a> {
-    /// Markup of a fixed shape, as a block (see `block` in the runtime): its
-    /// template is defined once, and each render passes the holes' values.
-    fn block(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
-        let (name, parts, key, _) = self.block_parts(el)?;
-        Ok(format!("W.b({}, [{}], {})", name, parts.vals.join(", "), key))
-    }
-
-    /// The block for `el`, defined: its name, holes, key, and what the key
-    /// reads from around the loop it is in.
-    fn block_parts(&mut self, el: &HtmlEl) -> Result<(String, BlockParts, String, Vec<String>), QuilloError> {
-        let mut parts = BlockParts::default();
-        let tpl = self.block_el(el, &mut Vec::new(), &mut parts)?;
-        let mut key = ("null".to_string(), Vec::new());
-        for (name, v) in &el.attrs {
             if name == "key" {
-                if let AttrVal::Expr(e) = v {
-                    key = self.noted(|c| c.expr(e))?;
+                continue;
+            }
+            match v {
+                AttrVal::Bool => props.push(format!("{}: true", js_str(name))),
+                AttrVal::Expr(e) => {
+                    let (v, r) = self.reactive_expr(e)?;
+                    if r {
+                        props.push(format!("get {}() {{ return {}; }}", js_str(name), v));
+                    } else {
+                        props.push(format!("{}: {}", js_str(name), v));
+                    }
                 }
+                AttrVal::Spread(e) => spreads.push(self.reactive_expr(e)?.0),
             }
         }
-        let name = format!("$b{}", self.blocks.len());
-        let holes: Vec<String> = parts.holes.iter().map(|(k, at, n)| format!("[{}, {}, {}]", k, at, js_str(n))).collect();
-        self.blocks.push(format!(
-            "const {} = W.block({}, [{}], {}, {});",
-            name,
-            tpl,
-            holes.join(", "),
-            block_mount(&parts),
-            block_patch(&parts)
-        ));
-        Ok((name, parts, key.0, key.1))
+        let kids = if el.children.is_empty() {
+            "null".to_string()
+        } else {
+            let mut ks = Vec::new();
+            for c in &el.children {
+                ks.push(match c {
+                    HtmlChild::El(e) => self.html(e)?,
+                    HtmlChild::Expr(x) => self.markup(x)?,
+                });
+            }
+            format!("W.frag([{}])", ks.join(", "))
+        };
+        let spreads = if spreads.is_empty() { String::new() } else { format!(", () => [{}]", spreads.join(", ")) };
+        Ok(format!("W.c({}, {{{}}}, {}{})", f, props.join(", "), kids, spreads))
     }
 
-    /// Compiles with `f`, noting what is read from around the innermost loop
-    /// being compiled (nothing outside one).
-    fn noted<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, QuilloError>) -> Result<(T, Vec<String>), QuilloError> {
-        let Some(outer) = self.reads.last() else { return Ok((f(self)?, Vec::new())) };
-        let (ctx, scopes) = (outer.ctx, outer.scopes);
-        self.reads.push(Reads { ctx, scopes, deps: Vec::new(), impure: false });
-        let r = f(self);
-        let reads = self.reads.pop().expect("pushed");
-        Ok((r?, reads.deps))
+    /// The form of view `name` for `<Name .../>`: its code once, with its
+    /// props as getters (see `W.view` in the runtime), after the bundle's
+    /// definitions.
+    fn need_view(&mut self, name: &str) -> Result<(), QuilloError> {
+        if !self.views.insert(name.to_string()) {
+            return Ok(());
+        }
+        let Some(Value::Func(f)) = lookup(&self.it.globals, name) else { return Ok(()) };
+        let def = f.def.clone();
+        let (js, _) = self.global(name, def.line)?;
+        let saved_ctxs = std::mem::take(&mut self.ctxs);
+        let saved_what = std::mem::replace(&mut self.what, format!("<{}>", def.name));
+        let saved_line = self.line;
+        self.line = def.line;
+        let res = self.setup(&def, true);
+        self.ctxs = saved_ctxs;
+        self.what = saved_what;
+        self.line = saved_line;
+        let code = res?;
+        self.view_defs.push(format!("W.view({}, {});", js, code));
+        Ok(())
     }
 
-    /// `el`'s template, `[tag, [[name, value], ...], [child, ...]]`, adding
-    /// its holes to `parts`; `path` is where it is in the block.
-    fn block_el(&mut self, el: &HtmlEl, path: &mut Vec<usize>, parts: &mut BlockParts) -> Result<String, QuilloError> {
+    /// `el`'s template, `[tag, [[name, value], ...], [kid, ...], [[kind,
+    /// name, i], ...]]` (see `tmpl` in the runtime), adding to `vals` the
+    /// values of its holes.
+    fn tpl_el(&mut self, el: &HtmlEl, vals: &mut Vec<String>) -> Result<String, QuilloError> {
         self.line = el.line;
         let mut fixed_attrs: Vec<String> = Vec::new();
-        let mut at: Option<usize> = None;
-        let mut hole = |parts: &mut BlockParts, kind: u8, name: &str, (val, deps): (String, Vec<String>)| {
-            let i = *at.get_or_insert_with(|| {
-                parts.paths.push(path.clone());
-                parts.paths.len() - 1
-            });
-            parts.holes.push((kind, i, name.to_string()));
-            parts.vals.push(val);
-            parts.deps.push(deps);
+        let mut holes: Vec<String> = Vec::new();
+        let hole = |holes: &mut Vec<String>, vals: &mut Vec<String>, kind: u8, name: &str, v: String| {
+            holes.push(format!("[{}, {}, {}]", kind, js_str(name), vals.len()));
+            vals.push(v);
         };
+        let mut spread_js = Vec::new();
+        let mut spread_r = false;
+        for (_, v) in &el.attrs {
+            if let AttrVal::Spread(e) = v {
+                let (v, r) = self.reactive_expr(e)?;
+                spread_js.push(v);
+                spread_r |= r;
+            }
+        }
         if let Some(id) = &el.id {
             match fixed(id) {
                 Some(l) => fixed_attrs.push(format!("[\"id\", {}]", lit_js(l))),
                 None => {
-                    let v = self.noted(|c| c.expr(id))?;
-                    hole(parts, 0, "id", v);
+                    let v = self.hole_value(id, vals.len())?;
+                    hole(&mut holes, vals, 0, "id", v);
                 }
             }
         }
@@ -2098,29 +2435,88 @@ impl<'a> Compiler<'a> {
                 classes.push(e);
             }
         }
-        if classes.iter().all(|e| matches!(fixed(e), Some(Lit::Str(_)))) {
-            let names: Vec<&str> = classes.iter().filter_map(|e| match fixed(e) {
-                Some(Lit::Str(s)) if !s.is_empty() => Some(&**s),
-                _ => None,
-            }).collect();
+        if spread_js.is_empty() && classes.iter().all(|e| matches!(fixed(e), Some(Lit::Str(_)))) {
+            let names: Vec<&str> = classes
+                .iter()
+                .filter_map(|e| match fixed(e) {
+                    Some(Lit::Str(s)) if !s.is_empty() => Some(&**s),
+                    _ => None,
+                })
+                .collect();
             if !names.is_empty() {
                 fixed_attrs.push(format!("[\"class\", {}]", js_str(&names.join(" "))));
             }
         } else {
-            let (js, deps) = self.noted(|c| classes.iter().map(|e| c.expr(e)).collect::<Result<Vec<_>, _>>())?;
-            let v = if js.len() == 1 { format!("W.cls1({})", js[0]) } else { format!("W.cls([{}])", js.join(", ")) };
-            hole(parts, 1, "", (v, deps));
+            let mut js = Vec::new();
+            let mut r = spread_r;
+            // One hole for all of them: only the row read, the row's.
+            let row = if spread_js.is_empty() { self.cur_row.clone() } else { None };
+            let saved = row.as_ref().map(|_| self.read_log.replace(Vec::new()));
+            let got: Result<Vec<(String, bool)>, QuilloError> = classes.iter().map(|e| self.reactive_expr(e)).collect();
+            let log = saved.map(|saved| std::mem::replace(&mut self.read_log, saved).unwrap_or_default());
+            for (v, x) in got? {
+                js.push(v);
+                r |= x;
+            }
+            if let (Some(row), Some(log)) = (&row, log) {
+                if r && !log.is_empty() && log.iter().all(|s| s == row) && vals.len() < 31 {
+                    self.row_mask |= 1 << vals.len();
+                }
+                if let Some(outer) = &mut self.read_log {
+                    outer.extend(log);
+                }
+            }
+            let v = if !spread_js.is_empty() {
+                js.push(format!("...W.spreadcls([{}])", spread_js.join(", ")));
+                format!("W.cls([{}])", js.join(", "))
+            } else if js.len() == 1 {
+                format!("W.cls1({})", js[0])
+            } else {
+                format!("W.cls([{}])", js.join(", "))
+            };
+            hole(&mut holes, vals, 1, "", if r { format!("() => {}", v) } else { v });
         }
+        let mut written = Vec::new();
         for (name, v) in &el.attrs {
-            if name == "key" || name == "class" {
+            if matches!(v, AttrVal::Spread(_)) || name == "key" || name == "class" {
                 continue;
             }
+            written.push(js_str(name));
             if let Some(ev) = name.strip_prefix('@') {
                 let f = match v {
-                    AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
-                    _ => ("true".to_string(), Vec::new()),
+                    AttrVal::Expr(e @ Expr::Lambda(_)) => self.expr(e)?,
+                    AttrVal::Expr(e) => {
+                        let (f, r) = self.reactive_expr(e)?;
+                        if r {
+                            // The handler it reads when the event comes.
+                            format!("($e) => {{ const $f = {}; if (typeof $f === \"function\") return $f.length > 0 ? $f($e) : $f(); }}", f)
+                        } else {
+                            f
+                        }
+                    }
+                    _ => "true".to_string(),
                 };
-                hole(parts, 2, event_name(ev), f);
+                hole(&mut holes, vals, 2, event_name(ev), f);
+                continue;
+            }
+            if let Some(prop) = name.strip_prefix("bind:") {
+                let AttrVal::Expr(Expr::Ident(var, _)) = v else {
+                    return self.err(format!("`bind:{}` needs a variable: bind:{}={{name}}", prop, prop));
+                };
+                let (event, read) = match prop {
+                    "value" => ("input", "e.target.value"),
+                    "checked" => ("change", "e.target.checked"),
+                    other => return self.err(format!("`bind:{}` is not supported (use bind:value or bind:checked)", other)),
+                };
+                let saved = self.reactive;
+                let (get, set) = match self.resolve(var)? {
+                    Resolved::State(js) => (format!("() => {}.v", js), format!("{}.set({})", js, read)),
+                    Resolved::Local(js, _) => (js.clone(), format!("({} = {})", js, read)),
+                    _ => return self.err(format!("`bind:{}` needs component state, like `state {}`", prop, var)),
+                };
+                self.reactive = saved;
+                hole(&mut holes, vals, 0, prop, get);
+                hole(&mut holes, vals, 2, event, format!("(e) => {{ {}; }}", set));
                 continue;
             }
             // value, checked and selected are the element's live state,
@@ -2133,138 +2529,55 @@ impl<'a> Compiler<'a> {
                     Some(l) => fixed_attrs.push(format!("[{}, {}]", js_str(name), lit_js(l))),
                     None => unreachable!(),
                 },
-                _ => {
-                    let val = match v {
-                        AttrVal::Expr(e) => self.noted(|c| c.expr(e))?,
-                        _ => ("true".to_string(), Vec::new()),
-                    };
-                    if live {
-                        self.live_holes += 1;
-                    }
-                    hole(parts, 0, name, val);
+                AttrVal::Expr(e) if !live => {
+                    let v = self.hole_value(e, vals.len())?;
+                    hole(&mut holes, vals, 0, name, v);
                 }
+                AttrVal::Expr(e) => {
+                    let v = self.dyn_value(e)?;
+                    hole(&mut holes, vals, 0, name, v);
+                }
+                _ => hole(&mut holes, vals, 0, name, "true".into()),
             }
         }
-        // Children: in the template when they are all fixed text and
-        // elements; otherwise the element's content is a hole.
-        let all_fixed = el.children.iter().all(|c| match c {
-            HtmlChild::El(e) => inlineable(e),
-            HtmlChild::Expr(e) => matches!(fixed(e), Some(Lit::Str(_))),
-        });
+        if !spread_js.is_empty() {
+            let v = format!("W.spread([{}], [{}])", spread_js.join(", "), written.join(", "));
+            hole(&mut holes, vals, 3, "", if spread_r { format!("() => {}", v) } else { v });
+        }
+        // Children: fixed text and elements are in the template; anything
+        // else is a value shown in its place.
         let mut kids = Vec::new();
-        if all_fixed {
-            for (i, c) in el.children.iter().enumerate() {
-                match c {
-                    HtmlChild::El(e) => {
-                        path.push(i);
-                        kids.push(self.block_el(e, path, parts)?);
-                        path.pop();
-                    }
-                    HtmlChild::Expr(e) => {
-                        if let Some(Lit::Str(s)) = fixed(e) {
-                            kids.push(js_str(s));
-                        }
-                    }
+        for c in &el.children {
+            match c {
+                HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => kids.push(js_str(s)),
+                HtmlChild::El(e) if inlineable(e) => kids.push(self.tpl_el(e, vals)?),
+                HtmlChild::El(e) => {
+                    let v = self.html(e)?;
+                    kids.push(vals.len().to_string());
+                    vals.push(v);
+                }
+                HtmlChild::Expr(e) => {
+                    let v = if has_markup(e) { self.markup(e)? } else { self.hole_value(e, vals.len())? };
+                    kids.push(vals.len().to_string());
+                    vals.push(v);
                 }
             }
-        } else if let [HtmlChild::Expr(e)] = el.children.as_slice() {
-            // The only child: an empty text node in the template, which text
-            // fills (see the runtime's `block`).
-            kids.push("\"\"".to_string());
-            let (v, deps) = self.noted(|c| c.expr(e))?;
-            path.push(0);
-            parts.paths.push(path.clone());
-            path.pop();
-            parts.holes.push((3, parts.paths.len() - 1, String::new()));
-            parts.vals.push(v);
-            parts.deps.push(deps);
-        } else {
-            let (js, deps) = self.noted(|c| {
-                el.children
-                    .iter()
-                    .map(|ch| match ch {
-                        HtmlChild::El(e) => c.html(e),
-                        HtmlChild::Expr(x) => c.expr(x),
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })?;
-            hole(parts, 4, "", (format!("[{}]", js.join(", ")), deps));
         }
-        Ok(format!("[{}, [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", ")))
+        self.line = el.line;
+        Ok(format!("[{}, [{}], [{}], [{}]]", js_str(&el.tag), fixed_attrs.join(", "), kids.join(", "), holes.join(", ")))
     }
 }
 
-/// A block's mount function, `($v, $r, $s)`: from `$r`, a fresh copy of
-/// the template, it finds the nodes with holes (by `firstChild` and
-/// `nextSibling`, each step taken once) and fills the holes from `$v.vals`;
-/// `$s` says whether it is SVG.
-fn block_mount(parts: &BlockParts) -> String {
-    fn node(p: &[usize], known: &mut HashMap<Vec<usize>, String>, code: &mut String) -> String {
-        if let Some(v) = known.get(p) {
-            return v.clone();
-        }
-        let (parent, last) = (&p[..p.len() - 1], p[p.len() - 1]);
-        // From the nearest sibling already found, else from the parent.
-        let from_sibling = (0..last).rev().find_map(|b| {
-            let mut q = parent.to_vec();
-            q.push(b);
-            known.get(&q).map(|v| format!("{}{}", v, ".nextSibling".repeat(last - b)))
-        });
-        let walk = match from_sibling {
-            Some(w) => w,
-            None => format!("{}.firstChild{}", node(parent, known, code), ".nextSibling".repeat(last)),
-        };
-        let v = format!("$n{}", known.len());
-        let _ = write!(code, "const {} = {}; ", v, walk);
-        known.insert(p.to_vec(), v.clone());
-        v
-    }
-    let mut known = HashMap::new();
-    known.insert(Vec::new(), "$r".to_string());
-    let mut code = String::new();
-    let els: Vec<String> = parts.paths.iter().map(|p| node(p, &mut known, &mut code)).collect();
-    let _ = write!(code, "$v.els = [{}]; const $x = $v.vals; ", els.join(", "));
-    for (i, (kind, at, name)) in parts.holes.iter().enumerate() {
-        let e = &els[*at];
-        let _ = match kind {
-            0 => write!(code, "setProp({}, {}, $x[{}], undefined); ", e, js_str(name), i),
-            1 => write!(code, "if (!isNil($x[{i}]) && $x[{i}] !== \"\") setClass({}, $x[{i}], $s); ", e, i = i),
-            2 => write!(code, "listen({}, {}, $x[{}]); ", e, js_str(name), i),
-            3 => write!(
-                code,
-                "if (typeof $x[{i}] === \"string\" || typeof $x[{i}] === \"number\") {e}.data = $x[{i}]; else showNodes($v, {i}, {e}.parentNode, $x[{i}], $s); ",
-                i = i,
-                e = e
-            ),
-            _ => write!(code, "showNodes($v, {}, {}, $x[{}], $s); ", i, e, i),
-        };
-    }
-    format!("function ($v, $r, $s) {{ {}}}", code)
+/// Whether `el` can be part of its parent's template: an element (not a
+/// component) without a `key`, which makes it start afresh when it changes.
+fn inlineable(el: &HtmlEl) -> bool {
+    !el.tag.starts_with(|c: char| c.is_uppercase()) && el.attrs.iter().all(|(name, _)| name != "key")
 }
 
-/// A block's patch function, `($a, $v)`: block `$v` takes over `$a`'s DOM
-/// and updates the holes whose values changed (see `updateHole` in the
-/// runtime, which it calls for anything but the plain cases).
-fn block_patch(parts: &BlockParts) -> String {
-    let mut code = String::from("const $e = ($v.els = $a.els), $x = $v.vals, $o = $a.vals; $v.parts = $a.parts; $v.svg = $a.svg; ");
-    for (i, (kind, at, name)) in parts.holes.iter().enumerate() {
-        let _ = match kind {
-            // Inputs' live value follows the state even when unchanged.
-            0 if matches!(name.as_str(), "value" | "checked" | "selected") => {
-                write!(code, "setProp($e[{}], {}, $x[{}], $o[{}]); ", at, js_str(name), i, i)
-            }
-            0 => write!(code, "if ($x[{i}] !== $o[{i}]) setProp($e[{}], {}, $x[{i}], $o[{i}]); ", at, js_str(name), i = i),
-            1 => write!(code, "if ($x[{i}] !== $o[{i}]) setClass($e[{}], $x[{i}], $v.svg); ", at, i = i),
-            2 if name == "click" => write!(code, "$e[{}].__click = $x[{}]; ", at, i),
-            2 => write!(code, "listen($e[{}], {}, $x[{}]); ", at, js_str(name), i),
-            3 => write!(
-                code,
-                "if ($x[{i}] !== $o[{i}]) {{ if ((typeof $x[{i}] === \"string\" || typeof $x[{i}] === \"number\") && !($v.parts && $v.parts[{i}])) $e[{at}].data = $x[{i}]; else updateHole($v, {i}, $x[{i}], $o[{i}]); }} ",
-                i = i,
-                at = at
-            ),
-            _ => write!(code, "if ($x[{i}] !== $o[{i}]) updateHole($v, {i}, $x[{i}], $o[{i}]); ", i = i),
-        };
+/// A value fixed when the program is written: text, a number or a bool.
+fn fixed(e: &Expr) -> Option<&Lit> {
+    match e {
+        Expr::Lit(l) => Some(l),
+        _ => None,
     }
-    format!("function ($a, $v) {{ {}}}", code)
 }

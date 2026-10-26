@@ -1,6 +1,6 @@
 component Counter(start: int = 0) {
-    state count = start                  // state, kept between renders
-    let double = count * 2               // recomputed on every render
+    state count = start                  // state: assigning it updates what shows it
+    let double = count * 2               // follows count
     <div>
         <span>{count} (x2 = {double})</span>
         <button @click={() => { count += 1 }}>+</button>

@@ -212,11 +212,12 @@ fn components_render_on_the_server_inside_islands() {
         r#"
 component Counter(start: int = 0, label: str = "n") {
     ~count = start
+    ~text = label
     let double = count * 2
     <div.counter>
         <span>{label}: {count} ({double})</span>
         <button @click={() => { count += 1 }}>+</button>
-        <input bind:value={label}/>
+        <input bind:value={text}/>
     </div>
 }
 route GET / = <html><body><Counter start={2}/></body></html>
@@ -225,7 +226,7 @@ route GET /bare = <Counter/>
     );
     let r = get(&mut it, "/");
     let page = r.text();
-    assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2}">"#), "{}", page);
+    assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2,&quot;text&quot;:&quot;n&quot;}">"#), "{}", page);
     assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></quillo-island>"), "{}", page);
     // The bundle loads when it is needed (a loader, last in the body).
     let tail = &page[page.rfind("<script").unwrap()..];
@@ -297,7 +298,7 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     let js = get(&mut small, "/_quillo/quillo.js").text();
     // No server fns: no RPC code. Rendering and booting, of course.
     assert!(!js.contains("async function rpc"), "{}", js);
-    assert!(js.contains("function boot(") && js.contains("function mount("));
+    assert!(js.contains("function boot(") && js.contains("function resume("));
     // Builtins come along only when used.
     assert!(!js.contains("B.group_by") && !js.contains("B.sort_by"));
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
@@ -395,7 +396,7 @@ route GET / = <List p="> "/>
     assert!(page.contains(r#"data-l="{&quot;xs&quot;:{&quot;f&quot;:&quot;load&quot;,&quot;a&quot;:[&quot;&gt; &quot;],&quot;t&quot;:[&quot;var:items&quot;]}}""#), "{}", page);
     assert!(page.contains("<li>&gt; a</li>"), "{}", page);
     let js = get(&mut it, "/_quillo/quillo.js").text();
-    assert!(js.contains(r#"W.live($i, "xs", "load", [$p_"#), "{}", js);
+    assert!(js.contains(r#"W.live($i, "xs", "load", () => [$p.p])"#), "{}", js);
 }
 
 #[test]
@@ -527,6 +528,6 @@ route GET / = <html><body><List/></body></html>
     let page = get(&mut it, "/").text();
     let at = page.find("/_quillo/b/").expect(&page);
     let js = get(&mut it, &page[at..at + page[at..].find('"').unwrap()]).text();
-    let memo = js.lines().find(|l| l.contains("W.memo(")).expect("the loop is memoized");
-    assert!(!memo.contains("zzparam"), "{}", memo);
+    let rows = js.lines().find(|l| l.contains("W.each(")).expect("the loop follows its list");
+    assert!(!rows.contains("zzparam"), "{}", rows);
 }

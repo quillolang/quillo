@@ -12,19 +12,12 @@ const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !
 class QuilloError extends Error {}
 class Ret { constructor(v) { this.v = v; } }
 class Err { constructor(e) { this.error = e === undefined ? null : e; } }
-class VNode {}
-class VText extends VNode { constructor(t) { super(); this.t = t; } }
-class VEl extends VNode { constructor(tag, props, on, kids, key) { super(); this.tag = tag; this.props = props; this.on = on; this.kids = kids; this.key = key; } }
-class VComp extends VNode { constructor(def, props, key) { super(); this.def = def; this.props = props; this.key = key; } }
-class VRaw extends VNode { constructor(html) { super(); this.html = html; } }
-// Markup of a fixed shape: the values of its holes (see `block`).
-class VBlock extends VNode { constructor(def, vals, key) { super(); this.def = def; this.vals = vals; this.key = key; } }
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode) && !isEvent(v)));
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
 // What Quillo code does not reach on the page's objects: what runs text as
 // code or HTML (markup in components does that safely), and the way to the
@@ -48,7 +41,7 @@ function foreignCall(o, name, args) {
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
 const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
-  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof VNode));
+  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html));
 // Functions of the page that run text as code: Quillo code calls none of
 // them, however it came by one.
 let deniedFns = null;
@@ -70,7 +63,7 @@ function typeName(v) {
   }
   if (Array.isArray(v)) return "list";
   if (v instanceof Err) return "error";
-  if (v instanceof VNode) return "html";
+  if (v instanceof Html) return "html";
   return "map";
 }
 
@@ -85,7 +78,7 @@ function typeIs(t, v) {
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
     case "map": return isMap(v) || isEvent(v);
-    case "html": return v instanceof VNode;
+    case "html": return v instanceof Html;
     case "fn": return typeof v === "function";
     default:
       // Strings a type names ("admin" | "member"), and the program's own types.
@@ -209,7 +202,7 @@ function repr(v) {
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
   if (v instanceof Err) return "err(" + repr(v.error) + ")";
-  if (v instanceof VNode) return "<html>";
+  if (v instanceof Html) return "<html>";
   if (isEvent(v)) return "<event " + v.type + ">";
   const ks = Object.keys(v);
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
@@ -245,30 +238,22 @@ function add(a, b) {
   if (typeof a === "number" && typeof b === "number") return a + b;
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
-  if (a instanceof VNode && b instanceof VNode) return frag([a, b]);
+  if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
   if (isMap(a) && isMap(b)) return Object.assign({}, a, b);
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
-function arith(op, verb) {
-  return (a, b) => {
-    if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
-    if (isInt(a) && isInt(b)) {
-      if (b === 0 && (op === "/" || op === "%")) fail("division by zero");
-    }
-    switch (op) {
-      case "-": return a - b;
-      case "*": return a * b;
-      case "/": return a / b;
-      default: return a % b;
-    }
-  };
+// Numbers: the usual case first; anything else says what is wrong.
+function arith(a, b, op, verb) {
+  if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
+  if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
+  return op === "/" ? a / b : a % b;
 }
-const sub = arith("-", "subtract");
-const mul = arith("*", "multiply");
-const div = arith("/", "divide");
-const mod = arith("%", "take the remainder of");
+const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? a - b : arith(a, b, "-", "subtract"));
+const mul = (a, b) => (typeof a === "number" && typeof b === "number" ? a * b : arith(a, b, "*", "multiply"));
+const div = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a / b : arith(a, b, "/", "divide"));
+const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a % b : arith(a, b, "%", "take the remainder of"));
 
 function order(a, b) {
   const c = cmp(a, b);
@@ -280,7 +265,7 @@ const le = (a, b) => order(a, b) <= 0;
 const gt = (a, b) => order(a, b) > 0;
 const ge = (a, b) => order(a, b) >= 0;
 
-function range(a, b) {
+function intRange(a, b) {
   if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
   if (b - a > 10000000) fail("range is too large");
   const out = [];
@@ -372,7 +357,7 @@ function index(o, i) {
   fail(`cannot index ${typeName(o)} with ${typeName(i)}`);
 }
 
-function call(f, args) {
+function callFn(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
   denied(f);
   return f(...args);
@@ -381,7 +366,7 @@ function call(f, args) {
 // `recv.name(args)`: a function stored in the map, or `name(recv, args)`.
 function mcall(recv, name, fb, args) {
   if (foreign(recv) && typeof recv[name] === "function") return foreignCall(recv, name, args);
-  if (isMap(recv) && hasOwn(recv, name)) return call(recv[name], args);
+  if (isMap(recv) && hasOwn(recv, name)) return callFn(recv[name], args);
   if (typeof fb === "function") return fb(recv, ...args);
   fail(`${typeName(recv)} has no method \`${name}\``);
 }
@@ -571,7 +556,7 @@ function toJSON(v) {
   if (isNil(v)) return null;
   if (v instanceof Err) return { error: toJSON(v.error) };
   if (Array.isArray(v)) return v.map(toJSON);
-  if (v instanceof VNode) return "";
+  if (v instanceof Html) return "";
   if (typeof v === "function") return repr(v);
   if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = toJSON(v[k]); return o; }
   if (typeof v === "number" && !isFinite(v)) return null;
@@ -579,11 +564,6 @@ function toJSON(v) {
 }
 
 const B = {};
-// Runs f after each of the component's renders, after what already does.
-function afterEach(inst, f) {
-  const before = inst.afterRender;
-  inst.afterRender = before ? () => { before(); f(); } : f;
-}
 
 // ---- streams (src/stream.rs) -------------------------------------------
 // What a streamed answer sends, given to f as it arrives: an event's data
@@ -658,49 +638,28 @@ B.receive = meta(async (url, f, opts) => {
   return null;
 }, "receive", null);
 
-// `listen(url, f)` while a component renders: reads the stream at url (a
-// GET), calling f with what it sends, for as long as the renders keep
-// asking; a render that does not ask, or the component leaving the page,
-// stops it. Dropped connections are opened again (after a second, then
-// longer); a stream that ends is not.
+// `listen(url, f)` in a component: reads the stream at url (a GET),
+// calling f with what it sends, for as long as the code that asked keeps
+// asking (an effect that runs again without asking, or the component
+// leaving the page, stops it). Dropped connections are opened again
+// (after a second, then longer); a stream that ends is not.
 B.listen = meta((url, f) => {
-  const inst = rendering;
-  if (!inst) fail("`listen` works while a component renders");
+  if (!Owner) fail("`listen` works in a component");
   S(url, "listen");
   F(f, "listen", 2);
-  if (!inst.streams) {
-    inst.streams = [];
-    inst.streamsAsked = 0;
-    inst.stopStreams = () => {
-      for (const s of inst.streams.splice(inst.streamsAsked)) s.ctl.abort();
-      inst.streamsAsked = 0;
-    };
-    afterEach(inst, inst.stopStreams);
-    onGone(inst, () => {
-      inst.streamsAsked = 0;
-      inst.stopStreams();
-    });
-  }
-  const i = inst.streamsAsked++;
-  let s = inst.streams[i];
-  if (s && s.url === url) { s.f = f; return null; }
-  if (s) s.ctl.abort();
-  s = inst.streams[i] = { url, f, ctl: new AbortController() };
-  const me = s;
+  const ctl = new AbortController();
+  onCleanup(() => ctl.abort());
   (async () => {
     let wait = 1000;
-    while (!me.ctl.signal.aborted) {
+    while (!ctl.signal.aborted) {
       try {
-        const res = await fetch(withBase(url), { signal: me.ctl.signal, headers: { accept: "text/event-stream, application/x-ndjson, */*" } });
+        const res = await fetch(withBase(url), { signal: ctl.signal, headers: { accept: "text/event-stream, application/x-ndjson, */*" } });
         if (!res.ok) throw new Error(`${res.status}`);
         wait = 1000;
-        // The latest f each time (a render may give a new one), taking as many as it does.
-        const latest = (...a) => me.f(...a);
-        Object.defineProperty(latest, "$p", { get: () => (Array.isArray(me.f.$p) ? me.f.$p : new Array(me.f.length)) });
-        await readStream(res, latest, "listen", me.ctl.signal);
+        await readStream(res, f, "listen", ctl.signal);
         return;
       } catch (e) {
-        if (me.ctl.signal.aborted) return;
+        if (ctl.signal.aborted) return;
         if (e instanceof QuilloError) return report(e);
         await new Promise((r) => setTimeout(r, wait));
         wait = Math.min(wait * 2, 30000);
@@ -710,49 +669,23 @@ B.listen = meta((url, f) => {
   return null;
 }, "listen", null);
 
-// `every(ms, f)` while a component renders: calls f every ms milliseconds for
-// as long as its renders keep asking (with the latest f and ms). A render that
-// does not ask (a paused game: `if running { every(100, step) }`) stops it,
-// and so does the component leaving the page.
+// `every(ms, f)` in a component: calls f every ms milliseconds for as long
+// as the code that asked keeps asking. `if running { every(100, step) }`
+// runs again when `running` changes, and stops it when it is false; the
+// component leaving the page stops it too.
 B.every = meta((ms, f) => {
-  const inst = rendering;
-  if (!inst) fail("`every` works while a component renders");
+  if (!Owner) fail("`every` works in a component");
   N(ms, "every");
   F(f, "every", 2);
-  if (!inst.timers) {
-    inst.timers = [];
-    inst.timersAsked = 0;
-    // After each render: stop the timers it did not ask for.
-    inst.stopTimers = () => {
-      for (const t of inst.timers.splice(inst.timersAsked)) clearInterval(t.id);
-      inst.timersAsked = 0;
-    };
-    afterEach(inst, inst.stopTimers);
-    onGone(inst, () => {
-      inst.timersAsked = 0;
-      inst.stopTimers();
-    });
-  }
-  const timers = inst.timers;
-  const i = inst.timersAsked++;
-  let t = timers[i];
-  if (!t || t.ms !== ms) {
-    if (t) clearInterval(t.id);
-    t = timers[i] = { ms, f, id: 0 };
-    t.id = setInterval(() => {
-      if (inst.kids !== null && !inst.el.isConnected) {
-        inst.timersAsked = 0;
-        return inst.stopTimers();
-      }
-      try {
-        const r = t.f();
-        if (r instanceof Promise) r.catch(report);
-      } catch (e) {
-        report(e);
-      }
-    }, Math.max(ms, 1));
-  }
-  t.f = f;
+  const id = setInterval(() => {
+    try {
+      const r = f();
+      if (r instanceof Promise) r.catch(report);
+    } catch (e) {
+      report(e);
+    }
+  }, Math.max(ms, 1));
+  onCleanup(() => clearInterval(id));
   return null;
 }, "every", null);
 
@@ -835,7 +768,7 @@ B.reverse = meta((v) => {
 B.first = meta((l) => { l = L(l, "first"); return l.length ? l[0] : null; }, "first", null);
 B.last = meta((l) => { l = L(l, "last"); return l.length ? l[l.length - 1] : null; }, "last", null);
 B.push = meta((l, x = null) => L(l, "push").concat([x]), "push", null);
-B.range = meta((a, b) => b === undefined ? range(0, I(a, "range")) : range(I(a, "range"), I(b, "range", 2)), "range", null);
+B.range = meta((a, b) => b === undefined ? intRange(0, I(a, "range")) : intRange(I(a, "range"), I(b, "range", 2)), "range", null);
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
 B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
 B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
@@ -858,7 +791,7 @@ B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "me
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
-B.raw = meta((v) => new VRaw(display(v)), "raw", null);
+B.raw = meta((v) => rawHtml(display(v)), "raw", null);
 // ask(message, options) and notify(message, options): a dialog that waits
 // for an answer, and a note that goes by itself. They are markup with q-
 // classes in a host on the page (#q-notices), laid out and styled by the
@@ -1035,7 +968,7 @@ const HL = (() => {
     return out + esc(s.slice(plainAt).join(""));
   };
 })();
-B.highlight = meta((code, lang) => new VRaw(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
+B.highlight = meta((code, lang) => rawHtml(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
 
 B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
 B.now = meta(() => Date.now(), "now", null);
@@ -1224,9 +1157,9 @@ const ssOf = (x, m) => {
 const sortedOf = (x) => Float64Array.from(x).sort();
 const overflowed = (n) => { if (!Number.isSafeInteger(n)) fail("integer overflow"); return n; };
 
-const domain = (f, x) => fail(`\`math.${f}\`: math domain error (${display(x)})`);
-const checked = (f, x, y, ok) => {
-  if (!ok || (Number.isNaN(y) && !Number.isNaN(x))) domain(f, x);
+const mathDomain = (f, x) => fail(`\`math.${f}\`: math domain error (${display(x)})`);
+const mathChecked = (f, x, y, ok) => {
+  if (!ok || (Number.isNaN(y) && !Number.isNaN(x))) mathDomain(f, x);
   if (!Number.isFinite(y) && !Number.isNaN(y) && Number.isFinite(x)) fail(`\`math.${f}\`: math range error (${display(x)})`);
   return y;
 };
@@ -1236,7 +1169,7 @@ const checked2 = (f, x, y, r, ok) => {
   if (!Number.isFinite(r) && !Number.isNaN(r) && Number.isFinite(x) && Number.isFinite(y)) fail(`\`math.${f}\`: math range error (${display(x)}, ${display(y)})`);
   return r;
 };
-const unary = (f, g, dom = () => true) => (x) => { N(x, "math." + f); return checked(f, x, g(x), Number.isNaN(x) || dom(x)); };
+const unary = (f, g, dom = () => true) => (x) => { N(x, "math." + f); return mathChecked(f, x, g(x), Number.isNaN(x) || dom(x)); };
 
 // erf: a series below 2, else from erfc's continued fraction.
 const erfc = (x) => {
@@ -1306,10 +1239,10 @@ B.math = {
   expm1: unary("expm1", Math.expm1),
   log: (x, b) => {
     N(x, "math.log");
-    if (!given(b)) return checked("log", x, Math.log(x), Number.isNaN(x) || x > 0);
+    if (!given(b)) return mathChecked("log", x, Math.log(x), Number.isNaN(x) || x > 0);
     N(b, "math.log", 2);
     if (b <= 0 || b === 1) fail(`\`math.log\`: math domain error (base ${display(b)})`);
-    return checked("log", x, Math.log(x) / Math.log(b), Number.isNaN(x) || x > 0);
+    return mathChecked("log", x, Math.log(x) / Math.log(b), Number.isNaN(x) || x > 0);
   },
   log2: unary("log2", Math.log2, (x) => x > 0),
   log10: unary("log10", Math.log10, (x) => x > 0),
@@ -1359,7 +1292,7 @@ B.math = {
     while (Math.abs(m) >= 1) { m /= 2; e += 1; }
     return [m, e];
   },
-  ldexp: (x, e) => { N(x, "math.ldexp"); I(e, "math.ldexp", 2); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return checked("ldexp", x, r * 2 ** e, true); },
+  ldexp: (x, e) => { N(x, "math.ldexp"); I(e, "math.ldexp", 2); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return mathChecked("ldexp", x, r * 2 ** e, true); },
   factorial: (n) => { natural(n, "math.factorial"); let r = 1; for (let k = 2; k <= n; k++) r = overflowed(r * k); return r; },
   gcd: (...args) => intsOf(args, "math.gcd").reduce(gcd2, 0),
   lcm: (...args) => { let acc = 1; for (const n of intsOf(args, "math.lcm")) { if (n === 0) return 0; acc = overflowed(acc / gcd2(acc, n) * Math.abs(n)); } return acc; },
@@ -1745,7 +1678,7 @@ function liveSeen(seq, server = "") {
 function liveTopics() {
   const all = new Set();
   for (const s of Live.subs) {
-    if (s.inst.kids !== null && !s.inst.el.isConnected) { Live.subs.delete(s); continue; }
+    if (s.inst.dead) { Live.subs.delete(s); continue; }
     for (const t of s.topics) all.add(t);
   }
   return [...all].sort();
@@ -1814,72 +1747,701 @@ async function liveRefresh(sub) {
     if (failed) { report(value.error); return; }
     liveSeen(seq, server);
     sub.topics = topics;
-    sub.inst.set(sub.name, value);
+    sub.sig.set(value);
     liveRestart();
   } catch (e) {
     report(e);
   }
 }
 
-// ---- virtual DOM -------------------------------------------------------
+// ---- reactivity ----------------------------------------------------------
+// A component's code runs once. Its state is signals (`Sig`); what reads
+// them, a memo or an effect (`Calc`), hears when they change. Effects run
+// again in a batch, in a microtask, in the order they were made; memos only
+// when read, and only if something they read changed. Each holds what was
+// made while it ran (effects, memos, cleanups), which goes when it runs
+// again or is disposed: a component, a row, a branch takes all of its
+// effects with it when it leaves the page.
 
-function frag(items) { return items; }
+const CLEAN = 0, CHECK = 1, DIRTY = 2;
+let Listener = null;
+let Owner = null;
+let effectQueue = [];
+let flushing = false;
+let calcIds = 0;
 
-function norm(x, out) {
-  if (isNil(x) || x === false || x === true) return out;
-  if (Array.isArray(x)) { for (const y of x) norm(y, out); return out; }
-  if (x instanceof VNode) { out.push(x); return out; }
-  out.push(new VText(display(x)));
+// What owns what is made while it runs: a component, a row, a branch.
+class Scope {
+  constructor() {
+    this.owned = null;
+    this.clean = null;
+    this.dead = false;
+    this.up = Owner;
+    // Made to size while small (an array pushed to from empty keeps room
+    // for a dozen and more; a row's scope owns one or two).
+    if (Owner) Owner.owned = Owner.owned ? (Owner.owned.length < 8 ? Owner.owned.concat([this]) : (Owner.owned.push(this), Owner.owned)) : [this];
+  }
+}
+
+function disposeKids(s) {
+  const owned = s.owned, clean = s.clean;
+  s.owned = null;
+  s.clean = null;
+  if (owned) for (const k of owned) { k.up = null; dispose(k); }
+  if (clean) for (const f of clean) { try { f(); } catch (e) { report(e); } }
+}
+
+// A scope gone: what it made goes too, and it lets go of what it read.
+function dispose(s) {
+  if (s.dead) return;
+  s.dead = true;
+  const up = s.up;
+  if (up && up.owned) {
+    const i = up.owned.indexOf(s), last = up.owned.pop();
+    if (last !== s) up.owned[i] = last;
+  }
+  s.up = null;
+  disposeKids(s);
+  if (s.src) unlinkFrom(s, 0);
+}
+
+// Runs `f` when the current scope goes (or its computation runs again).
+function onCleanup(f) {
+  if (Owner) (Owner.clean || (Owner.clean = [])).push(f);
+}
+
+// What reads what, both ways, in one array each: `c.src` holds pairs
+// [source, where c is in its `obs`], `s.obs` pairs [reader, where s is in
+// its `src`]. Either side lets go in constant time. Small arrays are made
+// to size (a pushed-to array would keep room for a dozen more).
+class Sig {
+  constructor(v) { this._v = v; this.obs = null; this.keys = null; }
+  get v() { if (Listener) link(Listener, this); return this._v; }
+  set(v) {
+    const was = this._v;
+    if (v === was) return null;
+    this._v = v;
+    const o = this.obs;
+    if (o) for (let i = 0; i < o.length; i += 2) stale(o[i], DIRTY);
+    // Those that only asked whether it is one value (see `isNow`).
+    if (this.keys) { keyStale(this.keys.get(was)); keyStale(this.keys.get(v)); }
+    return null;
+  }
+}
+
+// What tells those, when a page has them (`isNow` brings it).
+let keyStale = null;
+
+class Calc extends Scope {
+  constructor(fn, effect) {
+    super();
+    this.fn = fn;
+    this.effect = effect;
+    this.state = DIRTY;
+    this.src = null;
+    this.at = 0;
+    this.obs = null;
+    this._v = undefined;
+    this.id = ++calcIds;
+    // An effect on the page: `apply(value)` (as a method, untracked) puts
+    // what `fn` gave on `el`; `name` and `old` are its to use.
+    this.apply = null;
+    this.el = null;
+    this.name = null;
+    this.old = undefined;
+  }
+  // A memo's value, brought up to date.
+  get v() {
+    if (Listener) link(Listener, this);
+    fresh(this);
+    return this._v;
+  }
+}
+
+const pair = (a, x, y) => {
+  if (!a) return [x, y];
+  if (a.length === 2) return [a[0], a[1], x, y];
+  if (a.length < 16) return a.concat([x, y]);
+  a.push(x, y);
+  return a;
+};
+
+// `c` read `s`. A computation running again mostly reads what it read
+// before, in the same order: then nothing changes but `c.at`.
+function link(c, s) {
+  if (c.dead) return;
+  const src = c.src, at = c.at;
+  if (src) {
+    if (at < src.length) {
+      if (src[at] === s) { c.at = at + 2; return; }
+      unlinkFrom(c, at);
+    }
+    if (at <= 16) for (let i = 0; i < at; i += 2) if (src[i] === s) return;
+  }
+  const idx = src ? src.length : 0;
+  c.src = pair(src, s, s.obs ? s.obs.length : 0);
+  s.obs = pair(s.obs, c, idx);
+  c.at = idx + 2;
+}
+
+// `c` lets go of its sources from `from` on.
+function unlinkFrom(c, from) {
+  const src = c.src;
+  for (let i = src.length - 2; i >= from; i -= 2) {
+    const slot = src.pop(), s = src.pop(), obs = s.obs, n = obs.length - 2;
+    if (slot < n) {
+      const last = obs[n], li = obs[n + 1];
+      obs[slot] = last;
+      obs[slot + 1] = li;
+      last.src[li + 1] = slot;
+    }
+    obs.pop();
+    obs.pop();
+    if (n === 0 && s.of) s.of.keys.delete(s.k);
+  }
+}
+
+function stale(c, level) {
+  if (c.state >= level || c.dead) return;
+  const was = c.state;
+  c.state = level;
+  if (was !== CLEAN) return;
+  if (c.effect) {
+    effectQueue.push(c);
+    if (!flushing) { flushing = true; queueMicrotask(flush); }
+  } else if (c.obs) {
+    const o = c.obs;
+    for (let i = 0; i < o.length; i += 2) stale(o[i], CHECK);
+  }
+}
+
+// Brings `c` up to date: if a memo it read may have changed, that memo is
+// brought up to date first, and `c` runs only if one did.
+function fresh(c) {
+  if (c.state === CHECK) {
+    const src = c.src;
+    if (src) for (let i = 0; i < src.length; i += 2) {
+      const s = src[i];
+      if (s instanceof Calc) {
+        fresh(s);
+        if (c.state === DIRTY) break;
+      }
+    }
+    if (c.state === CHECK) c.state = CLEAN;
+  }
+  if (c.state === DIRTY) runCalc(c);
+}
+
+function runCalc(c) {
+  disposeKids(c);
+  c.at = 0;
+  const l = Listener, o = Owner;
+  Listener = c;
+  Owner = c;
+  let v;
+  try {
+    v = c.fn();
+    if (c.apply !== null) {
+      Listener = null;
+      c.apply(v);
+    }
+  } catch (e) {
+    Listener = l;
+    Owner = o;
+    if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
+    c.state = c.effect ? CLEAN : DIRTY;
+    if (c.effect) { report(e); return; }
+    throw e;
+  }
+  Listener = l;
+  Owner = o;
+  if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
+  c.state = CLEAN;
+  if (!c.effect && v !== c._v) {
+    c._v = v;
+    const ob = c.obs;
+    if (ob) for (let i = 0; i < ob.length; i += 2) if (ob[i].state === CHECK) ob[i].state = DIRTY;
+  }
+}
+
+function flush() {
+  let rounds = 0;
+  while (effectQueue.length) {
+    if (++rounds > 1000) {
+      effectQueue = [];
+      report("updates go round in a loop: something sets what it reads");
+      break;
+    }
+    const q = effectQueue;
+    effectQueue = [];
+    // In the order they were made (mostly so already).
+    for (let i = 1; i < q.length; i++) if (q[i - 1].id > q[i].id) { q.sort((a, b) => a.id - b.id); break; }
+    for (const c of q) if (!c.dead) fresh(c);
+  }
+  flushing = false;
+}
+
+// Runs `f` now, and again (in a batch) whenever what it read changes.
+function effect(f) {
+  const c = new Calc(f, true);
+  runCalc(c);
+  return c;
+}
+
+// An effect putting what `get` gives on the page with `apply`, run now.
+function bound(get, apply, el, name, old) {
+  const c = new Calc(get, true);
+  c.apply = apply;
+  c.el = el;
+  c.name = name;
+  c.old = old;
+  runCalc(c);
+  return c;
+}
+
+// `f`'s value, kept until what it read changes, then worked out again when
+// next read. (Worked out at once the first time, as the code is written.)
+function memo(f) {
+  const c = new Calc(f, false);
+  runCalc(c);
+  return c;
+}
+
+function untrack(f) {
+  const l = Listener;
+  Listener = null;
+  try { return f(); } finally { Listener = l; }
+}
+
+function within(scope, f) {
+  const o = Owner, l = Listener;
+  Owner = scope;
+  Listener = null;
+  try { return f(); } finally { Owner = o; Listener = l; }
+}
+
+// W.is(state, x), for `x == state` read while tracking: it changes only when
+// the state becomes `x` or stops being it, so what reads it hears of just
+// those changes (a thousand rows asking whether each is the chosen one: two
+// run, not all).
+class SelKey {
+  constructor(of, k) { this.of = of; this.k = k; this.obs = null; }
+}
+
+function isNow(s, x) {
+  if (Listener && x !== null && typeof x !== "object") {
+    const keys = s.keys || (s.keys = new Map());
+    let key = keys.get(x);
+    if (!key) keys.set(x, (key = new SelKey(s, x)));
+    link(Listener, key);
+    return eq(s._v, x);
+  }
+  return eq(s.v, x);
+}
+keyStale = (key) => {
+  const o = key && key.obs;
+  if (o) for (let i = 0; i < o.length; i += 2) stale(o[i], DIRTY);
+};
+
+// ---- markup ----------------------------------------------------------------
+// Markup is made into nodes when it is put on the page: `make(c, out)`
+// adds its nodes to `out`, each time anew (the same markup can be put in
+// twice). `c` says where: a parent and, while the server's page is taken
+// up (`c.claim`), the page's node to take up next, which taking up moves past.
+
+class Html { constructor(make) { if (make) this.make = make; } }
+
+const SVG = "http://www.w3.org/2000/svg";
+const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
+const isText = (x) => typeof x === "string" || typeof x === "number";
+// Taking up the server's page: inputs keep what was typed (see setProp).
+let claiming = 0;
+
+class Mismatch extends Error {}
+
+// The page's text node at `c.n`, taken up as text `t`: split where the
+// browser joined it with text after it; an empty one is made.
+function claimText(c, t) {
+  if (t === "") {
+    const e = document.createTextNode("");
+    c.p.insertBefore(e, c.n);
+    return e;
+  }
+  const n = c.n;
+  if (!n || n.nodeType !== 3) throw new Mismatch("text");
+  if (n.data === t) { c.n = n.nextSibling; return n; }
+  if (n.data.startsWith(t)) { c.n = n.splitText(t.length); return n; }
+  throw new Mismatch("text");
+}
+
+// The nodes for value `v` (text, markup, a list of them), into `out`.
+function put(v, c, out) {
+  if (isNil(v) || v === false || v === true) return;
+  if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
+  if (v instanceof Html) { v.make(c, out); return; }
+  const t = display(v);
+  out.push(c.claim ? claimText(c, t) : document.createTextNode(t));
+}
+
+// A part's nodes now: a dynamic part keeps its own (see `dyn`), ahead of
+// its marker.
+function nodesOf(list, out = []) {
+  for (const n of list) {
+    if (n.__part) nodesOf(n.__part.nodes, out);
+    out.push(n);
+  }
   return out;
 }
 
-// `x` as a list of nodes; a memoized loop's rows (see `rows`) are one.
-function nodes(x) { return x !== null && x !== undefined && x.$rows === true ? x : norm(x, []); }
-
-// HTML literal: W.h(tag, props, on, kids, key)
-function h(tag, props, on, kids, key) {
-  return new VEl(tag, props, on, norm(kids, []), isNil(key) ? null : display(key));
+function removeNodes(list) {
+  for (const n of nodesOf(list)) if (n.parentNode) n.parentNode.removeChild(n);
 }
 
-// ---- blocks ------------------------------------------------------------
-// Markup whose shape never changes (its tags, fixed attributes and text) is
-// compiled into a block: a template, made once and cloned for each use, with
-// holes for what can change. A render gives only the holes' values, and an
-// update compares them with the last ones.
-//
-// tpl: [tag, [[name, value], ...], [child, ...]], a child being text or a tpl.
-// holes: [kind, node, name]: 0 attribute, 1 class, 2 handler, 3 an element's
-// only child (its node is an empty text node in the template, which text
-// fills), 4 an element's children.
-// mount(v, root, svg): compiled for the block, it finds the nodes with holes
-// in a copy of the template (`v.els`) and fills them from `v.vals`.
-// patch(a, v): compiled too, v takes over a's DOM and updates what changed.
-function block(tpl, holes, mount, patch) {
-  return { tpl, kinds: holes.map((h) => h[0]), at: holes.map((h) => h[1]), names: holes.map((h) => h[2]), mount, patch, html: null, svg: null };
+// A part of the page that follows `get`: its nodes, then a marker (an
+// empty text node) that later nodes go in front of. A text that becomes
+// another text is changed in place.
+function dyn(get, c, out) {
+  bound(get, dynApply, { nodes: [], end: null, c, out }, null, undefined);
 }
 
-// A use of block `def`: W.b(def, values, key). Numbers and strings are
-// keys as they are.
-function b(def, vals, key) {
-  return new VBlock(def, vals, isNil(key) ? null : typeof key === "number" || typeof key === "string" ? key : display(key));
+function dynApply(x) {
+  const r = this.el, c = r.c;
+  if (r.end === null) {
+    const got = [];
+    put(x, c, got);
+    r.nodes = got;
+    r.end = document.createTextNode("");
+    r.end.__part = r;
+    if (c.claim) c.p.insertBefore(r.end, c.n);
+    for (const n of got) r.out.push(n);
+    r.out.push(r.end);
+    r.c = { claim: false, svg: c.svg };
+    r.out = null;
+    return;
+  }
+  const one = r.nodes.length === 1 ? r.nodes[0] : null;
+  if (one && one.nodeType === 3 && !one.__part && isText(x)) {
+    const t = display(x);
+    if (one.data !== t) one.data = t;
+    return;
+  }
+  removeNodes(r.nodes);
+  const got = [];
+  put(x, c, got);
+  const p = r.end.parentNode;
+  if (p) for (const n of got) p.insertBefore(n, r.end);
+  r.nodes = got;
 }
 
-// A block's DOM, made once and cloned: elements from <svg> down are SVG's
-// (a block may hold an <svg> inside HTML), and HTML again inside a
-// <foreignObject>.
+// An element's only content, following `get`: its children, without markers.
+function dynAll(el, get, claim, svg) {
+  bound(get, dynAllApply, el, svg, claim);
+}
+
+function dynAllApply(x) {
+  const el = this.el, svg = this.name;
+  if (this.old) {
+    // Taking up the page's children, the first time.
+    this.old = false;
+    const c = { p: el, n: el.firstChild, claim: true, svg };
+    if (isText(x) && !el.firstChild) el.appendChild(document.createTextNode(""));
+    c.n = el.firstChild;
+    const got = [];
+    put(x, c, got);
+    if (isText(x) && got.length === 0) el.appendChild(document.createTextNode(""));
+    rest(el, c.n);
+    return;
+  }
+  const t = el.firstChild;
+  if (t && t === el.lastChild && t.nodeType === 3 && !t.__part && isText(x)) {
+    const s = display(x);
+    if (t.data !== s) t.data = s;
+    return;
+  }
+  const got = [];
+  put(x, { claim: false, svg }, got);
+  if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
+  el.replaceChildren(...got);
+}
+
+// What is left of an element's children after taking it up: empty text
+// nodes go; anything else is not what the code makes.
+function rest(el, n) {
+  while (n) {
+    const next = n.nextSibling;
+    if (n.nodeType === 3 && n.data === "") el.removeChild(n);
+    else throw new Mismatch("extra");
+    n = next;
+  }
+}
+
+// ---- templates -----------------------------------------------------------
+// Markup of a fixed shape is a template, made once and cloned for each
+// use: [tag, [[name, value], ...], [kid, ...], [[kind, name, i], ...]], a
+// kid being text, a template, or a number: value `i`, shown there. The
+// last list is the element's holes: 0 an attribute, 1 its class, 2 a
+// handler, 3 `{...map}` spread into it. A hole's value is fixed, or a
+// function giving it (then it follows what that reads).
+
+function block(tpl) {
+  plan(tpl);
+  return { tpl, html: null, svg: null };
+}
+
+// Which of a template's children have holes: `tp.dyn`, whether `tp` or
+// what is in it has any; `tp.last`, its last child that does (made copies
+// are walked that far, and only into those).
+function plan(tp) {
+  let last = -1;
+  tp[2].forEach((k, i) => { if (typeof k === "number" || (typeof k === "object" && plan(k))) last = i; });
+  tp.last = last;
+  return (tp.dyn = last >= 0 || tp[3].length > 0);
+}
+
 function blockTemplate(def, svg) {
   const make = (t, inSvg) => {
     const here = inSvg || t[0] === "svg";
     const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
     for (const [k, v] of t[1]) setProp(el, k, v, undefined);
-    for (const c of t[2]) el.appendChild(typeof c === "string" ? document.createTextNode(c) : make(c, here && t[0] !== "foreignObject"));
+    for (const k of t[2]) el.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
     return el;
   };
   return svg ? (def.svg || (def.svg = make(def.tpl, true))) : (def.html || (def.html = make(def.tpl, false)));
 }
 
-// Whether what goes inside `el` is SVG.
-const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
+// W.t(def, values): a use of a template.
+// In a `for` row's own template, `row` is the row's item and `mask` says
+// which values read nothing else: the row updates those itself (`direct`).
+class Tmpl extends Html {
+  constructor(def, vals, row, mask) {
+    super(null);
+    this.def = def;
+    this.vals = vals;
+    this.row = row;
+    this.mask = mask;
+  }
+  make(c, out) {
+    const def = this.def, svg = c.svg || def.tpl[0] === "svg";
+    const r = rowNow, m = maskNow;
+    rowNow = this.row;
+    maskNow = this.mask;
+    try {
+      if (c.claim) {
+        const el = c.n;
+        claimEl(def.tpl, el, this.vals, svg);
+        c.n = el.nextSibling;
+        out.push(el);
+        return;
+      }
+      const el = blockTemplate(def, svg).cloneNode(true);
+      wire(def.tpl, el, this.vals, svg);
+      out.push(el);
+    } finally {
+      rowNow = r;
+      maskNow = m;
+    }
+  }
+}
+
+const tmpl = (def, vals, row = null, mask = 0) => new Tmpl(def, vals, row, mask);
+
+// The row whose template is being made, and which of its values read only
+// it; what makes those (`rowHole`, which pages with `for` rows bring).
+let rowNow = null, maskNow = 0, rowHole = null;
+const byRow = (i) => rowNow !== null && ((maskNow >> i) & 1) === 1;
+
+function wire(tp, el, vals, svg) {
+  const holes = tp[3];
+  for (let i = 0; i < holes.length; i++) { const h = holes[i]; hole(el, h[0], h[1], vals[h[2]], svg, h[2]); }
+  const kids = tp[2], last = tp.last;
+  if (last < 0) return;
+  const sv = inner(tp, svg);
+  if (kids.length === 1 && typeof kids[0] === "number") { showIn(el, vals[kids[0]], false, sv, kids[0]); return; }
+  let n = el.firstChild;
+  for (let i = 0; i <= last; i++) {
+    const k = kids[i], next = i < last ? n.nextSibling : null;
+    if (typeof k === "number") showAt(el, n, vals[k], sv, k);
+    else if (typeof k === "object" && k.dyn) wire(k, n, vals, sv);
+    n = next;
+  }
+}
+
+const inner = (tp, svg) => (svg || tp[0] === "svg") && tp[0] !== "foreignObject";
+
+// The page's element `el` taken up as template `tp`.
+function claimEl(tp, el, vals, svg) {
+  if (!el || el.nodeType !== 1 || el.localName.toLowerCase() !== String(tp[0]).toLowerCase()) throw new Mismatch("element");
+  claiming++;
+  try { for (const h of tp[3]) hole(el, h[0], h[1], vals[h[2]], svg, h[2]); } finally { claiming--; }
+  const kids = tp[2], sv = inner(tp, svg);
+  // The server writes a textarea's value as its text.
+  if (kids.length === 0 && tp[0] === "textarea") return;
+  if (kids.length === 1 && typeof kids[0] === "number") { showIn(el, vals[kids[0]], true, sv, kids[0]); return; }
+  const c = { p: el, n: el.firstChild, claim: true, svg: sv };
+  for (const k of kids) {
+    if (typeof k === "string") claimText(c, k);
+    else if (typeof k === "number") showClaim(c, vals[k], k);
+    else { const n = c.n; claimEl(k, n, vals, sv); c.n = n.nextSibling; }
+  }
+  rest(el, c.n);
+}
+
+const live = (name) => name === "value" || name === "checked" || name === "selected";
+
+function hole(el, kind, name, v, svg, i) {
+  if (kind === 2) { listen(el, name, v); return; }
+  if (kind === 3) { spreadInto(el, v); return; }
+  if (typeof v !== "function") {
+    if (kind === 0) setProp(el, name, v, undefined);
+    else if (!isNil(v) && v !== "") setClass(el, v, svg);
+    return;
+  }
+  if (kind === 0 && live(name)) {
+    // Follows the state even after the user changed it (see `fire`).
+    (el.__live || (el.__live = {}))[name] = v;
+    bound(v, liveApply, el, name, undefined);
+    return;
+  }
+  if (byRow(i)) rowHole(rowNow, v, kind === 0 ? attrApply : classApply, el, kind === 0 ? name : svg, undefined, false);
+  else if (kind === 0) bound(v, attrApply, el, name, undefined);
+  else bound(v, classApply, el, svg, undefined);
+}
+
+function liveApply(x) { setProp(this.el, this.name, x, undefined); }
+function attrApply(x) { setProp(this.el, this.name, x, this.old); this.old = x; }
+function classApply(x) { if (x !== this.old) setClass(this.el, x, this.name); this.old = x; }
+
+// A value shown among other nodes, at placeholder `at`.
+function showAt(p, at, v, svg, i) {
+  if (typeof v !== "function") {
+    const got = [];
+    put(v, { claim: false, svg }, got);
+    for (const n of got) p.insertBefore(n, at);
+    p.removeChild(at);
+    return;
+  }
+  const got = [];
+  if (byRow(i)) rowHole(rowNow, v, dynApply, { nodes: [], end: null, c: { claim: false, svg }, out: got }, null, undefined, true);
+  else dyn(v, { claim: false, svg }, got);
+  for (const n of got) p.insertBefore(n, at);
+  p.removeChild(at);
+}
+
+// The same, taking up the page's nodes at `c`.
+function showClaim(c, v, i) {
+  if (typeof v !== "function") { put(v, c, []); return; }
+  if (byRow(i)) rowHole(rowNow, v, dynApply, { nodes: [], end: null, c, out: [] }, null, undefined, true);
+  else dyn(v, c, []);
+}
+
+// A value that is an element's only content.
+function showIn(el, v, claim, svg, i) {
+  if (typeof v === "function") {
+    if (byRow(i)) rowHole(rowNow, v, dynAllApply, el, svg, claim, true);
+    else dynAll(el, v, claim, svg);
+    return;
+  }
+  if (claim) {
+    const c = { p: el, n: el.firstChild, claim: true, svg };
+    if (isText(v) && !el.firstChild) el.appendChild(document.createTextNode(""));
+    c.n = el.firstChild;
+    put(v, c, []);
+    rest(el, c.n);
+    return;
+  }
+  const got = [];
+  put(v, { claim: false, svg }, got);
+  if (isText(v)) { el.firstChild.data = display(v); return; }
+  el.replaceChildren(...got);
+}
+
+// `{...map}` into an element: attributes and `@event` handlers, as a
+// written-out attribute would be, except that those written out win.
+function spreadInto(el, get) {
+  let had = {};
+  effect(() => {
+    const now = typeof get === "function" ? get() : get;
+    untrack(() => {
+      for (const k of Object.keys(had)) if (!hasOwn(now, k)) { if (k[0] === "@") listen(el, k.slice(1), null); else setProp(el, k, null, had[k]); }
+      for (const k of Object.keys(now)) { if (k[0] === "@") listen(el, k.slice(1), now[k]); else setProp(el, k, now[k], had[k]); }
+      had = now;
+    });
+  });
+}
+
+// W.spread(maps, written): the attributes the maps give an element, without
+// those it has written out, the key and the class (added to its own).
+function spreadAttrs(maps, written) {
+  const o = {};
+  for (const m of maps) {
+    if (isNil(m)) continue;
+    if (!isMap(m)) fail(`\`{...}\` needs a map, got ${typeName(m)}`);
+    for (const k of Object.keys(m)) {
+      if (k === "key" || k === "class" || written.includes(k) || hasOwn(o, k)) continue;
+      if (k[0] !== "@" && !spreadAttrOk(k)) continue;
+      o[k] = m[k];
+    }
+  }
+  return o;
+}
+
+const spreadClasses = (maps) => maps.filter((m) => isMap(m) && hasOwn(m, "class")).map((m) => m.class);
+
+// Several values side by side, each fixed or following what it reads.
+function frag(items) {
+  return new Html((c, out) => {
+    for (const x of items) {
+      if (typeof x === "function") dyn(x, c, out);
+      else put(x, c, out);
+    }
+  });
+}
+
+// A part made again only when `key` changes (an element or component with
+// a `key`, outside a loop: a new key starts it afresh).
+function keyed(key, make) {
+  const k = memo(key);
+  return frag([() => { k.v; return untrack(make); }]);
+}
+
+// `cond ? <a/> : <b/>` and the like: `which` says which branch shows, and
+// a branch is made again only when that changes.
+function choose(which, branches) {
+  const w = memo(which);
+  return frag([() => { const i = w.v; return i < 0 || i >= branches.length ? null : part(untrack(branches[i])); }]);
+}
+
+// What a branch or a row gives: a function is a part that follows it.
+function part(v) {
+  return typeof v === "function" ? frag([v]) : v;
+}
+
+// Raw HTML, kept in a <quillo-raw> (how the page shows it after taking it up).
+function rawHtml(html) {
+  return new Html((c, out) => {
+    if (c.claim) {
+      const n = c.n;
+      if (n && n.nodeType === 1 && n.localName === "quillo-raw") { c.n = n.nextSibling; out.push(n); return; }
+      const t = document.createElement("template");
+      t.innerHTML = html;
+      const wrap = document.createElement("quillo-raw");
+      wrap.style.display = "contents";
+      c.p.insertBefore(wrap, c.n);
+      for (let i = 0; i < t.content.childNodes.length; i++) {
+        const m = wrap.nextSibling;
+        if (!m) throw new Mismatch("raw");
+        wrap.appendChild(m);
+      }
+      c.n = wrap.nextSibling;
+      out.push(wrap);
+      return;
+    }
+    const el = document.createElement("quillo-raw");
+    el.style.display = "contents";
+    el.innerHTML = html;
+    out.push(el);
+  });
+}
 
 function setClass(el, v, svg) {
   if (isNil(v) || v === "") el.removeAttribute("class");
@@ -1887,126 +2449,17 @@ function setClass(el, v, svg) {
   else el.className = v;
 }
 
-const isText = (x) => typeof x === "string" || typeof x === "number";
-
-function mountBlock(v, svg) {
-  const def = v.def;
-  svg = svg || def.tpl[0] === "svg";
-  const root = blockTemplate(def, svg).cloneNode(true);
-  v.parts = null;
-  v.svg = svg;
-  def.mount(v, root, svg);
-  return (v.d = root);
-}
-
-// Hole `i` of block `v` shows virtual DOM: `el`'s children become `x`.
-function showNodes(v, i, el, x, svg) {
-  const ks = nodes(x);
-  svg = svg || inSvg(el);
-  if (adopting) adoptKids(el, ks, svg);
-  else {
-    el.textContent = "";
-    for (const k of ks) el.appendChild(mount(k, svg));
-  }
-  (v.parts || (v.parts = new Array(v.vals.length)))[i] = ks;
-  v.els[v.def.at[i]] = el;
-}
-
-function patchBlock(a, v) {
-  if (a !== v) v.def.patch(a, v);
-}
-
-// Hole `i` of mounted block `v` goes from `old` to `x`. A hole of kind 3
-// holds a text node while it shows text; showing virtual DOM, its node is
-// the element and `parts` has what it shows.
-function updateHole(v, i, x, old) {
-  const def = v.def, kind = def.kinds[i], at = def.at[i], name = def.names[i], els = v.els;
-  // Handlers are new closures each render: only the one to call changes.
-  if (kind === 2) { listen(els[at], name, x); return; }
-  // Inputs' value and checked follow the state even when the user changed them.
-  if (x === old && !(kind === 0 && (name === "value" || name === "checked" || name === "selected"))) return;
-  const n = els[at];
-  if (kind === 0) setProp(n, name, x, old);
-  else if (kind === 1) setClass(n, x, v.svg);
-  else {
-    const was = v.parts && v.parts[i];
-    if (!was) {
-      if (isText(x)) n.data = display(x);
-      else showNodes(v, i, n.parentNode, x, v.svg);
-    } else if (kind === 3 && isText(x)) {
-      for (const k of was) drop(k);
-      n.textContent = "";
-      const t = document.createTextNode(display(x));
-      n.appendChild(t);
-      els[at] = t;
-      v.parts[i] = null;
-    } else {
-      const ks = nodes(x);
-      patchKids(n, was, ks, v.svg || inSvg(n));
-      v.parts[i] = ks;
-    }
-  }
-}
-
-// A row kept from the last render (see `memo`), one of whose holes read
-// something that changed: the hole and its DOM are updated in place.
-function hole(v, i, x) {
-  const old = v.vals[i];
-  v.vals[i] = x;
-  updateHole(v, i, x, old);
-}
-
-// `<Card .../>`: a view call, or a component instance. Spread maps fill
-// the parameters not written out; their other keys are ignored.
-function comp(def, props, kids, key, spreads) {
-  if (typeof def !== "function") fail(`<${def}> is not a view`);
-  const ps = def.$p || [];
-  for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
-  for (const m of spreads || []) {
-    if (isNil(m)) continue;
-    if (!isMap(m)) fail(`\`{...}\` in <${def.$name}> needs a map, got ${typeName(m)}`);
-    for (const k of Object.keys(m)) if (ps.includes(k) && k !== "children" && k !== "key" && !hasOwn(props, k)) props[k] = m[k];
-  }
-  if (ps.includes("children")) props.children = norm(kids, []);
-  if (def.$comp) return new VComp(def, props, isNil(key) ? null : display(key));
-  return def(...ps.map((p) => props[p]));
-}
-
-// An element with `{...map}` attributes: written-out ones win, classes add up,
-// and `@event` keys become handlers.
-function hs(tag, spreads, props, on, kids, key) {
-  const p = {};
-  const o = Object.assign({}, on || {});
-  const classes = [];
-  for (const m of spreads) {
-    if (isNil(m)) continue;
-    if (!isMap(m)) fail(`\`{...}\` in <${tag}> needs a map, got ${typeName(m)}`);
-    for (const k of Object.keys(m)) {
-      if (k === "key") continue;
-      if (k === "class") { classes.push(m[k]); continue; }
-      if (k[0] !== "@" && !spreadAttrOk(k)) continue;
-      if (k[0] === "@") { if (!hasOwn(o, k.slice(1))) o[k.slice(1)] = m[k]; continue; }
-      if (!hasOwn(props, k)) p[k] = m[k];
-    }
-  }
-  Object.assign(p, props);
-  if (classes.length) p.class = [props.class, ...classes].filter((x) => !isNil(x) && x !== false && x !== "").map(display).join(" ");
-  return h(tag, p, Object.keys(o).length ? o : null, kids, key);
-}
 
 // ---- client-side navigation ---------------------------------------------
-// Components that call url() re-render when the URL changes. Once one has,
+// What reads url() follows the URL. Once something has,
 // clicks on same-site links inside components change the URL without a
 // reload (not with a modifier key, target, download or data-reload).
 
-let rendering = null;
-const Nav = { subs: new Set(), on: false };
+const Nav = { at: new Sig(""), on: false };
 
+// What reads url() follows it.
 function navChanged() {
-  for (const i of [...Nav.subs]) {
-    if (i.kids !== null && !i.el.isConnected) { Nav.subs.delete(i); continue; }
-    i.update();
-  }
+  Nav.at.set(location.href);
 }
 
 function navStart() {
@@ -2040,11 +2493,8 @@ function navigate(to) {
 
 function currentUrl() {
   navStart();
-  const inst = rendering;
-  if (inst && !Nav.subs.has(inst)) {
-    Nav.subs.add(inst);
-    onGone(inst, () => Nav.subs.delete(inst));
-  }
+  if (Nav.at._v === "" && typeof location !== "undefined") Nav.at._v = location.href;
+  Nav.at.v;
   const p = location.pathname;
   return {
     path: BASE && p.startsWith(BASE) ? p.slice(BASE.length) || "/" : p,
@@ -2053,8 +2503,6 @@ function currentUrl() {
   };
 }
 
-const SVG = "http://www.w3.org/2000/svg";
-let hydrating = null;
 
 // Spread keys are data: plain attribute names only, and no event handlers
 // or srcdoc, which would run the value as code (as on the server).
@@ -2074,7 +2522,7 @@ function scriptURL(u) {
 function setProp(el, k, v, old) {
   if (k === "value" || k === "checked" || k === "selected") {
     // Taking up the server's HTML: what the page shows (typed, ticked) stays.
-    if (adopting) return;
+    if (claiming) return;
     const nv = k === "value" ? (isNil(v) ? "" : display(v)) : truthy(v);
     if (el[k] !== nv) el[k] = nv;
     if (k !== "value") { if (nv) el.setAttribute(k, ""); else el.removeAttribute(k); }
@@ -2097,6 +2545,9 @@ function fire(el, type, ev) {
   } catch (e) {
     report(e);
   }
+  // An input shows the state's value even if the user typed something the
+  // state did not take (once what the handler changed is shown).
+  if (el.__live) queueMicrotask(() => { for (const k of Object.keys(el.__live)) setProp(el, k, untrack(el.__live[k]), undefined); });
 }
 
 // Calls `f` on `t` events from `el`; a later call replaces `f`. Clicks
@@ -2122,10 +2573,8 @@ function listen(el, t, f) {
 
 let delegating = false;
 
-// The component whose DOM is being made or patched, and `$mount` when a
-// component uses `@mount` (the compiler names the event so, and the bundle
-// carries it only then).
-let updating = null;
+// `$mount` when a component uses `@mount` (the compiler names the event
+// so, and the bundle carries it only then).
 let mountHook = null;
 
 function unhook(g) {
@@ -2133,15 +2582,15 @@ function unhook(g) {
 }
 
 // `@mount={(el) => ...}`: called once the element is on the page, once in
-// its life (later renders' closures are not called). A function it returns
-// is called when the element leaves the page, or its component does.
+// its life. A function it returns is called when the element leaves the
+// page (with the part it is in), or its component does.
 function $mount(el, f) {
   if (el.__mounted) return;
   el.__mounted = true;
   if ($mount.q.length === 0) queueMicrotask(() => {
-    for (const [el, f, inst] of $mount.q.splice(0)) {
-      if (!el.isConnected || (inst && inst.dead)) continue;
-      const keep = (g) => { if (typeof g === "function" && inst) (inst.hooks || (inst.hooks = [])).push([el, g]); };
+    for (const [el, f, owner] of $mount.q.splice(0)) {
+      if (!el.isConnected || (owner && owner.dead)) continue;
+      const keep = (g) => { if (typeof g === "function" && owner) (owner.clean || (owner.clean = [])).push(() => unhook(g)); };
       try {
         const r = f.length > 0 ? f(el) : f();
         if (r instanceof Promise) r.then(keep, report); else keep(r);
@@ -2150,7 +2599,7 @@ function $mount(el, f) {
       }
     }
   });
-  $mount.q.push([el, f, updating || rendering]);
+  $mount.q.push([el, f, Owner]);
 }
 $mount.q = [];
 mountHook = $mount;
@@ -2165,188 +2614,208 @@ function delegated(ev) {
   }
 }
 
-function setEvents(el, on) {
-  if (el.__click && !(on && hasOwn(on, "click"))) el.__click = null;
-  const cur = el.__w;
-  if (cur) for (const t of Object.keys(cur)) if (!on || !hasOwn(on, t)) cur[t] = null;
-  if (!on) return;
-  for (const t of Object.keys(on)) listen(el, t, on[t]);
+
+// ---- lists -----------------------------------------------------------------
+// `for x in xs => <row/>`: a row for each item, kept while its key (or,
+// without one, its place) stays, and given its new item when that
+// changed. Rows that must move are moved: the fewest that leave the others
+// in order, so a swap moves two and a removal none.
+
+function each(list, key, row) {
+  return new Html((c, out) => {
+    const st = { rows: [], end: null, get nodes() { const a = []; for (const r of this.rows) for (const n of r.nodes) a.push(n); return a; } };
+    const svg = c.svg;
+    let first = true;
+    // Rows are their own scopes, not their owner's: they come and go
+    // without it, and go with it.
+    onCleanup(() => { for (const r of st.rows) dispose(r.scope); st.rows = []; });
+    effect(() => {
+      const items = iter(list());
+      untrack(() => {
+        if (!first) { reconcile(st, items, key, row, svg); return; }
+        first = false;
+        st.rows = items.map((x, i) => newRow(x, key ? key(x) : i, row, c, out));
+        st.end = document.createTextNode("");
+        st.end.__part = st;
+        if (c.claim) c.p.insertBefore(st.end, c.n);
+        out.push(st.end);
+      });
+    });
+  });
 }
 
-function mount(v, svg) {
-  if (v instanceof VBlock) return mountBlock(v, svg);
-  if (v instanceof VText) return (v.d = document.createTextNode(v.t));
-  if (v instanceof VRaw) {
-    const el = document.createElement("quillo-raw");
-    el.style.display = "contents";
-    el.innerHTML = v.html;
-    return (v.d = el);
+// A row's item: a signal that also runs what follows only it (`rowDirect`).
+class Item extends Sig {
+  constructor(v, scope) {
+    super(v);
+    this.direct = null;
+    this.scope = scope;
   }
-  if (v instanceof VComp) {
-    const h = takeHydration(v.def.$name);
-    const inst = new Inst(v.def, v.props, h && h.s, h && h.l);
-    const el = document.createElement("quillo-island");
-    el.style.display = "contents";
-    inst.el = el;
-    inst.update();
-    v.inst = inst;
-    return (v.d = el);
+  set(v) {
+    if (v === this._v) return null;
+    super.set(v);
+    const ds = this.direct;
+    if (!ds) return null;
+    const l = Listener, o = Owner;
+    Listener = null;
+    Owner = this.scope;
+    try {
+      for (let i = 0; i < ds.length; i++) {
+        const d = ds[i];
+        let x;
+        try { x = d.fn(); } catch (e) { report(e); continue; }
+        if (d.kid && !plainVal(x)) { ds.splice(i--, 1); bound(d.fn, d.apply, d.el, d.name, d.old); continue; }
+        d.apply(x);
+      }
+    } finally {
+      Listener = l;
+      Owner = o;
+    }
+    return null;
   }
-  const isSvg = svg || v.tag === "svg";
-  const el = isSvg ? document.createElementNS(SVG, v.tag) : document.createElement(v.tag);
-  for (const k of Object.keys(v.props)) setProp(el, k, v.props[k], undefined);
-  setEvents(el, v.on);
-  for (const k of v.kids) el.appendChild(mount(k, isSvg && v.tag !== "foreignObject"));
-  return (v.d = el);
+}
+rowHole = rowDirect;
+
+// What follows only a row's item: no effect, but a record the item runs
+// when it changes (see `Item`). Shown markup, which could hold effects of
+// its own, makes it an effect after all.
+class Direct {
+  constructor(fn, apply, el, name, old, kid) {
+    this.fn = fn;
+    this.apply = apply;
+    this.el = el;
+    this.name = name;
+    this.old = old;
+    this.kid = kid;
+  }
 }
 
-function same(a, b) {
-  if (a.constructor !== b.constructor) return false;
-  if (a instanceof VBlock) return a.def === b.def && a.key === b.key;
-  if (a instanceof VEl) return a.tag === b.tag && a.key === b.key;
-  if (a instanceof VComp) return a.def === b.def && a.key === b.key;
-  return true;
+const plainVal = (x) => x === null || x === undefined || (typeof x !== "object" && typeof x !== "function");
+
+function rowDirect(row, fn, apply, el, name, old, kid) {
+  const l = Listener;
+  Listener = null;
+  let x;
+  try { x = fn(); } catch (e) { report(e); } finally { Listener = l; }
+  if (kid && !plainVal(x)) { bound(fn, apply, el, name, old); return; }
+  const d = new Direct(fn, apply, el, name, old, kid);
+  Listener = null;
+  try { d.apply(x); } finally { Listener = l; }
+  row.direct = row.direct ? row.direct.concat([d]) : [d];
 }
 
-function patch(parent, a, b, svg) {
-  // The same node: a row the render took over unchanged (see `memo`).
-  if (a === b) return;
-  if (!same(a, b)) {
-    const d = mount(b, svg);
-    parent.replaceChild(d, a.d);
-    drop(a);
+function newRow(x, k, row, c, out) {
+  const o = Owner, l = Listener;
+  Owner = null;
+  Listener = null;
+  const sc = new Scope();
+  const r = { key: k, item: new Item(x, sc), scope: sc, nodes: null };
+  Owner = r.scope;
+  const got = [];
+  try { put(part(row(r.item)), c, got); } finally { Owner = o; Listener = l; }
+  r.nodes = got.slice();
+  for (const n of r.nodes) out.push(n);
+  return r;
+}
+
+// The first node of a part's nodes (see `nodesOf`), without listing them.
+function firstOf(list) {
+  for (const n of list) {
+    if (n.__part) { const f = firstOf(n.__part.nodes); if (f) return f; }
+    return n;
+  }
+  return null;
+}
+
+function dropRow(r) {
+  removeNodes(r.nodes);
+  dispose(r.scope);
+}
+
+// Every row gone: the whole parent emptied at once when they are all it holds.
+function clearRows(st, p) {
+  const old = st.rows, end = st.end;
+  const first = old.length ? firstOf(old[0].nodes) : null;
+  if (first && p.firstChild === first && p.lastChild === end) {
+    p.textContent = "";
+    p.appendChild(end);
+  } else if (first && first.parentNode === p) {
+    const range = document.createRange();
+    range.setStartBefore(first);
+    range.setEndBefore(end);
+    range.deleteContents();
+  }
+  for (const r of old) dispose(r.scope);
+  st.rows = [];
+}
+
+function reconcile(st, items, key, row, svg) {
+  const end = st.end, p = end.parentNode, n = items.length;
+  if (!p) return;
+  if (n === 0) { clearRows(st, p); return; }
+  let old = st.rows, w = old.length;
+  const keys = new Array(n);
+  let same = n === w;
+  for (let i = 0; i < n; i++) {
+    const k = key ? key(items[i]) : i;
+    keys[i] = k;
+    if (same && old[i].key !== k) same = false;
+  }
+  // Every row where it was (some items changed): nothing moves.
+  if (same) {
+    for (let i = 0; i < n; i++) { const r = old[i]; if (r.item._v !== items[i]) r.item.set(items[i]); }
     return;
   }
-  const d = (b.d = a.d);
-  if (b instanceof VBlock) return patchBlock(a, b);
-  if (b instanceof VText) { if (a.t !== b.t) d.data = b.t; return; }
-  if (b instanceof VRaw) { if (a.html !== b.html) d.innerHTML = b.html; return; }
-  if (b instanceof VComp) {
-    b.inst = a.inst;
-    b.inst.props = b.props;
-    b.inst.update();
-    return;
-  }
-  const isSvg = svg || b.tag === "svg";
-  for (const k of Object.keys(a.props)) if (!hasOwn(b.props, k)) setProp(d, k, null, a.props[k]);
-  for (const k of Object.keys(b.props)) setProp(d, k, b.props[k], a.props[k]);
-  setEvents(d, b.on);
-  patchKids(d, a.kids, b.kids, isSvg && b.tag !== "foreignObject");
-}
-
-function keyOf(v) { return v instanceof VBlock || v instanceof VEl || v instanceof VComp ? v.key : null; }
-
-// `el`'s children were `old` and become `kids` (all of its children).
-function patchKids(el, old, kids, svg) {
-  if (kids.length === 0) { if (old.length) clearKids(el, old); return; }
-  if (old.length === 0) { for (const k of kids) el.appendChild(mount(k, svg)); return; }
-  // The same nodes as before (rows a render kept): nothing to do.
-  if (old.length === kids.length) {
-    let i = 0;
-    while (i < kids.length && old[i] === kids[i]) i++;
-    if (i === kids.length) return;
-  }
-  if (kids.some((k) => keyOf(k) !== null)) return patchKeyed(el, old, kids, svg);
-  const n = Math.min(old.length, kids.length);
-  for (let i = 0; i < n; i++) patch(el, old[i], kids[i], svg);
-  for (let i = n; i < kids.length; i++) el.appendChild(mount(kids[i], svg));
-  for (let i = n; i < old.length; i++) unmount(el, old[i]);
-}
-
-function clearKids(el, old) {
-  for (const o of old) drop(o);
-  el.textContent = "";
-}
-
-function sameKey(a, b) {
-  const k = keyOf(b);
-  return k !== null && keyOf(a) === k && same(a, b);
-}
-
-// Children with keys: those whose key stays are kept and updated; of them,
-// the longest run already in order stays where it is and the others move,
-// so a swap moves two and a removal none.
-function patchKeyed(el, old, kids, svg) {
-  let s = 0, oe = old.length - 1, ne = kids.length - 1;
-  while (s <= oe && s <= ne && (old[s] === kids[s] || sameKey(old[s], kids[s]))) { patch(el, old[s], kids[s], svg); s++; }
-  while (s <= oe && s <= ne && (old[oe] === kids[ne] || sameKey(old[oe], kids[ne]))) { patch(el, old[oe], kids[ne], svg); oe--; ne--; }
-  const end = ne + 1 < kids.length ? kids[ne + 1].d : null;
-  if (s > oe) {
-    for (let i = s; i <= ne; i++) el.insertBefore(mount(kids[i], svg), end);
-    return;
-  }
-  if (s > ne) {
-    for (let j = s; j <= oe; j++) unmount(el, old[j]);
-    return;
-  }
-  // Each new child's old one: at the same place, or at the same place from
-  // the end, else (for the few left) by key.
-  const m = ne - s + 1, shift = oe - ne;
-  const from = new Int32Array(m).fill(-1);
-  const used = new Uint8Array(oe + 1);
+  // Each new row's old one: at the same place, or by key.
+  const from = new Int32Array(n).fill(-1), used = new Uint8Array(w);
   let left = 0;
-  for (let i = 0; i < m; i++) {
-    const k = kids[s + i];
-    let j = s + i;
-    if (!(j <= oe && !used[j] && (old[j] === k || sameKey(old[j], k)))) {
-      j = s + i + shift;
-      if (!(j >= s && j <= oe && !used[j] && (old[j] === k || sameKey(old[j], k)))) j = -1;
-    }
-    if (j >= 0) { used[j] = 1; from[i] = j; } else left++;
+  for (let i = 0; i < n; i++) {
+    if (i < w && old[i].key === keys[i]) { from[i] = i; used[i] = 1; } else left++;
   }
-  if (left > 0) {
-    const byKey = new Map(), unkeyed = [];
-    for (let j = s; j <= oe; j++) {
-      if (used[j]) continue;
-      const k = keyOf(old[j]);
-      if (k === null) unkeyed.push(j);
-      else if (!byKey.has(k)) byKey.set(k, j);
-    }
-    let u = 0;
-    for (let i = 0; i < m && (byKey.size > 0 || u < unkeyed.length); i++) {
+  if (left > 0 && w > 0) {
+    const byKey = new Map();
+    for (let j = w - 1; j >= 0; j--) if (!used[j]) byKey.set(old[j].key, j);
+    for (let i = 0; i < n; i++) {
       if (from[i] >= 0) continue;
-      const k = kids[s + i], key = keyOf(k);
-      let j = key === null ? (u < unkeyed.length ? unkeyed[u++] : -1) : (byKey.has(key) ? byKey.get(key) : -1);
-      if (j >= 0 && (used[j] || !same(old[j], k))) j = -1;
-      if (j >= 0) { used[j] = 1; from[i] = j; }
+      const j = byKey.get(keys[i]);
+      if (j !== undefined && !used[j]) { from[i] = j; used[j] = 1; byKey.delete(keys[i]); left--; }
     }
   }
-  let last = -1, moved = false, kept = 0;
-  for (let i = 0; i < m; i++) {
-    const j = from[i];
-    if (j < 0) continue;
-    kept++;
-    if (j < last) moved = true;
-    else last = j;
-  }
-  // Nothing kept of a whole list: emptied at once, then filled.
-  if (kept === 0 && s === 0 && oe === old.length - 1 && ne === kids.length - 1) {
-    clearKids(el, old);
-    for (const k of kids) el.appendChild(mount(k, svg));
-    return;
-  }
-  for (let j = s; j <= oe; j++) if (!used[j]) unmount(el, old[j]);
-  // Most children where they were (a swap): those stay and the few others
-  // move, without working out the longest run in order.
-  let stay = null;
-  if (moved) {
-    let displaced = 0;
-    for (let i = 0; i < m && displaced <= 16; i++) if (from[i] >= 0 && from[i] !== s + i) displaced++;
-    if (displaced <= 16) {
-      stay = new Uint8Array(m);
-      for (let i = 0; i < m; i++) stay[i] = from[i] === s + i ? 1 : 0;
-    } else stay = inOrder(from);
-  }
-  let after = end;
-  for (let i = m - 1; i >= 0; i--) {
-    const k = kids[s + i], j = from[i];
-    if (j < 0) el.insertBefore(mount(k, svg), after);
-    else {
-      patch(el, old[j], k, svg);
-      if (moved && !stay[i]) el.insertBefore(k.d, after);
+  // None kept: the old rows go at once.
+  if (left === n && w > 0) { clearRows(st, p); old = []; w = 0; }
+  for (let j = 0; j < w; j++) if (!used[j]) dropRow(old[j]);
+  // The kept rows already in order stay; the others move. New rows go in
+  // together, as a fragment.
+  let moved = false, last = -1;
+  for (let i = 0; i < n; i++) { const j = from[i]; if (j < 0) continue; if (j < last) moved = true; else last = j; }
+  const stay = moved ? inOrder(from) : null;
+  const rows = new Array(n);
+  let after = end, pend = null;
+  for (let i = n - 1; i >= 0; i--) {
+    const j = w ? from[i] : -1;
+    let r;
+    if (j < 0) {
+      const got = [];
+      r = newRow(items[i], keys[i], row, { claim: false, svg }, got);
+      if (!pend) pend = document.createDocumentFragment();
+      for (let k = got.length - 1; k >= 0; k--) pend.insertBefore(got[k], pend.firstChild);
+    } else {
+      if (pend) { const f = pend.firstChild; p.insertBefore(pend, after); if (f) after = f; pend = null; }
+      r = old[j];
+      r.key = keys[i];
+      if (r.item._v !== items[i]) r.item.set(items[i]);
+      if (moved && !stay[i]) {
+        const ns = nodesOf(r.nodes);
+        if (ns.length === 1) p.insertBefore(ns[0], after);
+        else { const f = document.createDocumentFragment(); for (const x of ns) f.appendChild(x); p.insertBefore(f, after); }
+      }
+      const f = firstOf(r.nodes);
+      if (f) after = f;
     }
-    after = k.d;
+    rows[i] = r;
   }
+  if (pend) p.insertBefore(pend, after);
+  st.rows = rows;
 }
 
 // The positions of a longest increasing run of `a`'s values (skipping -1).
@@ -2365,236 +2834,129 @@ function inOrder(a) {
   return keep;
 }
 
-function unmount(el, v) {
-  drop(v);
-  if (v.d && v.d.parentNode === el) el.removeChild(v.d);
-}
+// ---- components ------------------------------------------------------------
+// `<Card .../>`: a component, a view, or a function. A component's and a
+// view's code runs once, with its props as getters, so what it shows
+// follows the parent's values without the parent running again. A plain
+// function returning markup is called again when its arguments change.
 
-// Part of the page is gone: the components in it stop what they started.
-function drop(v) {
-  if (v instanceof VComp) { if (v.inst) v.inst.destroy(); }
-  else if (v instanceof VBlock) { if (v.parts) for (const ks of v.parts) if (ks) for (const k of ks) drop(k); }
-  else if (v.kids) for (const k of v.kids) drop(k);
-}
-
-// Runs `f` when the component leaves the page (see Inst.destroy).
-function onGone(inst, f) {
-  (inst.cleanup || (inst.cleanup = [])).push(f);
-}
-
-// ---- components --------------------------------------------------------
-
-// A loop's rows from one render to the next (see `memo`): the list they
-// were made for, and the rows, in order.
-class Memo {
-  constructor() { this.deps = null; this.changed = -1; this.list = null; this.rows = null; }
-}
-
-// `for` loop `slot` in component `inst`'s render: its rows from the last
-// render, and which of what else they read (`deps`) changed, as bits.
-function memo(inst, slot, deps) {
-  const ms = inst.memos || (inst.memos = []);
-  const m = ms[slot] || (ms[slot] = new Memo());
-  let changed = 0;
-  if (m.deps === null || m.deps.length !== deps.length) changed = -1;
-  else for (let i = 0; i < deps.length; i++) if (m.deps[i] !== deps[i]) changed |= i < 31 ? 1 << i : -1;
-  m.changed = changed;
-  m.deps = deps;
-  return m;
-}
-
-// A memoized loop's rows: `make(x)` makes the row for item x, and
-// `refresh(row, x, changed)` brings a kept one up to date with what changed
-// (without it, any change makes every row again). A row is kept for the
-// same item (the same value): looked for at the same place first, then at
-// the same place from the end (after rows were added or removed before
-// it), then, for what is left, anywhere.
-function rows(m, list, make, refresh) {
-  const n = list.length, c = m.changed;
-  const keep = c === 0 || (refresh !== null && c !== -1);
-  const was = keep ? m.list : null, old = m.rows;
-  const w = was === null ? 0 : was.length;
-  if (was === list) {
-    // The very list of the last render: its rows, in order, the same array
-    // when all are still on the page (so what shows them is left alone).
-    let fresh = null;
-    for (let k = 0; k < n; k++) {
-      const v = old[k];
-      if (!v.d) {
-        if (fresh === null) { fresh = old.slice(); fresh.$rows = true; }
-        fresh[k] = make(list[k]);
-      } else if (c) refresh(v, list[k], c);
+function comp(def, props, kids, spreads) {
+  if (typeof def !== "function") fail(`<${def}> is not a view`);
+  const ps = def.$p || [];
+  for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
+  let p = props;
+  if (spreads) p = withSpreads(props, ps, def, spreads);
+  if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids;
+  return new Html((c, out) => {
+    if (def.$comp) { out.push(island(def, p, takeHydration(def.$name), c)); return; }
+    if (def.$view) {
+      const s = new Scope();
+      within(s, () => put(part(def.$view(p)), c, out));
+      return;
     }
-    if (fresh !== null) m.rows = fresh;
-    return m.rows;
+    dyn(() => def(...ps.map((k) => p[k])), c, out);
+  });
+}
+
+// Props with `{...map}` spreads: what is not written out comes from the maps.
+function withSpreads(props, ps, def, spreads) {
+  const o = {};
+  for (const k of Object.keys(props)) Object.defineProperty(o, k, Object.getOwnPropertyDescriptor(props, k));
+  for (const k of ps) {
+    if (k === "children" || k === "key" || hasOwn(o, k)) continue;
+    Object.defineProperty(o, k, {
+      enumerable: true,
+      get() {
+        for (const m of spreads()) {
+          if (isNil(m)) continue;
+          if (!isMap(m)) fail(`\`{...}\` in <${def.$name}> needs a map, got ${typeName(m)}`);
+          if (hasOwn(m, k)) return m[k];
+        }
+        return undefined;
+      },
+    });
   }
-  // An array of nodes, none of them null or a list, marked as such for
-  // `nodes` (arrays made from it, by `+`, map or slice, are not).
-  const out = new Array(n);
-  out.$rows = true;
-  if (w === 0) for (let k = 0; k < n; k++) out[k] = make(list[k]);
-  else {
-    const used = new Uint8Array(w), shift = w - n;
-    let left = 0;
-    for (let k = 0; k < n; k++) {
-      const x = list[k];
-      let j = k;
-      if (!(j < w && was[j] === x && !used[j])) {
-        j = k + shift;
-        if (!(j >= 0 && j < w && was[j] === x && !used[j])) j = -1;
-      }
-      // A row from a render that failed was never shown: made again.
-      const v = j >= 0 ? old[j] : undefined;
-      if (v !== undefined && v.d) {
-        used[j] = 1;
-        if (c) refresh(v, x, c);
-        out[k] = v;
-      } else left++;
-    }
-    if (left > 0) {
-      let byItem = null;
-      for (let j = 0; j < w; j++) if (!used[j] && old[j].d && !(byItem || (byItem = new Map())).has(was[j])) byItem.set(was[j], j);
-      for (let k = 0; k < n && left > 0; k++) {
-        if (out[k] !== undefined) continue;
-        const x = list[k], j = byItem === null ? undefined : byItem.get(x);
-        if (j !== undefined && !used[j]) {
-          used[j] = 1;
-          const v = old[j];
-          if (c) refresh(v, x, c);
-          out[k] = v;
-        } else out[k] = make(x);
-        left--;
-      }
-    }
-  }
-  m.list = list;
-  m.rows = out;
-  return out;
+  return o;
 }
 
-class Inst {
-  constructor(def, props, state, live) {
+// A parameter's default when the prop is not given.
+function withDefaults(p, defaults) {
+  const o = {};
+  for (const k of Object.keys(p)) if (!hasOwn(defaults, k)) Object.defineProperty(o, k, Object.getOwnPropertyDescriptor(p, k));
+  for (const k of Object.keys(defaults)) {
+    const src = Object.getOwnPropertyDescriptor(p, k);
+    Object.defineProperty(o, k, {
+      enumerable: true,
+      get() { const v = src ? (src.get ? src.get.call(p) : src.value) : undefined; return v === undefined ? defaults[k]() : v; },
+    });
+  }
+  return o;
+}
+
+class Inst extends Scope {
+  constructor(def, props, state, liveInfo) {
+    super();
     this.def = def;
     this.props = props;
-    this.liveInfo = live || null;
-    this.subs = {};
-    this.s = state || {};
-    this.ready = new Set(Object.keys(this.s));
-    this.kids = null;
+    this.s0 = state || {};
+    this.liveInfo = liveInfo || null;
     this.el = null;
-    this.queued = false;
   }
 
-  // `~name = init`: runs init the first time only.
-  state(name, init) {
-    if (this.ready.has(name)) return;
-    this.ready.add(name);
+  // `state name = init`: what the server rendered with, or init's value.
+  // Asked again (a body made again whole), the same state.
+  sig(name, init) {
+    const had = this.sigs || (this.sigs = {});
+    if (had[name]) return had[name];
+    if (hasOwn(this.s0, name)) return (had[name] = new Sig(this.s0[name]));
     const v = init();
     if (v instanceof Promise) {
-      this.s[name] = null;
-      v.then((x) => this.set(name, x), report);
+      const s = new Sig(null);
+      v.then((x) => s.set(x), report);
+      return (had[name] = s);
+    }
+    return (had[name] = new Sig(v));
+  }
+}
+
+// A component in its <quillo-island>: made, or taking up the page's.
+function island(def, props, h, c) {
+  const inst = new Inst(def, props, h && h.s, h && h.l);
+  let el;
+  if (c.claim) {
+    el = c.n;
+    if (!el || el.nodeType !== 1 || el.localName !== "quillo-island" || el.dataset.c !== def.$name) throw new Mismatch("component");
+    el.__q = true;
+    c.n = el.nextSibling;
+  } else {
+    el = document.createElement("quillo-island");
+    el.style.display = "contents";
+  }
+  inst.el = el;
+  run(inst, el, c.claim);
+  return el;
+}
+
+// The component's code, once; then its markup put in its island.
+function run(inst, el, claim) {
+  within(inst, () => {
+    let view;
+    try {
+      view = part(inst.def(inst, inst.props));
+    } catch (e) {
+      if (e instanceof Ret) view = e.v;
+      else { report(e); return; }
+    }
+    if (claim) {
+      const c = { p: el, n: el.firstChild, claim: true, svg: false };
+      put(view, c, []);
+      rest(el, c.n);
     } else {
-      this.s[name] = v;
+      const got = [];
+      put(view, { claim: false, svg: false }, got);
+      el.append(...got);
     }
-  }
-
-  set(name, v) {
-    this.s[name] = v;
-    if (!this.queued) {
-      this.queued = true;
-      queueMicrotask(() => { this.queued = false; this.update(); });
-    }
-    return null;
-  }
-
-  render() {
-    const ps = this.def.$p;
-    const args = ps.map((p) => {
-      const v = this.props[p];
-      return p === "children" && typeof v === "string" ? new VRaw(v) : v;
-    });
-    const outer = rendering;
-    rendering = this;
-    try {
-      return norm(this.def(this, ...args), []);
-    } catch (e) {
-      if (e instanceof Ret) return norm(e.v, []);
-      throw e;
-    } finally {
-      rendering = outer;
-      if (this.afterRender) this.afterRender();
-    }
-  }
-
-  // Gone from the page: its timers, live data and url() listening stop
-  // (whatever registered with onGone), and so does every component inside.
-  destroy() {
-    if (this.dead) return;
-    this.dead = true;
-    if (this.cleanup) for (const f of this.cleanup) f();
-    if (this.hooks) { for (const [, g] of this.hooks) unhook(g); this.hooks = null; }
-    if (this.kids) for (const k of this.kids) drop(k);
-  }
-
-  // Takes up the server's HTML as it is: the render's nodes are matched to
-  // the page's (nothing is made again), handlers attached. HTML that is not
-  // what the render gives (changed by hand, say) is made again instead.
-  adopt() {
-    if (this.dead) return;
-    let kids;
-    try {
-      kids = this.render();
-    } catch (e) {
-      report(e);
-      return;
-    }
-    const outer = updating;
-    updating = this;
-    adopting++;
-    let ok = true;
-    try {
-      adoptKids(this.el, kids, false);
-      this.kids = kids;
-      if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
-    } catch (e) {
-      if (!(e instanceof Mismatch)) report(e);
-      ok = false;
-    } finally {
-      adopting--;
-      updating = outer;
-    }
-    if (!ok) {
-      // Counted, so a page (or a test) can tell its HTML was made again.
-      if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
-      this.kids = null;
-      this.update();
-    }
-  }
-
-  update() {
-    if (this.dead) return;
-    let kids;
-    try {
-      kids = this.render();
-    } catch (e) {
-      report(e);
-      return;
-    }
-    const outer = updating;
-    updating = this;
-    try {
-      if (this.kids === null) {
-        this.el.replaceChildren(...kids.map((k) => mount(k, false)));
-      } else {
-        patchKids(this.el, this.kids, kids, false);
-      }
-    } finally {
-      updating = outer;
-    }
-    this.kids = kids;
-    // Elements with an @mount cleanup that this render took off the page.
-    if (this.hooks) this.hooks = this.hooks.filter(([el, g]) => el.isConnected || (unhook(g), false));
-  }
+  });
 }
 
 // Island JSON, with error values (`{"$quillo_err": x}`) restored.
@@ -2602,6 +2964,8 @@ function islandJSON(text, fallback) {
   if (!text) return fallback;
   return JSON.parse(text, (k, v) => (v && typeof v === "object" && !Array.isArray(v) && hasOwn(v, "$quillo_err") && Object.keys(v).length === 1) ? new Err(v.$quillo_err) : v);
 }
+
+let hydrating = null;
 
 function takeHydration(name) {
   const q = hydrating && hydrating[name];
@@ -2615,119 +2979,12 @@ function report(e) {
 
 // ---- resuming: the server's HTML, taken up as it is ----------------------
 //
-// A component's HTML from the server is not made again: its render is
-// matched to the nodes on the page (text the browser merged is split where
-// the render has several texts, empty ones are added), handlers attached,
-// and from then on only what changes is patched. Components are taken up
-// when someone first reaches for them; those that run by themselves, or
-// are the page, as soon as the bundle is in.
-
-class Mismatch extends Error {}
-let adopting = 0;
-
-// The page's element `el` given the node shape of block template `t`.
-function tplAlign(t, el) {
-  if (!el || el.nodeType !== 1 || el.localName !== String(t[0]).toLowerCase()) throw new Mismatch("element");
-  const kids = t[2];
-  // A hole for all its children (adopted with the hole), or none.
-  if (kids.length === 0) return;
-  // A hole for its only child: a text node, there even when empty.
-  if (kids.length === 1 && kids[0] === "") {
-    if (!el.firstChild) el.appendChild(document.createTextNode(""));
-    return;
-  }
-  let n = el.firstChild;
-  for (const c of kids) {
-    if (typeof c === "string") {
-      if (!n || n.nodeType !== 3) throw new Mismatch("text");
-      if (n.data !== c) {
-        if (c.length && n.data.startsWith(c)) n.splitText(c.length);
-        else throw new Mismatch("text");
-      }
-    } else {
-      tplAlign(c, n);
-    }
-    n = n.nextSibling;
-  }
-  if (n) throw new Mismatch("extra");
-}
-
-function adoptBlock(v, n, svg) {
-  const def = v.def;
-  svg = svg || def.tpl[0] === "svg";
-  tplAlign(def.tpl, n);
-  v.parts = null;
-  v.svg = svg;
-  def.mount(v, n, svg);
-  return (v.d = n);
-}
-
-// `el`'s children are what `ks` render: matched one by one.
-function adoptKids(el, ks, svg) {
-  let n = el.firstChild;
-  for (const k of ks) n = adoptNode(el, n, k, svg);
-  while (n) {
-    const next = n.nextSibling;
-    if (n.nodeType === 3 && n.data === "") el.removeChild(n);
-    else throw new Mismatch("extra");
-    n = next;
-  }
-}
-
-// Node `k` takes up the page's node `n` (and those after it it needs);
-// what comes after it is returned.
-function adoptNode(el, n, k, svg) {
-  if (k instanceof VText) {
-    const t = String(k.t);
-    if (t === "") {
-      const e = document.createTextNode("");
-      el.insertBefore(e, n);
-      k.d = e;
-      return n;
-    }
-    if (!n || n.nodeType !== 3) throw new Mismatch("text");
-    if (n.data === t) { k.d = n; return n.nextSibling; }
-    if (n.data.startsWith(t)) { const rest = n.splitText(t.length); k.d = n; return rest; }
-    throw new Mismatch("text");
-  }
-  if (!n || n.nodeType !== 1) throw new Mismatch("node");
-  if (k instanceof VBlock) { adoptBlock(k, n, svg); return n.nextSibling; }
-  if (k instanceof VComp) {
-    if (n.localName !== "quillo-island" || n.dataset.c !== k.def.$name) throw new Mismatch("component");
-    const h = takeHydration(k.def.$name);
-    const inst = new Inst(k.def, k.props, h && h.s, h && h.l);
-    inst.el = n;
-    n.__q = true;
-    inst.adopt();
-    k.inst = inst;
-    k.d = n;
-    return n.nextSibling;
-  }
-  if (k instanceof VRaw) {
-    if (n.localName === "quillo-raw") { k.d = n; return n.nextSibling; }
-    // The server writes raw HTML as it is: its nodes go into the wrapper the
-    // browser keeps it in.
-    const t = document.createElement("template");
-    t.innerHTML = k.html;
-    const wrap = document.createElement("quillo-raw");
-    wrap.style.display = "contents";
-    el.insertBefore(wrap, n);
-    for (let i = 0; i < t.content.childNodes.length; i++) {
-      const m = wrap.nextSibling;
-      if (!m) throw new Mismatch("raw");
-      wrap.appendChild(m);
-    }
-    k.d = wrap;
-    return wrap.nextSibling;
-  }
-  const isSvg = svg || k.tag === "svg";
-  if (n.localName !== String(k.tag).toLowerCase()) throw new Mismatch("element");
-  k.d = n;
-  for (const p of Object.keys(k.props)) setProp(n, p, k.props[p], undefined);
-  setEvents(n, k.on);
-  adoptKids(n, k.kids, isSvg && k.tag !== "foreignObject");
-  return n.nextSibling;
-}
+// A component's HTML from the server is not made again: its code runs, and
+// its markup takes up the page's nodes (text the browser joined is split
+// where the code has several texts, empty ones are added), handlers are
+// attached, and from then on each part follows what it reads. Components
+// are taken up when someone first reaches for them; those that run by
+// themselves, or are the page, as soon as the bundle is in.
 
 // The outermost island a node is in.
 function outerIsland(node) {
@@ -2738,32 +2995,54 @@ function outerIsland(node) {
 
 // An island taken up: its component (and those inside it) resumed from
 // the state the server wrote, on the HTML it wrote.
-function resume(island) {
-  if (island.__q) return;
-  island.__q = true;
-  const def = C[island.dataset.c];
-  if (!def) { report(`unknown component <${island.dataset.c}>`); return; }
-  hydrating = {};
-  for (const inner of island.querySelectorAll("quillo-island")) {
-    (hydrating[inner.dataset.c] = hydrating[inner.dataset.c] || []).push({
-      s: islandJSON(inner.dataset.s, {}),
-      l: islandJSON(inner.dataset.l, null),
-    });
-    liveSeen(...(inner.dataset.v || "").split(":"));
+function resume(el) {
+  if (el.__q) return;
+  el.__q = true;
+  const def = C[el.dataset.c];
+  if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
+  const queue = () => {
+    const q = {};
+    for (const inner of el.querySelectorAll("quillo-island")) {
+      (q[inner.dataset.c] = q[inner.dataset.c] || []).push({ s: islandJSON(inner.dataset.s, {}), l: islandJSON(inner.dataset.l, null) });
+    }
+    return q;
+  };
+  for (const inner of el.querySelectorAll("quillo-island")) liveSeen(...(inner.dataset.v || "").split(":"));
+  liveSeen(...(el.dataset.v || "").split(":"));
+  const props = islandJSON(el.dataset.p, {});
+  // A top island's children come as the HTML the server made of them.
+  if (typeof props.children === "string") props.children = rawHtml(props.children);
+  const state = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
+  hydrating = queue();
+  let inst = new Inst(def, props, state, liveInfo);
+  inst.el = el;
+  let ok = true;
+  try {
+    run(inst, el, true);
+    if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
+  } catch (e) {
+    if (!(e instanceof Mismatch)) report(e);
+    ok = false;
   }
-  liveSeen(...(island.dataset.v || "").split(":"));
-  const inst = new Inst(def, islandJSON(island.dataset.p, {}), islandJSON(island.dataset.s, {}), islandJSON(island.dataset.l, null));
-  inst.el = island;
-  inst.adopt();
+  if (!ok) {
+    // Counted, so a page (or a test) can tell its HTML was made again.
+    if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+    dispose(inst);
+    hydrating = queue();
+    el.replaceChildren();
+    inst = new Inst(def, props, state, liveInfo);
+    inst.el = el;
+    run(inst, el, false);
+  }
   hydrating = null;
   // What was typed before it was taken up: the component hears it now.
-  for (const el of island.querySelectorAll("input, textarea, select")) {
-    const changed = el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked
-      : el.tagName === "SELECT" ? [...el.options].some((o) => o.selected !== o.defaultSelected)
-      : el.value !== el.defaultValue;
+  for (const f of el.querySelectorAll("input, textarea, select")) {
+    const changed = f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked
+      : f.tagName === "SELECT" ? [...f.options].some((o) => o.selected !== o.defaultSelected)
+      : f.value !== f.defaultValue;
     if (changed) {
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      f.dispatchEvent(new Event("input", { bubbles: true }));
+      f.dispatchEvent(new Event("change", { bubbles: true }));
     }
   }
 }
@@ -2814,6 +3093,7 @@ W.Ret = Ret;
 W.fail = fail;
 W.truthy = truthy;
 W.eq = eq;
+W.is = isNow;
 W.add = add;
 W.sub = sub;
 W.mul = mul;
@@ -2823,12 +3103,12 @@ W.lt = lt;
 W.le = le;
 W.gt = gt;
 W.ge = ge;
-W.range = range;
+W.range = intRange;
 W.neg = neg;
 W.field = field;
 W.fieldp = fieldp;
 W.index = index;
-W.call = call;
+W.call = callFn;
 W.mcall = mcall;
 W.type = (name, shape) => {
   OWN_TYPES[name] = shape;
@@ -2839,6 +3119,15 @@ W.type = (name, shape) => {
   };
 };
 W.tryv = tryv;
+// `for` over `enumerate(xs)`, `range(a, b)` and `a..b`, by number: checked
+// as those check, without making the list.
+W.enumlist = (l) => L(l, "enumerate");
+W.span = (a, b, dots) => {
+  if (!dots) { if (b === undefined) { b = I(a, "range"); a = 0; } else { a = I(a, "range"); b = I(b, "range", 2); } }
+  if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
+  if (b - a > 10000000) fail("range is too large");
+  return [a, b];
+};
 W.iter = iter;
 W.match = match;
 W.arity = arity;
@@ -2846,14 +3135,19 @@ W.missing = missing;
 W.argty = argty;
 W.retty = retty;
 W.meta = meta;
-W.h = h;
 W.block = block;
-W.b = b;
-W.hole = hole;
-W.rows = rows;
+W.t = tmpl;
+W.frag = frag;
+W.each = each;
+W.choose = choose;
+W.keyed = keyed;
+W.c = comp;
 W.memo = memo;
-W.hs = hs;
-W.comp = comp;
+W.effect = effect;
+W.props = withDefaults;
+W.spread = spreadAttrs;
+W.spreadcls = spreadClasses;
+W.Html = Html;
 W.display = display;
 W.repr = repr;
 W.short = short;
@@ -2866,33 +3160,37 @@ W.component = (name, params, render) => {
   C[name] = render;
   return render;
 };
-// `~name = live(fname, ...args)`: state that follows the server. Each
-// render passes the arguments again; when they change (`live(load, id)`
-// after `id` changed), it loads again.
+// A function's form for `<Name .../>`: its code once, with props as getters.
+W.view = (f, view) => { f.$view = view; return f; };
+// `state name = live(fname, ...args)`: state that follows the server. When
+// its arguments change (`live(load, id)` after `id` changed), it loads again.
 W.live = (inst, name, fname, args) => {
-  const old = inst.subs[name];
-  if (old) {
-    if (eq(old.args, args)) return;
-    old.args = args;
-    liveRefresh(old);
-    return;
-  }
-  const info = inst.liveInfo && inst.liveInfo[name];
-  const sub = { inst, name, fname, args, topics: info ? info.t : [] };
-  if (!Object.keys(inst.subs).length) {
-    onGone(inst, () => {
-      for (const s of Object.values(inst.subs)) Live.subs.delete(s);
-      liveRestart();
-    });
-  }
-  inst.subs[name] = sub;
-  Live.subs.add(sub);
-  if (!inst.ready.has(name)) {
-    inst.ready.add(name);
-    inst.s[name] = null;
-    liveRefresh(sub);
-  } else {
-    liveRestart();
-  }
+  const had0 = inst.sigs || (inst.sigs = {});
+  if (had0[name]) return had0[name];
+  return (had0[name] = within(inst, () => liveSig(inst, name, fname, args)));
 };
+function liveSig(inst, name, fname, args) {
+  const info = inst.liveInfo && inst.liveInfo[name];
+  const had = hasOwn(inst.s0, name);
+  const sig = new Sig(had ? inst.s0[name] : null);
+  const sub = { inst, sig, name, fname, args: null, topics: info ? info.t : [] };
+  Live.subs.add(sub);
+  onCleanup(() => { Live.subs.delete(sub); liveRestart(); });
+  let first = true;
+  effect(() => {
+    const a = args();
+    untrack(() => {
+      if (first) {
+        first = false;
+        sub.args = a;
+        if (had) liveRestart(); else liveRefresh(sub);
+        return;
+      }
+      if (eq(sub.args, a)) return;
+      sub.args = a;
+      liveRefresh(sub);
+    });
+  });
+  return sig;
+}
 W.server = (name) => meta((...args) => rpc(name, args), name, null);

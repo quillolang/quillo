@@ -287,6 +287,34 @@ fn components_call_the_pages_javascript() {
     assert_eq!(r, want);
 }
 
+/// Fine-grained updates: a component's code runs once; changing one row's
+/// text changes that text and nothing else; a child does not run again when
+/// its parent's other state changes; setting the same value does nothing.
+#[test]
+fn changes_touch_only_what_shows_them() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("fine.qwe"), free_port(), Some(&dir.join("fine.js")));
+    let want = serde_json::json!({
+        "start": { "parent": 1, "child": 1 },
+        "edit": ["characterData"],
+        "rows": ["a", "B", "c"],
+        "sameRows": true,
+        "childOnOther": [],
+        "other": "1",
+        "same": [],
+        "label": ["characterData"],
+        "child": "y",
+        "runs": { "parent": 1, "child": 1 },
+        "remade": 0,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// A component's translations: the server's locale and text, then the same
 /// plural rules in the browser.
 #[test]

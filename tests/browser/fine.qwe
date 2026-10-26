@@ -1,0 +1,28 @@
+// What fine-grained updates promise: a component's code runs once, a
+// change touches only what shows it, a child does not run again for its
+// parent's state, and the same value set again does nothing. Driven by
+// fine.js (tests/browser.rs).
+
+component Child(label: str) {
+    js("tally.run", "child")
+    <span class="child">{label}</span>
+}
+
+component Parent() {
+    state items = [{ id: 1, text: "a" }, { id: 2, text: "b" }, { id: 3, text: "c" }]
+    state other = 0
+    state label = "x"
+    js("tally.run", "parent")
+    <div>
+        <ul>{for it in items => <li key={it.id}>{it.text}</li>}</ul>
+        <b class="other">{other}</b>
+        <Child label={label}/>
+        <button id="edit" @click={() => { items = items | map((it) => it.id == 2 ? merge(it, { text: "B" }) : it) }}>edit</button>
+        <button id="other" @click={() => { other += 1 }}>other</button>
+        <button id="same" @click={() => { other = other }}>same</button>
+        <button id="label" @click={() => { label = "y" }}>label</button>
+    </div>
+}
+
+let tally = "window.tally = { runs: {}, run: (w) => { tally.runs[w] = (tally.runs[w] || 0) + 1; return null; } };"
+route GET / = <html><head><script>{raw(tally)}</script></head><body><Parent/></body></html>

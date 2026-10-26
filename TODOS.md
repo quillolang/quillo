@@ -45,25 +45,26 @@ Known limits of what is there, from the security review and the soak test:
 
 ## Reactivity in the browser
 
-Assigning to a component's `state` re-runs the component's function. Markup of a fixed shape is
-compiled into blocks (a cloned template with holes for what can change), so
-an update compares hole values rather than whole trees; keyed lists move only
-the rows that must move; and the rows of a keyed `for` loop are kept from one
-render to the next, with only the holes that read what changed recomputed.
-Child components still update whenever their parent does.
+Fine-grained: a component's (and a view's) code runs once; `state` is a
+signal, a `let` that reads what changes a memo, a statement that does an
+effect, and each hole in the markup an effect on its own node. Props are
+getters, `for` in markup keeps a row per key (or place) with its item as a
+signal, and `if` / `match` make a branch again only when another is chosen.
+Assigning the value a state already has does nothing.
 
-- [ ] **Skip children whose props did not change.** Values are immutable, so
-      "same props" is an identity check per prop (`VComp` in `patch`,
-      `src/client/runtime.js`). Callbacks written inline are new closures on
-      each render and will still count as changed.
-- [ ] **Skip assignments that change nothing.** `Inst.set` queues an update
-      even when the new value is the old one.
-- [ ] **Keep more than keyed loop rows.** Rows without a `key`, loops in
-      views (which have no component to remember them in) and loops inside
-      other loops (which run once per outer item, so a memo would need a key
-      per run) are made again on each render. So is markup outside loops; its
-      holes could be recomputed only when what they read changed, like kept
-      rows'.
+- [ ] **Faster row creation.** Making 1,000 rows takes about 2.1 ms of
+      script against Solid's 1.4 (bench/README.md): a scope, an item signal,
+      a template instance and its hole functions for each row, and the
+      template walked generically (`wire`); code made per template, as the
+      compiler once made for blocks, would walk it straight.
+- [ ] **Bodies made again whole.** A component body that can `return` early
+      (or use `?`), or assigns its own variables as it runs, is one region
+      made again when what it read changes (its state kept). The compiler
+      could say so, or split such bodies too.
+- [ ] **Inputs that the state did not change.** An input's `value={x}` is
+      put back after its own events, but not when another element's handler
+      sets `x` to the value it already had (nothing changed, so nothing
+      runs).
 - [ ] **Cheaper calls in compiled code.** Every function call checks its
       arguments and catches `return`; building 1,000 rows in Quillo code costs
       several times what plain JavaScript does.

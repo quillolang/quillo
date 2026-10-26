@@ -20,7 +20,7 @@ let tour = [
                "`|` pipes a request through middleware, and `reply` answers from anywhere."] },
     { name: "Components", file: "components.qwe",
       title: "Rendered on the server, resumed in the browser",
-      points: ["`state` is kept between renders and re-renders when assigned. Everything else is recomputed.",
+      points: ["A component runs once; assigning `state` updates just the places that show it.",
                "The server sends HTML; the browser takes over its elements instead of redrawing them.",
                "Each page loads only its own components, about 8 KB gzipped, when they are reached."] },
     { name: "Server functions", file: "server.qwe",
@@ -55,6 +55,39 @@ let bench = [
     { op: "stats.linear_regression", quillo: 1.3, python: 182 },
     { op: "stats.median", quillo: 1.3, python: 44 },
     { op: "sort", quillo: 4.6, python: 46 },
+]
+
+// The UI benchmark (bench/ui in the repository), as bench/ui/run.js prints it:
+// a line of names, then a line per measure, its label and a value per name.
+// Replace bench/ui.txt with a new run's output to update the page.
+let ui = {
+    let lines = split(trim(read_file("bench/ui.txt")), "\n") | map((l) => split(l, " ") | filter((w) => w != ""))
+    let names = first(lines)
+    let n = len(names)
+    let rows = drop(lines, 1)
+        | filter((ws) => len(ws) > n && all(drop(ws, len(ws) - n), (v) => !is_err(float(v))))
+        | map((ws) => {
+            let values = drop(ws, len(ws) - n)
+            { label: join(take(ws, len(ws) - n), " "), raw: values, nums: values | map((v) => float(v)) }
+        })
+    { names, rows }
+}
+
+fn ui_row(label: str) = find(ui.rows, (r) => r.label == label)
+
+let UI_NAMES = { vanilla: "Plain JS", quillo: "Quillo", solid: "Solid", svelte: "Svelte", vue: "Vue", preact: "Preact", react: "React" }
+let UI_OPS = [
+    { label: "create1k (ms)", text: "Create 1,000 rows" },
+    { label: "replace1k (ms)", text: "Replace 1,000 rows" },
+    { label: "update10th (ms)", text: "Update every 10th row" },
+    { label: "select (ms)", text: "Select a row" },
+    { label: "swap (ms)", text: "Swap two rows" },
+    { label: "remove (ms)", text: "Remove a row" },
+    { label: "create10k (ms)", text: "Create 10,000 rows" },
+    { label: "append1k (ms)", text: "Append 1,000 rows" },
+    { label: "clear1k (ms)", text: "Clear 1,000 rows" },
+    { label: "rowsMB (MB)", text: "Memory, 1,000 rows (MB)" },
+    { label: "scriptKB (KB)", text: "Script, compressed (KB)" },
 ]
 
 let features = [
@@ -99,6 +132,38 @@ component Tour(items: list) {
                     <li>{for [i, s] in enumerate(split(p, "`")) => i % 2 == 1 ? <code>{s}</code> : s}</li>}</ul>
             </div>
             <Window title={item.file}><Code lines={item.lines}/></Window>
+        </div>
+    </div>
+}
+
+// The totals as bars, from 0, fastest first; then each operation, the best in bold.
+view UiBench() {
+    let total = ui_row("total")
+    let script = ui_row("script only")
+    let entries = (for [i, n] in enumerate(ui.names) => { name: n, raw: total.raw[i], num: total.nums[i], script: script.raw[i] })
+        | sort_by((e) => e.num)
+    let top = max(total.nums)
+    <div.uibench>
+        <ol.bench.bars>
+            {for e in entries =>
+                <li tabindex="0" class={e.name == "quillo" && "quillo"}>
+                    <span.who>{UI_NAMES[e.name] ?? e.name}</span>
+                    <span.track><span.fill style={`width: ${round(e.num / top * 100, 1)}%`}></span></span>
+                    <b>{e.raw}×</b>
+                    <span.tip role="tooltip">{UI_NAMES[e.name] ?? e.name}: {e.raw}× the fastest in all, {e.script}× in script alone</span>
+                </li>}
+        </ol>
+        <div.table-wrap>
+            <table.ops>
+                <thead><tr><th>Operation</th>{for n in ui.names => <th class={n == "quillo" && "quillo"}>{UI_NAMES[n] ?? n}</th>}</tr></thead>
+                <tbody>{for op in UI_OPS => {
+                    let r = ui_row(op.label)
+                    // 0 is a script written into the page itself, not a smaller one.
+                    let best = min(r.nums | filter((v) => v > 0))
+                    <tr><td>{op.text}</td>{for [i, n] in enumerate(ui.names) =>
+                        <td class={`${n == "quillo" ? "quillo" : ""} ${r.nums[i] == best ? "best" : ""}`}>{r.nums[i] == 0 ? "inline" : r.raw[i]}</td>}</tr>
+                }}</tbody>
+            </table>
         </div>
     </div>
 }
@@ -242,6 +307,15 @@ route GET / =
                     {inline("`math`, `stats` and `vec` give Python's exact answers, worked on by every core. How many times faster than Python 3.9, on a million floats (log scale; hover for timings):")}
                 </p>
                 <Bench rows={bench}/>
+
+                <h3.subhead>And close to hand-written JavaScript <em>in the browser.</em></h3>
+                <p.sub>
+                    {inline("Components compile to JavaScript with fine-grained signals: assigning `state` updates the places that show it, with no virtual DOM. In the keyed [js-framework-benchmark](https://github.com/krausest/js-framework-benchmark) app, driven in headless Chrome, each operation is timed from the click until the page is laid out. The total is the geometric mean of each time over the fastest one's, so 1.00 is the fastest and lower is better (hover for script time alone):")}
+                </p>
+                <UiBench/>
+                <p.note>
+                    {inline("Medians of several runs in one browser, on one machine. Run it yourself with `node bench/ui/run.js`; the apps are in [bench/ui](" + REPO + "/tree/main/bench/ui).")}
+                </p>
             </section>
 
             <section.section>
