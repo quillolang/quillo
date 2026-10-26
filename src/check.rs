@@ -649,7 +649,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("csp", "map | bool | null=", "null"),
     ("csp_nonce", "", "str"),
     ("rate_limit", "str, int, str | int, map | null=", "bool"),
-    ("rate_limit_reset", "str", "null"),
+    ("rate_limit_reset", "str, map | null=", "null"),
     ("image.info", "str", "map | error(str)"),
     ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),

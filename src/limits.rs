@@ -207,18 +207,23 @@ fn rate_limit(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Bool(allowed))
 }
 
-/// `rate_limit_reset(key)`: forgets the key's calls (after a login that
-/// went well, say), in this process and in the database.
+/// `rate_limit_reset(key, { store })`: forgets the key's calls (after a
+/// login that went well, say).
 fn rate_limit_reset(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let key = match args.first() {
         Some(Value::Str(s)) => s.to_string(),
         other => return fail(line, format!("`rate_limit_reset` needs a key, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
+    let opts = match args.get(1) {
+        Some(Value::Map(m)) => Some(m.clone()),
+        _ => None,
+    };
+    let db = use_db(it, opts.as_deref(), line)?;
     let k = full_key(it, &key);
     if let Some(m) = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.remove(&k);
     }
-    if it.site.sessions.is_some() {
+    if db {
         let _ = crate::db::own_sql(it, |_| "delete from _quillo_limits where k = ?".into(), vec![Value::str(&k)]);
     }
     Ok(Value::Nil)
