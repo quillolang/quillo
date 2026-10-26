@@ -161,6 +161,21 @@ route GET /verify = audit.verify()
 }
 
 #[test]
+fn a_database_opened_after_another_was_closed_has_the_table_made() {
+    // Programs one after another, each with a database of its own: one is
+    // often put where the one before it was in memory, and must not be
+    // taken for it (it does not have the table yet).
+    for i in 0..40 {
+        let d = dir(&format!("reopened-{}", i));
+        let mut it = app(&d, "db.open(\"app.db\")\nroute POST /a = audit(\"tick\").seq");
+        let r = send(&mut it, "POST", "localhost", "/a");
+        assert_eq!((r.status, r.text()), (200, "1".to_string()), "program {}", i);
+        drop(it);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
 fn appends_from_several_connections_keep_one_chain() {
     let d = dir("concurrent");
     // Two programs (as two servers would) on one SQLite file.

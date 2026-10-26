@@ -92,9 +92,29 @@ pub fn row_hash(prev: &str, tenant: &str, seq: i64, at: &str, actor: Option<&str
     crate::crypto::hex(&h.finalize())
 }
 
-/// Databases known to have the table (by their `Backend`'s address).
-fn made() -> &'static Mutex<std::collections::HashSet<usize>> {
-    static M: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> = std::sync::OnceLock::new();
+/// Databases (by their `Backend`'s address) known to have something, such
+/// as the table. Each is kept as a `Weak` too: while it is in the set, its
+/// address cannot be given to a database opened after it was closed (one
+/// that may not have the table yet), as a bare address could be.
+#[derive(Default)]
+struct Known(std::collections::HashMap<usize, std::sync::Weak<Backend>>);
+
+impl Known {
+    fn has(&self, b: &Arc<Backend>) -> bool {
+        self.0.contains_key(&(Arc::as_ptr(b) as usize))
+    }
+
+    fn add(&mut self, b: &Arc<Backend>) {
+        // Those closed since are let go (and their addresses with them).
+        if self.0.len() >= 64 {
+            self.0.retain(|_, w| w.strong_count() > 0);
+        }
+        self.0.insert(Arc::as_ptr(b) as usize, Arc::downgrade(b));
+    }
+}
+
+fn made() -> &'static Mutex<Known> {
+    static M: std::sync::OnceLock<Mutex<Known>> = std::sync::OnceLock::new();
     M.get_or_init(Default::default)
 }
 
@@ -128,8 +148,7 @@ fn table_sql(b: &Backend) -> &'static str {
 /// database it is done on a connection of its own, outside any
 /// transaction: MySQL would commit the request's transaction on `create`.
 fn ensure(it: &mut Interp, b: &Arc<Backend>) -> Result<(), String> {
-    let key = Arc::as_ptr(b) as usize;
-    if made().lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+    if made().lock().unwrap_or_else(|e| e.into_inner()).has(b) {
         return Ok(());
     }
     let sql = table_sql(b);
@@ -155,7 +174,7 @@ fn ensure(it: &mut Interp, b: &Arc<Backend>) -> Result<(), String> {
             })?
         }
     }
-    made().lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+    made().lock().unwrap_or_else(|e| e.into_inner()).add(b);
     Ok(())
 }
 
@@ -168,9 +187,10 @@ const LOCK_ROW: [&str; 2] =
 /// that commits at once. Made inside the appends' transactions instead,
 /// two first appends at once could each wait for the other on MySQL.
 fn lock_row(it: &mut Interp, b: &Arc<Backend>, tenant: &str) -> Result<(), String> {
-    static DONE: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-    let key = (Arc::as_ptr(b) as usize, tenant.to_string());
-    if matches!(&**b, Backend::Sqlite(_)) || DONE.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+    // Held as a `Weak`, as in `Known`: the address stays this database's.
+    static DONE: Mutex<Vec<(std::sync::Weak<Backend>, String)>> = Mutex::new(Vec::new());
+    let here = |(w, t): &(std::sync::Weak<Backend>, String)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(b)) && t == tenant;
+    if matches!(&**b, Backend::Sqlite(_)) || DONE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(here) {
         return Ok(());
     }
     let (pool, t, sql) = (b.clone(), tenant.to_string(), LOCK_ROW[b.is_mysql() as usize]);
@@ -184,7 +204,7 @@ fn lock_row(it: &mut Interp, b: &Arc<Backend>, tenant: &str) -> Result<(), Strin
     if done.len() > 10_000 {
         done.clear();
     }
-    done.push(key);
+    done.push((Arc::downgrade(b), tenant.to_string()));
     Ok(())
 }
 
