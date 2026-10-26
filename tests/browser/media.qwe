@@ -1,0 +1,7 @@
+// A stream from RTP, played in the page (tests/browser.rs, media_*).
+// VIDEO_PORT and AUDIO_PORT are replaced by the test with free ports.
+
+media.rtp("cam", { video: VIDEO_PORT, audio: AUDIO_PORT })
+
+route GET / = <html><body><quillo-media stream="cam" controls/></body></html>
+route GET /streams = media.streams()

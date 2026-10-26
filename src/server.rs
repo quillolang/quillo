@@ -34,7 +34,7 @@ impl HttpResponse {
     }
 }
 
-fn plain(status: u16, msg: &str) -> HttpResponse {
+pub fn plain(status: u16, msg: &str) -> HttpResponse {
     HttpResponse {
         status,
         headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
@@ -305,6 +305,14 @@ impl Interp {
                 resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
             }
         }
+        // A page that plays a stream loads the player.
+        if html && req.method != "HEAD" {
+            let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
+            if let (Some(_), None) = (has(&resp.body, b"<quillo-media"), has(&resp.body, b"/_quillo/media.js")) {
+                let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
+                resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
+            }
+        }
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             let mut tags = String::new();
@@ -468,6 +476,13 @@ impl Interp {
                 body: js.as_bytes().to_vec(),
             };
         }
+        if rest == "media.js" {
+            return HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "no-cache".into())],
+                body: crate::client::media_script(&self.base).into_bytes(),
+            };
+        }
         if rest == "quillo.js" {
             // The browser keeps its copy and asks whether it is still current.
             let etag = format!("\"{:016x}\"", {
@@ -496,6 +511,33 @@ impl Interp {
         }
         if let Some(name) = rest.strip_prefix("job/") {
             return self.run_job(name, req, qs);
+        }
+        // What pages sent on a channel (see `wt`).
+        if let Some(name) = rest.strip_prefix("channel/") {
+            if req.method != "POST" || !is_job_request(req) {
+                return plain(404, "not found\n");
+            }
+            return crate::wt::answer(self, name, &req.body);
+        }
+        // A page of the program's, about to connect for channels: who it is.
+        if rest == "wt-ticket" {
+            if req.method != "POST" {
+                return plain(405, "method not allowed\n");
+            }
+            if cross_site(req) {
+                return plain(403, "only the program's own pages connect\n");
+            }
+            self.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
+            let r = crate::wt::ticket(self);
+            self.current_request = None;
+            return r;
+        }
+        // Packets that came to a port the program listens on (see `udp`).
+        if let Some(port) = rest.strip_prefix("udp/") {
+            if req.method != "POST" || !is_job_request(req) {
+                return plain(404, "not found\n");
+            }
+            return crate::udp::answer(self, port, &req.body);
         }
         // The scheduler, asking that the calls made later that are due be made.
         if rest == "later" {
@@ -750,6 +792,19 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
         let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed)).unwrap_or_default());
         resp.headers.push(("cache-control".into(), "no-store".into()));
         send_on(stream, resp);
+    })
+}
+
+/// A page's channels over a WebSocket (where WebTransport cannot be had),
+/// on a thread of its own for as long as the page stays.
+fn serve_channels(req: HttpRequest) -> Answer {
+    let Some(ticket) = crate::wt::ticket_of(req.url.split_once('?').map_or("", |(_, q)| q)) else {
+        return Answer::Respond(plain(403, "no ticket, or an old one\n"));
+    };
+    waiter("quillo-ch", move |stream| {
+        if let Some(socket) = crate::ws::Socket::accept(&req, stream) {
+            crate::wt::over_websocket(socket, ticket);
+        }
     })
 }
 
@@ -1213,6 +1268,9 @@ impl Worker {
         if path.ends_with("/_quillo/live") {
             return serve_live(app.shared.clone(), req);
         }
+        if path.ends_with("/_quillo/wt") && crate::ws::is_upgrade(&req) {
+            return serve_channels(req);
+        }
         if let (Some(key), "/_quillo/announce") = (&app.cluster_key, req.url.as_str()) {
             // Without a secret, the key is no secret either: only limer's
             // own host may announce.
@@ -1301,9 +1359,14 @@ impl Worker {
         }
         // Chrome asks every site for this while DevTools is open; it is not
         // the program's business, so it is not logged.
+        // Nor are the batches of UDP packets handed to the program: they are
+        // counted as packets (see `udp`), not requests.
         let took = start.elapsed().as_secs_f64();
-        crate::metrics::answered(resp.status, took);
-        if req.url != "/.well-known/appspecific/com.chrome.devtools.json" {
+        let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/");
+        if !delivery {
+            crate::metrics::answered(resp.status, took);
+        }
+        if req.url != "/.well-known/appspecific/com.chrome.devtools.json" && !delivery {
             match crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::metrics::TEXT => {
                     crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms)\n", req.method, req.url, resp.status, took * 1000.0))
@@ -1441,12 +1504,24 @@ fn start_background(it: &Interp, addr: std::net::SocketAddr) {
     }
 }
 
+/// Starts handing UDP packets to the program `app` runs (see `udp`).
+fn start_udp(app: &Arc<App>, addr: std::net::SocketAddr) {
+    let app = app.clone();
+    crate::udp::start(addr, move || match &*app.current().1 {
+        Loaded::Ready(it) => crate::udp::ports(it),
+        Loaded::Failed(_) => Vec::new(),
+    });
+}
+
 /// Starts the job scheduler for the program `app` runs (see `jobs`).
 fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
     *app.addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
     if let Loaded::Ready(it) = &*app.current().1 {
         start_background(it, addr);
     }
+    // Also for a program that listens on no port yet: a reload may add one.
+    start_udp(app, addr);
+    crate::wt::serving(addr);
     let app = app.clone();
     crate::jobs::start(addr, move || match &*app.current().1 {
         Loaded::Ready(it) => it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect(),

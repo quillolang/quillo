@@ -52,6 +52,12 @@ options for `run`:
   --no-prefetch  pages do not prefetch the links pointed at (see Prefetching
                  in the user guide)
   --max-body N   largest request body to accept, in bytes (default 10 MiB)
+  --wt-port N    the UDP port pages connect to for channels over WebTransport
+                 (default: the HTTP port's number)
+  --tls-cert F, --tls-key F
+                 the certificate and key (PEM) WebTransport presents; without
+                 them it makes its own, which pages take by its hash
+  --no-wt        no WebTransport: pages' channels use a WebSocket
   --log F        the request log on stderr: text (the default), json (a JSON
                  object per line: time, method, path, status, ms, ip, tenant)
                  or off
@@ -63,7 +69,8 @@ options for `run`:
   --service S    the pool's name (default: the file's name, without .qwe)
 
 `app` takes the options of `run` except --host, --register and --service; its
-port, by default one the system picks, answers only the window.";
+port, by default one the system picks, answers only the window. `--open PATH`
+is the page the window opens on (default /).";
 
 // The system's allocator on the event loops, mimalloc on the threads that
 // wait for them (see quillo::alloc).
@@ -211,6 +218,26 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 }
                 o.base = Some(b.to_string());
             }
+            ("--no-wt", _) => {
+                quillo::wt::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            ("--wt-port", Some(v)) => match v.parse::<u16>() {
+                Ok(n) if n > 0 => {
+                    quillo::wt::PORT.store(n, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    eprintln!("quillo: --wt-port needs a port number");
+                    return Err(2);
+                }
+            },
+            ("--tls-cert", Some(v)) => {
+                let _ = quillo::wt::TLS_CERT.set(v.into());
+            }
+            ("--tls-key", Some(v)) => {
+                let _ = quillo::wt::TLS_KEY.set(v.into());
+            }
             ("--no-prefetch", _) => {
                 quillo::server::PREFETCH.store(false, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
@@ -275,6 +302,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
         }
         i += 2;
+    }
+    if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
+        eprintln!("quillo: --tls-cert and --tls-key go together");
+        return Err(2);
     }
     Ok(o)
 }

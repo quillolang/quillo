@@ -85,6 +85,13 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
     Ok(assemble("(function () {", &program, "})();"))
 }
 
+/// The script pages with `<quillo-media>` load: the player and the
+/// connection it uses, and nothing else of the runtime.
+pub fn media_script(base: &str) -> String {
+    let program = format!("BASE = {};\nmediaDefine();\n", js_str(base));
+    assemble("(function () {", &program, "})();")
+}
+
 /// A script that runs the runtime, compiles the global function `name`,
 /// calls it and prints the result's repr: for testing against the server.
 pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
@@ -871,14 +878,14 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "channel")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
                 self.globals.insert(name.to_string(), r.clone());
                 Ok(r)
             }
-            Value::Map(m) if (name == "db" || name == "http") && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
+            Value::Map(m) if matches!(name, "db" | "http" | "udp" | "media") && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
                 self.err(format!("`{}` is not available in the browser; use it from a `server fn`", name))
             }
             Value::Func(f) if f.def.server => {

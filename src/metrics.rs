@@ -67,6 +67,14 @@ pub fn render() -> String {
     let _ = writeln!(s, "quillo_requests_in_progress {}", IN_PROGRESS.load(Relaxed));
     s.push_str("# HELP quillo_connections Open client connections.\n# TYPE quillo_connections gauge\n");
     let _ = writeln!(s, "quillo_connections {}", CONNECTIONS.load(Relaxed));
+    s.push_str("# HELP quillo_udp_received_total UDP packets received on ports the program listens on.\n# TYPE quillo_udp_received_total counter\n");
+    let _ = writeln!(s, "quillo_udp_received_total {}", crate::udp::RECEIVED.load(Relaxed));
+    s.push_str("# HELP quillo_udp_dropped_total UDP packets dropped because their port's queue was full.\n# TYPE quillo_udp_dropped_total counter\n");
+    let _ = writeln!(s, "quillo_udp_dropped_total {}", crate::udp::DROPPED.load(Relaxed));
+    s.push_str("# HELP quillo_channel_pages Pages connected for channels.\n# TYPE quillo_channel_pages gauge\n");
+    let _ = writeln!(s, "quillo_channel_pages {}", crate::wt::connected());
+    s.push_str("# HELP quillo_channel_dropped_total Channel messages dropped because a queue was full.\n# TYPE quillo_channel_dropped_total counter\n");
+    let _ = writeln!(s, "quillo_channel_dropped_total {}", crate::wt::DROPPED.load(Relaxed));
     s.push_str("# HELP quillo_uptime_seconds Seconds since the server started.\n# TYPE quillo_uptime_seconds gauge\n");
     let _ = writeln!(s, "quillo_uptime_seconds {:.0}", STARTED.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
     s

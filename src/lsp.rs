@@ -459,7 +459,7 @@ impl Server {
                 items.push(json!({ "label": name, "kind": 3, "detail": sig }));
             }
         }
-        for m in ["json", "db", "http"] {
+        for m in ["json", "db", "http", "udp", "channel", "media"] {
             if seen.insert(m.to_string()) {
                 items.push(json!({ "label": m, "kind": 9, "detail": format!("module {}", m) }));
             }

@@ -34,6 +34,9 @@ serves them:
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
 | `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers (see [Concurrency](#concurrency-and-reloading)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
+| `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
+| `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own |
+| `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 
@@ -48,7 +51,8 @@ cargo build --release --features app      # Linux also needs libwebkit2gtk-4.1-d
 ./target/release/quillo app examples/notes.qwe --watch
 ```
 
-It takes the options of `run` except `--host`, `--register` and `--service`. The
+It takes the options of `run` except `--host`, `--register` and `--service`, and
+`--open PATH`, the page the window opens on (`--open /admin`; `/` by default). The
 program is served on 127.0.0.1, at a port the system picks, to the window alone:
 the window's first request carries a token made for this launch and trades it
 for a cookie, and requests without one (other programs, pages of other sites)
@@ -305,7 +309,7 @@ fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(
 ```
 
 The effects are `db`, `http`, `fs` (files), `env` (environment variables), `time` (`now`,
-`sleep`) and `random`. Inside a `with` function, a builtin that needs another effect,
+`sleep`), `random` and `net` (`udp.send`, `udp.reply`). Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
 `quillo check` (which also warns when an undeclared helper may use one). The limit holds
 for everything the function calls, including the lambdas it passes to `map`.
@@ -911,6 +915,148 @@ HTTP/1.1, across its tabs. That suits a job's progress or a reply being written;
 data every page follows, `live` (see [Live data](#live-data)) shares one WebSocket.
 Outside the server (a program's own requests in tests), the function runs first and
 the whole answer is sent at once.
+
+### UDP
+
+A program can take UDP packets on a port, answer them, and send its own: readings from
+sensors, syslog, a game's moves, metrics.
+
+```quillo
+let readings = []
+
+udp.listen(9000, (p) => {
+    readings = readings + [json.parse(p.text)]   // pages with live(...) on it follow
+    udp.reply(p, "ok")                           // sent back from port 9000
+})
+
+udp.send("10.0.0.5", 514, "<14>app started")
+```
+
+- `udp.listen(port, f, { host, queue })` is written at the top of a program. The port is
+  taken when the program runs, so one that is in use is an error at once. `host` is the
+  address to listen on (every one, `"0.0.0.0"`, unless given).
+- `f` gets each packet: `{ text, bytes, from: { host, port }, port, at }`. `text` is the
+  packet as text, or `null` when it is not UTF-8; `bytes` is its bytes as a list of
+  numbers; `at` is when it came, in milliseconds since 1970.
+- The handler runs like a request: waiting on a database or `http.*` holds up no one, and
+  it sees the program's globals, so a page following them with `live` sees each packet.
+  Packets reach it in the order they came, one at a time. An error in it is logged and
+  the next packet goes on.
+- Packets wait in a queue while the handler is busy (10,000 unless `queue` says
+  otherwise). A full queue drops its oldest packet, as UDP would; with `--metrics`,
+  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them.
+- `udp.send(host, port, data, { from })` sends one packet; `udp.reply(packet, data)` sends
+  back to where a packet came from, from the port it came to (as most protocols expect).
+  `data` is text, a list of byte values, or any other value as JSON; a packet holds up to
+  65,507 bytes. Both return `null`, or an error value when the host has no address or the
+  system refuses the packet. They need the `net` effect.
+- With `--reload` and `--watch`, a port the program still listens on stays open, and its
+  packets go to the new version's handler; a port it stopped listening on is closed.
+- One program on a machine listens on a port: run with `--instances`, the instances share
+  the socket. A program mounted in another (`mount /x = "x.qwe"`) gets its own ports' packets.
+
+### Channels
+
+A channel carries messages between the server and its pages as they happen: moves in a
+game, cursors, readings from a device, a chat. Pages send to the program, which answers
+one page, all of them, or none.
+
+```quillo
+channel.on("game", (msg, peer) => {
+    // Everyone else in the channel sees the move.
+    channel.broadcast("game", { id: peer.id, pos: msg.pos }, { except: peer })
+})
+
+component Board() {
+    state others = {}
+    let game = channel.open("game", (m) => { others = set(others, m.id, m.pos) })
+    <canvas @pointermove={(e) => game.send({ pos: [e.clientX, e.clientY] })}/>
+}
+```
+
+- In a component, `channel.open(name, f)` opens a channel for as long as the code that
+  called it stands (the component leaving the page closes it): `f` gets each message the
+  server sends on it, and `.send(value)` sends one to the server. On the server, while
+  the page is rendered, it opens nothing.
+- On the server, `channel.on(name, f, { join, leave })` is written at the top of a
+  program. `f(msg, peer)` gets each message from a page; `peer` is `{ id, session }`, and
+  `session()` in `f` is the page's session too (as it was when the page connected), as
+  is its tenant. Messages reach `f` in the order they came, one at a time, as UDP
+  packets do (see [UDP](#udp)): like a request, with waits holding up no one.
+- `join(peer)` decides whether a page may join: anyone who can open a page can ask, so a
+  channel whose messages are not for everyone has one (`(peer) => peer.session.user !=
+  null`). `leave(peer)` hears that a page left, or closed. A channel no `channel.on`
+  names may be joined, to hear what the program broadcasts on it; what pages send on it
+  goes nowhere.
+- `channel.broadcast(name, value, { except, reliable })` sends to every page in the
+  channel and gives how many; `channel.send(name, peer, value, { reliable })` sends to
+  one, and gives whether it was there; `channel.peers(name)` gives the ids of the pages
+  in it. They need the `net` effect, and wait for nothing: a page that cannot keep up
+  misses messages rather than holding up the program.
+
+How messages travel:
+
+- A page opens one connection for all its channels. Where the browser has WebTransport
+  (HTTP/3, over UDP), a message that fits in a datagram (about 1,100 bytes as JSON) goes
+  as one: it arrives as soon as it can, may come out of order, and may be lost, as a
+  game's moves or a sensor's readings can afford to be. Larger messages, and those sent
+  with `{ reliable: true }` (from either side: `game.send(v, { reliable: true })`), go on
+  a stream: all of them, in order.
+- Where WebTransport cannot be had (the browser lacks it, UDP is blocked, the page is
+  served from a name its certificate does not cover), the page uses a WebSocket, which
+  carries every message reliably. The connection is opened again when it drops, and the
+  channels joined again.
+- The server listens for WebTransport on the UDP port with the HTTP port's number
+  (`--wt-port` for another), from when the first page asks to connect. It makes a
+  certificate of its own, which browsers take by its hash, and a new one before it ends
+  (browsers take such certificates for two weeks at most); `--tls-cert` and `--tls-key`
+  give it a real one. Behind a proxy that passes HTTP only, open the UDP port to the
+  server itself, or pages use the WebSocket. `--no-wt` turns WebTransport off.
+- Broadcasts reach the pages connected to this server. With `--metrics`,
+  `quillo_channel_pages` counts them and `quillo_channel_dropped_total` the messages
+  dropped because a queue was full.
+
+UDP and channels together pass a device's packets on to pages as they come; see
+[examples/telemetry.qwe](examples/telemetry.qwe).
+
+### Media
+
+A program can take a camera's or an encoder's stream as RTP and play it in its pages,
+a fraction of a second behind:
+
+```quillo
+media.rtp("cam", { video: 5004, audio: 5006 })
+
+route GET / = <html><body><quillo-media stream="cam" controls muted/></body></html>
+```
+
+```sh
+ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
+  -map 0:v -c:v libx264 -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 60 \
+  -f rtp rtp://127.0.0.1:5004 -map 0:a -c:a libopus -f rtp rtp://127.0.0.1:5006
+```
+
+- `media.rtp(name, { video, audio, host })` is written at the top of a program. Video is
+  H.264 and audio Opus, each on a port of its own (`{ port: 5004, codec: "h264" }` says
+  so in full). The packets never reach Quillo code: the server puts them back in order,
+  makes frames of them (it reads single NAL units, STAP-A and FU-A), and passes each on
+  to every page watching, without decoding or encoding anything.
+- `<quillo-media stream="cam">` in any page plays the stream: the page loads a small
+  script for it (4.5 KB compressed), which decodes with the browser's own decoders
+  (WebCodecs) and draws on a canvas. `controls` adds a button for sound, and `muted`
+  starts without it (browsers play sound only after a click on the page). Its
+  `data-state` is `connecting`, `waiting`, `playing` or `unsupported` (no WebCodecs),
+  for styling.
+- Frames travel on the page's channel connection: over WebTransport, a stream per
+  track; else over the WebSocket. The server keeps the video since the last keyframe, so
+  a page that starts watching shows a picture at once. A page that falls behind skips
+  to the next keyframe, and so does a stream that lost a packet of video.
+- `media.streams()` gives each stream's viewers and, per track, `frames`, `fps`, `kbps`
+  and `lost` packets.
+- Audio and video are each played as they come, so they are in step within about a
+  tenth of a second. The camera's encoder decides the picture: keyframes every second
+  or two (`-g 60` at 30 fps) let pages that start watching (or fall behind) catch up
+  quickly; `-tune zerolatency` keeps the encoder from holding frames back.
 
 ### Static files
 
@@ -1666,7 +1812,10 @@ src/statics.rs     files served with file()
 src/site.rs        what a program sets about its site: tenants, cross-site posts
 src/jobs.rs        jobs run on a schedule
 src/viewcache.rs   reusing views' HTML while their inputs are unchanged
-src/ws.rs          WebSockets, for live updates and --watch reloads
+src/ws.rs          WebSockets, for live updates, --watch reloads and channels
+src/udp.rs         UDP: udp.listen, udp.send, udp.reply
+src/wt.rs          channels between the server and its pages, over WebTransport
+src/media.rs       RTP from cameras and encoders, passed on to <quillo-media>
 src/cluster.rs     several servers behind limer: --register, broadcasts
 src/metrics.rs     what GET /_quillo/metrics reports
 src/shared.rs      the interpreter lock and other state shared between threads
@@ -1681,12 +1830,13 @@ src/island.rs      when a page loads its components' code
 src/lsp.rs         the language server
 editors/vscode/    the VS Code extension
 
-examples/          hello, orders, todo, notes, compose, layout, spa, scroll, life, storm,
-                   services, and index (all of them in one server)
+examples/          hello, orders, todo, notes, compose, layout, spa, scroll, virtual, life,
+                   storm, telemetry (with sensors), media, services, and index (most of
+                   them in one server)
 apps/crm/          a whole application: a multi-tenant CRM
 site/              quillolang.org, written in Quillo; its docs are made from this README
 tests/             the language, routes, records, effects, the checker, numbers, streams,
-                   services, sessions, uploads, tenants, several databases, the compiler
+                   UDP, services, sessions, uploads, tenants, several databases, the compiler
                    (in Node), the browser (headless Chrome), PostgreSQL and MariaDB
                    (throwaway servers), the CRM, and the language server
 ```

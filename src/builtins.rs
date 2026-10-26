@@ -125,6 +125,15 @@ pub fn install(env: &Env) {
     let mut http = Map::new();
     crate::fetch::install(&mut http);
     define(env, "http", Value::map(http));
+    let mut udp = Map::new();
+    crate::udp::install(&mut udp);
+    define(env, "udp", Value::map(udp));
+    let mut channel = Map::new();
+    crate::wt::install(&mut channel);
+    define(env, "channel", Value::map(channel));
+    let mut media = Map::new();
+    crate::media::install(&mut media);
+    define(env, "media", Value::map(media));
     let mut crypto = Map::new();
     crate::crypto::install(&mut crypto);
     define(env, "crypto", Value::map(crypto));

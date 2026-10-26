@@ -17,6 +17,7 @@ mount /orders = "orders.qwe"
 mount /todo = "todo.qwe"
 mount /notes = "notes.qwe"
 mount /scroll = "scroll.qwe"
+mount /virtual = "virtual.qwe"
 mount /compose = "compose.qwe"
 mount /layout = "layout.qwe"
 mount /spa = "spa.qwe"
@@ -32,6 +33,7 @@ let examples = [
     { id: "compose", path: "/compose", name: "Composition", about: "Views and components built from each other." },
     { id: "layout", path: "/layout", name: "JSON layout", about: "A page described as JSON, with a live editor." },
     { id: "scroll", path: "/scroll", name: "Infinite scroll", about: "100,000 rows; only what is on screen is rendered." },
+    { id: "virtual", path: "/virtual", name: "Virtual list", about: "1,000,000 rows of 10 columns, 20 on screen: drag the scrollbar anywhere." },
     { id: "hello", path: "/hello/hello/Quillo", name: "Hello", about: "Routes, typed path params, query patterns." },
     { id: "orders", path: "/orders/orders", name: "Orders API", about: "Routing on what is inside a JSON body." },
 ]

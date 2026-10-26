@@ -39,6 +39,10 @@ pub struct Site {
     pub locale_rule: Option<Value>,
     /// What `schedule` set to run (see `jobs`).
     pub jobs: Vec<std::sync::Arc<crate::jobs::Job>>,
+    /// What `udp.listen` listens for (see `udp`).
+    pub udp: Vec<std::sync::Arc<crate::udp::Listener>>,
+    /// What `channel.on` handles (see `wt`).
+    pub channels: Vec<std::sync::Arc<crate::wt::Handler>>,
 }
 
 impl Site {

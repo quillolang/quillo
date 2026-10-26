@@ -196,11 +196,7 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
     if DISABLED.load(Ordering::Relaxed) {
         return;
     }
-    let addr = match addr.ip() {
-        ip if ip.is_unspecified() && ip.is_ipv4() => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
-        ip if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port())),
-        _ => addr,
-    };
+    let addr = loopback(addr);
     let spawned = std::thread::Builder::new().name("quillo-jobs".into()).spawn(move || {
         use std::collections::{HashMap, HashSet};
         let mut last: HashMap<String, u64> = HashMap::new();
@@ -237,6 +233,16 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
     });
     if let Err(e) = spawned {
         eprintln!("quillo: cannot start the job scheduler: {}", e);
+    }
+}
+
+/// Where this process reaches the server listening on `addr`: itself, for
+/// a server listening on every address.
+pub fn loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match addr.ip() {
+        ip if ip.is_unspecified() && ip.is_ipv4() => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
+        ip if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port())),
+        _ => addr,
     }
 }
 

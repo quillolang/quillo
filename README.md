@@ -104,6 +104,22 @@ route POST /remind = billing.later.send_reminder(request.form.name)
 components and services, and finds mistakes without running anything; the language
 server brings that, with completion and go-to-definition, to your editor.
 
+**Real time, over UDP too.** A program takes UDP packets on a port, and pages get
+messages as they happen over WebTransport, as datagrams that wait for nothing (or
+reliably, when they must). A camera's RTP stream plays in any page with
+`<quillo-media>`, a fraction of a second behind.
+
+```quillo
+udp.listen(9000, (p) => channel.broadcast("readings", json.parse(p.text)))
+media.rtp("cam", { video: 5004, audio: 5006 })
+
+component Gauge() {
+    state last = null
+    channel.open("readings", (r) => { last = r })
+    <p>{last.v} <quillo-media stream="cam"/></p>
+}
+```
+
 **The rest is in the box.** Links prefetched as you point at them (and never doing
 anything by it), sessions, uploads, images, translations, streaming, scheduled jobs,
 metrics, a JavaScript bridge for browser libraries, multi-tenant hosting, graceful
@@ -119,7 +135,8 @@ cargo build --release
 ```
 
 Then open any of the [examples](examples): routes, a todo app, live notes, a
-single-page app, infinite scroll over 100,000 rows, the Game of Life, services; or
+single-page app, infinite scroll over 100,000 rows, a virtual list of a million, the
+Game of Life, live telemetry over UDP, a camera's stream, services; or
 [apps/crm](apps/crm), a whole multi-tenant CRM with a shop, campaigns, a page designer
 and plugins. [editors/vscode](editors/vscode) is the VS Code extension.
 

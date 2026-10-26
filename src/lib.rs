@@ -16,6 +16,9 @@ pub mod i18n;
 pub mod imaging;
 pub mod island;
 pub mod jobs;
+pub mod udp;
+pub mod wt;
+pub mod media;
 pub mod interp;
 #[cfg(feature = "jit")]
 pub mod jit;

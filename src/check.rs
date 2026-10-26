@@ -629,6 +629,16 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
+    ("udp.listen", "int, fn, map | null=", "null"),
+    ("udp.send", "str, int, any, map | null=", "null | error(str)"),
+    ("udp.reply", "map, any", "null | error(str)"),
+    ("channel.on", "str, fn, map | null=", "null"),
+    ("channel.send", "str, map | str, any, map | null=", "bool"),
+    ("channel.broadcast", "str, any, map | null=", "int"),
+    ("channel.peers", "str", "list"),
+    ("channel.open", "str, fn, map | null=", "map"),
+    ("media.rtp", "str, map", "null"),
+    ("media.streams", "", "list"),
     // src/numeric.rs
     ("math.sqrt", "num", "float"),
     ("math.cbrt", "num", "float"),
@@ -745,7 +755,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
 
-const MODULES: &[&str] = &["json", "db", "http", "crypto", "image", "math", "stats", "vec"];
+const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -2728,7 +2738,8 @@ impl Checker {
                 detail: Sig::builtin(&full, p, r).text(),
             });
         }
-        if !BROWSER_MODULES.contains(&m) {
+        // A page opens channels; the rest of `channel` is the server's.
+        if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
             self.browser_forbidden(&format!("`{}`", full));
         }
         let sig = Arc::new(Sig::builtin(&full, p, r));

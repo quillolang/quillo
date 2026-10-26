@@ -109,8 +109,8 @@ impl Ty {
 }
 
 /// Effects a function can declare with `with`, and the builtins that use them.
-pub const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random"];
-pub const ALL_EFFECTS: u8 = 0b11_1111;
+pub const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random", "net"];
+pub const ALL_EFFECTS: u8 = 0b111_1111;
 
 pub fn effect_bit(name: &str) -> u8 {
     EFFECTS.iter().position(|e| *e == name).map_or(0, |i| 1 << i)
@@ -136,6 +136,7 @@ pub fn builtin_effect(name: &str) -> u8 {
             "env" => "env",
             "now" | "sleep" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
+            "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }
     };

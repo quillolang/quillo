@@ -37,6 +37,11 @@ fn run_page_with(chrome: &Path, app: &Path, port: u16, script: Option<&Path>) ->
 }
 
 fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>) -> serde_json::Value {
+    run_page_args(chrome, app, port, path, script, &[])
+}
+
+/// Like `run_page_with_path`, with options for the server.
+fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Option<&Path>, args: &[&str]) -> serde_json::Value {
     // One Chrome at a time: several at once overload small CI machines.
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -45,6 +50,7 @@ fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: 
         .arg("run")
         .arg(app)
         .args(["--port", &port.to_string()])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -606,4 +612,162 @@ fn pages_read_streams_as_they_come() {
         "errors": []
     });
     assert_eq!(result, want);
+}
+
+/// The program for the channel tests, listening for UDP on `udp`.
+fn channels_program(udp: u16) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("quillo-channels-{}-{}", std::process::id(), udp));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser/channels.qwe")).unwrap();
+    std::fs::write(d.join("channels.qwe"), src.replace("UDP_PORT", &udp.to_string())).unwrap();
+    d.join("channels.qwe")
+}
+
+/// Pages on a channel hear each other (through the server's handler), the
+/// server's broadcasts, and UDP packets the server is sent; a channel whose
+/// `join` says no gets nothing; a page that leaves is out.
+fn channels_work(args: &[&str], via: &str) {
+    let Some(chrome) = chrome() else { return };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let app = channels_program(udp);
+    // Readings, as a device would send them, while the page runs.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                let _ = s.send_to(format!("reading {}", n).as_bytes(), ("127.0.0.1", udp));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&root.join("tests/browser/channels.js")), args);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sender.join().unwrap();
+    assert_eq!(r["via"], via, "{}", r);
+    assert_eq!(r["viaFrame"], via, "{}", r);
+    for k in ["bothGot", "bigGot", "serverGot", "udpGot", "orderKept"] {
+        assert_eq!(r[k], true, "{}: {}", k, r);
+    }
+    assert_eq!(r["vip"], "0", "a page the channel refused got its broadcast: {}", r);
+    assert_eq!(r["peersBefore"], 2, "{}", r);
+    assert_eq!(r["peersAfter"], 1, "{}", r);
+    assert_eq!(r["who"], "ana", "the handler did not see the page's session: {}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+}
+
+#[test]
+fn channels_over_webtransport() {
+    channels_work(&[], "webtransport");
+}
+
+#[test]
+fn channels_over_a_websocket_without_webtransport() {
+    channels_work(&["--no-wt"], "websocket");
+}
+
+/// Streams a test picture and a tone to `video` and `audio` as RTP, as a
+/// camera would (with a keyframe every `gop` frames); `None` without ffmpeg.
+fn ffmpeg_rtp(video: u16, audio: u16, gop: u32) -> Option<std::process::Child> {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-re"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=30", "-f", "lavfi", "-i", "sine=frequency=440"])
+        .args(["-map", "0:v", "-c:v", "libx264", "-tune", "zerolatency", "-profile:v", "baseline", "-pix_fmt", "yuv420p"])
+        .args(["-g", &gop.to_string(), "-f", "rtp", &format!("rtp://127.0.0.1:{}", video)])
+        .args(["-map", "1:a", "-c:a", "libopus", "-f", "rtp", &format!("rtp://127.0.0.1:{}", audio)])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// RTP from ffmpeg plays in `<quillo-media>`: video drawn, audio decoded,
+/// and a page that comes in the middle of a long gap between keyframes
+/// starts at once, from the frames the server kept.
+fn media_plays(args: &[&str], via: &str) {
+    let Some(chrome) = chrome() else { return };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let free_udp = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (video, audio) = (free_udp(), free_udp());
+    let d = std::env::temp_dir().join(format!("quillo-media-{}-{}", std::process::id(), video));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = std::fs::read_to_string(root.join("tests/browser/media.qwe")).unwrap();
+    std::fs::write(d.join("media.qwe"), src.replace("VIDEO_PORT", &video.to_string()).replace("AUDIO_PORT", &audio.to_string())).unwrap();
+    // A keyframe every 10 s, from when the server listens; the page comes
+    // 3 s after it.
+    let mut ff = None;
+    let r = run_page_args_late(&chrome, &d.join("media.qwe"), free_port(), &root.join("tests/browser/media.js"), args, Duration::from_secs(3), || {
+        ff = ffmpeg_rtp(video, audio, 300);
+        ff.is_some()
+    });
+    let Some(mut ff) = ff else { return };
+    let _ = ff.kill();
+    let _ = ff.wait();
+    let Some(r) = r else { return };
+    assert_eq!(r["via"], via, "{}", r);
+    assert_eq!(r["state"], "playing", "{}", r);
+    assert!(r["video"].as_u64().unwrap_or(0) >= 45, "too few frames decoded: {}", r);
+    assert!(r["liveFrames"].as_u64().unwrap_or(0) >= 20, "frames stopped coming: {}", r);
+    assert!(r["audio"].as_u64().unwrap_or(0) > 0, "no audio decoded: {}", r);
+    assert_eq!(r["width"], 640, "{}", r);
+    assert!(r["colors"].as_u64().unwrap_or(0) > 10, "the picture is blank: {}", r);
+    assert!(r["firstFrameMs"].as_u64().unwrap_or(99_999) < 2500, "the first frame took too long: {}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+}
+
+/// Like `run_page_args`, with `start` called once the server listens, and
+/// the page loaded `late` after; `None` when `start` says it could not.
+fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args: &[&str], late: Duration, start: impl FnOnce() -> bool) -> Option<serde_json::Value> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(app)
+        .args(["--port", &port.to_string()])
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !start() {
+        let _ = server.kill();
+        let _ = server.wait();
+        return None;
+    }
+    std::thread::sleep(late);
+    let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
+    let out = Command::new("node")
+        .arg(dir.join("run.js"))
+        .arg(chrome)
+        .arg(format!("http://127.0.0.1:{}/", port))
+        .arg(&profile)
+        .arg("60000")
+        .arg(script)
+        .output()
+        .expect("node");
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&profile);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Some(serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout))))
+}
+
+#[test]
+fn media_over_webtransport() {
+    media_plays(&[], "webtransport");
+}
+
+#[test]
+fn media_over_a_websocket_without_webtransport() {
+    media_plays(&["--no-wt"], "websocket");
 }

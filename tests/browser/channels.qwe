@@ -1,0 +1,42 @@
+// Channels between pages and the server (tests/browser.rs, channels_*).
+// UDP_PORT is replaced by the test with a free port.
+
+let log = []
+
+// Readings sent to the server over UDP go on to the pages.
+udp.listen(UDP_PORT, (p) => {
+    channel.broadcast("room", { text: `udp ${p.text}` })
+})
+
+channel.on("room", (msg, peer) => {
+    log = log + [msg.text]
+    let text = msg.text == "who" ? `who:${session().name ?? "nobody"}` : msg.text
+    channel.broadcast("room", { text }, { reliable: msg.reliable == true })
+})
+
+// No one is let in.
+channel.on("vip", (m) => null, { join: (peer) => false })
+
+component Room() {
+    state got = []
+    let room = channel.open("room", (m) => { got = got + [m.text] })
+    let _vip = channel.open("vip", (m) => { got = got + ["vip got in"] })
+    <div>
+        <button id="send" @click={() => room.send({ text: "hi" })}>Send</button>
+        <button id="big" @click={() => room.send({ text: repeat("x", 5000) })}>Big</button>
+        <button id="who" @click={() => room.send({ text: "who" })}>Who</button>
+        <button id="order" @click={() => {
+            for i in range(1, 21) { room.send({ text: `o${i}`, reliable: true }, { reliable: true }) }
+        }}>Order</button>
+        <ul>{for t in got => <li>{t}</li>}</ul>
+    </div>
+}
+
+route GET / {
+    set_session({ name: "ana" })
+    <html><body><Room/></body></html>
+}
+route GET /bcast/:t = str(channel.broadcast("room", { text: t }))
+route GET /vip = str(channel.broadcast("vip", "secret"))
+route GET /peers = str(len(channel.peers("room")))
+route GET /log = log

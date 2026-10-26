@@ -1609,6 +1609,412 @@ B.vec = {
   },
 };
 
+// ---- channels -------------------------------------------------------------
+// `channel.open(name, f)` in a component: `f` hears what the server sends on
+// the channel for as long as the code that opened it stands, and `.send(v)`
+// gives the channel's handler on the server a message. A page's channels
+// share one connection: WebTransport where the browser has it (small
+// messages go as datagrams, which may be lost or come out of order; larger
+// and reliable ones on a stream), else a WebSocket. It is opened again when
+// it drops, and the channels joined again.
+
+const Chan = { subs: new Map(), media: new Map(), joined: new Set(), waiting: new Map(), conn: null, running: false, wt: true };
+
+B.channel = {
+  open: meta((name, f, opts) => {
+    S(name, "channel.open");
+    F(f, "channel.open", 2);
+    let subs = Chan.subs.get(name);
+    if (!subs) {
+      subs = new Set();
+      Chan.subs.set(name, subs);
+      if (Chan.conn) Chan.conn.put(JSON.stringify(["j", name]), true);
+    }
+    const sub = { f };
+    subs.add(sub);
+    chanStart();
+    if (Owner) {
+      onCleanup(() => {
+        subs.delete(sub);
+        if (subs.size || Chan.subs.get(name) !== subs) return;
+        Chan.subs.delete(name);
+        Chan.joined.delete(name);
+        Chan.waiting.delete(name);
+        if (Chan.conn) Chan.conn.put(JSON.stringify(["l", name]), true);
+      });
+    }
+    return { send: meta((v, o) => chanSend(name, v, o), "send", null) };
+  }, "channel.open", null),
+};
+
+// Sent once the server has let the page in; until then (and while the
+// connection is down) kept, up to a point.
+function chanSend(name, v, o) {
+  const text = JSON.stringify(["m", name, toJSON(v)]);
+  const reliable = isMap(o) && truthy(o.reliable);
+  if (Chan.conn && Chan.joined.has(name)) {
+    Chan.conn.put(text, reliable);
+    return null;
+  }
+  const w = Chan.waiting.get(name) || [];
+  if (w.length < 256) w.push([text, reliable]);
+  Chan.waiting.set(name, w);
+  return null;
+}
+
+function chanStart() {
+  if (Chan.running) return;
+  Chan.running = true;
+  (async () => {
+    let wait = 500;
+    while (Chan.subs.size || Chan.media.size) {
+      try {
+        const c = await chanConnect();
+        Chan.conn = c;
+        if (typeof window !== "undefined") window.__quilloChannelVia = c.via;
+        wait = 500;
+        for (const name of Chan.subs.keys()) c.put(JSON.stringify(["j", name]), true);
+        for (const name of Chan.media.keys()) c.put(JSON.stringify(["v", name]), true);
+        await c.closed;
+      } catch (e) {}
+      Chan.conn = null;
+      Chan.joined.clear();
+      if (!Chan.subs.size && !Chan.media.size) break;
+      await new Promise((r) => setTimeout(r, wait));
+      wait = Math.min(wait * 2, 15000);
+    }
+    Chan.running = false;
+  })();
+}
+
+async function chanConnect() {
+  const r = await fetch(BASE + "/_quillo/wt-ticket", { method: "POST" });
+  if (!r.ok) throw new Error("no ticket");
+  const info = await r.json();
+  const q = "?t=" + encodeURIComponent(info.ticket);
+  if (Chan.wt && info.port && typeof WebTransport === "function") {
+    try {
+      return await chanTransport(info, q);
+    } catch (e) {
+      // Blocked, refused or too slow here: a WebSocket from now on.
+      Chan.wt = false;
+    }
+  }
+  return chanSocket(q);
+}
+
+async function chanTransport(info, q) {
+  const host = location.hostname.includes(":") ? "[" + location.hostname + "]" : location.hostname;
+  const opts = info.hash ? { serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(info.hash.match(/../g).map((x) => parseInt(x, 16))) }] } : {};
+  const t = new WebTransport("https://" + host + ":" + info.port + "/_quillo/wt" + q, opts);
+  let timer;
+  try {
+    await Promise.race([t.ready, new Promise((_, no) => { timer = setTimeout(() => no(new Error("timeout")), 1500); })]);
+  } catch (e) {
+    try { t.close(); } catch (e2) {}
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+  const bs = await t.createBidirectionalStream();
+  const out = bs.writable.getWriter(), dg = t.datagrams.writable.getWriter();
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const c = {
+    via: "webtransport",
+    put(text, reliable) {
+      const b = enc.encode(text);
+      if (!reliable && b.length <= (t.datagrams.maxDatagramSize || 1000)) {
+        dg.write(b).catch(() => {});
+        return;
+      }
+      const f = new Uint8Array(4 + b.length);
+      new DataView(f.buffer).setUint32(0, b.length);
+      f.set(b, 4);
+      out.write(f).catch(() => {});
+    },
+    closed: t.closed.then(() => {}, () => {}),
+  };
+  (async () => {
+    const rd = t.datagrams.readable.getReader();
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) return;
+      chanGot(dec.decode(value));
+    }
+  })().catch(() => {});
+  (async () => {
+    const rd = bs.readable.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) return;
+      const all = new Uint8Array(buf.length + value.length);
+      all.set(buf);
+      all.set(value, buf.length);
+      buf = all;
+      while (buf.length >= 4) {
+        const n = new DataView(buf.buffer, buf.byteOffset).getUint32(0);
+        if (buf.length < 4 + n) break;
+        chanGot(dec.decode(buf.subarray(4, 4 + n)));
+        buf = buf.slice(4 + n);
+      }
+    }
+  })().catch(() => {});
+  // Frames of the streams watched: a stream per track, opened by the server.
+  (async () => {
+    const rd = t.incomingUnidirectionalStreams.getReader();
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) return;
+      chanFrames(value);
+    }
+  })().catch(() => {});
+  // The server waits for this stream, which opens with what is first sent.
+  c.put(JSON.stringify(["h"]), true);
+  return c;
+}
+
+// Each frame after its length.
+async function chanFrames(stream) {
+  const rd = stream.getReader();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { value, done } = await rd.read();
+    if (done) return;
+    const all = new Uint8Array(buf.length + value.length);
+    all.set(buf);
+    all.set(value, buf.length);
+    buf = all;
+    let at = 0;
+    while (buf.length - at >= 4) {
+      const n = new DataView(buf.buffer, buf.byteOffset + at).getUint32(0);
+      if (buf.length - at < 4 + n) break;
+      chanFrame(buf.subarray(at + 4, at + 4 + n));
+      at += 4 + n;
+    }
+    buf = buf.slice(at);
+  }
+}
+
+// `[name length][name][kind][key][timestamp]`, then the frame.
+function chanFrame(b) {
+  const n = b[0], name = new TextDecoder().decode(b.subarray(1, 1 + n));
+  const fs = Chan.media.get(name);
+  if (!fs) return;
+  const ts = new DataView(b.buffer, b.byteOffset + 3 + n).getUint32(0);
+  for (const f of fs) f(b[1 + n], b[2 + n] === 1, ts, b.subarray(7 + n));
+}
+
+// Frames of stream `name` to `f(kind, key, ts, data)`, until what it gives
+// back is called.
+function chanWatch(name, f) {
+  let fs = Chan.media.get(name);
+  if (!fs) {
+    fs = new Set();
+    Chan.media.set(name, fs);
+    if (Chan.conn) Chan.conn.put(JSON.stringify(["v", name]), true);
+  }
+  fs.add(f);
+  chanStart();
+  return () => {
+    fs.delete(f);
+    if (fs.size || Chan.media.get(name) !== fs) return;
+    Chan.media.delete(name);
+    if (Chan.conn) Chan.conn.put(JSON.stringify(["u", name]), true);
+  };
+}
+
+function chanSocket(q) {
+  return new Promise((ok, no) => {
+    const s = new WebSocket(location.origin.replace(/^http/, "ws") + BASE + "/_quillo/wt" + q);
+    s.binaryType = "arraybuffer";
+    let ended;
+    const closed = new Promise((r) => (ended = r));
+    s.onopen = () => ok({ via: "websocket", put: (text) => s.send(text), closed });
+    s.onmessage = (m) => { if (typeof m.data === "string") chanGot(m.data); else chanFrame(new Uint8Array(m.data)); };
+    s.onclose = () => { ended(); no(new Error("closed")); };
+  });
+}
+
+// `["j", name, yes]`: the answer to joining; `["m", name, value]`: a message.
+function chanGot(text) {
+  let m;
+  try { m = JSON.parse(text); } catch (e) { return; }
+  const [k, name, v] = m, subs = Chan.subs.get(name);
+  if (!subs) return;
+  if (k === "j") {
+    if (!v) { console.warn("quillo: the server did not let this page join channel " + name); return; }
+    Chan.joined.add(name);
+    const w = Chan.waiting.get(name) || [];
+    Chan.waiting.delete(name);
+    for (const [t, reliable] of w) Chan.conn && Chan.conn.put(t, reliable);
+    return;
+  }
+  if (k !== "m") return;
+  const val = fromJSON(v);
+  for (const s of subs) {
+    try {
+      const r = s.f(val);
+      if (r instanceof Promise) r.catch(report);
+    } catch (e) {
+      report(e);
+    }
+  }
+}
+
+// ---- <quillo-media> ---------------------------------------------------------
+// `<quillo-media stream="cam">` plays a stream the server takes as RTP (see
+// src/media.rs): H.264 video drawn on a canvas, Opus audio, both decoded
+// with WebCodecs. It is muted until clicked unless it has no `muted`
+// attribute and the page may already play sound; with `controls`, a
+// button turns sound on and off. `data-state` says how it is going:
+// connecting, waiting (for a keyframe, or for frames), playing, unsupported.
+
+function mediaDefine() {
+  if (typeof customElements === "undefined" || customElements.get("quillo-media")) return;
+  customElements.define("quillo-media", class extends HTMLElement {
+    connectedCallback() {
+      if (!this.player) this.player = mediaPlayer(this);
+    }
+    disconnectedCallback() {
+      if (this.player) this.player.stop();
+      this.player = null;
+    }
+  });
+}
+
+function mediaPlayer(el) {
+  const name = el.getAttribute("stream") || "";
+  const st = { video: 0, audio: 0, keyframes: 0, codec: "", vd: null, ad: null, actx: null, at: 0, last: 0, base: null, abase: null };
+  el.mediaStats = st;
+  if (!el.style.display) el.style.display = "inline-block";
+  if (!el.style.position) el.style.position = "relative";
+  if (typeof VideoDecoder === "undefined") {
+    el.dataset.state = "unsupported";
+    el.textContent = "This browser cannot play this stream.";
+    return { stop() {} };
+  }
+  el.dataset.state = "connecting";
+  const canvas = document.createElement("canvas");
+  canvas.style.cssText = "display:block;width:100%;height:auto;background:#000";
+  el.replaceChildren(canvas);
+  const g = canvas.getContext("2d");
+  let muted = el.hasAttribute("muted");
+  let button = null;
+  if (el.hasAttribute("controls")) {
+    button = document.createElement("button");
+    button.type = "button";
+    button.style.cssText = "position:absolute;right:.5rem;bottom:.5rem;font:inherit;padding:.25rem .6rem;border:0;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;cursor:pointer";
+    const label = () => { button.textContent = muted ? "\u{1F507} Sound off" : "\u{1F50A} Sound on"; };
+    label();
+    button.onclick = (e) => {
+      e.stopPropagation();
+      muted = !muted;
+      label();
+      if (!muted && st.actx) st.actx.resume();
+    };
+    el.appendChild(button);
+  }
+  el.addEventListener("click", () => { if (st.actx) st.actx.resume(); });
+  // Microseconds from the stream's start, across 32-bit wraps.
+  const micros = (ts, rate, which) => {
+    if (st[which] === null) st[which] = ts;
+    return Math.round(((ts - st[which]) >>> 0) * 1e6 / rate);
+  };
+  const newVideo = () => {
+    const vd = new VideoDecoder({
+      output: (f) => {
+        // Catching up (a page that starts watching gets the frames since
+        // the last keyframe at once): only the newest is worth drawing.
+        if (st.vd && st.vd.decodeQueueSize === 0) {
+          if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+            canvas.width = f.displayWidth;
+            canvas.height = f.displayHeight;
+          }
+          g.drawImage(f, 0, 0);
+        }
+        f.close();
+        st.video++;
+        st.last = Date.now();
+        el.dataset.state = "playing";
+      },
+      error: () => { st.vd = null; },
+    });
+    return vd;
+  };
+  const video = (key, ts, data) => {
+    if (!st.vd || st.vd.state === "closed") {
+      if (!key) { el.dataset.state = "waiting"; return; }
+      // The profile and level, from the sequence parameter set.
+      let codec = "avc1.42E01F";
+      for (let i = 0; i + 7 < data.length; i++) {
+        if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1 && (data[i + 3] & 0x1f) === 7) {
+          codec = "avc1." + [data[i + 4], data[i + 5], data[i + 6]].map((x) => x.toString(16).padStart(2, "0")).join("");
+          break;
+        }
+      }
+      st.codec = codec;
+      st.vd = newVideo();
+      st.vd.configure({ codec, optimizeForLatency: true });
+    }
+    // Too far behind (more than the server keeps for a page that starts
+    // watching): start again from the next keyframe.
+    if (st.vd.decodeQueueSize > 600) {
+      st.vd.close();
+      st.vd = null;
+      return;
+    }
+    if (key) st.keyframes++;
+    st.vd.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: micros(ts, 90000, "base"), data }));
+  };
+  const audio = (ts, data) => {
+    if (muted || typeof AudioDecoder === "undefined") return;
+    if (!st.ad || st.ad.state === "closed") {
+      st.actx = st.actx || new AudioContext({ sampleRate: 48000 });
+      st.ad = new AudioDecoder({
+        output: (d) => {
+          const actx = st.actx;
+          const buf = actx.createBuffer(d.numberOfChannels, d.numberOfFrames, d.sampleRate);
+          for (let c = 0; c < d.numberOfChannels; c++) d.copyTo(buf.getChannelData(c), { planeIndex: c, format: "f32-planar" });
+          d.close();
+          st.audio++;
+          if (actx.state !== "running") return;
+          const src = actx.createBufferSource();
+          src.buffer = buf;
+          src.connect(actx.destination);
+          // A little ahead, so gaps between packets are not heard.
+          const now = actx.currentTime;
+          if (st.at < now + 0.02 || st.at > now + 0.5) st.at = now + 0.12;
+          src.start(st.at);
+          st.at += buf.duration;
+        },
+        error: () => { st.ad = null; },
+      });
+      st.ad.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 });
+    }
+    st.ad.decode(new EncodedAudioChunk({ type: "key", timestamp: micros(ts, 48000, "abase"), data }));
+  };
+  const stop = chanWatch(name, (kind, key, ts, data) => {
+    try {
+      if (kind === 1) video(key, ts, data);
+      else if (kind === 2) audio(ts, data);
+    } catch (e) {
+      st.vd = null;
+    }
+  });
+  const idle = setInterval(() => {
+    if (st.last && Date.now() - st.last > 3000) el.dataset.state = "waiting";
+  }, 1000);
+  return {
+    stop() {
+      stop();
+      clearInterval(idle);
+      for (const d of [st.vd, st.ad]) if (d && d.state !== "closed") d.close();
+      if (st.actx) st.actx.close();
+    },
+  };
+}
+
 // ---- server fns --------------------------------------------------------
 
 async function rpcRaw(name, args, live) {

@@ -24,6 +24,24 @@ enum UserEvent {
 }
 
 pub fn main(file: &str, flags: &[String]) -> i32 {
+    // `--open /admin`: the page the window opens on (the program's own path).
+    let mut open = "/".to_string();
+    let mut rest = Vec::new();
+    let mut it = flags.iter();
+    while let Some(f) = it.next() {
+        if f == "--open" {
+            match it.next() {
+                Some(p) if p.starts_with('/') && !p.starts_with("//") => open = p.clone(),
+                _ => {
+                    eprintln!("quillo: --open takes a path of the program, such as /admin");
+                    return 2;
+                }
+            }
+        } else {
+            rest.push(f.clone());
+        }
+    }
+    let flags = &rest[..];
     let o = match crate::run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
@@ -47,7 +65,7 @@ pub fn main(file: &str, flags: &[String]) -> i32 {
         Err(code) => return code,
     };
     let origin = format!("http://{}", addr);
-    match open_window(&name, &origin, &token, watch) {
+    match open_window(&name, &origin, &open, &token, watch) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("quillo: cannot open the window: {}", e);
@@ -96,7 +114,7 @@ fn start_program(path: &Path, o: crate::RunOptions, token: String) -> Result<Soc
 }
 
 /// Runs the window until it is closed; does not return when it opens.
-fn open_window(name: &str, origin: &str, token: &str, devtools: bool) -> Result<(), String> {
+fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: bool) -> Result<(), String> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title(name)
@@ -108,7 +126,7 @@ fn open_window(name: &str, origin: &str, token: &str, devtools: bool) -> Result<
     let opens = event_loop.create_proxy();
     let (own, own_too) = (origin.to_string(), origin.to_string());
     let builder = WebViewBuilder::new()
-        .with_url(format!("{}/?_quillo_launch={}", origin, token))
+        .with_url(format!("{}{}{}_quillo_launch={}", origin, start, if start.contains('?') { '&' } else { '?' }, token))
         .with_devtools(devtools)
         .with_document_title_changed_handler(move |t| {
             let _ = titles.send_event(UserEvent::Title(t));

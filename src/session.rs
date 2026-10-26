@@ -92,6 +92,29 @@ fn open(ctx: &str, cookie: &str) -> Option<Value> {
     Some(Value::from_json(j.get("d")?))
 }
 
+/// `payload`, signed with the session key for `purpose`: something the
+/// server gave out and takes back, with no one able to change it between
+/// (a page's ticket to join channels; see `wt`). Servers sharing
+/// `QUILLO_SECRET` take each other's.
+pub fn seal(purpose: &str, payload: &str) -> String {
+    let body = b64url(payload.as_bytes());
+    format!("{}.{}", body, sign(purpose, &body))
+}
+
+/// What `seal` signed, if `token` is unchanged.
+pub fn unseal(purpose: &str, token: &str) -> Option<String> {
+    let (body, sig) = token.split_once('.')?;
+    if !crate::crypto::same(sign(purpose, body).as_bytes(), sig.as_bytes()) {
+        return None;
+    }
+    String::from_utf8(unb64url(body)?).ok()
+}
+
+/// The request's session, as `session()` gives it.
+pub fn current(it: &mut Interp) -> Value {
+    session(it, Vec::new(), 0).unwrap_or_else(|_| Value::map(Map::new()))
+}
+
 fn header(it: &mut Interp, name: &str) -> Option<String> {
     let Some(Value::Map(req)) = it.request_value() else { return None };
     let Some(Value::Map(h)) = req.get("headers") else { return None };
