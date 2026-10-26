@@ -7,7 +7,8 @@
 //! Postgres expects; for types without a direct encoding (numeric, dates,
 //! uuid, arrays, ...) the parameter is sent as text and cast by Postgres.
 //! Results come back as Quillo values: numbers, strings, booleans, JSON as
-//! maps and lists, arrays as lists, and dates, times and UUIDs as strings.
+//! maps and lists, arrays as lists, `numeric` as decimals, and dates, times
+//! and UUIDs as strings.
 
 use crate::value::*;
 use bytes::{BufMut, BytesMut};
@@ -785,6 +786,7 @@ impl ToSql for PgParam {
             match v {
                 Value::Int(n) => Ok(*n),
                 Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Ok(*f as i64),
+                Value::Dec(d) if d.round(0, crate::decimal::Rounding::Down).ok() == Some(*d) => d.trunc_i64().ok_or_else(|| bad(v, ty)),
                 Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty)),
                 _ => Err(bad(v, ty)),
             }
@@ -801,6 +803,7 @@ impl ToSql for PgParam {
                 let f = match v {
                     Value::Int(n) => *n as f64,
                     Value::Float(f) => *f,
+                    Value::Dec(d) => d.to_f64(),
                     Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty))?,
                     _ => return Err(bad(v, ty)),
                 };
@@ -928,8 +931,10 @@ fn json(raw: &[u8]) -> Result<Value, BoxErr> {
     Ok(Value::from_json(&j))
 }
 
-/// Postgres's binary NUMERIC: an int when it has no fraction and fits,
-/// else a float.
+/// Postgres's binary NUMERIC: an int when it has no scale (as `sum` of
+/// ints gives) and fits; else a decimal, its scale kept ("12.50"); else,
+/// past 28 digits after the point or 29 in all, its exact text. NaN and
+/// the infinities are floats.
 fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
     let ndigits = i16::from_be_bytes(take(raw, &mut at)?) as usize;
@@ -970,12 +975,12 @@ fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     frac.truncate(dscale);
     let neg = sign == 0x4000;
     let text = format!("{}{}{}{}", if neg { "-" } else { "" }, int_part, if frac.is_empty() { "" } else { "." }, frac);
-    if frac.chars().all(|c| c == '0') {
+    if dscale == 0 {
         if let Ok(n) = format!("{}{}", if neg { "-" } else { "" }, int_part).parse::<i64>() {
             return Ok(Value::Int(n));
         }
     }
-    Ok(text.parse::<f64>().map(Value::Float).unwrap_or_else(|_| Value::str(text)))
+    Ok(crate::decimal::Dec::parse(&text).map_or_else(|| Value::str(text), Value::Dec))
 }
 
 /// A one- or more-dimensional array as (nested) lists.

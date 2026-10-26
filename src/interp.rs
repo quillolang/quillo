@@ -1,6 +1,7 @@
 //! Tree-walking evaluator: expressions, patterns and HTML rendering.
 
 use crate::ast::*;
+use crate::decimal::Dec;
 use crate::error::QuilloError;
 use crate::parser::Parser;
 use crate::shared::Shared;
@@ -190,6 +191,7 @@ pub fn lit_value(l: &Lit) -> Value {
         Lit::Bool(b) => Value::Bool(*b),
         Lit::Int(n) => Value::Int(*n),
         Lit::Float(f) => Value::Float(*f),
+        Lit::Dec(d) => Value::Dec(*d),
         Lit::Str(s) => Value::Str(s.clone()),
     }
 }
@@ -199,6 +201,7 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
         "any" => true,
         "int" => matches!(v, Value::Int(_)),
         "float" => matches!(v, Value::Float(_)),
+        "dec" => matches!(v, Value::Dec(_)),
         "num" => matches!(v, Value::Int(_) | Value::Float(_)),
         "str" => matches!(v, Value::Str(_)),
         "bool" => matches!(v, Value::Bool(_)),
@@ -233,6 +236,19 @@ fn ty_text(ty: &Ty) -> String {
     ty.text()
 }
 
+/// A value as a decimal, for a `dec` pattern or record field: a decimal,
+/// an int, numeric text ("12.50", from a query, a form or JSON) or a float
+/// (a JSON number, through its shortest text).
+pub fn as_dec(v: &Value) -> Option<Dec> {
+    match v {
+        Value::Dec(d) => Some(*d),
+        Value::Int(n) => Some(Dec::from_i64(*n)),
+        Value::Float(f) => Dec::from_f64(*f),
+        Value::Str(s) => Dec::parse(s.trim()),
+        _ => None,
+    }
+}
+
 /// Converts request text to the type a pattern asks for.
 pub fn coerce(t: &str, s: &str) -> Option<Value> {
     let s = s.trim();
@@ -240,6 +256,7 @@ pub fn coerce(t: &str, s: &str) -> Option<Value> {
         "int" => s.parse::<i64>().ok().map(Value::Int),
         "float" => s.parse::<f64>().ok().map(Value::Float),
         "num" => s.parse::<i64>().ok().map(Value::Int).or_else(|| s.parse::<f64>().ok().map(Value::Float)),
+        "dec" => Dec::parse(s).map(Value::Dec),
         "bool" => match s {
             "true" | "on" | "1" | "yes" => Some(Value::Bool(true)),
             "false" | "off" | "0" | "no" => Some(Value::Bool(false)),
@@ -407,21 +424,48 @@ fn render_value(v: &Value, out: &mut String) {
     }
 }
 
-/// JSON for an island's props and state: like `to_json`, but an error value
-/// becomes `{"$quillo_err": payload}`, which the browser turns back into one.
+/// JSON for an island's props and state, and for what server fns take and
+/// give: like `to_json`, but an error value becomes `{"$quillo_err":
+/// payload}`, a decimal `{"$dec": "12.50"}` and an int past what a JS number
+/// holds whole `{"$int": "9007199254740993"}`, which the browser turns back
+/// into an error value, its decimal and a BigInt.
 pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Err(e) => serde_json::json!({ "$quillo_err": island_json(e) }),
+        Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
+        Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
         Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.to_string(), island_json(x))).collect()),
         other => other.to_json(),
     }
 }
 
+/// The largest int a JS number holds whole: 2^53 - 1.
+const JS_SAFE: u64 = (1 << 53) - 1;
+
+/// `island_json` read back: what the browser sent a server fn.
+pub fn from_island_json(j: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match j {
+        J::Array(a) => Value::list(a.iter().map(from_island_json).collect()),
+        J::Object(o) if o.len() == 1 => {
+            let (k, x) = o.iter().next().unwrap();
+            match (k.as_str(), x) {
+                ("$dec", J::String(s)) => Dec::parse(s).map_or_else(|| Value::str(s), Value::Dec),
+                ("$int", J::String(s)) => s.parse::<i64>().map_or_else(|_| Value::str(s), Value::Int),
+                ("$quillo_err", x) => Value::err(from_island_json(x)),
+                _ => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+            }
+        }
+        J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+        other => Value::from_json(other),
+    }
+}
+
 /// Why a value cannot travel to the browser as JSON, if it cannot.
 pub fn not_sendable(v: &Value) -> Option<&'static str> {
     match v {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => None,
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) => None,
         Value::List(l) => l.iter().find_map(not_sendable),
         Value::Map(m) => m.values().find_map(not_sendable),
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
@@ -458,6 +502,48 @@ pub(crate) fn short(v: &Value) -> String {
     }
 }
 
+fn verb(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "subtract",
+        BinOp::Mul => "multiply",
+        BinOp::Div => "divide",
+        _ => "take the remainder of",
+    }
+}
+
+/// Said after "expects a number, got dec" from what works on floats.
+pub const FLOAT_ONLY: &str = " (this works on floats: convert a dec with float(x))";
+
+/// What to do about a decimal met with a float, said after the error.
+pub(crate) fn dec_hint(a: &Value, b: &Value) -> &'static str {
+    match (a, b) {
+        (Value::Dec(_), Value::Float(_)) | (Value::Float(_), Value::Dec(_)) => {
+            ": a dec is exact and a float is not, so convert one with dec(x) or float(x)"
+        }
+        _ => "",
+    }
+}
+
+/// Arithmetic with a decimal: with another, or an int, it is exact and
+/// gives a decimal; with a float it is an error, never a silent float.
+fn dec_op(op: BinOp, a: &Value, b: &Value, line: u32) -> Result<Value, Ctrl> {
+    let (x, y) = match (a, b) {
+        (Value::Dec(x), Value::Dec(y)) => (*x, *y),
+        (Value::Dec(x), Value::Int(y)) => (*x, Dec::from_i64(*y)),
+        (Value::Int(x), Value::Dec(y)) => (Dec::from_i64(*x), *y),
+        _ => return fail(line, format!("cannot {} {} and {}{}", verb(op), a.type_name(), b.type_name(), dec_hint(a, b))),
+    };
+    let r = match op {
+        BinOp::Add => x.add(y),
+        BinOp::Sub => x.sub(y),
+        BinOp::Mul => x.mul(y),
+        BinOp::Div => x.div(y),
+        _ => x.rem(y),
+    };
+    r.map(Value::Dec).map_err(|e| Ctrl::Error(QuilloError::new(e.message(), line)))
+}
+
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
     use Value::*;
     let overflow = || Ctrl::Error(QuilloError::new("integer overflow", line));
@@ -490,6 +576,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 }
                 Ok(Value::map(m))
             }
+            (x @ Dec(_), y) | (x, y @ Dec(_)) => dec_op(op, &x, &y, line),
             (x, y) => match (x.as_f64(), y.as_f64()) {
                 (Some(p), Some(q)) => Ok(Float(p + q)),
                 _ => fail(line, format!("cannot add {} and {}", x.type_name(), y.type_name())),
@@ -515,12 +602,10 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 };
                 return r.map(Int).ok_or_else(overflow);
             }
-            let verb = match op {
-                BinOp::Sub => "subtract",
-                BinOp::Mul => "multiply",
-                BinOp::Div => "divide",
-                _ => "take the remainder of",
-            };
+            if matches!(a, Dec(_)) || matches!(b, Dec(_)) {
+                return dec_op(op, &a, &b, line);
+            }
+            let verb = verb(op);
             match (a.as_f64(), b.as_f64()) {
                 (Some(x), Some(y)) => Ok(Float(match op {
                     BinOp::Sub => x - y,
@@ -535,7 +620,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
         BinOp::Ne => Ok(Bool(!equal(&a, &b))),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let Some(ord) = compare(&a, &b) else {
-                return fail(line, format!("cannot compare {} with {}", a.type_name(), b.type_name()));
+                return fail(line, format!("cannot compare {} with {}{}", a.type_name(), b.type_name(), dec_hint(&a, &b)));
             };
             Ok(Bool(match op {
                 BinOp::Lt => ord.is_lt(),
@@ -1353,6 +1438,7 @@ impl Interp {
                     n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(QuilloError::new("integer overflow", line)))
                 }
                 Value::Float(f) => Ok(Value::Float(-f)),
+                Value::Dec(d) => Ok(Value::Dec(d.neg())),
                 o => fail(line, format!("cannot negate {}", o.type_name())),
             },
         }
@@ -2113,6 +2199,9 @@ impl Interp {
                 let ty = Ty { names: vec![t.clone()], optional: false, elem: None, fields: None };
                 crate::record::make(self, &ty, v, lenient)?.ok()
             }
+            // A decimal from an int, numeric text or a JSON number, in
+            // any pattern: what it is given is converted.
+            Pattern::Type(t) if t == "dec" => as_dec(v).map(Value::Dec),
             Pattern::Type(t) => {
                 if type_name_matches(t, v) {
                     Some(v.clone())

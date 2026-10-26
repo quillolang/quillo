@@ -472,19 +472,56 @@ fn to_sql(v: &Value) -> Sql {
         Value::Bool(b) => Sql::Integer(*b as i64),
         Value::Int(n) => Sql::Integer(*n),
         Value::Float(f) => Sql::Real(*f),
+        // SQLite has no decimals: the text, exactly (see `Col::Dec`).
+        Value::Dec(d) => Sql::Text(d.to_string()),
         Value::Str(s) => Sql::Text(s.to_string()),
         Value::Html(h) => Sql::Text(h.to_string()),
         other => Sql::Text(other.to_json().to_string()),
     }
 }
 
+/// What a SQLite column's declared type says about reading it.
+#[derive(Clone, Copy, PartialEq)]
+enum Col {
+    Plain,
+    /// `boolean` or `bool`.
+    Bool,
+    /// `decimal`, `numeric`, `money` and the like (`decimal(12,2)`,
+    /// `decimal_text`): read as decimals.
+    Dec,
+}
+
+fn col_kind(decl: Option<&str>) -> Col {
+    let t = decl.unwrap_or("").trim().to_ascii_lowercase();
+    if t.starts_with("bool") {
+        Col::Bool
+    } else if ["decimal", "numeric", "money"].iter().any(|p| t.starts_with(p)) || t == "dec" || t.starts_with("dec(") {
+        Col::Dec
+    } else {
+        Col::Plain
+    }
+}
+
 /// SQLite has no booleans: `true` is stored as 1. In a column declared
 /// `boolean` (or `bool`) 0 and 1 come back as `false` and `true`, since 0
 /// would be true in Quillo; elsewhere, such as `select x = 1`, they are ints.
-fn from_sql(v: ValueRef, is_bool: bool) -> Value {
+///
+/// Nor has it decimals. A column declared `decimal(12,2)` (or `numeric`,
+/// `money`) comes back as decimals, from what SQLite kept: text exactly, an
+/// integer, or a real through its shortest text. Such a column has NUMERIC
+/// affinity, so SQLite turns "0.10" into the real 0.1 (and more than 15
+/// digits are rounded); one declared `decimal_text` has TEXT affinity and
+/// keeps the digits as written.
+fn from_sql(v: ValueRef, kind: Col) -> Value {
     match v {
         ValueRef::Null => Value::Nil,
-        ValueRef::Integer(n @ (0 | 1)) if is_bool => Value::Bool(n == 1),
+        ValueRef::Integer(n @ (0 | 1)) if kind == Col::Bool => Value::Bool(n == 1),
+        ValueRef::Integer(n) if kind == Col::Dec => Value::Dec(crate::decimal::Dec::from_i64(n)),
+        ValueRef::Real(f) if kind == Col::Dec => crate::decimal::Dec::from_f64(f).map_or(Value::Float(f), Value::Dec),
+        ValueRef::Text(t) if kind == Col::Dec => {
+            let s = String::from_utf8_lossy(t);
+            crate::decimal::Dec::parse(s.trim()).map_or_else(|| Value::str(&*s), Value::Dec)
+        }
         ValueRef::Integer(n) => Value::Int(n),
         ValueRef::Real(f) => Value::Float(f),
         ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t)),
@@ -529,17 +566,13 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
 fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     bind(&mut stmt, params)?;
-    let cols: Vec<(String, bool)> = stmt
-        .columns()
-        .iter()
-        .map(|c| (c.name().to_string(), c.decl_type().map_or(false, |t| t.to_ascii_lowercase().starts_with("bool"))))
-        .collect();
+    let cols: Vec<(String, Col)> = stmt.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect();
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let mut m = Map::new();
-        for (i, (c, is_bool)) in cols.iter().enumerate() {
-            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *is_bool));
+        for (i, (c, kind)) in cols.iter().enumerate() {
+            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
         }
         out.push(Value::map(m));
         if limit.map_or(false, |l| out.len() >= l) {

@@ -1,0 +1,27 @@
+// Decimals and ints past 2^53 in the page: from the server's props and
+// state, through a server fn and back, shown as the server shows them.
+// Driven by decimals.js.
+
+server fn tax(amount: dec) -> dec = round(amount * 0.08m, 2, "half_up")
+server fn echo(x) = x
+
+component Cart(prices: list<dec>, big: int) {
+    state total = sum(prices)
+    state taxed = 0m
+    state back = null
+    <div>
+        <p id="total">{total}</p>
+        <p id="taxed">{taxed}</p>
+        <p id="big">{big + 1}</p>
+        <p id="kind">{type_of(total)} {type_of(big)}</p>
+        <p id="back">{back}</p>
+        <button id="add" @click={() => { total = total + 0.10m }}>add</button>
+        <button id="tax" @click={() => { taxed = tax(total) }}>tax</button>
+        <button id="echo" @click={() => {
+            let r = echo({ d: total, n: big, l: [1.50m] })
+            back = `${type_of(r.d)} ${r.d} ${type_of(r.n)} ${r.n} ${r.l[0]}`
+        }}>echo</button>
+    </div>
+}
+
+route GET / = <html><body><Cart prices={[19.99m, 0.01m, 5.00m]} big={9007199254740993}/></body></html>

@@ -154,6 +154,8 @@ fn to_my(v: &Value) -> Result<My, String> {
         Value::Bool(b) => My::Int(*b as i64),
         Value::Int(n) => My::Int(*n),
         Value::Float(f) => My::Double(*f),
+        // As text, which MySQL converts to a DECIMAL exactly.
+        Value::Dec(d) => My::Bytes(d.to_string().into_bytes()),
         Value::Str(s) => My::Bytes(s.as_bytes().to_vec()),
         Value::Html(h) => My::Bytes(h.as_bytes().to_vec()),
         Value::List(_) | Value::Map(_) => My::Bytes(v.json_text().into_bytes()),
@@ -173,11 +175,11 @@ fn from_my(v: My, col: &mysql_async::Column) -> Value {
         My::Bytes(b) => {
             let text = String::from_utf8_lossy(&b);
             match ty {
-                ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => match (text.parse::<i64>(), text.parse::<f64>()) {
-                    (Ok(n), _) => Value::Int(n),
-                    (_, Ok(f)) if f.fract() == 0.0 && f.abs() < 9.0e15 => Value::Int(f as i64),
-                    (_, Ok(f)) => Value::Float(f),
-                    _ => Value::str(text),
+                // An int without a scale (as `sum` of ints gives), else a
+                // decimal with its scale, else (too many digits) the text.
+                ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => match text.parse::<i64>() {
+                    Ok(n) => Value::Int(n),
+                    Err(_) => crate::decimal::Dec::parse(&text).map_or_else(|| Value::str(&*text), Value::Dec),
                 },
                 ColumnType::MYSQL_TYPE_JSON => {
                     serde_json::from_str::<serde_json::Value>(&text).map(|j| Value::from_json(&j)).unwrap_or_else(|_| Value::str(text))

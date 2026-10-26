@@ -145,6 +145,8 @@ fn same(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        // The same digits: 12.5 and 12.50 show differently.
+        (Value::Dec(x), Value::Dec(y)) => x.mantissa() == y.mantissa() && x.scale() == y.scale(),
         (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => Arc::ptr_eq(x, y) || x == y,
         (Value::List(x), Value::List(y)) => Arc::ptr_eq(x, y),
         (Value::Map(x), Value::Map(y)) => Arc::ptr_eq(x, y),

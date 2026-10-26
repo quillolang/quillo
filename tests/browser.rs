@@ -771,3 +771,24 @@ fn media_over_webtransport() {
 fn media_over_a_websocket_without_webtransport() {
     media_plays(&["--no-wt"], "websocket");
 }
+
+/// Decimals and ints past 2^53 cross to the page and back with their type:
+/// props, state, a server fn's arguments and answer.
+#[test]
+fn decimals_cross_to_the_page_and_back() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("decimals.qwe"), free_port(), Some(&dir.join("decimals.js")));
+    let want = serde_json::json!({
+        "server": ["25.00", "9007199254740994", "dec int"],
+        "added": "25.10",
+        "taxed": "2.01",
+        "back": "dec 25.10 int 9007199254740993 1.50",
+        "big": "9007199254740994",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}

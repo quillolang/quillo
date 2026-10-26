@@ -14,6 +14,7 @@ pub fn install(env: &Env) {
         ("str", to_str),
         ("int", to_int),
         ("float", to_float),
+        ("dec", to_dec),
         ("len", len),
         ("type_of", type_of),
         ("upper", upper),
@@ -233,6 +234,8 @@ fn to_int(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         Value::Int(n) => Value::Int(n),
         Value::Float(f) if f.is_finite() => Value::Int(f.trunc() as i64),
         Value::Bool(b) => Value::Int(b as i64),
+        // The whole part (toward zero).
+        Value::Dec(d) => d.trunc_i64().map_or_else(|| Value::err(Value::str(format!("{} is too large for an int", d))), Value::Int),
         Value::Str(s) => coerce("int", &s).unwrap_or_else(|| Value::err(Value::str(format!("not an int: {:?}", &*s)))),
         other => Value::err(Value::str(format!("cannot convert {} to int", other.type_name()))),
     })
@@ -242,10 +245,30 @@ fn to_float(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(match arg(&args, 0) {
         Value::Int(n) => Value::Float(n as f64),
         Value::Float(f) => Value::Float(f),
+        Value::Dec(d) => Value::Float(d.to_f64()),
         Value::Str(s) => {
             coerce("float", &s).unwrap_or_else(|| Value::err(Value::str(format!("not a number: {:?}", &*s))))
         }
         other => Value::err(Value::str(format!("cannot convert {} to float", other.type_name()))),
+    })
+}
+
+/// `dec(x)`: a decimal from text (exactly), an int, or a float (through its
+/// shortest text, so `dec(0.1)` is 0.1m).
+fn to_dec(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    use crate::decimal::Dec;
+    Ok(match arg(&args, 0) {
+        Value::Dec(d) => Value::Dec(d),
+        Value::Int(n) => Value::Dec(Dec::from_i64(n)),
+        Value::Float(f) => match Dec::from_f64(f) {
+            Some(d) => Value::Dec(d),
+            None => Value::err(Value::str("cannot convert float to dec: it is too large, or not a number")),
+        },
+        Value::Str(s) => match Dec::parse(s.trim()) {
+            Some(d) => Value::Dec(d),
+            None => Value::err(Value::str(format!("not a decimal: {:?}", &*s))),
+        },
+        other => Value::err(Value::str(format!("cannot convert {} to dec", other.type_name()))),
     })
 }
 
@@ -444,7 +467,10 @@ fn extreme(args: &[Value], name: &str, line: u32, want: std::cmp::Ordering) -> R
             Some(b) => match compare(x, &b) {
                 Some(o) if o == want => x.clone(),
                 Some(_) => b,
-                None => return fail(line, format!("`{}` cannot compare {} with {}", name, x.type_name(), b.type_name())),
+                None => {
+                    let hint = crate::interp::dec_hint(x, &b);
+                    return fail(line, format!("`{}` cannot compare {} with {}{}", name, x.type_name(), b.type_name(), hint));
+                }
             },
         });
     }
@@ -463,12 +489,12 @@ fn sort_values(mut items: Vec<(Value, Value)>, name: &str, line: u32) -> R {
     let mut bad = None;
     items.sort_by(|a, b| {
         compare(&a.0, &b.0).unwrap_or_else(|| {
-            bad = Some((a.0.type_name(), b.0.type_name()));
+            bad = Some((a.0.type_name(), b.0.type_name(), crate::interp::dec_hint(&a.0, &b.0)));
             std::cmp::Ordering::Equal
         })
     });
-    if let Some((x, y)) = bad {
-        return fail(line, format!("`{}` cannot compare {} with {}", name, x, y));
+    if let Some((x, y, hint)) = bad {
+        return fail(line, format!("`{}` cannot compare {} with {}{}", name, x, y, hint));
     }
     Ok(Value::list(items.into_iter().map(|(_, v)| v).collect()))
 }
@@ -544,18 +570,18 @@ fn values(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = m_arg(&args, 0, "get", line)?;
-    let k = arg(&args, 1).display();
+    let k = arg(&args, 1).key_text();
     Ok(m.get(k.as_str()).cloned().unwrap_or_else(|| arg(&args, 2)))
 }
 
 fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::Bool(m_arg(&args, 0, "has", line)?.contains_key(arg(&args, 1).display().as_str())))
+    Ok(Value::Bool(m_arg(&args, 0, "has", line)?.contains_key(arg(&args, 1).key_text().as_str())))
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = m_arg(&args, 0, "set", line)?;
     let mut m = Arc::unwrap_or_clone(m);
-    m.insert(arg(&args, 1).display().into(), arg(&args, 2));
+    m.insert(arg(&args, 1).key_text().into(), arg(&args, 2));
     Ok(Value::map(m))
 }
 
@@ -567,7 +593,7 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => {
             let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "remove", line)?);
-            m.shift_remove(arg(&args, 1).display().as_str());
+            m.shift_remove(arg(&args, 1).key_text().as_str());
             Ok(Value::map(m))
         }
     }
@@ -1071,11 +1097,15 @@ fn uuid(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
 // ---- math --------------------------------------------------------------
 
 fn num_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<f64, Ctrl> {
+    if let Some(Value::Dec(_)) = args.get(i) {
+        return fail(line, format!("`{}` expects a number as argument {}, got dec{}", f, i + 1, crate::interp::FLOAT_ONLY));
+    }
     want(args, i, f, "a number", line, |v| v.as_f64())
 }
 
 fn abs(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
+        Value::Dec(d) => Ok(Value::Dec(d.abs())),
         Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(crate::QuilloError::new("integer overflow", line))),
         _ => Ok(Value::Float(num_arg(&args, 0, "abs", line)?.abs())),
     }
@@ -1089,8 +1119,35 @@ fn to_int_or_float(f: f64) -> Value {
     }
 }
 
-/// `round(x)` gives an int; `round(x, digits)` a float with that many decimals.
+/// A decimal rounded: `round(d, digits = 0, mode = "half_even")`. It keeps
+/// exactly `digits` decimals (`round(12.5m, 2)` is 12.50).
+fn round_dec(d: crate::decimal::Dec, args: &[Value], line: u32) -> R {
+    use crate::decimal::Rounding;
+    let digits = match args.get(1) {
+        None | Some(Value::Nil) => 0,
+        Some(Value::Int(n)) => (*n).clamp(-28, 28) as i32,
+        Some(other) => return fail(line, format!("`round` expects an int as argument 2, got {}", other.type_name())),
+    };
+    let mode = match args.get(2) {
+        None | Some(Value::Nil) => Rounding::HalfEven,
+        Some(Value::Str(s)) => match Rounding::parse(s) {
+            Some(m) => m,
+            None => return fail(line, format!("`round`: unknown rounding {:?} (one of {})", &**s, Rounding::NAMES)),
+        },
+        Some(other) => return fail(line, format!("`round` expects a str as argument 3, got {}", other.type_name())),
+    };
+    d.round(digits, mode).map(Value::Dec).map_err(|e| Ctrl::Error(crate::QuilloError::new(e.message(), line)))
+}
+
+/// `round(x)` gives an int; `round(x, digits)` a float with that many
+/// decimals. A decimal stays one (`round_dec`).
 fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Value::Dec(d) = arg(&args, 0) {
+        return round_dec(d, &args, line);
+    }
+    if !matches!(arg(&args, 2), Value::Nil) {
+        return fail(line, "`round` takes a rounding mode for a dec only: convert with dec(x)");
+    }
     let x = num_arg(&args, 0, "round", line)?;
     if args.len() > 1 {
         let d = i_arg(&args, 1, "round", line)?.clamp(0, 15) as i32;
@@ -1101,10 +1158,16 @@ fn round(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn floor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Value::Dec(d) = arg(&args, 0) {
+        return round_dec(d, &[Value::Nil, Value::Int(0), Value::str("floor")], line);
+    }
     Ok(to_int_or_float(num_arg(&args, 0, "floor", line)?.floor()))
 }
 
 fn ceil(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Value::Dec(d) = arg(&args, 0) {
+        return round_dec(d, &[Value::Nil, Value::Int(0), Value::str("ceiling")], line);
+    }
     Ok(to_int_or_float(num_arg(&args, 0, "ceil", line)?.ceil()))
 }
 
@@ -1192,7 +1255,7 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "group_by", line)?;
     let mut groups: IndexMap<String, Vec<Value>> = IndexMap::new();
     for x in l.iter() {
-        let k = it.call1(&f, x.clone(), line)?.display();
+        let k = it.call1(&f, x.clone(), line)?.key_text();
         groups.entry(k).or_default().push(x.clone());
     }
     Ok(Value::map(groups.into_iter().map(|(k, v)| (k.into(), Value::list(v))).collect()))
