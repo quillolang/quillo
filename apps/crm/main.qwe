@@ -23,6 +23,11 @@ db.open("data/{tenant}.db")
 // Quillo's own tables (scheduled jobs' runs), with the rest of the data.
 db.system("data/quillo-system.db")
 db.migrate("migrations")
+// Sessions on the server, so signing out (or an admin) ends them: half an
+// hour unused, or twelve hours, signs a person out. Pages run only their
+// own scripts.
+sessions({ store: "db", idle: "30m", max_age: "12h" })
+csp()
 
 use "lib/util.qwe"
 use "lib/rules.qwe"
@@ -45,6 +50,7 @@ use "plugins/studio/index.qwe"
 let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality, plugin_notices, plugin_newsroom] + studio_plugins
 
 use "lib/records.qwe"
+use "lib/security.qwe"
 use "lib/commerce.qwe"
 use "lib/marketing.qwe"
 use "lib/flows.qwe"
@@ -84,6 +90,7 @@ use "ui/code.qwe"
 use "ui/site.qwe"
 use "ui/objects.qwe"
 use "ui/review.qwe"
+use "ui/security.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -213,13 +220,66 @@ route GET /login {
 
 route POST /login { form: { email: str, password: str } } {
     workspace_here()
-    let u = db.one("select * from users where email = ?", lower(trim(email)))
+    rate_limit(`login:${request.ip}`, 30, "1m", { reply: true })
+    let who = lower(trim(email))
+    if login_locked(who) { return redirect(`/login?problem=locked&email=${who}`) }
+    let u = db.one("select * from users where email = ?", who)
     if !crypto.verify_password(password, u.password_hash) {
+        login_failed(who)
         return redirect(`/login?problem=wrong&email=${email}`)
     }
+    // A second step: the code, or setting the app up when the workspace asks.
+    if has_two_step(u) || two_step_required() {
+        set_session({ pending: u.id, pending_at: now() })
+        return redirect(has_two_step(u) ? "/login/code" : "/login/setup")
+    }
+    login_ok(who)
     set_session({ user: u.id })
     put_setting("url", `${SCHEME}://${request.headers.host}`)
     redirect("/app")
+}
+
+route GET /login/code {
+    workspace_here()
+    pending_user() ?? reply 303 redirect("/login?problem=expired")
+    <CodePage problem={request.query.problem ?? ""}/>
+}
+
+route POST /login/code { form: { code: str } } {
+    workspace_here()
+    let u = pending_user() ?? reply 303 redirect("/login?problem=expired")
+    if login_locked(u.email) { return redirect(`/login?problem=locked&email=${u.email}`) }
+    if !has_two_step(u) || !second_step_ok(u, code) {
+        login_failed(u.email)
+        return redirect("/login/code?problem=wrong")
+    }
+    login_ok(u.email)
+    set_session({ user: u.id })
+    put_setting("url", `${SCHEME}://${request.headers.host}`)
+    redirect("/app")
+}
+
+route GET /login/setup {
+    workspace_here()
+    let u = pending_user() ?? reply 303 redirect("/login?problem=expired")
+    if has_two_step(u) { return redirect("/login/code") }
+    let s = new_two_step(u)
+    <TwoStepSetupPage secret={s.secret} uri={s.uri} problem={request.query.problem ?? ""}/>
+}
+
+route POST /login/setup { form: { code: str } } {
+    workspace_here()
+    let u = pending_user() ?? reply 303 redirect("/login?problem=expired")
+    if has_two_step(u) { return redirect("/login/code") }
+    let codes = confirm_two_step(u, code)
+    if is_err(codes) {
+        login_failed(u.email)
+        return redirect("/login/setup?problem=wrong")
+    }
+    login_ok(u.email)
+    set_session({ user: u.id })
+    put_setting("url", `${SCHEME}://${request.headers.host}`)
+    <RecoveryPage {codes}/>
 }
 
 route POST /logout {

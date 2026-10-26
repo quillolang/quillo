@@ -1100,3 +1100,9 @@ kbd { font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 
   border-left: 1px solid #e4e7ec; box-shadow: -12px 0 32px rgba(16, 24, 40, .12); font: 14px system-ui, -apple-system, sans-serif; }
 .fb-sent { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: #ecfdf3; color: #067647; font-size: 13px; }
 .fb-panel .muted { color: #5b6472; }
+
+/* Two-step sign-in: the setup key and recovery codes, to read and copy. */
+code.secret { display: inline-block; font-size: 15px; letter-spacing: .06em; padding: 6px 10px; user-select: all; }
+.recovery-codes { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; list-style: none; padding: 0; margin: 0; }
+.recovery-codes code { font-size: 14px; user-select: all; }
+.devices button.ghost { margin-left: auto; }
