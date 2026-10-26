@@ -41,6 +41,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 bytes = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
+# Numeric functions compiled to machine code (src/jit.rs).
+cranelift-codegen = { version = "=0.134.4", optional = true }
+cranelift-frontend = { version = "=0.134.4", optional = true }
+cranelift-jit = { version = "=0.134.4", optional = true }
+cranelift-module = { version = "=0.134.4", optional = true }
+cranelift-native = { version = "=0.134.4", optional = true }
 # `quillo app`: the program in a native window (see src/desktop.rs).
 wry = { version = "0.57", optional = true, features = ["devtools"] }
 tao = { version = "0.37", optional = true }
@@ -50,7 +56,9 @@ tao = { version = "0.37", optional = true }
 muda = { version = "0.21", optional = true }
 
 [features]
-default = ["mysql"]
+default = ["mysql", "jit"]
+# Numeric functions compiled to machine code (src/jit.rs).
+jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 app = ["dep:wry", "dep:tao", "dep:muda"]
 # MySQL and MariaDB for `db` (src/my.rs).
 mysql = ["dep:mysql_async"]

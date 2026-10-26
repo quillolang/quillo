@@ -417,7 +417,7 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, hot: Default::default() })
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
@@ -466,7 +466,7 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of component `{}`", name));
         };
-        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line })
+        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, hot: Default::default() })
     }
 
     /// `state count = ...` (or `~count = ...`) in a component: the state's
@@ -1521,7 +1521,8 @@ impl Parser {
                 }
             }
         }
-        Ok(HtmlEl { tag, id, classes, attrs, children, line })
+        let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
+        Ok(HtmlEl { tag, id, classes, attrs, children, line, facts })
     }
 
     fn read_interp_name(&mut self) -> PResult<Expr> {
@@ -1579,6 +1580,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32) -> Expr {
         component: false,
         line,
         body,
+        hot: Default::default(),
     }))
 }
 

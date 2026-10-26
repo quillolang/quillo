@@ -429,6 +429,8 @@ fn run_loop(
     index: usize,
     max_waiting: usize,
 ) -> Result<(), String> {
+    // mimalloc here too (see src/alloc.rs).
+    crate::alloc::waiter_thread();
     let waker = inbox.waker.clone();
     lock(&LOOPS).push(waker.clone());
     let pool = Arc::new(Pool {

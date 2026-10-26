@@ -1,14 +1,14 @@
-//! The program's memory allocator: the system's on the event loops, and
-//! mimalloc on the threads that wait for the server (database runtime,
-//! waiting pool).
+//! The program's memory allocator: mimalloc on the event loops and the
+//! threads that wait for the server (database runtime, waiting pool), the
+//! system's elsewhere (the main thread, before the server starts).
 //!
-//! What those threads make, such as rows read from the database, is mostly
-//! freed on an event loop. Freeing on another thread is cheap in mimalloc
-//! and costly in the system allocator. On the event loop, though, measured
-//! on macOS, socket reads and writes run faster with the system allocator
-//! than with mimalloc or jemalloc, and they are most of its time on small
-//! answers. Each block is freed by the allocator that made it; mimalloc
-//! knows its own (`mi_is_in_heap_region`).
+//! What the waiting threads make, such as rows read from the database, is
+//! mostly freed on an event loop; freeing on another thread is cheap in
+//! mimalloc and costly in the system allocator. On the event loops,
+//! measured on macOS (bench/server), mimalloc answers 5% more small
+//! requests a second than the system allocator, and 7% more pages that
+//! build lists and HTML. Each block is freed by the allocator that made it;
+//! mimalloc knows its own (`mi_is_in_heap_region`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -18,8 +18,8 @@ thread_local! {
     static WAITER: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Marks the current thread as one that waits for the server: its
-/// allocations come from mimalloc from now on.
+/// Marks the current thread (an event loop, or one that waits for the
+/// server): its allocations come from mimalloc from now on.
 pub fn waiter_thread() {
     WAITER.with(|w| w.set(true));
 }

@@ -17,6 +17,8 @@ pub mod imaging;
 pub mod island;
 pub mod jobs;
 pub mod interp;
+#[cfg(feature = "jit")]
+pub mod jit;
 pub mod lexer;
 pub mod metrics;
 pub mod migrate;

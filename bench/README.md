@@ -58,19 +58,20 @@ cargo build --release
 node bench/server/run.cjs 8
 ```
 
-Requests a second (p99 latency in ms), same machine:
+Requests a second (p99 latency in ms), one process each, same machine:
 
-| one process | Quillo | Node 24 | Bun 1.4 |
+| | Quillo | Node 24 | Bun 1.4 |
 |---|---:|---:|---:|
-| text | **243k** (0.4) | 157k (0.7) | 228k (0.5) |
-| JSON | **235k** (0.3) | 149k (0.8) | 228k (0.5) |
-| fortunes | **139k** (0.5) | 86k (1.4) | 168k (0.8) |
-| compute (10,000-step loop) | **1.0k** (72) | 24.7k (4.8) | 23.7k (5.0) |
+| text | **262k** (0.3) | 157k (0.7) | 225k (0.5) |
+| JSON | **258k** (0.3) | 155k (0.7) | 227k (0.5) |
+| fortunes | **180k** (0.4) | 89k (1.3) | 169k (0.8) |
+| compute (10,000-step loop) | **26.4k** (2.5) | 24.4k (4.9) | 23.4k (5.1) |
 
-Each of them keeps about one core busy. Quillo is a tree-walking interpreter:
-code that loops in the language is some 25 times slower than in a JavaScript
-JIT, while what it does natively (HTTP, JSON, rendering HTML) is as fast as Bun.
-With 6 processes (`--instances 6`, Node's cluster, Bun's `reusePort`) the
-load generator, on the same 4 performance cores, is what limits text and JSON
-(about 190–230k for all three); macOS does not spread connections across
-`reusePort` sockets, so Bun stays at one process's figures there.
+Each keeps about one core busy. The compute loop is plain arithmetic, which Quillo
+compiles to machine code (README, "Compiled numbers"): it is then as fast as the
+JavaScript JITs' (the rest of each request, HTTP and JSON, is faster in Quillo). With 6
+processes (`--instances 6`, Node's cluster), compute goes to 132k for Quillo and 103k
+for Node; macOS does not spread connections across Bun's `reusePort` sockets, so Bun
+stays at one process's figures. For the other answers, the load generator, on the
+same 4 performance cores as the servers, is what limits 6 processes: their figures
+there say more about the machine than about the servers.

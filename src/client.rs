@@ -695,6 +695,7 @@ impl<'a> Compiler<'a> {
                             component: false,
                             line: td.line,
                             body: e.clone(),
+                            hot: Default::default(),
                         };
                         let saved = std::mem::take(&mut self.ctxs);
                         let r = self.function(&def);
@@ -994,6 +995,7 @@ impl<'a> Compiler<'a> {
             component: false,
             line,
             body: e,
+            hot: Default::default(),
         };
         // Until made, references to it (from functions it holds) find it.
         self.globals.insert(name.to_string(), (js.to_string(), false));

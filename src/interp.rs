@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::error::QuilloError;
-use crate::parser::{Parser, VOID_TAGS};
+use crate::parser::Parser;
 use crate::shared::Shared;
 use crate::value::*;
 use std::collections::HashSet;
@@ -235,19 +235,45 @@ pub fn escape(s: &str) -> String {
 /// `escape`, appending to `out`: runs without special characters are
 /// copied whole.
 pub fn escape_into(s: &str, out: &mut String) {
-    let mut done = 0;
-    for (i, b) in s.bytes().enumerate() {
-        let entity = match b {
+    fn entity(b: u8) -> Option<&'static str> {
+        Some(match b {
             b'&' => "&amp;",
             b'<' => "&lt;",
             b'>' => "&gt;",
             b'"' => "&quot;",
             b'\'' => "&#39;",
-            _ => continue,
-        };
-        out.push_str(&s[done..i]);
-        out.push_str(entity);
-        done = i + 1;
+            _ => return None,
+        })
+    }
+    // Eight bytes at a time: whether any is one of the five (a zero byte
+    // after xor with it, found without a branch per byte).
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let has = |x: u64, c: u8| {
+        let y = x ^ (LO * c as u64);
+        y.wrapping_sub(LO) & !y & HI
+    };
+    let b = s.as_bytes();
+    let (mut done, mut i) = (0, 0);
+    while i + 8 <= b.len() {
+        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        if has(x, b'&') | has(x, b'<') | has(x, b'>') | has(x, b'"') | has(x, b'\'') != 0 {
+            for j in i..i + 8 {
+                if let Some(e) = entity(b[j]) {
+                    out.push_str(&s[done..j]);
+                    out.push_str(e);
+                    done = j + 1;
+                }
+            }
+        }
+        i += 8;
+    }
+    for j in i..b.len() {
+        if let Some(e) = entity(b[j]) {
+            out.push_str(&s[done..j]);
+            out.push_str(e);
+            done = j + 1;
+        }
     }
     out.push_str(&s[done..]);
 }
@@ -407,7 +433,18 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
             (x, Str(y)) => Ok(Value::str(format!("{}{}", x.display(), y))),
             (Html(x), Html(y)) => Ok(Value::html(format!("{}{}", x, y))),
             (List(x), List(y)) => {
-                let mut v = Arc::unwrap_or_clone(x);
+                // Made to size at once (not grown as it is filled).
+                let mut v = match Arc::try_unwrap(x) {
+                    std::result::Result::Ok(mut v) => {
+                        v.reserve_exact(y.len());
+                        v
+                    }
+                    std::result::Result::Err(x) => {
+                        let mut v = Vec::with_capacity(x.len() + y.len());
+                        v.extend(x.iter().cloned());
+                        v
+                    }
+                };
                 v.extend(y.iter().cloned());
                 Ok(Value::list(v))
             }
@@ -1022,6 +1059,7 @@ impl Interp {
                         vec![Expr::Lit(Lit::Str(td.name.as_str().into())), Expr::Ident("fields".into(), line)],
                         line,
                     ),
+                    hot: Default::default(),
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
@@ -1113,6 +1151,17 @@ impl Interp {
             Expr::Pipe(lhs, rhs, line) => self.eval_pipe(lhs, rhs, env, *line),
             Expr::Call(callee, args, line) => self.eval_call(callee, args, None, env, *line),
             Expr::Field(obj, name, line) => {
+                // A local map's field, without a copy of the map.
+                if let Expr::Ident(var, _) = &**obj {
+                    let found = with_local(env, var, |v| match v {
+                        Value::Map(m) if m.len() <= 8 => m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x.clone()),
+                        Value::Map(m) => m.get(name.as_str()).cloned(),
+                        _ => None,
+                    });
+                    if let Some(Some(x)) = found {
+                        return Ok(x);
+                    }
+                }
                 let v = self.eval(obj, env)?;
                 self.get_field(v, name, *line)
             }
@@ -1141,7 +1190,7 @@ impl Interp {
             Expr::Unary(op, x, line) => self.eval_unary(*op, x, env, *line),
             Expr::Index(obj, idx, line) => self.eval_index(obj, idx, env, *line),
             Expr::Match(subj, arms, line) => self.eval_match(subj, arms, env, *line),
-            Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line),
+            Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line, true),
             Expr::Reply(status, body, line) => self.eval_reply(status, body.as_deref(), env, *line),
             Expr::Html(el, _) => self.eval_html(el, env),
         }
@@ -1169,12 +1218,22 @@ impl Interp {
 
     #[inline(never)]
     fn eval_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Value, Ctrl> {
-        let scope = Scope::child(env);
+        // A block that declares nothing runs in the scope around it: the
+        // same names mean the same, with no scope to make (a loop's body).
+        let declares = !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(_)));
+        let scope = if declares { Scope::child(env) } else { env.clone() };
         let mut last = Value::Nil;
-        for s in stmts {
-            last = self.exec_stmt(s, &scope)?;
+        let n = stmts.len();
+        for (i, s) in stmts.iter().enumerate() {
+            last = match s {
+                // A loop whose list nobody takes makes none.
+                Stmt::Expr(Expr::For(pat, iter, body, line)) if i + 1 < n => self.eval_for(pat, iter, body, &scope, *line, false)?,
+                s => self.exec_stmt(s, &scope)?,
+            };
         }
-        Scope::done(scope);
+        if declares {
+            Scope::done(scope);
+        }
         Ok(last)
     }
 
@@ -1266,37 +1325,105 @@ impl Interp {
     }
 
     #[inline(never)]
-    fn eval_for(&mut self, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
-        let it = self.eval(iter, env)?;
-        let items: Vec<Value> = match &it {
-            Value::List(l) => l.to_vec(),
-            Value::Map(m) => m.iter().map(|(k, v)| Value::list(vec![Value::str(k), v.clone()])).collect(),
-            Value::Str(s) => s.chars().map(|c| Value::str(c.to_string())).collect(),
-            Value::Nil => Vec::new(),
-            other => return fail(line, format!("cannot loop over {}", other.type_name())),
-        };
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            if self.fuel != u64::MAX {
-                self.burn(line)?;
+    /// `for`: the list of what the body gave for each item (`keep`), or
+    /// nothing when no one takes it.
+    fn eval_for(&mut self, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32, keep: bool) -> Result<Value, Ctrl> {
+        let mut out = Vec::new();
+        let mut scope = None;
+        // `range(a, b)` and `a..b`: counted, without making the list.
+        if let Some((a, b)) = self.counted(iter, env, line)? {
+            if keep {
+                out.reserve((b - a).max(0) as usize);
             }
-            let scope = Scope::child(env);
-            if let Pattern::Bind(n) = pat {
-                define(&scope, n, item);
-                out.push(self.eval(body, &scope)?);
-                Scope::done(scope);
-                continue;
+            for i in a..b {
+                let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line)?;
+                if keep {
+                    out.push(v);
+                }
             }
+        } else {
+            let it = self.eval(iter, env)?;
+            let made: Vec<Value>;
+            let items: &[Value] = match &it {
+                Value::List(l) => l,
+                Value::Map(m) => {
+                    made = m.iter().map(|(k, v)| Value::list(vec![Value::str(k), v.clone()])).collect();
+                    &made
+                }
+                Value::Str(s) => {
+                    made = s.chars().map(|c| Value::str(c.to_string())).collect();
+                    &made
+                }
+                Value::Nil => &[],
+                other => return fail(line, format!("cannot loop over {}", other.type_name())),
+            };
+            if keep {
+                out.reserve(items.len());
+            }
+            for item in items {
+                let v = self.for_step(pat, item.clone(), body, env, &mut scope, line)?;
+                if keep {
+                    out.push(v);
+                }
+            }
+        }
+        if let Some(s) = scope {
+            Scope::done(s);
+        }
+        Ok(if keep { Value::list(out) } else { Value::Nil })
+    }
+
+    /// One step of a loop: `item` bound by `pat` in a scope of its own (the
+    /// last step's again, when nothing kept it), and the body's value.
+    fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel != u64::MAX {
+            self.burn(line)?;
+        }
+        if !scope.as_mut().map_or(false, Scope::reuse) {
+            *scope = Some(Scope::child(env));
+        }
+        let sc = scope.as_ref().expect("set above");
+        if let Pattern::Bind(n) = pat {
+            define(sc, n, item);
+        } else {
             let mut binds = Vec::new();
             if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
                 return fail(line, format!("`for` pattern does not match {}", short(&item)));
             }
             for (n, x) in binds {
-                define(&scope, &n, x);
+                define(sc, &n, x);
             }
-            out.push(self.eval(body, &scope)?);
         }
-        Ok(Value::list(out))
+        self.eval(body, sc)
+    }
+
+    /// The bounds of `range(a, b)`, `range(n)` or `a..b` (the builtin, not
+    /// a variable of that name), checked as those check them; None for
+    /// anything else.
+    fn counted(&mut self, iter: &Expr, env: &Env, line: u32) -> Result<Option<(i64, i64)>, Ctrl> {
+        let (a, b, f) = match iter {
+            Expr::Binary(BinOp::Range, a, b, _) => (self.eval(a, env)?, self.eval(b, env)?, None),
+            Expr::Call(callee, args, _) if (args.len() == 1 || args.len() == 2) && matches!(&**callee, Expr::Ident(n, _) if n == "range") => {
+                let Some(f @ Value::Builtin("range", _)) = lookup(env, "range") else { return Ok(None) };
+                if args.len() == 1 {
+                    (Value::Int(0), self.eval(&args[0], env)?, Some(f))
+                } else {
+                    (self.eval(&args[0], env)?, self.eval(&args[1], env)?, Some(f))
+                }
+            }
+            _ => return Ok(None),
+        };
+        match (&a, &b) {
+            (Value::Int(x), Value::Int(y)) if y.saturating_sub(*x) <= 10_000_000 => Ok(Some((*x, *y))),
+            // Anything else fails as it would have.
+            _ => match f {
+                Some(f) => {
+                    let args = if matches!(iter, Expr::Call(_, args, _) if args.len() == 1) { vec![b] } else { vec![a, b] };
+                    self.call(&f, args, line).map(|_| None)
+                }
+                None => binop(BinOp::Range, a, b, line).map(|_| None),
+            },
+        }
     }
 
     #[inline(never)]
@@ -1439,6 +1566,13 @@ impl Interp {
     pub fn call_closure(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         if self.fuel != u64::MAX {
             self.burn(line)?;
+        }
+        // Numbers in, a number out: in machine code once it is called again.
+        #[cfg(feature = "jit")]
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH {
+            if let Some(r) = crate::jit::call(c, &args, self.depth) {
+                return r;
+            }
         }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
@@ -1813,21 +1947,26 @@ impl Interp {
         out: &mut String,
     ) -> Result<(), Ctrl> {
         let it = self.eval(iter, env)?;
+        // One scope for the rows, emptied for each, unless a row kept it.
+        let mut scope: Option<Env> = None;
         let mut each = |this: &mut Self, item: &Value| -> Result<(), Ctrl> {
-            let scope = Scope::child(env);
+            if !scope.as_mut().map_or(false, Scope::reuse) {
+                scope = Some(Scope::child(env));
+            }
+            let scope = scope.as_ref().expect("set above");
             // `for p in items`: nothing to match.
             if let Pattern::Bind(n) = pat {
-                define(&scope, n, item.clone());
-                return this.render_expr_into(body, &scope, out);
+                define(scope, n, item.clone());
+                return this.render_expr_into(body, scope, out);
             }
             let mut binds = Vec::new();
             if this.match_pat(pat, item, Mode::Strict, env, &mut binds)?.is_none() {
                 return fail(line, format!("`for` pattern does not match {}", short(item)));
             }
             for (n, x) in binds {
-                define(&scope, &n, x);
+                define(scope, &n, x);
             }
-            this.render_expr_into(body, &scope, out)
+            this.render_expr_into(body, scope, out)
         };
         match &it {
             Value::List(l) => {
@@ -1847,6 +1986,9 @@ impl Interp {
             }
             Value::Nil => {}
             other => return fail(line, format!("cannot loop over {}", other.type_name())),
+        }
+        if let Some(s) = scope {
+            Scope::done(s);
         }
         Ok(())
     }
@@ -1991,26 +2133,96 @@ impl Interp {
     }
 
     fn render_el(&mut self, el: &HtmlEl, env: &Env) -> Result<String, Ctrl> {
-        let mut out = String::new();
+        // Room for what it made last time, at once.
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut out = String::with_capacity(el.facts.last_len.load(Relaxed));
         self.render_el_into(el, env, &mut out)?;
+        el.facts.last_len.store(out.len(), Relaxed);
         Ok(out)
     }
 
     fn render_el_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
-        if el.tag.chars().next().map_or(false, |c| c.is_uppercase()) {
+        let f = &el.facts;
+        if f.component {
             return self.render_component_into(el, env, out);
         }
-        if el.tag == "html" {
+        // An element whose HTML never changes is made once.
+        if f.fixed {
+            if let Some(h) = f.html_once.get() {
+                out.push_str(h);
+                return Ok(());
+            }
+            let start = out.len();
+            self.render_tag_into(el, env, out)?;
+            let _ = f.html_once.set(Arc::from(&out[start..]));
+            return Ok(());
+        }
+        // Tags that never change: their HTML is in pieces, made once.
+        if f.tags_fixed {
+            if f.pieces.get().is_none() {
+                let mut pieces = Vec::new();
+                let mut html = String::new();
+                self.pieces_into(el, env, &mut pieces, &mut html)?;
+                if !html.is_empty() {
+                    pieces.push(Piece::Html(html.into()));
+                }
+                let _ = f.pieces.set(pieces);
+            }
+            for p in f.pieces.get().expect("set above") {
+                match p {
+                    Piece::Html(h) => out.push_str(h),
+                    Piece::Expr(e) => self.render_expr_into(e, env, out)?,
+                    Piece::El(e) => self.render_el_into(e, env, out)?,
+                }
+            }
+            return Ok(());
+        }
+        self.render_tag_into(el, env, out)
+    }
+
+    /// `el` as pieces (see `ElFacts::pieces`): its tags and those of the
+    /// elements in it like it as HTML, the rest as it is, to render each time.
+    fn pieces_into(&mut self, el: &HtmlEl, env: &Env, pieces: &mut Vec<Piece>, html: &mut String) -> Result<(), Ctrl> {
+        html.push('<');
+        html.push_str(&el.tag);
+        self.render_attrs_fast(el, env, html)?;
+        html.push('>');
+        if el.facts.void {
+            return Ok(());
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(e) if e.facts.tags_fixed => self.pieces_into(e, env, pieces, html)?,
+                HtmlChild::Expr(e @ Expr::Lit(Lit::Str(_))) => self.render_expr_into(e, env, html)?,
+                _ => {
+                    if !html.is_empty() {
+                        pieces.push(Piece::Html(std::mem::take(html).into()));
+                    }
+                    pieces.push(match c {
+                        HtmlChild::El(e) => Piece::El(e.clone()),
+                        HtmlChild::Expr(e) => Piece::Expr(e.clone()),
+                    });
+                }
+            }
+        }
+        html.push_str("</");
+        html.push_str(&el.tag);
+        html.push('>');
+        Ok(())
+    }
+
+    fn render_tag_into(&mut self, el: &HtmlEl, env: &Env, out: &mut String) -> Result<(), Ctrl> {
+        let f = &el.facts;
+        if f.html {
             out.push_str("<!doctype html>");
         }
         out.push('<');
         out.push_str(&el.tag);
         // Most elements have no spread, no `class=` and are no <textarea>:
         // their attributes are written as they are evaluated.
-        let fast = el.tag != "textarea" && el.attrs.iter().all(|(n, a)| !matches!(a, AttrVal::Spread(_)) && n != "class");
-        let text_value = if fast { self.render_attrs_fast(el, env, out)?; None } else { self.render_attrs(el, env, out)? };
+        let text_value = if f.plain_attrs { self.render_attrs_fast(el, env, out)?; None } else { self.render_attrs(el, env, out)? };
         out.push('>');
-        if VOID_TAGS.contains(&el.tag.as_str()) {
+        if f.void {
             return Ok(());
         }
         match text_value {
@@ -2018,7 +2230,7 @@ impl Interp {
             // A style sheet is raw text to the browser: `.a > b` must stay
             // as written. Only `</` is changed, so the text cannot end the
             // element early.
-            None if el.tag == "style" => {
+            None if f.style => {
                 for c in &el.children {
                     if let HtmlChild::Expr(e) = c {
                         let v = self.eval(e, env)?;

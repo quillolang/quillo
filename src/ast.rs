@@ -164,6 +164,9 @@ pub struct FnDef {
     pub component: bool,
     pub line: u32,
     pub body: Expr,
+    /// How often it was called, for compiling it (src/jit.rs); `u32::MAX`
+    /// once it is known that it cannot be.
+    pub hot: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +253,106 @@ pub struct HtmlEl {
     pub attrs: Vec<(String, AttrVal)>,
     pub children: Vec<HtmlChild>,
     pub line: u32,
+    /// What rendering needs to know of it, worked out when it is parsed.
+    pub facts: ElFacts,
+}
+
+/// A part of an element whose tags never change (see `ElFacts::pieces`).
+#[derive(Debug, Clone)]
+pub enum Piece {
+    Html(Arc<str>),
+    Expr(Expr),
+    El(HtmlEl),
+}
+
+/// An element's facts for the server's renderer (src/interp.rs), so that
+/// rendering one does not look at its tag's text again.
+#[derive(Default)]
+pub struct ElFacts {
+    /// A capitalized tag: a view or component.
+    pub component: bool,
+    /// A void element (`<br>`): no children, no closing tag.
+    pub void: bool,
+    /// `<html>`, which the doctype goes before.
+    pub html: bool,
+    /// `<style>`, whose text is raw.
+    pub style: bool,
+    /// No `{...spread}`, no `class=`, no <textarea>: attributes are written
+    /// as they are evaluated.
+    pub plain_attrs: bool,
+    /// Nothing in it changes (literal attributes and text, elements likewise,
+    /// no URLs a base path changes): its HTML is made once, kept in `html_once`.
+    pub fixed: bool,
+    pub html_once: std::sync::OnceLock<Arc<str>>,
+    /// Its tags and attributes, and those of the elements in it like it,
+    /// never change (only what is shown in them does): it is rendered as
+    /// `pieces`, fixed HTML between what is evaluated, made on first use.
+    pub tags_fixed: bool,
+    pub pieces: std::sync::OnceLock<Vec<Piece>>,
+    /// The length of its HTML last time, to make room for it at once.
+    pub last_len: std::sync::atomic::AtomicUsize,
+}
+
+impl ElFacts {
+    pub fn of(tag: &str, id: &Option<Expr>, classes: &[Expr], attrs: &[(String, AttrVal)], children: &[HtmlChild], void: bool) -> ElFacts {
+        let lit = |e: &Expr| matches!(e, Expr::Lit(_));
+        let component = tag.starts_with(|c: char| c.is_uppercase());
+        let plain_attrs = tag != "textarea" && attrs.iter().all(|(n, a)| !matches!(a, AttrVal::Spread(_)) && n != "class");
+        let tags_fixed = !component
+            && plain_attrs
+            && tag != "html"
+            && tag != "style"
+            && id.as_ref().map_or(true, lit)
+            && classes.iter().all(lit)
+            && attrs.iter().all(|(n, v)| match v {
+                AttrVal::Bool => true,
+                AttrVal::Expr(e) => lit(e) && !crate::interp::url_attr(n),
+                AttrVal::Spread(_) => false,
+            });
+        let fixed = !component
+            && id.as_ref().map_or(true, lit)
+            && classes.iter().all(lit)
+            && attrs.iter().all(|(n, v)| match v {
+                AttrVal::Bool => true,
+                AttrVal::Expr(e) => {
+                    lit(e) && !["href", "src", "action", "formaction", "poster"].iter().any(|u| u.eq_ignore_ascii_case(n))
+                }
+                AttrVal::Spread(_) => false,
+            })
+            && children.iter().all(|c| match c {
+                HtmlChild::El(e) => e.facts.fixed,
+                HtmlChild::Expr(e) => matches!(e, Expr::Lit(Lit::Str(_))),
+            });
+        ElFacts {
+            component,
+            void,
+            html: tag == "html",
+            style: tag == "style",
+            plain_attrs,
+            fixed,
+            html_once: std::sync::OnceLock::new(),
+            tags_fixed,
+            pieces: std::sync::OnceLock::new(),
+            last_len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Clone for ElFacts {
+    fn clone(&self) -> ElFacts {
+        ElFacts {
+            html_once: self.html_once.clone(),
+            pieces: self.pieces.clone(),
+            last_len: std::sync::atomic::AtomicUsize::new(self.last_len.load(std::sync::atomic::Ordering::Relaxed)),
+            ..*self
+        }
+    }
+}
+
+impl std::fmt::Debug for ElFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ElFacts")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

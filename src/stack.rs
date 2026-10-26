@@ -31,6 +31,13 @@ fn limit() -> usize {
     })
 }
 
+/// Bytes left on the current stack, before its end (and `MARGIN`), when
+/// known.
+pub fn remaining() -> Option<usize> {
+    let end = limit();
+    (end != 0).then(|| (psm::stack_pointer() as usize).saturating_sub(end))
+}
+
 /// Makes `limit` the current stack's end (when switching to or from a
 /// coroutine); returns the previous one.
 pub fn switch(limit: usize) -> usize {

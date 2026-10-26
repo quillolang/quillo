@@ -677,6 +677,18 @@ impl Scope {
         });
     }
 
+    /// Empties a scope for another loop step, if nothing else holds it (a
+    /// function made in the last step would): then it can be used again.
+    pub fn reuse(e: &mut Env) -> bool {
+        match Arc::get_mut(e) {
+            Some(s) => {
+                s.vars.vars.get_mut().clear();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn vars(&self) -> VarsGuard<'_> {
         self.vars.lock()
     }
@@ -694,6 +706,20 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
             return Some(v.clone());
         }
         cur = cur.parent.as_deref()?;
+    }
+}
+
+/// Calls `f` with local variable `name` where it is, without copying it;
+/// None if it is not a local (globals are read through `lookup`, which the
+/// view cache follows).
+pub fn with_local<R>(env: &Env, name: &str, f: impl FnOnce(&Value) -> R) -> Option<R> {
+    let mut cur: &Scope = env;
+    loop {
+        let parent = cur.parent.as_deref()?;
+        if let Some(v) = cur.vars().get(name) {
+            return Some(f(v));
+        }
+        cur = parent;
     }
 }
 
