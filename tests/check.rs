@@ -312,7 +312,7 @@ fn annotations_say_what_lists_and_maps_hold() {
 }
 
 fn strict(src: &str) -> Vec<String> {
-    let opts = quillo::check::Options { strict_null: true };
+    let opts = quillo::check::Options { strict_null: true, ..Default::default() };
     quillo::check::check_source_opts(src, "t.qwe", Path::new("."), opts)
         .diagnostics
         .iter()

@@ -224,6 +224,29 @@ fn svg_inside_html_draws() {
     assert_eq!(r, want);
 }
 
+/// Attributes a component takes from data: a spread cannot add handlers,
+/// whatever the key's case or `bind:`, nor replace an attribute written
+/// out; a sandboxed frame's page follows the state.
+#[test]
+fn spread_attributes_from_data_stay_attributes() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("attrs.qwe"), free_port(), Some(&dir.join("attrs.js")));
+    let want = serde_json::json!({
+        "form": ["/login", "post"],
+        "formAttrs": ["action", "href", "id", "method", "title"],
+        "link": ["/ok", "window.clicked = 1", "kept"],
+        "linkAttrs": ["action", "href", "id", "method", "onclick", "title"],
+        "frame": "<p>second</p>",
+        "ran": 0,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// A page loads its components' code when it is needed: not before someone
 /// reaches for one (what they typed and clicked meanwhile is kept), and at
 /// once for one that runs by itself. It resumes on the server's HTML: the

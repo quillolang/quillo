@@ -23,6 +23,80 @@ const SAFE: &[&str] = &[
 /// Steps (calls and loop rounds) a script may take.
 pub const SCRIPT_STEPS: u64 = 20_000;
 
+/// The most a value a script makes may hold, in bytes, roughly: a string's
+/// bytes, and eight for each number, item or entry, through nested lists
+/// and maps. Each 1 KB made also costs a step.
+pub const SCRIPT_BYTES: usize = 1 << 20;
+
+/// How deep a script's lists and maps may nest.
+const SCRIPT_NESTING: usize = 256;
+
+/// The size of `v`, made by a script, or why it is too big. It counts no
+/// further than the limit, so a check costs at most that.
+pub fn too_big(v: &Value) -> Result<usize, &'static str> {
+    let mut n = 0usize;
+    let mut todo = vec![(v, 0usize)];
+    while let Some((v, depth)) = todo.pop() {
+        if depth > SCRIPT_NESTING {
+            return Err("the script nested lists or maps too deeply");
+        }
+        match v {
+            Value::Str(s) | Value::Html(s) => n += s.len(),
+            Value::List(l) => {
+                n = n.saturating_add(8 * l.len());
+                if n <= SCRIPT_BYTES {
+                    todo.extend(l.iter().map(|x| (x, depth + 1)));
+                }
+            }
+            Value::Map(m) => {
+                for (k, x) in m.iter() {
+                    n += 8 + k.len();
+                    if n > SCRIPT_BYTES {
+                        break;
+                    }
+                    todo.push((x, depth + 1));
+                }
+            }
+            Value::Err(x) => todo.push((x, depth + 1)),
+            _ => n += 8,
+        }
+        if n > SCRIPT_BYTES {
+            return Err("the script made a value larger than 1 MB");
+        }
+    }
+    Ok(n)
+}
+
+/// Whether builtin `name` would make a value over the limit from `args`,
+/// checked before it runs: `join`, `replace` and `split` can make far more
+/// than they are given.
+pub fn would_be_too_big(name: &str, args: &[Value]) -> bool {
+    let text = |i: usize| match args.get(i) {
+        Some(Value::Str(s)) => Some(&**s),
+        _ => None,
+    };
+    let times = |s: &str, part: &str| if part.is_empty() { s.chars().count() + 1 } else { s.matches(part).count() + 1 };
+    let made = match name {
+        "join" => match args.first() {
+            Some(Value::List(l)) => {
+                let sep = text(1).map_or(0, str::len);
+                too_big(&args[0]).unwrap_or(usize::MAX).saturating_add(sep.saturating_mul(l.len()))
+            }
+            _ => 0,
+        },
+        "replace" => match (text(0), text(1), text(2)) {
+            (Some(s), Some(from), Some(to)) => s.len().saturating_add(times(s, from).saturating_mul(to.len())),
+            _ => 0,
+        },
+        "split" => match text(0) {
+            Some(s) => s.len().saturating_add(8 * times(s, text(1).unwrap_or(" "))),
+            _ => 0,
+        },
+        _ => 0,
+    };
+    made > SCRIPT_BYTES
+}
+
 fn bad(what: &str) -> Value {
     Value::err(Value::str(what))
 }
@@ -66,9 +140,6 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
         Ok(s) => s,
         Err(e) => return bad(&format!("line {}: {}", e.line, e.msg)),
     };
-    if let Some(why) = stmts.iter().find_map(forbidden_stmt) {
-        return bad(why);
-    }
     // Its world: the safe builtins, then its variables.
     let root = Scope::root();
     for name in SAFE {
@@ -82,26 +153,32 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
             define(&env, k, v.clone());
         }
     }
+    // A budget of steps, and no effects for what the script reaches by
+    // itself; helpers the program passes in keep what the program may do
+    // (`Interp::script_mask`).
     let saved = std::mem::replace(&mut it.fuel, SCRIPT_STEPS);
-    let mut last = Value::Nil;
-    let mut out = None;
-    for s in stmts.iter() {
-        match it.exec_stmt(s, &env) {
-            Ok(v) => last = v,
-            Err(Ctrl::Return(v)) => {
-                out = Some(v);
-                break;
-            }
-            Err(Ctrl::Error(e)) => {
-                out = Some(bad(&if e.line > 0 { format!("line {}: {}", e.line, e.msg) } else { e.msg.clone() }));
-                break;
-            }
-            Err(Ctrl::Reply(_)) => {
-                out = Some(bad("a script cannot reply"));
-                break;
+    let saved_allowed = std::mem::replace(&mut it.allowed, 0);
+    let saved_restrictor = it.restrictor.take();
+    let saved_script = it.script.replace((root.clone(), saved_allowed));
+    // Room on the stack for code nested as deeply as the parser allows.
+    let out = crate::stack::for_nesting(crate::parser::MAX_NESTING, || {
+        if let Some(why) = stmts.iter().find_map(forbidden_stmt) {
+            return bad(why);
+        }
+        let mut last = Value::Nil;
+        for s in stmts.iter() {
+            match it.exec_stmt(s, &env) {
+                Ok(v) => last = v,
+                Err(Ctrl::Return(v)) => return v,
+                Err(Ctrl::Error(e)) => return bad(&if e.line > 0 { format!("line {}: {}", e.line, e.msg) } else { e.msg.clone() }),
+                Err(Ctrl::Reply(_)) => return bad("a script cannot reply"),
             }
         }
-    }
+        last
+    });
     it.fuel = saved;
-    out.unwrap_or(last)
+    it.allowed = saved_allowed;
+    it.restrictor = saved_restrictor;
+    it.script = saved_script;
+    out
 }

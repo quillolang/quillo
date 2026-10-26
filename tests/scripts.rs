@@ -50,3 +50,40 @@ run_script("for x in items => x", { items: bigger })"#;
     assert_eq!(run(r#"run_script("1 +", {})
 len(range(30000) | map((x) => x))"#), "30000");
 }
+
+#[test]
+fn methods_are_the_scripts_own_builtins() {
+    assert_eq!(run(r#"run_script("name.upper + `${tags.len}`", { name: "ada", tags: [1, 2] })"#), "\"ADA2\"");
+    assert_eq!(run(r#"run_script("items.sort_by((x) => x.n).first.n", { items: [{ n: 2 }, { n: 1 }] })"#), "1");
+    let e = run(r#"run_script("\"HOME\".env", {})"#);
+    assert!(e.contains("has no field `env`"), "{}", e);
+    let e = run(r#"fn secret(x) = 42
+run_script("1.secret", {})"#);
+    assert!(e.contains("has no field `secret`"), "{}", e);
+}
+
+#[test]
+fn scripts_cannot_make_huge_values() {
+    // Doubling a string: refused once it passes 1 MB.
+    let e = run(r#"run_script("let s = \"x\"\nfor i in 0..28 { s = s + s }\nlen(s)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    let e = run(r#"run_script("let xs = [1]\nfor i in 0..28 { xs = xs + xs }\nlen(xs)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    // Lists that share themselves count each time they appear.
+    let e = run(r#"run_script("let xs = [1]\nfor i in 0..40 { xs = [xs, xs] }\nstr(xs)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    let e = run(r#"run_script("let xs = 0\nfor i in 0..1000 { xs = [xs] }\n1", {})"#);
+    assert!(e.contains("too deeply"), "{:.200}", e);
+    // Builtins that make much more than they are given are stopped before.
+    let e = run(r#"run_script("let s = join(map(0..1000, (i) => \"x\"), \"\")\nreplace(s + s, \"\", s)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    let e = run(r#"run_script("let s = join(map(0..1000, (i) => \"x\"), \"\")\njoin(map(0..1000, (i) => \"\"), s + s)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    let e = run(r#"run_script("let s = join(map(0..1000, (i) => \"x\"), \"\")\n`${s}${s}`.len", {})"#);
+    assert_eq!(e, "2000");
+    let e = run(r#"run_script("len(0..10000000)", {})"#);
+    assert!(e.contains("larger than 1 MB"), "{:.200}", e);
+    // Big values cost steps.
+    let e = run(r#"run_script("let s = join(map(0..1000, (i) => \"x\"), \"\")\nlet t = s\nfor i in 0..9 { t = t + t }\nfor i in 0..40 { len(t + \"y\") }", {})"#);
+    assert!(e.contains("too many steps"), "{:.200}", e);
+}

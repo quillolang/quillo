@@ -106,7 +106,7 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             match args.iter().skip(2).find(|a| !a.starts_with("--")) {
-                Some(f) => check(f, quillo::check::Options { strict_null }),
+                Some(f) => check(f, quillo::check::Options { strict_null, ..Default::default() }),
                 None => usage(),
             }
         }

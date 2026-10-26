@@ -79,8 +79,11 @@ pub struct Interp {
     /// (`run_script`); `u64::MAX` everywhere else.
     pub(crate) fuel: u64,
     /// Effects the running code may use, and the `with` function that limited them.
-    allowed: u8,
-    restrictor: Option<Arc<FnDef>>,
+    pub(crate) allowed: u8,
+    /// While a sandboxed script runs: its outermost scope, and the effects
+    /// the program had (see `script_mask`).
+    pub(crate) script: Option<(Env, u8)>,
+    pub(crate) restrictor: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
     pub server_fns: Arc<Vec<String>>,
     /// What the program set about its site (see `site::Site`).
@@ -386,10 +389,26 @@ pub fn attr_name_ok(name: &str) -> bool {
         && name.chars().all(|c| !c.is_control() && !matches!(c, ' ' | '"' | '\'' | '>' | '<' | '/' | '=' | '`' | '{' | '}'))
 }
 
-/// Whether a key of a `{...map}` spread may become an attribute.
-fn spread_attr_allowed(name: &str) -> bool {
+/// An attribute's name as the browser compares it: lower case, without the
+/// `bind:` of `bind:value`.
+fn attr_key(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    attr_name_ok(name) && !lower.starts_with("on") && lower != "srcdoc" && !name.starts_with("__")
+    match lower.strip_prefix("bind:") {
+        Some(rest) => rest.to_string(),
+        None => lower,
+    }
+}
+
+/// Whether a key of a `{...map}` spread may become an attribute. The name
+/// that would be written is checked: `bind:onclick` is `onclick`. Names
+/// with `:` (but `xlink:href`) and `@` handlers come only from the program.
+fn spread_attr_allowed(name: &str) -> bool {
+    let key = attr_key(name);
+    attr_name_ok(name)
+        && !code_attr(&key)
+        && !name.starts_with("__")
+        && !name.starts_with('@')
+        && (!name.contains(':') || key == "xlink:href")
 }
 
 fn render_value(v: &Value, out: &mut String) {
@@ -574,6 +593,7 @@ impl Interp {
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
+            script: None,
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
@@ -631,6 +651,7 @@ impl Interp {
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
+            script: None,
             restrictor: None,
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
@@ -1134,6 +1155,7 @@ impl Interp {
                         vec![Expr::Lit(Lit::Str(td.name.as_str().into())), Expr::Ident("fields".into(), line)],
                         line,
                     ),
+                    nesting: 0,
                     hot: Default::default(),
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
@@ -1218,6 +1240,9 @@ impl Interp {
             Expr::Binary(op, a, b, line) => {
                 let x = self.eval(a, env)?;
                 let y = self.eval(b, env)?;
+                if self.fuel != u64::MAX {
+                    return self.script_binop(*op, x, y, *line);
+                }
                 binop(*op, x, y, *line)
             }
             Expr::Coalesce(a, b) => {
@@ -1243,7 +1268,7 @@ impl Interp {
                     }
                 }
                 let v = self.eval(obj, env)?;
-                self.get_field(v, name, *line)
+                self.get_field(v, name, env, *line)
             }
             Expr::Try(x) => {
                 let v = self.eval(x, env)?;
@@ -1285,7 +1310,7 @@ impl Interp {
             Expr::Field(obj, name, l) => {
                 let recv = self.eval(obj, env)?;
                 let db_on = crate::db::conn_of(&recv, name);
-                let f = self.get_field(recv, name, *l)?;
+                let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
                 self.call(&f, vec![v], line)
             }
@@ -1321,7 +1346,7 @@ impl Interp {
     fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
         let mut s = String::new();
         self.template_into(parts, env, &mut s)?;
-        Ok(Value::str(s))
+        self.script_made(Value::str(s), 0)
     }
 
     #[inline(never)]
@@ -1330,7 +1355,7 @@ impl Interp {
         for i in items {
             v.push(self.eval(i, env)?);
         }
-        Ok(Value::list(v))
+        self.script_made(Value::list(v), 0)
     }
 
     #[inline(never)]
@@ -1340,7 +1365,41 @@ impl Interp {
             let v = self.eval(x, env)?;
             m.insert(k.into(), v);
         }
-        Ok(Value::map(m))
+        self.script_made(Value::map(m), 0)
+    }
+
+    /// `v`, unless a sandboxed script made it too big; a script also pays
+    /// for what it makes, a step for each 1 KB (src/script.rs).
+    #[inline]
+    fn script_made(&mut self, v: Value, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel != u64::MAX {
+            self.pay_for(&v, line)?;
+        }
+        Ok(v)
+    }
+
+    #[cold]
+    fn pay_for(&mut self, v: &Value, line: u32) -> Result<(), Ctrl> {
+        let n = crate::script::too_big(v).or_else(|why| fail(line, why))?;
+        let cost = (n / 1024) as u64;
+        if cost > self.fuel {
+            return fail(line, "the script took too many steps");
+        }
+        self.fuel -= cost;
+        Ok(())
+    }
+
+    /// An operator in a sandboxed script: a range it may not make is
+    /// refused before it is made, and the result is paid for.
+    #[cold]
+    fn script_binop(&mut self, op: BinOp, x: Value, y: Value, line: u32) -> Result<Value, Ctrl> {
+        if let (BinOp::Range, Value::Int(a), Value::Int(b)) = (op, &x, &y) {
+            if b.saturating_sub(*a).saturating_mul(8) > crate::script::SCRIPT_BYTES as i64 {
+                return fail(line, "the script made a value larger than 1 MB");
+            }
+        }
+        let v = binop(op, x, y, line)?;
+        self.script_made(v, line)
     }
 
     #[inline(never)]
@@ -1413,7 +1472,8 @@ impl Interp {
         // `range(a, b)` and `a..b`: counted, without making the list.
         if let Some((a, b)) = self.counted(iter, env, line)? {
             if keep {
-                out.reserve((b - a).max(0) as usize);
+                // A script stops after its steps: no room for more.
+                out.reserve(((b - a).max(0) as u64).min(self.fuel) as usize);
             }
             for i in a..b {
                 let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line)?;
@@ -1450,7 +1510,11 @@ impl Interp {
         if let Some(s) = scope {
             Scope::done(s);
         }
-        Ok(if keep { Value::list(out) } else { Value::Nil })
+        if keep {
+            self.script_made(Value::list(out), line)
+        } else {
+            Ok(Value::Nil)
+        }
     }
 
     /// One step of a loop: `item` bound by `pat` in a scope of its own (the
@@ -1574,7 +1638,8 @@ impl Interp {
         self.call(&f, argv, line)
     }
 
-    fn get_field(&mut self, v: Value, name: &str, line: u32) -> Result<Value, Ctrl> {
+    /// `v.name`, read where `env` is the scope of the code that reads it.
+    fn get_field(&mut self, v: Value, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match &v {
             Value::Nil => return Ok(Value::Nil),
             Value::Map(m) => {
@@ -1602,8 +1667,10 @@ impl Interp {
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
-        // this way, so any other missing key on a record is simply null.
-        if let Some(f) = lookup(&self.globals, name) {
+        // this way, so any other missing key on a record is simply null. The
+        // function is the one in scope where the field is read: a script's
+        // scope holds only what it was given, not the program's globals.
+        if let Some(f) = lookup_fn(env, name) {
             let usable = match (&v, &f) {
                 (Value::Map(_), Value::Builtin(..)) => matches!(name, "len" | "keys" | "values"),
                 (Value::Map(_), _) => false,
@@ -1638,6 +1705,9 @@ impl Interp {
                 if name.starts_with("native:") {
                     return crate::native::call(self, name, args, line);
                 }
+                if self.fuel != u64::MAX {
+                    return self.script_builtin(name, *func, args, line);
+                }
                 func(self, args, line)
             }
             Value::Func(c) => {
@@ -1662,9 +1732,9 @@ impl Interp {
         }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
-        if let (Some((field, at)), [Some(_)]) = (projection(&c.def), args.as_slice()) {
+        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
-            return self.get_field(v, field, at);
+            return self.get_field(v, field, &c.env, at);
         }
         let n = args.len();
         self.call_closure_with(c, args, n, line)
@@ -1680,8 +1750,8 @@ impl Interp {
             self.burn(line)?;
             self.burn(line)?;
         }
-        if let Some((field, at)) = projection(&c.def) {
-            return self.get_field(x, field, at);
+        if let (Some((field, at)), u64::MAX) = (projection(&c.def), self.fuel) {
+            return self.get_field(x, field, &c.env, at);
         }
         let c = c.clone();
         self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
@@ -1689,7 +1759,13 @@ impl Interp {
 
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
-        let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line))?;
+        let mask = if self.fuel != u64::MAX { self.script_mask(c) } else { None };
+        let outer = mask.map(|m| std::mem::replace(&mut self.allowed, m));
+        let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line));
+        if let Some(a) = outer {
+            self.allowed = a;
+        }
+        let r = r?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
                 return fail(
@@ -1744,8 +1820,9 @@ impl Interp {
             None => None,
         };
         self.depth += 1;
-        // Grow the stack on demand, so deep recursion works on any thread.
-        let r = crate::stack::maybe_grow(128 << 10, 4 << 20, || body(self));
+        // Grow the stack on demand, so deep recursion works on any thread,
+        // and so that a body that nests deeply has room for it.
+        let r = crate::stack::for_nesting(def.nesting, || body(self));
         self.depth -= 1;
         if let Some((mask, who)) = saved {
             self.allowed = mask;
@@ -1770,6 +1847,14 @@ impl Interp {
         }
     }
 
+    /// In a sandboxed script, the effects function `c` may use: none for the
+    /// script's own, those the program had for a helper it passed in.
+    #[cold]
+    fn script_mask(&self, c: &Closure) -> Option<u8> {
+        let (root, outer) = self.script.as_ref()?;
+        Some(if within(&c.env, root) { 0 } else { *outer })
+    }
+
     /// One step of a sandboxed script's budget.
     #[cold]
     fn burn(&mut self, line: u32) -> Result<(), Ctrl> {
@@ -1778,6 +1863,17 @@ impl Interp {
         }
         self.fuel -= 1;
         Ok(())
+    }
+
+    /// A builtin called by a sandboxed script: one that would make a value
+    /// over the limit is refused before it runs.
+    #[cold]
+    fn script_builtin(&mut self, name: &str, func: BuiltinFn, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        if crate::script::would_be_too_big(name, &args) {
+            return fail(line, "the script made a value larger than 1 MB");
+        }
+        let v = func(self, args, line)?;
+        self.script_made(v, line)
     }
 
     #[cold]
@@ -2205,6 +2301,8 @@ impl Interp {
         for (name, val) in &el.attrs {
             match val {
                 AttrVal::Bool => explicit.push((name.clone(), Value::Bool(true))),
+                // Refused when the program is loaded; never written all the same.
+                AttrVal::Expr(_) if code_from_data(&el.tag, &el.attrs, name, val) => {}
                 AttrVal::Expr(e) => explicit.push((name.clone(), self.eval(e, env)?)),
                 AttrVal::Spread(e) => match self.eval(e, env)? {
                     Value::Map(m) => spread.extend(m.iter().map(|(k, v)| (k.to_string(), v.clone()))),
@@ -2359,15 +2457,19 @@ impl Interp {
         // Spread keys are data, often from outside: only plain attribute
         // names, and no event handlers (`onclick`) or `srcdoc`, which run
         // the value as code or as a page.
+        // Names are compared as the browser does (`ACTION` is `action`), so
+        // a spread key cannot stand in for a written attribute.
         let spread: Vec<(String, Value)> = spread.into_iter().filter(|(n, _)| spread_attr_allowed(n)).collect();
-        let written: HashSet<&str> =
-            explicit.iter().map(|(n, _)| n.strip_prefix("bind:").unwrap_or(n.as_str())).collect();
+        let mut written: HashSet<String> = explicit.iter().map(|(n, _)| attr_key(n)).collect();
         // Written classes first, then the spread's.
-        let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| n == "class");
-        let mut entries: Vec<(String, Value)> = spread
-            .into_iter()
-            .filter(|(n, _)| !written.contains(n.as_str()) && !(n == "id" && el.id.is_some()))
-            .collect();
+        let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| attr_key(n) == "class");
+        let mut entries: Vec<(String, Value)> = Vec::new();
+        for (n, v) in spread {
+            // Once each: the first of `href` and `HREF` in a spread.
+            if !(attr_key(&n) == "id" && el.id.is_some()) && written.insert(attr_key(&n)) {
+                entries.push((n, v));
+            }
+        }
         entries.extend(explicit.iter().cloned());
         entries.extend(spread_class);
         // A textarea's value is its text, not an attribute.
@@ -2394,7 +2496,7 @@ impl Interp {
                 text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
                 continue;
             }
-            if name == "class" {
+            if name.eq_ignore_ascii_case("class") {
                 if !matches!(v, Value::Nil | Value::Bool(false)) {
                     classes.push(v.display());
                 }
@@ -2443,6 +2545,9 @@ impl Interp {
             // `@click` handlers only exist in the browser, `key` only matters
             // there; `bind:value={x}` renders as `value`.
             if name.starts_with('@') || name == "key" {
+                continue;
+            }
+            if code_from_data(&el.tag, &el.attrs, name, val) {
                 continue;
             }
             let name = name.strip_prefix("bind:").unwrap_or(name);
@@ -2501,6 +2606,9 @@ impl Interp {
                     Value::Int(n) => push_int(out, n),
                     v => out.push_str(&v.display()),
                 },
+            }
+            if self.fuel != u64::MAX && out.len() > crate::script::SCRIPT_BYTES {
+                return fail(0, "the script made a value larger than 1 MB");
             }
         }
         Ok(())

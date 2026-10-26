@@ -629,12 +629,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
-    ("http.get", "str, map | null=", "map | error(str)"),
-    ("http.delete", "str, map | null=", "map | error(str)"),
-    ("http.post", "str, any=, map | null=", "map | error(str)"),
-    ("http.put", "str, any=, map | null=", "map | error(str)"),
-    ("http.patch", "str, any=, map | null=", "map | error(str)"),
-    ("http.request", "str, str, any=, map | null=", "map | error(str)"),
+    ("http.get", "str, map | null=, map | null=", "map | error(str)"),
+    ("http.delete", "str, map | null=, map | null=", "map | error(str)"),
+    ("http.post", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.put", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.patch", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.request", "str, str, any=, map | null=, map | null=", "map | error(str)"),
     ("set_cookie", "str, any=, map | null=", "null"),
     ("delete_cookie", "str, map | null=", "null"),
     ("session", "", "map"),
@@ -1048,7 +1048,17 @@ pub struct Options {
     /// argument `str | null` for a `str` parameter, `count + 1` with
     /// `count: int | null`. Checks such as `x != null` narrow the type.
     pub strict_null: bool,
+    /// Read only files inside the program's folder: `use`, `mount` and
+    /// `service` paths made of plain names, as `read_file` takes them. For
+    /// code that comes from a program's users (`check_program`).
+    pub confined: bool,
 }
+
+/// How many programs deep `mount` and `service` may lead, and files deep
+/// `use` may: past that the check stops there with an error, instead of
+/// running out of stack.
+const MAX_PROGRAMS: u32 = 16;
+const MAX_USES: u32 = 64;
 
 /// Checks a program file and the files it `use`s.
 pub fn check_file(path: &Path) -> Analysis {
@@ -1094,6 +1104,12 @@ pub fn check_source_opts(src: &str, file: &str, base_dir: &Path, opts: Options) 
 }
 
 fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
+    if DEPTH.with(|d| d.get()) >= MAX_PROGRAMS {
+        let mut a = Analysis::default();
+        let message = format!("programs mount or call each other more than {} deep", MAX_PROGRAMS);
+        a.diagnostics.push(Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message });
+        return a;
+    }
     let outermost = DEPTH.with(|d| {
         d.set(d.get() + 1);
         d.get() == 1
@@ -1112,6 +1128,7 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
 fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let mut c = Checker::new(file);
     c.strict_null = opts.strict_null;
+    c.confined = opts.confined;
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     match Parser::new(src).parse_program() {
@@ -1201,6 +1218,12 @@ struct Checker {
     hint: Option<Vec<T>>,
     /// Warn where a value may be null and null does not work (`--strict-null`).
     strict_null: bool,
+    /// See `Options::confined`.
+    confined: bool,
+    /// Files `use`d inside one another, and expressions inside one another,
+    /// at the point being checked.
+    uses: u32,
+    depth: u32,
     file: Arc<str>,
     line: u32,
     out: Analysis,
@@ -1247,6 +1270,9 @@ impl Checker {
             services: HashMap::new(),
             hint: None,
             strict_null: false,
+            confined: false,
+            uses: 0,
+            depth: 0,
             file: Arc::from(file),
             line: 0,
             out: Analysis::default(),
@@ -1278,11 +1304,26 @@ impl Checker {
         self.diag_at(self.file.clone(), self.line, Severity::Warning, msg);
     }
 
+    fn options(&self) -> Options {
+        Options { strict_null: self.strict_null, confined: self.confined }
+    }
+
+    /// The file a `use`, `mount` or `service` names; when confined, none
+    /// for a path that could lead outside the program's folder.
+    fn file_at(&mut self, base: &Path, path: &str, file: &Arc<str>, line: u32) -> Option<PathBuf> {
+        let plain = !path.is_empty() && Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+        if self.confined && !plain {
+            self.diag_at(file.clone(), line, Severity::Error, format!("path must stay inside the program's folder: {}", path));
+            return None;
+        }
+        Some(base.join(path))
+    }
+
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
             if let Stmt::Service(name, prefix, path, _, line) = s {
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 match crate::service::offered(&full) {
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
                     Ok(defs) => {
@@ -1302,7 +1343,7 @@ impl Checker {
                         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                         let first = SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
                         if first {
-                            let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
+                            let sub = check_file_opts(&full, HashMap::new(), self.options());
                             SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
                             self.out.diagnostics.extend(sub.diagnostics);
                             if let Some(prefix) = prefix {
@@ -1325,11 +1366,11 @@ impl Checker {
             }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 if !full.is_file() {
                     self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: no such file", full.display()));
                 } else {
-                    let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
+                    let sub = check_file_opts(&full, HashMap::new(), self.options());
                     self.out.diagnostics.extend(sub.diagnostics);
                     self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
                         s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
@@ -1340,7 +1381,7 @@ impl Checker {
                 continue;
             }
             if let Stmt::Use(path, line) = s {
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 if !seen.insert(key) {
                     continue;
@@ -1363,9 +1404,17 @@ impl Checker {
                     }
                     continue;
                 }
+                if self.uses >= MAX_USES {
+                    self.diag_at(file.clone(), *line, Severity::Error, format!("files `use` each other more than {} deep", MAX_USES));
+                    continue;
+                }
                 match text {
                     Ok(src) => match Parser::new(&src).parse_program() {
-                        Ok(sub) => self.expand(Arc::new(sub), fname, base, seen, order),
+                        Ok(sub) => {
+                            self.uses += 1;
+                            self.expand(Arc::new(sub), fname, base, seen, order);
+                            self.uses -= 1;
+                        }
                         Err(e) => self.diag_at(fname, e.line, Severity::Error, e.msg),
                     },
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
@@ -2163,6 +2212,18 @@ impl Checker {
     // ---- expressions ---------------------------------------------------
 
     fn expr(&mut self, e: &Expr) -> T {
+        // The parser refuses code that nests deeper; a guard all the same.
+        if self.depth >= 2 * crate::parser::MAX_NESTING {
+            self.error("the code nests too deeply");
+            return T::ANY;
+        }
+        self.depth += 1;
+        let t = crate::stack::maybe_grow(256 << 10, 4 << 20, || self.expr_here(e));
+        self.depth -= 1;
+        t
+    }
+
+    fn expr_here(&mut self, e: &Expr) -> T {
         match e {
             Expr::Lit(l) => lit_t(l),
             Expr::Template(parts) => {
@@ -3010,7 +3071,7 @@ impl Checker {
         }
         for c in &el.children {
             match c {
-                HtmlChild::El(e) => self.html(e),
+                HtmlChild::El(e) => crate::stack::maybe_grow(256 << 10, 4 << 20, || self.html(e)),
                 HtmlChild::Expr(x) => {
                     self.expr(x);
                 }
