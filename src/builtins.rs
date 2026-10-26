@@ -1007,7 +1007,9 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     let base = it.base_dir.to_string_lossy().into_owned();
-    let found = it.unlocked(move || crate::check::check_file_with(&full, overrides).diagnostics);
+    // The code may come from the program's users: it reads nothing outside the folder.
+    let opts = crate::check::Options { confined: true, ..Default::default() };
+    let found = it.unlocked(move || crate::check::check_file_opts(&full, overrides, opts).diagnostics);
     Ok(Value::list(
         found
             .into_iter()

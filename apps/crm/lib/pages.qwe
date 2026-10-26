@@ -5,7 +5,8 @@
 // published version, which visitors see at /p/<slug> (or at the
 // workspace's own address, for the home page). A section is made the same
 // way but has no address: pages put it in with the Section block, and
-// show its published version wherever they do.
+// show its published version wherever they do. Owners, admins and
+// designers change pages (`need_designer`); any member may look.
 
 
 fn page_out(r) = r == null ? null : merge(r, {
@@ -99,7 +100,7 @@ fn section_uses() = db.query("select id, title, kind, draft, published from page
 
 // Pinned: in everyone's sidebar. A folder: where the Pages page groups it.
 server fn set_page_place(id: int, place: map) {
-    need_user()?
+    need_designer()?
     if db.one("select id from pages where id = ?", id) == null { return err("No such page") }
     if place.pinned != null { db.exec("update pages set pinned = ? where id = ?", place.pinned == true ? 1 : 0, id) }
     if place.folder != null { db.exec("update pages set folder = ? where id = ?", folder_name(place.folder), id) }
@@ -147,7 +148,7 @@ fn preview_token_of(id: int) {
 
 // A new link: the one before stops working.
 server fn new_preview_link(id: int) {
-    need_user()?
+    need_designer()?
     if db.one("select id from pages where id = ?", id) == null { return err("No such page") }
     let t = crypto.token(18)
     db.exec("update pages set preview_token = ? where id = ?", t, id)
@@ -156,7 +157,7 @@ server fn new_preview_link(id: int) {
 
 // The blocks on the designer's screen, and the one being edited.
 server fn live_draft(id: int, blocks: list, focus) {
-    let u = need_user()?
+    let u = need_designer()?
     db.exec("insert into page_live (page_id, blocks, focus, user_id, updated_at) values (?, ?, ?, ?, ?)
              on conflict (page_id) do update set blocks = excluded.blocks, focus = excluded.focus, user_id = excluded.user_id, updated_at = excluded.updated_at",
         id, json.stringify(blocks), str(focus ?? ""), u.id, now())
@@ -165,7 +166,7 @@ server fn live_draft(id: int, blocks: list, focus) {
 
 // Only which block is being edited.
 server fn live_focus(id: int, focus) {
-    need_user()?
+    need_designer()?
     db.exec("update page_live set focus = ? where page_id = ?", str(focus ?? ""), id)
     true
 }
@@ -204,7 +205,7 @@ server fn live_view(token: str) {
 // block in that order that is neither sent nor saved (the page changed
 // elsewhere): refused as stale, and the designer saves the whole page.
 server fn save_changes(id: int, c: map) {
-    need_user()?
+    need_designer()?
     let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
     let saved = upgrade_blocks(p.draft.blocks ?? [])
     let changed = c.blocks ?? {}
@@ -217,7 +218,7 @@ server fn save_changes(id: int, c: map) {
 
 // A draft may be saved as it is; only the address must be one.
 server fn save_page(p: map) {
-    need_user()?
+    need_designer()?
     let slug = slugify(p.slug ?? "")
     if slug == "" { return err({ problems: problem("slug", "Choose its address") }) }
     if db.one("select id from pages where slug = ? and id != ?", slug, p.id) != null { return err({ problems: problem("slug", "Another page has this address") }) }
@@ -230,7 +231,7 @@ server fn save_page(p: map) {
 
 // Publishing checks the draft with the page rules the designer showed.
 server fn publish_page(id: int) {
-    need_user()?
+    need_designer()?
     let p = (page_out(db.one("select * from pages where id = ?", id)) ?? err("No such page"))?
     // The rules see every block, those in columns too.
     let record = merge(p.draft, { id: str(p.id), kind: p.kind, title: p.title, slug: p.slug, description: p.description, blocks: flat_blocks(p.draft.blocks) })
@@ -247,7 +248,7 @@ fn in_use(id: int, live_only: bool) {
 }
 
 server fn unpublish_page(id: int) {
-    need_user()?
+    need_designer()?
     in_use(id, true)?
     db.exec("update pages set published = null, home = 0, updated_at = ? where id = ?", now(), id)
     true
@@ -302,7 +303,7 @@ server fn save_theme(t: map) {
 }
 
 server fn new_page(template: str) {
-    need_user()?
+    need_designer()?
     let t = page_template(template)
     let kind = template == "section" ? "section" : "page"
     let base = kind == "section" ? "section" : slugify(t.title)

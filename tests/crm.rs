@@ -1289,3 +1289,88 @@ fn feedback_from_the_live_preview_is_the_teams_to_do() {
     assert!(anon(&mut crm, "resolve_feedback", serde_json::json!([token, fid, true]))["err"].is_string());
     assert!(anon(&mut crm, "give_feedback", shot("Again", "Carla"))["err"].is_string());
 }
+
+/// A member of the team (no designer's group), signed in.
+fn member(crm: &mut Crm, owner: &str, name: &str, email: &str) -> String {
+    let host = "acme.localhost:9000";
+    let added = crm.rpc(host, "add_user", serde_json::json!([{ "name": name, "email": email, "password": "a-long-password", "role": "member" }]), Some(owner));
+    assert!(added.get("ok").is_some(), "{}", added);
+    let r = crm.form(host, "/login", &format!("email={}&password=a-long-password", email.replace('@', "%40")), None);
+    r.header("set-cookie").unwrap().split(';').next().unwrap().to_string()
+}
+
+#[test]
+fn only_designers_change_pages() {
+    let mut crm = Crm::new("page-roles");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    let id = crm.rpc(host, "new_page", serde_json::json!(["blank"]), Some(&owner))["ok"].as_i64().unwrap();
+    let page = serde_json::json!({ "id": id, "title": "Mine now", "slug": "mine", "description": "", "blocks": [{ "id": "b1", "type": "text", "config": { "body": "Hello from Sam" } }] });
+    for (f, args) in [
+        ("new_page", serde_json::json!(["blank"])),
+        ("save_page", serde_json::json!([page.clone()])),
+        ("save_changes", serde_json::json!([id, { "meta": { "title": "Mine now" } }])),
+        ("publish_page", serde_json::json!([id])),
+        ("unpublish_page", serde_json::json!([id])),
+        ("new_preview_link", serde_json::json!([id])),
+        ("set_page_place", serde_json::json!([id, { "pinned": true }])),
+        ("live_draft", serde_json::json!([id, [], ""])),
+        ("save_theme", serde_json::json!([{ "color": "#000000" }])),
+    ] {
+        let r = crm.rpc(host, f, args, Some(&sam));
+        assert!(r["err"].as_str().unwrap_or("").contains("designers"), "{}: {}", f, r);
+    }
+    assert_eq!(crm.send(host, "GET", "/p/mine", "", None).status, 404);
+    // Looking is still theirs; the owner (an admin) changes and publishes.
+    assert!(crm.rpc(host, "list_pages", serde_json::json!([]), Some(&sam))["ok"].is_array());
+    assert!(crm.rpc(host, "save_page", serde_json::json!([page]), Some(&owner))["ok"].is_object());
+    assert!(crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&owner))["ok"].is_object());
+    assert!(crm.send(host, "GET", "/p/mine", "", None).text().contains("Hello from Sam"));
+}
+
+#[test]
+fn flow_webhooks_reach_only_the_public_internet() {
+    use std::io::Read;
+    let mut crm = Crm::new("webhooks");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    // A service inside, which must hear nothing.
+    let inside = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = inside.local_addr().unwrap().port();
+    inside.set_nonblocking(true).unwrap();
+    let flow = |url: &str| serde_json::json!([{ "name": "Hook", "active": false, "graph": {
+        "nodes": [
+            { "id": "t", "type": "trigger", "x": 0, "y": 0, "config": { "event": "contact_created" } },
+            { "id": "w", "type": "webhook", "x": 200, "y": 0, "config": { "url": url } },
+        ],
+        "edges": [{ "from": "t", "port": "out", "to": "w" }],
+    } }]);
+    // A member may neither make nor start flows.
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    assert!(crm.rpc(host, "save_flow", flow("https://example.com/"), Some(&sam))["err"].as_str().unwrap_or("").contains("designers"));
+    assert!(crm.rpc(host, "new_flow", serde_json::json!(["welcome"]), Some(&sam))["err"].as_str().unwrap_or("").contains("designers"));
+    let contact = crm.rpc(host, "save_contact", serde_json::json!([{ "first_name": "Grace", "email": "grace@navy.test", "stage": "lead", "tags": [] }]), Some(&owner))["ok"]["id"].as_i64().unwrap();
+    for (i, (url, why)) in [
+        (format!("http://127.0.0.1:{}/internal", port), "must start with https://"),
+        (format!("https://127.0.0.1:{}/internal", port), "not an address on the public internet"),
+        (format!("https://localhost:{}/internal", port), "not an address on the public internet"),
+        ("https://169.254.169.254/latest/meta-data/".to_string(), "not an address on the public internet"),
+        ("https://[::1]/".to_string(), "not an address on the public internet"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = crm.rpc(host, "save_flow", flow(&url), Some(&owner))["ok"]["id"].as_i64().unwrap();
+        assert!(crm.rpc(host, "start_flow", serde_json::json!([f, contact]), Some(&sam))["err"].as_str().unwrap_or("").contains("designers"));
+        let run = crm.rpc(host, "start_flow", serde_json::json!([f, contact]), Some(&owner))["ok"].clone();
+        let log = run["log"].to_string();
+        assert!(log.contains("webhook failed") && log.contains(why), "{}: {}", url, log);
+        let _ = i;
+    }
+    let mut buf = [0u8; 16];
+    match inside.accept() {
+        Ok((mut s, _)) => panic!("the service inside was called: {:?}", s.read(&mut buf)),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+    }
+}

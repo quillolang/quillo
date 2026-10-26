@@ -353,11 +353,19 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `.class` and `#id` shorthand, with `{}` interpolation in the name.
 - `{name}` is short for `name={name}`, and `{...map}` spreads a map's keys as attributes
   (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. Attributes written
-  out win over spread ones; classes from both are kept. On a view or component, spread
+  out win over spread ones, whatever the case of the key (`ACTION` is `action`); classes
+  from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example ``href={`/todos/${id}`}``.
   `true` renders a bare attribute; `false`/`null` leaves it out.
+- Event handler attributes (`onclick`, any `on...`) and `srcdoc` take only `"text"`
+  written in the program: the browser decodes their value and runs it, so escaping
+  cannot keep data out of the code. `onmouseover={...}` is an error when the program
+  loads (and in `quillo check`); handle events with `@mouseover={...}`. An `<iframe>`
+  with a written `sandbox` attribute that does not say `allow-same-origin` may take
+  `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
+  are its parameters, so `on_change={...}` there is fine.
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
@@ -760,7 +768,34 @@ sites cannot add without asking first; a form another site posts is refused.
 `check_program("main.qwe", { "plugins/x.qwe": text })` gives what `quillo check` says of
 a program, as `{ file, line, severity, message }` maps, with some files' text given in
 place of what is on disk: a tool that writes Quillo code can check it before writing
-it. `delete_file(path)` removes a file or folder inside the program's folder.
+it. The code checked may come from users, so it reads only files inside the program's
+folder: a `use`, `mount` or `service` path with `..` or starting with `/` is reported
+as an error, not read. `delete_file(path)` removes a file or folder inside the
+program's folder.
+
+### Scripts from users
+
+`run_script(source, vars)` runs code a program's users write (a rule on a form's field,
+who may see a record) on the server, and gives its last expression's value, or an error
+value saying what went wrong:
+
+```quillo
+run_script("value > 3 ? null : `at least 4, got ${value}`", { value: 5 })   // null
+```
+
+- The script sees the values in `vars` and the builtins that only compute (`len`,
+  `upper`, `map`, `filter`, ...). Method calls are the same: `"x".upper` works,
+  `"HOME".env` and `"f".read_file` do not, nor the program's functions.
+- It cannot define functions (it can write `(x) => ...`), routes, state or markup,
+  `use` files or reply.
+- It has no effects of its own: a builtin such as `env` passed in `vars` still cannot
+  run. A function of the program passed in `vars` runs as the program's, with what the
+  program may do, so it is the program's way to let a script ask for more
+  (`{ taken: (code) => db.one(...) != null }`).
+- It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
+  1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
+  costs a step: doubling a string in a loop stops there, not when the memory runs out.
+- Like any code, it may nest at most 256 levels deep.
 
 ### Images
 
@@ -914,7 +949,8 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   name), each line of newline-delimited JSON, or each piece of text, and may stop
   it by returning `false`. Given `send`, what arrives goes straight on. It gives
   `{ status, ok, headers }` once the answer has ended (with the `body` when it is
-  not a success), or an error value when it could not be had.
+  not a success), or an error value when it could not be had. The map also takes
+  `redirects` and `public_only` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request and calls `f` with what the answer streams, until it ends; `listen(url,
   f)` in a component's code follows a stream for as long as the code that called it
@@ -1287,9 +1323,14 @@ See [examples/services](examples/services): a shop that bills through a billing 
 Safety built in:
 
 - Text in HTML and attribute values is escaped. Keys of a `{...map}` spread on an element
-  become attributes only if they are plain names that run nothing: `onclick`, `srcdoc`
-  and names with quotes or `>` are dropped. `javascript:` URLs in `href`, `src` and the
-  like render as `about:blank#blocked`.
+  become attributes only if they are plain names that run nothing: `onclick` (in any
+  case, and as `bind:onclick`), `srcdoc`, names with `:` (but `xlink:href`), `@` or
+  quotes or `>` are dropped, and a key cannot replace an attribute written out, in
+  another case either. Event handler attributes and `srcdoc` take only text written in
+  the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
+  and the like render as `about:blank#blocked`.
+- Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
+  when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
   from a request add headers of its own.
 - A failing request answers `internal error`; the message, with file and line, goes to
@@ -1717,6 +1758,26 @@ http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 
 Every HTTP status is a response; failing to connect is an error value.
 `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+
+Options come after the headers (`http.get(url, headers, opts)`, `http.post(url, body,
+headers, opts)`), and in `http.stream`'s map:
+
+- `redirects: 0` answers a redirect with the 3xx response itself, instead of following
+  it (up to 5 are followed otherwise, to any address).
+- `public_only: true` connects only to addresses on the public internet: not this
+  machine, private or link-local networks (where a cloud's metadata service is at
+  169.254.169.254), or addresses kept for other uses, in IPv4 or IPv6. The addresses
+  the host name gives are checked as the connection is made, so a name cannot pass a
+  check and then lead inside.
+
+For an address a program's users give (a webhook), use both, and require `https://`:
+
+```quillo
+fn post_hook(url: str, body) {
+    if !starts_with(url, "https://") { return err("the address must start with https://") }
+    http.post(url, body, {}, { redirects: 0, public_only: true })
+}
+```
 
 ## Checking
 

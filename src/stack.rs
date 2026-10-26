@@ -15,6 +15,17 @@ thread_local! {
     static LIMIT: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Stack one level of nesting in a function's body may take while it is
+/// evaluated (see `parser::MAX_NESTING`): far more in a debug build.
+pub const PER_LEVEL: usize = if cfg!(debug_assertions) { 24 << 10 } else { 8 << 10 };
+
+/// Runs `f` with room for code nested `levels` deep: on a new piece of
+/// stack if this one has too little left.
+pub fn for_nesting<R>(levels: u32, f: impl FnOnce() -> R) -> R {
+    let need = (128 << 10).max(levels as usize * PER_LEVEL);
+    maybe_grow(need, (4 << 20).max(need + (256 << 10)), f)
+}
+
 /// Kept free above a stack's end: its guard page, and room for code that
 /// does not check (builtins, serialization).
 pub const MARGIN: usize = 64 << 10;

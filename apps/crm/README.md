@@ -39,13 +39,16 @@ visitors would see it, following each change as it is typed (`live`) and the blo
 | **Desks** | Each category of posts can have its own editors, reviewers and publishers, and the approvals a post needs: draft → review → approved → published, with changes asked for by note, mail at each step, and a queue of what waits for you. |
 | **Questions and notes** | The app asks before it deletes, and tells you what it did, in dialogs and notes on the page (`ask`, `notify`), in a notice style plugins bring (Standard, Quiet; Glass and Bold from the Notice styles plugin): where they open and how they look. |
 | **Newsroom suite** | A plugin whose model is a newspaper's: Categories (which can depend on one another: Elections, part of Politics) and Articles, with their states (Draft, In review, Changes asked, Approved, Published) and moves for the Writers, Reviewers and Publishers groups, all the workspace's own to design further. Reviewers mark any words or picture and comment; threads are answered and resolved; moves tell the next people. Articles are the site: a front page, a page per section, a page per story. |
-| **Roles and groups** | Roles: what each may do with each object (see, edit, delete), each field (edit, read, hidden), and an access script deciding which records they see. Groups: people who work together, who get the group's roles and are what it is on the team (designers, writers, reviewers, publishers). |
+| **Roles and groups** | Roles: what each may do with each object (see, edit, delete), each field (edit, read, hidden), and an access script deciding which records they see. Groups: people who work together, who get the group's roles and are what it is on the team (designers, writers, reviewers, publishers). Only owners, admins and designers change pages, the theme, objects and flows, and start flows; other members see them. |
 | **States** | Objects have states and the moves between them: each move for some groups or roles, with a form of the fields it needs; the state changes by a move and nothing else. Flows start when a record moves, ask a group or a role to decide (approved / rejected), and move records. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
 
 Payments run in test mode (`4242 4242 4242 4242` pays, `4000 0000 0000 0002` is
 declined), and mail stays in the outbox until a mail webhook is set in Settings: then
-each mail is POSTed there as `{ to, subject, html }`, the shape email APIs take.
+each mail is POSTed there as `{ to, subject, html }`, the shape email APIs take. Mail
+webhooks and flows' webhook steps post only to https:// addresses on the public internet
+(not the server itself, its network or a cloud's metadata service), without following
+redirects.
 
 ## How it is put together
 

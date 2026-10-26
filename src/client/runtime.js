@@ -3164,7 +3164,7 @@ function blockTemplate(def, svg) {
   const make = (t, inSvg) => {
     const here = inSvg || t[0] === "svg";
     const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
-    for (const [k, v] of t[1]) setProp(el, k, v, undefined);
+    for (const [k, v] of t[1]) codeAttr(k) ? el.setAttribute(k, v === true ? "" : display(v)) : setProp(el, k, v, undefined);
     for (const k of t[2]) el.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
     return el;
   };
@@ -3333,14 +3333,19 @@ function spreadInto(el, get) {
 
 // W.spread(maps, written): the attributes the maps give an element, without
 // those it has written out, the key and the class (added to its own).
+// Names are compared as the browser does (`ACTION` is `action`), so a key
+// cannot stand in for a written attribute.
 function spreadAttrs(maps, written) {
   const o = {};
+  const seen = new Set(written.map(attrKey));
   for (const m of maps) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...}\` needs a map, got ${typeName(m)}`);
     for (const k of Object.keys(m)) {
-      if (k === "key" || k === "class" || written.includes(k) || hasOwn(o, k)) continue;
+      const n = attrKey(k);
+      if (n === "key" || n === "class" || seen.has(n)) continue;
       if (k[0] !== "@" && !spreadAttrOk(k)) continue;
+      seen.add(n);
       o[k] = m[k];
     }
   }
@@ -3470,10 +3475,22 @@ function currentUrl() {
 
 // Spread keys are data: plain attribute names only, and no event handlers
 // or srcdoc, which would run the value as code (as on the server).
-function spreadAttrOk(k) {
-  const l = k.toLowerCase();
-  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !l.startsWith("on") && l !== "srcdoc" && !k.startsWith("__");
+// An attribute's name as the browser compares it.
+const attrKey = (k) => k.toLowerCase().replace(/^bind:/, "");
+
+// Attributes whose value runs as code or shows as a page of the site.
+function codeAttr(k) {
+  const n = attrKey(k);
+  return n.startsWith("on") || n === "srcdoc";
 }
+
+// The name that would be written is checked (`bind:onclick` is `onclick`);
+// names with `:` (but xlink:href) come only from the program.
+function spreadAttrOk(k) {
+  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !codeAttr(k) && !k.startsWith("__") && (!k.includes(":") || attrKey(k) === "xlink:href");
+}
+
+const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.test(el.getAttribute("sandbox"));
 
 const URL_ATTRS = ["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
 
@@ -3493,6 +3510,9 @@ function setProp(el, k, v, old) {
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
+  // Only text written in the program goes there (set with the template),
+  // and a page for a sandboxed frame that is kept away from the site.
+  if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
   if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);

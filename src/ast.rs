@@ -165,6 +165,9 @@ pub struct FnDef {
     pub component: bool,
     pub line: u32,
     pub body: Expr,
+    /// How deeply its body nests (at most `parser::MAX_NESTING`): a call
+    /// makes sure there is stack for that much.
+    pub nesting: u32,
     /// How often it was called, for compiling it (src/jit.rs); `u32::MAX`
     /// once it is known that it cannot be.
     pub hot: std::sync::atomic::AtomicU32,
@@ -237,6 +240,37 @@ pub enum AttrVal {
     /// `{...map}`: each key of the map becomes an attribute (or a prop).
     /// Stored under the name `...`.
     Spread(Expr),
+}
+
+/// Attributes whose value the browser runs as code (`onclick`) or shows as
+/// a page of the site (`srcdoc`). Escaping does not help there: the browser
+/// decodes the value first.
+pub fn code_attr(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_prefix("bind:").unwrap_or(&name);
+    name.starts_with("on") || name == "srcdoc"
+}
+
+/// Whether attribute `name` of element `tag` is given a value worked out
+/// when the page is made, where only text written in the program may go:
+/// `onclick={...}`. A component's attributes are its parameters, so they
+/// may be anything; and an `<iframe>` whose written `sandbox` keeps its
+/// page away from the site (no allow-same-origin) may show any `srcdoc`.
+pub fn code_from_data(tag: &str, attrs: &[(String, AttrVal)], name: &str, v: &AttrVal) -> bool {
+    if tag.starts_with(|c: char| c.is_uppercase()) || !code_attr(name) || matches!(v, AttrVal::Bool | AttrVal::Expr(Expr::Lit(_))) {
+        return false;
+    }
+    let sandboxed = || {
+        attrs.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("sandbox")
+                && match v {
+                    AttrVal::Bool => true,
+                    AttrVal::Expr(Expr::Lit(Lit::Str(s))) => !s.to_ascii_lowercase().contains("allow-same-origin"),
+                    _ => false,
+                }
+        })
+    };
+    !(name.eq_ignore_ascii_case("srcdoc") && sandboxed())
 }
 
 #[derive(Debug, Clone)]

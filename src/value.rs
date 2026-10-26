@@ -710,6 +710,32 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
     }
 }
 
+/// Whether `env` is `root` or a scope inside it.
+pub fn within(env: &Env, root: &Env) -> bool {
+    let mut cur: &Scope = env;
+    loop {
+        if std::ptr::eq(cur, &**root) {
+            return true;
+        }
+        cur = match cur.parent.as_deref() {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+}
+
+/// The nearest function named `name` in scope, passing over other values
+/// of that name: `xs.keys` still calls `keys` where a local `keys` is a list.
+pub fn lookup_fn(env: &Env, name: &str) -> Option<Value> {
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(v @ (Value::Func(_) | Value::Builtin(..))) = cur.vars().get(name) {
+            return Some(v.clone());
+        }
+        cur = cur.parent.as_deref()?;
+    }
+}
+
 /// Calls `f` with local variable `name` where it is, without copying it;
 /// None if it is not a local (globals are read through `lookup`, which the
 /// view cache follows).
