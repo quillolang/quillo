@@ -56,8 +56,8 @@ const MAX_DETAILS: usize = 64 << 10;
 /// Why SQL a program runs through `db` may not run: it writes to the audit
 /// log, which only `audit(...)` adds to.
 pub(crate) fn refused(sql: &str) -> Option<String> {
-    // Most SQL does not name it at all.
-    if !sql.to_ascii_lowercase().contains("_quillo_audit") {
+    // Most SQL does not name it at all (and this runs for every query).
+    if !sql.as_bytes().windows(13).any(|w| w.eq_ignore_ascii_case(b"_quillo_audit")) {
         return None;
     }
     let t = crate::sqlinfo::tables_of(sql);

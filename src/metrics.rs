@@ -37,6 +37,8 @@ struct Daily {
 }
 
 static LOG_FILE: std::sync::Mutex<Option<Daily>> = std::sync::Mutex::new(None);
+/// Whether `LOG_FILE` is set, read for every request.
+static TO_FILE: AtomicBool = AtomicBool::new(false);
 /// Lines not written yet, for the file and stdout.
 static PENDING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -46,6 +48,7 @@ pub fn log_to_file(base: &std::path::Path, keep: u32) -> Result<(), String> {
     let mut d = Daily { base: base.to_path_buf(), keep, day: -1, file: None };
     d.open(today())?;
     *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+    TO_FILE.store(true, Relaxed);
     Ok(())
 }
 
@@ -100,8 +103,7 @@ impl Daily {
 /// Adds a line to the request log: to stderr (in batches), or to the file
 /// and stdout when the log goes there.
 pub fn log_line(line: std::fmt::Arguments) {
-    let to_file = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-    if !to_file && !LOG_STDOUT.load(Relaxed) {
+    if !TO_FILE.load(Relaxed) && !LOG_STDOUT.load(Relaxed) {
         crate::httpd::log_fmt(line);
         return;
     }
@@ -117,6 +119,9 @@ pub fn log_line(line: std::fmt::Arguments) {
 
 /// Writes out what `log_line` kept (called with the stderr log's batches).
 pub fn flush() {
+    if !TO_FILE.load(Relaxed) && !LOG_STDOUT.load(Relaxed) {
+        return;
+    }
     let text = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
     if !text.is_empty() {
         write_out(&text);
