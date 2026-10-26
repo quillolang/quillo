@@ -111,6 +111,7 @@ pub fn install(env: &Env) {
         ("navigate", navigate),
         ("publish", publish),
         ("watch", watch),
+        ("redact", crate::redact::redact),
     ];
     for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
@@ -122,6 +123,9 @@ pub fn install(env: &Env) {
     let mut db = Map::new();
     crate::db::install(&mut db);
     define(env, "db", Value::map(db));
+    let mut audit = Map::new();
+    crate::audit::install(&mut audit);
+    define(env, "audit", Value::map(audit));
     let mut http = Map::new();
     crate::fetch::install(&mut http);
     define(env, "http", Value::map(http));
@@ -136,6 +140,7 @@ pub fn install(env: &Env) {
     define(env, "media", Value::map(media));
     let mut crypto = Map::new();
     crate::crypto::install(&mut crypto);
+    crate::cipher::install(&mut crypto);
     define(env, "crypto", Value::map(crypto));
     let mut image = Map::new();
     crate::imaging::install(&mut image);
@@ -223,7 +228,9 @@ fn f_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Value, Ctrl> {
 // ---- general -----------------------------------------------------------
 
 fn print(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    println!("{}", args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" "));
+    // Values under sensitive keys, card numbers and IBANs are masked (see `redact`).
+    let line = args.iter().map(|v| crate::redact::value(v).display()).collect::<Vec<_>>().join(" ");
+    println!("{}", crate::redact::text(&line));
     Ok(Value::Nil)
 }
 

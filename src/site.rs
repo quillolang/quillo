@@ -43,6 +43,8 @@ pub struct Site {
     pub udp: Vec<std::sync::Arc<crate::udp::Listener>>,
     /// What `channel.on` handles (see `wt`).
     pub channels: Vec<std::sync::Arc<crate::wt::Handler>>,
+    /// `audit.actor`'s function: who the user is, for the audit log.
+    pub audit_actor: Option<Value>,
 }
 
 impl Site {

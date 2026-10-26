@@ -126,7 +126,7 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
-    let e = if name.starts_with("db.") {
+    let e = if name.starts_with("db.") || matches!(name, "audit" | "audit.query" | "audit.verify") {
         "db"
     } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
         "http"
@@ -135,7 +135,9 @@ pub fn builtin_effect(name: &str) -> u8 {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
             "env" => "env",
             "now" | "sleep" | "date.today" | "date.now" => "time",
-            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
+            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" | "crypto.encrypt" | "crypto.reencrypt" => "random",
+            // Stripe's signatures carry a time, checked against the clock.
+            "crypto.verify_webhook" => "time",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }
