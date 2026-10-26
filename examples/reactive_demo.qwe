@@ -1,0 +1,91 @@
+// app.qwe
+
+component ComplexReactiveDemo() {
+    // 1. Core State Inputs
+    state count = 0
+    state username = ""
+
+    // 2. The Dependency Graph (Domino Calculations)
+    let double = count * 2
+    let is_even = count % 2 == 0
+    let text_length = username | trim() | len()
+    let standard_name = text_length == 0 ? "Stranger" : username
+
+    // ─── THE COMPLEX BRANCH FLAGS ───
+    // These boolean fields automatically re-evaluate whenever count changes
+    let milestone_reached = count >= 10
+    let unlock_secret = count == 7
+    let panic_mode = count < 0
+
+    // The panels below: the math engine, its controls, and the branches,
+    // which appear and vanish as the flags above change.
+    <div class="demo-box" style="max-width: 500px; margin: 2rem auto; padding: 1.5rem; background: #1e293b; border-radius: 12px; color: #f8fafc; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.3);">
+        
+        <h2>👋 Welcome, {standard_name}!</h2>
+        <p.muted style="color: #94a3b8; font-size: 0.85rem;">Name length: <b>{text_length}</b> characters.</p>
+        
+        <div style="margin: 1.5rem 0; padding: 1rem; background: #0f172a; border-radius: 8px;">
+            <input bind:value={username} placeholder="Type your name..." style="width: 100%; padding: 0.5rem; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box;"/>
+        </div>
+
+        <hr style="border: 0; border-top: 1px solid #334155; margin: 1.5rem 0;"/>
+
+        <h3>🧮 Math Engine Core</h3>
+        <p>Count: <b style="font-variant-numeric: tabular-nums; color: #38bdf8;">{count}</b></p>
+        <p>Doubled: <b style="font-variant-numeric: tabular-nums; color: #a855f7;">{double}</b></p>
+        <p>Parity Matrix: <b>{is_even ? "EVEN 🟢" : "ODD 🔵"}</b></p>
+
+        <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+            <button @click={() => { count += 1 }} style="background: #0284c7; color: #fff; border: none; padding: 0.6rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600;">+ Increment</button>
+            <button @click={() => { count -= 1 }} style="background: #e11d48; color: #fff; border: none; padding: 0.6rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600;">- Decrement</button>
+            <button @click={() => { count = 0 }} style="background: #475569; color: #fff; border: none; padding: 0.6rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600;">Reset</button>
+        </div>
+
+        <hr style="border: 0; border-top: 1px solid #334155; margin: 1.5rem 0;"/>
+
+        <h3>🔮 Reactive Horizon Branches</h3>
+
+        {if panic_mode {
+            <div class="alert panic" style="background: #881337; color: #fda4af; padding: 0.75rem; border-radius: 6px; margin-bottom: 0.5rem; border: 1px solid #f43f5e;">
+                ⚠️ <b>Warning:</b> Count dipped below zero! Processing negative states.
+            </div>
+        }}
+
+        {if unlock_secret {
+            <div class="alert secret" style="background: #14532d; color: #86efac; padding: 0.75rem; border-radius: 6px; margin-bottom: 0.5rem; border: 1px solid #22c55e;">
+                ✨ <b>Lucky 7 Unlocked!</b> You hit the hidden engine threshold variable.
+            </div>
+        }}
+
+        {match milestone_reached {
+            true =>
+                <div class="alert success" style="background: #1e3a8a; color: #93c5fd; padding: 0.75rem; border-radius: 6px; border: 1px solid #3b82f6;">
+                    🏆 <b>Milestone achieved!</b> Count is double-digits. Fine-grained signal limits holding steady.
+                </div>
+            false =>
+                <p style="color: #64748b; font-size: 0.9rem; font-style: italic;">
+                    Keep incrementing... reach 10 to clear this block branch.
+                </p>
+        }}
+
+    </div>
+}
+
+let style = css`
+body { background: #0f172a; font-family: system-ui, sans-serif; margin: 0; padding: 2rem; }
+button:hover { opacity: 0.9; }
+`
+
+// Map the public entry point route to render our testing layout component directly
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Advanced Reactive Branching</title>
+            <style>{style}</style>
+        </head>
+        <body>
+            <ComplexReactiveDemo/>
+        </body>
+    </html>

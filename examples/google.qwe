@@ -1,0 +1,92 @@
+/// Initialize the built-in SQLite engine in memory for instant testing
+db.open(":memory:")
+
+// Automatically provision the tables on launch
+db.exec("create table if not exists items (id integer primary key, name text not null, count int not null default 0)")
+db.exec("insert into items (name, count) values ('Remote Control Cars', 12), ('3D Filament Spools', 5), ('Microservices Configs', 75)")
+
+// ─── SERVER ENGINE LOGIC (BACKEND DATA PIPELINES) ───
+
+server fn fetch_inventory() with db {
+    db.query("select id, name, count from items order by id desc")
+}
+
+server fn increment_item(id: int) with db {
+    db.exec("update items set count = count + 1 where id = ?", id)?
+}
+
+server fn add_new_item(name: str) with db {
+    if trim(name) == "" { return }
+    db.exec("insert into items (name, count) values (?, 0)", name)?
+}
+
+// ─── CLIENT ISOMORPHIC LOGIC (FRONTEND & ROUTER) ───
+
+component InventoryManager() {
+    // live() automatically listens to database adjustments over one WebSocket loop
+    state inventory = live(fetch_inventory)
+    state newItemName = ""
+
+    <div class="card">
+        <h3>📦 Live Stock Control</h3>
+        <div class="input-group">
+            <input bind:value={newItemName} placeholder="Add new inventory name..."/>
+            <button @click={() => { add_new_item(newItemName); newItemName = "" }}>Add</button>
+        </div>
+        <ul>
+            {for item in inventory => 
+                <li key={item.id}>
+                    <span>{item.name} (<b>{item.count}</b> units)</span>
+                    <button @click={() => increment_item(item.id)}>+ Restock</button>
+                </li>
+            }
+        </ul>
+    </div>
+}
+
+component SettingsPanel() {
+    <div class="card">
+        <h3>⚙️ System Configurations</h3>
+        <p>Database Engine: <b>SQLite (In-Memory)</b></p>
+        <p>Deployment Pipeline State: <b>Hot-Reload Enabled (--watch)</b></p>
+    </div>
+}
+
+component AppLayout() {
+    // url() natively binds to the window location state for single-page mapping
+    let currentPath = url().path
+
+    <div class="app-container">
+        <header>
+            <h1>⚡ Quillo Isomorphic SPA</h1>
+            <nav>
+                <a href="/" class={currentPath == "/" && "active"}>Dashboard</a>
+                <a href="/settings" class={currentPath == "/settings" && "active"}>System Settings</a>
+            </nav>
+        </header>
+
+        <main>
+            {match currentPath {
+                "/" => <InventoryManager/>
+                "/settings" => <SettingsPanel/>
+                _ => <h2>404 - Area Uncharted</h2>
+            }}
+        </main>
+    </div>
+}
+
+// ─── PUBLIC APP ROUTING OVERLAYS ───
+
+route GET /static/*path = file("public/" + path)
+
+// One route for every page: AppLayout picks what to show from the path
+route GET /*rest =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Inventory</title>
+            <link rel="stylesheet" href="/static/google.css"/>
+        </head>
+        <body><AppLayout/></body>
+    </html>
