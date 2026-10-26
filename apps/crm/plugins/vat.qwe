@@ -5,6 +5,17 @@ let EU = ["AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR"
 
 fn vat_rate(ctx) = float(str((ctx.settings ?? {}).vat_rate ?? "0")) ?? 0
 
+fn vat_id_of(o) = upper(replace(str(o.vat_id ?? ""), " ", ""))
+
+// A business with a VAT number from another EU country: no tax (reverse
+// charge). Only the number's shape is checked here, not that it is real,
+// so an order that took the tax off this way is flagged for review.
+fn reverse_charge(o, ctx) {
+    let id = vat_id_of(o)
+    let home = upper(str((ctx.settings ?? {}).country ?? ""))
+    id != "" && contains(EU, slice(id, 0, 2)) && slice(id, 0, 2) != home
+}
+
 let plugin_vat = {
     id: "vat",
     name: "Sales tax / VAT",
@@ -23,12 +34,10 @@ let plugin_vat = {
     },
     // Tax on a purchase, in cents: none for a business with a VAT number in
     // another EU country (reverse charge), the workspace's rate otherwise.
-    taxes: (o, subtotal_cents, ctx) => {
-        let id = upper(replace(str(o.vat_id ?? ""), " ", ""))
-        let home = upper(str((ctx.settings ?? {}).country ?? ""))
-        let reverse = id != "" && contains(EU, slice(id, 0, 2)) && slice(id, 0, 2) != home
-        reverse ? 0 : round(subtotal_cents * vat_rate(ctx) / 100)
-    },
+    taxes: (o, subtotal_cents, ctx) => reverse_charge(o, ctx) ? 0 : round(subtotal_cents * vat_rate(ctx) / 100),
+    // What the team checks by hand before shipping: the VAT number that took
+    // the tax off, with the EU's VIES service (anyone can type one in).
+    review: (o, ctx) => reverse_charge(o, ctx) ? `no VAT charged for VAT number ${vat_id_of(o)} (reverse charge): check it with VIES before shipping` : null,
 }
 
 let runners_vat = {}
