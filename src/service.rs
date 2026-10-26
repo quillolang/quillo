@@ -602,7 +602,7 @@ fn log_call(name: &str, f: &str, url: &str, status: u16, start: Instant, tries: 
     if crate::metrics::LOG.load(Ordering::Relaxed) != crate::metrics::JSON {
         return;
     }
-    crate::httpd::log_fmt(format_args!(
+    crate::metrics::log_line(format_args!(
         "{{\"time\":\"{}\",\"service\":{},\"fn\":{},\"url\":{},\"status\":{},\"ms\":{:.2},\"tries\":{},\"rid\":{}}}\n",
         crate::httpd::iso_now(),
         serde_json::Value::from(name),

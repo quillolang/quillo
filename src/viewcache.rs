@@ -164,6 +164,7 @@ fn same(a: &Value, b: &Value) -> bool {
 pub fn impure_builtin(name: &str) -> bool {
     name.starts_with("db.")
         || name.starts_with("http.")
+        || name.starts_with("audit")
         // Rust may do anything.
         || name.starts_with("native:")
         || matches!(
@@ -186,6 +187,10 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "image.info"
                 | "image.convert"
                 | "crypto.hash_password"
+                | "crypto.encrypt"
+                | "crypto.reencrypt"
+                | "crypto.verify_webhook"
+                | "redact"
                 | "live"
                 | "url"
                 | "navigate"

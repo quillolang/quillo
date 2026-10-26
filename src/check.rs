@@ -686,6 +686,16 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.totp_verify", "str, str | int | null, map | null=", "int | null"),
     ("crypto.recovery_codes", "int=", "list"),
     ("crypto.verify_recovery_code", "str, list | null", "int | null"),
+    ("crypto.encrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.decrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.reencrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.verify_webhook", "str, str | null, str | null, map | null=", "bool | error(str)"),
+    ("audit", "str, any=", "map | error(str)"),
+    ("audit.query", "map | null=", "list | error(str)"),
+    ("audit.verify", "", "map | error(str)"),
+    ("audit.actor", "fn", "null"),
+    ("db.backup", "str, map | null=", "map | error(str)"),
+    ("redact", "str | list", "null"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
@@ -856,7 +866,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "audit"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -865,7 +875,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload",
       "sessions", "renew_session", "end_sessions", "user_sessions", "security_headers", "csp", "csp_nonce", "rate_limit", "rate_limit_reset",
-      "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code"];
+      "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code", "redact"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -2260,6 +2270,9 @@ impl Checker {
             if let Some(g) = self.globals.get(&n).cloned() {
                 if let Some(s) = &g.sig {
                     mask |= if s.builtin { s.effects.unwrap_or(0) } else { self.fn_effects(s) };
+                } else if MODULES.contains(&n.as_str()) {
+                    // A module called as a function: `audit(...)`.
+                    mask |= builtin_effect(&n);
                 }
             } else if let Some((m, f)) = n.split_once('.') {
                 if MODULES.contains(&m) {
@@ -2669,6 +2682,12 @@ impl Checker {
                 }
             }
         }
+        // `audit(...)`: the module `audit` is a function too.
+        if let Expr::Ident(n, _) = callee {
+            if n == "audit" && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
+                return self.module_call(n, "", args, pre);
+            }
+        }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
             // `billing.later.invoice(args)`: the same call, made later; its id.
@@ -2983,7 +3002,7 @@ impl Checker {
 
     fn module_call(&mut self, m: &str, f: &str, args: &[Expr], pre: Option<T>) -> T {
         let line = self.line;
-        let full = format!("{}.{}", m, f);
+        let full = if f.is_empty() { m.to_string() } else { format!("{}.{}", m, f) };
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
             argts.push(self.expr(a));

@@ -52,6 +52,7 @@ pub fn install(m: &mut Map) {
         ("db.system", system),
         ("db.shards", shards),
         ("db.atomic", atomic),
+        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -98,7 +99,7 @@ pub enum Pinned {
 }
 
 impl Pinned {
-    fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+    pub(crate) fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
         match self {
             Pinned::Pg(c) => c.query(sql, params, limit),
             #[cfg(feature = "mysql")]
@@ -106,7 +107,7 @@ impl Pinned {
         }
     }
 
-    fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+    pub(crate) fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
         match self {
             Pinned::Pg(c) => c.exec(sql, params),
             #[cfg(feature = "mysql")]
@@ -114,7 +115,7 @@ impl Pinned {
         }
     }
 
-    fn batch(&mut self, sql: &str) -> Result<(), String> {
+    pub(crate) fn batch(&mut self, sql: &str) -> Result<(), String> {
         match self {
             Pinned::Pg(c) => c.batch(sql),
             #[cfg(feature = "mysql")]
@@ -125,7 +126,7 @@ impl Pinned {
 
 impl Backend {
     /// A connection from the pool, for a server database.
-    fn checkout(&self) -> Result<Pinned, String> {
+    pub(crate) fn checkout(&self) -> Result<Pinned, String> {
         match self {
             Backend::Postgres(p) => p.checkout().map(Pinned::Pg),
             #[cfg(feature = "mysql")]
@@ -134,7 +135,7 @@ impl Backend {
         }
     }
 
-    fn give_back(&self, c: Pinned) {
+    pub(crate) fn give_back(&self, c: Pinned) {
         match (self, c) {
             (Backend::Postgres(p), Pinned::Pg(c)) => p.give_back(c),
             #[cfg(feature = "mysql")]
@@ -144,7 +145,7 @@ impl Backend {
         }
     }
 
-    fn is_mysql(&self) -> bool {
+    pub(crate) fn is_mysql(&self) -> bool {
         #[cfg(feature = "mysql")]
         if let Backend::Mysql(_) = self {
             return true;
@@ -309,7 +310,7 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend,
 }
 
 /// The database a call is on: a connection's (`db.connect`), or the program's.
-fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
+pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
     let Some(i) = on else { return backend(it) };
     let slot = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone());
     match slot {
@@ -438,7 +439,7 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
 /// Runs `f` on a server database's connection without holding the
 /// interpreter lock: the request's transaction connection if it has one,
 /// else one from the pool.
-fn pooled_run<T: Send>(
+pub(crate) fn pooled_run<T: Send>(
     it: &mut Interp,
     b: &Arc<Backend>,
     f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send,
@@ -463,6 +464,12 @@ fn pooled_run<T: Send>(
             r
         }),
     }
+}
+
+/// Whether this request has a `db.transaction` open on `b` (a server
+/// database: SQLite's is on its one connection).
+pub(crate) fn in_transaction(it: &Interp, b: &Arc<Backend>) -> bool {
+    it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b))
 }
 
 /// In the server, outside a transaction, queries use the connections all
@@ -578,7 +585,7 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
     Ok(())
 }
 
-fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     bind(&mut stmt, params)?;
     let cols: Vec<(String, Col)> = stmt.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect();
@@ -601,7 +608,7 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
 /// and its writes are announced (after the transaction, if any, commits).
 /// A connection's tables are topics of their own (`db@<label>:orders`), so
 /// that one `orders` changing does not refresh pages showing another.
-fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
+pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
     let t = crate::sqlinfo::tables_of(sql);
     let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(l, _)| l.clone())) {
         Some(label) => format!("db@{}:", label),
@@ -864,6 +871,7 @@ fn connection(i: usize) -> Value {
         ("db.migrate", migrate),
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
+        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -922,6 +930,9 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
+    if let Some(why) = crate::audit::refused(&sql) {
+        return Ok(db_err(why));
+    }
     it.wrote_req = Some(crate::httpd::request_number());
     let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
@@ -1191,6 +1202,9 @@ pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    if let Some(why) = crate::audit::refused(&sql) {
+        return Err(why);
+    }
     if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err("not while the page is prefetched".into());
     }

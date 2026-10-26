@@ -211,7 +211,8 @@ fn pages_are_made_of_plugin_blocks_and_publish_only_when_the_rules_pass() {
         { "id": "b3", "type": "product", "config": { "product": "tee" } },
     ]);
     crm.rpc(host, "save_page", serde_json::json!([{ "id": id, "title": "New arrivals", "slug": "new-arrivals", "description": "Tees", "blocks": fixed }]), Some(&cookie));
-    assert!(crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&cookie))["ok"].is_object());
+    let published = crm.rpc(host, "publish_page", serde_json::json!([id]), Some(&cookie));
+    assert!(published["ok"].is_object(), "{}", published);
     let html = crm.send(host, "GET", "/p/new-arrivals", "", None).text();
     assert!(html.contains("<h1>Organic tees</h1>") && html.contains("privacy@acme.test") && html.contains("href=\"/shop/tee\""), "{}", html);
     assert!(html.contains("<title>New arrivals · Acme</title>"));
@@ -1548,7 +1549,105 @@ fn signing_in_takes_two_steps_and_sessions_end_on_the_server() {
     assert!(crm.rpc(host, "sign_out_everywhere", serde_json::json!([cy_id]), Some(&cy))["err"].is_string());
     assert_eq!(crm.rpc(host, "sign_out_everywhere", serde_json::json!([cy_id]), Some(&ada3))["ok"], 1);
     assert!(crm.rpc(host, "load_workspace", serde_json::json!([]), Some(&cy))["err"].is_string());
+    // No longer required, Ada turns hers off.
+    assert_eq!(crm.rpc(host, "set_two_step_required", serde_json::json!([false]), Some(&ada3))["ok"], true);
+    let r = crm.rpc(host, "turn_off_two_step", serde_json::json!(["an-even-longer-one"]), Some(&ada3));
+    assert_eq!(r["ok"], true, "{}", r);
+
+    // All of it is in the audit log: a sign-in only once its second step is
+    // passed; failed and locked tries, codes that did not work, the recovery
+    // code used, two steps on and off, the new password, the admin's sign-out
+    // and the workspace's requirement.
+    let rows = crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&ada3));
+    let rows = rows["ok"].as_array().unwrap_or_else(|| panic!("{}", rows)).clone();
+    let actions: Vec<&str> = rows.iter().rev().map(|r| r["action"].as_str().unwrap()).collect();
+    #[rustfmt::skip]
+    assert_eq!(
+        actions,
+        [
+            "workspace.create", "login", "login.failed", "user.add", "user.add",
+            "login.failed", "login.failed", "login.failed", "login.failed", "login.failed", "login.locked",
+            "two_step.on", "login.failed", "login", "two_step.recovery_code", "login", "login.failed",
+            "password.change", "settings.two_step_required", "two_step.on", "login", "sessions.end_all",
+            "settings.two_step_required", "two_step.off",
+        ],
+        "{:#?}",
+        rows
+    );
+    let rows: Vec<serde_json::Value> = rows.into_iter().rev().collect();
+    let details = |i: usize| rows[i]["details"].clone();
+    assert_eq!(details(5), serde_json::json!({ "email": "bob@acme.test", "step": "password" }));
+    assert_eq!(details(10), serde_json::json!({ "email": "bob@acme.test", "step": "password" }));
+    assert_eq!((rows[11]["who"].clone(), details(11)["user"].clone()), ("Ada".into(), rows[13]["actor"].as_str().unwrap().parse::<i64>().unwrap().into()));
+    assert_eq!(details(12), serde_json::json!({ "email": "ada@acme.test", "step": "code" }));
+    assert_eq!((rows[13]["who"].clone(), details(13)), ("Ada".into(), serde_json::json!({ "method": "password", "second_step": "app" })));
+    // The recovery code: used before Ada is signed in, so the row names her in its details.
+    assert_eq!(details(14)["left"], 9);
+    assert_eq!(details(15)["second_step"], "recovery_code");
+    assert_eq!(details(18), serde_json::json!({ "on": true }));
+    assert_eq!(details(19)["user"], cy_id);
+    assert_eq!((rows[20]["who"].clone(), details(20)["second_step"].clone()), ("Cy".into(), "app".into()));
+    assert_eq!(details(21), serde_json::json!({ "user": cy_id, "ended": 1 }));
+    assert_eq!((rows[21]["who"].clone(), rows[23]["who"].clone()), ("Ada".into(), "Ada".into()));
+    let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&ada3));
+    assert_eq!(v["ok"]["ok"], true, "{}", v);
+
     // Logging out ends the session on the server: a copy of the cookie is worth nothing.
     crm.form(host, "/logout", "", Some(&ada3));
     assert!(crm.rpc(host, "load_workspace", serde_json::json!([]), Some(&ada3))["err"].is_string());
+}
+
+#[test]
+fn the_audit_log_has_sign_ins_team_changes_deletes_and_exports() {
+    let mut crm = Crm::new("audit");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    // A wrong password, then a member added and signed in, given a role.
+    let r = crm.form(host, "/login", "email=ada%40acme.test&password=wrong", None);
+    assert_eq!(r.header("location"), Some("/login?problem=wrong&email=ada@acme.test"));
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    let role = crm.rpc(host, "save_role", serde_json::json!([{ "name": "Sales", "access": {} }]), Some(&owner));
+    let role_id = role["ok"].as_i64().unwrap_or_else(|| panic!("{}", role));
+    let users = crm.rpc(host, "load_workspace", serde_json::json!([]), Some(&owner));
+    let sam_id = users["ok"]["users"].as_array().unwrap().iter().find(|u| u["name"] == "Sam").unwrap()["id"].as_i64().unwrap();
+    assert!(crm.rpc(host, "set_user_role", serde_json::json!([sam_id, role_id]), Some(&owner))["ok"].is_boolean());
+    // Settings, a contact deleted, the contacts exported, signing out.
+    let s = crm.rpc(host, "save_settings", serde_json::json!([{ "name": "Acme Ltd", "currency": "USD", "country": "US", "vat_rate": "0" }]), Some(&owner));
+    assert_eq!(s["ok"], true, "{}", s);
+    let c = crm.rpc(host, "save_contact", serde_json::json!([{ "first_name": "Bo", "last_name": "B", "email": "bo@x.test", "stage": "lead", "tags": [], "fields": {} }]), Some(&owner));
+    let cid = c["ok"]["id"].as_i64().unwrap_or_else(|| panic!("{}", c));
+    assert_eq!(crm.rpc(host, "delete_contact", serde_json::json!([cid]), Some(&owner))["ok"], true);
+    // A member may not delete it, and that leaves no row.
+    assert!(crm.rpc(host, "delete_contact", serde_json::json!([cid]), Some(&sam))["err"].is_string());
+    assert_eq!(crm.send(host, "GET", "/app/export/contacts.csv", "", Some(&owner)).status, 200);
+    crm.send(host, "POST", "/logout", "", Some(&sam));
+
+    // Only admins read it.
+    assert!(crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&sam))["err"].is_string());
+    let rows = crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&owner));
+    let rows = rows["ok"].as_array().unwrap_or_else(|| panic!("{}", rows)).clone();
+    let actions: Vec<&str> = rows.iter().rev().map(|r| r["action"].as_str().unwrap()).collect();
+    assert_eq!(
+        actions,
+        // (The sign-up's link tried twice: the second is a failed sign-in.)
+        ["workspace.create", "login", "login.failed", "login.failed", "user.add", "login", "role.create", "user.role", "settings.change", "contact.delete", "contacts.export", "logout"],
+        "{:#?}",
+        rows
+    );
+    let by = |a: &str| rows.iter().find(|r| r["action"] == a).unwrap().clone();
+    assert_eq!(rows.iter().find(|r| r["action"] == "login.failed" && r["details"]["email"].is_string()).unwrap()["details"]["email"], "ada@acme.test");
+    assert_eq!(by("contact.delete")["who"], "Ada");
+    assert_eq!(by("contact.delete")["details"]["id"], cid);
+    assert_eq!(by("logout")["who"], "Sam");
+    assert_eq!(by("user.role")["details"], serde_json::json!({ "user": sam_id, "role": role_id }));
+    assert_eq!(by("settings.change")["details"]["changed"], serde_json::json!(["name"]));
+    let only = crm.rpc(host, "list_audit", serde_json::json!([{ "action": "login*" }]), Some(&owner));
+    assert_eq!(only["ok"].as_array().unwrap().len(), 4, "{}", only);
+
+    // The chain holds, until someone edits the database file.
+    let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&owner));
+    assert_eq!((&v["ok"]["ok"], &v["ok"]["rows"]), (&serde_json::json!(true), &serde_json::json!(12)), "{}", v);
+    crm.sql("acme", "update _quillo_audit set actor = '1' where action = 'logout'");
+    let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&owner));
+    assert_eq!((&v["ok"]["ok"], &v["ok"]["broken"]["seq"]), (&serde_json::json!(false), &serde_json::json!(12)), "{}", v);
 }

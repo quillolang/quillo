@@ -49,6 +49,8 @@ pub struct Site {
     pub headers: crate::access::Policy,
     /// The Content-Security-Policy every answer carries (`csp`).
     pub csp: Option<crate::access::Csp>,
+    /// `audit.actor`'s function: who the user is, for the audit log.
+    pub audit_actor: Option<Value>,
 }
 
 impl Site {

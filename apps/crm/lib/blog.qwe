@@ -68,7 +68,8 @@ server fn publish_post(id: int) {
     refused("post", p, rule_ctx())?
     let can = post_can(u, p)
     if !can.publish { return err({ problems: problem("", can.why != "" ? can.why : "Send it for review first") }) }
-    db.exec("update posts set status = 'published', stage = 'published', published_at = coalesce(published_at, ?), updated_at = ? where id = ?", now(), now(), id)
+    audited("post.publish", { id, title: p.title }, () =>
+        db.exec("update posts set status = 'published', stage = 'published', published_at = coalesce(published_at, ?), updated_at = ? where id = ?", now(), now(), id))?
     if can.desk != null { note_review(id, u, "published", "") }
     post_out(db.one("select * from posts where id = ?", id))
 }
@@ -78,13 +79,13 @@ server fn unpublish_post(id: int) {
     let p = (post_out(db.one("select * from posts where id = ?", id)) ?? err("No such post"))?
     let d = desk_for(p.category ?? "")
     if d != null && !on_desk(d, u, "publishers") { return err(`Only the ${desk_name(d)}'s publishers unpublish`) }
-    db.exec("update posts set status = 'draft', stage = 'draft', submitted_at = null, updated_at = ? where id = ?", now(), id)
+    audited("post.unpublish", { id }, () => db.exec("update posts set status = 'draft', stage = 'draft', submitted_at = null, updated_at = ? where id = ?", now(), id))?
     true
 }
 
 server fn delete_post(id: int) {
     need_admin()?
-    db.exec("delete from posts where id = ?", id)
+    audited("post.delete", { id }, () => db.exec("delete from posts where id = ?", id))?
     true
 }
 
@@ -126,7 +127,7 @@ server fn list_comments(status: str) {
 
 server fn moderate_comment(id: int, status: str) {
     need_user()?
-    if status == "delete" { db.exec("delete from comments where id = ?", id) }
+    if status == "delete" { audited("comment.delete", { id }, () => db.exec("delete from comments where id = ?", id))? }
     else if contains(["approved", "spam", "pending"], status) { db.exec("update comments set status = ? where id = ?", status, id) }
     else { return err("Approve, spam or delete") }
     true

@@ -185,7 +185,7 @@ server fn save_contact(c: map) {
 
 server fn delete_contact(id: int) {
     need_admin()?
-    db.exec("delete from contacts where id = ?", id)
+    audited("contact.delete", { id }, () => db.exec("delete from contacts where id = ?", id))?
     true
 }
 
@@ -301,7 +301,7 @@ server fn move_deal(id: int, stage_id: int) {
 
 server fn delete_deal(id: int) {
     need_user()?
-    db.exec("delete from deals where id = ?", id)
+    audited("deal.delete", { id }, () => db.exec("delete from deals where id = ?", id))?
     true
 }
 

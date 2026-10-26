@@ -526,7 +526,7 @@ fn has_markup(e: &Expr) -> bool {
 
 /// Builtins whose results may be private to the server: its environment,
 /// its files, its database, other services.
-const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
+const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http", "audit"];
 
 /// Top-level variables whose value comes, directly or through other such
 /// variables, from `PRIVATE_SOURCES`, a service, or a function that uses
@@ -546,7 +546,8 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
     let mut vars: HashSet<String> = HashSet::new();
     // Functions that use what is private: calling one gives a private value.
     // They can be called as methods too (`"KEY".env`).
-    let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
+    // `crypto.decrypt` too: what it gives back is the secret.
+    let mut fns: HashSet<String> = ["env", "read_file", "decrypt", "reencrypt"].iter().map(|s| s.to_string()).collect();
     // Whether `e` uses a private name (other than the `shadowed` ones), its
     // functions' bodies included when `inside` is set.
     let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {

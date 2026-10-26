@@ -3,8 +3,11 @@
 pub mod access;
 pub mod alloc;
 pub mod ast;
+pub mod audit;
+pub mod backup;
 pub mod builtins;
 pub mod check;
+pub mod cipher;
 pub mod client;
 pub mod cluster;
 pub mod crypto;
@@ -40,6 +43,7 @@ pub mod server;
 pub mod numeric;
 pub mod dates;
 pub mod record;
+pub mod redact;
 pub mod par;
 pub mod service;
 pub mod stream;
@@ -54,6 +58,7 @@ pub mod totp;
 pub mod upload;
 pub mod value;
 pub mod viewcache;
+pub mod webhook;
 pub mod ws;
 
 pub use error::QuilloError;

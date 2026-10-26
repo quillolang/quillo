@@ -42,6 +42,8 @@ const CHANGES: &[&str] = &[
     "http.patch",
     "http.delete",
     "image.convert",
+    "audit",
+    "db.backup",
     "__service",
     "__service_later",
 ];
@@ -544,7 +546,8 @@ fn projection(def: &FnDef) -> Option<(&str, u32)> {
 }
 
 pub(crate) fn short(v: &Value) -> String {
-    let r = v.repr();
+    // Values under sensitive keys, card numbers and IBANs are not shown (see `redact`).
+    let r = crate::redact::text(&crate::redact::value(v).repr()).into_owned();
     if r.chars().count() > 40 {
         format!("{}…", r.chars().take(40).collect::<String>())
     } else {
@@ -1847,6 +1850,11 @@ impl Interp {
             Value::Func(c) => {
                 let c = c.clone();
                 self.call_closure(&c, args.into_iter().map(Some).collect(), line)
+            }
+            // A module that is also a function: `audit(...)` beside `audit.query`.
+            Value::Map(m) if matches!(m.get(crate::audit::CALL_KEY), Some(Value::Builtin(..))) => {
+                let f = m.get(crate::audit::CALL_KEY).cloned().unwrap_or(Value::Nil);
+                self.call(&f, args, line)
             }
             other => fail(line, format!("cannot call {}: it is not a function", other.type_name())),
         }

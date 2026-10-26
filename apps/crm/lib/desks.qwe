@@ -150,9 +150,11 @@ server fn save_desk(d: map) {
     if reviewers > 0 && len(d.reviewer_groups ?? []) == 0 && len(d.reviewers ?? []) < n { return err({ problems: problem("reviewers", `${plural(n, "approval")} need at least as many reviewers`) }) }
     let vals = { category, editors: ids(d.editors), reviewers: ids(d.reviewers), publishers: ids(d.publishers), eg: ids(d.editor_groups), rg: ids(d.reviewer_groups), pg: ids(d.publisher_groups), n }
     if d.id == null {
+        audit("desk.create", vals)
         db.exec("insert into desks (category, editors, reviewers, publishers, editor_groups, reviewer_groups, publisher_groups, approvals, created_at) values (:category, :editors, :reviewers, :publishers, :eg, :rg, :pg, :n, :at)",
             set(vals, "at", now())).last_id
     } else {
+        audit("desk.change", set(vals, "id", d.id))
         db.exec("update desks set category = :category, editors = :editors, reviewers = :reviewers, publishers = :publishers, editor_groups = :eg, reviewer_groups = :rg, publisher_groups = :pg, approvals = :n where id = :id",
             set(vals, "id", d.id))
         d.id
@@ -161,6 +163,6 @@ server fn save_desk(d: map) {
 
 server fn delete_desk(id: int) {
     need_admin()?
-    db.exec("delete from desks where id = ?", id)
+    audited("desk.delete", { id }, () => db.exec("delete from desks where id = ?", id))?
     true
 }

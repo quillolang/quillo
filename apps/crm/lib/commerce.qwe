@@ -100,7 +100,7 @@ server fn refund_order(id: int) {
     need_admin()?
     let o = (db.one("select * from orders where id = ?", id) ?? err("No such order"))?
     if o.status != "paid" { return err("Only a paid order can be refunded") }
-    db.exec("update orders set status = 'refunded' where id = ?", id)
+    audited("order.refund", { id, number: o.number, total_cents: o.total_cents }, () => db.exec("update orders set status = 'refunded' where id = ?", id))?
     // What was sold goes back on the shelf.
     for i in parsed(o.items, []) => take_stock(i.product_id, i.variant ?? "", -i.qty)
     note_activity("order", o.contact_id, null, `Order ${o.number} refunded (${fmt_money(o.total_cents, settings().currency ?? "USD")})`)
@@ -141,7 +141,7 @@ server fn save_discount(d: map) {
 
 server fn delete_discount(id: int) {
     need_admin()?
-    db.exec("delete from discounts where id = ?", id)
+    audited("discount.delete", { id }, () => db.exec("delete from discounts where id = ?", id))?
     true
 }
 

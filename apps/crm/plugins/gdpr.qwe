@@ -31,6 +31,7 @@ fn gdpr_forget(config, run) {
     db.exec("update contacts set first_name = '', last_name = 'Forgotten', email = '', phone = '', tags = '[]', fields = '{}', subscribed = 0, updated_at = ? where id = ?", now(), id)
     db.exec("delete from notes where contact_id = ?", id)
     db.exec("delete from form_submissions where contact_id = ?", id)
+    audit("contact.forget", { id, flow: run.flow_id })
     { port: null, log: "forgot the contact" }
 }
 

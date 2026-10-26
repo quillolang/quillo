@@ -526,9 +526,37 @@ fn the_log_can_be_json_lines() {
     let log = String::from_utf8_lossy(&out.stderr);
     let line = log.lines().find(|l| l.contains("/hello")).unwrap_or_else(|| panic!("no log line in {}", log));
     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{}: {}", e, line));
-    assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello?x=1"), Some(200)));
+    // The path without its query string, unless --log-query.
+    assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello"), Some(200)));
     assert!(v["time"].as_str().map_or(false, |t| t.ends_with('Z') && t.len() == 24), "{}", line);
     assert!(v["ms"].is_number() && v["ip"].is_string(), "{}", line);
+}
+
+#[test]
+fn the_log_goes_to_a_file_a_day_with_the_user_and_old_days_go() {
+    let d = temp_dir("logfile");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /in = { set_session({ user: 42 }); \"in\" }\nroute GET /pay = \"paid\"\n").unwrap();
+    std::fs::create_dir_all(d.join("logs")).unwrap();
+    // Days long past, and a file of someone else's.
+    std::fs::write(d.join("logs/requests-2001-01-01.log"), "old\n").unwrap();
+    std::fs::write(d.join("logs/requests-notes.log"), "mine\n").unwrap();
+    let log = d.join("logs/requests.log");
+    let srv = start(&f, &["--log", "json", "--log-file", log.to_str().unwrap(), "--log-keep", "30", "--log-query"]);
+    assert_eq!(get(srv.port, "/in?x=1").1, "in");
+    assert_eq!(get(srv.port, "/pay?card_number=4111111111111111&n=2").1, "paid");
+    std::thread::sleep(Duration::from_millis(1500));
+    let names: Vec<String> = std::fs::read_dir(d.join("logs")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(!names.contains(&"requests-2001-01-01.log".to_string()), "{:?}", names);
+    assert!(names.contains(&"requests-notes.log".to_string()), "{:?}", names);
+    let today = names.iter().find(|n| n.starts_with("requests-20") && n != &"requests-2001-01-01.log").unwrap_or_else(|| panic!("{:?}", names));
+    let text = std::fs::read_to_string(d.join("logs").join(today)).unwrap();
+    let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {}", e, l))).collect();
+    assert_eq!(lines.len(), 2, "{}", text);
+    assert_eq!((lines[0]["path"].as_str(), lines[0]["user"].as_str()), (Some("/in?x=1"), Some("42")), "{}", text);
+    assert!(lines[0]["rid"].is_string() && lines[0]["ip"].is_string(), "{}", text);
+    assert_eq!(lines[1]["path"].as_str(), Some("/pay?card_number=[redacted]&n=2"), "{}", text);
+    assert!(lines[1].get("user").is_none(), "{}", text);
 }
 
 #[test]

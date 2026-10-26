@@ -1,7 +1,9 @@
 // Signing in safely: wrong passwords lock an account for a while, a second
 // step (an authenticator app's code, or a recovery code) for those who set
 // one up (or everyone, when the workspace asks), and the sessions each
-// person has open, which they or an admin can end.
+// person has open, which they or an admin can end. Each of these is in the
+// audit log (lib/audit.qwe); a row written before someone is signed in
+// names them in its details.
 
 let ISSUER = "Relay"
 // Five wrong passwords or codes in fifteen minutes lock the account for
@@ -26,21 +28,25 @@ fn pending_user() {
     db.one("select * from users where id = ?", s.pending)
 }
 
-// A code from the app (six digits, each once) or a recovery code (each once).
-fn second_step_ok(u, code: str) {
+// A code from the app (six digits, each once) or a recovery code (each
+// once): which it was ("app" or "recovery_code"), or null for neither. A
+// recovery code used is in the audit log with how many are left.
+fn second_step(u, code: str) {
     let typed = trim(code)
     let digits = replace(typed, " ", "")
     if len(digits) == 6 && int(digits) != null {
         let step = crypto.totp_verify(u.totp_secret, digits, { after: u.totp_step })
-        if step == null { return false }
+        if step == null { return null }
         db.exec("update users set totp_step = ? where id = ?", step, u.id)
-        return true
+        return "app"
     }
     let hashes = parsed(u.recovery_hashes, [])
     let i = crypto.verify_recovery_code(typed, hashes)
-    if i == null { return false }
-    db.exec("update users set recovery_hashes = ? where id = ?", json.stringify(take(hashes, i) + drop(hashes, i + 1)), u.id)
-    true
+    if i == null { return null }
+    let left = take(hashes, i) + drop(hashes, i + 1)
+    let used = audited("two_step.recovery_code", { user: u.id, left: len(left) }, () =>
+        db.exec("update users set recovery_hashes = ? where id = ?", json.stringify(left), u.id))
+    is_err(used) ? null : "recovery_code"
 }
 
 // A new secret for the app, kept in the session until a code confirms it.
@@ -61,8 +67,8 @@ fn confirm_two_step(u, code: str) {
     let step = crypto.totp_verify(secret, replace(trim(code), " ", ""))
     if step == null { return err({ problems: problem("code", "That code does not match; check the app's clock and try the next one") }) }
     let codes = crypto.recovery_codes(10)
-    db.exec("update users set totp_secret = ?, totp_step = ?, recovery_hashes = ? where id = ?",
-        secret, step, json.stringify(codes | map((c) => c.hash)), u.id)
+    audited("two_step.on", { user: u.id }, () => db.exec("update users set totp_secret = ?, totp_step = ?, recovery_hashes = ? where id = ?",
+        secret, step, json.stringify(codes | map((c) => c.hash)), u.id))?
     set_session(remove(session(), "new_secret"))
     codes | map((c) => c.code)
 }
@@ -99,7 +105,7 @@ server fn renew_recovery_codes(password: str) {
     if !has_two_step(me) { return err("Set up two-step sign-in first") }
     if !crypto.verify_password(password, me.password_hash) { return err({ problems: problem("password", "That is not your password") }) }
     let codes = crypto.recovery_codes(10)
-    db.exec("update users set recovery_hashes = ? where id = ?", json.stringify(codes | map((c) => c.hash)), u.id)
+    audited("two_step.recovery_codes", { user: u.id }, () => db.exec("update users set recovery_hashes = ? where id = ?", json.stringify(codes | map((c) => c.hash)), u.id))?
     codes | map((c) => c.code)
 }
 
@@ -108,17 +114,19 @@ server fn turn_off_two_step(password: str) {
     let me = db.one("select * from users where id = ?", u.id)
     if two_step_required() { return err("This workspace requires two-step sign-in") }
     if !crypto.verify_password(password, me.password_hash) { return err({ problems: problem("password", "That is not your password") }) }
-    db.exec("update users set totp_secret = '', totp_step = 0, recovery_hashes = '[]' where id = ?", u.id)
+    audited("two_step.off", { user: u.id }, () => db.exec("update users set totp_secret = '', totp_step = 0, recovery_hashes = '[]' where id = ?", u.id))?
     true
 }
 
-// A new password ends every other session of yours.
+// A new password ends every other session of yours. (Sessions are kept
+// apart from the workspace's transactions: they are ended after it.)
 server fn change_password(current: str, next: str) {
     let u = need_user()?
     let me = db.one("select * from users where id = ?", u.id)
     if !crypto.verify_password(current, me.password_hash) { return err({ problems: problem("current", "That is not your password") }) }
     if len(next) < 10 { return err({ problems: problem("next", "At least 10 characters") }) }
-    db.exec("update users set password_hash = ? where id = ?", crypto.hash_password(next), u.id)
+    let hash = crypto.hash_password(next)
+    audited("password.change", { user: u.id }, () => db.exec("update users set password_hash = ? where id = ?", hash, u.id))?
     end_sessions(u.id, { keep_current: true })
 }
 
@@ -141,7 +149,9 @@ server fn end_my_other_sessions() {
 // An admin signs someone out everywhere (a lost laptop, someone leaving).
 server fn sign_out_everywhere(user_id: int) {
     need_admin()?
-    end_sessions(user_id)
+    let ended = end_sessions(user_id)
+    audit("sessions.end_all", { user: user_id, ended })
+    ended
 }
 
 server fn set_two_step_required(on: bool) {
@@ -149,7 +159,7 @@ server fn set_two_step_required(on: bool) {
     if on && !has_two_step(db.one("select totp_secret from users where id = ?", u.id)) {
         return err("Set up two-step sign-in for yourself first")
     }
-    put_setting("require_two_step", on)
+    audited("settings.two_step_required", { on }, () => put_setting("require_two_step", on))?
     true
 }
 

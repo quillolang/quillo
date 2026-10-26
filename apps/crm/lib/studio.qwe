@@ -222,6 +222,7 @@ server fn studio_release(id: str) {
     let written = write_index(entries)
     delete_file(`${STUDIO}/${id}.draft.qwe`)
     put_registry(set(r, "plugins", entries | map((x) => x.id == id ? merge(x, { released_at: now(), released_by: u.email, updated_at: now() }) : x)))
+    audit("plugin.release", { id, version })
     { released: version, written }
 }
 

@@ -11,6 +11,7 @@ cargo build --release
 ./target/release/quillo run examples/notes.qwe --watch   # http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
+./target/release/quillo keygen                           # a key for crypto.encrypt
 ./target/release/quillo repl
 ./target/release/quillo lsp                              # language server (for editors)
 cargo test
@@ -40,7 +41,9 @@ serves them:
 | `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
 | `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own |
 | `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
-| `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` |
+| `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
+| `--log-file F`, `--log-keep N` | the request log to a file a day instead of stderr, keeping N days of them |
+| `--log-stdout`, `--log-query` | the request log on stdout (with `--log-file`, there too); JSON lines with query strings |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 
 ### Desktop apps
@@ -331,9 +334,9 @@ fn fetch_avatar(url: str) with http = http.get(url).body
 fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
 ```
 
-The effects are `db`, `http`, `fs` (files), `env` (environment variables), `time` (`now`,
-`date.today`, `date.now`, `sleep`, `crypto.totp_verify`, `rate_limit`), `random` (with
-`crypto.token`, `crypto.totp_secret`, `crypto.recovery_codes`) and `net` (`udp.send`,
+The effects are `db` (with `audit`), `http`, `fs` (files), `env` (environment variables), `time` (`now`,
+`date.today`, `date.now`, `sleep`, `crypto.totp_verify`, `rate_limit`, `crypto.verify_webhook`), `random` (with
+`crypto.token`, `crypto.totp_secret`, `crypto.recovery_codes`, `crypto.encrypt`) and `net` (`udp.send`,
 `udp.reply`). `end_sessions` and `user_sessions` need `db`. Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
 `quillo check` (which also warns when an undeclared helper may use one). The limit holds
@@ -1488,7 +1491,7 @@ See [examples/services](examples/services): a shop that bills through a billing 
 
 ## Standard library
 
-- **General:** `print str int float dec len type_of`
+- **General:** `print str int float dec len type_of`, and `redact(keys)` (see [Sensitive values](#sensitive-values))
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
 - **Translations:** `t(key, vars)`, `locale()`, `translations`, `locale_from` and
   `with_locale` (see [Translations](#translations)).
@@ -1514,12 +1517,17 @@ See [examples/services](examples/services): a shop that bills through a billing 
   another server's answer as it arrives, and `listen` and `receive` read streams in a
   page (see [Streaming](#streaming)).
 - **Database:** `db.open db.exec db.query db.one db.transaction db.migrate db.connect
-  db.tenants db.tenant_exists db.shards db.atomic db.system` (see [Database](#database)).
+  db.tenants db.tenant_exists db.shards db.atomic db.system db.backup` (see [Database](#database)).
+- **Audit:** `audit(action, details)`, `audit.query`, `audit.verify`, `audit.actor` (see
+  [Audit log](#audit-log)).
 - **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (hex), `crypto.token(bytes
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
-  is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets).
-  One-time codes and recovery codes: see [Two-step sign-in](#two-step-sign-in).
+  is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets);
+  `crypto.encrypt`, `crypto.decrypt` and `crypto.reencrypt` (see [Encrypted
+  fields](#encrypted-fields)) and `crypto.verify_webhook` (see [Webhook
+  signatures](#webhook-signatures)). One-time codes and recovery codes: see [Two-step
+  sign-in](#two-step-sign-in).
   Password hashing takes tens of milliseconds and 19 MiB on purpose, runs off the event
   loop, and at most one per core at a time (others wait their turn), so a flood of
   logins slows logins down rather than taking the server's memory.
@@ -1945,6 +1953,33 @@ db.migrate()
   them: `verify_ca=false` and `verify_identity=false` (a certificate of your own,
   checked less), `built_in_roots=false`. Before, TLS was off unless `require_ssl=true`.
 
+**Backups.** `db.backup(path)` copies a SQLite database while it is in use, with SQLite's
+online backup API:
+
+```quillo
+db.backup("backups/app.db")                                // { path, bytes, ms, removed }
+schedule("0 3 * * *", () => db.backup("backups/app-{time}.db", { keep: 14 }))
+```
+
+- The copy is read on a connection of its own, in one step: in WAL mode that is a read,
+  which sees the database as it was when the copy began (whole transactions, nothing
+  half written) and holds up no one's writes. It is written beside where it goes and
+  renamed there once whole, so a backup file that is there is complete, and it is one
+  file (no `-wal` beside it), ready to open: `db.open("backups/app-20261027T030000Z.db")`
+  restores it, or copy it over the database while the program is stopped.
+- `{time}` in the path is the UTC time, `20261027T030000Z`; with `{ keep: N }`, files the
+  same path made at other times are removed, keeping the N newest. `{tenant}` is the
+  tenant's name: with a database per tenant, a job backs each one up with
+  `for t in db.tenants() => with_tenant(t, () => db.backup("backups/{tenant}-{time}.db", { keep: 14 }))`.
+- A relative path is in the program's folder. Keep copies on another disk too: a
+  backup next to the database goes when the disk does.
+- `analytics.backup(path)` backs up a connection's database. For PostgreSQL and MySQL
+  it is an error value: use their own tools, which a scheduled job outside Quillo runs:
+  `pg_dump --format=custom --file=app-$(date -u +%Y%m%dT%H%M%SZ).dump "$DATABASE_URL"`
+  (restored with `pg_restore --clean --dbname=...`), or `mysqldump --single-transaction
+  --routines app > app.sql` (restored with `mysql app < app.sql`). A hosted database's
+  point-in-time recovery (WAL archiving, binary logs) loses less than a nightly dump.
+
 ### Several databases
 
 `db` is the program's database. `db.connect(target)` opens another, with the same
@@ -2040,7 +2075,9 @@ db.atomic([db, ledger], () => {
 
 ### Quillo's own tables
 
-Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
+The audit log (`_quillo_audit`) is always the program's database's, the tenant's with
+one per tenant, so that it is written in the same transactions as the changes it is
+about (see [Audit log](#audit-log)). Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
 made later (`_quillo_later`), the decisions of `db.atomic` (`_quillo_atomic`), and
 sessions and rate limits when sessions are kept in the database (`_quillo_sessions`,
 `_quillo_limits`, each row marked with its tenant) are kept in the program's database. When there is a database per tenant they cannot be,
@@ -2103,6 +2140,80 @@ route GET / = <h1>Welcome, {tenant()}</h1>
   `tenant()` or read the database are never served from the view cache. Cookies
   belong to the host they were set on, so each subdomain has its own.
 
+### Audit log
+
+`audit(action, details)` records that something was done, by whom, in an append-only
+table Quillo keeps in the program's database:
+
+```quillo
+server fn delete_contact(id: int) with db {
+    need_admin()?
+    db.transaction(() => {
+        db.exec("delete from contacts where id = ?", id)
+        audit("contact.delete", { id })?          // both, or neither
+    })
+}
+audit.query({ action: "contact.*", since: "2026-10-01", limit: 50 })   // newest first
+audit.verify()          // { ok: true, rows: 1234, last: "9f2c..." }, or where it breaks
+```
+
+- A row has its `seq` (1, 2, ... for each tenant), `at` (UTC, RFC 3339 with
+  milliseconds), `action`, `details` (any value, kept as JSON, at most 64 KB), `actor`,
+  `tenant`, the request's id (`rid`), `ip` and user agent (`agent`), and `prev` and `hash`.
+  `audit` returns `{ seq, hash, at }`, or an error value if the database could not take
+  the row.
+- The actor is the session's `user` (`set_session({ user: u.id })`), as text, or null.
+  `audit.actor(() => current_user().email)` at the top of the program says otherwise:
+  the function runs for each row.
+- Inside `db.transaction` the row is written in the transaction: a change rolled back
+  leaves no row, and one committed always has its row. Give `audit(...)` a `?`, as above,
+  and a row that could not be written rolls the change back too. Outside a
+  transaction it is written in one of its own.
+- Values under sensitive keys (`password`, `iban`, ... see
+  [Sensitive values](#sensitive-values)) are stored as `[redacted]`: keep ids in the
+  details, not documents or secrets.
+- `audit.query(options)`: `actor`, `action` (ending in `*` for a prefix: `"contact.*"`),
+  `since` (inclusive) and `until` (exclusive), as dates, RFC 3339 times in UTC or
+  milliseconds; `before` (a `seq`, for the next page) and `limit` (100 unless given, at
+  most 10,000). It reads the current tenant's rows.
+
+**The chain.** Each row's `hash` is the SHA-256 of the row before's hash and of its own
+contents (`[tenant, seq, at, actor, action, details, rid, ip, agent]`, as JSON), and the
+first row follows 64 zeros. `audit.verify()` walks the tenant's rows from the first: a
+row whose contents changed, a row removed or added in the middle, breaks the chain
+there, and it answers `{ ok: false, rows, broken: { seq, id, why } }` naming the first
+such row (`rows` are those that checked out before it). Rows removed from the end
+leave a chain that checks out, shorter: keep `last` (the newest hash) somewhere else
+now and then (a log collector, a daily email) and compare.
+
+**Taking turns.** Appends for a tenant are made one at a time, so the chain has one
+order with any number of servers. On PostgreSQL and MySQL each append locks the
+tenant's row in `_quillo_audit_lock` (`select ... for update`) until its transaction
+ends, then reads the last row and writes the next; on SQLite, writes take turns
+anyway (`begin immediate` outside a transaction). `unique (tenant, seq)` makes sure
+of it. A transaction that audits holds the lock until it commits, so keep those short.
+
+**Append-only.** `db.exec` and `db.query` refuse SQL that writes to `_quillo_audit` or
+`_quillo_audit_lock` (`update`, `delete`, `insert`, `drop`, ...): only `audit` adds to
+it. That stops mistakes in the program, not someone with the database's password. To
+make the database enforce it, have the tables owned by another role (the one that
+runs migrations) and give the program's user no more than this; on PostgreSQL:
+
+```sql
+-- once the program has made the tables (its first audit), as their owner:
+revoke all on _quillo_audit, _quillo_audit_lock from app;
+grant select, insert on _quillo_audit to app;
+grant usage on sequence _quillo_audit_id_seq to app;
+grant select, insert, update on _quillo_audit_lock to app;   -- its rows are locks
+```
+
+On MySQL: `grant select, insert on app._quillo_audit to 'app'@'%'` and `grant select,
+insert, update on app._quillo_audit_lock to 'app'@'%'`, with no other grant on the
+database that covers those tables. A user who cannot create tables finds them made
+and carries on. Keeping rows for as long as the rules ask (seven years, say) and
+copying them to storage that cannot be changed (a bucket with object lock) are the
+operator's: Quillo never deletes rows.
+
 ### HTTP client
 
 ```quillo
@@ -2113,6 +2224,67 @@ http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 
 Every HTTP status is a response; failing to connect is an error value.
 `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+
+### Encrypted fields
+
+`crypto.encrypt(text)` encrypts a value to keep in the database (an IBAN, a tax id),
+with AES-256-GCM, and `crypto.decrypt(token)` gives it back:
+
+```quillo
+db.exec("insert into accounts (owner, iban) values (?, ?)", owner, crypto.encrypt(iban))
+let iban = crypto.decrypt(row.iban)?          // the text, or an error value
+```
+
+- The keys are in `QUILLO_ENCRYPTION_KEYS`: `id:base64key` pairs, separated by commas,
+  the current key first: `k2026:3q2+7w...,k2025:Yx9...`. `quillo keygen` (or
+  `quillo keygen k2026`) prints a new one; so does `echo "k2026:$(openssl rand -base64 32)"`.
+  Keep them where the program's other secrets are, never in its files.
+- A token is `qe1.<key id>.<nonce, ciphertext and tag, base64url>`: it names its key, and
+  has a random 96-bit nonce, so the same text encrypts differently each time (equal
+  values cannot be found by comparing tokens: keep a `crypto.hmac` of the value beside
+  it to look one up). The version and key id are authenticated with the text: a token
+  changed in any way, or given another key's id, does not decrypt.
+- Rotating keys: put a new key first and keep the old ones after it. New values use
+  the new key; old ones still decrypt. `crypto.reencrypt(token)` gives a value under the
+  current key (a token made with it already comes back as it is), so a job can move a
+  table over, after which the old key can go:
+  `for r in db.query("select id, iban from accounts") => db.exec("update accounts set iban = ? where id = ?", crypto.reencrypt(r.iban)?, r.id)`.
+- A token that does not decrypt (changed, another key's, no keys set) is an error value,
+  never a crash. Each function takes the keys as a second argument too, in the same
+  form, for a key ring of the program's own (a tenant's, say).
+- The keys are read where they are used, in Rust, and are never a Quillo value. A
+  component that uses what `crypto.decrypt` gave a global is a load-time error, as with
+  `env` (see [Safety built in](#standard-library)), and components cannot call `crypto`.
+- `crypto.encrypt` needs the `random` effect.
+
+### Webhook signatures
+
+`crypto.verify_webhook(body, header, secret, options)` checks that a webhook came from
+the service it says, with the request's body as it was sent (`request.body` is that
+text, not JSON parsed and written again):
+
+```quillo
+route POST /hooks/stripe {
+    let ok = crypto.verify_webhook(request.body, request.headers["stripe-signature"], env("STRIPE_WEBHOOK_SECRET"))
+    if !ok { reply 400 ok.error }
+    let event = request.json
+    ...
+}
+crypto.verify_webhook(request.body, request.headers["x-hub-signature-256"], secret)    // GitHub
+crypto.verify_webhook(request.body, request.headers["x-shopify-hmac-sha256"], secret)  // Shopify
+```
+
+- `scheme: "stripe"`: the header is `t=<time>,v1=<hex>,...`, an HMAC-SHA256 of
+  `<t>.<body>`. Any of its `v1` signatures may match (Stripe sends two while a secret
+  is rolled), and `t` must be within `tolerance` of now (`"5m"` unless given), so a
+  webhook sent again later is refused.
+- `scheme: "hmac-sha256"`: an HMAC-SHA256 of the body, in hex with or without `sha256=`
+  before it (GitHub), or in base64 (Shopify).
+- Without `scheme`, a header with `t=` and `v1=` is Stripe's, any other the plain one.
+- Signatures are compared in constant time. The answer is `true`, or an error value
+  saying why not, which is falsy: `if !ok` works, and `ok.error` says what failed. A
+  missing header or secret is an error value too.
+- It needs the `time` effect (Stripe's timestamps are checked against the clock).
 
 Options come after the headers (`http.get(url, headers, opts)`, `http.post(url, body,
 headers, opts)`), and in `http.stream`'s map:
@@ -2242,14 +2414,62 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path -> 200 (0.4ms)`. With `--log json` the
-line is a JSON object instead, for log collectors: `time` (ISO 8601, UTC), `method`,
-`path`, `status`, `ms`, `ip`, and `tenant` when the request had one. `--log off` turns
-the request log off; errors are still printed.
+line is a JSON object instead, for log collectors: `time` (RFC 3339, UTC, with
+milliseconds), `method`, `path` (without the query string), `status`, `ms`, `ip`,
+`tenant` when the request had one, `user` (the session's `user`, when the request read
+or set its session) and `rid` (the request's id, also sent back as `x-request-id`).
+`--log-query` keeps query strings in `path`. Sensitive query parameters (`?password=`,
+`?card_number=`, ... see [Sensitive values](#sensitive-values)) show as `[redacted]`, in
+either format. `--log off` turns the request log off; errors are still printed.
+
+Where it goes:
+
+- `--log-file logs/requests.log` writes it to a file a day instead of stderr, by the UTC
+  date: `logs/requests-2026-10-27.log`. A new day's file starts at midnight UTC.
+- `--log-keep 90` removes that file's days older than 90 days, as each day starts
+  (without it, every day is kept).
+- `--log-stdout` writes it to stdout, as well as to the file with `--log-file`.
+- Lines are written in batches, at least once a second.
+
+To ship it to a collector, have the collector read the files or the output. With
+[Vector](https://vector.dev): a `file` source on `logs/requests-*.log` with a
+`parse_json` transform, sent on to Elasticsearch, Loki, Datadog or S3; with Fluent Bit,
+a `tail` input with the `json` parser; under systemd or Docker, `--log json --log-stdout`
+and the journal's or the container runtime's log driver. Keep the files on a disk of
+their own, and the collector's copies for as long as the audit rules ask; the
+[audit log](#audit-log) says what people did, this log what was asked of the server.
 
 With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format: requests
 answered by status class (`quillo_requests_total`), a histogram of how long they took
 (`quillo_request_duration_seconds`), requests in progress, open connections and uptime.
 It is off by default, since anyone who can reach the server could read it.
+
+### Sensitive values
+
+Some values must not reach logs or error messages: passwords, card numbers, IBANs.
+Quillo masks them where it writes something down:
+
+```quillo
+redact(["tax_id", "account_number"])     // more keys, besides the ones built in
+print({ name: "Ada", password: pw })     // { name: "Ada", password: [redacted] }
+```
+
+- Values under these map keys show as `[redacted]`: `password`, `password_hash`,
+  `passwd`, `secret`, `client_secret`, `api_key`, `access_token`, `refresh_token`,
+  `authorization`, `cookie`, `card_number`, `cvv`, `cvc`, `iban`, `ssn`, and those given
+  to `redact` (at the top of the program; any case, `-` read as `_`). In maps, at any
+  depth, and in text that reads `password: ...`, `"iban": "..."` or `card_number=...`.
+- Card numbers (13 to 19 digits, with spaces or dashes or not, in the ranges cards use,
+  passing the Luhn check) and IBANs (whose check digits work out) are masked wherever
+  they appear in that text, under any key or none.
+- Where: error messages (what `quillo` prints for a failed request, and shows on the
+  page with `--watch`), values in messages about them (`expected int, got {...}`),
+  `print`, query strings in the request log, and the [audit log](#audit-log)'s details.
+  Metrics hold counts, never values.
+- The program's values are not changed: `form.password` is the password, and a page
+  shows what it is given. Text the program builds itself and prints is masked only
+  where it looks like the above; prefer printing maps to building such text.
+- The keys are the process's: a program and the programs it mounts share them.
 
 ## Cached views
 
