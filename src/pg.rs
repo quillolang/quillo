@@ -59,8 +59,10 @@ fn tls() -> tokio_postgres_rustls::MakeRustlsConnect {
 }
 
 impl Pool {
-    /// Parses the URL and opens one connection to check it. TLS is used
-    /// when the server offers it (`sslmode=require` insists on it).
+    /// Parses the URL and opens one connection to check it. TLS is required
+    /// for a server on another machine, and used on this one when it offers
+    /// it, unless the URL says otherwise (`sslmode=disable`, `prefer` or
+    /// `require`); see `tls_unless_local`.
     pub fn open(url: &str) -> Result<Pool, String> {
         Pool::open_as(url, true)
     }
@@ -69,6 +71,7 @@ impl Pool {
     pub fn open_as(url: &str, make: bool) -> Result<Pool, String> {
         let (url, max, schema) = take_options(url)?;
         let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        tls_unless_local(&url, &mut config);
         if let Some(s) = &schema {
             config.options(&search_path(s));
         }
@@ -157,6 +160,33 @@ impl Pool {
 
 /// The connection option that makes `schema` where tables are looked for
 /// and made.
+/// Whether a database host is this machine: the password and the data then
+/// cross no network that someone else could be on.
+pub(crate) fn local_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.is_empty()
+        || h.starts_with('/')
+        || h.eq_ignore_ascii_case("localhost")
+        || h.to_ascii_lowercase().ends_with(".localhost")
+        || h.parse::<std::net::IpAddr>().map_or(false, |a| a.is_loopback())
+}
+
+/// Postgres's own default, `sslmode=prefer`, sends the password in the
+/// clear to anyone in the middle who says it has no TLS. So for a server
+/// on another machine TLS is required (and its certificate checked, as
+/// rustls always does), unless the URL names an `sslmode` itself.
+fn tls_unless_local(url: &str, config: &mut postgres::Config) {
+    use postgres::config::Host;
+    let remote = config.get_hosts().iter().any(|h| match h {
+        Host::Tcp(name) => !local_host(name),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    });
+    if remote && !url.contains("sslmode=") {
+        config.ssl_mode(postgres::config::SslMode::Require);
+    }
+}
+
 fn search_path(schema: &str) -> String {
     format!("-c search_path=\"{}\"", schema)
 }
@@ -1078,5 +1108,24 @@ mod tests {
         assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
         assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
+    }
+
+    #[test]
+    fn tls_is_required_for_a_server_on_another_machine() {
+        use postgres::config::SslMode;
+        let mode = |url: &str| {
+            let mut c: postgres::Config = url.parse().unwrap();
+            tls_unless_local(url, &mut c);
+            c.get_ssl_mode()
+        };
+        // What the review saw: `prefer`, which someone in the middle can turn off.
+        assert_eq!(mode("postgres://u:p@db.example.com/app"), SslMode::Require);
+        assert_eq!(mode("postgres://u:p@10.0.0.5:5432/app"), SslMode::Require);
+        assert_eq!(mode("host=db.example.com user=u dbname=app"), SslMode::Require);
+        // Said in the URL: as it says. On this machine: Postgres's default.
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=disable"), SslMode::Disable);
+        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app", "host=/tmp user=u"] {
+            assert_eq!(mode(local), SslMode::Prefer, "{}", local);
+        }
     }
 }

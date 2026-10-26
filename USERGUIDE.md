@@ -1603,9 +1603,14 @@ db.migrate()
   (its `parallel` calls' too) go to the same one, so the database reads them together.
   While those connections wait on a slow query, new requests use others, up to
   `pool_size`.
-- TLS is used when the server offers it (`?sslmode=require` insists), with certificates
-  checked against the usual public certificate authorities, as hosted Postgres services
-  use.
+- TLS is required for a server on another machine, with its certificate checked
+  against the usual public certificate authorities, as hosted Postgres services use. On
+  this machine (`localhost`, `127.0.0.1`, `::1`, a Unix socket) it is used when the
+  server offers it. `?sslmode=` in the URL decides instead: `require`, `prefer` (TLS if
+  offered, which someone on the network can refuse in the server's name) or `disable`
+  (for a database on a private network without TLS, such as a container next to the
+  app). Before, TLS was only preferred everywhere: a URL to another machine whose server
+  has no TLS now needs `?sslmode=disable` to connect.
 
 **MySQL and MariaDB** (the `mysql` feature, built in by default; `cargo build
 --no-default-features` leaves it out):
@@ -1623,6 +1628,12 @@ db.migrate()
   keeps what it did before the failure: put one change in each file.
 - A database per tenant: `mysql://host/app_{tenant}`, made when the program makes the
   tenant, and listed by `db.tenants()`.
+- TLS is required for a server on another machine, with its certificate and name
+  checked; on this machine (`localhost`, `127.0.0.1`, `::1`, `?socket=...`) it is not
+  used. `?require_ssl=true` asks for it here too, and `?require_ssl=false` turns it off
+  (a database on a private network without TLS). Further options, as the driver takes
+  them: `verify_ca=false` and `verify_identity=false` (a certificate of your own,
+  checked less), `built_in_roots=false`. Before, TLS was off unless `require_ssl=true`.
 
 ### Several databases
 
