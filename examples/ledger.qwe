@@ -1,0 +1,230 @@
+// A double-entry ledger: accounts in a currency, journal entries whose
+// postings add up to zero in each currency, and balances worked out from
+// the postings. A transfer is one entry. It runs in a serializable
+// transaction, tried again when another got in its way, and it is
+// idempotent: a client that sends it again (after a timeout, say) with
+// the same Idempotency-Key gets the first answer, and no second transfer.
+//
+//   quillo run examples/ledger.qwe          SQLite, in examples/ledger.db
+//   LEDGER_DB=postgres://localhost/ledger quillo run examples/ledger.qwe
+//
+//   curl localhost:8080/api/accounts
+//   curl localhost:8080/api/transfers -H "Idempotency-Key: $(uuidgen)" \
+//        --json '{"from": "alice", "to": "bob", "amount": "12.50", "currency": "EUR"}'
+
+let target = env("LEDGER_DB", "ledger.db")
+db.open(target)
+db.migrate(starts_with(target, "postgres") ? "ledger/postgres" : "ledger/sqlite")
+
+// Business days: no weekends, and the days the payment system is closed.
+let calendar = { holidays: ["2026-12-25", "2026-12-28", "2027-01-01"] }
+
+// Who posts. A real ledger signs its tellers in (see "Cookies and
+// sessions" in the guide); this one calls everyone "demo".
+fn teller() = session().user ?? "demo"
+
+// ---- the books -----------------------------------------------------------
+
+// A posting is `{ account, amount }`, the amount money: what goes into the
+// account, or out of it when below zero. Each currency's add up to zero.
+fn balanced(postings: list) -> bool =
+    postings
+        | group_by((p) => p.amount.currency)
+        | values
+        | all((ps) => sum(ps | map((p) => money.to_minor(p.amount))) == 0)
+
+// Posts a journal entry, and gives its id. The postings are checked here,
+// for a clear message, and again by the database when the entry is
+// marked posted (a trigger), so no code path can post one unbalanced.
+// TODO: record who posted it with `audit(...)` once there is one; until
+// then the entry keeps `created_by`.
+fn post(memo: str, value_date: str, postings: list, by: str) -> str ! str with db, time, random {
+    if len(postings) < 2 { return err("an entry needs two postings or more") }
+    if !balanced(postings) { return err("the postings do not add up to zero") }
+    let id = uuid()
+    db.exec("insert into entries (id, memo, value_date, created_by, created_at) values (?, ?, ?, ?, ?)",
+        id, memo, value_date, by, date.now())?
+    for [line, p] in enumerate(postings) {
+        db.exec("insert into postings (entry_id, line, account_id, currency, amount_minor) values (?, ?, ?, ?, ?)",
+            id, line + 1, p.account, p.amount.currency, money.to_minor(p.amount))?
+    }
+    db.exec("update entries set posted = 1 where id = ?", id)?
+    id
+}
+
+fn account(id: str) with db = db.one("select id, name, currency, kind from accounts where id = ?", id)
+
+// An account's balance, from its posted entries.
+fn balance(a: map) with db {
+    let minor = db.one("select coalesce(sum(p.amount_minor), 0) as minor
+                        from postings p join entries e on e.id = p.entry_id
+                        where p.account_id = ? and e.posted = 1", a.id).minor
+    money.from_minor(minor, a.currency)
+}
+
+fn balances() with db =
+    db.query("select id, name, currency, kind from accounts order by currency, kind desc, id")
+        | map((a) => a + { balance: balance(a) })
+
+// Why a transfer cannot be made, or null. It only reads, so a refusal
+// writes nothing.
+fn refusal(from: str, to: str, amount: map) with db {
+    let src = account(from)
+    let dst = account(to)
+    if src == null || dst == null { return `no account ${src == null ? from : to}` }
+    if from == to { return "pick two different accounts" }
+    if src.currency != amount.currency || dst.currency != amount.currency {
+        return `both accounts must be in ${amount.currency}`
+    }
+    if money.compare(amount, money.zero(amount.currency)) <= 0 { return "the amount must be more than zero" }
+    if src.kind == "customer" && money.compare(balance(src), amount) < 0 {
+        return `not enough money in ${src.name}'s account`
+    }
+    null
+}
+
+// Moves money: one entry, two postings. It reads the balance and then
+// writes, so it belongs in a serializable transaction (see `transfer_once`):
+// two transfers from one account at once cannot both see the money that
+// only one of them may take. The value date is today, or the next business day.
+fn transfer(from: str, to: str, amount: map, memo: str, by: str) -> map ! str with db, time, random {
+    let value_date = date.add_business_days(date.today(), 0, calendar)
+    let entry = post(memo != "" ? memo : `Transfer from ${from} to ${to}`, value_date, [
+        { account: from, amount: money.neg(amount) },
+        { account: to, amount },
+    ], by)?
+    { entry, value_date, from, to, amount, balance: balance(account(from)) }
+}
+
+// The transaction, its retries and the key. Inside, nothing but the
+// database: it may run more than once.
+let once = { isolation: "serializable", retries: 8 }
+
+// ---- the API -------------------------------------------------------------
+
+route GET /api/accounts = balances()
+
+route POST /api/transfers { json: { from: str, to: str, amount: dec, currency: str, memo: str = "" } } {
+    let m = money.of(amount, currency) ?? reply 422 { error: `${amount} is not an amount in ${currency}` }
+    idempotent(once + { required: true }, () => {
+        let why = refusal(from, to, m)
+        if why != null {
+            respond(422, { error: why })        // a refusal is an answer too: kept for the key
+        } else {
+            respond(201, transfer(from, to, m, memo, teller())?)
+        }
+    })
+}
+
+route GET /api/entries = db.query("select id, memo, value_date, created_by from entries where posted = 1 order by created_at desc limit 20")
+
+// ---- the page --------------------------------------------------------------
+
+server fn load_balances() with db = balances()
+
+// The page sends a key with each call, and sends the call again if its
+// answer does not come back: the transfer is made once.
+server fn send_money(from: str, to: str, amount: str, memo: str) -> map ! str with db, time, random =
+    idempotent(once, () => {
+        let src = account(from)
+        if src == null { return err(`no account ${from}`) }
+        let m = money.of(amount, src.currency)?
+        let why = refusal(from, to, m)
+        why != null ? err(why) : transfer(from, to, m, memo, teller())
+    })
+
+component Ledger() {
+    state accounts = live(load_balances)
+    state from = "alice"
+    state to = "bob"
+    state amount = ""
+    state memo = ""
+    state done = null
+    state problem = null
+    <section>
+        <table.accounts>
+            <thead><tr><th>Account</th><th>Kind</th><th class="num">Balance</th></tr></thead>
+            <tbody>
+                {for a in accounts => <tr key={a.id} class={a.kind}>
+                    <td>{a.name}</td>
+                    <td>{a.kind}</td>
+                    <td class="num">{money.format(a.balance, "en-IE")}</td>
+                </tr>}
+            </tbody>
+        </table>
+        <form.transfer @submit={() => {
+            let r = send_money(from, to, amount, memo)
+            if is_err(r) {
+                problem = r.error
+                done = null
+            } else {
+                done = `Moved ${money.format(r.amount, "en-IE")}, value date ${r.value_date}`
+                problem = null
+                amount = ""
+                memo = ""
+            }
+        }}>
+            <label>From <select bind:value={from}>{for a in accounts => <option value={a.id}>{a.name} ({a.currency})</option>}</select></label>
+            <label>To <select bind:value={to}>{for a in accounts => <option value={a.id}>{a.name} ({a.currency})</option>}</select></label>
+            <label>Amount <input bind:value={amount} inputmode="decimal" placeholder="12.50" required/></label>
+            <label>Memo <input bind:value={memo} placeholder="Rent"/></label>
+            <button>Transfer</button>
+        </form>
+        {done && <p.done>{done}</p>}
+        {problem && <p.problem>{problem}</p>}
+    </section>
+}
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Ledger</title>
+            <style>{css`
+                body { font: 16px system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
+                td, th { padding: .35rem .5rem; border-bottom: 1px solid #ddd; text-align: left; }
+                .num { text-align: right; font-variant-numeric: tabular-nums; }
+                tr.bank { color: #777; }
+                form { display: grid; gap: .5rem; }
+                .problem { color: #b00; }
+            `}</style>
+        </head>
+        <body>
+            <h1>Ledger</h1>
+            <Ledger/>
+        </body>
+    </html>
+
+// ---- opening balances --------------------------------------------------------
+
+// The first time: accounts, and money for the customers from the bank's
+// opening-balance accounts (which go below zero by as much).
+if db.one("select count(*) as c from accounts").c == 0 {
+    db.transaction(() => {
+        for [id, name, currency, kind] in [
+            ["opening-eur", "Opening balances (EUR)", "EUR", "bank"],
+            ["opening-usd", "Opening balances (USD)", "USD", "bank"],
+            ["alice", "Alice", "EUR", "customer"],
+            ["bob", "Bob", "EUR", "customer"],
+            ["carol", "Carol", "EUR", "customer"],
+            ["dan", "Dan", "USD", "customer"],
+            ["erin", "Erin", "USD", "customer"],
+        ] {
+            db.exec("insert into accounts (id, name, currency, kind) values (?, ?, ?, ?)", id, name, currency, kind)?
+        }
+        let today = date.add_business_days(date.today(), 0, calendar)
+        let eur = (n) => money.of(n, "EUR")
+        let usd = (n) => money.of(n, "USD")
+        post("Opening balances", today, [
+            { account: "opening-eur", amount: eur(-1750) },
+            { account: "alice", amount: eur(1000) },
+            { account: "bob", amount: eur(500) },
+            { account: "carol", amount: eur(250) },
+            { account: "opening-usd", amount: usd(-800) },
+            { account: "dan", amount: usd(600) },
+            { account: "erin", amount: usd(200) },
+        ], "setup")?
+    })
+}
