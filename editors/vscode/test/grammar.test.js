@@ -75,6 +75,22 @@ const cases = [
   ['if !ok { return 1 }', "!", "keyword.operator.logical.quillo"],
   ['match e { { type: "click", x: int } => x }', "int", "support.type.pattern.quillo"],
   ['let v = request.json', "request", "variable.language.request.quillo"],
+  // UDP, channels and media.
+  ['udp.listen(9000, (p) => udp.reply(p, "ok"))', "udp", "support.module.quillo"],
+  ['udp.listen(9000, (p) => udp.reply(p, "ok"))', "listen", "support.function.quillo"],
+  ['udp.listen(9000, (p) => udp.reply(p, "ok"))', "reply", "support.function.quillo"],
+  ['channel.broadcast("game", msg, { except: peer })', "channel", "support.module.quillo"],
+  ['channel.broadcast("game", msg, { except: peer })', "broadcast", "support.function.quillo"],
+  ['let game = channel.open("game", (m) => { last = m })', "open", "support.function.quillo"],
+  ['media.rtp("cam", { video: 5004, audio: 5006 })', "media", "support.module.quillo"],
+  ['media.rtp("cam", { video: 5004, audio: 5006 })', "rtp", "support.function.quillo"],
+  ['let r = math.sqrt(2)', "math", "support.module.quillo"],
+  ['fn ping(h: str) with net = udp.send(h, 9, "x")', "net", "support.constant.effect.quillo"],
+  ['<quillo-media stream="cam" controls/>', "quillo-media", "entity.name.tag.quillo"],
+  ['<quillo-media stream="cam" controls/>', "stream", "entity.other.attribute-name.quillo"],
+  ['    every(1000, tick)', "every", "support.function.builtin.quillo"],
+  ['    listen("/progress", (p) => { done = p.done })', "listen", "support.function.builtin.quillo"],
+  ['route GET /feed = events((send) => send(1))', "events", "support.function.builtin.quillo"],
 ];
 
 (async () => {

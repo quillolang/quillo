@@ -115,6 +115,15 @@ fn language_server_round_trip() {
     let items = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 0 } }), &mut notes);
     let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
     assert!(["add", "total", "shout", "len", "route", "component", "str"].iter().all(|l| labels.contains(l)), "{:?}", labels);
+    // Every module, and their functions after the dot.
+    assert!(["udp", "channel", "media", "math", "vec"].iter().all(|l| labels.contains(l)), "{:?}", labels);
+    for (line, want) in [("let x = udp.", ["listen", "send", "reply"]), ("let x = channel.", ["open", "broadcast", "peers"]), ("let x = media.", ["rtp", "streams", "rtp"])] {
+        let changed = format!("{}{}", text, line);
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": changed }] }));
+        let items = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": line.len() } }), &mut notes);
+        let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
+        assert!(want.iter().all(|l| labels.contains(l)), "{}: {:?}", line, labels);
+    }
 
     // Outline.
     let syms = c.request("textDocument/documentSymbol", json!({ "textDocument": { "uri": uri } }), &mut notes);

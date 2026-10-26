@@ -17,7 +17,6 @@ const KEYWORDS: &[&str] = &[
 ];
 const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
-const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random"];
 
 struct Doc {
     text: String,
@@ -423,7 +422,7 @@ impl Server {
         let src = doc.text.lines().nth(line).unwrap_or("");
         let before: String = src.chars().take(char_col(src, col)).collect();
         let mut items = Vec::new();
-        // After `db.`, `http.` or `json.`: that module's functions.
+        // After `db.`, `udp.` or any module's name: its functions.
         let trimmed = before.trim_end_matches(is_word);
         if let Some(prefix) = trimmed.strip_suffix('.') {
             let module: String = prefix.chars().rev().take_while(|c| is_word(*c)).collect::<Vec<_>>().into_iter().rev().collect();
@@ -459,7 +458,7 @@ impl Server {
                 items.push(json!({ "label": name, "kind": 3, "detail": sig }));
             }
         }
-        for m in ["json", "db", "http", "udp", "channel", "media"] {
+        for m in check::MODULES {
             if seen.insert(m.to_string()) {
                 items.push(json!({ "label": m, "kind": 9, "detail": format!("module {}", m) }));
             }
@@ -478,7 +477,7 @@ impl Server {
             }
         }
         if before.contains(" with ") {
-            for e in EFFECTS {
+            for e in crate::ast::EFFECTS {
                 items.push(json!({ "label": e, "kind": 14, "detail": "effect" }));
             }
         }

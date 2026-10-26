@@ -755,7 +755,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
 
-const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =

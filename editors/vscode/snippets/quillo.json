@@ -74,5 +74,30 @@
       "\t</html>"
     ],
     "description": "An HTML page route"
+  },
+  "udp.listen": {
+    "prefix": "udplisten",
+    "body": ["udp.listen(${1:9000}, (p) => {", "\t${0:udp.reply(p, \"ok\")}", "})"],
+    "description": "Take UDP packets on a port: p.text, p.bytes, p.from"
+  },
+  "channel.on": {
+    "prefix": "channelon",
+    "body": ["channel.on(\"${1:room}\", (msg, peer) => {", "\tchannel.broadcast(\"${1:room}\", ${0:msg}, { except: peer })", "})"],
+    "description": "Handle what pages send on a channel"
+  },
+  "channel.open": {
+    "prefix": "channelopen",
+    "body": ["let ${1:room} = channel.open(\"${2:room}\", (m) => {", "\t$0", "})"],
+    "description": "Open a channel in a component; .send(value) to send"
+  },
+  "media.rtp": {
+    "prefix": "mediartp",
+    "body": ["media.rtp(\"${1:cam}\", { video: ${2:5004}, audio: ${3:5006} })", "$0"],
+    "description": "Take an RTP stream (H.264, Opus) for <quillo-media stream=\"cam\">"
+  },
+  "quillo-media": {
+    "prefix": "quillo-media",
+    "body": ["<quillo-media stream=\"${1:cam}\" controls${2: muted}/>"],
+    "description": "Play a stream taken with media.rtp"
   }
 }

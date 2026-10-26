@@ -193,7 +193,7 @@
           }
         },
         {
-          "match": "\\b(with)\\s+((?:(?:db|http|fs|env|time|random)\\s*,?\\s*)+)",
+          "match": "\\b(with)\\s+((?:(?:db|http|fs|env|time|random|net)\\s*,?\\s*)+)",
           "captures": {
             "1": {
               "name": "keyword.other.with.quillo"
@@ -445,7 +445,7 @@
       ]
     },
     "module-call": {
-      "match": "\\b(json|db|http)(\\.)([a-z_]\\w*)",
+      "match": "\\b(json|db|http|udp|channel|media|crypto|image|math|stats|vec)(\\.)([a-z_]\\w*)",
       "captures": {
         "1": {
           "name": "support.module.quillo"
@@ -461,7 +461,7 @@
     "call": {
       "patterns": [
         {
-          "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat|live|publish|watch)\\b(?=\\s*\\()",
+          "match": "\\b(print|str|int|float|len|type_of|upper|lower|trim|split|join|contains|starts_with|ends_with|replace|slice|map|filter|find|any|all|reduce|sum|min|max|sort|sort_by|reverse|first|last|push|range|enumerate|keys|values|get|has|set|remove|merge|err|is_err|unwrap|raw|escape|env|now|sleep|file|redirect|respond|read_file|write_file|random|random_int|uuid|abs|round|floor|ceil|sqrt|pow|unique|flatten|zip|take|drop|count|group_by|index_of|repeat|live|publish|watch|delete_file|check_program|join_on|markdown|highlight|run_script|sql_name|sql_param|ask|notify|translations|locale_from|locale|with_locale|t|schedule|allow_cross_site|tenant|tenant_from|with_tenant|save_upload|read_upload|js|js_new|parallel|every|stream|events|listen|receive|url|css|sql|navigate|set_cookie|delete_cookie|session|set_session|end_session)\\b(?=\\s*\\()",
           "name": "support.function.builtin.quillo"
         },
         {
