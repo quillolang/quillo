@@ -195,9 +195,19 @@ fn http(port: u16, method: &str, path: &str, headers: &[(&str, String)], body: &
     (status, body)
 }
 
-fn sign(secret: &str, t: u64, f: &str, tenant: &str, body: &str) -> String {
-    let msg = format!("{}\n{}\n{}\n{}", t, f, tenant, body);
-    quillo::crypto::hex(&quillo::crypto::hmac_sha256(secret.as_bytes(), msg.as_bytes()))
+/// The headers of a call to service `to`'s `f`, signed with `secret` at time `t`.
+fn signed(secret: &str, t: u64, to: &str, f: &str, call: &str, body: &str) -> Vec<(&'static str, String)> {
+    let sig = quillo::service::signature(secret, t, to, f, "", call, body.as_bytes());
+    vec![
+        ("Content-Type", "application/json".into()),
+        ("X-Quillo-Service", format!("t={},sig={}", t, sig)),
+        ("X-Quillo-To", to.into()),
+        ("X-Quillo-Call", call.into()),
+    ]
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[test]
@@ -217,10 +227,10 @@ fn split_a_service_is_called_over_http_signed() {
     assert_eq!(text(&get(&mut it, "/count")), "1");
     assert_eq!(text(&get(&mut it, "/as/acme")), "acme");
     // Unsigned, wrongly signed, or too old: refused. Only server fns are offered.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = now_secs();
     let call = |f: &str, t: u64, key: &str| {
         let body = r#"["eve", 1]"#;
-        http(port, "POST", &format!("/_quillo/service/{}", f), &[("Content-Type", "application/json".into()), ("X-Quillo-Service", format!("t={},sig={}", t, sign(key, t, f, "", body)))], body)
+        http(port, "POST", &format!("/_quillo/service/{}", f), &signed(key, t, "billing", f, &quillo::service::new_id(16), body), body)
     };
     assert_eq!(http(port, "POST", "/_quillo/service/invoice", &[("Content-Type", "application/json".into())], r#"["eve", 1]"#).0, 401);
     assert_eq!(call("invoice", now, "another-secret").0, 401);
@@ -258,10 +268,44 @@ fn a_service_run_alone_answers_only_signed_calls() {
     let json = ("Content-Type", "application/json".to_string());
     assert_eq!(http(port, "POST", "/_quillo/rpc/add", &[json.clone()], "[[1, 2]]").0, 404);
     // Signed calls are checked all the way in, as pages' calls are.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let call = |body: &str| http(port, "POST", "/_quillo/service/add", &[json.clone(), ("X-Quillo-Service", format!("t={},sig={}", now, sign(secret, now, "add", "", body)))], body);
+    let now = now_secs();
+    let call = |body: &str| http(port, "POST", "/_quillo/service/add", &signed(secret, now, "ledger", "add", &quillo::service::new_id(16), body), body);
     assert_eq!(call(r#"[["1) or 1=1 --", 2]]"#).0, 400);
     assert_eq!(call("[[1, 2]]"), (200, r#"{"ok":3}"#.to_string()));
+}
+
+#[test]
+fn a_signed_call_runs_once_and_only_at_the_service_it_names() {
+    let d = dir("replay");
+    std::fs::write(d.join("ledger.qwe"), "let runs = 0\nserver fn add(x: int) -> int {\n    runs += 1\n    runs\n}\nroute GET /runs = str(runs)\n").unwrap();
+    std::fs::write(d.join("other.qwe"), "server fn add(x: int) -> int = 0\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let (port, named) = (free_port(), free_port());
+    let _ledger = start(&d.join("ledger.qwe"), port, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let _named = start(&d.join("other.qwe"), named, &["--service-name", "ledger"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let now = now_secs();
+    // What the review did: the same signed call sent again. It is answered
+    // as it was the first time; the function does not run again.
+    let headers = signed(secret, now, "ledger", "add", "abc123", "[1]");
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers, "[1]"), (200, r#"{"ok":1}"#.to_string()));
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers, "[1]"), (200, r#"{"ok":1}"#.to_string()));
+    assert_eq!(http(port, "GET", "/runs", &[], "").1, "1");
+    // The call id is signed: another id under the same signature is refused,
+    // and so is a call with none.
+    let mut other_id = headers.clone();
+    other_id[3].1 = "abc124".into();
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &other_id, "[1]").0, 401);
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers[..3], "[1]").0, 401);
+    // So is the service it is for: a call signed for another service is
+    // refused, here by its file's name and there by --service-name.
+    let for_billing = signed(secret, now, "billing", "add", "abc125", "[1]");
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &for_billing, "[1]").0, 401);
+    let mut retargeted = headers.clone();
+    retargeted[2].1 = "billing".into();
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &retargeted, "[1]").0, 401);
+    assert_eq!(http(named, "POST", "/_quillo/service/add", &signed(secret, now, "ledger", "add", "abc126", "[1]"), "[1]").0, 200);
+    assert_eq!(http(named, "POST", "/_quillo/service/add", &signed(secret, now, "other", "add", "abc127", "[1]"), "[1]").0, 401);
+    assert_eq!(http(port, "GET", "/runs", &[], "").1, "1");
 }
 
 #[test]

@@ -176,6 +176,26 @@ server fn tagged(m: { tags: list<str> }) -> int = len(m.tags)
     }
 }
 
+#[test]
+fn server_fn_record_arguments_keep_only_their_own_fields() {
+    let mut it = app(
+        r#"
+type Profile = { name: str, role: str = "member" }
+server fn save(p: Profile) = json.stringify(p)
+server fn many(ps: list<Profile>) = json.stringify(ps)
+"#,
+    );
+    let call = |it: &mut Interp, f: &str, body: &str| send(it, "POST", &format!("/_quillo/rpc/{}", f), &[("Content-Type", "application/json")], body);
+    // What the review sent: a field the record does not have, as a
+    // `{ json: Profile }` route pattern would leave out.
+    let r = call(&mut it, "save", r#"[{"name":"ada","is_admin":true}]"#);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(!r.text().contains("is_admin") && r.text().contains("member"), "{}", r.text());
+    let r = call(&mut it, "many", r#"[[{"name":"ada","role":"x","is_admin":true}]]"#);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(!r.text().contains("is_admin") && r.text().contains("ada"), "{}", r.text());
+}
+
 // ---- the server itself, over a socket ------------------------------------------------------
 
 use std::io::{Read, Write};

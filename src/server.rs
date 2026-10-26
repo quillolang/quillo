@@ -601,9 +601,10 @@ impl Interp {
                 .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
-        if let Err(msg) = check_args(&self.types, &c.def, &args) {
-            return rpc_error(400, &msg);
-        }
+        let args = match take_args(self, &c.def, args) {
+            Ok(a) => a,
+            Err(msg) => return rpc_error(400, &msg),
+        };
         let query = Value::map(parse_urlencoded(qs));
         let mut reqmap = build_request(req, path, &query);
         if let Some(id) = &self.request_id {
@@ -816,27 +817,32 @@ fn serve_channels(req: HttpRequest) -> Answer {
     })
 }
 
-/// Checks a browser's (or another service's) arguments against a `server
-/// fn`'s parameters, all the way in: list items, map values and record
-/// fields too, since the function trusts its types.
-pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+/// The arguments a browser (or another service) calls a `server fn` with,
+/// checked all the way in (list items, map values and record fields, since
+/// the function trusts its types) and made into its parameters' types as
+/// `Type(v)` makes them: a record keeps only its own fields, so what is
+/// sent cannot add `is_admin` to one, and fields left out get their defaults.
+pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Vec<Value>, String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
     }
-    for (i, p) in def.params.iter().enumerate() {
-        match args.get(i) {
-            None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
-            Some(v) => {
-                if let Some(ty) = &p.ty {
-                    if let Err(why) = crate::record::fits(types, ty, v, true) {
-                        return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)));
-                    }
-                }
-            }
-            None => {}
+    if let Some(p) = def.params.get(args.len()..).and_then(|rest| rest.iter().find(|p| p.default.is_none())) {
+        return Err(format!("missing argument `{}` for `{}`", p.name, def.name));
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (v, p) in args.into_iter().zip(&def.params) {
+        let Some(ty) = &p.ty else {
+            out.push(v);
+            continue;
+        };
+        match crate::record::make(it, ty, &v, false) {
+            Ok(Ok(x)) => out.push(x),
+            Ok(Err(why)) => return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why))),
+            Err(Ctrl::Error(e)) => return Err(format!("argument `{}` of `{}`: {}", p.name, def.name, e)),
+            Err(_) => return Err(format!("argument `{}` of `{}` could not be made", p.name, def.name)),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {

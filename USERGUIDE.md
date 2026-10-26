@@ -31,6 +31,7 @@ serves them:
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
 | `--as-service` | serve the program as a service: its `server fn`s answer other services' signed calls, not pages (see [Services](#services)) |
+| `--service-name NAME` | the name other programs call this service by, when it is not the program's file name; calls signed for another service are refused |
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
@@ -224,7 +225,9 @@ match v {
   returns: `greet({ name: "Ada" })` fails with `` argument `u` of `greet` must be User,
   got map { name: "Ada" } (`email` is missing) ``. A field with a default must be
   there too; `User(...)` is what puts it in. A `server fn`'s arguments from the browser
-  are checked the same way.
+  (or another service) are made as `User(v)` makes them: checked the same way, with
+  defaults put in and fields the record does not have left out, so a page cannot add
+  `is_admin` to the profile it saves.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are.
@@ -692,7 +695,7 @@ the whole call; error values are results like any other.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
-otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
+otherwise), and records made as `User(v)` makes them (other fields left out); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json`, and only
 from the program's own pages: a request a browser marks as coming from another site
 (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
@@ -1216,16 +1219,24 @@ service /billing = "billing.qwe"
   goes straight to it.
 - **Split**, a service runs elsewhere: `--service-url billing=http://10.0.0.5:8081` (or
   `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
-  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service)
-  and the time (a call more than five minutes old is refused); the tenant goes with
-  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
+  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service).
+  The signature covers the time (a call more than five minutes old is refused), the
+  service it is for, the function, the tenant, the arguments and the call's id. A
+  service takes only calls for itself: its name is the program's file name
+  (`billing.qwe` is `billing`), or `--service-name billing` when the file is named
+  otherwise. It remembers each call's id for longer than a signature lasts, so a call
+  sent again, by a retry or by someone who saw it on the network, is answered as it
+  was and not run again. That memory is each process's own: when a service runs at
+  several addresses, use HTTPS (or a private network) between services so calls cannot
+  be seen and sent to another of them. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
   but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
   `.../job/...`). Run alone, a service is a program served as one:
   `quillo run billing.qwe --base /billing --as-service` (`--base`: the path it is
   served under, which its links and redirects carry; `--as-service`: see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they
   declare) as a process of its own, on a port of its own, its log lines marked with its
-  name, all signed with one secret; they stop with it.
+  name, all signed with one secret (32 random bytes from the system, unless
+  `QUILLO_SERVICE_SECRET` is set); they stop with it.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`), so a program behaves the same whichever way it runs.
   Optional arguments left out are not sent, so the service's own defaults apply. A
@@ -1248,7 +1259,7 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
   is tried at the next address, a little later each time. A call sent but not answered in
   time is tried again at the same address, with the same call id: the service remembers
-  the calls it answered (for ten minutes) and gives the same answer, so the function
+  the calls it answered (for eleven minutes) and gives the same answer, so the function
   runs once however often the call is sent. A call still running there is waited for.
 - **Left alone when failing.** An address that fails several calls in a row is not
   called for a while (its circuit is open), then tried with one call; the others take its

@@ -51,6 +51,10 @@ options for `run`:
                  program is: its links and redirects carry it
   --as-service   serve the program as a service: its server fns answer only
                  other services' signed calls, not pages (--split sets it)
+  --service-name NAME
+                 the name other programs call this service by, when it is
+                 not the program's file name: calls signed for another
+                 service are refused
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
   --no-jobs      run none of the program's `schedule`d jobs on this server
@@ -185,6 +189,8 @@ struct RunOptions {
     split: bool,
     /// Run as a service (`--as-service`): server fns only for other services.
     as_service: bool,
+    /// The service this is, when not its file's name (`--service-name`).
+    service_name: Option<String>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -203,6 +209,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         base: None,
         split: false,
         as_service: false,
+        service_name: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -242,6 +249,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
             ("--base", Some(v)) => {
                 let b = v.trim_end_matches('/');
                 if !b.starts_with('/') || b.contains("//") || b.contains('?') {
@@ -346,6 +354,9 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
 /// declared no routes, so there is nothing to serve. `Err` is the exit code.
 fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // Signed service calls name the service they are for (see `service::answer`).
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    quillo::service::serve_as(o.service_name.as_deref().unwrap_or(&stem));
     let checked = if o.static_check { static_errors(path) } else { Ok(()) };
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
