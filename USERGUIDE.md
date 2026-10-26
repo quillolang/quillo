@@ -1422,7 +1422,7 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   past 64 bits (`math.factorial(21)`).
 - **`stats`:** `mean fmean(data, weights) geometric_mean harmonic_mean`, `median
   median_low median_high mode multimode`, `pvariance variance pstdev stdev` (each with an
-  optional known mean), `quantiles(data, n = 4, method = "exclusive")`, `covariance
+  optional known mean), `quantiles(data, n = 4, method = "exclusive")` (n up to 10,000), `covariance
   correlation(x, y, method = "linear") linear_regression(x, y, proportional = false)`,
   `normal_pdf normal_cdf normal_inv` (x, mu = 0, sigma = 1); and, beyond Python's,
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),

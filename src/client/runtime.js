@@ -1420,7 +1420,7 @@ B.stats = {
   quantiles: (l, n, method) => {
     const f = "stats.quantiles", d = sortedOf(dataOf(l, f, 1)), ld = d.length;
     n = given(n) ? I(n, f, 2) : 4;
-    if (n < 1) fail(`\`${f}\`: n must be at least 1`);
+    if (n < 1 || n > 10000) fail(`\`${f}\`: n must be from 1 to 10000, got ${n}`);
     method = given(method) ? S(method, f, 3) : "exclusive";
     if (ld === 1) return new Array(n - 1).fill(d[0]);
     const out = [];

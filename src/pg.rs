@@ -962,10 +962,10 @@ fn json(raw: &[u8]) -> Result<Value, BoxErr> {
 /// else a float.
 fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndigits = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndigits = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     let weight = i16::from_be_bytes(take(raw, &mut at)?) as i64;
     let sign = u16::from_be_bytes(take(raw, &mut at)?);
-    let dscale = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let dscale = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     match sign {
         0xC000 => return Ok(Value::Float(f64::NAN)),
         0xD000 => return Ok(Value::Float(f64::INFINITY)),
@@ -1008,18 +1008,27 @@ fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     Ok(text.parse::<f64>().map(Value::Float).unwrap_or_else(|_| Value::str(text)))
 }
 
-/// A one- or more-dimensional array as (nested) lists.
+/// Most dimensions a Postgres array has (its MAXDIM).
+const MAX_DIMS: usize = 6;
+
+/// A one- or more-dimensional array as (nested) lists. The sizes it states
+/// are checked against what came: a server (or someone in the middle) that
+/// says -1 or 2^31 cannot make this take all the memory there is.
 fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndim = i32::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndim = usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).ok().filter(|n| *n <= MAX_DIMS).ok_or("bad array dimensions")?;
     let _has_null = i32::from_be_bytes(take(raw, &mut at)?);
     let _oid = u32::from_be_bytes(take(raw, &mut at)?);
     let mut dims = Vec::with_capacity(ndim);
     for _ in 0..ndim {
-        dims.push(i32::from_be_bytes(take(raw, &mut at)?) as usize);
+        dims.push(usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad array size")?);
         let _lower = i32::from_be_bytes(take(raw, &mut at)?);
     }
-    let total: usize = if ndim == 0 { 0 } else { dims.iter().product() };
+    let total: usize = if ndim == 0 { 0 } else { dims.iter().try_fold(1usize, |t, d| t.checked_mul(*d)).ok_or("bad array size")? };
+    // Each item is at least its 4-byte length.
+    if total > (raw.len() - at) / 4 {
+        return Err("array too short".into());
+    }
     let mut items = Vec::with_capacity(total);
     for _ in 0..total {
         let len = i32::from_be_bytes(take(raw, &mut at)?);
@@ -1027,7 +1036,7 @@ fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
             items.push(Value::Nil);
         } else {
             let len = len as usize;
-            let bytes = raw.get(at..at + len).ok_or("array too short")?;
+            let bytes = raw.get(at..at.saturating_add(len)).ok_or("array too short")?;
             at += len;
             items.push(decode(elem, bytes)?);
         }
@@ -1108,6 +1117,23 @@ mod tests {
         assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
         assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
+    }
+
+    #[test]
+    fn lengths_a_server_sends_are_checked() {
+        let be = |xs: &[i32]| xs.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        // What the review saw: negative sizes cast to huge ones.
+        assert!(array(&Type::INT4, &be(&[-1, 0, 23])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, -1, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, i32::MAX, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[2, 0, 23, 65536, 1, 65536, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[7, 0, 23])).is_err());
+        let ok = array(&Type::INT4, &be(&[1, 0, 23, 2, 1, 4, 7, -1])).unwrap();
+        assert_eq!(ok.repr(), "[7, null]");
+        let n = |h: [i16; 4]| h.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        assert!(numeric(&n([-1, 0, 0, 0])).is_err());
+        assert!(numeric(&n([0, 0, 0, -1])).is_err());
+        assert!(matches!(numeric(&n([0, 0, 0, 2])), Ok(Value::Int(0) | Value::Float(_))));
     }
 
     #[test]
