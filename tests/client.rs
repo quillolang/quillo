@@ -177,6 +177,36 @@ fn compile_errors_name_what_cannot_run_in_the_browser() {
 }
 
 #[test]
+fn secrets_read_through_a_function_or_a_service_stay_on_the_server() {
+    let d = std::env::temp_dir().join(format!("quillo-client-private-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("config.qwe"), "server fn cfg() = { title: \"Shop\", key: env(\"HOME\") }\n").unwrap();
+    let cases = [
+        // The review's case: the whole map, password and all, was in the bundle.
+        ("fn load_config() = { title: \"Shop\", db_password: env(\"X\") ?? \"\" }\nlet CONFIG = load_config()\ncomponent C() = <p>{CONFIG.title}</p>", "`CONFIG` is read from"),
+        // Through functions calling functions, and variables using them.
+        ("fn secret() = read_file(\"x\") ?? \"\"\nfn wrapped() = { s: secret() }\nlet W = wrapped()\nlet SHOWN = W.s\ncomponent C() = <p>{SHOWN}</p>", "`SHOWN` is read from"),
+        // A function called as a method.
+        ("let K = \"HOME\".env\ncomponent C() = <p>{K}</p>", "`K` is read from"),
+        ("fn load(n) = { v: env(n) }\nlet K = \"HOME\".load\ncomponent C() = <p>{K.v}</p>", "`K` is read from"),
+        // A service's answer.
+        ("service config = \"config.qwe\"\nlet CFG = config.cfg()\ncomponent C() = <p>{CFG.title}</p>", "`CFG` is read from"),
+        // Made by functions that read nothing private: sent, as before.
+        ("fn label(file) = upper(file)\nfn items() = [1, 2, 3] | map((x) => x * 2)\nlet TITLE = label(\"shop\")\nlet ITEMS = items()\ncomponent C() = <p>{TITLE} {len(ITEMS)}</p>", ""),
+    ];
+    for (src, want) in cases {
+        let r = Interp::new(&d).load_source(src, "c.qwe");
+        if want.is_empty() {
+            assert!(r.is_ok(), "{}: {:?}", src, r.err().map(|e| e.to_string()));
+        } else {
+            let e = r.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains(want) && e.contains("<C>"), "{}\n-> {}", src, e);
+        }
+    }
+}
+
+#[test]
 /// The one known difference: JS numbers do not remember being written `2.0`.
 fn browser_floats_with_no_fraction_print_as_ints() {
     let (s, b) = both("", "7.5");

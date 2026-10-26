@@ -552,6 +552,11 @@ impl Interp {
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
         };
+        // A service's server fns are for other services, whose calls are
+        // signed (`service/` above): never answered unsigned.
+        if self.is_service {
+            return rpc_error(404, &format!("no server fn `{}` (a service's server fns are called by other services, not by pages)", name));
+        }
         if req.method != "POST" {
             return plain(405, "method not allowed\n");
         }
@@ -617,6 +622,9 @@ impl Interp {
             t.sort();
             t
         });
+        if let Some(t) = &topics {
+            self.shared.track(t);
+        }
         self.current_request = None;
         let with_topics = |mut j: serde_json::Value| {
             if let Some(t) = &topics {
@@ -808,7 +816,9 @@ fn serve_channels(req: HttpRequest) -> Answer {
     })
 }
 
-/// Checks a browser's arguments against a `server fn`'s parameters.
+/// Checks a browser's (or another service's) arguments against a `server
+/// fn`'s parameters, all the way in: list items, map values and record
+/// fields too, since the function trusts its types.
 pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
@@ -818,7 +828,7 @@ pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, 
             None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
             Some(v) => {
                 if let Some(ty) = &p.ty {
-                    if let Err(why) = crate::record::fits(types, ty, v, false) {
+                    if let Err(why) = crate::record::fits(types, ty, v, true) {
                         return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)));
                     }
                 }
@@ -966,15 +976,14 @@ pub struct App {
     /// Run the static checker before each reload.
     pub static_check: bool,
     /// One of several servers (`--register`): the key announcements from
-    /// the others must carry.
+    /// the others are signed with (see `cluster::announced`).
     pub cluster_key: Option<String>,
-    /// When limer has no admin secret: the addresses announcements may come
-    /// from (besides this machine).
-    pub cluster_sources: Option<Vec<std::net::IpAddr>>,
     /// Largest request body accepted, in bytes.
     pub max_body: usize,
     /// The path the program is served under (`--base`), kept when it is loaded again.
     pub base: String,
+    /// Run as a service (`--as-service`): see `Interp::is_service`.
+    pub is_service: bool,
     /// A desktop app (`quillo app`): only requests that carry this token
     /// are answered (see `launch_gate`).
     pub launch_token: Option<String>,
@@ -998,9 +1007,9 @@ impl App {
             watch,
             static_check: true,
             cluster_key: None,
-            cluster_sources: None,
             max_body: MAX_BODY,
             base: String::new(),
+            is_service: false,
             launch_token: None,
             reload: false,
             addr: Mutex::new(None),
@@ -1037,6 +1046,7 @@ impl App {
         // `shared::Services`).
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
         it.base = self.base.clone();
+        it.is_service = self.is_service;
         let res = if problems.is_empty() {
             it.load_file(&self.main_file)
         } else {
@@ -1272,14 +1282,6 @@ impl Worker {
             return serve_channels(req);
         }
         if let (Some(key), "/_quillo/announce") = (&app.cluster_key, req.url.as_str()) {
-            // Without a secret, the key is no secret either: only limer's
-            // own host may announce.
-            let from: Option<std::net::IpAddr> = req.remote.parse().ok();
-            if let Some(allowed) = &app.cluster_sources {
-                if !from.map_or(false, |ip| ip.is_loopback() || allowed.contains(&ip)) {
-                    return Answer::Respond(HttpResponse { status: 403, headers: Vec::new(), body: Vec::new() });
-                }
-            }
             let body = &req.body[..req.body.len().min(1 << 16)];
             let status = crate::cluster::announced(&app.shared, key, body);
             return Answer::Respond(HttpResponse { status, headers: Vec::new(), body: Vec::new() });

@@ -529,31 +529,76 @@ fn has_markup(e: &Expr) -> bool {
 const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
 
 /// Top-level variables whose value comes, directly or through other such
-/// variables, from `PRIVATE_SOURCES`. Components get other globals' values
-/// written into the browser bundle, which anyone can download; these they
-/// must ask a `server fn` for.
+/// variables, from `PRIVATE_SOURCES`, a service, or a function that uses
+/// any of them (`let CONFIG = load_config()`). Components get other
+/// globals' values written into the browser bundle, which anyone can
+/// download; these they must ask a `server fn` for.
 fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
-    let mut private: HashSet<String> = HashSet::new();
+    let mut services: HashSet<String> = HashSet::new();
+    for stmts in program {
+        for st in stmts.iter() {
+            if let Stmt::Service(name, ..) = st {
+                services.insert(name.clone());
+            }
+        }
+    }
+    let sources: HashSet<&str> = PRIVATE_SOURCES.iter().copied().collect();
+    let mut vars: HashSet<String> = HashSet::new();
+    // Functions that use what is private: calling one gives a private value.
+    // They can be called as methods too (`"KEY".env`).
+    let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
+    // Whether `e` uses a private name (other than the `shadowed` ones), its
+    // functions' bodies included when `inside` is set.
+    let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
+        let mut found = false;
+        each_expr_in(
+            e,
+            &mut |x| match x {
+                Expr::Ident(n, _) if !shadowed.contains(n) => {
+                    found |= sources.contains(n.as_str()) || services.contains(n) || vars.contains(n) || fns.contains(n)
+                }
+                Expr::Field(_, n, _) => found |= fns.contains(n),
+                _ => {}
+            },
+            inside,
+        );
+        found
+    };
+    // What a variable's functions use, as before: a function value is made
+    // in the browser from its definition, and the server fns it calls stay
+    // on the server.
+    let uses_in_fns = |e: &Expr, vars: &HashSet<String>| {
+        let mut found = false;
+        each_expr(e, &mut |x| {
+            if let Expr::Ident(n, _) = x {
+                found |= sources.contains(n.as_str()) || vars.contains(n);
+            }
+        });
+        found
+    };
     loop {
-        let before = private.len();
+        let before = vars.len() + fns.len();
         for stmts in program {
             for st in stmts.iter() {
-                let Stmt::Let(p, e, _) = st else { continue };
-                let mut tainted = false;
-                each_expr(e, &mut |x| {
-                    if let Expr::Ident(n, _) = x {
-                        tainted |= PRIVATE_SOURCES.contains(&n.as_str()) || private.contains(n);
+                match st {
+                    Stmt::Let(p, e, _) if uses(e, false, &[], &vars, &fns) || uses_in_fns(e, &vars) => {
+                        let mut names = Vec::new();
+                        pattern_names(p, &mut names);
+                        vars.extend(names);
                     }
-                });
-                if tainted {
-                    let mut names = Vec::new();
-                    pattern_names(p, &mut names);
-                    private.extend(names);
+                    Stmt::Fn(d) if !fns.contains(&d.name) => {
+                        // Its parameters are its own, whatever their names.
+                        let params: Vec<String> = d.params.iter().map(|p| p.name.clone()).collect();
+                        if uses(&d.body, true, &params, &vars, &fns) {
+                            fns.insert(d.name.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        if private.len() == before {
-            return private;
+        if vars.len() + fns.len() == before {
+            return vars;
         }
     }
 }
@@ -951,8 +996,8 @@ impl<'a> Compiler<'a> {
                 }
                 if self.private.contains(name) {
                     return self.err(format!(
-                        "`{}` is read from the server's environment, files or database, and would be sent to \
-                         every browser; pass what the page needs as a prop or read it with a `server fn`",
+                        "`{}` is read from the server's environment, files, database or a service, and would be \
+                         sent to every browser; pass what the page needs as a prop or read it with a `server fn`",
                         name
                     ));
                 }
