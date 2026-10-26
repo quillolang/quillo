@@ -486,8 +486,9 @@ enum Col {
     Plain,
     /// `boolean` or `bool`.
     Bool,
-    /// `decimal`, `numeric`, `money` and the like (`decimal(12,2)`,
-    /// `decimal_text`): read as decimals.
+    /// `decimal(12,2)`, `decimal_text`, `money`, `numeric(12,2)`: read as
+    /// decimals. A bare `numeric` is SQLite's name for any number, and
+    /// stays one.
     Dec,
 }
 
@@ -495,7 +496,7 @@ fn col_kind(decl: Option<&str>) -> Col {
     let t = decl.unwrap_or("").trim().to_ascii_lowercase();
     if t.starts_with("bool") {
         Col::Bool
-    } else if ["decimal", "numeric", "money"].iter().any(|p| t.starts_with(p)) || t == "dec" || t.starts_with("dec(") {
+    } else if ["decimal", "money", "dec(", "numeric("].iter().any(|p| t.starts_with(p)) || t == "dec" {
         Col::Dec
     } else {
         Col::Plain
@@ -506,8 +507,8 @@ fn col_kind(decl: Option<&str>) -> Col {
 /// `boolean` (or `bool`) 0 and 1 come back as `false` and `true`, since 0
 /// would be true in Quillo; elsewhere, such as `select x = 1`, they are ints.
 ///
-/// Nor has it decimals. A column declared `decimal(12,2)` (or `numeric`,
-/// `money`) comes back as decimals, from what SQLite kept: text exactly, an
+/// Nor has it decimals. A column declared `decimal(12,2)` (or
+/// `numeric(12,2)`, `money`) comes back as decimals, from what SQLite kept: text exactly, an
 /// integer, or a real through its shortest text. Such a column has NUMERIC
 /// affinity, so SQLite turns "0.10" into the real 0.1 (and more than 15
 /// digits are rounded); one declared `decimal_text` has TEXT affinity and

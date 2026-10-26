@@ -238,15 +238,16 @@ fn server_fns_keep_decimals_both_ways() {
 fn sqlite_keeps_decimals() {
     let src = r#"
 db.open(":memory:")
-db.exec("create table t (id integer, price decimal(12,2), exact decimal_text, note text)")
-db.exec("insert into t values (1, ?, ?, ?)", 12.50m, 0.10m, 3.5m)
-db.exec("insert into t values (2, ?, ?, ?)", 7, "12345678901234567890.123456789", null)
+db.exec("create table t (id integer, price decimal(12,2), exact decimal_text, note text, n numeric)")
+db.exec("insert into t values (1, ?, ?, ?, 2.5)", 12.50m, 0.10m, 3.5m)
+db.exec("insert into t values (2, ?, ?, ?, 3)", 7, "12345678901234567890.123456789", null)
 let rows = db.query("select * from t order by id")
-[rows[0].price, rows[0].exact, rows[0].note, rows[1].price, rows[1].exact, db.one("select sum(price) as s from t").s]
+[rows[0].price, rows[0].exact, rows[0].note, rows[1].price, rows[1].exact, db.one("select sum(price) as s from t").s, rows[0].n, rows[1].n]
 "#;
     // `decimal(12,2)` has NUMERIC affinity: SQLite keeps 12.50 as the real
-    // 12.5. `decimal_text` keeps the text; a `text` column gives text back.
-    assert_eq!(ev(src), "[12.5m, 0.10m, \"3.5\", 7m, 12345678901234567890.123456789m, 19.5]");
+    // 12.5. `decimal_text` keeps the text; a `text` column gives text back,
+    // and a bare `numeric` (SQLite's name for any number) numbers.
+    assert_eq!(ev(src), "[12.5m, 0.10m, \"3.5\", 7m, 12345678901234567890.123456789m, 19.5, 2.5, 3]");
 }
 
 #[test]

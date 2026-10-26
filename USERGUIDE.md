@@ -1368,7 +1368,8 @@ as text, which MySQL turns exactly into a `decimal` column, but into a double in
 expression: write `cast(? as decimal(12, 2))` there.
 
 SQLite has no decimals. A decimal is stored as its text, and a column declared
-`decimal(12, 2)`, `numeric` or `money` is read back as decimals. But such a column has
+`decimal(12, 2)`, `numeric(12, 2)` or `money` is read back as decimals (a bare `numeric`,
+SQLite's name for any number, gives numbers as before). But such a column has
 NUMERIC affinity: SQLite turns "0.10" into the real 0.1 (and rounds past 15 digits), so
 the scale is lost and large amounts are not exact. For exact amounts, declare the
 column `decimal_text` (TEXT affinity: SQLite keeps the digits as written, and Quillo

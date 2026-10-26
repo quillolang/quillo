@@ -416,7 +416,8 @@ function eq(a, b) {
   if (a === b) return true;
   // Different numbers, strings, bools and functions; null and undefined match.
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
-    return a instanceof Dec || b instanceof Dec ? decEq(a, b) : isNil(a) && isNil(b);
+    // Two numbers (the usual case) test only their types here.
+    return (typeof a === "object" || typeof b === "object") && (a instanceof Dec || b instanceof Dec) ? decEq(a, b) : isNil(a) && isNil(b);
   }
   if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
