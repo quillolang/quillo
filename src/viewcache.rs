@@ -205,6 +205,7 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "session"
                 | "set_session"
                 | "end_session"
+                | "idempotent"
         )
 }
 

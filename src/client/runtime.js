@@ -3059,10 +3059,25 @@ function mediaPlayer(el) {
 
 // ---- server fns --------------------------------------------------------
 
-async function rpcRaw(name, args, live) {
+// A server fn that uses `idempotent` gets a key with each call (the same for
+// the call's tries), and the call is sent again when its answer does not
+// come back: the connection failed, the server was busy (409: the first try
+// is still running) or a proxy gave up on it (502-504). The server runs it
+// once, and gives the first answer to the tries after it.
+const RETRIED = [409, 502, 503, 504];
+
+function idemKey() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+async function rpcRaw(name, args, live, idem) {
   let r;
   const headers = { "content-type": "application/json" };
   if (live) headers["x-quillo-live"] = "1";
+  if (idem) headers["idempotency-key"] = idemKey();
   // Files (from an <input type=file>) go as parts of a multipart body, the
   // other arguments as JSON beside them.
   let payload;
@@ -3078,14 +3093,20 @@ async function rpcRaw(name, args, live) {
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
   const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
-  try {
-    r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
-      method: "POST",
-      headers,
-      body: payload,
-    });
-  } catch (e) {
-    return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
+  for (let tries = idem ? 4 : 1; ; ) {
+    try {
+      r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
+        method: "POST",
+        headers,
+        body: payload,
+      });
+    } catch (e) {
+      r = null;
+      if (--tries <= 0) return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
+    }
+    if (r && !(idem && RETRIED.includes(r.status) && --tries > 0)) break;
+    // 0.25 s, 0.5 s, 1 s, give or take a quarter.
+    await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
   let body = null;
   try { body = untagDeep(await r.json()); } catch (_) {}
@@ -3094,8 +3115,8 @@ async function rpcRaw(name, args, live) {
   return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "" };
 }
 
-async function rpc(name, args) {
-  return (await rpcRaw(name, args, false)).value;
+async function rpc(name, args, idem) {
+  return (await rpcRaw(name, args, false, idem)).value;
 }
 
 // ---- live updates --------------------------------------------------------
@@ -4685,4 +4706,4 @@ function liveSig(inst, name, fname, args) {
   });
   return sig;
 }
-W.server = (name) => meta((...args) => rpc(name, args), name, null);
+W.server = (name, idem) => meta((...args) => rpc(name, args, idem), name, null);

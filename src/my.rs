@@ -38,7 +38,10 @@ pub struct Pool {
     pool: Option<mysql_async::Pool>,
 }
 
-pub struct Conn(Option<mysql_async::Conn>);
+/// A connection; and, in a transaction that retries, whether a statement
+/// failed because of another transaction (see `crate::txn`; None: not
+/// watching).
+pub struct Conn(Option<mysql_async::Conn>, Option<bool>);
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -77,13 +80,13 @@ impl Pool {
         }
         let pool = mysql_async::Pool::new(opts);
         let c = run(pool.get_conn()).map_err(|e| e.to_string())?;
-        drop(Conn(Some(c)));
+        drop(Conn(Some(c), None));
         Ok(Pool { pool: Some(pool) })
     }
 
     pub fn checkout(&self) -> Result<Conn, String> {
         let pool = self.pool.as_ref().expect("open");
-        run(pool.get_conn()).map(|c| Conn(Some(c))).map_err(|e| e.to_string())
+        run(pool.get_conn()).map(|c| Conn(Some(c), None)).map_err(|e| e.to_string())
     }
 
     pub fn give_back(&self, c: Conn) {
@@ -106,11 +109,11 @@ impl Conn {
     pub fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
         let (sql, params) = translate(sql, params)?;
         let c = self.conn();
-        run(async move {
-            let mut result = c.exec_iter(sql, params).await.map_err(|e| e.to_string())?;
+        let r = run(async move {
+            let mut result = c.exec_iter(sql, params).await?;
             let cols = result.columns().unwrap_or_else(|| Vec::new().into());
             let mut out = Vec::new();
-            while let Some(row) = result.next().await.map_err(|e| e.to_string())? {
+            while let Some(row) = result.next().await? {
                 let mut m = Map::with_capacity(cols.len());
                 for (i, col) in cols.iter().enumerate() {
                     let v = row.as_ref(i).cloned().unwrap_or(My::NULL);
@@ -121,21 +124,23 @@ impl Conn {
                     break;
                 }
             }
-            result.drop_result().await.map_err(|e| e.to_string())?;
-            Ok(out)
-        })
+            result.drop_result().await?;
+            Ok::<_, mysql_async::Error>(out)
+        });
+        r.map_err(|e| self.failed(e))
     }
 
     /// `{ changes, last_id }`. Without parameters the text may hold several
     /// statements.
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
-        let c = self.conn();
-        if params.is_empty() {
-            run(c.query_drop(sql)).map_err(|e| e.to_string())?;
+        let r = if params.is_empty() {
+            run(self.conn().query_drop(sql))
         } else {
             let (sql, params) = translate(sql, params)?;
-            run(c.exec_drop(sql, params)).map_err(|e| e.to_string())?;
-        }
+            run(self.conn().exec_drop(sql, params))
+        };
+        r.map_err(|e| self.failed(e))?;
+        let c = self.conn();
         let mut m = Map::new();
         m.insert("changes".into(), Value::Int(c.affected_rows() as i64));
         m.insert("last_id".into(), Value::Int(c.last_insert_id().unwrap_or(0) as i64));
@@ -143,8 +148,31 @@ impl Conn {
     }
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
-        let c = self.conn();
-        run(c.query_drop(sql)).map_err(|e| e.to_string())
+        let r = run(self.conn().query_drop(sql));
+        r.map_err(|e| self.failed(e))
+    }
+
+    /// The error's message; a deadlock (1213, which rolls the whole
+    /// transaction back) or a lock wait that timed out (1205) is also
+    /// noted, when watching, for the transaction to run again.
+    fn failed(&mut self, e: mysql_async::Error) -> String {
+        if let (Some(c), mysql_async::Error::Server(s)) = (self.1.as_mut(), &e) {
+            if s.code == 1213 || s.code == 1205 {
+                *c = true;
+            }
+        }
+        e.to_string()
+    }
+
+    /// Starts (or stops) noting conflicts with other transactions.
+    pub fn watch_conflicts(&mut self, on: bool) {
+        self.1 = on.then_some(false);
+    }
+
+    /// Whether a statement failed because of another transaction since
+    /// `watch_conflicts(true)`.
+    pub fn conflicted(&self) -> bool {
+        self.1 == Some(true)
     }
 }
 

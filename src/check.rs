@@ -648,7 +648,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
-    ("db.transaction", "fn", "any"),
+    ("db.transaction", "map | fn, fn=", "any"),
+    ("idempotent", "map | fn, fn=", "any"),
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
@@ -2214,6 +2215,24 @@ impl Checker {
         mask
     }
 
+    /// A transaction with `retries` runs its function again after a
+    /// conflict, and what it sent to other servers cannot be taken back.
+    fn retried_effects(&mut self, name: &str, args: &[Expr]) {
+        let [Expr::Map(opts), Expr::Lambda(f), ..] = args else { return };
+        if !opts.iter().any(|(k, v)| k == "retries" && !matches!(v, Expr::Lit(Lit::Int(0)))) {
+            return;
+        }
+        let used = self.fn_effects(&Sig::of_def(f)) & (crate::ast::effect_bit("http") | crate::ast::effect_bit("net"));
+        if used != 0 {
+            self.warn(format!(
+                "the function given to `{}` with retries uses the {} effect: it runs again when the transaction conflicts, \
+                 and what it sent is not taken back; send it after the transaction",
+                name,
+                effect_names(used).join(" and ")
+            ));
+        }
+    }
+
     fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
@@ -2980,6 +2999,9 @@ impl Checker {
                     name
                 ));
             }
+        }
+        if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
+            self.retried_effects(name, arg_exprs);
         }
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {
