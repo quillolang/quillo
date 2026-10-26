@@ -1380,11 +1380,16 @@ Safety built in:
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error.
-- `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
+- `quillo check` warns about SQL put together from values (`${x}`, `+`, or
+  `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
+  connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
+  db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them), and named parameters with
   `sql_param(name)` — both take only letters, digits and `_`, and SQL made of them,
-  text as written and choices between those is not warned about.
+  text as written (also kept in a variable) and choices between those is not warned
+  about. It is a warning, not a proof: SQL built in another function, or in a list made
+  with `map`, is not followed.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 

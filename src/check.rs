@@ -1256,6 +1256,25 @@ struct Checker {
     line: u32,
     out: Analysis,
     reported: HashSet<(Arc<str>, u32, String)>,
+    /// What is known of variables' text for the SQL warning, innermost
+    /// last: the depth of the scope each was made in, its name, and what
+    /// it holds (see `SqlVar`).
+    sql_vars: Vec<(usize, String, SqlVar)>,
+    /// What the variable `define` makes next holds (set by `let`).
+    next_sql: SqlVar,
+}
+
+/// What a variable holds, as far as SQL goes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SqlVar {
+    Other,
+    /// Text that cannot carry SQL of its own: written in the program, or
+    /// made with `sql_name`.
+    Safe,
+    /// Text put together from values (`${x}` or `+ x`).
+    Built,
+    /// A connection from `db.connect`.
+    Conn,
 }
 
 fn def_key(d: &Arc<FnDef>) -> usize {
@@ -1305,6 +1324,8 @@ impl Checker {
             line: 0,
             out: Analysis::default(),
             reported: HashSet::new(),
+            sql_vars: Vec::new(),
+            next_sql: SqlVar::Other,
         }
     }
 
@@ -1593,6 +1614,10 @@ impl Checker {
     }
 
     fn pop(&mut self) {
+        let depth = self.scopes.len().saturating_sub(1);
+        while self.sql_vars.last().map_or(false, |(d, _, _)| *d > depth) {
+            self.sql_vars.pop();
+        }
         if let Some(scope) = self.scopes.pop() {
             for (name, v) in scope {
                 if v.kind == Kind::Let && !v.used && !name.starts_with('_') && self.quiet == 0 {
@@ -1603,6 +1628,8 @@ impl Checker {
     }
 
     fn define(&mut self, name: &str, t: T, sig: Option<Arc<Sig>>, kind: Kind) {
+        let sql = std::mem::replace(&mut self.next_sql, SqlVar::Other);
+        self.sql_vars.push((self.scopes.len(), name.to_string(), sql));
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
         match self.scopes.last_mut() {
             Some(s) => {
@@ -1899,16 +1926,31 @@ impl Checker {
                 let t = self.expr(e);
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
+                let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
                 for (n, t, sig) in binds {
                     let kind = if matches!(p, Pattern::Bind(_)) { Kind::Let } else { Kind::Bound };
                     let t = if self.assigned.contains(&n) { T::ANY } else { t };
+                    self.next_sql = sql;
                     self.define(&n, t, sig, kind);
                 }
+                self.next_sql = SqlVar::Other;
                 T::of(NIL)
             }
             Stmt::Assign(name, op, e, line) => {
                 self.line = *line;
                 let rhs = self.expr(e);
+                // `q = ...` and `q += ...`: what the text holds now.
+                let was = self.sql_var(name);
+                let now = match op {
+                    AssignOp::Set => Some(self.sql_kind(e)),
+                    AssignOp::Add if matches!(was, SqlVar::Safe | SqlVar::Built) && !self.sql_safe(e) => Some(SqlVar::Built),
+                    _ => None,
+                };
+                if let Some(k) = now {
+                    if let Some(v) = self.sql_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
+                        v.2 = k;
+                    }
+                }
                 let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
                 match found {
                     None => self.error(format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name)),
@@ -2355,6 +2397,16 @@ impl Checker {
             Expr::Pipe(lhs, rhs, line) => {
                 let v = self.expr(lhs);
                 self.line = *line;
+                // `` `select ... ${q}` | db.query ``: the text is the SQL.
+                let target = match &**rhs {
+                    Expr::Call(callee, _, _) => self.sql_target(callee),
+                    other => self.sql_target(other),
+                };
+                if let Some(name) = target {
+                    if self.sql_built(lhs) {
+                        self.warn_sql(&name);
+                    }
+                }
                 match &**rhs {
                     Expr::Call(callee, args, l) => {
                         self.line = *l;
@@ -2579,6 +2631,14 @@ impl Checker {
                 }
                 if MODULES.contains(&m.as_str()) && !self.is_local(m) {
                     return self.module_call(m, name, args, pre);
+                }
+            }
+            // `conn.query(sql)` on a connection from `db.connect`.
+            if pre.is_none() {
+                if let (Some(what), Some(sql)) = (self.sql_target(callee), args.first()) {
+                    if what != format!("db.{}", name) && self.sql_built(sql) {
+                        self.warn_sql(&what);
+                    }
                 }
             }
             let recv = self.expr(obj);
@@ -2892,6 +2952,103 @@ impl Checker {
         self.quiet > 0
     }
 
+    // ---- SQL built from values ----------------------------------------
+
+    fn warn_sql(&mut self, name: &str) {
+        self.warn(format!(
+            "`{}` with SQL built from values: a value containing a quote can change the query \
+             (SQL injection); write `?` in the SQL and pass the values after it",
+            name
+        ));
+    }
+
+    /// What the variable `name` holds, as far as SQL goes.
+    fn sql_var(&self, name: &str) -> SqlVar {
+        self.sql_vars.iter().rev().find(|(_, n, _)| n == name).map_or(SqlVar::Other, |v| v.2)
+    }
+
+    /// What a `let` of `e` holds.
+    fn sql_kind(&self, e: &Expr) -> SqlVar {
+        if self.sql_built(e) {
+            SqlVar::Built
+        } else if self.sql_safe(e) {
+            SqlVar::Safe
+        } else if is_connect(e) {
+            SqlVar::Conn
+        } else {
+            SqlVar::Other
+        }
+    }
+
+    /// The query function `callee` names, if it is one that takes SQL:
+    /// `db.query`, or `query` on a connection from `db.connect`.
+    fn sql_target(&self, callee: &Expr) -> Option<String> {
+        let Expr::Field(obj, f, _) = callee else { return None };
+        if !matches!(f.as_str(), "query" | "one" | "exec") {
+            return None;
+        }
+        match &**obj {
+            Expr::Ident(m, _) if m == "db" && !self.is_local(m) => Some(format!("db.{}", f)),
+            Expr::Ident(m, _) if self.sql_var(m) == SqlVar::Conn => Some(format!("{}.{}", m, f)),
+            other if is_connect(other) => Some(format!("db.connect(...).{}", f)),
+            _ => None,
+        }
+    }
+
+    /// Whether SQL text is put together from values: `${x}` in a template,
+    /// sql`...${x}...`, `"..." + x`, `join(["...", x])`, or a variable
+    /// holding such text.
+    fn sql_built(&self, e: &Expr) -> bool {
+        let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !self.sql_safe(e)));
+        match e {
+            Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Built,
+            Expr::Template(parts) => interpolates(parts),
+            Expr::Call(f, args, _) => match args.as_slice() {
+                [Expr::Template(parts)] => interpolates(parts),
+                [Expr::List(items), rest @ ..] if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
+                _ => false,
+            },
+            Expr::Pipe(lhs, rhs, _) => match (&**lhs, &**rhs) {
+                (Expr::List(items), Expr::Call(f, rest, _)) if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
+                (Expr::List(items), f) if is_join(f) => items.iter().any(|x| !self.sql_safe(x)),
+                _ => false,
+            },
+            Expr::Binary(BinOp::Add, a, b, _) => {
+                let text = |x: &Expr| match x {
+                    Expr::Lit(Lit::Str(_)) | Expr::Template(_) => true,
+                    Expr::Ident(n, _) => matches!(self.sql_var(n), SqlVar::Safe | SqlVar::Built),
+                    _ => false,
+                };
+                self.sql_built(a) || self.sql_built(b) || (text(a) && !self.sql_safe(b)) || (text(b) && !self.sql_safe(a))
+            }
+            Expr::If(_, a, b) => self.sql_built(a) || b.as_deref().map_or(false, |b| self.sql_built(b)),
+            Expr::Match(_, arms, _) => arms.iter().any(|a| self.sql_built(&a.body)),
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.sql_built(e)),
+            _ => false,
+        }
+    }
+
+    /// SQL text a program may put together: names made with `sql_name` and
+    /// `sql_param` (checked as they are made, so they cannot carry SQL of
+    /// their own), text as written (or kept in a variable), and choices
+    /// (`if`, `match`), joins and templates of those.
+    fn sql_safe(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(_) => true,
+            Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Safe,
+            Expr::Call(f, args, _) => {
+                matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param")
+                    || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
+            }
+            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if self.sql_safe(e))),
+            Expr::Binary(BinOp::Add, a, b, _) => self.sql_safe(a) && self.sql_safe(b),
+            Expr::If(_, a, b) => self.sql_safe(a) && b.as_deref().map_or(true, |b| self.sql_safe(b)),
+            Expr::Match(_, arms, _) => arms.iter().all(|a| self.sql_safe(&a.body)),
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.sql_safe(e)),
+            _ => false,
+        }
+    }
+
     /// A call of something of type `ft`: arguments, effects, browser rules
     /// and the result type.
     fn apply(&mut self, ft: T, sig: Option<Arc<Sig>>, args: Vec<T>, arg_exprs: &[Expr], name: &str) -> T {
@@ -2927,13 +3084,10 @@ impl Checker {
                 _ => {}
             }
         }
-        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
-            if arg_exprs.first().map_or(false, sql_built_from_values) {
-                self.warn(format!(
-                    "`{}` with SQL built from values: a value containing a quote can change the query \
-                     (SQL injection); write `?` in the SQL and pass the values after it",
-                    name
-                ));
+        // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
+        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") && args.len() == arg_exprs.len() {
+            if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
+                self.warn_sql(name);
             }
         }
         // Effects.
@@ -3396,34 +3550,17 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
     });
 }
 
-/// Whether SQL text is put together from values: `${x}` in a template,
-/// sql`...${x}...`, or `"..." + x`.
-fn sql_built_from_values(e: &Expr) -> bool {
-    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !sql_safe(e)));
+/// `db.connect(...)`, or that with `?`.
+fn is_connect(e: &Expr) -> bool {
     match e {
-        Expr::Template(parts) => interpolates(parts),
-        Expr::Call(_, args, _) => matches!(args.as_slice(), [Expr::Template(parts)] if interpolates(parts)),
-        Expr::Binary(BinOp::Add, a, b, _) => {
-            let text = |x: &Expr| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_));
-            (text(a) && !matches!(**b, Expr::Lit(_))) || (text(b) && !matches!(**a, Expr::Lit(_))) || sql_built_from_values(a)
-        }
+        Expr::Try(x) => is_connect(x),
+        Expr::Call(f, _, _) => matches!(&**f, Expr::Field(o, n, _) if n == "connect" && matches!(&**o, Expr::Ident(m, _) if m == "db")),
         _ => false,
     }
 }
 
-/// SQL text a program may put together: names made with `sql_name` and
-/// `sql_param` (checked as they are made, so they cannot carry SQL of their
-/// own), text as written, and choices (`if`, `match`) and templates of those.
-fn sql_safe(e: &Expr) -> bool {
-    match e {
-        Expr::Lit(Lit::Str(_)) => true,
-        Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param"),
-        Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if sql_safe(e))),
-        Expr::If(_, a, b) => sql_safe(a) && b.as_deref().map_or(true, sql_safe),
-        Expr::Match(_, arms, _) => arms.iter().all(|a| sql_safe(&a.body)),
-        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if sql_safe(e)),
-        _ => false,
-    }
+fn is_join(f: &Expr) -> bool {
+    matches!(f, Expr::Ident(n, _) if n == "join")
 }
 
 /// The type a type-testing pattern accepts: `int | null` is int or null.
