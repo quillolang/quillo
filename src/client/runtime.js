@@ -1052,7 +1052,7 @@ const plural = (locale, n) => {
   }
 };
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
-B.t = meta((k, vars) => {
+const translate = (k, vars, esc) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
   let e = d && hasOwn(d.t, k) ? d.t[k] : k;
@@ -1060,8 +1060,11 @@ B.t = meta((k, vars) => {
     const cat = typeof vars.count === "number" ? plural(d.locale, vars.count) : "other";
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
-  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? display(vars[name]) : m);
-}, "t", null);
+  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(display(vars[name])) : m);
+};
+B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
+// raw(t(key, vars)): the translation's markup, with the values put in escaped.
+B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);

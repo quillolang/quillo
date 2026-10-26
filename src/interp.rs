@@ -1661,6 +1661,17 @@ impl Interp {
         } else {
             self.eval(callee, env)?
         };
+        // `raw(t(key, vars))`: the translation's markup, but the values put
+        // in it are text, escaped (see `i18n::t_html`).
+        if let (Value::Builtin("raw", _), None, [Expr::Call(inner, targs, l)]) = (&f, &pre, args) {
+            if matches!(&**inner, Expr::Ident(n, _) if n == "t") && matches!(self.eval(inner, env)?, Value::Builtin("t", _)) {
+                let mut tv = Vec::with_capacity(targs.len());
+                for a in targs {
+                    tv.push(self.eval(a, env)?);
+                }
+                return crate::i18n::t_html(self, tv, *l);
+            }
+        }
         if let Some(p) = pre {
             argv.push(p);
         }

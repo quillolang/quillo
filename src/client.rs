@@ -1758,7 +1758,17 @@ impl<'a> Compiler<'a> {
             }
             Expr::Call(callee, args, line) => {
                 self.line = *line;
-                self.call(callee, args, None)?
+                // `raw(t(key, vars))`: the values put in are escaped (as on the server).
+                let is = |c: &mut Self, e: &Expr, name: &str| -> Result<bool, QuilloError> {
+                    Ok(matches!(e, Expr::Ident(n, _) if n == name) && matches!(c.resolve(name)?, Resolved::Global(js, _) if js == format!("B.{}", name)))
+                };
+                match args.as_slice() {
+                    [Expr::Call(inner, targs, _)] if is(self, callee, "raw")? && is(self, inner, "t")? => {
+                        let vs = targs.iter().map(|a| self.expr(a)).collect::<Result<Vec<_>, _>>()?;
+                        format!("B.t_html({})", vs.join(", "))
+                    }
+                    _ => self.call(callee, args, None)?,
+                }
             }
             Expr::Field(obj, name, line) => {
                 self.line = *line;

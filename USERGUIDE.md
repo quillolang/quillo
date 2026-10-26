@@ -1189,7 +1189,10 @@ view Header(user) = <header>
   other`) picks the form for `count` by the language's rules (English, French, Russian,
   Polish, Czech, Arabic, Hebrew, Japanese and others).
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
-  wrote in them.
+  wrote in them. In that form the values put in (`{name}`) are still escaped, on the
+  server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
+  translation's `<b>` and shows the name as text. (Only that form: `raw` of a variable
+  holding `t(...)`'s text makes all of it HTML.)
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
