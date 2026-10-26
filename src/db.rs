@@ -275,8 +275,38 @@ fn db_err(e: impl std::fmt::Display) -> Value {
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
-    c.execute_batch("pragma foreign_keys = on; pragma journal_mode = wal;")?;
+    c.execute_batch("pragma foreign_keys = on")?;
+    wal(&c)?;
     Ok(c)
+}
+
+/// Puts a database in WAL mode, safely when several connections (several
+/// servers) open a new file at once. While the file is still empty, SQLite
+/// can take one connection's log for a stale one and drop what was
+/// committed to it; so a new file first gets its first page, under the
+/// write lock, from whichever connection comes first. Then the switch to
+/// WAL, which SQLite refuses at once (busy, without waiting) while another
+/// connection is reading, is tried again for a few seconds.
+fn wal(c: &Connection) -> Result<(), rusqlite::Error> {
+    let pages = |c: &Connection| c.query_row("pragma page_count", [], |r| r.get::<_, i64>(0));
+    if pages(c)? == 0 {
+        c.execute_batch("begin immediate")?;
+        let made = match pages(c) {
+            Ok(0) => c.execute_batch("create table _quillo_new (x); drop table _quillo_new"),
+            other => other.map(|_| ()),
+        };
+        c.execute_batch(if made.is_ok() { "commit" } else { "rollback" })?;
+        made?;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match c.query_row("pragma journal_mode = wal", [], |r| r.get::<_, String>(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy && start.elapsed() < std::time::Duration::from_secs(5) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            r => return r.map(|_| ()),
+        }
+    }
 }
 
 /// Opens a path (SQLite) or a postgres:// URL. Connecting to Postgres
