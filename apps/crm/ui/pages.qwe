@@ -902,6 +902,7 @@ component PluginsPage(ws: map, on_change) {
 component SettingsPage(ws: map, on_change) {
     state tab = "workspace"
     let tabs = [["workspace", "Workspace"], ["profile", "Your profile"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"], ["groups", "Groups"], ["roles", "Roles"], ["desks", "Desks"]]
+        + (ws.user.role != "member" ? [["audit", "Audit log"]] : [])
     <div>
         <PageHead title="Settings"/>
         <nav.tabs>{for t in tabs => <button type="button" class={tab == t[0] ? "tab on" : "tab"} @click={() => { tab = t[0] }}>{t[1]}</button>}</nav>
@@ -913,6 +914,7 @@ component SettingsPage(ws: map, on_change) {
             "desks" => <DesksSettings {ws}/>
             "fields" => <FieldSettings {ws} {on_change}/>
             "pipelines" => <PipelineSettings {ws} {on_change}/>
+            "audit" => <AuditSettings {ws}/>
             _ => <TeamSettings {ws} {on_change}/>
         }}
     </div>

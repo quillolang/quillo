@@ -353,17 +353,20 @@ server fn save_flow(f: map) {
     let t = now()
     let graph = json.stringify(f.graph)
     if f.id == null {
-        let r = db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, ?, ?, ?)", trim(f.name), graph, f.active == true ? 1 : 0, t, t)
+        let r = audited("flow.create", (r) => { id: r.last_id, name: trim(f.name), active: f.active == true }, () =>
+            db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, ?, ?, ?)", trim(f.name), graph, f.active == true ? 1 : 0, t, t))?
         flow_out(db.one("select * from flows where id = ?", r.last_id))
     } else {
-        db.exec("update flows set name = ?, graph = ?, active = ?, updated_at = ? where id = ?", trim(f.name), graph, f.active == true ? 1 : 0, t, f.id)
+        let was = db.one("select active from flows where id = ?", f.id)
+        audited("flow.change", { id: f.id, name: trim(f.name), active: f.active == true, was_active: (was ?? {}).active == 1 }, () =>
+            db.exec("update flows set name = ?, graph = ?, active = ?, updated_at = ? where id = ?", trim(f.name), graph, f.active == true ? 1 : 0, t, f.id))?
         flow_out(db.one("select * from flows where id = ?", f.id))
     }
 }
 
 server fn delete_flow(id: int) {
     need_admin()?
-    db.exec("delete from flows where id = ?", id)
+    audited("flow.delete", { id }, () => db.exec("delete from flows where id = ?", id))?
     true
 }
 
@@ -380,7 +383,8 @@ server fn start_flow(id: int, contact_id: int) {
 server fn new_flow(template: str) {
     need_designer()?
     let t = with_product(flow_template(template))
-    let r = db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 0, ?, ?)", t.name, json.stringify(t.graph), now(), now())
+    let r = audited("flow.create", (r) => { id: r.last_id, name: t.name, template, active: false }, () =>
+        db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 0, ?, ?)", t.name, json.stringify(t.graph), now(), now()))?
     r.last_id
 }
 

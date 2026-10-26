@@ -45,6 +45,7 @@ use "plugins/studio/index.qwe"
 let plugins = [plugin_core, plugin_blog, plugin_gdpr, plugin_loyalty, plugin_vat, plugin_paywall, plugin_sponsors, plugin_quality, plugin_notices, plugin_newsroom] + studio_plugins
 
 use "lib/records.qwe"
+use "lib/audit.qwe"
 use "lib/commerce.qwe"
 use "lib/marketing.qwe"
 use "lib/flows.qwe"
@@ -84,6 +85,7 @@ use "ui/code.qwe"
 use "ui/site.qwe"
 use "ui/objects.qwe"
 use "ui/review.qwe"
+use "ui/audit.qwe"
 
 // `http://acme.localhost:9000` for a workspace, from the main site's host.
 fn workspace_url(slug: str, host: str) {
@@ -215,14 +217,17 @@ route POST /login { form: { email: str, password: str } } {
     workspace_here()
     let u = db.one("select * from users where email = ?", lower(trim(email)))
     if !crypto.verify_password(password, u.password_hash) {
+        audit("login.failed", { email: lower(trim(email)) })
         return redirect(`/login?problem=wrong&email=${email}`)
     }
     set_session({ user: u.id })
+    audit("login", { method: "password" })
     put_setting("url", `${SCHEME}://${request.headers.host}`)
     redirect("/app")
 }
 
 route POST /logout {
+    if tenant() != null { audit("logout") }
     end_session()
     redirect("/login")
 }
@@ -231,9 +236,13 @@ route POST /logout {
 route GET /welcome/:token {
     workspace_here()
     let row = db.one("select * from sign_in_tokens where token = ? and expires_at > ?", token, now())
-    if row == null { return redirect("/login?problem=expired") }
+    if row == null {
+        audit("login.failed", { method: "link" })
+        return redirect("/login?problem=expired")
+    }
     db.exec("delete from sign_in_tokens where token = ?", token)
     set_session({ user: row.user_id })
+    audit("login", { method: "link" })
     put_setting("url", `${SCHEME}://${request.headers.host}`)
     redirect("/app")
 }
@@ -246,6 +255,7 @@ route GET /app/export/contacts.csv {
     let rows = db.query("select * from contacts order by id") | map(contact_out) | map((c) =>
         csv_row([c.first_name, c.last_name, c.email, c.phone, c.stage, c.subscribed ? "yes" : "no", join(c.tags, " ")]
             + (fields | map((f) => c.fields[f.key]))))
+    audit("contacts.export", { rows: len(rows) })
     respond(200, join([head] + rows, "\n") + "\n", { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=contacts.csv" })
 }
 
@@ -280,6 +290,7 @@ route POST /app/import/contacts {
         }
     })
     let ok = results | filter((r) => r) | len
+    audit("contacts.import", { imported: ok, skipped: len(results) - ok })
     drain_runs()
     redirect(`/app/contacts?imported=${ok}&skipped=${len(results) - ok}`)
 }

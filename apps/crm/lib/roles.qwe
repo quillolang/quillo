@@ -173,23 +173,28 @@ server fn save_role(r: map) {
     let broken = keys(access) | filter((k) => !blank(access[k].script) && is_err(run_script(`let _check = () => {\n${access[k].script}\n}\nnull`, {})))
     if len(broken) > 0 { return err({ problems: problem("access", `The script for ${join(broken, ", ")} does not read as code`) }) }
     if r.id == null {
-        db.exec("insert into roles (name, access, created_at) values (?, ?, ?)", trim(r.name), json.stringify(access), now()).last_id
+        audited("role.create", (id) => { id, name: trim(r.name), access }, () =>
+            db.exec("insert into roles (name, access, created_at) values (?, ?, ?)", trim(r.name), json.stringify(access), now()).last_id)
     } else {
-        db.exec("update roles set name = ?, access = ? where id = ?", trim(r.name), json.stringify(access), r.id)
-        r.id
+        audited("role.change", { id: r.id, name: trim(r.name), access }, () => {
+            db.exec("update roles set name = ?, access = ? where id = ?", trim(r.name), json.stringify(access), r.id)
+            r.id
+        })
     }
 }
 
 server fn delete_role(id: int) {
     need_admin()?
-    db.exec("update users set role_id = null where role_id = ?", id)
-    db.exec("delete from roles where id = ?", id)
+    audited("role.delete", { id }, () => {
+        db.exec("update users set role_id = null where role_id = ?", id)
+        db.exec("delete from roles where id = ?", id)
+    })?
     true
 }
 
 server fn set_user_role(user_id: int, role_id) {
     need_admin()?
-    db.exec("update users set role_id = ? where id = ? and role = 'member'", role_id, user_id)
+    audited("user.role", { user: user_id, role: role_id }, () => db.exec("update users set role_id = ? where id = ? and role = 'member'", role_id, user_id))?
     true
 }
 
@@ -215,16 +220,20 @@ server fn save_group(g: map) {
     if db.one("select id from groups where lower(name) = ? and id != ?", lower(trim(g.name)), g.id ?? 0) != null { return err({ problems: problem("name", "There is a group with this name") }) }
     let ids = (xs) => json.stringify((xs ?? []) | map((x) => int(x) ?? 0) | filter((x) => x > 0) | unique)
     let caps = json.stringify((g.capabilities ?? []) | filter((c) => any(CAPABILITIES, (k) => k[0] == c)) | unique)
+    let what = { name: trim(g.name), members: ids(g.members), roles: ids(g.roles), capabilities: caps }
     if g.id == null {
-        db.exec("insert into groups (name, members, roles, capabilities, created_at) values (?, ?, ?, ?, ?)", trim(g.name), ids(g.members), ids(g.roles), caps, now()).last_id
+        audited("group.create", (id) => set(what, "id", id), () =>
+            db.exec("insert into groups (name, members, roles, capabilities, created_at) values (?, ?, ?, ?, ?)", trim(g.name), ids(g.members), ids(g.roles), caps, now()).last_id)
     } else {
-        db.exec("update groups set name = ?, members = ?, roles = ?, capabilities = ? where id = ?", trim(g.name), ids(g.members), ids(g.roles), caps, g.id)
-        g.id
+        audited("group.change", set(what, "id", g.id), () => {
+            db.exec("update groups set name = ?, members = ?, roles = ?, capabilities = ? where id = ?", trim(g.name), ids(g.members), ids(g.roles), caps, g.id)
+            g.id
+        })
     }
 }
 
 server fn delete_group(id: int) {
     need_admin()?
-    db.exec("delete from groups where id = ?", id)
+    audited("group.delete", { id }, () => db.exec("delete from groups where id = ?", id))?
     true
 }

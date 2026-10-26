@@ -74,7 +74,7 @@ server fn delete_media(id: int) {
     let m = (db.one("select * from media where id = ?", id) ?? err("No such image"))?
     delete_file(media_original(m))
     delete_file(`${media_dir()}/cache/${m.key}`)
-    db.exec("delete from media where id = ?", id)
+    audited("media.delete", { id, key: m.key }, () => db.exec("delete from media where id = ?", id))?
     true
 }
 

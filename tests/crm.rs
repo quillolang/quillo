@@ -1374,3 +1374,58 @@ fn flow_webhooks_reach_only_the_public_internet() {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
     }
 }
+
+#[test]
+fn the_audit_log_has_sign_ins_team_changes_deletes_and_exports() {
+    let mut crm = Crm::new("audit");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    // A wrong password, then a member added and signed in, given a role.
+    let r = crm.form(host, "/login", "email=ada%40acme.test&password=wrong", None);
+    assert_eq!(r.header("location"), Some("/login?problem=wrong&email=ada@acme.test"));
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    let role = crm.rpc(host, "save_role", serde_json::json!([{ "name": "Sales", "access": {} }]), Some(&owner));
+    let role_id = role["ok"].as_i64().unwrap_or_else(|| panic!("{}", role));
+    let users = crm.rpc(host, "load_workspace", serde_json::json!([]), Some(&owner));
+    let sam_id = users["ok"]["users"].as_array().unwrap().iter().find(|u| u["name"] == "Sam").unwrap()["id"].as_i64().unwrap();
+    assert!(crm.rpc(host, "set_user_role", serde_json::json!([sam_id, role_id]), Some(&owner))["ok"].is_boolean());
+    // Settings, a contact deleted, the contacts exported, signing out.
+    let s = crm.rpc(host, "save_settings", serde_json::json!([{ "name": "Acme Ltd", "currency": "USD", "country": "US", "vat_rate": "0" }]), Some(&owner));
+    assert_eq!(s["ok"], true, "{}", s);
+    let c = crm.rpc(host, "save_contact", serde_json::json!([{ "first_name": "Bo", "last_name": "B", "email": "bo@x.test", "stage": "lead", "tags": [], "fields": {} }]), Some(&owner));
+    let cid = c["ok"]["id"].as_i64().unwrap_or_else(|| panic!("{}", c));
+    assert_eq!(crm.rpc(host, "delete_contact", serde_json::json!([cid]), Some(&owner))["ok"], true);
+    // A member may not delete it, and that leaves no row.
+    assert!(crm.rpc(host, "delete_contact", serde_json::json!([cid]), Some(&sam))["err"].is_string());
+    assert_eq!(crm.send(host, "GET", "/app/export/contacts.csv", "", Some(&owner)).status, 200);
+    crm.send(host, "POST", "/logout", "", Some(&sam));
+
+    // Only admins read it.
+    assert!(crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&sam))["err"].is_string());
+    let rows = crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&owner));
+    let rows = rows["ok"].as_array().unwrap_or_else(|| panic!("{}", rows)).clone();
+    let actions: Vec<&str> = rows.iter().rev().map(|r| r["action"].as_str().unwrap()).collect();
+    assert_eq!(
+        actions,
+        // (The sign-up's link tried twice: the second is a failed sign-in.)
+        ["workspace.create", "login", "login.failed", "login.failed", "user.add", "login", "role.create", "user.role", "settings.change", "contact.delete", "contacts.export", "logout"],
+        "{:#?}",
+        rows
+    );
+    let by = |a: &str| rows.iter().find(|r| r["action"] == a).unwrap().clone();
+    assert_eq!(rows.iter().find(|r| r["action"] == "login.failed" && r["details"]["email"].is_string()).unwrap()["details"]["email"], "ada@acme.test");
+    assert_eq!(by("contact.delete")["who"], "Ada");
+    assert_eq!(by("contact.delete")["details"]["id"], cid);
+    assert_eq!(by("logout")["who"], "Sam");
+    assert_eq!(by("user.role")["details"], serde_json::json!({ "user": sam_id, "role": role_id }));
+    assert_eq!(by("settings.change")["details"]["changed"], serde_json::json!(["name"]));
+    let only = crm.rpc(host, "list_audit", serde_json::json!([{ "action": "login*" }]), Some(&owner));
+    assert_eq!(only["ok"].as_array().unwrap().len(), 4, "{}", only);
+
+    // The chain holds, until someone edits the database file.
+    let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&owner));
+    assert_eq!((&v["ok"]["ok"], &v["ok"]["rows"]), (&serde_json::json!(true), &serde_json::json!(12)), "{}", v);
+    crm.sql("acme", "update _quillo_audit set actor = '1' where action = 'logout'");
+    let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&owner));
+    assert_eq!((&v["ok"]["ok"], &v["ok"]["broken"]["seq"]), (&serde_json::json!(false), &serde_json::json!(12)), "{}", v);
+}

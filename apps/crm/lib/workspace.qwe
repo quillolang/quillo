@@ -92,6 +92,7 @@ fn setup_workspace(w: map, url: str) {
         db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 1, ?, ?)", tpl.name, json.stringify(tpl.graph), t, t)
     }
     install_models(p.plugins)
+    audit("workspace.create", { slug: w.slug, owner: lower(trim(w.email)) })
     sign_in_token(owner)
 }
 
@@ -192,8 +193,13 @@ server fn save_settings(s: map) {
     if is_err(rate) || rate < 0 || rate > 50 { return err({ problems: problem("vat_rate", "A rate from 0 to 50 (percent)") }) }
     if blank(s.name) { return err({ problems: problem("name", "The workspace needs a name") }) }
     if !blank(s.mail_webhook) && !starts_with(s.mail_webhook, "https://") { return err({ problems: problem("mail_webhook", "An https:// address") }) }
-    for k in ["name", "currency", "country", "vat_rate", "mail_webhook"] => s[k] != null && put_setting(k, trim(str(s[k])))
-    true
+    let names = ["name", "currency", "country", "vat_rate", "mail_webhook"]
+    let before = settings()
+    let changed = names | filter((k) => s[k] != null && str(before[k] ?? "") != trim(str(s[k])))
+    audited("settings.change", { changed }, () => {
+        for k in names => s[k] != null && put_setting(k, trim(str(s[k])))
+        true
+    })
 }
 
 server fn mail_webhook_of() {
@@ -222,7 +228,9 @@ server fn set_plugins(enabled: list) {
     let known = plugins | map((p) => p.id)
     let before = enabled_plugins()
     let now_on = enabled | filter((id) => id != "core" && contains(known, id)) | unique
-    put_setting("plugins", now_on)
+    let on = now_on | filter((id) => !contains(before, id))
+    let off = before | filter((id) => !contains(now_on, id))
+    audited("plugins.change", { on, off }, () => put_setting("plugins", now_on))?
     // A plugin switched on brings its model (what the workspace lacks).
     install_models(now_on | filter((id) => !contains(before, id)))
     true
@@ -284,7 +292,7 @@ server fn delete_field(id: int) {
         let through = db.query("select label, options from custom_fields where entity = ? and type = 'lookup'", f.entity) | filter((x) => (parsed(x.options, [])[0] ?? "") == f.key)
         if len(through) > 0 { return err(`${through[0].label} shows a field through ${f.label}: remove it first`) }
     }
-    db.exec("delete from custom_fields where id = ?", id)
+    audited("field.delete", { id, entity: f.entity, key: f.key }, () => db.exec("delete from custom_fields where id = ?", id))?
     if starts_with(f.entity, "obj.") { sync_table(slice(f.entity, 4)) }
     true
 }
@@ -316,7 +324,9 @@ server fn add_user(u: map) {
     if !is_email(u.email) { return err({ problems: problem("email", "Their email address") }) }
     if len(u.password ?? "") < 10 { return err({ problems: problem("password", "At least 10 characters") }) }
     if db.one("select id from users where email = ?", lower(trim(u.email))) != null { return err({ problems: problem("email", "Already on the team") }) }
-    db.exec("insert into users (email, name, password_hash, role, created_at) values (?, ?, ?, ?, ?)",
-        lower(trim(u.email)), trim(u.name), crypto.hash_password(u.password), u.role == "admin" ? "admin" : "member", now())
+    let role = u.role == "admin" ? "admin" : "member"
+    let hash = crypto.hash_password(u.password)
+    audited("user.add", (r) => { id: r.last_id, email: lower(trim(u.email)), role }, () =>
+        db.exec("insert into users (email, name, password_hash, role, created_at) values (?, ?, ?, ?, ?)", lower(trim(u.email)), trim(u.name), hash, role, now()))?
     true
 }

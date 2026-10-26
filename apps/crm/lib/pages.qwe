@@ -236,7 +236,8 @@ server fn publish_page(id: int) {
     // The rules see every block, those in columns too.
     let record = merge(p.draft, { id: str(p.id), kind: p.kind, title: p.title, slug: p.slug, description: p.description, blocks: flat_blocks(p.draft.blocks) })
     refused("page", record, page_ctx())?
-    db.exec("update pages set published = draft, published_at = ?, updated_at = ? where id = ?", now(), now(), id)
+    audited("page.publish", { id, title: p.title, slug: p.slug }, () =>
+        db.exec("update pages set published = draft, published_at = ?, updated_at = ? where id = ?", now(), now(), id))?
     page_out(db.one("select * from pages where id = ?", id))
 }
 
@@ -250,7 +251,7 @@ fn in_use(id: int, live_only: bool) {
 server fn unpublish_page(id: int) {
     need_designer()?
     in_use(id, true)?
-    db.exec("update pages set published = null, home = 0, updated_at = ? where id = ?", now(), id)
+    audited("page.unpublish", { id }, () => db.exec("update pages set published = null, home = 0, updated_at = ? where id = ?", now(), id))?
     true
 }
 
@@ -259,6 +260,7 @@ server fn set_home(id: int) {
     db.transaction(() => {
         db.exec("update pages set home = 0")
         db.exec("update pages set home = 1 where id = ? and kind = 'page'", id)
+        audit("page.home", { id })?
     })
     true
 }
@@ -266,7 +268,7 @@ server fn set_home(id: int) {
 server fn delete_page(id: int) {
     need_admin()?
     in_use(id, false)?
-    db.exec("delete from pages where id = ?", id)
+    audited("page.delete", { id }, () => db.exec("delete from pages where id = ?", id))?
     true
 }
 
@@ -298,7 +300,7 @@ server fn save_theme(t: map) {
         menu: t.menu == null ? null : links(t.menu), footer: trim(t.footer ?? ""), footer_links: links(t.footer_links), css: t.css ?? "",
     }
     refused("theme", theme, rule_ctx())?
-    put_setting("theme", theme)
+    audited("theme.change", { id: theme.id }, () => put_setting("theme", theme))?
     theme
 }
 
