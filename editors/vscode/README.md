@@ -14,6 +14,11 @@ Language support for [Quillo](https://github.com/wisp-one/quillo), the small web
 - **Outline** of functions, views, components, variables and routes.
 - **Snippets**: `route`, `routejson`, `fn`, `fnb`, `server fn`, `view`, `component`, `match`, `for`, `page`,
   and for real time: `udplisten`, `channelon`, `channelopen`, `mediartp`, `quillo-media`.
+- **Rust in `.qwer` files**: highlighted as Rust, with the `//! [dependencies]` header as TOML;
+  the Rust compiler's errors and warnings as you open and save (through `cargo check`);
+  a warning on each `pub fn` Quillo cannot export, saying why; hover shows how Quillo sees an
+  export, and the outline lists them. Their functions are checked, completed and hovered in
+  the `.qwe` files that `use` them. With rust-analyzer installed, it works in them too.
 - **Commands**: *Quillo: Run this file (watch mode)* (also the ▶ button), *Quillo: Check this file*,
   *Quillo: Restart the language server*.
 

@@ -118,6 +118,54 @@ const cases = [
       console.log(`FAIL ${f}: tokenizer state still nested at end of file (depth ${state.depth})`);
     }
   }
-  console.log(failed ? `${failed} failed` : `all ${cases.length} grammar cases passed`);
+  // A .qwer file: Rust, with its dependencies header as TOML (with VS Code's
+  // own Rust grammar, where it can be found).
+  const rustGrammar = [
+    process.env.VSCODE_RUST_GRAMMAR,
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/rust/syntaxes/rust.tmLanguage.json",
+    "/usr/share/code/resources/app/extensions/rust/syntaxes/rust.tmLanguage.json",
+  ].find((p) => p && fs.existsSync(p));
+  let rustCases = 0;
+  if (rustGrammar) {
+    const files = {
+      "source.rust": rustGrammar,
+      "quillo.qwer.dependencies": path.join(__dirname, "../syntaxes/qwer-dependencies.json"),
+    };
+    const rustRegistry = new vsctm.Registry({
+      onigLib,
+      loadGrammar: async (scope) => files[scope] && vsctm.parseRawGrammar(fs.readFileSync(files[scope], "utf8"), files[scope]),
+      getInjections: (scope) => (scope === "source.rust" ? ["quillo.qwer.dependencies"] : undefined),
+    });
+    const rust = await rustRegistry.loadGrammar("source.rust");
+    const src = fs.readFileSync(path.join(__dirname, "../../../tests/fixtures/deps.qwer"), "utf8").split("\n");
+    const want = [
+      [2, "dependencies", "entity.name.section.toml"],
+      [3, "image", "support.type.property-name.toml"],
+      [3, "0.25", "string.quoted.double.toml"],
+      [4, "default-features", "support.type.property-name.toml"],
+      [4, "false", "constant.language.boolean.toml"],
+      [7, "pub", "storage.modifier.visibility.rust"],
+      [7, "brightness", "entity.name.function.rust"],
+      // Below the header, Rust is Rust: no TOML in a later doc comment.
+      [6, "= not toml", "comment.line.documentation.rust"],
+    ];
+    let state = vsctm.INITIAL;
+    const lines = src.map((l) => {
+      const r = rust.tokenizeLine(l, state);
+      state = r.ruleStack;
+      return r.tokens.map((t) => ({ text: l.slice(t.startIndex, t.endIndex), scopes: t.scopes }));
+    });
+    for (const [n, text, scope] of want) {
+      rustCases++;
+      const tok = lines[n].find((t) => t.text === text) || lines[n].find((t) => t.text.includes(text));
+      if (!tok || !tok.scopes.includes(scope)) {
+        failed++;
+        console.log(`FAIL .qwer line ${n + 1} ${JSON.stringify(text)}\n  want ${scope}\n  got  ${tok ? tok.scopes.join(" ") : "(no token)"}`);
+      }
+    }
+  } else {
+    console.log("(no Rust grammar found: the .qwer cases were skipped)");
+  }
+  console.log(failed ? `${failed} failed` : `all ${cases.length + rustCases} grammar cases passed`);
   process.exit(failed ? 1 : 0);
 })();

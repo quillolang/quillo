@@ -162,6 +162,8 @@ fn same(a: &Value, b: &Value) -> bool {
 pub fn impure_builtin(name: &str) -> bool {
     name.starts_with("db.")
         || name.starts_with("http.")
+        // Rust may do anything.
+        || name.starts_with("native:")
         || matches!(
             name,
             "print"

@@ -10,6 +10,7 @@ Quillo is a single binary, built with Cargo:
 cargo build --release
 ./target/release/quillo run examples/notes.qwe --watch   # http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
+./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
 ./target/release/quillo repl
 ./target/release/quillo lsp                              # language server (for editors)
 cargo test
@@ -82,29 +83,46 @@ the browser and on the server.
 
 ### Values
 
-`null`, `true`/`false`, `42`, `3.14`, `1e-9` and `6.02e23`, `"strings"` or `'strings'`, template strings
-`` `Hello, ${name}` ``, lists `[1, 2, 3]`, maps `{ name: "Ada", "content-type": "text/plain" }`,
-functions, HTML and error values. A map entry `{ id }` is short for `{ id: id }`.
+| Kind | Written |
+|---|---|
+| Null and booleans | `null`, `true`, `false` |
+| Numbers | `42`, `3.14`, `1e-9`, `6.02e23` |
+| Strings | `"strings"` or `'strings'`: plain text, so JSON is easy to write: `'{"a": 1}'` |
+| Template strings | `` `Hello, ${name}` ``: the only strings that interpolate; they can span lines |
+| Lists | `[1, 2, 3]` |
+| Maps | `{ name: "Ada", "content-type": "text/plain" }`; `{ id }` is short for `{ id: id }` |
+| Others | functions, HTML and error values |
 
-`xs[0]` is the first item and `xs[-1]` the last (negative indexes count from the end;
-`first(xs)` and `last(xs)` say the same in words). An index past the end, a missing map
-key, or any field of `null` gives `null`. Strings index by character: `"héllo"[1]`
-is `"é"`.
+| Expression | Gives |
+|---|---|
+| `xs[0]` | the first item; `first(xs)` says the same in words |
+| `xs[-1]` | the last item (`last(xs)`): negative indexes count from the end |
+| `xs[99]`, a missing map key, a field of `null` | `null` |
+| `"héllo"[1]` | `"é"`: strings index by character |
 
 A name right before a template calls it with the text: `` shout`hi ${name}` `` is
 `` shout(`hi ${name}`) ``. The builtins `css` and `sql` return the text as it is, and
 tell editors to highlight it as CSS or SQL.
 
-Only template strings (backticks) interpolate; `"..."` and `'...'` are plain text, so
-JSON is easy to write: `'{"a": 1}'`. Template strings can span lines.
+Operators are as in JavaScript, with these meanings:
 
-Operators are as in JavaScript: `+ - * / %`, `== !=` (deep equality, like comparing
-JSON), `< <= > >=`, `!`, `&&`, `||`, `??` and `cond ? a : b`. `null`, `false` and error
-values are falsy; everything else (including `0` and `""`) is truthy. `a && b` and
-`a || b` give back one of their operands, so `{loading && <Spinner/>}` works. Because
-`""` is truthy, `name || "anonymous"` keeps an empty name: write `name ?? "anonymous"` to
-replace only null, or `name != "" ? name : "anonymous"` (`quillo check` points these out). `/` divides exactly, as in JavaScript: `7 / 2` is `3.5`,
-and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division.
+| Operator | Means |
+|---|---|
+| `+ - * %` | as in JavaScript |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division |
+| `== !=` | deep equality, like comparing JSON |
+| `< <= > >=` | comparison |
+| `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
+| `??` | the right side when the left is `null` or an error value |
+| `cond ? a : b` | `a` if `cond` is truthy, else `b` |
+
+| Falsy | Truthy |
+|---|---|
+| `null`, `false` and error values | everything else, `0` and `""` included |
+
+Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
+`name ?? "anonymous"` to replace only null, or `name != "" ? name : "anonymous"`
+(`quillo check` points these out).
 
 ### Coming from JavaScript
 
@@ -1760,6 +1778,70 @@ loop, on doubles).
 - Not with a fuel limit (scripts given a budget of steps), and not in builds without
   the `jit` feature (`cargo build --no-default-features --features mysql`).
 
+## Rust
+
+A `.qwer` file is Rust, and a program `use`s it as it uses a `.qwe` file: its top-level
+`pub fn`s are the program's functions. Here is `imaging.qwer`:
+
+```rust
+//! [dependencies]
+//! image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+/// How bright a picture is, from 0 to 255.
+pub fn brightness(path: &str) -> Result<f64, String> {
+    let img = image::open(path).map_err(|e| e.to_string())?.to_luma8();
+    Ok(img.pixels().map(|p| p.0[0] as f64).sum::<f64>() / img.len() as f64)
+}
+```
+
+```quillo
+use "imaging.qwer"
+
+route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
+```
+
+- Values cross as Quillo has them: `i64` and the other integers are `int`; `f64` and
+  `f32` are `float`; `bool`; `String`, `&str` and `char` are `str`; `Vec<T>` and `&[T]`
+  are lists; `HashMap<String, T>` and `BTreeMap<String, T>` are maps; `Option<T>` is the
+  value or `null`; `serde_json::Value` is anything. A function returning
+  `Result<T, E>` gives `T`, or an error value with `E`'s message, so `?` and `??` work
+  on it. `()` is `null`.
+- The rest of the file is ordinary Rust: private functions, structs, `impl`s, modules,
+  `use`. A `pub fn` that is generic, `async`, takes `&mut`, or has a type that cannot
+  cross is not exported, and `quillo check` says why.
+- The `//! [dependencies]` lines are the file's crates, as in `Cargo.toml`. They must
+  be the file's first lines: below any other line, even a comment, they are not read.
+  `serde_json` is always there.
+- `quillo check` reads the functions' types from the Rust, without building anything:
+  calls are checked, and editors show them on hover. They run on the server only;
+  components call them through a `server fn`.
+
+How it runs:
+
+- `use` builds the file with `cargo` (in a crate of its own in Quillo's cache,
+  `~/.cache/quillo/native`, or `QUILLO_NATIVE_CACHE`; the crates' builds are shared), and
+  keeps the library in `.quillo/native/` next to the file, named by a hash of the file's
+  content: the next start loads it without building. A build takes seconds the first
+  time, more with large crates.
+- `quillo build app.qwe` builds every `.qwer` file a program uses. Deploy `.quillo/native/`
+  with the program, and the server needs no Rust: it loads what was built for that
+  content (on the same kind of machine).
+- A call runs off the event loop, without the lock Quillo code holds: a slow function
+  holds up no one, and calls from several requests run on several cores at once. The
+  values cross as JSON, which suits most calls; a list of millions of numbers takes a
+  while to cross.
+- A panic is an error in the request that called the function, like any other; the
+  server goes on. Arguments of the wrong type are refused before the function runs.
+- With `--watch` and `--reload`, a `.qwer` file that changes is built again and the
+  program reloaded with it. A build that fails prints the compiler's errors, and the
+  program goes on as it was. Requests in progress finish with the version they started
+  with: libraries stay loaded.
+- Rust can do anything the server can, so `.qwer` files are the developers', like the
+  rest of the program: never let a program's users write them (they write sandboxed
+  Quillo with `run_script`).
+
+See [examples/rust.qwe](examples/rust.qwe) and [examples/rust.qwer](examples/rust.qwer).
+
 ## Not built yet
 
 - `match` exhaustiveness in the checker
@@ -1783,6 +1865,7 @@ src/error.rs       errors with a file and line
 src/record.rs      records: type User = { ... }, made, checked, in patterns
 src/check.rs       the static checker (quillo check, quillo run, the language server)
 src/script.rs      run_script: code a program's users write, sandboxed
+src/native.rs      Rust in a program: .qwer files read, built, loaded and called
 
 The standard library
 src/builtins.rs    the builtins every program can call
@@ -1831,12 +1914,13 @@ src/lsp.rs         the language server
 editors/vscode/    the VS Code extension
 
 examples/          hello, orders, todo, notes, compose, layout, spa, scroll, virtual, life,
-                   storm, telemetry (with sensors), media, services, and index (most of
-                   them in one server)
+                   storm, telemetry (with sensors), media, rust (with rust.qwer),
+                   services, and index (most of them in one server)
 apps/crm/          a whole application: a multi-tenant CRM
 site/              quillolang.org, written in Quillo; its docs are made from this README
 tests/             the language, routes, records, effects, the checker, numbers, streams,
-                   UDP, services, sessions, uploads, tenants, several databases, the compiler
+                   UDP, Rust (.qwer), services, sessions, uploads, tenants, several
+                   databases, the compiler
                    (in Node), the browser (headless Chrome), PostgreSQL and MariaDB
                    (throwaway servers), the CRM, and the language server
 ```

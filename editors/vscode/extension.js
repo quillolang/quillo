@@ -26,8 +26,10 @@ async function startClient() {
     "Quillo",
     { run: { command, args: ["lsp"] }, debug: { command, args: ["lsp"] } },
     {
-      documentSelector: [{ scheme: "file", language: "quillo" }],
-      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.qwe") },
+      // .qwer files are Rust (rust-analyzer's too, where it is installed);
+      // the server adds what Quillo makes of them, and the compiler's errors.
+      documentSelector: [{ scheme: "file", language: "quillo" }, { scheme: "file", pattern: "**/*.qwer" }],
+      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{qwe,qwer}") },
     }
   );
   try {

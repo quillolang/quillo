@@ -14,6 +14,7 @@ impl Client {
     fn start() -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("lsp")
+            .env("QUILLO_NATIVE_CACHE", std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native-cache"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -172,4 +173,66 @@ fn a_used_file_is_checked_as_part_of_its_program() {
     assert_eq!(d.as_array().unwrap().len(), 1, "{}", d);
     assert!(d[0]["message"].as_str().unwrap().contains("unknown name `shuot` (did you mean `shout`?)"), "{}", d);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `.qwer` file: what Quillo cannot export is said as it is typed, and
+/// the Rust compiler's errors once it is opened or saved; hover shows how
+/// Quillo sees an export.
+#[test]
+fn rust_files_get_quillo_and_compiler_diagnostics() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-qwer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let path = dir.join("lib.qwer");
+    let text = "pub struct P;\n\n/// Adds two numbers.\npub fn add(a: i64, b: i64) -> i64 {\n    a + b + \"x\"\n}\n\npub fn point() -> P { P }\n";
+    std::fs::write(&path, text).unwrap();
+    let uri = format!("file://{}", path.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": text } }));
+    // First what Quillo makes of it, then the compiler's errors with it.
+    let mut quillo_seen = false;
+    let diags = loop {
+        let m = c.recv();
+        if m["method"] != "textDocument/publishDiagnostics" || m["params"]["uri"] != json!(uri) {
+            continue;
+        }
+        let d = m["params"]["diagnostics"].as_array().unwrap().clone();
+        quillo_seen |= d.iter().any(|x| x["source"] == "quillo");
+        if d.iter().any(|x| x["source"] == "rustc") {
+            break d;
+        }
+    };
+    assert!(quillo_seen);
+    let quillo: Vec<&Value> = diags.iter().filter(|x| x["source"] == "quillo").collect();
+    assert!(quillo.len() == 1 && quillo[0]["message"].as_str().unwrap().contains("`point` is not exported"), "{:?}", diags);
+    let rustc: Vec<&Value> = diags.iter().filter(|x| x["source"] == "rustc" && x["severity"] == 1).collect();
+    assert!(!rustc.is_empty(), "{:?}", diags);
+    // On the line of the mistake, in the file itself.
+    assert_eq!(rustc[0]["range"]["start"]["line"], 4, "{:?}", rustc);
+    let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }), &mut notes);
+    let h = h["contents"]["value"].as_str().unwrap_or("").to_string();
+    assert!(h.contains("add(int, int) -> int") && h.contains("Adds two numbers."), "{}", h);
+    let syms = c.request("textDocument/documentSymbol", json!({ "textDocument": { "uri": uri } }), &mut notes);
+    let names: Vec<&str> = syms.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["add"]);
+    // Fixed and saved: the compiler has nothing more to say.
+    let fixed = text.replace(" + \"x\"", "");
+    std::fs::write(&path, &fixed).unwrap();
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": fixed }] }));
+    c.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
+    loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            let d = m["params"]["diagnostics"].as_array().unwrap();
+            if !d.iter().any(|x| x["source"] == "rustc" && x["severity"] == 1) && d.iter().all(|x| x["source"] != "quillo" || x["message"].as_str().unwrap().contains("point")) && !d.is_empty() {
+                break;
+            }
+        }
+    }
+    c.request("shutdown", Value::Null, &mut notes);
+    c.notify("exit", Value::Null);
+    assert!(c.child.wait().unwrap().success());
 }

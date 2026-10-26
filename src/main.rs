@@ -22,6 +22,9 @@ usage:
   quillo check <file.qwe>           check a program without running it
                [--strict-null]      and warn where a value may be null and
                                     null does not work
+  quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
+                                    into .quillo/native/ next to them, so it
+                                    runs where Rust is not installed
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
   quillo <file.qwe>                 same as `quillo run`
@@ -107,6 +110,24 @@ fn real_main(args: Vec<String>) -> i32 {
                 None => usage(),
             }
         }
+        Some("build") => match args.get(2) {
+            Some(f) => match quillo::native::build_all(Path::new(f)) {
+                Ok(libs) => {
+                    for l in &libs {
+                        println!("built {}", l.display());
+                    }
+                    if libs.is_empty() {
+                        println!("{} uses no .qwer files: nothing to build", f);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("quillo: {}", e);
+                    1
+                }
+            },
+            None => usage(),
+        },
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {

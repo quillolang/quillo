@@ -24,7 +24,8 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "onLanguage:quillo"
+    "onLanguage:quillo",
+    "workspaceContains:**/*.qwer"
   ],
   "contributes": {
     "languages": [
@@ -38,6 +39,12 @@
           ".qwe"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "rust",
+        "extensions": [
+          ".qwer"
+        ]
       }
     ],
     "grammars": [
@@ -49,6 +56,13 @@
           "meta.embedded.block.css": "css",
           "meta.embedded.block.sql": "sql"
         }
+      },
+      {
+        "scopeName": "quillo.qwer.dependencies",
+        "path": "./syntaxes/qwer-dependencies.json",
+        "injectTo": [
+          "source.rust"
+        ]
       }
     ],
     "snippets": [

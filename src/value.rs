@@ -244,6 +244,7 @@ impl Value {
                 m.iter().map(|(k, v)| format!("{}: {}", fmt_key(k), v.repr())).collect::<Vec<_>>().join(", ")
             ),
             Value::Func(c) => format!("<fn {}>", c.def.name),
+            Value::Builtin(n, _) if n.starts_with("native:") => format!("<rust fn {}>", crate::native::display_name(n)),
             Value::Builtin(n, _) => format!("<builtin {}>", n),
             Value::Html(h) => h.to_string(),
             Value::Response(r) => format!("<response {}>", r.status),

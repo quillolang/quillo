@@ -10,6 +10,7 @@ use serde_json::{json, Value as J};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "in",
@@ -28,6 +29,31 @@ pub struct Server {
     out: io::Stdout,
     /// From the editor's `initializationOptions` (`{ "strictNull": true }`).
     opts: check::Options,
+    /// `.qwer` files' diagnostics: Quillo's (as they are typed) and the Rust
+    /// compiler's (when opened and saved, worked out on a thread of their own).
+    rust: Arc<Mutex<HashMap<String, RustDiags>>>,
+}
+
+#[derive(Default)]
+struct RustDiags {
+    quillo: Vec<J>,
+    cargo: Vec<J>,
+    /// A check is running; another is wanted when it ends.
+    running: bool,
+    again: bool,
+}
+
+/// Sends a message from any thread (stdout's lock keeps messages whole).
+fn send_any(msg: &J) {
+    let body = msg.to_string();
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = out.flush();
+}
+
+fn publish_rust(uri: &str, d: &RustDiags) {
+    let all: Vec<J> = d.quillo.iter().chain(d.cargo.iter()).cloned().collect();
+    send_any(&json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": all } }));
 }
 
 fn read_message(input: &mut impl BufRead) -> io::Result<Option<J>> {
@@ -207,7 +233,7 @@ fn symbol_kind(k: SymbolKind) -> u32 {
 
 impl Server {
     pub fn new() -> Self {
-        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options::default() }
+        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options::default(), rust: Default::default() }
     }
 
     fn send(&mut self, msg: J) {
@@ -256,7 +282,11 @@ impl Server {
                 "textDocument/didOpen" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
                     let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
-                    self.update(uri, text);
+                    let rust = uri.ends_with(".qwer");
+                    self.update(uri.clone(), text);
+                    if rust {
+                        self.check_rust(uri);
+                    }
                 }
                 "textDocument/didChange" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
@@ -265,6 +295,10 @@ impl Server {
                     }
                 }
                 "textDocument/didSave" => {
+                    let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
+                    if uri.ends_with(".qwer") {
+                        self.check_rust(uri);
+                    }
                     // Other open files may `use` the saved one.
                     let open: Vec<(String, String)> = self.docs.iter().map(|(u, d)| (u.clone(), d.text.clone())).collect();
                     for (u, t) in open {
@@ -274,6 +308,7 @@ impl Server {
                 "textDocument/didClose" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
                     self.docs.remove(&uri);
+                    self.rust.lock().unwrap_or_else(|e| e.into_inner()).remove(&uri);
                     self.send(json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [] } }));
                 }
                 "textDocument/hover" => {
@@ -302,6 +337,9 @@ impl Server {
     }
 
     fn update(&mut self, uri: String, text: String) {
+        if uri.ends_with(".qwer") {
+            return self.update_rust(uri, text);
+        }
         let path = uri_to_path(&uri);
         let file = path.display().to_string();
         let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
@@ -350,6 +388,85 @@ impl Server {
         self.docs.insert(uri, Doc { text, analysis });
     }
 
+    /// A `.qwer` file: what Quillo makes of it (its exports, and what it
+    /// cannot export), as it is typed.
+    fn update_rust(&mut self, uri: String, text: String) {
+        let path = uri_to_path(&uri);
+        let file = path.display().to_string();
+        let parsed = crate::native::parse(&text);
+        let quillo: Vec<J> = parsed
+            .problems
+            .iter()
+            .map(|(line, msg)| json!({ "range": diag_range(&text, *line, msg), "severity": 2, "source": "quillo", "message": msg }))
+            .collect();
+        let symbols = parsed
+            .exports
+            .iter()
+            .map(|e| {
+                let mut detail = check::native_signature(e);
+                if !e.doc.is_empty() {
+                    detail = format!("{}\n\n{}", detail, e.doc);
+                }
+                check::Symbol { name: e.name.clone(), kind: SymbolKind::Function, file: file.clone(), line: e.line, detail }
+            })
+            .collect();
+        {
+            let mut all = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+            let d = all.entry(uri.clone()).or_default();
+            d.quillo = quillo;
+            publish_rust(&uri, d);
+        }
+        self.docs.insert(uri, Doc { text, analysis: check::Analysis { symbols, ..Default::default() } });
+    }
+
+    /// The Rust compiler's view of a `.qwer` file as saved, on a thread of
+    /// its own (`cargo check` takes a moment); one at a time per file.
+    fn check_rust(&mut self, uri: String) {
+        {
+            let mut all = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+            let d = all.entry(uri.clone()).or_default();
+            if d.running {
+                d.again = true;
+                return;
+            }
+            d.running = true;
+        }
+        let rust = self.rust.clone();
+        std::thread::spawn(move || loop {
+            let path = uri_to_path(&uri);
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let cargo: Vec<J> = match crate::native::check(&path) {
+                Ok(notes) => notes
+                    .iter()
+                    .map(|n| {
+                        let col = |line: u32, c: u32| {
+                            let src = text.lines().nth(line.saturating_sub(1) as usize).unwrap_or("");
+                            utf16_col(src, c as usize)
+                        };
+                        let range = if n.end_line == n.line && n.end_col == n.col {
+                            diag_range(&text, n.line, "")
+                        } else {
+                            json!({
+                                "start": { "line": n.line.saturating_sub(1), "character": col(n.line, n.col) },
+                                "end": { "line": n.end_line.saturating_sub(1), "character": col(n.end_line, n.end_col) }
+                            })
+                        };
+                        json!({ "range": range, "severity": if n.error { 1 } else { 2 }, "source": "rustc", "message": n.message })
+                    })
+                    .collect(),
+                Err(e) => vec![json!({ "range": diag_range(&text, 1, ""), "severity": 3, "source": "quillo", "message": e })],
+            };
+            let mut all = rust.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(d) = all.get_mut(&uri) else { return };
+            d.cargo = cargo;
+            publish_rust(&uri, d);
+            if !std::mem::take(&mut d.again) {
+                d.running = false;
+                return;
+            }
+        });
+    }
+
     fn position(params: &J) -> (String, usize, usize) {
         (
             params["textDocument"]["uri"].as_str().unwrap_or("").to_string(),
@@ -383,6 +500,13 @@ impl Server {
     }
 
     fn hover(&self, params: &J) -> J {
+        // In a .qwer file: what Quillo sees of an exported function.
+        let (uri, _, _) = Self::position(params);
+        if uri.ends_with(".qwer") {
+            let Some((_, r)) = self.reference_at(params) else { return J::Null };
+            let (sig, doc) = r.detail.split_once("\n\n").unwrap_or((&r.detail, ""));
+            return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```\n{}\n\n*Exported to the programs that `use` this file.*", sig, doc) } });
+        }
         if let Some((_, r)) = self.reference_at(params) {
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", r.detail) } });
         }
@@ -418,6 +542,10 @@ impl Server {
 
     fn completion(&self, params: &J) -> J {
         let (uri, line, col) = Self::position(params);
+        // Rust: Quillo's names would only be in the way.
+        if uri.ends_with(".qwer") {
+            return json!([]);
+        }
         let Some(doc) = self.docs.get(&uri) else { return json!([]) };
         let src = doc.text.lines().nth(line).unwrap_or("");
         let before: String = src.chars().take(char_col(src, col)).collect();

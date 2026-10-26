@@ -188,6 +188,25 @@ fn record_shape(td: &TypeDef) -> u32 {
 
 /// What `User(...)` takes and gives: a map in which the fields with a
 /// default, or that may be null, may be left out; a User, or an error value.
+/// A `.qwer` function as the checker sees it: its parameters' and result's
+/// Quillo types, from their Rust types.
+fn native_sig(e: &crate::native::Export, file: &Arc<str>) -> Sig {
+    let q = |t: &str| crate::native::quillo_type(t).unwrap_or_else(|_| "any".into());
+    let params: Vec<String> = e.params.iter().map(|(_, t)| q(t)).collect();
+    let ret = e.ret.as_deref().map_or("null".to_string(), q);
+    let mut sig = Sig::builtin(&e.name, &params.join(", "), &ret);
+    for (p, (name, _)) in sig.params.iter_mut().zip(&e.params) {
+        p.name = name.clone();
+    }
+    sig.native = Some(file.clone());
+    sig
+}
+
+/// How Quillo sees a `.qwer` function: `brightness(str) -> float | error(str)`.
+pub fn native_signature(e: &crate::native::Export) -> String {
+    native_sig(e, &Arc::from("")).text()
+}
+
 fn record_sig(td: &TypeDef) -> Sig {
     let rec = ty_t(&Ty { names: vec![td.name.clone()], optional: false, elem: None, fields: None });
     let was = RECORD_INPUT.with(|c| c.replace(true));
@@ -210,6 +229,7 @@ fn record_sig(td: &TypeDef) -> Sig {
         component: false,
         builtin: false,
         def: None,
+        native: None,
     }
 }
 
@@ -800,6 +820,8 @@ struct Sig {
     component: bool,
     builtin: bool,
     def: Option<Arc<FnDef>>,
+    /// A `.qwer` file's function: the file it is in.
+    native: Option<Arc<str>>,
 }
 
 impl Sig {
@@ -833,6 +855,7 @@ impl Sig {
             component: false,
             builtin: true,
             def: None,
+            native: None,
         }
     }
 
@@ -858,6 +881,7 @@ impl Sig {
             component: def.component,
             builtin: false,
             def: Some(def.clone()),
+            native: None,
         }
     }
 
@@ -1165,6 +1189,8 @@ struct Checker {
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
+    /// Functions of `.qwer` files the program uses, with their files.
+    natives: Vec<(Arc<str>, crate::native::Export)>,
     /// Checking the `live(...)` that sets a component's state.
     live_ok: bool,
     /// The services a program calls (`service billing = "billing.qwe"`): the
@@ -1216,6 +1242,7 @@ impl Checker {
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
+            natives: Vec::new(),
             live_ok: false,
             services: HashMap::new(),
             hint: None,
@@ -1320,6 +1347,22 @@ impl Checker {
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
                 let text = self.overrides.get(&full).cloned().map_or_else(|| std::fs::read_to_string(&full), Ok);
+                // Rust: its functions' signatures, read without building it.
+                if path.ends_with(".qwer") {
+                    match text {
+                        Ok(src) => {
+                            let parsed = crate::native::parse(&src);
+                            for (l, msg) in parsed.problems {
+                                self.diag_at(fname.clone(), l, Severity::Warning, msg);
+                            }
+                            for e in parsed.exports {
+                                self.natives.push((fname.clone(), e));
+                            }
+                        }
+                        Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
+                    }
+                    continue;
+                }
                 match text {
                     Ok(src) => match Parser::new(&src).parse_program() {
                         Ok(sub) => self.expand(Arc::new(sub), fname, base, seen, order),
@@ -1336,6 +1379,16 @@ impl Checker {
     fn run(&mut self, order: Vec<Item>) {
         for it in &order {
             collect_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned);
+        }
+        for (file, e) in std::mem::take(&mut self.natives) {
+            let sig = native_sig(&e, &file);
+            let short = file.rsplit('/').next().unwrap_or(&file).to_string();
+            let mut detail = format!("{}  (Rust, {})", sig.text(), short);
+            if !e.doc.is_empty() {
+                detail = format!("{}\n\n{}", detail, e.doc);
+            }
+            self.out.symbols.push(Symbol { name: e.name.clone(), kind: SymbolKind::Function, file: file.to_string(), line: e.line, detail });
+            self.globals.insert(e.name.clone(), Var { t: T::of(FN), sig: Some(Arc::new(sig)), file, line: e.line, kind: Kind::Global, used: true, ready: true });
         }
         // Everything top-level is known up front; it becomes usable from
         // top-level code once the program has run its definition.
@@ -2822,6 +2875,10 @@ impl Checker {
         if let Some(c) = self.in_component() {
             if sig.builtin && BROWSER_ONLY_SERVER.contains(&sig.name.as_str()) {
                 self.error(format!("`{}` is not available in the browser, where <{}> also runs; use a `server fn`", sig.name, c));
+            }
+            if let Some(f) = &sig.native {
+                let f = f.rsplit('/').next().unwrap_or(f).to_string();
+                self.error(format!("`{}` is Rust ({}), which runs on the server, not in <{}>; call it from a `server fn`", sig.name, f, c));
             }
             let nested = self.fns.last().map_or(false, |f| f.nested);
             if sig.server && !nested {

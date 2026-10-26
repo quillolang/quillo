@@ -1089,6 +1089,14 @@ impl Interp {
                 if !Arc::make_mut(&mut self.loaded).insert(key) {
                     return Ok(Value::Nil);
                 }
+                // Rust: built, loaded, and its functions defined (see `native`).
+                if path.ends_with(".qwer") {
+                    let fname = full.display().to_string();
+                    return match crate::native::use_file(self, &full, *line) {
+                        Err(Ctrl::Error(e)) => Err(Ctrl::Error(e.in_file(&fname))),
+                        other => other.map(|_| Value::Nil),
+                    };
+                }
                 let src = std::fs::read_to_string(&full)
                     .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
@@ -1626,6 +1634,9 @@ impl Interp {
                 }
                 if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {
                     self.mark_impure();
+                }
+                if name.starts_with("native:") {
+                    return crate::native::call(self, name, args, line);
                 }
                 func(self, args, line)
             }

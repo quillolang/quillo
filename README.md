@@ -100,6 +100,15 @@ route POST /buy = billing.invoice(request.form.name, 1200)?
 route POST /remind = billing.later.send_reminder(request.form.name)
 ```
 
+**Rust when you want it.** A `.qwer` file is Rust: `use "imaging.qwer"` builds it, and its
+`pub fn`s are the program's functions, checked against their Rust types, running off the
+event loop on every core, built again when they change.
+
+```rust
+// imaging.qwer
+pub fn brightness(path: &str) -> Result<f64, String> { /* any crate you like */ }
+```
+
 **Checked before it runs.** `quillo check` knows types, records, effects, routes,
 components and services, and finds mistakes without running anything; the language
 server brings that, with completion and go-to-definition, to your editor.
@@ -136,7 +145,7 @@ cargo build --release
 
 Then open any of the [examples](examples): routes, a todo app, live notes, a
 single-page app, infinite scroll over 100,000 rows, a virtual list of a million, the
-Game of Life, live telemetry over UDP, a camera's stream, services; or
+Game of Life, live telemetry over UDP, a camera's stream, Rust in a program, services; or
 [apps/crm](apps/crm), a whole multi-tenant CRM with a shop, campaigns, a page designer
 and plugins. [editors/vscode](editors/vscode) is the VS Code extension.
 

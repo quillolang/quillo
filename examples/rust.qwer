@@ -1,0 +1,48 @@
+//! Number work for examples/rust.qwe, in Rust.
+//!
+//! Every top-level `pub fn` here is a function of the programs that
+//! `use "rust.qwer"`: Quillo builds this file (once per content) and loads it.
+
+use std::collections::HashMap;
+
+/// How many primes there are below `n`, and the largest of them.
+pub fn primes(n: i64) -> HashMap<String, i64> {
+    let n = n.clamp(0, 200_000_000) as usize;
+    let mut composite = vec![false; n];
+    let (mut count, mut largest) = (0, 0);
+    for i in 2..n {
+        if !composite[i] {
+            count += 1;
+            largest = i as i64;
+            let mut j = i * i;
+            while j < n {
+                composite[j] = true;
+                j += i;
+            }
+        }
+    }
+    HashMap::from([("count".to_string(), count), ("largest".to_string(), largest)])
+}
+
+/// The number below `n` whose Collatz sequence is longest, and its length.
+pub fn longest_collatz(n: i64) -> Result<Vec<i64>, String> {
+    if n < 2 || n > 50_000_000 {
+        return Err(format!("{} is out of range (2 to 50,000,000)", n));
+    }
+    let n = n as usize;
+    let mut steps = vec![0u32; n];
+    let (mut best, mut best_len) = (1, 1);
+    for start in 2..n {
+        let (mut x, mut len) = (start as u64, 0u32);
+        while x >= start as u64 {
+            x = if x % 2 == 0 { x / 2 } else { 3 * x + 1 };
+            len += 1;
+        }
+        steps[start] = len + steps[x as usize];
+        if steps[start] + 1 > best_len {
+            best = start;
+            best_len = steps[start] + 1;
+        }
+    }
+    Ok(vec![best as i64, best_len as i64])
+}

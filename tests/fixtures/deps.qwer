@@ -1,0 +1,8 @@
+//! Pictures.
+//!
+//! [dependencies]
+//! image = "0.25"
+//! jpeg = { version = "1", default-features = false }
+
+/// Doc = not toml
+pub fn brightness(path: &str) -> f64 { 0.0 }

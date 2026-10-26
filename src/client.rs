@@ -872,6 +872,8 @@ impl<'a> Compiler<'a> {
                     let r = (format!("B.{}", b), *b == "parallel" || *b == "ask" || *b == "receive");
                     self.globals.insert(name.to_string(), r.clone());
                     Ok(r)
+                } else if b.starts_with("native:") {
+                    self.err(format!("`{}` is Rust, which runs on the server, not in the browser; call it from a `server fn`", crate::native::display_name(b)))
                 } else {
                     self.err(format!("`{}` is not available in the browser; call it from a `server fn`", b))
                 }

@@ -6,3 +6,6 @@
 /site/dist
 /bench/ui/frameworks/node_modules
 /bench/ui/frameworks/dist
+
+# Libraries built from .qwer files (quillo build)
+.quillo/
