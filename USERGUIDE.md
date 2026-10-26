@@ -965,7 +965,8 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   name), each line of newline-delimited JSON, or each piece of text, and may stop
   it by returning `false`. Given `send`, what arrives goes straight on. It gives
   `{ status, ok, headers }` once the answer has ended (with the `body` when it is
-  not a success), or an error value when it could not be had. The map also takes
+  not a success), or an error value when it could not be had (also when one event or
+  line goes past 16 MiB without ending). The map also takes
   `redirects` and `public_only` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request and calls `f` with what the answer streams, until it ends; `listen(url,
