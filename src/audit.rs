@@ -5,7 +5,7 @@
 //! audit("contact.delete", { id })                  // who, what, when, from where
 //! audit.query({ actor: "42", action: "contact.*", since: "2026-10-01", limit: 50 })
 //! audit.verify()                                   // { ok, rows, last }, or where it breaks
-//! audit.actor(() => current_user()?.email)         // who "the user" is (default: session().user)
+//! audit.actor(() => current_user().email)         // who "the user" is (default: session().user)
 //! ```
 //!
 //! Each row goes to `_quillo_audit` in the program's database (the

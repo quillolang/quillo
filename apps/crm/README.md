@@ -42,6 +42,7 @@ visitors would see it, following each change as it is typed (`live`) and the blo
 | **Roles and groups** | Roles: what each may do with each object (see, edit, delete), each field (edit, read, hidden), and an access script deciding which records they see. Groups: people who work together, who get the group's roles and are what it is on the team (designers, writers, reviewers, publishers). Only owners, admins and designers change pages, the theme, objects and flows, and start flows; other members see them. |
 | **States** | Objects have states and the moves between them: each move for some groups or roles, with a form of the fields it needs; the state changes by a move and nothing else. Flows start when a record moves, ask a group or a role to decide (approved / rejected), and move records. |
 | **Workspaces** | Signing up on the main site; presets per industry (pipeline, products, forms, flows, plugins); a team with owner, admin and member roles; settings. |
+| **Audit log** | Sign-ins (and failed ones), signing out, the team and its roles and groups, settings and plugins, pages and posts published, flows changed, deletes, refunds and exports, each with who, when and from where; in Settings for admins, with a check that no row was changed since it was written (`lib/audit.qwe`). A change and its row are written together, or neither is. |
 
 Payments run in test mode (`4242 4242 4242 4242` pays, `4000 0000 0000 0002` is
 declined), and mail stays in the outbox until a mail webhook is set in Settings: then
@@ -318,5 +319,8 @@ two modes are the same program: with one workspace, every request belongs to it.
 - Many workspaces: `CRM_DOMAIN=example.com` and a wildcard DNS record (`*.example.com`); one: `CRM_MODE=single`. Either way behind a proxy
   that terminates HTTPS (limer, Caddy, nginx); set `CRM_SCHEME=https`.
 - `QUILLO_SECRET` to a long random string, the same on every server: it signs sessions.
-- `data/` holds every workspace's database: back it up.
+- `data/` holds every workspace's database: back it up (`db.backup` in a scheduled job, for
+  each workspace: see the user guide's Database section).
+- The audit log is in each workspace's database (`_quillo_audit`); `--log json --log-file
+  logs/requests.log` keeps the request log, with the user, a file a day.
 - Set a mail webhook in each workspace's Settings to send mail for real.
