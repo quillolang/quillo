@@ -332,9 +332,6 @@ pub fn url_attr(name: &str) -> bool {
 /// What a `javascript:` URL in one of `URL_ATTRS` becomes.
 pub const BLOCKED_URL: &str = "about:blank#blocked";
 
-/// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
-/// however browsers would read it (they skip leading spaces and control
-/// characters and ignore tabs and line breaks inside).
 /// Whether a value written in a URL attribute would be a `javascript:` URL:
 /// its text is what the attribute says, whatever its type (an `html`
 /// value from `markdown(u, { inline: true })` too).
@@ -346,6 +343,9 @@ fn shows_script_url(v: &Value) -> bool {
     }
 }
 
+/// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
+/// however browsers would read it (they skip leading spaces and control
+/// characters and ignore tabs and line breaks inside).
 pub fn script_url(url: &str) -> bool {
     // Paths and fragments, the usual case, have no scheme.
     if matches!(url.as_bytes().first(), Some(b'/' | b'#' | b'?')) {
@@ -2458,9 +2458,6 @@ impl Interp {
         }
         match text_value {
             Some(t) => out.push_str(&escape(&t)),
-            // A style sheet is raw text to the browser: `.a > b` must stay
-            // as written. Only `</` is changed, so the text cannot end the
-            // element early.
             // A script is code to the browser, where HTML escaping means
             // nothing: a value goes in as JSON (a JS value, `<` escaped), and
             // HTML (`raw(...)`) as it is, but without `</` or `<!--`, so
@@ -2476,6 +2473,9 @@ impl Interp {
                     }
                 }
             }
+            // A style sheet is raw text to the browser: `.a > b` must stay
+            // as written. Only `</` is changed, so the text cannot end the
+            // element early.
             None if f.style => {
                 for c in &el.children {
                     if let HtmlChild::Expr(e) = c {
