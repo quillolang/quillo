@@ -75,6 +75,29 @@ let ui = {
 
 fn ui_row(label: str) = find(ui.rows, (r) => r.label == label)
 
+// The server benchmark (bench/server): requests a second, one process each, as
+// a table with tabs: the runtimes, then a row per answer, "262k" and the like.
+fn per_second(s: str) = ends_with(s, "k") ? float(slice(s, 0, len(s) - 1)) * 1000 : float(s)
+
+let served = {
+    let lines = split(trim(read_file("bench/server.txt")), "\n") | map((l) => split(l, "\t"))
+    let names = drop(first(lines), 1)
+    let rows = drop(lines, 1) | map((r) => {
+        let test = first(r)
+        let open = index_of(test, " (")
+        {
+            title: open != null ? slice(test, 0, open) : test,
+            note: open != null ? slice(test, open + 2, len(test) - 1) : null,
+            raw: drop(r, 1),
+            nums: drop(r, 1) | map(per_second),
+        }
+    })
+    { names, rows }
+}
+
+// A runtime's color follows it, whatever the order: Quillo, then Node, then Bun.
+fn runtime_class(name: str) = `rt-${lower(first(split(name, " ")))}`
+
 let UI_NAMES = { vanilla: "Plain JS", quillo: "Quillo", solid: "Solid", svelte: "Svelte", vue: "Vue", preact: "Preact", react: "React" }
 let UI_OPS = [
     { label: "create1k (ms)", text: "Create 1,000 rows" },
@@ -93,10 +116,10 @@ let UI_OPS = [
 let features = [
     { title: "Checked before it runs", text: "`quillo check` holds the program to its types, records, list and map shapes, effects and error types, and warns about SQL built from values." },
     { title: "Safe by default", text: "Text is escaped, cross-site posts are refused, sessions are signed cookies and `javascript:` URLs are blocked." },
-    { title: "SQLite built in", text: "Or PostgreSQL or MySQL, with the same functions, and several at once. Transactions nest, and migrations run in order, once." },
-    { title: "Streaming", text: "`stream` and `events` send an answer as it is made, from a CSV export to a model's reply word by word." },
+    { title: "SQLite built in", text: "Or PostgreSQL or MySQL, with the same functions, and several at once. Transactions nest, and migrations run in order, once: [the guide](/docs/database/)." },
+    { title: "Real time, over UDP", text: "Packets on a UDP port, messages to pages as WebTransport datagrams, a camera's RTP stream in any page, answers streamed as they are made: [the guide](/docs/realtime/)." },
     { title: "Translations", text: "`t(\"cart.items\", { count })` picks plural forms by the language's rules, on the server and in components." },
-    { title: "Services", text: "Split a part of an app into its own server without changing its code; calls are signed with HMAC." },
+    { title: "Microservices", text: "Split a part of an app into its own server without changing its code. Calls are signed, retried, and run once: [the guide](/docs/microservices/)." },
     { title: "Numbers and data", text: "`math`, `stats` and `vec` give Python's answers, on every core, in the server and the browser." },
     { title: "Desktop apps", text: "`quillo app` runs the same program in a native window, with the platform's own web view." },
 ]
@@ -167,6 +190,31 @@ view UiBench() {
         </div>
     </div>
 }
+
+// One panel per answer, each to its own scale from 0 (compute is a tenth of the rest).
+view ServerBench() =
+    <div.served>
+        <ul.legend>{for n in served.names => <li class={runtime_class(n)}><i></i>{n}</li>}</ul>
+        <div.panels>
+            {for r in served.rows => {
+                let top = max(r.nums)
+                let q = r.nums[0]
+                let others = drop(r.nums, 1)
+                <figure.srv-panel>
+                    <figcaption><b>{upper(r.title[0]) + slice(r.title, 1)}</b>{r.note && <span>{r.note}</span>}</figcaption>
+                    <ol>{for [i, n] in enumerate(served.names) =>
+                        <li class={runtime_class(n)}>
+                            <span.who>{n}</span>
+                            <span.track><span.fill style={`width: ${round(r.nums[i] / top * 100, 1)}%`}></span></span>
+                            <b>{r.raw[i]}</b>
+                        </li>}</ol>
+                    <p.lead>{q >= max(others)
+                        ? `Quillo: ${round(q / max(others), 2)}× the next, ${round(q / min(others), 2)}× the slowest`
+                        : `Quillo: ${round(q / max(others), 2)}× the fastest`}</p>
+                </figure>
+            }}
+        </div>
+    </div>
 
 view Bench(rows: list) {
     let top = math.log10(max(rows | map((r) => r.python / r.quillo)))
@@ -314,7 +362,16 @@ route GET / =
                 </p>
                 <UiBench/>
                 <p.note>
-                    {inline("Medians of several runs in one browser, on one machine. Run it yourself with `node bench/ui/run.js`; the apps are in [bench/ui](" + REPO + "/tree/main/bench/ui).")}
+                    {inline("Medians of several runs, on an Apple M-series laptop (10 cores) in headless Chrome. Run it yourself with `node bench/ui/run.js`; the apps are in [bench/ui](" + REPO + "/tree/main/bench/ui).")}
+                </p>
+
+                <h3.subhead>And serving faster than <em>Node and Bun.</em></h3>
+                <p.sub>
+                    {inline("Requests a second from one process, kept busy by 64 connections from the same machine: plain text, JSON, TechEmpower's Fortunes without a database (sorted, escaped HTML, computed on every request) and a 10,000-step arithmetic loop, which Quillo compiles to machine code.")}
+                </p>
+                <ServerBench/>
+                <p.note>
+                    {inline("Each server keeps about one core busy. Run it yourself with `node bench/server/run.cjs 8`; the servers and the load generator are in [bench/server](" + REPO + "/tree/main/bench/server).")}
                 </p>
             </section>
 
@@ -336,9 +393,14 @@ route GET / =
                 <p.sub>
                     {inline("Then open http://127.0.0.1:8080. `quillo check app.qwe` finds mistakes without running, `quillo repl` tries things out, and the VS Code extension (or `quillo lsp` in any editor) adds diagnostics, hover and completion.")}
                 </p>
+                <aside.why-qwe>
+                    <div.keys aria-hidden="true">{for k in split("QWERTY", "") =>
+                        <kbd class={contains("QWE", k) && "hit"}>{k}</kbd>}</div>
+                    <p>{inline("**Why `.qwe`?** For ergonomics. Q, W and E sit side by side at the start of the keyboard's top row: one roll of the left hand, in every command and file name, with no reaching and no looking down.")}</p>
+                </aside>
                 <div.ctas>
                     <a.btn.primary href={REPO}>Quillo on GitHub</a>
-                    <a.btn href={`${REPO}#language-tour`}>Read the language tour →</a>
+                    <a.btn href="/docs/language-tour/">Read the language tour →</a>
                 </div>
             </section>
 

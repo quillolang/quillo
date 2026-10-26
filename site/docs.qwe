@@ -4,12 +4,19 @@
 // The Examples pages show each program in examples/, whole. Both are read
 // through content/, links to the repository's USERGUIDE.md and examples/.
 
+use "demos/reactivity/counter.qwe"
+use "demos/reactivity/timer.qwe"
+use "demos/reactivity/rows.qwe"
+use "demos/reactivity/branch.qwe"
+use "demos/reactivity/props.qwe"
+
 let GROUPS = [
-    { name: "Guide", pages: ["introduction", "language-tour", "components", "routes"] },
-    { name: "Reference", pages: ["standard-library", "checking", "concurrency-and-reloading", "cached-views"] },
+    { name: "Guide", pages: ["introduction", "language-tour", "components", "reactivity", "async", "routes", "realtime", "prefetching", "validation", "database", "microservices"] },
+    { name: "Reference", pages: ["standard-library", "checking", "concurrency-and-reloading", "cached-views", "compiled-numbers"] },
     { name: "Examples", pages: ["examples", "examples/hello", "examples/orders", "examples/todo",
         "examples/notes", "examples/compose", "examples/layout", "examples/spa", "examples/scroll",
-        "examples/life", "examples/storm", "examples/services", "examples/index"] },
+        "examples/virtual", "examples/life", "examples/storm", "examples/telemetry", "examples/media",
+        "examples/services", "examples/index"] },
     { name: "Project", pages: ["layout", "not-built-yet"] },
 ]
 
@@ -23,8 +30,12 @@ let EXAMPLES = [
     { name: "layout", title: "JSON layout", blurb: "A page described as JSON, rendered by one view, with a live editor beside it." },
     { name: "spa", title: "Single-page app", blurb: "Client-side navigation, deep links, a cart that survives pages and live stock." },
     { name: "scroll", title: "Infinite scroll", blurb: "100,000 rows, loaded 200 at a time, with only the visible ones in the page." },
+    { name: "virtual", title: "Virtual list", blurb: "A million rows of ten columns, twenty on screen: drag the scrollbar anywhere." },
     { name: "life", title: "Game of Life", blurb: "A board in a component's state, stepped by a timer that runs in the browser." },
     { name: "storm", title: "State storm", blurb: "A dashboard under a storm of random changes, tested for leaks." },
+    { name: "telemetry", title: "Telemetry", blurb: "Sensors send readings over UDP; every page sees them as they come, over a channel.",
+      also: ["sensors.qwe"] },
+    { name: "media", title: "Camera", blurb: "A camera's RTP stream, played in the page a fraction of a second behind." },
     { name: "services", title: "Services", blurb: "A shop that bills through a billing service, in one process or split apart.",
       files: ["app.qwe", "shop.qwe", "billing.qwe"] },
     { name: "index", title: "All examples", blurb: "Every example mounted under its own path in one server, behind tabs." },
@@ -37,6 +48,15 @@ fn slug(text: str) =
     split(lower(text), "") | map((c) => contains(ALNUM, c) ? c : c == " " || c == "-" ? "-" : "") | join("")
 
 fn page_url(s: str) = s == "introduction" ? "/docs/" : `/docs/${s}/`
+
+// Pages written for the site rather than cut from the README: guides/<slug>.md,
+// a `# ` title, then headings and code as the README has them.
+let GUIDES = ["reactivity", "async", "realtime", "prefetching", "validation", "database", "microservices"]
+
+fn guide(s: str) {
+    let lines = split(read_file(`guides/${s}.md`), "\n")
+    { slug: s, title: slice(first(lines), 2), blocks: blocks(drop(lines, 1)), guide: true }
+}
 
 // The comment a file starts with, as markdown: lines indented further than a
 // list item's are commands, shown as code.
@@ -57,7 +77,8 @@ fn about(header: list) =
 fn shell(lines: list) = { type: "shell", lines: lines | map((l) => [{ k: "prompt", text: "$ " }, { k: "plain", text: l }]) }
 
 fn example_page(e: map) {
-    let files = e.files ? e.files | map((f) => `${e.name}/${f}`) : [`${e.name}.qwe`]
+    // `files`: a directory's; `also`: files beside the example's own, shown after it.
+    let files = e.files ? e.files | map((f) => `${e.name}/${f}`) : [`${e.name}.qwe`] + (e.also ?? [])
     let main = split(read_file(`content/examples/${first(files)}`), "\n")
     let head = header_lines(main)
     let sources = for [i, f] in enumerate(files) => {
@@ -110,6 +131,8 @@ fn blocks(lines: list) =
                 ? merge(st, { out: push(st.out, merge(st.code, { type: "code" })), code: null })
                 : merge(st, { code: merge(st.code, { lines: push(st.code.lines, line) }) }))
         : starts_with(line, "```") ? merge(flush(st), { code: { lang: trim(slice(line, 3)), lines: [] } })
+        // `{{demo counter}}`: a live demo, its code beside it (see Demo).
+        : starts_with(line, "{{demo ") ? merge(flush(st), { out: push(flush(st).out, { type: "demo", name: trim(slice(line, 7, len(line) - 2)) }) })
         : starts_with(line, "### ") || starts_with(line, "#### ") ? {
             let level = starts_with(line, "#### ") ? 4 : 3
             let text = trim(slice(line, level + 1))
@@ -119,7 +142,16 @@ fn blocks(lines: list) =
 
 fn quillo_like(b: map) = b.lang == "quillo" || (b.lang == "" && any(b.lines, (l) => contains(l, "fn ") || contains(l, "route ")))
 
-let sources = (cut_pages(read_file("content/USERGUIDE.md")) | map((p) => { slug: slug(p.title), title: p.title, blocks: blocks(p.lines) }))
+// Sections written for the site, added at the end of a README page: extras/<slug>.md.
+let EXTRAS = ["introduction"]
+
+fn extra(s: str) = contains(EXTRAS, s) ? blocks(split(read_file(`extras/${s}.md`), "\n")) : []
+
+let sources = (cut_pages(read_file("content/USERGUIDE.md")) | map((p) => {
+        let s = slug(p.title)
+        { slug: s, title: p.title, blocks: blocks(p.lines) + extra(s) }
+    }))
+    + (GUIDES | map(guide))
     + [merge(overview, { slug: "examples" })]
     + (EXAMPLES | map((e) => merge(example_page(e), { slug: `examples/${e.name}` })))
 
@@ -133,15 +165,18 @@ let pages = sources | map((p) => {
         group: find(GROUPS, (g) => contains(g.pages, s)).name,
         blocks: bs,
         toc: bs | filter((b) => b.type == "h") | map((b) => { id: b.id, text: replace(b.text, "`", ""), level: b.level }),
+        guide: p.guide ?? false,
     }
 }) | filter((p) => p.group != null)
 
 // Pages in reading order: the groups', one after another.
 let ordered = flatten(GROUPS | map((g) => g.pages)) | map((s) => find(pages, (p) => p.slug == s))
 
-// Where each anchor lives, for the README's `](#...)` links.
+// Where each anchor lives, for the README's `](#...)` links: a page's name,
+// and the README's headings. A guide's headings are left out: its "Live data"
+// is not the README's.
 let anchors = reduce(pages, {}, (acc, p) =>
-    reduce(p.toc, set(acc, p.slug, p.url), (a, h) => set(a, h.id, `${p.url}#${h.id}`)))
+    reduce(p.guide ? [] : p.toc, set(acc, p.slug, p.url), (a, h) => set(a, h.id, `${p.url}#${h.id}`)))
 
 fn fix_anchors(text: str) {
     let parts = split(text, "](#")
@@ -161,6 +196,21 @@ fn fix_links(text: str) =
         | replace("](apps/", `](${REPO}/tree/main/apps/`)
         | replace("](editors/", `](${REPO}/tree/main/editors/`)
 
+// A demo's code, read from demos/reactivity/<name>.qwe, beside the component
+// itself running: what the page shows is what runs.
+view Demo(name: str) =
+    <div.demo-pair>
+        <div.snippet><div.file>{name}.qwe</div><Code lines={highlight(read_file(`demos/reactivity/${name}.qwe`))}/></div>
+        <div.demo-stage>{match name {
+            "counter" => <CounterDemo/>
+            "timer" => <TimerDemo/>
+            "rows" => <RowsDemo/>
+            "branch" => <BranchDemo/>
+            "props" => <PropsDemo/>
+            _ => <p>No demo {name}</p>
+        }}</div>
+    </div>
+
 view Block(b: map) =
     match b.type {
         "md" => markdown(fix_links(b.text))
@@ -168,6 +218,7 @@ view Block(b: map) =
             ? <h3 id={b.id}><a.anchor href={`#${b.id}`}>{markdown(b.text, { inline: true })}</a></h3>
             : <h4 id={b.id}><a.anchor href={`#${b.id}`}>{markdown(b.text, { inline: true })}</a></h4>
         "shell" => <div.snippet.terminal><Code lines={b.lines}/></div>
+        "demo" => <Demo name={b.name}/>
         "cards" => <div.cards>{for e in EXAMPLES =>
             <a.card href={page_url(`examples/${e.name}`)}><b>{e.title}</b><span>{e.blurb}</span><code>{e.name}{e.files ? "/" : ".qwe"}</code></a>}</div>
         _ => <div.snippet>{b.file && <div.file>{b.file}</div>}<Code lines={quillo_like(b)
@@ -188,7 +239,7 @@ component OnThisPage(items: list) {
     }}>
         <p>On this page</p>
         <ul>{for h in items =>
-            <li key={h.id} class={`${h.level == 4 ? "sub" : ""} ${h.id == active ? "active" : ""}`}>
+            <li key={h.id} class={`${h.level == 4 ? "toc-sub" : ""} ${h.id == active ? "active" : ""}`}>
                 <a href={`#${h.id}`} @click={() => { active = h.id }}>{h.text}</a>
             </li>}</ul>
     </nav>
@@ -220,7 +271,8 @@ view DocsPage(page: map) {
                 {prev ? <a.prev href={prev.url}><small>Previous</small>{prev.title}</a> : <span></span>}
                 {next ? <a.next href={next.url}><small>Next</small>{next.title}</a> : <span></span>}
             </nav>
-            <p.edit><a href={`${REPO}/blob/main/USERGUIDE.md`}>Edit this page on GitHub</a> · made from the user guide</p>
+            {!page.guide && !starts_with(page.slug, "examples") &&
+                <p.edit><a href={`${REPO}/blob/main/USERGUIDE.md`}>Edit this page on GitHub</a> · made from the user guide</p>}
         </article>
         {len(page.toc) > 0 ? <OnThisPage items={page.toc}/> : <div></div>}
     </div>

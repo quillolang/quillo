@@ -1,0 +1,16 @@
+component TimerDemo() {
+    state running = false
+    state speed = 2             // ticks a second
+    state ticks = 0
+    if running {
+        // runs again when `running` or `speed` changes
+        every(1000 / speed, () => { ticks += 1 })
+    }
+    <div.demo-box>
+        <p>Ticks <b>{ticks}</b> at <b>{speed}</b> a second.</p>
+        <button @click={() => { running = !running }}>{running ? "Stop" : "Start"}</button>
+        <button @click={() => { speed = speed == 2 ? 10 : 2 }}>
+            Speed {speed == 2 ? "up" : "down"}
+        </button>
+    </div>
+}

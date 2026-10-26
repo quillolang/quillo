@@ -1,0 +1,18 @@
+component Badge(value: int) {
+    state clicks = 0                        // the child's own
+    <p>
+        Parent says <b>{value}</b>; clicked here <b>{clicks}</b>
+        <button @click={() => { clicks += 1 }}>Click</button>
+    </p>
+}
+
+component PropsDemo() {
+    state n = 1
+    state version = 1
+    <div.demo-box>
+        <Badge value={n}/>
+        <Badge key={version} value={n}/>
+        <button @click={() => { n += 1 }}>Parent: add one</button>
+        <button @click={() => { version += 1 }}>New key for the second</button>
+    </div>
+}

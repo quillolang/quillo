@@ -40,11 +40,14 @@ fn word_kind(t: map, prev, next, declared: bool = false) {
     if starts_with(w, "@") { return "attr" }
     if starts_with(w, "~") || declared { return "state" }
     if after_lt { return is_upper(w[0]) ? "comp" : "tag" }
+    // Right after a tag's `>` (not an arrow's `=>`) is text in markup.
+    if prev != null && prev.k == "p" && ends_with(prev.text, ">") && !ends_with(prev.text, "=>") { return "plain" }
     if contains(KEYWORDS, w) { return "kw" }
-    if contains(TYPES, w) { return "type" }
     if contains("0123456789", w[0]) { return "num" }
     if is_upper(w[0]) { return "comp" }
+    // `map(...)` and `int(...)` are calls, though `map` and `int` are also types.
     if next != null && next.k == "p" && starts_with(next.text, "(") { return "call" }
+    if contains(TYPES, w) { return "type" }
     "plain"
 }
 

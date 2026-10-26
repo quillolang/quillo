@@ -75,7 +75,7 @@
 .toc p { font: 500 11.5px/1 var(--mono); text-transform: uppercase; letter-spacing: .14em; color: var(--faint); margin: 0 0 14px; }
 .toc ul { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--line); }
 .toc a { display: block; padding: 5px 0 5px 14px; margin-left: -1px; border-left: 1px solid transparent; color: var(--muted); text-decoration: none; line-height: 1.4; transition: color .15s, border-color .15s; }
-.toc li.sub a { padding-left: 28px; font-size: 13px; }
+.toc li.toc-sub a { padding-left: 28px; font-size: 13px; }
 .toc a:hover { color: var(--text); }
 .toc li.active a { color: var(--gold); border-left-color: var(--gold); }
 
@@ -101,3 +101,29 @@
   .cards, .pager { grid-template-columns: minmax(0, 1fr); }
   .pager .next { grid-column: 1; }
 }
+
+/* Live demos: the code, and the component running beside it */
+.demo-pair { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; margin: 6px 0 24px; }
+.demo-pair .snippet { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.demo-pair .demo-stage { border-top: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
+.demo-pair .snippet { margin: 0; }
+.demo-stage {
+  border: 1px solid var(--line); border-radius: 12px; padding: 20px; display: grid; align-content: center;
+  background: radial-gradient(80% 70% at 50% 0%, rgba(243, 181, 74, .08), transparent 70%), var(--surface);
+}
+.demo-box { font-size: 15px; }
+.demo-box p { margin: 0 0 12px; }
+.demo-box b { color: var(--gold); font-variant-numeric: tabular-nums; }
+.demo-box .muted { color: var(--faint); font-size: 14px; }
+.demo-box ul { margin: 0 0 14px; padding-left: 18px; }
+.demo-box li { margin: 6px 0; }
+.demo-box button {
+  font: 500 13.5px var(--sans); color: var(--text); background: var(--raised); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 12px; margin: 4px 6px 0 0; cursor: pointer;
+}
+.demo-box button:hover { border-color: var(--gold); }
+.demo-box input {
+  font: 14px var(--sans); color: var(--text); background: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; width: 9.5em; margin-left: 6px;
+}
+.demo-box input:focus { outline: none; border-color: var(--gold); }

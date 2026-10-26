@@ -1,0 +1,15 @@
+component BranchDemo() {
+    state signed_in = false
+    state name = "Ada"
+    <div.demo-box>
+        {signed_in
+            ? <p>Hello, <b>{name}</b>. <input placeholder="type, then sign out"/></p>
+            : <p>Signed out.</p>}
+        <button @click={() => { signed_in = !signed_in }}>
+            {signed_in ? "Sign out" : "Sign in"}
+        </button>
+        <button @click={() => { name = name == "Ada" ? "Grace" : "Ada" }}>
+            Change name
+        </button>
+    </div>
+}

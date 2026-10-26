@@ -40,13 +40,17 @@ for js in $(find "$out" -name index.html -exec grep -oh '/_quillo/b/[0-9a-f]*\.j
 done
 
 # Bundles are named by their content, so browsers may keep them for good.
+# Pages may be kept 30 seconds, as quillo run lets a prefetched page be kept:
+# a browser without speculation rules fetches the page a link points to, and
+# the click is answered from its cache. (LiteSpeed keeps a static file's
+# headers whatever the request, so this cannot be for prefetches alone.)
 cat > "$out/.htaccess" <<'EOF'
 <IfModule mod_headers.c>
   <FilesMatch "\.(js|woff2)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
   </FilesMatch>
   <FilesMatch "\.html$">
-    Header set Cache-Control "no-cache"
+    Header set Cache-Control "private, max-age=30"
   </FilesMatch>
 </IfModule>
 <IfModule mod_deflate.c>

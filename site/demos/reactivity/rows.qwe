@@ -1,0 +1,21 @@
+component RowsDemo() {
+    state items = [
+        { id: 1, text: "Apples" },
+        { id: 2, text: "Bread" },
+        { id: 3, text: "Coffee" },
+    ]
+    let add = () => {
+        let id = len(items) + 1
+        items = items + [{ id, text: `Item ${id}` }]
+    }
+    let shout = (id) => {
+        items = items | map((i) => i.id == id ? merge(i, { text: upper(i.text) }) : i)
+    }
+    <div.demo-box>
+        <ul>{for i in items =>
+            <li key={i.id}>{i.text} <input placeholder="a note"/></li>}</ul>
+        <button @click={() => { items = reverse(items) }}>Reverse</button>
+        <button @click={() => shout(2)}>Change Bread</button>
+        <button @click={add}>Add</button>
+    </div>
+}
