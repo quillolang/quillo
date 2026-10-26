@@ -1603,6 +1603,8 @@ pub(crate) fn flush_log() {
         let _ = std::io::stderr().write_all(l.as_bytes());
         l.clear();
     }
+    drop(l);
+    crate::metrics::flush();
 }
 
 #[cfg(test)]

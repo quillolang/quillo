@@ -1,6 +1,14 @@
 //! What the server counts for `GET /_quillo/metrics` (with `--metrics`), in
-//! Prometheus's text format, and the request log's shape (`--log`). Each
-//! request adds to a few atomic counters; nothing else is kept.
+//! Prometheus's text format, and the request log's shape (`--log`) and
+//! where it goes (`--log-file`, `--log-stdout`). Each request adds to a few
+//! atomic counters; nothing else is kept.
+//!
+//! The request log goes to stderr unless told otherwise. With `--log-file
+//! logs/requests.log` it goes to a file a day (`logs/requests-2026-10-27.log`,
+//! by the UTC date), and with `--log-keep 90` files older than 90 days are
+//! removed as a new day's starts. `--log-stdout` sends it to stdout (as well
+//! as the file, with both). Lines are written in batches, at least once a
+//! second.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::OnceLock;
@@ -14,6 +22,127 @@ pub static LOG: AtomicU8 = AtomicU8::new(TEXT);
 pub const TEXT: u8 = 0;
 pub const JSON: u8 = 1;
 pub const OFF: u8 = 2;
+/// `--log-query`: JSON lines keep the query string (its sensitive values
+/// masked); without it, `path` is the path alone.
+pub static LOG_QUERY: AtomicBool = AtomicBool::new(false);
+/// `--log-stdout`: the request log on stdout.
+pub static LOG_STDOUT: AtomicBool = AtomicBool::new(false);
+
+/// `--log-file`: a file a day, and how many days of them are kept (0: all).
+struct Daily {
+    base: std::path::PathBuf,
+    keep: u32,
+    day: i64,
+    file: Option<std::fs::File>,
+}
+
+static LOG_FILE: std::sync::Mutex<Option<Daily>> = std::sync::Mutex::new(None);
+/// Lines not written yet, for the file and stdout.
+static PENDING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Sends the request log to files named after `base`, one a day, keeping
+/// `keep` days of them (0: all). Checks that the first can be written.
+pub fn log_to_file(base: &std::path::Path, keep: u32) -> Result<(), String> {
+    let mut d = Daily { base: base.to_path_buf(), keep, day: -1, file: None };
+    d.open(today())?;
+    *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+    Ok(())
+}
+
+fn today() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) / 86400
+}
+
+impl Daily {
+    /// The file for `day`: the base name with the date before its extension.
+    fn path_for(&self, day: i64) -> std::path::PathBuf {
+        let (y, m, d) = crate::httpd::civil(day);
+        let stem = self.base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = self.base.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        self.base.with_file_name(format!("{}-{}-{:02}-{:02}{}", stem, y, m, d, ext))
+    }
+
+    fn open(&mut self, day: i64) -> Result<(), String> {
+        let p = self.path_for(day);
+        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        }
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+        self.file = Some(f);
+        self.day = day;
+        self.prune(day);
+        Ok(())
+    }
+
+    /// Removes the days' files older than `keep` days.
+    fn prune(&self, day: i64) {
+        if self.keep == 0 {
+            return;
+        }
+        let Some(dir) = self.base.parent().map(|d| if d.as_os_str().is_empty() { std::path::Path::new(".") } else { d }) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        // Names sort by their dates: the oldest kept is today's less
+        // `keep - 1` days.
+        let oldest = self.path_for(day - self.keep as i64 + 1).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = self.base.file_stem().map(|s| format!("{}-", s.to_string_lossy())).unwrap_or_default();
+        let ext = self.base.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(date) = name.strip_prefix(&stem).and_then(|r| r.strip_suffix(&ext)) else { continue };
+            let dated = date.len() == 10 && date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+            if dated && name < oldest {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Adds a line to the request log: to stderr (in batches), or to the file
+/// and stdout when the log goes there.
+pub fn log_line(line: std::fmt::Arguments) {
+    let to_file = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if !to_file && !LOG_STDOUT.load(Relaxed) {
+        crate::httpd::log_fmt(line);
+        return;
+    }
+    use std::fmt::Write as _;
+    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = p.write_fmt(line);
+    if p.len() > 32 << 10 {
+        let text = std::mem::take(&mut *p);
+        drop(p);
+        write_out(&text);
+    }
+}
+
+/// Writes out what `log_line` kept (called with the stderr log's batches).
+pub fn flush() {
+    let text = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+    if !text.is_empty() {
+        write_out(&text);
+    }
+}
+
+fn write_out(text: &str) {
+    use std::io::Write;
+    if LOG_STDOUT.load(Relaxed) {
+        let _ = std::io::stdout().lock().write_all(text.as_bytes());
+    }
+    let mut g = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(d) = g.as_mut() {
+        let day = today();
+        if day != d.day {
+            if let Err(e) = d.open(day) {
+                eprintln!("quillo: the request log: {}", e);
+            }
+        }
+        if let Some(f) = d.file.as_mut() {
+            if let Err(e) = f.write_all(text.as_bytes()) {
+                eprintln!("quillo: the request log: {}", e);
+            }
+        }
+    }
+}
 
 /// Answers by status class: 1xx to 5xx.
 static ANSWERED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];

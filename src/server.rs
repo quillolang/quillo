@@ -1369,24 +1369,40 @@ impl Worker {
             crate::metrics::answered(resp.status, took);
         }
         if req.url != "/.well-known/appspecific/com.chrome.devtools.json" && !delivery {
+            // Query strings' sensitive values are masked (see `redact`).
             match crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::metrics::TEXT => {
-                    crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms)\n", req.method, req.url, resp.status, took * 1000.0))
-                }
+                crate::metrics::TEXT => crate::metrics::log_line(format_args!(
+                    "{} {} -> {} ({:.1}ms)\n",
+                    req.method,
+                    crate::redact::url(&req.url),
+                    resp.status,
+                    took * 1000.0
+                )),
                 crate::metrics::JSON => {
                     let tenant = match self.local.as_ref().and_then(|it| it.tenant.clone().flatten()) {
                         Some(t) => format!(",\"tenant\":{}", serde_json::Value::from(&*t)),
                         None => String::new(),
                     };
-                    crate::httpd::log_fmt(format_args!(
-                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{},\"rid\":{}}}\n",
+                    // Who: the session's `user`, when the request read or set it.
+                    let user = match self.local.as_ref().and_then(crate::audit::known_user) {
+                        Some(u) => format!(",\"user\":{}", serde_json::Value::from(u)),
+                        None => String::new(),
+                    };
+                    let path = if crate::metrics::LOG_QUERY.load(std::sync::atomic::Ordering::Relaxed) {
+                        crate::redact::url(&req.url)
+                    } else {
+                        std::borrow::Cow::Borrowed(req.url.split('?').next().unwrap_or(""))
+                    };
+                    crate::metrics::log_line(format_args!(
+                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{}{},\"rid\":{}}}\n",
                         crate::httpd::iso_now(),
                         serde_json::Value::from(req.method.as_str()),
-                        serde_json::Value::from(req.url.as_str()),
+                        serde_json::Value::from(&*path),
                         resp.status,
                         took * 1000.0,
                         serde_json::Value::from(req.remote.as_str()),
                         tenant,
+                        user,
                         serde_json::Value::from(&*rid)
                     ))
                 }
