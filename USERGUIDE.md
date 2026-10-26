@@ -1264,8 +1264,8 @@ service /billing = "billing.qwe"
   name, all signed with one secret (32 random bytes from the system, unless
   `QUILLO_SERVICE_SECRET` is set); they stop with it.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
-  function arrives as `null`), so a program behaves the same whichever way it runs.
-  Optional arguments left out are not sent, so the service's own defaults apply. A
+  function arrives as `null`; a decimal stays a decimal, its scale and all), so a
+  program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
   call that cannot be made (the service not answering) is an error value: `?` passes
   it on, `??` replaces it.
 - `quillo check` checks each call against the service's `server fn`s (their names,

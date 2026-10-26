@@ -347,6 +347,53 @@ fn services_may_use_one_another() {
     assert_eq!(text(&get(&mut it, "/")), "ping pong from b, which knows a");
 }
 
+const PRICES: &str = r#"
+server fn total(price: dec, qty: int) -> dec = price * qty
+"#;
+
+const TILL: &str = r#"
+service prices = "prices.qwe"
+
+route GET /total {
+    let t = prices.total(12.50m, 3)
+    `${type_of(t)} ${t}`
+}
+route GET /sum {
+    let t = prices.total(0.10m, 3) + prices.total(0.20m, 1)
+    `${type_of(t)} ${t}`
+}
+"#;
+
+#[test]
+fn a_decimal_crosses_to_a_service_and_back_exactly() {
+    let d = dir("dec");
+    std::fs::write(d.join("prices.qwe"), PRICES).unwrap();
+    std::fs::write(d.join("till.qwe"), TILL).unwrap();
+    // In one process: a decimal, scale and all, both ways (not a float, not text).
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("till.qwe")).unwrap();
+    assert_eq!(text(&get(&mut it, "/total")), "dec 37.50");
+    assert_eq!(text(&get(&mut it, "/sum")), "dec 0.50");
+    // Over HTTP: tagged as for a page's server fns; text and ints for a `dec` parameter too.
+    // The same secret as the other tests: the variable is the whole process's.
+    let secret = "a-test-secret-for-services";
+    std::env::set_var("QUILLO_SERVICE_SECRET", secret);
+    let port = free_port();
+    let _prices = start(&d.join("prices.qwe"), port, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let mut it = Interp::new(&d);
+    it.shared.service_urls.lock().unwrap().insert("prices".into(), format!("http://127.0.0.1:{}", port));
+    it.load_file(&d.join("till.qwe")).unwrap();
+    assert_eq!(text(&get(&mut it, "/total")), "dec 37.50");
+    assert_eq!(text(&get(&mut it, "/sum")), "dec 0.50");
+    let now = now_secs();
+    for (i, (body, want)) in [(r#"[{"$dec": "0.10"}, 3]"#, r#"{"ok":{"$dec":"0.30"}}"#), (r#"["0.10", 3]"#, r#"{"ok":{"$dec":"0.30"}}"#), (r#"[2, 3]"#, r#"{"ok":{"$dec":"6"}}"#)].into_iter().enumerate() {
+        let (status, got) = http(port, "POST", "/_quillo/service/total", &signed(secret, now, "prices", "total", &format!("dec{}", i), body), body);
+        assert_eq!((status, got.as_str()), (200, want), "{}", body);
+    }
+    let body = r#"["ten", 3]"#;
+    assert_eq!(http(port, "POST", "/_quillo/service/total", &signed(secret, now, "prices", "total", "dec9", body), body).0, 400);
+}
+
 // ---- holding up: replicas, retries, request ids, calls made later ----------------------------
 
 /// A raw GET, with its headers: (status, headers in lower case, body).

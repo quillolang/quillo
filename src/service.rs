@@ -408,12 +408,20 @@ pub fn request_id(given: Option<&str>) -> Arc<str> {
 }
 
 /// A copy of a value, as the other side of a network would have it (an
-/// error stays one, as the answer of a call says so).
+/// error stays one, as the answer of a call says so; a decimal stays one).
 fn crossed(v: &Value) -> Value {
-    match v {
-        Value::Err(e) => Value::err(crossed(e)),
-        v => Value::from_json(&v.to_json()),
-    }
+    from_wire(&to_wire(v))
+}
+
+/// JSON for what a service call takes and gives: as for a page's server
+/// fns (`island_json`), so a decimal crosses as `{"$dec": "12.50"}`, scale
+/// and all, and comes out a decimal, not text, and an error stays one.
+fn to_wire(v: &Value) -> serde_json::Value {
+    crate::interp::island_json(v)
+}
+
+fn from_wire(j: &serde_json::Value) -> Value {
+    crate::interp::from_island_json(j)
 }
 
 fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, line: u32) -> Outcome {
@@ -492,7 +500,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         return Outcome::Missed(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, urls.join(",")));
     };
     let o = opts(name);
-    let body = serde_json::Value::Array(args.iter().map(|a| a.to_json()).collect()).to_string().into_bytes();
+    let body = serde_json::Value::Array(args.iter().map(to_wire).collect()).to_string().into_bytes();
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
     let rid = rid.map(|r| r.to_string()).unwrap_or_default();
     let caller = if it.base.is_empty() { "/".to_string() } else { it.base.clone() };
@@ -558,8 +566,8 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
                 return Outcome::Ran(match status {
                     200 => match serde_json::from_str::<serde_json::Value>(&text) {
-                        Ok(j) if j.get("ok").is_some() => Value::from_json(&j["ok"]),
-                        Ok(j) if j.get("err").is_some() => Value::err(Value::from_json(&j["err"])),
+                        Ok(j) if j.get("ok").is_some() => from_wire(&j["ok"]),
+                        Ok(j) if j.get("err").is_some() => Value::err(from_wire(&j["err"])),
                         _ => Value::err(Value::str(format!("service {}: an answer that is not one", name))),
                     },
                     _ => Value::err(Value::str(format!("service {}: {} {}", name, status, reason(&text)))),
@@ -693,7 +701,7 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
         return refused(404, &format!("no server fn `{}`", f));
     };
     let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
-        Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
+        Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
     let args = match crate::server::take_args(it, &c.def, args) {
@@ -712,8 +720,8 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     match it.call_closure(&c, args.into_iter().map(Some).collect(), 0) {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
-            Value::Err(e) => json(200, serde_json::json!({ "err": e.to_json() })),
-            v => json(200, serde_json::json!({ "ok": v.to_json() })),
+            Value::Err(e) => json(200, serde_json::json!({ "err": to_wire(&e) })),
+            v => json(200, serde_json::json!({ "ok": to_wire(&v) })),
         },
         Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
         Err(Ctrl::Error(e)) => {
@@ -862,7 +870,7 @@ pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         id: new_id(24),
         service,
         f,
-        args: serde_json::Value::Array(sent.iter().map(|a| a.to_json()).collect()).to_string(),
+        args: serde_json::Value::Array(sent.iter().map(to_wire).collect()).to_string(),
         tenant: it.tenant().map(|t| t.to_string()).unwrap_or_default(),
         rid: it.request_id.as_deref().unwrap_or("").to_string(),
         at: now_ms(),
@@ -934,7 +942,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
 /// One call made later: Ok when it got through (whatever the function gave).
 fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
     let args = match serde_json::from_str::<serde_json::Value>(&c.args) {
-        Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect(),
+        Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect(),
         _ => Vec::new(),
     };
     let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
