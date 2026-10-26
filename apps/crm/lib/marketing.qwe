@@ -57,7 +57,7 @@ fn deliver_mail() {
 }
 
 fn post_mail(hook: str, m: map) {
-    let r = http.post(hook, { to: m.to_email, subject: m.subject, html: m.body })
+    let r = post_hook(hook, { to: m.to_email, subject: m.subject, html: m.body })
     !is_err(r) && r.ok
 }
 

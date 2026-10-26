@@ -236,8 +236,17 @@ fn step_deal(config, run) {
 
 fn step_webhook(config, run) {
     let c = contact_out(run_contact(run))
-    let r = http.post(config.url ?? "", { event: "flow.step", flow_run: run.id, context: run.context, contact: c })
+    let r = post_hook(trim(str(config.url ?? "")), { event: "flow.step", flow_run: run.id, context: run.context, contact: c })
     is_err(r) ? { port: "out", log: `webhook failed: ${r.error}` } : { port: "out", log: `webhook answered ${r.status}` }
+}
+
+// A post to an address someone in the workspace typed, checked each time it
+// is sent: https only, to an address on the public internet (not this
+// server, the network it is on, or a cloud's metadata service), and no
+// redirects, which could lead there.
+fn post_hook(url: str, body) {
+    if !starts_with(url, "https://") { return err("the address must start with https://") }
+    http.post(url, body, {}, { redirects: 0, public_only: true })
 }
 
 // ---- steps people take: a group's or a role's decision -------------------------------
@@ -337,7 +346,7 @@ server fn get_flow(id: int) {
 // Saving checks the graph with the same rules the designer hints from. An
 // active flow must be free of errors; a draft may be saved as it is.
 server fn save_flow(f: map) {
-    need_user()?
+    need_designer()?
     if blank(f.name) { return err({ problems: problem("name", "Name the flow") }) }
     let ctx = rule_ctx()
     if f.active == true { refused("flow", f.graph, ctx)? }
@@ -360,7 +369,7 @@ server fn delete_flow(id: int) {
 
 // Starts a flow for one contact, whatever its trigger (trying a flow out).
 server fn start_flow(id: int, contact_id: int) {
-    need_user()?
+    need_designer()?
     let f = (flow_out(db.one("select * from flows where id = ?", id)) ?? err("No such flow"))?
     let trigger = (find(f.graph.nodes ?? [], (n) => n.type == "trigger") ?? err("The flow has no trigger"))?
     let run = (start_run(f, trigger, { contact_id }) ?? err("This contact is in this flow already"))?
@@ -369,7 +378,7 @@ server fn start_flow(id: int, contact_id: int) {
 }
 
 server fn new_flow(template: str) {
-    need_user()?
+    need_designer()?
     let t = with_product(flow_template(template))
     let r = db.exec("insert into flows (name, graph, active, created_at, updated_at) values (?, ?, 0, ?, ?)", t.name, json.stringify(t.graph), now(), now())
     r.last_id
