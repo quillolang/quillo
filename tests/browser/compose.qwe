@@ -5,7 +5,7 @@ view Card(title: str, children) =
     <section.card><h2>{title}</h2>{children}</section>
 
 component Counter(label: str, start: int = 0, on_change = null) {
-    ~n = start
+    state n = start
     <p.counter>
         <span.label>{label}</span>: <span.n>{n}</span>
         <button @click={() => {
@@ -16,7 +16,7 @@ component Counter(label: str, start: int = 0, on_change = null) {
 }
 
 component Panel(header, children) {
-    ~open = true
+    state open = true
     <div.panel>
         <div.header @click={() => { open = !open }}>{header}</div>
         {open && <div.body>{children}</div>}
@@ -24,8 +24,8 @@ component Panel(header, children) {
 }
 
 component Dashboard() {
-    ~total = 0
-    ~log = []
+    state total = 0
+    state log = []
     <Card title="Counters">
         <Counter label="Apples" on_change={(v) => {
             total = v

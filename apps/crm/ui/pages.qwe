@@ -23,7 +23,7 @@ view Timeline(items: list, show_contact: bool = false) =
 // ---- the dashboard -------------------------------------------------------------------------
 
 component Dashboard(ws: map) {
-    ~d = live(load_dashboard)
+    state d = live(load_dashboard)
     if d == null { return <Loading/> }
     if is_err(d) { return <Empty title="Could not load the dashboard"/> }
     let cur = ws.currency
@@ -63,12 +63,12 @@ component Dashboard(ws: map) {
 // ---- contacts ---------------------------------------------------------------------------------
 
 component ContactsPage(ws: map, query: map) {
-    ~q = ""
-    ~stage = ""
-    ~tag = ""
-    ~adding = false
-    ~importing = false
-    ~tags = all_tags() ?? []
+    state q = ""
+    state stage = ""
+    state tag = ""
+    state adding = false
+    state importing = false
+    state tags = all_tags() ?? []
     <div>
         <PageHead title="Contacts" sub="Everyone you sell to, write for, or work with.">
             <a.button href="/app/export/contacts.csv" data-reload>Export CSV</a>
@@ -101,7 +101,7 @@ component ContactsPage(ws: map, query: map) {
 }
 
 component ContactTable(query: map) {
-    ~rows = live(list_contacts, query)
+    state rows = live(list_contacts, query)
     if rows == null { return <Loading/> }
     if is_err(rows) { return <Empty title="Could not load contacts"/> }
     len(rows) == 0
@@ -122,12 +122,12 @@ component ContactTable(query: map) {
 // Editing a contact: the rules of core and of the plugins switched on, and
 // the workspace's own fields, hint as you type; the server checks again.
 component ContactForm(contact: map, ws: map, on_saved) {
-    ~c = contact
-    ~tag_text = join(contact.tags ?? [], ", ")
-    ~touched = contact.id != null
-    ~server = []
-    ~busy = false
-    ~companies = list_companies("") ?? []
+    state c = contact
+    state tag_text = join(contact.tags ?? [], ", ")
+    state touched = contact.id != null
+    state server = []
+    state busy = false
+    state companies = list_companies("") ?? []
     let ctx = ctx_of(ws)
     let problems = touched ? validate("contact", c, ctx) + server : server
     let on_field = (path, v) => {
@@ -169,16 +169,16 @@ component ContactForm(contact: map, ws: map, on_saved) {
 }
 
 component ContactPage(id: int, ws: map) {
-    ~c = live(get_contact, id)
-    ~tab = "timeline"
-    ~editing = false
-    ~note = ""
-    ~task = { title: "", due: "" }
-    ~task_problems = []
-    ~flows = list_flows() ?? []
-    ~flow_pick = ""
-    ~message = ""
-    ~linked = records_of_contact(id)
+    state c = live(get_contact, id)
+    state tab = "timeline"
+    state editing = false
+    state note = ""
+    state task = { title: "", due: "" }
+    state task_problems = []
+    state flows = list_flows() ?? []
+    state flow_pick = ""
+    state message = ""
+    state linked = records_of_contact(id)
     if c == null { return <Loading/> }
     if is_err(c) { return <Empty title="No such contact"><p><a href="/app/contacts">All contacts</a></p></Empty> }
     let cur = ws.currency
@@ -274,9 +274,9 @@ component ContactPage(id: int, ws: map) {
 // ---- companies ------------------------------------------------------------------------------
 
 component CompaniesPage(ws: map) {
-    ~q = ""
-    ~rows = list_companies("")
-    ~adding = false
+    state q = ""
+    state rows = list_companies("")
+    state adding = false
     let cur = ws.currency
     <div>
         <PageHead title="Companies"><button.primary @click={() => { adding = true }}>New company</button></PageHead>
@@ -303,9 +303,9 @@ component CompaniesPage(ws: map) {
 }
 
 component CompanyForm(company: map, ws: map, on_saved) {
-    ~co = company
-    ~touched = company.id != null
-    ~server = []
+    state co = company
+    state touched = company.id != null
+    state server = []
     let ctx = ctx_of(ws)
     let problems = touched ? validate("company", co, ctx) + server : server
     let on_field = (path, v) => { co = put(co, path, v); touched = true; server = [] }
@@ -327,9 +327,9 @@ component CompanyForm(company: map, ws: map, on_saved) {
 }
 
 component CompanyPage(id: int, ws: map) {
-    ~co = live(get_company, id)
-    ~editing = false
-    ~linked = records_of_company(id)
+    state co = live(get_company, id)
+    state editing = false
+    state linked = records_of_company(id)
     if co == null { return <Loading/> }
     if is_err(co) { return <Empty title="No such company"/> }
     <div>
@@ -350,7 +350,7 @@ component CompanyPage(id: int, ws: map) {
 // ---- deals ---------------------------------------------------------------------------------------
 
 component DealsPage(ws: map) {
-    ~pipeline = (ws.pipelines[0] ?? {}).id ?? 0
+    state pipeline = (ws.pipelines[0] ?? {}).id ?? 0
     <div>
         <PageHead title="Deals" sub="Drag a card to move it along.">
             <select aria-label="Pipeline" @change={(e) => { pipeline = int(e.value) ?? pipeline }}>
@@ -362,11 +362,11 @@ component DealsPage(ws: map) {
 }
 
 component DealBoard(pipeline: int, ws: map) {
-    ~board = live(load_board, pipeline)
-    ~dragging = null
-    ~over = null
-    ~editing = null
-    ~problems = []
+    state board = live(load_board, pipeline)
+    state dragging = null
+    state over = null
+    state editing = null
+    state problems = []
     if board == null { return <Loading/> }
     if is_err(board) { return <Empty title="Could not load the board"/> }
     let cur = ws.currency
@@ -404,11 +404,11 @@ component DealBoard(pipeline: int, ws: map) {
 }
 
 component DealForm(deal: map, ws: map, stages: list, on_saved) {
-    ~d = deal
-    ~value_text = str((deal.value_cents ?? 0) / 100)
-    ~touched = deal.id != null
-    ~server = []
-    ~people = list_contacts({ q: "", stage: "", tag: "" }) ?? []
+    state d = deal
+    state value_text = str((deal.value_cents ?? 0) / 100)
+    state touched = deal.id != null
+    state server = []
+    state people = list_contacts({ q: "", stage: "", tag: "" }) ?? []
     let stage = find(stages, (s) => s.id == d.stage_id) ?? {}
     let ctx = ctx_of(ws, { stage_kind: stage.kind ?? "open" })
     let record = set(d, "value_cents", parse_money(value_text))
@@ -443,9 +443,9 @@ component DealForm(deal: map, ws: map, stages: list, on_saved) {
 // ---- tasks -------------------------------------------------------------------------------------
 
 component TasksPage(ws: map) {
-    ~show_done = false
-    ~t = { title: "", due: "" }
-    ~problems = []
+    state show_done = false
+    state t = { title: "", due: "" }
+    state problems = []
     <div.stack>
         <RecordQueue/>
         <FlowDecisions/>
@@ -469,7 +469,7 @@ component TasksPage(ws: map) {
 }
 
 component TaskList(show_done: bool, today: str) {
-    ~rows = live(list_tasks, show_done)
+    state rows = live(list_tasks, show_done)
     if rows == null { return <Loading/> }
     if is_err(rows) { return <Empty title="Could not load tasks"/> }
     len(rows) == 0 ? <Empty title="Nothing to do"><p>Flows and people add tasks here.</p></Empty>
@@ -484,7 +484,7 @@ component TaskList(show_done: bool, today: str) {
 // ---- products and orders ------------------------------------------------------------------------
 
 component ProductsPage(ws: map) {
-    ~tab = "products"
+    state tab = "products"
     <div>
         <PageHead title="Products" sub="What your shop sells, at /shop.">
             <a.button href="/shop" target="_blank">Open the shop</a>
@@ -500,8 +500,8 @@ component ProductsPage(ws: map) {
 }
 
 component ProductList(ws: map) {
-    ~rows = live(list_products)
-    ~editing = null
+    state rows = live(list_products)
+    state editing = null
     let cur = ws.currency
     <div.stack>
         {ws.user.role != "member" && <div><button.primary @click={() => { editing = { name: "", sku: "", price_cents: 0, kind: "one_time", interval: "", description: "", stock: null, active: true, images: [], category: "", compare_at_cents: null, featured: false, digital: false } }}>New product</button></div>}
@@ -526,12 +526,12 @@ component ProductList(ws: map) {
 }
 
 component ProductForm(product: map, ws: map, on_saved) {
-    ~p = product
-    ~price_text = str((product.price_cents ?? 0) / 100)
-    ~compare_text = product.compare_at_cents == null ? "" : str(product.compare_at_cents / 100)
-    ~stock_text = product.stock == null ? "" : str(product.stock)
-    ~touched = product.id != null
-    ~server = []
+    state p = product
+    state price_text = str((product.price_cents ?? 0) / 100)
+    state compare_text = product.compare_at_cents == null ? "" : str(product.compare_at_cents / 100)
+    state stock_text = product.stock == null ? "" : str(product.stock)
+    state touched = product.id != null
+    state server = []
     let ctx = ctx_of(ws)
     let record = set(p, "price_cents", parse_money(price_text))
         | set("stock", stock_text == "" ? null : int(stock_text) ?? -1)
@@ -593,8 +593,8 @@ component ProductForm(product: map, ws: map, on_saved) {
 }
 
 component DiscountsPanel(ws: map) {
-    ~rows = live(list_discounts)
-    ~editing = null
+    state rows = live(list_discounts)
+    state editing = null
     let cur = ws.currency
     <div.stack>
         {ws.user.role != "member" && <div><button.primary @click={() => { editing = { code: "", kind: "percent", value: 10, min_cents: 0, max_uses: null, active: true } }}>New code</button></div>}
@@ -617,11 +617,11 @@ component DiscountsPanel(ws: map) {
 }
 
 component DiscountForm(discount: map, ws: map, on_saved) {
-    ~d = discount
-    ~value_text = discount.kind == "amount" ? str(discount.value / 100) : str(discount.value)
-    ~min_text = str((discount.min_cents ?? 0) / 100)
-    ~max_text = discount.max_uses == null ? "" : str(discount.max_uses)
-    ~server = []
+    state d = discount
+    state value_text = discount.kind == "amount" ? str(discount.value / 100) : str(discount.value)
+    state min_text = str((discount.min_cents ?? 0) / 100)
+    state max_text = discount.max_uses == null ? "" : str(discount.max_uses)
+    state server = []
     let record = merge(d, {
         code: upper(d.code ?? ""),
         value: d.kind == "amount" ? parse_money(value_text) : int(value_text) ?? 0,
@@ -653,10 +653,10 @@ component DiscountForm(discount: map, ws: map, on_saved) {
 }
 
 component ShippingPanel(ws: map) {
-    ~rate = str((int(ws.settings.shipping_cents) ?? 0) / 100)
-    ~free = str((int(ws.settings.free_shipping_over_cents) ?? 0) / 100)
-    ~saved = false
-    ~server = []
+    state rate = str((int(ws.settings.shipping_cents) ?? 0) / 100)
+    state free = str((int(ws.settings.free_shipping_over_cents) ?? 0) / 100)
+    state saved = false
+    state server = []
     <section.card.narrow.stack>
         <p.muted>One rate for every order with something to ship; digital products and subscriptions ship free.</p>
         <TextField label={`Shipping (${ws.currency}; 0: free)`} field="shipping" value={rate} problems={server} on_change={(v) => { rate = v; saved = false }}/>
@@ -673,7 +673,7 @@ component ShippingPanel(ws: map) {
 }
 
 component OrdersPage(ws: map) {
-    ~status = ""
+    state status = ""
     <div>
         <PageHead title="Orders">
             <select aria-label="Status" @change={(e) => { status = e.value }}>
@@ -685,7 +685,7 @@ component OrdersPage(ws: map) {
 }
 
 component OrderTable(status: str, ws: map) {
-    ~rows = live(list_orders, status)
+    state rows = live(list_orders, status)
     if rows == null { return <Loading/> }
     if is_err(rows) || len(rows) == 0 { return <Empty title="No orders yet"><p>Share your shop: <a href="/shop" target="_blank">/shop</a></p></Empty> }
     let cur = ws.currency
@@ -708,8 +708,8 @@ component OrderTable(status: str, ws: map) {
 // ---- forms, campaigns, outbox -------------------------------------------------------------------
 
 component FormsPage(ws: map) {
-    ~rows = live(list_forms)
-    ~editing = null
+    state rows = live(list_forms)
+    state editing = null
     <div>
         <PageHead title="Forms" sub="Sign-up forms for your site, newsletter and landing pages.">
             {ws.user.role != "member" && <button.primary @click={() => { editing = { name: "", slug: "", headline: "", fields: ["email"], tags: [] } }}>New form</button>}
@@ -730,9 +730,9 @@ component FormsPage(ws: map) {
 }
 
 component FormEditor(form: map, on_saved) {
-    ~f = form
-    ~tag_text = join(form.tags ?? [], ", ")
-    ~problems = []
+    state f = form
+    state tag_text = join(form.tags ?? [], ", ")
+    state problems = []
     let toggle = (field) => { f = set(f, "fields", contains(f.fields, field) ? f.fields | filter((x) => x != field) : f.fields + [field]) }
     <form.stack @submit={() => {
         let r = save_form(set(f, "tags", tag_list(tag_text)))
@@ -753,8 +753,8 @@ component FormEditor(form: map, on_saved) {
 }
 
 component CampaignsPage(ws: map) {
-    ~rows = live(list_campaigns)
-    ~editing = null
+    state rows = live(list_campaigns)
+    state editing = null
     <div>
         <PageHead title="Campaigns" sub="Newsletters and announcements to your subscribers.">
             <button.primary @click={() => { editing = { name: "", subject: "", body: "Hi {{first_name}},\n\n", audience: { tag: "" } } }}>New campaign</button>
@@ -777,12 +777,12 @@ component CampaignsPage(ws: map) {
 }
 
 component CampaignEditor(campaign: map, ws: map, on_done) {
-    ~c = campaign
-    ~server = []
-    ~preview = null
-    ~size = audience_size(campaign.audience)
-    ~tags = all_tags() ?? []
-    ~sending = false
+    state c = campaign
+    state server = []
+    state preview = null
+    state size = audience_size(campaign.audience)
+    state tags = all_tags() ?? []
+    state sending = false
     let sent = c.status == "sent"
     let ctx = ctx_of(ws)
     let problems = validate("campaign", c, ctx) + server
@@ -827,8 +827,8 @@ component CampaignEditor(campaign: map, ws: map, on_done) {
 }
 
 component OutboxPage(ws: map) {
-    ~rows = live(list_outbox)
-    ~open = null
+    state rows = live(list_outbox)
+    state open = null
     <div>
         <PageHead title="Outbox" sub={ws.mail_live ? "Mail goes out through your mail webhook." : "Test mode: mail is kept here, not sent. Add a mail webhook in Settings."}/>
         {rows == null ? <Loading/>
@@ -850,8 +850,8 @@ component OutboxPage(ws: map) {
 // ---- plugins and settings ----------------------------------------------------------------------
 
 component PluginsPage(ws: map, on_change) {
-    ~enabled = ws.enabled
-    ~saving = false
+    state enabled = ws.enabled
+    state saving = false
     let admin = ws.user.role != "member"
     <div>
         <PageHead title="Plugins" sub="Each brings fields, rules that check your data, and flow steps. Switch on what fits."/>
@@ -900,7 +900,7 @@ component PluginsPage(ws: map, on_change) {
 }
 
 component SettingsPage(ws: map, on_change) {
-    ~tab = "workspace"
+    state tab = "workspace"
     let tabs = [["workspace", "Workspace"], ["profile", "Your profile"], ["fields", "Custom fields"], ["pipelines", "Pipelines"], ["team", "Team"], ["groups", "Groups"], ["roles", "Roles"], ["desks", "Desks"]]
     <div>
         <PageHead title="Settings"/>
@@ -920,10 +920,10 @@ component SettingsPage(ws: map, on_change) {
 
 // Your name and a line about you: the blog shows them with your posts.
 component ProfileSettings(ws: map, on_change) {
-    ~name = ws.user.name
-    ~bio = ws.user.bio ?? ""
-    ~problems = []
-    ~saved = false
+    state name = ws.user.name
+    state bio = ws.user.bio ?? ""
+    state problems = []
+    state saved = false
     <form.card.stack.narrow @submit={() => {
         let r = save_profile(name, bio)
         if is_err(r) { problems = refusal_problems(r) } else { saved = true; on_change() }
@@ -936,10 +936,10 @@ component ProfileSettings(ws: map, on_change) {
 }
 
 component WorkspaceSettings(ws: map, on_change) {
-    ~s = merge(ws.settings, { mail_webhook: "" })
-    ~hook = mail_webhook_of() ?? ""
-    ~problems = []
-    ~saved = false
+    state s = merge(ws.settings, { mail_webhook: "" })
+    state hook = mail_webhook_of() ?? ""
+    state problems = []
+    state saved = false
     let change = (k) => (v) => { s = set(s, k, v); saved = false; problems = [] }
     <form.card.stack.narrow @submit={() => {
         let r = save_settings(set(s, "mail_webhook", hook))
@@ -959,9 +959,9 @@ component WorkspaceSettings(ws: map, on_change) {
 }
 
 component FieldSettings(ws: map, on_change) {
-    ~f = { entity: "contact", label: "", type: "text", required: false, options: [] }
-    ~options_text = ""
-    ~problems = []
+    state f = { entity: "contact", label: "", type: "text", required: false, options: [] }
+    state options_text = ""
+    state problems = []
     // Contacts', companies' and deals' own fields; objects' are in their designer.
     let mine = ws.fields | filter((x) => contains(["contact", "company", "deal"], x.entity))
     <div.grid2>
@@ -996,9 +996,9 @@ component FieldSettings(ws: map, on_change) {
 }
 
 component PipelineSettings(ws: map, on_change) {
-    ~name = ""
-    ~stage = { pipeline_id: (ws.pipelines[0] ?? {}).id, name: "", probability: 50, kind: "open" }
-    ~problems = []
+    state name = ""
+    state stage = { pipeline_id: (ws.pipelines[0] ?? {}).id, name: "", probability: 50, kind: "open" }
+    state problems = []
     <div.stack>
         {for p in ws.pipelines => <section.card key={p.id}>
             <h2>{p.name}</h2>
@@ -1026,9 +1026,9 @@ component PipelineSettings(ws: map, on_change) {
 }
 
 component TeamSettings(ws: map, on_change) {
-    ~u = { name: "", email: "", password: "", role: "member" }
-    ~problems = []
-    ~added = false
+    state u = { name: "", email: "", password: "", role: "member" }
+    state problems = []
+    state added = false
     <div.grid2>
         <section.card>
             <h2>Team</h2>

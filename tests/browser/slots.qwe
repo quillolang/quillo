@@ -20,7 +20,7 @@ view Card(title: str, footer = null, children) =
 view Badge(n: int) = <span.badge class={n > 2 && "hot"}>{n}</span>
 
 component Tally(label: str) {
-    ~n = 0
+    state n = 0
     <span.tally><b>{label}</b> <i>{n}</i> <button.inc @click={() => { n += 1 }}>+</button></span>
 }
 
@@ -40,12 +40,12 @@ fn added(groups: list) =
     groups | map((g) => g.id == 2 ? set(g, "items", g.items + [{ id: 23, name: "kale", n: 1 }]) : g)
 
 component Board() {
-    ~groups = [
+    state groups = [
         { id: 1, name: "fruit", items: [{ id: 11, name: "apple", n: 1 }, { id: 12, name: "pear", n: 3 }] },
         { id: 2, name: "veg", items: [{ id: 21, name: "leek", n: 2 }] },
     ]
-    ~open = 1
-    ~extra = { title: "extra", "data-x": "1" }
+    state open = 1
+    state extra = { title: "extra", "data-x": "1" }
     <div.board>
         <button type="button" id="add" @click={() => { groups = added(groups) }}>add</button>
         <button type="button" id="rename" @click={() => { groups = named(groups, 1, "fruits") }}>rename</button>

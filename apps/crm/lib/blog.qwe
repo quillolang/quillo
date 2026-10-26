@@ -297,10 +297,10 @@ fn blog_feed() {
 // The comment form: the comment rules hint as you type; the server checks
 // again and keeps it for a moderator.
 component CommentForm(slug: str) {
-    ~c = { name: "", email: "", body: "", website: "" }
-    ~touched = []
-    ~server = []
-    ~sent = false
+    state c = { name: "", email: "", body: "", website: "" }
+    state touched = []
+    state server = []
+    state sent = false
     let all = validate("comment", c, { enabled: ["blog"] }) + server
     let shown = all | filter((p) => contains(touched, p.field))
     let change = (k) => (v) => { c = set(c, k, v); touched = unique(touched + [k]); server = [] }

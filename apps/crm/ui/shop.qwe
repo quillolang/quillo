@@ -105,7 +105,7 @@ fn shipping_note(s: map, cur: str) {
 
 // The pictures of a product: one large, the others to choose from.
 component Gallery(images: list, name: str) {
-    ~at = 0
+    state at = 0
     if len(images) == 0 { return <div.gallery><div.gallery-main.shop-noimg>{slice(name, 0, 1)}</div></div> }
     <div.gallery>
         <div.gallery-main><Picture v={images[min([at, len(images) - 1])]} alt={name} shown={640}/></div>
@@ -169,12 +169,12 @@ view CheckoutPage() =
 // has on, such as tax) hint as you type and show the total the server will
 // charge.
 component Checkout() {
-    ~c = checkout_context()
-    ~o = { name: "", email: "", address: "", card: "", expiry: "", cvc: "", country: "", vat_id: "" }
-    ~touched = []
-    ~server = []
-    ~paid = null
-    ~busy = false
+    state c = checkout_context()
+    state o = { name: "", email: "", address: "", card: "", expiry: "", cvc: "", country: "", vat_id: "" }
+    state touched = []
+    state server = []
+    state paid = null
+    state busy = false
     if c == null { return <Loading/> }
     if is_err(c) { return <div.site-narrow><h1>The checkout did not load</h1></div> }
     if paid == null && len(c.lines) == 0 { return <div.site-narrow><h1>Your cart is empty</h1><p><a href="/shop">Go shopping</a></p></div> }

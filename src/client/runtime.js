@@ -1,5 +1,5 @@
 // Quillo browser runtime: values, the standard library, a small virtual DOM,
-// components with ~state, and calls to `server fn`s. The compiled program is
+// components with state, and calls to `server fn`s. The compiled program is
 // appended after this and registers its functions in G.
 "use strict";
 
@@ -87,9 +87,117 @@ function typeIs(t, v) {
     case "map": return isMap(v) || isEvent(v);
     case "html": return v instanceof VNode;
     case "fn": return typeof v === "function";
-    default: return false;
+    default:
+      // Strings a type names ("admin" | "member"), and the program's own types.
+      if (t[0] === '"') return v === JSON.parse(t);
+      return ownTypes ? ownTypes.is(t, v) : false;
   }
 }
+
+// The program's own types, when it has any (set by `W.type`, which brings
+// the code for them into the bundle): checks, reasons, and making values.
+let ownTypes = null;
+
+// ---- records (src/record.rs) -------------------------------------------
+// The program's own types, as the compiler gave them (W.type): a record's
+// fields ({r: [[name, type, default]]}) or the type a name stands for ({a:
+// type}). A type is {n: names, o: null allowed, e: list item, f: fields, t: text}.
+const OWN_TYPES = Object.create(null);
+const ownTyOf = (name) => ({ n: [name], o: false, e: null, f: null, t: name });
+// Where a value goes wrong, and how ("" when it is just not the type).
+const OWN_PLAIN = { path: "", what: "" };
+const ownWhyAt = (seg, w) => ({ path: w.path === "" ? seg : w.path[0] === "[" ? seg + w.path : seg + "." + w.path, what: w.what });
+const ownWhyHere = (w, t, v) => (w.what ? w : { path: w.path, what: `must be ${t.t}, got ${typeName(v)} ${short(v)}` });
+const ownWhyText = (w) => (!w.what ? null : w.path ? `\`${w.path}\` ${w.what}` : w.what);
+const ownBecause = (w) => { const t = w && ownWhyText(w); return t ? ` (${t})` : ""; };
+
+// null when v is of type t, else where it is not. At the top of an
+// annotation lists and maps are checked as any list and map; records field
+// by field, and all that is inside them.
+function ownFits(t, v, deep, depth = 0) {
+  if ((t.o && isNil(v)) || depth > 64) return null;
+  let best = OWN_PLAIN;
+  for (const n of t.n) {
+    const w = ownFitsName(n, t, v, deep, depth);
+    if (!w) return null;
+    if (!best.what && w.what) best = w;
+  }
+  return best;
+}
+function ownFieldsFit(fs, m, depth) {
+  for (const [k, ft] of fs) {
+    const x = hasOwn(m, k) ? m[k] : null;
+    if (isNil(x)) { if (ft.o) continue; return { path: k, what: "is missing" }; }
+    const w = ownFits(ft, x, true, depth + 1);
+    if (w) return ownWhyAt(k, ownWhyHere(w, ft, x));
+  }
+  return null;
+}
+function ownFitsName(n, t, v, deep, depth) {
+  if (n[0] === '"') return v === JSON.parse(n) ? null : OWN_PLAIN;
+  const td = OWN_TYPES[n];
+  if (td) {
+    if (td.a) return ownFits(td.a, v, deep, depth + 1);
+    return isMap(v) ? ownFieldsFit(td.r, v, depth) : OWN_PLAIN;
+  }
+  if (/^[A-Z]/.test(n) || !typeIs(n, v)) return OWN_PLAIN;
+  if (deep && n === "list" && t.e) {
+    for (let i = 0; i < v.length; i++) {
+      const w = ownFits(t.e, v[i], true, depth + 1);
+      if (w) return ownWhyAt(`[${i}]`, ownWhyHere(w, t.e, v[i]));
+    }
+  }
+  if (deep && n === "map" && t.f) return ownFieldsFit(t.f, v, depth);
+  return null;
+}
+
+const ownHasRecord = (t, d = 0) => d < 8 && (t.n.some((n) => OWN_TYPES[n] && (OWN_TYPES[n].r || ownHasRecord(OWN_TYPES[n].a, d + 1))) || (!!t.e && ownHasRecord(t.e, d + 1)));
+
+// v made a value of type t: records made from maps (defaults put in, other
+// fields left out), lists of them item by item, the rest checked as it is.
+function ownMake(t, v, depth = 0) {
+  if ((t.o && isNil(v)) || depth > 64) return { ok: true, v };
+  let best = OWN_PLAIN;
+  for (const n of t.n) {
+    const r = ownMakeName(n, t, v, depth);
+    if (r.ok) return r;
+    if (!best.what && r.w.what) best = r.w;
+  }
+  return { ok: false, w: best };
+}
+function ownMakeName(n, t, v, depth) {
+  const td = OWN_TYPES[n];
+  if (td) {
+    if (td.a) return ownMake(td.a, v, depth + 1);
+    if (!isMap(v)) return { ok: false, w: OWN_PLAIN };
+    const out = {};
+    for (const [k, ft, def] of td.r) {
+      let x = hasOwn(v, k) ? v[k] : null;
+      if (isNil(x)) {
+        if (def) x = def();
+        else if (ft.o) continue;
+        else return { ok: false, w: { path: k, what: "is missing" } };
+      }
+      const r = ownMake(ft, x, depth + 1);
+      if (!r.ok) return { ok: false, w: ownWhyAt(k, ownWhyHere(r.w, ft, x)) };
+      Object.defineProperty(out, k, { value: r.v, enumerable: true, writable: true, configurable: true });
+    }
+    return { ok: true, v: out };
+  }
+  if (n === "list" && Array.isArray(v) && t.e && ownHasRecord(t.e)) {
+    const out = [];
+    for (let i = 0; i < v.length; i++) {
+      const r = ownMake(t.e, v[i], depth + 1);
+      if (!r.ok) return { ok: false, w: ownWhyAt(`[${i}]`, ownWhyHere(r.w, t.e, v[i])) };
+      out.push(r.v);
+    }
+    return { ok: true, v: out };
+  }
+  const w = ownFits({ n: [n], o: false, e: t.e, f: t.f, t: t.t }, v, true, depth);
+  return w ? { ok: false, w } : { ok: true, v };
+}
+
+
 
 const fmtKey = (k) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : JSON.stringify(k);
 
@@ -306,15 +414,17 @@ function arity(n, max, name) {
   if (n > max) fail(`\`${name}\` takes ${max} argument${max === 1 ? "" : "s"}, got ${n}`);
 }
 function missing(p, name) { fail(`missing argument \`${p}\` in call to \`${name}\``); }
+// What a record lacks, after a mismatch: " (`email` is missing)".
+const lacks = (v, names, opt) => (ownTypes ? ownTypes.lacks(v, names, opt) : "");
 function argty(v, names, opt, p, name) {
-  if (!tyOk(v, names, opt)) fail(`argument \`${p}\` of \`${name}\` must be ${tyText(names, opt)}, got ${typeName(v)} ${short(v)}`);
+  if (!tyOk(v, names, opt)) fail(`argument \`${p}\` of \`${name}\` must be ${tyText(names, opt)}, got ${typeName(v)} ${short(v)}${lacks(v, names, opt)}`);
 }
 function retty(v, names, opt, name, enames, eopt) {
   if (v instanceof Err) {
     if (enames && !tyOk(v.error, enames, eopt)) fail(`\`${name}\` declares errors as \`! ${tyText(enames, eopt)}\`, but returned err(${short(v.error)})`);
     return v;
   }
-  if (names && !tyOk(v, names, opt)) fail(`\`${name}\` must return ${tyText(names, opt)}, but returned ${typeName(v)} ${short(v)}`);
+  if (names && !tyOk(v, names, opt)) fail(`\`${name}\` must return ${tyText(names, opt)}, but returned ${typeName(v)} ${short(v)}${lacks(v, names, opt)}`);
   return v;
 }
 
@@ -339,12 +449,24 @@ function getPath(v, path) {
   return cur;
 }
 
+// What the last record pattern made of its value (`User as u` binds that).
+let madeLast;
+
 function matchInto(p, v, b) {
   switch (p.k) {
     case "w": return true;
     case "b": b[p.n] = v; return true;
     case "l": return eq(p.v, v);
-    case "t": return typeIs(p.t, v);
+    case "t": {
+      madeLast = undefined;
+      // A record: the value made as `User(v)` makes it.
+      const r = ownTypes && ownTypes.make(p.t, v);
+      if (r) {
+        if (r.ok) madeLast = r.v;
+        return r.ok;
+      }
+      return typeIs(p.t, v);
+    }
     case "a": {
       for (const q of p.ps) {
         const t = {};
@@ -354,7 +476,7 @@ function matchInto(p, v, b) {
     }
     case "as": {
       if (!matchInto(p.p, v, b)) return false;
-      b[p.n] = v;
+      b[p.n] = p.p.k === "t" && madeLast !== undefined ? madeLast : v;
       return true;
     }
     case "ls": {
@@ -378,7 +500,7 @@ function matchInto(p, v, b) {
         }
         const before = Object.keys(b).length;
         if (!matchInto(f.p, x, b)) return false;
-        if (f.ty && Object.keys(b).length === before) b[f.path[f.path.length - 1]] = x;
+        if (f.ty && Object.keys(b).length === before) b[f.path[f.path.length - 1]] = f.p.k === "t" && madeLast !== undefined ? madeLast : x;
       }
       return true;
     }
@@ -457,6 +579,137 @@ function toJSON(v) {
 }
 
 const B = {};
+// Runs f after each of the component's renders, after what already does.
+function afterEach(inst, f) {
+  const before = inst.afterRender;
+  inst.afterRender = before ? () => { before(); f(); } : f;
+}
+
+// ---- streams (src/stream.rs) -------------------------------------------
+// What a streamed answer sends, given to f as it arrives: an event's data
+// (JSON, parsed) and its name, a line of JSON, or a piece of text.
+async function readStream(res, f, who, signal) {
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
+  const parse = (t) => { try { return JSON.parse(t); } catch (_) { return t; } };
+  const give = async (args) => {
+    const n = Array.isArray(f.$p) ? f.$p.length : f.length;
+    const r = f(...args.slice(0, Math.max(n, 1)));
+    return r instanceof Promise ? await r : r;
+  };
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const pieces = (end) => {
+    const out = [];
+    if (kind === "text") { if (buf) out.push([buf]); buf = ""; return out; }
+    if (kind === "lines") {
+      const lines = buf.split("\n");
+      buf = end ? "" : lines.pop();
+      for (const l of lines) if (l.trim()) out.push([parse(l.replace(/\r$/, ""))]);
+      return out;
+    }
+    buf = buf.replace(/\r\n/g, "\n");
+    const blocks = buf.split("\n\n");
+    buf = end ? "" : blocks.pop();
+    for (const b of blocks) {
+      const data = [];
+      let name = null;
+      for (const l of b.split("\n")) {
+        const i = l.indexOf(":");
+        const field = i < 0 ? l : l.slice(0, i);
+        let v = i < 0 ? "" : l.slice(i + 1);
+        if (v[0] === " ") v = v.slice(1);
+        if (field === "data") data.push(v);
+        else if (field === "event") name = v;
+      }
+      if (data.length) out.push([parse(data.join("\n")), name]);
+    }
+    return out;
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) buf += dec.decode(value, { stream: !done });
+    for (const args of pieces(done)) {
+      if (signal && signal.aborted) return;
+      if ((await give(args)) === false) { reader.cancel().catch(() => {}); return; }
+    }
+    if (done) return;
+  }
+}
+
+// `receive(url, f, { method, body, headers })` in a handler: sends the
+// request and calls f with what the answer streams, until it ends (or f
+// gives false). An error value if it could not be had.
+B.receive = meta(async (url, f, opts) => {
+  S(url, "receive");
+  F(f, "receive", 2);
+  opts = M(opts, "receive", 3);
+  const init = { method: opts.method ? S(opts.method, "receive").toUpperCase() : (isNil(opts.body) ? "GET" : "POST"), headers: {} };
+  if (isMap(opts.headers)) for (const k of Object.keys(opts.headers)) init.headers[k] = display(opts.headers[k]);
+  if (!isNil(opts.body)) {
+    if (typeof opts.body === "string") init.body = opts.body;
+    else { init.body = JSON.stringify(toJSON(opts.body)); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
+  }
+  let res;
+  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
+  if (!res.ok) return new Err(`receive: ${res.status} ${await res.text().catch(() => "")}`.trim());
+  try { await readStream(res, f, "receive"); } catch (e) { if (e instanceof QuilloError) throw e; return new Err("receive: " + e.message); }
+  return null;
+}, "receive", null);
+
+// `listen(url, f)` while a component renders: reads the stream at url (a
+// GET), calling f with what it sends, for as long as the renders keep
+// asking; a render that does not ask, or the component leaving the page,
+// stops it. Dropped connections are opened again (after a second, then
+// longer); a stream that ends is not.
+B.listen = meta((url, f) => {
+  const inst = rendering;
+  if (!inst) fail("`listen` works while a component renders");
+  S(url, "listen");
+  F(f, "listen", 2);
+  if (!inst.streams) {
+    inst.streams = [];
+    inst.streamsAsked = 0;
+    inst.stopStreams = () => {
+      for (const s of inst.streams.splice(inst.streamsAsked)) s.ctl.abort();
+      inst.streamsAsked = 0;
+    };
+    afterEach(inst, inst.stopStreams);
+    onGone(inst, () => {
+      inst.streamsAsked = 0;
+      inst.stopStreams();
+    });
+  }
+  const i = inst.streamsAsked++;
+  let s = inst.streams[i];
+  if (s && s.url === url) { s.f = f; return null; }
+  if (s) s.ctl.abort();
+  s = inst.streams[i] = { url, f, ctl: new AbortController() };
+  const me = s;
+  (async () => {
+    let wait = 1000;
+    while (!me.ctl.signal.aborted) {
+      try {
+        const res = await fetch(withBase(url), { signal: me.ctl.signal, headers: { accept: "text/event-stream, application/x-ndjson, */*" } });
+        if (!res.ok) throw new Error(`${res.status}`);
+        wait = 1000;
+        // The latest f each time (a render may give a new one), taking as many as it does.
+        const latest = (...a) => me.f(...a);
+        Object.defineProperty(latest, "$p", { get: () => (Array.isArray(me.f.$p) ? me.f.$p : new Array(me.f.length)) });
+        await readStream(res, latest, "listen", me.ctl.signal);
+        return;
+      } catch (e) {
+        if (me.ctl.signal.aborted) return;
+        if (e instanceof QuilloError) return report(e);
+        await new Promise((r) => setTimeout(r, wait));
+        wait = Math.min(wait * 2, 30000);
+      }
+    }
+  })();
+  return null;
+}, "listen", null);
+
 // `every(ms, f)` while a component renders: calls f every ms milliseconds for
 // as long as its renders keep asking (with the latest f and ms). A render that
 // does not ask (a paused game: `if running { every(100, step) }`) stops it,
@@ -470,13 +723,14 @@ B.every = meta((ms, f) => {
     inst.timers = [];
     inst.timersAsked = 0;
     // After each render: stop the timers it did not ask for.
-    inst.afterRender = () => {
+    inst.stopTimers = () => {
       for (const t of inst.timers.splice(inst.timersAsked)) clearInterval(t.id);
       inst.timersAsked = 0;
     };
+    afterEach(inst, inst.stopTimers);
     onGone(inst, () => {
       inst.timersAsked = 0;
-      inst.afterRender();
+      inst.stopTimers();
     });
   }
   const timers = inst.timers;
@@ -488,7 +742,7 @@ B.every = meta((ms, f) => {
     t.id = setInterval(() => {
       if (inst.kids !== null && !inst.el.isConnected) {
         inst.timersAsked = 0;
-        return inst.afterRender();
+        return inst.stopTimers();
       }
       try {
         const r = t.f();
@@ -888,6 +1142,17 @@ function fromJSON(j) {
   if (j === undefined) return null;
   return j;
 }
+
+// `User(fields)`: a User, or an error value saying what is wrong.
+B.__record = meta((name, v) => {
+  const td = OWN_TYPES[name];
+  if (!td) fail(`there is no type \`${name}\``);
+  if (td.r && isNil(v)) v = {};
+  if (td.r && !isMap(v)) return new Err(`${name}: expects a map of its fields, got ${typeName(v)} ${short(v)}`);
+  const r = ownMake(ownTyOf(name), v);
+  if (r.ok) return r.v;
+  return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`);
+}, "__record", null);
 
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
@@ -1453,7 +1718,7 @@ async function rpc(name, args) {
 }
 
 // ---- live updates --------------------------------------------------------
-// Each `~x = live(load, ...)` is a subscription to the topics `load` read
+// Each `state x = live(load, ...)` is a subscription to the topics `load` read
 // (tables and globals). One WebSocket to /_quillo/live carries changes to any
 // of them; then the affected loaders run again. When the topics change, it
 // is opened again for the new ones. (A WebSocket, because browsers allow a
@@ -2565,6 +2830,14 @@ W.fieldp = fieldp;
 W.index = index;
 W.call = call;
 W.mcall = mcall;
+W.type = (name, shape) => {
+  OWN_TYPES[name] = shape;
+  ownTypes = ownTypes || {
+    is: (t, v) => !!OWN_TYPES[t] && ownFits(ownTyOf(t), v, false) === null,
+    lacks: (v, names, opt) => ownBecause(ownFits({ n: names, o: opt, e: null, f: null, t: tyText(names, opt) }, v, false)),
+    make: (t, v) => (OWN_TYPES[t] ? ownMake(ownTyOf(t), v) : null),
+  };
+};
 W.tryv = tryv;
 W.iter = iter;
 W.match = match;

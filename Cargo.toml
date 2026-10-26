@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 mio = { version = "1", features = ["os-poll", "net"] }
+# Waiting for a slow client to take more of a streamed answer (src/httpd.rs).
+libc = "0.2"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"], optional = true }
 httparse = "1"
 corosensei = "0.3"
 psm = "0.1"
@@ -47,4 +50,7 @@ tao = { version = "0.37", optional = true }
 muda = { version = "0.21", optional = true }
 
 [features]
+default = ["mysql"]
 app = ["dep:wry", "dep:tao", "dep:muda"]
+# MySQL and MariaDB for `db` (src/my.rs).
+mysql = ["dep:mysql_async"]

@@ -7,7 +7,7 @@ use crate::ast::*;
 
 /// Builtins that, called while a component renders, make it run without
 /// anyone touching it: timers, live data, the page's own JavaScript.
-const BY_ITSELF: &[&str] = &["every", "live", "js", "js_new"];
+const BY_ITSELF: &[&str] = &["every", "live", "listen", "js", "js_new"];
 
 /// Whether a component's body (not its event handlers, which only run when
 /// someone acts) starts timers or live data, runs JavaScript, or has an

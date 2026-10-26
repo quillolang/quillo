@@ -94,6 +94,66 @@ fn postgres() {
     queries_wait_without_blocking_and_transactions_are_private(&database(&pg, "served"));
     migrations_apply_once_and_roll_back_on_failure(&database(&pg, "migrated"));
     each_tenant_gets_a_schema_of_its_own(&database(&pg, "tenants"));
+    several_databases_of_several_kinds(&database(&pg, "main_db"), &database(&pg, "other_db"), &database(&pg, "beta_db"));
+}
+
+/// `db` on one Postgres database, a connection to another, and tenants
+/// whose databases are SQLite files or Postgres, as a registry says.
+fn several_databases_of_several_kinds(main: &str, other: &str, beta: &str) {
+    let d = std::env::temp_dir().join(format!("quillo-pg-several-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = format!(
+        r#"db.open("{main}")
+db.exec("create table if not exists notes (id serial primary key, text text)")
+let other = db.connect("{other}")
+other.exec("create table if not exists notes (id serial primary key, text text)")
+let registry = db.connect("registry.db")
+registry.exec("create table if not exists tenants (name text primary key, url text)")
+registry.exec("insert or replace into tenants values ('acme', 'acme.db'), ('beta', '{beta}')")
+let tenants = db.connect((t) => registry.one("select url from tenants where name = ?", t)?.url)
+fn both() = [len(db.query("select * from notes")), len(other.query("select * from notes"))]
+fn inner_fails() = db.transaction(() => {{
+    db.exec("insert into notes (text) values ('kept')")
+    let r = other.transaction(() => {{
+        other.exec("insert into notes (text) values ('lost')")
+        err("no")
+    }})
+    is_err(r) ? "inner rolled back" : "?"
+}})
+fn outer_fails() = db.transaction(() => {{
+    other.transaction(() => other.exec("insert into notes (text) values ('committed')"))
+    db.exec("insert into notes (text) values ('lost')")
+    err("no")
+}})
+fn put(t) = with_tenant(t, () => {{
+    tenants.exec("create table if not exists items (n text)")
+    tenants.exec("insert into items values (?)", t)
+    tenants.query("select n from items") | map((r) => r.n)
+}})
+"#
+    );
+    let mut it = quillo::Interp::new(&d);
+    it.load_source(&src, "app.qwe").unwrap_or_else(|e| panic!("{}", e));
+    let call = |it: &mut quillo::Interp, f: &str, args: Vec<quillo::value::Value>| -> String {
+        match it.call(&quillo::value::lookup(&it.globals, f).unwrap(), args, 0) {
+            Ok(v) => v.repr(),
+            Err(quillo::interp::Ctrl::Error(e)) => format!("ERROR: {}", e.msg),
+            Err(_) => "returned".into(),
+        }
+    };
+    assert_eq!(call(&mut it, "both", vec![]), "[0, 0]");
+    // Each connection's transaction is its own: the inner one rolls back alone.
+    assert_eq!(call(&mut it, "inner_fails", vec![]), r#""inner rolled back""#);
+    assert_eq!(call(&mut it, "both", vec![]), "[1, 0]");
+    // The other one committed before the outer one rolled back.
+    assert_eq!(call(&mut it, "outer_fails", vec![]), r#"err("no")"#);
+    assert_eq!(call(&mut it, "both", vec![]), "[1, 1]");
+    // A tenant on SQLite, another on Postgres, through one connection.
+    assert_eq!(call(&mut it, "put", vec![quillo::value::Value::str("acme")]), r#"["acme"]"#);
+    assert_eq!(call(&mut it, "put", vec![quillo::value::Value::str("beta")]), r#"["beta"]"#);
+    assert!(d.join("acme.db").is_file());
+    assert_eq!(run(beta, "db.query(\"select n from items\") | map((r) => r.n)"), r#"["beta"]"#);
 }
 
 fn each_tenant_gets_a_schema_of_its_own(url: &str) {

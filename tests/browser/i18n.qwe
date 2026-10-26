@@ -9,7 +9,7 @@ translations({
 locale_from((r) => r.query.lang)
 
 component Cart() {
-    ~n = 1
+    state n = 1
     <div>
         <span class="count">{t("items", { count: n })}</span>
         <button id="add" @click={() => { n += 1 }}>{t("add")}</button>

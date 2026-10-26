@@ -1,0 +1,12 @@
+match event {
+    { type: "click", x: int, y: int } => `click at ${x},${y}`
+    { type: "key", key: "Enter" | "Return" } => "enter"
+    int as n if n < 0 => "negative"
+    _ => "other"
+}
+
+fn parse_age(s: str) -> int ! str =
+    match int(s) {
+        int as n if n >= 0 => n
+        _ => err(`bad age: ${s}`)
+    }

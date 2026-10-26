@@ -547,3 +547,22 @@ fn a_state_storm_leaves_nothing_behind() {
     });
     assert_eq!(r, want);
 }
+
+#[test]
+fn pages_read_streams_as_they_come() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let result = run_page(&chrome, "streams.qwe", free_port());
+    let want = serde_json::json!({
+        "progressDone": true,
+        "names": "progress,progress,progress",
+        "replyDone": true,
+        "replySteps": true,
+        "ticking": true,
+        "tickerStopped": true,
+        "errors": []
+    });
+    assert_eq!(result, want);
+}

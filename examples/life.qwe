@@ -79,10 +79,10 @@ fn flip(board: list, y: int, x: int) =
     range(0, H) | map((r) => r != y ? board[r] : range(0, W) | map((c) => c == x ? 1 - board[r][c] : board[r][c]))
 
 component Life() {
-    ~board = board_of(first(patterns))
-    ~running = false
-    ~speed = 8          // generations per second
-    ~generation = 0
+    state board = board_of(first(patterns))
+    state running = false
+    state speed = 8     // generations per second
+    state generation = 0
 
     let step = () => {
         board = next(board)

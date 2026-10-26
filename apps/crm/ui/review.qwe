@@ -4,14 +4,14 @@
 
 component ReviewPanel(okey: str, id: int, ws: map) {
     let key = okey
-    ~doc = review_view(key, id)
-    ~notes = list_annotations(key, id)
-    ~picked = null
-    ~draft = ""
-    ~replies = {}
-    ~show_resolved = false
-    ~painted = 0
-    ~problems = []
+    state doc = review_view(key, id)
+    state notes = list_annotations(key, id)
+    state picked = null
+    state draft = ""
+    state replies = {}
+    state show_resolved = false
+    state painted = 0
+    state problems = []
     if doc == null || notes == null { return <Loading/> }
     if is_err(doc) || is_err(notes) { return <Empty title="The review did not load"/> }
     let refresh = () => { notes = list_annotations(key, id); painted = painted + 1 }
@@ -73,7 +73,7 @@ component ReviewPanel(okey: str, id: int, ws: map) {
 
 // What waits for this person: records their groups and roles move next.
 component RecordQueue() {
-    ~rows = my_records_queue()
+    state rows = my_records_queue()
     rows == null || is_err(rows) || len(rows) == 0 ? null : <section.card.stack>
         <h2>Waiting for you</h2>
         <table.table.compact><tbody>{for x in rows => <tr key={`${x.object}-${x.id}`} class="clickable" @click={() => { navigate(`/app/o/${x.object}/${x.id}`) }}>

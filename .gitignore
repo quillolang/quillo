@@ -2,3 +2,5 @@
 *.db
 *.db-wal
 *.db-shm
+.cpanel_token.txt
+/site/dist

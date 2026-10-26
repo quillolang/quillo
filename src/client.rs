@@ -32,7 +32,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -262,7 +262,7 @@ struct FnCtx {
     temps: usize,
     is_async: bool,
     needs_async: bool,
-    /// The component being compiled, for error messages and `~` rules.
+    /// The component being compiled, for error messages and `state` rules.
     component: Option<String>,
     /// `for` loops given a memo so far (see `memo` in the runtime).
     memos: usize,
@@ -319,6 +319,8 @@ struct Compiler<'a> {
     line: u32,
     /// The component or function being compiled, for error messages.
     what: String,
+    /// The program's own types whose shapes are in the bundle (`W.type`).
+    types: HashSet<String>,
 }
 
 fn js_str(s: &str) -> String {
@@ -343,7 +345,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => expr_assigned(e, out),
             Stmt::Fn(d) => expr_assigned(&d.body, out),
             Stmt::Route(r) => expr_assigned(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
         }
     }
 }
@@ -413,7 +415,7 @@ fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 }
                 Stmt::Fn(d) => each_expr(&d.body, f),
                 Stmt::Route(r) => each_expr(&r.body, f),
-                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
+                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
             }
         }
     };
@@ -602,7 +604,86 @@ impl<'a> Compiler<'a> {
             counter: 0,
             line: 0,
             what: String::new(),
+            types: HashSet::new(),
         }
+    }
+
+    /// Puts the shape of the program's own type `name` in the bundle (and
+    /// of the types it names), for `User(...)`, annotations and patterns.
+    fn need_type(&mut self, name: &str) -> Result<(), QuilloError> {
+        let Some(td) = self.it.types.get(name).cloned() else { return Ok(()) };
+        if !self.types.insert(name.to_string()) {
+            return Ok(());
+        }
+        let shape = if td.is_record() {
+            let mut fs = Vec::new();
+            for (k, ft) in td.ty.fields.as_deref().unwrap_or_default() {
+                let t = self.ty_shape(ft)?;
+                let d = match td.defaults.iter().find(|(d, _)| d == k) {
+                    // Made for each record, in the program's top-level scope.
+                    Some((_, e)) => {
+                        let def = FnDef {
+                            name: format!("{}.{}", td.name, k),
+                            params: Vec::new(),
+                            ret: None,
+                            err: None,
+                            effects: None,
+                            server: false,
+                            component: false,
+                            line: td.line,
+                            body: e.clone(),
+                        };
+                        let saved = std::mem::take(&mut self.ctxs);
+                        let r = self.function(&def);
+                        self.ctxs = saved;
+                        let (code, is_async) = r?;
+                        if is_async {
+                            self.line = td.line;
+                            return self.err(format!("the default of `{}` in `{}` waits on the server, which a record made in the browser cannot", k, td.name));
+                        }
+                        code
+                    }
+                    None => "null".into(),
+                };
+                fs.push(format!("[{}, {}, {}]", js_str(k), t, d));
+            }
+            format!("{{r: [{}]}}", fs.join(", "))
+        } else {
+            format!("{{a: {}}}", self.ty_shape(&td.ty)?)
+        };
+        self.defs.push(format!("W.type({}, {});", js_str(name), shape));
+        Ok(())
+    }
+
+    /// A type for the runtime's record checks: names, null allowed, what a
+    /// list holds and a map's fields.
+    fn ty_shape(&mut self, t: &Ty) -> Result<String, QuilloError> {
+        for n in &t.names {
+            self.need_type(n)?;
+        }
+        let e = match &t.elem {
+            Some(e) => self.ty_shape(e)?,
+            None => "null".into(),
+        };
+        let f = match &t.fields {
+            Some(fs) => {
+                let mut out = Vec::new();
+                for (k, ft) in fs {
+                    out.push(format!("[{}, {}]", js_str(k), self.ty_shape(ft)?));
+                }
+                format!("[{}]", out.join(", "))
+            }
+            None => "null".into(),
+        };
+        Ok(format!("{{n: [{}], o: {}, e: {}, f: {}, t: {}}}", t.names.iter().map(|n| js_str(n)).collect::<Vec<_>>().join(", "), t.optional, e, f, js_str(&t.text())))
+    }
+
+    /// The shapes of the types an annotation names.
+    fn need_types_in(&mut self, t: &Ty) -> Result<(), QuilloError> {
+        if t.names.iter().any(|n| self.it.types.contains_key(n)) || t.elem.is_some() || t.fields.is_some() {
+            self.ty_shape(t)?;
+        }
+        Ok(())
     }
 
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, QuilloError> {
@@ -726,7 +807,7 @@ impl<'a> Compiler<'a> {
                 if CLIENT_BUILTINS.contains(b) {
                     // `parallel` waits for what it calls, and `ask` for an
                     // answer: they are awaited.
-                    let r = (format!("B.{}", b), *b == "parallel" || *b == "ask");
+                    let r = (format!("B.{}", b), *b == "parallel" || *b == "ask" || *b == "receive");
                     self.globals.insert(name.to_string(), r.clone());
                     Ok(r)
                 } else {
@@ -753,6 +834,10 @@ impl<'a> Compiler<'a> {
             }
             Value::Func(f) => {
                 let def = f.def.clone();
+                // `User(...)`: the record's shape goes with it.
+                if self.it.types.contains_key(name) {
+                    self.need_type(name)?;
+                }
                 // Recursive references see the function as not async until
                 // known. If it turns out async, it is compiled again with
                 // them awaited, and so is what it compiled meanwhile, which
@@ -899,6 +984,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             if let Some(ty) = &p.ty {
+                self.need_types_in(ty)?;
                 let call = format!("W.argty({}, {}, {}, {});", js, ty_js(&Some(ty.clone())), js_str(&p.name), fname);
                 // The common types checked in place; `argty` says what is wrong.
                 let checks: Option<Vec<String>> = ty
@@ -962,6 +1048,9 @@ impl<'a> Compiler<'a> {
         self.line = saved_line;
         let (names, body) = res?;
         let checked = def.ret.is_some() || def.err.is_some();
+        for t in def.ret.iter().chain(def.err.iter()) {
+            self.need_types_in(t)?;
+        }
         let run = if leaves_early(&def.body) {
             format!(
                 "{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n",
@@ -1091,7 +1180,7 @@ impl<'a> Compiler<'a> {
                         Resolved::State(n) => format!("$i.s[{}]", js_str(n)),
                         Resolved::Global(..) => {
                             return self.err(format!(
-                                "cannot assign to `{}` in the browser: it is a server variable (use `~{}` state in the component, or a `server fn`)",
+                                "cannot assign to `{}` in the browser: it is a server variable (use `state {}` in the component, or a `server fn`)",
                                 name, name
                             ))
                         }
@@ -1130,9 +1219,9 @@ impl<'a> Compiler<'a> {
                 Stmt::State(name, e, line) => {
                     self.line = *line;
                     if self.ctxs.len() != 1 || self.ctx().scopes.len() != 2 || self.ctx().component.is_none() {
-                        return self.err("`~` state can only be declared directly in a component's body");
+                        return self.err("`state` can only be declared directly in a component's body");
                     }
-                    // `~x = live(load, ...args)`: a subscription.
+                    // `state x = live(load, ...args)`: a subscription.
                     if let Some((fname, args)) = self.live_call(e)? {
                         let mut argv = Vec::new();
                         for a in args {
@@ -1198,6 +1287,10 @@ impl<'a> Compiler<'a> {
                     self.line = *line;
                     return self.err("`service` must be at the top level");
                 }
+                Stmt::Type(td) => {
+                    self.line = td.line;
+                    return self.err("`type` must be at the top level");
+                }
             }
         }
         if stmts.is_empty() {
@@ -1226,7 +1319,7 @@ impl<'a> Compiler<'a> {
                 Some(Value::Func(c)) if c.def.server => f.clone(),
                 _ => return self.err(format!("`live` needs a server fn: `{}` is not one", f)),
             },
-            _ => return self.err("`live` needs a server fn by name: ~items = live(load_items, ...)"),
+            _ => return self.err("`live` needs a server fn by name: state items = live(load_items, ...)"),
         };
         Ok(Some((fname, &args[1..])))
     }
@@ -1721,7 +1814,7 @@ impl<'a> Compiler<'a> {
         if is_async && self.ctx().component.is_some() {
             return self.err(format!(
                 "`{}` waits on the server, so a component can only call it from an event handler \
-                 (@click={{fn() {{ ... }}}}) or to set state: ~x = {}(...)",
+                 (@click={{() => {{ ... }}}}) or to set state: state x = {}(...)",
                 name, name
             ));
         }
@@ -1733,7 +1826,10 @@ impl<'a> Compiler<'a> {
             Pattern::Wild => "{k: \"w\"}".into(),
             Pattern::Bind(n) => format!("{{k: \"b\", n: {}}}", js_str(n)),
             Pattern::Lit(l) => format!("{{k: \"l\", v: {}}}", lit_js(l)),
-            Pattern::Type(t) => format!("{{k: \"t\", t: {}}}", js_str(t)),
+            Pattern::Type(t) => {
+                self.need_type(t)?;
+                format!("{{k: \"t\", t: {}}}", js_str(t))
+            }
             Pattern::Alt(ps) => {
                 let mut out = Vec::new();
                 for q in ps {

@@ -12,8 +12,8 @@ route POST /api/notes { json: { text: str } } = db.exec("insert into notes (text
 route POST /api/hit { hits += 1 }
 
 component Board() {
-    ~notes = live(load_notes)
-    ~hits = live(get_hits)
+    state notes = live(load_notes)
+    state hits = live(get_hits)
     <div #board>
         <ul>{for n in notes => <li key={n}>{n}</li>}</ul>
         <p.hits>{hits}</p>
@@ -23,8 +23,8 @@ component Board() {
 
 // `live(load, id)` loads again when `id` changes.
 component Note() {
-    ~id = 1
-    ~note = live(note_at, id)
+    state id = 1
+    state note = live(note_at, id)
     <p.note @click={() => { id = 2 }}>{note}</p>
 }
 

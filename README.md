@@ -22,8 +22,8 @@ Components run in the browser too, with state, and call the server directly:
 server fn add_note(text: str) -> list ! str with db { ... }
 
 component Notes(initial: list) {
-    ~notes = initial
-    ~draft = ""
+    state notes = initial
+    state draft = ""
     <form @submit={() => { notes = add_note(draft) ?? notes; draft = "" }}>
         <input bind:value={draft}/>
         <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
@@ -32,8 +32,8 @@ component Notes(initial: list) {
 ```
 
 Quillo is a tree-walking interpreter in Rust with a built-in HTTP server, a static
-checker, a compiler from components to JavaScript, an embedded SQLite database and
-a language server for editors.
+checker, a compiler from components to JavaScript, an embedded SQLite database (and
+PostgreSQL and MySQL drivers) and a language server for editors.
 
 ```sh
 cargo build --release
@@ -51,9 +51,16 @@ serves them:
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1) |
 | `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages |
+| `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
 | `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
+| `--split` | run each `service` as a process of its own (see [Services](#services)) |
+| `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`) |
+| `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
+| `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
+| `--no-jobs` | run none of the program's scheduled jobs on this server |
+| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers (see [Concurrency](#concurrency-and-reloading)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
@@ -88,7 +95,8 @@ app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live compone
 [spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
 [life.qwe](examples/life.qwe) (Conway's Game of Life, run by a timer in the browser),
 [storm.qwe](examples/storm.qwe) (a dashboard under a storm of random changes, tested for leaks),
-and [index.qwe](examples/index.qwe), which mounts all of them in one server.
+[services](examples/services) (a shop that bills through a billing service, in one process or
+split apart), and [index.qwe](examples/index.qwe), which mounts all of them in one server.
 
 A whole application: [apps/crm](apps/crm) is a multi-tenant CRM for merchants, bloggers
 and news outlets, with a shop, campaigns, a flow designer, and plugins whose rules run in
@@ -142,7 +150,7 @@ Most expressions read as they would in JavaScript. The differences:
   for 0. Where a value is known to be a string or a number, the checker warns about
   `||`, `&&`, `!`, `if` and `? :` on it and suggests the explicit form
   (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`).
-- `match`, `|`, patterns, `route`, `reply`, `~state` and `with` effects have no
+- `match`, `|`, patterns, `route`, `reply`, `state` and `with` effects have no
   JavaScript equivalent.
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
 
@@ -176,6 +184,63 @@ they are `list` and `map`.
 ```
 fn titles(posts: list<{ id: int, title: str }>) = posts | map((p) => p.title)
 ```
+
+### Records
+
+`type` names a shape, so it can be used by name, checked when the program runs, and
+made from what a client sends:
+
+```quillo
+type Address = { city: str, zip: str? }
+type User = {
+    name: str,
+    email: str,
+    role: "admin" | "member" = "member",    // one of these strings; a default
+    address: Address?,
+    tags: list<str> = [],
+}
+type Id = int | str                         // another name for a type
+
+let ada = User({ name: "Ada", email: "ada@example.com" })
+// { name: "Ada", email: "ada@example.com", role: "member", tags: [] }
+
+fn greet(u: User) = `Hi ${u.name}`
+
+route POST /users { json: User } = save(json)    // the body, made a User; else no match
+route POST /users = respond(422, "not a user")
+
+match v {
+    User as u => u.role
+    _ => "not a user"
+}
+```
+
+- A record is a map: JSON, the browser and every map function see it as one. What its
+  name adds is checking.
+- `User(fields)` makes one: each field is checked, records in it are made the same way
+  (and lists of them, item by item), missing fields get their defaults (made afresh
+  for each record), and fields the record does not have are left out, so what a client
+  sends cannot add any (`is_staff: true` in a body does not get through). It gives an
+  error value saying what is wrong, as `int("x")` does: `User({ name: "Ada" })` is
+  `err("User: `email` is missing")`, and a deeper mistake names its place
+  (`` `address.city` is missing ``, `` `tags[1]` must be str, got int 2 ``). So
+  `User(request.json)?` passes it on, and `?? reply 400` answers it.
+- In an annotation, a record is checked field by field when the function is called or
+  returns: `greet({ name: "Ada" })` fails with `` argument `u` of `greet` must be User,
+  got map { name: "Ada" } (`email` is missing) ``. A field with a default must be
+  there too; `User(...)` is what puts it in. A `server fn`'s arguments from the browser
+  are checked the same way.
+- In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
+  `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
+  converted to the numbers and booleans the record asks for, as query values are.
+- `quillo check` holds code to the fields: `u.nmae` (did you mean `name`?), a field
+  `User` does not have in `User({ ... })`, a missing field or one of the wrong type,
+  and a default that is not of its field's type.
+- A type is named like `User` or `OrderLine` (a capital letter first, and small ones),
+  which keeps it apart from constants such as `MAX` or `DAY`. A record may name itself
+  (`type Node = { value: int, kids: list<Node> = [] }`).
+- Strings in a type (`"admin" | "member"`) are checked when the program runs; `quillo
+  check` takes them as `str`.
 
 ### Pipelines and method calls
 
@@ -219,6 +284,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 | `int as n` | binds what matched |
 | `[first, second, ..rest]` | lists |
 | `{ type: "user", name, customer.id: id, limit: int = 20 }` | maps (extra keys are allowed); `a.b` looks inside nested maps; `= default` fills a missing field |
+| `User`, `User as u` | what `User(v)` makes of it (see [Records](#records)) |
 
 In a map pattern, `key: int` (a bare type) also binds `key`.
 
@@ -312,7 +378,7 @@ A `component` is a view with state that also runs in the browser:
 
 ```quillo
 component Counter(start: int = 0) {
-    ~count = start                       // state: set once, kept between renders
+    state count = start                  // state: set once, kept between renders
     let double = count * 2               // recomputed on every render
     <div>
         <span>{count} (x2 = {double})</span>
@@ -326,7 +392,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - The server renders it like a view, inside a `<quillo-island>` that carries its props
   and state. The page loads its bundle automatically, and the browser resumes the
   component from that state, on the server's own elements (see below).
-- Assigning to a `~` variable re-renders the component. Lists keep their DOM (and
+- `state count = start` declares state: set once, on the first render, and kept
+  between renders (`~count = start` is the short form). After that it is just `count`:
+  assigning to it (`count += 1`) re-renders the component. Lists keep their DOM (and
   focus) when items have `key={...}`. Nested components keep their own state.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...).
   The function may take the event `e`:
@@ -343,6 +411,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   for as long as its renders keep calling `every`: `if running { every(100, step) }`
   runs a game while `running` is true, with the latest `step` and speed, and stops when
   it is false or the component leaves the page. On the server it does nothing.
+  `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)).
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
   (and in `quillo check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
@@ -383,12 +452,12 @@ component, its attributes are the props, and what is between the tags arrives as
 view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
 
 component Counter(label: str, start: int = 0, on_change = null) {
-    ~n = start
+    state n = start
     <p>{label}: {n} <button @click={() => { n += 1; on_change && on_change(n) }}>+</button></p>
 }
 
 component Panel(header, children) {          // `header` is a named slot: any HTML
-    ~open = true
+    state open = true
     <div>
         <div @click={() => { open = !open }}>{header}</div>
         {open && children}
@@ -396,7 +465,7 @@ component Panel(header, children) {          // `header` is a named slot: any HT
 }
 
 component Dashboard() {
-    ~total = 0
+    state total = 0
     <Card title="Counters">
         <Counter label="Apples" on_change={(v) => { total = v }}/>   // child to parent
         <Counter label="Pears" start={3}/>
@@ -406,7 +475,7 @@ component Dashboard() {
 ```
 
 - **Down:** props. **Up:** pass a function (`on_change`) and call it.
-- Each component keeps its own `~state`, also when its parent re-renders; give
+- Each component keeps its own state, also when its parent re-renders; give
   components in a list a `key={...}` so each keeps its own.
 - Views are plain functions: they have no state and add nothing to the browser bundle
   unless a component uses them.
@@ -421,7 +490,7 @@ and call into it:
 
 ```quillo
 component Sales(points: list) {
-    ~chart = null
+    state chart = null
     <canvas @mount={(el) => {
         chart = js_new("Chart", el, { type: "line", data: points })
         () => chart.destroy()                   // when the canvas leaves the page
@@ -456,13 +525,13 @@ without reloading; Back and Forward work. `navigate("/path")` does the same from
 
 ```quillo
 component App() {
-    ~cart = []                                    // survives moving between pages
+    state cart = []                               // survives moving between pages
     let path = url().path
     <div>
         <nav><a href="/">Home</a> <a href="/products">Products</a> Cart: {len(cart)}</nav>
         {match split(path, "/") | filter((s) => s != "") {
             [] => <Home/>
-            ["products"] => <ProductList/>                      // loads with ~items = list_products()
+            ["products"] => <ProductList/>                      // loads with state items = list_products()
             ["products", id] => <ProductPage key={id} id={int(id)} on_add={(p) => { cart = cart + [p] }}/>
             _ => <NotFound {path}/>
         }}
@@ -472,7 +541,7 @@ component App() {
 route GET /*rest = <html><body><App/></body></html>       // every path renders on the server
 ```
 
-Pages load their data with `server fn`s in `~state` initializers: on the server while
+Pages load their data with `server fn`s in `state` initializers: on the server while
 rendering, in the browser when you navigate to them. Give a page component a `key` from
 its URL (`key={id}`) so a new product starts with fresh state. See
 [spa.qwe](examples/spa.qwe), which also answers 404 on the server for unknown paths.
@@ -489,7 +558,7 @@ server fn load_notes() = db.query("select * from notes order by id")
 server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
 
 component Notes(initial: list) {
-    ~notes = live(load_notes)     // every open page sees new notes
+    state notes = live(load_notes)  // every open page sees new notes
     ...
 }
 ```
@@ -497,7 +566,7 @@ component Notes(initial: list) {
 - What a loader *reads* is recorded: the tables in its queries (`from notes`,
   `join users`) and the global variables it uses (`todos`). What any code *writes* is
   announced: `insert`/`update`/`delete` through `db.*` and assignments to globals.
-  This works the same with SQLite and PostgreSQL, and with data kept in variables.
+  This works the same with SQLite, PostgreSQL and MySQL, and with data kept in variables.
 - Inside `db.transaction`, the announcement waits for the commit, and is dropped
   on rollback.
 - `publish("topic")` announces anything else, and `watch("topic")` inside a loader
@@ -560,9 +629,9 @@ server fn add_note(text: str) -> list ! str with db {
 }
 
 component Notes(initial: list) {
-    ~notes = initial
-    ~draft = ""
-    ~problem = null
+    state notes = initial
+    state draft = ""
+    state problem = null
     <form @submit={() => {
         let r = add_note(draft)                    // a request to the server
         if is_err(r) { problem = r.error } else { notes = r }
@@ -575,7 +644,7 @@ component Notes(initial: list) {
 In component code the call is awaited automatically. A call that fails (the
 connection drops, the server errors) returns an error value, like `http.*` on the
 server, so `let more = load_more() ?? []` carries on and can try again later. It works in event handlers and
-in `~state` initializers (`~todos = load_todos()`: the server runs it while rendering,
+in `state` initializers (`state todos = load_todos()`: the server runs it while rendering,
 so the page arrives with the data). Calling one while rendering is an error.
 
 There is no `async` or `await` to write: on the server a call simply waits (and other
@@ -616,7 +685,7 @@ route METHOD /path { ... block ... }
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS HEAD ANY`. A `HEAD` request is served by the `GET` route without a body.
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also `float`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path.
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
-- **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `files`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values.
+- **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `files`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values. `{ json: User }` takes the body as a [record](#records).
 - **Reserved:** paths under `/_quillo/` belong to Quillo (the browser bundle, server fn calls, `--watch`).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
 
@@ -656,7 +725,7 @@ is, for `save_upload`:
 server fn add_photo(file: map) = save_upload(file, `photos/${uuid()}.jpg`)
 
 component Photo() {
-    ~saved = null
+    state saved = null
     <input type="file" accept="image/*" @change={(e) => { saved = add_photo(e.target.files[0]) }}/>
 }
 ```
@@ -737,6 +806,8 @@ route POST /logout { end_session(); redirect("/") }
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
+| `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
+| `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 
 `reply status [body]` ends the request right away, from anywhere: inside a
 helper, a pipeline stage or a `??` fallback. This is how middleware works:
@@ -756,6 +827,77 @@ route GET /users/:id(int) {
     user
 }
 ```
+
+### Streaming
+
+A route can send its answer as it makes it: a large export row by row, a job's
+progress, a model's reply word by word. The client has the head at once, and each
+`send` as it is made.
+
+```quillo
+route GET /orders.csv = stream((send) => {
+    send("id,total\n")
+    for o in db.query("select id, total from orders") { send(`${o.id},${o.total}\n`) }
+}, { type: "text/csv", headers: { "content-disposition": "attachment" } })
+
+route GET /jobs/:id/progress = events((send) => {
+    for step in range(10) {
+        work(id, step)
+        send({ done: step + 1, of: 10 }, "progress")   // a value, and an event name
+    }
+})
+
+// A model's answer, passed on as it arrives.
+route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat", send, {
+    body: { prompt: request.json.prompt, stream: true },
+    headers: { authorization: `Bearer ${env("API_KEY")}` },
+}))
+```
+
+- `stream(f)` sends what `send` is given: text as it is, other values as a line of
+  JSON (newline-delimited JSON, with `type: "application/x-ndjson"`). `events(f)`
+  sends Server-Sent Events: each value as JSON in an event's data, with a name if
+  `send` is given one; `send(null)` is a comment, which keeps a quiet connection
+  open.
+- The rest of the server carries on meanwhile. A `send` waits only when the client
+  reads slower than the program writes, and then it waits as a database call does,
+  holding up no other request. Proxies are asked not to hold the answer back.
+- When the client goes away (or the server stops), the next `send` ends the
+  function, so a stream that runs until someone leaves stops when they do. An
+  error in the function after the answer began cuts the connection, so the client
+  knows the answer is incomplete.
+- `http.stream(url, f, { method, body, headers })` reads another server's answer as
+  it arrives: `f` gets each event (its data, parsed as JSON when it is, and its
+  name), each line of newline-delimited JSON, or each piece of text, and may stop
+  it by returning `false`. Given `send`, what arrives goes straight on. It gives
+  `{ status, ok, headers }` once the answer has ended (with the `body` when it is
+  not a success), or an error value when it could not be had.
+- In a page, `receive(url, f, { method, body, headers })` in a handler sends the
+  request and calls `f` with what the answer streams, until it ends; `listen(url,
+  f)` while a component renders follows a stream for as long as its renders keep
+  asking (and opens it again if the connection drops):
+
+```quillo
+component Chat() {
+    state answer = ""
+    <div>
+        <button @click={() => receive("/ask", (part) => { answer = answer + part.text }, { body: { prompt: "hi" } })}>Ask</button>
+        <p>{answer}</p>
+    </div>
+}
+
+component Progress(job: int) {
+    state done = 0
+    listen(`/jobs/${job}/progress`, (p) => { done = p.done })
+    <progress value={done} max="10" />
+}
+```
+
+Each open `listen` holds one of the six connections a browser keeps to a site over
+HTTP/1.1, across its tabs. That suits a job's progress or a reply being written; for
+data every page follows, `live` (see [Live data](#live-data)) shares one WebSocket.
+Outside the server (a program's own requests in tests), the function runs first and
+the whole answer is sent at once.
 
 ### Static files
 
@@ -889,9 +1031,16 @@ See [examples/services](examples/services): a shop that bills through a billing 
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
   [Numbers and data](#numbers-and-data).
+- **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
+  (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
 - **Web:** `raw escape env now file redirect respond json.parse json.stringify set_cookie
   delete_cookie session set_session end_session`
+- **Streaming:** `stream(f)` and `events(f)` answer as they go, `http.stream` reads
+  another server's answer as it arrives, and `listen` and `receive` read streams in a
+  page (see [Streaming](#streaming)).
+- **Database:** `db.open db.exec db.query db.one db.transaction db.migrate db.connect
+  db.tenants db.tenant_exists` (see [Database](#database)).
 - **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (hex), `crypto.token(bytes
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
@@ -1012,12 +1161,13 @@ takes a fifteenth of the comprehension's time.
 
 ### Database
 
-`db` talks to SQLite (built in) or PostgreSQL, with the same functions. SQL problems
-are error values, so `?` and `??` work on them.
+`db` talks to SQLite (built in), PostgreSQL or MySQL/MariaDB, with the same functions.
+SQL problems are error values, so `?` and `??` work on them.
 
 ```quillo
 db.open("app.db")                                   // SQLite, next to the program; ":memory:" also works
 db.open("postgres://user:pass@host:5432/app")       // PostgreSQL
+db.open("mysql://user:pass@host:3306/app")          // MySQL or MariaDB (also mariadb://)
 db.exec("create table if not exists todos (id serial primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
 db.query("select * from todos where id > ?", 10)           // a list of maps
@@ -1026,7 +1176,7 @@ db.one("insert into todos (text) values (?) returning id", text)
 db.transaction(() => { ... })                              // all or nothing; nests
 ```
 
-Without `db.open`, the database is `$QUILLO_DB` (a path or a `postgres://` URL), or else
+Without `db.open`, the database is `$QUILLO_DB` (a path or a URL), or else
 SQLite in memory. A transaction rolls back if its function fails, returns an error
 value or replies early.
 
@@ -1068,6 +1218,51 @@ db.migrate()
   checked against the usual public certificate authorities, as hosted Postgres services
   use.
 
+**MySQL and MariaDB** (the `mysql` feature, built in by default; `cargo build
+--no-default-features` leaves it out):
+
+- Placeholders are `?`, or `:name` with a map (translated, skipping quotes, backticks
+  and comments). Statements are prepared, so values never become SQL text.
+- Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
+  numbers, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
+  and dates and times as ISO text. `last_id` is the new row's `auto_increment` id.
+- Connections come from a pool, and a query releases the interpreter lock while it
+  waits, as with Postgres. A transaction keeps one connection until it ends; nested
+  ones are savepoints.
+- `db.migrate()` takes turns through a named lock (`get_lock`). A statement that
+  changes the schema commits at once in MySQL, so a migration that fails part way
+  keeps what it did before the failure: put one change in each file.
+- A database per tenant: `mysql://host/app_{tenant}`, made when the program makes the
+  tenant, and listed by `db.tenants()`.
+
+### Several databases
+
+`db` is the program's database. `db.connect(target)` opens another, with the same
+functions, and its own transactions, migrations and live updates:
+
+```quillo
+db.open("app.db")
+let analytics = db.connect(env("ANALYTICS_URL"))           // any kind: SQLite, Postgres, MySQL
+analytics.migrate("migrations/analytics")
+analytics.query("select day, sum(total) from sales group by day")
+db.transaction(() => {
+    db.exec("insert into orders ...")
+    analytics.transaction(() => analytics.exec("insert into sales ..."))   // its own
+})
+```
+
+- Call its functions on it, `analytics.query(...)` (or `sql | analytics.one`): that is
+  how they know which database. Connect at the top of the program; the same target
+  again is the same connection, not a new pool.
+- A transaction is its own database's: one inside another on a different database
+  commits or rolls back on its own.
+- Live data tells them apart: a page showing `analytics`' `orders` does not refresh
+  when `db`'s `orders` changes. Its topics carry a label, not the URL.
+- A connection never reaches the browser (its URL may hold a password).
+
+Mounted programs and services have their own `db` too, so one Quillo can run programs
+on different databases side by side.
+
 ### Many tenants
 
 One program can serve many tenants (customers, teams, sites), each with its own data:
@@ -1089,6 +1284,15 @@ route GET / = <h1>Welcome, {tenant()}</h1>
   header, a path segment, a lookup), a name or null. `tenant()` is the current one, or
   null. A tenant's name is lowercase letters, digits, `-` and `_` (at most 63); anything
   else is no tenant, so a name is always safe in a file name or a database name.
+- A function as the target says where each tenant's database is, so tenants can be on
+  different kinds of database. It is asked once for each tenant, when first used; null
+  means there is no such tenant. It cannot use the database it picks for (keep the list
+  in another):
+
+  ```quillo
+  let registry = db.connect("registry.db")
+  db.open((tenant) => registry.one("select url from tenants where name = ?", tenant)?.url)
+  ```
 - A `db.open` target with `{tenant}` in it is a database per tenant: a SQLite file each,
   a PostgreSQL schema each in one database with `?schema=t_{tenant}`, or a database each
   with `postgres://host/app_{tenant}` (made by you beforehand). Give schemas a prefix:
@@ -1120,6 +1324,7 @@ http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 ```
 
 Every HTTP status is a response; failing to connect is an error value.
+`http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 
 ## Checking
 
@@ -1245,36 +1450,76 @@ up to date the moment something it shows changes.
 
 ## Not built yet
 
-- `match` exhaustiveness and record types in the checker
+- `match` exhaustiveness in the checker
 - compiling components to WebAssembly (they compile to JavaScript)
 - a formatter
 
 ## Layout
 
 ```
-src/lexer.rs      tokens; newline handling
-src/parser.rs     recursive descent: statements, expressions, patterns, HTML, routes, components
-src/interp.rs     evaluator, pattern matching, HTML and component rendering, effects
-src/builtins.rs   standard library
-src/db.rs         db: SQLite, and the shared API
-src/pg.rs         db: PostgreSQL (pool, placeholders, types)
-src/fetch.rs      http: the HTTP client
-src/server.rs     request matching, server fns, responses, worker pool, --watch
-src/service.rs    services: in this process or elsewhere, signed calls, --split
-src/numeric.rs    math, stats and vec: Python's math and statistics, numpy's operations
-src/par.rs        a pool of threads for long lists, in chunks of a fixed size
-src/ws.rs         WebSockets, for live updates and --watch reloads
-src/cluster.rs    several servers behind limer: --register, broadcasts
-src/viewcache.rs  reusing views' HTML while their inputs are unchanged
-src/shared.rs     the interpreter lock and other state shared between threads
-src/check.rs      the static checker
-src/client.rs     compiles components to JavaScript
-src/client/runtime.js   the browser runtime: values, standard library, virtual DOM
-src/lsp.rs        the language server
-src/main.rs       CLI: run, check, repl, lsp
-editors/vscode/   the VS Code extension
-examples/         hello, orders, todo, notes
-tests/            language, routing, effects, checker, compiler (in Node), browser
-                  (headless Chrome), PostgreSQL (a throwaway server), server and
-                  language server tests
+src/main.rs        CLI: run, app, check, repl, lsp
+src/lib.rs         the crate: what the binary and the tests use
+
+The language
+src/lexer.rs       tokens; newline handling
+src/parser.rs      recursive descent: statements, expressions, patterns, HTML, routes, components
+src/ast.rs         the syntax tree, types, effects
+src/interp.rs      evaluator, pattern matching, HTML and component rendering, effects
+src/value.rs       values, maps, scopes
+src/error.rs       errors with a file and line
+src/record.rs      records: type User = { ... }, made, checked, in patterns
+src/check.rs       the static checker (quillo check, quillo run, the language server)
+src/script.rs      run_script: code a program's users write, sandboxed
+
+The standard library
+src/builtins.rs    the builtins every program can call
+src/numeric.rs     math, stats and vec: Python's math and statistics, numpy's operations
+src/par.rs         a pool of threads for long lists, in chunks of a fixed size
+src/crypto.rs      crypto: hashes, signatures, tokens, passwords
+src/imaging.rs     image: what an image file is, and new files made from it
+src/highlight.rs   highlight(code, lang): source code as HTML
+src/i18n.rs        translations
+src/fetch.rs       http: the HTTP client, and http.stream
+
+Databases
+src/db.rs          db: SQLite, connections, tenants, transactions, and the shared API
+src/pg.rs          PostgreSQL (pool, pipelining, placeholders, types)
+src/my.rs          MySQL and MariaDB (the mysql feature)
+src/migrate.rs     db.migrate: schema files applied once each
+src/sqlinfo.rs     which tables a statement reads and writes, for live updates
+
+Serving
+src/httpd.rs       the event loop: connections, requests as coroutines, waiting off the loop
+src/server.rs      request matching, server fns, responses, --watch
+src/stream.rs      answers sent as they are made: stream, events, send
+src/service.rs     services: in this process or elsewhere, signed calls, --split
+src/session.rs     cookies and sessions
+src/upload.rs      files sent with a form
+src/statics.rs     files served with file()
+src/site.rs        what a program sets about its site: tenants, cross-site posts
+src/jobs.rs        jobs run on a schedule
+src/viewcache.rs   reusing views' HTML while their inputs are unchanged
+src/ws.rs          WebSockets, for live updates and --watch reloads
+src/cluster.rs     several servers behind limer: --register, broadcasts
+src/metrics.rs     what GET /_quillo/metrics reports
+src/shared.rs      the interpreter lock and other state shared between threads
+src/alloc.rs       the memory allocator: the system's on event loops, mimalloc elsewhere
+src/stack.rs       room on the stack for deep recursion
+src/desktop.rs     quillo app: the program in a native window
+
+The browser and editors
+src/client.rs      compiles components to JavaScript
+src/client/runtime.js  the browser runtime: values, standard library, virtual DOM
+src/island.rs      when a page loads its components' code
+src/lsp.rs         the language server
+editors/vscode/    the VS Code extension
+
+examples/          hello, orders, todo, notes, compose, layout, spa, scroll, life, storm,
+                   services, and index (all of them in one server)
+apps/crm/          a whole application: a multi-tenant CRM
+site/              quillolang.org, written in Quillo; its docs are made from this README
+tests/             the language, routes, records, effects, the checker, numbers, streams,
+                   services, sessions, uploads, tenants, several databases, the compiler
+                   (in Node), the browser (headless Chrome), PostgreSQL and MariaDB
+                   (throwaway servers), the CRM, and the language server
 ```

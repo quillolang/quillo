@@ -5,7 +5,7 @@ server fn save(text: str) -> list {
 }
 
 component Counter(start: int = 0) {
-    ~count = start
+    state count = start
     <div #counter>
         <span.value>{count}</span>
         <button.inc @click={() => { count += 1 }}>+</button>
@@ -13,9 +13,9 @@ component Counter(start: int = 0) {
 }
 
 component Todos(initial: list) {
-    ~items = initial
-    ~draft = ""
-    ~status = "idle"
+    state items = initial
+    state draft = ""
+    state status = "idle"
     <div #todos>
         <form @submit={() => {
             status = "saving"

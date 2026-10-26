@@ -1031,7 +1031,13 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
             }
             Item::Request { req, keep_alive } => {
                 let head = req.method == "HEAD";
-                match worker.answer(app, req) {
+                match worker.answer(app, req, Some(&mut ConnSink(c))) {
+                    Answer::Streamed { close } => {
+                        if close || !keep_alive {
+                            c.closing = true;
+                            return Fate::Keep;
+                        }
+                    }
                     Answer::Respond(resp) => {
                         let close = !keep_alive || resp.header("connection").map_or(false, |v| v.eq_ignore_ascii_case("close"));
                         write_response(&mut c.output, &resp, head, close);
@@ -1046,6 +1052,49 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
         }
     }
     Fate::Keep
+}
+
+/// A streamed answer's way onto the connection (src/stream.rs): what is
+/// sent goes out at once; when the client reads slower than that, the
+/// request waits (on a pool thread, as for the database) until it takes more.
+struct ConnSink<'a>(&'a mut Conn);
+
+impl crate::stream::Sink for ConnSink<'_> {
+    fn write(&mut self, data: &[u8]) -> bool {
+        let c = &mut *self.0;
+        c.output.extend_from_slice(data);
+        loop {
+            match flush(c) {
+                Err(_) => return false,
+                Ok(true) => return true,
+                Ok(false) => {}
+            }
+            if !writable(&c.stream) {
+                return false;
+            }
+        }
+    }
+}
+
+/// Waits until the socket takes more (for up to `SLOW`); false if it does not.
+fn writable(s: &TcpStream) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = s.as_raw_fd();
+        let wait = move || {
+            let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: one pollfd, of a socket the paused request keeps open.
+            unsafe { libc::poll(&mut p, 1, SLOW.as_millis() as libc::c_int) > 0 }
+        };
+        wait_elsewhere(wait).unwrap_or_else(|f| f())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = s;
+        std::thread::sleep(Duration::from_millis(5));
+        true
+    }
 }
 
 /// Writes as much of `output` as the socket takes; `true` when all of it.
@@ -1225,6 +1274,16 @@ pub(crate) fn write_response(out: &mut Vec<u8>, resp: &HttpResponse, head: bool,
 /// The status line and headers for a body `len` long (written by the
 /// caller, if at all); whether the status has no body.
 pub(crate) fn write_head(out: &mut Vec<u8>, resp: &HttpResponse, len: u64, close: bool) -> bool {
+    write_head_as(out, resp, Some(len), close)
+}
+
+/// The head of an answer sent in chunks, as it is made.
+pub(crate) fn write_stream_head(out: &mut Vec<u8>, resp: &HttpResponse) {
+    write_head_as(out, resp, None, false);
+}
+
+/// With `len` None, the body is chunked.
+fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close: bool) -> bool {
     out.extend_from_slice(b"HTTP/1.1 ");
     push_num(out, resp.status as u64);
     out.push(b' ');
@@ -1248,9 +1307,14 @@ pub(crate) fn write_head(out: &mut Vec<u8>, resp: &HttpResponse, len: u64, close
     }
     let bodyless = resp.status < 200 || resp.status == 204 || resp.status == 304;
     if !bodyless {
-        out.extend_from_slice(b"content-length: ");
-        push_num(out, len);
-        out.extend_from_slice(b"\r\n");
+        match len {
+            Some(len) => {
+                out.extend_from_slice(b"content-length: ");
+                push_num(out, len);
+                out.extend_from_slice(b"\r\n");
+            }
+            None => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
+        }
     }
     if !server {
         out.extend_from_slice(b"server: Quillo\r\n");

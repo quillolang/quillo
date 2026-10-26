@@ -223,12 +223,18 @@ impl Interp {
         if let Some((prefix, url)) = self.remote_mounts.iter().find(|(p, _)| path == p.as_str() || path.starts_with(&format!("{}/", p))).cloned() {
             return crate::service::pass_on(self, &url, &prefix, req);
         }
+        self.pending_stream = None;
+        // One a request made and nothing took (a job that gave back a stream).
+        drop(crate::stream::take_made());
         for (prefix, sub) in self.mounts.iter_mut() {
             if path == prefix.as_str() || path.starts_with(&format!("{}/", prefix)) {
                 let rest = &req.url[prefix.len()..];
                 let mut inner = req.clone();
                 inner.url = if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() };
-                return sub.handle(&inner);
+                sub.streams_direct = self.streams_direct;
+                let resp = sub.handle(&inner);
+                self.pending_stream = sub.pending_stream.take();
+                return resp;
             }
         }
         self.rendered_island = false;
@@ -246,6 +252,24 @@ impl Interp {
             }
         }
         let mut resp = self.handle_inner(req);
+        // A streamed answer: its function, for the server to run after the
+        // head; or, with no server to, run now into the body.
+        if resp.header(crate::stream::MARK).is_some() {
+            let made = crate::stream::take_made();
+            if self.streams_direct {
+                self.pending_stream = made;
+            } else {
+                resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::stream::MARK));
+                if let (Some(p), false) = (made, req.method == "HEAD") {
+                    let mut out = crate::stream::Buffer(Vec::new());
+                    if let crate::stream::Ended::Failed = crate::stream::run(self, p, &mut out, false) {
+                        resp = plain(500, "internal error\n");
+                    } else {
+                        resp.body = out.0;
+                    }
+                }
+            }
+        }
         for c in self.set_cookies.drain(..) {
             resp.headers.push(("set-cookie".into(), c));
         }
@@ -497,7 +521,7 @@ impl Interp {
                 .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
-        if let Err(msg) = check_args(&c.def, &args) {
+        if let Err(msg) = check_args(&self.types, &c.def, &args) {
             return rpc_error(400, &msg);
         }
         let query = Value::map(parse_urlencoded(qs));
@@ -590,6 +614,9 @@ pub(crate) enum Answer {
     /// The connection goes to a thread of its own (pages waiting for live
     /// data or reloads, large files), which answers on it directly.
     Detach(crate::httpd::Detached),
+    /// Sent already, as it was made (`stream`, `events`); `close` when the
+    /// connection cannot carry another answer.
+    Streamed { close: bool },
 }
 
 /// Writes, on a connection a thread now owns, the answers to the requests
@@ -690,7 +717,7 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
 }
 
 /// Checks a browser's arguments against a `server fn`'s parameters.
-pub(crate) fn check_args(def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
     }
@@ -699,8 +726,8 @@ pub(crate) fn check_args(def: &crate::ast::FnDef, args: &[Value]) -> Result<(), 
             None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
             Some(v) => {
                 if let Some(ty) = &p.ty {
-                    if !crate::interp::type_matches(ty, v) {
-                        return Err(format!("argument `{}` of `{}` must be {}, got {}", p.name, def.name, ty.text(), v.type_name()));
+                    if let Err(why) = crate::record::fits(types, ty, v, false) {
+                        return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)));
                     }
                 }
             }
@@ -763,6 +790,13 @@ fn value_response(v: Value) -> HttpResponse {
 fn render_response(r: &Response) -> HttpResponse {
     let (ctype, body): (Option<&str>, Vec<u8>) = match &r.body {
         Body::Bytes(b) => (None, b.clone()),
+        // Its function runs once the head is sent (see `Interp::handle`).
+        Body::Stream { f, events } => {
+            crate::stream::made(f.clone(), *events);
+            let mut headers = r.headers.clone();
+            headers.push((crate::stream::MARK.into(), "1".into()));
+            return HttpResponse { status: r.status, headers, body: Vec::new() };
+        }
         Body::Value(v) => match v {
             Value::Nil => (None, Vec::new()),
             Value::Html(h) => (Some("text/html; charset=utf-8"), h.as_bytes().to_vec()),
@@ -1073,8 +1107,9 @@ impl Worker {
         Worker { generation: 0, local: None, program: app.current().1 }
     }
 
-    /// Answers a request. The caller holds the interpreter lock.
-    pub(crate) fn answer(&mut self, app: &Arc<App>, req: HttpRequest) -> Answer {
+    /// Answers a request, a streamed answer on `sink` (the connection) as it
+    /// is made. The caller holds the interpreter lock.
+    pub(crate) fn answer(&mut self, app: &Arc<App>, req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
         if let Some(token) = &app.launch_token {
             if let Some(resp) = launch_gate(&req, token).filter(|_| !is_job_request(&req)) {
                 return Answer::Respond(resp);
@@ -1125,7 +1160,10 @@ impl Worker {
             plain(200, &self.generation.to_string())
         } else {
             match (&mut self.local, &*self.program) {
-                (Some(it), _) => match run_program(it, &req) {
+                (Some(it), _) => match {
+                    it.streams_direct = sink.is_some();
+                    run_program(it, &req)
+                } {
                     Some(r) => r,
                     None => {
                         eprintln!("quillo: internal error (a bug in Quillo) while handling {} {}", req.method, req.url);
@@ -1139,7 +1177,29 @@ impl Worker {
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
-        if app.watch {
+        // Streamed: the head now, then what the function sends.
+        let mut streamed = None;
+        if let Some(i) = resp.headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(crate::stream::MARK)) {
+            resp.headers.remove(i);
+            let pending = self.local.as_mut().and_then(|it| it.pending_stream.take());
+            match (sink, pending, self.local.as_mut()) {
+                (Some(sink), Some(p), Some(it)) => {
+                    resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
+                    let mut head = Vec::new();
+                    crate::httpd::write_stream_head(&mut head, &resp);
+                    let close = if !sink.write(&head) {
+                        true
+                    } else if req.method == "HEAD" {
+                        false
+                    } else {
+                        !matches!(crate::stream::run(it, p, sink, true), crate::stream::Ended::Done)
+                    };
+                    streamed = Some(close);
+                }
+                _ => resp = plain(500, "internal error\n"),
+            }
+        }
+        if app.watch && streamed.is_none() {
             inject_dev_script(&mut resp, self.generation);
         }
         // Chrome asks every site for this while DevTools is open; it is not
@@ -1169,6 +1229,9 @@ impl Worker {
                 }
                 _ => {}
             }
+        }
+        if let Some(close) = streamed {
+            return Answer::Streamed { close };
         }
         if resp.header("x-content-type-options").is_none() {
             resp.headers.push(("x-content-type-options".into(), "nosniff".into()));

@@ -7,12 +7,12 @@
 // Many pages: pages and sections apart, searched, sorted, grouped in
 // folders (folded as you like); the pinned ones first, and in the sidebar.
 component PagesPage(ws: map, on_change) {
-    ~rows = live(list_pages)
-    ~making = false
-    ~kind = "page"
-    ~q = ""
-    ~sort = "changed"
-    ~folded = []
+    state rows = live(list_pages)
+    state making = false
+    state kind = "page"
+    state q = ""
+    state sort = "changed"
+    state folded = []
     let templates = [
         ["launch", "Product launch", "A hero, a product to buy, a testimonial, a sign-up."],
         ["membership", "Membership", "Why become a member, the plans, a free newsletter."],
@@ -161,40 +161,40 @@ let COLUMN_SUGGESTS = ["text", "image", "button", "quote"]
 // in columns, each column suggesting what to add; the blocks' library and
 // the outline on the left, the page's or the block's settings on the right.
 component PageDesigner(id: int, ws: map) {
-    ~p = get_page(id)
-    ~preview = preview_of(id)
-    ~blocks = null
-    ~meta = null
-    ~selected = null
-    ~dragging = null
-    ~server = []
-    ~saved = ""
-    ~rctx = page_rule_ctx()
-    ~adding = null
+    state p = get_page(id)
+    state preview = preview_of(id)
+    state blocks = null
+    state meta = null
+    state selected = null
+    state dragging = null
+    state server = []
+    state saved = ""
+    state rctx = page_rule_ctx()
+    state adding = null
     // Where a drop would go: { parent, col, at }.
-    ~drop_to = null
+    state drop_to = null
     // The blocks as they were before each change, latest first (⌘Z), and
     // the changes undone (⌘⇧Z).
-    ~history = []
-    ~future = []
+    state history = []
+    state future = []
     // The blocks before the typing in place now going on.
-    ~typing_from = null
-    ~left = "blocks"
-    ~side = "block"
-    ~lib_q = ""
+    state typing_from = null
+    state left = "blocks"
+    state side = "block"
+    state lib_q = ""
     // Choosing a block to add: { parent, col, at } (a place in a list) or { replace } (an empty one).
-    ~inserting = null
-    ~ins_q = ""
-    ~ins_at = 0
+    state inserting = null
+    state ins_q = ""
+    state ins_at = 0
     // Typing reaches the live preview at most every 300 ms, and once more when it pauses.
-    ~pushed_at = 0
-    ~dirty = false
+    state pushed_at = 0
+    state dirty = false
     // Optional fields added while empty ("block:key"): shown, to be typed into.
-    ~reveal = []
+    state reveal = []
     // Feedback from the live preview: the team's to-dos, as they come.
-    ~fb = live(page_feedback, id)
-    ~fb_drafts = {}
-    ~fb_resolved = false
+    state fb = live(page_feedback, id)
+    state fb_drafts = {}
+    state fb_resolved = false
     if p == null { return <Loading/> }
     if is_err(p) { return <Empty title="No such page"><p><a href="/app/pages">All pages</a></p></Empty> }
     let bs = upgrade_blocks(blocks ?? p.draft.blocks ?? [])

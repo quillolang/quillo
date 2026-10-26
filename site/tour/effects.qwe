@@ -1,0 +1,7 @@
+fn load_user(id: int) with db = db.one("select * from users where id = ?", id)
+fn fetch_avatar(url: str) with http = http.get(url).body
+
+fn profile(id: int) with db, http {
+    let [user, orders] = parallel(() => load_user(id), () => load_orders(id))
+    { user, orders, avatar: fetch_avatar(user.avatar) }
+}

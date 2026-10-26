@@ -3,13 +3,13 @@
 // workspace's own, with the site shown as it will look while you change it.
 
 component SiteEditor(ws: map, on_change) {
-    ~setup = site_setup()
-    ~t = merge(DEFAULT_THEME, ws.settings.theme ?? {})
-    ~server = []
-    ~saved = false
-    ~what = "home"
-    ~shown = preview_site(merge(DEFAULT_THEME, ws.settings.theme ?? {}), "home")
-    ~css_open = (ws.settings.theme ?? {}).css != null && (ws.settings.theme ?? {}).css != ""
+    state setup = site_setup()
+    state t = merge(DEFAULT_THEME, ws.settings.theme ?? {})
+    state server = []
+    state saved = false
+    state what = "home"
+    state shown = preview_site(merge(DEFAULT_THEME, ws.settings.theme ?? {}), "home")
+    state css_open = (ws.settings.theme ?? {}).css != null && (ws.settings.theme ?? {}).css != ""
     if setup == null { return <Loading/> }
     if is_err(setup) { return <Empty title="The theme did not load"><p>{err_text(setup)}</p></Empty> }
     let problems = validate("theme", t, ctx_of(ws)) + server
@@ -135,8 +135,8 @@ view LinkList(links: list, options: list, on_change, on_reset = null) {
 
 // How the app asks and tells: the notice styles plugins bring.
 component NoticeSettings(ws: map) {
-    ~picked = ws.notice
-    ~problems = []
+    state picked = ws.notice
+    state problems = []
     <section.card.stack.narrow>
         <h2>Questions and notes</h2>
         <p.muted.small>How the app asks before it deletes, and tells you what it did. Plugins bring more styles.</p>

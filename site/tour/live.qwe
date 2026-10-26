@@ -1,0 +1,8 @@
+server fn load_notes() = db.query("select * from notes order by id")
+
+server fn add_note(text: str) = db.exec("insert into notes (text) values (?)", text)
+
+component Notes() {
+    state notes = live(load_notes)  // every open page sees new notes
+    <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
+}

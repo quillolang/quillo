@@ -167,6 +167,8 @@ pub struct Response {
 pub enum Body {
     Value(Value),
     Bytes(Vec<u8>),
+    /// Sent as the function makes it (`stream`, `events`: src/stream.rs).
+    Stream { f: Value, events: bool },
 }
 
 impl Value {
@@ -366,6 +368,7 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (Map(x), Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| equal(v, w))),
         (Err(x), Err(y)) => equal(x, y),
         (Func(x), Func(y)) => Arc::ptr_eq(x, y),
+        (Builtin(x, _), Builtin(y, _)) => x == y,
         _ => false,
     }
 }

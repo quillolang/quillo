@@ -36,11 +36,11 @@ view Landing() =
 
 // `single`: setting up the one workspace, which has no address to choose.
 component Signup(domain: str, single: bool = false) {
-    ~w = { name: "", slug: "", industry: "merchant", owner_name: "", email: "", password: "", currency: "USD" }
-    ~touched = []
-    ~server = []
-    ~free = null
-    ~busy = false
+    state w = { name: "", slug: "", industry: "merchant", owner_name: "", email: "", password: "", currency: "USD" }
+    state touched = []
+    state server = []
+    state free = null
+    state busy = false
     let all = check_workspace(single ? set(w, "slug", "main") : w) + server
     // Hints for what you have typed in, not for what you have yet to.
     let shown = all | filter((p) => contains(touched, p.field))
@@ -136,11 +136,11 @@ view FormPage(slug: str) =
 
 // `embedded`: inside a page's block, which has its own heading.
 component PublicForm(slug: str, embedded: bool = false) {
-    ~c = form_context(slug)
-    ~s = { email: "", first_name: "", last_name: "", consent: false }
-    ~touched = []
-    ~server = []
-    ~done = null
+    state c = form_context(slug)
+    state s = { email: "", first_name: "", last_name: "", consent: false }
+    state touched = []
+    state server = []
+    state done = null
     if c == null { return <Loading/> }
     if is_err(c) { return <h1>No such form</h1> }
     let all = validate("signup", s, c.ctx) + server
@@ -183,18 +183,18 @@ view UnsubscribedPage(ok: bool, name: str) =
 // snapshot of it to draw on and say what they think; everyone's feedback,
 // and the team's answers, as they come; the viewer resolves it.
 component LivePreview(token: str) {
-    ~v = live(live_view, token)
-    ~fb = live(preview_feedback, token)
-    ~choosing = false
-    ~chosen = null
-    ~shot = null
-    ~color = "#e11d48"
-    ~author = ""
-    ~body = ""
-    ~problems = []
-    ~panel = false
-    ~drafts = {}
-    ~sent = ""
+    state v = live(live_view, token)
+    state fb = live(preview_feedback, token)
+    state choosing = false
+    state chosen = null
+    state shot = null
+    state color = "#e11d48"
+    state author = ""
+    state body = ""
+    state problems = []
+    state panel = false
+    state drafts = {}
+    state sent = ""
     if v == null { return <p.pb-missing>Loading…</p> }
     if is_err(v) { return <section.np-empty><h1>This preview is not available</h1><p>{err_text(v)}</p></section> }
     let items = fb == null || is_err(fb) ? [] : fb

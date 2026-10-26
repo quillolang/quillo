@@ -3,11 +3,11 @@
 // still get right. Driven by lists.js (tests/browser.rs).
 
 component Lists() {
-    ~items = range(1, 7) | map((i) => { id: i, label: `item ${i}` })
-    ~picked = 0
-    ~rich = false
-    ~prefix = ""
-    ~clicks = []
+    state items = range(1, 7) | map((i) => { id: i, label: `item ${i}` })
+    state picked = 0
+    state rich = false
+    state prefix = ""
+    state clicks = []
     // A variable the rows' handlers keep: when it changes, so must they.
     let note = prefix
     <div.lists>

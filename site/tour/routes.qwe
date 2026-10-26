@@ -1,0 +1,8 @@
+route GET /hello/:name = `Hello, ${name}!`
+
+route POST /orders { json: { type: "order" | "refund", qty: int } } {
+    reply 201 { accepted: true, qty }
+}
+
+route GET /feed ? { page: int = 1 } =
+    request | auth.required | load_feed(page) | render_feed

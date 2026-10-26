@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "in",
-    "true", "false", "null", "reply", "as", "with",
+    "true", "false", "null", "reply", "as", "with", "state", "type", "service",
 ];
 const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
@@ -517,7 +517,7 @@ impl Default for Server {
 fn keyword_doc(w: &str) -> Option<String> {
     let text = match w {
         "route" => "`route METHOD /path/:param ? { query } { request pattern } = expr`\n\nDeclares an HTTP route. Routes are tried in order; the first whose method, path and patterns match handles the request.",
-        "component" => "`component Name(props) { ~state = init ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to `~state` re-renders it. Handlers: `@click={() => { count += 1 }}`.",
+        "component" => "`component Name(props) { state count = 0 ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to its state re-renders it. Handlers: `@click={() => { count += 1 }}`.",
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
@@ -525,6 +525,9 @@ fn keyword_doc(w: &str) -> Option<String> {
         "match" => "`match value { pattern [if guard] => result ... }`",
         "use" => "`use \"lib.qwe\"` runs another file once, into the global scope.",
         "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",
+        "state" => "`state count = 0` in a component: state, set on the first render and kept between renders (`~count = 0` is the short form). Assigning to `count` re-renders the component.",
+        "type" => "`type User = { name: str, role: \"admin\" | \"member\" = \"member\" }`\n\nA record (or another name for a type). `User({ ... })` makes one, or gives an error value; in annotations and patterns it is checked field by field.",
+        "service" => "`service billing = \"billing.qwe\"` (or `service /shop = \"shop.qwe\"`): a part of the app that runs here or as a server of its own; its `server fn`s are called as `billing.invoice(...)`.",
         _ => return None,
     };
     Some(text.to_string())

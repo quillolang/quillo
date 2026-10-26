@@ -276,3 +276,25 @@ fn constants_holding_functions_are_made_in_the_browser_too() {
     let e = it.load_source(src, "case.qwe").err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("changes"), "{}", e);
 }
+
+#[test]
+fn state_is_declared_with_state_or_tilde() {
+    let src = r#"
+component C(start: int = 1) {
+    state count = start
+    ~other = count + 1
+    let state = { label: "a name like any other" }
+    <p>{count} {other} {state.label}</p>
+}
+route GET / = <C start={5} />
+"#;
+    let mut it = Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    let r = it.handle(&quillo::server::HttpRequest { method: "GET".into(), url: "/".into(), headers: vec![("Host".into(), "x".into())], body: Vec::new(), remote: "127.0.0.1".into() });
+    let html = String::from_utf8_lossy(&r.body).into_owned();
+    assert!(html.contains("5 6 a name like any other"), "{}", html);
+    let a = quillo::check::check_source(src, "main.qwe", std::path::Path::new("."));
+    assert!(a.errors().next().is_none(), "{:?}", a.errors().map(|e| e.message.clone()).collect::<Vec<_>>());
+    let js = quillo::client::test_script(&it, "C");
+    assert!(js.is_ok(), "{:?}", js.err());
+}

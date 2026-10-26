@@ -19,7 +19,7 @@ view Stat(label: str, value: num, trend: str = "") =
 view Card(title: str, children) = <section.card><h3>{title}</h3>{children}</section>
 
 component Counter(label: str, start: int = 0, step: int = 1) {
-    ~n = start
+    state n = start
     <p.counter>
         {label}: <b>{n}</b>
         <button @click={() => { n += step }}>+{step}</button>
@@ -42,7 +42,7 @@ view Node(node) = match node {
 fn blocks(children) = for c in children => <Node node={c}/>
 
 component Editor(initial: str) {
-    ~source = initial
+    state source = initial
     let layout = json.parse(source)
     <div.editor>
         <textarea spellcheck={false} bind:value={source}></textarea>

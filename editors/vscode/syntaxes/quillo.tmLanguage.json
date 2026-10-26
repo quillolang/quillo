@@ -348,6 +348,17 @@
         {
           "name": "storage.type.quillo",
           "match": "\\b(let|fn|view|component|server)\\b"
+        },
+        {
+          "name": "storage.type.quillo",
+          "match": "\\btype(?=\\s+[A-Z])"
+        },
+        {
+          "match": "\\b(state)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*=(?!=))",
+          "captures": {
+            "1": { "name": "storage.type.quillo" },
+            "2": { "name": "variable.other.state.quillo" }
+          }
         }
       ]
     },

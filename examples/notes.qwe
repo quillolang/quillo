@@ -37,9 +37,9 @@ server fn remove_note(id: int) -> list with db {
 }
 
 component Notes() {
-    ~notes = live(load_notes)
-    ~draft = ""
-    ~problem = null
+    state notes = live(load_notes)
+    state draft = ""
+    state problem = null
     let open = notes | count((n) => n.done == 0)
     <section.notes>
         <form @submit={() => {

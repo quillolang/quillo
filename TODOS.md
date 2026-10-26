@@ -45,7 +45,7 @@ Known limits of what is there, from the security review and the soak test:
 
 ## Reactivity in the browser
 
-Assigning `~x` re-runs the component's function. Markup of a fixed shape is
+Assigning to a component's `state` re-runs the component's function. Markup of a fixed shape is
 compiled into blocks (a cloned template with holes for what can change), so
 an update compares hole values rather than whole trees; keyed lists move only
 the rows that must move; and the rows of a keyed `for` loop are kept from one
@@ -83,6 +83,15 @@ Child components still update whenever their parent does.
 - [ ] **Round-robin reconnects.** A page whose live socket lands on a different
       server reloads all its live data once. Fine with `sticky_cookie`; worth
       measuring without it.
+
+## Tests
+
+- [ ] **Ports taken by another test.** `tests/cluster.rs`, `tests/browser.rs` and
+      `tests/services.rs` pick a free port and release it before their server
+      takes it, so a test running alongside can get it first, and the test then
+      talks to the wrong server. `tests/streams.rs` waits for its own server to
+      say it is listening and tries another port if it could not; the others
+      should too.
 
 ## Several servers behind limer
 
@@ -122,10 +131,15 @@ view cache. Next, by expected gain:
 
 - [ ] **Enhanced forms** as a feature: `<form enhance>` (or similar) submitting
       with `fetch` and swapping in the response, for apps that are mostly views.
-- [ ] **Per-page bundles.** Each page could get only the components it uses;
-      today `/_quillo/quillo.js` carries every component of the program.
-- [ ] **Shorter two-way binding** for state, such as `<input ~value={name}/>`
-      next to `bind:value`, if it reads better in practice.
+- [ ] **Shorter two-way binding** for state, next to `bind:value`, if one reads
+      better in practice.
+- [ ] **Connections in components, found by `quillo check`.** A component that
+      uses a `db.connect` connection (or anything read from the database) stops
+      the program from loading, with a clear message, but `quillo check` does not
+      report it beforehand.
+- [ ] **One interface for database drivers.** Transactions share one path for
+      PostgreSQL and MySQL; the rest (queries, pools, migrations, tenants) is still
+      written per driver in `src/db.rs`, so a new one touches several places.
 - [ ] **JavaScript-truthiness warnings beyond known types.** The checker warns
       about `||`, `&&`, `!`, `if` and `? :` only where a value is known to be
       a string or a number. Callbacks such as `filter((x) => x.name)` and

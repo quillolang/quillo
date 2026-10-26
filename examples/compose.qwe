@@ -15,7 +15,7 @@ view Card(title: str, children) =
     </section>
 
 component Counter(label: str, start: int = 0, step: int = 1, on_change = null) {
-    ~n = start
+    state n = start
     <div.counter>
         <span.label>{label}</span>
         <button @click={() => { n -= step; on_change && on_change(label, n) }}>−</button>
@@ -25,7 +25,7 @@ component Counter(label: str, start: int = 0, step: int = 1, on_change = null) {
 }
 
 component Panel(header, open: bool = true, children) {
-    ~shown = open
+    state shown = open
     <div.panel>
         <button.header @click={() => { shown = !shown }}>
             {shown ? "▾" : "▸"} {header}
@@ -35,8 +35,8 @@ component Panel(header, open: bool = true, children) {
 }
 
 component Dashboard() {
-    ~totals = { Apples: 0, Pears: 3, Plums: 0 }
-    ~log = []
+    state totals = { Apples: 0, Pears: 3, Plums: 0 }
+    state log = []
     let fruit = values(totals) | sum
 
     // Called by the Counters when their count changes.

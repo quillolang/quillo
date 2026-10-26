@@ -42,8 +42,8 @@ view SelectField(label: str, field: str, value, options: list, problems: list, o
 // is a first choice whose value is "". Its input is in no form, so Enter
 // chooses and does not send the form around it.
 component PickOne(label: str, field: str, value, options: list, problems: list, on_change, empty: str = "") {
-    ~q = null
-    ~at = 0
+    state q = null
+    state at = 0
     let all = (empty == "" ? [] : [{ value: "", label: empty }]) + options
     let chosen = find(all, (o) => str(o.value) == str(value ?? ""))
     let words = lower(trim(q ?? ""))

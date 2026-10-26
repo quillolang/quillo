@@ -229,6 +229,23 @@ impl Parser {
                     self.next()?;
                     return Ok(Stmt::Fn(Arc::new(self.parse_component(line)?)));
                 }
+                "type" => {
+                    // `type Name = ...`; otherwise `type` is a name.
+                    let saved = self.save();
+                    self.next()?;
+                    if let Tok::Ident(n) = self.peek()? {
+                        let capital = n.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+                        self.next()?;
+                        if capital && self.at(&Tok::Assign)? {
+                            if !crate::ast::is_type_name(&n) {
+                                return Err(QuilloError::new(format!("a type is named like `User` or `OrderLine`, with small letters: `{}` reads as a constant", n), line));
+                            }
+                            self.next()?;
+                            return Ok(Stmt::Type(Arc::new(self.parse_typedef(n, line)?)));
+                        }
+                    }
+                    self.restore(saved);
+                }
                 "service" => {
                     // `service name = "file.qwe"` or `service /prefix = "file.qwe"`;
                     // otherwise `service` is a name.
@@ -404,7 +421,7 @@ impl Parser {
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
-    /// `component Name(params) { ~state = init ... <html/> }`. `~` statements
+    /// `component Name(params) { state x = init ... <html/> }`. `state` statements
     /// may only appear directly in the body.
     fn parse_component(&mut self, line: u32) -> PResult<FnDef> {
         let name = self.expect_ident("a component name")?;
@@ -436,8 +453,7 @@ impl Parser {
                     return self.err_at("unexpected end of input: missing `}`");
                 }
                 let l = self.line()?;
-                if self.eat(&Tok::Tilde)? {
-                    let n = self.expect_ident("a state name after `~`")?;
+                if let Some(n) = self.state_decl()? {
                     self.expect(&Tok::Assign, "`=` after the state name")?;
                     let e = self.parse_expr()?;
                     stmts.push(Stmt::State(n, e, l));
@@ -453,6 +469,30 @@ impl Parser {
         Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line })
     }
 
+    /// `state count = ...` (or `~count = ...`) in a component: the state's
+    /// name, with what comes after it next. Otherwise nothing is taken, and
+    /// `state` is a name like any other (`let state = ...`, `state.label`).
+    fn state_decl(&mut self) -> PResult<Option<String>> {
+        if self.eat(&Tok::Tilde)? {
+            return self.expect_ident("a state name after `~`").map(Some);
+        }
+        if !matches!(self.peek()?, Tok::Ident(w) if w == "state") {
+            return Ok(None);
+        }
+        let saved = self.save();
+        self.next()?;
+        if let Tok::Ident(n) = self.peek()? {
+            if !KEYWORDS.contains(&n.as_str()) {
+                self.next()?;
+                if self.at(&Tok::Assign)? {
+                    return Ok(Some(n));
+                }
+            }
+        }
+        self.restore(saved);
+        Ok(None)
+    }
+
     fn parse_type(&mut self) -> PResult<Ty> {
         let mut names: Vec<String> = Vec::new();
         let mut optional = false;
@@ -464,9 +504,14 @@ impl Parser {
                 Tok::Ident(s) => s,
                 // `{ title: str, tags: list<str> }`: a map and its fields.
                 Tok::LBrace => {
-                    fields = Some(self.parse_shape()?);
+                    fields = Some(self.parse_shape(None)?);
                     "map".to_string()
                 }
+                // `"admin" | "member"`: one of these strings.
+                Tok::Str(parts) => match lit_string(parts) {
+                    Some(s) => serde_json::to_string(&s).unwrap_or_default(),
+                    None => return Err(QuilloError::new("a string in a type cannot contain `${…}`", t.line)),
+                },
                 other => return Err(QuilloError::new(format!("expected a type, found {}", other.describe()), t.line)),
             };
             // `list<int>`: what the list holds.
@@ -479,13 +524,13 @@ impl Parser {
             }
             if name == "null" {
                 optional = true;
-            } else if TYPE_NAMES.contains(&name.as_str()) {
+            } else if TYPE_NAMES.contains(&name.as_str()) || name.starts_with('"') || crate::ast::is_type_name(&name) {
                 if !names.contains(&name) {
                     names.push(name);
                 }
             } else {
                 return Err(QuilloError::new(
-                    format!("unknown type `{}` (known types: {}, null)", name, TYPE_NAMES.join(", ")),
+                    format!("unknown type `{}` (known types: {}, null, and the program's own, which start with a capital letter)", name, TYPE_NAMES.join(", ")),
                     t.line,
                 ));
             }
@@ -502,8 +547,22 @@ impl Parser {
         Ok(Ty { names, optional, elem, fields })
     }
 
-    /// The fields of a map type, after its `{`.
-    fn parse_shape(&mut self) -> PResult<Vec<(String, Ty)>> {
+    /// `type Name = ...` after the `=`: a record's fields, each perhaps with
+    /// a default (`role: str = "member"`), or another type.
+    fn parse_typedef(&mut self, name: String, line: u32) -> PResult<TypeDef> {
+        self.skip_seps()?;
+        if self.eat(&Tok::LBrace)? {
+            let mut defaults = Vec::new();
+            let fields = self.parse_shape(Some(&mut defaults))?;
+            return Ok(TypeDef { name, ty: Ty { names: vec!["map".into()], optional: false, elem: None, fields: Some(fields) }, defaults, line });
+        }
+        let ty = self.parse_type()?;
+        Ok(TypeDef { name, ty, defaults: Vec::new(), line })
+    }
+
+    /// The fields of a map type, after its `{`; with `defaults`, a record's,
+    /// which may have them.
+    fn parse_shape(&mut self, mut defaults: Option<&mut Vec<(String, Expr)>>) -> PResult<Vec<(String, Ty)>> {
         let mut fields: Vec<(String, Ty)> = Vec::new();
         loop {
             self.skip_list_seps()?;
@@ -521,6 +580,13 @@ impl Parser {
             };
             self.expect(&Tok::Colon, &format!("`:` and a type after `{}`", key))?;
             let ty = self.parse_type()?;
+            if let Some(ds) = defaults.as_deref_mut() {
+                if self.eat(&Tok::Assign)? {
+                    let e = self.parse_expr()?;
+                    ds.retain(|(k, _)| *k != key);
+                    ds.push((key.clone(), e));
+                }
+            }
             fields.retain(|(k, _)| *k != key);
             fields.push((key, ty));
             match self.peek()? {
@@ -1222,6 +1288,8 @@ impl Parser {
                 "null" => Pattern::Lit(Lit::Nil),
                 "nil" => return Err(QuilloError::new("use `null` instead of `nil`", line)),
                 t if TYPE_NAMES.contains(&t) => Pattern::Type(k.clone()),
+                // A record, or another type of the program's own.
+                t if crate::ast::is_type_name(t) => Pattern::Type(k.clone()),
                 t if KEYWORDS.contains(&t) => {
                     return Err(QuilloError::new(format!("unexpected keyword `{}` in pattern", t), line))
                 }

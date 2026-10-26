@@ -3,12 +3,14 @@
 Language support for [Quillo](https://github.com/wisp-one/quillo), the small web language.
 
 - **Highlighting** for routes and paths, HTML literals (tags, `.class#id`, `@event`, `bind:value`),
-  string interpolation, `~state`, types, effects and pipelines.
+  string interpolation, `state` declarations, `type` records, numbers such as `1e-9`, types,
+  effects and pipelines.
 - **Diagnostics as you type**: unknown names, wrong arguments, type mismatches, effects,
   component props, code that cannot run in the browser, unused variables.
 - **Hover** shows types and signatures; **Go to Definition** works across `use`d files.
-- **Completion** for your functions and variables, builtins (with signatures), `db.`, `http.`
-  and `json.` members, keywords, types, HTTP methods and effects.
+- **Completion** for your functions and variables, builtins (with signatures), the members of
+  `db.`, `http.`, `json.`, `crypto.`, `image.`, `math.`, `stats.` and `vec.`, keywords, types,
+  HTTP methods and effects.
 - **Outline** of functions, views, components, variables and routes.
 - **Snippets**: `route`, `routejson`, `fn`, `fnb`, `server fn`, `view`, `component`, `match`, `for`, `page`.
 - **Commands**: *Quillo: Run this file (watch mode)* (also the ▶ button), *Quillo: Check this file*,

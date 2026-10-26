@@ -3,10 +3,10 @@
 // interop.js (tests/browser.rs).
 
 component Widget() {
-    ~value = 1
-    ~shown = true
-    ~gauge = null
-    ~doubled = 0
+    state value = 1
+    state shown = true
+    state gauge = null
+    state doubled = 0
     <div>
         {shown && <div class="gauge" @mount={(el) => {
             gauge = js_new("Gauge", el, value)

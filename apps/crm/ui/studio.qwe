@@ -3,11 +3,11 @@
 // this workspace's pages and flows, and release it for every workspace.
 
 component StudioPage(ws: map, on_change) {
-    ~rows = studio_list()
-    ~id = ""
-    ~name = ""
-    ~problems = []
-    ~try_drafts = ws.try_drafts
+    state rows = studio_list()
+    state id = ""
+    state name = ""
+    state problems = []
+    state try_drafts = ws.try_drafts
     <div>
         <PageHead title="Plugin studio" sub="Write plugins here, try them in your pages and flows, release them to every workspace."/>
         <section.card.studio-try>
@@ -47,19 +47,19 @@ component StudioPage(ws: map, on_change) {
 }
 
 component PluginEditor(id: str, ws: map) {
-    ~p = studio_get(id)
-    ~src = null
-    ~problems = []
-    ~message = ""
-    ~busy = false
+    state p = studio_get(id)
+    state src = null
+    state problems = []
+    state message = ""
+    state busy = false
     // Live: checked when typing pauses, saved (and so loaded by the
     // program, and shown in the preview) whenever the checks pass.
-    ~live = true
-    ~typed_at = null
-    ~checking = false
-    ~waiting = null
-    ~frame = 0
-    ~pane = "preview"
+    state live = true
+    state typed_at = null
+    state checking = false
+    state waiting = null
+    state frame = 0
+    state pane = "preview"
     if p == null { return <Loading/> }
     if is_err(p) { return <Empty title={str(p.error)}><p><a href="/app/studio">The studio</a></p></Empty> }
     let code = src ?? p.source

@@ -1,0 +1,24 @@
+component Todo() {
+    state items = [
+        { id: 1, text: "Read the tour", done: true },
+        { id: 2, text: "Write a route", done: false },
+    ]
+    state draft = ""
+    let left = items | filter((i) => !i.done) | len
+
+    <form.todo @submit={() => {
+        if trim(draft) != "" {
+            items = items + [{ id: len(items) + 1, text: draft, done: false }]
+            draft = ""
+        }
+    }}>
+        <input bind:value={draft} placeholder="Add something…"/>
+        <ul>{for i in items =>
+            <li key={i.id} class={i.done && "done"} @click={() => {
+                items = items | map((j) =>
+                    j.id == i.id ? merge(j, { done: !j.done }) : j)
+            }}>{i.text}</li>
+        }</ul>
+        <small>{left} left</small>
+    </form>
+}

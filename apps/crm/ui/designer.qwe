@@ -4,7 +4,7 @@
 // be switched on.
 
 component FlowsPage(ws: map) {
-    ~rows = live(list_flows)
+    state rows = live(list_flows)
     let templates = [
         ["purchase", "After a purchase", "Thank buyers, tag them, follow up big orders, ask for a review."],
         ["welcome", "Welcome, then offer", "Greet new subscribers, offer a product, wait for the purchase."],
@@ -92,20 +92,20 @@ let GROUP_COLOR = { Start: "#0f766e", Message: "#2563eb", Sell: "#c2410c", Timin
 // ---- the designer -----------------------------------------------------------------------
 
 component FlowDesigner(id: int, ws: map) {
-    ~f = live(get_flow, id)
-    ~graph = null
-    ~name = null
-    ~active = null
-    ~selected = null
-    ~edge_on = null
-    ~drag = null
-    ~linking = null
-    ~mouse = { x: 0, y: 0 }
-    ~server = []
-    ~saved = ""
-    ~contacts = list_contacts({ q: "", stage: "", tag: "" }) ?? []
-    ~run_for = ""
-    ~zoom = 1
+    state f = live(get_flow, id)
+    state graph = null
+    state name = null
+    state active = null
+    state selected = null
+    state edge_on = null
+    state drag = null
+    state linking = null
+    state mouse = { x: 0, y: 0 }
+    state server = []
+    state saved = ""
+    state contacts = list_contacts({ q: "", stage: "", tag: "" }) ?? []
+    state run_for = ""
+    state zoom = 1
     if f == null { return <Loading/> }
     if is_err(f) { return <Empty title="No such flow"><p><a href="/app/flows">All flows</a></p></Empty> }
     let g = graph ?? f.graph

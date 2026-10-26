@@ -1,0 +1,61 @@
+// Streams read in the browser: `listen` while a component renders, and
+// `receive` from a handler (src/stream.rs, src/client/runtime.js).
+
+let ticks_sent = 0
+
+route GET /progress = events((send) => {
+    for i in range(3) {
+        send({ done: i + 1 }, "progress")
+        sleep(100)
+    }
+})
+
+route POST /reply = stream((send) => {
+    for w in split(`echo ${request.json.prompt} back`, " ") {
+        send(w + " ")
+        sleep(80)
+    }
+})
+
+route GET /ticks = events((send) => {
+    for i in range(100000) {
+        send(i)
+        ticks_sent = ticks_sent + 1
+        sleep(50)
+    }
+})
+
+route GET /ticks-sent = str(ticks_sent)
+
+component Progress() {
+    state done = 0
+    state names = []
+    listen("/progress", (p, name) => {
+        done = p.done
+        names = names + [name]
+    })
+    <p.progress data-names={join(names, ",")}>{done}</p>
+}
+
+component Chat() {
+    state answer = ""
+    <div>
+        <button.ask @click={() => { receive("/reply", (t) => { answer = answer + t }, { body: { prompt: "hi" } }) }}>Ask</button>
+        <p.reply>{answer}</p>
+    </div>
+}
+
+component Ticker() {
+    state on = true
+    state tick = -1
+    if on {
+        listen("/ticks", (n) => { tick = n })
+    }
+    <div>
+        <button.off @click={() => { on = false }}>Stop</button>
+        <p.tick>{tick}</p>
+    </div>
+}
+
+let test_js = read_file("streams.js")
+route GET / = <html><body><Progress /><Chat /><Ticker /><script>{raw(test_js)}</script></body></html>

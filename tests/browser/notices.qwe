@@ -2,7 +2,7 @@
 // itself. Driven by notices.js.
 
 component Deleter() {
-    ~n = 3
+    state n = 3
     <div>
         <p id="n">{n}</p>
         <button id="del" @click={() => {

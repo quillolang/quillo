@@ -1,0 +1,10 @@
+component Counter(start: int = 0) {
+    state count = start                  // state, kept between renders
+    let double = count * 2               // recomputed on every render
+    <div>
+        <span>{count} (x2 = {double})</span>
+        <button @click={() => { count += 1 }}>+</button>
+    </div>
+}
+
+route GET / = <html><body><Counter start={5}/></body></html>

@@ -87,7 +87,7 @@ pub struct Interp {
     islands: Vec<(Map, Map)>,
     /// While a `live` loader runs: the topics (tables, globals) it reads.
     pub reads: Option<std::collections::HashSet<String>>,
-    /// The subscription the last `live(...)` call set up, for `~state`.
+    /// The subscription the last `live(...)` call set up, for `state`.
     pub last_live: Option<Value>,
     /// Open `db.transaction`s, and changes to announce when they commit.
     pub tx_depth: usize,
@@ -96,9 +96,21 @@ pub struct Interp {
     /// request, so while one is open the lock is kept (see `unlocked`).
     pub sqlite_tx: usize,
     /// The Postgres connection this request's `db.transaction` holds.
-    pub pg_tx: std::sync::Mutex<Option<crate::db::PgTx>>,
+    pub pg_tx: std::sync::Mutex<Vec<crate::db::TxConn>>,
     /// This program's database (SQLite or a Postgres pool), opened on first use.
     pub db: Arc<std::sync::Mutex<Option<crate::db::DbSlot>>>,
+    /// Databases besides `db` (`db.connect`): each with its label for live
+    /// updates, shared by the program's forks.
+    pub(crate) db_conns: Arc<std::sync::Mutex<Vec<(String, crate::db::DbSlot)>>>,
+    /// The connection a `db` function was just called on (`analytics.query`),
+    /// taken by the function as it starts.
+    pub(crate) db_on: Option<usize>,
+    /// Tenant databases whose function (`db.open((tenant) => ...)`) is
+    /// running, which may not use them itself.
+    pub(crate) db_resolving: Vec<usize>,
+    /// Why the function picking a tenant's database failed, when it was by
+    /// using that database (said even if the function went on regardless).
+    pub(crate) db_loop: Option<String>,
     /// Where this program is mounted ("" at the root, "/notes" under `mount`).
     /// Root-relative links, redirects and browser URLs get it as a prefix.
     pub base: String,
@@ -107,6 +119,16 @@ pub struct Interp {
     /// Services with a prefix that run elsewhere: their routes are passed
     /// on to them (`service /shop = "shop.qwe"`, src/service.rs).
     pub remote_mounts: Vec<(String, String)>,
+    /// The stream `send` writes to, while a `stream`'s function runs.
+    pub(crate) stream_out: Option<crate::stream::Out>,
+    /// The function of the streamed answer `handle` just made, for the
+    /// server to run once it has sent the head (see `streams_direct`).
+    pub(crate) pending_stream: Option<crate::stream::Pending>,
+    /// Set by the server: `handle` leaves a streamed answer's function to it,
+    /// rather than make the whole answer first.
+    pub(crate) streams_direct: bool,
+    /// The program's own types (`type User = { ... }`: src/record.rs).
+    pub(crate) types: Arc<crate::record::Types>,
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
@@ -154,8 +176,22 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
     }
 }
 
+/// Whether `v` is of type `ty`, as a builtin type: the program's own types
+/// are known to `Interp::fits`.
 pub fn type_matches(ty: &Ty, v: &Value) -> bool {
     (ty.optional && matches!(v, Value::Nil)) || ty.names.iter().any(|n| type_name_matches(n, v))
+}
+
+/// " (`email` is missing)": what a record lacks, after a mismatch.
+pub(crate) fn because(why: &crate::record::Why) -> String {
+    why.text().map_or(String::new(), |t| format!(" ({})", t))
+}
+
+impl Interp {
+    /// Whether `v` is of type `ty`, records (src/record.rs) included.
+    pub(crate) fn fits(&self, ty: &Ty, v: &Value) -> bool {
+        crate::record::fits(&self.types, ty, v, false).is_ok()
+    }
 }
 
 fn ty_text(ty: &Ty) -> String {
@@ -480,16 +516,24 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
-            pg_tx: std::sync::Mutex::new(None),
+            pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
             sqlite_tx: 0,
             db: Arc::new(std::sync::Mutex::new(None)),
+            db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
+            db_on: None,
+            db_resolving: Vec::new(),
+            db_loop: None,
             base: String::new(),
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
+            types: Arc::new(Default::default()),
+            stream_out: None,
+            pending_stream: None,
+            streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
             spare: String::new(),
@@ -525,16 +569,24 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
-            pg_tx: std::sync::Mutex::new(None),
+            pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
             sqlite_tx: 0,
             db: self.db.clone(),
+            db_conns: self.db_conns.clone(),
+            db_on: None,
+            db_resolving: Vec::new(),
+            db_loop: None,
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
+            types: self.types.clone(),
+            stream_out: None,
+            pending_stream: None,
+            streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
             spare: String::new(),
@@ -681,7 +733,7 @@ impl Interp {
         }
         let in_tx = self.tx_depth > 0
             || self.sqlite_tx > 0
-            || self.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            || !self.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() {
             let mut out = Vec::with_capacity(fs.len());
             for f in &fs {
@@ -949,6 +1001,31 @@ impl Interp {
                 }
                 Ok(Value::Nil)
             }
+            Stmt::Type(td) => {
+                if !Arc::ptr_eq(env, &self.globals) {
+                    return fail(td.line, "`type` must be at the top level");
+                }
+                Arc::make_mut(&mut self.types).insert(td.name.clone(), td.clone());
+                // `User(fields)` makes one (`__record`, src/record.rs).
+                let line = td.line;
+                let def = Arc::new(FnDef {
+                    name: td.name.clone(),
+                    params: vec![Param { name: "fields".into(), ty: None, default: Some(Expr::Lit(Lit::Nil)) }],
+                    ret: None,
+                    err: None,
+                    effects: None,
+                    server: false,
+                    component: false,
+                    line,
+                    body: Expr::Call(
+                        Box::new(Expr::Ident("__record".into(), line)),
+                        vec![Expr::Lit(Lit::Str(td.name.as_str().into())), Expr::Ident("fields".into(), line)],
+                        line,
+                    ),
+                });
+                define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
+                Ok(Value::Nil)
+            }
             Stmt::Service(name, prefix, file, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`service` must be at the top level");
@@ -1075,6 +1152,14 @@ impl Interp {
         let v = self.eval(lhs, env)?;
         match rhs {
             Expr::Call(callee, args, l) => self.eval_call(callee, args, Some(v), env, *l),
+            // `sql | analytics.one`: on that connection.
+            Expr::Field(obj, name, l) => {
+                let recv = self.eval(obj, env)?;
+                let db_on = crate::db::conn_of(&recv, name);
+                let f = self.get_field(recv, name, *l)?;
+                self.db_on = db_on;
+                self.call(&f, vec![v], line)
+            }
             other => {
                 let f = self.eval(other, env)?;
                 self.call(&f, vec![v], line)
@@ -1248,10 +1333,15 @@ impl Interp {
         line: u32,
     ) -> Result<Value, Ctrl> {
         let mut argv = Vec::with_capacity(args.len() + 2);
+        // `analytics.query(...)` on a connection from `db.connect`: which one.
+        let mut db_on = None;
         let f = if let Expr::Field(obj, name, _) = callee {
             let recv = self.eval(obj, env)?;
             let method = match &recv {
-                Value::Map(m) => m.get(name.as_str()).cloned(),
+                Value::Map(m) => {
+                    db_on = crate::db::conn_of(&recv, name);
+                    m.get(name.as_str()).cloned()
+                }
                 _ => None,
             };
             match method {
@@ -1273,6 +1363,7 @@ impl Interp {
         for a in args {
             argv.push(self.eval(a, env)?);
         }
+        self.db_on = db_on;
         self.call(&f, argv, line)
     }
 
@@ -1295,6 +1386,7 @@ impl Interp {
                     return Ok(match &r.body {
                         Body::Value(b) => b.clone(),
                         Body::Bytes(b) => Value::str(String::from_utf8_lossy(b)),
+                        Body::Stream { .. } => Value::Nil,
                     })
                 }
                 _ => {}
@@ -1379,7 +1471,7 @@ impl Interp {
         let def = c.def.clone();
         let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line))?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
-            if !type_matches(ety, payload) {
+            if !self.fits(ety, payload) {
                 return fail(
                     def.line,
                     format!(
@@ -1485,11 +1577,13 @@ impl Interp {
         };
         Scope::done(scope);
         if let Some(ty) = &def.ret {
-            if !matches!(r, Value::Err(_)) && !type_matches(ty, &r) {
-                return fail(
-                    def.line,
-                    format!("`{}` must return {}, but returned {} {}", def.name, ty_text(ty), r.type_name(), short(&r)),
-                );
+            if !matches!(r, Value::Err(_)) {
+                if let Err(why) = crate::record::fits(&self.types, ty, &r, false) {
+                    return fail(
+                        def.line,
+                        format!("`{}` must return {}, but returned {} {}{}", def.name, ty_text(ty), r.type_name(), short(&r), because(&why)),
+                    );
+                }
             }
         }
         Ok(r)
@@ -1515,16 +1609,17 @@ impl Interp {
                 },
             };
             if let Some(ty) = &p.ty {
-                if !type_matches(ty, &v) {
+                if let Err(why) = crate::record::fits(&self.types, ty, &v, false) {
                     return fail(
                         line,
                         format!(
-                            "argument `{}` of `{}` must be {}, got {} {}",
+                            "argument `{}` of `{}` must be {}, got {} {}{}",
                             p.name,
                             def.name,
                             ty_text(ty),
                             v.type_name(),
-                            short(&v)
+                            short(&v),
+                            because(&why)
                         ),
                     );
                 }
@@ -1784,6 +1879,11 @@ impl Interp {
                 } else {
                     None
                 }
+            }
+            // A record: the value made as `User(v)` makes it.
+            Pattern::Type(t) if self.types.contains_key(t) => {
+                let ty = Ty { names: vec![t.clone()], optional: false, elem: None, fields: None };
+                crate::record::make(self, &ty, v, lenient)?.ok()
             }
             Pattern::Type(t) => {
                 if type_name_matches(t, v) {

@@ -12,17 +12,17 @@ let TYPE_LABELS = {
 // Many objects: searched, sorted, grouped in folders (folded as you like),
 // as cards or a table; the pinned ones first, and in everyone's sidebar.
 component ObjectsPage(ws: map, on_change) {
-    ~rows = list_objects()
-    ~templates = null
-    ~o = { name: "", plural: "", icon: "◆", table: "" }
+    state rows = list_objects()
+    state templates = null
+    state o = { name: "", plural: "", icon: "◆", table: "" }
     // The table's name follows the plural until it is typed.
-    ~table_typed = false
-    ~problems = []
-    ~making = false
-    ~q = ""
-    ~layout = ""
-    ~sort = "name"
-    ~folded = []
+    state table_typed = false
+    state problems = []
+    state making = false
+    state q = ""
+    state layout = ""
+    state sort = "name"
+    state folded = []
     let admin = ws.designer == true
     let open = (key) => { on_change(); navigate(`/app/objects/${key}`) }
     let table = table_typed ? o.table : table_name(blank(o.plural) ? (blank(o.name) ? "" : `${o.name}s`) : o.plural)
@@ -128,20 +128,20 @@ component ObjectsPage(ws: map, on_change) {
 
 component ObjectDesigner(okey: str, ws: map, on_change) {
     let key = okey
-    ~o = get_object(key)
-    ~f = { label: "", type: "text", required: false, options: [] }
-    ~options_text = ""
-    ~target = ""
-    ~via = ""
-    ~via_field = ""
-    ~rule = { if: { field: "", op: "is", value: "" }, then: { field: "", op: "is filled", value: "" }, message: "", warning: false }
-    ~problems = []
-    ~saved = ""
-    ~sample = { fields: {} }
-    ~scripting = null
-    ~sample_scripts = []
-    ~typed_at = null
-    ~renaming = null
+    state o = get_object(key)
+    state f = { label: "", type: "text", required: false, options: [] }
+    state options_text = ""
+    state target = ""
+    state via = ""
+    state via_field = ""
+    state rule = { if: { field: "", op: "is", value: "" }, then: { field: "", op: "is filled", value: "" }, message: "", warning: false }
+    state problems = []
+    state saved = ""
+    state sample = { fields: {} }
+    state scripting = null
+    state sample_scripts = []
+    state typed_at = null
+    state renaming = null
     if o == null { return <Loading/> }
     if is_err(o) { return <Empty title="No such object"><p><a href="/app/objects">Objects</a></p></Empty> }
     let reload = () => { o = get_object(key); on_change() }
@@ -395,8 +395,8 @@ let FIELD_GLYPHS = { text: "Aa", textarea: "¶", markdown: "M", number: "#", mon
 // The list's columns, for everyone, in a menu by its button: a switch per
 // field, the shown ones first; Escape or a click outside closes it.
 component ColumnsMenu(o: map, shown: list, on_set) {
-    ~open = false
-    ~q = ""
+    state open = false
+    state q = ""
     let found = (f) => q == "" || contains(lower(f.label), lower(q))
     let on = o.fields | filter((f) => contains(shown, f.key) && found(f))
     let off = o.fields | filter((f) => !contains(shown, f.key) && found(f))
@@ -422,11 +422,11 @@ component ColumnsMenu(o: map, shown: list, on_set) {
 
 component RecordsPage(okey: str, ws: map) {
     let key = okey
-    ~o = get_object(key)
-    ~q = ""
-    ~rows = list_records(key, "")
-    ~editing = null
-    ~state = ""
+    state o = get_object(key)
+    state q = ""
+    state rows = list_records(key, "")
+    state editing = null
+    state state = ""
     if o == null { return <Loading/> }
     if is_err(o) { return <Empty title="No such object"><p><a href="/app/objects">Objects</a></p></Empty> }
     // The columns its designer chose; else the first short fields: not pictures,
@@ -476,12 +476,12 @@ component RecordsPage(okey: str, ws: map) {
 // A record's form: the object's fields; its rules (and plugins' rules for
 // it) hint as you type, and the server checks again.
 component RecordForm(o: map, record: map, ws: map, on_saved) {
-    ~r = record
-    ~touched = record.id != null
-    ~server = []
-    ~choices = link_choices(o.key)
-    ~scripted = []
-    ~typed_at = null
+    state r = record
+    state touched = record.id != null
+    state server = []
+    state choices = link_choices(o.key)
+    state scripted = []
+    state typed_at = null
     let ctx = ctx_of(ws, { fields: ws.fields + o.fields })
     // The fields' rule scripts run on the server: asked when typing pauses.
     if typed_at != null {
@@ -514,11 +514,11 @@ component RecordForm(o: map, record: map, ws: map, on_saved) {
 
 component RecordPage(okey: str, id: int, ws: map) {
     let key = okey
-    ~o = get_object(key)
-    ~r = get_record(key, id)
-    ~message = ""
-    ~moving = null
-    ~tab = "fields"
+    state o = get_object(key)
+    state r = get_record(key, id)
+    state message = ""
+    state moving = null
+    state tab = "fields"
     if o == null || r == null { return <Loading/> }
     if is_err(o) || is_err(r) { return <Empty title="No such record"><p><a href={`/app/o/${key}`}>Back</a></p></Empty> }
     <div.stack>
@@ -575,12 +575,12 @@ view LinkedRecords(records: list, title: str = "Records") =
 let ACCESS_HELP = "A script that gives true for the records this role sees. It has record (the fields), owner_id, id and user (id, name, email): owner_id == user.id, or record.status != \"draft\"."
 
 component RolesSettings(ws: map, on_change) {
-    ~rows = list_roles()
-    ~editing = null
-    ~problems = []
-    ~tried = {}
-    ~ofields = null
-    ~find = ""
+    state rows = list_roles()
+    state editing = null
+    state problems = []
+    state tried = {}
+    state ofields = null
+    state find = ""
     let admin = ws.user.role != "member"
     let objects = ws.objects ?? []
     let level_of = (r, o) => (r.access[o.key] ?? {}).level ?? "none"
@@ -653,10 +653,10 @@ component RolesSettings(ws: map, on_change) {
 let SCRIPT_HELP = "Runs on the server when a record is saved. It has value, record (every field), is_new, user, today, and others_with(field, value) (how many other records have it) and contact(id). Give true (or null) when it is fine, false or a message when it is not, or { message, warning: true }."
 
 component FieldScript(okey: str, f: map, sample: map, on_saved) {
-    ~src = f.script ?? ""
-    ~result = null
-    ~problems = []
-    ~saved = false
+    state src = f.script ?? ""
+    state result = null
+    state problems = []
+    state saved = false
     <div.field-script.stack>
         <CodeEditor value={src} lang="qwe" rows={4} {problems} on_change={(v) => { src = v; saved = false; result = null }}/>
         <p.muted.small>{SCRIPT_HELP}</p>
@@ -688,9 +688,9 @@ view StateBadge(o: map, state: str) {
 // A move's form: the fields it asks for; then the record's rules, in the
 // state it goes to, decide (on the server).
 component MoveForm(o: map, record: map, move: map, ws: map, on_moved) {
-    ~r = record
-    ~server = []
-    ~choices = link_choices(o.key)
+    state r = record
+    state server = []
+    state choices = link_choices(o.key)
     let asked = o.fields | filter((f) => contains(move.fields ?? [], f.key))
     let to = (find(o.states, (st) => st.key == move.to) ?? { label: move.to }).label
     <form.stack @submit={() => {
@@ -708,8 +708,8 @@ component MoveForm(o: map, record: map, move: map, ws: map, on_moved) {
 // The object designer's states, and the moves between them: who may make
 // each, and the fields its form asks for.
 component StatesEditor(o: map, ws: map, on_save, problems: list) {
-    ~states = o.states ?? []
-    ~m = { label: "", from: [], to: "", groups: [], roles: [], fields: [] }
+    state states = o.states ?? []
+    state m = { label: "", from: [], to: "", groups: [], roles: [], fields: [] }
     let toggle = (k, v) => { m = set(m, k, contains(m[k], v) ? m[k] | filter((x) => x != v) : m[k] + [v]) }
     let label_of = (k) => (find(states, (st) => st.key == k) ?? { label: k }).label
     let names = (ids, all) => ids | map((i) => (find(all, (x) => x.id == i) ?? { name: "?" }).name) | join(", ")
@@ -759,9 +759,9 @@ component StatesEditor(o: map, ws: map, on_save, problems: list) {
 // ---- groups -------------------------------------------------------------------------------
 
 component GroupsSettings(ws: map, on_change) {
-    ~rows = list_groups()
-    ~editing = null
-    ~problems = []
+    state rows = list_groups()
+    state editing = null
+    state problems = []
     let admin = ws.user.role != "member"
     let toggle = (k, v) => { editing = set(editing, k, contains(editing[k] ?? [], v) ? editing[k] | filter((x) => x != v) : (editing[k] ?? []) + [v]) }
     let name_of = (uid) => (find(ws.users, (u) => u.id == uid) ?? { name: "?" }).name
@@ -801,9 +801,9 @@ component GroupsSettings(ws: map, on_change) {
 
 // Decisions flows ask of this person's groups and roles.
 component FlowDecisions() {
-    ~rows = my_flow_tasks()
-    ~notes = {}
-    ~message = ""
+    state rows = my_flow_tasks()
+    state notes = {}
+    state message = ""
     rows == null || is_err(rows) || len(rows) == 0 ? null : <section.card.stack>
         <h2>Waiting for your decision</h2>
         {message != "" && <p.ok>{message}</p>}
@@ -823,7 +823,7 @@ component FlowDecisions() {
 
 // Formatted text: written in Markdown, shown as it will read.
 component MarkdownField(label: str, field: str, value, problems: list, on_change) {
-    ~preview = null
+    state preview = null
     <div.field.md-field>
         <div.inline><span.label.grow>{label}</span>
             <button.tab type="button" class={preview == null ? "on" : ""} @click={() => { preview = null }}>Write</button>
@@ -838,7 +838,7 @@ component MarkdownField(label: str, field: str, value, problems: list, on_change
 
 // Where the object's records show on the site, and which field is what.
 component ObjectSiteEditor(o: map, on_save, problems: list) {
-    ~s = merge(SITE_DEFAULT, o.site ?? {})
+    state s = merge(SITE_DEFAULT, o.site ?? {})
     let pick = (k, label, types) => <SelectField {label} field={k} value={s[k]} options={o.fields | filter((f) => types == null || contains(types, f.type)) | map((f) => { value: f.key, label: f.label })}
         problems={[]} on_change={(v) => { s = set(s, k, v) }} empty="—"/>
     <section.card.stack>

@@ -1,4 +1,5 @@
-//! `db`: an embedded SQLite database, or PostgreSQL.
+//! `db`: an embedded SQLite database, PostgreSQL, or MySQL/MariaDB; and
+//! as many of them at once as a program connects to.
 //!
 //! ```text
 //! db.open("app.db")                          // SQLite, next to the program
@@ -8,7 +9,15 @@
 //! db.query("select * from todos where id > ?", 10)           // list of maps
 //! db.one("select * from todos where id = :id", { id })       // a map or null
 //! db.transaction(() => { ... })                              // all or nothing
+//! let analytics = db.connect("postgres://.../analytics")     // another database
+//! analytics.query("select ...")                              // the same functions
+//! db.open((tenant) => registry.one("select url from tenants where name = ?", tenant).url)
 //! ```
+//!
+//! `db` is the program's database; `db.connect` opens others, each with the
+//! same functions, its own transactions, migrations and live updates. A
+//! target with `{tenant}` in it, or a function of the tenant's name, gives
+//! each tenant a database of its own (with a function, of any kind).
 //!
 //! SQL problems are returned as error values, so `?` and `??` work on them.
 //! Until `db.open` is called the database is `$QUILLO_DB` (a path or a
@@ -39,6 +48,7 @@ pub fn install(m: &mut Map) {
         ("db.migrate", migrate),
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
+        ("db.connect", db_connect),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -49,6 +59,81 @@ pub fn install(m: &mut Map) {
 pub enum Backend {
     Sqlite(Mutex<Connection>),
     Postgres(pg::Pool),
+    #[cfg(feature = "mysql")]
+    Mysql(crate::my::Pool),
+}
+
+/// A MySQL or MariaDB URL (whether or not this Quillo was built with MySQL).
+pub fn is_mysql_url(s: &str) -> bool {
+    s.starts_with("mysql://") || s.starts_with("mariadb://")
+}
+
+/// A database on a server (not a SQLite file).
+fn is_server_url(s: &str) -> bool {
+    pg::is_url(s) || is_mysql_url(s)
+}
+
+/// A connection taken from a server database's pool.
+pub enum Pinned {
+    Pg(pg::Conn),
+    #[cfg(feature = "mysql")]
+    My(crate::my::Conn),
+}
+
+impl Pinned {
+    fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+        match self {
+            Pinned::Pg(c) => c.query(sql, params, limit),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.query(sql, params, limit),
+        }
+    }
+
+    fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+        match self {
+            Pinned::Pg(c) => c.exec(sql, params),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.exec(sql, params),
+        }
+    }
+
+    fn batch(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Pinned::Pg(c) => c.batch(sql),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.batch(sql),
+        }
+    }
+}
+
+impl Backend {
+    /// A connection from the pool, for a server database.
+    fn checkout(&self) -> Result<Pinned, String> {
+        match self {
+            Backend::Postgres(p) => p.checkout().map(Pinned::Pg),
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(p) => p.checkout().map(Pinned::My),
+            Backend::Sqlite(_) => Err("SQLite has no pool".into()),
+        }
+    }
+
+    fn give_back(&self, c: Pinned) {
+        match (self, c) {
+            (Backend::Postgres(p), Pinned::Pg(c)) => p.give_back(c),
+            #[cfg(feature = "mysql")]
+            (Backend::Mysql(p), Pinned::My(c)) => p.give_back(c),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    fn is_mysql(&self) -> bool {
+        #[cfg(feature = "mysql")]
+        if let Backend::Mysql(_) = self {
+            return true;
+        }
+        false
+    }
 }
 
 /// The program's database: one, or one per tenant when `db.open`'s target
@@ -62,8 +147,42 @@ pub enum DbSlot {
 /// Tenants' databases, opened when first used (and migrated, after
 /// `db.migrate`); the least recently used are closed past `OPEN_TENANTS`.
 pub struct TenantDbs {
-    template: String,
+    target: Target,
     open: Mutex<indexmap::IndexMap<String, Arc<Backend>>>,
+    /// The migrations each is brought up to date with when opened.
+    migrations: Mutex<Option<std::path::PathBuf>>,
+}
+
+/// Where a tenant's database is: `{tenant}` in a path or URL, or what a
+/// function of the tenant's name gives (a database of any kind each).
+enum Target {
+    Text(String),
+    Fn(Value),
+}
+
+impl TenantDbs {
+    fn new(target: Target) -> TenantDbs {
+        TenantDbs { target, open: Mutex::new(Default::default()), migrations: Mutex::new(None) }
+    }
+
+    fn template(&self) -> Option<&str> {
+        match &self.target {
+            Target::Text(t) => Some(t),
+            Target::Fn(_) => None,
+        }
+    }
+}
+
+/// The key of a connection's number in the map `db.connect` gives.
+pub const CONN_KEY: &str = "$db";
+
+/// The connection `recv.name(...)` is a `db` function of, if it is one.
+pub(crate) fn conn_of(recv: &Value, name: &str) -> Option<usize> {
+    let Value::Map(m) = recv else { return None };
+    match (m.get(name), m.get(CONN_KEY)) {
+        (Some(Value::Builtin(b, _)), Some(Value::Int(id))) if b.starts_with("db.") => Some(*id as usize),
+        _ => None,
+    }
 }
 
 /// Tenant databases kept open at once: SQLite files, and Postgres
@@ -71,10 +190,11 @@ pub struct TenantDbs {
 const OPEN_TENANTS: usize = 1024;
 const OPEN_PG_TENANTS: usize = 16;
 
-/// A Postgres connection kept by one request for its `db.transaction`.
-pub struct PgTx {
+/// A server database's connection kept by one request for its
+/// `db.transaction`, one for each database it has one open on.
+pub struct TxConn {
     backend: Arc<Backend>,
-    conn: Option<pg::Conn>,
+    conn: Option<Pinned>,
     depth: usize,
 }
 
@@ -97,6 +217,15 @@ fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
 /// `open_backend`; with `make` false, a Postgres schema (`?schema=`) must
 /// exist already.
 fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend, String> {
+    if is_mysql_url(target) {
+        #[cfg(feature = "mysql")]
+        {
+            let url = target.to_string();
+            return it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(Backend::Mysql);
+        }
+        #[cfg(not(feature = "mysql"))]
+        return Err("this Quillo was built without MySQL (cargo build --features mysql)".into());
+    }
     if pg::is_url(target) {
         let url = target.to_string();
         return it.unlocked(move || pg::Pool::open_as(&url, make)).map(Backend::Postgres);
@@ -107,6 +236,25 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend,
         it.base_dir.join(target).display().to_string()
     };
     connect(&full).map(|c| Backend::Sqlite(Mutex::new(c))).map_err(|e| e.to_string())
+}
+
+/// The database a call is on: a connection's (`db.connect`), or the program's.
+fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
+    let Some(i) = on else { return backend(it) };
+    let slot = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone());
+    match slot {
+        Some(DbSlot::One(b)) => Ok(b),
+        Some(DbSlot::PerTenant(t)) => tenant_backend(it, &t),
+        None => Err("this connection is not one of this program's".into()),
+    }
+}
+
+/// The slot a call is on, if it has been opened.
+fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
+    match on {
+        None => it.db.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        Some(i) => it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone()),
+    }
 }
 
 /// The program's database (the tenant's, for one per tenant), opening the
@@ -120,7 +268,7 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
     if target.contains("{tenant}") {
-        let t = Arc::new(TenantDbs { template: target, open: Mutex::new(Default::default()) });
+        let t = Arc::new(TenantDbs::new(Target::Text(target)));
         *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::PerTenant(t.clone()));
         return tenant_backend(it, &t);
     }
@@ -146,11 +294,11 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
             return Ok(open[last].clone());
         }
     }
-    let target = dbs.template.replace("{tenant}", &name);
+    let target = tenant_target(it, dbs, &name)?;
     // A request's host can name any tenant, so only the program makes one
     // (`with_tenant`, when signing a tenant up): made-up names make nothing.
     let make = it.tenant_named;
-    if !pg::is_url(&target) && target != ":memory:" {
+    if !is_server_url(&target) && target != ":memory:" {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
         if !make && !full.exists() {
             return Err(format!("there is no tenant {:?}: with_tenant({:?}, ...) makes its database", &*name, &*name));
@@ -160,7 +308,9 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         }
     }
     let b = Arc::new(open_backend_as(it, &target, make).map_err(|e| format!("tenant {}: {}", name, e))?);
-    if let Some(dir) = it.site.migrations.clone() {
+    let is_default = matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
+    let dir = dbs.migrations.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
+    if let Some(dir) = dir {
         let mb = b.clone();
         let applied = it.unlocked(move || crate::migrate::run(&mb, &dir)).map_err(|e| format!("tenant {}: {}", name, e))?;
         for m in applied {
@@ -168,34 +318,68 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         }
     }
     let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
-    // Each open Postgres tenant keeps connections (a few each).
-    let most = if pg::is_url(&target) { OPEN_PG_TENANTS } else { OPEN_TENANTS };
+    // Each open server tenant keeps connections (a few each).
+    let most = if is_server_url(&target) { OPEN_PG_TENANTS } else { OPEN_TENANTS };
     while open.len() >= most {
         open.shift_remove_index(0);
     }
     Ok(open.entry(name.to_string()).or_insert(b).clone())
 }
 
-/// Runs `f` on a Postgres connection without holding the interpreter
-/// lock: the request's transaction connection if it has one, else one
-/// from the pool.
-fn pg_run<T: Send>(
+/// Where tenant `name`'s database is: its template filled in, or what the
+/// function gives for it (which may not use that database itself).
+fn tenant_target(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> Result<String, String> {
+    match tenant_target_or_none(it, dbs, name)? {
+        Some(t) => Ok(t),
+        None => Err(format!("tenant {}: the function for tenants' databases gave null, not a path or a URL", name)),
+    }
+}
+
+/// `tenant_target`; None when the function gives null (no such tenant).
+fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> Result<Option<String>, String> {
+    let f = match &dbs.target {
+        Target::Text(t) => return Ok(Some(t.replace("{tenant}", name))),
+        Target::Fn(f) => f.clone(),
+    };
+    let key = Arc::as_ptr(dbs) as usize;
+    if it.db_resolving.contains(&key) {
+        let why = format!("tenant {}: the function that says where a tenant's database is cannot use that database itself; keep the list in another (db.connect)", name);
+        it.db_loop = Some(why.clone());
+        return Err(why);
+    }
+    it.db_resolving.push(key);
+    let r = it.call(&f, vec![Value::str(name)], 0);
+    it.db_resolving.retain(|k| *k != key);
+    if let Some(why) = it.db_loop.take() {
+        return Err(why);
+    }
+    match r {
+        Ok(Value::Str(s)) | Err(Ctrl::Return(Value::Str(s))) => Ok(Some(s.to_string())),
+        Ok(Value::Nil) | Err(Ctrl::Return(Value::Nil)) => Ok(None),
+        Ok(Value::Err(e)) => Err(format!("tenant {}: {}", name, e.display())),
+        Ok(other) => Err(format!("tenant {}: the function for tenants' databases gave {}, not a path or a URL", name, other.type_name())),
+        Err(Ctrl::Error(e)) => Err(format!("tenant {}: {}", name, e.msg)),
+        Err(_) => Err(format!("tenant {}: the function for tenants' databases did not give a path or a URL", name)),
+    }
+}
+
+/// Runs `f` on a server database's connection without holding the
+/// interpreter lock: the request's transaction connection if it has one,
+/// else one from the pool.
+fn pooled_run<T: Send>(
     it: &mut Interp,
     b: &Arc<Backend>,
-    f: impl FnOnce(&mut pg::Conn) -> Result<T, String> + Send,
+    f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send,
 ) -> Result<T, String> {
-    let Backend::Postgres(pool) = &**b else { unreachable!("pg_run on SQLite") };
-    let pinned = match &mut *it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()) {
-        Some(tx) if Arc::ptr_eq(&tx.backend, b) => tx.conn.take(),
-        _ => None,
-    };
+    let pool = &**b;
+    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)).and_then(|tx| tx.conn.take());
     match pinned {
         Some(mut c) => {
             let (c, r) = it.unlocked(move || {
                 let r = f(&mut c);
                 (c, r)
             });
-            if let Some(tx) = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(tx) = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)) {
                 tx.conn = Some(c);
             }
             r
@@ -212,7 +396,7 @@ fn pg_run<T: Send>(
 /// In the server, outside a transaction, queries use the connections all
 /// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
 fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
-    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(false, |t| Arc::ptr_eq(&t.backend, b));
+    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b));
     (!pinned && crate::httpd::in_task()).then(|| pool.lanes())
 }
 
@@ -309,15 +493,21 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
 
 /// Live updates: a statement's reads become the running loader's topics,
 /// and its writes are announced (after the transaction, if any, commits).
-fn announce(it: &mut Interp, sql: &str) {
+/// A connection's tables are topics of their own (`db@<label>:orders`), so
+/// that one `orders` changing does not refresh pages showing another.
+fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
     let t = crate::sqlinfo::tables_of(sql);
+    let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(l, _)| l.clone())) {
+        Some(label) => format!("db@{}:", label),
+        None => "db:".to_string(),
+    };
     if it.reads.is_some() {
         for r in &t.reads {
-            it.watch(format!("db:{}", r));
+            it.watch(format!("{}{}", prefix, r));
         }
     }
     if !t.writes.is_empty() {
-        it.publish(t.writes.iter().map(|w| format!("db:{}", w)).collect());
+        it.publish(t.writes.iter().map(|w| format!("{}{}", prefix, w)).collect());
     }
 }
 
@@ -350,9 +540,9 @@ fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
 /// `db.open(target)`: a SQLite file next to the program, ":memory:", or a
 /// postgres:// URL.
 /// The program's database per tenant, or an error naming `f`.
-fn per_tenant(it: &Interp, f: &str, line: u32) -> Result<Arc<TenantDbs>, Ctrl> {
-    match &*it.db.lock().unwrap_or_else(|e| e.into_inner()) {
-        Some(DbSlot::PerTenant(t)) => Ok(t.clone()),
+fn per_tenant(it: &Interp, on: Option<usize>, f: &str, line: u32) -> Result<Arc<TenantDbs>, Ctrl> {
+    match slot_on(it, on) {
+        Some(DbSlot::PerTenant(t)) => Ok(t),
         _ => fail(line, format!("`{}` needs a database per tenant: db.open(\"data/{{tenant}}.db\")", f)),
     }
 }
@@ -360,7 +550,8 @@ fn per_tenant(it: &Interp, f: &str, line: u32) -> Result<Arc<TenantDbs>, Ctrl> {
 /// `db.tenant_exists(name)`: whether the tenant has a database (made by
 /// `with_tenant`), without making one.
 fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let dbs = per_tenant(it, "db.tenant_exists", line)?;
+    let on = it.db_on.take();
+    let dbs = per_tenant(it, on, "db.tenant_exists", line)?;
     let name = match args.first() {
         Some(Value::Str(s)) => s.clone(),
         other => return fail(line, format!("`db.tenant_exists` expects a name, got {}", other.map_or("nothing", |v| v.type_name()))),
@@ -371,9 +562,17 @@ fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if dbs.open.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&*name) {
         return Ok(Value::Bool(true));
     }
-    let target = dbs.template.replace("{tenant}", &name);
+    let target = match tenant_target_or_none(it, &dbs, &name) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(Value::Bool(false)),
+        Err(e) => return Ok(db_err(e)),
+    };
     if pg::is_url(&target) {
         return Ok(Value::Bool(it.unlocked(move || pg::Pool::open_as(&target, false).is_ok())));
+    }
+    #[cfg(feature = "mysql")]
+    if is_mysql_url(&target) {
+        return Ok(Value::Bool(it.unlocked(move || crate::my::Pool::open_as(&target, false).is_ok())));
     }
     let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
     Ok(Value::Bool(full.is_file()))
@@ -383,16 +582,33 @@ fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// (for a job that does something for each). SQLite files, and PostgreSQL
 /// schemas (`?schema=t_{tenant}`).
 fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
-    let dbs = per_tenant(it, "db.tenants", line)?;
-    let (before, after) = dbs.template.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
+    let on = it.db_on.take();
+    let dbs = per_tenant(it, on, "db.tenants", line)?;
+    let Some(template) = dbs.template().map(str::to_string) else {
+        return fail(line, "`db.tenants` lists the databases a template names (data/{tenant}.db); where a function says where they are, keep the list of tenants yourself");
+    };
+    let (before, after) = template.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
     let mut names: Vec<String> = Vec::new();
-    if pg::is_url(&dbs.template) {
+    if is_mysql_url(&template) {
+        // Databases named around {tenant}: `app_{tenant}` in mysql://host/app_{tenant}.
+        #[cfg(feature = "mysql")]
+        {
+            let path = template.split('?').next().unwrap_or("");
+            let (server, db) = path.rsplit_once('/').unwrap_or((path, ""));
+            let (pre, post) = db.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
+            let server = format!("{}/", server);
+            match it.unlocked(move || crate::my::Pool::open_as(&server, false).and_then(|p| p.databases())) {
+                Ok(all) => names.extend(all.iter().filter_map(|d| d.strip_prefix(&pre).and_then(|r| r.strip_suffix(&post)).map(str::to_string))),
+                Err(e) => return Ok(db_err(e)),
+            }
+        }
+    } else if pg::is_url(&template) {
         // The schema's name around {tenant}: `t_{tenant}` in `?schema=t_{tenant}&...`.
         let Some(q) = before.rsplit_once("schema=").map(|(_, p)| p.to_string()) else {
             return fail(line, "`db.tenants` lists PostgreSQL schemas (?schema=t_{tenant}), not databases");
         };
         let suffix: String = after.chars().take_while(|c| *c != '&').collect();
-        let base = dbs.template.split('?').next().unwrap_or("").to_string();
+        let base = template.split('?').next().unwrap_or("").to_string();
         let found = it.unlocked(move || -> Result<Vec<String>, String> {
             let pool = pg::Pool::open(&base)?;
             let mut c = pool.checkout()?;
@@ -444,21 +660,71 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
     Ok(Value::list(names.into_iter().map(Value::str).collect()))
 }
 
-fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let target = sql_arg(&args, "db.open", line)?;
-    // One database per tenant: each is opened when its tenant first uses it.
-    if target.contains("{tenant}") {
-        let t = TenantDbs { template: target, open: Mutex::new(Default::default()) };
-        *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::PerTenant(Arc::new(t)));
-        return Ok(Value::Nil);
+/// A database slot for `db.open`'s or `db.connect`'s target: one per
+/// tenant (a `{tenant}` template, or a function), or one opened now.
+fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Result<DbSlot, String>, Ctrl> {
+    match args.first() {
+        Some(Value::Str(t)) if t.contains("{tenant}") => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string())))))),
+        Some(Value::Str(t)) => Ok(open_backend(it, t).map(|b| DbSlot::One(Arc::new(b)))),
+        // Where each tenant's database is, opened when its tenant first uses it.
+        Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Fn(fv.clone())))))),
+        other => fail(
+            line,
+            format!("`{}` expects a path, a URL, or a function giving one for each tenant, got {}", f, other.map_or("nothing", |v| v.type_name())),
+        ),
     }
-    match open_backend(it, &target) {
-        Ok(b) => {
-            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::One(Arc::new(b)));
+}
+
+fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    match slot_for(it, &args, "db.open", line)? {
+        Ok(slot) => {
+            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(slot);
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),
     }
+}
+
+/// `db.connect(target)`: another database, as a map of the same functions
+/// as `db` (`analytics.query(...)`). The same target again (from a route,
+/// say) is the same connection, not a new pool.
+fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let label = match args.first() {
+        // A label for its live updates' topics, the same on every server (and no secret in it).
+        Some(Value::Str(t)) => crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(t.as_bytes()))[..12].to_string(),
+        _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).len()),
+    };
+    if matches!(args.first(), Some(Value::Str(_))) {
+        if let Some(i) = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter().position(|(l, _)| *l == label) {
+            return Ok(connection(i));
+        }
+    }
+    let slot = match slot_for(it, &args, "db.connect", line)? {
+        Ok(s) => s,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    conns.push((label, slot));
+    Ok(connection(conns.len() - 1))
+}
+
+/// A connection as programs see it: `db`'s functions, and its number.
+fn connection(i: usize) -> Value {
+    let mut m = Map::new();
+    m.insert(CONN_KEY.into(), Value::Int(i as i64));
+    let fns: &[(&'static str, BuiltinFn)] = &[
+        ("db.exec", exec),
+        ("db.query", query),
+        ("db.one", one),
+        ("db.transaction", transaction),
+        ("db.migrate", migrate),
+        ("db.tenants", tenants),
+        ("db.tenant_exists", tenant_exists),
+    ];
+    for (name, f) in fns {
+        m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
+    }
+    Value::map(m)
 }
 
 /// `db.migrate(dir = "migrations")`: applies the folder's SQL files the
@@ -470,14 +736,19 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Str(s)) => s.to_string(),
         Some(other) => return fail(line, format!("`db.migrate` expects a folder name, got {}", other.type_name())),
     };
+    let on = it.db_on.take();
     let full = it.base_dir.join(&dir);
-    std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
-    // One database per tenant: each is migrated when first opened.
-    let per_tenant = matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::PerTenant(_)));
-    if per_tenant && it.tenant().is_none() {
-        return Ok(Value::list(Vec::new()));
+    if on.is_none() {
+        std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
     }
-    let b = match backend(it) {
+    // One database per tenant: each is migrated when first opened.
+    if let Some(DbSlot::PerTenant(t)) = slot_on(it, on) {
+        *t.migrations.lock().unwrap_or_else(|e| e.into_inner()) = Some(full.clone());
+        if it.tenant().is_none() {
+            return Ok(Value::list(Vec::new()));
+        }
+    }
+    let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => return fail(line, format!("db.migrate: {}", e)),
     };
@@ -496,9 +767,10 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `db.exec(sql, ...params)`: `{ changes, last_id }`. Without parameters the
 /// text may hold several statements (a schema, for example).
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
     let params = args[1..].to_vec();
-    let b = match backend(it) {
+    let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
@@ -527,12 +799,17 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             None => {
                 let sql = sql.clone();
-                pg_run(it, &b, move |c| c.exec(&sql, &params))
+                pooled_run(it, &b, move |c| c.exec(&sql, &params))
             }
         },
+        #[cfg(feature = "mysql")]
+        Backend::Mysql(_) => {
+            let sql = sql.clone();
+            pooled_run(it, &b, move |c| c.exec(&sql, &params))
+        }
     };
     if res.is_ok() {
-        announce(it, &sql);
+        announce(it, &sql, on);
     }
     Ok(res.unwrap_or_else(db_err))
 }
@@ -544,46 +821,64 @@ pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
     if !matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::One(_))) {
         return true;
     }
-    let made = exec(it, vec![Value::str("create table if not exists _quillo_jobs (name text primary key, at bigint not null)")], 0);
+    let mysql = backend(it).map_or(false, |b| b.is_mysql());
+    let table = if mysql {
+        "create table if not exists _quillo_jobs (name varchar(255) primary key, at bigint not null)"
+    } else {
+        "create table if not exists _quillo_jobs (name text primary key, at bigint not null)"
+    };
+    let made = exec(it, vec![Value::str(table)], 0);
     if !matches!(made, Ok(Value::Map(_))) {
         return true;
     }
-    let sql = "insert into _quillo_jobs (name, at) values (?, ?) \
-               on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at";
+    // A later run claims it (MySQL counts a row it leaves as it was as no change).
+    let sql = if mysql {
+        "insert into _quillo_jobs (name, at) values (?, ?) on duplicate key update at = if(at < values(at), values(at), at)"
+    } else {
+        "insert into _quillo_jobs (name, at) values (?, ?) \
+         on conflict (name) do update set at = excluded.at where _quillo_jobs.at < excluded.at"
+    };
     match exec(it, vec![Value::str(sql), Value::str(name), Value::Int(at as i64)], 0) {
         Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
         _ => true,
     }
 }
 
-fn select(it: &mut Interp, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
-    let b = backend(it)?;
+fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    let b = backend_on(it, on)?;
     let res = match &*b {
         Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
             None => {
                 let sql = sql.clone();
-                pg_run(it, &b, move |c| c.query(&sql, &params, limit))
+                pooled_run(it, &b, move |c| c.query(&sql, &params, limit))
             }
         },
+        #[cfg(feature = "mysql")]
+        Backend::Mysql(_) => {
+            let sql = sql.clone();
+            pooled_run(it, &b, move |c| c.query(&sql, &params, limit))
+        }
     };
     if res.is_ok() {
-        announce(it, &sql);
+        announce(it, &sql, on);
     }
     res
 }
 
 /// `db.query(sql, ...params)`: every row, as maps from column to value.
 fn query(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
     let sql = sql_arg(&args, "db.query", line)?;
-    Ok(select(it, sql, args[1..].to_vec(), None).map(Value::list).unwrap_or_else(db_err))
+    Ok(select(it, on, sql, args[1..].to_vec(), None).map(Value::list).unwrap_or_else(db_err))
 }
 
 /// `db.one(sql, ...params)`: the first row, or null.
 fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
     let sql = sql_arg(&args, "db.one", line)?;
-    Ok(select(it, sql, args[1..].to_vec(), Some(1))
+    Ok(select(it, on, sql, args[1..].to_vec(), Some(1))
         .map(|r| r.into_iter().next().unwrap_or(Value::Nil))
         .unwrap_or_else(db_err))
 }
@@ -592,13 +887,14 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// rolls back if it fails, returns an error value, or replies early.
 /// Transactions nest (as savepoints).
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
     let f = match args.first() {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
         other => {
             return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
         }
     };
-    let b = match backend(it) {
+    let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
@@ -622,25 +918,26 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 _ => r,
             }
         }
-        Backend::Postgres(pool) => {
+        _ => {
+            let pool = &*b;
             // Keep one connection for this request until the outermost
             // transaction ends.
-            let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(false, |t| Arc::ptr_eq(&t.backend, &b));
+            let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
             if !pinned {
                 let c = match it.unlocked(|| pool.checkout()) {
                     Ok(c) => c,
                     Err(e) => return Ok(db_err(e)),
                 };
-                *it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(PgTx { backend: b.clone(), conn: Some(c), depth: 0 });
+                it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
-                let tx = g.as_mut().expect("pinned");
+                let tx = g.iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).expect("pinned");
                 tx.depth += 1;
                 tx.depth
             };
             let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
-            let started = pg_run(it, &b, move |c| c.batch(&begin));
+            let started = pooled_run(it, &b, move |c| c.batch(&begin));
             let mark = tx_begin(it);
             let r = match started {
                 Ok(()) => it.call(&f, Vec::new(), line),
@@ -653,19 +950,19 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 (true, false) => format!("release savepoint quillo_tx_{}", depth),
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
-            let ended = pg_run(it, &b, move |c| c.batch(&end));
+            let ended = pooled_run(it, &b, move |c| c.batch(&end));
             tx_end(it, mark, commit && ended.is_ok());
             let done = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
-                let tx = g.as_mut().expect("pinned");
-                tx.depth -= 1;
-                if tx.depth == 0 {
-                    g.take()
+                let i = g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)).expect("pinned");
+                g[i].depth -= 1;
+                if g[i].depth == 0 {
+                    Some(g.remove(i))
                 } else {
                     None
                 }
             };
-            if let Some(PgTx { conn: Some(c), .. }) = done {
+            if let Some(TxConn { conn: Some(c), .. }) = done {
                 pool.give_back(c);
             }
             match ended {

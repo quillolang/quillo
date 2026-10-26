@@ -2,8 +2,8 @@
 // one that runs by itself. Driven by lazy.js.
 
 component Form() {
-    ~name = ""
-    ~clicks = 0
+    state name = ""
+    state clicks = 0
     <div>
         <input id="name" value={name} @input={(e) => { name = e.value }}/>
         <p id="echo">{name}</p>
@@ -12,7 +12,7 @@ component Form() {
 }
 
 component Clock() {
-    ~n = 0
+    state n = 0
     every(50, () => { n = n + 1 })
     <p id="ticks">{n}</p>
 }

@@ -83,7 +83,7 @@ view NotFound(path: str) =
     </section>
 
 component ProductList() {
-    ~items = live(list_products)
+    state items = live(list_products)
     <section>
         <h2>Products</h2>
         {items == null
@@ -94,8 +94,8 @@ component ProductList() {
 }
 
 component ProductPage(id: int, on_add = null) {
-    ~product = live(get_product, id)
-    ~problem = null
+    state product = live(get_product, id)
+    state problem = null
     <section>
         {product == null ? <p.muted>Loading…</p>
             : is_err(product) ? <NotFound path={`/products/${id}`}/>
@@ -135,8 +135,8 @@ view NavLink(href: str, path: str, children) =
     <a {href} class={(href == "/" ? path == "/" : starts_with(path, href)) && "active"}>{children}</a>
 
 component App() {
-    ~cart = []
-    ~ordered = 0
+    state cart = []
+    state ordered = 0
     let path = url().path
     let segs = split(path, "/") | filter((s) => s != "")
     let total = cart | map((p) => p.price) | sum

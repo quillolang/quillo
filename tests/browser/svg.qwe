@@ -2,8 +2,8 @@
 // conditions: every one must be SVG's, or nothing draws. Driven by svg.js.
 
 component Chart() {
-    ~points = [3, 5, 2]
-    ~show = false
+    state points = [3, 5, 2]
+    state show = false
     <div.wrap>
         <h1>Chart</h1>
         <svg width="200" height="100" class="chart">

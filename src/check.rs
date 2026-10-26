@@ -136,6 +136,81 @@ thread_local! {
     /// Checks in progress on this thread (a mounted program is checked
     /// inside its parent's check): the tables are emptied by the outermost.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The program's own types (`type User = { ... }`), found before its
+    /// code is checked; each program checked has its own.
+    static RECORDS: std::cell::RefCell<HashMap<String, Arc<TypeDef>>> = std::cell::RefCell::new(HashMap::new());
+    /// How deep in its own types a type is being worked out (one may name itself).
+    static RECORD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Working out what `User(...)` takes: in it, and in the records inside,
+    /// a field with a default may be left out.
+    static RECORD_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn record(name: &str) -> Option<Arc<TypeDef>> {
+    if !crate::ast::is_type_name(name) {
+        return None;
+    }
+    RECORDS.with(|r| r.borrow().get(name).cloned())
+}
+
+/// Works out `f` one level deeper in the program's types; past a few, the
+/// type is left open (a map whose fields are not known).
+fn in_record<R>(open: R, f: impl FnOnce() -> R) -> R {
+    let d = RECORD_DEPTH.with(|d| d.get());
+    if d >= 4 {
+        return open;
+    }
+    RECORD_DEPTH.with(|c| c.set(d + 1));
+    let r = f();
+    RECORD_DEPTH.with(|c| c.set(d));
+    r
+}
+
+/// A record's fields, as a shape (as `User(...)` takes them, with RECORD_INPUT).
+fn record_shape(td: &TypeDef) -> u32 {
+    let input = RECORD_INPUT.with(|c| c.get());
+    in_record(0, || {
+        shape_id(
+            td.ty
+                .fields
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|(k, ft)| {
+                    let t = ty_t(ft);
+                    let t = if input && td.defaults.iter().any(|(d, _)| d == k) { t.union(T::of(NIL)) } else { t };
+                    (Arc::from(k.as_str()), t)
+                })
+                .collect(),
+        )
+    })
+}
+
+/// What `User(...)` takes and gives: a map in which the fields with a
+/// default, or that may be null, may be left out; a User, or an error value.
+fn record_sig(td: &TypeDef) -> Sig {
+    let rec = ty_t(&Ty { names: vec![td.name.clone()], optional: false, elem: None, fields: None });
+    let was = RECORD_INPUT.with(|c| c.replace(true));
+    let input = if td.is_record() {
+        let mut t = T::of(MAP | NIL);
+        t.shape = record_shape(td);
+        t
+    } else {
+        ty_t(&td.ty).union(T::of(NIL))
+    };
+    RECORD_INPUT.with(|c| c.set(was));
+    Sig {
+        name: td.name.clone(),
+        params: vec![PSig { name: "fields".into(), ty: input.bits, full: input, optional: true, annotated: true }],
+        variadic: false,
+        ret: Some(rec.union(T::error(STR))),
+        err: None,
+        effects: Some(0),
+        server: false,
+        component: false,
+        builtin: false,
+        def: None,
+    }
 }
 
 fn elem_id(e: T) -> u32 {
@@ -271,6 +346,21 @@ fn ty_t(t: &Ty) -> T {
     if let (Some(fs), true) = (&t.fields, out.bits & MAP != 0) {
         out.shape = shape_id(fs.iter().map(|(k, ft)| (Arc::from(k.as_str()), ty_t(ft))).collect());
     }
+    // One of the program's own types: its fields (or what it stands for).
+    let own: Vec<Arc<TypeDef>> = t.names.iter().filter_map(|n| record(n)).collect();
+    if let ([td], true) = (own.as_slice(), t.fields.is_none()) {
+        if td.is_record() {
+            out.shape = record_shape(td);
+        } else {
+            let a = in_record(T::ANY, || ty_t(&td.ty));
+            if out.elem == 0 {
+                out.elem = a.elem;
+            }
+            if out.shape == 0 {
+                out.shape = a.shape;
+            }
+        }
+    }
     out
 }
 
@@ -307,6 +397,12 @@ fn ty_bits(t: &Ty) -> u16 {
 }
 
 fn name_bits(n: &str) -> u16 {
+    if n.starts_with('"') {
+        return STR;
+    }
+    if let Some(td) = record(n) {
+        return if td.is_record() { MAP } else { in_record(ANY, || ty_bits(&td.ty)) };
+    }
     match n {
         "any" => ANY,
         "num" => NUM,
@@ -488,6 +584,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("live", "fn, any...", "any"),
     ("parallel", "any...", "list"),
     ("every", "num, fn", "null"),
+    ("stream", "fn, map | null=", "response"),
+    ("events", "fn, map | null=", "response"),
+    ("listen", "str, fn", "null"),
+    ("receive", "str, fn, map | null=", "null | error(str)"),
     ("url", "", "map"),
     ("css", "str", "str"),
     ("sql", "str", "str"),
@@ -496,7 +596,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("watch", "any...", "null"),
     ("json.parse", "str", "any"),
     ("json.stringify", "any, any=", "str"),
-    ("db.open", "str", "null | error(str)"),
+    ("db.open", "str | fn", "null | error(str)"),
+    ("db.connect", "str | fn", "map | error(str)"),
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
@@ -523,6 +624,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.hash_password", "str", "str"),
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
+    ("http.stream", "str, fn, map | null=", "map | error(str)"),
     // src/numeric.rs
     ("math.sqrt", "num", "float"),
     ("math.cbrt", "num", "float"),
@@ -646,7 +748,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
-      "schedule", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -961,7 +1063,10 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
     if outermost {
         TABLES.with(|t| *t.borrow_mut() = Tables::default());
     }
+    // A mounted program's types are its own.
+    let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
     let a = check_source_in(src, file, base_dir, overrides, opts);
+    RECORDS.with(|r| *r.borrow_mut() = outer_records);
     DEPTH.with(|d| d.set(d.get() - 1));
     a
 }
@@ -1046,7 +1151,7 @@ struct Checker {
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
-    /// Checking the `live(...)` that sets a component's `~state`.
+    /// Checking the `live(...)` that sets a component's state.
     live_ok: bool,
     /// The services a program calls (`service billing = "billing.qwe"`): the
     /// server fns each offers, by name.
@@ -1171,6 +1276,12 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
             }
+            if let Stmt::Type(td) = s {
+                let again = RECORDS.with(|r| r.borrow_mut().insert(td.name.clone(), td.clone())).is_some();
+                if again {
+                    self.diag_at(file.clone(), td.line, Severity::Error, format!("type `{}` is defined twice", td.name));
+                }
+            }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
                 let full = base.join(path);
@@ -1227,6 +1338,20 @@ impl Checker {
                     self.globals.insert(
                         name.clone(),
                         Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false },
+                    );
+                }
+                Stmt::Type(td) => {
+                    self.globals.insert(
+                        td.name.clone(),
+                        Var {
+                            t: T::of(FN),
+                            sig: Some(Arc::new(record_sig(td))),
+                            file: it.file.clone(),
+                            line: td.line,
+                            kind: Kind::Global,
+                            used: true,
+                            ready: true,
+                        },
                     );
                 }
                 Stmt::Let(p, _, line) => {
@@ -1710,6 +1835,24 @@ impl Checker {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`service` must be at the top level");
+                }
+                T::of(NIL)
+            }
+            Stmt::Type(td) => {
+                self.line = td.line;
+                if !self.scopes.is_empty() {
+                    self.error("`type` must be at the top level");
+                }
+                // A default must be of its field's type.
+                for (k, e) in &td.defaults {
+                    let t = self.expr(e);
+                    self.line = td.line;
+                    if let Some((_, fty)) = td.ty.fields.as_deref().unwrap_or_default().iter().find(|(f, _)| f == k) {
+                        let want = ty_t(fty);
+                        if t.bits & !ERR != 0 && t.bits & want.bits & !ERR == 0 {
+                            self.error(format!("the default of `{}` in `{}` is {}, which is not {}", k, td.name, t_text(t), fty.text()));
+                        }
+                    }
                 }
                 T::of(NIL)
             }
@@ -2251,6 +2394,18 @@ impl Checker {
 
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<T>) -> T {
         let line = self.line;
+        // `User({ ... })`: a field the record does not have is a mistake.
+        if let (Expr::Ident(n, _), Some(Expr::Map(entries)), None) = (callee, args.first(), &pre) {
+            if let Some(td) = record(n).filter(|td| td.is_record() && !self.is_local(n)) {
+                let fs = td.ty.fields.as_deref().unwrap_or_default();
+                let shape: Shape = fs.iter().map(|(k, ft)| (Arc::from(k.as_str()), ty_t(ft))).collect::<Vec<_>>().into();
+                for (k, _) in entries {
+                    if !k.starts_with("...") && !fs.iter().any(|(f, _)| f == k) {
+                        self.error(format!("`{}` has no field `{}`{}", n, k, field_hint(k, &shape)));
+                    }
+                }
+            }
+        }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
             if let Expr::Ident(m, _) = &**obj {
@@ -2647,7 +2802,7 @@ impl Checker {
             let nested = self.fns.last().map_or(false, |f| f.nested);
             if sig.server && !nested {
                 self.error(format!(
-                    "`{}` waits on the server, so <{}> can only call it from an event handler (@click={{fn() {{ ... }}}}) or to set state: ~x = {}(...)",
+                    "`{}` waits on the server, so <{}> can only call it from an event handler (@click={{() => {{ ... }}}}) or to set state: state x = {}(...)",
                     name, c, name
                 ));
             }
@@ -2660,12 +2815,12 @@ impl Checker {
                         self.error(format!("`live` needs a server fn: `{}` is not one", f));
                     }
                 }
-                Some(_) => self.error("`live` needs a server fn by name: ~items = live(load_items, ...)"),
+                Some(_) => self.error("`live` needs a server fn by name: state items = live(load_items, ...)"),
                 None => {}
             }
             if let Some(c) = self.in_component() {
                 if !self.live_ok {
-                    self.error(format!("in <{}>, `live(...)` sets state: ~items = live(load_items, ...)", c));
+                    self.error(format!("in <{}>, `live(...)` sets state: state items = live(load_items, ...)", c));
                 }
             }
             return T::ANY;
@@ -3020,6 +3175,7 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
             Stmt::Fn(d) => walk_expr(&d.body, f),
             Stmt::Route(r) => walk_expr(&r.body, f),
             Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
+            Stmt::Type(td) => td.defaults.iter().for_each(|(_, e)| walk_expr(e, f)),
         }
     }
 }
@@ -3053,7 +3209,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Return(Some(e)) => assigned_in(e, out),
             Stmt::Fn(d) => assigned_in(&d.body, out),
             Stmt::Route(r) => assigned_in(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
         }
     }
 }
@@ -3103,7 +3259,7 @@ fn sql_safe(e: &Expr) -> bool {
 /// The type a type-testing pattern accepts: `int | null` is int or null.
 fn type_test_t(p: &Pattern) -> T {
     match p {
-        Pattern::Type(ty) => T::of(name_bits(ty)),
+        Pattern::Type(ty) => ty_t(&Ty { names: vec![ty.clone()], optional: false, elem: None, fields: None }),
         Pattern::Lit(Lit::Nil) => T::of(NIL),
         Pattern::Alt(ps) => ps.iter().fold(T::NEVER, |t, q| t.union(type_test_t(q))),
         _ => T::ANY,

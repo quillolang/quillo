@@ -26,9 +26,9 @@ server fn load_after(last_id: int, limit: int) -> list with db =
 fn total() with db = db.one("select count(*) as n from items").n
 
 component Feed(count: int) {
-    ~items = load_after(0, PAGE)
-    ~top = 0
-    ~loading = false
+    state items = load_after(0, PAGE)
+    state top = 0
+    state loading = false
 
     // The window: visible rows, widened by the buffer on both sides.
     let first_row = max([0, floor(top / ROW) - BUFFER])

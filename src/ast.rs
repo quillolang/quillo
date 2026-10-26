@@ -160,7 +160,7 @@ pub struct FnDef {
     pub effects: Option<Vec<String>>,
     /// `server fn`: callable from the browser.
     pub server: bool,
-    /// `component`: a view with `~state` that also runs in the browser.
+    /// `component`: a view with `state` that also runs in the browser.
     pub component: bool,
     pub line: u32,
     pub body: Expr,
@@ -268,7 +268,7 @@ pub enum Stmt {
     Route(Arc<RouteDef>),
     Use(String, u32),
     Return(Option<Expr>),
-    /// `~name = expr` in a component: state, set once, kept between renders.
+    /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
     State(String, Expr, u32),
     /// `mount /prefix = "app.qwe"`: another program, served under the prefix.
     Mount(String, String, u32),
@@ -277,4 +277,32 @@ pub enum Stmt {
     /// named after the file, and its routes served under /shop): a part
     /// that runs in this process or as a server of its own (src/service.rs).
     Service(String, Option<String>, String, u32),
+    /// `type User = { name: str, role: "admin" | "member" = "member" }`: a
+    /// record (src/record.rs), or another name for a type.
+    Type(Arc<TypeDef>),
+}
+
+/// A type with a name: a record's fields (and their defaults), or a type
+/// the name stands for.
+#[derive(Debug)]
+pub struct TypeDef {
+    pub name: String,
+    /// A record is a `map` with `fields`.
+    pub ty: Ty,
+    /// The fields that have a default, and its expression.
+    pub defaults: Vec<(String, Expr)>,
+    pub line: u32,
+}
+
+impl TypeDef {
+    pub fn is_record(&self) -> bool {
+        self.ty.fields.is_some() && self.ty.names == ["map"]
+    }
+}
+
+/// Whether a name is one of the program's own types (a record, or another
+/// named type): written like `User` or `OrderLine`, a capital letter first
+/// and a small one in it, unlike constants such as `MAX` or `NODE_W`.
+pub fn is_type_name(n: &str) -> bool {
+    n.chars().next().map_or(false, |c| c.is_ascii_uppercase()) && n.chars().any(|c| c.is_ascii_lowercase())
 }

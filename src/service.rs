@@ -178,7 +178,7 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
         return error(format!("service {}: no server fn `{}`", name, f));
     };
     let args: Vec<Value> = args.iter().map(crossed).collect();
-    if let Err(msg) = crate::server::check_args(&c.def, &args) {
+    if let Err(msg) = crate::server::check_args(&svc.types, &c.def, &args) {
         return error(format!("service {}: {}", name, msg));
     }
     svc.tenant = Some(tenant.clone());
@@ -301,7 +301,7 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
-    if let Err(msg) = crate::server::check_args(&c.def, &args) {
+    if let Err(msg) = crate::server::check_args(&it.types, &c.def, &args) {
         return refused(400, &msg);
     }
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });

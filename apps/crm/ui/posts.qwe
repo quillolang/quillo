@@ -14,7 +14,7 @@ fn stage_tone(stage: str) = match stage {
 }
 
 component PostsPage(ws: map) {
-    ~tab = "posts"
+    state tab = "posts"
     <div>
         <PageHead title="Posts" sub="Your blog, at /blog, with an RSS feed.">
             <a.button href="/blog" target="_blank" data-reload>View the blog ↗</a>
@@ -34,7 +34,7 @@ component PostsPage(ws: map) {
 }
 
 component PostList() {
-    ~rows = live(list_posts)
+    state rows = live(list_posts)
     rows == null ? <Loading/>
     : is_err(rows) || len(rows) == 0 ? <Empty title="No posts yet"><p>Write the first one.</p></Empty>
     : <table.table>
@@ -52,7 +52,7 @@ component PostList() {
 
 // What waits for me: posts to review, and approved posts to publish.
 component MyQueue() {
-    ~rows = my_queue()
+    state rows = my_queue()
     rows == null ? <Loading/>
     : is_err(rows) || len(rows) == 0 ? <Empty title="Nothing waits for you"><p>Posts sent for review on your desks show here.</p></Empty>
     : <table.table>
@@ -68,8 +68,8 @@ component MyQueue() {
 
 // Readers' comments: each waits here until approved.
 component CommentsPanel() {
-    ~status = "pending"
-    ~rows = live(list_comments, status)
+    state status = "pending"
+    state rows = live(list_comments, status)
     <div.stack>
         <div.inline>{for s in [["pending", "Waiting"], ["approved", "Approved"], ["spam", "Spam"]] =>
             <button type="button" class={status == s[0] ? "choice on" : "choice"} @click={() => { status = s[0]; rows = list_comments(s[0]) }}>{s[1]}</button>}</div>
@@ -88,15 +88,15 @@ component CommentsPanel() {
 }
 
 component PostEditor(id: int, ws: map) {
-    ~p = get_post(id)
-    ~draft = null
-    ~tag_text = null
-    ~preview = null
-    ~server = []
-    ~saved = ""
-    ~cats = post_categories_all()
-    ~flow = post_workflow(id)
-    ~note = ""
+    state p = get_post(id)
+    state draft = null
+    state tag_text = null
+    state preview = null
+    state server = []
+    state saved = ""
+    state cats = post_categories_all()
+    state flow = post_workflow(id)
+    state note = ""
     if p == null { return <Loading/> }
     if is_err(p) { return <Empty title="No such post"><p><a href="/app/posts">All posts</a></p></Empty> }
     let d = draft ?? p
@@ -208,10 +208,10 @@ component PostEditor(id: int, ws: map) {
 
 // Desks (Settings): who writes, reviews and publishes each category's posts.
 component DesksSettings(ws: map) {
-    ~rows = list_desks()
-    ~cats = post_categories_all()
-    ~editing = null
-    ~problems = []
+    state rows = list_desks()
+    state cats = post_categories_all()
+    state editing = null
+    state problems = []
     let admin = ws.user.role != "member"
     let name_of = (uid) => (find(ws.users, (u) => u.id == uid) ?? { name: "?" }).name
     let people = (ids) => len(ids) == 0 ? "no one (owners and admins only)" : ids | map(name_of) | join(", ")

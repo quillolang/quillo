@@ -45,9 +45,9 @@ let NAV = [
 fn nav_active(href: str, path: str) = href == "/app" ? path == "/app" || path == "/app/" : starts_with(path, href)
 
 component App() {
-    ~ws = load_workspace()
-    ~nav = live(sidebar_nav)
-    ~reloads = 0
+    state ws = load_workspace()
+    state nav = live(sidebar_nav)
+    state reloads = 0
     let path = url().path
     let segs = drop(split(path, "/") | filter((s) => s != ""), 1)
     if ws == null { return <Loading/> }
@@ -117,9 +117,9 @@ component App() {
 // Everything, from one box (⌘K): objects, pages, records, contacts,
 // companies, deals, products. The arrows choose, Enter opens.
 component Search() {
-    ~q = ""
-    ~found = []
-    ~at = 0
+    state q = ""
+    state found = []
+    state at = 0
     let close = () => { q = ""; found = []; at = 0 }
     <div.search>
         <input type="search" aria-label="Search" placeholder="Search everything…  ⌘K" value={q} role="combobox" aria-expanded={len(found) > 0}

@@ -66,6 +66,7 @@ pub fn install(env: &Env) {
         ("tenant_from", tenant_from),
         ("with_tenant", with_tenant),
         ("__service", crate::service::call),
+        ("__record", crate::record::construct),
         ("redirect", redirect),
         ("respond", respond),
         ("read_file", read_file),
@@ -109,7 +110,7 @@ pub fn install(env: &Env) {
         ("publish", publish),
         ("watch", watch),
     ];
-    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS) {
+    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
     let mut json = Map::new();
@@ -1335,7 +1336,7 @@ fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 // ---- live updates ------------------------------------------------------
 
-/// `~items = live(load_items, ...args)` in a component: calls the server fn
+/// `state items = live(load_items, ...args)` in a component: calls the server fn
 /// now, and the browser calls it again whenever something it read changes.
 fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = match args.first() {

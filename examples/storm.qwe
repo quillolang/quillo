@@ -24,13 +24,13 @@ let tabs = ["list", "grid", "form"]
 fn initial_items() = range(0, 12) | map((i) => { id: i, label: `Item ${i}` })
 
 component Ticker(label: str, ms: int) {
-    ~n = 0
+    state n = 0
     every(ms, () => { n += 1 })
     <span.ticker>{label} <b>{n}</b></span>
 }
 
 component Counter(id: int, on_change) {
-    ~n = 0
+    state n = 0
     <div.counter>
         <button @click={() => {
             n += 1
@@ -41,7 +41,7 @@ component Counter(id: int, on_change) {
 }
 
 component Item(item: map, open: bool, on_toggle, on_remove) {
-    ~clicks = 0
+    state clicks = 0
     <li.item class={open && "open"}>
         <button.link @click={() => {
             clicks += 1
@@ -59,7 +59,7 @@ component Where() {
 }
 
 component Visits() {
-    ~count = live(visit_count)
+    state count = live(visit_count)
     <div.visits>
         Visits: <b>{count ?? "…"}</b>
         <button @click={() => { add_visit() }}>Visit</button>
@@ -73,14 +73,14 @@ view Panel(title: str, children) =
     </section>
 
 component Storm() {
-    ~items = initial_items()
-    ~next_id = 12
-    ~open = []
-    ~tab = "list"
-    ~storm = false
-    ~changes = 0
-    ~text = "hello"
-    ~totals = {}
+    state items = initial_items()
+    state next_id = 12
+    state open = []
+    state tab = "list"
+    state storm = false
+    state changes = 0
+    state text = "hello"
+    state totals = {}
 
     let toggle = (id) => { open = any(open, (o) => o == id) ? open | filter((o) => o != id) : open + [id] }
     let remove = (id) => {
