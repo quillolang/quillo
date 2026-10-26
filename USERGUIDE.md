@@ -327,7 +327,9 @@ fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(
 ```
 
 The effects are `db`, `http`, `fs` (files), `env` (environment variables), `time` (`now`,
-`date.today`, `date.now`, `sleep`), `random` and `net` (`udp.send`, `udp.reply`). Inside a `with` function, a builtin that needs another effect,
+`date.today`, `date.now`, `sleep`, `crypto.totp_verify`, `rate_limit`), `random` (with
+`crypto.token`, `crypto.totp_secret`, `crypto.recovery_codes`) and `net` (`udp.send`,
+`udp.reply`). `end_sessions` and `user_sessions` need `db`. Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
 `quillo check` (which also warns when an undeclared helper may use one). The limit holds
 for everything the function calls, including the lambdas it passes to `map`.
@@ -630,6 +632,9 @@ quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each serv
 - Announcements are delivered once, without retries: a server that cannot be
   reached when one is sent misses it, and its pages show that change only when
   they next load the data (the next change to it, or a reload).
+- Sessions kept in the database (`sessions({ store: "db" })`) and their rate limits
+  are the same on every server: one ended through one server is ended on all.
+  Signed sessions need the same `QUILLO_SECRET` on each.
 
 ### Server functions
 
@@ -790,14 +795,20 @@ route POST /logout { end_session(); redirect("/") }
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
-- A session is a cookie signed with HMAC-SHA256: the browser can read it but not
-  change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in the
-  session and the rest in the database. The signature covers its expiry, its tenant
+  `renew_session()` gives the same session a new id (after a change of rights).
+- By default a session is a cookie signed with HMAC-SHA256: the browser can read it
+  but not change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in
+  the session and the rest in the database. The signature covers its expiry, its tenant
   and the program's mount point, so it is no session past its time, for another
   tenant, or in another mounted program.
-- `end_session()` removes the cookie from the browser, but a copy someone kept stays
-  valid until it expires. To end sessions on the server (log out everywhere, a stolen
-  laptop), keep an id in the session and check it against the database.
+- A signed session cannot be ended: `end_session()` removes the cookie from the
+  browser, but a copy someone kept stays valid until it expires. Sessions kept in the
+  database (below) can be, and are recommended for programs people sign in to.
+- The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole
+  site (as in production): browsers take a cookie with that prefix only from the very
+  host, over HTTPS, so a sibling subdomain (another tenant's site) cannot plant one.
+  Elsewhere (`--watch`, a mounted program) it is `quillo_session`. A request with two
+  session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
   when the server stops.
@@ -807,6 +818,164 @@ route POST /logout { end_session(); redirect("/") }
   default. `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
   such as limer in front). `request.cookies` has what the browser sent.
+
+#### Sessions that can be ended
+
+```quillo
+sessions({ store: "db", idle: "30m", max_age: "12h" })    // at the top of the program
+
+route POST /login { form: { email: str, password: str } } {
+    ...
+    set_session({ user: user.id })            // a new id: the user changed
+    redirect("/")
+}
+route POST /logout { end_session(); redirect("/login") }  // ended on the server too
+route POST /password { ...; end_sessions(me.id, { keep_current: true }); ... }
+route GET /devices = user_sessions(session().user)   // [{ id, created, seen, expires, ip, agent, current }]
+```
+
+- With `sessions({ store: "db" })` the cookie holds only a random id (32 bytes from the
+  operating system), and the session is a row of `_quillo_sessions`, one of [Quillo's
+  own tables](#quillos-own-tables), stored under the id's SHA-256. Every server of the
+  program reads the same rows, so a session ended on one is ended on all of them. There
+  is no size limit but the database's.
+- A session ends `max_age` after it began (12 hours unless given; `set_session`'s own
+  `max_age` sets it for one session), or once unused for `idle` (30 minutes unless
+  given; `false` for no limit). Being used is noted at most once a minute.
+- `set_session` keeps the session's id while its `user` field stays the same (a cart,
+  a preference), and gives it a new one when `user` changes, as when logging in: an id
+  someone planted or saw before the login is worth nothing after it. So name who is
+  logged in `user`.
+- `end_sessions(user)` ends every session of that user in this tenant, on every server
+  (after a new password, or by an admin); `{ keep_current: true }` keeps the one making
+  the request, `{ id }` ends just one, from `user_sessions`' list. It gives how many it
+  ended. `user_sessions(user)` lists a user's live sessions, the latest used first, for
+  a page of the devices signed in: times are seconds since 1970, `ip` and `agent` (the
+  browser's `User-Agent`) as they were when the session began.
+- `sessions({ store: "cookie" })` is the default: signed cookies, as above. Switching
+  store signs everyone out once.
+
+#### Two-step sign-in
+
+```quillo
+let secret = crypto.totp_secret()                               // keep it with the user
+let uri = crypto.totp_uri(secret, user.email, "Acme")           // otpauth://… for the app
+let step = crypto.totp_verify(user.totp_secret, code, { after: user.totp_step })
+if step == null { reply 401 "Wrong code" }
+db.exec("update users set totp_step = ? where id = ?", step, user.id)   // each code works once
+
+let codes = crypto.recovery_codes(10)              // [{ code, hash }]: show the codes once,
+                                                   // keep the hashes
+let i = crypto.verify_recovery_code(typed, hashes) // which one it was, or null: remove it
+```
+
+- Codes are the ones every authenticator app makes (TOTP, RFC 6238: HMAC-SHA1 of the
+  30-second time step, 6 digits). `crypto.totp_secret(bytes = 20)` gives a new secret in
+  base32; `crypto.totp_uri(secret, account, issuer)` the `otpauth://` address apps take,
+  as a link on a phone or a QR code elsewhere (or show the secret to type in).
+- `crypto.totp_verify(secret, code, { window: 1, after, at })` gives the time step the
+  code is right for, or null. It takes the codes of `window` steps either side of now
+  (clocks drift), comparing each in constant time. A code works once when the program
+  keeps the step it gave and passes it back as `after`: codes of that step and earlier
+  are refused, so one seen over a shoulder or used already is worth nothing. `at` is the
+  time in seconds, for tests.
+- `crypto.recovery_codes(n = 10)` makes codes like `7k2m-x9qp-4hzt` (60 random bits),
+  each with its Argon2id hash, as for passwords. `crypto.verify_recovery_code(code,
+  hashes)` finds which hash a typed code matches, in any case, with or without dashes;
+  the program removes that hash so the code works once. Hashing takes tens of
+  milliseconds a code, off the event loop.
+- Between the password and the code, keep who is signing in in the session under
+  another name (`{ pending: user.id }`), and set `user` only after the code: until then
+  no one is signed in. The CRM in apps/crm does all of this, with a lockout.
+
+#### Rate limits
+
+```quillo
+route POST /login { form: { email: str, password: str } } {
+    rate_limit(`login:${request.ip}`, 30, "1m", { reply: true })   // else 429, Retry-After
+    let key = `login-fail:${lower(email)}`
+    if !rate_limit(key, 5, "15m", { cost: 0 }) { reply 429 "Too many tries; wait a while" }
+    let user = db.one("select * from users where email = ?", lower(email))
+    if !crypto.verify_password(password, user?.password_hash) {
+        rate_limit(key, 5, "15m")            // a failure counts
+        reply 401 "Wrong email or password"
+    }
+    rate_limit_reset(key)
+    ...
+}
+```
+
+- `rate_limit(key, n, per, { cost, reply, store })` counts a call under `key` and gives
+  whether it is within `n` calls in `per` (a duration like `"1m"`). It counts over a
+  sliding window (this window's calls, and the last one's weighed by how much of it is
+  still within `per`), so there is no burst at the turn of a minute. Calls refused count
+  too: a client that keeps trying stays refused.
+- `{ reply: true }` answers a call over the limit with 429 Too Many Requests and a
+  `Retry-After` header saying when one would be allowed. `{ cost: 0 }` only asks whether
+  one more would be; a cost above 1 counts as that many. `rate_limit_reset(key)` forgets
+  a key's calls.
+- Keys belong to the tenant and the mount point: one tenant's limits never touch
+  another's.
+- Counts are kept in the process, unless sessions are kept in the database: then they
+  are kept in it too (`_quillo_limits`), and every server of the program counts the
+  same calls. `{ store: "memory" }` or `{ store: "db" }` chooses for one limit.
+- `request.ip` is the address the connection came from: behind a proxy, every request
+  comes from the proxy, so limit by an account (or a header the proxy sets) there.
+
+#### Security headers
+
+Every answer says how the browser should treat it:
+
+| Header | Value |
+|---|---|
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `X-Frame-Options` and `Content-Security-Policy: frame-ancestors` | `SAMEORIGIN` and `'self'`: no other site may put the page in a frame |
+| `X-Content-Type-Options` | `nosniff` |
+| `Strict-Transport-Security` | `max-age=31536000`, when the request came over HTTPS |
+
+Quillo serves plain HTTP behind a proxy that ends TLS (limer), so a request came over
+HTTPS when the proxy says so with `X-Forwarded-Proto: https` (or `Forwarded:
+proto=https`). Browsers ignore `Strict-Transport-Security` over plain HTTP, so one who
+forges that header gains nothing. It is never sent with `--watch` or in desktop apps.
+
+```quillo
+security_headers({ hsts: "max-age=63072000; includeSubDomains", frame: "DENY" })
+security_headers({ referrer_policy: "no-referrer" })
+
+route GET /widget {
+    security_headers({ frame: false })        // this answer may be framed anywhere
+    <Widget/>
+}
+route GET /raw = respond(200, body, { "x-frame-options": "DENY" })   // its own: kept
+```
+
+`security_headers({ hsts, referrer_policy, frame })` changes them (`false` leaves one
+out; `frame` is `"SAMEORIGIN"` or `"DENY"`), and `security_headers(false)` sends none: at
+the top of the program for every answer, in a route for its answer only. A header the
+route sets itself is kept as it is.
+
+**Content-Security-Policy.** `csp()` at the top of a program sends a strict policy with
+every answer, under which a page runs only its own site's scripts and the inline ones
+carrying the answer's nonce, new each time:
+
+```text
+script-src 'self' 'nonce-…'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+```
+
+- What Quillo writes into pages carries the nonce: the component loader, translations,
+  prefetching, `--watch`'s reload. Components are laid out by a `<style>` with the nonce
+  instead of style attributes. The browser runtime needs no `eval`. A script injected
+  into a page (through `raw`, say) does not run.
+- The program's own inline scripts need the nonce too: `<script nonce={csp_nonce()}>`.
+  `csp_nonce()` gives the answer's nonce. Event handler attributes (`onclick="..."`) do
+  not run under the policy; components' `@click` and scripts that add listeners do.
+- `csp({ script_src: ["https://cdn.example.com"], img_src: ["'self'", "data:"] })`:
+  `script_src` adds sources to `script-src`; other directives (with `_` for `-`) are
+  added, or replace the defaults (`base_uri`, `object_src`, `frame_ancestors`);
+  `report_only: true` sends it as `Content-Security-Policy-Report-Only`, which reports
+  what it would block without blocking (frames aside); `report_uri` says where.
+- In a route, `csp(false)` sends none with its answer and `csp({ ... })` another policy.
+  A route that sets `Content-Security-Policy` itself keeps its own.
 
 ### What a route returns
 
@@ -1262,6 +1431,7 @@ See [examples/services](examples/services): a shop that bills through a billing 
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
   is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets).
+  One-time codes and recovery codes: see [Two-step sign-in](#two-step-sign-in).
   Password hashing takes tens of milliseconds and 19 MiB on purpose, runs off the event
   loop, and at most one per core at a time (others wait their turn), so a flood of
   logins slows logins down rather than taking the server's memory.
@@ -1631,8 +1801,9 @@ db.atomic([db, ledger], () => {
 ### Quillo's own tables
 
 Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
-made later (`_quillo_later`) and the decisions of `db.atomic` (`_quillo_atomic`) are
-kept in the program's database. When there is a database per tenant they cannot be,
+made later (`_quillo_later`), the decisions of `db.atomic` (`_quillo_atomic`), and
+sessions and rate limits when sessions are kept in the database (`_quillo_sessions`,
+`_quillo_limits`, each row marked with its tenant) are kept in the program's database. When there is a database per tenant they cannot be,
 and go to the system database instead: `db.system(target)` (a database every server of
 the program shares, for several servers), `$QUILLO_SYSTEM_DB`, or else a SQLite file
 `quillo-system.db` next to the program. `db.system` also keeps them apart from the
@@ -1764,9 +1935,9 @@ What a reload keeps, and what it starts afresh:
   transaction in progress goes on, and commits or rolls back as it would have). Requests
   that come after are answered by the new version. While the new version loads, Quillo
   code waits (what waits on a database goes on); no request is dropped.
-- **Sessions** are signed cookies, not server memory: they stay valid. The key is
-  `QUILLO_SECRET`; without it a key made at start, which a reload keeps and a restart
-  does not (everyone is signed out), so set it in production.
+- **Sessions** are signed cookies or rows in the database, not server memory: they stay
+  valid. The signing key is `QUILLO_SECRET`; without it a key made at start, which a
+  reload keeps and a restart does not (everyone is signed out), so set it in production.
 - **Global variables** start afresh: keep in the database what must last.
 - The old version's database connections close once no request uses it (within a second
   or so of the last one). Calls made later and transactions over several databases left
@@ -1958,6 +2129,7 @@ src/numeric.rs     math, stats and vec: Python's math and statistics, numpy's op
 src/dates.rs       date: calendars, time zones, business days, day counts
 src/par.rs         a pool of threads for long lists, in chunks of a fixed size
 src/crypto.rs      crypto: hashes, signatures, tokens, passwords
+src/totp.rs        one-time codes from authenticator apps, and recovery codes
 src/imaging.rs     image: what an image file is, and new files made from it
 src/highlight.rs   highlight(code, lang): source code as HTML
 src/i18n.rs        translations
@@ -1976,6 +2148,9 @@ src/server.rs      request matching, server fns, responses, --watch
 src/stream.rs      answers sent as they are made: stream, events, send
 src/service.rs     services: in this process or elsewhere, signed calls, --split
 src/session.rs     cookies and sessions
+src/session_store.rs  sessions kept in the database, which can be ended
+src/access.rs      security headers, the Content-Security-Policy and its nonce
+src/limits.rs      rate limits, in the process or the database
 src/upload.rs      files sent with a form
 src/statics.rs     files served with file()
 src/site.rs        what a program sets about its site: tenants, cross-site posts
