@@ -334,6 +334,7 @@ fn the_ways_around_the_pages_checks_do_not_run_text() {
         "adopt": "refused",
         "script": "refused",
         "svgscript": "refused",
+        "setter": "refused",
         "wrapped": "refused",
         "target": "<b>made</b>",
         "pwned": null

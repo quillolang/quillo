@@ -232,11 +232,7 @@ function foreignName(name) {
 function foreignCall(o, name, args) {
   foreignName(name);
   const f = o[name];
-  guardCall(`\`${name}\``, f, args);
-  if (name === "setAttribute" || name === "setAttributeNS") {
-    const k = String(args[name === "setAttribute" ? 0 : 1]).toLowerCase();
-    if (k.startsWith("on") || k === "srcdoc") fail(`\`${name}\` does not set ${k}: it runs text as code`);
-  }
+  guardCall(`\`${name}\``, f, args, name);
   return fromPage(Reflect.apply(f, o, args));
 }
 // An object from the page's scripts (an element, a library's), not one the
@@ -246,22 +242,25 @@ const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis 
 // Functions of the page that run text as code or HTML, or that step around
 // the checks here (setting any property, calling a method with any `this`,
 // reading a property by a name from data, making a function from text, or
-// parsing markup into nodes): Quillo code calls none of them, and hands none
-// to the page's functions, however it came by one.
-let deniedFns = null, makers = null;
-function deniedSet() {
+// parsing markup into nodes): Quillo code calls none of them, and hands
+// none to the page's functions, however it came by one.
+let deniedFns = null;
+// Where the tag of an element made, and the name of an attribute set, are
+// in the arguments of the page's functions that make and set them.
+let makers = null;
+let setters = null;
+function guarded() {
   if (deniedFns !== null) return deniedFns;
-  deniedFns = new Set();
-  const g = globalThis;
+  const g = globalThis, out = new Set();
   const add = (o, ...names) => {
     if (o) for (const n of names) {
       // Getters of the page's prototypes throw when read off them.
-      try { if (typeof o[n] === "function") deniedFns.add(o[n]); } catch (_) {}
+      try { if (typeof o[n] === "function") out.add(o[n]); } catch (_) {}
     }
   };
   add(g, "eval", "Function", "setTimeout", "setInterval", "execScript");
   // Function's kin, which any async or generator function leads to.
-  for (const f of [async function () {}, function* () {}, async function* () {}]) deniedFns.add(Object.getPrototypeOf(f).constructor);
+  for (const f of [async function () {}, function* () {}, async function* () {}]) out.add(Object.getPrototypeOf(f).constructor);
   add(Function.prototype, "call", "apply", "bind");
   add(g.Reflect, "apply", "construct", "get", "set", "defineProperty", "setPrototypeOf", "getOwnPropertyDescriptor");
   add(Object, "assign", "defineProperty", "defineProperties", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors");
@@ -271,31 +270,46 @@ function deniedSet() {
   add(g.Element && g.Element.prototype, "insertAdjacentHTML", "setHTMLUnsafe");
   add(g.ShadowRoot && g.ShadowRoot.prototype, "setHTMLUnsafe");
   add(g.Range && g.Range.prototype, "createContextualFragment");
-  // The tag's place in each.
-  makers = new Map();
-  if (g.Document) [["createElement", 0], ["createElementNS", 1]].forEach(([n, i]) => { if (typeof g.Document.prototype[n] === "function") makers.set(g.Document.prototype[n], i); });
-  return deniedFns;
+  const places = (o, pairs) => {
+    const m = new Map();
+    if (o) for (const [n, i] of pairs) if (typeof o.prototype[n] === "function") m.set(o.prototype[n], i);
+    return m;
+  };
+  makers = places(g.Document, [["createElement", 0], ["createElementNS", 1]]);
+  setters = places(g.Element, [["setAttribute", 0], ["setAttributeNS", 1]]);
+  return (deniedFns = out);
 }
 function denied(f) {
-  if (deniedSet().has(f)) fail(`\`${f.name || "this function"}\` is not called from Quillo code: it runs text as code or steps around these checks`);
+  if (guarded().has(f)) fail(`\`${f.name || "this function"}\` is not called from Quillo code: it runs text as code or steps around these checks`);
 }
 // Functions that came from the page as values (`js("lib.fn")`, or what one
-// of its functions gave back): calling one checks what it is given.
-const pageFns = new WeakSet();
+// of its functions gave back), each with what calls it: `pageCall`, which
+// checks what it is given.
+const pageFns = new WeakMap();
 function fromPage(r) {
   if (typeof r === "function") {
-    if (deniedSet().has(r)) fail(`\`${r.name || "this function"}\` is not given to Quillo code: it runs text as code`);
-    pageFns.add(r);
+    if (guarded().has(r)) fail(`\`${r.name || "this function"}\` is not given to Quillo code: it runs text as code`);
+    pageFns.set(r, pageCall);
   }
   return r === undefined ? null : r;
 }
-// A call of the page's function f with args: f is not one of the above,
-// makes no script element, and is given nothing that would run as code.
-function guardCall(what, f, args) {
+function pageCall(f, args) {
+  guardArgs(`\`${f.name || "this function"}\``, args, 0);
+  return fromPage(f(...args));
+}
+// A call of the page's function f (the method `name`) with args: f is not
+// one of the above, makes no script element, sets no handler or srcdoc,
+// and is given nothing that would run as code.
+function guardCall(what, f, args, name) {
   denied(f);
   if (makers.has(f)) {
     const tag = String(args[makers.get(f)]).split(":").pop().trim().toLowerCase();
     if (tag === "script") fail(`${what} does not make a script element: it runs text as code`);
+  }
+  const at = setters.has(f) ? setters.get(f) : name === "setAttribute" ? 0 : name === "setAttributeNS" ? 1 : -1;
+  if (at >= 0) {
+    const k = String(args[at]).toLowerCase();
+    if (k.startsWith("on") || k === "srcdoc") fail(`${what} does not set ${k}: it runs text as code`);
   }
   guardArgs(what, args, 0);
 }
@@ -308,7 +322,7 @@ function guardArgs(what, args, depth) {
     if (typeof a === "string") {
       if (scriptURL(a)) fail(`${what} is not given a javascript: URL`);
     } else if (typeof a === "function") {
-      if (deniedSet().has(a)) fail(`${what} is not given \`${a.name || "this function"}\`: it runs text as code`);
+      if (guarded().has(a)) fail(`${what} is not given \`${a.name || "this function"}\`: it runs text as code`);
     } else if (a !== null && typeof a === "object" && depth < 16) {
       if (Array.isArray(a)) guardArgs(what, a, depth + 1);
       else if (foreign(a)) {
@@ -668,7 +682,8 @@ function index(o, i) {
 function callFn(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
   denied(f);
-  if (pageFns.has(f)) { guardArgs(`\`${f.name || "this function"}\``, args, 0); return fromPage(f(...args)); }
+  const call = pageFns.get(f);
+  if (call !== undefined) return call(f, args);
   return f(...args);
 }
 

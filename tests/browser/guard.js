@@ -7,13 +7,14 @@
     await tick(300);
     window.__quilloErrors = window.__quilloErrors || [];
     // Each button's error, cut to what says why.
-    for (const id of ["reflect", "parse", "adopt", "script", "svgscript", "wrapped"]) {
+    for (const id of ["reflect", "parse", "adopt", "script", "svgscript", "setter", "wrapped"]) {
       const before = window.__quilloErrors.length;
       $("#" + id).click(); await tick(200);
       const e = window.__quilloErrors.slice(before);
-      out[id] = e.length === 1 && /is not called from Quillo code|another document|script element|javascript: URL/.test(e[0]) ? "refused" : e;
+      out[id] = e.length === 1 && /is not called from Quillo code|another document|script element|does not set onclick|javascript: URL/.test(e[0]) ? "refused" : e;
     }
     $("#ok").click(); await tick();
+    document.body.click(); await tick();
     out.target = $("#target").innerHTML;
     out.pwned = window.pwned || null;
   } catch (e) { out.exception = String(e && e.stack || e); }

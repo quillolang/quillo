@@ -1,6 +1,7 @@
 // The ways around the checks on the page's functions that a review found,
 // each tried by a button in a real page: setting innerHTML through
-// Reflect, nodes parsed from markup, and script elements. None of them
+// Reflect, nodes parsed from markup, script elements, a handler set
+// through a method reached by its path. None of them
 // runs its text; the last button shows what a program means to do still
 // works. Driven by guard.js (tests/browser.rs).
 
@@ -25,6 +26,7 @@ component Guard() {
         <button id="svgscript" @click={() => {
             js("document.createElementNS", "http://www.w3.org/2000/svg", "svg:script")
         }}>svg script</button>
+        <button id="setter" @click={() => { js("document.body.setAttribute", "onclick", "window.pwned = 'setter'") }}>setter</button>
         <button id="wrapped" @click={() => { js("window.open", ["javascript:window.pwned = 'wrapped'"]) }}>wrapped</button>
         <button id="ok" @click={() => {
             let b = js("document").createElement("b")
