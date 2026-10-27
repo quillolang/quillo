@@ -262,7 +262,10 @@ has all of it: [the language](USERGUIDE.md#language-tour),
 [the standard library](USERGUIDE.md#standard-library) and
 [databases](USERGUIDE.md#database), [services](USERGUIDE.md#services),
 [checking](USERGUIDE.md#checking), and
-[running in production](USERGUIDE.md#concurrency-and-reloading).
+[running in production](USERGUIDE.md#concurrency-and-reloading). The site also has
+[Installing](https://quillolang.org/docs/install/) and
+[Hosting](https://quillolang.org/docs/hosting/): a proxy for HTTPS, systemd, Docker,
+the database, and a checklist before going live.
 
 ## Community
 
