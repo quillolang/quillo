@@ -769,10 +769,12 @@ calls it. Calls run one after another. To run several at once, give them to
 let [user, orders] = parallel(() => load_user(id), () => load_orders(id))
 ```
 
-In the browser that is `Promise.all`. On the server each function runs on a thread of
-its own, so their waits (database, `http.*`, `sleep`) overlap; inside a transaction they
-run one after another, since other threads' SQL would not be part of it. A failure stops
-the whole call; error values are results like any other.
+In the browser that is `Promise.all`. In a request on the server each function runs as a
+coroutine of its own on the event loop (outside a request, on a thread of its own), so
+their waits (database, `http.*`, `sleep`) overlap. Their computing does not: Quillo code
+runs one piece at a time, so `parallel` shortens waiting, not arithmetic. Inside a
+transaction they run one after another, since the others' SQL would not be part of it. A
+failure stops the whole call; error values are results like any other.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
 the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
@@ -792,6 +794,32 @@ From hand-written JavaScript: `await quillo.server.add_note("text")`.
 A call that must not happen twice (a payment, a transfer) is wrapped in
 [`idempotent`](#idempotent-requests): the page then sends a key with each call, and
 sends the call again when its answer does not come back, and the server runs it once.
+
+#### What the browser can reach
+
+Components and server code share a file, but not what they can touch:
+
+- A component cannot use `db`, `request`, `env`, `http`, files, Rust (`.qwer`) functions,
+  or a global the server changes: that is an error when the program loads, and in the
+  editor. Top-level values that come from them (`let KEY = env("STRIPE_KEY")`,
+  `let CONFIG = load_config()`) are not written into the browser's bundle either, which
+  anyone can download: a component that uses one is an error, and asks a `server fn`.
+- A `server fn` is the way in, and it is a public address. Anyone can send
+  `POST /_quillo/rpc/<name>` with any arguments, from a script or the browser's console,
+  signed in or not; refusing other sites' pages stops other sites, not people. So each
+  one checks, as a route does, who is asking and whether they may touch *this* record,
+  and gives its parameters types (one without a type takes any JSON):
+
+  ```quillo
+  server fn delete_note(id: int) {
+      let me = session().user ?? reply 401 "Log in first"
+      db.exec("delete from notes where id = ? and owner = ?", id, me)
+  }
+  ```
+
+- What a `server fn` returns, and the props a page gives a component, reach the browser
+  in full: `db.one("select * from users where id = ?", id)` sends `password_hash` too.
+  Select the columns the page shows.
 
 ## Routes
 
@@ -1799,7 +1827,9 @@ takes a fifteenth of the comprehension's time.
 ### Database
 
 `db` talks to SQLite (built in), PostgreSQL or MySQL/MariaDB, with the same functions.
-SQL problems are error values, so `?` and `??` work on them.
+SQL problems are error values, so `?` and `??` work on them. `db` is a library, not
+syntax: other stores (Redis, MongoDB, ...) come in through Rust (see
+[Other stores](#other-stores)).
 
 ```quillo
 db.open("app.db")                                   // SQLite, next to the program; ":memory:" also works
@@ -2208,6 +2238,27 @@ the database is shared, and changes to it (and `publish`) reach live pages on ev
 instance. SQLite in memory (`:memory:`) is one database per instance, so use a file or
 PostgreSQL to share data between them.
 
+What holds up the loop is code that computes for long without waiting: a loop over a
+million rows keeps every other request on its instance waiting until it ends. Quillo does
+not break into it, since that would end the promise above (a handler runs on its own
+between waits). Images, `crypto.hash_password`, files and Rust (`.qwer`) functions run off
+the loop, and sorting and `stats`, `vec` and `math` on large lists are spread over the
+cores. So put long computing in Rust (see [Rust](#rust)), or run more instances.
+
+How long a wait may last:
+
+- `--workers N` (64 by default) requests can wait at once, each on a pool thread; more
+  wait for a thread, while requests that only compute go on being answered. PostgreSQL
+  queries take no thread.
+- `http.*`: 10 s to connect, 60 s in all (300 s between the parts of a stream). A call to
+  a `service` elsewhere: 10 s, or its `timeout` (see [Services](#services)).
+- A PostgreSQL connection: when all of the pool's are taken, a request waits up to 30 s
+  for one, then gets an error.
+- A query has no limit from Quillo: give the database one (on PostgreSQL,
+  `alter role app set statement_timeout = '5s'`).
+- Inside a SQLite transaction a wait holds up every request, since another request's SQL
+  would land in the transaction: keep `http.*` and `sleep` out of them.
+
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. `--reload` reloads it the same way without
 `--watch`'s development aids (errors on pages, refreshing them), for production
@@ -2445,6 +2496,71 @@ How it runs:
   Quillo with `run_script`).
 
 See [rust.qwe](https://github.com/quillolang/examples/blob/main/rust.qwe) and [rust.qwer](https://github.com/quillolang/examples/blob/main/rust.qwer).
+
+### Other stores
+
+`db` is for SQL databases. For another kind (Redis, MongoDB, a graph database), use its
+crate in a `.qwer` file: its functions are the driver, and the program calls them like
+any other. A count of visits in Redis:
+
+```rust
+//! [dependencies]
+//! redis = "0.27"
+
+use std::sync::OnceLock;
+
+/// The client, made on the first call (`REDIS_URL`, or Redis on this machine).
+fn client() -> Result<&'static redis::Client, String> {
+    static C: OnceLock<redis::Client> = OnceLock::new();
+    if let Some(c) = C.get() {
+        return Ok(c);
+    }
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+    let c = redis::Client::open(url).map_err(|e| e.to_string())?;
+    Ok(C.get_or_init(|| c))
+}
+
+/// The value at `key`, or null.
+pub fn cache_get(key: &str) -> Result<Option<String>, String> {
+    let mut con = client()?.get_connection().map_err(|e| e.to_string())?;
+    redis::cmd("GET").arg(key).query(&mut con).map_err(|e| e.to_string())
+}
+
+/// Adds one to the number at `key`, and gives the new number.
+pub fn cache_incr(key: &str) -> Result<i64, String> {
+    let mut con = client()?.get_connection().map_err(|e| e.to_string())?;
+    redis::cmd("INCR").arg(key).query(&mut con).map_err(|e| e.to_string())
+}
+```
+
+```quillo
+use "redis.qwer"
+
+server fn visits(page: str) {
+    watch(`visits:${page}`)                  // live pages showing this follow the topic
+    int(cache_get(`visits:${page}`)? ?? "0")
+}
+
+server fn visit(page: str) {
+    let n = cache_incr(`visits:${page}`)?
+    publish(`visits:${page}`)                // and refresh when it changes
+    n
+}
+
+component Visits(page: str) {
+    state n = live(visits, page)
+    <button @click={() => visit(page)}>{n} visits</button>
+}
+```
+
+- Values cross as JSON, so a connection cannot be a Quillo value: the Rust keeps it in a
+  `static`, and the library stays loaded between calls. (This one connects on each call;
+  a pool, such as the crate's `r2d2` feature, keeps connections open.)
+- Calls run off the event loop, so a slow store holds up no one, and a store that is
+  down gives an error value.
+- What `db` does by itself is the program's to do here: live pages follow what a loader
+  `watch`es and a write `publish`es, as above, and writes are not part of
+  `db.transaction`.
 
 ## Not built yet
 
