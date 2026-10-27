@@ -1,6 +1,8 @@
 //! Services: a part of an app that runs in this process or as a server of
 //! its own, called the same way either way (src/service.rs).
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 use std::io::{Read, Write};
@@ -67,6 +69,16 @@ fn get(it: &mut Interp, url: &str) -> HttpResponse {
     })
 }
 
+fn post_json(it: &mut Interp, url: &str, body: &str) -> HttpResponse {
+    it.handle(&HttpRequest {
+        method: "POST".into(),
+        url: url.into(),
+        headers: vec![("Host".into(), "localhost".into()), ("Content-Type".into(), "application/json".into())],
+        body: body.as_bytes().to_vec(),
+        remote: "127.0.0.1".into(),
+    })
+}
+
 fn text(r: &HttpResponse) -> String {
     String::from_utf8_lossy(&r.body).into_owned()
 }
@@ -87,6 +99,26 @@ fn in_one_process_a_service_is_one_and_called_directly() {
     assert_eq!(text(&get(&mut it, "/shop/count")), "2");
     // The tenant goes along.
     assert_eq!(text(&get(&mut it, "/shop/as/acme")), "acme");
+}
+
+#[test]
+fn pages_cannot_call_a_services_server_fns() {
+    let d = dir("no-rpc");
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("app.qwe")).unwrap();
+    // The review's call: an invoice for 1 cent, past the shop's price.
+    let r = post_json(&mut it, "/billing/_quillo/rpc/invoice", r#"["mallory",1,"free"]"#);
+    assert_eq!(r.status, 404, "{}", text(&r));
+    assert_eq!(text(&get(&mut it, "/billing")), "<p>0 invoices</p>");
+    // Unsigned at its own address too.
+    assert_eq!(post_json(&mut it, "/billing/_quillo/service/invoice", r#"["mallory",1]"#).status, 401);
+    // The shop still calls it.
+    assert_eq!(text(&get(&mut it, "/shop/buy/ana")), "#1 ana none");
+    // A program's own server fns are still the pages' to call.
+    std::fs::write(d.join("main.qwe"), "service /billing = \"billing.qwe\"\nserver fn hello() = \"hi\"\n").unwrap();
+    let mut main = Interp::new(&d);
+    main.load_file(&d.join("main.qwe")).unwrap();
+    assert_eq!(text(&post_json(&mut main, "/_quillo/rpc/hello", "[]")), r#"{"ok":"hi"}"#);
 }
 
 #[test]
@@ -141,12 +173,14 @@ fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server(child);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server(child)
+    server
 }
 
 fn http(port: u16, method: &str, path: &str, headers: &[(&str, String)], body: &str) -> (u16, String) {
@@ -165,9 +199,19 @@ fn http(port: u16, method: &str, path: &str, headers: &[(&str, String)], body: &
     (status, body)
 }
 
-fn sign(secret: &str, t: u64, f: &str, tenant: &str, body: &str) -> String {
-    let msg = format!("{}\n{}\n{}\n{}", t, f, tenant, body);
-    quillo::crypto::hex(&quillo::crypto::hmac_sha256(secret.as_bytes(), msg.as_bytes()))
+/// The headers of a call to service `to`'s `f`, signed with `secret` at time `t`.
+fn signed(secret: &str, t: u64, to: &str, f: &str, call: &str, body: &str) -> Vec<(&'static str, String)> {
+    let sig = quillo::service::signature(secret, t, to, f, "", call, body.as_bytes());
+    vec![
+        ("Content-Type", "application/json".into()),
+        ("X-Quillo-Service", format!("t={},sig={}", t, sig)),
+        ("X-Quillo-To", to.into()),
+        ("X-Quillo-Call", call.into()),
+    ]
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[test]
@@ -187,10 +231,10 @@ fn split_a_service_is_called_over_http_signed() {
     assert_eq!(text(&get(&mut it, "/count")), "1");
     assert_eq!(text(&get(&mut it, "/as/acme")), "acme");
     // Unsigned, wrongly signed, or too old: refused. Only server fns are offered.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = now_secs();
     let call = |f: &str, t: u64, key: &str| {
         let body = r#"["eve", 1]"#;
-        http(port, "POST", &format!("/_quillo/service/{}", f), &[("Content-Type", "application/json".into()), ("X-Quillo-Service", format!("t={},sig={}", t, sign(key, t, f, "", body)))], body)
+        http(port, "POST", &format!("/_quillo/service/{}", f), &signed(key, t, "billing", f, &quillo::service::new_id(16), body), body)
     };
     assert_eq!(http(port, "POST", "/_quillo/service/invoice", &[("Content-Type", "application/json".into())], r#"["eve", 1]"#).0, 401);
     assert_eq!(call("invoice", now, "another-secret").0, 401);
@@ -210,6 +254,62 @@ fn split_a_service_is_called_over_http_signed() {
     app.load_file(&d.join("app.qwe")).unwrap();
     assert_eq!(text(&get(&mut app, "/billing")), "<p>2 invoices</p>");
     assert_eq!(text(&get(&mut app, "/")), "billed 2");
+    // But not calls of its functions, nor Quillo's other addresses.
+    for path in ["/billing/_quillo/rpc/invoice", "/billing//_quillo/rpc/invoice", "/billing/_quillo/service/invoice", "/billing/_quillo/job/x", "/billing/_quillo/later"] {
+        let r = post_json(&mut app, path, r#"["mallory",1,"free"]"#);
+        assert_eq!(r.status, 404, "{}: {}", path, text(&r));
+    }
+    assert_eq!(text(&get(&mut app, "/billing")), "<p>2 invoices</p>");
+}
+
+#[test]
+fn a_service_run_alone_answers_only_signed_calls() {
+    let d = dir("alone");
+    std::fs::write(d.join("ledger.qwe"), "server fn add(amounts: list<int>) -> int = sum(amounts)\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let port = free_port();
+    let _ledger = start(&d.join("ledger.qwe"), port, &["--as-service"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let json = ("Content-Type", "application/json".to_string());
+    assert_eq!(http(port, "POST", "/_quillo/rpc/add", &[json.clone()], "[[1, 2]]").0, 404);
+    // Signed calls are checked all the way in, as pages' calls are.
+    let now = now_secs();
+    let call = |body: &str| http(port, "POST", "/_quillo/service/add", &signed(secret, now, "ledger", "add", &quillo::service::new_id(16), body), body);
+    assert_eq!(call(r#"[["1) or 1=1 --", 2]]"#).0, 400);
+    assert_eq!(call("[[1, 2]]"), (200, r#"{"ok":3}"#.to_string()));
+}
+
+#[test]
+fn a_signed_call_runs_once_and_only_at_the_service_it_names() {
+    let d = dir("replay");
+    std::fs::write(d.join("ledger.qwe"), "let runs = 0\nserver fn add(x: int) -> int {\n    runs += 1\n    runs\n}\nroute GET /runs = str(runs)\n").unwrap();
+    std::fs::write(d.join("other.qwe"), "server fn add(x: int) -> int = 0\n").unwrap();
+    let secret = "a-test-secret-for-services";
+    let (port, named) = (free_port(), free_port());
+    let _ledger = start(&d.join("ledger.qwe"), port, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let _named = start(&d.join("other.qwe"), named, &["--service-name", "ledger"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let now = now_secs();
+    // What the review did: the same signed call sent again. It is answered
+    // as it was the first time; the function does not run again.
+    let headers = signed(secret, now, "ledger", "add", "abc123", "[1]");
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers, "[1]"), (200, r#"{"ok":1}"#.to_string()));
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers, "[1]"), (200, r#"{"ok":1}"#.to_string()));
+    assert_eq!(http(port, "GET", "/runs", &[], "").1, "1");
+    // The call id is signed: another id under the same signature is refused,
+    // and so is a call with none.
+    let mut other_id = headers.clone();
+    other_id[3].1 = "abc124".into();
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &other_id, "[1]").0, 401);
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &headers[..3], "[1]").0, 401);
+    // So is the service it is for: a call signed for another service is
+    // refused, here by its file's name and there by --service-name.
+    let for_billing = signed(secret, now, "billing", "add", "abc125", "[1]");
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &for_billing, "[1]").0, 401);
+    let mut retargeted = headers.clone();
+    retargeted[2].1 = "billing".into();
+    assert_eq!(http(port, "POST", "/_quillo/service/add", &retargeted, "[1]").0, 401);
+    assert_eq!(http(named, "POST", "/_quillo/service/add", &signed(secret, now, "ledger", "add", "abc126", "[1]"), "[1]").0, 200);
+    assert_eq!(http(named, "POST", "/_quillo/service/add", &signed(secret, now, "other", "add", "abc127", "[1]"), "[1]").0, 401);
+    assert_eq!(http(port, "GET", "/runs", &[], "").1, "1");
 }
 
 #[test]
@@ -229,6 +329,10 @@ fn split_runs_each_service_as_a_process_of_its_own() {
     }
     assert_eq!(http(port, "GET", "/billing", &[], "").1, "<p>1 invoices</p>");
     assert_eq!(http(port, "GET", "/", &[], "").1, "billed 1");
+    // Pages cannot call billing's functions, through the app or otherwise.
+    let json = ("Content-Type", "application/json".to_string());
+    assert_eq!(http(port, "POST", "/billing/_quillo/rpc/invoice", &[json], r#"["mallory",1,"free"]"#).0, 404);
+    assert_eq!(http(port, "GET", "/billing", &[], "").1, "<p>1 invoices</p>");
     // Stopped with the app: no service left behind.
     drop(app);
     std::thread::sleep(Duration::from_millis(500));
@@ -245,6 +349,53 @@ fn services_may_use_one_another() {
     let mut it = Interp::new(&d);
     it.load_file(&d.join("main.qwe")).unwrap();
     assert_eq!(text(&get(&mut it, "/")), "ping pong from b, which knows a");
+}
+
+const PRICES: &str = r#"
+server fn total(price: dec, qty: int) -> dec = price * qty
+"#;
+
+const TILL: &str = r#"
+service prices = "prices.qwe"
+
+route GET /total {
+    let t = prices.total(12.50m, 3)
+    `${type_of(t)} ${t}`
+}
+route GET /sum {
+    let t = prices.total(0.10m, 3) + prices.total(0.20m, 1)
+    `${type_of(t)} ${t}`
+}
+"#;
+
+#[test]
+fn a_decimal_crosses_to_a_service_and_back_exactly() {
+    let d = dir("dec");
+    std::fs::write(d.join("prices.qwe"), PRICES).unwrap();
+    std::fs::write(d.join("till.qwe"), TILL).unwrap();
+    // In one process: a decimal, scale and all, both ways (not a float, not text).
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("till.qwe")).unwrap();
+    assert_eq!(text(&get(&mut it, "/total")), "dec 37.50");
+    assert_eq!(text(&get(&mut it, "/sum")), "dec 0.50");
+    // Over HTTP: tagged as for a page's server fns; text and ints for a `dec` parameter too.
+    // The same secret as the other tests: the variable is the whole process's.
+    let secret = "a-test-secret-for-services";
+    std::env::set_var("QUILLO_SERVICE_SECRET", secret);
+    let port = free_port();
+    let _prices = start(&d.join("prices.qwe"), port, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let mut it = Interp::new(&d);
+    it.shared.service_urls.lock().unwrap().insert("prices".into(), format!("http://127.0.0.1:{}", port));
+    it.load_file(&d.join("till.qwe")).unwrap();
+    assert_eq!(text(&get(&mut it, "/total")), "dec 37.50");
+    assert_eq!(text(&get(&mut it, "/sum")), "dec 0.50");
+    let now = now_secs();
+    for (i, (body, want)) in [(r#"[{"$dec": "0.10"}, 3]"#, r#"{"ok":{"$dec":"0.30"}}"#), (r#"["0.10", 3]"#, r#"{"ok":{"$dec":"0.30"}}"#), (r#"[2, 3]"#, r#"{"ok":{"$dec":"6"}}"#)].into_iter().enumerate() {
+        let (status, got) = http(port, "POST", "/_quillo/service/total", &signed(secret, now, "prices", "total", &format!("dec{}", i), body), body);
+        assert_eq!((status, got.as_str()), (200, want), "{}", body);
+    }
+    let body = r#"["ten", 3]"#;
+    assert_eq!(http(port, "POST", "/_quillo/service/total", &signed(secret, now, "prices", "total", "dec9", body), body).0, 400);
 }
 
 // ---- holding up: replicas, retries, request ids, calls made later ----------------------------

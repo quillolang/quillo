@@ -1,6 +1,7 @@
 //! Tree-walking evaluator: expressions, patterns and HTML rendering.
 
 use crate::ast::*;
+use crate::decimal::Dec;
 use crate::error::QuilloError;
 use crate::parser::Parser;
 use crate::shared::Shared;
@@ -28,6 +29,7 @@ const CHANGES: &[&str] = &[
     "db.exec",
     "db.migrate",
     "db.atomic",
+    "idempotent",
     "set_cookie",
     "delete_cookie",
     "set_session",
@@ -41,6 +43,8 @@ const CHANGES: &[&str] = &[
     "http.patch",
     "http.delete",
     "image.convert",
+    "audit",
+    "db.backup",
     "__service",
     "__service_later",
 ];
@@ -79,8 +83,11 @@ pub struct Interp {
     /// (`run_script`); `u64::MAX` everywhere else.
     pub(crate) fuel: u64,
     /// Effects the running code may use, and the `with` function that limited them.
-    allowed: u8,
-    restrictor: Option<Arc<FnDef>>,
+    pub(crate) allowed: u8,
+    /// While a sandboxed script runs: its outermost scope, and the effects
+    /// the program had (see `script_mask`).
+    pub(crate) script: Option<(Env, u8)>,
+    pub(crate) restrictor: Option<Arc<FnDef>>,
     /// Names of `server fn`s, callable from the browser.
     pub server_fns: Arc<Vec<String>>,
     /// What the program set about its site (see `site::Site`).
@@ -99,6 +106,11 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
+    /// What the request set about its answer's headers, and its session's row (see `access`).
+    pub access: crate::access::PerRequest,
+    /// Writes to Quillo's own tables held back until the transaction open on
+    /// their SQLite database ends (see `db::own_sql`).
+    pub own_later: Vec<crate::db::Held>,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -154,6 +166,9 @@ pub struct Interp {
     /// Services with a prefix that run elsewhere: their routes are passed
     /// on to them (`service /shop = "shop.qwe"`, src/service.rs).
     pub remote_mounts: Vec<(String, String)>,
+    /// Loaded as a service (src/service.rs): its server fns are called by
+    /// other services, signed, never by browsers (`/_quillo/rpc`).
+    pub is_service: bool,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -199,6 +214,7 @@ pub fn lit_value(l: &Lit) -> Value {
         Lit::Bool(b) => Value::Bool(*b),
         Lit::Int(n) => Value::Int(*n),
         Lit::Float(f) => Value::Float(*f),
+        Lit::Dec(d) => Value::Dec(*d),
         Lit::Str(s) => Value::Str(s.clone()),
     }
 }
@@ -208,6 +224,7 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
         "any" => true,
         "int" => matches!(v, Value::Int(_)),
         "float" => matches!(v, Value::Float(_)),
+        "dec" => matches!(v, Value::Dec(_)),
         "num" => matches!(v, Value::Int(_) | Value::Float(_)),
         "str" => matches!(v, Value::Str(_)),
         "bool" => matches!(v, Value::Bool(_)),
@@ -242,6 +259,19 @@ fn ty_text(ty: &Ty) -> String {
     ty.text()
 }
 
+/// A value as a decimal, for a `dec` pattern or record field: a decimal,
+/// an int, numeric text ("12.50", from a query, a form or JSON) or a float
+/// (a JSON number, through its shortest text).
+pub fn as_dec(v: &Value) -> Option<Dec> {
+    match v {
+        Value::Dec(d) => Some(*d),
+        Value::Int(n) => Some(Dec::from_i64(*n)),
+        Value::Float(f) => Dec::from_f64(*f),
+        Value::Str(s) => Dec::parse(s.trim()),
+        _ => None,
+    }
+}
+
 /// Converts request text to the type a pattern asks for.
 pub fn coerce(t: &str, s: &str) -> Option<Value> {
     let s = s.trim();
@@ -249,6 +279,7 @@ pub fn coerce(t: &str, s: &str) -> Option<Value> {
         "int" => s.parse::<i64>().ok().map(Value::Int),
         "float" => s.parse::<f64>().ok().map(Value::Float),
         "num" => s.parse::<i64>().ok().map(Value::Int).or_else(|| s.parse::<f64>().ok().map(Value::Float)),
+        "dec" => Dec::parse(s).map(Value::Dec),
         "bool" => match s {
             "true" | "on" | "1" | "yes" => Some(Value::Bool(true)),
             "false" | "off" | "0" | "no" => Some(Value::Bool(false)),
@@ -335,6 +366,41 @@ pub fn url_attr(name: &str) -> bool {
 /// What a `javascript:` URL in one of `URL_ATTRS` becomes.
 pub const BLOCKED_URL: &str = "about:blank#blocked";
 
+/// Whether an attribute of an SVG animation gives its value to another
+/// attribute (`<set attributeName="href" to={u}>`), which may be a URL one:
+/// `to`, `from`, `by`, and `values`, a list split by `;`. Their values are
+/// checked as URLs whatever the attribute animated, since a `javascript:`
+/// value means nothing anywhere else.
+pub fn anim_value_attr(tag: &str, name: &str) -> bool {
+    (tag.eq_ignore_ascii_case("set") || tag.eq_ignore_ascii_case("animate"))
+        && ["to", "from", "by", "values"].iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
+/// Whether any of an animation's `;`-separated values is a script URL.
+fn script_url_in_list(text: &str) -> bool {
+    text.split(';').any(script_url)
+}
+
+/// Like `shows_script_url`, for an animation's values.
+fn shows_script_url_in_list(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => script_url_in_list(s),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::List(_) | Value::Map(_) => false,
+        other => script_url_in_list(&other.display()),
+    }
+}
+
+/// Whether a value written in a URL attribute would be a `javascript:` URL:
+/// its text is what the attribute says, whatever its type (an `html`
+/// value from `markdown(u, { inline: true })` too).
+fn shows_script_url(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => script_url(s),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::List(_) | Value::Map(_) => false,
+        other => script_url(&other.display()),
+    }
+}
+
 /// Whether a URL would run code when followed: `javascript:` or `vbscript:`,
 /// however browsers would read it (they skip leading spaces and control
 /// characters and ignore tabs and line breaks inside).
@@ -395,10 +461,26 @@ pub fn attr_name_ok(name: &str) -> bool {
         && name.chars().all(|c| !c.is_control() && !matches!(c, ' ' | '"' | '\'' | '>' | '<' | '/' | '=' | '`' | '{' | '}'))
 }
 
-/// Whether a key of a `{...map}` spread may become an attribute.
-fn spread_attr_allowed(name: &str) -> bool {
+/// An attribute's name as the browser compares it: lower case, without the
+/// `bind:` of `bind:value`.
+fn attr_key(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    attr_name_ok(name) && !lower.starts_with("on") && lower != "srcdoc" && !name.starts_with("__")
+    match lower.strip_prefix("bind:") {
+        Some(rest) => rest.to_string(),
+        None => lower,
+    }
+}
+
+/// Whether a key of a `{...map}` spread may become an attribute. The name
+/// that would be written is checked: `bind:onclick` is `onclick`. Names
+/// with `:` (but `xlink:href`) and `@` handlers come only from the program.
+fn spread_attr_allowed(name: &str) -> bool {
+    let key = attr_key(name);
+    attr_name_ok(name)
+        && !code_attr(&key)
+        && !name.starts_with("__")
+        && !name.starts_with('@')
+        && (!name.contains(':') || key == "xlink:href")
 }
 
 fn render_value(v: &Value, out: &mut String) {
@@ -416,21 +498,63 @@ fn render_value(v: &Value, out: &mut String) {
     }
 }
 
-/// JSON for an island's props and state: like `to_json`, but an error value
-/// becomes `{"$quillo_err": payload}`, which the browser turns back into one.
+/// A value placed in a `<script>` (see `render_tag_into`).
+fn script_value(v: &Value, out: &mut String) {
+    match v {
+        Value::Nil | Value::Bool(false) => {}
+        Value::Html(h) => out.push_str(&h.replace("</", "<\\/").replace("<!--", "<\\!--")),
+        other => out.push_str(&script_json(&other.to_json())),
+    }
+}
+
+/// JSON that is safe inside `<script>`: no `</script>`, `<!--` or line
+/// separators (which end a string in older JavaScript).
+pub fn script_json(j: &serde_json::Value) -> String {
+    serde_json::to_string(j).unwrap_or_default().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+}
+
+/// JSON for an island's props and state, and for what server fns take and
+/// give: like `to_json`, but an error value becomes `{"$quillo_err":
+/// payload}`, a decimal `{"$dec": "12.50"}` and an int past what a JS number
+/// holds whole `{"$int": "9007199254740993"}`, which the browser turns back
+/// into an error value, its decimal and a BigInt.
 pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Err(e) => serde_json::json!({ "$quillo_err": island_json(e) }),
+        Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
+        Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
         Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k, x)| (k.to_string(), island_json(x))).collect()),
         other => other.to_json(),
     }
 }
 
+/// The largest int a JS number holds whole: 2^53 - 1.
+const JS_SAFE: u64 = (1 << 53) - 1;
+
+/// `island_json` read back: what the browser sent a server fn.
+pub fn from_island_json(j: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match j {
+        J::Array(a) => Value::list(a.iter().map(from_island_json).collect()),
+        J::Object(o) if o.len() == 1 => {
+            let (k, x) = o.iter().next().unwrap();
+            match (k.as_str(), x) {
+                ("$dec", J::String(s)) => Dec::parse(s).map_or_else(|| Value::str(s), Value::Dec),
+                ("$int", J::String(s)) => s.parse::<i64>().map_or_else(|_| Value::str(s), Value::Int),
+                ("$quillo_err", x) => Value::err(from_island_json(x)),
+                _ => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+            }
+        }
+        J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+        other => Value::from_json(other),
+    }
+}
+
 /// Why a value cannot travel to the browser as JSON, if it cannot.
 pub fn not_sendable(v: &Value) -> Option<&'static str> {
     match v {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => None,
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) => None,
         Value::List(l) => l.iter().find_map(not_sendable),
         Value::Map(m) => m.values().find_map(not_sendable),
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
@@ -459,12 +583,55 @@ fn projection(def: &FnDef) -> Option<(&str, u32)> {
 }
 
 pub(crate) fn short(v: &Value) -> String {
-    let r = v.repr();
+    // Values under sensitive keys, card numbers and IBANs are not shown (see `redact`).
+    let r = crate::redact::text(&crate::redact::value(v).repr()).into_owned();
     if r.chars().count() > 40 {
         format!("{}…", r.chars().take(40).collect::<String>())
     } else {
         r
     }
+}
+
+fn verb(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "subtract",
+        BinOp::Mul => "multiply",
+        BinOp::Div => "divide",
+        _ => "take the remainder of",
+    }
+}
+
+/// Said after "expects a number, got dec" from what works on floats.
+pub const FLOAT_ONLY: &str = " (this works on floats: convert a dec with float(x))";
+
+/// What to do about a decimal met with a float, said after the error.
+pub(crate) fn dec_hint(a: &Value, b: &Value) -> &'static str {
+    match (a, b) {
+        (Value::Dec(_), Value::Float(_)) | (Value::Float(_), Value::Dec(_)) => {
+            ": a dec is exact and a float is not, so convert one with dec(x) or float(x)"
+        }
+        _ => "",
+    }
+}
+
+/// Arithmetic with a decimal: with another, or an int, it is exact and
+/// gives a decimal; with a float it is an error, never a silent float.
+fn dec_op(op: BinOp, a: &Value, b: &Value, line: u32) -> Result<Value, Ctrl> {
+    let (x, y) = match (a, b) {
+        (Value::Dec(x), Value::Dec(y)) => (*x, *y),
+        (Value::Dec(x), Value::Int(y)) => (*x, Dec::from_i64(*y)),
+        (Value::Int(x), Value::Dec(y)) => (Dec::from_i64(*x), *y),
+        _ => return fail(line, format!("cannot {} {} and {}{}", verb(op), a.type_name(), b.type_name(), dec_hint(a, b))),
+    };
+    let r = match op {
+        BinOp::Add => x.add(y),
+        BinOp::Sub => x.sub(y),
+        BinOp::Mul => x.mul(y),
+        BinOp::Div => x.div(y),
+        _ => x.rem(y),
+    };
+    r.map(Value::Dec).map_err(|e| Ctrl::Error(QuilloError::new(e.message(), line)))
 }
 
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
@@ -499,6 +666,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 }
                 Ok(Value::map(m))
             }
+            (x @ Dec(_), y) | (x, y @ Dec(_)) => dec_op(op, &x, &y, line),
             (x, y) => match (x.as_f64(), y.as_f64()) {
                 (Some(p), Some(q)) => Ok(Float(p + q)),
                 _ => fail(line, format!("cannot add {} and {}", x.type_name(), y.type_name())),
@@ -524,12 +692,10 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 };
                 return r.map(Int).ok_or_else(overflow);
             }
-            let verb = match op {
-                BinOp::Sub => "subtract",
-                BinOp::Mul => "multiply",
-                BinOp::Div => "divide",
-                _ => "take the remainder of",
-            };
+            if matches!(a, Dec(_)) || matches!(b, Dec(_)) {
+                return dec_op(op, &a, &b, line);
+            }
+            let verb = verb(op);
             match (a.as_f64(), b.as_f64()) {
                 (Some(x), Some(y)) => Ok(Float(match op {
                     BinOp::Sub => x - y,
@@ -544,7 +710,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
         BinOp::Ne => Ok(Bool(!equal(&a, &b))),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let Some(ord) = compare(&a, &b) else {
-                return fail(line, format!("cannot compare {} with {}", a.type_name(), b.type_name()));
+                return fail(line, format!("cannot compare {} with {}{}", a.type_name(), b.type_name(), dec_hint(&a, &b)));
             };
             Ok(Bool(match op {
                 BinOp::Lt => ord.is_lt(),
@@ -583,6 +749,7 @@ impl Interp {
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
+            script: None,
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
             site: Arc::new(crate::site::Site::default()),
@@ -592,6 +759,8 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            access: Default::default(),
+            own_later: Vec::new(),
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -615,6 +784,7 @@ impl Interp {
             base: String::new(),
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
+            is_service: false,
             types: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
@@ -641,6 +811,7 @@ impl Interp {
             depth: 0,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
+            script: None,
             restrictor: None,
             server_fns: self.server_fns.clone(),
             site: self.site.clone(),
@@ -650,6 +821,8 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
+            access: Default::default(),
+            own_later: Vec::new(),
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
@@ -673,6 +846,7 @@ impl Interp {
             base: self.base.clone(),
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
+            is_service: self.is_service,
             types: self.types.clone(),
             stream_out: None,
             pending_stream: None,
@@ -1177,6 +1351,7 @@ impl Interp {
                         vec![Expr::Lit(Lit::Str(td.name.as_str().into())), Expr::Ident("fields".into(), line)],
                         line,
                     ),
+                    nesting: 0,
                     file: None,
                     hot: Default::default(),
                 });
@@ -1202,6 +1377,8 @@ impl Interp {
                 let mut sub = Interp::with_shared(dir, self.shared.clone());
                 sub.services = self.services.clone();
                 sub.base = format!("{}{}", self.base, prefix);
+                // What a service mounts is part of the service.
+                sub.is_service = self.is_service;
                 sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
                 // Watch the mounted program's files too.
                 Arc::make_mut(&mut self.loaded).extend(sub.files());
@@ -1262,6 +1439,9 @@ impl Interp {
             Expr::Binary(op, a, b, line) => {
                 let x = self.eval(a, env)?;
                 let y = self.eval(b, env)?;
+                if self.fuel != u64::MAX {
+                    return self.script_binop(*op, x, y, *line);
+                }
                 binop(*op, x, y, *line)
             }
             Expr::Coalesce(a, b) => {
@@ -1287,7 +1467,7 @@ impl Interp {
                     }
                 }
                 let v = self.eval(obj, env)?;
-                self.get_field(v, name, *line)
+                self.get_field(v, name, env, *line)
             }
             Expr::Try(x) => {
                 let v = self.eval(x, env)?;
@@ -1338,7 +1518,7 @@ impl Interp {
             Expr::Field(obj, name, l) => {
                 let recv = self.eval(obj, env)?;
                 let db_on = crate::db::conn_of(&recv, name);
-                let f = self.get_field(recv, name, *l)?;
+                let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
                 self.call(&f, vec![v], line)
             }
@@ -1374,7 +1554,7 @@ impl Interp {
     fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
         let mut s = String::new();
         self.template_into(parts, env, &mut s)?;
-        Ok(Value::str(s))
+        self.script_made(Value::str(s), 0)
     }
 
     #[inline(never)]
@@ -1383,7 +1563,7 @@ impl Interp {
         for i in items {
             v.push(self.eval(i, env)?);
         }
-        Ok(Value::list(v))
+        self.script_made(Value::list(v), 0)
     }
 
     #[inline(never)]
@@ -1393,7 +1573,41 @@ impl Interp {
             let v = self.eval(x, env)?;
             m.insert(k.into(), v);
         }
-        Ok(Value::map(m))
+        self.script_made(Value::map(m), 0)
+    }
+
+    /// `v`, unless a sandboxed script made it too big; a script also pays
+    /// for what it makes, a step for each 1 KB (src/script.rs).
+    #[inline]
+    fn script_made(&mut self, v: Value, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel != u64::MAX {
+            self.pay_for(&v, line)?;
+        }
+        Ok(v)
+    }
+
+    #[cold]
+    fn pay_for(&mut self, v: &Value, line: u32) -> Result<(), Ctrl> {
+        let n = crate::script::too_big(v).or_else(|why| fail(line, why))?;
+        let cost = (n / 1024) as u64;
+        if cost > self.fuel {
+            return fail(line, "the script took too many steps");
+        }
+        self.fuel -= cost;
+        Ok(())
+    }
+
+    /// An operator in a sandboxed script: a range it may not make is
+    /// refused before it is made, and the result is paid for.
+    #[cold]
+    fn script_binop(&mut self, op: BinOp, x: Value, y: Value, line: u32) -> Result<Value, Ctrl> {
+        if let (BinOp::Range, Value::Int(a), Value::Int(b)) = (op, &x, &y) {
+            if b.saturating_sub(*a).saturating_mul(8) > crate::script::SCRIPT_BYTES as i64 {
+                return fail(line, "the script made a value larger than 1 MB");
+            }
+        }
+        let v = binop(op, x, y, line)?;
+        self.script_made(v, line)
     }
 
     #[inline(never)]
@@ -1406,6 +1620,7 @@ impl Interp {
                     n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(QuilloError::new("integer overflow", line)))
                 }
                 Value::Float(f) => Ok(Value::Float(-f)),
+                Value::Dec(d) => Ok(Value::Dec(d.neg())),
                 o => fail(line, format!("cannot negate {}", o.type_name())),
             },
         }
@@ -1466,7 +1681,8 @@ impl Interp {
         // `range(a, b)` and `a..b`: counted, without making the list.
         if let Some((a, b)) = self.counted(iter, env, line)? {
             if keep {
-                out.reserve((b - a).max(0) as usize);
+                // A script stops after its steps: no room for more.
+                out.reserve(((b - a).max(0) as u64).min(self.fuel) as usize);
             }
             for i in a..b {
                 let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line)?;
@@ -1503,7 +1719,11 @@ impl Interp {
         if let Some(s) = scope {
             Scope::done(s);
         }
-        Ok(if keep { Value::list(out) } else { Value::Nil })
+        if keep {
+            self.script_made(Value::list(out), line)
+        } else {
+            Ok(Value::Nil)
+        }
     }
 
     /// One step of a loop: `item` bound by `pat` in a scope of its own (the
@@ -1617,6 +1837,17 @@ impl Interp {
         } else {
             self.eval(callee, env)?
         };
+        // `raw(t(key, vars))`: the translation's markup, but the values put
+        // in it are text, escaped (see `i18n::t_html`).
+        if let (Value::Builtin("raw", _), None, [Expr::Call(inner, targs, l)]) = (&f, &pre, args) {
+            if matches!(&**inner, Expr::Ident(n, _) if n == "t") && matches!(self.eval(inner, env)?, Value::Builtin("t", _)) {
+                let mut tv = Vec::with_capacity(targs.len());
+                for a in targs {
+                    tv.push(self.eval(a, env)?);
+                }
+                return crate::i18n::t_html(self, tv, *l);
+            }
+        }
         if let Some(p) = pre {
             argv.push(p);
         }
@@ -1627,7 +1858,8 @@ impl Interp {
         self.call(&f, argv, line)
     }
 
-    fn get_field(&mut self, v: Value, name: &str, line: u32) -> Result<Value, Ctrl> {
+    /// `v.name`, read where `env` is the scope of the code that reads it.
+    fn get_field(&mut self, v: Value, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match &v {
             Value::Nil => return Ok(Value::Nil),
             Value::Map(m) => {
@@ -1655,8 +1887,10 @@ impl Interp {
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
-        // this way, so any other missing key on a record is simply null.
-        if let Some(f) = lookup(&self.globals, name) {
+        // this way, so any other missing key on a record is simply null. The
+        // function is the one in scope where the field is read: a script's
+        // scope holds only what it was given, not the program's globals.
+        if let Some(f) = lookup_fn(env, name) {
             let usable = match (&v, &f) {
                 (Value::Map(_), Value::Builtin(..)) => matches!(name, "len" | "keys" | "values"),
                 (Value::Map(_), _) => false,
@@ -1691,11 +1925,19 @@ impl Interp {
                 if name.starts_with("native:") {
                     return crate::native::call(self, name, args, line);
                 }
+                if self.fuel != u64::MAX {
+                    return self.script_builtin(name, *func, args, line);
+                }
                 func(self, args, line)
             }
             Value::Func(c) => {
                 let c = c.clone();
                 self.call_closure(&c, args.into_iter().map(Some).collect(), line)
+            }
+            // A module that is also a function: `audit(...)` beside `audit.query`.
+            Value::Map(m) if matches!(m.get(crate::audit::CALL_KEY), Some(Value::Builtin(..))) => {
+                let f = m.get(crate::audit::CALL_KEY).cloned().unwrap_or(Value::Nil);
+                self.call(&f, args, line)
             }
             other => fail(line, format!("cannot call {}: it is not a function", other.type_name())),
         }
@@ -1715,9 +1957,9 @@ impl Interp {
         }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
-        if let (Some((field, at)), [Some(_)]) = (projection(&c.def), args.as_slice()) {
+        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
-            return self.get_field(v, field, at);
+            return self.get_field(v, field, &c.env, at);
         }
         let n = args.len();
         self.call_closure_with(c, args, n, line)
@@ -1733,8 +1975,8 @@ impl Interp {
             self.burn(line)?;
             self.burn(line)?;
         }
-        if let Some((field, at)) = projection(&c.def) {
-            return self.get_field(x, field, at);
+        if let (Some((field, at)), u64::MAX) = (projection(&c.def), self.fuel) {
+            return self.get_field(x, field, &c.env, at);
         }
         let c = c.clone();
         self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
@@ -1742,7 +1984,13 @@ impl Interp {
 
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
-        let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line))?;
+        let mask = if self.fuel != u64::MAX { self.script_mask(c) } else { None };
+        let outer = mask.map(|m| std::mem::replace(&mut self.allowed, m));
+        let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line));
+        if let Some(a) = outer {
+            self.allowed = a;
+        }
+        let r = r?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
                 return fail(
@@ -1801,8 +2049,9 @@ impl Interp {
         if debugging {
             crate::debug::enter(self, &def.name, def.file.clone(), def.line);
         }
-        // Grow the stack on demand, so deep recursion works on any thread.
-        let r = crate::stack::maybe_grow(128 << 10, 4 << 20, || body(self));
+        // Grow the stack on demand, so deep recursion works on any thread,
+        // and so that a body that nests deeply has room for it.
+        let r = crate::stack::for_nesting(def.nesting, || body(self));
         if debugging {
             crate::debug::leave(self);
         }
@@ -1830,6 +2079,14 @@ impl Interp {
         }
     }
 
+    /// In a sandboxed script, the effects function `c` may use: none for the
+    /// script's own, those the program had for a helper it passed in.
+    #[cold]
+    fn script_mask(&self, c: &Closure) -> Option<u8> {
+        let (root, outer) = self.script.as_ref()?;
+        Some(if within(&c.env, root) { 0 } else { *outer })
+    }
+
     /// One step of a sandboxed script's budget.
     #[cold]
     fn burn(&mut self, line: u32) -> Result<(), Ctrl> {
@@ -1838,6 +2095,17 @@ impl Interp {
         }
         self.fuel -= 1;
         Ok(())
+    }
+
+    /// A builtin called by a sandboxed script: one that would make a value
+    /// over the limit is refused before it runs.
+    #[cold]
+    fn script_builtin(&mut self, name: &str, func: BuiltinFn, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        if crate::script::would_be_too_big(name, &args) {
+            return fail(line, "the script made a value larger than 1 MB");
+        }
+        let v = func(self, args, line)?;
+        self.script_made(v, line)
     }
 
     #[cold]
@@ -1971,6 +2239,9 @@ impl Interp {
                     outer.locale |= track.locale;
                 }
                 r?;
+                if !track.impure {
+                    self.shared.track(&track.deps);
+                }
                 let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if track.impure {
                     cache.forbid(&c.def);
@@ -2187,6 +2458,9 @@ impl Interp {
                 let ty = Ty { names: vec![t.clone()], optional: false, elem: None, fields: None };
                 crate::record::make(self, &ty, v, lenient)?.ok()
             }
+            // A decimal from an int, numeric text or a JSON number, in
+            // any pattern: what it is given is converted.
+            Pattern::Type(t) if t == "dec" => as_dec(v).map(Value::Dec),
             Pattern::Type(t) => {
                 if type_name_matches(t, v) {
                     Some(v.clone())
@@ -2279,6 +2553,8 @@ impl Interp {
         for (name, val) in &el.attrs {
             match val {
                 AttrVal::Bool => explicit.push((name.clone(), Value::Bool(true))),
+                // Refused when the program is loaded; never written all the same.
+                AttrVal::Expr(_) if code_from_data(&el.tag, &el.attrs, name, val) => {}
                 AttrVal::Expr(e) => explicit.push((name.clone(), self.eval(e, env)?)),
                 AttrVal::Spread(e) => match self.eval(e, env)? {
                     Value::Map(m) => spread.extend(m.iter().map(|(k, v)| (k.to_string(), v.clone()))),
@@ -2387,6 +2663,21 @@ impl Interp {
         }
         match text_value {
             Some(t) => out.push_str(&escape(&t)),
+            // A script is code to the browser, where HTML escaping means
+            // nothing: a value goes in as JSON (a JS value, `<` escaped), and
+            // HTML (`raw(...)`) as it is, but without `</` or `<!--`, so
+            // neither can end the element early.
+            None if el.tag == "script" => {
+                for c in &el.children {
+                    match c {
+                        HtmlChild::Expr(e) if !matches!(e, Expr::Lit(Lit::Str(_))) => {
+                            let v = self.eval(e, env)?;
+                            script_value(&v, out);
+                        }
+                        c => self.render_child(c, env, out)?,
+                    }
+                }
+            }
             // A style sheet is raw text to the browser: `.a > b` must stay
             // as written. Only `</` is changed, so the text cannot end the
             // element early.
@@ -2433,15 +2724,19 @@ impl Interp {
         // Spread keys are data, often from outside: only plain attribute
         // names, and no event handlers (`onclick`) or `srcdoc`, which run
         // the value as code or as a page.
+        // Names are compared as the browser does (`ACTION` is `action`), so
+        // a spread key cannot stand in for a written attribute.
         let spread: Vec<(String, Value)> = spread.into_iter().filter(|(n, _)| spread_attr_allowed(n)).collect();
-        let written: HashSet<&str> =
-            explicit.iter().map(|(n, _)| n.strip_prefix("bind:").unwrap_or(n.as_str())).collect();
+        let mut written: HashSet<String> = explicit.iter().map(|(n, _)| attr_key(n)).collect();
         // Written classes first, then the spread's.
-        let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| n == "class");
-        let mut entries: Vec<(String, Value)> = spread
-            .into_iter()
-            .filter(|(n, _)| !written.contains(n.as_str()) && !(n == "id" && el.id.is_some()))
-            .collect();
+        let (spread_class, spread): (Vec<_>, Vec<_>) = spread.into_iter().partition(|(n, _)| attr_key(n) == "class");
+        let mut entries: Vec<(String, Value)> = Vec::new();
+        for (n, v) in spread {
+            // Once each: the first of `href` and `HREF` in a spread.
+            if !(attr_key(&n) == "id" && el.id.is_some()) && written.insert(attr_key(&n)) {
+                entries.push((n, v));
+            }
+        }
         entries.extend(explicit.iter().cloned());
         entries.extend(spread_class);
         // A textarea's value is its text, not an attribute.
@@ -2458,7 +2753,8 @@ impl Interp {
                 continue;
             }
             let v = match (&v, name) {
-                (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
+                _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
+                _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
                 (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }
@@ -2468,7 +2764,7 @@ impl Interp {
                 text_value = Some(if matches!(v, Value::Nil) { String::new() } else { v.display() });
                 continue;
             }
-            if name == "class" {
+            if name.eq_ignore_ascii_case("class") {
                 if !matches!(v, Value::Nil | Value::Bool(false)) {
                     classes.push(v.display());
                 }
@@ -2519,6 +2815,9 @@ impl Interp {
             if name.starts_with('@') || name == "key" {
                 continue;
             }
+            if code_from_data(&el.tag, &el.attrs, name, val) {
+                continue;
+            }
             let name = name.strip_prefix("bind:").unwrap_or(name);
             if !attr_name_ok(name) {
                 continue;
@@ -2529,7 +2828,7 @@ impl Interp {
                     out.push_str(name);
                 }
                 // A template outside URL attributes goes straight in, part by part.
-                AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) => {
+                AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) && !anim_value_attr(&el.tag, name) => {
                     out.push(' ');
                     out.push_str(name);
                     out.push_str("=\"");
@@ -2550,14 +2849,14 @@ impl Interp {
                     url.clear();
                     let r = self.template_into(parts, env, &mut url);
                     if r.is_ok() {
-                        self.write_url_attr(name, &url, out);
+                        self.write_url_attr(&el.tag, name, &url, out);
                     }
                     self.spare = url;
                     r?;
                 }
                 AttrVal::Expr(e) => {
                     let v = self.eval(e, env)?;
-                    self.write_attr(name, v, out);
+                    self.write_attr(&el.tag, name, v, out);
                 }
                 AttrVal::Spread(_) => unreachable!("render_attrs handles spreads"),
             }
@@ -2576,16 +2875,19 @@ impl Interp {
                     v => out.push_str(&v.display()),
                 },
             }
+            if self.fuel != u64::MAX && out.len() > crate::script::SCRIPT_BYTES {
+                return fail(0, "the script made a value larger than 1 MB");
+            }
         }
         Ok(())
     }
 
-    /// ` name="url"` for a URL attribute (see `write_attr`).
-    fn write_url_attr(&self, name: &str, url: &str, out: &mut String) {
+    /// ` name="url"` for a URL attribute of a `tag` (see `write_attr`).
+    fn write_url_attr(&self, tag: &str, name: &str, url: &str, out: &mut String) {
         out.push(' ');
         out.push_str(name);
         out.push_str("=\"");
-        if script_url(url) {
+        if script_url(url) || (anim_value_attr(tag, name) && script_url_in_list(url)) {
             out.push_str(BLOCKED_URL);
         } else if !self.base.is_empty() && matches!(name, "href" | "src" | "action" | "formaction" | "poster") {
             escape_into(&self.with_base(url), out);
@@ -2598,9 +2900,10 @@ impl Interp {
     /// ` name="value"`, or ` name` for true, nothing for false and null.
     /// URLs that would run script are blocked; site paths get the mount's
     /// prefix.
-    fn write_attr(&self, name: &str, v: Value, out: &mut String) {
+    fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut String) {
         let v = match (&v, name) {
-            (Value::Str(s), _) if url_attr(name) && script_url(s) => Value::str(BLOCKED_URL),
+            _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
+            _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
             (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                 Value::str(self.with_base(s))
             }
@@ -2760,8 +3063,12 @@ impl Interp {
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
         let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
+        // Under a Content-Security-Policy, a style element lays it out instead
+        // (see `Interp::handle`): style attributes carry no nonce.
+        let csp = self.access.csp.as_ref().map_or(self.site.csp.is_some(), |c| c.is_some());
         out.push_str(&format!(
-            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
+            "<quillo-island{} data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
+            if csp { "" } else { " style=\"display:contents\"" },
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),

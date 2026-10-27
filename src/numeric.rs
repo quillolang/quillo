@@ -14,7 +14,7 @@
 //! median is a selection, not a sort. What Python raises (a math domain
 //! error, statistics of no data) is an error here too.
 
-use crate::interp::{fail, Ctrl, Interp};
+use crate::interp::{Ctrl, Interp};
 use crate::value::*;
 use crate::par;
 use std::cmp::Ordering;
@@ -92,6 +92,16 @@ fn install(m: &mut Map, prefix: &str, fns: &[(&'static str, BuiltinFn)]) {
 }
 
 // ---- arguments ---------------------------------------------------------
+
+/// An error; one about a decimal says what to do with it. These functions
+/// work on floats, which a decimal becomes only when asked.
+fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
+    let msg = msg.into();
+    if msg.ends_with(" dec") || msg.contains(" dec and ") {
+        return crate::interp::fail(line, format!("{}{}", msg, crate::interp::FLOAT_ONLY));
+    }
+    crate::interp::fail(line, msg)
+}
 
 fn tn(v: Option<&Value>) -> &'static str {
     v.map_or("nothing", |v| v.type_name())
@@ -1420,14 +1430,18 @@ fn s_stdev(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Float(variance(&args, "stats.stdev", true, line)?.sqrt()))
 }
 
+/// Most parts `stats.quantiles` cuts data into: n - 1 numbers are made,
+/// and a request's n must not take the server's memory.
+pub const MOST_QUANTILES: i64 = 10_000;
+
 /// `stats.quantiles(data, n = 4, method = "exclusive")`: the n - 1 cut
 /// points, as Python computes them.
 fn s_quantiles(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "stats.quantiles";
     let (x, _) = data(&args, f, 1, line)?;
     let n = int_or(&args, 1, f, line, 4)?;
-    if n < 1 {
-        return fail(line, format!("`{}`: n must be at least 1", f));
+    if !(1..=MOST_QUANTILES).contains(&n) {
+        return fail(line, format!("`{}`: n must be from 1 to {}, got {}", f, MOST_QUANTILES, n));
     }
     let method = text_or(&args, 2, f, line, "exclusive")?;
     let ld = x.len() as i64;

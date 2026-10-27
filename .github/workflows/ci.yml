@@ -10,9 +10,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 24: its CLDR (47) is the one money's locale table was made from, which
+      # tests/money.rs compares with Intl.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
+      # tests/postgres.rs and tests/mysql.rs start servers of their own from these
+      # binaries, and skip without them.
+      - name: PostgreSQL and MariaDB for the tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql mariadb-server
+          echo "QUILLO_TEST_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/mariadb"
+          ln -s "$(command -v mariadbd || echo /usr/sbin/mariadbd)" "$(command -v mariadb-install-db)" "$RUNNER_TEMP/mariadb/"
+          echo "QUILLO_TEST_MYSQL_BIN=$RUNNER_TEMP/mariadb" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release
       - name: The environment check, and the sample app it runs
@@ -35,6 +46,13 @@ jobs:
       - name: The check in PowerShell 7
         shell: pwsh
         run: ./scripts/doctor.ps1
+
+  # Known vulnerabilities, licences and sources of dependencies (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   # `quillo app` (the native window) builds on each desktop platform.
   app:

@@ -13,6 +13,10 @@
 //!   shared `QUILLO_SERVICE_SECRET` and carrying the tenant; its routes, if
 //!   it has a prefix, are passed on to it.
 //!
+//! A service's server fns are for other services: it answers no page's call
+//! of them (`/_quillo/rpc`), here or run alone (`--as-service`), and Quillo's
+//! own addresses under its prefix are not passed on.
+//!
 //! Either way what crosses is data, as JSON: a program behaves the same
 //! whichever way it runs. `quillo run app.qwe --split` runs each service as
 //! a process of its own, to see it so (see `split`).
@@ -49,6 +53,17 @@ const WINDOW: u64 = 300;
 /// The secret services sign their calls with, if set.
 fn secret() -> Option<String> {
     std::env::var("QUILLO_SERVICE_SECRET").ok().filter(|s| !s.is_empty())
+}
+
+/// The service this process serves as (`--service-name`, or the program's
+/// file name): a signed call names the service it is for, and one for
+/// another is refused here. Not set (a program run by a test, or embedded),
+/// a call for any service is taken.
+static SERVED_AS: OnceLock<String> = OnceLock::new();
+
+/// Says which service this process is (see `SERVED_AS`); the first one set holds.
+pub fn serve_as(name: &str) {
+    let _ = SERVED_AS.set(name.to_string());
 }
 
 /// `QUILLO_SERVICE_BILLING` for `billing`.
@@ -374,9 +389,13 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
     remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)))
 }
 
-/// A random id of `n` hex digits.
+/// A random id of `n` hex digits. Call ids are the nonces of signed calls,
+/// so they come from the system's random bytes when it gives them.
 pub fn new_id(n: usize) -> String {
-    (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect()
+    match crate::crypto::random_bytes(n.div_ceil(2)) {
+        Some(b) => crate::crypto::hex(&b)[..n].to_string(),
+        None => (0..n).map(|_| char::from_digit(fastrand::u32(..16), 16).unwrap()).collect(),
+    }
 }
 
 /// A request's id: the `x-request-id` it came with, if it is a plain one,
@@ -389,12 +408,20 @@ pub fn request_id(given: Option<&str>) -> Arc<str> {
 }
 
 /// A copy of a value, as the other side of a network would have it (an
-/// error stays one, as the answer of a call says so).
+/// error stays one, as the answer of a call says so; a decimal stays one).
 fn crossed(v: &Value) -> Value {
-    match v {
-        Value::Err(e) => Value::err(crossed(e)),
-        v => Value::from_json(&v.to_json()),
-    }
+    from_wire(&to_wire(v))
+}
+
+/// JSON for what a service call takes and gives: as for a page's server
+/// fns (`island_json`), so a decimal crosses as `{"$dec": "12.50"}`, scale
+/// and all, and comes out a decimal, not text, and an error stays one.
+fn to_wire(v: &Value) -> serde_json::Value {
+    crate::interp::island_json(v)
+}
+
+fn from_wire(j: &serde_json::Value) -> Value {
+    crate::interp::from_island_json(j)
 }
 
 fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, line: u32) -> Outcome {
@@ -406,9 +433,10 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
         return Outcome::Ran(Value::err(Value::str(format!("service {}: no server fn `{}`", name, f))));
     };
     let args: Vec<Value> = args.iter().map(crossed).collect();
-    if let Err(msg) = crate::server::check_args(&svc.types, &c.def, &args) {
-        return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg))));
-    }
+    let args = match crate::server::take_args(&mut svc, &c.def, args) {
+        Ok(a) => a,
+        Err(msg) => return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg)))),
+    };
     svc.tenant = Some(tenant.clone());
     svc.tenant_named = tenant.is_some();
     svc.request_id = rid;
@@ -442,10 +470,11 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The signature of a call: the time, the function, the tenant and the
-/// arguments, under the shared secret.
-fn signature(secret: &str, t: u64, f: &str, tenant: &str, body: &[u8]) -> String {
-    let mut msg = format!("{}\n{}\n{}\n", t, f, tenant).into_bytes();
+/// The signature of a call: the time, the service it is for, the function,
+/// the tenant, the call id (which the service remembers, so the same call
+/// sent again is not run again) and the arguments, under the shared secret.
+pub fn signature(secret: &str, t: u64, to: &str, f: &str, tenant: &str, call: &str, body: &[u8]) -> String {
+    let mut msg = format!("quillo-service-2\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call).into_bytes();
     msg.extend_from_slice(body);
     crate::crypto::hex(&crate::crypto::hmac_sha256(secret.as_bytes(), &msg))
 }
@@ -471,7 +500,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         return Outcome::Missed(format!("service {}: runs at {}, but QUILLO_SERVICE_SECRET is not set to sign the call", name, urls.join(",")));
     };
     let o = opts(name);
-    let body = serde_json::Value::Array(args.iter().map(|a| a.to_json()).collect()).to_string().into_bytes();
+    let body = serde_json::Value::Array(args.iter().map(to_wire).collect()).to_string().into_bytes();
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
     let rid = rid.map(|r| r.to_string()).unwrap_or_default();
     let caller = if it.base.is_empty() { "/".to_string() } else { it.base.clone() };
@@ -491,9 +520,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             it.unlocked(move || std::thread::sleep(wait));
         }
         let t = now_secs();
-        let sig = signature(&secret, t, f, &tenant, &body);
+        let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
-        let (b, tn, r, c, cl) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone());
+        let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
         let timeout = o.timeout;
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
@@ -501,6 +530,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 .timeout(timeout)
                 .set("content-type", "application/json")
                 .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+                .set("x-quillo-to", &to)
                 .set("x-quillo-call", &c)
                 .set("x-quillo-caller", &cl);
             if !tn.is_empty() {
@@ -536,8 +566,8 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
                 return Outcome::Ran(match status {
                     200 => match serde_json::from_str::<serde_json::Value>(&text) {
-                        Ok(j) if j.get("ok").is_some() => Value::from_json(&j["ok"]),
-                        Ok(j) if j.get("err").is_some() => Value::err(Value::from_json(&j["err"])),
+                        Ok(j) if j.get("ok").is_some() => from_wire(&j["ok"]),
+                        Ok(j) if j.get("err").is_some() => Value::err(from_wire(&j["err"])),
                         _ => Value::err(Value::str(format!("service {}: an answer that is not one", name))),
                     },
                     _ => Value::err(Value::str(format!("service {}: {} {}", name, status, reason(&text)))),
@@ -572,7 +602,7 @@ fn log_call(name: &str, f: &str, url: &str, status: u16, start: Instant, tries: 
     if crate::metrics::LOG.load(Ordering::Relaxed) != crate::metrics::JSON {
         return;
     }
-    crate::httpd::log_fmt(format_args!(
+    crate::metrics::log_line(format_args!(
         "{{\"time\":\"{}\",\"service\":{},\"fn\":{},\"url\":{},\"status\":{},\"ms\":{:.2},\"tries\":{},\"rid\":{}}}\n",
         crate::httpd::iso_now(),
         serde_json::Value::from(name),
@@ -597,7 +627,9 @@ fn refused(status: u16, msg: &str) -> HttpResponse {
 
 /// `POST /_quillo/service/<fn>`: another service calling one of this
 /// program's server fns. Only a call signed with the shared secret, made
-/// in the last few minutes, is answered; it runs in the tenant it names.
+/// in the last few minutes, for this service, is answered, and only once
+/// (its call id is remembered for longer than a signature lasts); it runs
+/// in the tenant it names.
 pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     if req.method != "POST" {
         return refused(405, "a service call is a POST");
@@ -610,17 +642,24 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
     let tenant = header("x-quillo-tenant").unwrap_or("");
-    let expected = signature(&secret, t, f, tenant, &req.body);
+    let to = header("x-quillo-to").unwrap_or("");
+    let Some(c) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
+        return refused(401, "a service call carries its call id (x-quillo-call)");
+    };
+    let expected = signature(&secret, t, to, f, tenant, c, &req.body);
     if now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
         return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
+    }
+    if let Some(me) = SERVED_AS.get().filter(|me| *me != to) {
+        return refused(401, &format!("this call is for service `{}`; this is `{}` (see --service-name)", to, me));
     }
     if !tenant.is_empty() && !crate::site::tenant_name_ok(tenant) {
         return refused(400, "not a tenant's name");
     }
-    // A call sent again (it got no answer in time, or is a call made later,
-    // delivered twice): answered as it was, not run again.
-    let call = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric()));
-    if let Some(c) = call {
+    // A call sent again (it got no answer in time, is a call made later
+    // delivered twice, or was replayed by someone who saw it): answered as
+    // it was, not run again.
+    {
         let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
         match seen.get(c) {
             Some((_, Some(r))) => return r.clone(),
@@ -635,14 +674,12 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         }
     }
     let r = run_call(it, f, tenant, req);
-    if let Some(c) = call {
-        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
-        // A call that did not run (a busy server) may be sent again.
-        if r.status >= 502 {
-            seen.remove(c);
-        } else {
-            seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
-        }
+    let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+    // A call that did not run (a busy server) may be sent again.
+    if r.status >= 502 {
+        seen.remove(c);
+    } else {
+        seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
     }
     r
 }
@@ -653,8 +690,10 @@ fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
     S.get_or_init(Default::default)
 }
 
-/// How long, and how many, calls are remembered.
-const SEEN_FOR: Duration = Duration::from_secs(600);
+/// How long, and how many, calls are remembered: as long as a signature
+/// lasts either way (`WINDOW`), so a call cannot be sent again once
+/// forgotten.
+const SEEN_FOR: Duration = Duration::from_secs(2 * WINDOW + 60);
 const SEEN_MAX: usize = 100_000;
 
 fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpResponse {
@@ -662,12 +701,13 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
         return refused(404, &format!("no server fn `{}`", f));
     };
     let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
-        Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect::<Vec<_>>(),
+        Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
     };
-    if let Err(msg) = crate::server::check_args(&it.types, &c.def, &args) {
-        return refused(400, &msg);
-    }
+    let args = match crate::server::take_args(it, &c.def, args) {
+        Ok(a) => a,
+        Err(msg) => return refused(400, &msg),
+    };
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });
     it.tenant_named = !tenant.is_empty();
     // Called by another service: `request` is the request it came from, as
@@ -680,8 +720,8 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     match it.call_closure(&c, args.into_iter().map(Some).collect(), 0) {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
-            Value::Err(e) => json(200, serde_json::json!({ "err": e.to_json() })),
-            v => json(200, serde_json::json!({ "ok": v.to_json() })),
+            Value::Err(e) => json(200, serde_json::json!({ "err": to_wire(&e) })),
+            v => json(200, serde_json::json!({ "ok": to_wire(&v) })),
         },
         Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
         Err(Ctrl::Error(e)) => {
@@ -691,10 +731,21 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     }
 }
 
+/// Quillo's own addresses that are not passed on to a service under its
+/// prefix: calls of its functions, and what only its own server or other
+/// services ask of it.
+const NOT_PASSED_ON: &[&str] = &["rpc", "service", "job", "later", "channel", "udp", "wt-ticket", "announce", "metrics"];
+
 /// A request under a service's prefix, when the service runs elsewhere:
 /// passed on to it, without the prefix (as a mounted program sees it).
 pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> HttpResponse {
     let rest = &req.url[prefix.len()..];
+    let path = rest.split('?').next().unwrap_or("");
+    if let Some(inner) = path.trim_start_matches('/').strip_prefix("_quillo/") {
+        if NOT_PASSED_ON.contains(&inner.split('/').next().unwrap_or("")) {
+            return crate::server::plain_response(404, "not found\n");
+        }
+    }
     let target = format!("{}{}", url, if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() });
     const HOP: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization"];
     let headers: Vec<(String, String)> = req.headers.iter().filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h))).cloned().collect();
@@ -759,6 +810,7 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
                 sub.services = it.services.clone();
+                sub.is_service = true;
                 let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
                 it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
                 loaded?;
@@ -818,7 +870,7 @@ pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         id: new_id(24),
         service,
         f,
-        args: serde_json::Value::Array(sent.iter().map(|a| a.to_json()).collect()).to_string(),
+        args: serde_json::Value::Array(sent.iter().map(to_wire).collect()).to_string(),
         tenant: it.tenant().map(|t| t.to_string()).unwrap_or_default(),
         rid: it.request_id.as_deref().unwrap_or("").to_string(),
         at: now_ms(),
@@ -890,7 +942,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
 /// One call made later: Ok when it got through (whatever the function gave).
 fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
     let args = match serde_json::from_str::<serde_json::Value>(&c.args) {
-        Ok(serde_json::Value::Array(a)) => a.iter().map(Value::from_json).collect(),
+        Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect(),
         _ => Vec::new(),
     };
     let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
@@ -971,11 +1023,7 @@ fn free_port() -> std::io::Result<u16> {
 pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, String> {
     let services = declared(path)?;
     if std::env::var("QUILLO_SERVICE_SECRET").map_or(true, |s| s.is_empty()) {
-        let mut b = [0u8; 24];
-        for x in b.iter_mut() {
-            *x = fastrand::u8(..);
-        }
-        std::env::set_var("QUILLO_SERVICE_SECRET", crate::crypto::hex(&b));
+        std::env::set_var("QUILLO_SERVICE_SECRET", crate::crypto::hex(&crate::crypto::secret_bytes(32)));
     }
     let mut ports = Vec::new();
     for (name, _, _) in &services {
@@ -987,7 +1035,7 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
     let mut split = Split { children: Vec::new() };
     for ((name, prefix, file), port) in services.iter().zip(&ports) {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("run").arg(file).args(["--port", &port.to_string()]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd.arg("run").arg(file).args(["--port", &port.to_string(), "--as-service", "--service-name", name]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         if let Some(p) = prefix {
             cmd.args(["--base", p]);
         }

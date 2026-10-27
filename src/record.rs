@@ -210,6 +210,8 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
             }
             Ok(Ok(Value::list(out)))
         }
+        // A decimal field takes an int, numeric text or a JSON number.
+        ("dec", _) => Ok(crate::interp::as_dec(v).map(Value::Dec).ok_or_else(Why::default)),
         (t, Value::Str(s)) if lenient && !type_name_matches(t, v) => match crate::interp::coerce(t, s) {
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(Why::default())),

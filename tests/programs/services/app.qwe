@@ -8,7 +8,7 @@
 // QUILLO_SERVICE_SECRET (--split makes one). To run billing on a machine of
 // its own, start it alone and tell the others where it is:
 //
-//   QUILLO_SERVICE_SECRET=... quillo run billing.qwe --port 8081 --base /billing
+//   QUILLO_SERVICE_SECRET=... quillo run billing.qwe --port 8081 --base /billing --as-service
 //   QUILLO_SERVICE_SECRET=... quillo run app.qwe --service-url billing=http://10.0.0.5:8081
 
 service /shop = "shop.qwe"

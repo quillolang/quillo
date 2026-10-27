@@ -25,6 +25,8 @@ usage:
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
+  quillo keygen [id]                a key for crypto.encrypt, as an entry of
+                                    QUILLO_ENCRYPTION_KEYS (id:base64key)
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
   quillo dap                        debugger for editors (the Debug Adapter
@@ -52,6 +54,12 @@ options for `run`:
                  QUILLO_SERVICE_SECRET, the same on every service
   --base PATH    the path the program is served under (/shop), as a mounted
                  program is: its links and redirects carry it
+  --as-service   serve the program as a service: its server fns answer only
+                 other services' signed calls, not pages (--split sets it)
+  --service-name NAME
+                 the name other programs call this service by, when it is
+                 not the program's file name: calls signed for another
+                 service are refused
   --no-view-cache  render views every time, instead of reusing their HTML
                  while their arguments and the globals they read are unchanged
   --no-jobs      run none of the program's `schedule`d jobs on this server
@@ -65,13 +73,20 @@ options for `run`:
                  them it makes its own, which pages take by its hash
   --no-wt        no WebTransport: pages' channels use a WebSocket
   --log F        the request log on stderr: text (the default), json (a JSON
-                 object per line: time, method, path, status, ms, ip, tenant)
-                 or off
+                 object per line: time, method, path, status, ms, ip, tenant,
+                 user, rid) or off
+  --log-file F   the request log to a file a day instead (F-2026-10-27.log
+                 for F.log, by UTC date)
+  --log-keep N   remove the log's files older than N days (default: keep all)
+  --log-stdout   the request log on stdout (with --log-file, there too)
+  --log-query    keep query strings in JSON lines' paths (values of sensitive
+                 parameters masked)
   --metrics      answer GET /_quillo/metrics: request counts and times, open
                  connections and uptime, in Prometheus's text format
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
-                 servers there; the secret is read from $LIMER_ADMIN_SECRET
+                 servers there; limer's admin secret must be in
+                 $LIMER_ADMIN_SECRET
   --service S    the pool's name (default: the file's name, without .qwe)
 
 `app` takes the options of `run` except --host, --register and --service; its
@@ -111,7 +126,7 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             match args.iter().skip(2).find(|a| !a.starts_with("--")) {
-                Some(f) => check(f, quillo::check::Options { strict_null }),
+                Some(f) => check(f, quillo::check::Options { strict_null, ..Default::default() }),
                 None => usage(),
             }
         }
@@ -132,6 +147,16 @@ fn real_main(args: Vec<String>) -> i32 {
                 }
             },
             None => usage(),
+        },
+        Some("keygen") => match quillo::cipher::keygen(args.get(2).map(String::as_str)) {
+            Ok(k) => {
+                println!("{}", k);
+                0
+            }
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                2
+            }
         },
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
@@ -185,6 +210,10 @@ struct RunOptions {
     base: Option<String>,
     /// Each service its own process (`--split`).
     split: bool,
+    /// Run as a service (`--as-service`): server fns only for other services.
+    as_service: bool,
+    /// The service this is, when not its file's name (`--service-name`).
+    service_name: Option<String>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -202,7 +231,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         service_urls: Vec::new(),
         base: None,
         split: false,
+        as_service: false,
+        service_name: None,
     };
+    let mut log_file: Option<String> = None;
+    let mut log_keep = 0u32;
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -227,6 +260,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 i += 1;
                 continue;
             }
+            ("--as-service", _) => {
+                o.as_service = true;
+                i += 1;
+                continue;
+            }
             ("--service-url", Some(v)) => match v.split_once('=') {
                 Some((name, url)) if !name.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) => {
                     o.service_urls.push((name.to_string(), url.to_string()))
@@ -236,6 +274,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
             ("--base", Some(v)) => {
                 let b = v.trim_end_matches('/');
                 if !b.starts_with('/') || b.contains("//") || b.contains('?') {
@@ -297,6 +336,24 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 };
                 quillo::metrics::LOG.store(format, std::sync::atomic::Ordering::Relaxed);
             }
+            ("--log-file", Some(v)) => log_file = Some(v.clone()),
+            ("--log-keep", Some(v)) => match v.parse::<u32>() {
+                Ok(n) if n > 0 => log_keep = n,
+                _ => {
+                    eprintln!("quillo: --log-keep needs a number of days");
+                    return Err(2);
+                }
+            },
+            ("--log-stdout", _) => {
+                quillo::metrics::LOG_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            ("--log-query", _) => {
+                quillo::metrics::LOG_QUERY.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
             ("--host", Some(v)) => o.host = Some(v.clone()),
             ("--port", Some(v)) => o.port = Some(v.clone()),
             ("--register", Some(v)) => o.register = Some(v.clone()),
@@ -333,6 +390,19 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         eprintln!("quillo: --tls-cert and --tls-key go together");
         return Err(2);
     }
+    match log_file {
+        Some(f) => {
+            if let Err(e) = quillo::metrics::log_to_file(Path::new(&f), log_keep) {
+                eprintln!("quillo: --log-file: {}", e);
+                return Err(2);
+            }
+        }
+        None if log_keep > 0 => {
+            eprintln!("quillo: --log-keep goes with --log-file");
+            return Err(2);
+        }
+        None => {}
+    }
     Ok(o)
 }
 
@@ -342,6 +412,9 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     // Components in files of their own, for the browser's debugger.
     quillo::client::DEV.store(o.watch || quillo::debug::on(), std::sync::atomic::Ordering::Relaxed);
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // Signed service calls name the service they are for (see `service::answer`).
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    quillo::service::serve_as(o.service_name.as_deref().unwrap_or(&stem));
     let checked = if o.static_check { static_errors(path) } else { Ok(()) };
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
@@ -350,6 +423,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     let shared = interp.shared.clone();
     shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
+    interp.is_service = o.as_service;
     let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| e.to_string())) {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
@@ -373,6 +447,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     app.max_body = o.max_body;
     app.reload = o.reload;
     app.base = o.base.clone().unwrap_or_default();
+    app.is_service = o.as_service;
     Ok(Some(app))
 }
 
@@ -427,14 +502,38 @@ fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
     }
 }
 
+/// Signing secrets too short to be safe are warned about; encryption keys
+/// that cannot be used stop the program before it starts.
+fn secrets_ok() -> bool {
+    let (warnings, error) = quillo::crypto::secret_problems(|k| std::env::var(k).ok());
+    for w in warnings {
+        eprintln!("quillo: {}", w);
+    }
+    if let Some(e) = error {
+        eprintln!("quillo: {}", e);
+        return false;
+    }
+    true
+}
+
 fn run(file: &str, flags: &[String]) -> i32 {
     let o = match run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
     };
+    if !secrets_ok() {
+        return 2;
+    }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);
+    // Announcements are signed with a key made from limer's secret: without
+    // one, anyone who can reach a server could make its pages reload.
+    let limer_secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+    if o.register.is_some() && limer_secret.is_none() {
+        eprintln!("quillo: --register needs limer's admin secret in $LIMER_ADMIN_SECRET (and limer configured with it)");
+        return 2;
+    }
     // Each service its own process: started first, told where the others are.
     let _split = if o.split {
         if o.instances > 1 || o.register.is_some() {
@@ -468,17 +567,10 @@ fn run(file: &str, flags: &[String]) -> i32 {
         let service = o.service.unwrap_or_else(|| {
             path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into())
         });
-        let secret = std::env::var("LIMER_ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+        let Some(secret) = limer_secret else { return 2 };
         let m = quillo::cluster::Membership { admin, service, port, secret };
         member = Some(m.clone());
         app.cluster_key = Some(m.key());
-        if m.secret.is_none() {
-            eprintln!(
-                "quillo: warning: no LIMER_ADMIN_SECRET; change announcements are accepted only from {}'s host",
-                m.admin
-            );
-            app.cluster_sources = Some(m.admin_addresses());
-        }
         quillo::cluster::join(app.shared(), m);
     }
     stop_on_signal(member);

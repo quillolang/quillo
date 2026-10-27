@@ -7,7 +7,8 @@
 //! Postgres expects; for types without a direct encoding (numeric, dates,
 //! uuid, arrays, ...) the parameter is sent as text and cast by Postgres.
 //! Results come back as Quillo values: numbers, strings, booleans, JSON as
-//! maps and lists, arrays as lists, and dates, times and UUIDs as strings.
+//! maps and lists, arrays as lists, `numeric` as decimals, and dates, times
+//! and UUIDs as strings.
 
 use crate::value::*;
 use bytes::{BufMut, BytesMut};
@@ -23,6 +24,9 @@ type BoxErr = Box<dyn Error + Sync + Send>;
 /// Default and largest pool size; `?pool_size=N` in the URL changes it.
 const DEFAULT_POOL: usize = 8;
 
+/// How long a transaction waits for a connection of its own.
+pub const CHECKOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn is_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
 }
@@ -33,53 +37,50 @@ pub fn is_url(s: &str) -> bool {
 pub struct Conn {
     client: postgres::Client,
     stmts: HashMap<String, postgres::Statement>,
+    /// In a transaction that retries: whether a statement failed because
+    /// of another transaction (see `crate::txn`). None: not watching.
+    conflict: Option<bool>,
+    /// Opened past the pool's size by `checkout_nested`: closed when given
+    /// back, not kept.
+    aside: bool,
 }
 
 pub struct Pool {
     config: postgres::Config,
+    /// The same, for the connections requests share (`Lanes`).
+    async_config: tokio_postgres::Config,
     tls: tokio_postgres_rustls::MakeRustlsConnect,
     idle: Mutex<(Vec<Conn>, usize)>,
     freed: Condvar,
     max: usize,
-    url: String,
-    /// Quillo's `schema=` option: every connection's search_path.
-    schema: Option<String>,
     lanes: OnceLock<Arc<Lanes>>,
 }
 
-fn tls() -> tokio_postgres_rustls::MakeRustlsConnect {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("TLS protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tokio_postgres_rustls::MakeRustlsConnect::new(config)
-}
-
 impl Pool {
-    /// Parses the URL and opens one connection to check it. TLS is used
-    /// when the server offers it (`sslmode=require` insists on it).
+    /// Parses the URL and opens one connection to check it. TLS is required,
+    /// and the server's certificate and name checked, for a server on
+    /// another machine; it is used on this one when the server offers it.
+    /// The URL can say otherwise as libpq's do (`sslmode`, `sslrootcert`,
+    /// `sslcert`, `sslkey`); see `Tls`.
     pub fn open(url: &str) -> Result<Pool, String> {
         Pool::open_as(url, true)
     }
 
     /// `open`; with `make` false, the schema (`?schema=`) must exist.
     pub fn open_as(url: &str, make: bool) -> Result<Pool, String> {
-        let (url, max, schema) = take_options(url)?;
-        let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        let Options { url, max, schema, tls } = take_options(url)?;
+        let mut config: tokio_postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        let tls = tls.settle(&mut config)?;
         if let Some(s) = &schema {
             config.options(&search_path(s));
         }
         let pool = Pool {
-            config,
-            tls: tls(),
+            config: config.clone().into(),
+            async_config: config,
+            tls,
             idle: Mutex::new((Vec::new(), 0)),
             freed: Condvar::new(),
             max,
-            url: url.clone(),
-            schema: schema.clone(),
             lanes: OnceLock::new(),
         };
         let mut first = pool.checkout()?;
@@ -104,38 +105,60 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new() })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false })
     }
 
-    /// A connection: an idle one, a new one, or the next one returned.
-    pub fn checkout(&self) -> Result<Conn, String> {
+    /// An idle connection or a new one, or None when all `max` are taken.
+    pub fn try_checkout(&self) -> Result<Option<Conn>, String> {
         let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.0.pop() {
+            return Ok(Some(c));
+        }
+        if g.1 >= self.max {
+            return Ok(None);
+        }
+        g.1 += 1;
+        drop(g);
+        self.connect().map(Some).inspect_err(|_| {
+            self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+            self.freed.notify_one();
+        })
+    }
+
+    /// A connection: an idle one, a new one, or the next one returned
+    /// within `CHECKOUT_WAIT`, waiting on this thread. A request in the
+    /// server waits without a thread instead (`db::checkout_for_tx`).
+    pub fn checkout(&self) -> Result<Conn, String> {
+        let until = Instant::now() + CHECKOUT_WAIT;
         loop {
-            if let Some(c) = g.0.pop() {
+            if let Some(c) = self.try_checkout()? {
                 return Ok(c);
             }
-            if g.1 < self.max {
-                g.1 += 1;
-                drop(g);
-                return self.connect().inspect_err(|_| {
-                    self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
-                    self.freed.notify_one();
-                });
+            if Instant::now() >= until {
+                return Err(self.none_free());
             }
-            g = self.freed.wait(g).unwrap_or_else(|e| e.into_inner());
+            // In slices: one given back between the try and the wait is not
+            // missed for long.
+            let g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.freed.wait_timeout(g, std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Why no connection could be had.
+    pub fn none_free(&self) -> String {
+        format!(
+            "no PostgreSQL connection free after {} s: all {} are in use (`?pool_size=N` in the URL allows more)",
+            CHECKOUT_WAIT.as_secs(),
+            self.max
+        )
     }
 
     /// The connections requests in the server share (see `Lanes`).
     pub fn lanes(&self) -> Arc<Lanes> {
         self.lanes
             .get_or_init(|| {
-                let mut config: tokio_postgres::Config = self.url.parse().expect("parsed before");
-                if let Some(s) = &self.schema {
-                    config.options(&search_path(s));
-                }
                 Arc::new(Lanes {
-                    config,
+                    config: self.async_config.clone(),
                     tls: self.tls.clone(),
                     slots: (0..self.max).map(|_| Mutex::new(None)).collect(),
                 })
@@ -143,7 +166,22 @@ impl Pool {
             .clone()
     }
 
+    /// A connection for work a request does while it may already hold one
+    /// (a transaction's): Quillo's own tables, made or written apart. As
+    /// `checkout`, but when every connection is taken it opens one more
+    /// rather than wait, since the one it would wait for may be the
+    /// caller's own.
+    pub fn checkout_nested(&self) -> Result<Conn, String> {
+        match self.try_checkout()? {
+            Some(c) => Ok(c),
+            None => self.connect().map(|c| Conn { aside: true, ..c }),
+        }
+    }
+
     pub fn give_back(&self, c: Conn) {
+        if c.aside {
+            return;
+        }
         let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if c.client.is_closed() {
             g.1 -= 1;
@@ -155,23 +193,43 @@ impl Pool {
     }
 }
 
+/// Whether a database host is this machine: the password and the data then
+/// cross no network that someone else could be on.
+pub(crate) fn local_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.is_empty()
+        || h.starts_with('/')
+        || h.eq_ignore_ascii_case("localhost")
+        || h.to_ascii_lowercase().ends_with(".localhost")
+        || h.parse::<std::net::IpAddr>().map_or(false, |a| a.is_loopback())
+}
+
 /// The connection option that makes `schema` where tables are looked for
 /// and made.
 fn search_path(schema: &str) -> String {
     format!("-c search_path=\"{}\"", schema)
 }
 
+/// A URL's options that are Quillo's, or that the driver does not read.
+struct Options {
+    url: String,
+    max: usize,
+    schema: Option<String>,
+    tls: Tls,
+}
+
 /// Takes Quillo's own options out of the URL: `pool_size`, and `schema`
-/// (`?schema={tenant}`: a schema per tenant in one database).
-fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
-    let Some((base, query)) = url.split_once('?') else { return Ok((url.to_string(), DEFAULT_POOL, None)) };
-    let mut max = DEFAULT_POOL;
-    let mut schema = None;
+/// (`?schema={tenant}`: a schema per tenant in one database); and those
+/// about TLS (see `Tls`), which the driver reads only in part.
+fn take_options(url: &str) -> Result<Options, String> {
+    let mut o = Options { url: url.to_string(), max: DEFAULT_POOL, schema: None, tls: Tls::default() };
+    let Some((base, query)) = url.split_once('?') else { return Ok(o) };
     let mut rest = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let value = || crate::server::percent_decode(pair.split_once('=').map_or("", |(_, v)| v), false);
         match pair.split_once('=') {
             Some(("pool_size", v)) => {
-                max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
+                o.max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
             }
             Some(("schema", v)) => {
                 if !crate::site::tenant_name_ok(v) {
@@ -182,13 +240,230 @@ fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
                 if v == "public" || v == "information_schema" || v.starts_with("pg_") {
                     return Err(format!("the schema {:?} is Postgres's own; prefix tenants' (schema=t_{{tenant}})", v));
                 }
-                schema = Some(v.to_string());
+                o.schema = Some(v.to_string());
             }
+            Some(("sslmode", v)) => {
+                o.tls.mode = Some(match v {
+                    "disable" => SslMode::Disable,
+                    "prefer" => SslMode::Prefer,
+                    "require" => SslMode::Require,
+                    "verify-ca" => SslMode::VerifyCa,
+                    "verify-full" => SslMode::VerifyFull,
+                    _ => return Err(format!("bad sslmode: {:?} (disable, prefer, require, verify-ca or verify-full)", v)),
+                })
+            }
+            Some(("sslrootcert", _)) => o.tls.root = Some(value()),
+            Some(("sslcert", _)) => o.tls.cert = Some(value()),
+            Some(("sslkey", _)) => o.tls.key = Some(value()),
             _ => rest.push(pair),
         }
     }
-    let url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
-    Ok((url, max, schema))
+    o.url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
+    Ok(o)
+}
+
+// ---- TLS -----------------------------------------------------------------
+
+/// libpq's `sslmode`, less `allow` (plain first, which leaves the
+/// password to whoever answers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SslMode {
+    /// No TLS.
+    Disable,
+    /// TLS if the server offers it. Someone in the middle can say it does
+    /// not, so this is for servers on this machine.
+    Prefer,
+    /// TLS always, the certificate unchecked unless `sslrootcert` is given
+    /// (then as `VerifyCa`). Nobody can read the connection, but someone in
+    /// the middle can pose as the server.
+    Require,
+    /// TLS, with a certificate signed by a CA in `sslrootcert`, for any name.
+    VerifyCa,
+    /// TLS, with a certificate signed by a trusted CA, for the host's name.
+    VerifyFull,
+}
+
+/// What a URL says about TLS, as libpq reads it: `sslmode`; `sslrootcert`,
+/// a file of PEM certificates of the CAs to trust instead of the usual
+/// public ones (a cloud's own, or a company's), or `system` for the
+/// operating system's; and `sslcert` and `sslkey`, a certificate and its
+/// key for servers that ask for one.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Tls {
+    mode: Option<SslMode>,
+    root: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+/// How a server's certificate is checked.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Check {
+    Nothing,
+    Chain,
+    ChainAndName,
+}
+
+impl Tls {
+    /// The mode for these hosts. Postgres's own default, `prefer`, sends the
+    /// password in the clear to anyone in the middle who says the server has
+    /// no TLS; so for a server on another machine, TLS is required and its
+    /// certificate checked (`verify-full`) unless the URL says otherwise.
+    fn mode_for(&self, config: &tokio_postgres::Config) -> SslMode {
+        use tokio_postgres::config::Host;
+        let remote = config.get_hosts().iter().any(|h| match h {
+            Host::Tcp(name) => !local_host(name),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }) || config.get_hostaddrs().iter().any(|a| !a.is_loopback());
+        match self.mode {
+            Some(m) => m,
+            None if remote || self.root.as_deref() == Some("system") => SslMode::VerifyFull,
+            None => SslMode::Prefer,
+        }
+    }
+
+    /// What the certificate is checked for in `mode`. As libpq does, a root
+    /// certificate given makes `prefer` and `require` check the chain.
+    fn check(&self, mode: SslMode) -> Check {
+        match mode {
+            SslMode::VerifyFull => Check::ChainAndName,
+            SslMode::VerifyCa => Check::Chain,
+            SslMode::Prefer | SslMode::Require if self.root.is_some() => Check::Chain,
+            _ => Check::Nothing,
+        }
+    }
+
+    /// Sets the driver's mode in `config`, and makes the TLS connector.
+    fn settle(&self, config: &mut tokio_postgres::Config) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+        use tokio_postgres::config::SslMode as Driver;
+        let mode = self.mode_for(config);
+        config.ssl_mode(match mode {
+            SslMode::Disable => Driver::Disable,
+            SslMode::Prefer => Driver::Prefer,
+            _ => Driver::Require,
+        });
+        self.client_config(mode).map(tokio_postgres_rustls::MakeRustlsConnect::new)
+    }
+
+    fn client_config(&self, mode: SslMode) -> Result<rustls::ClientConfig, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(self.verifier(mode, provider)?);
+        match (&self.cert, &self.key) {
+            (None, None) => Ok(builder.with_no_client_auth()),
+            (Some(cert), Some(key)) => {
+                use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+                let chain = CertificateDer::pem_file_iter(cert)
+                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| format!("sslcert {}: {}", cert, e))?;
+                let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("sslkey {}: {}", key, e))?;
+                builder.with_client_auth_cert(chain, key).map_err(|e| format!("sslcert and sslkey: {}", e))
+            }
+            _ => Err("sslcert and sslkey go together: a certificate, and its key".into()),
+        }
+    }
+
+    /// What checks the server's certificate in `mode`.
+    fn verifier(&self, mode: SslMode, provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, String> {
+        let check = self.check(mode);
+        // libpq's rules, which keep a weak check from passing for a strong one.
+        if self.root.as_deref() == Some("system") && mode != SslMode::VerifyFull {
+            return Err(format!("sslrootcert=system needs sslmode=verify-full, not {:?}", mode));
+        }
+        if check == Check::Chain && self.root.is_none() {
+            return Err("sslmode=verify-ca needs sslrootcert, the CA certificates to check the server's against".into());
+        }
+        let algs = provider.signature_verification_algorithms;
+        Ok(match check {
+            Check::ChainAndName => rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(self.roots()?), provider)
+                .build()
+                .map_err(|e| e.to_string())?,
+            Check::Chain => Arc::new(Verifier { roots: Some(Arc::new(self.roots()?)), algs }),
+            Check::Nothing => Arc::new(Verifier { roots: None, algs }),
+        })
+    }
+
+    /// The CAs whose certificates are trusted: those in `sslrootcert`, the
+    /// system's, or the usual public ones.
+    fn roots(&self) -> Result<rustls::RootCertStore, String> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let mut roots = rustls::RootCertStore::empty();
+        match self.root.as_deref() {
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            Some("system") => {
+                let found = rustls_native_certs::load_native_certs();
+                roots.add_parsable_certificates(found.certs);
+                if roots.is_empty() {
+                    return Err(format!("sslrootcert=system: no CA certificates found on this system{}", found.errors.first().map(|e| format!(" ({})", e)).unwrap_or_default()));
+                }
+            }
+            Some(path) => {
+                let certs = CertificateDer::pem_file_iter(path)
+                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| format!("sslrootcert {}: {}", path, e))?;
+                for c in certs {
+                    roots.add(c).map_err(|e| format!("sslrootcert {}: {}", path, e))?;
+                }
+                if roots.is_empty() {
+                    return Err(format!("sslrootcert {}: no PEM certificates in it", path));
+                }
+            }
+        }
+        Ok(roots)
+    }
+}
+
+/// Checks a server's certificate for `verify-ca` (signed by one of `roots`,
+/// whatever name it is for), or not at all (`require` without a root
+/// certificate). Either way the server proves in the handshake that it
+/// holds the certificate's key.
+#[derive(Debug)]
+struct Verifier {
+    roots: Option<Arc<rustls::RootCertStore>>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Verifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(roots) = &self.roots {
+            let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+            rustls::client::verify_server_cert_signed_by_trust_anchor(&cert, roots, intermediates, now, self.algs.all)?;
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
 }
 
 /// The server's message for a database error, else the error itself.
@@ -207,6 +482,9 @@ fn describe(e: &postgres::Error) -> String {
             while let Some(inner) = src {
                 s.push_str(&format!(": {}", inner));
                 src = inner.source();
+            }
+            if s.contains("UnknownIssuer") {
+                s.push_str(" (the server's certificate is signed by a CA not among those trusted: give its CA's certificates with sslrootcert=/path/to/ca.pem)");
             }
             s
         }
@@ -246,7 +524,8 @@ impl Conn {
         let stmt = self.statement(&sql, &params)?;
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        let rows = self.client.query(&stmt, &refs).map_err(|e| describe(&e))?;
+        let rows = self.client.query(&stmt, &refs);
+        let rows = rows.map_err(|e| self.failed(&e))?;
         values(&rows, limit)
     }
 
@@ -254,14 +533,16 @@ impl Conn {
     /// `insert ... returning id` with `db.one` for that.
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
         let changes = if params.is_empty() && has_several_statements(sql) {
-            self.client.batch_execute(sql).map_err(|e| describe(&e))?;
+            let r = self.client.batch_execute(sql);
+            r.map_err(|e| self.failed(&e))?;
             Value::Nil
         } else {
             let (sql, params) = translate(sql, params)?;
             let stmt = self.statement(&sql, &params)?;
             let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
             let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            Value::Int(self.client.execute(&stmt, &refs).map_err(|e| describe(&e))? as i64)
+            let r = self.client.execute(&stmt, &refs);
+            Value::Int(r.map_err(|e| self.failed(&e))? as i64)
         };
         let mut m = Map::new();
         m.insert("changes".into(), changes);
@@ -270,7 +551,32 @@ impl Conn {
     }
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
-        self.client.batch_execute(sql).map_err(|e| describe(&e))
+        let r = self.client.batch_execute(sql);
+        r.map_err(|e| self.failed(&e))
+    }
+
+    /// The error's message; a serialization failure or a deadlock (SQLSTATE
+    /// 40001, 40P01) is also noted, when watching, for the transaction to
+    /// run again.
+    fn failed(&mut self, e: &postgres::Error) -> String {
+        use postgres::error::SqlState;
+        if let (Some(c), Some(code)) = (self.conflict.as_mut(), e.code()) {
+            if *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED {
+                *c = true;
+            }
+        }
+        describe(e)
+    }
+
+    /// Starts (or stops) noting conflicts with other transactions.
+    pub fn watch_conflicts(&mut self, on: bool) {
+        self.conflict = on.then_some(false);
+    }
+
+    /// Whether a statement failed because of another transaction since
+    /// `watch_conflicts(true)`.
+    pub fn conflicted(&self) -> bool {
+        self.conflict == Some(true)
     }
 }
 
@@ -779,6 +1085,7 @@ impl ToSql for PgParam {
             match v {
                 Value::Int(n) => Ok(*n),
                 Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Ok(*f as i64),
+                Value::Dec(d) if d.round(0, crate::decimal::Rounding::Down).ok() == Some(*d) => d.trunc_i64().ok_or_else(|| bad(v, ty)),
                 Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty)),
                 _ => Err(bad(v, ty)),
             }
@@ -795,6 +1102,7 @@ impl ToSql for PgParam {
                 let f = match v {
                     Value::Int(n) => *n as f64,
                     Value::Float(f) => *f,
+                    Value::Dec(d) => d.to_f64(),
                     Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty))?,
                     _ => return Err(bad(v, ty)),
                 };
@@ -922,14 +1230,16 @@ fn json(raw: &[u8]) -> Result<Value, BoxErr> {
     Ok(Value::from_json(&j))
 }
 
-/// Postgres's binary NUMERIC: an int when it has no fraction and fits,
-/// else a float.
+/// Postgres's binary NUMERIC: an int when it has no scale (as `sum` of
+/// ints gives) and fits; else a decimal, its scale kept ("12.50"); else,
+/// past 28 digits after the point or 29 in all, its exact text. NaN and
+/// the infinities are floats.
 fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndigits = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndigits = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     let weight = i16::from_be_bytes(take(raw, &mut at)?) as i64;
     let sign = u16::from_be_bytes(take(raw, &mut at)?);
-    let dscale = i16::from_be_bytes(take(raw, &mut at)?) as usize;
+    let dscale = usize::try_from(i16::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad numeric")?;
     match sign {
         0xC000 => return Ok(Value::Float(f64::NAN)),
         0xD000 => return Ok(Value::Float(f64::INFINITY)),
@@ -964,26 +1274,35 @@ fn numeric(raw: &[u8]) -> Result<Value, BoxErr> {
     frac.truncate(dscale);
     let neg = sign == 0x4000;
     let text = format!("{}{}{}{}", if neg { "-" } else { "" }, int_part, if frac.is_empty() { "" } else { "." }, frac);
-    if frac.chars().all(|c| c == '0') {
+    if dscale == 0 {
         if let Ok(n) = format!("{}{}", if neg { "-" } else { "" }, int_part).parse::<i64>() {
             return Ok(Value::Int(n));
         }
     }
-    Ok(text.parse::<f64>().map(Value::Float).unwrap_or_else(|_| Value::str(text)))
+    Ok(crate::decimal::Dec::parse(&text).map_or_else(|| Value::str(text), Value::Dec))
 }
 
-/// A one- or more-dimensional array as (nested) lists.
+/// Most dimensions a Postgres array has (its MAXDIM).
+const MAX_DIMS: usize = 6;
+
+/// A one- or more-dimensional array as (nested) lists. The sizes it states
+/// are checked against what came: a server (or someone in the middle) that
+/// says -1 or 2^31 cannot make this take all the memory there is.
 fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
     let mut at = 0;
-    let ndim = i32::from_be_bytes(take(raw, &mut at)?) as usize;
+    let ndim = usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).ok().filter(|n| *n <= MAX_DIMS).ok_or("bad array dimensions")?;
     let _has_null = i32::from_be_bytes(take(raw, &mut at)?);
     let _oid = u32::from_be_bytes(take(raw, &mut at)?);
     let mut dims = Vec::with_capacity(ndim);
     for _ in 0..ndim {
-        dims.push(i32::from_be_bytes(take(raw, &mut at)?) as usize);
+        dims.push(usize::try_from(i32::from_be_bytes(take(raw, &mut at)?)).map_err(|_| "bad array size")?);
         let _lower = i32::from_be_bytes(take(raw, &mut at)?);
     }
-    let total: usize = if ndim == 0 { 0 } else { dims.iter().product() };
+    let total: usize = if ndim == 0 { 0 } else { dims.iter().try_fold(1usize, |t, d| t.checked_mul(*d)).ok_or("bad array size")? };
+    // Each item is at least its 4-byte length.
+    if total > (raw.len() - at) / 4 {
+        return Err("array too short".into());
+    }
     let mut items = Vec::with_capacity(total);
     for _ in 0..total {
         let len = i32::from_be_bytes(take(raw, &mut at)?);
@@ -991,7 +1310,7 @@ fn array(elem: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
             items.push(Value::Nil);
         } else {
             let len = len as usize;
-            let bytes = raw.get(at..at + len).ok_or("array too short")?;
+            let bytes = raw.get(at..at.saturating_add(len)).ok_or("array too short")?;
             at += len;
             items.push(decode(elem, bytes)?);
         }
@@ -1069,8 +1388,111 @@ mod tests {
         assert_eq!(date_text(9131), "2024-12-31");
         assert_eq!(time_text(3_723_000_001), "01:02:03.000001");
         assert_eq!(pg_text(&Value::list(vec![Value::Int(1), Value::str("a\"b"), Value::Nil])), "{\"1\",\"a\\\"b\",NULL}");
-        assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
-        assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
+        let o = take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap();
+        assert_eq!((o.url.as_str(), o.max, o.schema, o.tls.mode), ("postgres://h/db", 3, None, Some(SslMode::Require)));
+        let o = take_options("postgres://h/db?schema=acme").unwrap();
+        assert_eq!((o.url.as_str(), o.max, o.schema), ("postgres://h/db", DEFAULT_POOL, Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
+    }
+
+    #[test]
+    fn lengths_a_server_sends_are_checked() {
+        let be = |xs: &[i32]| xs.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        // What the review saw: negative sizes cast to huge ones.
+        assert!(array(&Type::INT4, &be(&[-1, 0, 23])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, -1, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[1, 0, 23, i32::MAX, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[2, 0, 23, 65536, 1, 65536, 1])).is_err());
+        assert!(array(&Type::INT4, &be(&[7, 0, 23])).is_err());
+        let ok = array(&Type::INT4, &be(&[1, 0, 23, 2, 1, 4, 7, -1])).unwrap();
+        assert_eq!(ok.repr(), "[7, null]");
+        let n = |h: [i16; 4]| h.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+        assert!(numeric(&n([-1, 0, 0, 0])).is_err());
+        assert!(numeric(&n([0, 0, 0, -1])).is_err());
+        assert_eq!(numeric(&n([0, 0, 0, 2])).unwrap().repr(), "0.00m");
+    }
+
+    #[test]
+    fn tls_is_required_for_a_server_on_another_machine() {
+        let mode = |url: &str| {
+            let o = take_options(url).unwrap();
+            let c: tokio_postgres::Config = o.url.parse().unwrap();
+            o.tls.mode_for(&c)
+        };
+        // What the review saw: `prefer`, which someone in the middle can turn off.
+        assert_eq!(mode("postgres://u:p@db.example.com/app"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@10.0.0.5:5432/app"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@db.example.com/app?hostaddr=127.0.0.1"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@localhost/app?hostaddr=10.0.0.5"), SslMode::VerifyFull);
+        // Said in the URL: as it says. On this machine: Postgres's default.
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=disable"), SslMode::Disable);
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=verify-ca&sslrootcert=/ca.pem"), SslMode::VerifyCa);
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=require"), SslMode::Require);
+        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app"] {
+            assert_eq!(mode(local), SslMode::Prefer, "{}", local);
+        }
+        // The operating system's CAs: only to check the server's name too.
+        assert_eq!(mode("postgres://u@localhost/app?sslrootcert=system"), SslMode::VerifyFull);
+        assert!(take_options("postgres://h/db?sslmode=allow").is_err());
+    }
+
+    #[test]
+    fn tls_options_leave_the_url_and_say_what_is_checked() {
+        let o = take_options("postgres://u@h/db?sslmode=verify-ca&sslrootcert=%2Fetc%2Fdb%20ca.pem&connect_timeout=5&sslcert=/c.pem&sslkey=/k.pem").unwrap();
+        assert_eq!(o.url, "postgres://u@h/db?connect_timeout=5");
+        assert_eq!(o.tls, Tls { mode: Some(SslMode::VerifyCa), root: Some("/etc/db ca.pem".into()), cert: Some("/c.pem".into()), key: Some("/k.pem".into()) });
+        let t = |root: Option<&str>| Tls { root: root.map(str::to_string), ..Tls::default() };
+        assert_eq!(t(None).check(SslMode::VerifyFull), Check::ChainAndName);
+        assert_eq!(t(None).check(SslMode::Require), Check::Nothing);
+        assert_eq!(t(None).check(SslMode::Prefer), Check::Nothing);
+        // libpq's: a root certificate given makes `require` check the chain.
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::Require), Check::Chain);
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::VerifyCa), Check::Chain);
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::Disable), Check::Nothing);
+        let err = |tls: Tls, mode| tls.client_config(mode).err().unwrap_or_default();
+        assert!(err(t(None), SslMode::VerifyCa).contains("needs sslrootcert"));
+        assert!(err(t(Some("system")), SslMode::Require).contains("needs sslmode=verify-full"));
+        assert!(err(t(Some("/no/such/ca.pem")), SslMode::VerifyFull).contains("sslrootcert /no/such/ca.pem"));
+        assert!(err(Tls { cert: Some("/c.pem".into()), ..Tls::default() }, SslMode::Require).contains("go together"));
+        assert!(t(None).client_config(SslMode::VerifyFull).is_ok());
+        assert!(t(None).client_config(SslMode::Require).is_ok());
+    }
+
+    /// The certificates a server could present, checked as each mode does
+    /// (the verifier the connection would use, without a server).
+    #[test]
+    fn certificates_are_checked_as_the_mode_says() {
+        use rustls::pki_types::{ServerName, UnixTime};
+        let dir = std::env::temp_dir().join(format!("quillo-pg-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            p.distinguished_name.push(rcgen::DnType::CommonName, name);
+            let cert = p.self_signed(&key).unwrap();
+            std::fs::write(dir.join(format!("{}.pem", name)), cert.pem()).unwrap();
+            rcgen::Issuer::new(p, key)
+        };
+        let ours = ca("ours");
+        let _theirs = ca("theirs");
+        let server = rcgen::CertificateParams::new(vec!["db.example.internal".to_string()]).unwrap().signed_by(&rcgen::KeyPair::generate().unwrap(), &ours).unwrap();
+        let der = server.der().clone();
+        let check = |tls: &Tls, mode: SslMode, host: &str| {
+            let v = tls.verifier(mode, Arc::new(rustls::crypto::ring::default_provider())).unwrap();
+            v.verify_server_cert(&der, &[], &ServerName::try_from(host.to_string()).unwrap(), &[], UnixTime::now()).is_ok()
+        };
+        let ok = |root: &str, mode: SslMode, host: &str| check(&Tls { root: Some(dir.join(root).to_str().unwrap().to_string()), ..Tls::default() }, mode, host);
+        assert!(ok("ours.pem", SslMode::VerifyFull, "db.example.internal"));
+        assert!(!ok("ours.pem", SslMode::VerifyFull, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::VerifyFull, "db.example.internal"));
+        assert!(ok("ours.pem", SslMode::VerifyCa, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::VerifyCa, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::Require, "db.example.internal"));
+        // Without a root certificate, `require` takes any.
+        assert!(check(&Tls::default(), SslMode::Require, "x"));
+        // And the usual public CAs do not know a private one's.
+        assert!(!check(&Tls::default(), SslMode::VerifyFull, "db.example.internal"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

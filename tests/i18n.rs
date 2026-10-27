@@ -159,3 +159,37 @@ fn __t() = [0, 1, 2, 5, 11, 21, 22, 1.5] | map((n) => t("files", { count: n })) 
     assert_eq!(server, String::from_utf8_lossy(&out.stdout).trim());
     assert!(server.contains("\"21 файл\"") && server.contains("\"22 файла\"") && server.contains("\"5 файлов\""), "{}", server);
 }
+
+#[test]
+fn markup_in_a_translation_does_not_make_its_values_markup() {
+    // What the review saw: `raw(t(...))`, as recommended for markup written in
+    // translations, made a user's name HTML too.
+    let mut it = app(
+        r#"
+translations({ en: { welcome: "<b>Welcome</b>, {name}! {n} new" } })
+route GET /w ? { name: str } = <p>{raw(t("welcome", { name: name, n: 2 }))}</p>
+route GET /plain ? { name: str } = <p>{t("welcome", { name: name, n: 2 })}</p>
+"#,
+    );
+    let page = get(&mut it, "/w?name=%3Cimg%20src=x%20onerror=alert(1)%3E", &[]).text();
+    assert_eq!(page, "<p><b>Welcome</b>, &lt;img src=x onerror=alert(1)&gt;! 2 new</p>");
+    // Without raw, all of it is text, escaped once.
+    let page = get(&mut it, "/plain?name=%3Cb%3E", &[]).text();
+    assert_eq!(page, "<p>&lt;b&gt;Welcome&lt;/b&gt;, &lt;b&gt;! 2 new</p>");
+    // The browser makes the same call one that escapes the values.
+    let src = r#"
+translations({ en: { welcome: "<b>Welcome</b>, {name}!" } })
+fn __t() = raw(t("welcome", { name: "<i>x</i>" }))
+"#;
+    let mut it = Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap();
+    let script = quillo::client::test_script(&it, "__t").unwrap();
+    assert!(script.contains("B.t_html(") && !script.contains("B.raw("), "{}", script);
+    if !Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return;
+    }
+    let words = it.site.i18n.as_ref().unwrap().browser_json("en");
+    let js = format!("globalThis.window = {{ __quillo_i18n: {} }};\n{}", words, script);
+    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "<html>", "{}", String::from_utf8_lossy(&out.stderr));
+}

@@ -6,6 +6,8 @@ pub enum Lit {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// `12.50m`
+    Dec(crate::decimal::Dec),
     Str(Arc<str>),
 }
 
@@ -128,7 +130,7 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
-    let e = if name.starts_with("db.") {
+    let e = if name.starts_with("db.") || matches!(name, "audit" | "audit.query" | "audit.verify" | "idempotent") {
         "db"
     } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
         "http"
@@ -136,8 +138,11 @@ pub fn builtin_effect(name: &str) -> u8 {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
             "env" => "env",
-            "now" | "sleep" => "time",
-            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
+            "now" | "sleep" | "date.today" | "date.now" | "crypto.totp_verify" | "rate_limit" | "rate_limit_reset" => "time",
+            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" | "crypto.totp_secret" | "crypto.recovery_codes" | "crypto.encrypt" | "crypto.reencrypt" => "random",
+            "end_sessions" | "user_sessions" => "db",
+            // Stripe's signatures carry a time, checked against the clock.
+            "crypto.verify_webhook" => "time",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }
@@ -167,6 +172,9 @@ pub struct FnDef {
     pub component: bool,
     pub line: u32,
     pub body: Expr,
+    /// How deeply its body nests (at most `parser::MAX_NESTING`): a call
+    /// makes sure there is stack for that much.
+    pub nesting: u32,
     /// The file it was written in (an absolute path), when the parser was
     /// told: for the debugger's stack frames and breakpoints.
     pub file: Option<Arc<str>>,
@@ -246,6 +254,37 @@ pub enum AttrVal {
     Spread(Expr),
 }
 
+/// Attributes whose value the browser runs as code (`onclick`) or shows as
+/// a page of the site (`srcdoc`). Escaping does not help there: the browser
+/// decodes the value first.
+pub fn code_attr(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_prefix("bind:").unwrap_or(&name);
+    name.starts_with("on") || name == "srcdoc"
+}
+
+/// Whether attribute `name` of element `tag` is given a value worked out
+/// when the page is made, where only text written in the program may go:
+/// `onclick={...}`. A component's attributes are its parameters, so they
+/// may be anything; and an `<iframe>` whose written `sandbox` keeps its
+/// page away from the site (no allow-same-origin) may show any `srcdoc`.
+pub fn code_from_data(tag: &str, attrs: &[(String, AttrVal)], name: &str, v: &AttrVal) -> bool {
+    if tag.starts_with(|c: char| c.is_uppercase()) || !code_attr(name) || matches!(v, AttrVal::Bool | AttrVal::Expr(Expr::Lit(_))) {
+        return false;
+    }
+    let sandboxed = || {
+        attrs.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("sandbox")
+                && match v {
+                    AttrVal::Bool => true,
+                    AttrVal::Expr(Expr::Lit(Lit::Str(s))) => !s.to_ascii_lowercase().contains("allow-same-origin"),
+                    _ => false,
+                }
+        })
+    };
+    !(name.eq_ignore_ascii_case("srcdoc") && sandboxed())
+}
+
 #[derive(Debug, Clone)]
 pub enum HtmlChild {
     El(HtmlEl),
@@ -310,6 +349,7 @@ impl ElFacts {
             && plain_attrs
             && tag != "html"
             && tag != "style"
+            && tag != "script"
             && id.as_ref().map_or(true, lit)
             && classes.iter().all(lit)
             && attrs.iter().all(|(n, v)| match v {

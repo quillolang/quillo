@@ -1,17 +1,15 @@
 //! Runs the `quillo` binary as a server and talks to it over HTTP.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
-
 fn port() -> u16 {
-    let base = 20000 + (std::process::id() % 2000) as u16 * 10;
-    base + NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+    support::free_port()
 }
 
 struct Server {
@@ -48,12 +46,14 @@ fn start_with_env(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server { child, port }
+    server
 }
 
 fn request(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -139,8 +139,10 @@ fn parallel_takes_a_list_and_nests() {
     let t0 = Instant::now();
     assert_eq!(get(srv.port, "/list").1, "[0,10,20,30,40,50,60,70]");
     assert_eq!(get(srv.port, "/nested").1, "[[10,20],30]");
-    // Eight waits of 300 ms at once, then two levels of them.
-    assert!(t0.elapsed() < Duration::from_millis(1100), "took {:?}", t0.elapsed());
+    // Eight waits of 300 ms at once, then two levels of them: about 600 ms,
+    // where one after another would take 3.3 s. The bound leaves room for a
+    // loaded machine (a CI runner took 1.2 s).
+    assert!(t0.elapsed() < Duration::from_millis(2000), "took {:?}", t0.elapsed());
 }
 
 #[test]
@@ -478,7 +480,7 @@ fn stopping_finishes_requests_in_progress() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "{:?}", status);
-    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(!support::listening(port));
 }
 
 #[test]
@@ -507,28 +509,59 @@ fn the_log_can_be_json_lines() {
     let f = d.join("app.qwe");
     std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
     let port = port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+    // The log to a file, read once the server has stopped.
+    let log_file = d.join("server.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&f)
         .args(["--port", &port.to_string(), "--log", "json"])
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log_file).unwrap())
         .spawn()
         .unwrap();
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(get(port, "/hello?x=1").1, "hi");
     std::thread::sleep(Duration::from_millis(300));
-    let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
-    let log = String::from_utf8_lossy(&out.stderr);
+    drop(server);
+    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
     let line = log.lines().find(|l| l.contains("/hello")).unwrap_or_else(|| panic!("no log line in {}", log));
     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{}: {}", e, line));
-    assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello?x=1"), Some(200)));
+    // The path without its query string, unless --log-query.
+    assert_eq!((v["method"].as_str(), v["path"].as_str(), v["status"].as_u64()), (Some("GET"), Some("/hello"), Some(200)));
     assert!(v["time"].as_str().map_or(false, |t| t.ends_with('Z') && t.len() == 24), "{}", line);
     assert!(v["ms"].is_number() && v["ip"].is_string(), "{}", line);
+}
+
+#[test]
+fn the_log_goes_to_a_file_a_day_with_the_user_and_old_days_go() {
+    let d = temp_dir("logfile");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /in = { set_session({ user: 42 }); \"in\" }\nroute GET /pay = \"paid\"\n").unwrap();
+    std::fs::create_dir_all(d.join("logs")).unwrap();
+    // Days long past, and a file of someone else's.
+    std::fs::write(d.join("logs/requests-2001-01-01.log"), "old\n").unwrap();
+    std::fs::write(d.join("logs/requests-notes.log"), "mine\n").unwrap();
+    let log = d.join("logs/requests.log");
+    let srv = start(&f, &["--log", "json", "--log-file", log.to_str().unwrap(), "--log-keep", "30", "--log-query"]);
+    assert_eq!(get(srv.port, "/in?x=1").1, "in");
+    assert_eq!(get(srv.port, "/pay?card_number=4111111111111111&n=2").1, "paid");
+    std::thread::sleep(Duration::from_millis(1500));
+    let names: Vec<String> = std::fs::read_dir(d.join("logs")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(!names.contains(&"requests-2001-01-01.log".to_string()), "{:?}", names);
+    assert!(names.contains(&"requests-notes.log".to_string()), "{:?}", names);
+    let today = names.iter().find(|n| n.starts_with("requests-20") && n != &"requests-2001-01-01.log").unwrap_or_else(|| panic!("{:?}", names));
+    let text = std::fs::read_to_string(d.join("logs").join(today)).unwrap();
+    let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {}", e, l))).collect();
+    assert_eq!(lines.len(), 2, "{}", text);
+    assert_eq!((lines[0]["path"].as_str(), lines[0]["user"].as_str()), (Some("/in?x=1"), Some("42")), "{}", text);
+    assert!(lines[0]["rid"].is_string() && lines[0]["ip"].is_string(), "{}", text);
+    assert_eq!(lines[1]["path"].as_str(), Some("/pay?card_number=[redacted]&n=2"), "{}", text);
+    assert!(lines[1].get("user").is_none(), "{}", text);
 }
 
 #[test]
@@ -673,5 +706,82 @@ fn passwords_are_hashed_off_the_event_loop() {
     assert!(t0.elapsed() < Duration::from_millis(500), "took {:?}", t0.elapsed());
     for l in logins {
         assert_eq!(l.join().unwrap(), (200, "true".into()));
+    }
+}
+
+/// `/_quillo/live` over a WebSocket: the browser lets any site open one, so
+/// the server refuses pages of other sites, as it does for server fns. A
+/// page of the site, and a program (no Origin), connect.
+#[test]
+fn live_websockets_are_only_for_the_sites_own_pages() {
+    let d = temp_dir("live-origin");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = `hi`\n").unwrap();
+    let srv = start(&f, &[]);
+    // The status line of a WebSocket handshake with these headers.
+    let open = |extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET /_quillo/live?t=db%3Anotes HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}\r\n",
+            srv.port, extra
+        )
+        .unwrap();
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while !line.ends_with(b"\r\n") && s.read(&mut b).map_or(false, |n| n == 1) {
+            line.push(b[0]);
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    };
+    let other = "Origin: https://evil.example\r\n";
+    assert!(open(other).starts_with("HTTP/1.1 403"), "{}", open(other));
+    assert!(open("Origin: http://localhost:1\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: cross-site\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: same-site\r\n").starts_with("HTTP/1.1 403"));
+    let own = format!("Origin: http://localhost:{}\r\n", srv.port);
+    assert_eq!(open(&own), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open("Sec-Fetch-Site: same-origin\r\n"), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open(""), "HTTP/1.1 101 Switching Protocols");
+    // The long wait without a WebSocket too.
+    assert!(raw(srv.port, "GET /_quillo/live?since=1&t=x HTTP/1.1\r\nOrigin: https://evil.example").starts_with("HTTP/1.1 403"));
+}
+
+/// A desktop window's launch token is a secret of the machine's: whatever
+/// the log's form, with query strings or not, and for a request too broken
+/// to answer, the log never shows it.
+#[test]
+fn the_log_never_shows_a_launch_token() {
+    let d = temp_dir("launchlog");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
+    let token = "5ec12e7c0ffee5ec12e7c0ffee5ec12e7";
+    for flags in [&["--log", "text"][..], &["--log", "json", "--log-query"][..], &["--log", "json"][..]] {
+        let port = port();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(&f)
+            .args(["--port", &port.to_string()])
+            .args(flags)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !support::listening(port) {
+            assert!(Instant::now() < deadline, "server did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(get(port, &format!("/hello?a=1&_quillo_launch={}", token)).1, "hi");
+        // A header line without a colon: refused before it is a request.
+        let bad = raw(port, &format!("GET /hello?_quillo_launch={} HTTP/1.1\r\nno colon here", token));
+        assert!(bad.starts_with("HTTP/1.1 400"), "{}", bad);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(log.contains("/hello") && log.contains("-> 400"), "{:?}: {}", flags, log);
+        assert!(!log.contains(token) && !log.contains(&token[..12]), "{:?}: {}", flags, log);
     }
 }

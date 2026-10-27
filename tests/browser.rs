@@ -2,7 +2,8 @@
 //! whose page script clicks, types and submits, then records what it saw.
 //! Skipped when no Chrome is found (set QUILLO_CHROME to point at one).
 
-use std::net::TcpStream;
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,17 +47,19 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(app)
-        .args(["--port", &port.to_string()])
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(app)
+            .args(["--port", &port.to_string()])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -71,8 +74,7 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
         .args(script)
         .output()
         .expect("node");
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     let _ = std::fs::remove_dir_all(&profile);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
@@ -81,7 +83,7 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
 /// Node 22 or later (run.js uses its built-in WebSocket).
 /// A port nothing is listening on (tests run in parallel).
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn node_available() -> bool {
@@ -224,6 +226,31 @@ fn svg_inside_html_draws() {
     assert_eq!(r, want);
 }
 
+/// Attributes a component takes from data: a spread cannot add handlers,
+/// whatever the key's case or `bind:`, nor replace an attribute written
+/// out; a sandboxed frame's page follows the state; an SVG animation of an
+/// href is given no javascript: URL.
+#[test]
+fn spread_attributes_from_data_stay_attributes() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("attrs.qwe"), free_port(), Some(&dir.join("attrs.js")));
+    let want = serde_json::json!({
+        "form": ["/login", "post"],
+        "formAttrs": ["action", "href", "id", "method", "title"],
+        "link": ["/ok", "window.clicked = 1", "kept"],
+        "linkAttrs": ["action", "href", "id", "method", "onclick", "title"],
+        "frame": "<p>second</p>",
+        "anim": ["about:blank#blocked", "about:blank#blocked"],
+        "ran": 0,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// A page loads its components' code when it is needed: not before someone
 /// reaches for one (what they typed and clicked meanwhile is kept), and at
 /// once for one that runs by itself. It resumes on the server's HTML: the
@@ -289,6 +316,30 @@ fn components_call_the_pages_javascript() {
         "removed": [false, ["gauge"]],
         "back": ["gauge 3", 2],
         "errors": []
+    });
+    assert_eq!(r, want);
+}
+
+/// The ways around the checks on the page's functions, tried in a real
+/// page: none runs its text, and ordinary calls still work.
+#[test]
+fn the_ways_around_the_pages_checks_do_not_run_text() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("guard.qwe"), free_port(), Some(&dir.join("guard.js")));
+    let want = serde_json::json!({
+        "reflect": "refused",
+        "parse": "refused",
+        "adopt": "refused",
+        "script": "refused",
+        "svgscript": "refused",
+        "setter": "refused",
+        "wrapped": "refused",
+        "target": "<b>made</b>",
+        "pwned": null
     });
     assert_eq!(r, want);
 }
@@ -754,23 +805,23 @@ fn media_plays(args: &[&str], via: &str) {
 /// the page loaded `late` after; `None` when `start` says it could not.
 fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args: &[&str], late: Duration, start: impl FnOnce() -> bool) -> Option<serde_json::Value> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(app)
-        .args(["--port", &port.to_string()])
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(app)
+            .args(["--port", &port.to_string()])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
     if !start() {
-        let _ = server.kill();
-        let _ = server.wait();
         return None;
     }
     std::thread::sleep(late);
@@ -784,8 +835,7 @@ fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args:
         .arg(script)
         .output()
         .expect("node");
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     let _ = std::fs::remove_dir_all(&profile);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Some(serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout))))
@@ -799,6 +849,40 @@ fn media_over_webtransport() {
 #[test]
 fn media_over_a_websocket_without_webtransport() {
     media_plays(&["--no-wt"], "websocket");
+}
+
+/// Decimals and ints past 2^53 cross to the page and back with their type:
+/// props, state, a server fn's arguments and answer.
+#[test]
+fn decimals_cross_to_the_page_and_back() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("decimals.qwe"), free_port(), Some(&dir.join("decimals.js")));
+    let want = serde_json::json!({
+        "server": ["25.00", "9007199254740994", "dec int"],
+        "added": "25.10",
+        "taxed": "2.01",
+        "back": "dec 25.10 int 9007199254740993 1.50",
+        "big": "9007199254740994",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
+/// A strict Content-Security-Policy: components, prefetching and the
+/// `--watch` reload run; an inline script without the nonce does not.
+#[test]
+fn pages_work_under_a_strict_content_security_policy() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_args(&chrome, &dir.join("csp.qwe"), free_port(), "/", Some(&dir.join("csp.js")), &["--watch"]);
+    assert_eq!(r, serde_json::json!({ "count": "3", "good": true, "bad": false, "blocked": ["script-src-elem inline"], "errors": [] }));
 }
 
 #[test]
@@ -820,7 +904,7 @@ fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() 
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }

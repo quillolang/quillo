@@ -304,12 +304,15 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     let mut big = app("server fn save(x) = x\ncomponent C() { ~xs = []\n<button @click={() => { xs = save(xs | sort_by((x) => x)) }}></button> }\nroute GET / = <C/>\n");
     let js2 = get(&mut big, "/_quillo/quillo.js").text();
     assert!(js2.contains("async function rpc") && js2.contains("B.sort_by"));
-    // About 25 KB (8 KB compressed) since markup is compiled into blocks,
+    // About 29 KB (9 KB compressed) since markup is compiled into blocks,
     // keyed lists move only what changed and clicks are handled once; the
     // checks on the page's own objects (events' elements) are in it too,
     // what keeps typing and clicks from before the bundle came, and what
-    // resumes the server's page instead of making it again (half a KB).
-    assert!(js.len() < js2.len() && js.len() < 26_500, "{} vs {}", js.len(), js2.len());
+    // resumes the server's page instead of making it again (half a KB), and
+    // decimals and ints past 2^53, which any value from the server may be
+    // (3.5 KB), and the checks on what is handed to the page's functions
+    // (an event's element's methods, say: 400 bytes).
+    assert!(js.len() < js2.len() && js.len() < 30_500, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }

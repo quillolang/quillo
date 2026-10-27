@@ -1,0 +1,40 @@
+// The ways around the checks on the page's functions that a review found,
+// each tried by a button in a real page: setting innerHTML through
+// Reflect, nodes parsed from markup, script elements, a handler set
+// through a method reached by its path. None of them
+// runs its text; the last button shows what a program means to do still
+// works. Driven by guard.js (tests/browser.rs).
+
+component Guard() {
+    <div>
+        <div id="target"></div>
+        <button id="reflect" @click={() => {
+            js("lib.R").set(js("document.getElementById", "target"), "innerHTML", "<img src=x onerror=\"window.pwned = 'reflect'\">")
+        }}>reflect</button>
+        <button id="parse" @click={() => {
+            js("lib.parser").parseFromString("<img src=x onerror=\"window.pwned = 'parse'\">", "text/html")
+        }}>parse</button>
+        <button id="adopt" @click={() => {
+            let doc = js("lib.parsed", "<img src=x onerror=\"window.pwned = 'adopt'\">")
+            js("document.getElementById", "target").append(doc.body.firstChild)
+        }}>adopt</button>
+        <button id="script" @click={() => {
+            let s = js("document").createElement("SCRIPT")
+            s.append("window.pwned = 'script'")
+            js("document.body").append(s)
+        }}>script</button>
+        <button id="svgscript" @click={() => {
+            js("document.createElementNS", "http://www.w3.org/2000/svg", "svg:script")
+        }}>svg script</button>
+        <button id="setter" @click={() => { js("document.body.setAttribute", "onclick", "window.pwned = 'setter'") }}>setter</button>
+        <button id="wrapped" @click={() => { js("window.open", ["javascript:window.pwned = 'wrapped'"]) }}>wrapped</button>
+        <button id="ok" @click={() => {
+            let b = js("document").createElement("b")
+            b.append("made")
+            js("document.getElementById", "target").append(b)
+        }}>ok</button>
+    </div>
+}
+
+route GET /lib.js = file("guard-lib.js")
+route GET / = <html><head><script src="/lib.js"></script></head><body><Guard/></body></html>

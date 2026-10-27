@@ -245,6 +245,7 @@ impl Interp {
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
+        self.access = Default::default();
         self.locale = None;
         if !req.body.is_empty() {
             let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
@@ -278,6 +279,9 @@ impl Interp {
         for c in self.set_cookies.drain(..) {
             resp.headers.push(("set-cookie".into(), c));
         }
+        crate::db::own_later(self);
+        crate::access::apply(self, req, &mut resp);
+        let nonce = crate::access::nonce_attr(self);
         if !self.base.is_empty() {
             for (k, v) in resp.headers.iter_mut() {
                 if k.eq_ignore_ascii_case("location") {
@@ -301,14 +305,14 @@ impl Interp {
         // Every page prefetches the links pointed at.
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(at), None) = (has(&resp.body, b"</body>"), has(&resp.body, b"__quillo_pf")) {
-                resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
+            if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
+                resp.body.splice(at..at, format!("<script{}>{}</script>", nonce, PREFETCH_JS).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
         if html && req.method != "HEAD" {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
-            if let (Some(_), None) = (has(&resp.body, b"<quillo-media"), has(&resp.body, b"/_quillo/media.js")) {
+            if has(&resp.body, b"<quillo-media").is_some() && !script_tag_for(&resp.body, b"/_quillo/media.js") {
                 let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
                 resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
             }
@@ -319,20 +323,26 @@ impl Interp {
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
             if let (Some(i18n), Some(l)) = (self.site.i18n.clone(), self.locale()) {
-                tags.push_str(&format!("<script>window.__quillo_i18n={}</script>", i18n.browser_json(&l)));
+                tags.push_str(&format!("<script{}>window.__quillo_i18n={}</script>", nonce, i18n.browser_json(&l)));
             }
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
-            if has(&resp.body, b"/_quillo/quillo.js").is_none() {
+            if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
                 let names = std::mem::take(&mut self.island_names);
                 let src = match self.bundle_for_page(&names) {
                     Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
                     None => format!("{}/_quillo/quillo.js", self.base),
                 };
-                tags.push_str(&format!("<script>{}</script>", island_loader(&src)));
+                tags.push_str(&format!("<script{}>{}</script>", nonce, island_loader(&src)));
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
+            // Under a policy, components are laid out by a style element
+            // carrying the nonce, not by style attributes (see `island`).
+            let first = resp.body.windows(22).position(|w| w == b"<quillo-island data-c=");
+            if let Some(at) = first {
+                resp.body.splice(at..at, format!("<style{}>quillo-island{{display:contents}}</style>", nonce).into_bytes());
+            }
         }
         resp
     }
@@ -588,6 +598,11 @@ impl Interp {
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
         };
+        // A service's server fns are for other services, whose calls are
+        // signed (`service/` above): never answered unsigned.
+        if self.is_service {
+            return rpc_error(404, &format!("no server fn `{}` (a service's server fns are called by other services, not by pages)", name));
+        }
         if req.method != "POST" {
             return plain(405, "method not allowed\n");
         }
@@ -627,14 +642,16 @@ impl Interp {
                 .iter()
                 .map(|j| match j.get("$quillo_file").and_then(|i| i.as_u64()) {
                     Some(i) if j.as_object().map_or(false, |o| o.len() == 1) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
-                    _ => Value::from_json(j),
+                    // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
+                    _ => crate::interp::from_island_json(j),
                 })
                 .collect::<Vec<_>>(),
             _ => return rpc_error(400, "the body must be a JSON array of arguments"),
         };
-        if let Err(msg) = check_args(&self.types, &c.def, &args) {
-            return rpc_error(400, &msg);
-        }
+        let args = match take_args(self, &c.def, args) {
+            Ok(a) => a,
+            Err(msg) => return rpc_error(400, &msg),
+        };
         let query = Value::map(parse_urlencoded(qs));
         let mut reqmap = build_request(req, path, &query);
         if let Some(id) = &self.request_id {
@@ -653,6 +670,9 @@ impl Interp {
             t.sort();
             t
         });
+        if let Some(t) = &topics {
+            self.shared.track(t);
+        }
         self.current_request = None;
         let with_topics = |mut j: serde_json::Value| {
             if let Some(t) = &topics {
@@ -665,8 +685,8 @@ impl Interp {
         match res {
             Ok(v) | Err(Ctrl::Return(v)) => match v {
                 Value::Response(r) => render_response(&r),
-                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": e.to_json() }))),
-                v => json_response(200, with_topics(serde_json::json!({ "ok": v.to_json() }))),
+                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": crate::interp::island_json(&e) }))),
+                v => json_response(200, with_topics(serde_json::json!({ "ok": crate::interp::island_json(&v) }))),
             },
             Err(Ctrl::Reply(r)) => render_response(&r),
             Err(Ctrl::Error(e)) => {
@@ -701,25 +721,46 @@ pub const MAX_WAITERS: usize = 4096;
 /// Stack for the threads that wait for changes; they run no Quillo code.
 const WAITER_STACK: usize = 256 << 10;
 
+/// Most of those one client can hold (an address, or an IPv6 /64), so that
+/// one cannot take them all and leave the others' pages without updates.
+pub const MAX_WAITERS_PER_CLIENT: usize = 256;
+
 static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The places taken, by client.
+static WAITING: Mutex<Option<std::collections::HashMap<String, usize>>> = Mutex::new(None);
 
 /// A place among the `MAX_WAITERS`, given back when dropped.
-struct Waiter;
+struct Waiter(String);
 
 impl Waiter {
-    fn take() -> Option<Waiter> {
+    fn take(ip: &str) -> Option<Waiter> {
         use std::sync::atomic::Ordering::SeqCst;
+        let who = crate::statics::client_of(ip);
+        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let mine = m.get(&who).copied().unwrap_or(0);
+        if mine >= MAX_WAITERS_PER_CLIENT {
+            return None;
+        }
         if WAITERS.fetch_add(1, SeqCst) >= MAX_WAITERS {
             WAITERS.fetch_sub(1, SeqCst);
             return None;
         }
-        Some(Waiter)
+        m.insert(who.clone(), mine + 1);
+        Some(Waiter(who))
     }
 }
 
 impl Drop for Waiter {
     fn drop(&mut self) {
         WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.as_mut().and_then(|m| m.get_mut(&self.0)) {
+            *n -= 1;
+            if *n == 0 {
+                g.as_mut().map(|m| m.remove(&self.0));
+            }
+        }
     }
 }
 
@@ -766,9 +807,10 @@ fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64), head: boo
 }
 
 /// Hands the connection to `f` on a thread of its own, holding one of the
-/// waiting places; answers 503 when they are all taken.
-fn waiter(name: &'static str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
-    let Some(place) = Waiter::take() else {
+/// waiting places; answers 503 when they are all taken, or the client at
+/// `ip` holds its share of them.
+fn waiter(name: &'static str, ip: &str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
+    let Some(place) = Waiter::take(ip) else {
         let mut resp = plain(503, "too many pages are waiting for changes; try again later\n");
         resp.headers.push(("retry-after".into(), "5".into()));
         return Answer::Respond(resp);
@@ -803,7 +845,7 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
 /// plain request, the answer is the first change, or none after a while.
 fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
     let (mut since, server, topics) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
-    waiter("quillo-live", move |stream| {
+    waiter("quillo-live", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let mut server = server;
@@ -837,32 +879,41 @@ fn serve_channels(req: HttpRequest) -> Answer {
     let Some(ticket) = crate::wt::ticket_of(req.url.split_once('?').map_or("", |(_, q)| q)) else {
         return Answer::Respond(plain(403, "no ticket, or an old one\n"));
     };
-    waiter("quillo-ch", move |stream| {
+    waiter("quillo-ch", &req.remote.clone(), move |stream| {
         if let Some(socket) = crate::ws::Socket::accept(&req, stream) {
             crate::wt::over_websocket(socket, ticket);
         }
     })
 }
 
-/// Checks a browser's arguments against a `server fn`'s parameters.
-pub(crate) fn check_args(types: &crate::record::Types, def: &crate::ast::FnDef, args: &[Value]) -> Result<(), String> {
+/// The arguments a browser (or another service) calls a `server fn` with,
+/// checked all the way in (list items, map values and record fields, since
+/// the function trusts its types) and made into its parameters' types as
+/// `Type(v)` makes them: a record keeps only its own fields, so what is
+/// sent cannot add `is_admin` to one, and fields left out get their defaults.
+/// A `dec` (a parameter or a record's field) takes a decimal, an int, a
+/// number or numeric text ("12.50"), as a `dec` pattern takes it.
+pub(crate) fn take_args(it: &mut Interp, def: &crate::ast::FnDef, args: Vec<Value>) -> Result<Vec<Value>, String> {
     if args.len() > def.params.len() {
         return Err(format!("`{}` takes {} arguments, got {}", def.name, def.params.len(), args.len()));
     }
-    for (i, p) in def.params.iter().enumerate() {
-        match args.get(i) {
-            None if p.default.is_none() => return Err(format!("missing argument `{}` for `{}`", p.name, def.name)),
-            Some(v) => {
-                if let Some(ty) = &p.ty {
-                    if let Err(why) = crate::record::fits(types, ty, v, false) {
-                        return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why)));
-                    }
-                }
-            }
-            None => {}
+    if let Some(p) = def.params.get(args.len()..).and_then(|rest| rest.iter().find(|p| p.default.is_none())) {
+        return Err(format!("missing argument `{}` for `{}`", p.name, def.name));
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (v, p) in args.into_iter().zip(&def.params) {
+        let Some(ty) = &p.ty else {
+            out.push(v);
+            continue;
+        };
+        match crate::record::make(it, ty, &v, false) {
+            Ok(Ok(x)) => out.push(x),
+            Ok(Err(why)) => return Err(format!("argument `{}` of `{}` must be {}, got {}{}", p.name, def.name, ty.text(), v.type_name(), crate::interp::because(&why))),
+            Err(Ctrl::Error(e)) => return Err(format!("argument `{}` of `{}`: {}", p.name, def.name, e)),
+            Err(_) => return Err(format!("argument `{}` of `{}` could not be made", p.name, def.name)),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
@@ -875,6 +926,47 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
 
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
+}
+
+/// Whether a page has a `<script>` element (with a nonce or without) whose
+/// code starts with `code`: one put in already, as a mounted program's page
+/// has it, not text that quotes it, which is escaped.
+fn script_with(body: &[u8], code: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = body[from..].windows(code.len()).position(|w| w == code).map(|i| i + from) {
+        from = i + code.len();
+        let before = &body[..i];
+        if before.ends_with(b"<script>") {
+            return true;
+        }
+        let Some(lt) = before.iter().rposition(|b| *b == b'<') else { continue };
+        let tag = &before[lt..];
+        if tag.starts_with(b"<script nonce=\"") && tag.ends_with(b"\">") && tag.iter().filter(|b| **b == b'"').count() == 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a page has a `<script>` element whose `src` ends with `path`
+/// (the program wrote it, or a mounted program's page already has it).
+/// Only an element counts: text, which is escaped, cannot start one, nor
+/// can `markdown` (whose `<img src=...>` could name the same path), so a
+/// comment saying `/_quillo/quillo.js` does not stop the page loading it.
+fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = body[from..].windows(path.len()).position(|w| w == path).map(|i| i + from) {
+        from = i + path.len();
+        if !matches!(body.get(from), Some(b'"' | b'\'' | b'?' | b'#')) {
+            continue;
+        }
+        let Some(lt) = body[..i].iter().rposition(|b| *b == b'<') else { continue };
+        let tag = &body[lt..i];
+        if tag.len() > 7 && tag[..7].eq_ignore_ascii_case(b"<script") && matches!(tag[7], b' ' | b'\t' | b'\n' | b'/') && !tag.contains(&b'>') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Turns what a route produced into an HTTP response.
@@ -911,7 +1003,7 @@ pub static PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `download`, to this same page, inside `data-no-prefetch`, those a page's
 /// components follow themselves, or on a connection saving data.
 pub const PREFETCH_JS: &str = concat!(
-    "(()=>{const d=document,w=window,seen=new Set();if(w.__quillo_pf)return;w.__quillo_pf=1;",
+    "(()=>{const d=document,w=window,seen=new Set(),nn=d.currentScript&&d.currentScript.nonce;if(w.__quillo_pf)return;w.__quillo_pf=1;",
     "const c=navigator.connection;if(c&&(c.saveData||/2g/.test(c.effectiveType||\"\")))return;",
     "const spec=HTMLScriptElement.supports&&HTMLScriptElement.supports(\"speculationrules\");",
     "const link=(e)=>e.target&&e.target.closest&&e.target.closest(\"a[href]\");",
@@ -920,7 +1012,7 @@ pub const PREFETCH_JS: &str = concat!(
     "const u=new URL(a.href,location.href);if(u.origin!==location.origin||!/^https?:$/.test(u.protocol))return null;",
     "if(u.pathname===location.pathname&&u.search===location.search)return null;u.hash=\"\";return u.href};",
     "const go=(a)=>{const u=a&&want(a);if(!u||seen.has(u))return;seen.add(u);",
-    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
+    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";if(nn)s.nonce=nn;s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
     "else fetch(u,{credentials:\"same-origin\",headers:{\"x-quillo-prefetch\":\"1\"}}).catch(()=>{})};",
     "let t=0;const o={capture:true,passive:true};",
     "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
@@ -1002,15 +1094,14 @@ pub struct App {
     /// Run the static checker before each reload.
     pub static_check: bool,
     /// One of several servers (`--register`): the key announcements from
-    /// the others must carry.
+    /// the others are signed with (see `cluster::announced`).
     pub cluster_key: Option<String>,
-    /// When limer has no admin secret: the addresses announcements may come
-    /// from (besides this machine).
-    pub cluster_sources: Option<Vec<std::net::IpAddr>>,
     /// Largest request body accepted, in bytes.
     pub max_body: usize,
     /// The path the program is served under (`--base`), kept when it is loaded again.
     pub base: String,
+    /// Run as a service (`--as-service`): see `Interp::is_service`.
+    pub is_service: bool,
     /// A desktop app (`quillo app`): only requests that carry this token
     /// are answered (see `launch_gate`).
     pub launch_token: Option<String>,
@@ -1034,9 +1125,9 @@ impl App {
             watch,
             static_check: true,
             cluster_key: None,
-            cluster_sources: None,
             max_body: MAX_BODY,
             base: String::new(),
+            is_service: false,
             launch_token: None,
             reload: false,
             addr: Mutex::new(None),
@@ -1073,6 +1164,7 @@ impl App {
         // `shared::Services`).
         let mut it = Interp::with_shared(&self.base_dir, self.shared.clone());
         it.base = self.base.clone();
+        it.is_service = self.is_service;
         let res = if problems.is_empty() {
             it.load_file(&self.main_file)
         } else {
@@ -1162,7 +1254,7 @@ fn dev_script(version: u64) -> String {
 /// for a change do not hold on to the server's threads.
 fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
     let seen = req.url.split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
-    waiter("quillo-events", move |stream| {
+    waiter("quillo-events", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let seen = seen.unwrap_or(0);
@@ -1194,9 +1286,13 @@ fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
         return;
     }
     let body = String::from_utf8_lossy(&resp.body).into_owned();
+    let mut script = dev_script(version);
+    if let Some(n) = crate::access::nonce_in(resp) {
+        script = script.replacen("<script>", &format!("<script nonce=\"{}\">", n), 1);
+    }
     resp.body = match body.rfind("</body>") {
-        Some(i) => format!("{}{}{}", &body[..i], dev_script(version), &body[i..]),
-        None => format!("{}{}", body, dev_script(version)),
+        Some(i) => format!("{}{}{}", &body[..i], script, &body[i..]),
+        None => format!("{}{}", body, script),
     }
     .into_bytes();
 }
@@ -1298,6 +1394,13 @@ impl Worker {
             }
         }
         let path = req.url.split('?').next().unwrap_or("");
+        // A WebSocket is not kept to its site by the browser: a page on
+        // another site could open one here and hear the topics changing.
+        // Only the program's own pages connect, as only they call server fns.
+        let waits = (app.watch && path == "/_quillo/events") || path.ends_with("/_quillo/live") || path.ends_with("/_quillo/wt");
+        if waits && cross_site(&req) {
+            return Answer::Respond(plain(403, "only the program's own pages connect\n"));
+        }
         if app.watch && path == "/_quillo/events" {
             return serve_events(app.clone(), req);
         }
@@ -1308,14 +1411,6 @@ impl Worker {
             return serve_channels(req);
         }
         if let (Some(key), "/_quillo/announce") = (&app.cluster_key, req.url.as_str()) {
-            // Without a secret, the key is no secret either: only limer's
-            // own host may announce.
-            let from: Option<std::net::IpAddr> = req.remote.parse().ok();
-            if let Some(allowed) = &app.cluster_sources {
-                if !from.map_or(false, |ip| ip.is_loopback() || allowed.contains(&ip)) {
-                    return Answer::Respond(HttpResponse { status: 403, headers: Vec::new(), body: Vec::new() });
-                }
-            }
             let body = &req.body[..req.body.len().min(1 << 16)];
             let status = crate::cluster::announced(&app.shared, key, body);
             return Answer::Respond(HttpResponse { status, headers: Vec::new(), body: Vec::new() });
@@ -1354,7 +1449,7 @@ impl Worker {
                 } {
                     Some(r) => r,
                     None => {
-                        eprintln!("quillo: internal error (a bug in Quillo) while handling {} {}", req.method, req.url);
+                        eprintln!("quillo: internal error (a bug in Quillo) while handling {} {}", req.method, crate::redact::url(&req.url));
                         // Its state may be half-updated; start afresh.
                         self.local = None;
                         self.generation = 0;
@@ -1403,24 +1498,40 @@ impl Worker {
             crate::metrics::answered(resp.status, took);
         }
         if req.url != "/.well-known/appspecific/com.chrome.devtools.json" && !delivery {
+            // Query strings' sensitive values are masked (see `redact`).
             match crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::metrics::TEXT => {
-                    crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms)\n", req.method, req.url, resp.status, took * 1000.0))
-                }
+                crate::metrics::TEXT => crate::metrics::log_line(format_args!(
+                    "{} {} -> {} ({:.1}ms)\n",
+                    req.method,
+                    crate::redact::url(&req.url),
+                    resp.status,
+                    took * 1000.0
+                )),
                 crate::metrics::JSON => {
                     let tenant = match self.local.as_ref().and_then(|it| it.tenant.clone().flatten()) {
                         Some(t) => format!(",\"tenant\":{}", serde_json::Value::from(&*t)),
                         None => String::new(),
                     };
-                    crate::httpd::log_fmt(format_args!(
-                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{},\"rid\":{}}}\n",
+                    // Who: the session's `user`, when the request read or set it.
+                    let user = match self.local.as_ref().and_then(crate::audit::known_user) {
+                        Some(u) => format!(",\"user\":{}", serde_json::Value::from(u)),
+                        None => String::new(),
+                    };
+                    let path = if crate::metrics::LOG_QUERY.load(std::sync::atomic::Ordering::Relaxed) {
+                        crate::redact::url(&req.url)
+                    } else {
+                        std::borrow::Cow::Borrowed(req.url.split('?').next().unwrap_or(""))
+                    };
+                    crate::metrics::log_line(format_args!(
+                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{}{},\"rid\":{}}}\n",
                         crate::httpd::iso_now(),
                         serde_json::Value::from(req.method.as_str()),
-                        serde_json::Value::from(req.url.as_str()),
+                        serde_json::Value::from(&*path),
                         resp.status,
                         took * 1000.0,
                         serde_json::Value::from(req.remote.as_str()),
                         tenant,
+                        user,
                         serde_json::Value::from(&*rid)
                     ))
                 }
@@ -1523,6 +1634,9 @@ pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), Stri
 
 /// The cookie that admits a desktop app's window.
 const LAUNCH_COOKIE: &str = "quillo_launch";
+/// The query parameter a desktop window's first request carries the token
+/// in; its value is never written to a log (see `redact::url`).
+pub const LAUNCH_PARAM: &str = "_quillo_launch";
 
 /// Whether a request is the scheduler's (it carries this process's secret).
 fn is_job_request(req: &HttpRequest) -> bool {
@@ -1584,8 +1698,8 @@ pub fn launch_gate(req: &HttpRequest, token: &str) -> Option<HttpResponse> {
         }
     }
     let (path, query) = req.url.split_once('?').unwrap_or((req.url.as_str(), ""));
-    let param = "_quillo_launch=";
-    let offered = query.split('&').find_map(|kv| kv.strip_prefix(param));
+    let param = &format!("{}=", LAUNCH_PARAM);
+    let offered = query.split('&').find_map(|kv| kv.strip_prefix(param.as_str()));
     match offered {
         None if has_cookie => None,
         None => refuse(),
@@ -1643,4 +1757,24 @@ fn island_loader(src: &str) -> String {
         ),
         src
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_client_cannot_take_every_waiting_place() {
+        // What the review saw: one address holding all of `MAX_WAITERS`.
+        let mine: Vec<Waiter> = (0..MAX_WAITERS_PER_CLIENT).map(|_| Waiter::take("192.0.2.7").expect("a place")).collect();
+        assert!(Waiter::take("192.0.2.7").is_none());
+        assert!(Waiter::take("::ffff:192.0.2.7").is_none());
+        // Its IPv6 neighbours in the same /64 are the same client.
+        let six: Vec<Waiter> = (0..MAX_WAITERS_PER_CLIENT).map(|i| Waiter::take(&format!("2001:db8::{:x}", i + 1)).expect("a place")).collect();
+        assert!(Waiter::take("2001:db8::ffff").is_none());
+        assert!(Waiter::take("192.0.2.8").is_some());
+        drop(mine);
+        drop(six);
+        assert!(Waiter::take("192.0.2.7").is_some());
+    }
 }

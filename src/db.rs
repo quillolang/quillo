@@ -52,6 +52,7 @@ pub fn install(m: &mut Map) {
         ("db.system", system),
         ("db.shards", shards),
         ("db.atomic", atomic),
+        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -71,6 +72,20 @@ pub fn is_mysql_url(s: &str) -> bool {
     s.starts_with("mysql://") || s.starts_with("mariadb://")
 }
 
+/// Whether the program's database is MySQL (or will be, once opened):
+/// `sql_name` quotes names as it reads them.
+pub(crate) fn program_db_is_mysql(it: &Interp) -> bool {
+    match slot_on(it, None) {
+        Some(DbSlot::One(b)) => b.is_mysql(),
+        Some(DbSlot::PerTenant(t)) => match &t.target {
+            Target::Text(s) => is_mysql_url(s),
+            Target::Fn(_) => t.open.lock().unwrap_or_else(|e| e.into_inner()).values().next().map_or(false, |b| b.is_mysql()),
+        },
+        Some(DbSlot::Shards(_)) => false,
+        None => std::env::var("QUILLO_DB").map_or(false, |t| is_mysql_url(&t)),
+    }
+}
+
 /// A database on a server (not a SQLite file).
 fn is_server_url(s: &str) -> bool {
     pg::is_url(s) || is_mysql_url(s)
@@ -83,8 +98,15 @@ pub enum Pinned {
     My(crate::my::Conn),
 }
 
+/// What a statement gets in a transaction that already failed because of
+/// another (see `crate::txn`).
+const CONFLICTED: &str = "the transaction conflicted with another and was rolled back";
+
 impl Pinned {
-    fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+    pub(crate) fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+        if self.conflicted() {
+            return Err(CONFLICTED.into());
+        }
         match self {
             Pinned::Pg(c) => c.query(sql, params, limit),
             #[cfg(feature = "mysql")]
@@ -92,7 +114,10 @@ impl Pinned {
         }
     }
 
-    fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+    pub(crate) fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+        if self.conflicted() {
+            return Err(CONFLICTED.into());
+        }
         match self {
             Pinned::Pg(c) => c.exec(sql, params),
             #[cfg(feature = "mysql")]
@@ -100,18 +125,34 @@ impl Pinned {
         }
     }
 
-    fn batch(&mut self, sql: &str) -> Result<(), String> {
+    pub(crate) fn batch(&mut self, sql: &str) -> Result<(), String> {
         match self {
             Pinned::Pg(c) => c.batch(sql),
             #[cfg(feature = "mysql")]
             Pinned::My(c) => c.batch(sql),
         }
     }
+
+    fn watch_conflicts(&mut self, on: bool) {
+        match self {
+            Pinned::Pg(c) => c.watch_conflicts(on),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.watch_conflicts(on),
+        }
+    }
+
+    fn conflicted(&self) -> bool {
+        match self {
+            Pinned::Pg(c) => c.conflicted(),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.conflicted(),
+        }
+    }
 }
 
 impl Backend {
     /// A connection from the pool, for a server database.
-    fn checkout(&self) -> Result<Pinned, String> {
+    pub(crate) fn checkout(&self) -> Result<Pinned, String> {
         match self {
             Backend::Postgres(p) => p.checkout().map(Pinned::Pg),
             #[cfg(feature = "mysql")]
@@ -120,7 +161,19 @@ impl Backend {
         }
     }
 
-    fn give_back(&self, c: Pinned) {
+    /// A connection for work done while the request may hold one already
+    /// (Quillo's own tables): it never waits for one of the pool's (see
+    /// `pg::Pool::checkout_nested`). MySQL's pool is the driver's, larger.
+    pub(crate) fn checkout_nested(&self) -> Result<Pinned, String> {
+        match self {
+            Backend::Postgres(p) => p.checkout_nested().map(Pinned::Pg),
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(p) => p.checkout().map(Pinned::My),
+            Backend::Sqlite(_) => Err("SQLite has no pool".into()),
+        }
+    }
+
+    pub(crate) fn give_back(&self, c: Pinned) {
         match (self, c) {
             (Backend::Postgres(p), Pinned::Pg(c)) => p.give_back(c),
             #[cfg(feature = "mysql")]
@@ -130,7 +183,7 @@ impl Backend {
         }
     }
 
-    fn is_mysql(&self) -> bool {
+    pub(crate) fn is_mysql(&self) -> bool {
         #[cfg(feature = "mysql")]
         if let Backend::Mysql(_) = self {
             return true;
@@ -260,8 +313,38 @@ fn db_err(e: impl std::fmt::Display) -> Value {
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
-    c.execute_batch("pragma foreign_keys = on; pragma journal_mode = wal;")?;
+    c.execute_batch("pragma foreign_keys = on")?;
+    wal(&c)?;
     Ok(c)
+}
+
+/// Puts a database in WAL mode, safely when several connections (several
+/// servers) open a new file at once. While the file is still empty, SQLite
+/// can take one connection's log for a stale one and drop what was
+/// committed to it; so a new file first gets its first page, under the
+/// write lock, from whichever connection comes first. Then the switch to
+/// WAL, which SQLite refuses at once (busy, without waiting) while another
+/// connection is reading, is tried again for a few seconds.
+fn wal(c: &Connection) -> Result<(), rusqlite::Error> {
+    let pages = |c: &Connection| c.query_row("pragma page_count", [], |r| r.get::<_, i64>(0));
+    if pages(c)? == 0 {
+        c.execute_batch("begin immediate")?;
+        let made = match pages(c) {
+            Ok(0) => c.execute_batch("create table _quillo_new (x); drop table _quillo_new"),
+            other => other.map(|_| ()),
+        };
+        c.execute_batch(if made.is_ok() { "commit" } else { "rollback" })?;
+        made?;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match c.query_row("pragma journal_mode = wal", [], |r| r.get::<_, String>(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy && start.elapsed() < std::time::Duration::from_secs(5) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            r => return r.map(|_| ()),
+        }
+    }
 }
 
 /// Opens a path (SQLite) or a postgres:// URL. Connecting to Postgres
@@ -295,7 +378,7 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend,
 }
 
 /// The database a call is on: a connection's (`db.connect`), or the program's.
-fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
+pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
     let Some(i) = on else { return backend(it) };
     let slot = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone());
     match slot {
@@ -421,10 +504,41 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
     }
 }
 
+/// A connection of its own for a transaction. In a request, while none is
+/// free, the request waits without holding one of the server's waiting
+/// threads: those also run the queries and commits of the transactions
+/// that hold the connections, so waiting there could stop them all.
+pub(crate) fn checkout_for_tx(it: &mut Interp, b: &Arc<Backend>) -> Result<Pinned, String> {
+    let Backend::Postgres(pool) = &**b else {
+        let b = b.clone();
+        return it.unlocked(move || b.checkout());
+    };
+    let until = std::time::Instant::now() + crate::pg::CHECKOUT_WAIT;
+    let mut pause = std::time::Duration::from_millis(2);
+    loop {
+        let p = b.clone();
+        let taken = it.unlocked(move || match &*p {
+            Backend::Postgres(pool) => pool.try_checkout(),
+            _ => unreachable!(),
+        })?;
+        if let Some(c) = taken {
+            return Ok(Pinned::Pg(c));
+        }
+        if std::time::Instant::now() >= until {
+            return Err(pool.none_free());
+        }
+        // Made inside the future: a timer belongs to the runtime that runs it.
+        if crate::httpd::await_elsewhere(Box::pin(async move { tokio::time::sleep(pause).await })).is_none() {
+            std::thread::sleep(pause);
+        }
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Runs `f` on a server database's connection without holding the
 /// interpreter lock: the request's transaction connection if it has one,
 /// else one from the pool.
-fn pooled_run<T: Send>(
+pub(crate) fn pooled_run<T: Send>(
     it: &mut Interp,
     b: &Arc<Backend>,
     f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send,
@@ -451,6 +565,12 @@ fn pooled_run<T: Send>(
     }
 }
 
+/// Whether this request has a `db.transaction` open on `b` (a server
+/// database: SQLite's is on its one connection).
+pub(crate) fn in_transaction(it: &Interp, b: &Arc<Backend>) -> bool {
+    it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b))
+}
+
 /// In the server, outside a transaction, queries use the connections all
 /// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
 fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
@@ -472,19 +592,57 @@ fn to_sql(v: &Value) -> Sql {
         Value::Bool(b) => Sql::Integer(*b as i64),
         Value::Int(n) => Sql::Integer(*n),
         Value::Float(f) => Sql::Real(*f),
+        // SQLite has no decimals: the text, exactly (see `Col::Dec`).
+        Value::Dec(d) => Sql::Text(d.to_string()),
         Value::Str(s) => Sql::Text(s.to_string()),
         Value::Html(h) => Sql::Text(h.to_string()),
         other => Sql::Text(other.to_json().to_string()),
     }
 }
 
+/// What a SQLite column's declared type says about reading it.
+#[derive(Clone, Copy, PartialEq)]
+enum Col {
+    Plain,
+    /// `boolean` or `bool`.
+    Bool,
+    /// `decimal(12,2)`, `decimal_text`, `money`, `numeric(12,2)`: read as
+    /// decimals. A bare `numeric` is SQLite's name for any number, and
+    /// stays one.
+    Dec,
+}
+
+fn col_kind(decl: Option<&str>) -> Col {
+    let t = decl.unwrap_or("").trim().to_ascii_lowercase();
+    if t.starts_with("bool") {
+        Col::Bool
+    } else if ["decimal", "money", "dec(", "numeric("].iter().any(|p| t.starts_with(p)) || t == "dec" {
+        Col::Dec
+    } else {
+        Col::Plain
+    }
+}
+
 /// SQLite has no booleans: `true` is stored as 1. In a column declared
 /// `boolean` (or `bool`) 0 and 1 come back as `false` and `true`, since 0
 /// would be true in Quillo; elsewhere, such as `select x = 1`, they are ints.
-fn from_sql(v: ValueRef, is_bool: bool) -> Value {
+///
+/// Nor has it decimals. A column declared `decimal(12,2)` (or
+/// `numeric(12,2)`, `money`) comes back as decimals, from what SQLite kept: text exactly, an
+/// integer, or a real through its shortest text. Such a column has NUMERIC
+/// affinity, so SQLite turns "0.10" into the real 0.1 (and more than 15
+/// digits are rounded); one declared `decimal_text` has TEXT affinity and
+/// keeps the digits as written.
+fn from_sql(v: ValueRef, kind: Col) -> Value {
     match v {
         ValueRef::Null => Value::Nil,
-        ValueRef::Integer(n @ (0 | 1)) if is_bool => Value::Bool(n == 1),
+        ValueRef::Integer(n @ (0 | 1)) if kind == Col::Bool => Value::Bool(n == 1),
+        ValueRef::Integer(n) if kind == Col::Dec => Value::Dec(crate::decimal::Dec::from_i64(n)),
+        ValueRef::Real(f) if kind == Col::Dec => crate::decimal::Dec::from_f64(f).map_or(Value::Float(f), Value::Dec),
+        ValueRef::Text(t) if kind == Col::Dec => {
+            let s = String::from_utf8_lossy(t);
+            crate::decimal::Dec::parse(s.trim()).map_or_else(|| Value::str(&*s), Value::Dec)
+        }
         ValueRef::Integer(n) => Value::Int(n),
         ValueRef::Real(f) => Value::Float(f),
         ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t)),
@@ -527,20 +685,16 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
     Ok(())
 }
 
-fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     bind(&mut stmt, params)?;
-    let cols: Vec<(String, bool)> = stmt
-        .columns()
-        .iter()
-        .map(|c| (c.name().to_string(), c.decl_type().map_or(false, |t| t.to_ascii_lowercase().starts_with("bool"))))
-        .collect();
+    let cols: Vec<(String, Col)> = stmt.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect();
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let mut m = Map::new();
-        for (i, (c, is_bool)) in cols.iter().enumerate() {
-            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *is_bool));
+        for (i, (c, kind)) in cols.iter().enumerate() {
+            m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
         }
         out.push(Value::map(m));
         if limit.map_or(false, |l| out.len() >= l) {
@@ -554,7 +708,7 @@ fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) ->
 /// and its writes are announced (after the transaction, if any, commits).
 /// A connection's tables are topics of their own (`db@<label>:orders`), so
 /// that one `orders` changing does not refresh pages showing another.
-fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
+pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
     let t = crate::sqlinfo::tables_of(sql);
     let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(l, _)| l.clone())) {
         Some(label) => format!("db@{}:", label),
@@ -652,10 +806,11 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
         // Databases named around {tenant}: `app_{tenant}` in mysql://host/app_{tenant}.
         #[cfg(feature = "mysql")]
         {
-            let path = template.split('?').next().unwrap_or("");
+            let (path, query) = template.split_once('?').unwrap_or((&template, ""));
             let (server, db) = path.rsplit_once('/').unwrap_or((path, ""));
             let (pre, post) = db.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
-            let server = format!("{}/", server);
+            // The URL's options (TLS's among them) are the server's too.
+            let server = if query.is_empty() { format!("{}/", server) } else { format!("{}/?{}", server, query) };
             match it.unlocked(move || crate::my::Pool::open_as(&server, false).and_then(|p| p.databases())) {
                 Ok(all) => names.extend(all.iter().filter_map(|d| d.strip_prefix(&pre).and_then(|r| r.strip_suffix(&post)).map(str::to_string))),
                 Err(e) => return Ok(db_err(e)),
@@ -667,7 +822,14 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
             return fail(line, "`db.tenants` lists PostgreSQL schemas (?schema=t_{tenant}), not databases");
         };
         let suffix: String = after.chars().take_while(|c| *c != '&').collect();
-        let base = template.split('?').next().unwrap_or("").to_string();
+        // The URL without the schema: its other options (TLS's among them) kept.
+        let base = match template.split_once('?') {
+            Some((base, query)) => {
+                let rest: Vec<&str> = query.split('&').filter(|p| !p.starts_with("schema=")).collect();
+                if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) }
+            }
+            None => template.clone(),
+        };
         let found = it.unlocked(move || -> Result<Vec<String>, String> {
             let pool = pg::Pool::open(&base)?;
             let mut c = pool.checkout()?;
@@ -817,6 +979,7 @@ fn connection(i: usize) -> Value {
         ("db.migrate", migrate),
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
+        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -875,6 +1038,9 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
+    if let Some(why) = crate::audit::refused(&sql) {
+        return Ok(db_err(why));
+    }
     it.wrote_req = Some(crate::httpd::request_number());
     let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
@@ -976,6 +1142,87 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
     Some(Some(conns.len() - 1))
 }
 
+/// Runs `sql(mysql)` on the database of Quillo's own tables (made if
+/// needed, as for calls made later), apart from the program's transactions
+/// and live updates: for sessions and rate limits. Rows for a `select`.
+///
+/// A server database gives it a connection of its own. SQLite has one, so
+/// while a transaction is open on it (`db.transaction`, `idempotent`), a
+/// change would be part of that transaction: rolled back with a try that
+/// failed, made again by the next. So changes wait, and are made once the
+/// transaction has ended (`own_later`), whatever became of it: a session
+/// set or ended, a rate limit counted, as on a server database. Reads and
+/// tables made are not held back.
+pub(crate) fn own_sql(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    own_sql_made(it, sql, params, None)
+}
+
+/// `own_sql`, with what makes the change's table (statements, by
+/// dialect) if it is not there when a held change is made: made inside the
+/// transaction, it went with it if that was rolled back.
+pub(crate) fn own_sql_made(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>, make: Option<fn(bool) -> String>) -> Result<Vec<Value>, String> {
+    let b = match system_on_for(it, true, true) {
+        Some(on) => backend_on(it, on)?,
+        None => backend(it)?,
+    };
+    let text = sql(b.is_mysql());
+    if own_held(&b, &text) {
+        it.own_later.push(Held { make: make.map(|m| m(b.is_mysql())), backend: b, sql: text, params });
+        return Ok(Vec::new());
+    }
+    apart(it, &b, text, params)
+}
+
+/// A change to Quillo's own tables waiting for a transaction to end.
+pub struct Held {
+    backend: Arc<Backend>,
+    sql: String,
+    params: Vec<Value>,
+    make: Option<String>,
+}
+
+/// Whether a change to Quillo's own tables waits for a transaction to end.
+fn own_held(b: &Backend, sql: &str) -> bool {
+    let Backend::Sqlite(m) = b else { return false };
+    let verb = sql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or("").to_ascii_lowercase();
+    matches!(verb.as_str(), "insert" | "update" | "delete") && !m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit()
+}
+
+/// Whether `own_sql`'s next change would wait (rate limits count it
+/// themselves then).
+pub(crate) fn own_waits(it: &mut Interp) -> bool {
+    let b = match system_on_for(it, true, true) {
+        Some(on) => backend_on(it, on),
+        None => backend(it),
+    };
+    b.map_or(false, |b| own_held(&b, "insert"))
+}
+
+/// Makes the changes `own_sql` held back, on databases whose transaction
+/// has ended (at the end of each outermost transaction, and of a request).
+pub(crate) fn own_later(it: &mut Interp) {
+    if it.own_later.is_empty() {
+        return;
+    }
+    for h in std::mem::take(&mut it.own_later) {
+        let free = matches!(&*h.backend, Backend::Sqlite(m) if m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit());
+        if !free {
+            it.own_later.push(h);
+            continue;
+        }
+        let mut r = apart(it, &h.backend, h.sql.clone(), h.params.clone());
+        if let (Err(_), Some(make), Backend::Sqlite(m)) = (&r, &h.make, &*h.backend) {
+            r = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(make).map(|_| Vec::new()).map_err(|e| e.to_string());
+            if r.is_ok() {
+                r = apart(it, &h.backend, h.sql, h.params);
+            }
+        }
+        if let Err(e) = r {
+            eprintln!("quillo: Quillo's own tables: {}", e);
+        }
+    }
+}
+
 /// Whether a program uses `db.atomic` (then transactions it left prepared
 /// are looked after: see `recover`).
 pub fn uses_atomic(it: &Interp) -> bool {
@@ -1002,17 +1249,17 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// `db.exec` / `db.query` on connection `on` (None: the program's).
-fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+pub(crate) fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
     exec(it, args, 0)
 }
 
-fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+pub(crate) fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
     query(it, args, 0)
 }
 
-fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
+pub(crate) fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
     backend_on(it, on).map_or(false, |b| b.is_mysql())
 }
 
@@ -1132,6 +1379,9 @@ pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    if let Some(why) = crate::audit::refused(&sql) {
+        return Err(why);
+    }
     if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err("not while the page is prefetched".into());
     }
@@ -1194,37 +1444,76 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `db.transaction(() => { ... })`: commits if the function returns normally,
 /// rolls back if it fails, returns an error value, or replies early.
-/// Transactions nest (as savepoints).
+/// Transactions nest (as savepoints). `db.transaction({ isolation, retries },
+/// f)` sets the isolation level and runs `f` again on a conflict (see `txn`).
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
-    let f = match args.first() {
-        Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
-        other => {
-            return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
+    let (opts, f) = match args.as_slice() {
+        [f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::Options::default(), f.clone()),
+        [o @ Value::Map(_), f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::options(o, "db.transaction", line)?, f.clone()),
+        _ => {
+            let got = args.last().map_or("nothing", |v| v.type_name());
+            return fail(line, format!("`db.transaction` expects a function (after its options, if any), got {}", got));
         }
     };
+    crate::txn::run(it, on, &opts, line, &mut |it| it.call(&f, Vec::new(), line))
+}
+
+/// One try of a transaction on connection `on`: what `body` gave (or the
+/// error that ended it), and whether the database gave up on it because of
+/// another transaction (then it is worth another try; told only for the
+/// outermost transaction, the one that can be tried again).
+pub(crate) fn attempt(
+    it: &mut Interp,
+    on: Option<usize>,
+    opts: &crate::txn::Options,
+    line: u32,
+    body: &mut dyn FnMut(&mut Interp) -> R,
+) -> (R, bool) {
     let b = match backend_on(it, on) {
         Ok(b) => b,
-        Err(e) => return Ok(db_err(e)),
+        Err(e) => return (Ok(db_err(e)), false),
     };
     let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
+    let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
     match &*b {
         Backend::Sqlite(m) => {
-            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql).map_err(|e| e.to_string());
-            if let Err(e) = run("savepoint quillo_tx") {
-                return Ok(db_err(e));
+            let outermost = m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit();
+            if !outermost && opts.isolation.is_some() {
+                return (nested_isolation(), false);
+            }
+            // With options, the outermost takes the write lock at once.
+            let immediate = outermost && opts.given;
+            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql);
+            let busy = |e: &rusqlite::Error| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
+            if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
+                return (Ok(db_err(&e)), immediate && busy(&e));
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
-            let r = it.call(&f, Vec::new(), line);
+            let r = body(it);
             it.sqlite_tx -= 1;
             let commit = ok(&r);
-            let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
+            let end = match (commit, immediate) {
+                (true, true) => "commit",
+                (false, true) => "rollback",
+                (true, false) => "release quillo_tx",
+                (false, false) => "rollback to quillo_tx; release quillo_tx",
+            };
             let ended = run(end);
+            if ended.is_err() && immediate && commit {
+                let _ = run("rollback");
+            }
             tx_end(it, mark, commit && ended.is_ok());
+            if outermost {
+                own_later(it);
+            }
             match ended {
-                Err(e) if commit => Ok(db_err(e)),
-                _ => r,
+                Err(e) if commit => {
+                    let again = immediate && busy(&e);
+                    (Ok(db_err(e)), again)
+                }
+                _ => (r, false),
             }
         }
         _ => {
@@ -1232,11 +1521,15 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             // Keep one connection for this request until the outermost
             // transaction ends.
             let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
+            if pinned && opts.isolation.is_some() {
+                return (nested_isolation(), false);
+            }
             if !pinned {
-                let c = match it.unlocked(|| pool.checkout()) {
+                let mut c = match checkout_for_tx(it, &b) {
                     Ok(c) => c,
-                    Err(e) => return Ok(db_err(e)),
+                    Err(e) => return (Ok(db_err(e)), false),
                 };
+                c.watch_conflicts(true);
                 it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
@@ -1245,14 +1538,21 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 tx.depth += 1;
                 tx.depth
             };
-            let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
+            let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation) } else { format!("savepoint quillo_tx_{}", depth) };
             let started = pooled_run(it, &b, move |c| c.batch(&begin));
             let mark = tx_begin(it);
             let r = match started {
-                Ok(()) => it.call(&f, Vec::new(), line),
+                Ok(()) => body(it),
                 Err(e) => Ok(db_err(e)),
             };
-            let commit = ok(&r);
+            let conflicted = |it: &Interp| {
+                let g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                g.iter().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.as_ref()).map_or(false, |c| c.conflicted())
+            };
+            // A statement failed because of another transaction: this one
+            // is over, whatever the function made of the error.
+            let lost = depth == 1 && conflicted(it);
+            let commit = ok(&r) && !lost;
             let end = match (commit, depth == 1) {
                 (true, true) => "commit".to_string(),
                 (false, true) => "rollback".to_string(),
@@ -1260,6 +1560,8 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
             let ended = pooled_run(it, &b, move |c| c.batch(&end));
+            // The commit itself can fail so (a serializable transaction's often does).
+            let lost = lost || (depth == 1 && conflicted(it));
             tx_end(it, mark, commit && ended.is_ok());
             let done = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1271,12 +1573,14 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     None
                 }
             };
-            if let Some(TxConn { conn: Some(c), .. }) = done {
+            if let Some(TxConn { conn: Some(mut c), .. }) = done {
+                c.watch_conflicts(false);
                 pool.give_back(c);
             }
             match ended {
-                Err(e) if commit => Ok(db_err(e)),
-                _ => r,
+                Err(e) if commit => (Ok(db_err(e)), lost),
+                _ if lost && ok(&r) => (Ok(crate::txn::gave_up()), true),
+                _ => (r, lost),
             }
         }
     }
@@ -1429,7 +1733,7 @@ fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> 
         _ => {
             let b = b.clone();
             it.unlocked(move || {
-                let mut c = b.checkout()?;
+                let mut c = b.checkout_nested()?;
                 let lower = sql.trim_start().to_ascii_lowercase();
                 let r = if lower.starts_with("select") || lower.starts_with("xa recover") {
                     c.query(&sql, &params, None)
@@ -1553,8 +1857,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 _ => unreachable!(),
             },
             _ => {
-                let b = p.b.clone();
-                match it.unlocked(move || b.checkout()) {
+                match checkout_for_tx(it, &p.b) {
                     Ok(c) => {
                         it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
                         let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };

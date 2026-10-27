@@ -1,5 +1,7 @@
 //! UDP: packets to a program's ports, and from it (src/udp.rs).
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -23,7 +25,7 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn free_udp_port() -> u16 {
@@ -39,12 +41,14 @@ fn start(file: &Path, port: u16, extra: &[&str]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server(child);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server(child)
+    server
 }
 
 fn get(port: u16, path: &str) -> String {
@@ -267,35 +271,47 @@ fn a_port_already_taken_is_an_error_when_the_program_starts() {
     assert!(e.to_string().contains(&format!("cannot listen on UDP port {}", up)), "{}", e);
 }
 
+/// A burst far faster than a handler keeps up with (the sender here puts
+/// out a few hundred thousand packets a second; a debug build's handler
+/// takes about a hundred thousand) is held in the queue and handed over in
+/// batches. The queue is made to hold the whole burst: with the default of
+/// 10,000, the oldest would be dropped as promised (see
+/// `a_full_queue_drops_its_oldest_packets`). What may still be lost is what
+/// the system itself drops before the receiving thread takes it, which a
+/// busy machine can make happen; Quillo drops nothing.
 #[test]
 fn many_packets_go_through_in_batches() {
     let d = dir("many");
     let up = free_udp_port();
+    let total = 100_000;
     std::fs::write(
         d.join("main.qwe"),
-        format!("let n = 0\nlet sum = 0\nudp.listen({up}, (p) => {{\n    n += 1\n    sum += len(p.bytes)\n}})\nroute GET /n = str(n)\n"),
+        format!("let n = 0\nlet sum = 0\nudp.listen({up}, (p) => {{\n    n += 1\n    sum += len(p.bytes)\n}}, {{ queue: {total} }})\nroute GET /n = str(n)\n"),
     )
     .unwrap();
     let port = free_port();
-    let _s = start(&d.join("main.qwe"), port, &[]);
+    let _s = start(&d.join("main.qwe"), port, &["--metrics"]);
     let c = client();
-    let total = 100_000;
     let payload = [7u8; 64];
     let t = Instant::now();
-    for i in 0..total {
+    for _ in 0..total {
         c.send_to(&payload, ("127.0.0.1", up)).unwrap();
-        // A little room now and then, as a real sender's packets have.
-        if i % 2000 == 1999 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
-    let got: u64 = eventually(30, "the packets never all arrived", || {
+    let metric = |name: &str| -> u64 {
+        let m = get(port, "/_quillo/metrics");
+        m.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| panic!("no {} in {}", name, m))
+    };
+    // Settled once every packet has been handled, or every one the socket
+    // received with time given for the last to be taken from the system.
+    let sent = Instant::now();
+    let got: u64 = eventually(60, "the packets never all reached the handler", || {
         let n: u64 = get(port, "/n").parse().unwrap();
-        let settled = n == total || t.elapsed() > Duration::from_secs(10);
+        let settled = n == total || (n == metric("quillo_udp_received_total ") && sent.elapsed() > Duration::from_secs(3));
         settled.then_some(n)
     });
     let secs = t.elapsed().as_secs_f64();
     eprintln!("udp: {} of {} packets handled in {:.2}s ({:.0}/s)", got, total, secs, got as f64 / secs);
+    assert_eq!(metric("quillo_udp_dropped_total "), 0);
     assert!(got as f64 >= total as f64 * 0.95, "only {} of {} arrived", got, total);
 }
 

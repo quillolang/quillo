@@ -11,7 +11,8 @@
 //!
 //! Paths are inside the program's folder. Decoding is limited (12,000
 //! pixels a side, 512 MiB) so that a small file claiming to be a huge image
-//! cannot take the server's memory, and it runs off the event loop.
+//! cannot take the server's memory, and it runs off the event loop, a few
+//! conversions at a time (see `in_turn`).
 
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
@@ -185,11 +186,49 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
     Ok((img.width(), img.height()))
 }
 
+/// Most images converted at once: each may take up to `MOST_BYTES` to
+/// decode, so many uploads at once must not take that many times over.
+fn most_converting() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4)
+}
+
+/// Most conversions waiting for their turn; past that, an error at once.
+const MOST_WAITING: usize = 64;
+
+/// `f` once fewer than `most_converting()` conversions run, or an error when
+/// too many already wait.
+fn in_turn<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    use std::sync::{Condvar, Mutex};
+    // (running, waiting)
+    static AT_ONCE: Mutex<(usize, usize)> = Mutex::new((0, 0));
+    static FREED: Condvar = Condvar::new();
+    let mut n = AT_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    if n.0 >= most_converting() && n.1 >= MOST_WAITING {
+        return Err("too many images are being converted at once; try again shortly".into());
+    }
+    n.1 += 1;
+    while n.0 >= most_converting() {
+        n = FREED.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    n.1 -= 1;
+    n.0 += 1;
+    drop(n);
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            AT_ONCE.lock().unwrap_or_else(|e| e.into_inner()).0 -= 1;
+            FREED.notify_one();
+        }
+    }
+    let _done = Done;
+    f()
+}
+
 fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let src = path_arg(it, &args, 0, "image.convert", line)?;
     let dest = path_arg(it, &args, 1, "image.convert", line)?;
     let job = job_of(args.get(2), line)?;
-    Ok(match it.unlocked(move || make(&src, &dest, job)) {
+    Ok(match it.unlocked(move || in_turn(|| make(&src, &dest, job))) {
         Ok((w, h)) => {
             let mut m = Map::new();
             m.insert("width".into(), Value::Int(w as i64));
@@ -198,4 +237,34 @@ fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         Err(e) => err_value(e),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_few_images_are_converted_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // What the review saw: as many conversions at once as uploads.
+        static NOW: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    in_turn(|| {
+                        let n = NOW.fetch_add(1, SeqCst) + 1;
+                        MOST.fetch_max(n, SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        NOW.fetch_sub(1, SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        assert!(MOST.load(SeqCst) <= most_converting(), "{} at once", MOST.load(SeqCst));
+    }
 }

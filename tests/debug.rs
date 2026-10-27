@@ -130,7 +130,18 @@ impl Drop for Dap {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    low_port()
+}
+
+/// A free port below the ones systems give to outgoing connections (see
+/// tests/support's `free_port`).
+fn low_port() -> u16 {
+    loop {
+        let port = 10_000 + fastrand::u16(0..20_000);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// GET `path` on a thread of its own (the program stops while answering it).

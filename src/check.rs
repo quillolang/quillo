@@ -44,13 +44,15 @@ const FN: u16 = 128;
 const HTML: u16 = 256;
 const RESP: u16 = 512;
 const ERR: u16 = 1024;
+const DEC: u16 = 2048;
 const NUM: u16 = INT | FLOAT;
-const ANY: u16 = 2047;
-const BASE: [(u16, &str); 11] = [
+const ANY: u16 = 4095;
+const BASE: [(u16, &str); 12] = [
     (NIL, "null"),
     (BOOL, "bool"),
     (INT, "int"),
     (FLOAT, "float"),
+    (DEC, "dec"),
     (STR, "str"),
     (LIST, "list"),
     (MAP, "map"),
@@ -431,12 +433,28 @@ fn name_bits(n: &str) -> u16 {
     }
 }
 
+/// A money value's type (src/money.rs).
+fn money_t() -> T {
+    map_of(vec![(Arc::from("amount"), T::of(DEC)), (Arc::from("currency"), T::of(STR))])
+}
+
+/// After an error about a decimal and a float: what to do about it.
+fn dec_hint(x: T, y: T) -> &'static str {
+    let mixed = |a: T, b: T| a.bits & DEC != 0 && b.bits & FLOAT != 0;
+    if mixed(x, y) || mixed(y, x) {
+        ": a dec is exact and a float is not, so convert one with dec(x) or float(x)"
+    } else {
+        ""
+    }
+}
+
 fn lit_t(l: &Lit) -> T {
     T::of(match l {
         Lit::Nil => NIL,
         Lit::Bool(_) => BOOL,
         Lit::Int(_) => INT,
         Lit::Float(_) => FLOAT,
+        Lit::Dec(_) => DEC,
         Lit::Str(_) => STR,
     })
 }
@@ -467,6 +485,7 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                 BinOp::Add => match (x, y) {
                     (INT, INT) => Some(INT),
                     (STR, _) | (_, STR) => Some(STR),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (HTML, HTML) => Some(HTML),
                     (LIST, LIST) => Some(LIST),
                     (MAP, MAP) => Some(MAP),
@@ -475,16 +494,18 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                 },
                 BinOp::Div => match (x, y) {
                     (INT, INT) => Some(INT | FLOAT),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
                 },
                 BinOp::Sub | BinOp::Mul | BinOp::Mod => match (x, y) {
                     (INT, INT) => Some(INT),
+                    (DEC, DEC | INT) | (INT, DEC) => Some(DEC),
                     (INT | FLOAT, INT | FLOAT) => Some(FLOAT),
                     _ => None,
                 },
                 BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match (x, y) {
-                    (INT | FLOAT, INT | FLOAT) | (STR, STR) => Some(BOOL),
+                    (INT | FLOAT, INT | FLOAT) | (STR, STR) | (DEC, DEC | INT) | (INT, DEC) => Some(BOOL),
                     _ => None,
                 },
                 BinOp::Range => match (x, y) {
@@ -511,6 +532,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("str", "any=", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
+    ("dec", "any", "dec | error(str)"),
+    ("format_number", "num | dec, str | null=, int=", "str"),
     ("len", "str | list | map | html | null", "int"),
     ("type_of", "any", "str"),
     ("upper", "str", "str"),
@@ -566,10 +589,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
-    ("abs", "num", "num"),
-    ("round", "num, int=", "num"),
-    ("floor", "num", "num"),
-    ("ceil", "num", "num"),
+    ("abs", "num | dec", "num | dec"),
+    ("round", "num | dec, int=, str=", "num | dec"),
+    ("floor", "num | dec", "num | dec"),
+    ("ceil", "num | dec", "num | dec"),
     ("sqrt", "num", "float"),
     ("pow", "num, num", "num"),
     ("unique", "list | null", "list"),
@@ -627,21 +650,32 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
-    ("db.transaction", "fn", "any"),
+    ("db.transaction", "map | fn, fn=", "any"),
+    ("idempotent", "map | fn, fn=", "any"),
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
-    ("http.get", "str, map | null=", "map | error(str)"),
-    ("http.delete", "str, map | null=", "map | error(str)"),
-    ("http.post", "str, any=, map | null=", "map | error(str)"),
-    ("http.put", "str, any=, map | null=", "map | error(str)"),
-    ("http.patch", "str, any=, map | null=", "map | error(str)"),
-    ("http.request", "str, str, any=, map | null=", "map | error(str)"),
+    ("http.get", "str, map | null=, map | null=", "map | error(str)"),
+    ("http.delete", "str, map | null=, map | null=", "map | error(str)"),
+    ("http.post", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.put", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.patch", "str, any=, map | null=, map | null=", "map | error(str)"),
+    ("http.request", "str, str, any=, map | null=, map | null=", "map | error(str)"),
     ("set_cookie", "str, any=, map | null=", "null"),
     ("delete_cookie", "str, map | null=", "null"),
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
     ("end_session", "", "null"),
+    // src/session_store.rs, src/access.rs, src/limits.rs
+    ("sessions", "map", "null"),
+    ("renew_session", "", "null"),
+    ("end_sessions", "any, map | null=", "int"),
+    ("user_sessions", "any", "list | error(str)"),
+    ("security_headers", "map | bool | null=", "null"),
+    ("csp", "map | bool | null=", "null"),
+    ("csp_nonce", "", "str"),
+    ("rate_limit", "str, int, str | int, map | null=", "bool"),
+    ("rate_limit_reset", "str, map | null=", "null"),
     ("image.info", "str", "map | error(str)"),
     ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),
@@ -650,6 +684,21 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.hash_password", "str", "str"),
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
+    ("crypto.totp_secret", "int=", "str"),
+    ("crypto.totp_uri", "str, str, str | null=", "str"),
+    ("crypto.totp_verify", "str, str | int | null, map | null=", "int | null"),
+    ("crypto.recovery_codes", "int=", "list"),
+    ("crypto.verify_recovery_code", "str, list | null", "int | null"),
+    ("crypto.encrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.decrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.reencrypt", "str, str | null=", "str | error(str)"),
+    ("crypto.verify_webhook", "str, str | null, str | null, map | null=", "bool | error(str)"),
+    ("audit", "str, any=", "map | error(str)"),
+    ("audit.query", "map | null=", "list | error(str)"),
+    ("audit.verify", "", "map | error(str)"),
+    ("audit.actor", "fn", "null"),
+    ("db.backup", "str, map | null=", "map | error(str)"),
+    ("redact", "str | list", "null"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
@@ -661,6 +710,21 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.open", "str, fn, map | null=", "map"),
     ("media.rtp", "str, map", "null"),
     ("media.streams", "", "list"),
+    // src/money.rs
+    ("money.of", "dec | int | str, str, str=", "map | error(str)"),
+    ("money.from_minor", "int, str", "map | error(str)"),
+    ("money.to_minor", "map", "int"),
+    ("money.add", "map, map", "map"),
+    ("money.sub", "map, map", "map"),
+    ("money.mul", "map, dec | int, str=", "map"),
+    ("money.neg", "map", "map"),
+    ("money.compare", "map, map", "int"),
+    ("money.zero", "str", "map | error(str)"),
+    ("money.is_zero", "map", "bool"),
+    ("money.allocate", "map, list | int", "list"),
+    ("money.round", "map, str=", "map"),
+    ("money.minor_units", "str", "int | error(str)"),
+    ("money.format", "map, str | null=", "str"),
     // src/numeric.rs
     ("math.sqrt", "num", "float"),
     ("math.cbrt", "num", "float"),
@@ -777,19 +841,49 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("vec.matmul", "list, list", "list"),
     ("vec.transpose", "list | null", "list"),
     ("vec.column", "list | null, str | int", "list"),
+    // src/dates.rs
+    ("date.today", "str | null=", "str"),
+    ("date.now", "str | null=", "str"),
+    ("date.parse", "str, str | null=", "str | error(str)"),
+    ("date.valid", "any", "bool"),
+    ("date.of", "int, int, int", "str"),
+    ("date.parts", "str", "map"),
+    ("date.weekday", "str", "int"),
+    ("date.is_leap_year", "int | str", "bool"),
+    ("date.days_in_month", "int | str, int=", "int"),
+    ("date.add_days", "str, int", "str"),
+    ("date.add_months", "str, int", "str"),
+    ("date.add_years", "str, int", "str"),
+    ("date.days_between", "str, str", "int"),
+    ("date.months_between", "str, str", "int"),
+    ("date.start_of_month", "str", "str"),
+    ("date.end_of_month", "str", "str"),
+    ("date.to_zone", "str, str | null=", "str"),
+    ("date.date_in", "str, str | null=", "str"),
+    ("date.at", "str, str | null=, str | null=", "str"),
+    ("date.is_business_day", "str, map | null=", "bool"),
+    ("date.add_business_days", "str, int, map | null=", "str"),
+    ("date.business_days_between", "str, str, map | null=", "int"),
+    ("date.adjust", "str, str | null=, map | null=", "str"),
+    ("date.easter", "int", "str"),
+    ("date.day_count", "str, str, str", "int"),
+    ("date.year_fraction", "str, str, str", "float"),
+    ("date.format", "str, str | map", "str"),
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "re"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "audit", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload",
+      "sessions", "renew_session", "end_sessions", "user_sessions", "security_headers", "csp", "csp_nonce", "rate_limit", "rate_limit_reset",
+      "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code", "redact"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -1058,7 +1152,17 @@ pub struct Options {
     /// argument `str | null` for a `str` parameter, `count + 1` with
     /// `count: int | null`. Checks such as `x != null` narrow the type.
     pub strict_null: bool,
+    /// Read only files inside the program's folder: `use`, `mount` and
+    /// `service` paths made of plain names, as `read_file` takes them. For
+    /// code that comes from a program's users (`check_program`).
+    pub confined: bool,
 }
+
+/// How many programs deep `mount` and `service` may lead, and files deep
+/// `use` may: past that the check stops there with an error, instead of
+/// running out of stack.
+const MAX_PROGRAMS: u32 = 16;
+const MAX_USES: u32 = 64;
 
 /// Checks a program file and the files it `use`s.
 pub fn check_file(path: &Path) -> Analysis {
@@ -1104,6 +1208,12 @@ pub fn check_source_opts(src: &str, file: &str, base_dir: &Path, opts: Options) 
 }
 
 fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
+    if DEPTH.with(|d| d.get()) >= MAX_PROGRAMS {
+        let mut a = Analysis::default();
+        let message = format!("programs mount or call each other more than {} deep", MAX_PROGRAMS);
+        a.diagnostics.push(Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message });
+        return a;
+    }
     let outermost = DEPTH.with(|d| {
         d.set(d.get() + 1);
         d.get() == 1
@@ -1122,6 +1232,7 @@ fn check_source_with(src: &str, file: &str, base_dir: &Path, overrides: HashMap<
 fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let mut c = Checker::new(file);
     c.strict_null = opts.strict_null;
+    c.confined = opts.confined;
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     match Parser::new(src).parse_program() {
@@ -1200,9 +1311,6 @@ struct Checker {
     /// Checking top-level code as it runs (not a function or route body).
     sequential: bool,
     assigned: HashSet<String>,
-    /// `let`s (file, line, name) never reassigned whose value is SQL text
-    /// a program may put together (see `sql_safe`).
-    sql_texts: HashSet<(Arc<str>, u32, String)>,
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
@@ -1222,10 +1330,35 @@ struct Checker {
     hint: Option<Vec<T>>,
     /// Warn where a value may be null and null does not work (`--strict-null`).
     strict_null: bool,
+    /// See `Options::confined`.
+    confined: bool,
+    /// Files `use`d inside one another, and expressions inside one another,
+    /// at the point being checked.
+    uses: u32,
+    depth: u32,
     file: Arc<str>,
     line: u32,
     out: Analysis,
     reported: HashSet<(Arc<str>, u32, String)>,
+    /// What is known of variables' text for the SQL warning, innermost
+    /// last: the depth of the scope each was made in, its name, and what
+    /// it holds (see `SqlVar`).
+    sql_vars: Vec<(usize, String, SqlVar)>,
+    /// What the variable `define` makes next holds (set by `let`).
+    next_sql: SqlVar,
+}
+
+/// What a variable holds, as far as SQL goes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SqlVar {
+    Other,
+    /// Text that cannot carry SQL of its own: written in the program, or
+    /// made with `sql_name`.
+    Safe,
+    /// Text put together from values (`${x}` or `+ x`).
+    Built,
+    /// A connection from `db.connect`.
+    Conn,
 }
 
 fn def_key(d: &Arc<FnDef>) -> usize {
@@ -1260,7 +1393,6 @@ impl Checker {
             quiet: 0,
             sequential: true,
             assigned: HashSet::new(),
-            sql_texts: HashSet::new(),
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
@@ -1270,10 +1402,15 @@ impl Checker {
             services: HashMap::new(),
             hint: None,
             strict_null: false,
+            confined: false,
+            uses: 0,
+            depth: 0,
             file: Arc::from(file),
             line: 0,
             out: Analysis::default(),
             reported: HashSet::new(),
+            sql_vars: Vec::new(),
+            next_sql: SqlVar::Other,
         }
     }
 
@@ -1301,11 +1438,26 @@ impl Checker {
         self.diag_at(self.file.clone(), self.line, Severity::Warning, msg);
     }
 
+    fn options(&self) -> Options {
+        Options { strict_null: self.strict_null, confined: self.confined }
+    }
+
+    /// The file a `use`, `mount` or `service` names; when confined, none
+    /// for a path that could lead outside the program's folder.
+    fn file_at(&mut self, base: &Path, path: &str, file: &Arc<str>, line: u32) -> Option<PathBuf> {
+        let plain = !path.is_empty() && Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+        if self.confined && !plain {
+            self.diag_at(file.clone(), line, Severity::Error, format!("path must stay inside the program's folder: {}", path));
+            return None;
+        }
+        Some(base.join(path))
+    }
+
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
             if let Stmt::Service(name, prefix, path, _, line) = s {
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 match crate::service::offered(&full) {
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
                     Ok(defs) => {
@@ -1325,7 +1477,7 @@ impl Checker {
                         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                         let first = SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
                         if first {
-                            let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
+                            let sub = check_file_opts(&full, HashMap::new(), self.options());
                             SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
                             self.out.diagnostics.extend(sub.diagnostics);
                             if let Some(prefix) = prefix {
@@ -1348,11 +1500,11 @@ impl Checker {
             }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 if !full.is_file() {
                     self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: no such file", full.display()));
                 } else {
-                    let sub = check_file_opts(&full, HashMap::new(), Options { strict_null: self.strict_null });
+                    let sub = check_file_opts(&full, HashMap::new(), self.options());
                     self.out.diagnostics.extend(sub.diagnostics);
                     self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
                         s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
@@ -1363,7 +1515,7 @@ impl Checker {
                 continue;
             }
             if let Stmt::Use(path, line) = s {
-                let full = base.join(path);
+                let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 if !seen.insert(key) {
                     continue;
@@ -1386,9 +1538,17 @@ impl Checker {
                     }
                     continue;
                 }
+                if self.uses >= MAX_USES {
+                    self.diag_at(file.clone(), *line, Severity::Error, format!("files `use` each other more than {} deep", MAX_USES));
+                    continue;
+                }
                 match text {
                     Ok(src) => match Parser::new(&src).parse_program() {
-                        Ok(sub) => self.expand(Arc::new(sub), fname, base, seen, order),
+                        Ok(sub) => {
+                            self.uses += 1;
+                            self.expand(Arc::new(sub), fname, base, seen, order);
+                            self.uses -= 1;
+                        }
                         Err(e) => {
                             self.out.syntax_errors.push((fname.to_string(), e.line));
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
@@ -1500,9 +1660,17 @@ impl Checker {
                     self.line = *line;
                     self.scopes.clear();
                     let t = self.expr(e);
-                    self.note_sql_text(p, e);
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
+                    // What text a global holds, for the SQL warning in the
+                    // functions that use it; one reassigned anywhere holds
+                    // nothing known.
+                    if let Pattern::Bind(n) = p {
+                        if !self.assigned.contains(n) {
+                            let k = self.sql_kind(e);
+                            self.sql_vars.push((0, n.clone(), k));
+                        }
+                    }
                     for (n, t, sig) in binds {
                         let reassigned = self.assigned.contains(&n);
                         if let Some(g) = self.globals.get_mut(&n) {
@@ -1543,6 +1711,10 @@ impl Checker {
     }
 
     fn pop(&mut self) {
+        let depth = self.scopes.len().saturating_sub(1);
+        while self.sql_vars.last().map_or(false, |(d, _, _)| *d > depth) {
+            self.sql_vars.pop();
+        }
         if let Some(scope) = self.scopes.pop() {
             for (name, v) in scope {
                 if v.kind == Kind::Let && !v.used && !name.starts_with('_') && self.quiet == 0 {
@@ -1553,6 +1725,8 @@ impl Checker {
     }
 
     fn define(&mut self, name: &str, t: T, sig: Option<Arc<Sig>>, kind: Kind) {
+        let sql = std::mem::replace(&mut self.next_sql, SqlVar::Other);
+        self.sql_vars.push((self.scopes.len(), name.to_string(), sql));
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
         match self.scopes.last_mut() {
             Some(s) => {
@@ -1564,23 +1738,6 @@ impl Checker {
                 self.globals.insert(name.to_string(), Var { kind: Kind::Global, ..v });
             }
         }
-    }
-
-    /// Remembers `let order = match sort { ... }` when its value is SQL
-    /// text a program may put together, so SQL built with `order` is not
-    /// warned about.
-    fn note_sql_text(&mut self, p: &Pattern, e: &Expr) {
-        if let Pattern::Bind(n) = p {
-            if !self.assigned.contains(n) && sql_safe(e, &|v| self.sql_var(v)) {
-                self.sql_texts.insert((self.file.clone(), self.line, n.clone()));
-            }
-        }
-    }
-
-    /// Whether `name`, where it is used, is a `let` noted by `note_sql_text`.
-    fn sql_var(&self, name: &str) -> bool {
-        let v = self.scopes.iter().rev().find_map(|s| s.get(name)).or_else(|| self.globals.get(name));
-        v.is_some_and(|v| v.kind != Kind::Param && self.sql_texts.contains(&(v.file.clone(), v.line, name.to_string())))
     }
 
     fn record(&mut self, name: &str, v: &Var) {
@@ -1883,19 +2040,33 @@ impl Checker {
             Stmt::Let(p, e, line) => {
                 self.line = *line;
                 let t = self.expr(e);
-                self.note_sql_text(p, e);
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
+                let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
                 for (n, t, sig) in binds {
                     let kind = if matches!(p, Pattern::Bind(_)) { Kind::Let } else { Kind::Bound };
                     let t = if self.assigned.contains(&n) { T::ANY } else { t };
+                    self.next_sql = sql;
                     self.define(&n, t, sig, kind);
                 }
+                self.next_sql = SqlVar::Other;
                 T::of(NIL)
             }
             Stmt::Assign(name, op, e, line) => {
                 self.line = *line;
                 let rhs = self.expr(e);
+                // `q = ...` and `q += ...`: what the text holds now.
+                let was = self.sql_var(name);
+                let now = match op {
+                    AssignOp::Set => Some(self.sql_kind(e)),
+                    AssignOp::Add if matches!(was, SqlVar::Safe | SqlVar::Built) && !self.sql_safe(e) => Some(SqlVar::Built),
+                    _ => None,
+                };
+                if let Some(k) = now {
+                    if let Some(v) = self.sql_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
+                        v.2 = k;
+                    }
+                }
                 let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
                 match found {
                     None => self.error(format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name)),
@@ -2177,6 +2348,9 @@ impl Checker {
             if let Some(g) = self.globals.get(&n).cloned() {
                 if let Some(s) = &g.sig {
                     mask |= if s.builtin { s.effects.unwrap_or(0) } else { self.fn_effects(s) };
+                } else if MODULES.contains(&n.as_str()) {
+                    // A module called as a function: `audit(...)`.
+                    mask |= builtin_effect(&n);
                 }
             } else if let Some((m, f)) = n.split_once('.') {
                 if MODULES.contains(&m) {
@@ -2188,6 +2362,24 @@ impl Checker {
         }
         self.effect_cache.insert(key, mask);
         mask
+    }
+
+    /// A transaction with `retries` runs its function again after a
+    /// conflict, and what it sent to other servers cannot be taken back.
+    fn retried_effects(&mut self, name: &str, args: &[Expr]) {
+        let [Expr::Map(opts), Expr::Lambda(f), ..] = args else { return };
+        if !opts.iter().any(|(k, v)| k == "retries" && !matches!(v, Expr::Lit(Lit::Int(0)))) {
+            return;
+        }
+        let used = self.fn_effects(&Sig::of_def(f)) & (crate::ast::effect_bit("http") | crate::ast::effect_bit("net"));
+        if used != 0 {
+            self.warn(format!(
+                "the function given to `{}` with retries uses the {} effect: it runs again when the transaction conflicts, \
+                 and what it sent is not taken back; send it after the transaction",
+                name,
+                effect_names(used).join(" and ")
+            ));
+        }
     }
 
     fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
@@ -2254,6 +2446,18 @@ impl Checker {
     // ---- expressions ---------------------------------------------------
 
     fn expr(&mut self, e: &Expr) -> T {
+        // The parser refuses code that nests deeper; a guard all the same.
+        if self.depth >= 2 * crate::parser::MAX_NESTING {
+            self.error("the code nests too deeply");
+            return T::ANY;
+        }
+        self.depth += 1;
+        let t = crate::stack::maybe_grow(256 << 10, 4 << 20, || self.expr_here(e));
+        self.depth -= 1;
+        t
+    }
+
+    fn expr_here(&mut self, e: &Expr) -> T {
         match e {
             Expr::Lit(l) => lit_t(l),
             Expr::Template(parts) => {
@@ -2295,10 +2499,10 @@ impl Checker {
                         T::of(BOOL)
                     }
                     UnOp::Neg => {
-                        if t.bits != 0 && t.bits & NUM == 0 {
+                        if t.bits != 0 && t.bits & (NUM | DEC) == 0 {
                             self.error(format!("cannot negate {}", bits_text(t.bits)));
                         }
-                        T::of(t.bits & NUM)
+                        T::of(t.bits & (NUM | DEC))
                     }
                 }
             }
@@ -2344,7 +2548,7 @@ impl Checker {
                             _ => "compare",
                         };
                         let join = if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) { "with" } else { "and" };
-                        self.error(format!("cannot {} {} {} {}", verb, bits_text(x.bits), join, bits_text(y.bits)));
+                        self.error(format!("cannot {} {} {} {}{}", verb, bits_text(x.bits), join, bits_text(y.bits), dec_hint(x, y)));
                         T::ANY
                     }
                 }
@@ -2357,6 +2561,16 @@ impl Checker {
             Expr::Pipe(lhs, rhs, line) => {
                 let v = self.expr(lhs);
                 self.line = *line;
+                // `` `select ... ${q}` | db.query ``: the text is the SQL.
+                let target = match &**rhs {
+                    Expr::Call(callee, _, _) => self.sql_target(callee),
+                    other => self.sql_target(other),
+                };
+                if let Some(name) = target {
+                    if self.sql_built(lhs) {
+                        self.warn_sql(&name);
+                    }
+                }
                 match &**rhs {
                     Expr::Call(callee, args, l) => {
                         self.line = *l;
@@ -2573,6 +2787,12 @@ impl Checker {
                 }
             }
         }
+        // `audit(...)`: the module `audit` is a function too.
+        if let Expr::Ident(n, _) = callee {
+            if n == "audit" && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
+                return self.module_call(n, "", args, pre);
+            }
+        }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
             // `billing.later.invoice(args)`: the same call, made later; its id.
@@ -2590,6 +2810,14 @@ impl Checker {
                 }
                 if MODULES.contains(&m.as_str()) && !self.is_local(m) {
                     return self.module_call(m, name, args, pre);
+                }
+            }
+            // `conn.query(sql)` on a connection from `db.connect`.
+            if pre.is_none() {
+                if let (Some(what), Some(sql)) = (self.sql_target(callee), args.first()) {
+                    if what != format!("db.{}", name) && self.sql_built(sql) {
+                        self.warn_sql(&what);
+                    }
                 }
             }
             let recv = self.expr(obj);
@@ -2747,11 +2975,18 @@ impl Checker {
             "flatten" => a0.items()?.items().map(list_of),
             "split" | "keys" => Some(list_of(T::of(STR))),
             "range" => Some(list_of(T::of(INT))),
-            "sum" => a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0).map(|e| T::of(e.bits)),
+            "sum" => a0.items().filter(|e| e.bits != 0 && e.bits & !(NUM | DEC) == 0).map(|e| T::of(e.bits)),
             "min" | "max" => {
-                let e = a0.items().filter(|e| e.bits != 0 && e.bits & !NUM == 0)?;
+                let e = a0.items().filter(|e| e.bits != 0 && e.bits & !(NUM | DEC) == 0)?;
                 Some(T::of(if expr_at(0).is_some_and(never_empty) { e.bits } else { e.bits | NIL }))
             }
+            // Money is `{ amount: dec, currency: str }`.
+            "money.add" | "money.sub" | "money.mul" | "money.neg" | "money.round" => Some(money_t()),
+            "money.of" | "money.from_minor" | "money.zero" => Some(money_t().union(T::error(STR))),
+            "money.allocate" => Some(list_of(money_t())),
+            // A decimal gives a decimal; ints and floats as before.
+            "abs" | "floor" | "ceil" | "round" if a0.bits == DEC => Some(T::of(DEC)),
+            "abs" | "floor" | "ceil" | "round" if a0.bits & DEC == 0 && a0.bits != 0 => Some(T::of(NUM)),
             "merge" => Some(merge_maps(a0, *args.get(1)?)),
             "set" if args.len() == 3 => {
                 let fs = a0.fields().filter(|_| a0.bits & NIL == 0)?;
@@ -2776,7 +3011,7 @@ impl Checker {
     /// nothing fails: `name || "anonymous"` keeps an empty name. Warned only
     /// where the value is known to be a string or a number (or null).
     fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
-        if t.bits & (STR | NUM) == 0 || t.bits & !(STR | NUM | NIL) != 0 {
+        if t.bits & (STR | NUM | DEC) == 0 || t.bits & !(STR | NUM | DEC | NIL) != 0 {
             return;
         }
         let x = match e {
@@ -2792,7 +3027,7 @@ impl Checker {
         if t.bits & STR != 0 {
             empties.push("\"\"");
         }
-        if t.bits & NUM != 0 {
+        if t.bits & (NUM | DEC) != 0 {
             empties.push("0");
         }
         let empty = empties.join(" or ");
@@ -2872,7 +3107,7 @@ impl Checker {
 
     fn module_call(&mut self, m: &str, f: &str, args: &[Expr], pre: Option<T>) -> T {
         let line = self.line;
-        let full = format!("{}.{}", m, f);
+        let full = if f.is_empty() { m.to_string() } else { format!("{}.{}", m, f) };
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
             argts.push(self.expr(a));
@@ -2916,6 +3151,109 @@ impl Checker {
         self.quiet > 0
     }
 
+    // ---- SQL built from values ----------------------------------------
+
+    fn warn_sql(&mut self, name: &str) {
+        self.warn(format!(
+            "`{}` with SQL built from values: a value containing a quote can change the query \
+             (SQL injection); write `?` in the SQL and pass the values after it",
+            name
+        ));
+    }
+
+    /// What the variable `name` holds, as far as SQL goes.
+    fn sql_var(&self, name: &str) -> SqlVar {
+        self.sql_vars.iter().rev().find(|(_, n, _)| n == name).map_or(SqlVar::Other, |v| v.2)
+    }
+
+    /// What a `let` of `e` holds.
+    fn sql_kind(&self, e: &Expr) -> SqlVar {
+        if self.sql_built(e) {
+            SqlVar::Built
+        } else if self.sql_safe(e) {
+            SqlVar::Safe
+        } else if is_connect(e) {
+            SqlVar::Conn
+        } else {
+            SqlVar::Other
+        }
+    }
+
+    /// The query function `callee` names, if it is one that takes SQL:
+    /// `db.query`, or `query` on a connection from `db.connect`.
+    fn sql_target(&self, callee: &Expr) -> Option<String> {
+        let Expr::Field(obj, f, _) = callee else { return None };
+        if !matches!(f.as_str(), "query" | "one" | "exec") {
+            return None;
+        }
+        match &**obj {
+            Expr::Ident(m, _) if m == "db" && !self.is_local(m) => Some(format!("db.{}", f)),
+            Expr::Ident(m, _) if self.sql_var(m) == SqlVar::Conn => Some(format!("{}.{}", m, f)),
+            other if is_connect(other) => Some(format!("db.connect(...).{}", f)),
+            _ => None,
+        }
+    }
+
+    /// Whether SQL text is put together from values: `${x}` in a template,
+    /// sql`...${x}...`, `"..." + x`, `join(["...", x])`, or a variable
+    /// holding such text.
+    fn sql_built(&self, e: &Expr) -> bool {
+        let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !self.sql_safe(e)));
+        match e {
+            Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Built,
+            Expr::Template(parts) => interpolates(parts),
+            Expr::Call(f, args, _) => match args.as_slice() {
+                [Expr::Template(parts)] => interpolates(parts),
+                [Expr::List(items), rest @ ..] if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
+                _ => false,
+            },
+            Expr::Pipe(lhs, rhs, _) => match (&**lhs, &**rhs) {
+                (Expr::List(items), Expr::Call(f, rest, _)) if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
+                (Expr::List(items), f) if is_join(f) => items.iter().any(|x| !self.sql_safe(x)),
+                _ => false,
+            },
+            Expr::Binary(BinOp::Add, a, b, _) => {
+                self.sql_built(a) || self.sql_built(b) || (self.sql_text(a) && !self.sql_safe(b)) || (self.sql_text(b) && !self.sql_safe(a))
+            }
+            Expr::If(_, a, b) => self.sql_built(a) || b.as_deref().map_or(false, |b| self.sql_built(b)),
+            Expr::Match(_, arms, _) => arms.iter().any(|a| self.sql_built(&a.body)),
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.sql_built(e)),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is text: written, a variable holding text, or a join of
+    /// those with `+` (`"select * from t " + "order by "`).
+    fn sql_text(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(Lit::Str(_)) | Expr::Template(_) => true,
+            Expr::Ident(n, _) => matches!(self.sql_var(n), SqlVar::Safe | SqlVar::Built),
+            Expr::Binary(BinOp::Add, a, b, _) => self.sql_text(a) || self.sql_text(b),
+            _ => false,
+        }
+    }
+
+    /// SQL text a program may put together: names made with `sql_name` and
+    /// `sql_param` (checked as they are made, so they cannot carry SQL of
+    /// their own), text as written (or kept in a variable), and choices
+    /// (`if`, `match`), joins and templates of those.
+    fn sql_safe(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(_) => true,
+            Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Safe,
+            Expr::Call(f, args, _) => {
+                matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param")
+                    || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
+            }
+            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if self.sql_safe(e))),
+            Expr::Binary(BinOp::Add, a, b, _) => self.sql_safe(a) && self.sql_safe(b),
+            Expr::If(_, a, b) => self.sql_safe(a) && b.as_deref().map_or(true, |b| self.sql_safe(b)),
+            Expr::Match(_, arms, _) => arms.iter().all(|a| self.sql_safe(&a.body)),
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.sql_safe(e)),
+            _ => false,
+        }
+    }
+
     /// A call of something of type `ft`: arguments, effects, browser rules
     /// and the result type.
     fn apply(&mut self, ft: T, sig: Option<Arc<Sig>>, args: Vec<T>, arg_exprs: &[Expr], name: &str) -> T {
@@ -2951,14 +3289,14 @@ impl Checker {
                 _ => {}
             }
         }
-        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
-            if arg_exprs.first().map_or(false, |e| sql_built_from_values(e, &|v| self.sql_var(v))) {
-                self.warn(format!(
-                    "`{}` with SQL built from values: a value containing a quote can change the query \
-                     (SQL injection); write `?` in the SQL and pass the values after it",
-                    name
-                ));
+        // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
+        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") && args.len() == arg_exprs.len() {
+            if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
+                self.warn_sql(name);
             }
+        }
+        if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
+            self.retried_effects(name, arg_exprs);
         }
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {
@@ -3123,7 +3461,7 @@ impl Checker {
         }
         for c in &el.children {
             match c {
-                HtmlChild::El(e) => self.html(e),
+                HtmlChild::El(e) => crate::stack::maybe_grow(256 << 10, 4 << 20, || self.html(e)),
                 HtmlChild::Expr(x) => {
                     self.expr(x);
                 }
@@ -3420,21 +3758,11 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
     });
 }
 
-/// Whether SQL text is put together from values: `${x}` in a template,
-/// sql`...${x}...`, or `"..." + x`.
-fn sql_built_from_values(e: &Expr, var: &dyn Fn(&str) -> bool) -> bool {
-    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !sql_safe(e, var)));
+/// `db.connect(...)`, or that with `?`.
+fn is_connect(e: &Expr) -> bool {
     match e {
-        Expr::Template(parts) => interpolates(parts),
-        Expr::Call(_, args, _) => matches!(args.as_slice(), [Expr::Template(parts)] if interpolates(parts)),
-        Expr::Binary(BinOp::Add, ..) => {
-            // `"... where n = '" + n + "'"`: text joined with something
-            // that is not SQL text.
-            let mut parts = Vec::new();
-            add_operands(e, &mut parts);
-            parts.iter().any(|x| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_)))
-                && parts.iter().any(|x| !matches!(x, Expr::Lit(_)) && !sql_safe(x, var))
-        }
+        Expr::Try(x) => is_connect(x),
+        Expr::Call(f, _, _) => matches!(&**f, Expr::Field(o, n, _) if n == "connect" && matches!(&**o, Expr::Ident(m, _) if m == "db")),
         _ => false,
     }
 }
@@ -3450,33 +3778,8 @@ fn hides(sig: &Sig, name: &str) -> String {
     }
 }
 
-/// The operands of `a + b + c`.
-fn add_operands<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
-    match e {
-        Expr::Binary(BinOp::Add, a, b, _) => {
-            add_operands(a, out);
-            add_operands(b, out);
-        }
-        _ => out.push(e),
-    }
-}
-
-/// SQL text a program may put together: names made with `sql_name` and
-/// `sql_param` (checked as they are made, so they cannot carry SQL of their
-/// own), text as written, choices (`if`, `match`) and joins of those, and
-/// `let`s holding them (`var` says which names are such `let`s).
-fn sql_safe(e: &Expr, var: &dyn Fn(&str) -> bool) -> bool {
-    match e {
-        Expr::Lit(Lit::Str(_)) => true,
-        Expr::Ident(n, _) => var(n),
-        Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param"),
-        Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if sql_safe(e, var))),
-        Expr::Binary(BinOp::Add, a, b, _) => sql_safe(a, var) && sql_safe(b, var),
-        Expr::If(_, a, b) => sql_safe(a, var) && b.as_deref().map_or(true, |b| sql_safe(b, var)),
-        Expr::Match(_, arms, _) => arms.iter().all(|a| sql_safe(&a.body, var)),
-        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if sql_safe(e, var)),
-        _ => false,
-    }
+fn is_join(f: &Expr) -> bool {
+    matches!(f, Expr::Ident(n, _) if n == "join")
 }
 
 /// The type a type-testing pattern accepts: `int | null` is int or null.

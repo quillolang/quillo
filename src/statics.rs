@@ -142,20 +142,38 @@ const MOST_SENDS_PER_IP: usize = 8;
 
 static SENDING: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
+/// Who a limit per address counts a client as: its IPv4 address, or the
+/// /64 network of its IPv6 one, since one client is given a whole /64 and
+/// can take a new address in it for each connection.
+pub(crate) fn client_of(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(a)) => match a.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = a.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Ok(a) => a.to_string(),
+        Err(_) => ip.to_string(),
+    }
+}
+
 /// A place among the large-file sends, given back when dropped.
 pub struct SendPlace(String);
 
 impl SendPlace {
     pub fn take(ip: &str) -> Option<SendPlace> {
+        let who = client_of(ip);
         let mut g = lock(&SENDING);
         let m = g.get_or_insert_with(HashMap::new);
         let total: usize = m.values().sum();
-        let mine = m.get(ip).copied().unwrap_or(0);
+        let mine = m.get(&who).copied().unwrap_or(0);
         if total >= MOST_SENDS || mine >= MOST_SENDS_PER_IP {
             return None;
         }
-        m.insert(ip.to_string(), mine + 1);
-        Some(SendPlace(ip.to_string()))
+        m.insert(who.clone(), mine + 1);
+        Some(SendPlace(who))
     }
 }
 
@@ -176,6 +194,14 @@ impl Drop for SendPlace {
 /// readers taking a byte now and then cannot hold the places forever.
 const SLOWEST: u64 = 16 << 10;
 const GRACE: Duration = Duration::from_secs(20);
+/// Nor can one just fast enough hold a place for a whole large file: a
+/// send stops after this long (a browser or player goes on with a range).
+const LONGEST: Duration = Duration::from_secs(3600);
+
+/// Whether a send that has taken `took` and sent `sent` bytes goes on.
+fn keeps_place(took: Duration, sent: u64) -> bool {
+    took <= LONGEST && (took <= GRACE || sent >= took.as_secs() * SLOWEST)
+}
 
 /// Answers on a connection of its own: `resp`'s head, then `len` bytes of
 /// the file from `start` (none for `HEAD`), and closes it.
@@ -212,8 +238,7 @@ pub fn send(mut stream: std::net::TcpStream, resp: &crate::server::HttpResponse,
                     sent += w as u64;
                 }
             }
-            let took = began.elapsed();
-            if took > GRACE && sent < took.as_secs() * SLOWEST {
+            if !keeps_place(began.elapsed(), sent) {
                 return;
             }
         }
@@ -288,5 +313,30 @@ mod tests {
         assert_eq!(range("bytes=0-1,5-6", 100), None);
         assert_eq!(range("items=0-1", 100), None);
         assert!(matches("W/\"a\", \"b\"", "W/\"b\"") && matches("*", "W/\"x\"") && !matches("\"c\"", "W/\"b\""));
+    }
+
+    #[test]
+    fn large_file_places_count_an_ipv6_network_as_one_client() {
+        // What the review saw: each address of a /64 counted on its own.
+        let mut held = Vec::new();
+        for i in 0..MOST_SENDS_PER_IP {
+            held.push(SendPlace::take(&format!("2001:db8:1:2::{:x}", i + 1)).expect("a place"));
+        }
+        assert!(SendPlace::take("2001:db8:1:2:ffff::9").is_none());
+        assert!(SendPlace::take("2001:db8:1:3::1").is_some());
+        assert_eq!(client_of("::ffff:10.0.0.1"), "10.0.0.1");
+        assert_eq!(client_of("10.0.0.1"), "10.0.0.1");
+        drop(held);
+        assert!(SendPlace::take("2001:db8:1:2::1").is_some());
+    }
+
+    #[test]
+    fn a_send_ends_when_too_slow_or_too_long() {
+        assert!(keeps_place(Duration::from_secs(5), 0));
+        assert!(!keeps_place(Duration::from_secs(60), 60 * SLOWEST - 1));
+        assert!(keeps_place(Duration::from_secs(60), 60 * SLOWEST));
+        // A reader just fast enough is still let go in the end.
+        let long = LONGEST + Duration::from_secs(1);
+        assert!(!keeps_place(long, long.as_secs() * SLOWEST * 2));
     }
 }

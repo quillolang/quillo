@@ -11,6 +11,7 @@ cargo build --release
 ./target/release/quillo run app/main.qwe --watch        # the sample app: http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
+./target/release/quillo keygen                           # a key for crypto.encrypt
 ./target/release/quillo repl
 ./target/release/quillo lsp                              # language server (for editors)
 ./target/release/quillo dap                              # debugger (for editors)
@@ -31,15 +32,19 @@ serves them:
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
+| `--as-service` | serve the program as a service: its `server fn`s answer other services' signed calls, not pages (see [Services](#services)) |
+| `--service-name NAME` | the name other programs call this service by, when it is not the program's file name; calls signed for another service are refused |
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
-| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers (see [Concurrency](#concurrency-and-reloading)) |
+| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Concurrency](#concurrency-and-reloading)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 | `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
 | `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own |
 | `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
-| `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` |
+| `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
+| `--log-file F`, `--log-keep N` | the request log to a file a day instead of stderr, keeping N days of them |
+| `--log-stdout`, `--log-query` | the request log on stdout (with `--log-file`, there too); JSON lines with query strings |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 
 ### Desktop apps
@@ -89,6 +94,7 @@ the browser and on the server.
 |---|---|
 | Null and booleans | `null`, `true`, `false` |
 | Numbers | `42`, `3.14`, `1e-9`, `6.02e23` |
+| Decimals | `12.50m`, `5m`: exact, for money (see [Decimals](#decimals)) |
 | Strings | `"strings"` or `'strings'`: plain text, so JSON is easy to write: `'{"a": 1}'`. Escapes: `\n \t \r \0 \\ \" \' \` \$ \{ \}`, and `\u00e9` or `\u{1F600}` for any character |
 | Template strings | `` `Hello, ${name}` ``: the only strings that interpolate; they can span lines |
 | Lists | `[1, 2, 3]` |
@@ -191,8 +197,8 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 ```
 
 Type annotations are checked when the function is called and when it returns, and
-`quillo check` checks them before the program runs: `int float num str bool list map html
-fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
+`quillo check` checks them before the program runs: `int float dec num str bool list map
+html fn response any`. Unions are written `int | str`; add `?` or `| null` to also allow null
 (`str?`, `int | null`). `list<int>` says what a list holds, and `{ title: str, tags:
 list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
 call with a map missing `title`, a list of strings for `list<int>`), and at run time
@@ -246,7 +252,9 @@ match v {
   returns: `greet({ name: "Ada" })` fails with `` argument `u` of `greet` must be User,
   got map { name: "Ada" } (`email` is missing) ``. A field with a default must be
   there too; `User(...)` is what puts it in. A `server fn`'s arguments from the browser
-  are checked the same way.
+  (or another service) are made as `User(v)` makes them: checked the same way, with
+  defaults put in and fields the record does not have left out, so a page cannot add
+  `is_admin` to the profile it saves.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are.
@@ -301,7 +309,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 |---|---|
 | `_`, `name` | anything (`name` binds it) |
 | `42`, `"order"`, `true`, `null` | that literal |
-| `int`, `str`, `list`, ... | any value of that type |
+| `int`, `str`, `list`, ... | any value of that type (`dec` also takes an int, numeric text or a JSON number, made a decimal) |
 | `"order" \| "refund"` | either alternative |
 | `int as n` | binds what matched |
 | `[first, second, ..rest]` | lists |
@@ -354,8 +362,10 @@ fn fetch_avatar(url: str) with http = http.get(url).body
 fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
 ```
 
-The effects are `db`, `http`, `fs` (files), `env` (environment variables), `time` (`now`,
-`sleep`), `random` and `net` (`udp.send`, `udp.reply`). Inside a `with` function, a builtin that needs another effect,
+The effects are `db` (with `audit` and `idempotent`), `http`, `fs` (files), `env` (environment variables), `time` (`now`,
+`date.today`, `date.now`, `sleep`, `crypto.totp_verify`, `rate_limit`, `crypto.verify_webhook`), `random` (with
+`crypto.token`, `crypto.totp_secret`, `crypto.recovery_codes`, `crypto.encrypt`) and `net` (`udp.send`,
+`udp.reply`). `end_sessions` and `user_sessions` need `db`. Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
 `quillo check` (which also warns when an undeclared helper may use one). The limit holds
 for everything the function calls, including the lambdas it passes to `map`.
@@ -380,17 +390,32 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `.class` and `#id` shorthand, with `{}` interpolation in the name.
 - `{name}` is short for `name={name}`, and `{...map}` spreads a map's keys as attributes
   (or as a view's props): `<a {...link}>`, `<Card {...node.props}/>`. Attributes written
-  out win over spread ones; classes from both are kept. On a view or component, spread
+  out win over spread ones, whatever the case of the key (`ACTION` is `action`); classes
+  from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
 - Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example ``href={`/todos/${id}`}``.
   `true` renders a bare attribute; `false`/`null` leaves it out.
+- Event handler attributes (`onclick`, any `on...`) and `srcdoc` take only `"text"`
+  written in the program: the browser decodes their value and runs it, so escaping
+  cannot keep data out of the code. `onmouseover={...}` is an error when the program
+  loads (and in `quillo check`); handle events with `@mouseover={...}`. An `<iframe>`
+  with a written `sandbox` attribute that does not say `allow-same-origin` may take
+  `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
+  are its parameters, so `on_change={...}` there is fine.
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+- `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
+  so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
+  (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
+  `<\!--`, which mean the same inside JavaScript strings and cannot end the element
+  early, so `raw(json.stringify(x))` there is safe too. A component's `<script>` (made
+  in the browser, which runs it) takes only text written in the program. Script built
+  as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
 
@@ -555,9 +580,17 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`. What runs text as code or HTML is
-  refused, however it is reached: `eval`, `Function`, `setTimeout` and `setInterval`,
-  `insertAdjacentHTML`, `document.write`, `setAttribute("on...")`, `javascript:` URLs
-  given to the page's functions. Markup in the component does all of that safely.
+  refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
+  `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
+  elements, nodes of another document, `javascript:` URLs (in lists and maps too) given
+  to the page's functions, and what steps around these checks (`Reflect.set`,
+  `Object.assign`, `Function.prototype.call`). Markup in the component does all of that
+  safely.
+- These checks are a guard-rail against mistakes, not a security boundary. Code that
+  calls into the page can do what the page's scripts can, and a program set on it can
+  find ways through (a library function that writes HTML, a function of the page
+  reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
+  out of what `js` calls, as you would in JavaScript.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps
@@ -646,6 +679,12 @@ component Notes(initial: list) {
   allow only six HTTP/1.1 connections to a host across all tabs: requests left
   waiting would hold them, and server calls would queue behind them. Where a
   WebSocket cannot open, the page asks the same URL as a plain request instead.
+- A server keeps at most 4096 such connections open (live data, channels, `--watch`
+  reloads), and at most 256 for one client: an IPv4 address, or an IPv6 /64 network.
+  Past that, a page is answered `503` and tries again later. Behind a proxy that does
+  not pass the client's own connection through, every visitor is the proxy's address,
+  so put the proxy's own per-client limits in front (Quillo does not read
+  `X-Forwarded-For`, which a client can write).
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
 
@@ -675,6 +714,12 @@ quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each serv
   one that stops for 15) and sends the topics it changes to limer's
   `/broadcast`, which passes them to every member. The pool's name is the
   file's (`shop`), or `--service`.
+- limer's admin secret is required: `--register` does not start without
+  `LIMER_ADMIN_SECRET`. Each announcement is signed (HMAC-SHA256, with a key made
+  from the secret) together with the time and a random nonce; one that is not
+  signed so, more than a minute old, or seen before is refused. A server takes
+  only the topics it already knows (changed there, or shown on its pages), at most
+  256 a message.
 - What is shared is the database: tables (`db:` topics) and `publish` topics
   are announced. Data kept in variables belongs to each server and is not.
 - Sequence numbers are per server, and each carries its server's id. A page
@@ -685,6 +730,9 @@ quillo run shop.qwe --port 8081 --register http://10.0.0.1:2019   # on each serv
 - Announcements are delivered once, without retries: a server that cannot be
   reached when one is sent misses it, and its pages show that change only when
   they next load the data (the next change to it, or a reload).
+- Sessions kept in the database (`sessions({ store: "db" })`) and their rate limits
+  are the same on every server: one ended through one server is ended on all.
+  Signed sessions need the same `QUILLO_SECRET` on each.
 
 ### Server functions
 
@@ -731,7 +779,8 @@ run one after another, since other threads' SQL would not be part of it. A failu
 the whole call; error values are results like any other.
 
 Each call is a `POST /_quillo/rpc/<name>` with a JSON array of arguments, checked against
-the parameter types (a 400 otherwise); the answer is `{"ok": value}` or `{"err": payload}`.
+the parameter types all the way in (a `list<Role>`'s items, a record's fields; a 400
+otherwise), and records made as `User(v)` makes them (other fields left out); the answer is `{"ok": value}` or `{"err": payload}`.
 Only `server fn`s can be called, only with `content-type: application/json`, and only
 from the program's own pages: a request a browser marks as coming from another site
 (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. Inside one, `request`
@@ -743,6 +792,10 @@ server fn delete_all() = request | auth.required | (_) => { ... }
 ```
 
 From hand-written JavaScript: `await quillo.server.add_note("text")`.
+
+A call that must not happen twice (a payment, a transfer) is wrapped in
+[`idempotent`](#idempotent-requests): the page then sends a key with each call, and
+sends the call again when its answer does not come back, and the server runs it once.
 
 ## Routes
 
@@ -807,7 +860,34 @@ sites cannot add without asking first; a form another site posts is refused.
 `check_program("main.qwe", { "plugins/x.qwe": text })` gives what `quillo check` says of
 a program, as `{ file, line, severity, message }` maps, with some files' text given in
 place of what is on disk: a tool that writes Quillo code can check it before writing
-it. `delete_file(path)` removes a file or folder inside the program's folder.
+it. The code checked may come from users, so it reads only files inside the program's
+folder: a `use`, `mount` or `service` path with `..` or starting with `/` is reported
+as an error, not read. `delete_file(path)` removes a file or folder inside the
+program's folder.
+
+### Scripts from users
+
+`run_script(source, vars)` runs code a program's users write (a rule on a form's field,
+who may see a record) on the server, and gives its last expression's value, or an error
+value saying what went wrong:
+
+```quillo
+run_script("value > 3 ? null : `at least 4, got ${value}`", { value: 5 })   // null
+```
+
+- The script sees the values in `vars` and the builtins that only compute (`len`,
+  `upper`, `map`, `filter`, ...). Method calls are the same: `"x".upper` works,
+  `"HOME".env` and `"f".read_file` do not, nor the program's functions.
+- It cannot define functions (it can write `(x) => ...`), routes, state or markup,
+  `use` files or reply.
+- It has no effects of its own: a builtin such as `env` passed in `vars` still cannot
+  run. A function of the program passed in `vars` runs as the program's, with what the
+  program may do, so it is the program's way to let a script ask for more
+  (`{ taken: (code) => db.one(...) != null }`).
+- It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
+  1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
+  costs a step: doubling a string in a loop stops there, not when the memory runs out.
+- Like any code, it may nest at most 256 levels deep.
 
 ### Images
 
@@ -823,7 +903,10 @@ image.convert("photos/a.jpg", "cache/a-800.jpg", {
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
 check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
-allocated; both run off the event loop. Paths stay inside the program's folder.
+allocated; both run off the event loop. At most four conversions run at once (fewer on
+a machine with fewer cores), so many uploads together cannot each take 512 MiB; the rest
+wait their turn, and past 64 waiting `image.convert` gives an error value at once. Paths
+stay inside the program's folder.
 
 ### Cookies and sessions
 
@@ -845,23 +928,189 @@ route POST /logout { end_session(); redirect("/") }
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
-- A session is a cookie signed with HMAC-SHA256: the browser can read it but not
-  change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in the
-  session and the rest in the database. The signature covers its expiry, its tenant
+  `renew_session()` gives the same session a new id (after a change of rights).
+- By default a session is a cookie signed with HMAC-SHA256: the browser can read it
+  but not change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in
+  the session and the rest in the database. The signature covers its expiry, its tenant
   and the program's mount point, so it is no session past its time, for another
   tenant, or in another mounted program.
-- `end_session()` removes the cookie from the browser, but a copy someone kept stays
-  valid until it expires. To end sessions on the server (log out everywhere, a stolen
-  laptop), keep an id in the session and check it against the database.
+- A signed session cannot be ended: `end_session()` removes the cookie from the
+  browser, but a copy someone kept stays valid until it expires. Sessions kept in the
+  database (below) can be, and are recommended for programs people sign in to.
+- The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole
+  site (as in production): browsers take a cookie with that prefix only from the very
+  host, over HTTPS, so a sibling subdomain (another tenant's site) cannot plant one.
+  Elsewhere (`--watch`, a mounted program) it is `quillo_session`. A request with two
+  session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
-  when the server stops.
+  when the server stops. The server warns when it starts if the secret is shorter than
+  32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
+  can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
   default. `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
   such as limer in front). `request.cookies` has what the browser sent.
+
+#### Sessions that can be ended
+
+```quillo
+sessions({ store: "db", idle: "30m", max_age: "12h" })    // at the top of the program
+
+route POST /login { form: { email: str, password: str } } {
+    ...
+    set_session({ user: user.id })            // a new id: the user changed
+    redirect("/")
+}
+route POST /logout { end_session(); redirect("/login") }  // ended on the server too
+route POST /password { ...; end_sessions(me.id, { keep_current: true }); ... }
+route GET /devices = user_sessions(session().user)   // [{ id, created, seen, expires, ip, agent, current }]
+```
+
+- With `sessions({ store: "db" })` the cookie holds only a random id (32 bytes from the
+  operating system), and the session is a row of `_quillo_sessions`, one of [Quillo's
+  own tables](#quillos-own-tables), stored under the id's SHA-256. Every server of the
+  program reads the same rows, so a session ended on one is ended on all of them. There
+  is no size limit but the database's.
+- A session ends `max_age` after it began (12 hours unless given; `set_session`'s own
+  `max_age` sets it for one session), or once unused for `idle` (30 minutes unless
+  given; `false` for no limit). Being used is noted at most once a minute.
+- `set_session` keeps the session's id while its `user` field stays the same (a cart,
+  a preference), and gives it a new one when `user` changes, as when logging in: an id
+  someone planted or saw before the login is worth nothing after it. So name who is
+  logged in `user`.
+- `end_sessions(user)` ends every session of that user in this tenant, on every server
+  (after a new password, or by an admin); `{ keep_current: true }` keeps the one making
+  the request, `{ id }` ends just one, from `user_sessions`' list. It gives how many it
+  ended. `user_sessions(user)` lists a user's live sessions, the latest used first, for
+  a page of the devices signed in: times are seconds since 1970, `ip` and `agent` (the
+  browser's `User-Agent`) as they were when the session began.
+- `sessions({ store: "cookie" })` is the default: signed cookies, as above. Switching
+  store signs everyone out once.
+
+#### Two-step sign-in
+
+```quillo
+let secret = crypto.totp_secret()                               // keep it with the user
+let uri = crypto.totp_uri(secret, user.email, "Acme")           // otpauth://… for the app
+let step = crypto.totp_verify(user.totp_secret, code, { after: user.totp_step })
+if step == null { reply 401 "Wrong code" }
+db.exec("update users set totp_step = ? where id = ?", step, user.id)   // each code works once
+
+let codes = crypto.recovery_codes(10)              // [{ code, hash }]: show the codes once,
+                                                   // keep the hashes
+let i = crypto.verify_recovery_code(typed, hashes) // which one it was, or null: remove it
+```
+
+- Codes are the ones every authenticator app makes (TOTP, RFC 6238: HMAC-SHA1 of the
+  30-second time step, 6 digits). `crypto.totp_secret(bytes = 20)` gives a new secret in
+  base32; `crypto.totp_uri(secret, account, issuer)` the `otpauth://` address apps take,
+  as a link on a phone or a QR code elsewhere (or show the secret to type in).
+- `crypto.totp_verify(secret, code, { window: 1, after, at })` gives the time step the
+  code is right for, or null. It takes the codes of `window` steps either side of now
+  (clocks drift), comparing each in constant time. A code works once when the program
+  keeps the step it gave and passes it back as `after`: codes of that step and earlier
+  are refused, so one seen over a shoulder or used already is worth nothing. `at` is the
+  time in seconds, for tests.
+- `crypto.recovery_codes(n = 10)` makes codes like `7k2m-x9qp-4hzt` (60 random bits),
+  each with its Argon2id hash, as for passwords. `crypto.verify_recovery_code(code,
+  hashes)` finds which hash a typed code matches, in any case, with or without dashes;
+  the program removes that hash so the code works once. Hashing takes tens of
+  milliseconds a code, off the event loop.
+- Between the password and the code, keep who is signing in in the session under
+  another name (`{ pending: user.id }`), and set `user` only after the code: until then
+  no one is signed in. The CRM in apps/crm does all of this, with a lockout.
+
+#### Rate limits
+
+```quillo
+route POST /login { form: { email: str, password: str } } {
+    rate_limit(`login:${request.ip}`, 30, "1m", { reply: true })   // else 429, Retry-After
+    let key = `login-fail:${lower(email)}`
+    if !rate_limit(key, 5, "15m", { cost: 0 }) { reply 429 "Too many tries; wait a while" }
+    let user = db.one("select * from users where email = ?", lower(email))
+    if !crypto.verify_password(password, user?.password_hash) {
+        rate_limit(key, 5, "15m")            // a failure counts
+        reply 401 "Wrong email or password"
+    }
+    rate_limit_reset(key)
+    ...
+}
+```
+
+- `rate_limit(key, n, per, { cost, reply, store })` counts a call under `key` and gives
+  whether it is within `n` calls in `per` (a duration like `"1m"`). It counts over a
+  sliding window (this window's calls, and the last one's weighed by how much of it is
+  still within `per`), so there is no burst at the turn of a minute. Calls refused count
+  too: a client that keeps trying stays refused.
+- `{ reply: true }` answers a call over the limit with 429 Too Many Requests and a
+  `Retry-After` header saying when one would be allowed. `{ cost: 0 }` only asks whether
+  one more would be; a cost above 1 counts as that many. `rate_limit_reset(key)` forgets
+  a key's calls.
+- Keys belong to the tenant and the mount point: one tenant's limits never touch
+  another's.
+- Counts are kept in the process, unless sessions are kept in the database: then they
+  are kept in it too (`_quillo_limits`), and every server of the program counts the
+  same calls. `{ store: "memory" }` or `{ store: "db" }` chooses for one limit.
+- `request.ip` is the address the connection came from: behind a proxy, every request
+  comes from the proxy, so limit by an account (or a header the proxy sets) there.
+
+#### Security headers
+
+Every answer says how the browser should treat it:
+
+| Header | Value |
+|---|---|
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `X-Frame-Options` and `Content-Security-Policy: frame-ancestors` | `SAMEORIGIN` and `'self'`: no other site may put the page in a frame |
+| `X-Content-Type-Options` | `nosniff` |
+| `Strict-Transport-Security` | `max-age=31536000`, when the request came over HTTPS |
+
+Quillo serves plain HTTP behind a proxy that ends TLS (limer), so a request came over
+HTTPS when the proxy says so with `X-Forwarded-Proto: https` (or `Forwarded:
+proto=https`). Browsers ignore `Strict-Transport-Security` over plain HTTP, so one who
+forges that header gains nothing. It is never sent with `--watch` or in desktop apps.
+
+```quillo
+security_headers({ hsts: "max-age=63072000; includeSubDomains", frame: "DENY" })
+security_headers({ referrer_policy: "no-referrer" })
+
+route GET /widget {
+    security_headers({ frame: false })        // this answer may be framed anywhere
+    <Widget/>
+}
+route GET /raw = respond(200, body, { "x-frame-options": "DENY" })   // its own: kept
+```
+
+`security_headers({ hsts, referrer_policy, frame })` changes them (`false` leaves one
+out; `frame` is `"SAMEORIGIN"` or `"DENY"`), and `security_headers(false)` sends none: at
+the top of the program for every answer, in a route for its answer only. A header the
+route sets itself is kept as it is.
+
+**Content-Security-Policy.** `csp()` at the top of a program sends a strict policy with
+every answer, under which a page runs only its own site's scripts and the inline ones
+carrying the answer's nonce, new each time:
+
+```text
+script-src 'self' 'nonce-…'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+```
+
+- What Quillo writes into pages carries the nonce: the component loader, translations,
+  prefetching, `--watch`'s reload. Components are laid out by a `<style>` with the nonce
+  instead of style attributes. The browser runtime needs no `eval`. A script injected
+  into a page (through `raw`, say) does not run.
+- The program's own inline scripts need the nonce too: `<script nonce={csp_nonce()}>`.
+  `csp_nonce()` gives the answer's nonce. Event handler attributes (`onclick="..."`) do
+  not run under the policy; components' `@click` and scripts that add listeners do.
+- `csp({ script_src: ["https://cdn.example.com"], img_src: ["'self'", "data:"] })`:
+  `script_src` adds sources to `script-src`; other directives (with `_` for `-`) are
+  added, or replace the defaults (`base_uri`, `object_src`, `frame_ancestors`);
+  `report_only: true` sends it as `Content-Security-Policy-Report-Only`, which reports
+  what it would block without blocking (frames aside); `report_uri` says where.
+- In a route, `csp(false)` sends none with its answer and `csp({ ... })` another policy.
+  A route that sets `Content-Security-Policy` itself keeps its own.
 
 ### What a route returns
 
@@ -896,6 +1145,83 @@ route GET /users/:id(int) {
     user
 }
 ```
+
+### Idempotent requests
+
+A client that sent a payment and got no answer (a timeout, a dropped connection) cannot
+tell whether it was made. `idempotent(f)` lets it send the request again: a request
+with an `Idempotency-Key` header runs once, and the same request again with the same
+key gets the first answer, without running again. It works as Stripe's API does
+([idempotent requests](https://docs.stripe.com/api/idempotent_requests); the header is
+the IETF's [draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)):
+
+```quillo
+route POST /payments { json: { to: str, amount: dec } } = idempotent(() => {
+    let id = pay(to, amount)?
+    respond(201, { id })
+})
+
+server fn transfer(from: str, to: str, amount: str) =
+    idempotent({ isolation: "serializable", retries: 5 }, () => move(from, to, amount))
+```
+
+```sh
+curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bob", "amount": "12.50"}'
+```
+
+- The client makes up the key (a UUID; 1 to 255 visible characters), and sends the
+  same one when it sends the request again. A request with the key and another method,
+  path, query or body is refused with 422. One that comes while the first is still
+  running gets 409, and should be sent again a moment later. Neither runs.
+- The answer kept is the status, the headers (not `Set-Cookie`) and the body; a request
+  again gets it with `Idempotent-Replayed: true`. Answers are kept 24 hours, then the key
+  is new again: `{ max_age: "7d" }` (seconds, or a duration as for cookies) keeps them
+  longer. Expired ones are deleted as requests come.
+- Keys belong to the tenant, the mount point and the user: `session().user`, or the
+  `user` option for a request that names its caller otherwise (`{ user:
+  token.owner }`). The same key from another user is another request, and cannot read
+  this one's answer. Without a user (no session), keys are the clients' own random
+  values, shared by everyone who knows one.
+- Without the header, `f` simply runs; `{ required: true }` answers 400 instead.
+  Outside a request (a script, a job), `f` runs.
+- `idempotent` answers the request with what `f` gives, as the route or server fn would
+  have: it ends the request, so make it the last thing. What comes before it (an
+  `auth.required`, a pattern, a 400 for a bad form) runs every time and is not kept,
+  as Stripe keeps nothing for a request that failed validation.
+- A server fn whose body calls it gets a key from the page with each call. The page sends the
+  call again, with its key, when the connection fails, or the answer is 409 or 502 to
+  504: up to three more times, a quarter, half and a whole second later.
+
+**What is guaranteed.** The answers are kept in `_quillo_idempotency`, in the program's
+database (the tenant's, with a database per tenant), and `f` runs in a transaction on
+that database, which `idempotent` begins (so it takes `isolation` and `retries`, and is
+called outside `db.transaction`). The answer is written in that transaction, before it
+commits: the work and its answer are kept together, or neither is.
+
+- Before running, the key is claimed in a statement of its own, so that another request
+  with it sees it running (409).
+- When `f` returns, its answer is written and the transaction commits; then the answer
+  is sent. When `f` fails, returns an error value or replies early, the transaction
+  rolls back, the claim is given up, and the answer is sent but not kept: nothing
+  happened, so a retry runs again. To keep a refusal ("not enough money"), return it:
+  `respond(422, { error })` commits (what `f` wrote with it too) and is kept. A server
+  fn's error value is not kept: the page's retry asks again.
+- If the server stops (or loses the database) part way, the database rolls the
+  transaction back, and the claim is left. A minute after it was made, the next request
+  with the key takes it over and runs. If the first was only slow, and is still running
+  then, at most one of the two commits: the claim is taken over only while it is not
+  answered, and an answer is written only by the claim's holder, in its transaction; the
+  other rolls back and gets the first's answer, or 409.
+- On SQLite a transaction holds the database, so a second request with the key that
+  comes while the first runs waits for it, and gets its answer. On PostgreSQL and MySQL
+  it gets 409.
+- Work outside that database is not in the transaction: `http.post` to a payment
+  provider, another `db.connect`, files. For a handler that is mostly that,
+  `{ transaction: false }` runs `f` without one, and keeps every answer, failures too
+  (as Stripe does), since part of the work may have happened. A server that stops there
+  leaves the key running: it is not known whether the work happened, so requests with
+  the key get 409 until it expires. Give the provider the same key, if it takes one,
+  so that it too makes the payment once.
 
 ### Prefetching
 
@@ -961,7 +1287,9 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   name), each line of newline-delimited JSON, or each piece of text, and may stop
   it by returning `false`. Given `send`, what arrives goes straight on. It gives
   `{ status, ok, headers }` once the answer has ended (with the `body` when it is
-  not a success), or an error value when it could not be had.
+  not a success), or an error value when it could not be had (also when one event or
+  line goes past 16 MiB without ending). The map also takes
+  `redirects` and `public_only` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request and calls `f` with what the answer streams, until it ends; `listen(url,
   f)` in a component's code follows a stream for as long as the code that called it
@@ -1017,7 +1345,9 @@ udp.send("10.0.0.5", 514, "<14>app started")
   the next packet goes on.
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
   otherwise). A full queue drops its oldest packet, as UDP would; with `--metrics`,
-  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them.
+  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
+  a sender down, so where packets come in bursts faster than the handler takes them,
+  give `queue` room for the largest burst.
 - `udp.send(host, port, data, { from })` sends one packet; `udp.reply(packet, data)` sends
   back to where a packet came from, from the port it came to (as most protocols expect).
   `data` is text, a list of byte values, or any other value as JSON; a packet holds up to
@@ -1147,8 +1477,13 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   past the end gets a `416`.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
   disk. Larger ones are sent from disk as they are written, on a thread of their own
-  with a 64 KiB buffer, so a video costs no more memory than a page. The gzipped copy
-  of a text file is kept too, rather than compressed again for each request.
+  with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
+  sends run at once, 8 for one client (an IPv4 address, or an IPv6 /64 network; past
+  that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
+  seconds, and any send stops after an hour: a browser or player goes on from there
+  with a `Range` request. Behind a proxy every visitor shares the proxy's address and so
+  its 8 places; limit clients at the proxy instead. The gzipped copy of a text file is
+  kept too, rather than compressed again for each request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 ### Translations
@@ -1179,7 +1514,10 @@ view Header(user) = <header>
   other`) picks the form for `count` by the language's rules (English, French, Russian,
   Polish, Czech, Arabic, Hebrew, Japanese and others).
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
-  wrote in them.
+  wrote in them. In that form the values put in (`{name}`) are still escaped, on the
+  server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
+  translation's `<b>` and shows the name as text. (Only that form: `raw` of a variable
+  holding `t(...)`'s text makes all of it HTML.)
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
@@ -1227,22 +1565,36 @@ service /billing = "billing.qwe"
   goes straight to it.
 - **Split**, a service runs elsewhere: `--service-url billing=http://10.0.0.5:8081` (or
   `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
-  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service)
-  and the time (a call more than five minutes old is refused); the tenant goes with
-  it. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it.
-  Run alone, a service is an ordinary program: `quillo run billing.qwe --base /billing`
-  (`--base`: the path it is served under, which its links and redirects carry).
+  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service).
+  The signature covers the time (a call more than five minutes old is refused), the
+  service it is for, the function, the tenant, the arguments and the call's id. A
+  service takes only calls for itself: its name is the program's file name
+  (`billing.qwe` is `billing`), or `--service-name billing` when the file is named
+  otherwise. It remembers each call's id for longer than a signature lasts, so a call
+  sent again, by a retry or by someone who saw it on the network, is answered as it
+  was and not run again. That memory is each process's own: when a service runs at
+  several addresses, use HTTPS (or a private network) between services so calls cannot
+  be seen and sent to another of them. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
+  but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
+  `.../job/...`). Run alone, a service is a program served as one:
+  `quillo run billing.qwe --base /billing --as-service` (`--base`: the path it is
+  served under, which its links and redirects carry; `--as-service`: see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they
   declare) as a process of its own, on a port of its own, its log lines marked with its
-  name, all signed with one secret; they stop with it.
+  name, all signed with one secret (32 random bytes from the system, unless
+  `QUILLO_SERVICE_SECRET` is set); they stop with it.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
-  function arrives as `null`), so a program behaves the same whichever way it runs.
-  Optional arguments left out are not sent, so the service's own defaults apply. A
+  function arrives as `null`; a decimal stays a decimal, its scale and all), so a
+  program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
   call that cannot be made (the service not answering) is an error value: `?` passes
   it on, `??` replaces it.
 - `quillo check` checks each call against the service's `server fn`s (their names,
   arguments and types; it may fail, so the result may be an error), the browser cannot
   call a service, and a call needs the `http` effect. Services may use one another.
+- A service's `server fn`s are for other services: pages cannot call them. A service
+  does not answer `/_quillo/rpc/...` (in one process, under its prefix; split, `--split`
+  starts it with `--as-service`), only signed calls at `/_quillo/service/...`, whose
+  arguments are checked against the parameter types all the way in, as pages' calls are.
 - A program with `server fn`s and no routes is served too: a service may be only that.
 
 When a service runs elsewhere, its calls are made to hold up:
@@ -1253,7 +1605,7 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
   is tried at the next address, a little later each time. A call sent but not answered in
   time is tried again at the same address, with the same call id: the service remembers
-  the calls it answered (for ten minutes) and gives the same answer, so the function
+  the calls it answered (for eleven minutes) and gives the same answer, so the function
   runs once however often the call is sent. A call still running there is waited for.
 - **Left alone when failing.** An address that fails several calls in a row is not
   called for a while (its circuit is open), then tried with one call; the others take its
@@ -1287,7 +1639,7 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 
 ## Standard library
 
-- **General:** `print str int float len type_of`
+- **General:** `print str int float dec len type_of`, and `redact(keys)` (see [Sensitive values](#sensitive-values))
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
 - **Regular expressions:** `re.test(text, pattern)` (true or false), `re.find` (the first
   match, or null), `re.find_all` (every match), `re.replace(text, pattern, with)` (every
@@ -1318,7 +1670,10 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
-  [Numbers and data](#numbers-and-data).
+  [Numbers and data](#numbers-and-data). For money, [Decimals](#decimals) and
+  [Money](#money); `format_number(x, locale, digits)` writes a number as a locale does.
+- **Dates:** the `date` module: calendars, time zones, business days and day counts (see
+  [Dates and times](#dates-and-times)).
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
   (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
@@ -1330,11 +1685,17 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
   another server's answer as it arrives, and `listen` and `receive` read streams in a
   page (see [Streaming](#streaming)).
 - **Database:** `db.open db.exec db.query db.one db.transaction db.migrate db.connect
-  db.tenants db.tenant_exists db.shards db.atomic db.system` (see [Database](#database)).
+  db.tenants db.tenant_exists db.shards db.atomic db.system db.backup` (see [Database](#database)).
+- **Audit:** `audit(action, details)`, `audit.query`, `audit.verify`, `audit.actor` (see
+  [Audit log](#audit-log)).
 - **Crypto:** `crypto.sha256(text)` and `crypto.hmac(key, text)` (hex), `crypto.token(bytes
   = 32)` (random, URL-safe), `crypto.hash_password(pw)` (Argon2id, salted) and
   `crypto.verify_password(pw, hash)` (false for a wrong password and for anything that
-  is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets).
+  is not such a hash), `crypto.equal(a, b)` (in constant time, for comparing secrets);
+  `crypto.encrypt`, `crypto.decrypt` and `crypto.reencrypt` (see [Encrypted
+  fields](#encrypted-fields)) and `crypto.verify_webhook` (see [Webhook
+  signatures](#webhook-signatures)). One-time codes and recovery codes: see [Two-step
+  sign-in](#two-step-sign-in).
   Password hashing takes tens of milliseconds and 19 MiB on purpose, runs off the event
   loop, and at most one per core at a time (others wait their turn), so a flood of
   logins slows logins down rather than taking the server's memory.
@@ -1346,9 +1707,27 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 Safety built in:
 
 - Text in HTML and attribute values is escaped. Keys of a `{...map}` spread on an element
-  become attributes only if they are plain names that run nothing: `onclick`, `srcdoc`
-  and names with quotes or `>` are dropped. `javascript:` URLs in `href`, `src` and the
-  like render as `about:blank#blocked`.
+  become attributes only if they are plain names that run nothing: `onclick` (in any
+  case, and as `bind:onclick`), `srcdoc`, names with `:` (but `xlink:href`), `@` or
+  quotes or `>` are dropped, and a key cannot replace an attribute written out, in
+  another case either. Event handler attributes and `srcdoc` take only text written in
+  the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
+  and the like render as `about:blank#blocked`, whatever the value's type: the text the
+  attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
+  the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
+  each of `values`), which may be an `href`.
+- CSS takes data as it is written, by design: `style={...}` is escaped like any
+  attribute and `<style>{x}</style>` has its `</` rewritten, so neither can end the
+  element, but what they say is CSS. CSS runs no script in today's browsers; data put
+  there can still restyle the page (cover it with an overlay,
+  hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
+  `@import`), which tells another site that the page was viewed and can carry what the
+  style sheet says. Put only values you chose into styles (a colour from a list, a
+  number), or check what users give against what you allow. A policy that keeps loading
+  on the site, such as `csp({ img_src: "'self'", font_src: "'self'" })`, stops the
+  beacons that go through `url()`.
+- Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
+  when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
   from a request add headers of its own.
 - A failing request answers `internal error`; the message, with file and line, goes to
@@ -1362,21 +1741,157 @@ Safety built in:
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.
-- Globals read with `env`, `read_file` or the database are never written into the
-  browser bundle; a component that uses one is a load-time error.
-- `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
+  Nor can such a page open the WebSocket on which pages hear of live changes
+  (`/_quillo/live`), which the browser would otherwise let it do.
+- Globals read with `env`, `read_file`, the database or a service are never written
+  into the browser bundle, nor are those made by a function that reads them
+  (`let CONFIG = load_config()`); a component that uses one is a load-time error.
+- `quillo check` warns about SQL put together from values (`${x}`, `+`, or
+  `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
+  connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
+  db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
-  name in with `sql_name(name)` (or a list of them), and named parameters with
+  name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
+  the program's database is MySQL), and named parameters with
   `sql_param(name)` — both take only letters, digits and `_`. SQL made of them, text as
-  written, choices between those (`if`, `match`), joins of them with `+`, and `let`s
-  holding them is not warned about:
+  written (also kept in a variable), choices between those (`if`, `match`) and joins of
+  them with `+` is not warned about:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
-  `"select * from posts order by " + order`.
+  `"select * from posts order by " + order`. It is a warning, not a proof: SQL built in
+  another function, or in a list made with `map`, is not followed.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
 `use "lib.qwe"` runs another file once, into the global scope.
+
+### Decimals
+
+A `dec` is an exact decimal number, for money and whatever else is counted in cents:
+`12.50m`, `5m`, `-0.01m` (the `m` is C#'s). A float is a binary fraction, so `0.1 + 0.2`
+is `0.30000000000000004`; decimals are exact, so `0.1m + 0.2m == 0.3m`.
+
+```quillo
+let price = 19.99m
+let total = price * 3 + 4.50m          // 64.47m
+let vat = round(total * 0.21m, 2)      // 13.54m (half to even)
+let each = total / 3                   // 21.49m
+dec("12.50")  dec(42)  dec(0.1)        // 12.50m, 42m, 0.1m
+```
+
+- A decimal keeps its digits: `12.50m` shows as "12.50", and `1.10m * 3` is `3.30m`.
+  Equality and order do not see zeros at the end (`12.5m == 12.50m`), and neither do
+  map keys (`set`, `get`, `group_by`).
+- It holds 28 or 29 significant digits: a 96-bit whole number and up to 28 decimals, as
+  C#'s `decimal`. `+`, `-` and `*` are exact; an answer with more decimals than fit keeps
+  its whole part and rounds the rest half to even, and a whole part too big is an error
+  (`decimal overflow`), as with ints. `/` is exact when the answer has 28 decimals or
+  fewer, else rounded half to even to 28 or 29 digits (`1m / 3` is
+  `0.3333333333333333333333333333m`). Dividing by zero is an error, and `%` is the
+  remainder as for ints.
+- With an int, a decimal stays exact and gives a decimal. With a float it is an error,
+  never a silent float: `1.5m + 0.5` says to convert one with `dec(x)` or `float(x)`.
+  `==` compares a decimal and a float through the float's shortest text (`0.1m == 0.1`).
+- `dec(x)` makes one from text (exactly: `dec("abc")` is an error value, as `int("abc")`
+  is), an int, or a float through its shortest text (`dec(0.1)` is `0.1m`, not
+  `0.1000000000000000055…`). `int(d)` keeps the whole part, `float(d)` gives the
+  nearest float, `str(d)` its digits.
+- `round(d, digits = 0, mode = "half_even")` gives exactly that many decimals
+  (`round(12.5m, 2)` is `12.50m`; negative digits round to tens, hundreds, ...). The
+  modes: `half_even` (banker's rounding, the default), `half_up` (a half away from
+  zero, as taught at school), `half_down`, `up` (away from zero), `down` (toward zero),
+  `ceiling` and `floor`. `floor`, `ceil` and `abs` give decimals; `sum`, `min`, `max`
+  and `sort` take lists of them, and a sum stays exact.
+- `math`, `stats` and `vec` work on floats: a decimal there is an error that says to
+  use `float(x)`.
+- `json.stringify`, and a route answering a map, write a decimal as a string
+  (`"12.50"`), so nothing that reads it rounds it. `json.parse` makes no decimals:
+  numbers stay numbers.
+- In a pattern or a record's field, `dec` takes a decimal, an int, numeric text
+  (`"12.50"`, from a query, a form or JSON) or a JSON number (through its shortest
+  text), and gives a decimal: `route GET /quote ? { amount: dec }`, `type Line = {
+  price: dec }`, `/pay/:amount(dec)`. A `server fn`'s `dec` parameter takes the same
+  from a page. In an annotation (`fn f(x: dec)`) it takes only a decimal.
+- In the browser decimals are the same, and compiled components give the server's
+  answers: arithmetic, comparison, rounding, display. They cross between the server
+  and the page (props, state, server fns' arguments and answers) as decimals. Ints too
+  large for a JavaScript number (past 2^53) reach the page whole, as BigInts, and show
+  as on the server. The browser cannot tell `2.0` from `2`, so there a whole float
+  added to a decimal counts as an int.
+- `quillo check` knows them: `12.5m + 1` is a `dec`, `12.5m + 0.5` an error, and `round`,
+  `abs`, `floor`, `ceil`, `sum`, `min` and `max` keep the type they are given. `num` is
+  still `int | float`.
+- [Compiled numbers](#compiled-numbers) leave decimals to the interpreter.
+
+**In databases.** PostgreSQL's `numeric` and MySQL's `decimal` come back as decimals with
+their scale (`numeric(10, 2)` gives `19.99m`, and `12.50` stays `12.50m`), and decimals
+are sent exactly. A value without a scale (as `sum` of ints gives) is an int, and one
+past 28 decimals or 29 digits is its exact text. In MySQL a decimal parameter arrives
+as text, which MySQL turns exactly into a `decimal` column, but into a double inside an
+expression: write `cast(? as decimal(12, 2))` there.
+
+SQLite has no decimals. A decimal is stored as its text, and a column declared
+`decimal(12, 2)`, `numeric(12, 2)` or `money` is read back as decimals (a bare `numeric`,
+SQLite's name for any number, gives numbers as before). But such a column has
+NUMERIC affinity: SQLite turns "0.10" into the real 0.1 (and rounds past 15 digits), so
+the scale is lost and large amounts are not exact. For exact amounts, declare the
+column `decimal_text` (TEXT affinity: SQLite keeps the digits as written, and Quillo
+still reads them as decimals), or keep whole minor units (`amount_cents integer`; see
+`money.to_minor`). SQL's own sums and ordering do not work on text: add up and sort in
+Quillo, or keep minor units.
+
+### Money
+
+`money` keeps amounts of a currency: a map `{ amount: dec, currency: "USD" }`, the
+amount always with the currency's minor units (ISO 4217: JPY 0, USD 2, BHD 3). It is a
+plain map, so JSON, the database and the browser take it as it is, and `money` checks
+it each time it is given one. On the server and in the browser alike:
+
+```quillo
+let price = money.of(19.99m, "USD")             // { amount: 19.99m, currency: "USD" }
+money.of(form.amount, "EUR") ?? reply 400       // text from a form; an error value if bad
+money.of("12.345", "USD")                       // err: more decimals than USD has
+money.of("12.345", "USD", "half_up")            // 12.35
+money.from_minor(1250, "USD")                   // 12.50, from cents
+money.to_minor(price)                           // 1999
+money.add(a, b)  money.sub(a, b)  money.neg(a)  money.compare(a, b)   // -1, 0, 1
+money.mul(price, 3)  money.mul(price, 0.075m, "half_up")              // rounded to cents
+money.allocate(money.of(100, "USD"), [1, 1, 1])  // 33.34, 33.33, 33.33
+money.format(price, "de-DE")                    // "19,99 $"
+```
+
+- `money.of(amount, currency, mode)` takes a decimal, an int or numeric text (a float
+  is an error: `dec(x)` it first). An amount with more decimals than the currency has,
+  bad text and an unknown currency give error values, as `int("x")` does; with a
+  rounding mode (those of `round`), the amount is rounded instead. Codes are ISO 4217's
+  active ones (`money.minor_units("JPY")` is 0); codes without minor units, such as XAU,
+  are not money.
+- `add`, `sub` and `compare` take two amounts of one currency: two currencies are an
+  error, never a sum. `mul(m, factor, mode = "half_even")` multiplies by a decimal or an
+  int and rounds to the currency; `round(m, mode)` rounds an amount made by hand.
+  `zero(currency)`, `is_zero(m)`.
+- `money.allocate(m, ratios)` splits an amount by ratios (ints or decimals; a number n
+  for n equal parts) without losing or making a minor unit: each share gets its part,
+  rounded down, and the units left over go one each to the first shares (Martin
+  Fowler's allocation). The shares always add up to the amount.
+- `money.format(m, locale)` writes it as CLDR has it for the locale, the same as
+  `Intl.NumberFormat` in a browser: `$1,234.50` (en-US), `1.234,50 €` (de-DE),
+  `1 234,50 €` (fr-FR, a narrow no-break space between thousands), `￥1,235` (ja-JP),
+  `₹12,34,567.00` (en-IN). Without a locale it uses the program's (`locale()`, with
+  [Translations](#translations)), else en-US. Covered: en-US, en-GB, en-CA, en-AU,
+  en-NZ, en-IE, en-IN, en-SG, en-ZA, de-DE, de-AT, de-CH, fr-FR, fr-BE, fr-CA, fr-CH,
+  it-IT, it-CH, es-ES, es-MX, es-AR, pt-BR, pt-PT, nl-NL, nl-BE, sv-SE, nb-NO, da-DK,
+  fi-FI, pl-PL, cs-CZ, hu-HU, ro-RO, el-GR, tr-TR, ru-RU, uk-UA, ja-JP, zh-CN, zh-TW,
+  zh-HK, ko-KR, hi-IN, id-ID, th-TH, vi-VN, ms-MY and fil-PH. Another locale is written
+  as the first of its language (`de-LU` as de-DE, `fr` as fr-FR), else as en-US. The
+  common currencies have their symbols (`$`, `€`, `£`, `¥`, `₹`, `CA$`, ...); others
+  are written with their code (`XOF 1,235`).
+- `format_number(x, locale, digits)` writes any number the same way: `format_number(
+  1234567.5, "en-IN", 2)` is `"12,34,567.50"`.
+
+To hold the program to the shape, name it: `type Money = { amount: dec, currency: str }`
+makes `Money(request.json)` check what a client sends, and `quillo check` knows what the
+`money` functions give.
 
 ### Numbers and data
 
@@ -1404,7 +1919,7 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   past 64 bits (`math.factorial(21)`).
 - **`stats`:** `mean fmean(data, weights) geometric_mean harmonic_mean`, `median
   median_low median_high mode multimode`, `pvariance variance pstdev stdev` (each with an
-  optional known mean), `quantiles(data, n = 4, method = "exclusive")`, `covariance
+  optional known mean), `quantiles(data, n = 4, method = "exclusive")` (n up to 10,000), `covariance
   correlation(x, y, method = "linear") linear_regression(x, y, proportional = false)`,
   `normal_pdf normal_cdf normal_inv` (x, mu = 0, sigma = 1); and, beyond Python's,
   `percentile(data, p)` (p from 0 to 100, or a list of them; numpy's linear rule),
@@ -1452,6 +1967,89 @@ Making a list one item at a time is the interpreter's work, though: `map(range(n
 `vec` instead (`vec.div(vec.mod(vec.mul(vec.arange(n), k), m), 1000.0)`), the same list
 takes a fifteenth of the comprehension's time.
 
+### Dates and times
+
+There is no date type: a date is its ISO 8601 text, `"2026-10-27"`, and a date-time is
+RFC 3339 text with its offset, `"2026-10-27T14:30:00Z"` or `"2026-10-27T15:30:00+01:00"`.
+Text like that sorts and compares in time order (date-times when they have the same
+offset: keep them in UTC), and goes through JSON, databases, forms (`<input type="date">`)
+and the browser as it is. The `date` module works on it, on the server and in the browser
+alike, with the same answers:
+
+```quillo
+date.today()                          // "2026-10-27", in UTC; date.today("Europe/Paris")
+date.now()                            // "2026-10-27T14:30:00Z", to the second
+date.add_months("2026-01-31", 1)      // "2026-02-28": the end of the month, not March
+date.to_zone("2026-10-27T14:30:00Z", "Europe/Paris")       // "2026-10-27T15:30:00+01:00"
+date.at("2026-10-27", "17:00", "America/New_York")         // "2026-10-27T17:00:00-04:00"
+let cal = { holidays: ["2026-12-25", "2026-12-28", "2027-01-01"] }
+date.add_business_days(trade_date, 2, cal)                 // T+2 settlement
+date.adjust("2026-10-31", "modified_following")            // "2026-10-30"
+date.year_fraction("2026-01-15", "2026-07-15", "ACT/360")  // 0.5027777777777778
+date.format("2026-10-27", { locale: "de-DE", style: "long" })  // "27. Oktober 2026"
+date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or an error value
+```
+
+- **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time),
+  `date.parts(d)` (`{ year, month, day, weekday }`, weekday 1 for Monday to 7 for Sunday;
+  a date-time adds `hour minute second offset`), `date.weekday(d)`, `date.is_leap_year(year
+  or d)`, `date.days_in_month(d)` or `(year, month)`.
+- **Arithmetic:** `date.add_days(d, n)`, `date.add_months(d, n)` and `date.add_years(d, n)`
+  (a day past the month's end is its last day: `2024-02-29` plus a year is `2025-02-28`),
+  `date.days_between(a, b)` (`b - a`, in days), `date.months_between(a, b)` (whole months:
+  `2026-01-31` to `2026-02-28` is one), `date.start_of_month(d)`, `date.end_of_month(d)`.
+  These take dates; `date.date_in(t, tz)` gives a date-time's date.
+- **Time zones:** `date.to_zone(t, tz)` is the same instant at the zone's offset then
+  (daylight saving included); `date.date_in(t, tz)` its calendar date there;
+  `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go
+  forward is moved forward by the gap, 02:30 becoming 03:30; a time that happens twice
+  when they go back is the first). A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
+  an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
+  reads the system's time zone database, or a copy built into `quillo` where there is none
+  (Windows, small containers); the browser asks its own (`Intl`).
+- **Business days:** a calendar is `{ weekend: [6, 7], holidays: [...] }`, both optional
+  (by default Saturday and Sunday, and no holidays; `[5, 6]` for a Friday and Saturday
+  weekend). Quillo ships no country's holidays; `date.easter(year)` gives Easter Sunday,
+  from which many follow (Good Friday is two days before). `date.is_business_day(d,
+  cal)`, `date.add_business_days(d, n, cal)` (n business days on, or back for a negative
+  n; with 0, `d` or the next business day), `date.business_days_between(a, b, cal)`
+  (counting `a`, not `b`), and `date.adjust(d, convention, cal)` with `"following"` (the
+  default), `"modified_following"` (the next business day, unless that is next month:
+  then the one before), `"preceding"`, `"modified_preceding"` and `"unadjusted"`.
+- **Day counts:** `date.day_count(start, end, convention)` (days as the convention counts
+  them) and `date.year_fraction(start, end, convention)`, for interest:
+
+  | Convention | Year fraction |
+  |---|---|
+  | `ACT/360` | actual days / 360 |
+  | `ACT/365` (or `ACT/365F`) | actual days / 365, leap year or not |
+  | `ACT/ACT` (ISDA) | days in leap years / 366 + days in other years / 365 |
+  | `30/360` (bond basis, ISDA) | 30-day months: a 31st start is the 30th; a 31st end is the 30th when the start is then the 30th |
+  | `30U/360` (US, SIA) | as `30/360`, and the last day of February counts as the 30th when it starts a period, and when it ends one that started on one |
+  | `30E/360` (Eurobond) | every 31st is the 30th |
+
+  An end before the start gives the same count, negative. `Actual` for `ACT` and lower
+  case are fine.
+- **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
+  not), `MMMM MMM` (its name), `DD D`, `dddd ddd` (the weekday's name), `HH H` and `hh h`
+  (24 or 12 hours), `mm ss A` (AM/PM) and `Z` (the offset); anything else, and text in
+  `[brackets]`, is kept as it is. A date-time shows its time as written: `date.to_zone` it
+  first to show another zone's. `date.format(d, { locale, style })` gives a locale's
+  `"short"`, `"medium"` (the default), `"long"` or `"full"` date, and `{ locale, pattern }`
+  the pattern with that language's names. The locales are English (US, and the British
+  style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`), German, French, Spanish,
+  Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
+  forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
+  `date.parse(s, pattern)` reads by a pattern (English names; `YY` is 2000 to 2099; with a
+  time and no `Z`, UTC). Either gives an error value when the text is not a date.
+
+A malformed date (`"2026-02-30"`, `"27/10/2026"`, a number) is an error in every function
+but `date.parse` and `date.valid`. Years are 1 to 9999. `date.today` and `date.now` read
+the clock, so they are the `time` effect, and scripts run with `run_script` have the rest
+of `date` but not them. A program's own variable called `date` hides the module, as with
+the others.
+
 ### Database
 
 `db` talks to SQLite (built in), PostgreSQL or MySQL/MariaDB, with the same functions.
@@ -1467,11 +2065,57 @@ db.query("select * from todos where id > ?", 10)           // a list of maps
 db.one("select * from todos where id = :id", { id })       // a map, or null; keys the SQL does not use are ignored
 db.one("insert into todos (text) values (?) returning id", text)
 db.transaction(() => { ... })                              // all or nothing; nests
+db.transaction({ isolation: "serializable", retries: 3 }, () => { ... })
 ```
 
 Without `db.open`, the database is `$QUILLO_DB` (a path or a URL), or else
 SQLite in memory. A transaction rolls back if its function fails, returns an error
 value or replies early.
+
+**Isolation and retries.** `db.transaction(options, f)` takes the isolation level and
+how many times to run `f` again when the database gives up on it because of another
+transaction:
+
+```quillo
+fn withdraw(account: int, cents: int) with db =
+    db.transaction({ isolation: "serializable", retries: 5 }, () => {
+        let balance = db.one("select balance from accounts where id = ?", account).balance
+        if balance < cents { return err("not enough money") }
+        db.exec("update accounts set balance = balance - ? where id = ?", cents, account)?
+    })
+```
+
+- `isolation` is `"serializable"`, `"repeatable_read"` or `"read_committed"`; left out,
+  it is the database's default (read committed on PostgreSQL, repeatable read on MySQL).
+  PostgreSQL begins with `begin isolation level ...`, MySQL runs `set transaction
+  isolation level ...` before `begin`. SQLite lets one transaction write at a time, so
+  its transactions are serializable whatever is asked; with options it begins `begin
+  immediate`, taking the write lock at once (another process holding it is then a
+  conflict, tried again, rather than a failure half way).
+- `retries` (0 to 20; 0 by default) runs the whole function again after a serialization
+  failure or a deadlock: PostgreSQL's SQLSTATE 40001 and 40P01, MySQL's 1213 (deadlock),
+  1205 (lock wait timeout), 1020 (a row changed since the snapshot, MariaDB) and 1412 (a
+  table made since the transaction began), SQLite's busy database. Each try waits a little longer
+  than the last (about 10 ms, doubling up to 320 ms, give or take half, so the two that
+  collided do not collide again). Any other failure ends the transaction at once. Out of
+  tries, the transaction gives the database's error value.
+- After such a failure the transaction is over, whatever the function does with the
+  error value: PostgreSQL refuses its next statements, and MySQL has already rolled it
+  back (statements after it would otherwise run outside any transaction). So they fail
+  at once, and a function that carries on anyway is not committed, but tried again.
+- A transaction inside another is a savepoint, and cannot change the isolation: asking
+  is an error. Only the outermost one tries again; give it the options.
+- The function may run more than once, so it should do nothing that cannot be taken
+  back: no `http.*`, `udp.send` or `channel.send` in it (send them after the
+  transaction; `quillo check` warns), and global variables it changes are not rolled
+  back. What it does in the database is.
+- Under serializable isolation the database finds the conflicts itself: two
+  withdrawals that read the same balance cannot both commit. Under read committed (or
+  for a hot row, to wait instead of failing and trying again), lock what is read before
+  writing it: `select balance from accounts where id = ? for update` (PostgreSQL,
+  MySQL; SQLite has no `for update`, and needs none). A balance kept as a running total
+  is updated in place: `update accounts set balance = balance - ? where id = ? and
+  balance >= ?`, checking `changes`.
 
 **Migrations.** `db.migrate("migrations")` (the folder is optional; that is its default)
 brings the schema up to date from SQL files applied in name order: `001_todos.sql`,
@@ -1495,7 +2139,7 @@ db.migrate()
   are translated, skipping quotes, comments and `$$` strings. Queries are prepared, so
   values never become SQL text.
 - Values convert both ways: numbers, text, booleans, `json`/`jsonb` as maps and lists,
-  arrays as lists, `numeric` as numbers, and `uuid`, `date`, `timestamp`/`timestamptz`
+  arrays as lists, `numeric` as [decimals](#decimals), and `uuid`, `date`, `timestamp`/`timestamptz`
   (ISO 8601, in UTC) and `interval` as strings. For other column types the value is sent
   as text and Postgres converts it.
 - `last_id` is `null`: use `insert ... returning id` with `db.one`.
@@ -1507,9 +2151,12 @@ db.migrate()
   (its `parallel` calls' too) go to the same one, so the database reads them together.
   While those connections wait on a slow query, new requests use others, up to
   `pool_size`.
-- TLS is used when the server offers it (`?sslmode=require` insists), with certificates
-  checked against the usual public certificate authorities, as hosted Postgres services
-  use.
+- TLS is required for a server on another machine, with its certificate and name
+  checked; on this machine (`localhost`, `127.0.0.1`, `::1`, a Unix socket) it is used
+  when the server offers it. The URL can say otherwise, as libpq's do: see
+  [TLS to the database](#tls-to-the-database) below. Before, TLS was only preferred
+  everywhere: a URL to another machine whose server has no TLS now needs
+  `?sslmode=disable` to connect.
 
 **MySQL and MariaDB** (the `mysql` feature, built in by default; `cargo build
 --no-default-features` leaves it out):
@@ -1517,7 +2164,7 @@ db.migrate()
 - Placeholders are `?`, or `:name` with a map (translated, skipping quotes, backticks
   and comments). Statements are prepared, so values never become SQL text.
 - Values convert both ways: numbers, text, `tinyint(1)` as booleans, `decimal` as
-  numbers, MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
+  [decimals](#decimals), MySQL's `json` as maps and lists (MariaDB's JSON is text: `json.parse` it),
   and dates and times as ISO text. `last_id` is the new row's `auto_increment` id.
 - Connections come from a pool, and a query releases the interpreter lock while it
   waits, as with Postgres. A transaction keeps one connection until it ends; nested
@@ -1527,6 +2174,89 @@ db.migrate()
   keeps what it did before the failure: put one change in each file.
 - A database per tenant: `mysql://host/app_{tenant}`, made when the program makes the
   tenant, and listed by `db.tenants()`.
+- TLS is required for a server on another machine, with its certificate and name
+  checked; on this machine (`localhost`, `127.0.0.1`, `::1`, `?socket=...`) it is not
+  used unless the URL asks for it. See [TLS to the database](#tls-to-the-database)
+  below. Before, TLS was off unless `require_ssl=true`.
+
+#### TLS to the database
+
+Some hosted databases sign their certificates with a certificate authority (CA) of
+their own: Amazon RDS and Aurora, Google Cloud SQL (the instance's `server-ca.pem`), and
+a company's servers with its private CA. The public CAs that are trusted by default do not know those, so the
+connection fails with `invalid peer certificate: UnknownIssuer` until the URL names
+the CA's certificates (a PEM file, as the service publishes it):
+
+```quillo
+// Amazon RDS and Aurora: their CAs' bundle, saved where the program runs, from
+// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+db.open("postgres://app@mydb.abc123.eu-west-1.rds.amazonaws.com:5432/app?sslrootcert=/srv/app/global-bundle.pem")
+db.open("mysql://app@mydb.abc123.eu-west-1.rds.amazonaws.com:3306/app?ssl_ca=/srv/app/global-bundle.pem")
+// Or in $DATABASE_URL, with the password: postgres://app:...@...rds.amazonaws.com/app?sslrootcert=...
+```
+
+PostgreSQL reads the options libpq does:
+
+| In the URL | TLS | The server's certificate |
+|---|---|---|
+| `sslmode=verify-full` (the default for another machine) | always | signed by a trusted CA, for the host's name |
+| `sslmode=verify-ca` | always | signed by a CA in `sslrootcert`, for any name |
+| `sslmode=require` | always | not checked, unless `sslrootcert` is given (then as `verify-ca`) |
+| `sslmode=prefer` (the default on this machine) | when the server offers it | as with `require` |
+| `sslmode=disable` | never | |
+
+- `sslrootcert=/path/ca.pem`: the CAs to trust, in PEM, instead of the public ones.
+  `sslrootcert=system` trusts the operating system's CAs (with `verify-full` only).
+- `sslcert=/path/client.crt` and `sslkey=/path/client.key`: a certificate and its key
+  (PEM), for a server that asks for one (`hostssl ... cert` in `pg_hba.conf`).
+- `require` keeps the connection from being read, but not someone in the middle from
+  posing as the server, who then has the queries and the data. Use it only where the
+  network is yours; `verify-ca` with the CA's certificate costs no more. `prefer` is
+  weaker still: someone in the middle can say the server has no TLS.
+- `verify-ca` without `sslrootcert` is refused: any certificate from a public CA, for
+  anyone's site, would pass. Where the server is reached at an address its certificate
+  does not name, `verify-full` with the name in `host` and the address in `hostaddr`
+  (`postgres://db.internal/app?hostaddr=10.0.0.5`) checks the name too.
+
+MySQL and MariaDB take the MySQL driver's options:
+
+- `ssl_ca=/path/ca.pem`: the CAs to trust instead of the public ones (with
+  `built_in_roots=true`, as well as them). It asks for TLS on this machine too.
+- `ssl_server_name=db.example.com`: the name the certificate is checked for, where the
+  host connected to is an address or a tunnel. `verify_identity=false` is refused: the
+  driver checks the name regardless.
+- `verify_ca=false`: the certificate is not checked at all, which has the risk of
+  Postgres's `require` above.
+- `ssl_cert=/path/client.crt` and `ssl_key=/path/client.key`: a client certificate
+  (`REQUIRE X509`).
+- `require_ssl=true` asks for TLS on this machine; `require_ssl=false` turns it off.
+
+**Backups.** `db.backup(path)` copies a SQLite database while it is in use, with SQLite's
+online backup API:
+
+```quillo
+db.backup("backups/app.db")                                // { path, bytes, ms, removed }
+schedule("0 3 * * *", () => db.backup("backups/app-{time}.db", { keep: 14 }))
+```
+
+- The copy is read on a connection of its own, in one step: in WAL mode that is a read,
+  which sees the database as it was when the copy began (whole transactions, nothing
+  half written) and holds up no one's writes. It is written beside where it goes and
+  renamed there once whole, so a backup file that is there is complete, and it is one
+  file (no `-wal` beside it), ready to open: `db.open("backups/app-20261027T030000Z.db")`
+  restores it, or copy it over the database while the program is stopped.
+- `{time}` in the path is the UTC time, `20261027T030000Z`; with `{ keep: N }`, files the
+  same path made at other times are removed, keeping the N newest. `{tenant}` is the
+  tenant's name: with a database per tenant, a job backs each one up with
+  `for t in db.tenants() => with_tenant(t, () => db.backup("backups/{tenant}-{time}.db", { keep: 14 }))`.
+- A relative path is in the program's folder. Keep copies on another disk too: a
+  backup next to the database goes when the disk does.
+- `analytics.backup(path)` backs up a connection's database. For PostgreSQL and MySQL
+  it is an error value: use their own tools, which a scheduled job outside Quillo runs:
+  `pg_dump --format=custom --file=app-$(date -u +%Y%m%dT%H%M%SZ).dump "$DATABASE_URL"`
+  (restored with `pg_restore --clean --dbname=...`), or `mysqldump --single-transaction
+  --routines app > app.sql` (restored with `mysql app < app.sql`). A hosted database's
+  point-in-time recovery (WAL archiving, binary logs) loses less than a nightly dump.
 
 ### Several databases
 
@@ -1623,15 +2353,28 @@ db.atomic([db, ledger], () => {
 
 ### Quillo's own tables
 
-Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
-made later (`_quillo_later`) and the decisions of `db.atomic` (`_quillo_atomic`) are
-kept in the program's database. When there is a database per tenant they cannot be,
+The audit log (`_quillo_audit`) is always the program's database's, the tenant's with
+one per tenant, so that it is written in the same transactions as the changes it is
+about (see [Audit log](#audit-log)). Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
+made later (`_quillo_later`), the decisions of `db.atomic` (`_quillo_atomic`), and
+sessions and rate limits when sessions are kept in the database (`_quillo_sessions`,
+`_quillo_limits`, each row marked with its tenant) are kept in the program's database. When there is a database per tenant they cannot be,
 and go to the system database instead: `db.system(target)` (a database every server of
 the program shares, for several servers), `$QUILLO_SYSTEM_DB`, or else a SQLite file
 `quillo-system.db` next to the program. `db.system` also keeps them apart from the
 program's own tables when there is one database. A program with no database at all
 keeps its calls made later in that file too, so they outlive a restart (its jobs need
 no record: one server runs them).
+
+Sessions and rate limits are apart from the program's transactions: a session set, or a
+call counted, inside `db.transaction` (or `idempotent`) stays when the transaction is
+rolled back, and is not undone by a try that failed. On PostgreSQL and MySQL they use
+a connection of their own; SQLite has one connection, so there their changes are made
+as soon as the transaction has ended.
+
+The answers of [idempotent requests](#idempotent-requests) (`_quillo_idempotency`) are
+the exception: they are kept in the program's database, the tenant's when there is one
+per tenant, so they commit in the same transaction as the work they answer for.
 
 ### Many tenants
 
@@ -1685,6 +2428,82 @@ route GET / = <h1>Welcome, {tenant()}</h1>
   `tenant()` or read the database are never served from the view cache. Cookies
   belong to the host they were set on, so each subdomain has its own.
 
+### Audit log
+
+`audit(action, details)` records that something was done, by whom, in an append-only
+table Quillo keeps in the program's database:
+
+```quillo
+server fn delete_contact(id: int) with db {
+    need_admin()?
+    db.transaction(() => {
+        db.exec("delete from contacts where id = ?", id)
+        audit("contact.delete", { id })?          // both, or neither
+    })
+}
+audit.query({ action: "contact.*", since: "2026-10-01", limit: 50 })   // newest first
+audit.verify()          // { ok: true, rows: 1234, last: "9f2c..." }, or where it breaks
+```
+
+- A row has its `seq` (1, 2, ... for each tenant), `at` (UTC, RFC 3339 with
+  milliseconds), `action`, `details` (any value, kept as JSON, at most 64 KB), `actor`,
+  `tenant`, the request's id (`rid`), `ip` and user agent (`agent`), and `prev` and `hash`.
+  `audit` returns `{ seq, hash, at }`, or an error value if the database could not take
+  the row.
+- The actor is the session's `user` (`set_session({ user: u.id })`), as text, or null.
+  `audit.actor(() => current_user().email)` at the top of the program says otherwise:
+  the function runs for each row.
+- Inside `db.transaction` the row is written in the transaction: a change rolled back
+  leaves no row, and one committed always has its row. Give `audit(...)` a `?`, as above,
+  and a row that could not be written rolls the change back too. Outside a
+  transaction it is written in one of its own. In a transaction with `retries`, a try
+  rolled back takes its row with it; appends that collide (one tenant's rows take
+  turns) are conflicts like any other, and the transaction runs again.
+- Values under sensitive keys (`password`, `iban`, ... see
+  [Sensitive values](#sensitive-values)) are stored as `[redacted]`: keep ids in the
+  details, not documents or secrets.
+- `audit.query(options)`: `actor`, `action` (ending in `*` for a prefix: `"contact.*"`),
+  `since` (inclusive) and `until` (exclusive), as dates, RFC 3339 times in UTC or
+  milliseconds; `before` (a `seq`, for the next page) and `limit` (100 unless given, at
+  most 10,000). It reads the current tenant's rows.
+
+**The chain.** Each row's `hash` is the SHA-256 of the row before's hash and of its own
+contents (`[tenant, seq, at, actor, action, details, rid, ip, agent]`, as JSON), and the
+first row follows 64 zeros. `audit.verify()` walks the tenant's rows from the first: a
+row whose contents changed, a row removed or added in the middle, breaks the chain
+there, and it answers `{ ok: false, rows, broken: { seq, id, why } }` naming the first
+such row (`rows` are those that checked out before it). Rows removed from the end
+leave a chain that checks out, shorter: keep `last` (the newest hash) somewhere else
+now and then (a log collector, a daily email) and compare.
+
+**Taking turns.** Appends for a tenant are made one at a time, so the chain has one
+order with any number of servers. On PostgreSQL and MySQL each append locks the
+tenant's row in `_quillo_audit_lock` (`select ... for update`) until its transaction
+ends, then reads the last row and writes the next; on SQLite, writes take turns
+anyway (`begin immediate` outside a transaction). `unique (tenant, seq)` makes sure
+of it. A transaction that audits holds the lock until it commits, so keep those short.
+
+**Append-only.** `db.exec` and `db.query` refuse SQL that writes to `_quillo_audit` or
+`_quillo_audit_lock` (`update`, `delete`, `insert`, `drop`, ...): only `audit` adds to
+it. That stops mistakes in the program, not someone with the database's password. To
+make the database enforce it, have the tables owned by another role (the one that
+runs migrations) and give the program's user no more than this; on PostgreSQL:
+
+```sql
+-- once the program has made the tables (its first audit), as their owner:
+revoke all on _quillo_audit, _quillo_audit_lock from app;
+grant select, insert on _quillo_audit to app;
+grant usage on sequence _quillo_audit_id_seq to app;
+grant select, insert, update on _quillo_audit_lock to app;   -- its rows are locks
+```
+
+On MySQL: `grant select, insert on app._quillo_audit to 'app'@'%'` and `grant select,
+insert, update on app._quillo_audit_lock to 'app'@'%'`, with no other grant on the
+database that covers those tables. A user who cannot create tables finds them made
+and carries on. Keeping rows for as long as the rules ask (seven years, say) and
+copying them to storage that cannot be changed (a bucket with object lock) are the
+operator's: Quillo never deletes rows.
+
 ### HTTP client
 
 ```quillo
@@ -1695,6 +2514,89 @@ http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 
 Every HTTP status is a response; failing to connect is an error value.
 `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+
+### Encrypted fields
+
+`crypto.encrypt(text)` encrypts a value to keep in the database (an IBAN, a tax id),
+with AES-256-GCM, and `crypto.decrypt(token)` gives it back:
+
+```quillo
+db.exec("insert into accounts (owner, iban) values (?, ?)", owner, crypto.encrypt(iban))
+let iban = crypto.decrypt(row.iban)?          // the text, or an error value
+```
+
+- The keys are in `QUILLO_ENCRYPTION_KEYS`: `id:base64key` pairs, separated by commas,
+  the current key first: `k2026:3q2+7w...,k2025:Yx9...`. `quillo keygen` (or
+  `quillo keygen k2026`) prints a new one; so does `echo "k2026:$(openssl rand -base64 32)"`.
+  Keep them where the program's other secrets are, never in its files. A program does
+  not start when they are set but cannot be used (a key that is not 32 bytes, an id
+  twice), rather than failing at its first `crypto.encrypt`.
+- A token is `qe1.<key id>.<nonce, ciphertext and tag, base64url>`: it names its key, and
+  has a random 96-bit nonce, so the same text encrypts differently each time (equal
+  values cannot be found by comparing tokens: keep a `crypto.hmac` of the value beside
+  it to look one up). The version and key id are authenticated with the text: a token
+  changed in any way, or given another key's id, does not decrypt.
+- Rotating keys: put a new key first and keep the old ones after it. New values use
+  the new key; old ones still decrypt. `crypto.reencrypt(token)` gives a value under the
+  current key (a token made with it already comes back as it is), so a job can move a
+  table over, after which the old key can go:
+  `for r in db.query("select id, iban from accounts") => db.exec("update accounts set iban = ? where id = ?", crypto.reencrypt(r.iban)?, r.id)`.
+- A token that does not decrypt (changed, another key's, no keys set) is an error value,
+  never a crash. Each function takes the keys as a second argument too, in the same
+  form, for a key ring of the program's own (a tenant's, say).
+- The keys are read where they are used, in Rust, and are never a Quillo value. A
+  component that uses what `crypto.decrypt` gave a global is a load-time error, as with
+  `env` (see [Safety built in](#standard-library)), and components cannot call `crypto`.
+- `crypto.encrypt` needs the `random` effect.
+
+### Webhook signatures
+
+`crypto.verify_webhook(body, header, secret, options)` checks that a webhook came from
+the service it says, with the request's body as it was sent (`request.body` is that
+text, not JSON parsed and written again):
+
+```quillo
+route POST /hooks/stripe {
+    let ok = crypto.verify_webhook(request.body, request.headers["stripe-signature"], env("STRIPE_WEBHOOK_SECRET"))
+    if !ok { reply 400 ok.error }
+    let event = request.json
+    ...
+}
+crypto.verify_webhook(request.body, request.headers["x-hub-signature-256"], secret)    // GitHub
+crypto.verify_webhook(request.body, request.headers["x-shopify-hmac-sha256"], secret)  // Shopify
+```
+
+- `scheme: "stripe"`: the header is `t=<time>,v1=<hex>,...`, an HMAC-SHA256 of
+  `<t>.<body>`. Any of its `v1` signatures may match (Stripe sends two while a secret
+  is rolled), and `t` must be within `tolerance` of now (`"5m"` unless given), so a
+  webhook sent again later is refused.
+- `scheme: "hmac-sha256"`: an HMAC-SHA256 of the body, in hex with or without `sha256=`
+  before it (GitHub), or in base64 (Shopify).
+- Without `scheme`, a header with `t=` and `v1=` is Stripe's, any other the plain one.
+- Signatures are compared in constant time. The answer is `true`, or an error value
+  saying why not, which is falsy: `if !ok` works, and `ok.error` says what failed. A
+  missing header or secret is an error value too.
+- It needs the `time` effect (Stripe's timestamps are checked against the clock).
+
+Options come after the headers (`http.get(url, headers, opts)`, `http.post(url, body,
+headers, opts)`), and in `http.stream`'s map:
+
+- `redirects: 0` answers a redirect with the 3xx response itself, instead of following
+  it (up to 5 are followed otherwise, to any address).
+- `public_only: true` connects only to addresses on the public internet: not this
+  machine, private or link-local networks (where a cloud's metadata service is at
+  169.254.169.254), or addresses kept for other uses, in IPv4 or IPv6. The addresses
+  the host name gives are checked as the connection is made, so a name cannot pass a
+  check and then lead inside.
+
+For an address a program's users give (a webhook), use both, and require `https://`:
+
+```quillo
+fn post_hook(url: str, body) {
+    if !starts_with(url, "https://") { return err("the address must start with https://") }
+    http.post(url, body, {}, { redirects: 0, public_only: true })
+}
+```
 
 ## Checking
 
@@ -1766,9 +2668,9 @@ What a reload keeps, and what it starts afresh:
   transaction in progress goes on, and commits or rolls back as it would have). Requests
   that come after are answered by the new version. While the new version loads, Quillo
   code waits (what waits on a database goes on); no request is dropped.
-- **Sessions** are signed cookies, not server memory: they stay valid. The key is
-  `QUILLO_SECRET`; without it a key made at start, which a reload keeps and a restart
-  does not (everyone is signed out), so set it in production.
+- **Sessions** are signed cookies or rows in the database, not server memory: they stay
+  valid. The signing key is `QUILLO_SECRET`; without it a key made at start, which a
+  reload keeps and a restart does not (everyone is signed out), so set it in production.
 - **Global variables** start afresh: keep in the database what must last.
 - The old version's database connections close once no request uses it (within a second
   or so of the last one). Calls made later and transactions over several databases left
@@ -1872,14 +2774,62 @@ production a page's bundle is one minified file, as before.
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path -> 200 (0.4ms)`. With `--log json` the
-line is a JSON object instead, for log collectors: `time` (ISO 8601, UTC), `method`,
-`path`, `status`, `ms`, `ip`, and `tenant` when the request had one. `--log off` turns
-the request log off; errors are still printed.
+line is a JSON object instead, for log collectors: `time` (RFC 3339, UTC, with
+milliseconds), `method`, `path` (without the query string), `status`, `ms`, `ip`,
+`tenant` when the request had one, `user` (the session's `user`, when the request read
+or set its session) and `rid` (the request's id, also sent back as `x-request-id`).
+`--log-query` keeps query strings in `path`. Sensitive query parameters (`?password=`,
+`?card_number=`, ... see [Sensitive values](#sensitive-values)) show as `[redacted]`, in
+either format. `--log off` turns the request log off; errors are still printed.
+
+Where it goes:
+
+- `--log-file logs/requests.log` writes it to a file a day instead of stderr, by the UTC
+  date: `logs/requests-2026-10-27.log`. A new day's file starts at midnight UTC.
+- `--log-keep 90` removes that file's days older than 90 days, as each day starts
+  (without it, every day is kept).
+- `--log-stdout` writes it to stdout, as well as to the file with `--log-file`.
+- Lines are written in batches, at least once a second.
+
+To ship it to a collector, have the collector read the files or the output. With
+[Vector](https://vector.dev): a `file` source on `logs/requests-*.log` with a
+`parse_json` transform, sent on to Elasticsearch, Loki, Datadog or S3; with Fluent Bit,
+a `tail` input with the `json` parser; under systemd or Docker, `--log json --log-stdout`
+and the journal's or the container runtime's log driver. Keep the files on a disk of
+their own, and the collector's copies for as long as the audit rules ask; the
+[audit log](#audit-log) says what people did, this log what was asked of the server.
 
 With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format: requests
 answered by status class (`quillo_requests_total`), a histogram of how long they took
 (`quillo_request_duration_seconds`), requests in progress, open connections and uptime.
 It is off by default, since anyone who can reach the server could read it.
+
+### Sensitive values
+
+Some values must not reach logs or error messages: passwords, card numbers, IBANs.
+Quillo masks them where it writes something down:
+
+```quillo
+redact(["tax_id", "account_number"])     // more keys, besides the ones built in
+print({ name: "Ada", password: pw })     // { name: "Ada", password: [redacted] }
+```
+
+- Values under these map keys show as `[redacted]`: `password`, `password_hash`,
+  `passwd`, `secret`, `client_secret`, `api_key`, `access_token`, `refresh_token`,
+  `authorization`, `cookie`, `card_number`, `cvv`, `cvc`, `iban`, `ssn`, and those given
+  to `redact` (at the top of the program; any case, `-` read as `_`). In maps, at any
+  depth, and in text that reads `password: ...`, `"iban": "..."` or `card_number=...`.
+- Card numbers (13 to 19 digits, with spaces or dashes or not, in the ranges cards use,
+  passing the Luhn check) and IBANs (whose check digits work out) are masked wherever
+  they appear in that text, under any key or none.
+- Where: error messages (what `quillo` prints for a failed request, and shows on the
+  page with `--watch`), values in messages about them (`expected int, got {...}`),
+  `print`, query strings in the request log, and the [audit log](#audit-log)'s details.
+  Metrics hold counts, never values.
+- The program's values are not changed: `form.password` is the password, and a page
+  shows what it is given. Text the program builds itself and prints is masked only
+  where it looks like the above; prefer printing maps to building such text.
+- The keys are the process's: a program and the programs it mounts share them.
 
 ## Cached views
 
@@ -1918,7 +2868,7 @@ loop, on doubles).
   machine code gives up and the call is run again by the interpreter, which fails as
   always (the function changed nothing, so running it twice is running it once).
 - What it does not take runs in the interpreter as before: strings, lists, maps,
-  builtins, globals that are not functions, functions inside functions, a variable that
+  decimals, builtins, globals that are not functions, functions inside functions, a variable that
   changes type, and `/` of two ints, whose answer is an int or a float depending on the
   numbers (`6 / 3` is 2, `7 / 2` is 3.5).
 - A function it calls that is assigned something else is not called by the old code.
@@ -2017,8 +2967,10 @@ src/native.rs      Rust in a program: .qwer files read, built, loaded and called
 The standard library
 src/builtins.rs    the builtins every program can call
 src/numeric.rs     math, stats and vec: Python's math and statistics, numpy's operations
+src/dates.rs       date: calendars, time zones, business days, day counts
 src/par.rs         a pool of threads for long lists, in chunks of a fixed size
 src/crypto.rs      crypto: hashes, signatures, tokens, passwords
+src/totp.rs        one-time codes from authenticator apps, and recovery codes
 src/imaging.rs     image: what an image file is, and new files made from it
 src/highlight.rs   highlight(code, lang): source code as HTML
 src/i18n.rs        translations
@@ -2029,6 +2981,7 @@ src/db.rs          db: SQLite, connections, tenants, transactions, and the share
 src/pg.rs          PostgreSQL (pool, pipelining, placeholders, types)
 src/my.rs          MySQL and MariaDB (the mysql feature)
 src/migrate.rs     db.migrate: schema files applied once each
+src/txn.rs         db.transaction's isolation levels, and trying again after a conflict
 src/sqlinfo.rs     which tables a statement reads and writes, for live updates
 
 Serving
@@ -2037,6 +2990,10 @@ src/server.rs      request matching, server fns, responses, --watch
 src/stream.rs      answers sent as they are made: stream, events, send
 src/service.rs     services: in this process or elsewhere, signed calls, --split
 src/session.rs     cookies and sessions
+src/session_store.rs  sessions kept in the database, which can be ended
+src/access.rs      security headers, the Content-Security-Policy and its nonce
+src/limits.rs      rate limits, in the process or the database
+src/idempotency.rs idempotent(f): requests with an Idempotency-Key run once
 src/upload.rs      files sent with a form
 src/statics.rs     files served with file()
 src/site.rs        what a program sets about its site: tenants, cross-site posts

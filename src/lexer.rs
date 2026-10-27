@@ -16,6 +16,8 @@ pub enum Tok {
     Ident(String),
     Int(i64),
     Float(f64),
+    /// `12.50m`: an exact decimal.
+    Dec(crate::decimal::Dec),
     Str(Vec<StrPart>),
     LParen,
     RParen,
@@ -62,6 +64,7 @@ impl Tok {
             Tok::Ident(s) => format!("`{}`", s),
             Tok::Int(n) => format!("`{}`", n),
             Tok::Float(n) => format!("`{}`", n),
+            Tok::Dec(d) => format!("`{}m`", d),
             Tok::Str(_) => "a string".into(),
             Tok::Newline => "end of line".into(),
             Tok::Eof => "end of input".into(),
@@ -212,6 +215,7 @@ impl Lexer {
             Some(
                 Tok::Int(_)
                 | Tok::Float(_)
+                | Tok::Dec(_)
                 | Tok::Str(_)
                 | Tok::RParen
                 | Tok::RBrace
@@ -378,6 +382,13 @@ impl Lexer {
                 digits(self, &mut s);
                 float = true;
             }
+        }
+        // `12.50m`: a decimal, kept as written (C#'s suffix).
+        if self.peek_char() == Some('m') && !self.peek_char_at(1).map_or(false, |c| c.is_alphanumeric() || c == '_') {
+            self.bump();
+            return crate::decimal::Dec::parse(&s).map(Tok::Dec).ok_or_else(|| {
+                QuilloError::new(format!("decimal `{}m` does not fit: at most 28 digits after the point, 29 in all", s), line)
+            });
         }
         if float {
             return s.parse::<f64>().map(Tok::Float).map_err(|_| QuilloError::new("bad number", line));

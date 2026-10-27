@@ -85,7 +85,20 @@ route GET /feed ? { page: int = 1 } = request | auth.required | load_feed(page) 
 A component's code runs once; its state is signals, and each place in the page that
 shows a value follows that value alone. Rendered on the server, resumed in the browser
 on the server's own HTML. A page loads only what it uses, when someone reaches for it:
-8 KB compressed for a simple component, 13 KB for the benchmark's table.
+9 KB compressed for a simple component, 13 KB for the benchmark's table.
+
+### Exact money
+
+`0.1m + 0.2m == 0.3m`: decimals are a type of their own, exact from PostgreSQL's
+`numeric` to the page, never mixed with floats by accident; `money` keeps amounts in
+their currency's minor units, splits them without losing a cent, and writes them as
+each locale does.
+
+```quillo
+let total = money.mul(money.of(19.99m, "USD"), 3)       // 59.97
+money.allocate(total, [1, 1, 1]) | map((m) => money.format(m, "de-DE"))
+// ["19,99 $", "19,99 $", "19,99 $"]
+```
 
 ### Databases, all of them, at once
 

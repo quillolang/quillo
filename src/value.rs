@@ -139,6 +139,8 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// An exact decimal: `12.50m` (src/decimal.rs).
+    Dec(crate::decimal::Dec),
     Str(Arc<str>),
     List(Arc<Vec<Value>>),
     Map(Arc<Map>),
@@ -198,6 +200,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
             Value::Float(_) => "float",
+            Value::Dec(_) => "dec",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Map(_) => "map",
@@ -225,31 +228,82 @@ impl Value {
         match self {
             Value::Str(s) => s.to_string(),
             Value::Html(h) => h.to_string(),
+            Value::Dec(d) => d.to_string(),
             _ => self.repr(),
+        }
+    }
+
+    /// The text of a map key made from this value (`set`, `get`,
+    /// `group_by`): its display, with a decimal's zeros at the end left
+    /// out, so 12.5 and 12.50 are one key.
+    pub fn key_text(&self) -> String {
+        match self {
+            Value::Dec(d) => d.normalized().to_string(),
+            _ => self.display(),
         }
     }
 
     /// Source-like form used by the REPL and error messages.
     pub fn repr(&self) -> String {
+        let mut out = String::new();
+        self.repr_into(&mut out);
+        out
+    }
+
+    /// `repr`, written into `out`. A value nests as deeply as code may
+    /// (`parser::MAX_NESTING`), and `str` of it runs on the caller's stack,
+    /// so each level takes little: lists, maps and errors here, the rest
+    /// (and their formatting's locals) in `scalar_repr`.
+    fn repr_into(&self, out: &mut String) {
         match self {
-            Value::Nil => "null".into(),
-            Value::Bool(b) => b.to_string(),
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => fmt_float(*f),
-            Value::Str(s) => serde_json::to_string(&**s).unwrap_or_default(),
-            Value::List(l) => format!("[{}]", l.iter().map(|v| v.repr()).collect::<Vec<_>>().join(", ")),
-            Value::Map(m) if m.is_empty() => "{}".into(),
-            Value::Map(m) => format!(
-                "{{ {} }}",
-                m.iter().map(|(k, v)| format!("{}: {}", fmt_key(k), v.repr())).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Func(c) => format!("<fn {}>", c.def.name),
-            Value::Builtin(n, _) if n.starts_with("native:") => format!("<rust fn {}>", crate::native::display_name(n)),
-            Value::Builtin(n, _) => format!("<builtin {}>", n),
-            Value::Html(h) => h.to_string(),
-            Value::Response(r) => format!("<response {}>", r.status),
-            Value::Err(e) => format!("err({})", e.repr()),
+            Value::List(l) => {
+                out.push('[');
+                for (i, v) in l.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    v.repr_into(out);
+                }
+                out.push(']');
+            }
+            Value::Map(m) if m.is_empty() => out.push_str("{}"),
+            Value::Map(m) => {
+                out.push_str("{ ");
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    key_into(k, out);
+                    v.repr_into(out);
+                }
+                out.push_str(" }");
+            }
+            Value::Err(e) => {
+                out.push_str("err(");
+                e.repr_into(out);
+                out.push(')');
+            }
+            other => other.scalar_repr(out),
         }
+    }
+
+    #[inline(never)]
+    fn scalar_repr(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = match self {
+            Value::Nil => write!(out, "null"),
+            Value::Bool(b) => write!(out, "{}", b),
+            Value::Int(n) => write!(out, "{}", n),
+            Value::Float(f) => write!(out, "{}", fmt_float(*f)),
+            Value::Dec(d) => write!(out, "{}m", d),
+            Value::Str(s) => write!(out, "{}", serde_json::to_string(&**s).unwrap_or_default()),
+            Value::Func(c) => write!(out, "<fn {}>", c.def.name),
+            Value::Builtin(n, _) if n.starts_with("native:") => write!(out, "<rust fn {}>", crate::native::display_name(n)),
+            Value::Builtin(n, _) => write!(out, "<builtin {}>", n),
+            Value::Html(h) => write!(out, "{}", h),
+            Value::Response(r) => write!(out, "<response {}>", r.status),
+            Value::List(_) | Value::Map(_) | Value::Err(_) => Ok(self.repr_into(out)),
+        };
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -259,6 +313,8 @@ impl Value {
             Value::Bool(b) => J::Bool(*b),
             Value::Int(n) => J::from(*n),
             Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null),
+            // As text, so nothing that reads it rounds it to a float.
+            Value::Dec(d) => J::String(d.to_string()),
             Value::Str(s) => J::String(s.to_string()),
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
@@ -280,6 +336,7 @@ impl Value {
             Value::Float(f) => {
                 let _ = serde_json::to_writer(&mut *out, f);
             }
+            Value::Dec(d) => json_str_into(&d.to_string(), out),
             Value::Str(s) | Value::Html(s) => json_str_into(s, out),
             Value::List(l) => {
                 out.push(b'[');
@@ -345,6 +402,13 @@ fn fmt_float(f: f64) -> String {
     }
 }
 
+/// A map's key and its colon, as `repr` writes them.
+#[inline(never)]
+fn key_into(k: &str, out: &mut String) {
+    out.push_str(&fmt_key(k));
+    out.push_str(": ");
+}
+
 fn fmt_key(k: &str) -> String {
     let mut chars = k.chars();
     let ident = chars.next().map_or(false, |c| c.is_alphabetic() || c == '_')
@@ -363,6 +427,9 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (Int(x), Int(y)) => x == y,
         (Int(_) | Float(_), Int(_) | Float(_)) => a.as_f64() == b.as_f64(),
+        (Dec(_), Int(_) | Float(_) | Dec(_)) | (Int(_) | Float(_), Dec(_)) => {
+            dec_pair(a, b).map_or(false, |(x, y)| x == y)
+        }
         (Str(x), Str(y)) => x == y,
         (Html(x), Html(y)) => x == y,
         (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
@@ -374,12 +441,29 @@ pub fn equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Ordered values; None for those that are not (a decimal and a float
+/// are not: one is exact, the other not).
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Dec(x), Value::Dec(y)) => Some(x.cmp(*y)),
+        (Value::Dec(x), Value::Int(y)) => Some(x.cmp(crate::decimal::Dec::from_i64(*y))),
+        (Value::Int(x), Value::Dec(y)) => Some(crate::decimal::Dec::from_i64(*x).cmp(*y)),
         _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
+}
+
+/// Two numbers as decimals, one at least a decimal: a float through its
+/// shortest text, so `0.1m == 0.1` (as `dec(0.1) == 0.1m`).
+fn dec_pair(a: &Value, b: &Value) -> Option<(crate::decimal::Dec, crate::decimal::Dec)> {
+    let one = |v: &Value| match v {
+        Value::Dec(d) => Some(*d),
+        Value::Int(n) => Some(crate::decimal::Dec::from_i64(*n)),
+        Value::Float(f) => crate::decimal::Dec::from_f64(*f),
+        _ => None,
+    };
+    Some((one(a)?, one(b)?))
 }
 
 /// A JSON string, escaped as `serde_json` escapes it.
@@ -709,6 +793,32 @@ pub fn lookup(env: &Env, name: &str) -> Option<Value> {
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
+            return Some(v.clone());
+        }
+        cur = cur.parent.as_deref()?;
+    }
+}
+
+/// Whether `env` is `root` or a scope inside it.
+pub fn within(env: &Env, root: &Env) -> bool {
+    let mut cur: &Scope = env;
+    loop {
+        if std::ptr::eq(cur, &**root) {
+            return true;
+        }
+        cur = match cur.parent.as_deref() {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+}
+
+/// The nearest function named `name` in scope, passing over other values
+/// of that name: `xs.keys` still calls `keys` where a local `keys` is a list.
+pub fn lookup_fn(env: &Env, name: &str) -> Option<Value> {
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(v @ (Value::Func(_) | Value::Builtin(..))) = cur.vars().get(name) {
             return Some(v.clone());
         }
         cur = cur.parent.as_deref()?;

@@ -259,6 +259,31 @@ fn sql_built_from_values_is_a_warning() {
 }
 
 #[test]
+fn sql_built_from_values_is_found_however_it_reaches_the_query() {
+    // What the review wrote, each missed then: the SQL built in a `let`
+    // first, a connection from `db.connect`, the pipe form, and `join`.
+    one("fn f(n: str) with db {\n    let q = `select * from t where n = '${n}'`\n    db.query(q)\n}", "`db.query` with SQL built from values");
+    one("fn f(n: str) with db {\n    let q = \"select * from t where n = '\" + n\n    let r = q + \"'\"\n    db.one(r)\n}", "SQL injection");
+    one("fn f(n: str) with db {\n    let q = \"select * from t\"\n    q += \" where n = '\" + n + \"'\"\n    db.query(q)\n}", "SQL injection");
+    one("fn f(n: str) with db {\n    let a = db.connect(\"a.db\")\n    a.query(`select * from t where n = '${n}'`)\n}", "`a.query` with SQL built from values");
+    one("fn f(n: str) with db = db.connect(\"a.db\").exec(\"delete from t where n = \" + n)", "SQL injection");
+    one("fn f(n: str) with db = `select * from t where n = '${n}'` | db.query", "`db.query` with SQL built from values");
+    one("fn f(n: str) with db {\n    let a = db.connect(\"a.db\")\n    `select * from t where n = '${n}'` | a.query\n}", "`a.query` with SQL built from values");
+    one("fn f(n: str) with db = db.query(join([\"select * from t where n = '\", n, \"'\"], \"\"))", "SQL injection");
+    one("fn f(n: str) with db = db.query([\"select * from t where n =\", n] | join(\" \"))", "SQL injection");
+    // Text written in the program, kept in variables, joined or piped, and
+    // names made with sql_name, are not values.
+    clean("fn f(n: str) with db {\n    let cols = \"id, name\"\n    let q = `select ${cols} from t where n = ?`\n    db.query(q, n)\n}");
+    clean("fn f(t: str, n: str) with db {\n    let q = join([\"select * from\", sql_name(t), \"where n = ?\"], \" \")\n    db.query(q, n)\n}");
+    clean("fn f(n: str) with db {\n    let a = db.connect(\"a.db\")\n    \"select * from t where n = ?\" | a.query(n)\n}");
+    clean("fn f(n: str) with db = `select * from t where n = ${\"?\"}` | db.query(n)");
+    // A piped value is the SQL, not the argument after it.
+    clean("fn f(n: str) with db = \"select * from t where n = ?\" | db.query(`${n}`)");
+    // A variable of the same name elsewhere is another variable.
+    clean("fn g(n: str) = `n is ${n}`\nfn f(n: str) with db {\n    let q = \"select 1\"\n    db.query(q)\n}\nfn h(n: str) { let q = `x ${n}`\nq }");
+}
+
+#[test]
 fn names_in_sql_are_checked() {
     let run = |src: &str| match quillo::eval_str(src) {
         Ok(v) => v.display().to_string(),
@@ -319,7 +344,7 @@ fn annotations_say_what_lists_and_maps_hold() {
 }
 
 fn strict(src: &str) -> Vec<String> {
-    let opts = quillo::check::Options { strict_null: true };
+    let opts = quillo::check::Options { strict_null: true, ..Default::default() };
     quillo::check::check_source_opts(src, "t.qwe", Path::new("."), opts)
         .diagnostics
         .iter()

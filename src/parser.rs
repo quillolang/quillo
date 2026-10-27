@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 type PResult<T> = Result<T, QuilloError>;
 
-pub const TYPE_NAMES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
+pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
@@ -18,12 +18,25 @@ const KEYWORDS: &[&str] = &[
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
 
+/// How deeply expressions, patterns, types and elements may nest. Deeper
+/// source is refused here, so that nothing that walks it later (the
+/// checker, the interpreter, freeing it) runs out of stack.
+pub const MAX_NESTING: u32 = 256;
+const TOO_DEEP: &str = "the code nests too deeply";
+
 pub struct Parser {
     lx: Lexer,
     peeked: Option<Token>,
     /// While > 0, `name => ...` is not an arrow function: in `for x in xs => body`
     /// the `=>` belongs to the loop.
     no_bare_arrow: u32,
+    /// How deeply the code being parsed nests (see `MAX_NESTING`), and the
+    /// deepest it went in the function being parsed.
+    depth: u32,
+    deepest: u32,
+    /// What `ternary_ahead` found at each `?`, so that nested ternaries are
+    /// looked ahead at once each, not again for every one around them.
+    ternaries: std::collections::HashMap<(usize, bool), bool>,
     /// The file being parsed, stamped on its functions and routes.
     file: Option<Arc<str>>,
 }
@@ -32,6 +45,7 @@ fn can_start_expr(t: &Tok) -> bool {
     match t {
         Tok::Int(_)
         | Tok::Float(_)
+        | Tok::Dec(_)
         | Tok::Str(_)
         | Tok::LParen
         | Tok::LBracket
@@ -65,7 +79,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, file: None }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -153,13 +167,43 @@ impl Parser {
         Ok(())
     }
 
-    fn save(&self) -> (Lexer, Option<Token>) {
-        (self.lx.clone(), self.peeked.clone())
+    fn save(&self) -> (Lexer, Option<Token>, u32) {
+        (self.lx.clone(), self.peeked.clone(), self.depth)
     }
 
-    fn restore(&mut self, s: (Lexer, Option<Token>)) {
+    fn restore(&mut self, s: (Lexer, Option<Token>, u32)) {
         self.lx = s.0;
         self.peeked = s.1;
+        self.depth = s.2;
+    }
+
+    /// One level deeper, unless that is too deep. A chain such as
+    /// `a + b + c` nests as `(a + b) + c`, so each link counts too.
+    fn deeper(&mut self) -> PResult<()> {
+        if self.depth >= MAX_NESTING {
+            return self.err_at(format!("{} (more than {} levels)", TOO_DEEP, MAX_NESTING));
+        }
+        self.depth += 1;
+        self.deepest = self.deepest.max(self.depth);
+        Ok(())
+    }
+
+    /// `f`, and how deeply what it parsed nests: a function's body.
+    fn measured<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<(T, u32)> {
+        let outer = std::mem::replace(&mut self.deepest, self.depth);
+        let r = f(self)?;
+        let n = self.deepest - self.depth;
+        self.deepest = self.deepest.max(outer);
+        Ok((r, n))
+    }
+
+    /// `f`, one level deeper (on more stack, when this one runs low).
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let depth = self.depth;
+        self.deeper()?;
+        let r = crate::stack::maybe_grow(256 << 10, 2 << 20, || f(self));
+        self.depth = depth;
+        r
     }
 
     fn err_at<T>(&mut self, msg: impl Into<String>) -> PResult<T> {
@@ -429,14 +473,14 @@ impl Parser {
         } else {
             None
         };
-        let body = if self.eat(&Tok::Assign)? {
-            self.parse_arrow_body()?
+        let (body, nesting) = if self.eat(&Tok::Assign)? {
+            self.measured(Self::parse_arrow_body)?
         } else if self.at(&Tok::LBrace)? {
-            self.parse_block()?
+            self.measured(Self::parse_block)?
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, file: self.file.clone(), hot: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
@@ -459,7 +503,12 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen, "`)`")?;
-        let body = if self.eat(&Tok::Assign)? {
+        let (body, nesting) = self.measured(|p| p.component_body(&name))?;
+        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() })
+    }
+
+    fn component_body(&mut self, name: &str) -> PResult<Expr> {
+        Ok(if self.eat(&Tok::Assign)? {
             self.parse_expr()?
         } else if self.eat(&Tok::LBrace)? {
             let mut stmts = Vec::new();
@@ -484,8 +533,7 @@ impl Parser {
             Expr::Block(stmts)
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of component `{}`", name));
-        };
-        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, file: self.file.clone(), hot: Default::default() })
+        })
     }
 
     /// `state count = ...` (or `~count = ...`) in a component: the state's
@@ -513,6 +561,10 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> PResult<Ty> {
+        self.nested(Self::parse_type_union)
+    }
+
+    fn parse_type_union(&mut self) -> PResult<Ty> {
         let mut names: Vec<String> = Vec::new();
         let mut optional = false;
         let mut elem = None;
@@ -654,9 +706,9 @@ impl Parser {
                     let ty = if self.lx.peek_char() == Some('(') {
                         self.lx.bump();
                         let t = self.read_word();
-                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "num" | "str") {
+                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "dec" | "num" | "str") {
                             return Err(QuilloError::new(
-                                "path parameter types are written :name(int), :name(float), :name(num) or :name(str)",
+                                "path parameter types are written :name(int), :name(float), :name(dec), :name(num) or :name(str)",
                                 self.lx.line,
                             ));
                         }
@@ -763,9 +815,10 @@ impl Parser {
         })();
         match head {
             Ok(Some((params, ret))) => {
-                let body = self.no_bare_arrow_off(|p| p.parse_arrow_body())?;
+                let body = self.no_bare_arrow_off(|p| p.measured(Self::parse_arrow_body))?;
                 Ok(Some(arrow(params, ret, body, line, self.file.clone())))
             }
+            Err(e) if e.msg.starts_with(TOO_DEEP) => Err(e),
             _ => {
                 self.restore(saved);
                 Ok(None)
@@ -815,6 +868,10 @@ impl Parser {
     // ---- expressions ---------------------------------------------------
 
     pub fn parse_expr(&mut self) -> PResult<Expr> {
+        self.nested(Self::parse_ternary)
+    }
+
+    fn parse_ternary(&mut self) -> PResult<Expr> {
         let cond = self.parse_coalesce()?;
         // `cond ? a : b`
         if self.at(&Tok::Question)? {
@@ -828,15 +885,19 @@ impl Parser {
     }
 
     fn parse_coalesce(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_pipe()?;
         while self.eat(&Tok::QQ)? {
+            self.deeper()?;
             let rhs = self.parse_pipe()?;
             lhs = Expr::Coalesce(Box::new(lhs), Box::new(rhs));
         }
+        self.depth = depth;
         Ok(lhs)
     }
 
     fn parse_pipe(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_or()?;
         loop {
             let line = self.line()?;
@@ -844,32 +905,40 @@ impl Parser {
                 return self.err_at("the pipe is now a single `|`: `xs | map(f)`");
             }
             if !self.eat(&Tok::Bar)? {
+                self.depth = depth;
                 return Ok(lhs);
             }
+            self.deeper()?;
             let rhs = self.parse_or()?;
             lhs = Expr::Pipe(Box::new(lhs), Box::new(rhs), line);
         }
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_and()?;
         loop {
             let line = self.line()?;
             if !self.eat(&Tok::OrOr)? {
+                self.depth = depth;
                 return Ok(lhs);
             }
+            self.deeper()?;
             let rhs = self.parse_and()?;
             lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(rhs), line);
         }
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_cmp()?;
         loop {
             let line = self.line()?;
             if !self.eat(&Tok::AndAnd)? {
+                self.depth = depth;
                 return Ok(lhs);
             }
+            self.deeper()?;
             let rhs = self.parse_cmp()?;
             lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs), line);
         }
@@ -903,21 +972,27 @@ impl Parser {
     }
 
     fn parse_add(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_mul()?;
         loop {
             let line = self.line()?;
             let op = match self.peek()? {
                 Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
-                _ => return Ok(lhs),
+                _ => {
+                    self.depth = depth;
+                    return Ok(lhs);
+                }
             };
             self.next()?;
+            self.deeper()?;
             let rhs = self.parse_mul()?;
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs), line);
         }
     }
 
     fn parse_mul(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut lhs = self.parse_unary()?;
         loop {
             let line = self.line()?;
@@ -925,9 +1000,13 @@ impl Parser {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
                 Tok::Percent => BinOp::Mod,
-                _ => return Ok(lhs),
+                _ => {
+                    self.depth = depth;
+                    return Ok(lhs);
+                }
             };
             self.next()?;
+            self.deeper()?;
             let rhs = self.parse_unary()?;
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs), line);
         }
@@ -936,11 +1015,11 @@ impl Parser {
     fn parse_unary(&mut self) -> PResult<Expr> {
         let line = self.line()?;
         if self.eat(&Tok::Minus)? {
-            let e = self.parse_unary()?;
+            let e = self.nested(Self::parse_unary)?;
             return Ok(Expr::Unary(UnOp::Neg, Box::new(e), line));
         }
         if self.eat(&Tok::Bang)? {
-            let e = self.parse_unary()?;
+            let e = self.nested(Self::parse_unary)?;
             return Ok(Expr::Unary(UnOp::Not, Box::new(e), line));
         }
         self.parse_postfix()
@@ -948,7 +1027,11 @@ impl Parser {
 
     /// After `x`, is `? a : b` coming (a ternary), or is `?` the postfix
     /// that returns an error? A ternary needs an expression and then `:`.
-    fn ternary_ahead(&mut self) -> bool {
+    fn ternary_ahead(&mut self) -> PResult<bool> {
+        let at = (self.lx.pos, self.no_bare_arrow > 0);
+        if let Some(&known) = self.ternaries.get(&at) {
+            return Ok(known);
+        }
         let saved = self.save();
         let ok = (|| -> PResult<bool> {
             self.expect(&Tok::Question, "`?`")?;
@@ -957,17 +1040,27 @@ impl Parser {
             }
             self.parse_expr()?;
             Ok(self.at(&Tok::Colon)?)
-        })()
-        .unwrap_or(false);
+        })();
         self.restore(saved);
-        ok
+        let ok = match ok {
+            // Too deep either way.
+            Err(e) if e.msg.starts_with(TOO_DEEP) => return Err(e),
+            r => r.unwrap_or(false),
+        };
+        self.ternaries.insert(at, ok);
+        Ok(ok)
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
+        let depth = self.depth;
         let mut e = self.parse_primary()?;
         loop {
             let line = self.line()?;
-            match self.peek()? {
+            let t = self.peek()?;
+            if matches!(t, Tok::LParen | Tok::Dot | Tok::LBracket | Tok::Question) {
+                self.deeper()?;
+            }
+            match t {
                 Tok::LParen => {
                     self.next()?;
                     let args = self.no_bare_arrow_off(|p| {
@@ -1005,13 +1098,17 @@ impl Parser {
                     e = Expr::Index(Box::new(e), Box::new(i), line);
                 }
                 Tok::Question => {
-                    if self.ternary_ahead() {
+                    if self.ternary_ahead()? {
+                        self.depth = depth;
                         return Ok(e);
                     }
                     self.next()?;
                     e = Expr::Try(Box::new(e));
                 }
-                _ => return Ok(e),
+                _ => {
+                    self.depth = depth;
+                    return Ok(e);
+                }
             }
         }
     }
@@ -1022,6 +1119,7 @@ impl Parser {
         match t.tok {
             Tok::Int(n) => Ok(Expr::Lit(Lit::Int(n))),
             Tok::Float(f) => Ok(Expr::Lit(Lit::Float(f))),
+            Tok::Dec(d) => Ok(Expr::Lit(Lit::Dec(d))),
             Tok::Str(parts) => self.template(parts),
             Tok::LParen => {
                 if let Some(f) = self.try_arrow(line)? {
@@ -1085,7 +1183,7 @@ impl Parser {
                     // `x => body`: an arrow function with one parameter.
                     if self.no_bare_arrow == 0 && self.at(&Tok::FatArrow)? {
                         self.next()?;
-                        let body = self.parse_arrow_body()?;
+                        let body = self.measured(Self::parse_arrow_body)?;
                         let params = vec![Param { name: k.clone(), ty: None, default: None }];
                         return Ok(arrow(params, None, body, line, self.file.clone()));
                     }
@@ -1156,14 +1254,16 @@ impl Parser {
         }
     }
 
-    fn template(&self, parts: Vec<StrPart>) -> PResult<Expr> {
+    fn template(&mut self, parts: Vec<StrPart>) -> PResult<Expr> {
         let mut out = Vec::new();
         for p in parts {
             match p {
                 StrPart::Lit(s) => out.push(TPart::Lit(s)),
                 StrPart::Expr(src, line) => {
                     let mut sub = Parser::with_line(&src, line);
+                    (sub.depth, sub.deepest) = (self.depth, self.depth);
                     let e = sub.parse_expr()?;
+                    self.deepest = self.deepest.max(sub.deepest);
                     sub.skip_seps()?;
                     if !sub.at(&Tok::Eof)? {
                         return Err(QuilloError::new("unexpected text inside `{…}` in string", line));
@@ -1197,7 +1297,7 @@ impl Parser {
         let a = self.parse_block()?;
         let b = if self.eat_kw("else")? {
             if self.eat_kw("if")? {
-                Some(Box::new(self.parse_if()?))
+                Some(Box::new(self.nested(Self::parse_if)?))
             } else {
                 Some(Box::new(self.parse_block()?))
             }
@@ -1272,12 +1372,17 @@ impl Parser {
     // ---- patterns ------------------------------------------------------
 
     pub fn parse_pattern(&mut self) -> PResult<Pattern> {
+        self.nested(Self::parse_pattern_alts)
+    }
+
+    fn parse_pattern_alts(&mut self) -> PResult<Pattern> {
         let mut alts = vec![self.parse_pattern_atom()?];
         while self.eat(&Tok::Bar)? {
             alts.push(self.parse_pattern_atom()?);
         }
         let mut p = if alts.len() == 1 { alts.pop().unwrap() } else { Pattern::Alt(alts) };
         while self.eat_kw("as")? {
+            self.deeper()?;
             let n = self.expect_ident("a name after `as`")?;
             p = Pattern::As(Box::new(p), n);
         }
@@ -1301,11 +1406,13 @@ impl Parser {
         match t.tok {
             Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(n))),
             Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(f))),
+            Tok::Dec(d) => Ok(Pattern::Lit(Lit::Dec(d))),
             Tok::Minus => {
                 let t = self.next()?;
                 match t.tok {
                     Tok::Int(n) => Ok(Pattern::Lit(Lit::Int(-n))),
                     Tok::Float(f) => Ok(Pattern::Lit(Lit::Float(-f))),
+                    Tok::Dec(d) => Ok(Pattern::Lit(Lit::Dec(d.neg()))),
                     other => Err(QuilloError::new(format!("expected a number after `-`, found {}", other.describe()), line)),
                 }
             }
@@ -1506,6 +1613,16 @@ impl Parser {
                 Some(c) => return self.html_err(format!("unexpected `{}` in <{}> tag", c, tag)),
             }
         };
+        // The browser decodes these attributes before it runs them, so no
+        // escaping keeps a value from data from running as code.
+        if let Some((name, _)) = attrs.iter().find(|(n, v)| code_from_data(&tag, &attrs, n, v)) {
+            let lower = name.to_ascii_lowercase();
+            let msg = match lower.strip_prefix("bind:").unwrap_or(&lower).strip_prefix("on") {
+                Some(ev) => format!("`{}` in <{}> takes only text written here, as it runs as code: handle the event with `@{}={{...}}`", name, tag, ev),
+                None => format!("`{}` in <{}> takes only text written here, unless the element also has a `sandbox` attribute without allow-same-origin", name, tag),
+            };
+            return Err(QuilloError::new(msg, line));
+        }
         let mut children = Vec::new();
         if !self_closing {
             let mut text = String::new();
@@ -1533,7 +1650,7 @@ impl Parser {
                         push_text(&mut children, &mut text);
                         let l = self.lx.line;
                         self.lx.bump();
-                        children.push(HtmlChild::El(self.parse_html_el(l)?));
+                        children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
                     }
                     (Some('{'), _) => {
                         push_text(&mut children, &mut text);
@@ -1601,7 +1718,7 @@ impl Parser {
     }
 }
 
-fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32, file: Option<Arc<str>>) -> Expr {
+fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line: u32, file: Option<Arc<str>>) -> Expr {
     Expr::Lambda(Arc::new(FnDef {
         name: "<fn>".into(),
         params,
@@ -1612,6 +1729,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32, file: Optio
         component: false,
         line,
         body,
+        nesting,
         file,
         hot: Default::default(),
     }))

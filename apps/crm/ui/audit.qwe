@@ -1,0 +1,34 @@
+// The audit log, in Settings, for admins. "Check the log" walks Quillo's
+// chain of rows and names the first one changed since it was written.
+component AuditSettings(ws: map) {
+    state action = ""
+    state rows = list_audit({})
+    state checked = null
+    let older = () => {
+        let next = list_audit({ action, before: rows[-1].seq })
+        if !is_err(next) { rows = rows + next }
+    }
+    <div.stack>
+        <form.inline @submit={() => { rows = list_audit({ action }) }}>
+            <input aria-label="Action" placeholder="An action: login, role.*, contact.delete…" value={action} @input={(e) => { action = e.value }}/>
+            <button>Show</button>
+            <button.ghost type="button" @click={() => { checked = check_audit() }}>Check the log</button>
+        </form>
+        {checked != null && (is_err(checked) ? <p.bad>{err_text(checked)}</p>
+            : checked.ok ? <p.ok>All {plural(checked.rows, "row")} are as they were written.</p>
+            : <p.bad>Row {checked.broken.seq} is not as it was written: {checked.broken.why}.</p>)}
+        {rows == null ? <Loading/> : is_err(rows) ? <Empty title="The audit log did not load"/>
+        : len(rows) == 0 ? <Empty title="Nothing in the log yet"/>
+        : <table.table.compact>
+            <thead><tr><th>When (UTC)</th><th>Who</th><th>What</th><th>Details</th><th>From</th></tr></thead>
+            <tbody>{for r in rows => <tr key={r.seq}>
+                <td.small>{replace(slice(r.at, 0, 19), "T", " ")}</td>
+                <td>{r.who}</td>
+                <td><code>{r.action}</code></td>
+                <td.small><code>{r.details == null ? "" : json.stringify(r.details)}</code></td>
+                <td.small>{r.ip ?? ""}</td>
+            </tr>}</tbody>
+        </table>}
+        {rows != null && !is_err(rows) && len(rows) > 0 && len(rows) % 50 == 0 && <div><button.ghost @click={older}>Older</button></div>}
+    </div>
+}

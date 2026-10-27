@@ -3,6 +3,8 @@
 //! afterwards. Skipped when PostgreSQL's server programs are not installed;
 //! set QUILLO_TEST_PG_BIN to the folder holding initdb and pg_ctl.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -42,8 +44,14 @@ fn find_bin() -> Option<PathBuf> {
 
 /// Starts a throwaway server; it is stopped when the value is dropped.
 fn server() -> Option<Pg> {
+    server_with("pg", 25000, "", |_| {})
+}
+
+/// A throwaway server named `name`, on a port from `base`, with more
+/// options for `postgres`, and `setup` given its folder before it starts.
+fn server_with(name: &str, base: u16, extra: &str, setup: impl FnOnce(&Path)) -> Option<Pg> {
     let bin = find_bin()?;
-    let dir = std::env::temp_dir().join(format!("quillo-pg-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("quillo-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let out = Command::new(bin.join("initdb"))
         .arg("-D")
@@ -53,9 +61,10 @@ fn server() -> Option<Pg> {
         .output()
         .ok()?;
     assert!(out.status.success(), "initdb failed: {}", String::from_utf8_lossy(&out.stderr));
-    let port = 25000 + (std::process::id() % 2000) as u16;
+    setup(&dir);
+    let port = base + (std::process::id() % 2000) as u16;
     // Prepared transactions, for `db.atomic`.
-    let opts = format!("-p {} -k {} -c listen_addresses=127.0.0.1 -c fsync=off -c max_prepared_transactions=10", port, dir.display());
+    let opts = format!("-p {} -k {} -c listen_addresses=127.0.0.1 -c fsync=off -c max_prepared_transactions=10 {}", port, dir.display(), extra);
     let pg = Pg { bin, dir, url: format!("postgres://quillo@127.0.0.1:{}/postgres", port) };
     let ok = Command::new(pg.bin.join("pg_ctl"))
         .arg("-D")
@@ -98,6 +107,142 @@ fn postgres() {
     several_databases_of_several_kinds(&database(&pg, "main_db"), &database(&pg, "other_db"), &database(&pg, "beta_db"));
     replicas_take_reads_and_the_primary_the_rest(&database(&pg, "primary_db"), &database(&pg, "replica_db"));
     one_transaction_over_several_databases(&pg, &database(&pg, "bank_a"), &database(&pg, "bank_b"));
+    the_audit_log_takes_turns_and_a_clerk_cannot_change_it(&pg, &database(&pg, "audited"));
+}
+
+/// Certificates for a test of TLS, written to `dir`: `ca.pem`, a private
+/// CA; `other.pem`, a CA that signed nothing here; `server.crt` and
+/// `server.key`, for the name `db.quillo.test`, signed by the first; and
+/// `client.crt` and `client.key`, for the user `certuser`.
+fn certificates(dir: &Path) {
+    let ca = |name: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, name);
+        std::fs::write(dir.join(format!("{}.pem", name)), p.self_signed(&key).unwrap().pem()).unwrap();
+        rcgen::Issuer::new(p, key)
+    };
+    let ours = ca("ca");
+    ca("other");
+    let signed = |names: Vec<String>, cn: &str, file: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(names).unwrap();
+        p.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        std::fs::write(dir.join(format!("{}.crt", file)), p.signed_by(&key, &ours).unwrap().pem()).unwrap();
+        std::fs::write(dir.join(format!("{}.key", file)), key.serialize_pem()).unwrap();
+        // Postgres reads a key only its owner can.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(format!("{}.key", file)), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    };
+    signed(vec!["db.quillo.test".into()], "db.quillo.test", "server");
+    signed(vec![], "certuser", "client");
+}
+
+/// A server with TLS and a private CA's certificate, as on Amazon RDS or a
+/// company's own: what each `sslmode` takes and refuses, `sslrootcert`,
+/// and a client certificate. The server is reached at 127.0.0.1 under a
+/// name of its own (`hostaddr`), which makes it "another machine".
+#[test]
+fn postgres_over_tls() {
+    let pg = server_with("pgtls", 27000, "-c ssl=on -c ssl_ca_file=ca.pem", |dir| {
+        certificates(dir);
+        let hba = std::fs::read_to_string(dir.join("pg_hba.conf")).unwrap();
+        std::fs::write(dir.join("pg_hba.conf"), format!("hostssl all certuser 127.0.0.1/32 cert\n{}", hba)).unwrap();
+    });
+    let Some(pg) = pg else {
+        eprintln!("skipping: PostgreSQL's initdb and pg_ctl were not found");
+        return;
+    };
+    psql(&pg, &pg.url, &["create role certuser login"]);
+    let file = |f: &str| pg.dir.join(f).to_str().unwrap().to_string();
+    let port = pg.url.split(':').nth(2).unwrap().split('/').next().unwrap().to_string();
+    let named = format!("postgres://quillo@db.quillo.test:{}/postgres?hostaddr=127.0.0.1", port);
+    let by_ip = format!("postgres://quillo@127.0.0.1:{}/postgres", port);
+    let tls = "db.one(\"select ssl from pg_stat_ssl where pid = pg_backend_pid()\")";
+    let try_run = |url: &str| -> Result<String, String> {
+        let src = format!("let o = db.open(\"{}\")\nlet r = is_err(o) ? o : {}\nis_err(r) ? \"error: \" + str(r.error) : r.ssl", url, tls);
+        let out = quillo::Interp::new(".").load_source(&src, "pg.qwe").map(|v| v.display().to_string()).map_err(|e| e.to_string())?;
+        out.strip_prefix("error: ").map_or(Ok(out.clone()), |e| Err(e.to_string()))
+    };
+    let fails = |url: &str, what: &str| {
+        let e = try_run(url).expect_err(url);
+        assert!(e.contains(what), "{}: {}", url, e);
+    };
+    // Another machine: TLS, the certificate checked against the CAs given.
+    fails(&named, "UnknownIssuer");
+    assert_eq!(try_run(&format!("{}&sslrootcert={}", named, file("ca.pem"))).unwrap(), "true");
+    fails(&format!("{}&sslrootcert={}", named, file("other.pem")), "UnknownIssuer");
+    // verify-full checks the name; verify-ca, only the CA.
+    fails(&format!("{}?sslmode=verify-full&sslrootcert={}", by_ip, file("ca.pem")), "not valid for name");
+    assert_eq!(try_run(&format!("{}?sslmode=verify-ca&sslrootcert={}", by_ip, file("ca.pem"))).unwrap(), "true");
+    fails(&format!("{}?sslmode=verify-ca&sslrootcert={}", by_ip, file("other.pem")), "UnknownIssuer");
+    fails(&format!("{}?sslmode=verify-ca", by_ip), "needs sslrootcert");
+    // require: encrypted, checked only against a root certificate given.
+    assert_eq!(try_run(&format!("{}?sslmode=require", by_ip)).unwrap(), "true");
+    fails(&format!("{}?sslmode=require&sslrootcert={}", by_ip, file("other.pem")), "UnknownIssuer");
+    // This machine: TLS when offered, unchecked (it failed on a certificate
+    // the public CAs did not sign); or none.
+    assert_eq!(try_run(&by_ip).unwrap(), "true");
+    assert_eq!(try_run(&format!("{}?sslmode=disable", by_ip)).unwrap(), "false");
+    // A client certificate, for a user the server knows by it alone.
+    let cert_user = format!("postgres://certuser@db.quillo.test:{}/postgres?hostaddr=127.0.0.1&sslrootcert={}", port, file("ca.pem"));
+    fails(&cert_user, "certificate");
+    assert_eq!(try_run(&format!("{}&sslcert={}&sslkey={}", cert_user, file("client.crt"), file("client.key"))).unwrap(), "true");
+
+    // Tenants' schemas are listed over the same TLS.
+    let src = format!("db.open(\"{}&sslrootcert={}&schema=t_{{tenant}}\")\nwith_tenant(\"acme\", () => db.query(\"select 1\"))\ndb.tenants()", named, file("ca.pem"));
+    assert_eq!(quillo::Interp::new(".").load_source(&src, "pg.qwe").map(|v| v.repr()).unwrap_or_else(|e| e.to_string()), "[\"acme\"]");
+
+    // Requests in the server share connections of their own: the same TLS.
+    let app = pg.dir.join("app.qwe");
+    std::fs::write(&app, format!("db.open(\"{}&sslrootcert={}\")\nroute GET /tls = {}.ssl\n", named, file("ca.pem"), tls)).unwrap();
+    let (_server, http) = start_on(&app, 28000 + (std::process::id() % 2000) as u16);
+    assert_eq!(get(http, "/tls"), "true");
+}
+
+/// `audit`: rows in the change's transaction, appends from several
+/// connections at once in one chain, and a user with only the rights the
+/// user guide gives (insert and select) who can append but not change.
+fn the_audit_log_takes_turns_and_a_clerk_cannot_change_it(pg: &Pg, url: &str) {
+    let add = r#"
+db.exec("create table if not exists notes (n int)")
+fn add(n) = db.transaction(() => {
+    db.exec("insert into notes values (?)", n)
+    audit("note.add", { n })?
+    n < 0 ? err("no") : n
+})
+"#;
+    assert_eq!(run(url, &format!("{}
+[add(1), add(-1), audit(\"outside\").seq]", add)), r#"[1, err("no"), 2]"#);
+    assert_eq!(run(url, "audit.query({ action: \"note.*\" }) | map((r) => r.details.n)"), "[1]");
+    let hs: Vec<_> = (0..4)
+        .map(|w| {
+            let url = url.to_string();
+            std::thread::spawn(move || run(&url, &format!("for i in range(0, 25) {{ audit(\"tick\", {{ w: {}, i }}) }}\n1", w)))
+        })
+        .collect();
+    for h in hs {
+        assert_eq!(h.join().unwrap(), "1");
+    }
+    assert_eq!(run(url, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 102]");
+    assert!(run(url, "db.exec(\"delete from _quillo_audit\")").contains("append-only"));
+    // The rights the user guide gives the program's user.
+    psql(pg, url, &[
+        "create role clerk login",
+        "grant select, insert on notes, _quillo_audit to clerk",
+        "grant usage on sequence _quillo_audit_id_seq to clerk",
+        "grant select, insert, update on _quillo_audit_lock to clerk",
+        "revoke update, delete, truncate on _quillo_audit from clerk",
+    ]);
+    let clerk = url.replace("quillo@", "clerk@");
+    assert_eq!(run(&clerk, "audit(\"by the clerk\").seq"), "103");
+    assert_eq!(run(&clerk, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 103]");
+    let out = Command::new(pg.bin.join("psql")).args([&clerk, "-q", "-c", "update _quillo_audit set action = 'x'"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 fn psql(pg: &Pg, url: &str, sql: &[&str]) {
@@ -341,7 +486,28 @@ let row = db.one("select small, n, big, f, price, ok, name, code, data, raw, uid
         "[{ changes: 1, last_id: null }, { small: 3, n: 42, big: 9000000000, f: 2.5, price: 19.99, ok: true, name: \"Ada\", \
          code: \"x1\", data: { k: [1, null] }, raw: [1, 2], uid: \"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\", day: \"2024-02-29\", \
          at: \"2024-02-29T08:30:00Z\", plain: \"1999-12-31T23:59:59.5\", tags: [\"a\", \"b c\", \"q\\\"uote\"], nums: [1, 2, 3] }, \
-         { nothing: null, half: 10.5, whole: 7 }]"
+         { nothing: null, half: 10.5m, whole: 7 }]"
+            .replace("price: 19.99,", "price: 19.99m,")
+    );
+    // `numeric` is exact: decimals both ways, the scale kept; an int when it
+    // has none (`sum` of ints); text past what a decimal holds.
+    let r = run(
+        url,
+        r#"
+db.exec("create table money (id serial primary key, amount numeric(20, 4), f float8, n int8)")
+db.exec("insert into money (amount, f, n) values (?, ?, ?), (?, ?, ?)", 0.1m, 0.5m, 3m, 1234567890123.4567m, 2.25m, -4m)
+let rows = db.query("select amount, f, n from money order by id")
+let sums = db.one("select sum(amount) as s, sum(n) as n, avg(n) as a from money")
+let wide = db.one("select 12345678901234567890.123456789012345678901234567890::numeric as x, 'NaN'::numeric as nan")
+let back = db.one("select ?::numeric * 3 as t, ? = 0.30::numeric as same", 0.10m, 0.1m + 0.2m)
+[rows, sums, wide.x, wide.nan, back]
+"#,
+    );
+    assert_eq!(
+        r,
+        "[[{ amount: 0.1000m, f: 0.5, n: 3 }, { amount: 1234567890123.4567m, f: 2.25, n: -4 }], \
+         { s: 1234567890123.5567m, n: -1, a: -0.50000000000000000000m }, \
+         \"12345678901234567890.123456789012345678901234567890\", NaN, { t: 0.30m, same: true }]"
     );
 }
 
@@ -403,7 +569,10 @@ impl Drop for Running {
 }
 
 fn start(file: &Path) -> (Running, u16) {
-    let port = 26000 + (std::process::id() % 2000) as u16;
+    start_on(file, 26000 + (std::process::id() % 2000) as u16)
+}
+
+fn start_on(file: &Path, port: u16) -> (Running, u16) {
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
@@ -413,9 +582,10 @@ fn start(file: &Path) -> (Running, u16) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    support::stop_with_tests(&child);
     let child = Running(child);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }

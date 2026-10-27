@@ -14,43 +14,329 @@ class Ret { constructor(v) { this.v = v; } }
 class Err { constructor(e) { this.error = e === undefined ? null : e; } }
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+// Puts a key in a map the program made: "__proto__" is a key like any
+// other there (from JSON, say), not the object's prototype. Spreading
+// (`{ ...a, ...b }`) keeps it too; Object.assign and `o[k] = v` do not.
+const putKey = (o, k, v) => {
+  if (k === "__proto__") Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+  else o[k] = v;
+  return o;
+};
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !isEvent(v)));
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !isEvent(v)));
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
+
+// ---- decimals (src/decimal.rs, the same answers) -------------------------
+// A decimal is a whole number (a BigInt, at most 2^96 - 1 either way) and
+// how many of its digits come after the point (0 to 28). Ints past what a
+// JS number holds whole (2^53) are BigInts; smaller ones stay numbers, so
+// the usual arithmetic never meets either.
+
+class Dec { constructor(m, s) { this.m = m; this.s = s; } }
+const DEC_MAX = (1n << 96n) - 1n;
+const DEC_SCALE = 28;
+const P10 = [1n];
+const p10 = (k) => { while (P10.length <= k) P10.push(P10[P10.length - 1] * 10n); return P10[k]; };
+const babs = (x) => (x < 0n ? -x : x);
+const ROUNDINGS = "half_even, half_up, half_down, up, down, ceiling or floor";
+const DEC_FLOAT = ": a dec is exact and a float is not, so convert one with dec(x) or float(x)";
+const FLOAT_ONLY = " (this works on floats: convert a dec with float(x))";
+const isFloatV = (v) => typeof v === "number" && !Number.isInteger(v);
+const decHint = (a, b) => ((a instanceof Dec && isFloatV(b)) || (b instanceof Dec && isFloatV(a)) ? DEC_FLOAT : "");
+
+// Whether to add one to what is kept, given the first digit dropped,
+// whether any after it are not zero, and whether what is kept is odd.
+function decBump(mode, digit, rest, odd, neg) {
+  const any = digit !== 0 || rest;
+  switch (mode) {
+    case "half_even": return digit > 5 || (digit === 5 && (rest || odd));
+    case "half_up": return digit >= 5;
+    case "half_down": return digit > 5 || (digit === 5 && rest);
+    case "up": return any;
+    case "down": return false;
+    case "ceiling": return any && !neg;
+    case "floor": return any && neg;
+  }
+  return false;
+}
+
+// mag at scale made to fit (`fit` in src/decimal.rs): digits past the
+// 28th decimal or past 96 bits dropped and the rest rounded; null when the
+// whole part alone does not fit.
+function decFit(neg, mag, scale, sticky, mode) {
+  let digit = 0, rest = sticky, dropped = sticky;
+  for (;;) {
+    while (scale > DEC_SCALE || mag > DEC_MAX) {
+      if (scale === 0) return null;
+      rest = rest || digit !== 0;
+      digit = Number(mag % 10n);
+      mag /= 10n;
+      scale--;
+      dropped = true;
+    }
+    if (dropped && decBump(mode, digit, rest, (mag & 1n) === 1n, neg)) {
+      mag += 1n;
+      digit = 0; rest = false; dropped = false;
+      continue;
+    }
+    return new Dec(neg ? -mag : mag, scale);
+  }
+}
+const decOk = (d) => (d === null ? fail("decimal overflow") : d);
+
+function decAdd(a, b) {
+  if (a.s === b.s) { const m = a.m + b.m; if (babs(m) <= DEC_MAX) return new Dec(m, a.s); }
+  const s = Math.max(a.s, b.s);
+  const m = a.m * p10(s - a.s) + b.m * p10(s - b.s);
+  return decOk(decFit(m < 0n, babs(m), s, false, "half_even"));
+}
+function decMul(a, b) {
+  const m = a.m * b.m, s = a.s + b.s;
+  if (s <= DEC_SCALE && babs(m) <= DEC_MAX) return new Dec(m, s);
+  return decOk(decFit((a.m < 0n) !== (b.m < 0n), babs(m), s, false, "half_even"));
+}
+// Long division, a digit at a time, while there is a remainder and room.
+function decDiv(a, b) {
+  if (b.m === 0n) fail("division by zero");
+  const bm = babs(b.m);
+  let scale = a.s - b.s, q = babs(a.m) / bm, r = babs(a.m) % bm;
+  while (r !== 0n && (scale < 0 || (scale <= DEC_SCALE && q <= DEC_MAX))) {
+    r *= 10n;
+    q = q * 10n + r / bm;
+    r %= bm;
+    scale++;
+  }
+  if (scale < 0) { q *= p10(-scale); scale = 0; }
+  return decOk(decFit((a.m < 0n) !== (b.m < 0n), q, scale, r !== 0n, "half_even"));
+}
+function decRem(a, b) {
+  if (b.m === 0n) fail("division by zero");
+  const s = Math.max(a.s, b.s);
+  const r = (babs(a.m) * p10(s - a.s)) % (babs(b.m) * p10(s - b.s));
+  return decOk(decFit(a.m < 0n, r, s, false, "half_even"));
+}
+// Rounded to `digits` decimals, padded with zeros when it has fewer.
+function decRound(d, digits, mode) {
+  digits = Math.min(Math.max(digits, -DEC_SCALE), DEC_SCALE);
+  if (digits >= d.s) {
+    const m = d.m * p10(digits - d.s);
+    return babs(m) <= DEC_MAX ? new Dec(m, digits) : d;
+  }
+  const neg = d.m < 0n, mag = babs(d.m), p = p10(d.s - digits), unit = p / 10n;
+  let kept = mag / p;
+  const gone = mag % p;
+  if (decBump(mode, Number(gone / unit), gone % unit !== 0n, (kept & 1n) === 1n, neg)) kept += 1n;
+  return decOk(digits >= 0 ? decFit(neg, kept, digits, false, mode) : decFit(neg, kept * p10(-digits), 0, false, mode));
+}
+function decCmp(a, b) {
+  const s = Math.max(a.s, b.s);
+  const x = a.m * p10(s - a.s), y = b.m * p10(s - b.s);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+function decText(d) {
+  let t = babs(d.m).toString();
+  if (d.s > 0) {
+    if (t.length <= d.s) t = "0".repeat(d.s - t.length + 1) + t;
+    t = t.slice(0, t.length - d.s) + "." + t.slice(t.length - d.s);
+  }
+  return d.m < 0n ? "-" + t : t;
+}
+// Its text with no zeros at the end of the fraction: as a map key.
+function decKey(d) {
+  let m = d.m, s = d.s;
+  while (s > 0 && m % 10n === 0n) { m /= 10n; s--; }
+  return decText(new Dec(m, s));
+}
+const DEC_RE = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE](\+?\d{1,6}|-\d{1,5}))?$/;
+// Text as a program writes a number, exactly (null if digits past what a
+// decimal holds are not zeros), or rounded half to even.
+function decParse(s, rounded) {
+  if (typeof s !== "string" || s.length === 0 || s.length > 400) return null;
+  const r = DEC_RE.exec(s);
+  if (!r) return null;
+  const whole = r[2], frac = r[3] || "";
+  if (whole.length + frac.length === 0) return null;
+  const neg = r[1] === "-";
+  let mag = BigInt(whole + frac);
+  let scale = frac.length - (r[4] ? parseInt(r[4], 10) : 0);
+  if (scale < 0) {
+    if (mag !== 0n && -scale > 80) return null;
+    if (mag !== 0n) mag *= p10(-scale);
+    scale = 0;
+  }
+  // Zero is zero however many zeros are written after the point.
+  if (mag === 0n) scale = Math.min(scale, DEC_SCALE);
+  if (scale > 400) return null;
+  if (rounded) return decFit(neg, mag, scale, false, "half_even");
+  while (scale > DEC_SCALE || mag > DEC_MAX) {
+    if (scale === 0 || mag % 10n !== 0n) return null;
+    mag /= 10n;
+    scale--;
+  }
+  return new Dec(neg ? -mag : mag, scale);
+}
+// A float through its shortest text, so 0.1 is 0.1.
+const decFromFloat = (f) => (Number.isFinite(f) ? decParse(f.toExponential(), true) : null);
+// A value as a decimal, for a `dec` pattern or record field.
+function asDec(v) {
+  if (v instanceof Dec) return v;
+  if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
+  if (typeof v === "number") return decFromFloat(v);
+  if (typeof v === "string") return decParse(v.trim(), false);
+  return null;
+}
+function decArith(a, b, op, verb) {
+  const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
+  const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
+  if (x === null || y === null) fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}${decHint(a, b)}`);
+  switch (op) {
+    case "+": return decAdd(x, y);
+    case "-": return decAdd(x, new Dec(-y.m, y.s));
+    case "*": return decMul(x, y);
+    case "/": return decDiv(x, y);
+  }
+  return decRem(x, y);
+}
+
+// An int as the page keeps it: a number while it is whole as one.
+const I64_MIN = -(1n << 63n), I64_MAX = (1n << 63n) - 1n;
+const intOf = (b) => (b >= -9007199254740991n && b <= 9007199254740991n ? Number(b) : b);
+const bigChecked = (b) => (b < I64_MIN || b > I64_MAX ? fail("integer overflow") : intOf(b));
+// Arithmetic with an int past 2^53: exact, 64-bit as on the server.
+function bigArith(a, b, op, verb) {
+  const ai = isInt(a) || typeof a === "bigint", bi = isInt(b) || typeof b === "bigint";
+  if (ai && bi) {
+    const x = BigInt(a), y = BigInt(b);
+    if ((op === "/" || op === "%") && y === 0n) fail("division by zero");
+    if (op === "/") return x % y === 0n ? bigChecked(x / y) : Number(x) / Number(y);
+    return bigChecked(op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : x % y);
+  }
+  if ((ai || typeof a === "number") && (bi || typeof b === "number")) {
+    const x = Number(a), y = Number(b);
+    return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
+  }
+  fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
+}
 // What Quillo code does not reach on the page's objects: what runs text as
 // code or HTML (markup in components does that safely), and the way to the
-// Function constructor.
+// Function constructor. These checks are a guard-rail against mistakes, not
+// a wall: the page's own scripts can do anything, and a determined program
+// can find a way through them.
 const FOREIGN_DENY = ["eval", "Function", "setTimeout", "setInterval", "execScript", "execCommand", "insertAdjacentHTML",
-  "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln", "constructor", "__proto__", "prototype"];
+  "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln", "constructor", "__proto__", "prototype",
+  "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"];
 function foreignName(name) {
   if (FOREIGN_DENY.includes(name)) fail(`\`${name}\` is not used from Quillo code: it runs text as code or HTML`);
 }
 // Calls a method of the page's object `o`, unless it would run text as code.
 function foreignCall(o, name, args) {
   foreignName(name);
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`${name}\` is not given a javascript: URL`);
-  if (name === "setAttribute" || name === "setAttributeNS") {
-    const k = String(args[name === "setAttribute" ? 0 : 1]).toLowerCase();
-    if (k.startsWith("on") || k === "srcdoc") fail(`\`${name}\` does not set ${k}: it runs text as code`);
-  }
-  const r = o[name](...args);
-  return r === undefined ? null : r;
+  const f = o[name];
+  guardCall(`\`${name}\``, f, args, name);
+  return fromPage(Reflect.apply(f, o, args));
 }
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
 const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
-  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html));
-// Functions of the page that run text as code: Quillo code calls none of
-// them, however it came by one.
+  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec));
+// Functions of the page that run text as code or HTML, or that step around
+// the checks here (setting any property, calling a method with any `this`,
+// reading a property by a name from data, making a function from text, or
+// parsing markup into nodes): Quillo code calls none of them, and hands
+// none to the page's functions, however it came by one.
 let deniedFns = null;
+// Where the tag of an element made, and the name of an attribute set, are
+// in the arguments of the page's functions that make and set them.
+let makers = null;
+let setters = null;
+function guarded() {
+  if (deniedFns !== null) return deniedFns;
+  const g = globalThis, out = new Set();
+  const add = (o, ...names) => {
+    if (o) for (const n of names) {
+      // Getters of the page's prototypes throw when read off them.
+      try { if (typeof o[n] === "function") out.add(o[n]); } catch (_) {}
+    }
+  };
+  add(g, "eval", "Function", "setTimeout", "setInterval", "execScript");
+  // Function's kin, which any async or generator function leads to.
+  for (const f of [async function () {}, function* () {}, async function* () {}]) out.add(Object.getPrototypeOf(f).constructor);
+  add(Function.prototype, "call", "apply", "bind");
+  add(g.Reflect, "apply", "construct", "get", "set", "defineProperty", "setPrototypeOf", "getOwnPropertyDescriptor");
+  add(Object, "assign", "defineProperty", "defineProperties", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors");
+  add(g.DOMParser && g.DOMParser.prototype, "parseFromString");
+  add(g.Document, "parseHTMLUnsafe");
+  add(g.Document && g.Document.prototype, "write", "writeln", "execCommand");
+  add(g.Element && g.Element.prototype, "insertAdjacentHTML", "setHTMLUnsafe");
+  add(g.ShadowRoot && g.ShadowRoot.prototype, "setHTMLUnsafe");
+  add(g.Range && g.Range.prototype, "createContextualFragment");
+  const places = (o, pairs) => {
+    const m = new Map();
+    if (o) for (const [n, i] of pairs) if (typeof o.prototype[n] === "function") m.set(o.prototype[n], i);
+    return m;
+  };
+  makers = places(g.Document, [["createElement", 0], ["createElementNS", 1]]);
+  setters = places(g.Element, [["setAttribute", 0], ["setAttributeNS", 1]]);
+  return (deniedFns = out);
+}
 function denied(f) {
-  if (deniedFns === null) {
-    deniedFns = new Set();
-    for (const n of ["eval", "Function", "setTimeout", "setInterval", "execScript"]) if (typeof globalThis[n] === "function") deniedFns.add(globalThis[n]);
+  if (guarded().has(f)) fail(`\`${f.name || "this function"}\` is not called from Quillo code: it runs text as code or steps around these checks`);
+}
+// Functions that came from the page as values (`js("lib.fn")`, or what one
+// of its functions gave back), each with what calls it: `pageCall`, which
+// checks what it is given.
+const pageFns = new WeakMap();
+function fromPage(r) {
+  if (typeof r === "function") {
+    if (guarded().has(r)) fail(`\`${r.name || "this function"}\` is not given to Quillo code: it runs text as code`);
+    pageFns.set(r, pageCall);
   }
-  if (deniedFns.has(f)) fail(`\`${f.name}\` is not called from Quillo code: it runs text as code`);
+  return r === undefined ? null : r;
+}
+function pageCall(f, args) {
+  guardArgs(`\`${f.name || "this function"}\``, args, 0);
+  return fromPage(f(...args));
+}
+// A call of the page's function f (the method `name`) with args: f is not
+// one of the above, makes no script element, sets no handler or srcdoc,
+// and is given nothing that would run as code.
+function guardCall(what, f, args, name) {
+  denied(f);
+  if (makers.has(f)) {
+    const tag = String(args[makers.get(f)]).split(":").pop().trim().toLowerCase();
+    if (tag === "script") fail(`${what} does not make a script element: it runs text as code`);
+  }
+  const at = setters.has(f) ? setters.get(f) : name === "setAttribute" ? 0 : name === "setAttributeNS" ? 1 : -1;
+  if (at >= 0) {
+    const k = String(args[at]).toLowerCase();
+    if (k.startsWith("on") || k === "srcdoc") fail(`${what} does not set ${k}: it runs text as code`);
+  }
+  guardArgs(what, args, 0);
+}
+// What is handed to the page's functions: no javascript: URL (in a list or
+// a map too, which turn into it as text), no function above, no map that
+// makes its own text, and no node of another document (markup parsed from
+// text, whose handlers would run once it is on the page).
+function guardArgs(what, args, depth) {
+  for (const a of args) {
+    if (typeof a === "string") {
+      if (scriptURL(a)) fail(`${what} is not given a javascript: URL`);
+    } else if (typeof a === "function") {
+      if (guarded().has(a)) fail(`${what} is not given \`${a.name || "this function"}\`: it runs text as code`);
+    } else if (a !== null && typeof a === "object" && depth < 16) {
+      if (Array.isArray(a)) guardArgs(what, a, depth + 1);
+      else if (foreign(a)) {
+        if (typeof document !== "undefined" && typeof a.nodeType === "number" && (a.nodeType === 9 ? a : a.ownerDocument) !== document)
+          fail(`${what} is not given a node of another document: markup parsed from text runs its handlers on the page`);
+      } else if (isMap(a)) {
+        if (typeof a.toString === "function" && hasOwn(a, "toString") || typeof a.valueOf === "function" && hasOwn(a, "valueOf"))
+          fail(`${what} is not given a map with its own toString or valueOf`);
+        guardArgs(what, Object.values(a), depth + 1);
+      }
+    }
+  }
 }
 
 function typeName(v) {
@@ -60,7 +346,9 @@ function typeName(v) {
     case "number": return Number.isInteger(v) ? "int" : "float";
     case "string": return "str";
     case "function": return "fn";
+    case "bigint": return "int";
   }
+  if (v instanceof Dec) return "dec";
   if (Array.isArray(v)) return "list";
   if (v instanceof Err) return "error";
   if (v instanceof Html) return "html";
@@ -70,10 +358,11 @@ function typeName(v) {
 function typeIs(t, v) {
   switch (t) {
     case "any": return true;
-    case "int": return isInt(v);
+    case "int": return isInt(v) || typeof v === "bigint";
     // JS numbers do not remember whether they were written 2 or 2.0.
     case "float": return typeof v === "number";
-    case "num": return typeof v === "number";
+    case "num": return typeof v === "number" || typeof v === "bigint";
+    case "dec": return v instanceof Dec;
     case "str": return typeof v === "string";
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
@@ -133,6 +422,7 @@ function ownFitsName(n, t, v, deep, depth) {
     if (td.a) return ownFits(td.a, v, deep, depth + 1);
     return isMap(v) ? ownFieldsFit(td.r, v, depth) : OWN_PLAIN;
   }
+  if (n === "dec") return asDec(v) === null ? OWN_PLAIN : null;
   if (/^[A-Z]/.test(n) || !typeIs(n, v)) return OWN_PLAIN;
   if (deep && n === "list" && t.e) {
     for (let i = 0; i < v.length; i++) {
@@ -186,6 +476,8 @@ function ownMakeName(n, t, v, depth) {
     }
     return { ok: true, v: out };
   }
+  // A decimal field takes an int, numeric text or a JSON number.
+  if (n === "dec") { const d = asDec(v); return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
   const w = ownFits({ n: [n], o: false, e: t.e, f: t.f, t: t.t }, v, true, depth);
   return w ? { ok: false, w } : { ok: true, v };
 }
@@ -199,6 +491,8 @@ function repr(v) {
   if (typeof v === "string") return JSON.stringify(v);
   if (typeof v === "number") return String(v);
   if (typeof v === "boolean") return String(v);
+  if (typeof v === "bigint") return String(v);
+  if (v instanceof Dec) return decText(v) + "m";
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
   if (v instanceof Err) return "err(" + repr(v.error) + ")";
@@ -208,14 +502,20 @@ function repr(v) {
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? String(v) : v instanceof Dec ? decText(v) : repr(v);
+// A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
+const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
 const truthy = (v) => !(isNil(v) || v === false || v instanceof Err);
 
 function eq(a, b) {
   if (a === b) return true;
   // Different numbers, strings, bools and functions; null and undefined match.
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return isNil(a) && isNil(b);
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    // Two numbers (the usual case) test only their types here.
+    return (typeof a === "object" || typeof b === "object") && (a instanceof Dec || b instanceof Dec) ? decEq(a, b) : isNil(a) && isNil(b);
+  }
+  if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
   if (isMap(a) && isMap(b)) {
@@ -225,8 +525,24 @@ function eq(a, b) {
   return false;
 }
 
+// A decimal and a number, compared as decimals (a float through its text).
+function decEq(a, b) {
+  const x = a instanceof Dec ? a : typeof a === "number" || typeof a === "bigint" ? asDec(a) : null;
+  const y = b instanceof Dec ? b : typeof b === "number" || typeof b === "bigint" ? asDec(b) : null;
+  return x !== null && y !== null && decCmp(x, y) === 0;
+}
+
 function cmp(a, b) {
   if ((typeof a === "number" && typeof b === "number") || (typeof a === "string" && typeof b === "string")) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  // A decimal with a decimal or an int; not with a float.
+  if (a instanceof Dec || b instanceof Dec) {
+    const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
+    const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
+    return x === null || y === null ? null : decCmp(x, y);
+  }
+  if ((typeof a === "bigint" || typeof a === "number") && (typeof b === "bigint" || typeof b === "number")) {
     return a < b ? -1 : a > b ? 1 : 0;
   }
   return null;
@@ -238,14 +554,18 @@ function add(a, b) {
   if (typeof a === "number" && typeof b === "number") return a + b;
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
+  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
+  if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
-  if (isMap(a) && isMap(b)) return Object.assign({}, a, b);
+  if (isMap(a) && isMap(b)) return { ...a, ...b };
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
 // Numbers: the usual case first; anything else says what is wrong.
 function arith(a, b, op, verb) {
+  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, op, verb);
+  if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, op, verb);
   if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
   if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
   return op === "/" ? a / b : a % b;
@@ -257,7 +577,7 @@ const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0
 
 function order(a, b) {
   const c = cmp(a, b);
-  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}`);
+  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}${decHint(a, b)}`);
   return c;
 }
 const lt = (a, b) => order(a, b) < 0;
@@ -274,7 +594,11 @@ function intRange(a, b) {
 }
 
 function neg(v) {
-  if (typeof v !== "number") fail(`cannot negate ${typeName(v)}`);
+  if (typeof v !== "number") {
+    if (v instanceof Dec) return new Dec(-v.m, v.s);
+    if (typeof v === "bigint") return bigChecked(-v);
+    fail(`cannot negate ${typeName(v)}`);
+  }
   return -v;
 }
 
@@ -290,7 +614,7 @@ function eventField(e, name) {
       const f = t.tagName === "FORM" ? t : t.form;
       if (!f) return {};
       const out = {};
-      for (const [k, v] of new FormData(f)) out[k] = typeof v === "string" ? v : v.name;
+      for (const [k, v] of new FormData(f)) putKey(out, k, typeof v === "string" ? v : v.name);
       return out;
     }
   }
@@ -360,6 +684,8 @@ function index(o, i) {
 function callFn(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
   denied(f);
+  const call = pageFns.get(f);
+  if (call !== undefined) return call(f, args);
   return f(...args);
 }
 
@@ -444,6 +770,8 @@ function matchInto(p, v, b) {
     case "l": return eq(p.v, v);
     case "t": {
       madeLast = undefined;
+      // A decimal from an int, numeric text or a JSON number.
+      if (p.t === "dec") { const d = asDec(v); if (d === null) return false; madeLast = d; return true; }
       // A record: the value made as `User(v)` makes it.
       const r = ownTypes && ownTypes.make(p.t, v);
       if (r) {
@@ -500,12 +828,18 @@ function match(p, v) {
 
 // ---- the standard library (the parts that make sense in a browser) -----
 
-const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as argument ${i}, got ${isNil(v) && v === undefined ? "nothing" : typeName(v)}`); };
+const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as argument ${i}, got ${isNil(v) && v === undefined ? "nothing" : typeName(v)}${v instanceof Dec && what === "a number" ? FLOAT_ONLY : ""}`); };
 const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); return v; };
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
 const M = (v, f, i = 1) => { if (isNil(v)) return {}; want(isMap(v), f, "a map", i, v); return v; };
-const F = (v, f, i = 2) => { want(typeof v === "function", f, "a function", i, v); denied(v); return v; };
+const F = (v, f, i = 2) => {
+  want(typeof v === "function", f, "a function", i, v);
+  denied(v);
+  // The page's own function is called through one of Quillo's, which checks what it is given.
+  if (pageFns.has(v)) fail(`\`${f}\` is given a function of the page: wrap it, as in (x) => f(x)`);
+  return v;
+};
 const N = (v, f, i = 1) => { want(typeof v === "number", f, "a number", i, v); return v; };
 
 // Calls a function given to a builtin; it must not wait on the server.
@@ -527,10 +861,10 @@ function sortValues(items, name) {
   let bad = null;
   const sorted = items.slice().sort((a, b) => {
     const c = cmp(a[0], b[0]);
-    if (c === null) { bad = [typeName(a[0]), typeName(b[0])]; return 0; }
+    if (c === null) { bad = [typeName(a[0]), typeName(b[0]), decHint(a[0], b[0])]; return 0; }
     return c;
   });
-  if (bad) fail(`\`${name}\` cannot compare ${bad[0]} with ${bad[1]}`);
+  if (bad) fail(`\`${name}\` cannot compare ${bad[0]} with ${bad[1]}${bad[2]}`);
   return sorted.map((x) => x[1]);
 }
 
@@ -539,7 +873,7 @@ function extreme(l, name, want) {
   for (const x of L(l, name)) {
     if (best === null) { best = x; continue; }
     const c = cmp(x, best);
-    if (c === null) fail(`\`${name}\` cannot compare ${typeName(x)} with ${typeName(best)}`);
+    if (c === null) fail(`\`${name}\` cannot compare ${typeName(x)} with ${typeName(best)}${decHint(x, best)}`);
     if (c === want) best = x;
   }
   return best;
@@ -549,19 +883,28 @@ function coerce(t, s) {
   s = s.trim();
   if (t === "int") return /^[+-]?\d+$/.test(s) ? parseInt(s, 10) : null;
   if (t === "float" || t === "num") return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
+  if (t === "dec") return decParse(s, false);
   return null;
 }
 
-function toJSON(v) {
+// A value as JSON data. `wire`: for the program's own server (a server
+// fn's arguments), decimals and large ints tagged ({"$dec": "12.50"}) so
+// they arrive as they are; else a decimal is its text, as the server
+// writes it, and a large int its digits (`jsonText` writes them).
+function toJSON(v, wire) {
   if (isNil(v)) return null;
-  if (v instanceof Err) return { error: toJSON(v.error) };
-  if (Array.isArray(v)) return v.map(toJSON);
+  if (v instanceof Err) return { error: toJSON(v.error, wire) };
+  if (Array.isArray(v)) return v.map((x) => toJSON(x, wire));
   if (v instanceof Html) return "";
   if (typeof v === "function") return repr(v);
-  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = toJSON(v[k]); return o; }
+  if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
+  if (typeof v === "bigint") return wire ? { $int: String(v) } : "\u0000int:" + v;
+  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, toJSON(v[k], wire)); return o; }
   if (typeof v === "number" && !isFinite(v)) return null;
   return v;
 }
+// JSON text of a value, a large int written as its digits.
+const jsonText = (v, indent) => JSON.stringify(toJSON(v), null, indent).replace(/"\\u0000int:(-?\d+)"/g, "$1");
 
 const B = {};
 
@@ -629,7 +972,7 @@ B.receive = meta(async (url, f, opts) => {
   if (isMap(opts.headers)) for (const k of Object.keys(opts.headers)) init.headers[k] = display(opts.headers[k]);
   if (!isNil(opts.body)) {
     if (typeof opts.body === "string") init.body = opts.body;
-    else { init.body = JSON.stringify(toJSON(opts.body)); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
+    else { init.body = jsonText(opts.body); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
   }
   let res;
   try { res = await fetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
@@ -699,7 +1042,9 @@ B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }
 // HTML made from text (by raw or markdown) is that text, as on the server.
 B.str = meta((v) => v instanceof Html && v.text !== undefined ? v.text : display(v), "str", null);
 B.int = meta((v) => {
-  if (isInt(v)) return v;
+  if (isInt(v) || typeof v === "bigint") return v;
+  // The whole part (toward zero).
+  if (v instanceof Dec) { const w = v.m / p10(v.s); return w < I64_MIN || w > I64_MAX ? new Err(`${decText(v)} is too large for an int`) : intOf(w); }
   if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
   if (typeof v === "boolean") return v ? 1 : 0;
   if (typeof v === "string") { const n = coerce("int", v); return n === null ? new Err(`not an int: ${JSON.stringify(v)}`) : n; }
@@ -707,6 +1052,8 @@ B.int = meta((v) => {
 }, "int", null);
 B.float = meta((v) => {
   if (typeof v === "number") return v;
+  if (v instanceof Dec) return Number(decText(v));
+  if (typeof v === "bigint") return Number(v);
   if (typeof v === "string") { const n = coerce("float", v); return n === null ? new Err(`not a number: ${JSON.stringify(v)}`) : n; }
   return new Err(`cannot convert ${typeName(v)} to float`);
 }, "float", null);
@@ -718,6 +1065,15 @@ B.len = meta((v) => {
   fail(`\`len\` expects a str, list or map, got ${typeName(v)}`);
 }, "len", null);
 B.type_of = meta((v) => typeName(v), "type_of", null);
+// `dec(x)`: a decimal from text (exactly), an int, or a float (through its
+// shortest text, so dec(0.1) is 0.1m).
+B.dec = meta((v) => {
+  if (v instanceof Dec) return v;
+  if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
+  if (typeof v === "number") return decFromFloat(v) ?? new Err("cannot convert float to dec: it is too large, or not a number");
+  if (typeof v === "string") return decParse(v.trim(), false) ?? new Err(`not a decimal: ${JSON.stringify(v)}`);
+  return new Err(`cannot convert ${typeName(v)} to dec`);
+}, "dec", null);
 B.upper = meta((s) => S(s, "upper").toUpperCase(), "upper", null);
 B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
 B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
@@ -773,22 +1129,18 @@ B.range = meta((a, b) => b === undefined ? intRange(0, I(a, "range")) : intRange
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
 B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
 B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
-B.get = meta((m, k, d = null) => { m = M(m, "get"); k = display(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
-B.has = meta((m, k) => hasOwn(M(m, "has"), display(k)), "has", null);
+B.get = meta((m, k, d = null) => { m = M(m, "get"); k = keyText(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
+B.has = meta((m, k) => hasOwn(M(m, "has"), keyText(k)), "has", null);
 B.set = meta((m, k, v = null) => {
-  const o = { ...M(m, "set") }, key = display(k);
-  // "__proto__" is a key like any other here, not the object's prototype.
-  if (key === "__proto__") Object.defineProperty(o, key, { value: v, enumerable: true, writable: true, configurable: true });
-  else o[key] = v;
-  return o;
+  return putKey({ ...M(m, "set") }, keyText(k), v);
 }, "set", null);
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
-  const m = Object.assign({}, M(c, "remove"));
-  delete m[display(k)];
+  const m = { ...M(c, "remove") };
+  delete m[keyText(k)];
   return m;
 }, "remove", null);
-B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "merge", null);
+B.merge = meta((a, b) => ({ ...M(a, "merge"), ...M(b, "merge", 2) }), "merge", null);
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
@@ -892,7 +1244,7 @@ const HL = (() => {
   const L = (o) => Object.assign({ line: [], block: null, quotes: "", keywords: [], consts: [], types: false, tags: false, css: false, json: false, nocase: false }, o);
   const qwe = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"`", types: true, tags: true,
     keywords: ["let", "fn", "view", "component", "server", "route", "use", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
-    consts: ["true", "false", "null", "int", "str", "bool", "float", "map", "list", "any"] });
+    consts: ["true", "false", "null", "int", "str", "bool", "float", "dec", "map", "list", "any"] });
   const js = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"'`", types: true,
     keywords: ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "export", "extends", "finally", "for",
       "function", "if", "import", "in", "instanceof", "let", "new", "return", "super", "switch", "this", "throw", "try", "typeof", "var", "void",
@@ -1003,12 +1355,24 @@ B.random_int = meta((lo, hi) => {
 }, "random_int", null);
 B.uuid = meta(() => (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID()
   : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => { const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16); }), "uuid", null);
-B.abs = meta((x) => Math.abs(N(x, "abs")), "abs", null);
+B.abs = meta((x) => x instanceof Dec ? new Dec(babs(x.m), x.s) : typeof x === "bigint" ? bigChecked(babs(x)) : Math.abs(N(x, "abs")), "abs", null);
 // Halves round away from zero, as on the server (Math.round(-2.5) is -2).
 const roundHalf = (x) => Math.sign(x) * Math.round(Math.abs(x));
-B.round = meta((x, d) => { N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
-B.floor = meta((x) => Math.floor(N(x, "floor")), "floor", null);
-B.ceil = meta((x) => Math.ceil(N(x, "ceil")), "ceil", null);
+// A decimal rounded: round(d, digits = 0, mode = "half_even"), keeping
+// exactly `digits` decimals.
+function roundDec(x, d, mode) {
+  if (!isNil(d)) I(d, "round", 2);
+  if (isNil(mode)) mode = "half_even";
+  else if (typeof mode !== "string") fail(`\`round\` expects a str as argument 3, got ${typeName(mode)}`);
+  else if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(mode)) fail(`\`round\`: unknown rounding ${JSON.stringify(mode)} (one of ${ROUNDINGS})`);
+  return decRound(x, isNil(d) ? 0 : d, mode);
+}
+B.round = meta((x, d, mode) => {
+  if (x instanceof Dec) return roundDec(x, d, mode);
+  if (!isNil(mode)) fail("`round` takes a rounding mode for a dec only: convert with dec(x)");
+  N(x, "round"); if (d === undefined) return roundHalf(x); const p = 10 ** Math.min(Math.max(I(d, "round", 2), 0), 15); return roundHalf(x * p) / p; }, "round", null);
+B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : Math.floor(N(x, "floor")), "floor", null);
+B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : Math.ceil(N(x, "ceil")), "ceil", null);
 B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
 B.pow = meta((x, y) => N(x, "pow") ** N(y, "pow", 2), "pow", null);
 B.unique = meta((l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; }, "unique", null);
@@ -1017,7 +1381,7 @@ B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, 
 B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
 B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; }, "count", null);
-B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = display(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
+B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = keyText(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
@@ -1043,15 +1407,14 @@ B.js = meta((path, ...args) => {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
   }
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js\`: ${path} is not given a javascript: URL`);
-  const r = v.apply(owner, args);
-  return r === undefined ? null : r;
+  guardCall(`\`js\`: ${path}`, v, args);
+  return fromPage(Reflect.apply(v, owner, args));
 }, "js", null);
 B.js_new = meta((path, ...args) => {
   const [, v] = jsPath(path, "js_new");
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js_new\`: ${path} is not given a javascript: URL`);
-  return new v(...args);
+  guardCall(`\`js_new\`: ${path}`, v, args);
+  return fromPage(Reflect.construct(v, args));
 }, "js_new", null);
 
 // Translations: the page's locale and its text (see src/i18n.rs).
@@ -1075,7 +1438,7 @@ const plural = (locale, n) => {
   }
 };
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
-B.t = meta((k, vars) => {
+const translate = (k, vars, esc) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
   let e = d && hasOwn(d.t, k) ? d.t[k] : k;
@@ -1083,15 +1446,18 @@ B.t = meta((k, vars) => {
     const cat = typeof vars.count === "number" ? plural(d.locale, vars.count) : "other";
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
-  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? display(vars[name]) : m);
-}, "t", null);
+  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(display(vars[name])) : m);
+};
+B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
+// raw(t(key, vars)): the translation's markup, with the values put in escaped.
+B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
-  stringify: (v, pretty) => JSON.stringify(toJSON(v), null, truthy(pretty) ? 2 : undefined),
+  stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
 };
 
 function fromJSON(j) {
@@ -1331,10 +1697,232 @@ B.re = {
   },
 };
 
+// ---- money (src/money.rs, the same answers) ------------------------------
+// An amount of a currency, as a map { amount: dec, currency: "USD" }, with
+// the currency's ISO 4217 minor units; written as CLDR has it for a locale.
+
+const MONEY_CURRENCIES = "AED2 AFN2 ALL2 AMD2 AOA2 ARS2 AUD2 AWG2 AZN2 BAM2 BBD2 BDT2 BHD3 BIF0 BMD2 BND2 BOB2 BOV2 BRL2 BSD2 " +
+  "BTN2 BWP2 BYN2 BZD2 CAD2 CDF2 CHE2 CHF2 CHW2 CLF4 CLP0 CNY2 COP2 COU2 CRC2 CUC2 CUP2 CVE2 CZK2 DJF0 " +
+  "DKK2 DOP2 DZD2 EGP2 ERN2 ETB2 EUR2 FJD2 FKP2 GBP2 GEL2 GHS2 GIP2 GMD2 GNF0 GTQ2 GYD2 HKD2 HNL2 HTG2 " +
+  "HUF2 IDR2 ILS2 INR2 IQD3 IRR2 ISK0 JMD2 JOD3 JPY0 KES2 KGS2 KHR2 KMF0 KPW2 KRW0 KWD3 KYD2 KZT2 LAK2 " +
+  "LBP2 LKR2 LRD2 LSL2 LYD3 MAD2 MDL2 MGA2 MKD2 MMK2 MNT2 MOP2 MRU2 MUR2 MVR2 MWK2 MXN2 MXV2 MYR2 MZN2 " +
+  "NAD2 NGN2 NIO2 NOK2 NPR2 NZD2 OMR3 PAB2 PEN2 PGK2 PHP2 PKR2 PLN2 PYG0 QAR2 RON2 RSD2 RUB2 RWF0 SAR2 " +
+  "SBD2 SCR2 SDG2 SEK2 SGD2 SHP2 SLE2 SOS2 SRD2 SSP2 STN2 SVC2 SYP2 SZL2 THB2 TJS2 TMT2 TND3 TOP2 TRY2 " +
+  "TTD2 TWD2 TZS2 UAH2 UGX0 USD2 USN2 UYI0 UYU2 UYW4 UZS2 VED2 VES2 VND0 VUV0 WST2 XAF0 XCD2 XCG2 XOF0 " +
+  "XPF0 YER2 ZAR2 ZMW2 ZWG2";
+const MONEY_SYMBOLS = "USD=US$,EUR=\u20ac,GBP=\u00a3,JPY=JP\u00a5,CNY=CN\u00a5,INR=\u20b9,CAD=CA$,AUD=AU$,NZD=NZ$,BRL=R$,MXN=MX$,KRW=\u20a9,TWD=NT$,HKD=HK$,VND=\u20ab,ILS=\u20aa";
+const MONEY_LOCALES = "en-US\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,PHP=\u20b1\n" +
+  "en-GB\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-CA\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCAD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-AU\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=$,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "en-NZ\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,NZD=$,PHP=\u20b1\n" +
+  "en-IE\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1\n" +
+  "en-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,PHP=\u20b1\n" +
+  "en-SG\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,SGD=$,PHP=\u20b1\n" +
+  "en-ZA\t,\t\u00a0\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tAUD=A$,PHP=\u20b1,ZAR=R\n" +
+  "de-DE\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-AT\t,\t.\t\t\u00a0\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,THB=\u0e3f\n" +
+  "de-CH\t.\t\u2019\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=$,EUR=EUR,JPY=\u00a5,THB=\u0e3f\n" +
+  "fr-FR\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-BE\t,\t\u202f\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "fr-CA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$\u00a0US,JPY=\u00a5,INR=INR,CAD=$,AUD=$\u00a0AU,NZD=$\u00a0NZ,MXN=MXN,KRW=KRW,TWD=TWD,HKD=$\u00a0HK,SGD=$\u00a0SG,VND=VND,ILS=ILS\n" +
+  "fr-CH\t.\t\u202f\t,\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$US,GBP=\u00a3GB,JPY=JPY,CNY=CNY,CAD=$CA,AUD=$AU,NZD=$NZ,MXN=$MX,ARS=$AR,TWD=TWD,HKD=HKD,SGD=$SG\n" +
+  "it-IT\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "it-CH\t.\t\u2019\t\t\t-\t2\t\u00a4\u00a0#\t\u00a4-#\t\u00a4\u00a0#\t\u00a4-#\tUSD=USD,JPY=JPY,INR=INR,AUD=A$,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,VND=VND,PHP=\u20b1\n" +
+  "es-ES\t,\t.\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,THB=\u0e3f,ILS=ILS\n" +
+  "es-MX\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "es-AR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tEUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,ARS=$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pt-BR\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tTHB=\u0e3f\n" +
+  "pt-PT\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tTHB=\u0e3f\n" +
+  "nl-NL\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "nl-BE\t,\t.\t\t\t-\t0\t\u00a4\u00a0#\t\u00a4\u00a0-#\t\u00a4\u00a0#\t\u00a4\u00a0-#\tCAD=C$,THB=\u0e3f\n" +
+  "sv-SE\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tGBP=GBP,JPY=JPY,CNY=CNY,INR=INR,AUD=AUD,NZD=NZD,SEK=kr,NOK=Nkr,DKK=Dkr,BRL=BR$,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,EGP=EG\u00a3\n" +
+  "nb-NO\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,NOK=kr,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "da-DK\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tDKK=kr.,THB=\u0e3f\n" +
+  "fi-FI\t,\t\u00a0\t\t\t\u2212\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "pl-PL\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,PLN=z\u0142,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "cs-CZ\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tINR=INR,CZK=K\u010d,VND=VND,ILS=ILS\n" +
+  "hu-HU\t,\t\u00a0\t\t\t-\t2\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,HUF=Ft,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ro-RO\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=JPY,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "el-GR\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "tr-TR\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,TRY=\u20ba,THB=\u0e3f\n" +
+  "ru-RU\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=$,JPY=\u00a5,AUD=A$,RUB=\u20bd,UAH=\u20b4,THB=\u0e3f\n" +
+  "uk-UA\t,\t\u00a0\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tUSD=USD,EUR=EUR,GBP=GBP,JPY=\u00a5,CNY=CNY,INR=INR,CAD=CAD,AUD=AUD,NZD=NZD,UAH=\u20b4,BRL=BRL,MXN=MXN,KRW=KRW,TWD=TWD,HKD=HKD,VND=VND,ILS=ILS\n" +
+  "ja-JP\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\uffe5,CNY=\u5143,AUD=A$\n" +
+  "zh-CN\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tCNY=\u00a5\n" +
+  "zh-TW\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,KRW=\uffe6,TWD=$\n" +
+  "zh-HK\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5\n" +
+  "ko-KR\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\t\n" +
+  "hi-IN\t.\t,\t\t\t-\t1\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,AUD=A$,THB=\u0e3f\n" +
+  "id-ID\t,\t.\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tINR=Rs,THB=\u0e3f,IDR=Rp\n" +
+  "th-TH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tJPY=\u00a5,THB=\u0e3f\n" +
+  "vi-VN\t,\t.\t\t\t-\t0\t#\u00a0\u00a4\t-#\u00a0\u00a4\t#\u00a0\u00a4\t-#\u00a0\u00a4\tJPY=\u00a5,THB=\u0e3f\n" +
+  "ms-MY\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=USD,CAD=CAD,AUD=A$,MXN=MXN,MYR=RM\n" +
+  "fil-PH\t.\t,\t\t\t-\t0\t\u00a4#\t-\u00a4#\t\u00a4\u00a0#\t-\u00a4\u00a0#\tUSD=$,JPY=\u00a5,AUD=A$,THB=\u0e3f,PHP=\u20b1";
+let moneyT = null;
+function moneyTables() {
+  if (moneyT) return moneyT;
+  const pairs = (s) => { const o = Object.create(null); for (const p of s.split(",")) { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i)] = p.slice(i + 1); } return o; };
+  const units = Object.create(null);
+  for (const c of MONEY_CURRENCIES.split(" ")) units[c.slice(0, 3)] = +c.slice(3);
+  const locales = MONEY_LOCALES.split("\n").map((l) => {
+    const f = l.split("\t");
+    return { name: f[0], decimal: f[1], group: f[2], number: [f[3] || f[1], f[4] || f[2]], minus: f[5], indian: (+f[6] & 1) !== 0, min2: (+f[6] & 2) !== 0, pats: f.slice(7, 11), symbols: pairs(f[11] || "") };
+  });
+  return (moneyT = { units, locales, symbols: pairs(MONEY_SYMBOLS) });
+}
+const unitsOf = (code) => { const u = moneyTables().units[code]; return u === undefined ? null : u; };
+function localeData(name) {
+  const all = moneyTables().locales;
+  name = String(name).replace(/_/g, "-").toLowerCase();
+  const lang = name.split("-")[0];
+  return all.find((l) => l.name.toLowerCase() === name) || all.find((l) => l.name.split("-")[0].toLowerCase() === lang) || all[0];
+}
+function moneyDigits(loc, [decimal, group], d) {
+  const t = decText(new Dec(babs(d.m), d.s));
+  const dot = t.indexOf(".");
+  const whole = dot < 0 ? t : t.slice(0, dot), frac = dot < 0 ? "" : t.slice(dot + 1);
+  const n = whole.length, grouped = !(loc.min2 && n < 5);
+  let out = "";
+  for (let i = 0; i < n; i++) {
+    const left = n - i;
+    if (i > 0 && grouped && (loc.indian ? left === 3 || (left > 3 && (left - 3) % 2 === 0) : left % 3 === 0)) out += group;
+    out += whole[i];
+  }
+  return frac ? out + decimal + frac : out;
+}
+function formatAmount(d, code, places, locName) {
+  const loc = localeData(locName);
+  d = decRound(d, places, "half_even");
+  const sym = loc.symbols[code] ?? moneyTables().symbols[code] ?? code;
+  const before = loc.pats[0].indexOf("¤") < loc.pats[0].indexOf("#");
+  const side = before ? Array.from(sym).pop() : Array.from(sym)[0];
+  const letters = side !== undefined && /\p{L}/u.test(side);
+  const pat = loc.pats[(letters ? 2 : 0) + (d.m < 0n ? 1 : 0)];
+  const num = moneyDigits(loc, [loc.decimal, loc.group], d);
+  return pat.replace("-", loc.minus).replace("¤", sym).replace("#", num);
+}
+const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short(v)}`);
+function moneyCurrency(c, f, i) {
+  if (typeof c !== "string") fail(`\`${f}\` expects a currency code (a str) as argument ${i}, got ${moneyShort(c)}`);
+  const code = c.trim().toUpperCase(), u = unitsOf(code);
+  return u === null ? new Err(`unknown currency ${JSON.stringify(c)}`) : { code, units: u };
+}
+function moneyArg(v, f, i) {
+  const bad = (why) => fail(`\`${f}\` expects money ({ amount, currency }) as argument ${i}, got ${moneyShort(v)}${why}`);
+  if (!isMap(v)) bad("");
+  const c = hasOwn(v, "currency") ? v.currency : null;
+  if (typeof c !== "string") bad(": no currency");
+  const code = c.toUpperCase(), units = unitsOf(code);
+  if (units === null) bad(": unknown currency");
+  const a = hasOwn(v, "amount") ? v.amount : null;
+  const amount = a instanceof Dec || isInt(a) || typeof a === "bigint" || typeof a === "string" ? asDec(a) : null;
+  if (amount === null) bad(": its amount must be a dec");
+  return { amount, code, units };
+}
+function moneyMode(m, f) {
+  if (isNil(m)) return "half_even";
+  if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${f === "money.round" ? 2 : 3}, got ${moneyShort(m)}`);
+  if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(m)) fail(`\`${f}\`: unknown rounding ${JSON.stringify(m)} (one of ${ROUNDINGS})`);
+  return m;
+}
+const moneyOf = (amount, code) => ({ amount, currency: code });
+function moneySame(a, b, verb) {
+  if (a.code !== b.code) fail(`cannot ${verb} ${a.code} and ${b.code}: convert one currency to the other first`);
+}
+// The locale to write in: the one given, else the page's, else en-US.
+function moneyLocale(l, f, i) {
+  if (isNil(l)) { const d = i18n(); return d ? d.locale : "en-US"; }
+  if (typeof l !== "string") fail(`\`${f}\` expects a locale (a str) as argument ${i}, got ${moneyShort(l)}`);
+  return l;
+}
+B.money = {
+  of: (amount, currency, mode) => {
+    const c = moneyCurrency(currency, "money.of", 2);
+    if (c instanceof Err) return c;
+    let d;
+    if (amount instanceof Dec) d = amount;
+    else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
+    else if (typeof amount === "string") { d = decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
+    else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
+    else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
+    if (isNil(mode)) {
+      const exact = decRound(d, c.units, "down");
+      if (decCmp(exact, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
+      return moneyOf(exact, c.code);
+    }
+    return moneyOf(decRound(d, c.units, moneyMode(mode, "money.of")), c.code);
+  },
+  from_minor: (n, currency) => {
+    const c = moneyCurrency(currency, "money.from_minor", 2);
+    if (c instanceof Err) return c;
+    if (!isInt(n) && typeof n !== "bigint") fail(`\`money.from_minor\` expects an int as argument 1, got ${moneyShort(n)}`);
+    return moneyOf(new Dec(BigInt(n), c.units), c.code);
+  },
+  to_minor: (m) => {
+    const a = moneyArg(m, "money.to_minor", 1), d = decRound(a.amount, a.units, "half_even");
+    return d.s === a.units ? bigChecked(d.m) : fail("integer overflow");
+  },
+  add: (x, y) => { const a = moneyArg(x, "money.add", 1), b = moneyArg(y, "money.add", 2); moneySame(a, b, "add"); return moneyOf(decRound(decAdd(a.amount, b.amount), a.units, "half_even"), a.code); },
+  sub: (x, y) => { const a = moneyArg(x, "money.sub", 1), b = moneyArg(y, "money.sub", 2); moneySame(a, b, "subtract"); return moneyOf(decRound(decAdd(a.amount, new Dec(-b.amount.m, b.amount.s)), a.units, "half_even"), a.code); },
+  mul: (x, factor, mode) => {
+    const a = moneyArg(x, "money.mul", 1);
+    let f;
+    if (factor instanceof Dec) f = factor;
+    else if (isInt(factor) || typeof factor === "bigint") f = new Dec(BigInt(factor), 0);
+    else if (typeof factor === "number") fail("`money.mul` takes a dec or an int, not a float: convert it with dec(x)");
+    else fail(`\`money.mul\` expects a dec or an int as argument 2, got ${moneyShort(factor)}`);
+    return moneyOf(decRound(decMul(a.amount, f), a.units, moneyMode(mode, "money.mul")), a.code);
+  },
+  neg: (x) => { const a = moneyArg(x, "money.neg", 1); return moneyOf(new Dec(-a.amount.m, a.amount.s), a.code); },
+  compare: (x, y) => { const a = moneyArg(x, "money.compare", 1), b = moneyArg(y, "money.compare", 2); moneySame(a, b, "compare"); return decCmp(a.amount, b.amount); },
+  zero: (currency) => { const c = moneyCurrency(currency, "money.zero", 1); return c instanceof Err ? c : moneyOf(new Dec(0n, c.units), c.code); },
+  is_zero: (x) => moneyArg(x, "money.is_zero", 1).amount.m === 0n,
+  round: (x, mode) => { const a = moneyArg(x, "money.round", 1); return moneyOf(decRound(a.amount, a.units, moneyMode(mode, "money.round")), a.code); },
+  minor_units: (currency) => { const c = moneyCurrency(currency, "money.minor_units", 1); return c instanceof Err ? c : c.units; },
+  // Split by ratios without losing or making a minor unit: each share its
+  // part rounded down, the units left one each to the first shares with a
+  // ratio (Fowler's allocation).
+  allocate: (x, ratios) => {
+    const F = "money.allocate", a = moneyArg(x, F, 1);
+    let rs;
+    if (isInt(ratios) && ratios >= 1 && ratios <= 100000) rs = new Array(ratios).fill(new Dec(1n, 0));
+    else if (Array.isArray(ratios) && ratios.length > 0) {
+      rs = ratios.map((v, k) => {
+        if ((isInt(v) || typeof v === "bigint") && v >= 0) return new Dec(BigInt(v), 0);
+        if (v instanceof Dec && v.m >= 0n) return v;
+        fail(`\`${F}\`: ratio ${k} must be an int or a dec, 0 or more, got ${moneyShort(v)}`);
+      });
+    } else fail(`\`${F}\` expects a list of ratios or a number of parts as argument 2, got ${moneyShort(ratios)}`);
+    const s = Math.max(...rs.map((r) => r.s));
+    const whole = rs.map((r) => r.m * p10(s - r.s));
+    const total = whole.reduce((t, r) => t + r, 0n);
+    if (total <= 0n) fail(`\`${F}\`: the ratios must add up to more than 0`);
+    const minor = decRound(a.amount, a.units, "half_even").m, neg = minor < 0n, units = babs(minor);
+    const shares = whole.map((r) => (units * r) / total);
+    let left = units - shares.reduce((t, x) => t + x, 0n);
+    for (let i = 0; i < shares.length && left > 0n; i++) if (whole[i] > 0n) { shares[i] += 1n; left -= 1n; }
+    return shares.map((x) => moneyOf(new Dec(neg ? -x : x, a.units), a.code));
+  },
+  format: (x, locale) => { const a = moneyArg(x, "money.format", 1); return formatAmount(a.amount, a.code, a.units, moneyLocale(locale, "money.format", 2)); },
+};
+// format_number(x, locale, digits): a number as the locale writes one.
+B.format_number = meta((x, locale, digits) => {
+  let d;
+  if (x instanceof Dec) d = x;
+  else if (isInt(x) || typeof x === "bigint") d = new Dec(BigInt(x), 0);
+  else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
+  else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
+  const loc = localeData(moneyLocale(locale, "format_number", 2));
+  if (!isNil(digits)) d = decRound(d, Math.min(Math.max(I(digits, "format_number", 3), 0), 28), "half_even");
+  return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d);
+}, "format_number", null);
+
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
 
-const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}`); }); return l; };
+const decNote = (v) => (v instanceof Dec ? FLOAT_ONLY : "");
+const NS = (l, f, i = 1) => { l = L(l, f, i); l.forEach((v, k) => { if (typeof v !== "number") fail(`\`${f}\` expects a list of numbers, but item ${k} is ${typeName(v)}${decNote(v)}`); }); return l; };
 const given = (v) => !isNil(v);
 const csum2 = (xs) => {
   let s = 0, c = 0;
@@ -1564,7 +2152,7 @@ B.math = {
   isnan: (x) => Number.isNaN(N(x, "math.isnan")),
   prod: (l, start) => {
     let acc = given(start) ? N(start, "math.prod", 2) : 1;
-    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
+    for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}${decNote(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
     return acc;
   },
   fsum: (l) => fsum(NS(l, "math.fsum")),
@@ -1661,7 +2249,7 @@ B.stats = {
   quantiles: (l, n, method) => {
     const f = "stats.quantiles", d = sortedOf(dataOf(l, f, 1)), ld = d.length;
     n = given(n) ? I(n, f, 2) : 4;
-    if (n < 1) fail(`\`${f}\`: n must be at least 1`);
+    if (n < 1 || n > 10000) fail(`\`${f}\`: n must be from 1 to 10000, got ${n}`);
     method = given(method) ? S(method, f, 3) : "exclusive";
     if (ld === 1) return new Array(n - 1).fill(d[0]);
     const out = [];
@@ -1741,7 +2329,7 @@ B.stats = {
 };
 
 const vecArith = (op, f) => (a, b) => {
-  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}`);
+  if (typeof a !== "number" || typeof b !== "number") fail(`\`${f}\` expects numbers, got ${typeName(a)} and ${typeName(b)}${decNote(b) || decNote(a)}`);
   if ((op === "/" || op === "%") && b === 0 && isInt(a) && isInt(b)) fail(`\`${f}\`: division by zero`);
   const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "%" ? a % b : a / b;
   return isInt(a) && isInt(b) && Number.isInteger(r) ? overflowed(r) : r;
@@ -1769,7 +2357,7 @@ const matrixOf = (rows, f, i = 1) => {
   rows.forEach((r, k) => {
     if (!Array.isArray(r)) fail(`\`${f}\` expects a list of rows, but row ${k} is ${typeName(r)}`);
     if (r.length !== cols) fail(`\`${f}\`: row ${k} has ${r.length} numbers, row 0 has ${cols}`);
-    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}`); });
+    r.forEach((v) => { if (typeof v !== "number") fail(`\`${f}\` expects numbers, but row ${k} holds ${typeName(v)}${decNote(v)}`); });
   });
   return [rows, cols];
 };
@@ -1853,6 +2441,562 @@ B.vec = {
   },
 };
 
+// ---- date (src/dates.rs, the same answers) --------------------------------
+// A date is "2026-10-27" and a date-time "2026-10-27T14:30:00Z": text, as on
+// the server. The work is on day numbers (days from 1970-01-01) with the
+// server's integer algorithms; time zones come from Intl.DateTimeFormat.
+// Only the clock (date.today, date.now) differs from the server.
+
+const dtMod = (a, b) => a - Math.floor(a / b) * b;
+function dtDays(y, m, d) {
+  y = m <= 2 ? y - 1 : y;
+  const era = Math.floor(y / 400), yoe = y - era * 400;
+  const doy = Math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+function dtCivil(z) {
+  z += 719468;
+  const era = Math.floor(z / 146097), doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  return [yoe + era * 400 + (m <= 2 ? 1 : 0), m, d];
+}
+// 1 is Monday, 7 Sunday (ISO).
+const dtWeekday = (z) => dtMod(z + 3, 7) + 1;
+const dtLeap = (y) => y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+const dtMonthLen = (y, m) => m === 2 ? (dtLeap(y) ? 29 : 28) : (m === 4 || m === 6 || m === 9 || m === 11) ? 30 : 31;
+const dtInRange = (y) => y >= 1 && y <= 9999;
+const dtPad = (n, w = 2) => String(n).padStart(w, "0");
+const dtText = (z) => { const [y, m, d] = dtCivil(z); return `${dtPad(y, 4)}-${dtPad(m)}-${dtPad(d)}`; };
+function dtAddMonths(z, n) {
+  const [y, m, d] = dtCivil(z);
+  if (Math.abs(n) > 120000) return null;
+  const total = y * 12 + (m - 1) + n, ny = Math.floor(total / 12), nm = dtMod(total, 12) + 1;
+  return dtInRange(ny) ? dtDays(ny, nm, Math.min(d, dtMonthLen(ny, nm))) : null;
+}
+const dtNum = (s) => /^[0-9]+$/.test(s) ? Number(s) : null;
+const dtYmd = (y, m, d) => y !== null && m !== null && d !== null && dtInRange(y) && m >= 1 && m <= 12 && d >= 1 && d <= dtMonthLen(y, m) ? dtDays(y, m, d) : null;
+function dtDate(s) {
+  if (typeof s !== "string" || s.length !== 10 || s[4] !== "-" || s[7] !== "-") return null;
+  return dtYmd(dtNum(s.slice(0, 4)), dtNum(s.slice(5, 7)), dtNum(s.slice(8)));
+}
+function dtHms(s) {
+  const h = dtNum(s.slice(0, 2)), m = dtNum(s.slice(3, 5)), x = dtNum(s.slice(6, 8));
+  return h === null || m === null || x === null || s[2] !== ":" || s[5] !== ":" || h >= 24 || m >= 60 || x >= 60 ? null : h * 3600 + m * 60 + x;
+}
+// "Z", "+01:00", "-04:00" (and "+00:09:21", the old local mean times).
+function dtOffset(s) {
+  if (s === "Z") return 0;
+  const sign = s[0] === "+" ? 1 : s[0] === "-" ? -1 : 0;
+  if (!sign || (s.length !== 6 && !(s.length === 9 && s[6] === ":")) || s[3] !== ":") return null;
+  const h = dtNum(s.slice(1, 3)), m = dtNum(s.slice(4, 6)), x = s.length === 9 ? dtNum(s.slice(7, 9)) : 0;
+  return h === null || m === null || x === null || h >= 24 || m >= 60 || x >= 60 ? null : sign * (h * 3600 + m * 60 + x);
+}
+const dtAscii = (s) => /^[\x00-\x7f]*$/.test(s);
+// { day, sec, frac, off }: the local date and time as written, the fraction
+// of a second as written, and the offset in seconds east of UTC.
+function dtStamp(s) {
+  if (typeof s !== "string" || s.length < 20 || !dtAscii(s) || s[10] !== "T") return null;
+  const day = dtDate(s.slice(0, 10)), sec = dtHms(s.slice(11, 19));
+  if (day === null || sec === null) return null;
+  let i = 19;
+  if (s[i] === ".") {
+    i++;
+    while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+    if (i === 20 || i > 29) return null;
+  }
+  const off = dtOffset(s.slice(i));
+  return off === null ? null : { day, sec, frac: s.slice(19, i), off };
+}
+const dtInstant = (t) => t.day * 86400 + t.sec - t.off;
+function dtOffsetText(off) {
+  if (off === 0) return "Z";
+  const a = Math.abs(off), hm = (off < 0 ? "-" : "+") + dtPad(Math.floor(a / 3600)) + ":" + dtPad(Math.floor(a % 3600 / 60));
+  return a % 60 ? hm + ":" + dtPad(a % 60) : hm;
+}
+function dtStampText(instant, frac, off) {
+  const local = instant + off, day = Math.floor(local / 86400), sec = dtMod(local, 86400);
+  if (!dtInRange(dtCivil(day)[0])) return null;
+  return `${dtText(day)}T${dtPad(Math.floor(sec / 3600))}:${dtPad(Math.floor(sec % 3600 / 60))}:${dtPad(sec % 60)}${frac}${dtOffsetText(off)}`;
+}
+
+const dtGot = (v) => v === undefined ? "nothing" : typeof v === "string" ? JSON.stringify(v) : typeName(v);
+function dtDateArg(v, f, i) {
+  const z = dtDate(v);
+  if (z !== null) return z;
+  if (dtStamp(v)) fail(`\`${f}\` expects a date (YYYY-MM-DD) as argument ${i}, got the date-time ${dtGot(v)} (\`date.date_in\` gives its date)`);
+  fail(`\`${f}\` expects a date (YYYY-MM-DD) as argument ${i}, got ${dtGot(v)}`);
+}
+function dtStampArg(v, f, i) {
+  const t = dtStamp(v);
+  if (!t) fail(`\`${f}\` expects a date-time (like 2026-10-27T14:30:00Z) as argument ${i}, got ${dtGot(v)}`);
+  return t;
+}
+// [day, stamp or null]
+function dtEitherArg(v, f, i) {
+  const z = dtDate(v);
+  if (z !== null) return [z, null];
+  const t = dtStamp(v);
+  if (t) return [t.day, t];
+  fail(`\`${f}\` expects a date or a date-time as argument ${i}, got ${dtGot(v)}`);
+}
+const dtInt = (v, f, i) => { if (!isInt(v)) fail(`\`${f}\` expects an int as argument ${i}, got ${dtGot(v)}`); return v; };
+const dtStr = (v, f, i) => { if (typeof v !== "string") fail(`\`${f}\` expects a str as argument ${i}, got ${dtGot(v)}`); return v; };
+const dtOutOfRange = (f) => fail(`\`${f}\`: the date is out of range (years 1 to 9999)`);
+const dtDay = (z, f) => z !== null && dtInRange(dtCivil(z)[0]) ? dtText(z) : dtOutOfRange(f);
+
+// A zone: a fixed offset (seconds), or a formatter that tells its local time.
+const dtZones = new Map();
+function dtZone(v, f, i) {
+  if (isNil(v)) return 0;
+  if (typeof v !== "string") fail(`\`${f}\` expects a time zone (like "Europe/Paris") as argument ${i}, got ${dtGot(v)}`);
+  if (v.toUpperCase() === "UTC" || v === "Z") return 0;
+  if (v[0] === "+" || v[0] === "-") { const o = dtOffset(v); if (o !== null) return o; }
+  let fmt = dtZones.get(v);
+  if (!fmt) {
+    try {
+      fmt = new Intl.DateTimeFormat("en-US", { timeZone: v, hourCycle: "h23", era: "short", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+    } catch (e) {
+      fail(`\`${f}\`: unknown time zone ${dtGot(v)}`);
+    }
+    dtZones.set(v, fmt);
+  }
+  return fmt;
+}
+// The zone's offset at an instant (seconds since 1970, UTC).
+function dtOffsetAt(zone, instant) {
+  if (typeof zone === "number") return zone;
+  const p = {};
+  for (const x of zone.formatToParts(new Date(instant * 1000))) p[x.type] = x.value;
+  const y = p.era === "BC" || p.era === "B" ? 1 - Number(p.year) : Number(p.year);
+  const local = dtDays(y, Number(p.month), Number(p.day)) * 86400 + (Number(p.hour) % 24) * 3600 + Number(p.minute) * 60 + Number(p.second);
+  return local - instant;
+}
+// The instant a local time names: in a gap, that far after it; in an
+// overlap, the earlier ("compatible", as on the server).
+function dtLocalInstant(zone, local) {
+  const before = dtOffsetAt(zone, local - 86400), after = dtOffsetAt(zone, local + 86400);
+  const fits = (o) => dtOffsetAt(zone, local - o) === o;
+  const a = fits(before), b = fits(after);
+  if (a && b) return local - Math.max(before, after);
+  if (b) return local - after;
+  return local - before;
+}
+const dtClock = () => Math.floor(Date.now() / 1000);
+
+// { weekend: [6, 7], holidays: ["2026-12-25"] }
+function dtCalendar(v, f, i) {
+  const cal = { weekend: [false, false, false, false, false, false, true, true], holidays: new Set() };
+  if (isNil(v)) return cal;
+  if (!isMap(v)) fail(`\`${f}\` expects a calendar ({ weekend, holidays }) as argument ${i}, got ${dtGot(v)}`);
+  for (const k of Object.keys(v)) {
+    const x = v[k];
+    if (k !== "weekend" && k !== "holidays") fail(`\`${f}\`: a calendar has \`weekend\` and \`holidays\`, not \`${k}\``);
+    if (isNil(x)) continue;
+    if (!Array.isArray(x)) fail(`\`${f}\`: a calendar's ${k} is a list, got ${dtGot(x)}`);
+    if (k === "weekend") {
+      cal.weekend = [false, false, false, false, false, false, false, false];
+      for (const d of x) {
+        if (!isInt(d) || d < 1 || d > 7) fail(`\`${f}\`: a calendar's weekend is days 1 (Monday) to 7 (Sunday), got ${dtGot(d)}`);
+        cal.weekend[d] = true;
+      }
+      if (cal.weekend.slice(1).every((w) => w)) fail(`\`${f}\`: a calendar's weekend cannot be the whole week`);
+    } else {
+      for (const h of x) {
+        const z = dtDate(h);
+        if (z === null) fail(`\`${f}\`: a calendar's holidays are dates (YYYY-MM-DD), got ${dtGot(h)}`);
+        cal.holidays.add(z);
+      }
+    }
+  }
+  return cal;
+}
+const dtOpen = (cal, z) => !cal.weekend[dtWeekday(z)] && !cal.holidays.has(z);
+const dtStep = (z, by) => z === null || !dtInRange(dtCivil(z + by)[0]) ? null : z + by;
+function dtRoll(cal, z, by) {
+  while (z !== null && !dtOpen(cal, z)) z = dtStep(z, by);
+  return z;
+}
+// The business day conventions (ISDA 2006, section 4.12); undefined for an unknown one.
+function dtAdjust(cal, z, how) {
+  const month = (x) => dtCivil(x)[1];
+  const modified = (by) => { const x = dtRoll(cal, z, by); return x !== null && month(x) === month(z) ? x : dtRoll(cal, z, -by); };
+  switch (how) {
+    case "unadjusted": return z;
+    case "following": return dtRoll(cal, z, 1);
+    case "modified_following": return modified(1);
+    case "preceding": return dtRoll(cal, z, -1);
+    case "modified_preceding": return modified(-1);
+  }
+  return undefined;
+}
+
+// Day counts: [days as the convention counts them, the year fraction].
+function dtBasis(v, f) {
+  const n = dtStr(v, f, 3).trim().toUpperCase().replaceAll("ACTUAL", "ACT");
+  switch (n) {
+    case "ACT/360": return "act360";
+    case "ACT/365": case "ACT/365F": case "ACT/365 FIXED": return "act365";
+    case "ACT/ACT": case "ACT/ACT ISDA": return "actact";
+    case "30/360": case "30/360 ISDA": case "360/360": case "BOND BASIS": return "bond";
+    case "30U/360": case "30/360 US": return "us";
+    case "30E/360": case "EUROBOND BASIS": return "euro";
+  }
+  fail(`\`${f}\`: unknown day count convention ${dtGot(v)} (ACT/360, ACT/365, ACT/ACT, 30/360, 30U/360 or 30E/360)`);
+}
+function dtCount(c, a, b) {
+  const [y1, m1, d1] = dtCivil(a), [y2, m2, d2] = dtCivil(b), act = b - a;
+  const thirty = (e1, e2) => { const n = 360 * (y2 - y1) + 30 * (m2 - m1) + (e2 - e1); return [n, n / 360]; };
+  switch (c) {
+    case "act360": return [act, act / 360];
+    case "act365": return [act, act / 365];
+    case "actact": {
+      const base = (y) => dtLeap(y) ? 366 : 365;
+      if (y1 === y2) return [act, act / base(y1)];
+      return [act, (dtDays(y1 + 1, 1, 1) - a) / base(y1) + (y2 - y1 - 1) + (b - dtDays(y2, 1, 1)) / base(y2)];
+    }
+    case "bond": { const e1 = d1 === 31 ? 30 : d1; return thirty(e1, d2 === 31 && e1 === 30 ? 30 : d2); }
+    case "us": {
+      const febEnd = (y, m, d) => m === 2 && d === dtMonthLen(y, 2);
+      const f1 = febEnd(y1, m1, d1), f2 = febEnd(y2, m2, d2);
+      let e2 = f1 && f2 ? 30 : d2;
+      const e1 = f1 || d1 === 31 ? 30 : d1;
+      if (e2 === 31 && e1 === 30) e2 = 30;
+      return thirty(e1, e2);
+    }
+    case "euro": return thirty(Math.min(d1, 30), Math.min(d2, 30));
+  }
+}
+function dtCounted(a, b, c, f) {
+  a = dtDateArg(a, f, 1); b = dtDateArg(b, f, 2); c = dtBasis(c, f);
+  if (b < a) { const [n, x] = dtCount(c, b, a); return [-n, -x]; }
+  return dtCount(c, a, b);
+}
+
+// A language's names and date styles (pattern tokens), after CLDR; the
+// server has the same table.
+const dtEn = {
+  tags: ["en", "en-us"],
+  months: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+  mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+  days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+  dy: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+  styles: ["M/D/YY", "MMM D, YYYY", "MMMM D, YYYY", "dddd, MMMM D, YYYY"],
+};
+const dtLocales = [dtEn, {
+  tags: ["en-gb", "en-ie", "en-au", "en-nz", "en-in", "en-za"],
+  months: dtEn.months,
+  mon: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"],
+  days: dtEn.days, dy: dtEn.dy,
+  styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd, D MMMM YYYY"],
+}, {
+  tags: ["de"],
+  months: ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"],
+  mon: ["Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."],
+  days: ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
+  dy: ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."],
+  styles: ["DD.MM.YY", "DD.MM.YYYY", "D. MMMM YYYY", "dddd, D. MMMM YYYY"],
+}, {
+  tags: ["fr"],
+  months: ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
+  mon: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."],
+  days: ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
+  dy: ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."],
+  styles: ["DD/MM/YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["es"],
+  months: ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+  mon: ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"],
+  days: ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
+  dy: ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"],
+  styles: ["D/M/YY", "D MMM YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
+}, {
+  tags: ["it"],
+  months: ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+  mon: ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"],
+  days: ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
+  dy: ["lun", "mar", "mer", "gio", "ven", "sab", "dom"],
+  styles: ["DD/MM/YY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["nl"],
+  months: ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"],
+  mon: ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"],
+  days: ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
+  dy: ["ma", "di", "wo", "do", "vr", "za", "zo"],
+  styles: ["DD-MM-YYYY", "D MMM YYYY", "D MMMM YYYY", "dddd D MMMM YYYY"],
+}, {
+  tags: ["pt"],
+  months: ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
+  mon: ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."],
+  days: ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"],
+  dy: ["seg.", "ter.", "qua.", "qui.", "sex.", "sáb.", "dom."],
+  styles: ["DD/MM/YYYY", "D [de] MMM [de] YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"],
+}];
+function dtNames(locale) {
+  const tag = locale.trim().toLowerCase().replaceAll("_", "-"), lang = tag.split("-")[0];
+  return dtLocales.find((n) => n.tags.includes(tag)) || dtLocales.find((n) => n.tags.includes(lang)) || dtEn;
+}
+// Longest first, so "MMMM" is not read as "MM" twice.
+const dtTokens = ["YYYY", "YY", "MMMM", "MMM", "MM", "M", "DD", "D", "dddd", "ddd", "HH", "H", "hh", "h", "mm", "ss", "A", "Z"];
+const dtTimeTokens = ["HH", "H", "hh", "h", "mm", "ss", "A", "Z"];
+// A pattern's tokens: a token's text, or { lit } for text as it is ([brackets] and the rest).
+function dtTokenize(p) {
+  const out = [];
+  let i = 0;
+  next: while (i < p.length) {
+    if (p[i] === "[") {
+      let end = p.indexOf("]", i + 1);
+      if (end < 0) end = p.length;
+      out.push({ lit: p.slice(i + 1, end).join("") });
+      i = Math.min(end + 1, p.length);
+      continue;
+    }
+    for (const t of dtTokens) {
+      if (p.slice(i, i + t.length).join("") === t) { out.push(t); i += t.length; continue next; }
+    }
+    out.push({ lit: p[i] });
+    i++;
+  }
+  return out;
+}
+function dtRender(toks, n, z, t) {
+  const [y, m, d] = dtCivil(z), sec = t ? t.sec : 0, off = t ? t.off : 0;
+  const h = Math.floor(sec / 3600), mi = Math.floor(sec % 3600 / 60), s = sec % 60, h12 = (h + 11) % 12 + 1;
+  const v = { YYYY: dtPad(y, 4), YY: dtPad(y % 100), MMMM: n.months[m - 1], MMM: n.mon[m - 1], MM: dtPad(m), M: String(m), DD: dtPad(d), D: String(d),
+    dddd: n.days[dtWeekday(z) - 1], ddd: n.dy[dtWeekday(z) - 1], HH: dtPad(h), H: String(h), hh: dtPad(h12), h: String(h12), mm: dtPad(mi), ss: dtPad(s),
+    A: h < 12 ? "AM" : "PM", Z: dtOffsetText(off) };
+  return toks.map((x) => typeof x === "string" ? v[x] : x.lit).join("");
+}
+// Up to `max` digits at p.i (at least `min`).
+function dtDigits(s, p, min, max) {
+  const start = p.i;
+  while (p.i < s.length && p.i - start < max && s[p.i] >= "0" && s[p.i] <= "9") p.i++;
+  return p.i - start < min ? null : Number(s.slice(start, p.i).join(""));
+}
+// One of `words` at p.i, ignoring case, the longest that fits; its index.
+function dtWord(s, p, words) {
+  let best = null;
+  words.forEach((w, k) => {
+    const ws = Array.from(w);
+    if (p.i + ws.length <= s.length && s.slice(p.i, p.i + ws.length).join("").toLowerCase() === w.toLowerCase() && (!best || ws.length > best[1])) best = [k, ws.length];
+  });
+  if (!best) return null;
+  p.i += best[1];
+  return best[0];
+}
+// Text read by a pattern: a date, or a date-time when the pattern has a time.
+function dtRead(s, pattern) {
+  let y = null, mo = null, d = null, h = null, mi = 0, se = 0, pm = null, twelve = false, off = 0, timed = false;
+  const p = { i: 0 };
+  for (const tok of dtTokenize(pattern)) {
+    if (typeof tok !== "string") {
+      for (const c of Array.from(tok.lit)) { if (s[p.i] !== c) return null; p.i++; }
+      continue;
+    }
+    timed = timed || dtTimeTokens.includes(tok);
+    let x;
+    switch (tok) {
+      case "YYYY": x = y = dtDigits(s, p, 4, 4); break;
+      case "YY": x = dtDigits(s, p, 2, 2); y = x === null ? null : 2000 + x; break;
+      case "MMMM": x = dtWord(s, p, dtEn.months); mo = x === null ? null : x + 1; break;
+      case "MMM": x = dtWord(s, p, dtEn.mon); mo = x === null ? null : x + 1; break;
+      case "MM": x = mo = dtDigits(s, p, 2, 2); break;
+      case "M": x = mo = dtDigits(s, p, 1, 2); break;
+      case "DD": x = d = dtDigits(s, p, 2, 2); break;
+      case "D": x = d = dtDigits(s, p, 1, 2); break;
+      case "dddd": x = dtWord(s, p, dtEn.days); break;
+      case "ddd": x = dtWord(s, p, dtEn.dy); break;
+      case "HH": x = h = dtDigits(s, p, 2, 2); break;
+      case "H": x = h = dtDigits(s, p, 1, 2); break;
+      case "hh": case "h":
+        x = h = dtDigits(s, p, tok === "h" ? 1 : 2, 2);
+        if (x !== null && (x < 1 || x > 12)) return null;
+        twelve = true;
+        break;
+      case "mm": x = mi = dtDigits(s, p, 2, 2); break;
+      case "ss": x = se = dtDigits(s, p, 2, 2); break;
+      case "A": x = dtWord(s, p, ["AM", "PM"]); pm = x === 1; break;
+      // "Z", "+01:00" or "+0100".
+      case "Z": {
+        const len = s[p.i] === "Z" || s[p.i] === "z" ? 1 : s[p.i + 3] === ":" ? 6 : 5;
+        if (p.i + len > s.length) return null;
+        let o = s.slice(p.i, p.i + len).join("");
+        if (!dtAscii(o)) return null;
+        if (len === 5) o = o.slice(0, 3) + ":" + o.slice(3);
+        x = off = dtOffset(o.toUpperCase());
+        p.i += len;
+        break;
+      }
+    }
+    if (x === null) return null;
+  }
+  if (p.i !== s.length) return null;
+  const day = dtYmd(y, mo, d);
+  if (day === null) return null;
+  if (!timed) return dtText(day);
+  // "12:30 AM" is 00:30, "12:30 PM" 12:30.
+  let hour = h === null ? 0 : h;
+  if (twelve && pm !== null) hour = hour % 12 + (pm ? 12 : 0);
+  if (hour > 23 || mi > 59 || se > 59) return null;
+  return dtStampText(day * 86400 + hour * 3600 + mi * 60 + se - off, "", off);
+}
+// A date, or a date-time with "T", "t" or a space, seconds or not, and an
+// offset ("Z", "+01:00", "+0100", "+01"), as this module writes them.
+function dtReadIso(s) {
+  const z = dtDate(s);
+  if (z !== null) return dtText(z);
+  if (s.length < 16 || !dtAscii(s) || !"Tt ".includes(s[10])) return null;
+  const day = dtDate(s.slice(0, 10));
+  let sec = dtHms(s.slice(11, 16) + ":00");
+  if (day === null || sec === null) return null;
+  let i = 16;
+  if (s[16] === ":") {
+    const x = s.length >= 19 ? dtNum(s.slice(17, 19)) : null;
+    if (x === null || x > 59) return null;
+    sec += x;
+    i = 19;
+  }
+  const fs = i;
+  if (s[i] === "." || s[i] === ",") {
+    i++;
+    while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+    if (i === fs + 1 || i > fs + 10) return null;
+  }
+  const frac = i > fs ? "." + s.slice(fs + 1, i) : "", o = s.slice(i);
+  const off = o.length === 1 ? dtOffset(o.toUpperCase()) : o.length === 3 ? dtOffset(o + ":00")
+    : o.length === 5 && !o.includes(":") ? dtOffset(o.slice(0, 3) + ":" + o.slice(3)) : dtOffset(o);
+  return off === null ? null : dtStampText(day * 86400 + sec - off, frac, off);
+}
+
+B.date = {
+  today: (tz) => { const z = dtZone(tz, "date.today", 1), t = dtClock(); return dtText(Math.floor((t + dtOffsetAt(z, t)) / 86400)); },
+  now: (tz) => { const z = dtZone(tz, "date.now", 1), t = dtClock(); return dtStampText(t, "", dtOffsetAt(z, t)) || ""; },
+  parse: (s, pattern) => {
+    dtStr(s, "date.parse", 1);
+    if (isNil(pattern)) { const r = dtReadIso(s.trim()); return r === null ? new Err(`not a date or a date-time: ${dtGot(s)}`) : r; }
+    if (typeof pattern !== "string") fail(`\`date.parse\` expects a pattern (like "DD/MM/YYYY") as argument 2, got ${dtGot(pattern)}`);
+    const r = dtRead(Array.from(s.trim()), Array.from(pattern));
+    return r === null ? new Err(`${dtGot(s)} is not a date in the form ${dtGot(pattern)}`) : r;
+  },
+  valid: (s) => dtDate(s) !== null || dtStamp(s) !== null,
+  of: (y, m, d) => {
+    dtInt(y, "date.of", 1); dtInt(m, "date.of", 2); dtInt(d, "date.of", 3);
+    const z = dtYmd(y, m, d);
+    if (z === null) fail(`\`date.of\`: there is no date ${y}-${m}-${d}`);
+    return dtText(z);
+  },
+  parts: (v) => {
+    const [z, t] = dtEitherArg(v, "date.parts", 1), [year, month, day] = dtCivil(z);
+    const out = { year, month, day, weekday: dtWeekday(z) };
+    if (t) Object.assign(out, { hour: Math.floor(t.sec / 3600), minute: Math.floor(t.sec % 3600 / 60), second: t.sec % 60, offset: dtOffsetText(t.off) });
+    return out;
+  },
+  weekday: (v) => dtWeekday(dtEitherArg(v, "date.weekday", 1)[0]),
+  is_leap_year: (v) => dtLeap(typeof v === "string" ? dtCivil(dtEitherArg(v, "date.is_leap_year", 1)[0])[0] : dtInt(v, "date.is_leap_year", 1)),
+  days_in_month: (a, b) => {
+    const f = "date.days_in_month";
+    let y, m;
+    if (typeof a === "string") [y, m] = dtCivil(dtEitherArg(a, f, 1)[0]);
+    else { y = dtInt(a, f, 1); m = dtInt(b, f, 2); }
+    if (m < 1 || m > 12) fail(`\`${f}\`: there is no month ${m}`);
+    return dtMonthLen(y, m);
+  },
+  add_days: (v, n) => { const z = dtDateArg(v, "date.add_days", 1); dtInt(n, "date.add_days", 2); return dtDay(Math.abs(n) <= 4000000 ? z + n : null, "date.add_days"); },
+  add_months: (v, n) => { const z = dtDateArg(v, "date.add_months", 1); dtInt(n, "date.add_months", 2); return dtDay(dtAddMonths(z, n), "date.add_months"); },
+  add_years: (v, n) => { const z = dtDateArg(v, "date.add_years", 1); dtInt(n, "date.add_years", 2); return dtDay(Math.abs(n) <= 10000 ? dtAddMonths(z, n * 12) : null, "date.add_years"); },
+  days_between: (a, b) => { const x = dtDateArg(a, "date.days_between", 1); return dtDateArg(b, "date.days_between", 2) - x; },
+  months_between: (a, b) => {
+    a = dtDateArg(a, "date.months_between", 1); b = dtDateArg(b, "date.months_between", 2);
+    const from = (a, b) => {
+      if (b < a) return -from(b, a);
+      const [y1, m1] = dtCivil(a), [y2, m2] = dtCivil(b), n = (y2 * 12 + m2) - (y1 * 12 + m1), x = dtAddMonths(a, n);
+      return x === null || x > b ? n - 1 : n;
+    };
+    return from(a, b);
+  },
+  start_of_month: (v) => { const [y, m] = dtCivil(dtDateArg(v, "date.start_of_month", 1)); return dtText(dtDays(y, m, 1)); },
+  end_of_month: (v) => { const [y, m] = dtCivil(dtDateArg(v, "date.end_of_month", 1)); return dtText(dtDays(y, m, dtMonthLen(y, m))); },
+  to_zone: (v, tz) => {
+    const t = dtStampArg(v, "date.to_zone", 1), z = dtZone(tz, "date.to_zone", 2), i = dtInstant(t);
+    return dtStampText(i, t.frac, dtOffsetAt(z, i)) ?? dtOutOfRange("date.to_zone");
+  },
+  date_in: (v, tz) => {
+    const t = dtStampArg(v, "date.date_in", 1), z = dtZone(tz, "date.date_in", 2), i = dtInstant(t);
+    return dtDay(Math.floor((i + dtOffsetAt(z, i)) / 86400), "date.date_in");
+  },
+  at: (v, time, tz) => {
+    const f = "date.at", day = dtDateArg(v, f, 1);
+    let sec = 0;
+    if (!isNil(time)) {
+      sec = typeof time === "string" && time.length === 5 ? dtHms(time + ":00") : typeof time === "string" && time.length === 8 ? dtHms(time) : null;
+      if (sec === null) fail(`\`${f}\` expects a time (HH:MM or HH:MM:SS) as argument 2, got ${dtGot(time)}`);
+    }
+    const z = dtZone(tz, f, 3), i = dtLocalInstant(z, day * 86400 + sec);
+    return dtStampText(i, "", dtOffsetAt(z, i)) ?? dtOutOfRange(f);
+  },
+  is_business_day: (v, cal) => { const z = dtDateArg(v, "date.is_business_day", 1); return dtOpen(dtCalendar(cal, "date.is_business_day", 2), z); },
+  add_business_days: (v, n, cal) => {
+    const f = "date.add_business_days";
+    let z = dtDateArg(v, f, 1);
+    dtInt(n, f, 2);
+    cal = dtCalendar(cal, f, 3);
+    if (Math.abs(n) > 4000000) dtOutOfRange(f);
+    const by = n < 0 ? -1 : 1;
+    for (let k = 0; k < Math.abs(n); k++) z = dtRoll(cal, dtStep(z, by), by);
+    return dtDay(dtRoll(cal, z, 1), f);
+  },
+  business_days_between: (a, b, cal) => {
+    const f = "date.business_days_between";
+    a = dtDateArg(a, f, 1); b = dtDateArg(b, f, 2); cal = dtCalendar(cal, f, 3);
+    let n = 0;
+    for (let z = Math.min(a, b); z < Math.max(a, b); z++) if (dtOpen(cal, z)) n++;
+    return b < a ? -n : n;
+  },
+  adjust: (v, how, cal) => {
+    const f = "date.adjust", z = dtDateArg(v, f, 1);
+    if (!isNil(how) && typeof how !== "string") fail(`\`${f}\` expects a convention as argument 2, got ${dtGot(how)}`);
+    const r = dtAdjust(dtCalendar(cal, f, 3), z, isNil(how) ? "following" : how);
+    if (r === undefined) fail(`\`${f}\`: unknown convention ${dtGot(how)} (following, modified_following, preceding, modified_preceding or unadjusted)`);
+    return dtDay(r, f);
+  },
+  easter: (y) => {
+    dtInt(y, "date.easter", 1);
+    if (y < 1583 || y > 9999) fail(`\`date.easter\` is for Gregorian years (1583 to 9999), got ${y}`);
+    const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+    const g = Math.floor((b - Math.floor((b + 8) / 25) + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+    const l = (32 + 2 * e + 2 * Math.floor(c / 4) - h - c % 4) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451), n = h + l - 7 * m + 114;
+    return dtText(dtDays(y, Math.floor(n / 31), n % 31 + 1));
+  },
+  day_count: (a, b, c) => dtCounted(a, b, c, "date.day_count")[0],
+  year_fraction: (a, b, c) => dtCounted(a, b, c, "date.year_fraction")[1],
+  format: (v, how) => {
+    const f = "date.format", [z, t] = dtEitherArg(v, f, 1);
+    let pattern, n = dtEn;
+    if (typeof how === "string") pattern = how;
+    else if (isMap(how)) {
+      const has = (k) => hasOwn(how, k), loc = has("locale") ? how.locale : null;
+      if (!isNil(loc)) { if (typeof loc !== "string") fail(`\`${f}\`: locale is a str, like "de-DE", got ${dtGot(loc)}`); n = dtNames(loc); }
+      const k = Object.keys(how).find((k) => k !== "locale" && k !== "style" && k !== "pattern");
+      if (k !== undefined) fail(`\`${f}\`: the options are locale, style and pattern, not \`${k}\``);
+      const P = has("pattern") ? how.pattern : undefined, St = has("style") ? how.style : undefined;
+      if (typeof P === "string") pattern = P;
+      else if (isNil(P) && isNil(St)) pattern = n.styles[1];
+      else if (isNil(P) && typeof St === "string") {
+        const k = ["short", "medium", "long", "full"].indexOf(St);
+        if (k < 0) fail(`\`${f}\`: style is short, medium, long or full, got ${dtGot(St)}`);
+        pattern = n.styles[k];
+      } else fail(`\`${f}\`: pattern and style are strs, got ${dtGot(P !== undefined ? P : St)}`);
+    } else fail(`\`${f}\` expects a pattern (like "DD/MM/YYYY") or options as argument 2, got ${dtGot(how)}`);
+    const toks = dtTokenize(Array.from(pattern));
+    if (!t) { const x = toks.find((x) => dtTimeTokens.includes(x)); if (x) fail(`\`${f}\`: the pattern has a time (${x}), but ${dtGot(v)} is a date`); }
+    return dtRender(toks, n, z, t);
+  },
+};
+
 // ---- channels -------------------------------------------------------------
 // `channel.open(name, f)` in a component: `f` hears what the server sends on
 // the channel for as long as the code that opened it stands, and `.send(v)`
@@ -1894,7 +3038,7 @@ B.channel = {
 // Sent once the server has let the page in; until then (and while the
 // connection is down) kept, up to a point.
 function chanSend(name, v, o) {
-  const text = JSON.stringify(["m", name, toJSON(v)]);
+  const text = jsonText(["m", name, v]);
   const reliable = isMap(o) && truthy(o.reliable);
   if (Chan.conn && Chan.joined.has(name)) {
     Chan.conn.put(text, reliable);
@@ -2261,43 +3405,64 @@ function mediaPlayer(el) {
 
 // ---- server fns --------------------------------------------------------
 
-async function rpcRaw(name, args, live) {
+// A server fn that uses `idempotent` gets a key with each call (the same for
+// the call's tries), and the call is sent again when its answer does not
+// come back: the connection failed, the server was busy (409: the first try
+// is still running) or a proxy gave up on it (502-504). The server runs it
+// once, and gives the first answer to the tries after it.
+const RETRIED = [409, 502, 503, 504];
+
+function idemKey() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+async function rpcRaw(name, args, live, idem) {
   let r;
   const headers = { "content-type": "application/json" };
   if (live) headers["x-quillo-live"] = "1";
+  if (idem) headers["idempotency-key"] = idemKey();
   // Files (from an <input type=file>) go as parts of a multipart body, the
   // other arguments as JSON beside them.
   let payload;
   if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) {
     payload = new FormData();
-    payload.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a))));
+    payload.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a, true))));
     args.forEach((a, i) => { if (a instanceof Blob) payload.append("file" + i, a, a.name || "file"); });
     delete headers["content-type"];
     headers["x-quillo-rpc"] = "1";
   } else {
-    payload = JSON.stringify(args.map(toJSON));
+    payload = JSON.stringify(args.map((a) => toJSON(a, true)));
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
   const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
-  try {
-    r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
-      method: "POST",
-      headers,
-      body: payload,
-    });
-  } catch (e) {
-    return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
+  for (let tries = idem ? 4 : 1; ; ) {
+    try {
+      r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
+        method: "POST",
+        headers,
+        body: payload,
+      });
+    } catch (e) {
+      r = null;
+      if (--tries <= 0) return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
+    }
+    if (r && !(idem && RETRIED.includes(r.status) && --tries > 0)) break;
+    // 0.25 s, 0.5 s, 1 s, give or take a quarter.
+    await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
   let body = null;
-  try { body = await r.json(); } catch (_) {}
+  try { body = untagDeep(await r.json()); } catch (_) {}
   if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
   const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
   return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "" };
 }
 
-async function rpc(name, args) {
-  return (await rpcRaw(name, args, false)).value;
+async function rpc(name, args, idem) {
+  return (await rpcRaw(name, args, false, idem)).value;
 }
 
 // ---- live updates --------------------------------------------------------
@@ -2703,7 +3868,7 @@ class Html { constructor(make) { if (make) this.make = make; } }
 
 const SVG = "http://www.w3.org/2000/svg";
 const inSvg = (el) => el.namespaceURI === SVG && el.localName !== "foreignObject";
-const isText = (x) => typeof x === "string" || typeof x === "number";
+const isText = (x) => typeof x === "string" || typeof x === "number" || x instanceof Dec || typeof x === "bigint";
 // Taking up the server's page: inputs keep what was typed (see setProp).
 let claiming = 0;
 
@@ -2852,7 +4017,7 @@ function blockTemplate(def, svg) {
   const make = (t, inSvg) => {
     const here = inSvg || t[0] === "svg";
     const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
-    for (const [k, v] of t[1]) setProp(el, k, v, undefined);
+    for (const [k, v] of t[1]) codeAttr(k) ? el.setAttribute(k, v === true ? "" : display(v)) : setProp(el, k, v, undefined);
     for (const k of t[2]) el.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
     return el;
   };
@@ -3021,14 +4186,19 @@ function spreadInto(el, get) {
 
 // W.spread(maps, written): the attributes the maps give an element, without
 // those it has written out, the key and the class (added to its own).
+// Names are compared as the browser does (`ACTION` is `action`), so a key
+// cannot stand in for a written attribute.
 function spreadAttrs(maps, written) {
   const o = {};
+  const seen = new Set(written.map(attrKey));
   for (const m of maps) {
     if (isNil(m)) continue;
     if (!isMap(m)) fail(`\`{...}\` needs a map, got ${typeName(m)}`);
     for (const k of Object.keys(m)) {
-      if (k === "key" || k === "class" || written.includes(k) || hasOwn(o, k)) continue;
+      const n = attrKey(k);
+      if (n === "key" || n === "class" || seen.has(n)) continue;
       if (k[0] !== "@" && !spreadAttrOk(k)) continue;
+      seen.add(n);
       o[k] = m[k];
     }
   }
@@ -3162,12 +4332,29 @@ function currentUrl() {
 
 // Spread keys are data: plain attribute names only, and no event handlers
 // or srcdoc, which would run the value as code (as on the server).
-function spreadAttrOk(k) {
-  const l = k.toLowerCase();
-  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !l.startsWith("on") && l !== "srcdoc" && !k.startsWith("__");
+// An attribute's name as the browser compares it.
+const attrKey = (k) => k.toLowerCase().replace(/^bind:/, "");
+
+// Attributes whose value runs as code or shows as a page of the site.
+function codeAttr(k) {
+  const n = attrKey(k);
+  return n.startsWith("on") || n === "srcdoc";
 }
 
+// The name that would be written is checked (`bind:onclick` is `onclick`);
+// names with `:` (but xlink:href) come only from the program.
+function spreadAttrOk(k) {
+  return /^[^\s"'<>\/=`{}\u0000-\u001f\u007f]+$/.test(k) && !codeAttr(k) && !k.startsWith("__") && (!k.includes(":") || attrKey(k) === "xlink:href");
+}
+
+const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.test(el.getAttribute("sandbox"));
+
 const URL_ATTRS = ["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
+
+// An SVG animation's values go to another attribute (`<set
+// attributeName="href" to={u}>`), perhaps a URL one: they are checked as
+// URLs, each of `values` (split by ;) too, as on the server.
+const animValueAttr = (el, k) => (el.localName === "set" || el.localName === "animate") && /^(to|from|by|values)$/i.test(k);
 
 // javascript: and vbscript: URLs, read as browsers read them.
 function scriptURL(u) {
@@ -3185,9 +4372,13 @@ function setProp(el, k, v, old) {
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
-  if (URL_ATTRS.includes(k.toLowerCase()) && typeof v === "string" && scriptURL(v)) v = "about:blank#blocked";
+  // Only text written in the program goes there (set with the template),
+  // and a page for a sandboxed frame that is kept away from the site.
+  if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  const s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? JSON.stringify(toJSON(v)) : display(v);
+  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
+  // The text the attribute will say, whatever the value's type (html too).
+  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 
@@ -3615,10 +4806,31 @@ function run(inst, el, claim) {
   });
 }
 
-// Island JSON, with error values (`{"$quillo_err": x}`) restored.
+// Island JSON (and a server fn's answer), with error values
+// (`{"$quillo_err": x}`), decimals (`{"$dec": "12.50"}`) and large ints
+// (`{"$int": "9007199254740993"}`) restored.
 function islandJSON(text, fallback) {
   if (!text) return fallback;
-  return JSON.parse(text, (k, v) => (v && typeof v === "object" && !Array.isArray(v) && hasOwn(v, "$quillo_err") && Object.keys(v).length === 1) ? new Err(v.$quillo_err) : v);
+  return JSON.parse(text, (k, v) => untag(v));
+}
+function untag(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+  const ks = Object.keys(v);
+  if (ks.length !== 1) return v;
+  if (ks[0] === "$quillo_err") return new Err(v.$quillo_err);
+  if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
+  if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
+  return v;
+}
+// `untag` throughout JSON already parsed, from the inside out.
+function untagDeep(v) {
+  if (v === null || typeof v !== "object") return v;
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = untagDeep(v[i]); return v; }
+  for (const k of Object.keys(v)) {
+    const x = v[k], y = untagDeep(x);
+    if (y !== x) Object.defineProperty(v, k, { value: y, enumerable: true, writable: true, configurable: true });
+  }
+  return untag(v);
 }
 
 let hydrating = null;
@@ -3745,6 +4957,7 @@ const G = {};
 const C = {};
 const W = {};
 W.Err = Err;
+W.Dec = Dec;
 W.Ret = Ret;
 W.fail = fail;
 W.truthy = truthy;
@@ -3849,4 +5062,4 @@ function liveSig(inst, name, fname, args) {
   });
   return sig;
 }
-W.server = (name) => meta((...args) => rpc(name, args), name, null);
+W.server = (name, idem) => meta((...args) => rpc(name, args, idem), name, null);

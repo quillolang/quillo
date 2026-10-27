@@ -28,12 +28,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tokio-postgres = "0.7"
 indexmap = "2"
 stacker = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "backup"] }
 ureq = "2"
 fastrand = "2"
 ctrlc = { version = "3", features = ["termination"] }
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended", "v2"] }
 getrandom = "0.2"
+# AES-256-GCM for `crypto.encrypt` (src/cipher.rs); already there for rustls.
+ring = "0.17"
 sha2 = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 flate2 = "1"
@@ -45,8 +47,14 @@ postgres = { version = "0.19", features = ["with-serde_json-1"] }
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# `sslrootcert=system` for PostgreSQL: the operating system's CAs (src/pg.rs).
+rustls-native-certs = "0.8"
 bytes = "1"
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip: a float in JSON is read as the nearest one, not a step off.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# Time zones for `date` (src/dates.rs): the system's database, and a bundled
+# copy where there is none (Windows, small containers).
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 # Numeric functions compiled to machine code (src/jit.rs).
 cranelift-codegen = { version = "=0.134.4", optional = true }
 cranelift-frontend = { version = "=0.134.4", optional = true }
@@ -59,9 +67,17 @@ wtransport = { version = "0.7", optional = true, default-features = false, featu
 wry = { version = "0.57", optional = true, features = ["devtools"] }
 tao = { version = "0.37", optional = true }
 
+[dev-dependencies]
+# Certificates for the tests of TLS to databases (tests/postgres.rs, tests/mysql.rs).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
 # The macOS menu bar, without which copy and paste do not work in the window.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.21", optional = true }
+
+[lints.rust]
+# `cfg(fuzzing)`: hooks for the fuzz targets (fuzz/), which cargo-fuzz sets.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [features]
 default = ["mysql", "jit", "realtime"]
@@ -72,3 +88,11 @@ jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "
 app = ["dep:wry", "dep:tao", "dep:muda"]
 # MySQL and MariaDB for `db` (src/my.rs).
 mysql = ["dep:mysql_async"]
+
+# Password hashing is slow by design; unoptimized (debug builds, the tests),
+# far slower: a few logins at once then take seconds each.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

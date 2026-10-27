@@ -1,6 +1,8 @@
 //! Rust in a program: `.qwer` files (src/native.rs). These build with the
 //! `cargo` running the tests, into a cache of their own.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,7 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server {
@@ -42,23 +44,24 @@ fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server
         .stderr(Stdio::piped())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let mut server = Server(child);
     // The first build of the cache's dependencies takes a while.
     let deadline = Instant::now() + Duration::from_secs(300);
-    let mut child = child;
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        if let Ok(Some(_)) = child.try_wait() {
+    while !support::listening(port) {
+        if let Ok(Some(_)) = server.0.try_wait() {
             let mut err = String::new();
-            let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut err));
+            let _ = server.0.stderr.take().map(|mut e| e.read_to_string(&mut err));
             panic!("the server stopped:\n{}", err);
         }
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(50));
     }
     // What it prints later is not read; it must not fill the pipe.
-    if let Some(mut e) = child.stderr.take() {
+    if let Some(mut e) = server.0.stderr.take() {
         std::thread::spawn(move || std::io::copy(&mut e, &mut std::io::sink()));
     }
-    Server(child)
+    server
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {

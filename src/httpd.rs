@@ -147,6 +147,24 @@ struct Conn {
     /// answers before them are written: a client that sends and never reads
     /// cannot have its answers pile up in memory.
     pending: Vec<Item>,
+    /// Output has waited to be written since then, the client taking none
+    /// of it (`None`: nothing waits). See `sweep`.
+    stalled: Option<Instant>,
+    /// Reading stopped at `input_cap` with more perhaps waiting: read
+    /// again without waiting for a new event.
+    full: bool,
+    /// A chunked body being received: what is decoded so far (see `dechunk`).
+    chunked: Option<Dechunk>,
+}
+
+/// Room in a connection's input past the head and the body, for chunk
+/// framing and the start of a next request.
+const FRAMING: usize = 64 << 10;
+
+/// The most a connection's input holds before it stops reading (until
+/// the requests there are taken out).
+fn input_cap(max_body: usize) -> usize {
+    MAX_HEAD.saturating_add(max_body).saturating_add(FRAMING)
 }
 
 /// Answers waiting to be written past which a connection's other requests
@@ -672,13 +690,17 @@ impl Loop {
             closing: false,
             lingering: false,
             pending: Vec::new(),
+            stalled: None,
+            full: false,
+            chunked: None,
         }));
         crate::metrics::CONNECTIONS.fetch_add(1, SeqCst);
         // Its first request has often arrived with it.
         self.ready.push_back(i);
     }
 
-    /// Closes connections idle too long, or too slow to send a request.
+    /// Closes connections idle too long, too slow to send a request, or
+    /// not reading their answers.
     fn sweep(&mut self) {
         // Handles on a version of the program loaded over: let go, with its
         // database connections (requests still running on it keep theirs).
@@ -690,7 +712,12 @@ impl Loop {
             let stale = match c.receiving {
                 _ if c.lingering => now.duration_since(c.active) > LINGER,
                 Some(since) => now.duration_since(since) > SLOW,
-                None => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+                // A client that takes none of its answer for this long
+                // would hold the connection and the answer forever.
+                None => match c.stalled {
+                    Some(since) if !c.output.is_empty() => now.duration_since(since) > SLOW,
+                    _ => c.output.is_empty() && now.duration_since(c.active) > IDLE,
+                },
             };
             if stale {
                 if let Slot::Idle(c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
@@ -719,6 +746,8 @@ impl Loop {
         c.lingering = true;
         c.active = self.now;
         c.input = Vec::new();
+        c.chunked = None;
+        c.full = false;
         if c.writing {
             c.writing = false;
             let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
@@ -771,7 +800,15 @@ impl Loop {
         }
         let mut ended = false;
         let chunk = &mut self.chunk;
+        let cap = input_cap(self.app.max_body);
+        c.full = false;
         loop {
+            // No more than a request can take: the rest waits in the socket
+            // until the requests read so far are taken out.
+            if c.input.len() >= cap {
+                c.full = true;
+                break;
+            }
             match c.stream.read(chunk) {
                 Ok(0) => {
                     ended = true;
@@ -791,9 +828,18 @@ impl Loop {
                 Err(_) => return self.close(i, c),
             }
         }
-        let items = take_requests(&mut c, self.app.max_body, self.now);
+        // A bug in parsing costs this connection, not the server.
+        let (max_body, now) = (self.app.max_body, self.now);
+        let items = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_requests(&mut c, max_body, now))) {
+            Ok(items) => items,
+            Err(_) => {
+                eprintln!("quillo: internal error (a bug in Quillo) while reading a request");
+                return self.close(i, c);
+            }
+        };
         if items.is_empty() {
-            if ended {
+            // Full, and still no whole request: nothing more can arrive.
+            if ended || c.input.len() >= cap {
                 return self.close(i, c);
             }
             return self.finish(i, c, Fate::Keep);
@@ -965,8 +1011,9 @@ impl Loop {
                     let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);
                 }
                 let again = matches!(self.slots[i], Slot::Busy { again: true });
-                // Requests that arrived whole while it was answered.
-                let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty();
+                // Requests that arrived whole while it was answered, or
+                // input left unread when there was no room for it.
+                let more = !c.input.is_empty() && c.receiving.is_none() || !c.pending.is_empty() || c.full;
                 self.slots[i] = Slot::Idle(c);
                 if again || more {
                     self.ready.push_back(i);
@@ -993,8 +1040,8 @@ impl Loop {
 fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
     let mut items = Vec::new();
     while !c.input.is_empty() {
-        match parse(&c.input, &c.peer, max_body) {
-            Parsed::Need { expects_continue } => {
+        match take_one(&mut c.input, &mut c.chunked, &c.peer, max_body) {
+            Taken::Need { expects_continue } => {
                 c.receiving.get_or_insert(now);
                 if expects_continue && !c.continued {
                     c.continued = true;
@@ -1002,22 +1049,115 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
                 }
                 break;
             }
-            Parsed::Bad(status, why) => {
-                let line = c.input.split(|b| *b == b'\r').next().unwrap_or(&[]);
-                let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
-                c.input.clear();
-                items.push(Item::Bad(status, why, line));
+            Taken::Item(item @ Item::Bad(..)) => {
+                items.push(item);
                 break;
             }
-            Parsed::Done { req, len, keep_alive } => {
-                c.input.drain(..len);
+            Taken::Item(item) => {
                 c.receiving = None;
                 c.continued = false;
-                items.push(Item::Request { req, keep_alive });
+                items.push(item);
             }
         }
     }
     items
+}
+
+enum Taken {
+    Need { expects_continue: bool },
+    Item(Item),
+}
+
+/// The next request in `input`, taken out of it; or what is still needed,
+/// with what is decoded so far of a chunked body kept in `chunked`; or why
+/// the input is refused (then it is all dropped).
+fn take_one(input: &mut Vec<u8>, chunked: &mut Option<Dechunk>, peer: &str, max_body: usize) -> Taken {
+    match parse(input, peer, max_body, chunked) {
+        Parsed::Need { expects_continue } => {
+            // A chunked body's bytes already decoded are not kept twice,
+            // nor read again.
+            if let Some(d) = chunked {
+                input.drain(d.head..d.head + d.used);
+                d.used = 0;
+            }
+            Taken::Need { expects_continue }
+        }
+        Parsed::Bad(status, why) => {
+            let line = input.split(|b| *b == b'\r').next().unwrap_or(&[]);
+            let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
+            // As the log writes any URL: sensitive values masked.
+            let line = match line.split_once(' ') {
+                Some((method, rest)) => {
+                    let (target, version) = rest.split_once(' ').unwrap_or((rest, ""));
+                    let sep = if version.is_empty() { "" } else { " " };
+                    format!("{} {}{}{}", method, crate::redact::url(target), sep, version)
+                }
+                None => line,
+            };
+            input.clear();
+            *chunked = None;
+            Taken::Item(Item::Bad(status, why, line))
+        }
+        Parsed::Done { req, len, keep_alive } => {
+            *chunked = None;
+            input.drain(..len);
+            Taken::Item(Item::Request { req, keep_alive })
+        }
+    }
+}
+
+/// For the fuzz targets (fuzz/): requests framed from bytes as they come.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::*;
+
+    /// What a connection's input is taken as: each request (its method,
+    /// URL, headers, body and whether the connection is kept), then
+    /// "bad" if the rest was refused.
+    fn framed(pieces: &[&[u8]], max_body: usize) -> Vec<String> {
+        let (mut input, mut chunked, mut out) = (Vec::new(), None, Vec::new());
+        for piece in pieces {
+            input.extend_from_slice(piece);
+            while !input.is_empty() {
+                match take_one(&mut input, &mut chunked, "fuzz", max_body) {
+                    Taken::Need { .. } => break,
+                    Taken::Item(Item::Bad(..)) => {
+                        out.push("bad".to_string());
+                        return out;
+                    }
+                    Taken::Item(Item::Request { req, keep_alive }) => {
+                        out.push(format!("{} {} {:?} {:?} {}", req.method, req.url, req.headers, req.body, keep_alive));
+                        // The answer closes a connection not kept.
+                        if !keep_alive {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Frames `data` as one read, then as reads cut where `cuts` says (each
+    /// byte a piece's length): a request must not be taken otherwise for
+    /// coming in pieces, or the server and a proxy in front could disagree
+    /// on where one request ends.
+    pub fn framing(data: &[u8], cuts: &[u8], max_body: usize) {
+        let whole = framed(&[data], max_body);
+        let mut pieces = Vec::new();
+        let mut rest = data;
+        for &c in cuts.iter().cycle().take(if cuts.is_empty() { 0 } else { data.len() }) {
+            if rest.is_empty() {
+                break;
+            }
+            let (a, b) = rest.split_at((c as usize + 1).min(rest.len()));
+            pieces.push(a);
+            rest = b;
+        }
+        pieces.push(rest);
+        let cut = framed(&pieces, max_body);
+        assert_eq!(whole, cut, "framed otherwise in pieces of {:?}", pieces.iter().map(|p| p.len()).collect::<Vec<_>>());
+    }
 }
 
 /// In the request's coroutine: answers each item, in order.
@@ -1116,6 +1256,12 @@ fn flush(c: &mut Conn) -> std::io::Result<bool> {
         }
     }
     c.output.drain(..done);
+    // When the client last took some of what waits (see `sweep`).
+    c.stalled = match c.stalled {
+        _ if c.output.is_empty() => None,
+        Some(since) if done == 0 => Some(since),
+        _ => Some(Instant::now()),
+    };
     Ok(c.output.is_empty())
 }
 
@@ -1145,7 +1291,9 @@ enum Parsed {
     Done { req: HttpRequest, len: usize, keep_alive: bool },
 }
 
-fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
+/// `chunked_so_far` is what is decoded of a chunked body arriving in `buf`
+/// (made here when it starts).
+fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<Dechunk>) -> Parsed {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut r = httparse::Request::new(&mut headers);
     let head = match r.parse(buf) {
@@ -1161,22 +1309,22 @@ fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
     let version = r.version.unwrap_or(1);
     let mut hs: Vec<(String, String)> = Vec::with_capacity(r.headers.len());
     let mut length: Option<usize> = None;
-    let mut chunked = false;
+    let mut codings: Vec<String> = Vec::new();
     let mut connection = String::new();
     let mut expects_continue = false;
     for h in r.headers.iter() {
         let value = String::from_utf8_lossy(h.value).into_owned();
         if h.name.eq_ignore_ascii_case("content-length") {
-            match value.trim().parse::<usize>() {
-                Ok(n) if length.map_or(true, |m| m == n) => length = Some(n),
+            // Digits only: a proxy in front may read `+5` or `5 5` otherwise
+            // than this server does, and then the two disagree on where the
+            // next request starts.
+            let digits = value.trim_matches([' ', '\t']);
+            match digits.parse::<usize>() {
+                Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) && length.map_or(true, |m| m == n) => length = Some(n),
                 _ => return Parsed::Bad(400, "bad content-length"),
             }
         } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            if value.to_ascii_lowercase().split(',').any(|t| t.trim() == "chunked") {
-                chunked = true;
-            } else {
-                return Parsed::Bad(501, "unsupported transfer-encoding");
-            }
+            codings.extend(value.to_ascii_lowercase().split(',').map(|t| t.trim_matches([' ', '\t']).to_string()).filter(|t| !t.is_empty()));
         } else if h.name.eq_ignore_ascii_case("connection") {
             connection = value.to_ascii_lowercase();
         } else if h.name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue") {
@@ -1184,12 +1332,34 @@ fn parse(buf: &[u8], peer: &str, max_body: usize) -> Parsed {
         }
         hs.push((h.name.to_string(), value));
     }
+    // A body is framed one way only, and only the way both ends of a proxy
+    // read alike: `chunked` (last, and alone, since nothing else is decoded)
+    // over HTTP/1.1, or a length.
+    let chunked = !codings.is_empty();
+    if chunked {
+        if version == 0 {
+            return Parsed::Bad(400, "transfer-encoding is not HTTP/1.0");
+        }
+        if length.is_some() {
+            return Parsed::Bad(400, "both content-length and transfer-encoding");
+        }
+        if codings.last().map(String::as_str) != Some("chunked") {
+            return Parsed::Bad(400, "transfer-encoding does not end with chunked");
+        }
+        if codings.len() > 1 {
+            return Parsed::Bad(501, "unsupported transfer-encoding");
+        }
+    }
     let keep_alive = match version {
         0 => connection.contains("keep-alive"),
         _ => !connection.contains("close"),
     };
     let (body, len) = if chunked {
-        match dechunk(&buf[head..], max_body) {
+        let d = chunked_so_far.get_or_insert_with(|| Dechunk::new(head));
+        if d.head != head {
+            *d = Dechunk::new(head);
+        }
+        match dechunk(d, &buf[head..], max_body) {
             Chunked::Need => return Parsed::Need { expects_continue },
             Chunked::TooLarge => return Parsed::Bad(413, "request body too large"),
             Chunked::Bad => return Parsed::Bad(400, "bad chunked body"),
@@ -1225,39 +1395,116 @@ enum Chunked {
     Done(Vec<u8>, usize),
 }
 
-/// A `transfer-encoding: chunked` body: the data, and how many bytes it took.
-fn dechunk(buf: &[u8], max_body: usize) -> Chunked {
-    let mut body = Vec::new();
-    let mut at = 0;
+/// Longest chunk-size line.
+const MAX_CHUNK_LINE: usize = 1024;
+/// Most bytes of chunk extensions and trailers in one body, together.
+const MAX_CHUNK_EXTRA: usize = 8 << 10;
+
+/// A chunked body as it arrives: what is decoded so far, and where the
+/// decoding is. Kept with the connection between reads, so each byte is
+/// looked at once.
+struct Dechunk {
+    /// Where the body starts in the connection's input (the head's length).
+    head: usize,
+    /// The body so far.
+    body: Vec<u8>,
+    /// Bytes after the head already decoded. They are dropped from the
+    /// input when it waits for more (see `take_requests`).
+    used: usize,
+    step: Step,
+    /// Bytes of chunk extensions and trailers so far.
+    extra: usize,
+}
+
+enum Step {
+    /// A chunk-size line.
+    Size,
+    /// The data of a chunk: this many bytes still to come.
+    Data(usize),
+    /// The line end after a chunk's data.
+    DataEnd,
+    /// After the last chunk: trailer lines, then an empty line.
+    Trailers,
+}
+
+impl Dechunk {
+    fn new(head: usize) -> Self {
+        Dechunk { head, body: Vec::new(), used: 0, step: Step::Size, extra: 0 }
+    }
+}
+
+/// Goes on decoding a `transfer-encoding: chunked` body from `buf` (all of
+/// the input after the head). Done: the data, and how many bytes of `buf` it
+/// took.
+fn dechunk(d: &mut Dechunk, buf: &[u8], max_body: usize) -> Chunked {
     loop {
-        let Some(eol) = find_crlf(&buf[at..]) else { return if buf.len() - at > 1024 { Chunked::Bad } else { Chunked::Need } };
-        let line = &buf[at..at + eol];
-        let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
-        let Some(size) = std::str::from_utf8(size_text).ok().and_then(|s| usize::from_str_radix(s.trim(), 16).ok()) else {
-            return Chunked::Bad;
-        };
-        at += eol + 2;
-        if size == 0 {
-            // Trailers, then an empty line.
-            loop {
-                let Some(eol) = find_crlf(&buf[at..]) else { return Chunked::Need };
-                at += eol + 2;
+        let Some(rest) = buf.get(d.used..) else { return Chunked::Bad };
+        match d.step {
+            Step::Size => {
+                let Some(eol) = find_crlf(rest) else {
+                    return if rest.len() > MAX_CHUNK_LINE { Chunked::Bad } else { Chunked::Need };
+                };
+                let line = &rest[..eol];
+                let size_text = line.split(|b| *b == b';').next().unwrap_or(&[]);
+                d.extra += line.len() - size_text.len();
+                if eol > MAX_CHUNK_LINE || d.extra > MAX_CHUNK_EXTRA {
+                    return Chunked::Bad;
+                }
+                // Hex digits only (spaces or tabs only before a `;`), at
+                // most 16: a size that fits, however large, and that a proxy
+                // in front reads as this server does.
+                let size_text = if size_text.len() < line.len() {
+                    let end = size_text.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(0, |i| i + 1);
+                    &size_text[..end]
+                } else {
+                    size_text
+                };
+                if size_text.is_empty() || size_text.len() > 16 || !size_text.iter().all(u8::is_ascii_hexdigit) {
+                    return Chunked::Bad;
+                }
+                let size_text = std::str::from_utf8(size_text).unwrap_or("");
+                let Ok(size) = usize::from_str_radix(size_text, 16) else { return Chunked::Bad };
+                d.used += eol + 2;
+                d.step = if size == 0 {
+                    Step::Trailers
+                } else if size > max_body.saturating_sub(d.body.len()) {
+                    return Chunked::TooLarge;
+                } else {
+                    Step::Data(size)
+                };
+            }
+            Step::Data(left) => {
+                let n = left.min(rest.len());
+                d.body.extend_from_slice(&rest[..n]);
+                d.used += n;
+                if n < left {
+                    d.step = Step::Data(left - n);
+                    return Chunked::Need;
+                }
+                d.step = Step::DataEnd;
+            }
+            Step::DataEnd => match rest.get(..2) {
+                None => return Chunked::Need,
+                Some(b"\r\n") => {
+                    d.used += 2;
+                    d.step = Step::Size;
+                }
+                Some(_) => return Chunked::Bad,
+            },
+            Step::Trailers => {
+                let Some(eol) = find_crlf(rest) else {
+                    return if d.extra + rest.len() > MAX_CHUNK_EXTRA { Chunked::Bad } else { Chunked::Need };
+                };
+                d.used += eol + 2;
                 if eol == 0 {
-                    return Chunked::Done(body, at);
+                    return Chunked::Done(std::mem::take(&mut d.body), d.used);
+                }
+                d.extra += eol + 2;
+                if d.extra > MAX_CHUNK_EXTRA {
+                    return Chunked::Bad;
                 }
             }
         }
-        if body.len() + size > max_body {
-            return Chunked::TooLarge;
-        }
-        if buf.len() < at + size + 2 {
-            return Chunked::Need;
-        }
-        body.extend_from_slice(&buf[at..at + size]);
-        if &buf[at + size..at + size + 2] != b"\r\n" {
-            return Chunked::Bad;
-        }
-        at += size + 2;
     }
 }
 
@@ -1467,6 +1714,8 @@ pub(crate) fn flush_log() {
         let _ = std::io::stderr().write_all(l.as_bytes());
         l.clear();
     }
+    drop(l);
+    crate::metrics::flush();
 }
 
 #[cfg(test)]
@@ -1477,18 +1726,64 @@ mod tests {
         assert_eq!(super::http_date(1792716244), "Fri, 23 Oct 2026 00:44:04 GMT");
     }
 
+    use super::{dechunk, Chunked, Dechunk};
+
+    fn whole(b: &[u8], max: usize) -> Chunked {
+        dechunk(&mut Dechunk::new(0), b, max)
+    }
+
     #[test]
     fn chunked_bodies() {
         let b = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
-        match super::dechunk(b, 100) {
-            super::Chunked::Done(body, used) => {
+        match whole(b, 100) {
+            Chunked::Done(body, used) => {
                 assert_eq!(body, b"Wikipedia");
                 assert_eq!(&b[used..], b"NEXT");
             }
             _ => panic!("not parsed"),
         }
-        assert!(matches!(super::dechunk(b"4\r\nWi", 100), super::Chunked::Need));
-        assert!(matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::Need) || matches!(super::dechunk(b"ff\r\n", 10), super::Chunked::TooLarge));
-        assert!(matches!(super::dechunk(b"zz\r\n", 100), super::Chunked::Bad));
+        assert!(matches!(whole(b"4\r\nWi", 100), Chunked::Need));
+        assert!(matches!(whole(b"ff\r\n", 10), Chunked::TooLarge));
+        assert!(matches!(whole(b"zz\r\n", 100), Chunked::Bad));
+        // Sizes that would overflow, or are longer than any size can be.
+        assert!(matches!(whole(b"1\r\nA\r\nffffffffffffffff\r\nBB", 100), Chunked::TooLarge));
+        assert!(matches!(whole(b"00000000000000001\r\nA\r\n", 100), Chunked::Bad));
+        // Sizes as the review sent them: a sign, or spaces around.
+        for b in [&b"+5\r\nhello\r\n0\r\n\r\n"[..], b" 5 \r\nhello\r\n0\r\n\r\n", b"5 \r\nhello\r\n0\r\n\r\n", b"0x5\r\nhello\r\n0\r\n\r\n"] {
+            assert!(matches!(whole(b, 100), Chunked::Bad), "{}", String::from_utf8_lossy(b));
+        }
+        assert!(matches!(whole(b"5 ;x=1\r\nhello\r\n0\r\n\r\n", 100), Chunked::Done(..)));
+    }
+
+    #[test]
+    fn chunked_bodies_arriving_a_byte_at_a_time() {
+        let b = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
+        let mut d = Dechunk::new(0);
+        for n in 1..=b.len() {
+            match dechunk(&mut d, &b[..n], 100) {
+                Chunked::Need => {}
+                Chunked::Done(body, used) => {
+                    assert_eq!(body, b"Wikipedia");
+                    assert_eq!(used, b.len() - 4);
+                    return;
+                }
+                _ => panic!("refused at {}", n),
+            }
+        }
+        panic!("never done");
+    }
+
+    #[test]
+    fn chunk_extensions_and_trailers_are_limited() {
+        let mut long = b"1\r\nA\r\n0\r\n".to_vec();
+        for _ in 0..100 {
+            long.extend_from_slice(format!("X-T: {}\r\n", "y".repeat(200)).as_bytes());
+        }
+        assert!(matches!(whole(&long, 100), Chunked::Bad));
+        let mut ext = Vec::new();
+        for _ in 0..100 {
+            ext.extend_from_slice(format!("1;{}\r\nA\r\n", "e".repeat(200)).as_bytes());
+        }
+        assert!(matches!(whole(&ext, 1000), Chunked::Bad));
     }
 }

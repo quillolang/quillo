@@ -1,0 +1,6 @@
+# What fuzzing makes: the build, the inputs it found (seed.sh makes the
+# starting ones), crashes, and coverage reports.
+target/
+corpus/
+artifacts/
+coverage/

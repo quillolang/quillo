@@ -32,12 +32,12 @@ pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
-    "print", "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
+    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -81,7 +81,8 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
         for name in it.server_fns.iter() {
-            let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
+            let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&c.def));
+            let _ = writeln!(program, "server[{}] = W.server({}{});", js_str(name), js_str(name), if idem { ", true" } else { "" });
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
@@ -906,34 +907,80 @@ fn has_markup(e: &Expr) -> bool {
 
 /// Builtins whose results may be private to the server: its environment,
 /// its files, its database, other services.
-const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
+const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http", "audit"];
 
 /// Top-level variables whose value comes, directly or through other such
-/// variables, from `PRIVATE_SOURCES`. Components get other globals' values
-/// written into the browser bundle, which anyone can download; these they
-/// must ask a `server fn` for.
+/// variables, from `PRIVATE_SOURCES`, a service, or a function that uses
+/// any of them (`let CONFIG = load_config()`). Components get other
+/// globals' values written into the browser bundle, which anyone can
+/// download; these they must ask a `server fn` for.
 fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
-    let mut private: HashSet<String> = HashSet::new();
+    let mut services: HashSet<String> = HashSet::new();
+    for stmts in program {
+        for st in stmts.iter() {
+            if let Stmt::Service(name, ..) = st {
+                services.insert(name.clone());
+            }
+        }
+    }
+    let sources: HashSet<&str> = PRIVATE_SOURCES.iter().copied().collect();
+    let mut vars: HashSet<String> = HashSet::new();
+    // Functions that use what is private: calling one gives a private value.
+    // They can be called as methods too (`"KEY".env`).
+    // `crypto.decrypt` too: what it gives back is the secret.
+    let mut fns: HashSet<String> = ["env", "read_file", "decrypt", "reencrypt"].iter().map(|s| s.to_string()).collect();
+    // Whether `e` uses a private name (other than the `shadowed` ones), its
+    // functions' bodies included when `inside` is set.
+    let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
+        let mut found = false;
+        each_expr_in(
+            e,
+            &mut |x| match x {
+                Expr::Ident(n, _) if !shadowed.contains(n) => {
+                    found |= sources.contains(n.as_str()) || services.contains(n) || vars.contains(n) || fns.contains(n)
+                }
+                Expr::Field(_, n, _) => found |= fns.contains(n),
+                _ => {}
+            },
+            inside,
+        );
+        found
+    };
+    // What a variable's functions use, as before: a function value is made
+    // in the browser from its definition, and the server fns it calls stay
+    // on the server.
+    let uses_in_fns = |e: &Expr, vars: &HashSet<String>| {
+        let mut found = false;
+        each_expr(e, &mut |x| {
+            if let Expr::Ident(n, _) = x {
+                found |= sources.contains(n.as_str()) || vars.contains(n);
+            }
+        });
+        found
+    };
     loop {
-        let before = private.len();
+        let before = vars.len() + fns.len();
         for stmts in program {
             for st in stmts.iter() {
-                let Stmt::Let(p, e, _) = st else { continue };
-                let mut tainted = false;
-                each_expr(e, &mut |x| {
-                    if let Expr::Ident(n, _) = x {
-                        tainted |= PRIVATE_SOURCES.contains(&n.as_str()) || private.contains(n);
+                match st {
+                    Stmt::Let(p, e, _) if uses(e, false, &[], &vars, &fns) || uses_in_fns(e, &vars) => {
+                        let mut names = Vec::new();
+                        pattern_names(p, &mut names);
+                        vars.extend(names);
                     }
-                });
-                if tainted {
-                    let mut names = Vec::new();
-                    pattern_names(p, &mut names);
-                    private.extend(names);
+                    Stmt::Fn(d) if !fns.contains(&d.name) => {
+                        // Its parameters are its own, whatever their names.
+                        let params: Vec<String> = d.params.iter().map(|p| p.name.clone()).collect();
+                        if uses(&d.body, true, &params, &vars, &fns) {
+                            fns.insert(d.name.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        if private.len() == before {
-            return private;
+        if vars.len() + fns.len() == before {
+            return vars;
         }
     }
 }
@@ -1021,8 +1068,11 @@ fn lit_js(l: &Lit) -> String {
     match l {
         Lit::Nil => "null".into(),
         Lit::Bool(b) => b.to_string(),
+        // Past 2^53 a JS number is not whole: a BigInt, as the runtime has them.
+        Lit::Int(n) if n.unsigned_abs() > (1 << 53) - 1 => format!("{}n", n),
         Lit::Int(n) => n.to_string(),
         Lit::Float(f) if f.is_finite() => format!("{:?}", f),
+        Lit::Dec(d) => format!("new W.Dec({}n, {})", d.mantissa(), d.scale()),
         Lit::Float(_) => "null".into(),
         Lit::Str(s) => js_str(s),
     }
@@ -1083,6 +1133,7 @@ impl<'a> Compiler<'a> {
                             component: false,
                             line: td.line,
                             body: e.clone(),
+                            nesting: 0,
                             file: None,
                             hot: Default::default(),
                         };
@@ -1262,7 +1313,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "channel")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "date" | "money" | "channel")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -1275,7 +1326,8 @@ impl<'a> Compiler<'a> {
             Value::Func(f) if f.def.server => {
                 let r = (js.clone(), true);
                 self.globals.insert(name.to_string(), r.clone());
-                self.defs.push(format!("{} = W.server({});", js, js_str(name)));
+                let idem = if crate::idempotency::used_by(&f.def) { ", true" } else { "" };
+                self.defs.push(format!("{} = W.server({}{});", js, js_str(name), idem));
                 Ok(r)
             }
             Value::Func(f) => {
@@ -1333,8 +1385,8 @@ impl<'a> Compiler<'a> {
                 }
                 if self.private.contains(name) {
                     return self.err(format!(
-                        "`{}` is read from the server's environment, files or database, and would be sent to \
-                         every browser; pass what the page needs as a prop or read it with a `server fn`",
+                        "`{}` is read from the server's environment, files, database or a service, and would be \
+                         sent to every browser; pass what the page needs as a prop or read it with a `server fn`",
                         name
                     ));
                 }
@@ -1386,6 +1438,7 @@ impl<'a> Compiler<'a> {
             component: false,
             line,
             body: e,
+            nesting: 0,
             file: None,
             hot: Default::default(),
         };
@@ -2046,7 +2099,12 @@ impl<'a> Compiler<'a> {
             Expr::Map(entries) => {
                 let mut out = Vec::new();
                 for (k, v) in entries {
-                    out.push(format!("{}: {}", js_str(k), self.expr(v)?));
+                    // `"__proto__": v` would set the prototype; `["__proto__"]: v` is a key.
+                    if k == "__proto__" {
+                        out.push(format!("[{}]: {}", js_str(k), self.expr(v)?));
+                    } else {
+                        out.push(format!("{}: {}", js_str(k), self.expr(v)?));
+                    }
                 }
                 format!("{{{}}}", out.join(", "))
             }
@@ -2124,7 +2182,17 @@ impl<'a> Compiler<'a> {
             }
             Expr::Call(callee, args, line) => {
                 self.line = *line;
-                self.call(callee, args, None)?
+                // `raw(t(key, vars))`: the values put in are escaped (as on the server).
+                let is = |c: &mut Self, e: &Expr, name: &str| -> Result<bool, QuilloError> {
+                    Ok(matches!(e, Expr::Ident(n, _) if n == name) && matches!(c.resolve(name)?, Resolved::Global(js, _) if js == format!("B.{}", name)))
+                };
+                match args.as_slice() {
+                    [Expr::Call(inner, targs, _)] if is(self, callee, "raw")? && is(self, inner, "t")? => {
+                        let vs = targs.iter().map(|a| self.expr(a)).collect::<Result<Vec<_>, _>>()?;
+                        format!("B.t_html({})", vs.join(", "))
+                    }
+                    _ => self.call(callee, args, None)?,
+                }
             }
             Expr::Field(obj, name, line) => {
                 self.line = *line;
@@ -2442,6 +2510,31 @@ impl<'a> Compiler<'a> {
         let last = path.rsplit('.').next().unwrap_or("");
         if banned.contains(&last) {
             return self.err(format!("`{}` does not call {}: it runs text as code", f, path));
+        }
+        // Ways around the checks the runtime makes on the page's functions:
+        // setting any property, calling with any `this`, parsing markup.
+        let around = [
+            "Reflect.apply",
+            "Reflect.construct",
+            "Reflect.get",
+            "Reflect.set",
+            "Reflect.defineProperty",
+            "Reflect.setPrototypeOf",
+            "Reflect.getOwnPropertyDescriptor",
+            "Object.assign",
+            "Object.defineProperty",
+            "Object.defineProperties",
+            "Object.setPrototypeOf",
+            "Object.getOwnPropertyDescriptor",
+            "Object.getOwnPropertyDescriptors",
+            "DOMParser",
+        ];
+        let mut bare: &str = path;
+        while let Some(rest) = ["window.", "globalThis.", "self."].iter().find_map(|p| bare.strip_prefix(p)) {
+            bare = rest;
+        }
+        if around.contains(&bare) {
+            return self.err(format!("`{}` does not call {}: it steps around the checks on the page's functions", f, path));
         }
         Ok(())
     }
@@ -2978,6 +3071,12 @@ impl<'a> Compiler<'a> {
         // else is a value shown in its place.
         let mut kids = Vec::new();
         for c in &el.children {
+            // The browser runs a script the page puts in: what fills one
+            // would be code. (A view's, made on the server, takes values as
+            // JSON.)
+            if el.tag == "script" && !matches!(c, HtmlChild::Expr(Expr::Lit(Lit::Str(_)))) {
+                return self.err("a component's <script> takes only text written in the program; pass data in a `data-` attribute, or use a view");
+            }
             match c {
                 HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => kids.push(js_str(s)),
                 HtmlChild::El(e) if inlineable(e) => kids.push(self.tpl_el(e, vals)?),

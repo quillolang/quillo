@@ -1,0 +1,42 @@
+# `cargo deny check`: known vulnerabilities, licences and where crates come
+# from. Run in CI (.github/workflows/ci.yml).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained crates are reported for the ones Quillo uses directly.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# Every licence in the dependency tree today; a crate under any other one
+# fails the check until it is looked at.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    # File-level copyleft, met by using the crates unchanged: cssparser,
+    # selectors and option-ext, which only `quillo app`'s window (wry) uses.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
