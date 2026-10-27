@@ -190,11 +190,14 @@ interpreter's exact answers and errors.
 
 ## Getting started
 
-Quillo builds with a stable Rust toolchain ([rustup](https://rustup.rs)).
+Quillo builds with a stable Rust toolchain, 1.94 or later ([rustup](https://rustup.rs)),
+and a C compiler. `scripts/doctor.sh` checks for both, says what to install for anything
+missing, and lists what the tests use (Node, Chrome, PostgreSQL, MariaDB):
 
 ```sh
 git clone https://github.com/quillolang/quillo.git
 cd quillo
+sh scripts/doctor.sh            # add --build to also build and run the sample app
 cargo build --release
 ```
 
@@ -231,6 +234,7 @@ diagnostics, completion, go to definition and debugging.
 |---|---|
 | [`src/`](src) | The `quillo` binary: interpreter, number compiler, HTTP server, checker, component compiler, database drivers, language server and debug adapter |
 | [`app/`](app) | A sample app to start from: several files, migrations, CSS, JavaScript and an icon |
+| [`scripts/doctor.sh`](scripts/doctor.sh) | Checks that a machine can build and run Quillo |
 | [`tests/`](tests) | Integration and browser tests; [`tests/programs`](tests/programs) holds the programs they run |
 
 Everything else has a repository of its own:
