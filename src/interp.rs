@@ -29,6 +29,7 @@ const CHANGES: &[&str] = &[
     "db.exec",
     "db.migrate",
     "db.atomic",
+    "idempotent",
     "set_cookie",
     "delete_cookie",
     "set_session",

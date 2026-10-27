@@ -34,6 +34,9 @@ pub fn is_url(s: &str) -> bool {
 pub struct Conn {
     client: postgres::Client,
     stmts: HashMap<String, postgres::Statement>,
+    /// In a transaction that retries: whether a statement failed because
+    /// of another transaction (see `crate::txn`). None: not watching.
+    conflict: Option<bool>,
 }
 
 pub struct Pool {
@@ -108,7 +111,7 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new() })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None })
     }
 
     /// A connection: an idle one, a new one, or the next one returned.
@@ -277,7 +280,8 @@ impl Conn {
         let stmt = self.statement(&sql, &params)?;
         let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        let rows = self.client.query(&stmt, &refs).map_err(|e| describe(&e))?;
+        let rows = self.client.query(&stmt, &refs);
+        let rows = rows.map_err(|e| self.failed(&e))?;
         values(&rows, limit)
     }
 
@@ -285,14 +289,16 @@ impl Conn {
     /// `insert ... returning id` with `db.one` for that.
     pub fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
         let changes = if params.is_empty() && has_several_statements(sql) {
-            self.client.batch_execute(sql).map_err(|e| describe(&e))?;
+            let r = self.client.batch_execute(sql);
+            r.map_err(|e| self.failed(&e))?;
             Value::Nil
         } else {
             let (sql, params) = translate(sql, params)?;
             let stmt = self.statement(&sql, &params)?;
             let args: Vec<PgParam> = params.into_iter().map(PgParam).collect();
             let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            Value::Int(self.client.execute(&stmt, &refs).map_err(|e| describe(&e))? as i64)
+            let r = self.client.execute(&stmt, &refs);
+            Value::Int(r.map_err(|e| self.failed(&e))? as i64)
         };
         let mut m = Map::new();
         m.insert("changes".into(), changes);
@@ -301,7 +307,32 @@ impl Conn {
     }
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
-        self.client.batch_execute(sql).map_err(|e| describe(&e))
+        let r = self.client.batch_execute(sql);
+        r.map_err(|e| self.failed(&e))
+    }
+
+    /// The error's message; a serialization failure or a deadlock (SQLSTATE
+    /// 40001, 40P01) is also noted, when watching, for the transaction to
+    /// run again.
+    fn failed(&mut self, e: &postgres::Error) -> String {
+        use postgres::error::SqlState;
+        if let (Some(c), Some(code)) = (self.conflict.as_mut(), e.code()) {
+            if *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED {
+                *c = true;
+            }
+        }
+        describe(e)
+    }
+
+    /// Starts (or stops) noting conflicts with other transactions.
+    pub fn watch_conflicts(&mut self, on: bool) {
+        self.conflict = on.then_some(false);
+    }
+
+    /// Whether a statement failed because of another transaction since
+    /// `watch_conflicts(true)`.
+    pub fn conflicted(&self) -> bool {
+        self.conflict == Some(true)
     }
 }
 

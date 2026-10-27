@@ -334,7 +334,7 @@ fn fetch_avatar(url: str) with http = http.get(url).body
 fn profile(id: int) with db, http = { user: load_user(id), avatar: fetch_avatar(...) }
 ```
 
-The effects are `db` (with `audit`), `http`, `fs` (files), `env` (environment variables), `time` (`now`,
+The effects are `db` (with `audit` and `idempotent`), `http`, `fs` (files), `env` (environment variables), `time` (`now`,
 `date.today`, `date.now`, `sleep`, `crypto.totp_verify`, `rate_limit`, `crypto.verify_webhook`), `random` (with
 `crypto.token`, `crypto.totp_secret`, `crypto.recovery_codes`, `crypto.encrypt`) and `net` (`udp.send`,
 `udp.reply`). `end_sessions` and `user_sessions` need `db`. Inside a `with` function, a builtin that needs another effect,
@@ -730,6 +730,10 @@ server fn delete_all() = request | auth.required | (_) => { ... }
 
 From hand-written JavaScript: `await quillo.server.add_note("text")`.
 
+A call that must not happen twice (a payment, a transfer) is wrapped in
+[`idempotent`](#idempotent-requests): the page then sends a key with each call, and
+sends the call again when its answer does not come back, and the server runs it once.
+
 ## Routes
 
 ```quillo
@@ -1076,6 +1080,83 @@ route GET /users/:id(int) {
     user
 }
 ```
+
+### Idempotent requests
+
+A client that sent a payment and got no answer (a timeout, a dropped connection) cannot
+tell whether it was made. `idempotent(f)` lets it send the request again: a request
+with an `Idempotency-Key` header runs once, and the same request again with the same
+key gets the first answer, without running again. It works as Stripe's API does
+([idempotent requests](https://docs.stripe.com/api/idempotent_requests); the header is
+the IETF's [draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)):
+
+```quillo
+route POST /payments { json: { to: str, amount: dec } } = idempotent(() => {
+    let id = pay(to, amount)?
+    respond(201, { id })
+})
+
+server fn transfer(from: str, to: str, amount: str) =
+    idempotent({ isolation: "serializable", retries: 5 }, () => move(from, to, amount))
+```
+
+```sh
+curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bob", "amount": "12.50"}'
+```
+
+- The client makes up the key (a UUID; 1 to 255 visible characters), and sends the
+  same one when it sends the request again. A request with the key and another method,
+  path, query or body is refused with 422. One that comes while the first is still
+  running gets 409, and should be sent again a moment later. Neither runs.
+- The answer kept is the status, the headers (not `Set-Cookie`) and the body; a request
+  again gets it with `Idempotent-Replayed: true`. Answers are kept 24 hours, then the key
+  is new again: `{ max_age: "7d" }` (seconds, or a duration as for cookies) keeps them
+  longer. Expired ones are deleted as requests come.
+- Keys belong to the tenant, the mount point and the user: `session().user`, or the
+  `user` option for a request that names its caller otherwise (`{ user:
+  token.owner }`). The same key from another user is another request, and cannot read
+  this one's answer. Without a user (no session), keys are the clients' own random
+  values, shared by everyone who knows one.
+- Without the header, `f` simply runs; `{ required: true }` answers 400 instead.
+  Outside a request (a script, a job), `f` runs.
+- `idempotent` answers the request with what `f` gives, as the route or server fn would
+  have: it ends the request, so make it the last thing. What comes before it (an
+  `auth.required`, a pattern, a 400 for a bad form) runs every time and is not kept,
+  as Stripe keeps nothing for a request that failed validation.
+- A server fn whose body calls it gets a key from the page with each call. The page sends the
+  call again, with its key, when the connection fails, or the answer is 409 or 502 to
+  504: up to three more times, a quarter, half and a whole second later.
+
+**What is guaranteed.** The answers are kept in `_quillo_idempotency`, in the program's
+database (the tenant's, with a database per tenant), and `f` runs in a transaction on
+that database, which `idempotent` begins (so it takes `isolation` and `retries`, and is
+called outside `db.transaction`). The answer is written in that transaction, before it
+commits: the work and its answer are kept together, or neither is.
+
+- Before running, the key is claimed in a statement of its own, so that another request
+  with it sees it running (409).
+- When `f` returns, its answer is written and the transaction commits; then the answer
+  is sent. When `f` fails, returns an error value or replies early, the transaction
+  rolls back, the claim is given up, and the answer is sent but not kept: nothing
+  happened, so a retry runs again. To keep a refusal ("not enough money"), return it:
+  `respond(422, { error })` commits (what `f` wrote with it too) and is kept. A server
+  fn's error value is not kept: the page's retry asks again.
+- If the server stops (or loses the database) part way, the database rolls the
+  transaction back, and the claim is left. A minute after it was made, the next request
+  with the key takes it over and runs. If the first was only slow, and is still running
+  then, at most one of the two commits: the claim is taken over only while it is not
+  answered, and an answer is written only by the claim's holder, in its transaction; the
+  other rolls back and gets the first's answer, or 409.
+- On SQLite a transaction holds the database, so a second request with the key that
+  comes while the first runs waits for it, and gets its answer. On PostgreSQL and MySQL
+  it gets 409.
+- Work outside that database is not in the transaction: `http.post` to a payment
+  provider, another `db.connect`, files. For a handler that is mostly that,
+  `{ transaction: false }` runs `f` without one, and keeps every answer, failures too
+  (as Stripe does), since part of the work may have happened. A server that stops there
+  leaves the key running: it is not known whether the work happened, so requests with
+  the key get 409 until it expires. Give the provider the same key, if it takes one,
+  so that it too makes the payment once.
 
 ### Prefetching
 
@@ -1881,11 +1962,56 @@ db.query("select * from todos where id > ?", 10)           // a list of maps
 db.one("select * from todos where id = :id", { id })       // a map, or null
 db.one("insert into todos (text) values (?) returning id", text)
 db.transaction(() => { ... })                              // all or nothing; nests
+db.transaction({ isolation: "serializable", retries: 3 }, () => { ... })
 ```
 
 Without `db.open`, the database is `$QUILLO_DB` (a path or a URL), or else
 SQLite in memory. A transaction rolls back if its function fails, returns an error
 value or replies early.
+
+**Isolation and retries.** `db.transaction(options, f)` takes the isolation level and
+how many times to run `f` again when the database gives up on it because of another
+transaction:
+
+```quillo
+fn withdraw(account: int, cents: int) with db =
+    db.transaction({ isolation: "serializable", retries: 5 }, () => {
+        let balance = db.one("select balance from accounts where id = ?", account).balance
+        if balance < cents { return err("not enough money") }
+        db.exec("update accounts set balance = balance - ? where id = ?", cents, account)?
+    })
+```
+
+- `isolation` is `"serializable"`, `"repeatable_read"` or `"read_committed"`; left out,
+  it is the database's default (read committed on PostgreSQL, repeatable read on MySQL).
+  PostgreSQL begins with `begin isolation level ...`, MySQL runs `set transaction
+  isolation level ...` before `begin`. SQLite lets one transaction write at a time, so
+  its transactions are serializable whatever is asked; with options it begins `begin
+  immediate`, taking the write lock at once (another process holding it is then a
+  conflict, tried again, rather than a failure half way).
+- `retries` (0 to 20; 0 by default) runs the whole function again after a serialization
+  failure or a deadlock: PostgreSQL's SQLSTATE 40001 and 40P01, MySQL's 1213 (deadlock)
+  and 1205 (lock wait timeout), SQLite's busy database. Each try waits a little longer
+  than the last (about 10 ms, doubling up to 320 ms, give or take half, so the two that
+  collided do not collide again). Any other failure ends the transaction at once. Out of
+  tries, the transaction gives the database's error value.
+- After such a failure the transaction is over, whatever the function does with the
+  error value: PostgreSQL refuses its next statements, and MySQL has already rolled it
+  back (statements after it would otherwise run outside any transaction). So they fail
+  at once, and a function that carries on anyway is not committed, but tried again.
+- A transaction inside another is a savepoint, and cannot change the isolation: asking
+  is an error. Only the outermost one tries again; give it the options.
+- The function may run more than once, so it should do nothing that cannot be taken
+  back: no `http.*`, `udp.send` or `channel.send` in it (send them after the
+  transaction; `quillo check` warns), and global variables it changes are not rolled
+  back. What it does in the database is.
+- Under serializable isolation the database finds the conflicts itself: two
+  withdrawals that read the same balance cannot both commit. Under read committed (or
+  for a hot row, to wait instead of failing and trying again), lock what is read before
+  writing it: `select balance from accounts where id = ? for update` (PostgreSQL,
+  MySQL; SQLite has no `for update`, and needs none). A balance kept as a running total
+  is updated in place: `update accounts set balance = balance - ? where id = ? and
+  balance >= ?`, checking `changes`.
 
 **Migrations.** `db.migrate("migrations")` (the folder is optional; that is its default)
 brings the schema up to date from SQL files applied in name order: `001_todos.sql`,
@@ -2087,6 +2213,10 @@ the program shares, for several servers), `$QUILLO_SYSTEM_DB`, or else a SQLite 
 program's own tables when there is one database. A program with no database at all
 keeps its calls made later in that file too, so they outlive a restart (its jobs need
 no record: one server runs them).
+
+The answers of [idempotent requests](#idempotent-requests) (`_quillo_idempotency`) are
+the exception: they are kept in the program's database, the tenant's when there is one
+per tenant, so they commit in the same transaction as the work they answer for.
 
 ### Many tenants
 
@@ -2620,6 +2750,7 @@ src/db.rs          db: SQLite, connections, tenants, transactions, and the share
 src/pg.rs          PostgreSQL (pool, pipelining, placeholders, types)
 src/my.rs          MySQL and MariaDB (the mysql feature)
 src/migrate.rs     db.migrate: schema files applied once each
+src/txn.rs         db.transaction's isolation levels, and trying again after a conflict
 src/sqlinfo.rs     which tables a statement reads and writes, for live updates
 
 Serving
@@ -2631,6 +2762,7 @@ src/session.rs     cookies and sessions
 src/session_store.rs  sessions kept in the database, which can be ended
 src/access.rs      security headers, the Content-Security-Policy and its nonce
 src/limits.rs      rate limits, in the process or the database
+src/idempotency.rs idempotent(f): requests with an Idempotency-Key run once
 src/upload.rs      files sent with a form
 src/statics.rs     files served with file()
 src/site.rs        what a program sets about its site: tenants, cross-site posts
@@ -2656,7 +2788,8 @@ editors/vscode/    the VS Code extension
 
 examples/          hello, orders, todo, notes, compose, layout, spa, scroll, virtual, life,
                    storm, telemetry (with sensors), media, rust (with rust.qwer),
-                   services, and index (most of them in one server)
+                   services, ledger (double-entry bookkeeping), and index (most of them
+                   in one server)
 apps/crm/          a whole application: a multi-tenant CRM
 site/              quillolang.org, written in Quillo; its docs are made from this README
 tests/             the language, routes, records, effects, the checker, numbers, streams,

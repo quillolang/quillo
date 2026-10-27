@@ -223,6 +223,7 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "crypto.totp_verify"
                 | "crypto.recovery_codes"
                 | "crypto.verify_recovery_code"
+                | "idempotent"
         )
 }
 

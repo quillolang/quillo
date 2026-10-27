@@ -98,6 +98,7 @@ const cases = [
   ['    every(1000, tick)', "every", "support.function.builtin.quillo"],
   ['    listen("/progress", (p) => { done = p.done })', "listen", "support.function.builtin.quillo"],
   ['route GET /feed = events((send) => send(1))', "events", "support.function.builtin.quillo"],
+  ['route POST /pay = idempotent(() => pay())', "idempotent", "support.function.builtin.quillo"],
 ];
 
 (async () => {

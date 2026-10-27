@@ -98,8 +98,15 @@ pub enum Pinned {
     My(crate::my::Conn),
 }
 
+/// What a statement gets in a transaction that already failed because of
+/// another (see `crate::txn`).
+const CONFLICTED: &str = "the transaction conflicted with another and was rolled back";
+
 impl Pinned {
     pub(crate) fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
+        if self.conflicted() {
+            return Err(CONFLICTED.into());
+        }
         match self {
             Pinned::Pg(c) => c.query(sql, params, limit),
             #[cfg(feature = "mysql")]
@@ -108,6 +115,9 @@ impl Pinned {
     }
 
     pub(crate) fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
+        if self.conflicted() {
+            return Err(CONFLICTED.into());
+        }
         match self {
             Pinned::Pg(c) => c.exec(sql, params),
             #[cfg(feature = "mysql")]
@@ -120,6 +130,22 @@ impl Pinned {
             Pinned::Pg(c) => c.batch(sql),
             #[cfg(feature = "mysql")]
             Pinned::My(c) => c.batch(sql),
+        }
+    }
+
+    fn watch_conflicts(&mut self, on: bool) {
+        match self {
+            Pinned::Pg(c) => c.watch_conflicts(on),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.watch_conflicts(on),
+        }
+    }
+
+    fn conflicted(&self) -> bool {
+        match self {
+            Pinned::Pg(c) => c.conflicted(),
+            #[cfg(feature = "mysql")]
+            Pinned::My(c) => c.conflicted(),
         }
     }
 }
@@ -1102,17 +1128,17 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// `db.exec` / `db.query` on connection `on` (None: the program's).
-fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+pub(crate) fn exec_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
     exec(it, args, 0)
 }
 
-fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
+pub(crate) fn query_on(it: &mut Interp, on: Option<usize>, args: Vec<Value>) -> R {
     it.db_on = on;
     query(it, args, 0)
 }
 
-fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
+pub(crate) fn kind_on(it: &mut Interp, on: Option<usize>) -> bool {
     backend_on(it, on).map_or(false, |b| b.is_mysql())
 }
 
@@ -1297,37 +1323,73 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `db.transaction(() => { ... })`: commits if the function returns normally,
 /// rolls back if it fails, returns an error value, or replies early.
-/// Transactions nest (as savepoints).
+/// Transactions nest (as savepoints). `db.transaction({ isolation, retries },
+/// f)` sets the isolation level and runs `f` again on a conflict (see `txn`).
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
-    let f = match args.first() {
-        Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
-        other => {
-            return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
+    let (opts, f) = match args.as_slice() {
+        [f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::Options::default(), f.clone()),
+        [o @ Value::Map(_), f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::options(o, "db.transaction", line)?, f.clone()),
+        _ => {
+            let got = args.last().map_or("nothing", |v| v.type_name());
+            return fail(line, format!("`db.transaction` expects a function (after its options, if any), got {}", got));
         }
     };
+    crate::txn::run(it, on, &opts, line, &mut |it| it.call(&f, Vec::new(), line))
+}
+
+/// One try of a transaction on connection `on`: what `body` gave (or the
+/// error that ended it), and whether the database gave up on it because of
+/// another transaction (then it is worth another try; told only for the
+/// outermost transaction, the one that can be tried again).
+pub(crate) fn attempt(
+    it: &mut Interp,
+    on: Option<usize>,
+    opts: &crate::txn::Options,
+    line: u32,
+    body: &mut dyn FnMut(&mut Interp) -> R,
+) -> (R, bool) {
     let b = match backend_on(it, on) {
         Ok(b) => b,
-        Err(e) => return Ok(db_err(e)),
+        Err(e) => return (Ok(db_err(e)), false),
     };
     let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
+    let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
     match &*b {
         Backend::Sqlite(m) => {
-            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql).map_err(|e| e.to_string());
-            if let Err(e) = run("savepoint quillo_tx") {
-                return Ok(db_err(e));
+            let outermost = m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit();
+            if !outermost && opts.isolation.is_some() {
+                return (nested_isolation(), false);
+            }
+            // With options, the outermost takes the write lock at once.
+            let immediate = outermost && opts.given;
+            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql);
+            let busy = |e: &rusqlite::Error| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
+            if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
+                return (Ok(db_err(&e)), immediate && busy(&e));
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
-            let r = it.call(&f, Vec::new(), line);
+            let r = body(it);
             it.sqlite_tx -= 1;
             let commit = ok(&r);
-            let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
+            let end = match (commit, immediate) {
+                (true, true) => "commit",
+                (false, true) => "rollback",
+                (true, false) => "release quillo_tx",
+                (false, false) => "rollback to quillo_tx; release quillo_tx",
+            };
             let ended = run(end);
+            if ended.is_err() && immediate && commit {
+                let _ = run("rollback");
+            }
             tx_end(it, mark, commit && ended.is_ok());
             match ended {
-                Err(e) if commit => Ok(db_err(e)),
-                _ => r,
+                Err(e) if commit => {
+                    let again = immediate && busy(&e);
+                    (Ok(db_err(e)), again)
+                }
+                _ => (r, false),
             }
         }
         _ => {
@@ -1335,11 +1397,15 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             // Keep one connection for this request until the outermost
             // transaction ends.
             let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
+            if pinned && opts.isolation.is_some() {
+                return (nested_isolation(), false);
+            }
             if !pinned {
-                let c = match it.unlocked(|| pool.checkout()) {
+                let mut c = match it.unlocked(|| pool.checkout()) {
                     Ok(c) => c,
-                    Err(e) => return Ok(db_err(e)),
+                    Err(e) => return (Ok(db_err(e)), false),
                 };
+                c.watch_conflicts(true);
                 it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
@@ -1348,14 +1414,21 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 tx.depth += 1;
                 tx.depth
             };
-            let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
+            let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation) } else { format!("savepoint quillo_tx_{}", depth) };
             let started = pooled_run(it, &b, move |c| c.batch(&begin));
             let mark = tx_begin(it);
             let r = match started {
-                Ok(()) => it.call(&f, Vec::new(), line),
+                Ok(()) => body(it),
                 Err(e) => Ok(db_err(e)),
             };
-            let commit = ok(&r);
+            let conflicted = |it: &Interp| {
+                let g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                g.iter().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.as_ref()).map_or(false, |c| c.conflicted())
+            };
+            // A statement failed because of another transaction: this one
+            // is over, whatever the function made of the error.
+            let lost = depth == 1 && conflicted(it);
+            let commit = ok(&r) && !lost;
             let end = match (commit, depth == 1) {
                 (true, true) => "commit".to_string(),
                 (false, true) => "rollback".to_string(),
@@ -1363,6 +1436,8 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
             let ended = pooled_run(it, &b, move |c| c.batch(&end));
+            // The commit itself can fail so (a serializable transaction's often does).
+            let lost = lost || (depth == 1 && conflicted(it));
             tx_end(it, mark, commit && ended.is_ok());
             let done = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1374,12 +1449,14 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                     None
                 }
             };
-            if let Some(TxConn { conn: Some(c), .. }) = done {
+            if let Some(TxConn { conn: Some(mut c), .. }) = done {
+                c.watch_conflicts(false);
                 pool.give_back(c);
             }
             match ended {
-                Err(e) if commit => Ok(db_err(e)),
-                _ => r,
+                Err(e) if commit => (Ok(db_err(e)), lost),
+                _ if lost && ok(&r) => (Ok(crate::txn::gave_up()), true),
+                _ => (r, lost),
             }
         }
     }
