@@ -385,6 +385,36 @@ fn navigate_without_a_single_page_app_loads_the_page() {
     assert_eq!(r, want);
 }
 
+/// A component sets fields of the page's objects: an element it kept from
+/// @mount, and an event's element (`e.value = ""`), but not innerHTML.
+#[test]
+fn a_component_sets_fields_of_the_pages_objects() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("fields.qwe"), free_port(), Some(&dir.join("fields.js")));
+    assert_eq!((&r["mounted"], &r["cleared"], &r["by_event"], &r["added"], &r["bad"]), (&"mounted".into(), &"".into(), &"".into(), &"51".into(), &"".into()), "{}", r);
+    let errors = r["errors"].as_array().unwrap();
+    assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("`innerHTML` is not set from Quillo code"), "{}", r);
+}
+
+/// A link to a route that writes, pointed at (so prefetched, and refused)
+/// and then clicked, loads the page: Chrome's speculation rules keep a 2xx
+/// prefetch for the click, and a 204 kept that way left the browser where
+/// it was.
+#[test]
+fn a_refused_prefetch_does_not_stop_the_click() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("refused.qwe"), free_port(), Some(&dir.join("refused.js")));
+    assert_eq!(r, serde_json::json!({ "path": "/thread", "views": 1 }));
+}
+
 /// On a page that reads url(), a spot on the page (`#target`) is gone to as
 /// the browser goes there: scrolled into view and :target, with url().hash
 /// following. From a link, from navigate("#target"), and from navigate() to

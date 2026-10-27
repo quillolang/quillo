@@ -105,6 +105,7 @@ fn bad(what: &str) -> Value {
 fn forbidden_stmt(s: &Stmt) -> Option<&'static str> {
     match s {
         Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e)) => forbidden(e),
+        Stmt::SetField(o, _, _, e, _) => forbidden(o).or_else(|| forbidden(e)),
         Stmt::Return(None) => None,
         Stmt::Fn(_) => Some("a script cannot define functions (use `(x) => ...`)"),
         Stmt::Route(_) | Stmt::Mount(..) => Some("a script cannot define routes"),

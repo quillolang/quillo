@@ -331,13 +331,13 @@ fn maps_know_their_fields() {
 #[test]
 fn annotations_say_what_lists_and_maps_hold() {
     one("fn total(xs: list<int>) = sum(xs)\nfn f() = total([\"a\"])", "argument `xs` of `total` must be list<int>, got list<str>");
-    one("fn t(p: { title: str }) = p.title\nfn f() = t({ name: \"x\" })", "argument `p` of `t` has no field `title`");
-    one("fn t(p: { title: str }) = p.title\nfn f() = t({ title: 1 })", "has `title` as int, but it must be str");
-    one("fn t(p: { title: str }) = p.titel", "this map has no field `titel`");
-    one("fn t(ps: list<{ id: int }>) = ps | map((p) => p.di)", "this map has no field `di`");
+    one("fn tl(p: { title: str }) = p.title\nfn f() = tl({ name: \"x\" })", "argument `p` of `tl` has no field `title`");
+    one("fn tl(p: { title: str }) = p.title\nfn f() = tl({ title: 1 })", "has `title` as int, but it must be str");
+    one("fn tl(p: { title: str }) = p.titel", "this map has no field `titel`");
+    one("fn tl(ps: list<{ id: int }>) = ps | map((p) => p.di)", "this map has no field `di`");
     // Optional fields may be missing; extra ones are fine.
-    clean("fn t(p: { title: str, note: str? }) = p.title\nfn f() = t({ title: \"x\", extra: 1 })");
-    clean("fn t(p: { title: str }) -> { title: str, n: int } = merge(p, { n: 1 })");
+    clean("fn tl(p: { title: str, note: str? }) = p.title\nfn f() = tl({ title: \"x\", extra: 1 })");
+    clean("fn tl(p: { title: str }) -> { title: str, n: int } = merge(p, { n: 1 })");
     let prog = quillo::parser::Parser::new("fn t(p: { title: str, tags: list<str> }) = 1").parse_program().unwrap();
     let quillo::ast::Stmt::Fn(d) = &prog[0] else { unreachable!() };
     assert!(quillo::check::def_text(d).contains("p: { title: str, tags: list<str> }"), "{}", quillo::check::def_text(d));
@@ -428,9 +428,10 @@ fn service_calls_are_checked_against_what_the_service_offers() {
 fn errors_say_when_a_name_is_a_keyword_or_hides_a_builtin() {
     one("server fn reply(t: str) = t", "found `reply`, which is a keyword: pick another name");
     one("let reply = 1", "`reply` is a keyword, so it cannot be a name here");
-    one("fn notify(user: int, text: str) = user\nfn f() = notify(\"Posted\", \"x\")", "hides the builtin `notify`");
-    // Hiding a builtin is allowed; only a call that goes wrong mentions it.
-    clean("fn first(xs: list) = xs[0]\nprint(first([1]))");
+    // Hiding a builtin is a warning, and a call that goes wrong says so too.
+    let d = diags("fn notify(user: int, text: str) = user\nfn f() = notify(\"Posted\", \"x\")");
+    assert!(d.len() == 2 && d[0].starts_with("1 warning: `notify` hides the builtin `notify`") && d[1].contains("which hides the builtin `notify`"), "{:?}", d);
+    one("fn first(xs: list) = xs[0]\nprint(first([1]))", "1 warning: `first` hides the builtin `first`");
     // A function of the program's own with no builtin of that name: no note.
     let d = diags("fn post(text: str) = text\nfn f() = post(1)");
     assert!(d.len() == 1 && !d[0].contains("hides"), "{:?}", d);
@@ -451,4 +452,52 @@ fn patterns_written_out_are_checked() {
     one("fn f(s: str) = re.replace(s, \"a\", \"b\", \"x\")", "the flags are");
     // A pattern made as the program runs is checked then.
     clean("fn f(s: str, p: str) = re.test(s, p)");
+}
+
+/// The note that code may be for a newer Quillo follows only syntax this one
+/// does not know, not an error that names the rule broken.
+#[test]
+fn only_unknown_syntax_may_be_for_a_newer_quillo() {
+    let newer = |src: &str| !check_source(src, "t.qwe", Path::new(".")).syntax_errors.is_empty();
+    assert!(newer("let x = 1 # 2"));
+    assert!(newer("fn f() => 1"));
+    assert!(newer("let s = \"\\q\""));
+    assert!(!newer("fn reply(x) = x"));
+    assert!(!newer("let reply = 1"));
+    assert!(!newer("fn f() { g() = 1 }"));
+    assert!(!newer("let s = \"unterminated"));
+}
+
+/// A name the program defines twice is an error naming both places, in one
+/// file or across `use`d ones: the second would replace the first
+/// everywhere. One that hides a builtin is a warning.
+#[test]
+fn a_name_defined_twice_is_an_error() {
+    one("fn helper() = 1\nfn helper() = 2", "2 `helper` is defined twice, at t.qwe:1 and t.qwe:2");
+    one("fn helper() = 1\nlet helper = 5", "`helper` is defined twice");
+    one("type User = { n: int }\nfn User() = 1", "`User` is defined twice");
+    one("fn len(x) = 99", "1 warning: `len` hides the builtin `len`");
+    // `let` twice in one file gives the variable again.
+    clean("let x = 1\nlet x = x + 1\nprint(x)");
+    let d = std::env::temp_dir().join(format!("quillo-twice-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::write(d.join("lib/x.qwe"), "fn helper() = 1\nlet shared = 1\n").unwrap();
+    std::fs::write(d.join("lib/y.qwe"), "fn helper() = 2\nlet shared = 2\n").unwrap();
+    std::fs::write(d.join("main.qwe"), "use \"lib/x.qwe\"\nuse \"lib/y.qwe\"\nprint(helper() + shared)\n").unwrap();
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let msgs: Vec<String> = a.diagnostics.iter().map(|d| format!("{}:{} {}", d.file.rsplit('/').next().unwrap(), d.line, d.message)).collect();
+    assert!(msgs.iter().any(|m| m.starts_with("y.qwe:1 `helper` is defined twice, at lib/x.qwe:1 and lib/y.qwe:1")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m.starts_with("y.qwe:2 `shared` is defined twice, at lib/x.qwe:2 and lib/y.qwe:2")), "{:#?}", msgs);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `el.value = x`: in a component, on one of the page's objects; a map's
+/// fields are made anew, and outside a component there is nothing to set.
+#[test]
+fn fields_of_the_pages_objects_are_set_in_components() {
+    clean("component Picker() {\n    <input type=\"file\" @change={(e) => { e.target.value = \"\" }}/>\n}");
+    clean("component Box() {\n    <div @mount={(el) => { el.scrollTop += 10 }}></div>\n}");
+    one("component C() {\n    state m = { a: 1 }\n    <button @click={() => { m.a = 2 }}>x</button>\n}", "a map's fields are not set in place: write `m = set(m, \"a\", …)`");
+    one("fn f(m: map) {\n    m.a = 2\n}", "cannot set `a`: only the page's objects (an element, an event) have fields that are set, in a component");
+    one("fn f(xs: list) {\n    xs[0] = 1\n}", "only variables, and the fields of the page's objects (`el.value = x`), can be assigned to");
 }

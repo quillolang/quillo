@@ -411,6 +411,9 @@ pub enum AssignOp {
 pub enum Stmt {
     Let(Pattern, Expr, u32),
     Assign(String, AssignOp, Expr, u32),
+    /// `obj.name = expr` (or `+=`, `-=`): a field of one of the page's
+    /// objects (an element, an event), set in a component.
+    SetField(Expr, String, AssignOp, Expr, u32),
     Expr(Expr),
     Fn(Arc<FnDef>),
     Route(Arc<RouteDef>),

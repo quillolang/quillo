@@ -194,6 +194,10 @@ pub struct Interp {
 /// Deepest call nesting allowed before a "too much recursion" error.
 pub const MAX_DEPTH: usize = 10_000;
 
+/// What stops a prefetched page that would change something; the server
+/// answers it "not prefetched" and does not log it.
+pub const PREFETCH_REFUSED: &str = "not while the page is prefetched";
+
 /// A source file's absolute path, as the parser records it on what it
 /// parses (see `FnDef::file`).
 fn source_path(file: &Path) -> Option<Arc<str>> {
@@ -978,7 +982,7 @@ impl Interp {
         match &self.prefetching {
             Some(flag) => {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                fail(line, format!("not while the page is prefetched: {}", what))
+                fail(line, format!("{}: {}", PREFETCH_REFUSED, what))
             }
             None => Ok(()),
         }
@@ -1232,6 +1236,17 @@ impl Interp {
                     define(env, &n, v);
                 }
                 Ok(Value::Nil)
+            }
+            // The server has none of the page's objects: a map's fields are
+            // made with `set` or `{ ...m, name: v }`, never changed in place.
+            Stmt::SetField(o, name, _, e, line) => {
+                let o = self.eval(o, env)?;
+                self.eval(e, env)?;
+                let why = match o {
+                    Value::Map(_) => format!("a map's fields are not set in place: write `m = set(m, \"{}\", …)`", name),
+                    _ => format!("{} has no field `{}` to set: only the page's objects (an element, an event) do, in a component", o.type_name(), name),
+                };
+                fail(*line, why)
             }
             Stmt::Assign(name, op, e, line) => {
                 if self.prefetching.is_some() && lookup_global(env, name).map_or(false, |(_, global)| global) {

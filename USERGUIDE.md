@@ -455,9 +455,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   - `e.target`: the element itself;
   - any other field of the browser's event (`e.clientX`, `e.deltaY`, `e.shiftKey`,
     ...), then of the element (`e.scrollTop`, `e.scrollHeight`, `e.clientHeight`,
-    `e.dataset`, ...).
+    `e.dataset`, ...);
+  - its methods: `e.preventDefault()` keeps the browser from doing what it would (an
+    arrow key moving the cursor, a pasted image going into a textarea). It must come
+    before anything the handler waits for (a `server fn`), since by then the browser
+    has gone on.
 
-  `@submit` does not reload the page.
+  Setting a field sets the element's, when the event has no field of that name:
+  `e.value = ""` empties the input (a file picker too, so that picking the same file
+  again fires `change`). `@submit` does not reload the page.
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step.
 - `every(ms, f)` in a component's code calls `f` every `ms` milliseconds, in the browser,
   for as long as the code that called it stands: `if running { every(100, step) }`
@@ -574,7 +580,10 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
-  methods as fields: `el.value`, `chart.update()`. What runs text as code or HTML is
+  methods as fields: `el.value`, `chart.update()`; and their fields can be set:
+  `el.value = ""`, `el.scrollTop += 100` (only theirs: a map's fields are made anew,
+  with `set` or `{ ...m, name: v }`). `innerHTML`, `outerHTML`, `srcdoc` and `on...` are
+  not set, and nothing is set to a `javascript:` URL. What runs text as code or HTML is
   refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
   `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
   elements, nodes of another document, `javascript:` URLs (in lists and maps too) given
@@ -670,7 +679,11 @@ component Notes(initial: list) {
   }
   ```
 - A loader runs again as a call from the page, with the page's cookies, so `session()`
-  inside it is the viewer's session.
+  inside it is the viewer's session. So what should happen when new data arrives for a
+  viewer (marking posts or messages read) is done in the loader: a component's code
+  cannot call a `server fn` when state changes, but the loader is that call. A page
+  whose loader writes is not prefetched (see [Prefetching](#prefetching)); it is made
+  when the link is followed.
 - The server renders the first value; the page keeps one WebSocket open
   (`/_quillo/live`, served by its own thread), down which the server streams each
   change to its topics, and calls the loader again. A WebSocket, because browsers
@@ -1099,8 +1112,9 @@ keep it in their cache for 30 seconds, which the server allows for this.
 - **Prefetching changes nothing.** A route asked for ahead of a click may read (the
   database, files, other servers) but not write: `db.exec` or SQL that writes, assigning
   a global variable, cookies and sessions, files, `publish`, `http.post` and the like,
-  and calls to services stop it, and it is answered "not prefetched" (204). The page is
-  then made, as usual, when the link is followed. So a `GET` that does something (a
+  and calls to services stop it, and it is answered "not prefetched" (503, which the
+  browser drops, and which is not logged). The page is then made, as usual, when the
+  link is followed. So a `GET` that does something (a
   logout link, a counter) is never done by pointing at it.
 - **What is left alone:** links to other sites, with `target` or `download`, to the
   same page (`#section`), those a page's components follow themselves (see
@@ -1620,7 +1634,27 @@ Safety built in:
   instead of letting them write into the open transaction.
 
 Values are immutable: `push`, `set` and `+` return new lists and maps.
-`use "lib.qwe"` runs another file once, into the global scope.
+
+### Files of a program
+
+`use "lib/forum.qwe"` brings another file into the program:
+
+- Every file `use`d, and every file those `use`, adds its names to one set of names for
+  the whole program. The order of `use` lines does not matter, and names reach every
+  file: `ui/editor.qwe` can call a function from `lib/forum.qwe` that only `main.qwe`
+  `use`s.
+- So a file makes sense only in its program: `quillo check main.qwe` checks it with
+  the rest, and so does the editor (a file is checked as part of the program whose main
+  file, in its folder or one above, `use`s it). Go to definition finds where a name
+  comes from.
+- A name is defined once in a program: a second `fn helper()` in another file is an
+  error that names both places, since it would replace the first everywhere. `let x`
+  twice in one file gives the variable again. A function with a builtin's name is a
+  warning (it replaces the builtin for the whole program); a variable may take one
+  (`let count = 0`).
+- Paths are from the main file's folder, not from the file that writes them:
+  `lib/b.qwe` writes `use "lib/c.qwe"`.
+- A file `use`d twice, or by several files, runs once.
 
 ### Decimals
 

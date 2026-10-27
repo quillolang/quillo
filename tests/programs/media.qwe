@@ -23,12 +23,12 @@
 
 media.rtp("cam", { video: 5004, audio: 5006 })
 
-server fn stats() -> list = media.streams()
+server fn live_streams() -> list = media.streams()
 
 // How the stream is going, asked for every second.
 component Stats() {
-    state streams = stats()
-    every(1000, () => { streams = stats() ?? streams })
+    state streams = live_streams()
+    every(1000, () => { streams = live_streams() ?? streams })
     <p.stats>
         {for s in streams => <span key={s.name}>
             <b>{s.video.fps}</b> fps · <b>{s.video.kbps + s.audio.kbps}</b> kbit/s · <b>{s.viewers}</b> watching · <b>{s.video.lost + s.audio.lost}</b> packets lost

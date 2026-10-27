@@ -339,6 +339,23 @@ function guardArgs(what, args, depth) {
   }
 }
 
+// `x.name = v` in a component: a field of the page's object x (an event's
+// that it does not have is its element's: `e.value = ""`), not one that
+// runs text as code or HTML, and given nothing that would.
+function setField(o, name, v, op) {
+  if (!foreign(o)) {
+    fail(isMap(o) ? `a map's fields are not set in place: write \`m = set(m, "${name}", …)\``
+      : `${typeName(o)} has no field \`${name}\` to set: only the page's objects (an element, an event) do`);
+  }
+  foreignName(name);
+  if (/^on/i.test(name) || name === "innerHTML" || name === "outerHTML" || name === "srcdoc")
+    fail(`\`${name}\` is not set from Quillo code: it runs text as code or HTML`);
+  if (isEvent(o) && !(name in o) && o.target) o = o.target;
+  if (op) v = (op === "+" ? add : sub)(field(o, name, null), v);
+  guardArgs(`setting \`${name}\``, [v], 0);
+  o[name] = v;
+}
+
 function typeName(v) {
   if (isNil(v)) return "null";
   switch (typeof v) {
@@ -4451,6 +4468,7 @@ W.range = intRange;
 W.neg = neg;
 W.field = field;
 W.fieldp = fieldp;
+W.setf = setField;
 W.index = index;
 W.call = callFn;
 W.mcall = mcall;

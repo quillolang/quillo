@@ -290,7 +290,10 @@ impl Interp {
         // that went well is kept by the browser for the click.
         if let Some(refused) = prefetch {
             if refused.load(std::sync::atomic::Ordering::Relaxed) || resp.header("set-cookie").is_some() {
-                return HttpResponse { status: 204, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
+                // Not a 2xx, which Chrome's speculation rules would keep and
+                // answer the click with (a 204 leaves the browser where it
+                // was): with a 503 it drops the prefetch and loads the page.
+                return HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
             }
             if resp.status == 200 && resp.header("cache-control").is_none() {
                 resp.headers.push(("cache-control".into(), "private, max-age=30".into()));
@@ -960,7 +963,10 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Ok(v) | Err(Ctrl::Return(v)) => value_response(v),
         Err(Ctrl::Reply(r)) => render_response(&r),
         Err(Ctrl::Error(e)) => {
-            eprintln!("quillo: error: {}", e);
+            // A prefetch stopped before it changed something is expected.
+            if !e.msg.contains(crate::interp::PREFETCH_REFUSED) {
+                eprintln!("quillo: error: {}", e);
+            }
             // The message names files and lines of the program; it is for
             // its author (`--watch`), not for whoever sent the request.
             if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {

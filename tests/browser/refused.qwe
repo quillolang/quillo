@@ -1,0 +1,13 @@
+// A link to a route that writes, pointed at and then clicked: the prefetch
+// is refused, and the click loads the page. Driven by refused.js.
+
+let views = 0
+
+route GET / = <html><body><a id="go" href="/thread">Thread</a></body></html>
+
+route GET /thread {
+    views += 1
+    <html><body><script>{raw(`window.__views = ${views}`)}</script><script>{raw(REPORT)}</script></body></html>
+}
+
+let REPORT = "addEventListener('load', () => document.body.setAttribute('data-result', JSON.stringify({ path: location.pathname, views: window.__views })))"

@@ -153,7 +153,7 @@ fn quillo_check_holds_code_to_the_fields() {
     assert!(has("no field `skew`"), "{:?}", e);
     let e = check("type Bad = { n: int = \"x\" }\ntype User = { a: int }\n");
     assert!(e.iter().any(|m| m.contains("the default of `n` in `Bad` is str, which is not int")), "{:?}", e);
-    assert!(e.iter().any(|m| m.contains("type `User` is defined twice")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("`User` is defined twice")), "{:?}", e);
     // A type's name starts with a capital letter; an unknown lowercase one is a typo.
     let e = check("fn f(x: strng) = x\n");
     assert!(e.iter().any(|m| m.contains("unknown type `strng`")), "{:?}", e);

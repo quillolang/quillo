@@ -581,7 +581,7 @@ route GET /cached = respond(200, "mine", { "cache-control": "no-store" })
     for url in ["/write", "/returning", "/count", "/login"] {
         for h in [("X-Quillo-Prefetch", "1"), ("Sec-Purpose", "prefetch;prerender")] {
             let r = prefetch(&mut it, url, h);
-            assert_eq!((r.status, r.header("cache-control")), (204, Some("no-store")), "{} {:?}", url, h);
+            assert_eq!((r.status, r.header("cache-control")), (503, Some("no-store")), "{} {:?}", url, h);
         }
     }
     assert!(get(&mut it, "/read").text().starts_with("<!doctype html><html><body>0 0"), "nothing changed");

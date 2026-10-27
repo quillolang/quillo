@@ -429,7 +429,11 @@ impl Parser {
             self.next()?;
             let name = match e {
                 Expr::Ident(n, _) => n,
-                _ => return Err(QuilloError::new("only variables can be assigned to", line)),
+                Expr::Field(obj, name, _) => {
+                    let rhs = self.parse_expr()?;
+                    return Ok(Stmt::SetField(*obj, name, op, rhs, line));
+                }
+                _ => return Err(QuilloError::new("only variables, and the fields of the page's objects (`el.value = x`), can be assigned to", line)),
             };
             let rhs = self.parse_expr()?;
             return Ok(Stmt::Assign(name, op, rhs, line));

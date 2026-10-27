@@ -536,6 +536,40 @@ fn the_log_can_be_json_lines() {
     assert!(v["ms"].is_number() && v["ip"].is_string(), "{}", line);
 }
 
+/// A prefetch stopped because the route writes is expected: answered 503
+/// (which browsers drop) and not logged as an error; a real error still is.
+#[test]
+fn a_refused_prefetch_is_not_logged_as_an_error() {
+    let d = temp_dir("prefetchlog");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "let views = 0\nroute GET /thread {\n  views += 1\n  \"seen\"\n}\nroute GET /broken = unwrap(err(\"broken on purpose\"))\n").unwrap();
+    let port = port();
+    let log_file = d.join("server.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(&f)
+        .args(["--port", &port.to_string()])
+        .stderr(std::fs::File::create(&log_file).unwrap())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !support::listening(port) {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let prefetched = raw(port, "GET /thread HTTP/1.1\r\nSec-Purpose: prefetch");
+    assert!(prefetched.starts_with("HTTP/1.1 503"), "{}", prefetched);
+    assert_eq!(get(port, "/thread"), (200, "seen".to_string()));
+    assert_eq!(get(port, "/broken").0, 500);
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server);
+    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+    assert!(!log.contains("prefetched"), "{}", log);
+    assert!(log.contains("broken on purpose"), "{}", log);
+}
+
 #[test]
 fn scheduled_jobs_run_on_time_and_once_across_servers() {
     let d = temp_dir("jobs");

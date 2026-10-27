@@ -552,13 +552,16 @@ fn check(file: &str, opts: quillo::check::Options) -> i32 {
         eprintln!("quillo: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
         return 1;
     }
-    let count = |k: SymbolKind| analysis.symbols.iter().filter(|s| s.kind == k && s.file == file).count();
+    // The whole program: the file and those it `use`s.
+    let count = |k: SymbolKind| analysis.symbols.iter().filter(|s| s.kind == k).count();
+    let files = analysis.symbols.iter().map(|s| s.file.as_str()).chain([file]).collect::<std::collections::HashSet<_>>().len();
     println!(
-        "{}: ok ({} routes, {} functions, {} components){}",
+        "{}: ok ({} routes, {} functions, {} components{}){}",
         file,
         count(SymbolKind::Route),
         count(SymbolKind::Function) + count(SymbolKind::ServerFn) + count(SymbolKind::View),
         count(SymbolKind::Component),
+        if files > 1 { format!(", in {} files", files) } else { String::new() },
         plural_warnings(warnings)
     );
     0

@@ -1,0 +1,18 @@
+// Fields of the page's objects set from a component: an element kept from
+// @mount, an event's element, and what is refused. Driven by fields.js.
+
+component Form() {
+    state box = null
+    <div>
+        <input id="q" @mount={(el) => {
+            box = el
+            el.value = "mounted"
+        }}/>
+        <input id="r" @input={(e) => { e.value = "" }}/>
+        <input id="s" type="number" value="5" @change={(e) => { e.target.value += 1 }}/>
+        <button id="clear" @click={() => { box.value = "" }}>Clear</button>
+        <button id="bad" @click={() => { box.innerHTML = "<b>x</b>" }}>Bad</button>
+    </div>
+}
+
+route GET / = <html><body><Form/></body></html>

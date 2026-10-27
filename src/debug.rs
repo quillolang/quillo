@@ -121,7 +121,7 @@ fn rearm(st: &State) {
 /// declarations (functions, routes, types) are not stops.
 pub fn stmt_line(s: &Stmt) -> Option<u32> {
     let l = match s {
-        Stmt::Let(_, _, l) | Stmt::Assign(_, _, _, l) | Stmt::State(_, _, l) | Stmt::Use(_, l) => *l,
+        Stmt::Let(_, _, l) | Stmt::Assign(_, _, _, l) | Stmt::SetField(_, _, _, _, l) | Stmt::State(_, _, l) | Stmt::Use(_, l) => *l,
         Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_line(e),
         Stmt::Return(None) | Stmt::Fn(_) | Stmt::Route(_) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) => 0,
     };
@@ -720,6 +720,10 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<u32>) {
     }
     match s {
         Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::State(_, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e)) => walk(e, out),
+        Stmt::SetField(o, _, _, e, _) => {
+            walk(o, out);
+            walk(e, out)
+        }
         Stmt::Fn(d) => walk_body(&d.body, out),
         Stmt::Route(r) => walk_body(&r.body, out),
         Stmt::Service(_, _, _, Some(e), _) => walk(e, out),

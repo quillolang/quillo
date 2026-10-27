@@ -49,6 +49,18 @@ pub fn note_start() {
     BUILT.get_or_init(exe_modified);
 }
 
+/// Whether a parse error could be code for a newer Quillo: something this
+/// one does not know (`expected …, found …`, an unknown character or
+/// escape), not a rule it names (`reply` is a keyword, only variables can
+/// be assigned to), which a newer Quillo would refuse as well.
+pub fn may_be_newer_syntax(msg: &str) -> bool {
+    (msg.starts_with("expected ") && !msg.contains("which is a keyword"))
+        || msg.starts_with("unexpected character")
+        || msg.starts_with("unexpected keyword")
+        || msg.starts_with("unknown escape")
+        || msg.starts_with("bad escape")
+}
+
 /// After a syntax error: which quillo this is, as code written for a newer
 /// one fails to parse here (an old build left on the PATH, say).
 pub fn which_quillo() -> String {

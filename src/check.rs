@@ -1074,8 +1074,9 @@ pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: Vec<Symbol>,
     pub references: Vec<Reference>,
-    /// Where a file could not be parsed (file, line): perhaps it is for a
-    /// newer Quillo.
+    /// Where a file could not be parsed for syntax this Quillo does not
+    /// know (file, line): perhaps it is for a newer one. Errors that name
+    /// the rule broken (a keyword as a name, say) are not here.
     pub syntax_errors: Vec<(String, u32)>,
 }
 
@@ -1192,7 +1193,9 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             c.state_details();
         }
         Err(e) => {
-            c.out.syntax_errors.push((main.to_string(), e.line));
+            if crate::error::may_be_newer_syntax(&e.msg) {
+                c.out.syntax_errors.push((main.to_string(), e.line));
+            }
             c.diag_at(main, e.line, Severity::Error, e.msg)
         }
     }
@@ -1281,6 +1284,8 @@ struct Checker {
     /// at the point being checked.
     uses: u32,
     depth: u32,
+    /// The program's main file, whose folder names the others in messages.
+    main: Arc<str>,
     file: Arc<str>,
     line: u32,
     out: Analysis,
@@ -1350,6 +1355,7 @@ impl Checker {
             confined: false,
             uses: 0,
             depth: 0,
+            main: Arc::from(file),
             file: Arc::from(file),
             line: 0,
             out: Analysis::default(),
@@ -1437,11 +1443,9 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
             }
+            // A type defined twice is reported with every other name (`defines`).
             if let Stmt::Type(td) = s {
-                let again = RECORDS.with(|r| r.borrow_mut().insert(td.name.clone(), td.clone())).is_some();
-                if again {
-                    self.diag_at(file.clone(), td.line, Severity::Error, format!("type `{}` is defined twice", td.name));
-                }
+                RECORDS.with(|r| r.borrow_mut().insert(td.name.clone(), td.clone()));
             }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
@@ -1495,7 +1499,9 @@ impl Checker {
                             self.uses -= 1;
                         }
                         Err(e) => {
-                            self.out.syntax_errors.push((fname.to_string(), e.line));
+                            if crate::error::may_be_newer_syntax(&e.msg) {
+                                self.out.syntax_errors.push((fname.to_string(), e.line));
+                            }
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
                         }
                     },
@@ -1505,6 +1511,34 @@ impl Checker {
             }
             order.push(Item { stmt: s.clone(), file: file.clone() });
         }
+    }
+
+    /// Before `name`, defined at the top level of `file`, is added: one
+    /// the program already has is an error, wherever it is (the second
+    /// would replace the first everywhere), and a function taking a
+    /// builtin's name a warning (a variable may: `let count = 0`).
+    /// `let x` twice in one file stays a variable given again.
+    fn defines(&mut self, name: &str, file: &Arc<str>, line: u32, is_let: bool) {
+        let Some(g) = self.globals.get(name) else { return };
+        if &*g.file == "<builtin>" {
+            if is_let {
+                return;
+            }
+            let msg = format!("`{}` hides the builtin `{}`: the program's own is used everywhere, so pick another name", name, name);
+            self.diag_at(file.clone(), line, Severity::Warning, msg);
+            return;
+        }
+        // A top-level `let`'s variable, as yet unused and without a signature.
+        if is_let && g.sig.is_none() && !g.used && g.file == *file {
+            return;
+        }
+        let at = |f: &str, l: u32| {
+            let dir = Path::new(&*self.main).parent().unwrap_or(Path::new(""));
+            let short = Path::new(f).strip_prefix(dir).unwrap_or(Path::new(f));
+            format!("{}:{}", short.strip_prefix(".").unwrap_or(short).display(), l)
+        };
+        let msg = format!("`{}` is defined twice, at {} and {}: the second replaces the first everywhere, so rename one", name, at(&g.file, g.line), at(file, line));
+        self.diag_at(file.clone(), line, Severity::Error, msg);
     }
 
     fn run(&mut self, order: Vec<Item>) {
@@ -1524,6 +1558,19 @@ impl Checker {
         // Everything top-level is known up front; it becomes usable from
         // top-level code once the program has run its definition.
         for it in &order {
+            match &it.stmt {
+                Stmt::Fn(d) => self.defines(&d.name, &it.file, d.line, false),
+                Stmt::Service(name, _, _, _, line) => self.defines(name, &it.file, *line, false),
+                Stmt::Type(td) => self.defines(&td.name, &it.file, td.line, false),
+                Stmt::Let(p, _, line) => {
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    for n in names {
+                        self.defines(&n, &it.file, *line, true);
+                    }
+                }
+                _ => {}
+            }
             match &it.stmt {
                 Stmt::Fn(d) => {
                     let sig = Arc::new(Sig::of_def(d));
@@ -1995,6 +2042,23 @@ impl Checker {
                     self.define(&n, t, sig, kind);
                 }
                 self.next_sql = SqlVar::Other;
+                T::of(NIL)
+            }
+            // `el.value = x`: a field of one of the page's objects, which only
+            // a component has; a map's fields are made anew, not set.
+            Stmt::SetField(o, name, _, e, line) => {
+                self.line = *line;
+                let t = self.expr(o);
+                self.expr(e);
+                if self.in_component().is_none() {
+                    self.error(format!("cannot set `{}`: only the page's objects (an element, an event) have fields that are set, in a component", name));
+                } else if !t.vague() {
+                    if t.bits & MAP != 0 {
+                        self.error(format!("a map's fields are not set in place: write `m = set(m, \"{}\", …)`", name));
+                    } else {
+                        self.error(format!("{} has no field `{}` to set: only the page's objects (an element, an event) do", t_text(t), name));
+                    }
+                }
                 T::of(NIL)
             }
             Stmt::Assign(name, op, e, line) => {
@@ -3648,6 +3712,10 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     for s in stmts {
         match s {
             Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => walk_expr(e, f),
+            Stmt::SetField(o, _, _, e, _) => {
+                walk_expr(o, f);
+                walk_expr(e, f)
+            }
             Stmt::Return(Some(e)) => walk_expr(e, f),
             Stmt::Fn(d) => walk_expr(&d.body, f),
             Stmt::Route(r) => walk_expr(&r.body, f),
@@ -3683,6 +3751,10 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
                 assigned_in(e, out)
             }
             Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => assigned_in(e, out),
+            Stmt::SetField(o, _, _, e, _) => {
+                assigned_in(o, out);
+                assigned_in(e, out)
+            }
             Stmt::Return(Some(e)) => assigned_in(e, out),
             Stmt::Fn(d) => assigned_in(&d.body, out),
             Stmt::Route(r) => assigned_in(&r.body, out),

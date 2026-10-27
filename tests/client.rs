@@ -364,6 +364,27 @@ let all = [merge({}, m), {} + m, merge(m, {}), remove(m, "a"), set({}, "__proto_
     assert!(s.contains(r#"{\"__proto__\":{\"admin\":true},\"a\":1}"#), "{}", s);
 }
 
+/// `el.value = x` sets a field of one of the page's objects, but not one
+/// that runs text as code or HTML, nor to a javascript: URL; a map's fields
+/// are not set in place, on the server or in the browser.
+#[test]
+fn the_pages_objects_have_fields_that_can_be_set() {
+    if !node_available() {
+        return;
+    }
+    let prelude = "globalThis.lib = { el: new (class El { constructor() { this.value = \"a\"; this.n = 1; this.href = \"\"; } })() };";
+    let run = |body: &str| both_with(prelude, "", body).1;
+    assert_eq!(run("let el = js(\"lib.el\")\nel.value = \"typed\"\nel.n += 2\nel.n -= 1\n[el.value, el.n]"), "[\"typed\", 2]");
+    assert_eq!(run("let el = js(\"lib.el\")\nel.href = \"/page\"\nel.href"), "\"/page\"");
+    assert!(run("js(\"lib.el\").innerHTML = \"<img src=x onerror=alert(1)>\"").contains("runs text as code or HTML"));
+    assert!(run("js(\"lib.el\").outerHTML = \"<b>x</b>\"").contains("runs text as code or HTML"));
+    assert!(run("js(\"lib.el\").onclick = \"alert(1)\"").contains("runs text as code or HTML"));
+    assert!(run("js(\"lib.el\").href = \" javascript:alert(1)\"").contains("javascript: URL"));
+    assert!(run("js(\"lib.el\").constructor = 1").contains("runs text as code"));
+    same_error("", "let m = { a: 1 }\nm.a = 2\nm", "a map's fields are not set in place: write `m = set(m, \"a\", …)`");
+    same_error("", "let n = 1\nn.a = 2", "int has no field `a` to set");
+}
+
 #[test]
 fn constants_holding_functions_are_made_in_the_browser_too() {
     if !node_available() {

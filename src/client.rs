@@ -733,6 +733,10 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
                 expr_assigned(e, out);
             }
             Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => expr_assigned(e, out),
+            Stmt::SetField(o, _, _, e, _) => {
+                expr_assigned(o, out);
+                expr_assigned(e, out)
+            }
             Stmt::Return(Some(e)) => expr_assigned(e, out),
             Stmt::Fn(d) => expr_assigned(&d.body, out),
             Stmt::Route(r) => expr_assigned(&r.body, out),
@@ -807,6 +811,10 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
         for st in ss {
             match st {
                 Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) | Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x)) => {
+                    each_expr_in(x, f, fns)
+                }
+                Stmt::SetField(o, _, _, x, _) => {
+                    each_expr_in(o, f, fns);
                     each_expr_in(x, f, fns)
                 }
                 Stmt::Fn(d) if fns => each_expr_in(&d.body, f, fns),
@@ -1872,6 +1880,20 @@ impl<'a> Compiler<'a> {
                             }
                         }
                     }
+                    if last {
+                        body.push_str("return null;\n");
+                    }
+                }
+                Stmt::SetField(o, name, op, e, line) => {
+                    self.line = *line;
+                    let o = self.expr(o)?;
+                    let rhs = self.expr(e)?;
+                    let op = match op {
+                        AssignOp::Set => "",
+                        AssignOp::Add => ", \"+\"",
+                        AssignOp::Sub => ", \"-\"",
+                    };
+                    let _ = writeln!(body, "W.setf({}, {}, {}{});", o, js_str(name), rhs, op);
                     if last {
                         body.push_str("return null;\n");
                     }
