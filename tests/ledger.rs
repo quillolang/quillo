@@ -41,15 +41,17 @@ struct Done {
 /// would: again, with the same key, after a 409 (the first is still
 /// running), a 5xx or a dropped connection.
 fn until_final(port: u16, key: &str, body: &str) -> (u16, String) {
+    let mut last = String::new();
     for _ in 0..200 {
         let a = send(port, "POST", "/api/transfers", &[("Idempotency-Key", key)], body);
         if a.status == 201 || a.status == 422 {
             return (a.status, a.body);
         }
-        AGAIN.lock().unwrap().push((port, format!("{} {}", a.status, a.body)));
+        last = format!("{} {}", a.status, a.body);
+        AGAIN.lock().unwrap().push((port, last.clone()));
         std::thread::sleep(Duration::from_millis(20 + fastrand::u64(0..30)));
     }
-    panic!("no final answer for {} {}", key, body);
+    panic!("no final answer for {} {}; the last was {}", key, body, last);
 }
 
 fn transfers(port: u16) -> Vec<Done> {
@@ -229,6 +231,13 @@ fn postgres() {
     // How many transactions were rolled back (serialization failures, tried again).
     eprintln!("rolled back: {}", ask(&url, "select xact_rollback from pg_stat_database where datname = 'ledger'"));
     unbalanced_entries_are_refused_by_the_database(&url);
+
+    // Every connection of a small pool a transaction, each needing one more
+    // for Quillo's own tables (the audit log, made on first use): none
+    // waits for the others' (in CI, all of them once did, for ever).
+    let small = pg.database("ledger_small");
+    let sep = if small.contains('?') { '&' } else { '?' };
+    the_books_balance(&format!("{}{}pool_size=2", small, sep));
 }
 
 /// The triggers: an entry whose postings do not add up is not posted, and

@@ -24,6 +24,9 @@ type BoxErr = Box<dyn Error + Sync + Send>;
 /// Default and largest pool size; `?pool_size=N` in the URL changes it.
 const DEFAULT_POOL: usize = 8;
 
+/// How long a transaction waits for a connection of its own.
+const CHECKOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn is_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
 }
@@ -37,6 +40,9 @@ pub struct Conn {
     /// In a transaction that retries: whether a statement failed because
     /// of another transaction (see `crate::txn`). None: not watching.
     conflict: Option<bool>,
+    /// Opened past the pool's size by `checkout_nested`: closed when given
+    /// back, not kept.
+    aside: bool,
 }
 
 pub struct Pool {
@@ -99,11 +105,14 @@ impl Pool {
 
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
-        Ok(Conn { client, stmts: HashMap::new(), conflict: None })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false })
     }
 
-    /// A connection: an idle one, a new one, or the next one returned.
+    /// A connection: an idle one, a new one, or the next one returned
+    /// within `CHECKOUT_WAIT` (past it, an error rather than a request that
+    /// never ends, when every connection is held by work waiting for one).
     pub fn checkout(&self) -> Result<Conn, String> {
+        let until = Instant::now() + CHECKOUT_WAIT;
         let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(c) = g.0.pop() {
@@ -117,7 +126,15 @@ impl Pool {
                     self.freed.notify_one();
                 });
             }
-            g = self.freed.wait(g).unwrap_or_else(|e| e.into_inner());
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "no PostgreSQL connection free after {} s: all {} are in use (`?pool_size=N` in the URL allows more)",
+                    CHECKOUT_WAIT.as_secs(),
+                    self.max
+                ));
+            }
+            g = self.freed.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
@@ -134,7 +151,32 @@ impl Pool {
             .clone()
     }
 
+    /// A connection for work a request does while it may already hold one
+    /// (a transaction's): Quillo's own tables, made or written apart. As
+    /// `checkout`, but when every connection is taken it opens one more
+    /// rather than wait, since the one it would wait for may be the
+    /// caller's own.
+    pub fn checkout_nested(&self) -> Result<Conn, String> {
+        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.0.pop() {
+            return Ok(c);
+        }
+        if g.1 < self.max {
+            g.1 += 1;
+            drop(g);
+            return self.connect().inspect_err(|_| {
+                self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+                self.freed.notify_one();
+            });
+        }
+        drop(g);
+        self.connect().map(|c| Conn { aside: true, ..c })
+    }
+
     pub fn give_back(&self, c: Conn) {
+        if c.aside {
+            return;
+        }
         let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if c.client.is_closed() {
             g.1 -= 1;

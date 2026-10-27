@@ -161,6 +161,18 @@ impl Backend {
         }
     }
 
+    /// A connection for work done while the request may hold one already
+    /// (Quillo's own tables): it never waits for one of the pool's (see
+    /// `pg::Pool::checkout_nested`). MySQL's pool is the driver's, larger.
+    pub(crate) fn checkout_nested(&self) -> Result<Pinned, String> {
+        match self {
+            Backend::Postgres(p) => p.checkout_nested().map(Pinned::Pg),
+            #[cfg(feature = "mysql")]
+            Backend::Mysql(p) => p.checkout().map(Pinned::My),
+            Backend::Sqlite(_) => Err("SQLite has no pool".into()),
+        }
+    }
+
     pub(crate) fn give_back(&self, c: Pinned) {
         match (self, c) {
             (Backend::Postgres(p), Pinned::Pg(c)) => p.give_back(c),
@@ -1689,7 +1701,7 @@ fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> 
         _ => {
             let b = b.clone();
             it.unlocked(move || {
-                let mut c = b.checkout()?;
+                let mut c = b.checkout_nested()?;
                 let lower = sql.trim_start().to_ascii_lowercase();
                 let r = if lower.starts_with("select") || lower.starts_with("xa recover") {
                     c.query(&sql, &params, None)

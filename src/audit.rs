@@ -157,7 +157,9 @@ fn ensure(it: &mut Interp, b: &Arc<Backend>) -> Result<(), String> {
         _ => {
             let pool = b.clone();
             it.unlocked(move || {
-                let mut c = pool.checkout()?;
+                // Often inside the first append's transaction, which holds
+                // a connection: one that never waits for the pool.
+                let mut c = pool.checkout_nested()?;
                 // Two servers making it at once: one of them may fail; the
                 // second try finds it made.
                 let mut r = c.batch(sql);
@@ -195,7 +197,7 @@ fn lock_row(it: &mut Interp, b: &Arc<Backend>, tenant: &str) -> Result<(), Strin
     }
     let (pool, t, sql) = (b.clone(), tenant.to_string(), LOCK_ROW[b.is_mysql() as usize]);
     it.unlocked(move || {
-        let mut c = pool.checkout()?;
+        let mut c = pool.checkout_nested()?;
         let r = c.exec(sql, &[Value::str(t)]).map(|_| ());
         pool.give_back(c);
         r
