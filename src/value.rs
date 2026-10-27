@@ -245,26 +245,65 @@ impl Value {
 
     /// Source-like form used by the REPL and error messages.
     pub fn repr(&self) -> String {
+        let mut out = String::new();
+        self.repr_into(&mut out);
+        out
+    }
+
+    /// `repr`, written into `out`. A value nests as deeply as code may
+    /// (`parser::MAX_NESTING`), and `str` of it runs on the caller's stack,
+    /// so each level takes little: lists, maps and errors here, the rest
+    /// (and their formatting's locals) in `scalar_repr`.
+    fn repr_into(&self, out: &mut String) {
         match self {
-            Value::Nil => "null".into(),
-            Value::Bool(b) => b.to_string(),
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => fmt_float(*f),
-            Value::Dec(d) => format!("{}m", d),
-            Value::Str(s) => serde_json::to_string(&**s).unwrap_or_default(),
-            Value::List(l) => format!("[{}]", l.iter().map(|v| v.repr()).collect::<Vec<_>>().join(", ")),
-            Value::Map(m) if m.is_empty() => "{}".into(),
-            Value::Map(m) => format!(
-                "{{ {} }}",
-                m.iter().map(|(k, v)| format!("{}: {}", fmt_key(k), v.repr())).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Func(c) => format!("<fn {}>", c.def.name),
-            Value::Builtin(n, _) if n.starts_with("native:") => format!("<rust fn {}>", crate::native::display_name(n)),
-            Value::Builtin(n, _) => format!("<builtin {}>", n),
-            Value::Html(h) => h.to_string(),
-            Value::Response(r) => format!("<response {}>", r.status),
-            Value::Err(e) => format!("err({})", e.repr()),
+            Value::List(l) => {
+                out.push('[');
+                for (i, v) in l.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    v.repr_into(out);
+                }
+                out.push(']');
+            }
+            Value::Map(m) if m.is_empty() => out.push_str("{}"),
+            Value::Map(m) => {
+                out.push_str("{ ");
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    key_into(k, out);
+                    v.repr_into(out);
+                }
+                out.push_str(" }");
+            }
+            Value::Err(e) => {
+                out.push_str("err(");
+                e.repr_into(out);
+                out.push(')');
+            }
+            other => other.scalar_repr(out),
         }
+    }
+
+    #[inline(never)]
+    fn scalar_repr(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = match self {
+            Value::Nil => write!(out, "null"),
+            Value::Bool(b) => write!(out, "{}", b),
+            Value::Int(n) => write!(out, "{}", n),
+            Value::Float(f) => write!(out, "{}", fmt_float(*f)),
+            Value::Dec(d) => write!(out, "{}m", d),
+            Value::Str(s) => write!(out, "{}", serde_json::to_string(&**s).unwrap_or_default()),
+            Value::Func(c) => write!(out, "<fn {}>", c.def.name),
+            Value::Builtin(n, _) if n.starts_with("native:") => write!(out, "<rust fn {}>", crate::native::display_name(n)),
+            Value::Builtin(n, _) => write!(out, "<builtin {}>", n),
+            Value::Html(h) => write!(out, "{}", h),
+            Value::Response(r) => write!(out, "<response {}>", r.status),
+            Value::List(_) | Value::Map(_) | Value::Err(_) => Ok(self.repr_into(out)),
+        };
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -361,6 +400,13 @@ fn fmt_float(f: f64) -> String {
     } else {
         format!("{}", f)
     }
+}
+
+/// A map's key and its colon, as `repr` writes them.
+#[inline(never)]
+fn key_into(k: &str, out: &mut String) {
+    out.push_str(&fmt_key(k));
+    out.push_str(": ");
 }
 
 fn fmt_key(k: &str) -> String {
