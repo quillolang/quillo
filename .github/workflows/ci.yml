@@ -13,6 +13,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # tests/postgres.rs and tests/mysql.rs start servers of their own from these
+      # binaries, and skip without them.
+      - name: PostgreSQL and MariaDB for the tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql mariadb-server
+          echo "QUILLO_TEST_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/mariadb"
+          ln -s "$(command -v mariadbd || echo /usr/sbin/mariadbd)" "$(command -v mariadb-install-db)" "$RUNNER_TEMP/mariadb/"
+          echo "QUILLO_TEST_MYSQL_BIN=$RUNNER_TEMP/mariadb" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release
       - name: Tests (the browser test uses the runner's Chrome)
@@ -22,6 +31,13 @@ jobs:
       - name: VS Code extension
         working-directory: editors/vscode
         run: npm ci && npm test && npx vsce package --skip-license
+
+  # Known vulnerabilities, licences and sources of dependencies (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   # `quillo app` (the native window) builds on each desktop platform.
   app:
