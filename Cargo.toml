@@ -43,6 +43,8 @@ postgres = { version = "0.19", features = ["with-serde_json-1"] }
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# `sslrootcert=system` for PostgreSQL: the operating system's CAs (src/pg.rs).
+rustls-native-certs = "0.8"
 bytes = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 # Time zones for `date` (src/dates.rs): the system's database, and a bundled
@@ -59,6 +61,10 @@ wtransport = { version = "0.7", optional = true, default-features = false, featu
 # `quillo app`: the program in a native window (see src/desktop.rs).
 wry = { version = "0.57", optional = true, features = ["devtools"] }
 tao = { version = "0.37", optional = true }
+
+[dev-dependencies]
+# Certificates for the tests of TLS to databases (tests/postgres.rs, tests/mysql.rs).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 # The macOS menu bar, without which copy and paste do not work in the window.
 [target.'cfg(target_os = "macos")'.dependencies]

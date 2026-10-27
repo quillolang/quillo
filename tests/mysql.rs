@@ -32,9 +32,15 @@ fn bin() -> Option<PathBuf> {
 }
 
 fn server() -> Option<Server> {
+    server_with("my", |_| Vec::new())
+}
+
+/// A server in a folder named from `name`, started with the options `more`
+/// gives from that folder.
+fn server_with(name: &str, more: impl FnOnce(&std::path::Path) -> Vec<String>) -> Option<Server> {
     let bin = bin()?;
     let port = std::net::TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok()?.port();
-    let dir = std::env::temp_dir().join(format!("quillo-my-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("quillo-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let ok = Command::new(bin.join("mariadb-install-db"))
@@ -45,6 +51,7 @@ fn server() -> Option<Server> {
         .status()
         .ok()?;
     assert!(ok.success(), "mariadb-install-db failed");
+    let more = more(&dir);
     let child = Command::new(bin.join("mariadbd"))
         .arg("--no-defaults")
         .arg(format!("--datadir={}", dir.join("data").display()))
@@ -54,6 +61,7 @@ fn server() -> Option<Server> {
         .arg(format!("--pid-file={}", dir.join("pid").display()))
         .arg(format!("--log-error={}", dir.join("err.log").display()))
         .arg("--skip-grant-tables")
+        .args(more)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -105,6 +113,71 @@ fn add(n) = db.transaction(() => {{
     });
     assert_eq!(eval(&mut it, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 102]");
     assert!(eval(&mut it, "db.exec(\"delete from _quillo_audit\")").contains("append-only"));
+}
+
+/// Certificates for a test of TLS, written to `dir`: `ca.pem`, a private
+/// CA; `other.pem`, a CA that signed nothing here; and `server.crt` and
+/// `server.key`, for `localhost` and `db.quillo.test`, signed by the first.
+fn certificates(dir: &std::path::Path) {
+    let ca = |name: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, name);
+        std::fs::write(dir.join(format!("{}.pem", name)), p.self_signed(&key).unwrap().pem()).unwrap();
+        rcgen::Issuer::new(p, key)
+    };
+    let ours = ca("ca");
+    ca("other");
+    let key = rcgen::KeyPair::generate().unwrap();
+    let p = rcgen::CertificateParams::new(vec!["localhost".to_string(), "db.quillo.test".to_string()]).unwrap();
+    std::fs::write(dir.join("server.crt"), p.signed_by(&key, &ours).unwrap().pem()).unwrap();
+    std::fs::write(dir.join("server.key"), key.serialize_pem()).unwrap();
+}
+
+/// A server with TLS and a private CA's certificate: what `ssl_ca`,
+/// `ssl_server_name` and `verify_ca` take and refuse.
+#[test]
+fn mysql_over_tls() {
+    let s = server_with("mytls", |dir| {
+        certificates(dir);
+        let f = |n: &str| dir.join(n).display().to_string();
+        vec![format!("--ssl-ca={}", f("ca.pem")), format!("--ssl-cert={}", f("server.crt")), format!("--ssl-key={}", f("server.key"))]
+    });
+    let Some(s) = s else {
+        eprintln!("skipping: no MariaDB server (mariadbd, mariadb-install-db) was found");
+        return;
+    };
+    let file = |f: &str| s.dir.join(f).display().to_string();
+    let cipher = "db.one(\"show session status like 'Ssl_cipher'\")";
+    // The cipher in use, or the error connecting.
+    let try_run = |url: String| -> Result<String, String> {
+        let src = format!("let o = db.open(\"{}\")\nlet r = is_err(o) ? o : {}\nis_err(r) ? \"error: \" + str(r.error) : r.Value", url, cipher);
+        let out = Interp::new(".").load_source(&src, "my.qwe").map(|v| v.display().to_string()).map_err(|e| e.to_string())?;
+        out.strip_prefix("error: ").map_or(Ok(out.clone()), |e| Err(e.to_string()))
+    };
+    let encrypted = |url: String| {
+        let c = try_run(url.clone()).unwrap_or_else(|e| panic!("{}: {}", url, e));
+        assert!(!c.is_empty(), "{}: not encrypted", url);
+    };
+    let fails = |url: String, what: &str| {
+        let e = try_run(url.clone()).expect_err(&url);
+        assert!(e.contains(what), "{}: {}", url, e);
+    };
+    let at = |host: &str, q: String| format!("mysql://root@{}:{}/mysql?{}", host, s.port, q);
+    // A CA of its own: TLS, the certificate checked against it, and its name.
+    encrypted(at("localhost", format!("ssl_ca={}", file("ca.pem"))));
+    fails(at("localhost", format!("ssl_ca={}", file("other.pem"))), "UnknownIssuer");
+    fails(at("127.0.0.1", format!("ssl_ca={}", file("ca.pem"))), "not valid for name");
+    // Connected to by address, checked for a name it is for.
+    encrypted(at("127.0.0.1", format!("ssl_ca={}&ssl_server_name=db.quillo.test", file("ca.pem"))));
+    fails(at("127.0.0.1", format!("ssl_ca={}&ssl_server_name=elsewhere.test", file("ca.pem"))), "not valid for name");
+    fails(at("127.0.0.1", format!("ssl_ca={}&ssl_server_name=db.quillo.test", file("other.pem"))), "UnknownIssuer");
+    // The usual public CAs do not know it; unchecked, any certificate goes.
+    fails(at("localhost", "require_ssl=true".into()), "UnknownIssuer");
+    encrypted(at("127.0.0.1", "require_ssl=true&verify_ca=false".into()));
+    // This machine, nothing said: no TLS.
+    assert_eq!(try_run(at("127.0.0.1", String::new())).unwrap(), "");
 }
 
 /// One server for every scenario.

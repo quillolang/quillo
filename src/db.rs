@@ -736,10 +736,11 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
         // Databases named around {tenant}: `app_{tenant}` in mysql://host/app_{tenant}.
         #[cfg(feature = "mysql")]
         {
-            let path = template.split('?').next().unwrap_or("");
+            let (path, query) = template.split_once('?').unwrap_or((&template, ""));
             let (server, db) = path.rsplit_once('/').unwrap_or((path, ""));
             let (pre, post) = db.split_once("{tenant}").map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
-            let server = format!("{}/", server);
+            // The URL's options (TLS's among them) are the server's too.
+            let server = if query.is_empty() { format!("{}/", server) } else { format!("{}/?{}", server, query) };
             match it.unlocked(move || crate::my::Pool::open_as(&server, false).and_then(|p| p.databases())) {
                 Ok(all) => names.extend(all.iter().filter_map(|d| d.strip_prefix(&pre).and_then(|r| r.strip_suffix(&post)).map(str::to_string))),
                 Err(e) => return Ok(db_err(e)),
@@ -751,7 +752,14 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
             return fail(line, "`db.tenants` lists PostgreSQL schemas (?schema=t_{tenant}), not databases");
         };
         let suffix: String = after.chars().take_while(|c| *c != '&').collect();
-        let base = template.split('?').next().unwrap_or("").to_string();
+        // The URL without the schema: its other options (TLS's among them) kept.
+        let base = match template.split_once('?') {
+            Some((base, query)) => {
+                let rest: Vec<&str> = query.split('&').filter(|p| !p.starts_with("schema=")).collect();
+                if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) }
+            }
+            None => template.clone(),
+        };
         let found = it.unlocked(move || -> Result<Vec<String>, String> {
             let pool = pg::Pool::open(&base)?;
             let mut c = pool.checkout()?;

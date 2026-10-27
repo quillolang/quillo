@@ -38,52 +38,40 @@ pub struct Conn {
 
 pub struct Pool {
     config: postgres::Config,
+    /// The same, for the connections requests share (`Lanes`).
+    async_config: tokio_postgres::Config,
     tls: tokio_postgres_rustls::MakeRustlsConnect,
     idle: Mutex<(Vec<Conn>, usize)>,
     freed: Condvar,
     max: usize,
-    url: String,
-    /// Quillo's `schema=` option: every connection's search_path.
-    schema: Option<String>,
     lanes: OnceLock<Arc<Lanes>>,
 }
 
-fn tls() -> tokio_postgres_rustls::MakeRustlsConnect {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("TLS protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tokio_postgres_rustls::MakeRustlsConnect::new(config)
-}
-
 impl Pool {
-    /// Parses the URL and opens one connection to check it. TLS is required
-    /// for a server on another machine, and used on this one when it offers
-    /// it, unless the URL says otherwise (`sslmode=disable`, `prefer` or
-    /// `require`); see `tls_unless_local`.
+    /// Parses the URL and opens one connection to check it. TLS is required,
+    /// and the server's certificate and name checked, for a server on
+    /// another machine; it is used on this one when the server offers it.
+    /// The URL can say otherwise as libpq's do (`sslmode`, `sslrootcert`,
+    /// `sslcert`, `sslkey`); see `Tls`.
     pub fn open(url: &str) -> Result<Pool, String> {
         Pool::open_as(url, true)
     }
 
     /// `open`; with `make` false, the schema (`?schema=`) must exist.
     pub fn open_as(url: &str, make: bool) -> Result<Pool, String> {
-        let (url, max, schema) = take_options(url)?;
-        let mut config: postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
-        tls_unless_local(&url, &mut config);
+        let Options { url, max, schema, tls } = take_options(url)?;
+        let mut config: tokio_postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        let tls = tls.settle(&mut config)?;
         if let Some(s) = &schema {
             config.options(&search_path(s));
         }
         let pool = Pool {
-            config,
-            tls: tls(),
+            config: config.clone().into(),
+            async_config: config,
+            tls,
             idle: Mutex::new((Vec::new(), 0)),
             freed: Condvar::new(),
             max,
-            url: url.clone(),
-            schema: schema.clone(),
             lanes: OnceLock::new(),
         };
         let mut first = pool.checkout()?;
@@ -134,12 +122,8 @@ impl Pool {
     pub fn lanes(&self) -> Arc<Lanes> {
         self.lanes
             .get_or_init(|| {
-                let mut config: tokio_postgres::Config = self.url.parse().expect("parsed before");
-                if let Some(s) = &self.schema {
-                    config.options(&search_path(s));
-                }
                 Arc::new(Lanes {
-                    config,
+                    config: self.async_config.clone(),
                     tls: self.tls.clone(),
                     slots: (0..self.max).map(|_| Mutex::new(None)).collect(),
                 })
@@ -159,8 +143,6 @@ impl Pool {
     }
 }
 
-/// The connection option that makes `schema` where tables are looked for
-/// and made.
 /// Whether a database host is this machine: the password and the data then
 /// cross no network that someone else could be on.
 pub(crate) fn local_host(host: &str) -> bool {
@@ -172,37 +154,32 @@ pub(crate) fn local_host(host: &str) -> bool {
         || h.parse::<std::net::IpAddr>().map_or(false, |a| a.is_loopback())
 }
 
-/// Postgres's own default, `sslmode=prefer`, sends the password in the
-/// clear to anyone in the middle who says it has no TLS. So for a server
-/// on another machine TLS is required (and its certificate checked, as
-/// rustls always does), unless the URL names an `sslmode` itself.
-fn tls_unless_local(url: &str, config: &mut postgres::Config) {
-    use postgres::config::Host;
-    let remote = config.get_hosts().iter().any(|h| match h {
-        Host::Tcp(name) => !local_host(name),
-        #[allow(unreachable_patterns)]
-        _ => false,
-    });
-    if remote && !url.contains("sslmode=") {
-        config.ssl_mode(postgres::config::SslMode::Require);
-    }
-}
-
+/// The connection option that makes `schema` where tables are looked for
+/// and made.
 fn search_path(schema: &str) -> String {
     format!("-c search_path=\"{}\"", schema)
 }
 
+/// A URL's options that are Quillo's, or that the driver does not read.
+struct Options {
+    url: String,
+    max: usize,
+    schema: Option<String>,
+    tls: Tls,
+}
+
 /// Takes Quillo's own options out of the URL: `pool_size`, and `schema`
-/// (`?schema={tenant}`: a schema per tenant in one database).
-fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
-    let Some((base, query)) = url.split_once('?') else { return Ok((url.to_string(), DEFAULT_POOL, None)) };
-    let mut max = DEFAULT_POOL;
-    let mut schema = None;
+/// (`?schema={tenant}`: a schema per tenant in one database); and those
+/// about TLS (see `Tls`), which the driver reads only in part.
+fn take_options(url: &str) -> Result<Options, String> {
+    let mut o = Options { url: url.to_string(), max: DEFAULT_POOL, schema: None, tls: Tls::default() };
+    let Some((base, query)) = url.split_once('?') else { return Ok(o) };
     let mut rest = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let value = || crate::server::percent_decode(pair.split_once('=').map_or("", |(_, v)| v), false);
         match pair.split_once('=') {
             Some(("pool_size", v)) => {
-                max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
+                o.max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
             }
             Some(("schema", v)) => {
                 if !crate::site::tenant_name_ok(v) {
@@ -213,13 +190,230 @@ fn take_options(url: &str) -> Result<(String, usize, Option<String>), String> {
                 if v == "public" || v == "information_schema" || v.starts_with("pg_") {
                     return Err(format!("the schema {:?} is Postgres's own; prefix tenants' (schema=t_{{tenant}})", v));
                 }
-                schema = Some(v.to_string());
+                o.schema = Some(v.to_string());
             }
+            Some(("sslmode", v)) => {
+                o.tls.mode = Some(match v {
+                    "disable" => SslMode::Disable,
+                    "prefer" => SslMode::Prefer,
+                    "require" => SslMode::Require,
+                    "verify-ca" => SslMode::VerifyCa,
+                    "verify-full" => SslMode::VerifyFull,
+                    _ => return Err(format!("bad sslmode: {:?} (disable, prefer, require, verify-ca or verify-full)", v)),
+                })
+            }
+            Some(("sslrootcert", _)) => o.tls.root = Some(value()),
+            Some(("sslcert", _)) => o.tls.cert = Some(value()),
+            Some(("sslkey", _)) => o.tls.key = Some(value()),
             _ => rest.push(pair),
         }
     }
-    let url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
-    Ok((url, max, schema))
+    o.url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
+    Ok(o)
+}
+
+// ---- TLS -----------------------------------------------------------------
+
+/// libpq's `sslmode`, less `allow` (plain first, which leaves the
+/// password to whoever answers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SslMode {
+    /// No TLS.
+    Disable,
+    /// TLS if the server offers it. Someone in the middle can say it does
+    /// not, so this is for servers on this machine.
+    Prefer,
+    /// TLS always, the certificate unchecked unless `sslrootcert` is given
+    /// (then as `VerifyCa`). Nobody can read the connection, but someone in
+    /// the middle can pose as the server.
+    Require,
+    /// TLS, with a certificate signed by a CA in `sslrootcert`, for any name.
+    VerifyCa,
+    /// TLS, with a certificate signed by a trusted CA, for the host's name.
+    VerifyFull,
+}
+
+/// What a URL says about TLS, as libpq reads it: `sslmode`; `sslrootcert`,
+/// a file of PEM certificates of the CAs to trust instead of the usual
+/// public ones (a cloud's own, or a company's), or `system` for the
+/// operating system's; and `sslcert` and `sslkey`, a certificate and its
+/// key for servers that ask for one.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Tls {
+    mode: Option<SslMode>,
+    root: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+/// How a server's certificate is checked.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Check {
+    Nothing,
+    Chain,
+    ChainAndName,
+}
+
+impl Tls {
+    /// The mode for these hosts. Postgres's own default, `prefer`, sends the
+    /// password in the clear to anyone in the middle who says the server has
+    /// no TLS; so for a server on another machine, TLS is required and its
+    /// certificate checked (`verify-full`) unless the URL says otherwise.
+    fn mode_for(&self, config: &tokio_postgres::Config) -> SslMode {
+        use tokio_postgres::config::Host;
+        let remote = config.get_hosts().iter().any(|h| match h {
+            Host::Tcp(name) => !local_host(name),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }) || config.get_hostaddrs().iter().any(|a| !a.is_loopback());
+        match self.mode {
+            Some(m) => m,
+            None if remote || self.root.as_deref() == Some("system") => SslMode::VerifyFull,
+            None => SslMode::Prefer,
+        }
+    }
+
+    /// What the certificate is checked for in `mode`. As libpq does, a root
+    /// certificate given makes `prefer` and `require` check the chain.
+    fn check(&self, mode: SslMode) -> Check {
+        match mode {
+            SslMode::VerifyFull => Check::ChainAndName,
+            SslMode::VerifyCa => Check::Chain,
+            SslMode::Prefer | SslMode::Require if self.root.is_some() => Check::Chain,
+            _ => Check::Nothing,
+        }
+    }
+
+    /// Sets the driver's mode in `config`, and makes the TLS connector.
+    fn settle(&self, config: &mut tokio_postgres::Config) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+        use tokio_postgres::config::SslMode as Driver;
+        let mode = self.mode_for(config);
+        config.ssl_mode(match mode {
+            SslMode::Disable => Driver::Disable,
+            SslMode::Prefer => Driver::Prefer,
+            _ => Driver::Require,
+        });
+        self.client_config(mode).map(tokio_postgres_rustls::MakeRustlsConnect::new)
+    }
+
+    fn client_config(&self, mode: SslMode) -> Result<rustls::ClientConfig, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(self.verifier(mode, provider)?);
+        match (&self.cert, &self.key) {
+            (None, None) => Ok(builder.with_no_client_auth()),
+            (Some(cert), Some(key)) => {
+                use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+                let chain = CertificateDer::pem_file_iter(cert)
+                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| format!("sslcert {}: {}", cert, e))?;
+                let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("sslkey {}: {}", key, e))?;
+                builder.with_client_auth_cert(chain, key).map_err(|e| format!("sslcert and sslkey: {}", e))
+            }
+            _ => Err("sslcert and sslkey go together: a certificate, and its key".into()),
+        }
+    }
+
+    /// What checks the server's certificate in `mode`.
+    fn verifier(&self, mode: SslMode, provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, String> {
+        let check = self.check(mode);
+        // libpq's rules, which keep a weak check from passing for a strong one.
+        if self.root.as_deref() == Some("system") && mode != SslMode::VerifyFull {
+            return Err(format!("sslrootcert=system needs sslmode=verify-full, not {:?}", mode));
+        }
+        if check == Check::Chain && self.root.is_none() {
+            return Err("sslmode=verify-ca needs sslrootcert, the CA certificates to check the server's against".into());
+        }
+        let algs = provider.signature_verification_algorithms;
+        Ok(match check {
+            Check::ChainAndName => rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(self.roots()?), provider)
+                .build()
+                .map_err(|e| e.to_string())?,
+            Check::Chain => Arc::new(Verifier { roots: Some(Arc::new(self.roots()?)), algs }),
+            Check::Nothing => Arc::new(Verifier { roots: None, algs }),
+        })
+    }
+
+    /// The CAs whose certificates are trusted: those in `sslrootcert`, the
+    /// system's, or the usual public ones.
+    fn roots(&self) -> Result<rustls::RootCertStore, String> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let mut roots = rustls::RootCertStore::empty();
+        match self.root.as_deref() {
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            Some("system") => {
+                let found = rustls_native_certs::load_native_certs();
+                roots.add_parsable_certificates(found.certs);
+                if roots.is_empty() {
+                    return Err(format!("sslrootcert=system: no CA certificates found on this system{}", found.errors.first().map(|e| format!(" ({})", e)).unwrap_or_default()));
+                }
+            }
+            Some(path) => {
+                let certs = CertificateDer::pem_file_iter(path)
+                    .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| format!("sslrootcert {}: {}", path, e))?;
+                for c in certs {
+                    roots.add(c).map_err(|e| format!("sslrootcert {}: {}", path, e))?;
+                }
+                if roots.is_empty() {
+                    return Err(format!("sslrootcert {}: no PEM certificates in it", path));
+                }
+            }
+        }
+        Ok(roots)
+    }
+}
+
+/// Checks a server's certificate for `verify-ca` (signed by one of `roots`,
+/// whatever name it is for), or not at all (`require` without a root
+/// certificate). Either way the server proves in the handshake that it
+/// holds the certificate's key.
+#[derive(Debug)]
+struct Verifier {
+    roots: Option<Arc<rustls::RootCertStore>>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Verifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(roots) = &self.roots {
+            let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+            rustls::client::verify_server_cert_signed_by_trust_anchor(&cert, roots, intermediates, now, self.algs.all)?;
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
 }
 
 /// The server's message for a database error, else the error itself.
@@ -238,6 +432,9 @@ fn describe(e: &postgres::Error) -> String {
             while let Some(inner) = src {
                 s.push_str(&format!(": {}", inner));
                 src = inner.source();
+            }
+            if s.contains("UnknownIssuer") {
+                s.push_str(" (the server's certificate is signed by a CA not among those trusted: give its CA's certificates with sslrootcert=/path/to/ca.pem)");
             }
             s
         }
@@ -1119,8 +1316,10 @@ mod tests {
         assert_eq!(date_text(9131), "2024-12-31");
         assert_eq!(time_text(3_723_000_001), "01:02:03.000001");
         assert_eq!(pg_text(&Value::list(vec![Value::Int(1), Value::str("a\"b"), Value::Nil])), "{\"1\",\"a\\\"b\",NULL}");
-        assert_eq!(take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap(), ("postgres://h/db?sslmode=require".into(), 3, None));
-        assert_eq!(take_options("postgres://h/db?schema=acme").unwrap(), ("postgres://h/db".into(), DEFAULT_POOL, Some("acme".into())));
+        let o = take_options("postgres://h/db?pool_size=3&sslmode=require").unwrap();
+        assert_eq!((o.url.as_str(), o.max, o.schema, o.tls.mode), ("postgres://h/db", 3, None, Some(SslMode::Require)));
+        let o = take_options("postgres://h/db?schema=acme").unwrap();
+        assert_eq!((o.url.as_str(), o.max, o.schema), ("postgres://h/db", DEFAULT_POOL, Some("acme".into())));
         assert!(take_options("postgres://h/db?schema=a;drop").is_err());
     }
 
@@ -1143,20 +1342,85 @@ mod tests {
 
     #[test]
     fn tls_is_required_for_a_server_on_another_machine() {
-        use postgres::config::SslMode;
         let mode = |url: &str| {
-            let mut c: postgres::Config = url.parse().unwrap();
-            tls_unless_local(url, &mut c);
-            c.get_ssl_mode()
+            let o = take_options(url).unwrap();
+            let c: tokio_postgres::Config = o.url.parse().unwrap();
+            o.tls.mode_for(&c)
         };
         // What the review saw: `prefer`, which someone in the middle can turn off.
-        assert_eq!(mode("postgres://u:p@db.example.com/app"), SslMode::Require);
-        assert_eq!(mode("postgres://u:p@10.0.0.5:5432/app"), SslMode::Require);
-        assert_eq!(mode("host=db.example.com user=u dbname=app"), SslMode::Require);
+        assert_eq!(mode("postgres://u:p@db.example.com/app"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@10.0.0.5:5432/app"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@db.example.com/app?hostaddr=127.0.0.1"), SslMode::VerifyFull);
+        assert_eq!(mode("postgres://u:p@localhost/app?hostaddr=10.0.0.5"), SslMode::VerifyFull);
         // Said in the URL: as it says. On this machine: Postgres's default.
         assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=disable"), SslMode::Disable);
-        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app", "host=/tmp user=u"] {
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=verify-ca&sslrootcert=/ca.pem"), SslMode::VerifyCa);
+        assert_eq!(mode("postgres://u:p@db.internal/app?sslmode=require"), SslMode::Require);
+        for local in ["postgres://u@localhost/app", "postgres://u@127.0.0.1:5432/app", "postgres://u@[::1]/app"] {
             assert_eq!(mode(local), SslMode::Prefer, "{}", local);
         }
+        // The operating system's CAs: only to check the server's name too.
+        assert_eq!(mode("postgres://u@localhost/app?sslrootcert=system"), SslMode::VerifyFull);
+        assert!(take_options("postgres://h/db?sslmode=allow").is_err());
+    }
+
+    #[test]
+    fn tls_options_leave_the_url_and_say_what_is_checked() {
+        let o = take_options("postgres://u@h/db?sslmode=verify-ca&sslrootcert=%2Fetc%2Fdb%20ca.pem&connect_timeout=5&sslcert=/c.pem&sslkey=/k.pem").unwrap();
+        assert_eq!(o.url, "postgres://u@h/db?connect_timeout=5");
+        assert_eq!(o.tls, Tls { mode: Some(SslMode::VerifyCa), root: Some("/etc/db ca.pem".into()), cert: Some("/c.pem".into()), key: Some("/k.pem".into()) });
+        let t = |root: Option<&str>| Tls { root: root.map(str::to_string), ..Tls::default() };
+        assert_eq!(t(None).check(SslMode::VerifyFull), Check::ChainAndName);
+        assert_eq!(t(None).check(SslMode::Require), Check::Nothing);
+        assert_eq!(t(None).check(SslMode::Prefer), Check::Nothing);
+        // libpq's: a root certificate given makes `require` check the chain.
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::Require), Check::Chain);
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::VerifyCa), Check::Chain);
+        assert_eq!(t(Some("/ca.pem")).check(SslMode::Disable), Check::Nothing);
+        let err = |tls: Tls, mode| tls.client_config(mode).err().unwrap_or_default();
+        assert!(err(t(None), SslMode::VerifyCa).contains("needs sslrootcert"));
+        assert!(err(t(Some("system")), SslMode::Require).contains("needs sslmode=verify-full"));
+        assert!(err(t(Some("/no/such/ca.pem")), SslMode::VerifyFull).contains("sslrootcert /no/such/ca.pem"));
+        assert!(err(Tls { cert: Some("/c.pem".into()), ..Tls::default() }, SslMode::Require).contains("go together"));
+        assert!(t(None).client_config(SslMode::VerifyFull).is_ok());
+        assert!(t(None).client_config(SslMode::Require).is_ok());
+    }
+
+    /// The certificates a server could present, checked as each mode does
+    /// (the verifier the connection would use, without a server).
+    #[test]
+    fn certificates_are_checked_as_the_mode_says() {
+        use rustls::pki_types::{ServerName, UnixTime};
+        let dir = std::env::temp_dir().join(format!("quillo-pg-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            p.distinguished_name.push(rcgen::DnType::CommonName, name);
+            let cert = p.self_signed(&key).unwrap();
+            std::fs::write(dir.join(format!("{}.pem", name)), cert.pem()).unwrap();
+            rcgen::Issuer::new(p, key)
+        };
+        let ours = ca("ours");
+        let _theirs = ca("theirs");
+        let server = rcgen::CertificateParams::new(vec!["db.example.internal".to_string()]).unwrap().signed_by(&rcgen::KeyPair::generate().unwrap(), &ours).unwrap();
+        let der = server.der().clone();
+        let check = |tls: &Tls, mode: SslMode, host: &str| {
+            let v = tls.verifier(mode, Arc::new(rustls::crypto::ring::default_provider())).unwrap();
+            v.verify_server_cert(&der, &[], &ServerName::try_from(host.to_string()).unwrap(), &[], UnixTime::now()).is_ok()
+        };
+        let ok = |root: &str, mode: SslMode, host: &str| check(&Tls { root: Some(dir.join(root).to_str().unwrap().to_string()), ..Tls::default() }, mode, host);
+        assert!(ok("ours.pem", SslMode::VerifyFull, "db.example.internal"));
+        assert!(!ok("ours.pem", SslMode::VerifyFull, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::VerifyFull, "db.example.internal"));
+        assert!(ok("ours.pem", SslMode::VerifyCa, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::VerifyCa, "10.0.0.5"));
+        assert!(!ok("theirs.pem", SslMode::Require, "db.example.internal"));
+        // Without a root certificate, `require` takes any.
+        assert!(check(&Tls::default(), SslMode::Require, "x"));
+        // And the usual public CAs do not know a private one's.
+        assert!(!check(&Tls::default(), SslMode::VerifyFull, "db.example.internal"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
