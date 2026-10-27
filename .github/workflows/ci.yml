@@ -22,6 +22,20 @@ jobs:
       - name: Check the sample app and the test programs
         run: for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 
+  # scripts/doctor.ps1, run as a Windows user would: in Windows PowerShell 5.1,
+  # then the check alone in PowerShell 7.
+  doctor-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The environment check, and the sample app it runs
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
+      - name: The check in PowerShell 7
+        shell: pwsh
+        run: ./scripts/doctor.ps1
+
   # `quillo app` (the native window) builds on each desktop platform.
   app:
     strategy:

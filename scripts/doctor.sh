@@ -5,8 +5,7 @@
 #   sh scripts/doctor.sh            check the tools (a few seconds)
 #   sh scripts/doctor.sh --build    then build quillo and run the sample app
 #
-# macOS and Linux (and WSL). On Windows itself, Quillo needs Rust from
-# rustup.rs with the MSVC build tools it offers to install.
+# macOS and Linux (and WSL). On Windows, scripts/doctor.ps1 does the same.
 #
 # The optional tools are looked for where the tests look for them, and the
 # same variables point at them: QUILLO_CHROME, QUILLO_TEST_PG_BIN,

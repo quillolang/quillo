@@ -201,6 +201,12 @@ sh scripts/doctor.sh            # add --build to also build and run the sample a
 cargo build --release
 ```
 
+On Windows, in PowerShell, the check is `scripts\doctor.ps1`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
+```
+
 Run the sample app in [`app/`](app), then check it without running it:
 
 ```sh
@@ -234,7 +240,7 @@ diagnostics, completion, go to definition and debugging.
 |---|---|
 | [`src/`](src) | The `quillo` binary: interpreter, number compiler, HTTP server, checker, component compiler, database drivers, language server and debug adapter |
 | [`app/`](app) | A sample app to start from: several files, migrations, CSS, JavaScript and an icon |
-| [`scripts/doctor.sh`](scripts/doctor.sh) | Checks that a machine can build and run Quillo |
+| [`scripts/`](scripts) | `doctor.sh` (macOS, Linux) and `doctor.ps1` (Windows): check that a machine can build and run Quillo |
 | [`tests/`](tests) | Integration and browser tests; [`tests/programs`](tests/programs) holds the programs they run |
 
 Everything else has a repository of its own:
