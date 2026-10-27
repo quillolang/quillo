@@ -145,3 +145,111 @@ view cache. Next, by expected gain:
       about `||`, `&&`, `!`, `if` and `? :` only where a value is known to be
       a string or a number. Callbacks such as `filter((x) => x.name)` and
       untyped parameters are not covered.
+
+## Banking and finance
+
+What a bank's or a fintech's review would stop on first. Money is only `int`
+and `float` today: a PostgreSQL `NUMERIC` or MySQL `DECIMAL` column comes back
+as a float (`src/pg.rs` `numeric`, `src/my.rs`), so sums of prices drift by
+fractions of a cent, and ints past 2^53 are rounded in the browser.
+
+First, since their own review would find them:
+
+- [ ] **The open findings of `SECURITY_REVIEW.md`.** C1 (`run_script` reaches
+      the program's globals through `"x".env`) and H1 (`dechunk`'s
+      `body.len() + size` overflows) are still in the code. Then H2 to H4 and
+      the M items, in the order the review gives.
+
+Numbers:
+
+- [ ] **A decimal type, `dec`.** Exact base-10 numbers: a literal, `+ - *`
+      exact, `/` and `round(x, 2, "half_even")` with a stated rounding mode,
+      `dec` and `int` compared exactly, and `dec` with `float` an error rather
+      than a silent float. An i128 with a scale (28 digits, as C#'s decimal)
+      covers money without a big-number library.
+- [ ] **Decimals from and to databases.** `NUMERIC` and `DECIMAL` come back as
+      `dec` and are written back exactly; SQLite keeps them as text.
+- [ ] **Decimals in JSON and in the browser.** JSON gives them as strings
+      (`"12.50"`); route and record patterns take `dec` from strings and
+      numbers. The browser runtime needs its own decimal (over `BigInt`), and
+      ints past 2^53 must reach a page whole, not rounded.
+- [ ] **The checker and the JIT.** `dec` as a type in `quillo check`, with a
+      warning where a float meets one; compiled numeric functions leave `dec`
+      to the interpreter.
+- [ ] **Money.** An amount with its currency and the currency's minor units
+      (ISO 4217: JPY 0, USD 2, BHD 3). Adding two currencies is an error,
+      `money.allocate(total, [1, 1, 1])` splits without losing a cent, and
+      amounts are formatted by locale (`1.234,50 €`) through translations.
+
+Dates:
+
+- [ ] **Dates and times.** Only `now()` (an int) exists. Finance needs dates
+      without times (value dates), time zones, adding months (31 January plus
+      a month), day counts (30/360, ACT/365) and business days with a holiday
+      calendar.
+
+Correct under retries and load:
+
+- [ ] **Idempotency keys.** A route or server fn that takes an
+      `Idempotency-Key` and answers a retry with the first answer, kept in a
+      Quillo table, so a payment retried after a timeout is made once.
+- [ ] **Isolation levels.** `db.transaction` uses the database's default;
+      `db.transaction({ isolation: "serializable", retries: 3 }, ...)` would
+      retry on serialization failures. Document `select ... for update` for
+      balances.
+- [ ] **A ledger example.** Double-entry accounts and postings in
+      `examples/ledger.qwe`, and a test that runs transfers concurrently and
+      checks that every balance still sums to zero.
+
+Compliance:
+
+- [ ] **An audit log.** Who did what, when and from where; append-only, each
+      row hashing the one before, written in the same transaction as the
+      change.
+- [ ] **Encrypted fields.** `crypto.encrypt` and `crypto.decrypt` (AES-GCM),
+      with keys from the environment or a KMS; with encrypted sessions (see
+      Production).
+- [ ] **Account and card numbers kept out of logs.** A way to mark fields so
+      logs, error pages and metrics mask them.
+- [ ] **Webhook signatures.** `crypto.hmac` exists; a helper that checks a
+      timestamped signature (Stripe's form and similar) with a tolerance, in
+      constant time.
+
+## SOC 2
+
+SOC 2 is an audit of an organisation, not of a language: what Quillo can do is
+give the apps built with it (the CRM first) the controls an auditor looks for,
+and keep its own development to the standard an auditor of those apps will ask
+about. Several items above count here too: the audit log, encrypted fields,
+masked logs, and the open security review.
+
+In the runtime:
+
+- [ ] **Sessions that can be ended.** Signed cookies cannot be revoked: a
+      session id kept in a Quillo table, so that logging out, an admin, or a
+      password change ends it everywhere; an idle timeout beside the absolute
+      one; a new id on login; `__Host-` cookies (review L3).
+- [ ] **A second factor.** `crypto.totp` and its check (RFC 6238, with a
+      window), recovery codes, and the CRM asking for it.
+- [ ] **Rate limits.** `rate_limit(key, n, per)` for routes and server fns,
+      shared across servers through limer, and lockout after repeated failed
+      logins.
+- [ ] **Security headers by default.** `Strict-Transport-Security` over HTTPS,
+      `Referrer-Policy`, `frame-ancestors` (or `X-Frame-Options`), and a
+      Content-Security-Policy with a nonce per response (review L10).
+- [ ] **TLS to databases by default** for hosts other than localhost (review L12).
+- [ ] **Logs an auditor can use.** JSON lines with time, request id, user,
+      tenant and outcome; sent to a file or a collector; kept for a set time.
+- [ ] **Backups.** `db.backup(path)` for SQLite (its online backup API), on a
+      schedule, and a documented restore that is tested.
+- [ ] **The review's Low findings** (L1 to L16), each fixed or written down as
+      accepted with a reason.
+
+For the project:
+
+- [ ] **`SECURITY.md`**: how to report a vulnerability, and what happens then.
+- [ ] **Dependencies checked in CI** (`cargo deny`: advisories, licences,
+      sources), and Dependabot for Cargo, npm and GitHub Actions.
+- [ ] **A controls guide**: which of the Trust Services Criteria Quillo's
+      features help an app meet (access, change management, monitoring,
+      encryption, availability), and what stays the operator's to do.
