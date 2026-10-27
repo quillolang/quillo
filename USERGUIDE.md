@@ -11,7 +11,7 @@ cargo build --release
 ./target/release/quillo run app/main.qwe --watch        # the sample app: http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
-./target/release/quillo repl
+./target/release/quillo repl                             # try code line by line
 ./target/release/quillo lsp                              # language server (for editors)
 ./target/release/quillo dap                              # debugger (for editors)
 cargo test
@@ -1333,6 +1333,9 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   track; else over the WebSocket. The server keeps the video since the last keyframe, so
   a page that starts watching shows a picture at once. A page that falls behind skips
   to the next keyframe, and so does a stream that lost a packet of video.
+- A connection that drops is opened again (after half a second, then longer, up to 15
+  seconds) and the page goes on watching, as a page that starts does. With no frames for 3
+  seconds (the camera stopped, the connection is down), `data-state` is `waiting`.
 - `media.streams()` gives each stream's viewers and, per track, `frames`, `fps`, `kbps`
   and `lost` packets.
 - Audio and video are each played as they come, so they are in step within about a
@@ -2121,6 +2124,10 @@ db.atomic([db, ledger], () => {
 })
 ```
 
+- The list names the databases that take part: `db`, connections from `db.connect`, a
+  shard (`users.on(id)`), or shards whole (`users`: each of them). A database the
+  function uses that is not in the list is not part of it: its writes stay when the
+  rest rolls back.
 - It commits in two phases: each PostgreSQL and MySQL database prepares its part
   (prepared transactions, XA), the decision to commit is recorded with Quillo's own
   tables, a SQLite database (one at most) commits, and the prepared parts commit. A part
@@ -2350,6 +2357,34 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
   `--no-jobs` turns them off on a server. For a database per tenant, loop over your
   tenants inside the job with `with_tenant(name, () => ...)`.
 
+### The REPL
+
+`quillo repl` (or `quillo` alone) runs code as you type it, and prints each expression's
+value:
+
+```
+quillo> let xs = [1, 2, 3]
+quillo> xs | map((x) => x * 10)
+[10, 20, 30]
+quillo> fn double(n) {
+....>   return n * 2
+....> }
+quillo> double(21)
+42
+quillo> db.open("app.db")
+quillo> db.query("select * from notes")
+[{ id: 1, text: "first" }]
+```
+
+- What a line defines (`let`, `fn`, assignments, `use "lib.qwe"`) stays for the lines
+  after it. A statement left open (a `{` not yet closed) goes on to the next line, shown
+  by `....>`.
+- It runs from the folder it was started in: `use`, `db.open` and `read_file` paths are
+  from there. `db.open` (or `db.connect`) gives it a database, as in a program.
+- An error stops the rest of its line; what came before it stays. The static checks do
+  not run here (`quillo check` runs them on a file), and routes declared here are not
+  served. Ctrl-D exits.
+
 ### Debugging
 
 `quillo dap` is a debugger for editors: it speaks the Debug Adapter Protocol on stdin and
@@ -2408,6 +2443,23 @@ with the `.qwe` source beside them, and a variable a statement declares carries 
 (`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
 value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
 production a page's bundle is one minified file, as before.
+
+#### Other editors
+
+Any editor with a Debug Adapter Protocol client (Neovim's nvim-dap, Helix, Emacs's
+dape, Zed) can use `quillo dap` as an adapter it starts itself: the command `quillo`,
+the argument `dap`, messages on stdin and stdout. A `launch` request takes:
+
+| Argument | |
+|---|---|
+| `program` | the `.qwe` file to run (required) |
+| `args` | its `quillo run` options (`["--port", "8080"]`) |
+| `cwd` | the folder to run in |
+| `stopOnEntry` | stop at the first statement |
+| `noDebug` | run without stopping at breakpoints |
+
+`attach` is not supported yet: the debugger starts the program itself. `browser` and
+`url` are the VS Code extension's; elsewhere, open the page in a browser yourself.
 
 ### Logs and metrics
 
