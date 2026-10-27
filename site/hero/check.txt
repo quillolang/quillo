@@ -1,0 +1,13 @@
+use "lib/money.qwe"
+
+fn total(items: list) -> int = items | map((i) => i.cents) | sum()
+
+route GET /cart = {
+    total: price(totl([])),
+    label: price("free"),
+}
+---
+$ quillo check app.qwe
+app.qwe:6: error: unknown name `totl` (did you mean `total`?)
+app.qwe:7: error: argument `cents` of `price` must be int, got str
+quillo: 2 errors

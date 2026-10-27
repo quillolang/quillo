@@ -11,7 +11,7 @@ use "demos/reactivity/branch.qwe"
 use "demos/reactivity/props.qwe"
 
 let GROUPS = [
-    { name: "Guide", pages: ["introduction", "language-tour", "components", "reactivity", "async", "routes", "realtime", "prefetching", "validation", "database", "microservices", "rust"] },
+    { name: "Guide", pages: ["introduction", "language-tour", "components", "reactivity", "async", "routes", "realtime", "prefetching", "validation", "database", "structure", "microservices", "rust"] },
     { name: "Reference", pages: ["standard-library", "checking", "concurrency-and-reloading", "cached-views", "compiled-numbers"] },
     { name: "Examples", pages: ["examples", "examples/hello", "examples/orders", "examples/todo",
         "examples/notes", "examples/compose", "examples/layout", "examples/spa", "examples/scroll",
@@ -53,7 +53,7 @@ fn page_url(s: str) = s == "introduction" ? "/docs/" : `/docs/${s}/`
 
 // Pages written for the site rather than cut from the README: guides/<slug>.md,
 // a `# ` title, then headings and code as the README has them.
-let GUIDES = ["reactivity", "async", "realtime", "prefetching", "validation", "database", "microservices"]
+let GUIDES = ["reactivity", "async", "realtime", "prefetching", "validation", "database", "structure", "microservices"]
 
 fn guide(s: str) {
     let lines = split(read_file(`guides/${s}.md`), "\n")

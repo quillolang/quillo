@@ -1,0 +1,20 @@
+fn problem(field: str, text: str) = [{ field, text }]
+
+fn check_signup(s: map) =
+    (contains(s.email, "@") ? [] : problem("email", "Not an email"))
+    + (trim(s.name) != "" ? [] : problem("name", "Name, please"))
+
+component Signup() {
+    state email = ""
+    state name = ""
+    let problems = check_signup({ email, name })    // as you type
+    <form @submit={() => { sign_up({ email, name }) }}>
+        <input bind:value={email}/> <input bind:value={name}/>
+        <ul>{for p in problems => <li>{p.text}</li>}</ul>
+    </form>
+}
+
+server fn sign_up(s: map) -> map ! list {
+    let problems = check_signup(s)                  // and it decides
+    len(problems) > 0 ? err(problems) : s
+}

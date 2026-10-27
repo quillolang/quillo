@@ -1,0 +1,8 @@
+$ ls
+data  lib  main.qwe  migrations  ui
+$ quillo run main.qwe --watch --port 4321
+quillo: applied migration 001_orders.sql
+quillo: 1 route listening on http://127.0.0.1:4321
+quillo: watching for changes
+
+# no package.json, no node_modules, no bundler, no build step

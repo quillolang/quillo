@@ -476,6 +476,18 @@ impl Interp {
                 body: js.as_bytes().to_vec(),
             };
         }
+        // In development, the files a page's bundle loads (see `client::DEV`).
+        if let Some((hash, file)) = rest.strip_prefix("src/").and_then(|r| r.split_once('/')) {
+            let file = percent_decode(file, false);
+            return match crate::client::dev_file(hash, &file) {
+                Some(js) => HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "no-cache".into())],
+                    body: js.into_bytes(),
+                },
+                None => plain(404, "not found\n"),
+            };
+        }
         if rest == "media.js" {
             return HttpResponse {
                 status: 200,

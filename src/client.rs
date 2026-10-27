@@ -25,6 +25,11 @@ use std::sync::Arc;
 
 const RUNTIME: &str = include_str!("client/runtime.js");
 
+/// Development (`--watch`, the debugger): a page's bundle is a loader for
+/// the runtime and each component, view and function in a file of its own,
+/// named after the `.qwe` file it is in, with a source map to its lines.
+pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
     "print", "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
@@ -58,6 +63,9 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
     for (name, _) in &names {
         c.global(name, 0)?;
     }
+    if c.dev {
+        return Ok(dev::bundle(it, &c, !names.is_empty()));
+    }
     let mut program = String::new();
     if !it.base.is_empty() {
         let _ = writeln!(program, "BASE = {};", js_str(&it.base));
@@ -83,6 +91,349 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
         );
     }
     Ok(assemble("(function () {", &program, "})();"))
+}
+
+/// Where a statement's line is written into compiled code in development:
+/// `\u{1}12\u{1}`. Strings in compiled code are JSON, so the character is
+/// never in them as it is.
+const MARK: char = '\u{1}';
+
+/// Development bundles (see `DEV`): the runtime as it is written, the
+/// program's pieces in files of their own, and a loader that adds them to
+/// the page in order. They are plain scripts, not modules or closures, so
+/// the names the runtime declares are seen by every file after it.
+mod dev {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The files of the bundles made, by their hash: path → script.
+    static FILES: Mutex<Option<HashMap<String, Arc<HashMap<String, String>>>>> = Mutex::new(None);
+
+    /// A file of a development bundle (`/_quillo/src/<hash>/<path>`).
+    pub fn file(hash: &str, path: &str) -> Option<String> {
+        FILES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(hash)?.get(path).cloned()
+    }
+
+    /// A file being made: its path and code (with line marks), and where
+    /// the code comes from.
+    struct Piece {
+        path: String,
+        code: String,
+        source: Option<Arc<str>>,
+    }
+
+    pub fn bundle(it: &Interp, c: &Compiler, boots: bool) -> String {
+        let mut pieces: Vec<Piece> = Vec::new();
+        let mut prelude = String::new();
+        if !it.base.is_empty() {
+            let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
+        }
+        for b in &c.blocks {
+            prelude.push_str(b);
+            prelude.push('\n');
+        }
+        pieces.push(Piece { path: "program.js".into(), code: prelude, source: None });
+        let base = std::fs::canonicalize(&*it.base_dir).unwrap_or_else(|_| it.base_dir.to_path_buf());
+        // Each function the program wrote, in a file of its own (in the order
+        // they were compiled, which is the order they need); what else the
+        // program defines goes in files between them.
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        for d in &c.defs {
+            let def = defined(d).and_then(|n| match lookup(&it.globals, &n) {
+                Some(Value::Func(f)) if f.def.file.is_some() && !f.def.server => Some((n, f.def.clone())),
+                _ => None,
+            });
+            match def {
+                Some((name, def)) => {
+                    let file = def.file.clone().unwrap();
+                    let rel = std::path::Path::new(&*file).strip_prefix(&base).map(|p| p.to_path_buf()).unwrap_or_else(|_| {
+                        std::path::Path::new(&*file).file_name().map(std::path::PathBuf::from).unwrap_or_default()
+                    });
+                    let path = format!("{}/{}.js", url_path(&rel.to_string_lossy()), url_path(&name));
+                    by_name.insert(name, pieces.len());
+                    pieces.push(Piece { path, code: format!("{}\n", d), source: Some(file) });
+                }
+                None => match pieces.last_mut() {
+                    Some(p) if p.source.is_none() => {
+                        p.code.push_str(d);
+                        p.code.push('\n');
+                    }
+                    _ => {
+                        let n = pieces.len();
+                        pieces.push(Piece { path: format!("program-{}.js", n), code: format!("{}\n", d), source: None });
+                    }
+                },
+            }
+        }
+        // A view's `<Name/>` form goes with it.
+        for v in &c.view_defs {
+            let at = v.strip_prefix("W.view(").and_then(defined).and_then(|n| by_name.get(&n).copied());
+            match at {
+                Some(i) => {
+                    pieces[i].code.push_str(v);
+                    pieces[i].code.push('\n');
+                }
+                None => {
+                    let n = pieces.len();
+                    pieces.push(Piece { path: format!("program-{}.js", n), code: format!("{}\n", v), source: None });
+                }
+            }
+        }
+        let mut boot = String::new();
+        if !it.server_fns.is_empty() {
+            boot.push_str("const server = {};\n");
+            for name in it.server_fns.iter() {
+                let _ = writeln!(boot, "server[{}] = W.server({});", js_str(name), js_str(name));
+            }
+            boot.push_str("window.quillo = { server, components: C, rpc };\n");
+        }
+        if boots {
+            boot.push_str("if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n");
+        }
+        pieces.push(Piece { path: "boot.js".into(), code: boot, source: None });
+
+        let mut files: HashMap<String, String> = HashMap::new();
+        let mut order = vec!["quillo.js".to_string()];
+        files.insert("quillo.js".into(), RUNTIME.to_string());
+        let mut sources: HashMap<Arc<str>, Option<String>> = HashMap::new();
+        for p in pieces {
+            if p.code.trim().is_empty() {
+                continue;
+            }
+            let text = match &p.source {
+                Some(src) => {
+                    let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok()).clone();
+                    with_map(&p.code, src, content.as_deref())
+                }
+                None => format!("\"use strict\";\n{}", p.code.replace(MARK, "")),
+            };
+            order.push(p.path.clone());
+            files.insert(p.path, text);
+        }
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for f in &order {
+                f.hash(&mut h);
+                files[f].hash(&mut h);
+            }
+            format!("{:016x}", h.finish())
+        };
+        {
+            let mut all = FILES.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(HashMap::new);
+            // Bundles from long-gone versions of the program.
+            if all.len() > 256 {
+                all.clear();
+            }
+            all.insert(hash.clone(), Arc::new(files));
+        }
+        let list: Vec<String> = order.iter().map(|f| js_str(f)).collect();
+        format!(
+            "// Quillo in development: the runtime, and each component, view and function in a file\n\
+             // of its own, with a source map to the .qwe file it is in.\n\
+             (function () {{\n\
+             const at = {};\n\
+             for (const f of [{}]) {{\n\
+             const s = document.createElement(\"script\");\n\
+             s.src = at + f;\n\
+             s.async = false;\n\
+             document.head.appendChild(s);\n\
+             }}\n\
+             }})();\n",
+            js_str(&format!("{}/_quillo/src/{}/", it.base, hash)),
+            list.join(", ")
+        )
+    }
+
+    /// The global `G["name"] = ...` defines, if it is one.
+    fn defined(code: &str) -> Option<String> {
+        let rest = code.strip_prefix("G[")?;
+        let end = rest.find("]")?;
+        serde_json::from_str::<String>(&rest[..end]).ok()
+    }
+
+    /// A path as it goes in a URL: what is not plain is %-escaped.
+    fn url_path(p: &str) -> String {
+        let mut out = String::new();
+        for b in p.replace('\\', "/").bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+        out
+    }
+
+    /// `code` without its line marks, and a source map (inline) from each
+    /// mark's place to the line of `source` it names.
+    fn with_map(code: &str, source: &str, content: Option<&str>) -> String {
+        let (mut out, map) = mapped(code, source, content);
+        let _ = write!(out, "//# sourceMappingURL=data:application/json;charset=utf-8;base64,{}\n", crate::ws::base64(map.to_string().as_bytes()));
+        out
+    }
+
+    fn mapped(code: &str, source: &str, content: Option<&str>) -> (String, serde_json::Value) {
+        let mut out = String::from("\"use strict\";\n");
+        // One line of the map per line of the file: (column, source line, name).
+        let mut lines: Vec<Vec<(usize, u32, Option<usize>)>> = vec![Vec::new()];
+        let mut names: Vec<String> = Vec::new();
+        for line in code.lines() {
+            let mut marks: Vec<(usize, u32)> = Vec::new();
+            let mut text = String::new();
+            let mut parts = line.split(MARK);
+            text.push_str(parts.next().unwrap_or(""));
+            while let (Some(n), Some(after)) = (parts.next(), parts.next()) {
+                if let Ok(n) = n.parse::<u32>() {
+                    let col = text.encode_utf16().count();
+                    if marks.last().map_or(true, |&(c, _)| c != col) {
+                        marks.push((col, n));
+                    }
+                }
+                text.push_str(after);
+            }
+            // The program's own names (`$count_1` is `count`), for debuggers that
+            // show variables by the names the source gave them; on lines that
+            // come from a statement (others would gain a line they are not on).
+            let mut segs: Vec<(usize, u32, Option<usize>)> = marks.iter().map(|&(c, l)| (c, l, None)).collect();
+            for (col, name) in own_names(&text) {
+                let at = marks.iter().rev().find(|&&(c, _)| c <= col).map(|&(_, l)| l);
+                if let Some(l) = at {
+                    let i = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                        names.push(name);
+                        names.len() - 1
+                    });
+                    segs.push((col, l, Some(i)));
+                }
+            }
+            segs.sort_by_key(|s| s.0);
+            segs.dedup_by_key(|s| s.0);
+            out.push_str(&text);
+            out.push('\n');
+            lines.push(segs);
+        }
+        let mut mappings = String::new();
+        let (mut src_line, mut src_col, mut name) = (0i64, 0i64, 0i64);
+        for (i, segs) in lines.iter().enumerate() {
+            if i > 0 {
+                mappings.push(';');
+            }
+            let mut gen_col = 0i64;
+            for (j, &(col, line, n)) in segs.iter().enumerate() {
+                if j > 0 {
+                    mappings.push(',');
+                }
+                vlq(col as i64 - gen_col, &mut mappings);
+                vlq(0, &mut mappings);
+                vlq(line as i64 - 1 - src_line, &mut mappings);
+                vlq(0 - src_col, &mut mappings);
+                if let Some(n) = n {
+                    vlq(n as i64 - name, &mut mappings);
+                    name = n as i64;
+                }
+                gen_col = col as i64;
+                src_line = line as i64 - 1;
+                src_col = 0;
+            }
+        }
+        let url = format!("file://{}", url_path(source));
+        let map = serde_json::json!({
+            "version": 3,
+            "sources": [url],
+            "sourcesContent": [content],
+            "names": names,
+            "mappings": mappings,
+        });
+        (out, map)
+    }
+
+    /// Where compiled code declares the program's variables: `const $count_1`
+    /// (named by `fresh`), as (UTF-16 column, `count`). Only declarations: a
+    /// breakpoint on a name elsewhere in a statement could be moved by the
+    /// browser to the next one.
+    fn own_names(line: &str) -> Vec<(usize, String)> {
+        let b = line.as_bytes();
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'$' && (i == 0 || !word(b[i - 1])) {
+                let start = i;
+                i += 1;
+                while i < b.len() && word(b[i]) && b[i] != b'$' {
+                    i += 1;
+                }
+                let w = &line[start + 1..i];
+                let declared = ["const ", "let "].iter().any(|k| line[..start].ends_with(k));
+                if let (Some((name, n)), true) = (w.rsplit_once('_'), declared) {
+                    if !name.is_empty() && !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) {
+                        out.push((line[..start].encode_utf16().count(), name.to_string()));
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// A source map number: base64 digits of 5 bits each, the sign last.
+    fn vlq(n: i64, out: &mut String) {
+        const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut v = if n < 0 { ((-n) << 1) | 1 } else { n << 1 } as u64;
+        loop {
+            let mut d = (v & 31) as usize;
+            v >>= 5;
+            if v > 0 {
+                d |= 32;
+            }
+            out.push(DIGITS[d] as char);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn numbers_in_source_maps() {
+            let mut s = String::new();
+            for n in [0, 1, -1, 15, 16, -16, 1000] {
+                vlq(n, &mut s);
+                s.push(' ');
+            }
+            assert_eq!(s, "A C D e gB hB w+B ");
+        }
+
+        #[test]
+        fn marks_become_a_map() {
+            let code = format!("{m}3{m}const a = 1;\nfoo();\nif (x) {m}5{m}b(); {m}6{m}c();\n", m = MARK);
+            let (out, map) = mapped(&code, "/app/main.qwe", None);
+            assert_eq!(out, "\"use strict\";\nconst a = 1;\nfoo();\nif (x) b(); c();\n");
+            // Line 2 (after "use strict") col 0 → source line 3 (index 2); line 4: col 7 → 5, col 12 → 6.
+            assert_eq!(map["mappings"], ";AAEA;;OAEA,KACA");
+            assert_eq!(map["sources"][0], "file:///app/main.qwe");
+        }
+
+        #[test]
+        fn variables_keep_their_names() {
+            assert_eq!(own_names("const $count_1 = $i.sig(\"count\", () => $p.start + $my_total_12.v);"), vec![(6, "count".to_string())]);
+            assert_eq!(own_names("let $my_total_12 = 0;"), vec![(4, "my_total".to_string())]);
+            let code = format!("{m}2{m}const $count_1 = 0;\n{m}3{m}f($count_1);\n", m = MARK);
+            let (_, map) = mapped(&code, "/a.qwe", None);
+            assert_eq!(map["names"], serde_json::json!(["count"]));
+            assert_eq!(map["mappings"], ";AACA,MAAAA;AACA");
+        }
+    }
+}
+
+/// A file of a development bundle (see `DEV`).
+pub fn dev_file(hash: &str, path: &str) -> Option<String> {
+    dev::file(hash, path)
 }
 
 /// The script pages with `<quillo-media>` load: the player and the
@@ -331,6 +682,8 @@ struct Compiler<'a> {
     what: String,
     /// The program's own types whose shapes are in the bundle (`W.type`).
     types: HashSet<String>,
+    /// Whether statements are marked with the line they come from (see `DEV`).
+    dev: bool,
 }
 
 fn js_str(s: &str) -> String {
@@ -675,6 +1028,7 @@ impl<'a> Compiler<'a> {
             line: 0,
             what: String::new(),
             types: HashSet::new(),
+            dev: DEV.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1272,7 +1626,12 @@ impl<'a> Compiler<'a> {
         let mut body = String::new();
         let mut decls: Vec<String> = Vec::new();
         let n = stmts.len();
+        let mut pending: Option<(usize, Option<u32>)> = None;
         for (i, st) in stmts.iter().enumerate() {
+            if let Some((at, line)) = pending.take() {
+                self.mark(&mut body, at, line);
+            }
+            pending = Some((body.len(), crate::debug::stmt_line(st)));
             let last = i + 1 == n;
             match st {
                 Stmt::Expr(e) if last => {
@@ -1291,6 +1650,7 @@ impl<'a> Compiler<'a> {
                     self.line = *line;
                     let (v, r) = self.reactive_expr(e)?;
                     if !r {
+                        pending = None;
                         self.stmt(st, last, &mut body, &mut decls)?;
                         continue;
                     }
@@ -1318,8 +1678,14 @@ impl<'a> Compiler<'a> {
                         body.push_str("return null;\n");
                     }
                 }
-                _ => self.stmt(st, last, &mut body, &mut decls)?,
+                _ => {
+                    pending = None;
+                    self.stmt(st, last, &mut body, &mut decls)?
+                }
             }
+        }
+        if let Some((at, line)) = pending {
+            self.mark(&mut body, at, line);
         }
         if stmts.is_empty() {
             body.push_str("return null;\n");
@@ -1334,7 +1700,11 @@ impl<'a> Compiler<'a> {
     fn body(&mut self, e: &Expr) -> Result<String, QuilloError> {
         match e {
             Expr::Block(stmts) => self.stmts(stmts),
-            other => Ok(format!("return {};\n", self.expr(other)?)),
+            other => {
+                let mut out = format!("return {};\n", self.expr(other)?);
+                self.mark(&mut out, 0, Some(crate::debug::expr_line(other)).filter(|&l| l > 0));
+                Ok(out)
+            }
         }
     }
 
@@ -1365,6 +1735,20 @@ impl<'a> Compiler<'a> {
     /// One statement into `body` (the last returns its value); variables it
     /// declares into `decls`.
     fn stmt(&mut self, s: &Stmt, last: bool, body: &mut String, decls: &mut Vec<String>) -> Result<(), QuilloError> {
+        let start = body.len();
+        self.stmt_code(s, last, body, decls)?;
+        self.mark(body, start, crate::debug::stmt_line(s));
+        Ok(())
+    }
+
+    /// In development, the line a statement's code comes from, where it starts.
+    fn mark(&self, body: &mut String, at: usize, line: Option<u32>) {
+        if let (true, Some(line)) = (self.dev, line) {
+            body.insert_str(at, &format!("{}{}{}", MARK, line, MARK));
+        }
+    }
+
+    fn stmt_code(&mut self, s: &Stmt, last: bool, body: &mut String, decls: &mut Vec<String>) -> Result<(), QuilloError> {
         {
             match s {
                 Stmt::Expr(e) => {

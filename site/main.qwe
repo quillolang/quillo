@@ -7,10 +7,11 @@
 // page renders. The demos are `use`d too, so what the page shows is what runs.
 
 use "highlight.qwe"
+use "hero.qwe"
 use "demos/todo.qwe"
 use "demos/life.qwe"
 
-let REPO = "https://github.com/wisp-one/quillo"
+let REPO = "https://github.com/quillolang/quillo"
 
 let tour = [
     { name: "Routes", file: "routes.qwe",
@@ -94,6 +95,89 @@ let served = {
     })
     { names, rows }
 }
+
+// The hero's statements (hero.qwe shows them, one at a time). Their code is read
+// from hero/ and tour/; the speed one's numbers from bench/server.txt.
+fn pad(s: str, n: int) = len(s) >= n ? s : s + repeat(" ", n - len(s))
+fn pad_left(s: str, n: int) = len(s) >= n ? s : repeat(" ", n - len(s)) + s
+
+let bench_lines =
+    [[{ k: "comment", text: pad("", 12) + join(served.names | map((n) => pad_left(n, 9)), "") }], []]
+    + (served.rows | map((r) => [{ k: "plain", text: pad(r.title, 12) }, { k: "comp", text: pad_left(r.raw[0], 9) }]
+        + (drop(r.raw, 1) | map((v) => { k: "plain", text: pad_left(v, 9) }))))
+    + [[], [{ k: "comment", text: "// requests a second, one process each" }],
+        [{ k: "comment", text: "// fortunes: sorted, escaped HTML" }]]
+
+let speed_lede = {
+    let r = first(served.rows)
+    let ahead = all(served.rows, (row) => row.nums[0] >= max(drop(row.nums, 1)))
+    `${r.raw[0]} requests a second of ${r.title} in one process: ${round(r.nums[0] / r.nums[1], 1)}× ${served.names[1]} and ${round(r.nums[0] / r.nums[2], 1)}× ${served.names[2]}`
+        + (ahead ? `, and ahead in all ${len(served.rows)} tests, rendered HTML included.` : ".")
+}
+
+// A terminal: commands after `$ `, a `#` comment, the rest output.
+fn term_lines(text: str) = split(trim(text), "\n") | map((l) => {
+    let hash = index_of(l, "  # ")
+    starts_with(l, "$ ")
+        ? [{ k: "prompt", text: "$ " }, { k: "plain", text: slice(l, 2, hash ?? len(l)) }]
+            + (hash != null ? [{ k: "comment", text: slice(l, hash) }] : [])
+        : starts_with(l, "#") ? [{ k: "comment", text: l }]
+        : contains(l, ": error: ") ? {
+            let at = index_of(l, ": error: ")
+            [{ k: "comment", text: slice(l, 0, at + 2) }, { k: "err", text: "error:" }, { k: "plain", text: slice(l, at + 8) }]
+        }
+        : [{ k: "comment", text: l }]
+})
+
+let check_lines = {
+    let parts = split(read_file("hero/check.txt"), "\n---\n")
+    highlight(parts[0]) + [[]] + term_lines(parts[1])
+}
+
+let numbers_lede = {
+    let b = first(bench)
+    `\`${b.op}\` of a million floats in ${b.quillo} ms, where Python takes ${b.python}: the answers of Python's \`math\` and \`statistics\` and of numpy, on the server and in the browser.`
+}
+
+let slides = [
+    { id: "language", kicker: "v0.5 · MIT · one binary, written in Rust", head: "The web,", em: "as a language.",
+      lede: "Routes, request patterns, pipelines and HTML are part of Quillo's syntax, so a web app reads like a list of what it answers. Components render on the server and resume in the browser, with no build step.",
+      more: "Take the tour", href: "#tour", file: "app.qwe", lines: tour[0].lines },
+    { id: "fatigue", kicker: "One binary", head: "The end of", em: "JavaScript fatigue.",
+      lede: "No bundler, no framework to choose, no `node_modules` to keep alive. One binary is the server, the checker, the component compiler, SQLite and a language server.",
+      more: "Start in a minute", href: "#start", file: "terminal", lines: term_lines(read_file("hero/fatigue.txt")) },
+    { id: "async", kicker: "Server functions", head: "No fetch,", em: "no await.",
+      lede: "A component calls the server like a function. The compiler awaits it, the arguments are checked against their types, and a failure comes back as a value: no route, no JSON, no `try`.",
+      more: "See how", href: "/docs/async/", file: "notes.qwe", lines: highlight(read_file("hero/async.qwe")) },
+    { id: "rules", kicker: "Validation", head: "One rule,", em: "both sides.",
+      lede: "A rule is a plain function. The form runs it in the browser as you type, the `server fn` runs it again and has the last word, and the two can never disagree.",
+      more: "The guide", href: "/docs/validation/", file: "signup.qwe", lines: highlight(read_file("hero/rules.qwe")) },
+    { id: "speed", kicker: "Benchmarks", head: "Performance,", em: "from day one.",
+      lede: speed_lede, more: "The numbers", href: "#speed", file: "bench/server.txt", lines: bench_lines },
+    { id: "live", kicker: "Live data", head: "Live,", em: "by default.",
+      lede: "`live(load)` runs the loader again whenever a table it read changes, for everyone who has the page open. One WebSocket a page, no broker, the same with SQLite, PostgreSQL and MySQL.",
+      more: "Live data", href: "/docs/components/#live-data", file: "notes.qwe", lines: tour[3].lines },
+    { id: "realtime", kicker: "UDP · WebTransport · RTP", head: "Real time,", em: "over UDP.",
+      lede: "Packets on a port, messages to pages as WebTransport datagrams that wait for nothing, and a camera's stream in any page, a fraction of a second behind. No broker, no socket server.",
+      more: "The guide", href: "/docs/realtime/", file: "telemetry.qwe", lines: highlight(read_file("hero/realtime.qwe")) },
+    { id: "numbers", kicker: "math · stats · vec", head: "Data science,", em: "no Python.",
+      lede: numbers_lede, more: "Numbers and data", href: "/docs/standard-library/#numbers-and-data", file: "stats.qwe", lines: highlight(read_file("hero/numbers.qwe")) },
+    { id: "services", kicker: "Microservices", head: "Split it out,", em: "same code.",
+      lede: "A part of an app becomes a server of its own without its code changing. Calls between them are signed, retried when they fail, and run once.",
+      more: "Microservices", href: "/docs/microservices/", file: "shop.qwe", lines: highlight(read_file("hero/services.qwe")) },
+    { id: "prefetch", kicker: "Prefetching", head: "Here before", em: "the click.",
+      lede: "Every page asks for the pages it links to as they are pointed at, so a click shows the next one at once. Nothing to set up, and a prefetch never writes or signs anyone out.",
+      more: "Prefetching", href: "/docs/prefetching/", file: "docs.qwe", lines: highlight(read_file("hero/prefetch.qwe")) },
+    { id: "rust", kicker: "Rust in a program", head: "Rust,", em: "when you want it.",
+      lede: "A `.qwer` file is Rust. `use` it, and its `pub fn`s are your functions: checked against their Rust types, run off the event loop on every core, built again when they change.",
+      more: "Rust in Quillo", href: "/docs/rust/", file: "imaging.qwer", lines: highlight(read_file("hero/imaging.qwer"), "rust") },
+    { id: "portable", kicker: "quillo app", head: "Portable", em: "web apps.",
+      lede: "`quillo app` runs the same program in a native window, with the platform's own web view. Only that window can reach it, and closing the window ends it.",
+      more: "Desktop apps", href: "/docs/#desktop-apps", file: "terminal", lines: term_lines(read_file("hero/portable.txt")) },
+    { id: "check", kicker: "quillo check", head: "Checked", em: "before it runs.",
+      lede: "`quillo check` knows the types, records, effects, routes and components, and finds mistakes without running anything. Your editor shows them as you type.",
+      more: "What it checks", href: "/docs/checking/", file: "terminal", lines: check_lines },
+]
 
 // A runtime's color follows it, whatever the order: Quillo, then Node, then Bun.
 fn runtime_class(name: str) = `rt-${lower(first(split(name, " ")))}`
@@ -291,7 +375,7 @@ route GET / =
     <html lang="en">
         <Head title="Quillo — the web, as a language" path="/" css={style}
             description="Quillo is a small web programming language: routes, request patterns, pipelines, HTML and browser components are part of the syntax."
-            fonts={["instrument-serif", "instrument-serif-italic", "inter"]}/>
+            fonts={["instrument-serif", "instrument-serif-italic", "inter", "jetbrains-mono"]}/>
         <body>
             <header.nav>
                 <a.brand href="/"><Logo/>Quillo</a>
@@ -306,22 +390,9 @@ route GET / =
 
             <section.hero>
                 <Life board={seeded()}/>
-                <div.hero-inner>
-                    <div.hero-copy>
-                        <p.eyebrow>v0.5 · MIT · one binary, written in Rust</p>
-                        <h1>The web, <em>as a language.</em></h1>
-                        <p.lede>
-                            Routes, request patterns, pipelines and HTML are part of Quillo's syntax,
-                            so a web app reads like a list of what it answers. Components render on the
-                            server and resume in the browser, with no build step.
-                        </p>
-                        <div.ctas>
-                            <a.btn.primary href="#start">Get started</a>
-                            <a.btn href="#tour">Take the tour →</a>
-                        </div>
-                    </div>
-                    <Window title="app.qwe"><Code lines={tour[0].lines}/></Window>
-                </div>
+                <style>{raw(pick_css(len(slides)))}</style>
+                <Hero slides={slides}/>
+                <script>{raw(pick_script(len(slides)))}</script>
                 <p.hint>The cells behind this page are Conway's Life: a Quillo component running in your browser. Move your pointer across them.</p>
             </section>
 

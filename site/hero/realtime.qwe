@@ -1,0 +1,14 @@
+udp.listen(9000, (p) => {
+    channel.broadcast("readings", json.parse(p.text))
+})
+
+media.rtp("cam", { video: 5004, audio: 5006 })
+
+component Gauge() {
+    state last = null
+    channel.open("readings", (r) => { last = r })
+    <div>
+        <p>{last == null ? "Waiting" : `${last.id}: ${last.v}`}</p>
+        <quillo-media stream="cam" muted/>
+    </div>
+}

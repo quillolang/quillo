@@ -1,0 +1,7 @@
+let xs = range(0, 1000000) | map((i) => math.sin(i) * 100)
+
+stats.stdev(xs)                     // as Python's statistics module
+stats.describe(xs)                  // count, mean, std, quartiles, max
+stats.histogram(xs, 20)             // counts and edges, as numpy's
+stats.linear_regression(xs, xs)     // { slope, intercept }
+vec.rolling_mean(xs, 7)             // a week's moving average

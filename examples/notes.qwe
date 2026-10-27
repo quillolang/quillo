@@ -54,7 +54,7 @@ component Notes() {
         }}>
             <input bind:value={draft} placeholder="Write a note" autofocus/>
             <button>Add</button>
-        </form>
+    </form>
         {problem && <p.problem>{problem}</p>}
         <ul>
             {for n in notes => <li key={n.id} class={n.done == 1 && "done"}>

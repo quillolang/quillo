@@ -2,13 +2,13 @@
   "name": "quillo-lang",
   "displayName": "Quillo",
   "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion, outline (via `quillo lsp`) and debugging (via `quillo dap`).",
-  "version": "0.7.0",
-  "publisher": "wisp-one",
+  "version": "0.8.0",
+  "publisher": "quillolang",
   "icon": "icon.png",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wisp-one/quillo"
+    "url": "https://github.com/quillolang/quillo"
   },
   "engines": {
     "vscode": "^1.82.0"
@@ -180,6 +180,24 @@
                 "type": "boolean",
                 "description": "Stop at the program's first statement.",
                 "default": false
+              },
+              "browser": {
+                "type": [
+                  "boolean",
+                  "string"
+                ],
+                "enum": [
+                  true,
+                  false,
+                  "chrome",
+                  "edge"
+                ],
+                "default": false,
+                "description": "Also debug the components in the browser: opens Chrome (true or \"chrome\") or Edge (\"edge\") on the page, with VS Code's JavaScript debugger, once the server listens. Breakpoints in .qwe files stop there too."
+              },
+              "url": {
+                "type": "string",
+                "description": "The page the browser opens (default: the address the server listens on)."
               }
             }
           }
@@ -193,6 +211,16 @@
             "args": [
               "--watch"
             ]
+          },
+          {
+            "type": "quillo",
+            "request": "launch",
+            "name": "Debug this file and its pages",
+            "program": "${file}",
+            "args": [
+              "--watch"
+            ],
+            "browser": true
           }
         ],
         "configurationSnippets": [
@@ -207,6 +235,20 @@
               "args": [
                 "--watch"
               ]
+            }
+          },
+          {
+            "label": "Quillo: Debug a program and its pages",
+            "description": "Run a .qwe program with the debugger, and debug its components in Chrome",
+            "body": {
+              "type": "quillo",
+              "request": "launch",
+              "name": "Debug ${1:program} and its pages",
+              "program": "^\"\\${workspaceFolder}/${1:main.qwe}\"",
+              "args": [
+                "--watch"
+              ],
+              "browser": true
             }
           }
         ]

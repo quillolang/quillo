@@ -1,0 +1,14 @@
+server fn add_note(text: str) -> list ! str with db {
+    if trim(text) == "" { return err("A note needs some text") }
+    db.exec("insert into notes (text) values (?)", text)
+    db.query("select * from notes order by id")
+}
+
+component Notes() {
+    state notes = []
+    state draft = ""
+    <form @submit={() => { notes = add_note(draft) ?? notes }}>
+        <ul>{for n in notes => <li key={n.id}>{n.text}</li>}</ul>
+        <input bind:value={draft}/>
+    </form>
+}

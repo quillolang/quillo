@@ -1,0 +1,88 @@
+// The home page's hero: a few statements, one at a time. A visit starts on a
+// random one, picked before the page paints by the script `pick_script` gives
+// (so the first one shown is not replaced a moment later), and they go on in
+// order from there, holding while the pointer or the focus is on them.
+
+let HERO_SECONDS = 7
+
+// `code` in a slide's text, as in the tour.
+fn ticks(text: str) = for [i, s] in enumerate(split(text, "`")) => i % 2 == 1 ? <code>{s}</code> : s
+
+component Hero(slides: list) {
+    state active = 0
+    state playing = true
+    state held = false
+    state ready = false
+    let n = len(slides)
+
+    if ready && playing && !held {
+        every(HERO_SECONDS * 1000, () => { active = (active + 1) % n })
+    }
+
+    <div.carousel class={`${ready ? "ready" : ""} ${ready && playing && !held ? "running" : ""}`}
+        role="region" aria-roledescription="carousel" aria-label="What Quillo is"
+        @mouseenter={() => { held = true }} @mouseleave={() => { held = false }}
+        @focusin={() => { held = true }} @focusout={() => { held = false }}
+        @mount={(el) => {
+            active = (int(el.dataset.pick ?? "0") ?? 0) % n
+            playing = !js("window.matchMedia", "(prefers-reduced-motion: reduce)").matches
+            ready = true
+        }}>
+        <div.slides>
+            {for [i, s] in enumerate(slides) =>
+                <div.slide.hero-inner key={s.id} class={i == active && "active"}
+                    role="group" aria-roledescription="slide" aria-label={`${i + 1} of ${n}`}>
+                    <div.hero-copy>
+                        <p.eyebrow>{s.kicker}</p>
+                        {i == 0
+                            ? <h1>{s.head} <em>{s.em}</em></h1>
+                            : <h2.headline>{s.head} <em>{s.em}</em></h2>}
+                        <p.lede>{ticks(s.lede)}</p>
+                        <div.ctas>
+                            <a.btn.primary href="#start">Get started</a>
+                            <a.btn href={s.href}>{s.more} →</a>
+                        </div>
+                    </div>
+                    <Window title={s.file}><Code lines={s.lines}/></Window>
+                </div>}
+        </div>
+        <div.carousel-nav>
+            <button.cbtn type="button" aria-label="Previous" @click={() => { playing = false; active = (active + n - 1) % n }}>
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+            </button>
+            <div.dots>
+                {for [i, s] in enumerate(slides) =>
+                    <button.dot key={s.id} type="button" class={i == active && "active"}
+                        aria-label={`${s.head} ${s.em}`} aria-current={i == active ? "true" : "false"}
+                        @click={() => { playing = false; active = i }}><i></i></button>}
+            </div>
+            <button.cbtn type="button" aria-label="Next" @click={() => { playing = false; active = (active + 1) % n }}>
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+            </button>
+            <button.cbtn type="button" aria-label={playing ? "Pause" : "Play"} @click={() => { playing = !playing }}>
+                {playing
+                    ? <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3v10M11 3v10"/></svg>
+                    : <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3v10l8-5z"/></svg>}
+            </button>
+        </div>
+    </div>
+}
+
+// Run right after the carousel's HTML, before the page paints: which slide this
+// visit starts on. The component reads it when it resumes; until then, CSS
+// shows that slide (`pick_css`). Without scripts, the first one shows.
+fn pick_script(n: int) =
+    `(function(){var c=document.querySelector(".carousel");if(c)c.dataset.pick=Math.floor(Math.random()*${n})})()`
+
+fn pick_css(n: int) =
+    ".carousel[data-pick]:not(.ready) .slide.active { opacity: 0; visibility: hidden; transform: none; }\n"
+    + ".carousel[data-pick]:not(.ready) .dot.active { width: var(--dw); }\n"
+    + ".carousel[data-pick]:not(.ready) .dot.active i { width: var(--pw); background: var(--line); }\n"
+    + ".carousel[data-pick]:not(.ready) .dot.active i::after { width: 0; }\n"
+    + join(for i in range(0, n) => {
+        let at = `.carousel[data-pick="${i}"]:not(.ready)`
+        `${at} .slide:nth-child(${i + 1}) { opacity: 1; visibility: visible; transform: none; }\n`
+            + `${at} .dot:nth-child(${i + 1}) { width: var(--da); }\n`
+            + `${at} .dot:nth-child(${i + 1}) i { width: var(--pa); background: #3a3750; }\n`
+            + `${at} .dot:nth-child(${i + 1}) i::after { width: 100%; }\n`
+    }, "")

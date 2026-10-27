@@ -1,0 +1,9 @@
+fn label(n) = `count: ${n}`
+
+component Counter(start) {
+    state count = start
+    let shown = label(count)
+    <button @click={() => {
+        count += 1
+    }}>{shown}</button>
+}

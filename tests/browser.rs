@@ -771,3 +771,52 @@ fn media_over_webtransport() {
 fn media_over_a_websocket_without_webtransport() {
     media_plays(&["--no-wt"], "websocket");
 }
+
+#[test]
+fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let app = dir.join("devmode/main.qwe");
+    let source = dir.join("devmode/ui/counter.qwe").canonicalize().unwrap();
+    let port = free_port();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(&app)
+        .args(["--port", &port.to_string(), "--watch"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let profile = std::env::temp_dir().join(format!("quillo-chrome-{}-{}", std::process::id(), port));
+    // A breakpoint on `count += 1` (line 7), as an editor sets it, through the maps.
+    let out = Command::new("node")
+        .arg(dir.join("sourcemap.js"))
+        .arg(&chrome)
+        .arg(format!("http://127.0.0.1:{}/", port))
+        .arg(&profile)
+        .arg(&source)
+        .arg("7")
+        .output()
+        .expect("node");
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&profile);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let scripts: Vec<String> = r["scripts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
+    let files: Vec<&str> = scripts.iter().filter_map(|s| s.strip_prefix("/_quillo/src/")).map(|s| s.split_once('/').unwrap().1).collect();
+    assert_eq!(files, vec!["quillo.js", "program.js", "ui/counter.qwe/label.js", "ui/counter.qwe/Counter.js", "boot.js"]);
+    assert!(r["breakpointIn"].as_str().unwrap().ends_with("/ui/counter.qwe/Counter.js"), "{}", r);
+    assert_eq!(r["stoppedAt"], 7, "{}", r);
+    assert!(r["stops"].as_array().unwrap().iter().all(|l| l == 7), "{}", r);
+    assert_eq!(r["sourcesContent"], true);
+    assert_eq!(r["text"], "count: 6");
+}

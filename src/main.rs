@@ -339,6 +339,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
 /// Checks and loads the program, ready to serve. `Ok(None)`: it ran and
 /// declared no routes, so there is nothing to serve. `Err` is the exit code.
 fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
+    // Components in files of their own, for the browser's debugger.
+    quillo::client::DEV.store(o.watch || quillo::debug::on(), std::sync::atomic::Ordering::Relaxed);
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let checked = if o.static_check { static_errors(path) } else { Ok(()) };
     if let (Err(_), false) = (&checked, o.watch) {

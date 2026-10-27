@@ -1,0 +1,10 @@
+//! [dependencies]
+//! image = "0.25"
+
+/// How bright a picture is, from 0 to 255.
+pub fn brightness(path: &str) -> Result<f64, String> {
+    let img = image::open(path).map_err(|e| e.to_string())?;
+    let px = img.to_luma8();
+    let sum: f64 = px.pixels().map(|p| p.0[0] as f64).sum();
+    Ok(sum / px.len() as f64)
+}

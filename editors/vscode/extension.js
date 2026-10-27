@@ -67,6 +67,46 @@ const debugAdapters = {
   },
 };
 
+/**
+ * `"browser": true`: once the server says where it listens, the page opens in
+ * Chrome (or Edge) with VS Code's JavaScript debugger, as part of this session.
+ * The components come as files of their own with source maps (the server is
+ * in development mode), so breakpoints in .qwe files stop in the browser too.
+ */
+const browserTrackers = {
+  createDebugAdapterTracker(session) {
+    const want = session.configuration.browser;
+    if (!want) return undefined;
+    let opened = false;
+    return {
+      onDidSendMessage(m) {
+        if (opened || m.type !== "event" || m.event !== "output") return;
+        const found = /listening on (https?:\/\/\S+)/.exec(m.body.output || "");
+        if (!found) return;
+        opened = true;
+        const at = found[1].replace("//0.0.0.0", "//localhost").replace("//[::]", "//localhost");
+        const url = session.configuration.url || at;
+        const cwd = session.configuration.cwd || (session.workspaceFolder && session.workspaceFolder.uri.fsPath);
+        vscode.debug.startDebugging(
+          session.workspaceFolder,
+          {
+            type: want === "edge" ? "msedge" : "chrome",
+            request: "launch",
+            name: "Pages",
+            url,
+            webRoot: cwd,
+            sourceMaps: true,
+            pauseForSourceMap: true,
+            // The runtime: stepping goes through it to the program's code.
+            skipFiles: ["**/_quillo/src/*/quillo.js", "**/_quillo/src/*/program*.js", "**/_quillo/src/*/boot.js"],
+          },
+          { parentSession: session, lifecycleManagedByParent: true, compact: true }
+        );
+      },
+    };
+  },
+};
+
 /** F5 with no launch.json: debug the open .qwe file. */
 const debugConfigurations = {
   resolveDebugConfiguration(folder, config) {
@@ -110,6 +150,7 @@ async function activate(context) {
     }),
     vscode.debug.registerDebugAdapterDescriptorFactory("quillo", debugAdapters),
     vscode.debug.registerDebugConfigurationProvider("quillo", debugConfigurations),
+    vscode.debug.registerDebugAdapterTrackerFactory("quillo", browserTrackers),
     vscode.commands.registerCommand("quillo.check", async () => {
       const doc = currentFile();
       if (!doc) return;

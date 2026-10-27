@@ -197,7 +197,7 @@ server alike.
 
 ### A larger example
 
-The [CRM](https://github.com/wisp-one/quillo/tree/main/apps/crm) in the repository is
+The [CRM](https://github.com/quillolang/quillo/tree/main/apps/crm) in the repository is
 built this way. Each plugin brings rules for the kinds of records it cares about
 (contacts, deals, products, campaigns, public forms); `validate(kind, record, ctx)` in
 `lib/rules.qwe` runs those of the plugins a workspace has on. Its editors call it as you

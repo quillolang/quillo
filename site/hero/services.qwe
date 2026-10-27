@@ -1,0 +1,11 @@
+// shop.qwe: billing is a service, here or on a server of its own
+service billing = "billing.qwe" { timeout: "2s", retries: 1 }
+
+route POST /buy {
+    let inv = billing.invoice(request.form.name, 1200, "a mug")
+    if is_err(inv) { reply 400 <p>Not bought: {inv.error}</p> }
+    <p>Invoice #{inv.id}: {inv.cents} cents</p>
+}
+
+// one process:            quillo run app.qwe
+// split, the same code:   quillo run app.qwe --split

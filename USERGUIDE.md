@@ -1764,10 +1764,25 @@ When the program stops, all of it stops: no other request runs Quillo code until
 that is waiting for requests stops the next one to run.
 
 While debugging, views are not cached (`--no-view-cache`), so a breakpoint in one stops each
-time it renders, and functions are not compiled to machine code. Code that runs in the browser
-(a component's event handlers, and its updates after the first render) is not stopped by the
-debugger: the browser's developer tools debug the JavaScript it is compiled to. `.qwer`
-functions run as they are, without stops. It runs on macOS and Linux; not yet on Windows.
+time it renders, and functions are not compiled to machine code. `.qwer` functions run as they
+are, without stops. It runs on macOS and Linux; not yet on Windows.
+
+#### In the browser
+
+A component runs in the browser too, after its first render: its event handlers and updates.
+With `"browser": true` in the launch configuration (or `"edge"`), VS Code opens the page in
+Chrome (or Edge) once the server listens, with its JavaScript debugger, in the same session:
+a breakpoint on a line of a `.qwe` file stops on the server and in the browser, wherever that
+line runs. `"url"` names the page to open (by default, the address the server listens on).
+
+This works because in development (`--watch`, or under the debugger) a page's bundle is a
+small loader for files of their own: the runtime (`quillo.js`, as it is written), and each
+component, view and function at `/_quillo/src/<hash>/<file>.qwe/<Name>.js`, with a source map
+from its lines to the `.qwe` file's. The browser's developer tools show them by those names,
+with the `.qwe` source beside them, and a variable a statement declares carries its own name
+(`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
+value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
+production a page's bundle is one minified file, as before.
 
 ### Logs and metrics
 

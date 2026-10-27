@@ -1,0 +1,6 @@
+$ cargo build --release --features app
+$ quillo run notes.qwe       # in the browser, at 127.0.0.1:8080
+$ quillo app notes.qwe       # the same program, in a window of its own
+
+# WebKit on macOS and Linux, WebView2 on Windows
+# only its window can reach it; closing the window ends it

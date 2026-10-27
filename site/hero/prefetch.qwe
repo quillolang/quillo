@@ -1,0 +1,9 @@
+// Every link is fetched as it is pointed at: the click shows it at once.
+route GET /docs/:page = render(page)
+
+// A prefetch never writes: this one is answered "not prefetched",
+// and the visit is counted when the link is followed.
+route GET /count {
+    db.exec("insert into visits values (1)")
+    <p>counted</p>
+}

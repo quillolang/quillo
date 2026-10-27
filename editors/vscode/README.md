@@ -1,6 +1,6 @@
 # Quillo for VS Code
 
-Language support for [Quillo](https://github.com/wisp-one/quillo), the small web language.
+Language support for [Quillo](https://github.com/quillolang/quillo), the small web language.
 
 - **Highlighting** for routes and paths, HTML literals (tags, `.class#id`, `@event`, `bind:value`),
   string interpolation, `state` declarations, `type` records, numbers such as `1e-9`, types,
@@ -24,6 +24,9 @@ Language support for [Quillo](https://github.com/wisp-one/quillo), the small web
 - **Debugging** (F5 in a `.qwe` file): breakpoints (with conditions, hit counts and logpoints),
   stepping, the stack, variables (locals, globals and the request), the debug console, and
   stopping where a runtime error happens. Through `quillo dap`; see Debugging in the user guide.
+  With `"browser": true` in the launch configuration, the page opens in Chrome (`"edge"`: Edge)
+  with VS Code's JavaScript debugger too, and the same breakpoints stop in the components'
+  browser code (event handlers, updates), through source maps to the `.qwe` files.
 - **Commands**: *Quillo: Run this file (watch mode)* (also the ▶ button), *Quillo: Debug this file*,
   *Quillo: Check this file*, *Quillo: Restart the language server*.
 

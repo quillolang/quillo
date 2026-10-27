@@ -3,6 +3,13 @@
 @font-face { font-family: "Instrument Serif"; font-style: italic; font-weight: 400; font-display: swap; src: url(/fonts/instrument-serif-italic.woff2) format("woff2"); }
 @font-face { font-family: Inter; font-style: normal; font-weight: 400 600; font-display: swap; src: url(/fonts/inter.woff2) format("woff2"); }
 @font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 400 500; font-display: swap; src: url(/fonts/jetbrains-mono.woff2) format("woff2"); }
+/* Fallbacks sized to the fonts above (widths and heights measured in Chrome), so text
+   does not move when a font arrives after the first paint. */
+@font-face { font-family: "Serif Fallback"; font-style: normal; src: local("Times New Roman"), local("TimesNewRomanPSMT"), local("Liberation Serif"); size-adjust: 81.92%; ascent-override: 120.85%; descent-override: 37.84%; line-gap-override: 0%; }
+@font-face { font-family: "Serif Fallback"; font-style: italic; src: local("Times New Roman Italic"), local("TimesNewRomanPS-ItalicMT"), local("Liberation Serif Italic"); size-adjust: 87.46%; ascent-override: 113.2%; descent-override: 35.45%; line-gap-override: 0%; }
+@font-face { font-family: "Sans Fallback"; font-weight: 400; src: local("Arial"), local("ArialMT"), local("Liberation Sans"); size-adjust: 106.64%; ascent-override: 90.96%; descent-override: 22.5%; line-gap-override: 0%; }
+@font-face { font-family: "Sans Fallback"; font-weight: 600 700; src: local("Arial Bold"), local("Arial-BoldMT"), local("Liberation Sans Bold"); size-adjust: 106.64%; ascent-override: 90.96%; descent-override: 22.5%; line-gap-override: 0%; }
+@font-face { font-family: "Mono Fallback"; src: local("Menlo Regular"), local("Menlo-Regular"), local("Courier New"), local("CourierNewPSMT"), local("Liberation Mono"); ascent-override: 102%; descent-override: 30%; line-gap-override: 0%; }
 
 :root {
   --ink: #0b0a12;
@@ -15,9 +22,9 @@
   --gold: #f3b54a;
   --violet: #b9a8ff;
   --bar: #c08428;
-  --serif: "Instrument Serif", Georgia, serif;
-  --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --serif: "Instrument Serif", "Serif Fallback", Georgia, serif;
+  --sans: Inter, "Sans Fallback", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", "Mono Fallback", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -71,8 +78,8 @@ h1 em, h2 em { color: var(--gold); }
 }
 .hero-inner a, .hero-inner .window { pointer-events: auto; }
 .eyebrow { display: inline-block; font: 500 12px/1 var(--mono); letter-spacing: .04em; color: var(--muted); border: 1px solid var(--line); background: rgba(19, 18, 28, .7); padding: 7px 12px; border-radius: 999px; margin: 0 0 26px; }
-.hero h1 { font-size: clamp(54px, 8vw, 104px); line-height: .95; }
-.hero h1 em { display: block; background: linear-gradient(100deg, var(--gold), #f7d38c 45%, var(--violet)); -webkit-background-clip: text; background-clip: text; color: transparent; padding-bottom: .08em; }
+.hero h1, .hero .headline { font-size: clamp(54px, 8vw, 96px); line-height: .95; }
+.hero h1 em, .hero .headline em { display: block; background: linear-gradient(100deg, var(--gold), #f7d38c 45%, var(--violet)); -webkit-background-clip: text; background-clip: text; color: transparent; padding-bottom: .08em; }
 .lede { font-size: 18px; color: var(--muted); max-width: 34em; margin: 26px 0 32px; }
 .ctas { display: flex; gap: 12px; flex-wrap: wrap; }
 .btn {
@@ -83,6 +90,35 @@ h1 em, h2 em { color: var(--gold); }
 .btn.primary { background: var(--gold); color: #1a1205; border-color: var(--gold); }
 .btn.primary:hover { background: #f7c66b; }
 .hero .code { font-size: 12.5px; }
+/* Hero carousel (hero.qwe): the slides share one cell, so the hero is as tall as the tallest */
+.slides { display: grid; }
+.slide {
+  grid-area: 1 / 1; opacity: 0; visibility: hidden; transform: translateY(10px);
+  transition: opacity .7s ease, transform .7s ease, visibility 0s linear .7s;
+}
+.slide.hero-inner { align-items: start; align-content: start; }
+.slide .window { align-self: center; }
+.slide.active { opacity: 1; visibility: visible; transform: none; transition: opacity .7s ease, transform .7s ease, visibility 0s; }
+.carousel-nav { max-width: 1160px; margin: 36px auto 0; display: flex; align-items: center; gap: 8px; }
+.cbtn {
+  width: 36px; height: 36px; display: grid; place-items: center; padding: 0; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--line); background: rgba(25, 24, 38, .8); color: var(--muted); transition: color .15s, border-color .15s;
+}
+.cbtn:hover { color: var(--text); border-color: #3a3750; }
+.cbtn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.dots { display: flex; align-items: center; padding: 0 4px; --dw: 20px; --da: 40px; --pw: 8px; --pa: 28px; }
+.dot { width: var(--dw); height: 28px; padding: 0; border: 0; background: none; cursor: pointer; display: grid; place-items: center; transition: width .4s ease; }
+.dot i { position: relative; display: block; width: var(--pw); height: var(--pw); border-radius: 999px; background: var(--line); overflow: hidden; transition: width .4s ease, background .4s; }
+.dot i::after { content: ""; position: absolute; inset: 0; width: 0; background: linear-gradient(90deg, var(--gold), var(--violet)); }
+.dot:hover i { background: #3a3750; }
+.dot.active { width: var(--da); }
+.dot.active i { width: var(--pa); background: #3a3750; }
+.dot.active i::after { width: 100%; }
+.carousel.running .dot.active i::after { animation: hero-fill 7s linear both; }
+@keyframes hero-fill { from { width: 0; } to { width: 100%; } }
+.cbtn:focus-visible, .dot:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.t-prompt { color: var(--faint); }
+.t-err { color: #ff8f7a; }
 .hint { max-width: 1160px; margin: 56px auto 0; font-size: 13px; color: var(--faint); text-align: center; pointer-events: none; }
 
 /* Code windows */
@@ -278,8 +314,11 @@ footer {
   .panels { grid-template-columns: minmax(0, 1fr); }
   .why-qwe { flex-direction: column; align-items: flex-start; }
   .code { font-size: 12.5px; padding: 16px; }
+  .dots { --dw: 14px; --da: 30px; --pw: 6px; --pa: 22px; }
+  .carousel-nav { gap: 4px; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   * { transition: none !important; }
+  .dot i::after { animation: none !important; }
 }
