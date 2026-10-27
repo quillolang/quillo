@@ -53,6 +53,9 @@ h1 em, h2 em { color: var(--gold); }
 .nav nav a { text-decoration: none; color: var(--muted); transition: color .15s; }
 .nav nav a:hover { color: var(--text); }
 .nav .gh { color: var(--text); border: 1px solid var(--line); padding: 4px 12px; border-radius: 999px; margin: -5px 0; }
+.nav .stars { display: inline-flex; align-items: center; gap: 6px; }
+.nav .stars svg { width: 13px; height: 13px; color: var(--gold); }
+.nav .stars .count { margin-left: 2px; padding-left: 8px; border-left: 1px solid var(--line); color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Hero */
 .hero { position: relative; isolation: isolate; overflow: hidden; padding: 96px 16px 40px; }
@@ -291,6 +294,11 @@ footer {
   max-width: 1160px; margin: 120px auto 0; padding: 32px 16px 48px; border-top: 1px solid var(--line);
   display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; color: var(--faint); font-size: 14px;
 }
+footer .community { display: flex; gap: 22px; }
+footer .community a { color: var(--muted); text-decoration: none; transition: color .15s; }
+footer .community a:hover { color: var(--text); }
+.community-note { margin: 22px 0 0; color: var(--muted); font-size: 15px; }
+.community-note a { color: var(--text); }
 
 @media (max-width: 960px) {
   .hero { padding-top: 64px; }
@@ -321,4 +329,8 @@ footer {
   html { scroll-behavior: auto; }
   * { transition: none !important; }
   .dot i::after { animation: none !important; }
+}
+/* Phones: the Star pill goes to the repository too, so it stands in for GitHub. */
+@media (max-width: 480px) {
+  .nav nav a.gh:not(.stars) { display: none; }
 }

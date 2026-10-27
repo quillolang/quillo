@@ -277,7 +277,7 @@ view DocsPage(page: map) {
                 {next ? <a.next href={next.url}><small>Next</small>{next.title}</a> : <span></span>}
             </nav>
             {!page.guide && !starts_with(page.slug, "examples") &&
-                <p.edit><a href={`${REPO}/blob/main/USERGUIDE.md`}>Edit this page on GitHub</a> · made from the user guide</p>}
+                <p.edit><a href={`${REPO}/blob/main/USERGUIDE.md`}>Edit this page on GitHub</a> · made from the user guide · questions on <a href={DISCORD}>Discord</a> or <a href={REDDIT}>r/quillo</a></p>}
         </article>
         {len(page.toc) > 0 ? <OnThisPage items={page.toc}/> : <div></div>}
     </div>

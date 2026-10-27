@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- The Quillo banner. Laid out on a 1200×630 canvas (Open Graph, X, LinkedIn);
+     the background fills any window, so 1280×640 (GitHub's social preview) and
+     other sizes only add margin. Render with brand/render-banner.sh. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+@font-face { font-family: "Instrument Serif"; src: url("../site/public/fonts/instrument-serif.woff2") format("woff2"); }
+@font-face { font-family: "Instrument Serif"; font-style: italic; src: url("../site/public/fonts/instrument-serif-italic.woff2") format("woff2"); }
+@font-face { font-family: "Inter"; font-weight: 100 900; src: url("../site/public/fonts/inter.woff2") format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; src: url("../site/public/fonts/jetbrains-mono.woff2") format("woff2"); }
+
+:root {
+  --ink: #0b0a12;
+  --surface: #13121c;
+  --line: #262435;
+  --text: #ecebf3;
+  --muted: #a3a0b7;
+  --faint: #8b88a0;
+  --gold: #f3b54a;
+  --violet: #b9a8ff;
+}
+html, body { margin: 0; height: 100%; }
+body {
+  display: grid; place-items: center; overflow: hidden;
+  color: var(--text); font-family: "Inter", sans-serif;
+  background:
+    radial-gradient(900px 520px at 12% 108%, rgba(243, 181, 74, .22), transparent 70%),
+    radial-gradient(820px 560px at 92% -12%, rgba(185, 168, 255, .20), transparent 70%),
+    var(--ink);
+}
+/* The Game of Life board from the site's hero, faint, fading toward the text. */
+body::before {
+  content: ""; position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(236, 235, 243, .045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(236, 235, 243, .045) 1px, transparent 1px);
+  background-size: 28px 28px;
+  -webkit-mask-image: linear-gradient(100deg, transparent 30%, #000 85%);
+  mask-image: linear-gradient(100deg, transparent 30%, #000 85%);
+}
+.canvas {
+  position: relative; width: 1200px; height: 630px; box-sizing: border-box;
+  padding: 64px 72px; display: grid; grid-template-columns: 1fr 470px; gap: 56px; align-items: center;
+}
+.brand { display: flex; align-items: center; gap: 14px; font-size: 30px; font-weight: 600; letter-spacing: -.01em; }
+.brand svg { width: 46px; height: 46px; }
+h1 {
+  margin: 34px 0 0; font-family: "Instrument Serif", serif; font-weight: 400;
+  font-size: 98px; line-height: .95; letter-spacing: -.015em;
+}
+h1 em {
+  display: block; font-style: italic; padding-bottom: .08em;
+  background: linear-gradient(100deg, var(--gold), #f7d38c 45%, var(--violet));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.lede { margin: 22px 0 0; font-size: 23px; line-height: 1.4; color: var(--muted); max-width: 520px; }
+.url { margin-top: 30px; font-family: "JetBrains Mono", monospace; font-size: 17px; color: var(--faint); }
+.url b { color: var(--gold); font-weight: 400; }
+
+.window {
+  background: rgba(19, 18, 28, .92); border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .45), 0 0 0 1px rgba(255, 255, 255, .02) inset;
+  overflow: hidden;
+}
+.bar { display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.bar i { width: 11px; height: 11px; border-radius: 50%; background: #2c2a3d; }
+.bar span { margin-left: 10px; font-family: "JetBrains Mono", monospace; font-size: 14px; color: var(--faint); }
+pre {
+  margin: 0; padding: 22px 24px 26px; font-family: "JetBrains Mono", monospace;
+  font-size: 16.5px; line-height: 1.62; color: var(--text); font-variant-ligatures: none;
+}
+.k { color: var(--violet); }
+.s { color: #f7d38c; }
+.t { color: var(--gold); }
+.f { color: #8fd3c7; }
+.c { color: var(--faint); }
+</style>
+</head>
+<body>
+<div class="canvas">
+  <div>
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="g" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0" stop-color="#f3b54a"/><stop offset="1" stop-color="#b9a8ff"/></linearGradient></defs>
+        <rect width="32" height="32" rx="7" fill="#0b0a12" stroke="#262435"/>
+        <path d="M27 4C16 5 9.2 11.8 7.5 21.6L6 27.6l1.6.4 1.6-4.7C19 22.7 25.6 14.9 27 4z" fill="url(#g)"/>
+        <path d="M9.2 23.3C12.4 17.6 17 12.6 23 8.5" fill="none" stroke="#0b0a12" stroke-width="1.3" stroke-linecap="round"/>
+      </svg>
+      Quillo
+    </div>
+    <h1>The web,<em>as a language.</em></h1>
+    <p class="lede">Routes, HTML, components and databases are the syntax. One file, one binary.</p>
+    <div class="url"><b>quillolang.org</b> · github.com/quillolang/quillo</div>
+  </div>
+  <div class="window">
+    <div class="bar"><i></i><i></i><i></i><span>notes.qwe</span></div>
+<pre>db.open(<span class="s">"app.db"</span>)
+
+<span class="k">server fn</span> <span class="f">total</span>() -&gt; <span class="k">int with</span> db =
+    db.query(<span class="s">"select count(*) as n</span>
+<span class="s">              from notes"</span>)[<span class="t">0</span>].n
+
+<span class="k">component</span> <span class="t">Notes</span>() {
+    <span class="k">state</span> n = <span class="t">0</span>
+    <span class="t">&lt;button</span> @click={() =&gt; { n = <span class="f">total</span>() }}<span class="t">&gt;</span>
+        {n} notes
+    <span class="t">&lt;/button&gt;</span>
+}
+
+<span class="k">route</span> <span class="t">GET</span> / = <span class="t">&lt;Notes/&gt;</span></pre>
+  </div>
+</div>
+</body>
+</html>

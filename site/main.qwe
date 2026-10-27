@@ -12,6 +12,8 @@ use "demos/todo.qwe"
 use "demos/life.qwe"
 
 let REPO = "https://github.com/quillolang/quillo"
+let DISCORD = "https://discord.gg/XRpTQ4uTq"
+let REDDIT = "https://www.reddit.com/r/quillo/"
 
 let tour = [
     { name: "Routes", file: "routes.qwe",
@@ -217,6 +219,20 @@ view Logo() = raw(`<svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
   <path d="M8.5 24.3C12 18 17 12.5 23.5 8" fill="none" stroke="#0b0a12" stroke-width="1.4" stroke-linecap="round"/>
 </svg>`)
 
+// A Star button beside GitHub. The site is static, so the count comes from
+// GitHub's API in the browser (kept 10 minutes in sessionStorage, as the API
+// allows 60 calls an hour), and shows only once there is at least one star.
+let STARS_API = replace(REPO, "https://github.com/", "https://api.github.com/repos/")
+
+let stars_script = `(function(){var k="quillo-stars";function show(n){if(!(n>0))return;var t=n>=1000?(n/1000).toFixed(1).replace(/\\.0$/,"")+"k":String(n);document.querySelectorAll(".stars .count").forEach(function(e){e.textContent=t;e.hidden=false})}try{var c=JSON.parse(sessionStorage.getItem(k));if(c&&Date.now()-c.t<6e5)return show(c.n)}catch(e){}fetch("${STARS_API}").then(function(r){return r.ok?r.json():null}).then(function(d){if(!d)return;show(d.stargazers_count);try{sessionStorage.setItem(k,JSON.stringify({n:d.stargazers_count,t:Date.now()}))}catch(e){}}).catch(function(){})})()`
+
+view Stars() =
+    <a.gh.stars href={REPO} aria-label="Star Quillo on GitHub">
+        {raw(`<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 .8l2.2 4.6 5 .7-3.6 3.5.9 5L8 12.2l-4.5 2.4.9-5L.8 6.1l5-.7z"/></svg>`)}
+        Star<span.count hidden></span>
+        <script>{raw(stars_script)}</script>
+    </a>
+
 view Window(title: str, children) =
     <div.window>
         <div.bar><i></i><i></i><i></i><span>{title}</span></div>
@@ -329,6 +345,11 @@ view Head(title: str, description: str, path: str, css: str, fonts: list) =
         <meta name="description" content={description}/>
         <meta property="og:title" content={title}/>
         <meta property="og:description" content={description}/>
+        <meta property="og:image" content={SITE + "/banner.png"}/>
+        <meta property="og:image:width" content="2400"/>
+        <meta property="og:image:height" content="1260"/>
+        <meta property="og:image:alt" content="Quillo: the web, as a language."/>
+        <meta name="twitter:card" content="summary_large_image"/>
         <link rel="canonical" href={SITE + path}/>
         <meta name="theme-color" content="#0b0a12"/>
         <link rel="icon" href="/favicon.svg" type="image/svg+xml"/>
@@ -337,6 +358,8 @@ view Head(title: str, description: str, path: str, css: str, fonts: list) =
     </head>
 
 route GET /favicon.svg = file("public/favicon.svg", { cache: "30d" })
+// The link preview (brand/quillo-banner.png, linked into public/).
+route GET /banner.png = file("public/banner.png", { cache: "30d" })
 route GET /fonts/*path = file("public/fonts/" + path, { cache: "1y" })
 
 // Every page, for search engines and for export.sh, which renders each one.
@@ -360,7 +383,7 @@ fn docs(slug: str) {
                         <a href={p.url} class={g.name == page.group && "active"}>{g.name}</a>
                     }}
                 </nav>
-                <nav><a.gh href={REPO}>GitHub</a></nav>
+                <nav><Stars/><a.gh href={REPO}>GitHub</a></nav>
             </header>
             <DocsPage page={page}/>
         </body>
@@ -384,6 +407,7 @@ route GET / =
                     <a href="#demo">Demo</a>
                     <a href="/docs/">Docs</a>
                     <a href="#start">Start</a>
+                    <Stars/>
                     <a.gh href={REPO}>GitHub</a>
                 </nav>
             </header>
@@ -473,6 +497,7 @@ route GET / =
                     <a.btn.primary href={REPO}>Quillo on GitHub</a>
                     <a.btn href="/docs/language-tour/">Read the language tour →</a>
                 </div>
+                <p.community-note>Questions, ideas, something you made? Come say hi on <a href={DISCORD}>Discord</a> or <a href={REDDIT}>r/quillo</a>.</p>
             </section>
 
             <section.section.story>
@@ -486,6 +511,11 @@ route GET / =
 
             <footer>
                 <a.brand href="/"><Logo/>Quillo</a>
+                <nav.community aria-label="Community">
+                    <a href={REPO}>GitHub</a>
+                    <a href={DISCORD}>Discord</a>
+                    <a href={REDDIT}>r/quillo</a>
+                </nav>
                 <span>MIT licensed. This site is written in Quillo and served as static files.</span>
             </footer>
         </body>

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Renders the site to static files in site/dist: every page in /sitemap.txt
-# (as <path>/index.html), the component bundles they load, fonts and favicon. A static host serves them as they are; the
+# (as <path>/index.html), the component bundles they load, fonts, favicon and link preview. A static host serves them as they are; the
 # components run in the browser and call nothing on the server.
 #
 #   cargo build --release && site/export.sh
@@ -31,6 +31,7 @@ for path in $(sed 's|^https://[^/]*||' "$out/sitemap.txt"); do
     curl -sf "http://127.0.0.1:$port$path" -o "$out${path}index.html"
 done
 curl -sf "http://127.0.0.1:$port/favicon.svg" -o "$out/favicon.svg"
+curl -sf "http://127.0.0.1:$port/banner.png" -o "$out/banner.png"
 mkdir -p "$out/fonts"
 for f in "$here"/public/fonts/*.woff2; do
     curl -sf "http://127.0.0.1:$port/fonts/${f##*/}" -o "$out/fonts/${f##*/}"

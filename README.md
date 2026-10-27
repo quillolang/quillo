@@ -12,7 +12,9 @@
   <a href="https://quillolang.org">Website</a> ·
   <a href="https://quillolang.org/docs/">Documentation</a> ·
   <a href="examples">Examples</a> ·
-  <a href="editors/vscode">VS Code extension</a>
+  <a href="editors/vscode">VS Code extension</a> ·
+  <a href="https://discord.gg/XRpTQ4uTq">Discord</a> ·
+  <a href="https://www.reddit.com/r/quillo/">Reddit</a>
 </p>
 
 <p align="center">
@@ -59,6 +61,7 @@ calls the server: no API to write, no `fetch`, no `async`/`await`.
 - [Getting started](#getting-started)
 - [Repository layout](#repository-layout)
 - [Documentation](#documentation)
+- [Community](#community)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -228,6 +231,12 @@ has all of it: [the language](USERGUIDE.md#language-tour),
 [databases](USERGUIDE.md#database), [services](USERGUIDE.md#services),
 [checking](USERGUIDE.md#checking), and
 [running in production](USERGUIDE.md#concurrency-and-reloading).
+
+## Community
+
+- **[Discord](https://discord.gg/XRpTQ4uTq)**: questions, help, and what people are building
+- **[r/quillo](https://www.reddit.com/r/quillo/)**: news, show and tell, longer discussions
+- **[GitHub issues](https://github.com/quillolang/quillo/issues)**: bugs and feature requests
 
 ## Contributing
 
