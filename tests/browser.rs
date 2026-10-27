@@ -316,6 +316,29 @@ fn components_call_the_pages_javascript() {
     assert_eq!(r, want);
 }
 
+/// The ways around the checks on the page's functions, tried in a real
+/// page: none runs its text, and ordinary calls still work.
+#[test]
+fn the_ways_around_the_pages_checks_do_not_run_text() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("guard.qwe"), free_port(), Some(&dir.join("guard.js")));
+    let want = serde_json::json!({
+        "reflect": "refused",
+        "parse": "refused",
+        "adopt": "refused",
+        "script": "refused",
+        "svgscript": "refused",
+        "wrapped": "refused",
+        "target": "<b>made</b>",
+        "pwned": null
+    });
+    assert_eq!(r, want);
+}
+
 /// Fine-grained updates: a component's code runs once; changing one row's
 /// text changes that text and nothing else; a child does not run again when
 /// its parent's other state changes; setting the same value does nothing.

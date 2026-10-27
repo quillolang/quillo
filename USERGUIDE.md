@@ -549,9 +549,17 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`. What runs text as code or HTML is
-  refused, however it is reached: `eval`, `Function`, `setTimeout` and `setInterval`,
-  `insertAdjacentHTML`, `document.write`, `setAttribute("on...")`, `javascript:` URLs
-  given to the page's functions. Markup in the component does all of that safely.
+  refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
+  `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
+  elements, nodes of another document, `javascript:` URLs (in lists and maps too) given
+  to the page's functions, and what steps around these checks (`Reflect.set`,
+  `Object.assign`, `Function.prototype.call`). Markup in the component does all of that
+  safely.
+- These checks are a guard-rail against mistakes, not a security boundary. Code that
+  calls into the page can do what the page's scripts can, and a program set on it can
+  find ways through (a library function that writes HTML, a function of the page
+  reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
+  out of what `js` calls, as you would in JavaScript.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps

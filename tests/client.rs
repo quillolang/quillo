@@ -290,6 +290,80 @@ f("ran = 1")"#).contains("runs text as code"));
     assert_eq!(run("js(\"ran\")"), "0");
 }
 
+/// The routes around those checks a review found: setting a property or
+/// calling with any `this` through `Reflect` or `Object.assign`, the
+/// Function constructor reached from a function, and javascript: URLs
+/// wrapped in a list or a map. A guard-rail, not a wall (see USERGUIDE.md).
+#[test]
+fn the_ways_around_the_pages_checks_are_refused_too() {
+    let load = |body: &str| {
+        let mut it = Interp::new(".");
+        let src = format!("component C(name: str) {{\n    <button @click={{() => {{ {} }}}}>x</button>\n}}\n", body);
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    for path in ["Reflect.set", "window.Reflect.construct", "Object.assign", "globalThis.Object.defineProperty", "DOMParser"] {
+        let e = load(&format!("js({:?}, 1)", path));
+        assert!(e.contains("steps around"), "{}: {}", path, e);
+    }
+    assert!(load(r#"js_new("DOMParser")"#).contains("steps around"));
+    assert_eq!(load(r#"js("Object.keys", 1)"#), "");
+    if !node_available() {
+        return;
+    }
+    // A library that hands out what the program should not reach.
+    let prelude = "globalThis.window = globalThis; globalThis.seen = []; globalThis.lib = { \
+        R: Reflect, el: { innerHTML: '' }, getAssign: () => Object.assign, \
+        go: (...a) => { globalThis.seen.push(JSON.stringify(a)); return a.length; }, \
+        ctorOf: (f) => Object.getPrototypeOf(f).constructor, \
+        getEval: () => eval, \
+        getGo: () => (u) => { globalThis.seen.push(u); return 'went'; } };";
+    let run = |body: &str| both_with(prelude, "", body).1;
+    let refused = |body: &str, why: &str| {
+        let r = run(body);
+        assert!(r.starts_with("ERROR") && r.contains(why), "{}\n=> {}", body, r);
+    };
+    refused(r#"js("lib.R").set(js("lib.el"), "innerHTML", "<img src=x onerror=alert(1)>")"#, "is not called from Quillo code");
+    refused(r#"js("lib.getAssign")"#, "is not given to Quillo code");
+    refused(r#"js("lib.R").construct(js("lib.R").get(js("lib.go"), "constructor"), [["alert(1)"]])"#, "is not called from Quillo code");
+    refused(r#"js("lib.ctorOf", () => 1)"#, "is not given to Quillo code");
+    refused(r#"js("lib.getEval")"#, "is not given to Quillo code");
+    refused(r#"js("lib.go", ["javascript:alert(1)"])"#, "javascript: URL");
+    refused(r#"js("lib.go", [[" JavaScript:alert(1)"]])"#, "javascript: URL");
+    refused(r#"js("lib.go", { a: { href: "javascript:alert(1)" } })"#, "javascript: URL");
+    refused(r#"js("lib.go", { toString: () => "javascript:alert(1)" })"#, "own toString");
+    refused(r#"js_new("Array", ["javascript:alert(1)"])"#, "javascript: URL");
+    // A function the page gave back checks what it is given when called,
+    // and is not handed to a builtin to call unchecked.
+    refused(r#"let go = js("lib.getGo")
+go(["javascript:alert(1)"])"#, "javascript: URL");
+    refused(r#"map(["javascript:alert(1)"], js("lib.getGo"))"#, "wrap it");
+    // What a program means to do still works.
+    assert_eq!(run(r#"js("lib.go", ["https://example.com"], { n: 1, tags: ["a"] })"#), "2");
+    assert_eq!(run(r#"let go = js("lib.getGo")
+[go("https://example.com"), map(["/a"], (u) => go(u)), js("seen")]"#), r#"["went", ["went"], ["https://example.com", "/a"]]"#);
+}
+
+/// A "__proto__" key from JSON (or written in a map) is a key like any
+/// other in the browser too: merging, adding or removing keeps it as data,
+/// with the map's prototype untouched, and JSON gives it back.
+#[test]
+fn a_proto_key_is_data_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    let body = r#"let m = json.parse("{\"__proto__\": {\"admin\": true}, \"a\": 1}")
+let lit = { "__proto__": { admin: true }, b: 2 }
+let all = [merge({}, m), {} + m, merge(m, {}), remove(m, "a"), set({}, "__proto__", { admin: true }), lit, merge({}, lit)]
+[map(all, (x) => x.admin), map(all, (x) => keys(x)), map(all, (x) => json.stringify(x)), m.admin, lit.admin]"#;
+    same("", body);
+    let (s, _) = both("", body);
+    assert!(s.contains(r#"[null, null, null, null, null, null, null]"#), "{}", s);
+    assert!(s.contains(r#"{\"__proto__\":{\"admin\":true},\"a\":1}"#), "{}", s);
+}
+
 #[test]
 fn constants_holding_functions_are_made_in_the_browser_too() {
     if !node_available() {
