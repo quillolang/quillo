@@ -385,6 +385,29 @@ fn navigate_without_a_single_page_app_loads_the_page() {
     assert_eq!(r, want);
 }
 
+/// On a page that reads url(), a spot on the page (`#target`) is gone to as
+/// the browser goes there: scrolled into view and :target, with url().hash
+/// following. From a link, from navigate("#target"), and from navigate() to
+/// another page, once that page shows the spot.
+#[test]
+fn spots_on_a_page_are_gone_to_as_the_browser_would() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("hash.qwe"), free_port(), Some(&dir.join("hash.js")));
+    let want = serde_json::json!({
+        "link": { "at": true, "target": "target", "note": "/#target" },
+        "back": { "hash": "", "note": "/#" },
+        "same": { "at": true, "target": "target", "note": "/#target" },
+        "other": { "at": true, "target": "deep", "note": "/other#deep" },
+        "kept": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// markdown() in a component shows what the server makes of the text, as
 /// it is typed.
 #[test]

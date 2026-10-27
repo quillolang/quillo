@@ -600,7 +600,10 @@ bar in the browser, where what reads it follows it when it changes. Once a
 component has called it, clicks on same-site links inside components change the page
 without reloading; Back and Forward work. `navigate("/path")` does the same from code;
 on a page where no component has called `url()`, it loads that page as a link would.
-(Links with a modifier key, `target`, `download` or `data-reload` work as usual.)
+(Links with a modifier key, `target`, `download` or `data-reload` work as usual.) A link
+or `navigate("#spot")` to a spot on the same page goes there as the browser does:
+scrolled into view, and CSS `:target` set. `navigate("/page#spot")` goes to the spot
+once the new page shows it, and stays at the top if it never does.
 
 ```quillo
 component App() {

@@ -4288,6 +4288,7 @@ function navStart() {
   // Links in components are followed here: not prefetched as pages.
   window.__quillo_nav = true;
   window.addEventListener("popstate", navChanged);
+  window.addEventListener("hashchange", navChanged);
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const a = e.target.closest && e.target.closest("a[href]");
@@ -4299,6 +4300,9 @@ function navStart() {
     if (BASE && u.pathname !== BASE && !u.pathname.startsWith(BASE + "/")) return;
     const path = u.pathname.slice(BASE.length) || "/";
     if (path.startsWith("/_quillo/")) return;
+    // A spot on this page: the browser scrolls there and sets :target, and
+    // its popstate (or hashchange) updates url().
+    if (u.hash && u.pathname === location.pathname && u.search === location.search) return;
     e.preventDefault();
     navigate(path + u.search + u.hash);
   });
@@ -4311,10 +4315,37 @@ function navigate(to) {
     location.assign(full);
     return null;
   }
+  const u = new URL(full, location.href);
+  // A spot on this page: the browser goes there itself, as for a link.
+  if (u.hash && u.pathname === location.pathname && u.search === location.search) {
+    if (u.hash !== location.hash) location.hash = u.hash;
+    else toHash();
+    navChanged();
+    return null;
+  }
   if (full !== location.pathname + location.search + location.hash) history.pushState(null, "", full);
   window.scrollTo(0, 0);
   navChanged();
+  if (u.hash) toHash();
   return null;
+}
+
+// Goes to the element the address's #hash names, as the browser does for
+// a link (scrolled into view, and :target), once it is on the page: a page
+// just navigated to may show it only when its data has come. Stays at the
+// top when it never comes, or when the address changes meanwhile.
+function toHash() {
+  const at = location.href;
+  const id = decodeURIComponent(location.hash.slice(1));
+  let frames = 0;
+  const look = () => {
+    if (location.href !== at) return;
+    // The same address with a #hash: a fragment navigation, no reload and no
+    // new history entry.
+    if (document.getElementById(id) || document.getElementsByName(id)[0]) location.replace(at);
+    else if (++frames < 300) requestAnimationFrame(look);
+  };
+  look();
 }
 
 function currentUrl() {

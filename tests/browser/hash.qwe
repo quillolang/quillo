@@ -1,0 +1,20 @@
+// A page that reads url(), with spots to go to: a link to one on the page,
+// navigate() to one on the page, and navigate() to one on another page,
+// which is there only once that page has rendered. Driven by hash.js.
+
+view Tall(h: int) = <div style={`height:${h}px`}></div>
+
+component Routed() {
+    let u = url()
+    <div>
+        <p id="note">{`${u.path}#${u.hash}`}</p>
+        <button id="same" @click={() => navigate("#target")}>Here</button>
+        <button id="other" @click={() => navigate("/other#deep")}>There</button>
+        {u.path == "/other"
+            ? <div><Tall h={3000}/><h2 id="deep">Deep</h2><Tall h={2000}/></div>
+            : <div><Tall h={1500}/><a id="jump" href="#target">Jump</a><Tall h={2500}/><h2 id="target">Target</h2><Tall h={2000}/></div>}
+    </div>
+}
+
+route GET / = <html><body><Routed/></body></html>
+route GET /other = <html><body><Routed/></body></html>
