@@ -311,8 +311,9 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     // resumes the server's page instead of making it again (half a KB), and
     // decimals and ints past 2^53, which any value from the server may be
     // (3.5 KB), and the checks on what is handed to the page's functions
-    // (an event's element's methods, say: 400 bytes).
-    assert!(js.len() < js2.len() && js.len() < 30_500, "{} vs {}", js.len(), js2.len());
+    // (an event's element's methods, say: 400 bytes), and components that
+    // are a table's rows, and what says why a page was made again (1.5 KB).
+    assert!(js.len() < js2.len() && js.len() < 32_000, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }
@@ -591,4 +592,53 @@ route GET /cached = respond(200, "mine", { "cache-control": "no-store" })
     assert!(get(&mut it, "/login").header("set-cookie").is_some());
     // What the program says of caching stays as it says.
     assert_eq!(prefetch(&mut it, "/cached", ("X-Quillo-Prefetch", "1")).header("cache-control"), Some("no-store"));
+}
+
+/// A run-time error names the file its line is in, as `quillo check` does:
+/// a program of several files has many a line 3.
+#[test]
+fn errors_name_the_file_of_their_line() {
+    let d = std::env::temp_dir().join(format!("quillo-error-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("ui")).unwrap();
+    std::fs::write(d.join("ui/cards.qwe"), "view TaskCard(code: str, title: str) = <li>{code}: {title}</li>\nfn days(xs) = xs.day\nfn worse(x) ! str = err(42)\n").unwrap();
+    std::fs::write(
+        d.join("main.qwe"),
+        "use \"ui/cards.qwe\"\nfn data() = json.parse(\"[1]\")\nroute GET /a = <ul><TaskCard code={data()[0]} title=\"t\"/></ul>\n\
+         route GET /b = days(data())\nroute GET /c = data().nope\nroute GET /d = worse(1)\nroute GET /e = data() | map((x) => x.day)\n",
+    )
+    .unwrap();
+    let mut it = Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    // The message, for the program's author, is in the answer with --watch.
+    quillo::server::SHOW_ERRORS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cases = [
+        // The argument is wrong where the call is.
+        ("/a", "main.qwe:3: argument `code` of `TaskCard`"),
+        ("/b", "cards.qwe:2: list has no field `day`"),
+        ("/c", "main.qwe:5: list has no field `nope`"),
+        ("/d", "cards.qwe:3: `worse` declares errors"),
+        ("/e", "main.qwe:7: int has no field `day`"),
+    ];
+    for (path, want) in cases {
+        let r = get(&mut it, path);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert!(r.status == 500 && body.contains(want), "{}: {}", path, body);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `cookie(name)` reads the request's cookie from any function it runs.
+#[test]
+fn cookie_reads_the_requests_cookie_anywhere() {
+    let mut it = app("fn zone() = cookie(\"tz\") ?? \"UTC\"\nroute GET /tz = zone()\n");
+    let r = it.handle(&HttpRequest {
+        method: "GET".into(),
+        url: "/tz".into(),
+        headers: vec![("Host".into(), "localhost".into()), ("Cookie".into(), "a=1; tz=Asia/Manila".into())],
+        body: Vec::new(),
+        remote: "127.0.0.1".into(),
+    });
+    assert_eq!(String::from_utf8_lossy(&r.body), "Asia/Manila");
+    assert_eq!(String::from_utf8_lossy(&get(&mut it, "/tz").body), "UTC");
 }

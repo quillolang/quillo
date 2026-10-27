@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -125,7 +125,7 @@ mod dev {
 
     pub fn bundle(it: &Interp, c: &Compiler, boots: bool) -> String {
         let mut pieces: Vec<Piece> = Vec::new();
-        let mut prelude = String::new();
+        let mut prelude = String::from("DEV = true;\n");
         if !it.base.is_empty() {
             let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
         }
@@ -800,7 +800,7 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
 }
 
 /// Calls `f` on `e` and every expression inside it.
-fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     each_expr_in(e, f, true)
 }
 

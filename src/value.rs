@@ -395,11 +395,62 @@ impl Value {
 }
 
 fn fmt_float(f: f64) -> String {
+    if JS_NUMBERS.with(|j| j.get()) {
+        return js_number(f);
+    }
     if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
         format!("{:.1}", f)
     } else {
         format!("{}", f)
     }
+}
+
+thread_local! {
+    /// While the server renders a component, whose code also runs in the
+    /// browser: floats are written as JavaScript writes them, so the page
+    /// the server sends is the one the browser would make (see
+    /// `js_numbers`).
+    static JS_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` writing floats as JavaScript does (or not), as it was after.
+pub fn js_numbers<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = JS_NUMBERS.with(|j| j.replace(on));
+    let r = f();
+    JS_NUMBERS.with(|j| j.set(was));
+    r
+}
+
+/// A number as JavaScript's `String(x)` writes it: `8` for 8.0, an
+/// exponent from 1e21 up and below 1e-6 (`1e+21`, `1.5e-7`).
+pub fn js_number(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if f == 0.0 {
+        return "0".into();
+    }
+    // The shortest digits that give f back, and where the point goes:
+    // f = 0.digits × 10^n.
+    let sci = format!("{:e}", f.abs());
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exp.parse::<i32>().unwrap_or(0) + 1;
+    let text = if k <= n && n <= 21 {
+        format!("{}{}", digits, "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else {
+        let e = if n - 1 >= 0 { format!("+{}", n - 1) } else { (n - 1).to_string() };
+        if k == 1 { format!("{}e{}", digits, e) } else { format!("{}.{}e{}", &digits[..1], &digits[1..], e) }
+    };
+    if f < 0.0 { format!("-{}", text) } else { text }
 }
 
 /// A map's key and its colon, as `repr` writes them.
@@ -866,6 +917,20 @@ pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
     }
 }
 
+/// Takes a variable's value out of the nearest scope that has it, leaving
+/// null there, unless that is the globals: so that in `m = set(m, k, v)`
+/// the map has one owner, and is changed rather than copied.
+pub fn take_local(env: &Env, name: &str) -> Option<Value> {
+    let mut cur: &Scope = env;
+    loop {
+        let global = cur.parent.is_none();
+        if let Some(slot) = cur.vars().get_mut(name) {
+            return (!global).then(|| std::mem::replace(slot, Value::Nil));
+        }
+        cur = cur.parent.as_deref()?;
+    }
+}
+
 /// Updates an existing variable in the nearest scope that has it.
 pub fn assign(env: &Env, name: &str, v: Value) -> bool {
     assign_global(env, name, v).is_some()
@@ -907,5 +972,16 @@ mod tests {
         m.insert("empty".into(), Value::map(Map::new()));
         let v = Value::list(vec![Value::map(m), Value::list(vec![]), Value::Int(i64::MIN), Value::str("")]);
         assert_eq!(v.json_text(), v.to_json().to_string());
+    }
+}
+
+#[cfg(test)]
+mod js_number_tests {
+    /// What Node's `String(x)` gives for each.
+    #[test]
+    fn numbers_are_written_as_javascript_writes_them() {
+        let xs = [8.0, 2.5, 0.1 + 0.2, 1e21, 1.5e-7, 1e-6, 123456789012345680000.0, -0.000001234, 1e300, 5e-324, -42.0, 100.0, 0.5, 1.0 / 3.0, 9007199254740992.0, 1e16, 12345.6789];
+        let js = "8 2.5 0.30000000000000004 1e+21 1.5e-7 0.000001 123456789012345680000 -0.000001234 1e+300 5e-324 -42 100 0.5 0.3333333333333333 9007199254740992 10000000000000000 12345.6789";
+        assert_eq!(xs.iter().map(|x| super::js_number(*x)).collect::<Vec<_>>().join(" "), js);
     }
 }

@@ -422,7 +422,10 @@ impl Interp {
             }
 
             self.current_request = r.uses_request.then_some(reqv);
-            let mut resp = finish(if crate::debug::on() { self.debug_route(&r, &scope) } else { self.eval(&r.body, &scope) });
+            let file = std::mem::replace(&mut self.cur_file, r.file.clone());
+            let ran = if crate::debug::on() { self.debug_route(&r, &scope) } else { self.eval(&r.body, &scope) };
+            self.cur_file = file;
+            let mut resp = finish(crate::interp::in_file(ran, &r.file));
             // The page's components will need the locale (see `handle`).
             if self.rendered_island && self.site.i18n.is_some() {
                 self.locale();
@@ -999,7 +1002,7 @@ pub const PREFETCH_JS: &str = concat!(
     "const spec=HTMLScriptElement.supports&&HTMLScriptElement.supports(\"speculationrules\");",
     "const link=(e)=>e.target&&e.target.closest&&e.target.closest(\"a[href]\");",
     "const want=(a)=>{if(a.target&&a.target!==\"_self\"||a.hasAttribute(\"download\")||a.closest(\"[data-no-prefetch]\"))return null;",
-    "if(w.__quillo_nav&&a.closest(\"quillo-island\"))return null;",
+    "if(w.__quillo_nav&&a.closest(\"quillo-island,[data-qi]\"))return null;",
     "const u=new URL(a.href,location.href);if(u.origin!==location.origin||!/^https?:$/.test(u.protocol))return null;",
     "if(u.pathname===location.pathname&&u.search===location.search)return null;u.hash=\"\";return u.href};",
     "const go=(a)=>{const u=a&&want(a);if(!u||seen.has(u))return;seen.add(u);",
@@ -1550,6 +1553,9 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.len();
         eprintln!("quillo: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, shown);
+        if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(|e| e.into_inner()) {
+            eprintln!("quillo: database {}", db);
+        }
     }
     if app.watch {
         eprintln!("quillo: watching for changes");
@@ -1737,10 +1743,10 @@ fn island_loader(src: &str) -> String {
         concat!(
             "(()=>{{const d=document,q=window.__quillo_q=[];let go=0;",
             "const load=()=>{{if(go)return;go=1;const t=d.createElement(\"script\");t.src={};t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}};",
-            "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island\");",
+            "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island,[data-qi]\");",
             "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{window.__quillo_at=e.target;load()}}}},{{capture:true,passive:true}});",
             "for(const v of[\"click\",\"submit\"])d.addEventListener(v,(e)=>{{if(!window.__quillo_booted&&isl(e)){{e.preventDefault();e.stopPropagation();q.push(e);load()}}}},true);",
-            "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
+            "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
             "d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
         ),
         src

@@ -46,6 +46,7 @@ pub const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("set_cookie", set_cookie),
     ("delete_cookie", delete_cookie),
     ("session", session),
+    ("cookie", cookie),
     ("set_session", set_session),
     ("end_session", end_session),
 ];
@@ -281,6 +282,22 @@ fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
     let found = if valid.len() == 1 { valid.remove(0) } else { Value::map(Map::new()) };
     it.session = Some(found.clone());
     Ok(found)
+}
+
+/// `cookie(name)`: the request's cookie of that name, as `request.cookies`
+/// has it, or null (also outside a request). It works in any function the
+/// request runs, as `session()` does, so a helper need not be handed
+/// `request` by each caller.
+fn cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        other => return fail(line, format!("`cookie` expects a cookie's name, got {}", other.map_or("nothing", |v| v.type_name()))),
+    };
+    let Some(Value::Map(req)) = it.request_value() else { return Ok(Value::Nil) };
+    Ok(match req.get("cookies") {
+        Some(Value::Map(c)) => c.get(&*name).cloned().unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    })
 }
 
 /// `set_session(map, { max_age })`: replaces the session.

@@ -533,3 +533,16 @@ fn html_made_from_text_is_that_text_in_the_browser() {
     }
     same("", r#"[str(raw("<b>x</b>")), len(str(raw("<i>é</i>")))]"#);
 }
+
+#[test]
+fn spread_return_and_names_that_are_types_run_the_same_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    same("", "let m = { a: 1, b: 2 }\nlet xs = [1, 2]\nlet merge = 5\n[{ ...m, b: 3 }, { b: 0, ...m }, [...xs, 3], [0, ...xs, ...xs], [...xs], merge]");
+    same("fn f(x) {\n let y = x ?? return \"none\"\n y * 2\n}\nfn g(k) = match k {\n \"a\" => return 1\n _ => 2\n}", "[f(2), f(null), g(\"a\"), g(\"b\")]");
+    same("fn f() {\n let xs = for x in [1, 2, 3] => { if x == 2 { return \"left f\" }; x * 10 }\n xs\n}", "f()");
+    same("", "let x = 1\nlet int = x + 1\nlet num = 5\nlet out = []\nfor str in [\"a\"] { out = push(out, str) }\n[int, num, out, match 3 { int => \"an int\", _ => \"no\" }]");
+    same("", "let m = set({}, 5, \"five\")\nlet xs = [1, 2, 3]\n[m[5], m[6], set(xs, 1, 9), set(xs, -1, 0), xs]");
+    same_error("", "set([1, 2, 3], 3, 0)", "index 3 is outside a list of 3");
+}

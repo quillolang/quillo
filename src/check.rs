@@ -567,9 +567,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("values", "map | null", "list"),
     ("get", "map | null, any, any=", "any"),
     ("has", "map | null, any", "bool"),
-    ("set", "map | null, any, any=", "map"),
+    ("set", "map | list | null, any, any=", "map | list"),
     ("remove", "list | map | null, any", "list | map"),
     ("merge", "map | null, map | null", "map"),
+    ("__merge", "map | null, map | null", "map"),
     ("err", "any=", "error(any)"),
     ("is_err", "any", "bool"),
     ("unwrap", "any", "any"),
@@ -662,6 +663,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("http.patch", "str, any=, map | null=, map | null=", "map | error(str)"),
     ("http.request", "str, str, any=, map | null=, map | null=", "map | error(str)"),
     ("set_cookie", "str, any=, map | null=", "null"),
+    ("cookie", "str", "str | null"),
     ("delete_cookie", "str, map | null=", "null"),
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
@@ -827,7 +829,7 @@ pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", 
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "set_session", "end_session", "translations", "locale_from", "with_locale",
+      "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
@@ -2604,7 +2606,7 @@ impl Checker {
                 let o = self.expr(obj);
                 let i = self.expr(idx);
                 self.line = *line;
-                let ok = [(LIST, INT), (MAP, STR), (STR, INT), (NIL, ANY)]
+                let ok = [(LIST, INT), (MAP, STR), (MAP, INT), (STR, INT), (NIL, ANY)]
                     .iter()
                     .any(|(a, b)| o.bits & a != 0 && i.bits & b != 0);
                 if !ok && o.bits != 0 && i.bits != 0 {
@@ -2981,6 +2983,7 @@ impl Checker {
             "first" | "last" if expr_at(0).is_some_and(never_empty) => a0.items(),
             "find" | "first" | "last" => a0.items().map(|e| e.union(T::of(NIL))),
             "push" => Some(list_of(a0.items()?.union(*args.get(1)?))),
+            "set" if a0.bits & LIST != 0 && a0.bits & (MAP | NIL) == 0 => Some(list_of(a0.items()?.union(*args.get(2)?))),
             "flatten" => a0.items()?.items().map(list_of),
             "split" | "keys" => Some(list_of(T::of(STR))),
             "range" => Some(list_of(T::of(INT))),

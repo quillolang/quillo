@@ -9,6 +9,18 @@ use std::sync::Arc;
 
 type PResult<T> = Result<T, QuilloError>;
 
+/// `<Row key={x.id}/>` says which item of a list a row is: it is the
+/// list's, so a view or component cannot take it as a parameter.
+fn key_not_a_param(def: &FnDef) -> PResult<()> {
+    if def.params.iter().any(|p| p.name == "key") {
+        return Err(QuilloError::new(
+            format!("<{}> cannot take a parameter named `key`: in a list, key={{...}} says which item an element is, and is not passed on; name it otherwise (`code`, `id`)", def.name),
+            def.line,
+        ));
+    }
+    Ok(())
+}
+
 pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
@@ -247,17 +259,21 @@ impl Parser {
             match k.as_str() {
                 "let" => {
                     self.next()?;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_binding()?;
                     self.expect(&Tok::Assign, "`=`")?;
                     let e = self.parse_expr()?;
                     return Ok(Stmt::Let(pat, e, line));
                 }
                 "fn" | "view" => {
+                    let view = k == "view";
                     let saved = self.save();
                     self.next()?;
                     if let Tok::Ident(_) = self.peek()? {
                         let name = self.expect_ident("a function name")?;
                         let def = self.parse_fn_rest(name, line)?;
+                        if view || def.name.starts_with(|c: char| c.is_uppercase()) {
+                            key_not_a_param(&def)?;
+                        }
                         return Ok(Stmt::Fn(Arc::new(def)));
                     }
                     self.restore(saved);
@@ -508,7 +524,9 @@ impl Parser {
         }
         self.expect(&Tok::RParen, "`)`")?;
         let (body, nesting) = self.measured(|p| p.component_body(&name))?;
-        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() })
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() };
+        key_not_a_param(&def)?;
+        Ok(def)
     }
 
     fn component_body(&mut self, name: &str) -> PResult<Expr> {
@@ -1136,15 +1154,31 @@ impl Parser {
                 })
             }
             Tok::LBracket => self.no_bare_arrow_off(|p| {
+                // `[...xs, 3]` is `xs + [3]`: lists between the spreads.
+                let mut parts: Vec<Expr> = Vec::new();
                 let mut items = Vec::new();
                 while !p.at(&Tok::RBracket)? {
-                    items.push(p.parse_expr()?);
+                    if p.eat_spread()? {
+                        if !items.is_empty() {
+                            parts.push(Expr::List(std::mem::take(&mut items)));
+                        }
+                        parts.push(p.parse_expr()?);
+                    } else {
+                        items.push(p.parse_expr()?);
+                    }
                     if !p.eat(&Tok::Comma)? {
                         break;
                     }
                 }
                 p.expect(&Tok::RBracket, "`]` to close the list")?;
-                Ok(Expr::List(items))
+                if parts.is_empty() {
+                    return Ok(Expr::List(items));
+                }
+                if !items.is_empty() {
+                    parts.push(Expr::List(items));
+                }
+                // A list to start from, so that `[...xs]` is a list too.
+                Ok(parts.into_iter().fold(Expr::List(Vec::new()), |a, b| Expr::Binary(BinOp::Add, Box::new(a), Box::new(b), line)))
             }),
             Tok::LBrace => self.no_bare_arrow_off(|p| {
                 if p.brace_is_map()? {
@@ -1175,6 +1209,12 @@ impl Parser {
                     line,
                 )),
                 "reply" => self.parse_reply(line),
+                // `?? return null`, `pat => return x`: leaves the function, as
+                // the statement does.
+                "return" => {
+                    let e = if can_start_expr(&self.peek()?) { Some(self.parse_expr()?) } else { None };
+                    Ok(Expr::Block(vec![Stmt::Return(e)]))
+                }
                 kw if KEYWORDS.contains(&kw) => Err(QuilloError::new(format!("unexpected keyword `{}`", kw), line)),
                 _ if self.peeked.is_none() && self.lx.peek_char() == Some('`') => {
                     // A tagged template: css`...` is css(`...`).
@@ -1204,6 +1244,12 @@ impl Parser {
     fn brace_is_map(&mut self) -> PResult<bool> {
         match self.peek()? {
             Tok::RBrace => Ok(true),
+            Tok::DotDot => {
+                let s = self.save();
+                let r = self.eat_spread()?;
+                self.restore(s);
+                Ok(r)
+            }
             Tok::Ident(k) => {
                 let keyword = KEYWORDS.contains(&k.as_str());
                 let s = self.save();
@@ -1227,12 +1273,47 @@ impl Parser {
         }
     }
 
+    /// `...` before a value in a list or a map, which spreads it.
+    fn eat_spread(&mut self) -> PResult<bool> {
+        if !self.at(&Tok::DotDot)? {
+            return Ok(false);
+        }
+        let s = self.save();
+        self.next()?;
+        if self.eat(&Tok::Dot)? {
+            return Ok(true);
+        }
+        self.restore(s);
+        Ok(false)
+    }
+
     fn parse_map_rest(&mut self) -> PResult<Expr> {
+        // `{ ...m, name: v }` is `merge(m, { name: v })`: later keys win.
+        let mut parts: Vec<Expr> = Vec::new();
         let mut entries = Vec::new();
         loop {
             self.skip_list_seps()?;
             if self.eat(&Tok::RBrace)? {
-                return Ok(Expr::Map(entries));
+                if parts.is_empty() {
+                    return Ok(Expr::Map(entries));
+                }
+                if !entries.is_empty() {
+                    parts.push(Expr::Map(entries));
+                }
+                let line = self.lx.line;
+                let merge = |a: Expr, b: Expr| Expr::Call(Box::new(Expr::Ident("__merge".into(), line)), vec![a, b], line);
+                return Ok(parts.into_iter().fold(Expr::Map(Vec::new()), merge));
+            }
+            if self.eat_spread()? {
+                if !entries.is_empty() {
+                    parts.push(Expr::Map(std::mem::take(&mut entries)));
+                }
+                parts.push(self.parse_expr()?);
+                match self.peek()? {
+                    Tok::Comma | Tok::Newline | Tok::Semi | Tok::RBrace => {}
+                    other => return self.err_at(format!("expected `,` or `}}` in map, found {}", other.describe())),
+                }
+                continue;
             }
             let t = self.next()?;
             let (key, shorthand_ok) = match t.tok {
@@ -1348,8 +1429,18 @@ impl Parser {
         Ok(Expr::While(Box::new(cond), Box::new(body), line))
     }
 
+    /// What `let` and `for` bind: a pattern, in which a bare name binds
+    /// that name, even one that names a type (`let num = 5`), as a
+    /// parameter does; `match` tests types.
+    fn parse_binding(&mut self) -> PResult<Pattern> {
+        Ok(match self.parse_pattern()? {
+            Pattern::Type(n) if TYPE_NAMES.contains(&n.as_str()) => Pattern::Bind(n),
+            p => p,
+        })
+    }
+
     fn parse_for(&mut self, line: u32) -> PResult<Expr> {
-        let pat = self.parse_pattern()?;
+        let pat = self.parse_binding()?;
         if !self.eat_kw("in")? {
             return self.err_at("expected `in` after the `for` pattern");
         }
@@ -1617,6 +1708,11 @@ impl Parser {
                 Some(c) => return self.html_err(format!("unexpected `{}` in <{}> tag", c, tag)),
             }
         };
+        // One of the two would be lost: in a list, `key` and a view's own
+        // `key` was such a pair.
+        if let Some((_, (name, _))) = attrs.iter().enumerate().find(|(i, (n, _))| n != "..." && attrs[..*i].iter().any(|(m, _)| m == n)) {
+            return self.html_err(format!("attribute `{}` is written twice in <{}>", name, tag));
+        }
         // The browser decodes these attributes before it runs them, so no
         // escaping keeps a value from data from running as code.
         if let Some((name, _)) = attrs.iter().find(|(n, v)| code_from_data(&tag, &attrs, n, v)) {

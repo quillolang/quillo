@@ -501,3 +501,23 @@ fn fields_of_the_pages_objects_are_set_in_components() {
     one("fn f(m: map) {\n    m.a = 2\n}", "cannot set `a`: only the page's objects (an element, an event) have fields that are set, in a component");
     one("fn f(xs: list) {\n    xs[0] = 1\n}", "only variables, and the fields of the page's objects (`el.value = x`), can be assigned to");
 }
+
+#[test]
+fn key_is_the_lists_and_attributes_are_written_once() {
+    one("view Row(key: str, label: str) = <li>{key}: {label}</li>", "<Row> cannot take a parameter named `key`");
+    one("component Card(key: str) = <p>{key}</p>", "<Card> cannot take a parameter named `key`");
+    one("fn Row(key) = <li>{key}</li>", "<Row> cannot take a parameter named `key`");
+    clean("fn lookup(key) = key\nprint(lookup(1))");
+    one("view Card(id: int) = <li>{id}</li>\nlet xs = [1]\nprint(<ul>{for x in xs => <Card key={x} id={x} key={x}/>}</ul>)", "attribute `key` is written twice in <Card>");
+    one("print(<p class=\"a\" class=\"b\">x</p>)", "attribute `class` is written twice in <p>");
+    clean("print(<p.a class=\"b\">x</p>)");
+}
+
+#[test]
+fn newer_forms_check_clean() {
+    clean("let m = { a: 1 }\nlet xs = [1]\nprint([{ ...m, b: 2 }, [...xs, 3], set(xs, 0, 2), m[5]])");
+    clean("fn f(x) = x ?? return null\nprint(f(1))");
+    clean("let num = 5\nfor str in [\"a\"] { print(str) }\nprint(num + 1)");
+    clean("route GET /tz = cookie(\"tz\") ?? \"UTC\"");
+    one("component C() = <p>{cookie(\"tz\")}</p>", "`cookie` is not available in the browser");
+}

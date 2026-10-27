@@ -226,6 +226,28 @@ fn svg_inside_html_draws() {
     assert_eq!(r, want);
 }
 
+/// A component that is a table's row or a select's option stays where it
+/// is written (its root element is its island), and a number is written by
+/// the server as the browser writes it: the page is taken up, not made again.
+#[test]
+fn table_rows_and_numbers_are_taken_up_as_written() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("tables.qwe"), free_port(), Some(&dir.join("tables.js")));
+    let want = serde_json::json!({
+        "server": { "top": ["aoff", "boff"], "sheet": ["xoff", "yoff"], "options": ["one", "two"], "score": "8 days, 8.04e+22 0" },
+        "after": { "top": ["aoff", "bon"], "sheet": ["xon", "yoff", "zon"], "score": "8 days, 8.04e+22 1" },
+        "wrapped": 0,
+        "rows": 3,
+        "remade": 0,
+        "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
 /// Attributes a component takes from data: a spread cannot add handlers,
 /// whatever the key's case or `bind:`, nor replace an attribute written
 /// out; a sandboxed frame's page follows the state; an SVG animation of an

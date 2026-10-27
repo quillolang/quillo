@@ -52,6 +52,9 @@ pub fn install(env: &Env) {
         ("set", set),
         ("remove", remove),
         ("merge", merge),
+        // `{ ...m, name: v }` (src/parser.rs), which a variable named merge
+        // cannot change.
+        ("__merge", merge),
         ("err", err),
         ("is_err", is_err),
         ("unwrap", unwrap),
@@ -589,9 +592,29 @@ fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // `set(xs, i, v)`: a list with item i (from the end when negative) v.
+    if let Value::List(_) = arg(&args, 0) {
+        let i = i_arg(&args, 1, "set", line)?;
+        let v = arg(&args, 2);
+        let mut args = args;
+        let Value::List(l) = std::mem::replace(&mut args[0], Value::Nil) else { unreachable!() };
+        drop(args);
+        let n = l.len() as i64;
+        let at = if i < 0 { n + i } else { i };
+        if at < 0 || at >= n {
+            return fail(line, format!("`set`: index {} is outside a list of {}", i, n));
+        }
+        let mut l = Arc::unwrap_or_clone(l);
+        l[at as usize] = v;
+        return Ok(Value::list(l));
+    }
     let m = m_arg(&args, 0, "set", line)?;
+    let (k, v) = (arg(&args, 1).key_text(), arg(&args, 2));
+    // The arguments let go first: a map no one else holds is changed, not
+    // copied (see `in_place` in src/interp.rs).
+    drop(args);
     let mut m = Arc::unwrap_or_clone(m);
-    m.insert(arg(&args, 1).key_text().into(), arg(&args, 2));
+    m.insert(k.into(), v);
     Ok(Value::map(m))
 }
 
@@ -602,16 +625,21 @@ fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(Value::list(l.iter().filter(|v| !equal(v, &x)).cloned().collect()))
         }
         _ => {
-            let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "remove", line)?);
-            m.shift_remove(arg(&args, 1).key_text().as_str());
+            let m = m_arg(&args, 0, "remove", line)?;
+            let k = arg(&args, 1).key_text();
+            drop(args);
+            let mut m = Arc::unwrap_or_clone(m);
+            m.shift_remove(k.as_str());
             Ok(Value::map(m))
         }
     }
 }
 
 fn merge(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let mut m = Arc::unwrap_or_clone(m_arg(&args, 0, "merge", line)?);
-    for (k, v) in m_arg(&args, 1, "merge", line)?.iter() {
+    let (a, b) = (m_arg(&args, 0, "merge", line)?, m_arg(&args, 1, "merge", line)?);
+    drop(args);
+    let mut m = Arc::unwrap_or_clone(a);
+    for (k, v) in b.iter() {
         m.insert(k.clone(), v.clone());
     }
     Ok(Value::map(m))

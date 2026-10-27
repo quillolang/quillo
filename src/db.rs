@@ -927,10 +927,21 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
     }
 }
 
+/// The SQLite file the program opened last, for `quillo run` to say which
+/// it is: `db.open("app.db")` is next to the program, wherever Quillo runs.
+pub static OPENED: Mutex<Option<String>> = Mutex::new(None);
+
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match slot_for(it, &args, "db.open", line)? {
         Ok(slot) => {
             *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(slot);
+            if let Some(Value::Str(t)) = args.first() {
+                if !is_server_url(t) && &**t != ":memory:" && !t.contains("{tenant}") {
+                    let full = if Path::new(&**t).is_absolute() { Path::new(&**t).to_path_buf() } else { it.base_dir.join(&**t) };
+                    let full = std::fs::canonicalize(&full).unwrap_or(full);
+                    *OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some(full.display().to_string());
+                }
+            }
             Ok(Value::Nil)
         }
         Err(e) => Ok(db_err(e)),

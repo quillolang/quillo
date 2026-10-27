@@ -35,6 +35,16 @@ impl fmt::Display for QuilloError {
 
 impl std::error::Error for QuilloError {}
 
+/// A program's file as messages name it: relative to the folder Quillo
+/// runs in, when it is inside it (`ui/board.qwe`), else as it is.
+pub fn shown_path(file: &str) -> String {
+    let p = std::path::Path::new(file);
+    std::env::current_dir()
+        .ok()
+        .and_then(|d| p.strip_prefix(&d).ok().map(|r| r.display().to_string()))
+        .unwrap_or_else(|| file.to_string())
+}
+
 /// When this process's binary was built, as it was when the process
 /// started: a long-running one (the language server) keeps running the old
 /// code after a rebuild replaces the file.
@@ -92,5 +102,5 @@ pub fn which_quillo() -> String {
             at
         );
     }
-    format!("this is quillo {}{}{}; code written for a newer Quillo fails to parse like this", crate::version(), built, at)
+    format!("this is quillo {}{}{}; if the code was written for a newer Quillo, that would explain it", crate::version(), built, at)
 }

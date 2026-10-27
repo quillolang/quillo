@@ -5,6 +5,9 @@
 
 // Where the program is mounted ("" at the root); the bundle sets it.
 let BASE = "";
+// Development (`--watch`): a page the browser makes again, rather than
+// taking up the server's HTML, says why.
+let DEV = false;
 const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !== "/" ? BASE + u : u);
 
 // ---- values ------------------------------------------------------------
@@ -688,7 +691,7 @@ function index(o, i) {
   }
   // The page's objects: by name, or by number for lists of theirs (files, elements).
   if (foreign(o) && (typeof i === "string" || isInt(i))) return field(o, String(i), null);
-  if (isMap(o) && typeof i === "string") return hasOwn(o, i) ? o[i] : null;
+  if (isMap(o) && (typeof i === "string" || isInt(i))) return hasOwn(o, String(i)) ? o[String(i)] : null;
   if (typeof o === "string" && isInt(i)) {
     const cs = Array.from(o);
     const n = i < 0 ? cs.length + i : i;
@@ -1149,6 +1152,14 @@ B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[
 B.get = meta((m, k, d = null) => { m = M(m, "get"); k = keyText(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
 B.has = meta((m, k) => hasOwn(M(m, "has"), keyText(k)), "has", null);
 B.set = meta((m, k, v = null) => {
+  if (Array.isArray(m)) {
+    I(k, "set", 2);
+    const at = k < 0 ? m.length + k : k;
+    if (at < 0 || at >= m.length) fail(`\`set\`: index ${k} is outside a list of ${m.length}`);
+    const l = m.slice();
+    l[at] = v;
+    return l;
+  }
   return putKey({ ...M(m, "set") }, keyText(k), v);
 }, "set", null);
 B.remove = meta((c, k) => {
@@ -1158,6 +1169,7 @@ B.remove = meta((c, k) => {
   return m;
 }, "remove", null);
 B.merge = meta((a, b) => ({ ...M(a, "merge"), ...M(b, "merge", 2) }), "merge", null);
+B.__merge = B.merge;
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
@@ -3334,6 +3346,8 @@ const isText = (x) => typeof x === "string" || typeof x === "number" || x instan
 let claiming = 0;
 
 class Mismatch extends Error {}
+// What the page has where the code expected something else, for Mismatch.
+const onPage = (n) => !n ? "nothing" : n.nodeType === 3 ? JSON.stringify(n.data.slice(0, 80)) : n.nodeType === 1 ? `<${n.localName}>` : "a comment";
 
 // The page's text node at `c.n`, taken up as text `t`: split where the
 // browser joined it with text after it; an empty one is made.
@@ -3344,10 +3358,11 @@ function claimText(c, t) {
     return e;
   }
   const n = c.n;
-  if (!n || n.nodeType !== 3) throw new Mismatch("text");
-  if (n.data === t) { c.n = n.nextSibling; return n; }
-  if (n.data.startsWith(t)) { c.n = n.splitText(t.length); return n; }
-  throw new Mismatch("text");
+  if (n && n.nodeType === 3) {
+    if (n.data === t) { c.n = n.nextSibling; return n; }
+    if (n.data.startsWith(t)) { c.n = n.splitText(t.length); return n; }
+  }
+  throw new Mismatch(`the server wrote ${onPage(n)}, the browser ${JSON.stringify(t.slice(0, 80))}`);
 }
 
 // The nodes for value `v` (text, markup, a list of them), into `out`.
@@ -3446,7 +3461,7 @@ function rest(el, n) {
   while (n) {
     const next = n.nextSibling;
     if (n.nodeType === 3 && n.data === "") el.removeChild(n);
-    else throw new Mismatch("extra");
+    else throw new Mismatch(`the server wrote ${onPage(n)} after what the browser makes`);
     n = next;
   }
 }
@@ -3546,7 +3561,7 @@ const inner = (tp, svg) => (svg || tp[0] === "svg") && tp[0] !== "foreignObject"
 
 // The page's element `el` taken up as template `tp`.
 function claimEl(tp, el, vals, svg) {
-  if (!el || el.nodeType !== 1 || el.localName.toLowerCase() !== String(tp[0]).toLowerCase()) throw new Mismatch("element");
+  if (!el || el.nodeType !== 1 || el.localName.toLowerCase() !== String(tp[0]).toLowerCase()) throw new Mismatch(`the server wrote ${onPage(el)}, the browser <${tp[0]}>`);
   claiming++;
   try { for (const h of tp[3]) hole(el, h[0], h[1], vals[h[2]], svg, h[2]); } finally { claiming--; }
   const kids = tp[2], sv = inner(tp, svg);
@@ -3710,7 +3725,7 @@ function rawHtml(html) {
       c.p.insertBefore(wrap, c.n);
       for (let i = 0; i < t.content.childNodes.length; i++) {
         const m = wrap.nextSibling;
-        if (!m) throw new Mismatch("raw");
+        if (!m) throw new Mismatch("the server wrote other HTML than raw(...) makes in the browser");
         wrap.appendChild(m);
       }
       c.n = wrap.nextSibling;
@@ -3753,7 +3768,7 @@ function navStart() {
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const a = e.target.closest && e.target.closest("a[href]");
-    if (!a || !a.closest("quillo-island")) return;
+    if (!a || !a.closest(ISLANDS)) return;
     if ((a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return;
     const u = new URL(a.href, location.href);
     if (u.origin !== location.origin) return;
@@ -4258,22 +4273,42 @@ class Inst extends Scope {
   }
 }
 
+// Islands on the page: <quillo-island>, or, inside a table or a select
+// (where the browser's parser moves other elements out), the component's
+// own root element, marked data-qi.
+const ISLANDS = "quillo-island,[data-qi]";
+const ownRoot = (el) => el.localName !== "quillo-island";
+const TABLE_PARTS = new Set(["tr", "td", "th", "thead", "tbody", "tfoot", "caption", "colgroup", "option", "optgroup"]);
+// A component the page made in wrapper `w`: when its markup is one table
+// or select part, that element becomes the island, as the server writes it
+// (src/island.rs), so a row is a row of its table (`tbody.rows`, CSS).
+function asOwnRoot(w, inst) {
+  const r = w.firstChild;
+  if (!r || r !== w.lastChild || r.nodeType !== 1 || !TABLE_PARTS.has(r.localName)) return w;
+  r.setAttribute("data-qi", "");
+  r.dataset.c = w.dataset.c;
+  r.__q = true;
+  inst.el = r;
+  return r;
+}
+
 // A component in its <quillo-island>: made, or taking up the page's.
 function island(def, props, h, c) {
   const inst = new Inst(def, props, h && h.s, h && h.l);
   let el;
   if (c.claim) {
     el = c.n;
-    if (!el || el.nodeType !== 1 || el.localName !== "quillo-island" || el.dataset.c !== def.$name) throw new Mismatch("component");
+    if (!el || el.nodeType !== 1 || !el.matches(ISLANDS) || el.dataset.c !== def.$name) throw new Mismatch(`the server wrote ${onPage(el)}, the browser <${def.$name}>`);
     el.__q = true;
     c.n = el.nextSibling;
   } else {
     el = document.createElement("quillo-island");
     el.style.display = "contents";
+    el.dataset.c = def.$name;
   }
   inst.el = el;
   run(inst, el, c.claim);
-  return el;
+  return c.claim ? el : asOwnRoot(el, inst);
 }
 
 // The component's code, once; then its markup put in its island.
@@ -4286,7 +4321,13 @@ function run(inst, el, claim) {
       if (e instanceof Ret) view = e.v;
       else { report(e); return; }
     }
-    if (claim) {
+    if (claim && ownRoot(el)) {
+      // The island is the markup's root: taken up from where it stands.
+      const after = el.nextSibling;
+      const c = { p: el.parentNode, n: el, claim: true, svg: false };
+      put(view, c, []);
+      if (c.n !== after) throw new Mismatch(`the server wrote ${onPage(c.n)} after what the browser makes`);
+    } else if (claim) {
       const c = { p: el, n: el.firstChild, claim: true, svg: false };
       put(view, c, []);
       rest(el, c.n);
@@ -4348,8 +4389,8 @@ function report(e) {
 
 // The outermost island a node is in.
 function outerIsland(node) {
-  let i = node && node.nodeType === 1 && node.closest ? node.closest("quillo-island") : null;
-  for (let up = i && i.parentElement && i.parentElement.closest("quillo-island"); up; up = up.parentElement && up.parentElement.closest("quillo-island")) i = up;
+  let i = node && node.nodeType === 1 && node.closest ? node.closest(ISLANDS) : null;
+  for (let up = i && i.parentElement && i.parentElement.closest(ISLANDS); up; up = up.parentElement && up.parentElement.closest(ISLANDS)) i = up;
   return i;
 }
 
@@ -4362,12 +4403,12 @@ function resume(el) {
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
   const queue = () => {
     const q = {};
-    for (const inner of el.querySelectorAll("quillo-island")) {
+    for (const inner of el.querySelectorAll(ISLANDS)) {
       (q[inner.dataset.c] = q[inner.dataset.c] || []).push({ s: islandJSON(inner.dataset.s, {}), l: islandJSON(inner.dataset.l, null) });
     }
     return q;
   };
-  for (const inner of el.querySelectorAll("quillo-island")) liveSeen(...(inner.dataset.v || "").split(":"));
+  for (const inner of el.querySelectorAll(ISLANDS)) liveSeen(...(inner.dataset.v || "").split(":"));
   liveSeen(...(el.dataset.v || "").split(":"));
   const props = islandJSON(el.dataset.p, {});
   // A top island's children come as the HTML the server made of them.
@@ -4382,6 +4423,7 @@ function resume(el) {
     if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
   } catch (e) {
     if (!(e instanceof Mismatch)) report(e);
+    else if (DEV) console.warn(`quillo: <${el.dataset.c}> was made again, not taken up from the server's HTML: ${e.message}`);
     ok = false;
   }
   if (!ok) {
@@ -4389,10 +4431,23 @@ function resume(el) {
     if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
     dispose(inst);
     hydrating = queue();
-    el.replaceChildren();
+    if (ownRoot(el)) {
+      // Made by the page, a <quillo-island> stands anywhere.
+      const w = document.createElement("quillo-island");
+      w.style.display = "contents";
+      w.dataset.c = el.dataset.c;
+      w.__q = true;
+      el.replaceWith(w);
+      el = w;
+    } else el.replaceChildren();
     inst = new Inst(def, props, state, liveInfo);
     inst.el = el;
     run(inst, el, false);
+    if (el.localName === "quillo-island" && el.dataset.c) {
+      const w = el;
+      el = asOwnRoot(w, inst);
+      if (el !== w) w.replaceWith(el);
+    }
   }
   hydrating = null;
   // What was typed before it was taken up: the component hears it now.
@@ -4416,7 +4471,7 @@ function boot() {
   // Someone reaching for an island takes it up (before their event is
   // handled: it reaches the component).
   for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
-  const outer = [...document.querySelectorAll("quillo-island")].filter((i) => !(i.parentElement && i.parentElement.closest("quillo-island")));
+  const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
   for (const island of outer) {
     if (island.hasAttribute("data-e") || island.hasAttribute("data-l") || island.parentElement === document.body) resume(island);
   }

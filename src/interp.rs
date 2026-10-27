@@ -47,6 +47,16 @@ const CHANGES: &[&str] = &[
     "__service_later",
 ];
 
+/// A run-time error, told the file it happened in (as the program was
+/// given it: relative to the folder it runs in, when it is inside it)
+/// unless it knows already.
+pub(crate) fn in_file<T>(r: Result<T, Ctrl>, file: &Option<Arc<str>>) -> Result<T, Ctrl> {
+    match (r, file) {
+        (Err(Ctrl::Error(e)), Some(f)) if e.file.is_none() => Err(Ctrl::Error(e.in_file(&crate::error::shown_path(f)))),
+        (r, _) => r,
+    }
+}
+
 pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
     Err(Ctrl::Error(QuilloError::new(msg, line)))
 }
@@ -77,6 +87,10 @@ pub struct Interp {
     pub(crate) services: Arc<crate::shared::Services>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
+    /// The file of the function running, and of the one that called it:
+    /// a run-time error is told where it happened (see `enter_call`).
+    pub(crate) cur_file: Option<Arc<str>>,
+    caller_file: Option<Arc<str>>,
     /// Calls and loop steps left before a sandboxed script is stopped
     /// (`run_script`); `u64::MAX` everywhere else.
     pub(crate) fuel: u64,
@@ -743,6 +757,8 @@ impl Interp {
             shared,
             services: Default::default(),
             depth: 0,
+            cur_file: None,
+            caller_file: None,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
             script: None,
@@ -803,6 +819,8 @@ impl Interp {
             shared: self.shared.clone(),
             services: self.services.clone(),
             depth: 0,
+            cur_file: None,
+            caller_file: None,
             fuel: u64::MAX,
             allowed: ALL_EFFECTS,
             script: None,
@@ -1252,7 +1270,10 @@ impl Interp {
                 if self.prefetching.is_some() && lookup_global(env, name).map_or(false, |(_, global)| global) {
                     self.no_writes(&format!("assigning `{}`", name), *line)?;
                 }
-                let rhs = self.eval(e, env)?;
+                let rhs = match self.in_place(name, op, e, env)? {
+                    Some(v) => v,
+                    None => self.eval(e, env)?,
+                };
                 let v = match op {
                     AssignOp::Set => rhs,
                     AssignOp::Add | AssignOp::Sub => {
@@ -1629,6 +1650,49 @@ impl Interp {
         }
     }
 
+    /// `m = set(m, k, v)` (or `push`, `merge`, `remove`), as in a loop that
+    /// builds a map: the variable lets go of the value while the builtin
+    /// runs, which then changes it rather than copying it, so the loop
+    /// costs its length and not its square. Not when the other arguments
+    /// read the variable, nor for a global, which other requests read.
+    fn in_place(&mut self, name: &str, op: &AssignOp, e: &Expr, env: &Env) -> Result<Option<Value>, Ctrl> {
+        match op {
+            AssignOp::Set => self.in_place_call(Some(name), e, env),
+            _ => Ok(None),
+        }
+    }
+
+    /// The same for a call that is a function's whole body, on one of its
+    /// own parameters, as in `reduce(xs, {}, (m, x) => set(m, x.id, x))`
+    /// (`name` is None: the caller has checked it is a parameter).
+    fn in_place_call(&mut self, name: Option<&str>, e: &Expr, env: &Env) -> Result<Option<Value>, Ctrl> {
+        let Expr::Call(f, args, line) = e else { return Ok(None) };
+        let (Expr::Ident(fname, _), Some(Expr::Ident(first, _))) = (&**f, args.first()) else { return Ok(None) };
+        if name.is_some_and(|n| n != first) || !matches!(fname.as_str(), "set" | "push" | "merge" | "remove") {
+            return Ok(None);
+        }
+        let name = first.as_str();
+        let Some(b @ Value::Builtin(bname, _)) = lookup(env, fname) else { return Ok(None) };
+        if bname != fname.as_str() {
+            return Ok(None);
+        }
+        let mut reads = false;
+        for a in &args[1..] {
+            crate::client::each_expr(a, &mut |x| reads |= matches!(x, Expr::Ident(n, _) if n == name));
+        }
+        if reads || lookup_global(env, name).map_or(true, |(_, global)| global) {
+            return Ok(None);
+        }
+        let mut vals = Vec::with_capacity(args.len());
+        vals.push(Value::Nil);
+        for a in &args[1..] {
+            vals.push(self.eval(a, env)?);
+        }
+        let Some(old) = take_local(env, name) else { return Ok(None) };
+        vals[0] = old;
+        self.call(&b, vals, *line).map(Some)
+    }
+
     #[inline(never)]
     fn eval_index(&mut self, obj: &Expr, idx: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
         let o = self.eval(obj, env)?;
@@ -1639,6 +1703,9 @@ impl Interp {
                 Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
             }
             (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
+            // Keys are text: a number is the key it is written as, as for
+            // `set` and `get`.
+            (Value::Map(m), Value::Int(n)) => Ok(m.get(n.to_string().as_str()).cloned().unwrap_or(Value::Nil)),
             (Value::Str(s), Value::Int(n)) => {
                 let len = s.chars().count() as i64;
                 let n = if *n < 0 { len + n } else { *n };
@@ -1950,14 +2017,14 @@ impl Interp {
         #[cfg(feature = "jit")]
         if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() {
             if let Some(r) = crate::jit::call(c, &args, self.depth) {
-                return r;
+                return in_file(r, &c.def.file);
             }
         }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
         // field, without a scope for the call.
         if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
-            return self.get_field(v, field, &c.env, at);
+            return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
         }
         let n = args.len();
         self.call_closure_with(c, args, n, line)
@@ -1974,7 +2041,7 @@ impl Interp {
             self.burn(line)?;
         }
         if let (Some((field, at)), u64::MAX) = (projection(&c.def), self.fuel) {
-            return self.get_field(x, field, &c.env, at);
+            return in_file(self.get_field(x, field, &c.env, at), &c.def.file);
         }
         let c = c.clone();
         self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
@@ -1991,7 +2058,7 @@ impl Interp {
         let r = r?;
         if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
-                return fail(
+                return in_file(fail(
                     def.line,
                     format!(
                         "`{}` declares errors as `! {}`, but returned err({})",
@@ -1999,7 +2066,7 @@ impl Interp {
                         ety.text(),
                         short(payload)
                     ),
-                );
+                ), &def.file);
             }
         }
         Ok(r)
@@ -2043,6 +2110,8 @@ impl Interp {
             None => None,
         };
         self.depth += 1;
+        let caller = std::mem::replace(&mut self.cur_file, def.file.clone());
+        let outer_caller = std::mem::replace(&mut self.caller_file, caller.clone());
         let debugging = crate::debug::on();
         if debugging {
             crate::debug::enter(self, &def.name, def.file.clone(), def.line);
@@ -2054,6 +2123,9 @@ impl Interp {
             crate::debug::leave(self);
         }
         self.depth -= 1;
+        self.cur_file = caller;
+        self.caller_file = outer_caller;
+        let r = in_file(r, &def.file);
         if let Some((mask, who)) = saved {
             self.allowed = mask;
             self.restrictor = who;
@@ -2116,11 +2188,13 @@ impl Interp {
     }
 
     fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Value, Ctrl> {
-        let scope = self.bind_args(c, def, args, line)?;
+        let scope = self.bind_args(c, def, args, line).or_else(|e| in_file(Err(e), &self.caller_file))?;
         if crate::debug::on() {
             crate::debug::body(self, &def.body, &scope);
         }
-        let r = match self.eval(&def.body, &scope) {
+        let own_param = matches!(&def.body, Expr::Call(_, a, _) if matches!(a.first(), Some(Expr::Ident(n, _)) if def.params.iter().any(|p| p.name == *n)));
+        let in_place = if own_param { self.in_place_call(None, &def.body, &scope)? } else { None };
+        let r = match in_place.map(Ok).unwrap_or_else(|| self.eval(&def.body, &scope)) {
             Ok(v) | Err(Ctrl::Return(v)) => v,
             Err(Ctrl::Error(e)) if crate::debug::on() => {
                 crate::debug::failed(self, &e, &scope);
@@ -2254,7 +2328,7 @@ impl Interp {
     fn render_call_plain(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut String) -> Result<(), Ctrl> {
         let def = c.def.clone();
         self.enter_call(&def, args.len(), line, |this| {
-            let scope = this.bind_args(c, &def, args, line)?;
+            let scope = this.bind_args(c, &def, args, line).or_else(|e| in_file(Err(e), &this.caller_file))?;
             if crate::debug::on() {
                 crate::debug::body(this, &def.body, &scope);
             }
@@ -3025,7 +3099,7 @@ impl Interp {
         self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
         let mut body = String::new();
-        let r = self.render_call_into(&c, args, line, &mut body);
+        let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut body));
         let (state, live) = self.islands.pop().unwrap_or_default();
         r?;
         let props = if nested { Map::new() } else { props };
@@ -3061,14 +3135,27 @@ impl Interp {
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
         let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
-        out.push_str(&format!(
-            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
+        let data = format!(
+            " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}",
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),
             live_attrs,
             eager
-        ));
+        );
+        // Inside a table or a select the browser's parser moves any other
+        // element out, island and all: there the component's own root
+        // element is its island.
+        if let Some(at) = crate::island::own_root(&body) {
+            out.push_str(&body[..at]);
+            out.push_str(" data-qi");
+            out.push_str(&data);
+            out.push_str(&body[at..]);
+            return Ok(());
+        }
+        out.push_str("<quillo-island style=\"display:contents\"");
+        out.push_str(&data);
+        out.push('>');
         out.push_str(&body);
         out.push_str("</quillo-island>");
         Ok(())

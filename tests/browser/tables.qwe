@@ -1,0 +1,31 @@
+// Components that are a table's rows or a select's options, which the
+// browser's parser would move out of any wrapper, and numbers written
+// alike by the server and the browser: all taken up, none made again.
+// Driven by tables.js.
+
+component Line(name: str) {
+    state on = false
+    <tr class="line"><td>{name}</td><td><button @click={() => { on = !on }}>{on ? "on" : "off"}</button></td></tr>
+}
+
+component Sheet() {
+    state rows = ["x", "y"]
+    <div>
+        <table id="sheet"><tbody>{for r in rows => <Line key={r} name={r}/>}</tbody></table>
+        <button id="add" @click={() => { rows = rows + ["z"] }}>add</button>
+    </div>
+}
+
+component Choice(v: str) = <option value={v}>{v}</option>
+
+component Score(v: float) {
+    state n = 0
+    <p class="score">{round(v, 1)} days, {v * 1e22} <button @click={() => { n += 1 }}>{n}</button></p>
+}
+
+route GET / = <html><body>
+    <table id="top"><tbody><Line name="a"/><Line name="b"/></tbody></table>
+    <Sheet/>
+    <select id="pick"><Choice v="one"/><Choice v="two"/></select>
+    <div><Score v={8.04}/></div>
+</body></html>

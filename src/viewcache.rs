@@ -201,6 +201,7 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "set_cookie"
                 | "delete_cookie"
                 | "session"
+                | "cookie"
                 | "set_session"
                 | "end_session"
                 | "idempotent"

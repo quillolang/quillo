@@ -134,7 +134,8 @@ Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
 Most expressions read as they would in JavaScript. The differences:
 
 - `let` declares a variable (there is no `const` or `var`); values are immutable, so
-  `push`, `set` and `+` return new lists and maps.
+  `push`, `set` and `+` return new lists and maps. Spread works in literals as in
+  JavaScript: `{ ...m, name: v }`, `[...xs, 3]`.
 - Named functions are `fn name(params) = expr` or `fn name(params) { ... }`; anonymous
   ones are arrows. Blocks give back their last expression, so `return` is only for
   leaving early.
@@ -151,7 +152,9 @@ Most expressions read as they would in JavaScript. The differences:
   (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`).
 - `match`, `|`, patterns, `route`, `reply`, `state` and `with` effects have no
   JavaScript equivalent.
-- There is no `break` or `continue`: `return` leaves a loop early.
+- There is no `break` or `continue`: `return` leaves the function, from a loop too,
+  and from a `for … =>` that makes a list; to skip items, `filter` first. `return` is
+  also an expression, like `reply`: `let m = find(xs) ?? return null`, `"a" => return 1`.
 - Regular expressions are strings given to `re.*` (`re.find_all(text, "@(\\w+)")`), not
   `/.../` literals, and take only the syntax both sides read alike (see the standard
   library).
@@ -436,7 +439,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component from that state, on the server's own elements (see below). The island is
   `display: contents`, so it does not change the layout, but it is still an element:
   a child selector such as `.posts > li` does not reach the component's root element
-  (write `.posts li`, or give the component's root the class).
+  (write `.posts li`, or give the component's root the class). A component whose root
+  is a table's or a select's part (`tr`, `td`, `th`, `thead`, `tbody`, `tfoot`,
+  `caption`, `colgroup`, `option`, `optgroup`) has no island element, since the browser
+  would move it out of the table: its root element carries the island (`data-qi`), so a
+  row component is a row. `raw(...)` in a component is likewise in a
+  `<quillo-raw style="display: contents">`, which a child selector does not see through.
 - `state count = start` declares state, set once (`~count = start` is the short form).
   After that it is just `count`, and assigning to it (`count += 1`) updates what reads
   it, and nothing else. A component's code runs once. A `let` that reads state or props
@@ -445,6 +453,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   value follows only that value: changing one row's text changes that text. Assigning
   the value a state already has does nothing.
 - `for` in markup keeps a row for each item: by its `key={...}`, else by its place.
+  `key` is the list's, not passed to the view or component, so neither may take a
+  parameter named `key` (a load-time error); an attribute written twice on one element
+  is an error too.
   A row whose item changed is updated where it shows what changed, and moved rows keep
   their DOM (and focus). `if`, `? :` and `match` in markup make a branch again only
   when another one is chosen. Nested components keep their own state.
@@ -499,7 +510,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
   and styles: keyboard, focus and screen readers are taken care of.
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
-  as `2`. Arithmetic gives the same results on both sides.
+  as `2`. While the server renders a component it writes numbers the same way (`8`,
+  `1e+21`), so the page it sends is the one the browser would make and is taken up, not
+  made again. Arithmetic gives the same results on both sides. Elsewhere the server
+  writes `2.0`. With `--watch`, a component the browser had to make again says which,
+  and what differed, in the console.
 
 ### Composition
 
@@ -988,7 +1003,10 @@ route POST /logout { end_session(); redirect("/") }
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
   default. `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
-  such as limer in front). `request.cookies` has what the browser sent.
+  such as limer in front). `request.cookies` has what the browser sent, and
+  `cookie(name)` one of them (or null), in any function the request runs, as
+  `session()` is: a helper that reads the visitor's time zone from a cookie need not be
+  handed `request` by every caller.
 
 ### What a route returns
 
@@ -1636,7 +1654,14 @@ Safety built in:
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 
-Values are immutable: `push`, `set` and `+` return new lists and maps.
+Values are immutable: `push`, `set` and `+` return new lists and maps. A map's keys are
+text: `set(m, 5, x)` keys it `"5"`, and `m[5]`, `get(m, 5)` and `has(m, 5)` read that.
+`set(xs, i, v)` gives a list with item `i` replaced (from the end when negative). A map
+or list built in a loop with `m = set(m, k, v)` (or `push`, `merge`, `remove`), or as
+`reduce`'s total with `(m, x) => set(m, ...)`, is changed in place, since nothing else
+holds it: building one of 20,000 takes milliseconds. Where something else still holds
+it (the loop reads `m` in the same call, say), each step copies it. `flatten` takes one
+level off: `flatten(flatten(xs))` for two.
 
 ### Files of a program
 
@@ -1654,7 +1679,8 @@ Values are immutable: `push`, `set` and `+` return new lists and maps.
   error that names both places, since it would replace the first everywhere. `let x`
   twice in one file gives the variable again. A function with a builtin's name is a
   warning (it replaces the builtin for the whole program); a variable may take one
-  (`let count = 0`).
+  (`let count = 0`), a type's name included (`let num = 5`, `for str in names`): in
+  `let`, `for` and parameters a name binds, and only in `match` does `int` test a type.
 - Paths are from the main file's folder, not from the file that writes them:
   `lib/b.qwe` writes `use "lib/c.qwe"`.
 - A file `use`d twice, or by several files, runs once.
@@ -1883,7 +1909,9 @@ db.transaction({ isolation: "serializable", retries: 3 }, () => { ... })
 
 Without `db.open`, the database is `$QUILLO_DB` (a path or a URL), or else
 SQLite in memory. A transaction rolls back if its function fails, returns an error
-value or replies early.
+value or replies early. A SQLite path is from the program's folder, not the one Quillo
+runs in, and `quillo run` says which file it opened when it starts
+(`quillo: database /srv/app/app.db`).
 
 **Isolation and retries.** `db.transaction(options, f)` takes the isolation level and
 how many times to run `f` again when the database gives up on it because of another

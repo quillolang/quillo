@@ -435,3 +435,53 @@ fn while_loops_in_scripts_count_their_steps() {
     assert!(r.contains("err(") && r.contains("steps"), "{}", r);
     assert_eq!(ev(r#"run_script("let i = 0\nwhile i < 10 { i += 1 }\ni")"#), "10");
 }
+
+#[test]
+fn let_and_for_bind_names_that_are_types() {
+    assert_eq!(ev("let x = 1\nlet int = x + 1\nlet num = 5\nlet list = [num]\nlet float = 2.5\n[int, x, num + 1, list, float * 2]"), "[2, 1, 6, [5], 5.0]");
+    assert_eq!(ev("let out = []\nfor str in [\"a\", \"b\"] { out = push(out, str) }\nout"), "[\"a\", \"b\"]");
+    assert_eq!(ev("for num in [1, 2] => num * 10"), "[10, 20]");
+    // In `match`, a type's name still tests the type.
+    assert_eq!(ev("[match 3 { int => \"an int\", _ => \"no\" }, match \"s\" { int => 1, str => 2 }]"), "[\"an int\", 2]");
+}
+
+#[test]
+fn spread_in_maps_and_lists() {
+    assert_eq!(ev("let m = { a: 1, b: 2 }\n[{ ...m, b: 3 }, { b: 0, ...m }, { ...m }, { ...m, ...{ c: 3 } }, { ...null, a: 1 }]"), "[{ a: 1, b: 3 }, { b: 2, a: 1 }, { a: 1, b: 2 }, { a: 1, b: 2, c: 3 }, { a: 1 }]");
+    assert_eq!(ev("let xs = [1, 2]\n[[...xs, 3], [0, ...xs, ...xs], [...xs], [...[]], 0..3]"), "[[1, 2, 3], [0, 1, 2, 1, 2], [1, 2], [], [0, 1, 2]]");
+    // A variable named like the builtin spread uses changes nothing.
+    assert_eq!(ev("let merge = 5\nlet m = { a: 1 }\n{ ...m, b: merge }"), "{ a: 1, b: 5 }");
+    assert!(ev_err("[...1]").contains("cannot add"));
+}
+
+#[test]
+fn return_is_an_expression() {
+    let defs = "fn f(x) {\n let y = x ?? return \"none\"\n y * 2\n}\nfn g(k) = match k {\n \"a\" => return 1\n _ => 2\n}\nfn h(x) {\n let v = x ?? return\n v\n}\n";
+    assert_eq!(ev(&format!("{}[f(2), f(null), g(\"a\"), g(\"b\"), h(null), h(3)]", defs)), "[4, \"none\", 1, 2, null, 3]");
+    // From a list made with `for … =>`, it leaves the function.
+    assert_eq!(ev("fn f() {\n let xs = for x in [1, 2, 3] => { if x == 2 { return \"left f\" }; x * 10 }\n xs\n}\nf()"), "\"left f\"");
+}
+
+#[test]
+fn maps_are_indexed_by_their_keys_text_and_lists_take_set() {
+    assert_eq!(ev("let m = set({}, 5, \"five\")\nlet g = group_by([{ a: 1 }], (x) => x.a)\n[m[5], m[\"5\"], m[6], get(m, 5), len(g[1])]"), "[\"five\", \"five\", null, \"five\", 1]");
+    assert_eq!(ev("let xs = [1, 2, 3]\n[set(xs, 1, 9), set(xs, -1, 0), xs]"), "[[1, 9, 3], [1, 2, 0], [1, 2, 3]]");
+    assert!(ev_err("set([1, 2, 3], 3, 0)").contains("index 3 is outside a list of 3"));
+    assert!(ev_err("set([1], \"a\", 0)").contains("int"));
+}
+
+/// `m = set(m, k, v)` and `reduce(..., (m, x) => set(m, ...))` change the
+/// map in place; what still holds it keeps its own.
+#[test]
+fn maps_built_in_a_loop_are_not_copied_each_time() {
+    let start = std::time::Instant::now();
+    assert_eq!(ev("fn build(n) {\n let m = {}\n for i in range(n) { m = set(m, str(i), i) }\n m\n}\nlen(build(50000))"), "50000");
+    assert_eq!(ev("len(reduce(range(50000), {}, (m, i) => set(m, str(i), true)))"), "50000");
+    assert_eq!(ev("fn grow(n) {\n let xs = []\n for i in range(n) { xs = push(xs, i) }\n xs\n}\nlen(grow(50000))"), "50000");
+    // Quadratic, these would take tens of seconds.
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    // Values stay values: the map another variable holds is not changed.
+    assert_eq!(ev("let a = { x: 1 }\nfn f() {\n let m = a\n let b = m\n m = set(m, \"y\", 2)\n [a, b, m]\n}\nf()"), "[{ x: 1 }, { x: 1 }, { x: 1, y: 2 }]");
+    assert_eq!(ev("fn f() {\n let m = {}\n for i in range(3) { m = set(m, str(i), len(m)) }\n m\n}\nf()"), "{ \"0\": 0, \"1\": 1, \"2\": 2 }");
+    assert_eq!(ev("let outer = { n: 0 }\nlet adds = [1, 2] | map((k) => set(outer, str(k), k))\n[outer, adds]"), "[{ n: 0 }, [{ n: 0, \"1\": 1 }, { n: 0, \"2\": 2 }]]");
+}
