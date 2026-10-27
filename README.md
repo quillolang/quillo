@@ -191,7 +191,8 @@ interpreter's exact answers and errors.
 ## Getting started
 
 Quillo builds with a stable Rust toolchain, 1.94 or later ([rustup](https://rustup.rs)),
-and a C compiler. `scripts/doctor.sh` checks for both, says what to install for anything
+and a C compiler ([what to install](https://quillolang.org/docs/install/) on macOS, Linux and
+Windows). `scripts/doctor.sh` checks for both, says what to install for anything
 missing, and lists what the tests use (Node, Chrome, PostgreSQL, MariaDB):
 
 ```sh

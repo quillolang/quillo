@@ -107,7 +107,8 @@ Write-Host '  (the PostgreSQL and MariaDB tests start their own servers on macOS
 
 Write-Host ''
 if ($script:missing -gt 0) {
-    Write-Host "$($script:missing) thing(s) to install before Quillo builds." -ForegroundColor Red
+    Write-Host "$($script:missing) thing(s) to install before Quillo builds." -ForegroundColor Red -NoNewline
+    Write-Host " Each system's steps: https://quillolang.org/docs/install/"
     exit 1
 }
 Write-Host 'Everything Quillo needs is here.'

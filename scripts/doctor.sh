@@ -118,7 +118,7 @@ fi
 
 echo
 if [ "$missing" -gt 0 ]; then
-    printf "${r}%s thing(s) to install before Quillo builds.${n}\n" "$missing"
+    printf "${r}%s thing(s) to install before Quillo builds.${n} Each system's steps: https://quillolang.org/docs/install/\n" "$missing"
     exit 1
 fi
 echo "Everything Quillo needs is here."
