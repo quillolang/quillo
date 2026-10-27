@@ -165,6 +165,9 @@ pub struct FnDef {
     pub component: bool,
     pub line: u32,
     pub body: Expr,
+    /// The file it was written in (an absolute path), when the parser was
+    /// told: for the debugger's stack frames and breakpoints.
+    pub file: Option<Arc<str>>,
     /// How often it was called, for compiling it (src/jit.rs); `u32::MAX`
     /// once it is known that it cannot be.
     pub hot: std::sync::atomic::AtomicU32,
@@ -223,6 +226,8 @@ pub struct RouteDef {
     pub body_pat: Option<Pattern>,
     pub body: Expr,
     pub line: u32,
+    /// The file it was written in, as for `FnDef::file`.
+    pub file: Option<Arc<str>>,
     /// Whether the route can see `request`: its body (or a default in its
     /// patterns) names it, or it has a body pattern, which is matched
     /// against it. Otherwise the request map is made only if something asks

@@ -8,6 +8,7 @@ pub mod client;
 pub mod cluster;
 pub mod crypto;
 pub mod db;
+pub mod debug;
 pub mod error;
 pub mod fetch;
 pub mod highlight;

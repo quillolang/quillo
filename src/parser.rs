@@ -24,6 +24,8 @@ pub struct Parser {
     /// While > 0, `name => ...` is not an arrow function: in `for x in xs => body`
     /// the `=>` belongs to the loop.
     no_bare_arrow: u32,
+    /// The file being parsed, stamped on its functions and routes.
+    file: Option<Arc<str>>,
 }
 
 fn can_start_expr(t: &Tok) -> bool {
@@ -63,7 +65,13 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0 }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, file: None }
+    }
+
+    /// Records `file` on the functions and routes parsed (see `FnDef::file`).
+    pub fn in_file(mut self, file: Option<Arc<str>>) -> Self {
+        self.file = file;
+        self
     }
 
     // ---- token helpers -------------------------------------------------
@@ -427,7 +435,7 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, hot: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, file: self.file.clone(), hot: Default::default() })
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
@@ -476,7 +484,7 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of component `{}`", name));
         };
-        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, hot: Default::default() })
+        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, file: self.file.clone(), hot: Default::default() })
     }
 
     /// `state count = ...` (or `~count = ...`) in a component: the state's
@@ -713,7 +721,7 @@ impl Parser {
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
-        Ok(RouteDef { method, path, query, body_pat, body, line, uses_request })
+        Ok(RouteDef { method, path, query, body_pat, body, line, file: self.file.clone(), uses_request })
     }
 
     /// Runs `f` with `name => ...` arrows allowed again (inside brackets).
@@ -755,7 +763,7 @@ impl Parser {
         match head {
             Ok(Some((params, ret))) => {
                 let body = self.no_bare_arrow_off(|p| p.parse_arrow_body())?;
-                Ok(Some(arrow(params, ret, body, line)))
+                Ok(Some(arrow(params, ret, body, line, self.file.clone())))
             }
             _ => {
                 self.restore(saved);
@@ -1077,7 +1085,7 @@ impl Parser {
                         self.next()?;
                         let body = self.parse_arrow_body()?;
                         let params = vec![Param { name: k.clone(), ty: None, default: None }];
-                        return Ok(arrow(params, None, body, line));
+                        return Ok(arrow(params, None, body, line, self.file.clone()));
                     }
                     Ok(Expr::Ident(k.clone(), line))
                 }
@@ -1579,7 +1587,7 @@ impl Parser {
     }
 }
 
-fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32) -> Expr {
+fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32, file: Option<Arc<str>>) -> Expr {
     Expr::Lambda(Arc::new(FnDef {
         name: "<fn>".into(),
         params,
@@ -1590,6 +1598,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, body: Expr, line: u32) -> Expr {
         component: false,
         line,
         body,
+        file,
         hot: Default::default(),
     }))
 }

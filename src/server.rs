@@ -419,7 +419,7 @@ impl Interp {
             }
 
             self.current_request = r.uses_request.then_some(reqv);
-            let mut resp = finish(self.eval(&r.body, &scope));
+            let mut resp = finish(if crate::debug::on() { self.debug_route(&r, &scope) } else { self.eval(&r.body, &scope) });
             // The page's components will need the locale (see `handle`).
             if self.rendered_island && self.site.i18n.is_some() {
                 self.locale();

@@ -13,6 +13,7 @@ cargo build --release
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
 ./target/release/quillo repl
 ./target/release/quillo lsp                              # language server (for editors)
+./target/release/quillo dap                              # debugger (for editors)
 cargo test
 ```
 
@@ -60,8 +61,9 @@ for a cookie, and requests without one (other programs, pages of other sites)
 get 403. Links to other sites open in the system's browser.
 
 Editor support: [editors/vscode](editors/vscode) is a VS Code extension (highlighting,
-diagnostics as you type, hover, go to definition, completion, outline, snippets).
-Other editors can run `quillo lsp` directly.
+diagnostics as you type, hover, go to definition, completion, outline, snippets, and a
+debugger: see [Debugging](#debugging)). Other editors can run `quillo lsp` and `quillo dap`
+directly.
 
 Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders.qwe)
 (payload-based routing and middleware), [todo.qwe](examples/todo.qwe) (server-rendered
@@ -1722,6 +1724,50 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
   runs it. Without a database, or with one per tenant, each server runs its jobs;
   `--no-jobs` turns them off on a server. For a database per tenant, loop over your
   tenants inside the job with `with_tenant(name, () => ...)`.
+
+### Debugging
+
+`quillo dap` is a debugger for editors: it speaks the Debug Adapter Protocol on stdin and
+stdout, and runs the program as `quillo run` would. In VS Code, with the extension, press F5
+in a `.qwe` file (or *Quillo: Debug this file*, or the ▶ menu). A `launch.json` entry
+gives the options:
+
+```json
+{
+  "type": "quillo",
+  "request": "launch",
+  "name": "Debug the app",
+  "program": "${workspaceFolder}/main.qwe",
+  "args": ["--watch", "--port", "8080"],
+  "stopOnEntry": false
+}
+```
+
+- **Breakpoints** go on statements, in any file the program loads (`use`d files, mounted
+  programs). One on a line with nothing to run (a blank line, `fn name(...) {`) moves to the
+  next statement in the same function or route; outside any, it is not set.
+- **Conditional breakpoints** stop when their expression is true; a **hit count** stops
+  from that hit on (`3`), or at `== 3`, `> 3`, every `% 3`. **Logpoints** print their message to the
+  debug console, with each `{expression}` in it worked out, and do not stop.
+- **Runtime errors** (the mistakes that make a route answer 500) stop where they happen, with
+  the error and the variables as they were. *Runtime errors*, in the breakpoints list, turns this off.
+- **Stepping**: over, into and out of calls. A frame is a function, a view, a component, a
+  route (`GET /notes/:id`) or a file's top level (`<main>`).
+- **Variables**: the frame's locals, the program's globals (without its functions and the
+  builtins), and the request being answered. Lists and maps open; long lists come in pages.
+- **The debug console** runs code in the stopped frame: expressions, and assignments
+  (`count = 0`) too. Hovering a name shows its value; hovering does not call functions.
+- The program's output (`print`, the request log, errors) shows in the debug console.
+
+When the program stops, all of it stops: no other request runs Quillo code until it goes on
+(waits already under way, for a database or the network, finish meanwhile). Pausing a server
+that is waiting for requests stops the next one to run.
+
+While debugging, views are not cached (`--no-view-cache`), so a breakpoint in one stops each
+time it renders, and functions are not compiled to machine code. Code that runs in the browser
+(a component's event handlers, and its updates after the first render) is not stopped by the
+debugger: the browser's developer tools debug the JavaScript it is compiled to. `.qwer`
+functions run as they are, without stops. It runs on macOS and Linux; not yet on Windows.
 
 ### Logs and metrics
 

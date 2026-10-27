@@ -1,0 +1,80 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Quillo Rust",
+  "comment": "A .qwer file: Rust (VS Code's own grammar), with its `//! [dependencies]` header as TOML.",
+  "scopeName": "source.qwer",
+  "patterns": [
+    {
+      "include": "#dependencies"
+    },
+    {
+      "include": "source.rust"
+    }
+  ],
+  "repository": {
+    "dependencies": {
+      "name": "meta.dependencies.qwer",
+      "begin": "^\\s*(//!)\\s*(\\[)(dependencies)(\\])",
+      "beginCaptures": {
+        "1": {
+          "name": "comment.line.documentation.rust"
+        },
+        "2": {
+          "name": "punctuation.definition.table.toml"
+        },
+        "3": {
+          "name": "entity.name.section.toml"
+        },
+        "4": {
+          "name": "punctuation.definition.table.toml"
+        }
+      },
+      "while": "^\\s*(//!)",
+      "whileCaptures": {
+        "1": {
+          "name": "comment.line.documentation.rust"
+        }
+      },
+      "patterns": [
+        {
+          "match": "([A-Za-z0-9_-]+)\\s*(=)",
+          "captures": {
+            "1": {
+              "name": "support.type.property-name.toml"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.toml"
+            }
+          }
+        },
+        {
+          "name": "string.quoted.double.toml",
+          "begin": "\"",
+          "end": "\"|$",
+          "patterns": [
+            {
+              "name": "constant.character.escape.toml",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "constant.language.boolean.toml",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.numeric.toml",
+          "match": "\\b[0-9][0-9_.]*\\b"
+        },
+        {
+          "name": "punctuation.definition.table.inline.toml",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.definition.array.toml",
+          "match": "[\\[\\],]"
+        }
+      ]
+    }
+  }
+}

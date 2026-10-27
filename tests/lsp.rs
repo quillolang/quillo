@@ -236,3 +236,47 @@ fn rust_files_get_quillo_and_compiler_diagnostics() {
     c.notify("exit", Value::Null);
     assert!(c.child.wait().unwrap().success());
 }
+
+/// A word in markup's text is text, even when a component has its name:
+/// hover and go to definition say nothing of it, but do of the component.
+#[test]
+fn text_with_a_components_name_is_not_the_component() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-text-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.canonicalize().unwrap().join("main.qwe");
+    let text = "component Notes() {\n    state items = []\n    <ul>{len(items)}</ul>\n}\n\nroute GET / =\n    <div>\n        <h1>Notes</h1>\n        <Notes/>\n    </div>\n\ncomponent Form() {\n    state draft = \"\"\n    state problem = null\n    state count = 0\n    <form @submit={() => { problem = \"empty\"; count += 1; draft = \"\" }}><input bind:value={draft}/>{problem}{count}</form>\n}\n";
+    std::fs::write(&path, text).unwrap();
+    let uri = format!("file://{}", path.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let at = |line: u32, character: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+    // `Notes` in `<h1>Notes</h1>`: text.
+    assert_eq!(c.request("textDocument/hover", at(7, 13), &mut notes), Value::Null);
+    assert_eq!(c.request("textDocument/definition", at(7, 13), &mut notes), Value::Null);
+    // `<Notes/>`, and the definition itself: the component.
+    let h = c.request("textDocument/hover", at(8, 10), &mut notes);
+    assert!(h["contents"]["value"].as_str().unwrap_or("").contains("component Notes"), "{}", h);
+    // State is shown as it is declared, with the types it takes, though
+    // it is assigned (where checking takes it as anything).
+    let shown = |c: &mut Client, notes: &mut Vec<Value>, line: u32, ch: u32| -> String {
+        let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": ch } }), notes);
+        h["contents"]["value"].as_str().unwrap_or("").to_string()
+    };
+    assert!(shown(&mut c, &mut notes, 2, 15).contains("state items: list"));
+    assert!(shown(&mut c, &mut notes, 1, 12).contains("state items: list"), "on its declaration");
+    assert!(shown(&mut c, &mut notes, 12, 12).contains("state draft: str"), "{}", shown(&mut c, &mut notes, 12, 12));
+    assert!(shown(&mut c, &mut notes, 13, 12).contains("state problem: str | null") || shown(&mut c, &mut notes, 13, 12).contains("state problem: null | str"), "{}", shown(&mut c, &mut notes, 13, 12));
+    let at_count = text.lines().nth(15).unwrap().find("{count}").unwrap() as u32 + 2;
+    let used = shown(&mut c, &mut notes, 15, at_count);
+    assert!(used.contains("state count: int"), "{}", used);
+    let d = c.request("textDocument/definition", at(8, 10), &mut notes);
+    assert_eq!(d["range"]["start"]["line"], 0, "{}", d);
+    let h = c.request("textDocument/hover", at(0, 12), &mut notes);
+    assert!(h["contents"]["value"].as_str().unwrap_or("").contains("component Notes"), "{}", h);
+    c.request("shutdown", Value::Null, &mut notes);
+    c.notify("exit", Value::Null);
+    assert!(c.child.wait().unwrap().success());
+}

@@ -129,14 +129,13 @@ const cases = [
   if (rustGrammar) {
     const files = {
       "source.rust": rustGrammar,
-      "quillo.qwer.dependencies": path.join(__dirname, "../syntaxes/qwer-dependencies.json"),
+      "source.qwer": path.join(__dirname, "../syntaxes/qwer.tmLanguage.json"),
     };
     const rustRegistry = new vsctm.Registry({
       onigLib,
       loadGrammar: async (scope) => files[scope] && vsctm.parseRawGrammar(fs.readFileSync(files[scope], "utf8"), files[scope]),
-      getInjections: (scope) => (scope === "source.rust" ? ["quillo.qwer.dependencies"] : undefined),
     });
-    const rust = await rustRegistry.loadGrammar("source.rust");
+    const rust = await rustRegistry.loadGrammar("source.qwer");
     const src = fs.readFileSync(path.join(__dirname, "../../../tests/fixtures/deps.qwer"), "utf8").split("\n");
     const want = [
       [2, "dependencies", "entity.name.section.toml"],

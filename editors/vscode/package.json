@@ -1,9 +1,10 @@
 {
   "name": "quillo-lang",
   "displayName": "Quillo",
-  "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion and outline (via `quillo lsp`).",
-  "version": "0.6.0",
+  "description": "Quillo language support: highlighting, diagnostics, hover, go to definition, completion, outline (via `quillo lsp`) and debugging (via `quillo dap`).",
+  "version": "0.7.0",
   "publisher": "wisp-one",
+  "icon": "icon.png",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,6 +15,7 @@
   },
   "categories": [
     "Programming Languages",
+    "Debuggers",
     "Linters",
     "Snippets"
   ],
@@ -25,7 +27,9 @@
   "main": "./extension.js",
   "activationEvents": [
     "onLanguage:quillo",
-    "workspaceContains:**/*.qwer"
+    "onLanguage:qwer",
+    "onDebugResolve:quillo",
+    "onDebugDynamicConfigurations:quillo"
   ],
   "contributes": {
     "languages": [
@@ -38,13 +42,26 @@
         "extensions": [
           ".qwe"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/qwe-light.svg",
+          "dark": "./icons/qwe-dark.svg"
+        }
       },
       {
-        "id": "rust",
+        "id": "qwer",
+        "aliases": [
+          "Quillo Rust",
+          "qwer"
+        ],
         "extensions": [
           ".qwer"
-        ]
+        ],
+        "configuration": "./language-configuration-qwer.json",
+        "icon": {
+          "light": "./icons/qwer-light.svg",
+          "dark": "./icons/qwer-dark.svg"
+        }
       }
     ],
     "grammars": [
@@ -58,11 +75,9 @@
         }
       },
       {
-        "scopeName": "quillo.qwer.dependencies",
-        "path": "./syntaxes/qwer-dependencies.json",
-        "injectTo": [
-          "source.rust"
-        ]
+        "language": "qwer",
+        "scopeName": "source.qwer",
+        "path": "./syntaxes/qwer.tmLanguage.json"
       }
     ],
     "snippets": [
@@ -76,6 +91,12 @@
         "command": "quillo.run",
         "title": "Run this file (watch mode)",
         "category": "Quillo"
+      },
+      {
+        "command": "quillo.debug",
+        "title": "Debug this file",
+        "category": "Quillo",
+        "icon": "$(debug-alt)"
       },
       {
         "command": "quillo.check",
@@ -92,6 +113,11 @@
       "editor/title/run": [
         {
           "command": "quillo.run",
+          "when": "resourceLangId == quillo",
+          "group": "navigation"
+        },
+        {
+          "command": "quillo.debug",
           "when": "resourceLangId == quillo",
           "group": "navigation"
         }
@@ -111,7 +137,81 @@
           "description": "Port for `Quillo: Run this file`."
         }
       }
-    }
+    },
+    "breakpoints": [
+      {
+        "language": "quillo"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "quillo",
+        "label": "Quillo",
+        "languages": [
+          "quillo"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .qwe file to run.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Options for `quillo run`, such as [\"--port\", \"8080\", \"--watch\"].",
+                "default": [
+                  "--watch"
+                ]
+              },
+              "cwd": {
+                "type": "string",
+                "description": "The folder to run in.",
+                "default": "${workspaceFolder}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the program's first statement.",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "quillo",
+            "request": "launch",
+            "name": "Debug this file",
+            "program": "${file}",
+            "args": [
+              "--watch"
+            ]
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Quillo: Debug a program",
+            "description": "Run a .qwe program with the debugger",
+            "body": {
+              "type": "quillo",
+              "request": "launch",
+              "name": "Debug ${1:program}",
+              "program": "^\"\\${workspaceFolder}/${1:main.qwe}\"",
+              "args": [
+                "--watch"
+              ]
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "test": "node test/grammar.test.js",

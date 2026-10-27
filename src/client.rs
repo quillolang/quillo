@@ -702,6 +702,7 @@ impl<'a> Compiler<'a> {
                             component: false,
                             line: td.line,
                             body: e.clone(),
+                            file: None,
                             hot: Default::default(),
                         };
                         let saved = std::mem::take(&mut self.ctxs);
@@ -1004,6 +1005,7 @@ impl<'a> Compiler<'a> {
             component: false,
             line,
             body: e,
+            file: None,
             hot: Default::default(),
         };
         // Until made, references to it (from functions it holds) find it.

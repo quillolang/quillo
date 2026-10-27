@@ -27,6 +27,9 @@ usage:
                                     runs where Rust is not installed
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
+  quillo dap                        debugger for editors (the Debug Adapter
+                                    Protocol, on stdio): breakpoints, stepping,
+                                    variables
   quillo <file.qwe>                 same as `quillo run`
 
 options for `run`:
@@ -103,6 +106,8 @@ fn real_main(args: Vec<String>) -> i32 {
             Some(f) => run(f, &args[3..]),
             None => usage(),
         },
+        // A debug adapter for editors, on stdin and stdout (src/debug.rs).
+        Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             match args.iter().skip(2).find(|a| !a.starts_with("--")) {

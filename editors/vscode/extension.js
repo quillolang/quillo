@@ -1,4 +1,5 @@
-// Quillo for VS Code: starts `quillo lsp` and adds Run/Check commands.
+// Quillo for VS Code: starts `quillo lsp`, debugs with `quillo dap`, and adds
+// Run/Check/Debug commands.
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
@@ -26,9 +27,9 @@ async function startClient() {
     "Quillo",
     { run: { command, args: ["lsp"] }, debug: { command, args: ["lsp"] } },
     {
-      // .qwer files are Rust (rust-analyzer's too, where it is installed);
-      // the server adds what Quillo makes of them, and the compiler's errors.
-      documentSelector: [{ scheme: "file", language: "quillo" }, { scheme: "file", pattern: "**/*.qwer" }],
+      // .qwer files are Rust: the server says what Quillo makes of them, and
+      // what the compiler says (through `cargo check`).
+      documentSelector: [{ scheme: "file", language: "quillo" }, { scheme: "file", language: "qwer" }],
       synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{qwe,qwer}") },
     }
   );
@@ -52,11 +53,34 @@ function terminal() {
 function currentFile() {
   const ed = vscode.window.activeTextEditor;
   if (!ed || ed.document.languageId !== "quillo") {
-    vscode.window.showInformationMessage("Open a .quillo file first.");
+    vscode.window.showInformationMessage("Open a .qwe file first.");
     return null;
   }
   return ed.document;
 }
+
+/** The debugger: `quillo dap` runs the program and speaks the Debug Adapter Protocol. */
+const debugAdapters = {
+  createDebugAdapterDescriptor(session) {
+    const cwd = session.configuration.cwd || (session.workspaceFolder && session.workspaceFolder.uri.fsPath);
+    return new vscode.DebugAdapterExecutable(quilloPath(), ["dap"], cwd ? { cwd } : {});
+  },
+};
+
+/** F5 with no launch.json: debug the open .qwe file. */
+const debugConfigurations = {
+  resolveDebugConfiguration(folder, config) {
+    if (!config.type && !config.request && !config.name) {
+      const ed = vscode.window.activeTextEditor;
+      if (!ed || ed.document.languageId !== "quillo") return config;
+      return { type: "quillo", request: "launch", name: "Debug this file", program: ed.document.fileName, args: ["--watch"] };
+    }
+    if (!config.program) {
+      return vscode.window.showInformationMessage("Set \"program\" to the .qwe file to debug.").then(() => undefined);
+    }
+    return config;
+  },
+};
 
 const quote = (s) => `"${s.replace(/(["\\$`])/g, "\\$1")}"`;
 
@@ -71,6 +95,21 @@ async function activate(context) {
       t.show();
       t.sendText(`${quote(quilloPath())} run ${quote(doc.fileName)} --watch --port ${port}`);
     }),
+    vscode.commands.registerCommand("quillo.debug", async () => {
+      const doc = currentFile();
+      if (!doc) return;
+      await doc.save();
+      const port = vscode.workspace.getConfiguration("quillo").get("port") || 8080;
+      await vscode.debug.startDebugging(vscode.workspace.getWorkspaceFolder(doc.uri), {
+        type: "quillo",
+        request: "launch",
+        name: "Debug this file",
+        program: doc.fileName,
+        args: ["--watch", "--port", String(port)],
+      });
+    }),
+    vscode.debug.registerDebugAdapterDescriptorFactory("quillo", debugAdapters),
+    vscode.debug.registerDebugConfigurationProvider("quillo", debugConfigurations),
     vscode.commands.registerCommand("quillo.check", async () => {
       const doc = currentFile();
       if (!doc) return;

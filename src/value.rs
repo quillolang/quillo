@@ -695,6 +695,11 @@ impl Scope {
     }
 }
 
+/// The scope around `env`, if any.
+pub fn scope_parent(env: &Env) -> Option<&Env> {
+    env.parent.as_ref()
+}
+
 /// The variables defined directly in a scope (not its parents).
 pub fn scope_vars(env: &Env) -> Vec<(String, Value)> {
     env.vars().entries()
