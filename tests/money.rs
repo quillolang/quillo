@@ -9,6 +9,16 @@ fn node_available() -> bool {
     Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Runs `js` in Node, given on its standard input: as one argument, the
+/// thousands of cases below are past what Linux allows (128 KiB).
+fn node(js: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("node").arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("node");
+    child.stdin.take().unwrap().write_all(js.as_bytes()).expect("node's input");
+    child.wait_with_output().expect("node")
+}
+
 /// `body` run on the server, as a function's body: what it gives, or
 /// "ERROR: " and the message.
 fn server(body: &str) -> (quillo::Interp, String) {
@@ -29,7 +39,7 @@ fn same(body: &str, want: &str) {
     assert_eq!(s, want, "server: {}", body);
     if node_available() {
         let js = quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}\n{}", e, body));
-        let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+        let out = node(&js);
         assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), s, "browser differs: {}", body);
     }
@@ -130,7 +140,7 @@ fn formats_as_intl_does() {
         "const cases = {};\nconst bad = [];\nfor (const [l, c, a, u, got] of cases) {{\n  const want = new Intl.NumberFormat(l, {{ style: 'currency', currency: c, minimumFractionDigits: u, maximumFractionDigits: u, roundingMode: 'halfEven', signDisplay: 'negative' }}).format(a);\n  if (want !== got) bad.push([l, c, a, want, got]);\n}}\nconsole.log(JSON.stringify(bad.slice(0, 20)) + ' ' + bad.length);",
         serde_json::to_string(&cases.iter().map(|(l, c, a, u, g)| serde_json::json!([l, c, a, u, g])).collect::<Vec<_>>()).unwrap()
     );
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = node(&js);
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(text.ends_with(" 0"), "{}\nof {} cases", text, cases.len());
     // And plain numbers, with two decimals.
@@ -145,7 +155,7 @@ fn formats_as_intl_does() {
         "const bad = [];\nfor (const [l, a, got] of {}) {{\n  const want = new Intl.NumberFormat(l, {{ minimumFractionDigits: 2, maximumFractionDigits: 2, roundingMode: 'halfEven', signDisplay: 'negative' }}).format(a);\n  if (want !== got) bad.push([l, a, want, got]);\n}}\nconsole.log(JSON.stringify(bad.slice(0, 20)) + ' ' + bad.length);",
         serde_json::to_string(&nums).unwrap()
     );
-    let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
+    let out = node(&js);
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(text.ends_with(" 0"), "{}", text);
 }
