@@ -139,8 +139,10 @@ fn parallel_takes_a_list_and_nests() {
     let t0 = Instant::now();
     assert_eq!(get(srv.port, "/list").1, "[0,10,20,30,40,50,60,70]");
     assert_eq!(get(srv.port, "/nested").1, "[[10,20],30]");
-    // Eight waits of 300 ms at once, then two levels of them.
-    assert!(t0.elapsed() < Duration::from_millis(1100), "took {:?}", t0.elapsed());
+    // Eight waits of 300 ms at once, then two levels of them: about 600 ms,
+    // where one after another would take 3.3 s. The bound leaves room for a
+    // loaded machine (a CI runner took 1.2 s).
+    assert!(t0.elapsed() < Duration::from_millis(2000), "took {:?}", t0.elapsed());
 }
 
 #[test]
