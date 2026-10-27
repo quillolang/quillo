@@ -198,13 +198,16 @@ cd quillo
 cargo build --release
 ```
 
-Run an example from [quillolang/examples](https://github.com/quillolang/examples), then check a program without running it:
+Run the sample app in [`app/`](app), then check it without running it:
 
 ```sh
-git clone https://github.com/quillolang/examples.git ../quillo-examples
-./target/release/quillo run ../quillo-examples/notes.qwe --watch   # http://127.0.0.1:8080
-./target/release/quillo check app.qwe
+./target/release/quillo run app/main.qwe --watch   # http://127.0.0.1:8080
+./target/release/quillo check app/main.qwe
 ```
+
+`app/main.qwe` is a page, a component, server functions and a SQLite database in one
+file; edit it while it runs to start your own. More programs, each showing one part of
+Quillo, are in [quillolang/examples](https://github.com/quillolang/examples).
 
 `cargo install --path .` puts `quillo` on your `PATH` instead.
 
@@ -216,6 +219,7 @@ diagnostics, completion, go to definition and debugging.
 | Path | What it holds |
 |---|---|
 | [`src/`](src) | The `quillo` binary: interpreter, number compiler, HTTP server, checker, component compiler, database drivers, language server and debug adapter |
+| [`app/`](app) | A sample app to start from |
 | [`tests/`](tests) | Integration and browser tests; [`tests/programs`](tests/programs) holds the programs they run |
 
 Everything else has a repository of its own:
@@ -251,7 +255,7 @@ requests are welcome. Before sending a change:
 
 ```sh
 cargo test
-for f in tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
+for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 ```
 
 ## License

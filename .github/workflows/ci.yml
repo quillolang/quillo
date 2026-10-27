@@ -17,8 +17,8 @@ jobs:
         run: cargo build --release
       - name: Tests (the browser test uses the runner's Chrome)
         run: cargo test
-      - name: Check the test programs
-        run: for f in tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
+      - name: Check the sample app and the test programs
+        run: for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 
   # `quillo app` (the native window) builds on each desktop platform.
   app:

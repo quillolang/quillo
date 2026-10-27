@@ -8,7 +8,7 @@ Quillo is a single binary, built with Cargo:
 
 ```sh
 cargo build --release
-./target/release/quillo run ../quillo-examples/notes.qwe --watch   # http://127.0.0.1:8080
+./target/release/quillo run app/main.qwe --watch        # the sample app: http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
 ./target/release/quillo repl
@@ -50,7 +50,7 @@ its pages, and closing the window ends the program. It is built only on request:
 
 ```sh
 cargo build --release --features app      # Linux also needs libwebkit2gtk-4.1-dev
-./target/release/quillo app ../quillo-examples/notes.qwe --watch
+./target/release/quillo app app/main.qwe --watch
 ```
 
 It takes the options of `run` except `--host`, `--register` and `--service`, and
@@ -1973,6 +1973,7 @@ src/client/runtime.js  the browser runtime: values, standard library, signals an
 src/island.rs      when a page loads its components' code
 src/lsp.rs         the language server
 
+app/main.qwe       a sample app to start from
 tests/             the language, routes, records, effects, the checker, numbers, streams,
                    UDP, Rust (.qwer), services, sessions, uploads, tenants, several
                    databases, the compiler

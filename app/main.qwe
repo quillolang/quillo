@@ -1,0 +1,87 @@
+// A small Quillo app to start from: a page rendered on the server, a component
+// that runs in the browser, server functions it calls, and a SQLite database.
+//
+//   quillo run app/main.qwe --watch     then open http://localhost:8080
+//   quillo check app/main.qwe           finds mistakes without running it
+//
+// Edit this file while it runs: --watch reloads it on save.
+
+db.open("app.db")
+db.exec("create table if not exists todos (
+    id integer primary key,
+    text text not null,
+    done integer not null default 0
+)")
+
+fn all_todos() with db = db.query(sql`select id, text, done from todos order by id`)
+
+// A `server fn` runs on the server; the component below calls it like any
+// function, with no API or fetch to write.
+server fn add_todo(text: str) -> list ! str with db {
+    let t = trim(text)
+    if t == "" { return err("a todo needs some text") }
+    db.exec("insert into todos (text) values (?)", t)?
+    all_todos()
+}
+
+server fn toggle(id: int) -> list with db {
+    db.exec("update todos set done = 1 - done where id = ?", id)
+    all_todos()
+}
+
+component Todos(initial: list) {
+    state todos = initial
+    state draft = ""
+    state problem = null
+    <section>
+        <form @submit={() => {
+            let r = add_todo(draft)
+            if is_err(r) {
+                problem = r.error
+            } else {
+                todos = r
+                draft = ""
+                problem = null
+            }
+        }}>
+            <input bind:value={draft} placeholder="Something to do" autofocus/>
+            <button>Add</button>
+        </form>
+        {problem && <p.problem>{problem}</p>}
+        <ul>
+            {for t in todos => <li key={t.id}>
+                <label>
+                    <input type="checkbox" checked={t.done == 1} @change={() => { todos = toggle(t.id) }}/>
+                    {t.text}
+                </label>
+            </li>}
+        </ul>
+    </section>
+}
+
+let style = "
+    body { font: 16px system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem }
+    ul { padding: 0; list-style: none }
+    .problem { color: #b42318 }
+"
+
+view Page(title: str, children) =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title}</title>
+            <style>{style}</style>
+        </head>
+        <body>{children}</body>
+    </html>
+
+route GET / =
+    <Page title="My Quillo app">
+        <h1>To do</h1>
+        <Todos initial={all_todos()}/>
+    </Page>
+
+// The same data as JSON, and a route with a typed path parameter.
+route GET /api/todos = all_todos()
+route GET /hello/:name = `Hello, ${name}!`
