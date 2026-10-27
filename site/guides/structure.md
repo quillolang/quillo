@@ -168,7 +168,7 @@ cross between files.
 ### Editors
 
 **VS Code.** The Quillo extension
-([editors/vscode](https://github.com/wisp-one/quillo/tree/main/editors/vscode)) brings
+([editors/vscode](https://github.com/quillolang/quillo/tree/main/editors/vscode)) brings
 diagnostics as you type, hover, Go to Definition across `use`d files, completion (your
 names, builtins with their signatures, the members of `db.`, `http.`, `channel.` and the
 other modules, effects after `with`), an outline, snippets, and a debugger (F5, with
@@ -210,7 +210,7 @@ it `use`s changes, and refreshes the pages you have open.
 
 ### A larger example
 
-The [CRM](https://github.com/wisp-one/quillo/tree/main/apps/crm) in the repository is 47
+The [CRM](https://github.com/quillolang/quillo/tree/main/apps/crm) in the repository is 47
 files in this shape, with every `use` in its `main.qwe`:
 
 ```
