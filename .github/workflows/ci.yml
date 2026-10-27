@@ -12,7 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # 24: its CLDR (47) is the one money's locale table was made from, which
       # tests/money.rs compares with Intl.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # tests/postgres.rs and tests/mysql.rs start servers of their own from these
