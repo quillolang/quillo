@@ -1,8 +1,0 @@
-// Written by the plugin studio (Studio, in the app): the plugins made there.
-// Do not edit it by hand.
-
-
-let studio_plugins = []
-let studio_renderers = {}
-let studio_runners = {}
-let studio_built = 0

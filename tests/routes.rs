@@ -192,7 +192,7 @@ route GET /who = reply 401
 
 #[test]
 fn static_files_refuse_traversal() {
-    let mut it = app(r#"route GET /static/*path = file("examples/public/" + path)"#);
+    let mut it = app(r#"route GET /static/*path = file("tests/programs/public/" + path)"#);
     let r = get(&mut it, "/static/style.css");
     assert_eq!((r.status, r.header("content-type")), (200, Some("text/css; charset=utf-8")));
     assert_eq!(get(&mut it, "/static/../../Cargo.toml").status, 404);
@@ -401,7 +401,7 @@ route GET / = <List p="> "/>
 
 #[test]
 fn every_path_of_a_single_page_app_renders_on_the_server() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/spa.qwe")).unwrap();
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/spa.qwe")).unwrap();
     let mut it = app(&src);
     for (path, status, heading) in [
         ("/", 200, "Welcome"),

@@ -232,7 +232,7 @@ fn symbols_and_references_for_the_editor() {
 
 #[test]
 fn examples_are_clean() {
-    for f in ["examples/hello.qwe", "examples/orders.qwe", "examples/todo.qwe", "examples/notes.qwe", "tests/browser/app.qwe"] {
+    for f in ["tests/programs/hello.qwe", "tests/programs/orders.qwe", "tests/programs/todo.qwe", "tests/programs/notes.qwe", "tests/browser/app.qwe"] {
         let a = quillo::check::check_file(Path::new(f));
         assert!(a.diagnostics.is_empty(), "{}: {:#?}", f, a.diagnostics);
     }

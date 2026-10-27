@@ -134,7 +134,7 @@ fn components_hydrate_react_and_call_the_server() {
     assert_eq!(result, want);
 }
 
-/// examples/scroll.qwe: 100,000 rows, loaded 200 at a time, with only the
+/// tests/programs/scroll.qwe: 100,000 rows, loaded 200 at a time, with only the
 /// visible rows and a buffer of 5 on each side in the page.
 #[test]
 fn infinite_scroll_renders_only_a_window_of_rows() {
@@ -145,7 +145,7 @@ fn infinite_scroll_renders_only_a_window_of_rows() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let r = run_page_with(
         &chrome,
-        &root.join("examples/scroll.qwe"),
+        &root.join("tests/programs/scroll.qwe"),
         free_port(),
         Some(&root.join("tests/browser/scroll.js")),
     );
@@ -386,7 +386,7 @@ fn composition_survives_kept_rows() {
     assert_eq!(r, want);
 }
 
-/// examples/compose.qwe, clicked through.
+/// tests/programs/compose.qwe, clicked through.
 #[test]
 fn composition_example_works() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -396,7 +396,7 @@ fn composition_example_works() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let r = run_page_with(
         &chrome,
-        &root.join("examples/compose.qwe"),
+        &root.join("tests/programs/compose.qwe"),
         free_port(),
         Some(&root.join("tests/browser/compose-example.js")),
     );
@@ -411,7 +411,7 @@ fn composition_example_works() {
     assert_eq!(r, want);
 }
 
-/// examples/layout.qwe: a JSON-described page, edited live in the browser.
+/// tests/programs/layout.qwe: a JSON-described page, edited live in the browser.
 #[test]
 fn json_layout_renders_and_follows_edits() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -421,7 +421,7 @@ fn json_layout_renders_and_follows_edits() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let r = run_page_with(
         &chrome,
-        &root.join("examples/layout.qwe"),
+        &root.join("tests/programs/layout.qwe"),
         free_port(),
         Some(&root.join("tests/browser/layout.js")),
     );
@@ -440,7 +440,7 @@ fn json_layout_renders_and_follows_edits() {
     assert_eq!(r, want);
 }
 
-/// examples/spa.qwe: links, Back and Forward change pages without reloads,
+/// tests/programs/spa.qwe: links, Back and Forward change pages without reloads,
 /// and state (the cart) survives.
 #[test]
 fn single_page_app_navigates_without_reloading() {
@@ -451,7 +451,7 @@ fn single_page_app_navigates_without_reloading() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let r = run_page_with(
         &chrome,
-        &root.join("examples/spa.qwe"),
+        &root.join("tests/programs/spa.qwe"),
         free_port(),
         Some(&root.join("tests/browser/spa.js")),
     );
@@ -471,7 +471,7 @@ fn single_page_app_navigates_without_reloading() {
     assert_eq!(r, want);
 }
 
-/// examples/index.qwe mounts every example; the SPA works under /spa.
+/// tests/programs/index.qwe mounts every example; the SPA works under /spa.
 #[test]
 fn mounted_single_page_app_stays_under_its_prefix() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -481,7 +481,7 @@ fn mounted_single_page_app_stays_under_its_prefix() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let r = run_page_with_path(
         &chrome,
-        &root.join("examples/index.qwe"),
+        &root.join("tests/programs/index.qwe"),
         free_port(),
         "/spa",
         Some(&root.join("tests/browser/mounted.js")),
@@ -497,7 +497,7 @@ fn mounted_single_page_app_stays_under_its_prefix() {
     assert_eq!(r, want);
 }
 
-/// examples/index.qwe: tabs switch examples without reloading the page.
+/// tests/programs/index.qwe: tabs switch examples without reloading the page.
 #[test]
 fn example_gallery_tabs_switch_without_reloading() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -505,7 +505,7 @@ fn example_gallery_tabs_switch_without_reloading() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with_path(&chrome, &root.join("examples/index.qwe"), free_port(), "/", Some(&root.join("tests/browser/gallery.js")));
+    let r = run_page_with_path(&chrome, &root.join("tests/programs/index.qwe"), free_port(), "/", Some(&root.join("tests/browser/gallery.js")));
     let want = serde_json::json!({
         "start": ["/", "Todo", "/todo"],
         "shop": ["/?ex=spa", "Shop", "/spa"],
@@ -519,7 +519,7 @@ fn example_gallery_tabs_switch_without_reloading() {
     assert_eq!(r, want);
 }
 
-/// examples/spa.qwe: stock is live data; the cart reserves and returns it.
+/// tests/programs/spa.qwe: stock is live data; the cart reserves and returns it.
 #[test]
 fn shop_stock_updates_live_and_the_cart_reserves_it() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -527,7 +527,7 @@ fn shop_stock_updates_live_and_the_cart_reserves_it() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with(&chrome, &root.join("examples/spa.qwe"), free_port(), Some(&root.join("tests/browser/spa-live.js")));
+    let r = run_page_with(&chrome, &root.join("tests/programs/spa.qwe"), free_port(), Some(&root.join("tests/browser/spa-live.js")));
     let want = serde_json::json!({
         "before": "10 in stock",
         "liveArrived": true,
@@ -544,7 +544,7 @@ fn shop_stock_updates_live_and_the_cart_reserves_it() {
     assert_eq!(r, want);
 }
 
-/// examples/life.qwe: the browser computes the same generations as the
+/// tests/programs/life.qwe: the browser computes the same generations as the
 /// server, and `every` runs the game only while it plays.
 #[test]
 fn game_of_life_runs_in_the_browser() {
@@ -553,7 +553,7 @@ fn game_of_life_runs_in_the_browser() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let r = run_page_with(&chrome, &root.join("examples/life.qwe"), free_port(), Some(&root.join("tests/browser/life.js")));
+    let r = run_page_with(&chrome, &root.join("tests/programs/life.qwe"), free_port(), Some(&root.join("tests/browser/life.js")));
     let want = serde_json::json!({
         "start": ["0", "36"],
         "one": "39",
@@ -569,7 +569,7 @@ fn game_of_life_runs_in_the_browser() {
     assert_eq!(r, want);
 }
 
-/// examples/storm.qwe: storms that mount and unmount components with timers,
+/// tests/programs/storm.qwe: storms that mount and unmount components with timers,
 /// live data and url() leave nothing behind: no removed component still
 /// referenced, no timer running, the page back to its size.
 #[test]
@@ -579,7 +579,7 @@ fn a_state_storm_leaves_nothing_behind() {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut r = run_page_with(&chrome, &root.join("examples/storm.qwe"), free_port(), Some(&root.join("tests/browser/storm.js")));
+    let mut r = run_page_with(&chrome, &root.join("tests/programs/storm.qwe"), free_port(), Some(&root.join("tests/browser/storm.js")));
     // Reported for information; varies from run to run.
     r.as_object_mut().unwrap().remove("heapGrowthKB");
     let want = serde_json::json!({

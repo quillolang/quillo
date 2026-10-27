@@ -11,8 +11,8 @@
 <p align="center">
   <a href="https://quillolang.org">Website</a> ·
   <a href="https://quillolang.org/docs/">Documentation</a> ·
-  <a href="examples">Examples</a> ·
-  <a href="editors/vscode">VS Code extension</a> ·
+  <a href="https://github.com/quillolang/examples">Examples</a> ·
+  <a href="https://github.com/quillolang/editors">VS Code extension</a> ·
   <a href="https://discord.gg/XRpTQ4uTq">Discord</a> ·
   <a href="https://www.reddit.com/r/quillo/">Reddit</a>
 </p>
@@ -198,16 +198,17 @@ cd quillo
 cargo build --release
 ```
 
-Run an example, then check a program without running it:
+Run an example from [quillolang/examples](https://github.com/quillolang/examples), then check a program without running it:
 
 ```sh
-./target/release/quillo run examples/notes.qwe --watch   # http://127.0.0.1:8080
+git clone https://github.com/quillolang/examples.git ../quillo-examples
+./target/release/quillo run ../quillo-examples/notes.qwe --watch   # http://127.0.0.1:8080
 ./target/release/quillo check app.qwe
 ```
 
 `cargo install --path .` puts `quillo` on your `PATH` instead.
 
-For your editor, install the [VS Code extension](editors/vscode): highlighting,
+For your editor, install the [VS Code extension](https://github.com/quillolang/editors): highlighting,
 diagnostics, completion, go to definition and debugging.
 
 ## Repository layout
@@ -215,14 +216,17 @@ diagnostics, completion, go to definition and debugging.
 | Path | What it holds |
 |---|---|
 | [`src/`](src) | The `quillo` binary: interpreter, number compiler, HTTP server, checker, component compiler, database drivers, language server and debug adapter |
-| [`examples/`](examples) | Small programs, each showing one part of Quillo: routes, a todo app, live notes, a single-page app, infinite scroll, a virtual list of a million rows, the Game of Life, UDP telemetry, a camera stream, Rust in a program, services |
-| [`apps/crm`](apps/crm) | A whole multi-tenant CRM with a shop, campaigns, a page designer and plugins |
-| [`editors/vscode`](editors/vscode) | The VS Code extension |
-| [`tests/`](tests) | Integration and browser tests |
+| [`tests/`](tests) | Integration and browser tests; [`tests/programs`](tests/programs) holds the programs they run |
 
-The website ([quillolang/website](https://github.com/quillolang/website), with the logo
-and banners) and the benchmarks ([quillolang/benchmarks](https://github.com/quillolang/benchmarks))
-have repositories of their own.
+Everything else has a repository of its own:
+
+| Repository | What it holds |
+|---|---|
+| [quillolang/examples](https://github.com/quillolang/examples) | Small programs, each showing one part of Quillo: routes, a todo app, live notes, a single-page app, infinite scroll, a virtual list of a million rows, the Game of Life, UDP telemetry, a camera stream, Rust in a program, services |
+| [quillolang/apps](https://github.com/quillolang/apps) | Whole applications: a multi-tenant CRM with a shop, campaigns, a page designer and plugins |
+| [quillolang/editors](https://github.com/quillolang/editors) | The VS Code extension |
+| [quillolang/website](https://github.com/quillolang/website) | [quillolang.org](https://quillolang.org), written in Quillo, with the logo and banners |
+| [quillolang/benchmarks](https://github.com/quillolang/benchmarks) | The browser and server benchmarks |
 
 ## Documentation
 
@@ -247,7 +251,7 @@ requests are welcome. Before sending a change:
 
 ```sh
 cargo test
-for f in examples/*.qwe; do ./target/release/quillo check "$f"; done
+for f in tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 ```
 
 ## License

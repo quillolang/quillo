@@ -1,4 +1,4 @@
-// examples/storm.qwe: after storms that mount and unmount components (with
+// tests/programs/storm.qwe: after storms that mount and unmount components (with
 // timers, live data and url()), nothing removed is still held on to.
 (async () => {
   const out = {};

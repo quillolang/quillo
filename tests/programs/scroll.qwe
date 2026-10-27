@@ -1,0 +1,98 @@
+// Infinite scroll over 100,000 rows, rendering only what is on screen.
+//
+//   quillo run tests/programs/scroll.qwe --watch     then open http://localhost:8080
+//
+// The browser asks the server for rows 200 at a time as you near the end of
+// what it has. However many rows are loaded, only the ones in view, plus a
+// few above and below (the buffer), are in the page: each is placed at its
+// position inside a spacer as tall as all the loaded rows, so the scrollbar
+// behaves as if every row were there.
+
+db.open(":memory:")
+db.exec("create table items (id integer primary key, name text, score integer)")
+db.exec("with recursive n(i) as (select 1 union all select i + 1 from n where i < 100000)
+         insert into items (id, name, score)
+         select i, 'Item ' || i, abs(random()) % 1000 from n")
+
+let ROW = 36        // height of a row, in px
+let VIEW = 540      // height of the scrolling area, in px (15 rows)
+let BUFFER = 5      // rows rendered above and below the visible ones
+let PAGE = 200      // rows fetched per request
+
+// Keyset paging: "the next rows after this id" stays fast however deep you go.
+server fn load_after(last_id: int, limit: int) -> list with db =
+    db.query(sql`select id, name, score from items where id > ? order by id limit ?`, last_id, limit)
+
+fn total() with db = db.one("select count(*) as n from items").n
+
+component Feed(count: int) {
+    state items = load_after(0, PAGE)
+    state top = 0
+    state loading = false
+
+    // The window: visible rows, widened by the buffer on both sides.
+    let first_row = max([0, floor(top / ROW) - BUFFER])
+    let last_row = min([len(items), ceil((top + VIEW) / ROW) + BUFFER])
+
+    <section.feed>
+        <p.stats>
+            Rendering <b.rendered>{last_row - first_row}</b> of <b.loaded>{len(items)}</b> loaded rows
+            ({count} in all) · rows {first_row + 1}–{last_row}
+            {loading && <span.loading> · loading…</span>}
+        </p>
+        <div.viewport style={`height: ${VIEW}px`} @scroll={(e) => {
+            top = e.scrollTop
+            // Near the end of what is loaded? Fetch the next page.
+            let bottom = ceil((e.scrollTop + VIEW) / ROW)
+            if !loading && bottom + BUFFER * 4 >= len(items) && len(items) < count {
+                loading = true
+                // A failed load is an error value: carry on with what we
+                // have, and the next scroll tries again.
+                let more = load_after(last(items).id, PAGE) ?? []
+                items = items + more
+                loading = false
+            }
+        }}>
+            <div.spacer style={`height: ${len(items) * ROW}px`}>
+                {for i in range(first_row, last_row) => {
+                    let item = items[i]
+                    <div.row key={item.id} style={`top: ${i * ROW}px; height: ${ROW}px`}>
+                        <span.id>#{item.id}</span>
+                        <span.name>{item.name}</span>
+                        <span.score>{item.score}</span>
+                    </div>
+                }}
+            </div>
+        </div>
+    </section>
+}
+
+let style = css`
+body { font: 15px/1.4 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+.stats { color: #555; } .stats b { color: #222; }
+.viewport { overflow-y: auto; border: 1px solid #ddd; border-radius: 8px; }
+.spacer { position: relative; }
+.row { position: absolute; left: 0; right: 0; display: flex; gap: 1rem; align-items: center; padding: 0 1rem; box-sizing: border-box; border-bottom: 1px solid #f0f0f0; }
+.row .id { width: 5rem; color: #999; font-variant-numeric: tabular-nums; }
+.row .name { flex: 1; } .row .score { font-variant-numeric: tabular-nums; }
+.dom { color: #888; font-size: 13px; }
+`
+
+// A plain script, outside Quillo, that counts the row elements actually in
+// the page, to show the windowing at work.
+let dom_counter = "setInterval(() => { const n = document.querySelectorAll('.row').length; const el = document.querySelector('.dom b'); if (el) el.textContent = n; }, 200)"
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>Infinite scroll</title>
+            <style>{style}</style>
+        </head>
+        <body>
+            <h1>Infinite scroll</h1>
+            <Feed count={total()}/>
+            <p.dom>Row elements in the page right now: <b>0</b></p>
+            <script>{raw(dom_counter)}</script>
+        </body>
+    </html>

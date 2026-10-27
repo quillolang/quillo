@@ -3,7 +3,7 @@
 //! It checks documents as they change (with `crate::check`) and answers
 //! hover, go-to-definition, completion and document-symbol requests from
 //! what the checker records. Any LSP client can use it; the VS Code
-//! extension in `editors/vscode` starts it automatically.
+//! extension (quillolang/editors) starts it automatically.
 
 use crate::check::{self, Analysis, Severity, SymbolKind};
 use serde_json::{json, Value as J};

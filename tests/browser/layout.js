@@ -1,4 +1,4 @@
-// Edits the JSON in examples/layout.qwe and checks the preview.
+// Edits the JSON in tests/programs/layout.qwe and checks the preview.
 (async () => {
   const out = {};
   const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms));

@@ -1,4 +1,4 @@
-// examples/index.qwe: the SPA under /spa and the notes app under /notes.
+// tests/programs/index.qwe: the SPA under /spa and the notes app under /notes.
 (async () => {
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
