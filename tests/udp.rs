@@ -1,5 +1,7 @@
 //! UDP: packets to a program's ports, and from it (src/udp.rs).
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -39,12 +41,14 @@ fn start(file: &Path, port: u16, extra: &[&str]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server(child);
     let deadline = Instant::now() + Duration::from_secs(20);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server(child)
+    server
 }
 
 fn get(port: u16, path: &str) -> String {

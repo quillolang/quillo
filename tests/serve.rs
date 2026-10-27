@@ -1,5 +1,7 @@
 //! Runs the `quillo` binary as a server and talks to it over HTTP.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -48,12 +50,14 @@ fn start_with_env(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server { child, port }
+    server
 }
 
 fn request(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -507,13 +511,17 @@ fn the_log_can_be_json_lines() {
     let f = d.join("app.qwe");
     std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
     let port = port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+    // The log to a file, read once the server has stopped.
+    let log_file = d.join("server.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(&f)
         .args(["--port", &port.to_string(), "--log", "json"])
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&log_file).unwrap())
         .spawn()
         .unwrap();
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
@@ -521,9 +529,8 @@ fn the_log_can_be_json_lines() {
     }
     assert_eq!(get(port, "/hello?x=1").1, "hi");
     std::thread::sleep(Duration::from_millis(300));
-    let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
-    let log = String::from_utf8_lossy(&out.stderr);
+    drop(server);
+    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
     let line = log.lines().find(|l| l.contains("/hello")).unwrap_or_else(|| panic!("no log line in {}", log));
     let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{}: {}", e, line));
     // The path without its query string, unless --log-query.

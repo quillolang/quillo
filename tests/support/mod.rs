@@ -154,6 +154,7 @@ pub fn mariadb(name: &str) -> Option<Maria> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    stop_with_tests(&child);
     let s = Maria { child, dir, port };
     let deadline = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -170,6 +171,46 @@ impl Maria {
 }
 
 // ---- quillo run ------------------------------------------------------------
+
+/// Stops `child` (a server a test started) once this test process is gone.
+/// A test that panics drops what holds its servers, which kills them; one
+/// that aborts (a stack overflow, say) runs no destructors, and its servers
+/// would live on, holding the pipe `cargo test` reads the output from. A
+/// small shell watches both, and leaves when the server has stopped.
+pub fn stop_with_tests(child: &Child) {
+    let watch = format!(
+        "while kill -0 {test} 2>/dev/null && kill -0 {server} 2>/dev/null; do sleep 0.5; done; \
+         kill -0 {test} 2>/dev/null || {{ kill -INT {server} 2>/dev/null; sleep 2; kill -KILL {server} 2>/dev/null; }}",
+        test = std::process::id(),
+        server = child.id()
+    );
+    // In the background of a shell that ends at once: the watcher is no
+    // child of the tests', which would have to wait for it.
+    let _ = Command::new("sh")
+        .args(["-c", &format!("({}) </dev/null >/dev/null 2>&1 &", watch)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// A process a test started, killed when dropped (and when the test process
+/// is gone: see `stop_with_tests`).
+pub struct Guard(pub Child);
+
+impl Guard {
+    pub fn new(child: Child) -> Guard {
+        stop_with_tests(&child);
+        Guard(child)
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// A `quillo run` server, killed when dropped.
 pub struct Server {
@@ -205,6 +246,7 @@ pub fn serve(file: &Path, env: &[(&str, &str)]) -> Server {
         .stderr(if std::env::var("QUILLO_TEST_LOG").is_ok() { Stdio::inherit() } else { Stdio::null() })
         .spawn()
         .expect("cannot start quillo");
+    stop_with_tests(&child);
     let mut s = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(20);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {

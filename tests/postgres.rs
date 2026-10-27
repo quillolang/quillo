@@ -3,6 +3,8 @@
 //! afterwards. Skipped when PostgreSQL's server programs are not installed;
 //! set QUILLO_TEST_PG_BIN to the folder holding initdb and pg_ctl.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -476,6 +478,7 @@ fn start(file: &Path) -> (Running, u16) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    support::stop_with_tests(&child);
     let child = Running(child);
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {

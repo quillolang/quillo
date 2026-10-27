@@ -4,6 +4,8 @@
 //! Needs the limer binary: `$LIMER`, or `../limer/limer` beside this
 //! repository. Skipped without it.
 
+mod support;
+
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,6 +14,13 @@ use std::time::{Duration, Instant};
 const SECRET: &str = "cluster-test-secret-0123456789abcdef";
 
 struct Proc(Child);
+
+impl Proc {
+    fn new(child: Child) -> Proc {
+        support::stop_with_tests(&child);
+        Proc(child)
+    }
+}
 
 impl Drop for Proc {
     fn drop(&mut self) {
@@ -135,7 +144,7 @@ route GET / = <p>hello</p>
     wait_tcp(admin);
 
     let start = |port: u16| {
-        let p = Proc(
+        let p = Proc::new(
             Command::new(env!("CARGO_BIN_EXE_quillo"))
                 .arg("run")
                 .arg(&app)
@@ -287,7 +296,7 @@ fn announcements_are_signed_fresh_once_and_about_known_topics() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("LIMER_ADMIN_SECRET"));
 
     let port = free_port();
-    let _server = Proc(
+    let _server = Proc::new(
         Command::new(env!("CARGO_BIN_EXE_quillo"))
             .arg("run")
             .arg(&app)

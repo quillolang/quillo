@@ -1,5 +1,7 @@
 //! Requests that try to make a program do what its author did not write.
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 
@@ -300,12 +302,14 @@ fn serve(name: &str, src: &str, extra: &[&str]) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(20);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server { child, port }
+    server
 }
 
 /// Sends `raw` and reads the answer until the server closes (or 10 s pass).

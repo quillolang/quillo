@@ -1,6 +1,8 @@
 //! Services: a part of an app that runs in this process or as a server of
 //! its own, called the same way either way (src/service.rs).
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 use std::io::{Read, Write};
@@ -171,12 +173,14 @@ fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server
         .stderr(Stdio::null())
         .spawn()
         .expect("cannot start quillo");
+    support::stop_with_tests(&child);
+    let server = Server(child);
     let deadline = Instant::now() + Duration::from_secs(20);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Server(child)
+    server
 }
 
 fn http(port: u16, method: &str, path: &str, headers: &[(&str, String)], body: &str) -> (u16, String) {

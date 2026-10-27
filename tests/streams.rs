@@ -1,6 +1,8 @@
 //! Answers sent as they are made (`stream`, `events`: src/stream.rs), and
 //! read as they arrive (`http.stream`, and `listen`/`receive` in the browser).
 
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 use std::io::{Read, Write};
@@ -163,6 +165,7 @@ fn start(d: &Path) -> (Server, u16) {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
+        support::stop_with_tests(&child);
         let mut server = Server(child, log.clone());
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {

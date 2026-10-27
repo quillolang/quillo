@@ -2,6 +2,8 @@
 //! whose page script clicks, types and submits, then records what it saw.
 //! Skipped when no Chrome is found (set QUILLO_CHROME to point at one).
 
+mod support;
+
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,15 +48,17 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(app)
-        .args(["--port", &port.to_string()])
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(app)
+            .args(["--port", &port.to_string()])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
@@ -71,8 +75,7 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
         .args(script)
         .output()
         .expect("node");
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     let _ = std::fs::remove_dir_all(&profile);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
@@ -748,23 +751,23 @@ fn media_plays(args: &[&str], via: &str) {
 /// the page loaded `late` after; `None` when `start` says it could not.
 fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args: &[&str], late: Duration, start: impl FnOnce() -> bool) -> Option<serde_json::Value> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .arg("run")
-        .arg(app)
-        .args(["--port", &port.to_string()])
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let server = support::Guard::new(
+        Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(app)
+            .args(["--port", &port.to_string()])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
     if !start() {
-        let _ = server.kill();
-        let _ = server.wait();
         return None;
     }
     std::thread::sleep(late);
@@ -778,8 +781,7 @@ fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args:
         .arg(script)
         .output()
         .expect("node");
-    let _ = server.kill();
-    let _ = server.wait();
+    drop(server);
     let _ = std::fs::remove_dir_all(&profile);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Some(serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout))))
