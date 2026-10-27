@@ -2616,10 +2616,12 @@ builtin (`notify`, `first`) has the wrong arguments, the error says so: this `no
 the program's own, from line 1, which hides the builtin `notify`.
 
 After a syntax error, `quillo check`, `quillo run` and the language server say which
-quillo they are (`note: this is quillo 0.5.0, built 2026-10-27 at ...`): code written
-for a newer Quillo fails to parse in an older one, such as an old build left on the
-`PATH`. `scripts/doctor.sh` and `doctor.ps1` point out a `quillo` on the `PATH` older
-than the checkout's own build.
+quillo they are (`note: this is quillo 0.5.0 (f1695a3, 2026-10-27), built 2026-10-27 at
+...`): code written for a newer Quillo fails to parse in an older one, such as an old
+build left on the `PATH`. `quillo --version` names the commit too: `QUILLO_COMMIT` when
+the build sets it (as for a source archive, which has no git), else the checkout's.
+`scripts/doctor.sh` and `doctor.ps1` point out a `quillo` on the `PATH` older than the
+checkout's own build.
 
 It also knows what lists hold and which fields maps have, from what made them: a list
 or map literal, an annotation, `split`, `range`, `merge`, `set`. A lambda given to
