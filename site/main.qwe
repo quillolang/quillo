@@ -120,7 +120,7 @@ let features = [
     { title: "Real time, over UDP", text: "Packets on a UDP port, messages to pages as WebTransport datagrams, a camera's RTP stream in any page, answers streamed as they are made: [the guide](/docs/realtime/)." },
     { title: "Translations", text: "`t(\"cart.items\", { count })` picks plural forms by the language's rules, on the server and in components." },
     { title: "Microservices", text: "Split a part of an app into its own server without changing its code. Calls are signed, retried, and run once: [the guide](/docs/microservices/)." },
-    { title: "Numbers and data", text: "`math`, `stats` and `vec` give Python's answers, on every core, in the server and the browser." },
+    { title: "Numbers, data and Rust", text: "`math`, `stats` and `vec` give Python's answers on every core. For the rest, a `.qwer` file is Rust, called like any function: [the page](/docs/rust/)." },
     { title: "Desktop apps", text: "`quillo app` runs the same program in a native window, with the platform's own web view." },
 ]
 

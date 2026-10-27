@@ -11,11 +11,11 @@ use "demos/reactivity/branch.qwe"
 use "demos/reactivity/props.qwe"
 
 let GROUPS = [
-    { name: "Guide", pages: ["introduction", "language-tour", "components", "reactivity", "async", "routes", "realtime", "prefetching", "validation", "database", "microservices"] },
+    { name: "Guide", pages: ["introduction", "language-tour", "components", "reactivity", "async", "routes", "realtime", "prefetching", "validation", "database", "microservices", "rust"] },
     { name: "Reference", pages: ["standard-library", "checking", "concurrency-and-reloading", "cached-views", "compiled-numbers"] },
     { name: "Examples", pages: ["examples", "examples/hello", "examples/orders", "examples/todo",
         "examples/notes", "examples/compose", "examples/layout", "examples/spa", "examples/scroll",
-        "examples/virtual", "examples/life", "examples/storm", "examples/telemetry", "examples/media",
+        "examples/virtual", "examples/life", "examples/storm", "examples/telemetry", "examples/media", "examples/rust",
         "examples/services", "examples/index"] },
     { name: "Project", pages: ["layout", "not-built-yet"] },
 ]
@@ -36,6 +36,8 @@ let EXAMPLES = [
     { name: "telemetry", title: "Telemetry", blurb: "Sensors send readings over UDP; every page sees them as they come, over a channel.",
       also: ["sensors.qwe"] },
     { name: "media", title: "Camera", blurb: "A camera's RTP stream, played in the page a fraction of a second behind." },
+    { name: "rust", title: "Rust in a program", blurb: "Primes and Collatz chains in a .qwer file, called from a component through server fns.",
+      also: ["rust.qwer"] },
     { name: "services", title: "Services", blurb: "A shop that bills through a billing service, in one process or split apart.",
       files: ["app.qwe", "shop.qwe", "billing.qwe"] },
     { name: "index", title: "All examples", blurb: "Every example mounted under its own path in one server, behind tabs." },
@@ -84,7 +86,7 @@ fn example_page(e: map) {
     let sources = for [i, f] in enumerate(files) => {
         let lines = i == 0 ? drop(main, len(head)) : split(read_file(`content/examples/${f}`), "\n")
         [{ type: "h", level: 3, text: len(files) == 1 ? "Source" : f, id: len(files) == 1 ? "source" : slug(replace(f, "/", " ")) },
-         { type: "code", lang: "quillo", lines, file: f }]
+         { type: "code", lang: ends_with(f, ".qwer") ? "rust" : "quillo", lines, file: f }]
     }
     {
         title: e.title,
@@ -191,6 +193,8 @@ fn fix_anchors(text: str) {
 fn fix_links(text: str) =
     fix_anchors(text)
         | replace("](examples/services)", "](/docs/examples/services/)")
+        | replace("](examples/rust.qwer)", "](/docs/examples/rust/#rustqwer)")
+        | replace("](README.md)", "](/)")
         | replace("](examples/", "](/docs/examples/")
         | replace(".qwe)", "/)")
         | replace("](apps/", `](${REPO}/tree/main/apps/`)
@@ -223,6 +227,7 @@ view Block(b: map) =
             <a.card href={page_url(`examples/${e.name}`)}><b>{e.title}</b><span>{e.blurb}</span><code>{e.name}{e.files ? "/" : ".qwe"}</code></a>}</div>
         _ => <div.snippet>{b.file && <div.file>{b.file}</div>}<Code lines={quillo_like(b)
             ? highlight(join(b.lines, "\n"))
+            : b.lang == "rust" ? highlight(join(b.lines, "\n"), "rust")
             : b.lines | map((l) => [{ k: "plain", text: l }])}/></div>
     }
 

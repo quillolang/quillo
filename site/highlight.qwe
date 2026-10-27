@@ -10,6 +10,13 @@ let KEYWORDS = ["route", "fn", "let", "component", "view", "server", "match", "i
     "null", "GET", "POST", "PUT", "PATCH", "DELETE"]
 let TYPES = ["int", "str", "float", "num", "bool", "list", "map", "html", "any"]
 
+// For `.qwer` files and ```rust blocks: the same tokens, Rust's words.
+let RUST_KEYWORDS = ["fn", "pub", "let", "mut", "use", "return", "if", "else", "for", "in", "while",
+    "loop", "break", "continue", "match", "impl", "struct", "enum", "mod", "trait", "where", "as",
+    "const", "static", "ref", "move", "self", "Self", "crate", "super", "dyn", "true", "false"]
+let RUST_TYPES = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize", "f32",
+    "f64", "bool", "char", "str"]
+
 fn char_kind(c: str) = contains(WORD, c) ? "w" : c == " " ? "s" : "p"
 
 // Each character with its kind, following strings and `//` comments. A
@@ -51,19 +58,31 @@ fn word_kind(t: map, prev, next, declared: bool = false) {
     "plain"
 }
 
-fn classify(toks: list) =
+// Rust has no markup and no `state`: a word is a keyword, a number, a call
+// (or a macro, `vec!`), a type, or plain.
+fn rust_kind(t: map, next) {
+    let w = t.text
+    if contains(RUST_KEYWORDS, w) { return "kw" }
+    if contains("0123456789", w[0]) { return "num" }
+    if next != null && next.k == "p" && (starts_with(next.text, "(") || starts_with(next.text, "!")) { return "call" }
+    if contains(RUST_TYPES, w) || is_upper(w[0]) { return "type" }
+    "plain"
+}
+
+fn classify(toks: list, lang: str = "quillo") =
     for [i, t] in enumerate(toks) =>
-        t.k == "w" ? {
+        t.k == "w" && lang == "rust" ? { k: rust_kind(t, toks[i + 1]), text: t.text }
+        : t.k == "w" ? {
             let declared = i > 1 && toks[i - 1].k == "s" && toks[i - 2].text == "state"
             { k: word_kind(t, i > 0 ? toks[i - 1] : null, toks[i + 1], declared), text: t.text }
         } : t
 
-fn highlight(text: str) =
+fn highlight(text: str, lang: str = "quillo") =
     reduce(split(trim(text), "\n"), { lines: [], mode: "code", q: "" }, (st, line) => {
         let r = chars(line, st.mode, st.q)
         // Only backticks and double quotes go on: a `'` is as often an apostrophe in text.
         let open = r.mode == "string" && r.q != "'"
-        { lines: push(st.lines, classify(group(r.out))), mode: open ? "string" : "code", q: r.q }
+        { lines: push(st.lines, classify(group(r.out), lang)), mode: open ? "string" : "code", q: r.q }
     }).lines
 
 view Code(lines: list) =

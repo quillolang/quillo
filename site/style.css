@@ -28,7 +28,7 @@ body {
   overflow-x: hidden;
 }
 a { color: inherit; }
-code { font-family: var(--mono); font-size: .88em; color: var(--gold); }
+code { font-family: var(--mono); font-size: .88em; color: var(--gold); font-variant-ligatures: none; }
 h1, h2 { font-family: var(--serif); font-weight: 400; letter-spacing: -.01em; margin: 0; }
 h1 em, h2 em { color: var(--gold); }
 
