@@ -29,7 +29,6 @@ const CHANGES: &[&str] = &[
     "db.exec",
     "db.migrate",
     "db.atomic",
-    "idempotent",
     "set_cookie",
     "delete_cookie",
     "set_session",
@@ -43,8 +42,6 @@ const CHANGES: &[&str] = &[
     "http.patch",
     "http.delete",
     "image.convert",
-    "audit",
-    "db.backup",
     "__service",
     "__service_later",
 ];
@@ -106,11 +103,6 @@ pub struct Interp {
     pub set_cookies: Vec<String>,
     /// The request's session, once read or set.
     pub session: Option<Value>,
-    /// What the request set about its answer's headers, and its session's row (see `access`).
-    pub access: crate::access::PerRequest,
-    /// Writes to Quillo's own tables held back until the transaction open on
-    /// their SQLite database ends (see `db::own_sql`).
-    pub own_later: Vec<crate::db::Held>,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -583,8 +575,7 @@ fn projection(def: &FnDef) -> Option<(&str, u32)> {
 }
 
 pub(crate) fn short(v: &Value) -> String {
-    // Values under sensitive keys, card numbers and IBANs are not shown (see `redact`).
-    let r = crate::redact::text(&crate::redact::value(v).repr()).into_owned();
+    let r = v.repr();
     if r.chars().count() > 40 {
         format!("{}…", r.chars().take(40).collect::<String>())
     } else {
@@ -759,8 +750,6 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
-            access: Default::default(),
-            own_later: Vec::new(),
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -821,8 +810,6 @@ impl Interp {
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
-            access: Default::default(),
-            own_later: Vec::new(),
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
@@ -1933,11 +1920,6 @@ impl Interp {
             Value::Func(c) => {
                 let c = c.clone();
                 self.call_closure(&c, args.into_iter().map(Some).collect(), line)
-            }
-            // A module that is also a function: `audit(...)` beside `audit.query`.
-            Value::Map(m) if matches!(m.get(crate::audit::CALL_KEY), Some(Value::Builtin(..))) => {
-                let f = m.get(crate::audit::CALL_KEY).cloned().unwrap_or(Value::Nil);
-                self.call(&f, args, line)
             }
             other => fail(line, format!("cannot call {}: it is not a function", other.type_name())),
         }
@@ -3063,12 +3045,8 @@ impl Interp {
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
         let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
-        // Under a Content-Security-Policy, a style element lays it out instead
-        // (see `Interp::handle`): style attributes carry no nonce.
-        let csp = self.access.csp.as_ref().map_or(self.site.csp.is_some(), |c| c.is_some());
         out.push_str(&format!(
-            "<quillo-island{} data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
-            if csp { "" } else { " style=\"display:contents\"" },
+            "<quillo-island style=\"display:contents\" data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}>",
             escape(&el.tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),

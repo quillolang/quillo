@@ -895,19 +895,6 @@ fn decimals_cross_to_the_page_and_back() {
     assert_eq!(r, want);
 }
 
-/// A strict Content-Security-Policy: components, prefetching and the
-/// `--watch` reload run; an inline script without the nonce does not.
-#[test]
-fn pages_work_under_a_strict_content_security_policy() {
-    let Some(chrome) = chrome().filter(|_| node_available()) else {
-        eprintln!("skipping: needs Chrome and Node 22 or later");
-        return;
-    };
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
-    let r = run_page_args(&chrome, &dir.join("csp.qwe"), free_port(), "/", Some(&dir.join("csp.js")), &["--watch"]);
-    assert_eq!(r, serde_json::json!({ "count": "3", "good": true, "bad": false, "blocked": ["script-src-elem inline"], "errors": [] }));
-}
-
 #[test]
 fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {

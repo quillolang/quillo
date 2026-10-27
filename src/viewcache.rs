@@ -164,7 +164,6 @@ fn same(a: &Value, b: &Value) -> bool {
 pub fn impure_builtin(name: &str) -> bool {
     name.starts_with("db.")
         || name.starts_with("http.")
-        || name.starts_with("audit")
         // Rust may do anything.
         || name.starts_with("native:")
         || matches!(
@@ -172,8 +171,6 @@ pub fn impure_builtin(name: &str) -> bool {
             "print"
                 | "env"
                 | "now"
-                | "date.today"
-                | "date.now"
                 | "sleep"
                 | "file"
                 | "read_file"
@@ -187,10 +184,6 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "image.info"
                 | "image.convert"
                 | "crypto.hash_password"
-                | "crypto.encrypt"
-                | "crypto.reencrypt"
-                | "crypto.verify_webhook"
-                | "redact"
                 | "live"
                 | "url"
                 | "navigate"
@@ -210,20 +203,6 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "session"
                 | "set_session"
                 | "end_session"
-                | "sessions"
-                | "renew_session"
-                | "end_sessions"
-                | "user_sessions"
-                | "security_headers"
-                | "csp"
-                | "csp_nonce"
-                | "rate_limit"
-                | "rate_limit_reset"
-                | "crypto.totp_secret"
-                | "crypto.totp_verify"
-                | "crypto.recovery_codes"
-                | "crypto.verify_recovery_code"
-                | "idempotent"
         )
 }
 

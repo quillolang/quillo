@@ -23,8 +23,6 @@ usage:
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
-  quillo keygen [id]                a key for crypto.encrypt, as an entry of
-                                    QUILLO_ENCRYPTION_KEYS (id:base64key)
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
   quillo dap                        debugger for editors (the Debug Adapter
@@ -72,13 +70,7 @@ options for `run`:
   --no-wt        no WebTransport: pages' channels use a WebSocket
   --log F        the request log on stderr: text (the default), json (a JSON
                  object per line: time, method, path, status, ms, ip, tenant,
-                 user, rid) or off
-  --log-file F   the request log to a file a day instead (F-2026-10-27.log
-                 for F.log, by UTC date)
-  --log-keep N   remove the log's files older than N days (default: keep all)
-  --log-stdout   the request log on stdout (with --log-file, there too)
-  --log-query    keep query strings in JSON lines' paths (values of sensitive
-                 parameters masked)
+                 rid) or off
   --metrics      answer GET /_quillo/metrics: request counts and times, open
                  connections and uptime, in Prometheus's text format
   --register URL join limer's `discover` pool through its admin API (such as
@@ -145,16 +137,6 @@ fn real_main(args: Vec<String>) -> i32 {
                 }
             },
             None => usage(),
-        },
-        Some("keygen") => match quillo::cipher::keygen(args.get(2).map(String::as_str)) {
-            Ok(k) => {
-                println!("{}", k);
-                0
-            }
-            Err(e) => {
-                eprintln!("quillo: {}", e);
-                2
-            }
         },
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
@@ -232,8 +214,6 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         as_service: false,
         service_name: None,
     };
-    let mut log_file: Option<String> = None;
-    let mut log_keep = 0u32;
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -334,24 +314,6 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 };
                 quillo::metrics::LOG.store(format, std::sync::atomic::Ordering::Relaxed);
             }
-            ("--log-file", Some(v)) => log_file = Some(v.clone()),
-            ("--log-keep", Some(v)) => match v.parse::<u32>() {
-                Ok(n) if n > 0 => log_keep = n,
-                _ => {
-                    eprintln!("quillo: --log-keep needs a number of days");
-                    return Err(2);
-                }
-            },
-            ("--log-stdout", _) => {
-                quillo::metrics::LOG_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
-                i += 1;
-                continue;
-            }
-            ("--log-query", _) => {
-                quillo::metrics::LOG_QUERY.store(true, std::sync::atomic::Ordering::Relaxed);
-                i += 1;
-                continue;
-            }
             ("--host", Some(v)) => o.host = Some(v.clone()),
             ("--port", Some(v)) => o.port = Some(v.clone()),
             ("--register", Some(v)) => o.register = Some(v.clone()),
@@ -387,19 +349,6 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
         eprintln!("quillo: --tls-cert and --tls-key go together");
         return Err(2);
-    }
-    match log_file {
-        Some(f) => {
-            if let Err(e) = quillo::metrics::log_to_file(Path::new(&f), log_keep) {
-                eprintln!("quillo: --log-file: {}", e);
-                return Err(2);
-            }
-        }
-        None if log_keep > 0 => {
-            eprintln!("quillo: --log-keep goes with --log-file");
-            return Err(2);
-        }
-        None => {}
     }
     Ok(o)
 }
@@ -500,18 +449,11 @@ fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
     }
 }
 
-/// Signing secrets too short to be safe are warned about; encryption keys
-/// that cannot be used stop the program before it starts.
-fn secrets_ok() -> bool {
-    let (warnings, error) = quillo::crypto::secret_problems(|k| std::env::var(k).ok());
-    for w in warnings {
+/// Signing secrets too short to be safe are warned about.
+fn warn_of_secrets() {
+    for w in quillo::crypto::secret_problems(|k| std::env::var(k).ok()) {
         eprintln!("quillo: {}", w);
     }
-    if let Some(e) = error {
-        eprintln!("quillo: {}", e);
-        return false;
-    }
-    true
 }
 
 fn run(file: &str, flags: &[String]) -> i32 {
@@ -519,9 +461,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
         Ok(o) => o,
         Err(code) => return code,
     };
-    if !secrets_ok() {
-        return 2;
-    }
+    warn_of_secrets();
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);

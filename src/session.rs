@@ -6,7 +6,6 @@
 //! set_session({ user: user.id })                   // signed; 30 days unless { max_age }
 //! session().user                                   // {} when there is none
 //! end_session()
-//! renew_session()                                  // a new id (see session_store)
 //! ```
 //!
 //! A session is a map kept in a cookie, signed (HMAC-SHA256) with the
@@ -24,9 +23,6 @@
 //! `__Host-quillo_session`, which browsers only take from this very host,
 //! over HTTPS: a sibling subdomain (another tenant's) cannot plant one. Two
 //! session cookies that are both valid here are no session.
-//!
-//! `sessions({ store: "db" })` keeps sessions in the database instead, where
-//! they can be ended (see `session_store`).
 
 use crate::crypto::{b64url, hmac_sha256, unb64url};
 use crate::interp::{fail, Ctrl, Interp};
@@ -275,9 +271,6 @@ pub(crate) fn send_cookie(it: &mut Interp, value: &str, age: Option<u64>, line: 
 
 /// `session()`: the map `set_session` stored, or `{}`.
 fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
-    if it.site.sessions.is_some() {
-        return Ok(crate::session_store::read(it));
-    }
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }
@@ -299,21 +292,12 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let o = opts(&args, 1, "set_session", line)?;
     let age = match o.as_ref().and_then(|m| m.get("max_age")) {
-        None | Some(Value::Nil) => None,
+        None | Some(Value::Nil) => DEFAULT_AGE,
         Some(v) => match crate::builtins::duration_seconds(v) {
-            Some(n) if n > 0 => Some(n),
+            Some(n) if n > 0 => n,
             _ => return fail(line, format!("`set_session`'s max_age is seconds or a duration like \"30d\", got {}", v.repr())),
         },
     };
-    if it.site.sessions.is_some() {
-        return crate::session_store::write(it, data, age, line);
-    }
-    sign_in(it, data, age, line)
-}
-
-/// The session `data`, signed into the cookie.
-pub(crate) fn sign_in(it: &mut Interp, data: Value, age: Option<u64>, line: u32) -> R {
-    let age = age.unwrap_or(DEFAULT_AGE);
     let mut json = Vec::new();
     serde_json::to_writer(&mut json, &serde_json::json!({ "e": now() + age, "d": data.to_json() })).ok();
     let payload = b64url(&json);
@@ -332,9 +316,6 @@ pub(crate) fn sign_in(it: &mut Interp, data: Value, age: Option<u64>, line: u32)
 
 /// `end_session()`: forgets the session (logging out).
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
-    if it.site.sessions.is_some() {
-        return crate::session_store::end(it, line);
-    }
     send_cookie(it, "", Some(0), line)?;
     it.session = Some(Value::map(Map::new()));
     Ok(Value::Nil)

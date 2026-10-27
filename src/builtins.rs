@@ -115,9 +115,8 @@ pub fn install(env: &Env) {
         ("publish", publish),
         ("watch", watch),
         ("unwatched", unwatched),
-        ("redact", crate::redact::redact),
     ];
-    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::session_store::BUILTINS).chain(crate::access::BUILTINS).chain(crate::limits::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS).chain(crate::idempotency::BUILTINS) {
+    for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
     let mut re = Map::new();
@@ -130,9 +129,6 @@ pub fn install(env: &Env) {
     let mut db = Map::new();
     crate::db::install(&mut db);
     define(env, "db", Value::map(db));
-    let mut audit = Map::new();
-    crate::audit::install(&mut audit);
-    define(env, "audit", Value::map(audit));
     let mut http = Map::new();
     crate::fetch::install(&mut http);
     define(env, "http", Value::map(http));
@@ -147,7 +143,6 @@ pub fn install(env: &Env) {
     define(env, "media", Value::map(media));
     let mut crypto = Map::new();
     crate::crypto::install(&mut crypto);
-    crate::cipher::install(&mut crypto);
     define(env, "crypto", Value::map(crypto));
     let mut image = Map::new();
     crate::imaging::install(&mut image);
@@ -164,9 +159,6 @@ pub fn install(env: &Env) {
     let mut vec = Map::new();
     crate::numeric::install_vec(&mut vec);
     define(env, "vec", Value::map(vec));
-    let mut date = Map::new();
-    crate::dates::install(&mut date);
-    define(env, "date", Value::map(date));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).
@@ -238,9 +230,8 @@ fn f_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Value, Ctrl> {
 // ---- general -----------------------------------------------------------
 
 fn print(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    // Values under sensitive keys, card numbers and IBANs are masked (see `redact`).
-    let line = args.iter().map(|v| crate::redact::value(v).display()).collect::<Vec<_>>().join(" ");
-    println!("{}", crate::redact::text(&line));
+    let line = args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" ");
+    println!("{}", line);
     Ok(Value::Nil)
 }
 

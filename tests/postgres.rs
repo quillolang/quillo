@@ -107,7 +107,6 @@ fn postgres() {
     several_databases_of_several_kinds(&database(&pg, "main_db"), &database(&pg, "other_db"), &database(&pg, "beta_db"));
     replicas_take_reads_and_the_primary_the_rest(&database(&pg, "primary_db"), &database(&pg, "replica_db"));
     one_transaction_over_several_databases(&pg, &database(&pg, "bank_a"), &database(&pg, "bank_b"));
-    the_audit_log_takes_turns_and_a_clerk_cannot_change_it(&pg, &database(&pg, "audited"));
 }
 
 /// Certificates for a test of TLS, written to `dir`: `ca.pem`, a private
@@ -202,47 +201,6 @@ fn postgres_over_tls() {
     std::fs::write(&app, format!("db.open(\"{}&sslrootcert={}\")\nroute GET /tls = {}.ssl\n", named, file("ca.pem"), tls)).unwrap();
     let (_server, http) = start_on(&app, 28000 + (std::process::id() % 2000) as u16);
     assert_eq!(get(http, "/tls"), "true");
-}
-
-/// `audit`: rows in the change's transaction, appends from several
-/// connections at once in one chain, and a user with only the rights the
-/// user guide gives (insert and select) who can append but not change.
-fn the_audit_log_takes_turns_and_a_clerk_cannot_change_it(pg: &Pg, url: &str) {
-    let add = r#"
-db.exec("create table if not exists notes (n int)")
-fn add(n) = db.transaction(() => {
-    db.exec("insert into notes values (?)", n)
-    audit("note.add", { n })?
-    n < 0 ? err("no") : n
-})
-"#;
-    assert_eq!(run(url, &format!("{}
-[add(1), add(-1), audit(\"outside\").seq]", add)), r#"[1, err("no"), 2]"#);
-    assert_eq!(run(url, "audit.query({ action: \"note.*\" }) | map((r) => r.details.n)"), "[1]");
-    let hs: Vec<_> = (0..4)
-        .map(|w| {
-            let url = url.to_string();
-            std::thread::spawn(move || run(&url, &format!("for i in range(0, 25) {{ audit(\"tick\", {{ w: {}, i }}) }}\n1", w)))
-        })
-        .collect();
-    for h in hs {
-        assert_eq!(h.join().unwrap(), "1");
-    }
-    assert_eq!(run(url, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 102]");
-    assert!(run(url, "db.exec(\"delete from _quillo_audit\")").contains("append-only"));
-    // The rights the user guide gives the program's user.
-    psql(pg, url, &[
-        "create role clerk login",
-        "grant select, insert on notes, _quillo_audit to clerk",
-        "grant usage on sequence _quillo_audit_id_seq to clerk",
-        "grant select, insert, update on _quillo_audit_lock to clerk",
-        "revoke update, delete, truncate on _quillo_audit from clerk",
-    ]);
-    let clerk = url.replace("quillo@", "clerk@");
-    assert_eq!(run(&clerk, "audit(\"by the clerk\").seq"), "103");
-    assert_eq!(run(&clerk, "let v = audit.verify()\n[v.ok, v.rows]"), "[true, 103]");
-    let out = Command::new(pg.bin.join("psql")).args([&clerk, "-q", "-c", "update _quillo_audit set action = 'x'"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 fn psql(pg: &Pg, url: &str, sql: &[&str]) {

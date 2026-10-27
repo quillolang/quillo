@@ -66,10 +66,3 @@ path = "fuzz_targets/decimal_ops.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "dates"
-path = "fuzz_targets/dates.rs"
-test = false
-doc = false
-bench = false

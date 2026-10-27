@@ -1,7 +1,6 @@
-//! What the tests of transactions, idempotent requests and the ledger
-//! share: throwaway PostgreSQL and MariaDB servers, `quillo run` servers,
-//! and plain HTTP. Each is stopped when its value is dropped, even when a
-//! test fails.
+//! What the tests share: throwaway PostgreSQL and MariaDB servers,
+//! `quillo run` servers, and plain HTTP. Each is stopped when its value is
+//! dropped, even when a test fails.
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
@@ -254,7 +253,7 @@ pub fn serve(file: &Path, env: &[(&str, &str)]) -> Server {
         .arg(file)
         .args(["--port", &port.to_string(), "--workers", "8"])
         .envs(env.iter().copied())
-        .env("QUILLO_SECRET", "test secret for idempotency and ledger tests")
+        .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(if std::env::var("QUILLO_TEST_LOG").is_ok() { Stdio::inherit() } else { Stdio::null() })

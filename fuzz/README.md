@@ -17,7 +17,6 @@ cargo +nightly fuzz run parse -- -max_total_time=180 -rss_limit_mb=2048
 | `json` | JSON text to values and back |
 | `decimal` | Text to `dec`, which must read back as written |
 | `decimal_ops` | `+ - *` and comparison of decimals, against a big-integer reference |
-| `dates` | Text to dates and date-times, which must read back as written |
 
 What a target finds is kept in `fuzz/artifacts/<target>/`; run it again with
 `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`. Each bug found gets a

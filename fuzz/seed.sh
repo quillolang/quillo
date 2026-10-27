@@ -1,7 +1,7 @@
 #!/bin/sh
 # Makes the starting inputs in corpus/<target>/: the programs in examples/
-# and the repository's other .qwe files, and a few requests, JSON texts,
-# numbers and dates. Run from anywhere; what fuzzing finds is added there.
+# and the repository's other .qwe files, and a few requests, JSON texts
+# and numbers. Run from anywhere; what fuzzing finds is added there.
 set -e
 cd "$(dirname "$0")"
 root=..
@@ -21,7 +21,7 @@ for f in $root/tests/*.rs; do
 done
 cp corpus/parse/*_[0-9]* corpus/check/ 2>/dev/null || true
 
-mkdir -p corpus/http corpus/json corpus/decimal corpus/decimal_ops corpus/dates
+mkdir -p corpus/http corpus/json corpus/decimal corpus/decimal_ops
 # http's input is arbitrary's: the bytes of the request come last, after a
 # few that cut it into pieces.
 n=0
@@ -41,7 +41,4 @@ for d in 12.50 -0.05 3 2.5e-3 79228162514264337593543950335 0.000000000000000000
 done
 head -c 64 /dev/urandom > corpus/decimal_ops/random1
 head -c 64 /dev/urandom > corpus/decimal_ops/random2
-for d in 2026-10-27 2026-10-27T14:30:00Z 2026-10-27T15:30:00.250+01:00 0001-01-01T00:00:00+00:09:21 9999-12-31T23:59:59-04:00 2024-02-29; do
-    printf '%s' "$d" > "corpus/dates/$d"
-done
 echo "corpus/: $(find corpus -type f | wc -l | tr -d ' ') inputs"

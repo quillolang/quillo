@@ -28,14 +28,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tokio-postgres = "0.7"
 indexmap = "2"
 stacker = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 ureq = "2"
 fastrand = "2"
 ctrlc = { version = "3", features = ["termination"] }
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended", "v2"] }
 getrandom = "0.2"
-# AES-256-GCM for `crypto.encrypt` (src/cipher.rs); already there for rustls.
-ring = "0.17"
 sha2 = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 flate2 = "1"
@@ -52,9 +50,6 @@ rustls-native-certs = "0.8"
 bytes = "1"
 # float_roundtrip: a float in JSON is read as the nearest one, not a step off.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-# Time zones for `date` (src/dates.rs): the system's database, and a bundled
-# copy where there is none (Windows, small containers).
-jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 # Numeric functions compiled to machine code (src/jit.rs).
 cranelift-codegen = { version = "=0.134.4", optional = true }
 cranelift-frontend = { version = "=0.134.4", optional = true }

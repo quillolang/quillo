@@ -130,7 +130,7 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
-    let e = if name.starts_with("db.") || matches!(name, "audit" | "audit.query" | "audit.verify" | "idempotent") {
+    let e = if name.starts_with("db.") {
         "db"
     } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
         "http"
@@ -138,11 +138,8 @@ pub fn builtin_effect(name: &str) -> u8 {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
             "env" => "env",
-            "now" | "sleep" | "date.today" | "date.now" | "crypto.totp_verify" | "rate_limit" | "rate_limit_reset" => "time",
-            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" | "crypto.totp_secret" | "crypto.recovery_codes" | "crypto.encrypt" | "crypto.reencrypt" => "random",
-            "end_sessions" | "user_sessions" => "db",
-            // Stripe's signatures carry a time, checked against the clock.
-            "crypto.verify_webhook" => "time",
+            "now" | "sleep" => "time",
+            "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }

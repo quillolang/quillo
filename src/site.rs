@@ -43,14 +43,6 @@ pub struct Site {
     pub udp: Vec<std::sync::Arc<crate::udp::Listener>>,
     /// What `channel.on` handles (see `wt`).
     pub channels: Vec<std::sync::Arc<crate::wt::Handler>>,
-    /// Sessions kept in the database (`sessions`); None: signed cookies.
-    pub sessions: Option<crate::session_store::Config>,
-    /// The security headers every answer carries (`security_headers`).
-    pub headers: crate::access::Policy,
-    /// The Content-Security-Policy every answer carries (`csp`).
-    pub csp: Option<crate::access::Csp>,
-    /// `audit.actor`'s function: who the user is, for the audit log.
-    pub audit_actor: Option<Value>,
 }
 
 impl Site {

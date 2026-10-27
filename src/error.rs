@@ -23,9 +23,7 @@ impl QuilloError {
 
 impl fmt::Display for QuilloError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Shown in the terminal and, in development, on pages: values under
-        // sensitive keys, card numbers and IBANs masked (see `redact`).
-        let msg = crate::redact::text(&self.msg);
+        let msg = &self.msg;
         match (&self.file, self.line) {
             (Some(file), l) if l > 0 => write!(f, "{}:{}: {}", file, l, msg),
             (Some(file), _) => write!(f, "{}: {}", file, msg),

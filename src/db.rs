@@ -52,7 +52,6 @@ pub fn install(m: &mut Map) {
         ("db.system", system),
         ("db.shards", shards),
         ("db.atomic", atomic),
-        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -98,15 +97,8 @@ pub enum Pinned {
     My(crate::my::Conn),
 }
 
-/// What a statement gets in a transaction that already failed because of
-/// another (see `crate::txn`).
-const CONFLICTED: &str = "the transaction conflicted with another and was rolled back";
-
 impl Pinned {
     pub(crate) fn query(&mut self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
-        if self.conflicted() {
-            return Err(CONFLICTED.into());
-        }
         match self {
             Pinned::Pg(c) => c.query(sql, params, limit),
             #[cfg(feature = "mysql")]
@@ -115,9 +107,6 @@ impl Pinned {
     }
 
     pub(crate) fn exec(&mut self, sql: &str, params: &[Value]) -> Result<Value, String> {
-        if self.conflicted() {
-            return Err(CONFLICTED.into());
-        }
         match self {
             Pinned::Pg(c) => c.exec(sql, params),
             #[cfg(feature = "mysql")]
@@ -130,22 +119,6 @@ impl Pinned {
             Pinned::Pg(c) => c.batch(sql),
             #[cfg(feature = "mysql")]
             Pinned::My(c) => c.batch(sql),
-        }
-    }
-
-    fn watch_conflicts(&mut self, on: bool) {
-        match self {
-            Pinned::Pg(c) => c.watch_conflicts(on),
-            #[cfg(feature = "mysql")]
-            Pinned::My(c) => c.watch_conflicts(on),
-        }
-    }
-
-    fn conflicted(&self) -> bool {
-        match self {
-            Pinned::Pg(c) => c.conflicted(),
-            #[cfg(feature = "mysql")]
-            Pinned::My(c) => c.conflicted(),
         }
     }
 }
@@ -565,12 +538,6 @@ pub(crate) fn pooled_run<T: Send>(
     }
 }
 
-/// Whether this request has a `db.transaction` open on `b` (a server
-/// database: SQLite's is on its one connection).
-pub(crate) fn in_transaction(it: &Interp, b: &Arc<Backend>) -> bool {
-    it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b))
-}
-
 /// In the server, outside a transaction, queries use the connections all
 /// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
 fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
@@ -979,7 +946,6 @@ fn connection(i: usize) -> Value {
         ("db.migrate", migrate),
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
-        ("db.backup", crate::backup::backup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -1038,9 +1004,6 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let sql = sql_arg(&args, "db.exec", line)?;
-    if let Some(why) = crate::audit::refused(&sql) {
-        return Ok(db_err(why));
-    }
     it.wrote_req = Some(crate::httpd::request_number());
     let params = args[1..].to_vec();
     let b = match backend_on(it, on) {
@@ -1140,87 +1103,6 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
     let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
     conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
     Some(Some(conns.len() - 1))
-}
-
-/// Runs `sql(mysql)` on the database of Quillo's own tables (made if
-/// needed, as for calls made later), apart from the program's transactions
-/// and live updates: for sessions and rate limits. Rows for a `select`.
-///
-/// A server database gives it a connection of its own. SQLite has one, so
-/// while a transaction is open on it (`db.transaction`, `idempotent`), a
-/// change would be part of that transaction: rolled back with a try that
-/// failed, made again by the next. So changes wait, and are made once the
-/// transaction has ended (`own_later`), whatever became of it: a session
-/// set or ended, a rate limit counted, as on a server database. Reads and
-/// tables made are not held back.
-pub(crate) fn own_sql(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>) -> Result<Vec<Value>, String> {
-    own_sql_made(it, sql, params, None)
-}
-
-/// `own_sql`, with what makes the change's table (statements, by
-/// dialect) if it is not there when a held change is made: made inside the
-/// transaction, it went with it if that was rolled back.
-pub(crate) fn own_sql_made(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>, make: Option<fn(bool) -> String>) -> Result<Vec<Value>, String> {
-    let b = match system_on_for(it, true, true) {
-        Some(on) => backend_on(it, on)?,
-        None => backend(it)?,
-    };
-    let text = sql(b.is_mysql());
-    if own_held(&b, &text) {
-        it.own_later.push(Held { make: make.map(|m| m(b.is_mysql())), backend: b, sql: text, params });
-        return Ok(Vec::new());
-    }
-    apart(it, &b, text, params)
-}
-
-/// A change to Quillo's own tables waiting for a transaction to end.
-pub struct Held {
-    backend: Arc<Backend>,
-    sql: String,
-    params: Vec<Value>,
-    make: Option<String>,
-}
-
-/// Whether a change to Quillo's own tables waits for a transaction to end.
-fn own_held(b: &Backend, sql: &str) -> bool {
-    let Backend::Sqlite(m) = b else { return false };
-    let verb = sql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or("").to_ascii_lowercase();
-    matches!(verb.as_str(), "insert" | "update" | "delete") && !m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit()
-}
-
-/// Whether `own_sql`'s next change would wait (rate limits count it
-/// themselves then).
-pub(crate) fn own_waits(it: &mut Interp) -> bool {
-    let b = match system_on_for(it, true, true) {
-        Some(on) => backend_on(it, on),
-        None => backend(it),
-    };
-    b.map_or(false, |b| own_held(&b, "insert"))
-}
-
-/// Makes the changes `own_sql` held back, on databases whose transaction
-/// has ended (at the end of each outermost transaction, and of a request).
-pub(crate) fn own_later(it: &mut Interp) {
-    if it.own_later.is_empty() {
-        return;
-    }
-    for h in std::mem::take(&mut it.own_later) {
-        let free = matches!(&*h.backend, Backend::Sqlite(m) if m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit());
-        if !free {
-            it.own_later.push(h);
-            continue;
-        }
-        let mut r = apart(it, &h.backend, h.sql.clone(), h.params.clone());
-        if let (Err(_), Some(make), Backend::Sqlite(m)) = (&r, &h.make, &*h.backend) {
-            r = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(make).map(|_| Vec::new()).map_err(|e| e.to_string());
-            if r.is_ok() {
-                r = apart(it, &h.backend, h.sql, h.params);
-            }
-        }
-        if let Err(e) = r {
-            eprintln!("quillo: Quillo's own tables: {}", e);
-        }
-    }
 }
 
 /// Whether a program uses `db.atomic` (then transactions it left prepared
@@ -1379,9 +1261,6 @@ pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
-    if let Some(why) = crate::audit::refused(&sql) {
-        return Err(why);
-    }
     if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err("not while the page is prefetched".into());
     }
@@ -1444,76 +1323,37 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `db.transaction(() => { ... })`: commits if the function returns normally,
 /// rolls back if it fails, returns an error value, or replies early.
-/// Transactions nest (as savepoints). `db.transaction({ isolation, retries },
-/// f)` sets the isolation level and runs `f` again on a conflict (see `txn`).
+/// Transactions nest (as savepoints).
 fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
-    let (opts, f) = match args.as_slice() {
-        [f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::Options::default(), f.clone()),
-        [o @ Value::Map(_), f @ (Value::Func(_) | Value::Builtin(..))] => (crate::txn::options(o, "db.transaction", line)?, f.clone()),
-        _ => {
-            let got = args.last().map_or("nothing", |v| v.type_name());
-            return fail(line, format!("`db.transaction` expects a function (after its options, if any), got {}", got));
+    let f = match args.first() {
+        Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
+        other => {
+            return fail(line, format!("`db.transaction` expects a function, got {}", other.map_or("nothing", |v| v.type_name())))
         }
     };
-    crate::txn::run(it, on, &opts, line, &mut |it| it.call(&f, Vec::new(), line))
-}
-
-/// One try of a transaction on connection `on`: what `body` gave (or the
-/// error that ended it), and whether the database gave up on it because of
-/// another transaction (then it is worth another try; told only for the
-/// outermost transaction, the one that can be tried again).
-pub(crate) fn attempt(
-    it: &mut Interp,
-    on: Option<usize>,
-    opts: &crate::txn::Options,
-    line: u32,
-    body: &mut dyn FnMut(&mut Interp) -> R,
-) -> (R, bool) {
     let b = match backend_on(it, on) {
         Ok(b) => b,
-        Err(e) => return (Ok(db_err(e)), false),
+        Err(e) => return Ok(db_err(e)),
     };
     let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
-    let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
     match &*b {
         Backend::Sqlite(m) => {
-            let outermost = m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit();
-            if !outermost && opts.isolation.is_some() {
-                return (nested_isolation(), false);
-            }
-            // With options, the outermost takes the write lock at once.
-            let immediate = outermost && opts.given;
-            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql);
-            let busy = |e: &rusqlite::Error| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
-            if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
-                return (Ok(db_err(&e)), immediate && busy(&e));
+            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql).map_err(|e| e.to_string());
+            if let Err(e) = run("savepoint quillo_tx") {
+                return Ok(db_err(e));
             }
             let mark = tx_begin(it);
             it.sqlite_tx += 1;
-            let r = body(it);
+            let r = it.call(&f, Vec::new(), line);
             it.sqlite_tx -= 1;
             let commit = ok(&r);
-            let end = match (commit, immediate) {
-                (true, true) => "commit",
-                (false, true) => "rollback",
-                (true, false) => "release quillo_tx",
-                (false, false) => "rollback to quillo_tx; release quillo_tx",
-            };
+            let end = if commit { "release quillo_tx" } else { "rollback to quillo_tx; release quillo_tx" };
             let ended = run(end);
-            if ended.is_err() && immediate && commit {
-                let _ = run("rollback");
-            }
             tx_end(it, mark, commit && ended.is_ok());
-            if outermost {
-                own_later(it);
-            }
             match ended {
-                Err(e) if commit => {
-                    let again = immediate && busy(&e);
-                    (Ok(db_err(e)), again)
-                }
-                _ => (r, false),
+                Err(e) if commit => Ok(db_err(e)),
+                _ => r,
             }
         }
         _ => {
@@ -1521,15 +1361,11 @@ pub(crate) fn attempt(
             // Keep one connection for this request until the outermost
             // transaction ends.
             let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
-            if pinned && opts.isolation.is_some() {
-                return (nested_isolation(), false);
-            }
             if !pinned {
-                let mut c = match checkout_for_tx(it, &b) {
+                let c = match checkout_for_tx(it, &b) {
                     Ok(c) => c,
-                    Err(e) => return (Ok(db_err(e)), false),
+                    Err(e) => return Ok(db_err(e)),
                 };
-                c.watch_conflicts(true);
                 it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
@@ -1538,21 +1374,14 @@ pub(crate) fn attempt(
                 tx.depth += 1;
                 tx.depth
             };
-            let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation) } else { format!("savepoint quillo_tx_{}", depth) };
+            let begin = if depth == 1 { "begin".to_string() } else { format!("savepoint quillo_tx_{}", depth) };
             let started = pooled_run(it, &b, move |c| c.batch(&begin));
             let mark = tx_begin(it);
             let r = match started {
-                Ok(()) => body(it),
+                Ok(()) => it.call(&f, Vec::new(), line),
                 Err(e) => Ok(db_err(e)),
             };
-            let conflicted = |it: &Interp| {
-                let g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
-                g.iter().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.as_ref()).map_or(false, |c| c.conflicted())
-            };
-            // A statement failed because of another transaction: this one
-            // is over, whatever the function made of the error.
-            let lost = depth == 1 && conflicted(it);
-            let commit = ok(&r) && !lost;
+            let commit = ok(&r);
             let end = match (commit, depth == 1) {
                 (true, true) => "commit".to_string(),
                 (false, true) => "rollback".to_string(),
@@ -1560,8 +1389,6 @@ pub(crate) fn attempt(
                 (false, false) => format!("rollback to savepoint quillo_tx_{d}; release savepoint quillo_tx_{d}", d = depth),
             };
             let ended = pooled_run(it, &b, move |c| c.batch(&end));
-            // The commit itself can fail so (a serializable transaction's often does).
-            let lost = lost || (depth == 1 && conflicted(it));
             tx_end(it, mark, commit && ended.is_ok());
             let done = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1573,14 +1400,12 @@ pub(crate) fn attempt(
                     None
                 }
             };
-            if let Some(TxConn { conn: Some(mut c), .. }) = done {
-                c.watch_conflicts(false);
+            if let Some(TxConn { conn: Some(c), .. }) = done {
                 pool.give_back(c);
             }
             match ended {
-                Err(e) if commit => (Ok(db_err(e)), lost),
-                _ if lost && ok(&r) => (Ok(crate::txn::gave_up()), true),
-                _ => (r, lost),
+                Err(e) if commit => Ok(db_err(e)),
+                _ => r,
             }
         }
     }

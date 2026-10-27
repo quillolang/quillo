@@ -1,8 +1,7 @@
 //! `run_script(source, vars)`: code a program's users write (a rule on a
 //! form's field, who may see a record) run on the server, safely. The
 //! script sees only the variables it is given and the builtins that compute
-//! (`date` among them, without `date.today` and `date.now`: no database,
-//! files, network, clock, sessions or replies); it cannot
+//! (no database, files, network, clock, sessions or replies); it cannot
 //! define functions, routes or state; and it stops after a budget of steps.
 //! What it gives back is its last expression's value, or an error value
 //! saying what went wrong (a parse error, a name it may not use, too many
@@ -148,10 +147,6 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
             define(&root, name, v);
         }
     }
-    // Dates, without the clock: a script gives the same answer each time.
-    let mut date = Map::new();
-    crate::dates::install_pure(&mut date);
-    define(&root, "date", Value::map(date));
     let env = Scope::child(&root);
     if let Some(m) = vars {
         for (k, v) in m.iter() {

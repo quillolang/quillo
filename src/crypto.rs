@@ -7,7 +7,6 @@
 //! let h = crypto.hash_password(password)   // Argon2id, salted: store this
 //! crypto.verify_password(password, h)      // true or false
 //! crypto.equal(a, b)                       // compares in constant time
-//! crypto.totp_secret()                     // a second factor (see totp.rs)
 //! ```
 //!
 //! Password hashing takes tens of milliseconds and some memory on purpose
@@ -27,11 +26,6 @@ pub fn install(m: &mut Map) {
         ("crypto.hash_password", hash_password),
         ("crypto.verify_password", verify_password),
         ("crypto.equal", equal),
-        ("crypto.totp_secret", crate::totp::totp_secret),
-        ("crypto.totp_uri", crate::totp::totp_uri),
-        ("crypto.totp_verify", crate::totp::totp_verify),
-        ("crypto.recovery_codes", crate::totp::recovery_codes),
-        ("crypto.verify_recovery_code", crate::totp::verify_recovery_code),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("crypto.").into(), Value::Builtin(name, *f));
@@ -125,9 +119,8 @@ pub const MIN_SECRET: usize = 32;
 /// What is wrong with the secrets in the environment (read through `var`),
 /// for a server about to start: a warning for each signing secret shorter
 /// than `MIN_SECRET` (one signed cookie or call is enough to guess a short
-/// one offline), and an error for encryption keys that cannot be used
-/// (AES-256 takes keys of exactly 32 bytes).
-pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> (Vec<String>, Option<String>) {
+/// one offline).
+pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let mut warnings = Vec::new();
     for name in ["QUILLO_SECRET", "QUILLO_SERVICE_SECRET", "LIMER_ADMIN_SECRET"] {
         if let Some(s) = var(name).filter(|s| !s.is_empty()) {
@@ -141,9 +134,7 @@ pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> (Vec<String>, Op
             }
         }
     }
-    let env = crate::cipher::ENV;
-    let error = var(env).filter(|t| !t.trim().is_empty()).and_then(|t| crate::cipher::keyring(&t).err()).map(|e| format!("{}: {}", env, e));
-    (warnings, error)
+    warnings
 }
 
 pub fn random_bytes(n: usize) -> Option<Vec<u8>> {

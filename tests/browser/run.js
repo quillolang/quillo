@@ -54,8 +54,7 @@ async function main() {
     // Errors the runtime reports (quillo's `report`) are collected from the
     // first script on, for the tests' "errors" checks.
     await send("Page.enable");
-    // And what a Content-Security-Policy blocked, for the csp test.
-    await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__quilloErrors = []; window.__csp = []; document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(e.effectiveDirective + ' ' + e.blockedURI));" });
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: "window.__quilloErrors = [];" });
     await send("Page.navigate", { url });
     if (scriptFile) {
       for (;;) {

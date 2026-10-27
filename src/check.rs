@@ -650,8 +650,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.exec", "str, any...", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
-    ("db.transaction", "map | fn, fn=", "any"),
-    ("idempotent", "map | fn, fn=", "any"),
+    ("db.transaction", "fn", "any"),
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
     ("db.tenant_exists", "str", "bool"),
@@ -666,16 +665,6 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("session", "", "map"),
     ("set_session", "map | null, map | null=", "null"),
     ("end_session", "", "null"),
-    // src/session_store.rs, src/access.rs, src/limits.rs
-    ("sessions", "map", "null"),
-    ("renew_session", "", "null"),
-    ("end_sessions", "any, map | null=", "int"),
-    ("user_sessions", "any", "list | error(str)"),
-    ("security_headers", "map | bool | null=", "null"),
-    ("csp", "map | bool | null=", "null"),
-    ("csp_nonce", "", "str"),
-    ("rate_limit", "str, int, str | int, map | null=", "bool"),
-    ("rate_limit_reset", "str, map | null=", "null"),
     ("image.info", "str", "map | error(str)"),
     ("image.convert", "str, str, map | null=", "map | error(str)"),
     ("crypto.sha256", "str", "str"),
@@ -684,21 +673,6 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("crypto.hash_password", "str", "str"),
     ("crypto.verify_password", "str, str | null", "bool"),
     ("crypto.equal", "str, str", "bool"),
-    ("crypto.totp_secret", "int=", "str"),
-    ("crypto.totp_uri", "str, str, str | null=", "str"),
-    ("crypto.totp_verify", "str, str | int | null, map | null=", "int | null"),
-    ("crypto.recovery_codes", "int=", "list"),
-    ("crypto.verify_recovery_code", "str, list | null", "int | null"),
-    ("crypto.encrypt", "str, str | null=", "str | error(str)"),
-    ("crypto.decrypt", "str, str | null=", "str | error(str)"),
-    ("crypto.reencrypt", "str, str | null=", "str | error(str)"),
-    ("crypto.verify_webhook", "str, str | null, str | null, map | null=", "bool | error(str)"),
-    ("audit", "str, any=", "map | error(str)"),
-    ("audit.query", "map | null=", "list | error(str)"),
-    ("audit.verify", "", "map | error(str)"),
-    ("audit.actor", "fn", "null"),
-    ("db.backup", "str, map | null=", "map | error(str)"),
-    ("redact", "str | list", "null"),
     ("http.stream", "str, fn, map | null=", "map | error(str)"),
     ("udp.listen", "int, fn, map | null=", "null"),
     ("udp.send", "str, int, any, map | null=", "null | error(str)"),
@@ -841,49 +815,19 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("vec.matmul", "list, list", "list"),
     ("vec.transpose", "list | null", "list"),
     ("vec.column", "list | null, str | int", "list"),
-    // src/dates.rs
-    ("date.today", "str | null=", "str"),
-    ("date.now", "str | null=", "str"),
-    ("date.parse", "str, str | null=", "str | error(str)"),
-    ("date.valid", "any", "bool"),
-    ("date.of", "int, int, int", "str"),
-    ("date.parts", "str", "map"),
-    ("date.weekday", "str", "int"),
-    ("date.is_leap_year", "int | str", "bool"),
-    ("date.days_in_month", "int | str, int=", "int"),
-    ("date.add_days", "str, int", "str"),
-    ("date.add_months", "str, int", "str"),
-    ("date.add_years", "str, int", "str"),
-    ("date.days_between", "str, str", "int"),
-    ("date.months_between", "str, str", "int"),
-    ("date.start_of_month", "str", "str"),
-    ("date.end_of_month", "str", "str"),
-    ("date.to_zone", "str, str | null=", "str"),
-    ("date.date_in", "str, str | null=", "str"),
-    ("date.at", "str, str | null=, str | null=", "str"),
-    ("date.is_business_day", "str, map | null=", "bool"),
-    ("date.add_business_days", "str, int, map | null=", "str"),
-    ("date.business_days_between", "str, str, map | null=", "int"),
-    ("date.adjust", "str, str | null=, map | null=", "str"),
-    ("date.easter", "int", "str"),
-    ("date.day_count", "str, str, str", "int"),
-    ("date.year_fraction", "str, str, str", "float"),
-    ("date.format", "str, str | map", "str"),
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money", "re"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "audit", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "money", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload",
-      "sessions", "renew_session", "end_sessions", "user_sessions", "security_headers", "csp", "csp_nonce", "rate_limit", "rate_limit_reset",
-      "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code", "redact"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -2364,24 +2308,6 @@ impl Checker {
         mask
     }
 
-    /// A transaction with `retries` runs its function again after a
-    /// conflict, and what it sent to other servers cannot be taken back.
-    fn retried_effects(&mut self, name: &str, args: &[Expr]) {
-        let [Expr::Map(opts), Expr::Lambda(f), ..] = args else { return };
-        if !opts.iter().any(|(k, v)| k == "retries" && !matches!(v, Expr::Lit(Lit::Int(0)))) {
-            return;
-        }
-        let used = self.fn_effects(&Sig::of_def(f)) & (crate::ast::effect_bit("http") | crate::ast::effect_bit("net"));
-        if used != 0 {
-            self.warn(format!(
-                "the function given to `{}` with retries uses the {} effect: it runs again when the transaction conflicts, \
-                 and what it sent is not taken back; send it after the transaction",
-                name,
-                effect_names(used).join(" and ")
-            ));
-        }
-    }
-
     fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
@@ -3294,9 +3220,6 @@ impl Checker {
             if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
                 self.warn_sql(name);
             }
-        }
-        if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
-            self.retried_effects(name, arg_exprs);
         }
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {

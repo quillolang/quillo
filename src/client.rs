@@ -81,8 +81,7 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
         for name in it.server_fns.iter() {
-            let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&c.def));
-            let _ = writeln!(program, "server[{}] = W.server({}{});", js_str(name), js_str(name), if idem { ", true" } else { "" });
+            let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
@@ -907,7 +906,7 @@ fn has_markup(e: &Expr) -> bool {
 
 /// Builtins whose results may be private to the server: its environment,
 /// its files, its database, other services.
-const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http", "audit"];
+const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
 
 /// Top-level variables whose value comes, directly or through other such
 /// variables, from `PRIVATE_SOURCES`, a service, or a function that uses
@@ -927,8 +926,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
     let mut vars: HashSet<String> = HashSet::new();
     // Functions that use what is private: calling one gives a private value.
     // They can be called as methods too (`"KEY".env`).
-    // `crypto.decrypt` too: what it gives back is the secret.
-    let mut fns: HashSet<String> = ["env", "read_file", "decrypt", "reencrypt"].iter().map(|s| s.to_string()).collect();
+    let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
     // Whether `e` uses a private name (other than the `shadowed` ones), its
     // functions' bodies included when `inside` is set.
     let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
@@ -1313,7 +1311,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "date" | "money" | "channel")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -1326,8 +1324,7 @@ impl<'a> Compiler<'a> {
             Value::Func(f) if f.def.server => {
                 let r = (js.clone(), true);
                 self.globals.insert(name.to_string(), r.clone());
-                let idem = if crate::idempotency::used_by(&f.def) { ", true" } else { "" };
-                self.defs.push(format!("{} = W.server({}{});", js, js_str(name), idem));
+                self.defs.push(format!("{} = W.server({});", js, js_str(name)));
                 Ok(r)
             }
             Value::Func(f) => {

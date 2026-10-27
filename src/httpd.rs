@@ -1085,12 +1085,12 @@ fn take_one(input: &mut Vec<u8>, chunked: &mut Option<Dechunk>, peer: &str, max_
         Parsed::Bad(status, why) => {
             let line = input.split(|b| *b == b'\r').next().unwrap_or(&[]);
             let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
-            // As the log writes any URL: sensitive values masked.
+            // As the log writes any URL: a launch token masked.
             let line = match line.split_once(' ') {
                 Some((method, rest)) => {
                     let (target, version) = rest.split_once(' ').unwrap_or((rest, ""));
                     let sep = if version.is_empty() { "" } else { " " };
-                    format!("{} {}{}{}", method, crate::redact::url(target), sep, version)
+                    format!("{} {}{}{}", method, crate::server::log_url(target), sep, version)
                 }
                 None => line,
             };
@@ -1714,8 +1714,6 @@ pub(crate) fn flush_log() {
         let _ = std::io::stderr().write_all(l.as_bytes());
         l.clear();
     }
-    drop(l);
-    crate::metrics::flush();
 }
 
 #[cfg(test)]
