@@ -58,7 +58,7 @@ cranelift-codegen = { version = "=0.134.4", optional = true }
 cranelift-frontend = { version = "=0.134.4", optional = true }
 cranelift-jit = { version = "=0.134.4", optional = true }
 cranelift-module = { version = "=0.134.4", optional = true }
-cranelift-native = { version = "=0.134.4", optional = true }
+cranelift-native = { version = "=0.137.0", optional = true }
 # Channels and media to pages over WebTransport (HTTP/3 datagrams and streams; see src/wt.rs).
 wtransport = { version = "0.7", optional = true, default-features = false, features = ["ring", "self-signed"] }
 # `quillo app`: the program in a native window (see src/desktop.rs).
