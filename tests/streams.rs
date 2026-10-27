@@ -147,7 +147,7 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 /// Starts the program on a free port. Tests run side by side, so another

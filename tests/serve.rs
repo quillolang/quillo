@@ -6,14 +6,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
-
 fn port() -> u16 {
-    let base = 20000 + (std::process::id() % 2000) as u16 * 10;
-    base + NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+    support::free_port()
 }
 
 struct Server {

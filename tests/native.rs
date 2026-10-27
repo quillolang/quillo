@@ -30,7 +30,7 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server {

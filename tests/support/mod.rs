@@ -20,13 +20,17 @@ pub fn listening(port: u16) -> bool {
     }
 }
 
-/// A port no one is listening on, and not given to another test here.
+/// A port no one is listening on, and not given to another test here. Taken
+/// from 10000 to 30000, below the ports systems give to outgoing connections
+/// (32768 up on Linux, 49152 up on macOS): there, a test waiting for its
+/// server could be given the very port it waits on, and hold it so that the
+/// server cannot listen.
 pub fn free_port() -> u16 {
     static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
     loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = 10_000 + fastrand::u16(0..20_000);
         let mut given = GIVEN.lock().unwrap();
-        if !given.contains(&port) {
+        if !given.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             given.push(port);
             return port;
         }

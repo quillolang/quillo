@@ -305,8 +305,7 @@ impl Drop for Server {
 /// Ports outside the range the system gives clients, so that a client's
 /// connection cannot take a server's port before it listens.
 fn port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    40000 + (std::process::id() % 900) as u16 * 10 + NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    support::free_port()
 }
 
 fn serve(name: &str, src: &str, extra: &[&str]) -> Server {

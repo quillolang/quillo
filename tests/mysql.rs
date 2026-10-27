@@ -39,7 +39,7 @@ fn server() -> Option<Server> {
 /// gives from that folder.
 fn server_with(name: &str, more: impl FnOnce(&std::path::Path) -> Vec<String>) -> Option<Server> {
     let bin = bin()?;
-    let port = std::net::TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok()?.port();
+    let port = low_port();
     let dir = std::env::temp_dir().join(format!("quillo-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
@@ -284,5 +284,16 @@ fn listening(port: u16) -> bool {
     match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s.local_addr().map_or(false, |a| a.port() != port),
         Err(_) => false,
+    }
+}
+
+/// A free port below the ones systems give to outgoing connections (see
+/// tests/support's `free_port`).
+fn low_port() -> u16 {
+    loop {
+        let port = 10_000 + fastrand::u16(0..20_000);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
     }
 }

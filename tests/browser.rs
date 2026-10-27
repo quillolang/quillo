@@ -83,7 +83,7 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
 /// Node 22 or later (run.js uses its built-in WebSocket).
 /// A port nothing is listening on (tests run in parallel).
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn node_available() -> bool {

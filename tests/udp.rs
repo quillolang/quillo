@@ -25,7 +25,7 @@ impl Drop for Server {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    support::free_port()
 }
 
 fn free_udp_port() -> u16 {
