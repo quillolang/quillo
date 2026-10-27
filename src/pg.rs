@@ -25,7 +25,7 @@ type BoxErr = Box<dyn Error + Sync + Send>;
 const DEFAULT_POOL: usize = 8;
 
 /// How long a transaction waits for a connection of its own.
-const CHECKOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const CHECKOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn is_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
@@ -108,34 +108,49 @@ impl Pool {
         Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false })
     }
 
+    /// An idle connection or a new one, or None when all `max` are taken.
+    pub fn try_checkout(&self) -> Result<Option<Conn>, String> {
+        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.0.pop() {
+            return Ok(Some(c));
+        }
+        if g.1 >= self.max {
+            return Ok(None);
+        }
+        g.1 += 1;
+        drop(g);
+        self.connect().map(Some).inspect_err(|_| {
+            self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+            self.freed.notify_one();
+        })
+    }
+
     /// A connection: an idle one, a new one, or the next one returned
-    /// within `CHECKOUT_WAIT` (past it, an error rather than a request that
-    /// never ends, when every connection is held by work waiting for one).
+    /// within `CHECKOUT_WAIT`, waiting on this thread. A request in the
+    /// server waits without a thread instead (`db::checkout_for_tx`).
     pub fn checkout(&self) -> Result<Conn, String> {
         let until = Instant::now() + CHECKOUT_WAIT;
-        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(c) = g.0.pop() {
+            if let Some(c) = self.try_checkout()? {
                 return Ok(c);
             }
-            if g.1 < self.max {
-                g.1 += 1;
-                drop(g);
-                return self.connect().inspect_err(|_| {
-                    self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
-                    self.freed.notify_one();
-                });
+            if Instant::now() >= until {
+                return Err(self.none_free());
             }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(format!(
-                    "no PostgreSQL connection free after {} s: all {} are in use (`?pool_size=N` in the URL allows more)",
-                    CHECKOUT_WAIT.as_secs(),
-                    self.max
-                ));
-            }
-            g = self.freed.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
+            // In slices: one given back between the try and the wait is not
+            // missed for long.
+            let g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.freed.wait_timeout(g, std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Why no connection could be had.
+    pub fn none_free(&self) -> String {
+        format!(
+            "no PostgreSQL connection free after {} s: all {} are in use (`?pool_size=N` in the URL allows more)",
+            CHECKOUT_WAIT.as_secs(),
+            self.max
+        )
     }
 
     /// The connections requests in the server share (see `Lanes`).
@@ -157,20 +172,10 @@ impl Pool {
     /// rather than wait, since the one it would wait for may be the
     /// caller's own.
     pub fn checkout_nested(&self) -> Result<Conn, String> {
-        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = g.0.pop() {
-            return Ok(c);
+        match self.try_checkout()? {
+            Some(c) => Ok(c),
+            None => self.connect().map(|c| Conn { aside: true, ..c }),
         }
-        if g.1 < self.max {
-            g.1 += 1;
-            drop(g);
-            return self.connect().inspect_err(|_| {
-                self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
-                self.freed.notify_one();
-            });
-        }
-        drop(g);
-        self.connect().map(|c| Conn { aside: true, ..c })
     }
 
     pub fn give_back(&self, c: Conn) {

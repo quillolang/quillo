@@ -504,6 +504,37 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
     }
 }
 
+/// A connection of its own for a transaction. In a request, while none is
+/// free, the request waits without holding one of the server's waiting
+/// threads: those also run the queries and commits of the transactions
+/// that hold the connections, so waiting there could stop them all.
+pub(crate) fn checkout_for_tx(it: &mut Interp, b: &Arc<Backend>) -> Result<Pinned, String> {
+    let Backend::Postgres(pool) = &**b else {
+        let b = b.clone();
+        return it.unlocked(move || b.checkout());
+    };
+    let until = std::time::Instant::now() + crate::pg::CHECKOUT_WAIT;
+    let mut pause = std::time::Duration::from_millis(2);
+    loop {
+        let p = b.clone();
+        let taken = it.unlocked(move || match &*p {
+            Backend::Postgres(pool) => pool.try_checkout(),
+            _ => unreachable!(),
+        })?;
+        if let Some(c) = taken {
+            return Ok(Pinned::Pg(c));
+        }
+        if std::time::Instant::now() >= until {
+            return Err(pool.none_free());
+        }
+        // Made inside the future: a timer belongs to the runtime that runs it.
+        if crate::httpd::await_elsewhere(Box::pin(async move { tokio::time::sleep(pause).await })).is_none() {
+            std::thread::sleep(pause);
+        }
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Runs `f` on a server database's connection without holding the
 /// interpreter lock: the request's transaction connection if it has one,
 /// else one from the pool.
@@ -1493,7 +1524,7 @@ pub(crate) fn attempt(
                 return (nested_isolation(), false);
             }
             if !pinned {
-                let mut c = match it.unlocked(|| pool.checkout()) {
+                let mut c = match checkout_for_tx(it, &b) {
                     Ok(c) => c,
                     Err(e) => return (Ok(db_err(e)), false),
                 };
@@ -1825,8 +1856,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 _ => unreachable!(),
             },
             _ => {
-                let b = p.b.clone();
-                match it.unlocked(move || b.checkout()) {
+                match checkout_for_tx(it, &p.b) {
                     Ok(c) => {
                         it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
                         let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
