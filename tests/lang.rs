@@ -299,6 +299,9 @@ fn json_module() {
     assert_eq!(ev(r#"json.parse('{"a": [1, 2.5, null]}')"#), "{ a: [1, 2.5, null] }");
     assert_eq!(ev(r#"json.stringify({ a: 1, b: [true] })"#), r#""{\"a\":1,\"b\":[true]}""#);
     assert_eq!(ev(r#"is_err(json.parse("{"))"#), "true");
+    // Floats read as the nearest one, as written in a program (the fuzz
+    // target `json` found this one read a step off).
+    assert_eq!(ev(r#"json.parse("[1.8446744073709502e19, 18446744073709503230, 0.1, 2.2250738585072011e-308]") == [1.8446744073709502e19, 18446744073709503230.0, 0.1, 2.2250738585072011e-308]"#), "true");
 }
 
 #[test]

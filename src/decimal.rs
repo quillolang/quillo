@@ -384,12 +384,22 @@ impl Dec {
             if !matches!(b[i], b'e' | b'E') {
                 return None;
             }
-            let e = std::str::from_utf8(&b[i + 1..]).ok()?;
-            let e = e.strip_prefix('+').unwrap_or(e);
-            if e.is_empty() || e.len() > 6 || !e.trim_start_matches('-').bytes().all(|c| c.is_ascii_digit()) {
+            // One sign at most (the fuzz target `decimal` found "1e+-6"
+            // read, which the browser refuses), then up to 6 digits, or 5
+            // after a `-`.
+            let e = &b[i + 1..];
+            let (minus, digits) = match e.first() {
+                Some(b'+') => (false, &e[1..]),
+                Some(b'-') => (true, &e[1..]),
+                _ => (false, e),
+            };
+            if digits.is_empty() || digits.len() > if minus { 5 } else { 6 } || !digits.iter().all(u8::is_ascii_digit) {
                 return None;
             }
-            exp = e.parse().ok()?;
+            exp = digits.iter().fold(0i64, |n, c| n * 10 + (c - b'0') as i64);
+            if minus {
+                exp = -exp;
+            }
         }
         // The value is mag × 10^(extra + exp - frac).
         let mut scale = frac - exp - extra;
@@ -402,6 +412,11 @@ impl Dec {
                 mag = mag.mul_pow10(u32::try_from(-scale).ok()?)?;
             }
             scale = 0;
+        }
+        // Zero is zero however many zeros are written after the point (the
+        // fuzz target `decimal` found "0e-7957" refused).
+        if mag.is_zero() {
+            scale = scale.min(MAX_SCALE as i64);
         }
         if scale > 400 {
             return None;

@@ -1040,39 +1040,115 @@ impl Loop {
 fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
     let mut items = Vec::new();
     while !c.input.is_empty() {
-        match parse(&c.input, &c.peer, max_body, &mut c.chunked) {
-            Parsed::Need { expects_continue } => {
+        match take_one(&mut c.input, &mut c.chunked, &c.peer, max_body) {
+            Taken::Need { expects_continue } => {
                 c.receiving.get_or_insert(now);
                 if expects_continue && !c.continued {
                     c.continued = true;
                     c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
-                // A chunked body's bytes already decoded are not kept twice,
-                // nor read again.
-                if let Some(d) = &mut c.chunked {
-                    c.input.drain(d.head..d.head + d.used);
-                    d.used = 0;
-                }
                 break;
             }
-            Parsed::Bad(status, why) => {
-                let line = c.input.split(|b| *b == b'\r').next().unwrap_or(&[]);
-                let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
-                c.input.clear();
-                c.chunked = None;
-                items.push(Item::Bad(status, why, line));
+            Taken::Item(item @ Item::Bad(..)) => {
+                items.push(item);
                 break;
             }
-            Parsed::Done { req, len, keep_alive } => {
-                c.chunked = None;
-                c.input.drain(..len);
+            Taken::Item(item) => {
                 c.receiving = None;
                 c.continued = false;
-                items.push(Item::Request { req, keep_alive });
+                items.push(item);
             }
         }
     }
     items
+}
+
+enum Taken {
+    Need { expects_continue: bool },
+    Item(Item),
+}
+
+/// The next request in `input`, taken out of it; or what is still needed,
+/// with what is decoded so far of a chunked body kept in `chunked`; or why
+/// the input is refused (then it is all dropped).
+fn take_one(input: &mut Vec<u8>, chunked: &mut Option<Dechunk>, peer: &str, max_body: usize) -> Taken {
+    match parse(input, peer, max_body, chunked) {
+        Parsed::Need { expects_continue } => {
+            // A chunked body's bytes already decoded are not kept twice,
+            // nor read again.
+            if let Some(d) = chunked {
+                input.drain(d.head..d.head + d.used);
+                d.used = 0;
+            }
+            Taken::Need { expects_continue }
+        }
+        Parsed::Bad(status, why) => {
+            let line = input.split(|b| *b == b'\r').next().unwrap_or(&[]);
+            let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
+            input.clear();
+            *chunked = None;
+            Taken::Item(Item::Bad(status, why, line))
+        }
+        Parsed::Done { req, len, keep_alive } => {
+            *chunked = None;
+            input.drain(..len);
+            Taken::Item(Item::Request { req, keep_alive })
+        }
+    }
+}
+
+/// For the fuzz targets (fuzz/): requests framed from bytes as they come.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::*;
+
+    /// What a connection's input is taken as: each request (its method,
+    /// URL, headers, body and whether the connection is kept), then
+    /// "bad" if the rest was refused.
+    fn framed(pieces: &[&[u8]], max_body: usize) -> Vec<String> {
+        let (mut input, mut chunked, mut out) = (Vec::new(), None, Vec::new());
+        for piece in pieces {
+            input.extend_from_slice(piece);
+            while !input.is_empty() {
+                match take_one(&mut input, &mut chunked, "fuzz", max_body) {
+                    Taken::Need { .. } => break,
+                    Taken::Item(Item::Bad(..)) => {
+                        out.push("bad".to_string());
+                        return out;
+                    }
+                    Taken::Item(Item::Request { req, keep_alive }) => {
+                        out.push(format!("{} {} {:?} {:?} {}", req.method, req.url, req.headers, req.body, keep_alive));
+                        // The answer closes a connection not kept.
+                        if !keep_alive {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Frames `data` as one read, then as reads cut where `cuts` says (each
+    /// byte a piece's length): a request must not be taken otherwise for
+    /// coming in pieces, or the server and a proxy in front could disagree
+    /// on where one request ends.
+    pub fn framing(data: &[u8], cuts: &[u8], max_body: usize) {
+        let whole = framed(&[data], max_body);
+        let mut pieces = Vec::new();
+        let mut rest = data;
+        for &c in cuts.iter().cycle().take(if cuts.is_empty() { 0 } else { data.len() }) {
+            if rest.is_empty() {
+                break;
+            }
+            let (a, b) = rest.split_at((c as usize + 1).min(rest.len()));
+            pieces.push(a);
+            rest = b;
+        }
+        pieces.push(rest);
+        let cut = framed(&pieces, max_body);
+        assert_eq!(whole, cut, "framed otherwise in pieces of {:?}", pieces.iter().map(|p| p.len()).collect::<Vec<_>>());
+    }
 }
 
 /// In the request's coroutine: answers each item, in order.

@@ -243,6 +243,24 @@ fn stamp_text(instant: i64, frac: &str, off: i64) -> Option<String> {
     })
 }
 
+/// For the fuzz targets (fuzz/): what is read is written back the same.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::*;
+
+    pub fn round_trip(s: &str) {
+        if let Some(z) = parse_date(s) {
+            assert_eq!(date_text(z), s);
+        }
+        if let Some(st) = parse_stamp(s) {
+            // As written, but for the offset: `+00:00` is written `Z`.
+            let back = stamp_text(st.instant(), &st.frac, st.off).expect("a date-time read is in range");
+            let again = parse_stamp(&back).expect("a date-time written reads");
+            assert_eq!((again.instant(), again.frac, again.off), (st.instant(), st.frac, st.off), "{} became {}", s, back);
+        }
+    }
+}
+
 // ---- arguments ---------------------------------------------------------
 
 fn got(v: Option<&Value>) -> String {
