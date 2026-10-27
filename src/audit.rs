@@ -249,9 +249,18 @@ fn append(c: &mut dyn Conn, kind: &str, row: &Row) -> Result<(i64, String), Stri
     let tenant = Value::str(&row.tenant);
     // Appends for a tenant take turns: a lock on its row in
     // `_quillo_audit_lock` (made beforehand: see `lock_row`), held until the
-    // transaction ends.
+    // transaction ends. On PostgreSQL the row is updated (to itself), not
+    // only locked: in a repeatable read or serializable transaction, whose
+    // snapshot may be older than another append made while it waited, that
+    // is a serialization failure, and the transaction is tried again (see
+    // `txn`), where a lock alone would read a stale last row and repeat its
+    // number.
     if kind != "sqlite" {
-        let lock = "select tenant from _quillo_audit_lock where tenant = ? for update";
+        let lock = if kind == "pg" {
+            "update _quillo_audit_lock set tenant = tenant where tenant = ? returning tenant"
+        } else {
+            "select tenant from _quillo_audit_lock where tenant = ? for update"
+        };
         if c.rows(lock, std::slice::from_ref(&tenant))?.is_empty() {
             c.run(LOCK_ROW[(kind == "mysql") as usize], std::slice::from_ref(&tenant))?;
             c.rows(lock, std::slice::from_ref(&tenant))?;

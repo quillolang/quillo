@@ -162,11 +162,15 @@ impl Conn {
     }
 
     /// The error's message; a deadlock (1213, which rolls the whole
-    /// transaction back) or a lock wait that timed out (1205) is also
-    /// noted, when watching, for the transaction to run again.
+    /// transaction back), a lock wait that timed out (1205), a row changed
+    /// since this transaction's snapshot (1020: MariaDB's snapshot
+    /// isolation, on by default since 11.6) or a table made since the
+    /// transaction began (1412: the audit log's, made by another request's
+    /// first `audit`) is also noted, when watching, for the transaction to
+    /// run again.
     fn failed(&mut self, e: mysql_async::Error) -> String {
         if let (Some(c), mysql_async::Error::Server(s)) = (self.1.as_mut(), &e) {
-            if s.code == 1213 || s.code == 1205 {
+            if matches!(s.code, 1213 | 1205 | 1020 | 1412) {
                 *c = true;
             }
         }

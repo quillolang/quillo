@@ -314,3 +314,91 @@ fn count() = db.one("select count(*) as c from t").c
     assert_eq!(call(&mut it, "failed"), "err(\"no\")");
     assert_eq!(call(&mut it, "count"), "2");
 }
+
+// ---- audit rows in transactions tried again ----------------------------------
+
+/// Programs (each with its own connection) that each bump a counter a few
+/// times at once, in transactions that read, write and add an audit row,
+/// tried again when they conflict. A try rolled back takes its audit row
+/// with it: each bump that counted has one row, with the value it read, and
+/// the chain is whole. `setup` opens the database and makes `counter`;
+/// `read` is how the counter is read.
+fn audited_at_once(dir: &std::path::Path, setup: &str, opts: &str, read: &str) {
+    let src = format!(
+        r#"{setup}
+fn bump() {{
+    let r = db.transaction({opts}, () => {{
+        let n = db.one("{read}")?.n
+        audit("counter.bump", {{ from: n }})?
+        sleep(5)
+        db.exec("update counter set n = ? where id = 1", n + 1)?
+        n + 1
+    }})
+    is_err(r) ? `failed: ${{r.error}}` : "ok"
+}}
+fn total() = db.one("select n from counter where id = 1").n
+fn chain() = audit.verify()
+fn read() = audit.query({{ action: "counter.bump", limit: 1000 }}) | map((r) => r.details.from) | sort
+"#
+    );
+    const PROGRAMS: usize = 4;
+    const EACH: usize = 5;
+    let barrier = Arc::new(Barrier::new(PROGRAMS));
+    let threads: Vec<_> = (0..PROGRAMS)
+        .map(|_| {
+            let (dir, src, barrier) = (dir.to_path_buf(), src.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let mut it = program(&dir, &src);
+                barrier.wait();
+                (0..EACH).map(|_| call(&mut it, "bump")).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let got: Vec<String> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+    assert!(got.iter().all(|g| g == "\"ok\""), "{}: {:?}", opts, got);
+    let n = PROGRAMS * EACH;
+    assert_eq!(eval(dir, &src, "total"), n.to_string(), "{}", opts);
+    let chain = eval(dir, &src, "chain");
+    assert!(chain.starts_with(&format!("{{ ok: true, rows: {},", n)), "{}: {}", opts, chain);
+    let read: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    assert_eq!(eval(dir, &src, "read"), format!("[{}]", read.join(", ")), "{}", opts);
+}
+
+#[test]
+fn audit_rows_of_a_try_rolled_back_go_with_it() {
+    let dir = support::temp_dir("isolation-audit-sqlite");
+    let setup = "db.open(\"audited.db\")\ndb.exec(\"create table if not exists counter (id int primary key, n int not null)\")\ndb.exec(\"insert into counter values (1, 0) on conflict do nothing\")\n";
+    let read = "select n from counter where id = 1";
+    audited_at_once(&dir, setup, "{ isolation: \"serializable\", retries: 20 }", read);
+    let Some(pg) = support::postgres("isolation-audit") else {
+        eprintln!("skipping PostgreSQL: its initdb and pg_ctl were not found");
+        return;
+    };
+    for (name, iso) in [("audit_serializable", "serializable"), ("audit_repeatable", "repeatable_read"), ("audit_committed", "read_committed")] {
+        let url = pg.database(name);
+        let setup = format!(
+            "db.open(\"{}\")\ndb.exec(\"create table if not exists counter (id int primary key, n int not null)\")\ndb.exec(\"insert into counter values (1, 0) on conflict do nothing\")\n",
+            url
+        );
+        // Read committed would lose updates (each reads before the other
+        // writes): there the counter is read with a lock on its row.
+        let read = if iso == "read_committed" { "select n from counter where id = 1 for update" } else { read };
+        audited_at_once(&dir, &setup, &format!("{{ isolation: \"{}\", retries: 20 }}", iso), read);
+    }
+}
+
+#[test]
+#[cfg(feature = "mysql")]
+fn audit_rows_of_a_try_rolled_back_go_with_it_on_mariadb() {
+    let Some(my) = support::mariadb("isolation-audit") else {
+        eprintln!("skipping: no MariaDB server (mariadbd, mariadb-install-db) was found");
+        return;
+    };
+    let dir = support::temp_dir("isolation-audit-my");
+    assert_eq!(eval(&dir, &format!("db.open(\"{}\")\nfn make() = db.exec(\"create database audited\").changes", my.url("mysql")), "make"), "1");
+    let setup = format!(
+        "db.open(\"{}\")\ndb.exec(\"create table if not exists counter (id int primary key, n int not null) engine = innodb\")\ndb.exec(\"insert ignore into counter values (1, 0)\")\n",
+        my.url("audited")
+    );
+    audited_at_once(&dir, &setup, "{ isolation: \"serializable\", retries: 20 }", "select n from counter where id = 1");
+}

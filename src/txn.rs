@@ -17,7 +17,8 @@
 //! - `retries`: how many times to run the whole function again when the
 //!   database gave up on the transaction because of another one: PostgreSQL's
 //!   serialization failures and deadlocks (SQLSTATE 40001 and 40P01),
-//!   MySQL's deadlocks and lock wait timeouts (1213, 1205), and SQLite's
+//!   MySQL's deadlocks, lock wait timeouts, rows changed since the snapshot
+//!   and tables made since it began (1213, 1205, 1020, 1412), and SQLite's
 //!   busy database (another process writing). Each try waits a little
 //!   longer than the one before, with some randomness, so the transactions
 //!   that collided do not collide again. Any other failure ends it at once.

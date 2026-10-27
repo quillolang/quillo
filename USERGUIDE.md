@@ -1990,8 +1990,9 @@ fn withdraw(account: int, cents: int) with db =
   immediate`, taking the write lock at once (another process holding it is then a
   conflict, tried again, rather than a failure half way).
 - `retries` (0 to 20; 0 by default) runs the whole function again after a serialization
-  failure or a deadlock: PostgreSQL's SQLSTATE 40001 and 40P01, MySQL's 1213 (deadlock)
-  and 1205 (lock wait timeout), SQLite's busy database. Each try waits a little longer
+  failure or a deadlock: PostgreSQL's SQLSTATE 40001 and 40P01, MySQL's 1213 (deadlock),
+  1205 (lock wait timeout), 1020 (a row changed since the snapshot, MariaDB) and 1412 (a
+  table made since the transaction began), SQLite's busy database. Each try waits a little longer
   than the last (about 10 ms, doubling up to 320 ms, give or take half, so the two that
   collided do not collide again). Any other failure ends the transaction at once. Out of
   tries, the transaction gives the database's error value.
