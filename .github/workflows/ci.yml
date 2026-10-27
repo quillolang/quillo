@@ -10,9 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 24: its CLDR (47) is the one money's locale table was made from, which
+      # tests/money.rs compares with Intl.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       # tests/postgres.rs and tests/mysql.rs start servers of their own from these
       # binaries, and skip without them.
       - name: PostgreSQL and MariaDB for the tests

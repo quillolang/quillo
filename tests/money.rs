@@ -117,10 +117,19 @@ fn formats_as_each_locale_writes() {
 }
 
 /// Every covered locale and common currency, as the browser's own
-/// `Intl.NumberFormat` writes them (with ISO 4217's minor units).
+/// `Intl.NumberFormat` writes them (with ISO 4217's minor units), when
+/// Node's CLDR is the one the locale table was made from: CLDR changes
+/// marks between versions (de-CH's grouping became `’` in 47).
 #[test]
 fn formats_as_intl_does() {
+    const CLDR: &str = "47";
     if !node_available() {
+        return;
+    }
+    let cldr = node("console.log(process.versions.cldr ?? '')");
+    let cldr = String::from_utf8_lossy(&cldr.stdout).trim().to_string();
+    if cldr.split('.').next() != Some(CLDR) {
+        eprintln!("skipping: Node's CLDR is {}, the locale table's {}", cldr, CLDR);
         return;
     }
     let locales: Vec<&str> = quillo::money::LOCALES.lines().map(|l| l.split('\t').next().unwrap()).collect();
