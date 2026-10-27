@@ -36,8 +36,8 @@ fn balanced(postings: list) -> bool =
 // Posts a journal entry, and gives its id. The postings are checked here,
 // for a clear message, and again by the database when the entry is
 // marked posted (a trigger), so no code path can post one unbalanced.
-// TODO: record who posted it with `audit(...)` once there is one; until
-// then the entry keeps `created_by`.
+// The entry keeps who made it (`created_by`); the audit log has each
+// transfer too (see `transfer`).
 fn post(memo: str, value_date: str, postings: list, by: str) -> str ! str with db, time, random {
     if len(postings) < 2 { return err("an entry needs two postings or more") }
     if !balanced(postings) { return err("the postings do not add up to zero") }
@@ -87,12 +87,16 @@ fn refusal(from: str, to: str, amount: map) with db {
 // writes, so it belongs in a serializable transaction (see `transfer_once`):
 // two transfers from one account at once cannot both see the money that
 // only one of them may take. The value date is today, or the next business day.
+// Its row in the audit log is written in the same transaction: a try that
+// is rolled back (and run again) takes its row with it, and the log's
+// chain shows if a row is changed afterwards.
 fn transfer(from: str, to: str, amount: map, memo: str, by: str) -> map ! str with db, time, random {
     let value_date = date.add_business_days(date.today(), 0, calendar)
     let entry = post(memo != "" ? memo : `Transfer from ${from} to ${to}`, value_date, [
         { account: from, amount: money.neg(amount) },
         { account: to, amount },
     ], by)?
+    audit("ledger.transfer", { entry, from, to, amount: amount.amount, currency: amount.currency, value_date, by })?
     { entry, value_date, from, to, amount, balance: balance(account(from)) }
 }
 

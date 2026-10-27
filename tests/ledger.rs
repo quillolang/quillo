@@ -117,6 +117,28 @@ fn ask(target: &str, query: &str) -> String {
     }
 }
 
+/// The audit log, through a program of its own: whether its chain holds
+/// (`audit.verify()`), and the entries of the transfers in it.
+fn audited(target: &str) -> (serde_json::Value, Vec<String>) {
+    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"));
+    let src = format!(
+        "db.open(\"{}\")\nfn verify() = json.stringify(audit.verify())\nfn entries() = json.stringify(audit.query({{ action: \"ledger.transfer\", limit: 10000 }}) | map((r) => r.details.entry))\n",
+        target
+    );
+    it.load_source(&src, "audit.qwe").unwrap();
+    let mut call = |name: &str| -> serde_json::Value {
+        let f = quillo::value::lookup(&it.globals, name).unwrap();
+        match it.call(&f, vec![], 0) {
+            Ok(quillo::value::Value::Str(s)) => serde_json::from_str(&s).unwrap(),
+            Ok(other) => panic!("{}: {}", name, other.repr()),
+            Err(_) => panic!("{} failed", name),
+        }
+    };
+    let verify = call("verify");
+    let entries = call("entries").as_array().unwrap().iter().map(|e| e.as_str().unwrap().to_string()).collect();
+    (verify, entries)
+}
+
 fn the_books_balance(target: &str) {
     let s = serve(&example(), &[("LEDGER_DB", target)]);
     let port = s.port;
@@ -142,6 +164,14 @@ fn the_books_balance(target: &str) {
     let count = ask(target, "select count(*) as n from entries where created_by = 'demo'");
     assert_eq!(count, format!("[{{ n: {} }}]", made.len()), "no transfer was applied twice, or lost");
     assert_eq!(ask(target, "select count(*) as n from entries where posted = 0"), "[{ n: 0 }]");
+
+    // The audit log has each transfer made, once (the rows of tries rolled
+    // back went with them), and its chain holds.
+    let (verify, logged) = audited(target);
+    assert_eq!((&verify["ok"], &verify["rows"]), (&serde_json::json!(true), &serde_json::json!(made.len())), "{}", verify);
+    let logged_set: HashSet<String> = logged.iter().cloned().collect();
+    assert_eq!(logged.len(), logged_set.len(), "a transfer audited twice");
+    assert_eq!(logged_set, entries, "the audit log's transfers are those made");
 
     // Every entry adds up to zero, in each currency.
     assert_eq!(ask(target, "select entry_id from postings group by entry_id, currency having sum(amount_minor) <> 0"), "[]");
