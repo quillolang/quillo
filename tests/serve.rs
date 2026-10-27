@@ -785,3 +785,17 @@ fn the_log_never_shows_a_launch_token() {
         assert!(!log.contains(token) && !log.contains(&token[..12]), "{:?}: {}", flags, log);
     }
 }
+
+/// `quillo --version` names the commit it was built from (build.rs), so two
+/// builds of 0.5.0 can be told apart.
+#[test]
+fn the_version_names_the_commit() {
+    let out = Command::new(env!("CARGO_BIN_EXE_quillo")).arg("--version").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(text.starts_with(concat!("quillo ", env!("CARGO_PKG_VERSION"))), "{}", text);
+    let head = Command::new("git").args(["rev-parse", "--short=7", "HEAD"]).current_dir(env!("CARGO_MANIFEST_DIR")).output();
+    if let Some(h) = head.ok().filter(|h| h.status.success()) {
+        let hash = String::from_utf8_lossy(&h.stdout).trim().to_string();
+        assert!(text.contains(&format!("({}, ", hash)), "{} does not name {}", text, hash);
+    }
+}

@@ -10,8 +10,6 @@ use quillo::{Interp, Value};
 #[cfg(feature = "app")]
 mod desktop;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 const USAGE: &str = "\
 Quillo — a small web language
 
@@ -161,7 +159,7 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
-            println!("quillo {}", VERSION);
+            println!("quillo {}", quillo::version());
             0
         }
         Some("help" | "--help" | "-h") => {
@@ -638,7 +636,7 @@ fn repl() -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
     let mut buf = String::new();
-    println!("Quillo {} — enter expressions; Ctrl-D exits", VERSION);
+    println!("Quillo {} — enter expressions; Ctrl-D exits", quillo::version());
     loop {
         print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
         let _ = io::stdout().flush();

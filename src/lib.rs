@@ -69,6 +69,15 @@ pub use error::QuilloError;
 pub use interp::Interp;
 pub use value::Value;
 
+/// This build's version, and the commit it was built from when known
+/// (build.rs): "0.5.0 (d2c2aa4, 2026-10-27)".
+pub fn version() -> String {
+    match env!("QUILLO_COMMIT") {
+        "" => env!("CARGO_PKG_VERSION").to_string(),
+        commit => format!("{} ({})", env!("CARGO_PKG_VERSION"), commit),
+    }
+}
+
 /// Runs a snippet and returns the value of its last statement.
 pub fn eval_str(src: &str) -> Result<Value, QuilloError> {
     Interp::new(".").load_source(src, "<input>")

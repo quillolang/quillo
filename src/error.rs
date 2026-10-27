@@ -60,5 +60,5 @@ pub fn which_quillo() -> String {
         })
         .unwrap_or_default();
     let at = exe.map(|p| format!(" at {}", p.display())).unwrap_or_default();
-    format!("this is quillo {}{}{}; code written for a newer Quillo fails to parse like this", env!("CARGO_PKG_VERSION"), built, at)
+    format!("this is quillo {}{}{}; code written for a newer Quillo fails to parse like this", crate::version(), built, at)
 }
