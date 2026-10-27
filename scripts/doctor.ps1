@@ -15,7 +15,8 @@ if ($Rest -contains '--build') { $Build = $true }
 
 $ErrorActionPreference = 'Continue'
 $NodeMin = 22        # tests/browser/run.js uses Node's built-in WebSocket
-$DiskMinGB = 5       # a release build's target\ folder, with room to spare
+$DiskMinGB = 2       # a release build: about 1 GB of Cargo's compiled dependencies in target\
+$DiskTestsGB = 7     # the tests' builds take about 6 GB more
 
 $root = Split-Path -Parent $PSScriptRoot
 $rustMin = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^rust-version = "(.*)"').Matches[0].Groups[1].Value
@@ -66,8 +67,9 @@ if ($host_triple -like '*-gnu') {
 
 $drive = (Get-Item $root).PSDrive
 $freeGB = [math]::Floor($drive.Free / 1GB)
-if ($freeGB -ge $DiskMinGB) { Ok "$freeGB GB free on $($drive.Name):" }
-else { Need "only $freeGB GB free on $($drive.Name):" "a release build needs about $DiskMinGB GB for target\" }
+if ($freeGB -lt $DiskMinGB) { Need "only $freeGB GB free on $($drive.Name):" "a release build keeps about 1 GB of Cargo's compiled dependencies in target\ (quillo itself is about 20 MB)" }
+elseif ($freeGB -lt $DiskTestsGB) { Opt "$freeGB GB free on $($drive.Name): enough to build" "running the tests (cargo test) needs about 6 GB more in target\" }
+else { Ok "$freeGB GB free on $($drive.Name):" }
 
 if (Has 'Get-NetTCPConnection') {
     $taken = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

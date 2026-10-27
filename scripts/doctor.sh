@@ -13,7 +13,8 @@
 set -u
 
 NODE_MIN=22       # tests/browser/run.js uses Node's built-in WebSocket
-DISK_MIN_GB=5     # a release build's target/ folder, with room to spare
+DISK_MIN_GB=2     # a release build: about 1 GB of Cargo's compiled dependencies in target/
+DISK_TESTS_GB=7   # the tests' builds take about 6 GB more
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 RUST_MIN=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$root/Cargo.toml")   # from Cargo.toml
@@ -61,8 +62,13 @@ fi
 
 free_kb=$(df -Pk "$root" | awk 'NR == 2 { print $4 }')
 free_gb=$((free_kb / 1024 / 1024))
-if [ "$free_gb" -ge "$DISK_MIN_GB" ]; then ok "$free_gb GB free on disk"
-else need "only $free_gb GB free on disk" "a release build needs about $DISK_MIN_GB GB for target/"; fi
+if [ "$free_gb" -lt "$DISK_MIN_GB" ]; then
+    need "only $free_gb GB free on disk" "a release build keeps about 1 GB of Cargo's compiled dependencies in target/ (quillo itself is about 20 MB)"
+elif [ "$free_gb" -lt "$DISK_TESTS_GB" ]; then
+    opt "$free_gb GB free on disk: enough to build" "running the tests (cargo test) needs about 6 GB more in target/"
+else
+    ok "$free_gb GB free on disk"
+fi
 
 if has lsof && lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
     opt "port 8080 is taken (by $(lsof -nP -iTCP:8080 -sTCP:LISTEN | awk 'NR == 2 { print $1 }'))" "quillo run listens on 8080 unless given --port N or PORT"
