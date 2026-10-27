@@ -26,7 +26,7 @@ component PostsPage(ws: map) {
         <nav.tabs>{for t in [["posts", "Posts"], ["mine", "For me"], ["comments", "Comments"]] =>
             <button type="button" class={tab == t[0] ? "tab on" : "tab"} @click={() => { tab = t[0] }}>{t[1]}</button>}</nav>
         {match tab {
-            "comments" => <CommentsPanel/>
+            "comments" => <CommentsPanel moderates={ws.designer == true}/>
             "mine" => <MyQueue/>
             _ => <PostList/>
         }}
@@ -66,8 +66,8 @@ component MyQueue() {
     </table>
 }
 
-// Readers' comments: each waits here until approved.
-component CommentsPanel() {
+// Readers' comments: each waits here until a designer or an admin approves it.
+component CommentsPanel(moderates: bool) {
     state status = "pending"
     state rows = live(list_comments, status)
     <div.stack>
@@ -78,11 +78,11 @@ component CommentsPanel() {
         : <div.stack>{for c in rows => <section.card.comment-mod key={c.id}>
             <p.muted.small><b>{c.name}</b> ({c.email}) on <a href={`/blog/${c.slug}#comments`} target="_blank">{c.post}</a> · {fmt_ago(c.created_at, now())}</p>
             <p.comment-body>{c.body}</p>
-            <div.inline>
+            {moderates && <div.inline>
                 {status != "approved" && <button.primary @click={() => { moderate_comment(c.id, "approved"); rows = list_comments(status) }}>Approve</button>}
                 {status != "spam" && <button @click={() => { moderate_comment(c.id, "spam"); rows = list_comments(status) }}>Spam</button>}
                 <button.ghost @click={() => { moderate_comment(c.id, "delete"); rows = list_comments(status) }}>Delete</button>
-            </div>
+            </div>}
         </section>}</div>}
     </div>
 }

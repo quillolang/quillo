@@ -229,7 +229,10 @@ route POST /login { form: { email: str, password: str } } {
         return redirect(`/login?problem=locked&email=${who}`)
     }
     let u = db.one("select * from users where email = ?", who)
-    if !crypto.verify_password(password, u.password_hash) {
+    // An address no one has is checked against a stand-in hash (a null
+    // hash), so it takes as long as a wrong password: the time tells nothing.
+    let right = crypto.verify_password(password, u == null ? null : u.password_hash)
+    if u == null || !right {
         login_failed(who)
         audit("login.failed", { email: who, step: "password" })
         return redirect(`/login?problem=wrong&email=${email}`)
@@ -319,9 +322,12 @@ route GET /welcome/:token {
     redirect("/app")
 }
 
+// Every contact at once: admins only. (Contacts have no roles to say
+// which a member may see, as an object's records have.)
 route GET /app/export/contacts.csv {
     workspace_here()
     if current_user() == null { reply 401 "Sign in first" }
+    if is_err(need_admin()) { reply 403 "Only an admin can export" }
     let fields = custom_fields() | filter((f) => f.entity == "contact")
     let head = csv_row(["first_name", "last_name", "email", "phone", "stage", "subscribed", "tags"] + (fields | map((f) => f.key)))
     let rows = db.query("select * from contacts order by id") | map(contact_out) | map((c) =>
@@ -374,6 +380,7 @@ route GET /app/studio/:id/preview {
     studio_preview(id)
 }
 
+// An object's records, as the roles let the one who asks see them.
 route GET /app/export/objects/:key {
     workspace_here()
     if current_user() == null { reply 401 "Sign in first" }

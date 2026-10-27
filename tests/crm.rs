@@ -37,9 +37,15 @@ struct Crm {
 
 impl Crm {
     fn new(name: &str) -> Crm {
+        Crm::new_with(name, |_| {})
+    }
+
+    /// Like `new`, with the copy's files changed first.
+    fn new_with(name: &str, change: impl Fn(&Path)) -> Crm {
         let dir = std::env::temp_dir().join(format!("quillo-crm-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         copy_app(&dir);
+        change(&dir);
         let mut it = Interp::new(&dir);
         it.load_file(&dir.join("main.qwe")).unwrap_or_else(|e| panic!("{}", e));
         Crm { it, dir }
@@ -1650,4 +1656,154 @@ fn the_audit_log_has_sign_ins_team_changes_deletes_and_exports() {
     crm.sql("acme", "update _quillo_audit set actor = '1' where action = 'logout'");
     let v = crm.rpc(host, "check_audit", serde_json::json!([]), Some(&owner));
     assert_eq!((&v["ok"]["ok"], &v["ok"]["broken"]["seq"]), (&serde_json::json!(false), &serde_json::json!(12)), "{}", v);
+}
+
+/// Signing up makes a database file each time: a few an hour from one
+/// address, and so many an hour in all (here 7, as if CRM_SIGNUPS_PER_HOUR
+/// said so). A form with mistakes costs nothing.
+#[test]
+fn workspaces_are_made_a_few_at_a_time() {
+    let mut crm = Crm::new_with("signup-limits", |dir| {
+        let f = dir.join("lib/workspace.qwe");
+        let src = std::fs::read_to_string(&f).unwrap();
+        assert!(src.contains(r#"env("CRM_SIGNUPS_PER_HOUR", "100")) ?? 100"#));
+        std::fs::write(&f, src.replace(r#"env("CRM_SIGNUPS_PER_HOUR", "100")) ?? 100"#, r#"env("CRM_SIGNUPS_PER_HOUR_TEST", "7")) ?? 7"#)).unwrap();
+    });
+    let make = |crm: &mut Crm, slug: &str, ip: &str| {
+        let w = serde_json::json!([{ "name": "Shop", "slug": slug, "industry": "merchant", "owner_name": "Ada", "email": "ada@shop.test", "password": "a-long-password" }]);
+        let headers = vec![("Host".to_string(), "localhost:9000".to_string()), ("Content-Type".to_string(), "application/json".to_string())];
+        let r = crm.it.handle(&HttpRequest { method: "POST".into(), url: "/_quillo/rpc/create_workspace".into(), headers, body: w.to_string().into_bytes(), remote: ip.into() });
+        serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()
+    };
+    let bad = serde_json::json!([{ "slug": "x", "industry": "cars", "email": "no", "password": "1" }]);
+    for _ in 0..10 {
+        assert!(crm.rpc("localhost:9000", "create_workspace", bad.clone(), None)["err"]["problems"].is_array());
+    }
+    for i in 0..5 {
+        let r = make(&mut crm, &format!("shop{}", i), "10.0.0.1");
+        assert!(r["ok"]["url"].is_string(), "{}: {}", i, r);
+    }
+    let r = make(&mut crm, "shop5", "10.0.0.1");
+    assert!(r["err"]["problems"][0]["message"].as_str().unwrap_or("").contains("Too many workspaces"), "{}", r);
+    assert!(!crm.dir.join("data/shop5.db").exists());
+    // Another address may, until there are 7 in the hour from everyone.
+    assert!(make(&mut crm, "other0", "10.0.0.2")["ok"].is_object());
+    assert!(make(&mut crm, "other1", "10.0.0.3")["ok"].is_object());
+    let r = make(&mut crm, "other2", "10.0.0.4");
+    assert!(r["err"]["problems"][0]["message"].as_str().unwrap_or("").contains("Too many workspaces"), "{}", r);
+    assert!(!crm.dir.join("data/other2.db").exists());
+}
+
+/// The CRM's core entities, by who may do what: members edit contacts,
+/// deals and campaigns, their daily work; moderating readers' comments and
+/// deleting images (or changing other people's) are the designers' and the
+/// admins'; exporting every contact is the admins'; a deal is deleted by
+/// its owner or an admin. Signing in with an address no one has is
+/// refused as a wrong password is.
+#[test]
+fn members_keep_to_their_own_work() {
+    let mut crm = Crm::new("member-limits");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    let dee = member(&mut crm, &owner, "Dee", "dee@acme.test");
+    let ws = crm.rpc(host, "load_workspace", serde_json::json!([]), Some(&owner))["ok"].clone();
+    let uid = |n: &str| ws["users"].as_array().unwrap().iter().find(|u| u["name"] == n).unwrap()["id"].as_i64().unwrap();
+    let design = crm.rpc(host, "save_group", serde_json::json!([{ "name": "Design", "members": [uid("Dee")], "roles": [], "capabilities": ["designer"] }]), Some(&owner));
+    assert!(design["ok"].is_i64(), "{}", design);
+    let refused = |r: &serde_json::Value, why: &str| assert!(r["err"].as_str().unwrap_or("").contains(why), "{}", r);
+
+    // Comments: Sam may read them, not moderate them; Dee may.
+    crm.sql("acme", "insert into posts (id, slug, title, status, created_at, updated_at) values (1, 'hello', 'Hello', 'published', 0, 0);
+        insert into comments (id, post_id, name, email, body, created_at) values (1, 1, 'Jo', 'jo@x.test', 'First!', 0), (2, 1, 'Bo', 'bo@x.test', 'Buy now', 0);");
+    assert_eq!(crm.rpc(host, "list_comments", serde_json::json!(["pending"]), Some(&sam))["ok"].as_array().unwrap().len(), 2);
+    for status in ["approved", "spam", "delete"] {
+        refused(&crm.rpc(host, "moderate_comment", serde_json::json!([1, status]), Some(&sam)), "designers");
+    }
+    assert_eq!(crm.rpc(host, "list_comments", serde_json::json!(["pending"]), Some(&owner))["ok"].as_array().unwrap().len(), 2);
+    assert_eq!(crm.rpc(host, "moderate_comment", serde_json::json!([1, "approved"]), Some(&dee))["ok"], true);
+    assert_eq!(crm.rpc(host, "moderate_comment", serde_json::json!([2, "delete"]), Some(&owner))["ok"], true);
+
+    // Images: Sam changes the description of his own, not of others'; he
+    // deletes none. Dee and the owner do both.
+    crm.sql("acme", &format!("insert into media (id, key, name, format, width, height, size, uploaded_by, created_at) values
+        (1, 'k1', 'Ada''s', 'png', 10, 10, 1, {}, 0), (2, 'k2', 'Sam''s', 'png', 10, 10, 1, {}, 0), (3, 'k3', 'Third', 'png', 10, 10, 1, {}, 0)", uid("Ada"), uid("Sam"), uid("Ada")));
+    let alt = |id: i64| serde_json::json!([id, { "name": "Renamed", "alt": "A view" }]);
+    refused(&crm.rpc(host, "update_media", alt(1), Some(&sam)), "designers");
+    assert_eq!(crm.rpc(host, "update_media", alt(2), Some(&sam))["ok"]["alt"], "A view");
+    refused(&crm.rpc(host, "delete_media", serde_json::json!([2]), Some(&sam)), "designers");
+    assert_eq!(crm.rpc(host, "update_media", alt(1), Some(&dee))["ok"]["alt"], "A view");
+    assert_eq!(crm.rpc(host, "delete_media", serde_json::json!([2]), Some(&dee))["ok"], true);
+    assert_eq!(crm.rpc(host, "delete_media", serde_json::json!([3]), Some(&owner))["ok"], true);
+    assert_eq!(crm.rpc(host, "list_media", serde_json::json!([]), Some(&sam))["ok"].as_array().unwrap().len(), 1);
+
+    // Deals: Sam edits any, deletes his own only; the owner (an admin) any.
+    let stage = ws["stages"][0]["id"].as_i64().unwrap();
+    let deal = |crm: &mut Crm, c: &str, title: &str| {
+        let r = crm.rpc(host, "save_deal", serde_json::json!([{ "title": title, "value_cents": 1000, "stage_id": stage, "fields": {} }]), Some(c));
+        r["ok"]["id"].as_i64().unwrap_or_else(|| panic!("{}", r))
+    };
+    let adas = deal(&mut crm, &owner, "Ada's deal");
+    let sams = deal(&mut crm, &sam, "Sam's deal");
+    let other = deal(&mut crm, &owner, "Another of Ada's");
+    let edited = crm.rpc(host, "save_deal", serde_json::json!([{ "id": adas, "title": "Ada's deal, by Sam", "value_cents": 2000, "stage_id": stage, "fields": {} }]), Some(&sam));
+    assert_eq!(edited["ok"]["title"], "Ada's deal, by Sam", "{}", edited);
+    refused(&crm.rpc(host, "delete_deal", serde_json::json!([adas]), Some(&sam)), "owner or an admin");
+    refused(&crm.rpc(host, "delete_deal", serde_json::json!([adas]), Some(&dee)), "owner or an admin");
+    assert_eq!(crm.rpc(host, "delete_deal", serde_json::json!([sams]), Some(&sam))["ok"], true);
+    assert_eq!(crm.rpc(host, "delete_deal", serde_json::json!([other]), Some(&owner))["ok"], true);
+    let left = crm.rpc(host, "load_board", serde_json::json!([ws["pipelines"][0]["id"]]), Some(&owner))["ok"]["deals"].clone();
+    assert_eq!(left.as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![adas]);
+
+    // Every contact at once: the owner's (an admin's) to export, not Sam's or Dee's.
+    crm.rpc(host, "save_contact", serde_json::json!([{ "first_name": "Grace", "email": "grace@navy.test", "stage": "lead", "tags": [], "fields": {} }]), Some(&sam));
+    for c in [&sam, &dee] {
+        let r = crm.send(host, "GET", "/app/export/contacts.csv", "", Some(c));
+        assert_eq!(r.status, 403, "{}", r.text());
+        assert!(!r.text().contains("grace@navy.test"));
+    }
+    let r = crm.send(host, "GET", "/app/export/contacts.csv", "", Some(&owner));
+    assert_eq!(r.status, 200);
+    assert!(r.text().contains("grace@navy.test"));
+
+    // No such user: the same answer as a wrong password, not an error.
+    let r = crm.form(host, "/login", "email=nobody%40acme.test&password=a-long-password", None);
+    assert_eq!((r.status, r.header("location")), (303, Some("/login?problem=wrong&email=nobody@acme.test")));
+}
+
+/// An object's records exported: only those the member's roles show, and
+/// without the fields their roles hide, the title too when it is one.
+#[test]
+fn exported_records_leave_out_hidden_fields() {
+    let mut crm = Crm::new("export-hidden");
+    let owner = signup(&mut crm);
+    let host = "acme.localhost:9000";
+    let rpc = |crm: &mut Crm, c: &str, name: &str, args: serde_json::Value| crm.rpc(host, name, args, Some(c));
+    assert_eq!(rpc(&mut crm, &owner, "create_from_template", serde_json::json!(["Ticket"]))["ok"], "ticket");
+    let grace = rpc(&mut crm, &owner, "save_contact", serde_json::json!([{ "first_name": "Grace", "email": "grace@navy.test", "stage": "lead", "tags": [], "fields": {} }]))["ok"]["id"].as_i64().unwrap();
+    let r = rpc(&mut crm, &owner, "save_record", serde_json::json!(["ticket", { "fields": {
+        "subject": "Broken zip", "customer": grace.to_string(), "priority": "low", "status": "new", "details": "card ends 4242" } }]));
+    assert!(r["ok"].is_object(), "{}", r);
+    let role = |crm: &mut Crm, name: &str, fields: serde_json::Value| {
+        let r = crm.rpc(host, "save_role", serde_json::json!([{ "name": name, "access": { "ticket": { "level": "read", "script": "", "fields": fields } } }]), Some(&owner));
+        r["ok"].as_i64().unwrap_or_else(|| panic!("{}", r))
+    };
+    let no_details = role(&mut crm, "Front desk", serde_json::json!({ "details": "hidden" }));
+    let no_subject = role(&mut crm, "Auditors", serde_json::json!({ "subject": "hidden" }));
+    let sam = member(&mut crm, &owner, "Sam", "sam@acme.test");
+    let kim = member(&mut crm, &owner, "Kim", "kim@acme.test");
+    let ws = rpc(&mut crm, &owner, "load_workspace", serde_json::json!([]))["ok"].clone();
+    let uid = |n: &str| ws["users"].as_array().unwrap().iter().find(|u| u["name"] == n).unwrap()["id"].as_i64().unwrap();
+    rpc(&mut crm, &owner, "set_user_role", serde_json::json!([uid("Sam"), no_details]));
+    rpc(&mut crm, &owner, "set_user_role", serde_json::json!([uid("Kim"), no_subject]));
+    let export = |crm: &mut Crm, c: &str| crm.send(host, "GET", "/app/export/objects/ticket", "", Some(c)).text();
+
+    let all = export(&mut crm, &owner);
+    assert!(all.starts_with("id,title,subject,customer,priority,status,details,due\n") && all.contains("Broken zip") && all.contains("4242"), "{}", all);
+    let sams = export(&mut crm, &sam);
+    assert!(sams.starts_with("id,title,subject,customer,priority,status,due\n") && sams.contains("Broken zip"), "{}", sams);
+    assert!(!sams.contains("4242"), "{}", sams);
+    let kims = export(&mut crm, &kim);
+    assert!(kims.starts_with("id,title,customer,priority,status,details,due\n") && kims.contains("4242"), "{}", kims);
+    assert!(!kims.contains("Broken zip"), "{}", kims);
 }

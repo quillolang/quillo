@@ -481,13 +481,22 @@ server fn delete_record(key: str, id: int) {
     true
 }
 
+// Every record of an object, as the one who asks may see them: the
+// records their roles show, without the fields their roles hide (the
+// title too, when it is one of those).
 fn records_csv(key: str) {
     let u = current_user()
     let a = access_to(u, key)
     if !allows(a.level, "read") { return respond(403, "Your role may not see these records", {}) }
-    let fields = object_fields(key)
+    let o = need_object(key)
+    if is_err(o) { return respond(404, "No such object", {}) }
+    let all = object_fields(key)
+    let fields = all | filter((f) => field_level(a, f.key) != "hidden")
+    // The title is a field's value (see record_title).
+    let tf = find(all, (x) => x.key == o.title_field) ?? find(all, (x) => x.type == "text")
+    let title_hidden = tf != null && field_level(a, tf.key) == "hidden"
     let rows = sort_by(rec_all(key, 1000000), (r) => r.id) | filter((r) => may_see(u, a, r))
-        | map((r) => csv_row([str(r.id), r.title] + (fields | map((f) => str(r.fields[f.key] ?? "")))))
+        | map((r) => csv_row([str(r.id), title_hidden ? "" : r.title] + (fields | map((f) => str(r.fields[f.key] ?? "")))))
     audit("records.export", { object: key, rows: len(rows) })
     respond(200, join([csv_row(["id", "title"] + (fields | map((f) => f.key)))] + rows, "\n") + "\n",
         { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=${key}.csv` })

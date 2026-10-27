@@ -125,8 +125,10 @@ server fn list_comments(status: str) {
     db.query("select c.*, p.title as post, p.slug from comments c join posts p on p.id = c.post_id where (? = '' or c.status = ?) order by c.created_at desc limit 300", status, status)
 }
 
+// Approving, marking as spam and deleting are the designers' (and admins'):
+// what readers see on the site is theirs to decide.
 server fn moderate_comment(id: int, status: str) {
-    need_user()?
+    need_designer()?
     if status == "delete" { audited("comment.delete", { id }, () => db.exec("delete from comments where id = ?", id))? }
     else if contains(["approved", "spam", "pending"], status) { db.exec("update comments set status = ? where id = ?", status, id) }
     else { return err("Approve, spam or delete") }

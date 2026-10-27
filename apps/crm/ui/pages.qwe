@@ -71,7 +71,7 @@ component ContactsPage(ws: map, query: map) {
     state tags = all_tags() ?? []
     <div>
         <PageHead title="Contacts" sub="Everyone you sell to, write for, or work with.">
-            <a.button href="/app/export/contacts.csv" data-reload>Export CSV</a>
+            {ws.user.role != "member" && <a.button href="/app/export/contacts.csv" data-reload>Export CSV</a>}
             <button @click={() => { importing = !importing }}>Import CSV</button>
             <button.primary @click={() => { adding = true }}>New contact</button>
         </PageHead>
@@ -435,7 +435,7 @@ component DealForm(deal: map, ws: map, stages: list, on_saved) {
         <FormProblems problems={server}/>
         <div.form-actions>
             <button.primary>Save deal</button>
-            {d.id != null && <button.danger type="button" @click={() => { delete_deal(d.id); on_saved(null) }}>Delete</button>}
+            {d.id != null && (ws.user.role != "member" || d.owner_id == ws.user.id) && <button.danger type="button" @click={() => { delete_deal(d.id); on_saved(null) }}>Delete</button>}
         </div>
     </form>
 }
@@ -852,13 +852,15 @@ component OutboxPage(ws: map) {
 component PluginsPage(ws: map, on_change) {
     state enabled = ws.enabled
     state saving = false
+    // Made again when a switch-off is called off, so its switch shows on again.
+    state drawn = 0
     let admin = ws.user.role != "member"
     <div>
         <PageHead title="Plugins" sub="Each brings fields, rules that check your data, and flow steps. Switch on what fits."/>
         <div.plugins>{for p in plugins | filter((p) => p.id != "core") => {
             let on = contains(enabled, p.id)
             let rule_count = values(p.rules ?? {}) | map((rs) => len(rs)) | sum
-            <section key={p.id} class={on ? "card plugin on" : "card plugin"}>
+            <section key={`${p.id}.${drawn}`} class={on ? "card plugin on" : "card plugin"}>
                 <header>
                     <h3>{p.name}</h3>
                     <label class="switch"><input type="checkbox" checked={on} disabled={!admin || saving} @change={(e) => {
@@ -875,7 +877,7 @@ component PluginsPage(ws: map, on_change) {
                             saving = false
                             on_change()
                         } else {
-                            js("Reflect.set", e.target, "checked", true)
+                            drawn += 1
                         }
                     }}/><span></span></label>
                 </header>
