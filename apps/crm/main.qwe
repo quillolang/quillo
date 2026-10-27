@@ -307,15 +307,19 @@ route POST /logout {
     redirect("/login")
 }
 
-// The link from signing up: signs the owner in once.
+// The link from signing up: signs the owner in once, or takes them on to
+// the second step when they have one (or the workspace asks for it).
 route GET /welcome/:token {
     workspace_here()
     let row = db.one("select * from sign_in_tokens where token = ? and expires_at > ?", token, now())
-    if row == null {
+    let u = row == null ? null : db.one("select * from users where id = ?", row.user_id)
+    if u == null {
         audit("login.failed", { method: "link" })
         return redirect("/login?problem=expired")
     }
     db.exec("delete from sign_in_tokens where token = ?", token)
+    let next = second_step_next(u)
+    if next != null { return next }
     set_session({ user: row.user_id })
     audit("login", { method: "link" })
     put_setting("url", `${SCHEME}://${request.headers.host}`)

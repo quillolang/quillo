@@ -1807,3 +1807,45 @@ fn exported_records_leave_out_hidden_fields() {
     assert!(kims.starts_with("id,title,customer,priority,status,details,due\n") && kims.contains("4242"), "{}", kims);
     assert!(!kims.contains("Broken zip"), "{}", kims);
 }
+
+/// The link from signing up is a first step, as a password is: an owner
+/// with a second step, or a workspace that asks for one, goes on to it,
+/// and is not signed in until it is passed.
+#[test]
+fn a_sign_in_link_still_takes_the_second_step() {
+    let mut crm = Crm::new("link-two-step");
+    let host = "acme.localhost:9000";
+    let w = serde_json::json!([{ "name": "Acme", "slug": "acme", "industry": "merchant", "owner_name": "Ada", "email": "ada@acme.test", "password": "a-long-password" }]);
+    let url = crm.rpc("localhost:9000", "create_workspace", w, None)["ok"]["url"].as_str().unwrap().to_string();
+    let path = url["http://acme.localhost:9000".len()..].to_string();
+    let follow = |crm: &mut Crm, path: &str| {
+        let r = crm.send(host, "GET", path, "", None);
+        let cookie = r.header("set-cookie").map(|c| c.split(';').next().unwrap().to_string()).unwrap_or_default();
+        (r.status, r.header("location").map(str::to_string), cookie)
+    };
+    let signed_in = |crm: &mut Crm, cookie: &str| crm.rpc(host, "load_workspace", serde_json::json!([]), Some(cookie))["ok"].is_object();
+
+    // The workspace asks for a second step: the link leads to setting it up.
+    crm.sql("acme", "insert into settings (key, value) values ('require_two_step', 'true') on conflict (key) do update set value = excluded.value");
+    let (status, to, cookie) = follow(&mut crm, &path);
+    assert_eq!((status, to.as_deref()), (303, Some("/login/setup")));
+    assert!(!signed_in(&mut crm, &cookie));
+    assert_eq!(crm.send(host, "GET", "/login/setup", "", Some(&cookie)).status, 200);
+
+    // An owner with an authenticator app: the link leads to the code.
+    crm.sql("acme", "delete from settings where key = 'require_two_step';
+        update users set totp_secret = 'JBSWY3DPEHPK3PXP' where email = 'ada@acme.test';
+        insert into sign_in_tokens (token, user_id, expires_at) values ('second-link', (select id from users where email = 'ada@acme.test'), 9999999999999);");
+    let (status, to, cookie) = follow(&mut crm, "/welcome/second-link");
+    assert_eq!((status, to.as_deref()), (303, Some("/login/code")));
+    assert!(!signed_in(&mut crm, &cookie));
+    assert_eq!(crm.send(host, "GET", "/login/code", "", Some(&cookie)).status, 200);
+
+    // Without either, the link signs in, once.
+    crm.sql("acme", "update users set totp_secret = '' where email = 'ada@acme.test';
+        insert into sign_in_tokens (token, user_id, expires_at) values ('third-link', (select id from users where email = 'ada@acme.test'), 9999999999999);");
+    let (status, to, cookie) = follow(&mut crm, "/welcome/third-link");
+    assert_eq!((status, to.as_deref()), (303, Some("/app")));
+    assert!(signed_in(&mut crm, &cookie));
+    assert_eq!(follow(&mut crm, "/welcome/third-link").1.as_deref(), Some("/login?problem=expired"));
+}
