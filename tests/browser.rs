@@ -229,7 +229,8 @@ fn svg_inside_html_draws() {
 
 /// Attributes a component takes from data: a spread cannot add handlers,
 /// whatever the key's case or `bind:`, nor replace an attribute written
-/// out; a sandboxed frame's page follows the state.
+/// out; a sandboxed frame's page follows the state; an SVG animation of an
+/// href is given no javascript: URL.
 #[test]
 fn spread_attributes_from_data_stay_attributes() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -244,6 +245,7 @@ fn spread_attributes_from_data_stay_attributes() {
         "link": ["/ok", "window.clicked = 1", "kept"],
         "linkAttrs": ["action", "href", "id", "method", "onclick", "title"],
         "frame": "<p>second</p>",
+        "anim": ["about:blank#blocked", "about:blank#blocked"],
         "ran": 0,
         "errors": []
     });
@@ -315,6 +317,30 @@ fn components_call_the_pages_javascript() {
         "removed": [false, ["gauge"]],
         "back": ["gauge 3", 2],
         "errors": []
+    });
+    assert_eq!(r, want);
+}
+
+/// The ways around the checks on the page's functions, tried in a real
+/// page: none runs its text, and ordinary calls still work.
+#[test]
+fn the_ways_around_the_pages_checks_do_not_run_text() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("guard.qwe"), free_port(), Some(&dir.join("guard.js")));
+    let want = serde_json::json!({
+        "reflect": "refused",
+        "parse": "refused",
+        "adopt": "refused",
+        "script": "refused",
+        "svgscript": "refused",
+        "setter": "refused",
+        "wrapped": "refused",
+        "target": "<b>made</b>",
+        "pwned": null
     });
     assert_eq!(r, want);
 }

@@ -1686,7 +1686,12 @@ impl<'a> Compiler<'a> {
             Expr::Map(entries) => {
                 let mut out = Vec::new();
                 for (k, v) in entries {
-                    out.push(format!("{}: {}", js_str(k), self.expr(v)?));
+                    // `"__proto__": v` would set the prototype; `["__proto__"]: v` is a key.
+                    if k == "__proto__" {
+                        out.push(format!("[{}]: {}", js_str(k), self.expr(v)?));
+                    } else {
+                        out.push(format!("{}: {}", js_str(k), self.expr(v)?));
+                    }
                 }
                 format!("{{{}}}", out.join(", "))
             }
@@ -2086,6 +2091,31 @@ impl<'a> Compiler<'a> {
         let last = path.rsplit('.').next().unwrap_or("");
         if banned.contains(&last) {
             return self.err(format!("`{}` does not call {}: it runs text as code", f, path));
+        }
+        // Ways around the checks the runtime makes on the page's functions:
+        // setting any property, calling with any `this`, parsing markup.
+        let around = [
+            "Reflect.apply",
+            "Reflect.construct",
+            "Reflect.get",
+            "Reflect.set",
+            "Reflect.defineProperty",
+            "Reflect.setPrototypeOf",
+            "Reflect.getOwnPropertyDescriptor",
+            "Object.assign",
+            "Object.defineProperty",
+            "Object.defineProperties",
+            "Object.setPrototypeOf",
+            "Object.getOwnPropertyDescriptor",
+            "Object.getOwnPropertyDescriptors",
+            "DOMParser",
+        ];
+        let mut bare: &str = path;
+        while let Some(rest) = ["window.", "globalThis.", "self."].iter().find_map(|p| bare.strip_prefix(p)) {
+            bare = rest;
+        }
+        if around.contains(&bare) {
+            return self.err(format!("`{}` does not call {}: it steps around the checks on the page's functions", f, path));
         }
         Ok(())
     }

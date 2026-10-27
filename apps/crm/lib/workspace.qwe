@@ -105,17 +105,30 @@ fn sign_in_token(user_id: int) {
 // On the main site: is this address free?
 server fn slug_free(slug: str) = slugify(slug) == slug && !contains(RESERVED, slug) && !db.tenant_exists(slug)
 
+// Each workspace is a database file of its own, so signing up is limited:
+// a few an hour from one address, and so many an hour in all
+// (CRM_SIGNUPS_PER_HOUR, 100 by default). Checked once the form is
+// right, so mistakes cost nothing; counted only when one is made.
+let SIGNUPS_PER_IP = 5
+let SIGNUPS_PER_HOUR = int(env("CRM_SIGNUPS_PER_HOUR", "100")) ?? 100
+
 server fn create_workspace(form: map) {
     // With one workspace, it has no address of its own to choose, and can
     // be set up once.
     let w = SINGLE ? set(form, "slug", ONLY) : form
     let problems = errors_of(check_workspace(w))
     if len(problems) > 0 { return err({ problems }) }
+    let mine = `signup:${request.ip}`
+    if !rate_limit(mine, SIGNUPS_PER_IP, "1h", { cost: 0 }) || !rate_limit("signup:all", SIGNUPS_PER_HOUR, "1h", { cost: 0 }) {
+        return err({ problems: problem("", "Too many workspaces were made just now: try again in an hour") })
+    }
     if db.tenant_exists(w.slug) {
         return err({ problems: SINGLE ? problem("", "This CRM is set up already: sign in") : problem("slug", "That address is taken") })
     }
     let host = request.headers.host ?? DOMAIN
     let url = SINGLE ? `${SCHEME}://${host}` : workspace_url(w.slug, host)
+    rate_limit(mine, SIGNUPS_PER_IP, "1h")
+    rate_limit("signup:all", SIGNUPS_PER_HOUR, "1h")
     let token = with_tenant(w.slug, () => setup_workspace(w, url))
     { url: `${url}/welcome/${token}` }
 }

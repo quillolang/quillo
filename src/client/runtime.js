@@ -14,6 +14,14 @@ class Ret { constructor(v) { this.v = v; } }
 class Err { constructor(e) { this.error = e === undefined ? null : e; } }
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+// Puts a key in a map the program made: "__proto__" is a key like any
+// other there (from JSON, say), not the object's prototype. Spreading
+// (`{ ...a, ...b }`) keeps it too; Object.assign and `o[k] = v` do not.
+const putKey = (o, k, v) => {
+  if (k === "__proto__") Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+  else o[k] = v;
+  return o;
+};
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
@@ -211,36 +219,122 @@ function bigArith(a, b, op, verb) {
 }
 // What Quillo code does not reach on the page's objects: what runs text as
 // code or HTML (markup in components does that safely), and the way to the
-// Function constructor.
+// Function constructor. These checks are a guard-rail against mistakes, not
+// a wall: the page's own scripts can do anything, and a determined program
+// can find a way through them.
 const FOREIGN_DENY = ["eval", "Function", "setTimeout", "setInterval", "execScript", "execCommand", "insertAdjacentHTML",
-  "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln", "constructor", "__proto__", "prototype"];
+  "setHTMLUnsafe", "parseHTMLUnsafe", "createContextualFragment", "write", "writeln", "constructor", "__proto__", "prototype",
+  "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"];
 function foreignName(name) {
   if (FOREIGN_DENY.includes(name)) fail(`\`${name}\` is not used from Quillo code: it runs text as code or HTML`);
 }
 // Calls a method of the page's object `o`, unless it would run text as code.
 function foreignCall(o, name, args) {
   foreignName(name);
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`${name}\` is not given a javascript: URL`);
-  if (name === "setAttribute" || name === "setAttributeNS") {
-    const k = String(args[name === "setAttribute" ? 0 : 1]).toLowerCase();
-    if (k.startsWith("on") || k === "srcdoc") fail(`\`${name}\` does not set ${k}: it runs text as code`);
-  }
-  const r = o[name](...args);
-  return r === undefined ? null : r;
+  const f = o[name];
+  guardCall(`\`${name}\``, f, args, name);
+  return fromPage(Reflect.apply(f, o, args));
 }
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
 const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
   && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec));
-// Functions of the page that run text as code: Quillo code calls none of
-// them, however it came by one.
+// Functions of the page that run text as code or HTML, or that step around
+// the checks here (setting any property, calling a method with any `this`,
+// reading a property by a name from data, making a function from text, or
+// parsing markup into nodes): Quillo code calls none of them, and hands
+// none to the page's functions, however it came by one.
 let deniedFns = null;
+// Where the tag of an element made, and the name of an attribute set, are
+// in the arguments of the page's functions that make and set them.
+let makers = null;
+let setters = null;
+function guarded() {
+  if (deniedFns !== null) return deniedFns;
+  const g = globalThis, out = new Set();
+  const add = (o, ...names) => {
+    if (o) for (const n of names) {
+      // Getters of the page's prototypes throw when read off them.
+      try { if (typeof o[n] === "function") out.add(o[n]); } catch (_) {}
+    }
+  };
+  add(g, "eval", "Function", "setTimeout", "setInterval", "execScript");
+  // Function's kin, which any async or generator function leads to.
+  for (const f of [async function () {}, function* () {}, async function* () {}]) out.add(Object.getPrototypeOf(f).constructor);
+  add(Function.prototype, "call", "apply", "bind");
+  add(g.Reflect, "apply", "construct", "get", "set", "defineProperty", "setPrototypeOf", "getOwnPropertyDescriptor");
+  add(Object, "assign", "defineProperty", "defineProperties", "setPrototypeOf", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors");
+  add(g.DOMParser && g.DOMParser.prototype, "parseFromString");
+  add(g.Document, "parseHTMLUnsafe");
+  add(g.Document && g.Document.prototype, "write", "writeln", "execCommand");
+  add(g.Element && g.Element.prototype, "insertAdjacentHTML", "setHTMLUnsafe");
+  add(g.ShadowRoot && g.ShadowRoot.prototype, "setHTMLUnsafe");
+  add(g.Range && g.Range.prototype, "createContextualFragment");
+  const places = (o, pairs) => {
+    const m = new Map();
+    if (o) for (const [n, i] of pairs) if (typeof o.prototype[n] === "function") m.set(o.prototype[n], i);
+    return m;
+  };
+  makers = places(g.Document, [["createElement", 0], ["createElementNS", 1]]);
+  setters = places(g.Element, [["setAttribute", 0], ["setAttributeNS", 1]]);
+  return (deniedFns = out);
+}
 function denied(f) {
-  if (deniedFns === null) {
-    deniedFns = new Set();
-    for (const n of ["eval", "Function", "setTimeout", "setInterval", "execScript"]) if (typeof globalThis[n] === "function") deniedFns.add(globalThis[n]);
+  if (guarded().has(f)) fail(`\`${f.name || "this function"}\` is not called from Quillo code: it runs text as code or steps around these checks`);
+}
+// Functions that came from the page as values (`js("lib.fn")`, or what one
+// of its functions gave back), each with what calls it: `pageCall`, which
+// checks what it is given.
+const pageFns = new WeakMap();
+function fromPage(r) {
+  if (typeof r === "function") {
+    if (guarded().has(r)) fail(`\`${r.name || "this function"}\` is not given to Quillo code: it runs text as code`);
+    pageFns.set(r, pageCall);
   }
-  if (deniedFns.has(f)) fail(`\`${f.name}\` is not called from Quillo code: it runs text as code`);
+  return r === undefined ? null : r;
+}
+function pageCall(f, args) {
+  guardArgs(`\`${f.name || "this function"}\``, args, 0);
+  return fromPage(f(...args));
+}
+// A call of the page's function f (the method `name`) with args: f is not
+// one of the above, makes no script element, sets no handler or srcdoc,
+// and is given nothing that would run as code.
+function guardCall(what, f, args, name) {
+  denied(f);
+  if (makers.has(f)) {
+    const tag = String(args[makers.get(f)]).split(":").pop().trim().toLowerCase();
+    if (tag === "script") fail(`${what} does not make a script element: it runs text as code`);
+  }
+  const at = setters.has(f) ? setters.get(f) : name === "setAttribute" ? 0 : name === "setAttributeNS" ? 1 : -1;
+  if (at >= 0) {
+    const k = String(args[at]).toLowerCase();
+    if (k.startsWith("on") || k === "srcdoc") fail(`${what} does not set ${k}: it runs text as code`);
+  }
+  guardArgs(what, args, 0);
+}
+// What is handed to the page's functions: no javascript: URL (in a list or
+// a map too, which turn into it as text), no function above, no map that
+// makes its own text, and no node of another document (markup parsed from
+// text, whose handlers would run once it is on the page).
+function guardArgs(what, args, depth) {
+  for (const a of args) {
+    if (typeof a === "string") {
+      if (scriptURL(a)) fail(`${what} is not given a javascript: URL`);
+    } else if (typeof a === "function") {
+      if (guarded().has(a)) fail(`${what} is not given \`${a.name || "this function"}\`: it runs text as code`);
+    } else if (a !== null && typeof a === "object" && depth < 16) {
+      if (Array.isArray(a)) guardArgs(what, a, depth + 1);
+      else if (foreign(a)) {
+        if (typeof document !== "undefined" && typeof a.nodeType === "number" && (a.nodeType === 9 ? a : a.ownerDocument) !== document)
+          fail(`${what} is not given a node of another document: markup parsed from text runs its handlers on the page`);
+      } else if (isMap(a)) {
+        if (typeof a.toString === "function" && hasOwn(a, "toString") || typeof a.valueOf === "function" && hasOwn(a, "valueOf"))
+          fail(`${what} is not given a map with its own toString or valueOf`);
+        guardArgs(what, Object.values(a), depth + 1);
+      }
+    }
+  }
 }
 
 function typeName(v) {
@@ -462,7 +556,7 @@ function add(a, b) {
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
-  if (isMap(a) && isMap(b)) return Object.assign({}, a, b);
+  if (isMap(a) && isMap(b)) return { ...a, ...b };
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
@@ -518,7 +612,7 @@ function eventField(e, name) {
       const f = t.tagName === "FORM" ? t : t.form;
       if (!f) return {};
       const out = {};
-      for (const [k, v] of new FormData(f)) out[k] = typeof v === "string" ? v : v.name;
+      for (const [k, v] of new FormData(f)) putKey(out, k, typeof v === "string" ? v : v.name);
       return out;
     }
   }
@@ -588,6 +682,8 @@ function index(o, i) {
 function callFn(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
   denied(f);
+  const call = pageFns.get(f);
+  if (call !== undefined) return call(f, args);
   return f(...args);
 }
 
@@ -735,7 +831,13 @@ const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); retu
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
 const M = (v, f, i = 1) => { if (isNil(v)) return {}; want(isMap(v), f, "a map", i, v); return v; };
-const F = (v, f, i = 2) => { want(typeof v === "function", f, "a function", i, v); denied(v); return v; };
+const F = (v, f, i = 2) => {
+  want(typeof v === "function", f, "a function", i, v);
+  denied(v);
+  // The page's own function is called through one of Quillo's, which checks what it is given.
+  if (pageFns.has(v)) fail(`\`${f}\` is given a function of the page: wrap it, as in (x) => f(x)`);
+  return v;
+};
 const N = (v, f, i = 1) => { want(typeof v === "number", f, "a number", i, v); return v; };
 
 // Calls a function given to a builtin; it must not wait on the server.
@@ -795,7 +897,7 @@ function toJSON(v, wire) {
   if (typeof v === "function") return repr(v);
   if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
   if (typeof v === "bigint") return wire ? { $int: String(v) } : "\u0000int:" + v;
-  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = toJSON(v[k], wire); return o; }
+  if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, toJSON(v[k], wire)); return o; }
   if (typeof v === "number" && !isFinite(v)) return null;
   return v;
 }
@@ -1027,19 +1129,15 @@ B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[
 B.get = meta((m, k, d = null) => { m = M(m, "get"); k = keyText(k); return hasOwn(m, k) ? m[k] : d; }, "get", null);
 B.has = meta((m, k) => hasOwn(M(m, "has"), keyText(k)), "has", null);
 B.set = meta((m, k, v = null) => {
-  const o = { ...M(m, "set") }, key = keyText(k);
-  // "__proto__" is a key like any other here, not the object's prototype.
-  if (key === "__proto__") Object.defineProperty(o, key, { value: v, enumerable: true, writable: true, configurable: true });
-  else o[key] = v;
-  return o;
+  return putKey({ ...M(m, "set") }, keyText(k), v);
 }, "set", null);
 B.remove = meta((c, k) => {
   if (Array.isArray(c)) return c.filter((v) => !eq(v, k));
-  const m = Object.assign({}, M(c, "remove"));
+  const m = { ...M(c, "remove") };
   delete m[keyText(k)];
   return m;
 }, "remove", null);
-B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "merge", null);
+B.merge = meta((a, b) => ({ ...M(a, "merge"), ...M(b, "merge", 2) }), "merge", null);
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
@@ -1284,15 +1382,14 @@ B.js = meta((path, ...args) => {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
   }
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js\`: ${path} is not given a javascript: URL`);
-  const r = v.apply(owner, args);
-  return r === undefined ? null : r;
+  guardCall(`\`js\`: ${path}`, v, args);
+  return fromPage(Reflect.apply(v, owner, args));
 }, "js", null);
 B.js_new = meta((path, ...args) => {
   const [, v] = jsPath(path, "js_new");
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
-  for (const a of args) if (typeof a === "string" && scriptURL(a)) fail(`\`js_new\`: ${path} is not given a javascript: URL`);
-  return new v(...args);
+  guardCall(`\`js_new\`: ${path}`, v, args);
+  return fromPage(Reflect.construct(v, args));
 }, "js_new", null);
 
 // Translations: the page's locale and its text (see src/i18n.rs).
@@ -4004,6 +4101,11 @@ const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.te
 
 const URL_ATTRS = ["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
 
+// An SVG animation's values go to another attribute (`<set
+// attributeName="href" to={u}>`), perhaps a URL one: they are checked as
+// URLs, each of `values` (split by ;) too, as on the server.
+const animValueAttr = (el, k) => (el.localName === "set" || el.localName === "animate") && /^(to|from|by|values)$/i.test(k);
+
 // javascript: and vbscript: URLs, read as browsers read them.
 function scriptURL(u) {
   const s = String(u).replace(/^[\u0000-\u0020]+/, "").replace(/[\t\n\r]/g, "").slice(0, 11).toLowerCase();
@@ -4026,7 +4128,7 @@ function setProp(el, k, v, old) {
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
   // The text the attribute will say, whatever the value's type (html too).
-  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s)) v = s = "about:blank#blocked";
+  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 

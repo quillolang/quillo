@@ -549,9 +549,17 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`. What runs text as code or HTML is
-  refused, however it is reached: `eval`, `Function`, `setTimeout` and `setInterval`,
-  `insertAdjacentHTML`, `document.write`, `setAttribute("on...")`, `javascript:` URLs
-  given to the page's functions. Markup in the component does all of that safely.
+  refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
+  `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
+  elements, nodes of another document, `javascript:` URLs (in lists and maps too) given
+  to the page's functions, and what steps around these checks (`Reflect.set`,
+  `Object.assign`, `Function.prototype.call`). Markup in the component does all of that
+  safely.
+- These checks are a guard-rail against mistakes, not a security boundary. Code that
+  calls into the page can do what the page's scripts can, and a program set on it can
+  find ways through (a library function that writes HTML, a function of the page
+  reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
+  out of what `js` calls, as you would in JavaScript.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps
@@ -881,7 +889,9 @@ route POST /logout { end_session(); redirect("/") }
   session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
-  when the server stops.
+  when the server stops. The server warns when it starts if the secret is shorter than
+  32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
+  can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
@@ -1626,7 +1636,19 @@ Safety built in:
   another case either. Event handler attributes and `srcdoc` take only text written in
   the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
   and the like render as `about:blank#blocked`, whatever the value's type: the text the
-  attribute would say is checked, so `href={markdown(u, { inline: true })}` too.
+  attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
+  the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
+  each of `values`), which may be an `href`.
+- CSS takes data as it is written, by design: `style={...}` is escaped like any
+  attribute and `<style>{x}</style>` has its `</` rewritten, so neither can end the
+  element, but what they say is CSS. CSS runs no script in today's browsers; data put
+  there can still restyle the page (cover it with an overlay,
+  hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
+  `@import`), which tells another site that the page was viewed and can carry what the
+  style sheet says. Put only values you chose into styles (a colour from a list, a
+  number), or check what users give against what you allow. A policy that keeps loading
+  on the site, such as `csp({ img_src: "'self'", font_src: "'self'" })`, stops the
+  beacons that go through `url()`.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
@@ -1642,6 +1664,8 @@ Safety built in:
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.
+  Nor can such a page open the WebSocket on which pages hear of live changes
+  (`/_quillo/live`), which the browser would otherwise let it do.
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error.
@@ -2377,7 +2401,9 @@ let iban = crypto.decrypt(row.iban)?          // the text, or an error value
 - The keys are in `QUILLO_ENCRYPTION_KEYS`: `id:base64key` pairs, separated by commas,
   the current key first: `k2026:3q2+7w...,k2025:Yx9...`. `quillo keygen` (or
   `quillo keygen k2026`) prints a new one; so does `echo "k2026:$(openssl rand -base64 32)"`.
-  Keep them where the program's other secrets are, never in its files.
+  Keep them where the program's other secrets are, never in its files. A program does
+  not start when they are set but cannot be used (a key that is not 32 bytes, an id
+  twice), rather than failing at its first `crypto.encrypt`.
 - A token is `qe1.<key id>.<nonce, ciphertext and tag, base64url>`: it names its key, and
   has a random 96-bit nonce, so the same text encrypts differently each time (equal
   values cannot be found by comparing tokens: keep a `crypto.hmac` of the value beside

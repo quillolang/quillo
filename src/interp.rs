@@ -357,6 +357,30 @@ pub fn url_attr(name: &str) -> bool {
 /// What a `javascript:` URL in one of `URL_ATTRS` becomes.
 pub const BLOCKED_URL: &str = "about:blank#blocked";
 
+/// Whether an attribute of an SVG animation gives its value to another
+/// attribute (`<set attributeName="href" to={u}>`), which may be a URL one:
+/// `to`, `from`, `by`, and `values`, a list split by `;`. Their values are
+/// checked as URLs whatever the attribute animated, since a `javascript:`
+/// value means nothing anywhere else.
+pub fn anim_value_attr(tag: &str, name: &str) -> bool {
+    (tag.eq_ignore_ascii_case("set") || tag.eq_ignore_ascii_case("animate"))
+        && ["to", "from", "by", "values"].iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
+/// Whether any of an animation's `;`-separated values is a script URL.
+fn script_url_in_list(text: &str) -> bool {
+    text.split(';').any(script_url)
+}
+
+/// Like `shows_script_url`, for an animation's values.
+fn shows_script_url_in_list(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => script_url_in_list(s),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::List(_) | Value::Map(_) => false,
+        other => script_url_in_list(&other.display()),
+    }
+}
+
 /// Whether a value written in a URL attribute would be a `javascript:` URL:
 /// its text is what the attribute says, whatever its type (an `html`
 /// value from `markdown(u, { inline: true })` too).
@@ -2656,6 +2680,7 @@ impl Interp {
             }
             let v = match (&v, name) {
                 _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
+                _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
                 (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }
@@ -2729,7 +2754,7 @@ impl Interp {
                     out.push_str(name);
                 }
                 // A template outside URL attributes goes straight in, part by part.
-                AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) => {
+                AttrVal::Expr(Expr::Template(parts)) if !url_attr(name) && !anim_value_attr(&el.tag, name) => {
                     out.push(' ');
                     out.push_str(name);
                     out.push_str("=\"");
@@ -2750,14 +2775,14 @@ impl Interp {
                     url.clear();
                     let r = self.template_into(parts, env, &mut url);
                     if r.is_ok() {
-                        self.write_url_attr(name, &url, out);
+                        self.write_url_attr(&el.tag, name, &url, out);
                     }
                     self.spare = url;
                     r?;
                 }
                 AttrVal::Expr(e) => {
                     let v = self.eval(e, env)?;
-                    self.write_attr(name, v, out);
+                    self.write_attr(&el.tag, name, v, out);
                 }
                 AttrVal::Spread(_) => unreachable!("render_attrs handles spreads"),
             }
@@ -2783,12 +2808,12 @@ impl Interp {
         Ok(())
     }
 
-    /// ` name="url"` for a URL attribute (see `write_attr`).
-    fn write_url_attr(&self, name: &str, url: &str, out: &mut String) {
+    /// ` name="url"` for a URL attribute of a `tag` (see `write_attr`).
+    fn write_url_attr(&self, tag: &str, name: &str, url: &str, out: &mut String) {
         out.push(' ');
         out.push_str(name);
         out.push_str("=\"");
-        if script_url(url) {
+        if script_url(url) || (anim_value_attr(tag, name) && script_url_in_list(url)) {
             out.push_str(BLOCKED_URL);
         } else if !self.base.is_empty() && matches!(name, "href" | "src" | "action" | "formaction" | "poster") {
             escape_into(&self.with_base(url), out);
@@ -2801,9 +2826,10 @@ impl Interp {
     /// ` name="value"`, or ` name` for true, nothing for false and null.
     /// URLs that would run script are blocked; site paths get the mount's
     /// prefix.
-    fn write_attr(&self, name: &str, v: Value, out: &mut String) {
+    fn write_attr(&self, tag: &str, name: &str, v: Value, out: &mut String) {
         let v = match (&v, name) {
             _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
+            _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
             (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                 Value::str(self.with_base(s))
             }

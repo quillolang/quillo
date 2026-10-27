@@ -43,12 +43,14 @@ component MediaPage(ws: map) {
             {m.alt == "" && <Badge text="no description" tone="amber"/>}
         </button>}</div>}
         {open != null && <Drawer title={open.name} on_close={() => { open = null }}>
-            <MediaDetails m={open} on_done={() => { open = null }}/>
+            <MediaDetails m={open} designer={ws.designer == true} mine={open.uploaded_by == ws.user.id} on_done={() => { open = null }}/>
         </Drawer>}
     </div>
 }
 
-component MediaDetails(m: map, on_done) {
+// Designers and admins change any image and delete it; others change the
+// name and description of their own uploads.
+component MediaDetails(m: map, designer: bool, mine: bool, on_done) {
     state name = m.name
     state alt = m.alt
     state saved = false
@@ -58,12 +60,12 @@ component MediaDetails(m: map, on_done) {
         <TextField label="Name" field="name" value={name} problems={[]} on_change={(v) => { name = v; saved = false }}/>
         <TextField label="Description (what it shows, for screen readers)" field="alt" value={alt} problems={[]} on_change={(v) => { alt = v; saved = false }}/>
         <div.form-actions>
-            <button.primary @click={() => { update_media(m.id, { name, alt }); saved = true }}>Save</button>
+            {(designer || mine) && <button.primary @click={() => { update_media(m.id, { name, alt }); saved = true }}>Save</button>}
             {saved && <span.ok>Saved</span>}
             <span.grow></span>
-            <button.danger @click={() => {
+            {designer && <button.danger @click={() => {
                 if ask("Pages that show this image will no longer show it.", { title: "Delete this image?", ok: "Delete", tone: "danger" }) { delete_media(m.id); notify("Image deleted"); on_done() }
-            }}>Delete</button>
+            }}>Delete</button>}
         </div>
     </div>
 }

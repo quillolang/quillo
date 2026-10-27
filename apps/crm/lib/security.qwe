@@ -28,6 +28,15 @@ fn pending_user() {
     db.one("select * from users where id = ?", s.pending)
 }
 
+// After a first step other than the password (a link from signing up):
+// the second step still follows, as after the password. Where to go for
+// it, with `u` pending in the session; null when there is none to take.
+fn second_step_next(u) {
+    if !has_two_step(u) && !two_step_required() { return null }
+    set_session({ pending: u.id, pending_at: now() })
+    redirect(has_two_step(u) ? "/login/code" : "/login/setup")
+}
+
 // A code from the app (six digits, each once) or a recovery code (each
 // once): which it was ("app" or "recovery_code"), or null for neither. A
 // recovery code used is in the audit log with how many are left.

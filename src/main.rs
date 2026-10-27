@@ -495,11 +495,28 @@ fn run_instances(path: &Path, mut o: RunOptions, addr: &str) -> i32 {
     }
 }
 
+/// Signing secrets too short to be safe are warned about; encryption keys
+/// that cannot be used stop the program before it starts.
+fn secrets_ok() -> bool {
+    let (warnings, error) = quillo::crypto::secret_problems(|k| std::env::var(k).ok());
+    for w in warnings {
+        eprintln!("quillo: {}", w);
+    }
+    if let Some(e) = error {
+        eprintln!("quillo: {}", e);
+        return false;
+    }
+    true
+}
+
 fn run(file: &str, flags: &[String]) -> i32 {
     let o = match run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
     };
+    if !secrets_ok() {
+        return 2;
+    }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);

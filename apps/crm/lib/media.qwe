@@ -63,14 +63,19 @@ server fn upload_image(file: map) {
     media_out(db.one("select * from media where id = ?", id))
 }
 
+// An image's name and description, which every page that shows it uses:
+// its designers' and admins' to change, and the uploader's own.
 server fn update_media(id: int, m: map) {
-    need_user()?
+    let u = need_user()?
+    let before = (db.one("select uploaded_by from media where id = ?", id) ?? err("No such image"))?
+    if before.uploaded_by != u.id { need_designer()? }
     db.exec("update media set name = ?, alt = ? where id = ?", trim(m.name ?? ""), trim(m.alt ?? ""), id)
     media_out(db.one("select * from media where id = ?", id))
 }
 
+// Deleting takes an image off every page that shows it: designers and admins only.
 server fn delete_media(id: int) {
-    need_user()?
+    need_designer()?
     let m = (db.one("select * from media where id = ?", id) ?? err("No such image"))?
     delete_file(media_original(m))
     delete_file(`${media_dir()}/cache/${m.key}`)

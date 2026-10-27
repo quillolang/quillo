@@ -299,8 +299,12 @@ server fn move_deal(id: int, stage_id: int) {
     true
 }
 
+// A member deletes the deals they own; admins any. (Deals have an owner,
+// who made them, and no one else assigned.)
 server fn delete_deal(id: int) {
-    need_user()?
+    let u = need_user()?
+    let d = (db.one("select owner_id from deals where id = ?", id) ?? err("No such deal"))?
+    if u.role == "member" && d.owner_id != u.id { return err("Only the deal's owner or an admin can delete it") }
     audited("deal.delete", { id }, () => db.exec("delete from deals where id = ?", id))?
     true
 }

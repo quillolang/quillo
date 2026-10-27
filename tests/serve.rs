@@ -710,3 +710,80 @@ fn passwords_are_hashed_off_the_event_loop() {
         assert_eq!(l.join().unwrap(), (200, "true".into()));
     }
 }
+
+/// `/_quillo/live` over a WebSocket: the browser lets any site open one, so
+/// the server refuses pages of other sites, as it does for server fns. A
+/// page of the site, and a program (no Origin), connect.
+#[test]
+fn live_websockets_are_only_for_the_sites_own_pages() {
+    let d = temp_dir("live-origin");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = `hi`\n").unwrap();
+    let srv = start(&f, &[]);
+    // The status line of a WebSocket handshake with these headers.
+    let open = |extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET /_quillo/live?t=db%3Anotes HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}\r\n",
+            srv.port, extra
+        )
+        .unwrap();
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while !line.ends_with(b"\r\n") && s.read(&mut b).map_or(false, |n| n == 1) {
+            line.push(b[0]);
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    };
+    let other = "Origin: https://evil.example\r\n";
+    assert!(open(other).starts_with("HTTP/1.1 403"), "{}", open(other));
+    assert!(open("Origin: http://localhost:1\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: cross-site\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: same-site\r\n").starts_with("HTTP/1.1 403"));
+    let own = format!("Origin: http://localhost:{}\r\n", srv.port);
+    assert_eq!(open(&own), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open("Sec-Fetch-Site: same-origin\r\n"), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open(""), "HTTP/1.1 101 Switching Protocols");
+    // The long wait without a WebSocket too.
+    assert!(raw(srv.port, "GET /_quillo/live?since=1&t=x HTTP/1.1\r\nOrigin: https://evil.example").starts_with("HTTP/1.1 403"));
+}
+
+/// A desktop window's launch token is a secret of the machine's: whatever
+/// the log's form, with query strings or not, and for a request too broken
+/// to answer, the log never shows it.
+#[test]
+fn the_log_never_shows_a_launch_token() {
+    let d = temp_dir("launchlog");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
+    let token = "5ec12e7c0ffee5ec12e7c0ffee5ec12e7";
+    for flags in [&["--log", "text"][..], &["--log", "json", "--log-query"][..], &["--log", "json"][..]] {
+        let port = port();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(&f)
+            .args(["--port", &port.to_string()])
+            .args(flags)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "server did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(get(port, &format!("/hello?a=1&_quillo_launch={}", token)).1, "hi");
+        // A header line without a colon: refused before it is a request.
+        let bad = raw(port, &format!("GET /hello?_quillo_launch={} HTTP/1.1\r\nno colon here", token));
+        assert!(bad.starts_with("HTTP/1.1 400"), "{}", bad);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(log.contains("/hello") && log.contains("-> 400"), "{:?}: {}", flags, log);
+        assert!(!log.contains(token) && !log.contains(&token[..12]), "{:?}: {}", flags, log);
+    }
+}
