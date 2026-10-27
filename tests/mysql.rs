@@ -68,7 +68,7 @@ fn server_with(name: &str, more: impl FnOnce(&std::path::Path) -> Vec<String>) -
         .ok()?;
     let s = Server { child, dir, port };
     let deadline = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !listening(port) {
         assert!(Instant::now() < deadline, "mariadbd did not start: {}", std::fs::read_to_string(s.dir.join("err.log")).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -276,4 +276,13 @@ fn mysql() {
     let mut it = program(&work, &src);
     assert_eq!(eval(&mut it, "[move(30), move(60)]"), r#"[30, err("too much")]"#);
     assert_eq!(eval(&mut it, "[db.one(\"select n from acct\").n, b.one(\"select n from acct\").n, len(local.query(\"select * from moves\")), len(db.query(\"xa recover\"))]"), "[70, 30, 1, 0]");
+}
+
+/// Whether MariaDB listens on `port`: a connection to itself (Linux can
+/// give a socket the port it connects to) is not it.
+fn listening(port: u16) -> bool {
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s.local_addr().map_or(false, |a| a.port() != port),
+        Err(_) => false,
+    }
 }

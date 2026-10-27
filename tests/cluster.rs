@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -65,7 +65,7 @@ fn free_port() -> u16 {
 
 fn wait_tcp(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "nothing listening on {}", port);
         std::thread::sleep(Duration::from_millis(20));
     }

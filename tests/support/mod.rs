@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Whether a server listens on `port`. A port in the range Linux gives to
+/// outgoing connections (32768 to 60999) can be connected to by a socket
+/// given that same port, which then talks to itself: no server is there.
+pub fn listening(port: u16) -> bool {
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s.local_addr().map_or(false, |a| a.port() != port),
+        Err(_) => false,
+    }
+}
+
 /// A port no one is listening on, and not given to another test here.
 pub fn free_port() -> u16 {
     static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
@@ -157,7 +167,7 @@ pub fn mariadb(name: &str) -> Option<Maria> {
     stop_with_tests(&child);
     let s = Maria { child, dir, port };
     let deadline = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !listening(port) {
         assert!(Instant::now() < deadline, "mariadbd did not start: {}", std::fs::read_to_string(s.dir.join("err.log")).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -249,7 +259,7 @@ pub fn serve(file: &Path, env: &[(&str, &str)]) -> Server {
     stop_with_tests(&child);
     let mut s = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !listening(port) {
         if let Ok(Some(status)) = s.child.try_wait() {
             panic!("quillo run {} stopped: {}", file.display(), status);
         }

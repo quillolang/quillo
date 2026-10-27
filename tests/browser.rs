@@ -4,7 +4,6 @@
 
 mod support;
 
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,7 +59,7 @@ fn run_page_args(chrome: &Path, app: &Path, port: u16, path: &str, script: Optio
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -789,7 +788,7 @@ fn run_page_args_late(chrome: &Path, app: &Path, port: u16, script: &Path, args:
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }

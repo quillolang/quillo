@@ -44,7 +44,7 @@ fn start(file: &Path, port: u16, extra: &[&str]) -> Server {
     support::stop_with_tests(&child);
     let server = Server(child);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }

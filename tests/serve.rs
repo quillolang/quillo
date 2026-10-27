@@ -53,7 +53,7 @@ fn start_with_env(file: &Path, extra: &[&str], env: &[(&str, &str)]) -> Server {
     support::stop_with_tests(&child);
     let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -482,7 +482,7 @@ fn stopping_finishes_requests_in_progress() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "{:?}", status);
-    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(!support::listening(port));
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn the_log_can_be_json_lines() {
     support::stop_with_tests(&child);
     let server = Server { child, port };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         assert!(Instant::now() < deadline, "server did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -771,7 +771,7 @@ fn the_log_never_shows_a_launch_token() {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        while !support::listening(port) {
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(20));
         }

@@ -84,3 +84,11 @@ jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "
 app = ["dep:wry", "dep:tao", "dep:muda"]
 # MySQL and MariaDB for `db` (src/my.rs).
 mysql = ["dep:mysql_async"]
+
+# Password hashing is slow by design; unoptimized (debug builds, the tests),
+# far slower: a few logins at once then take seconds each.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

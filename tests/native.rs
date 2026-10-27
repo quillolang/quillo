@@ -48,7 +48,7 @@ fn start(file: &Path, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Server
     let mut server = Server(child);
     // The first build of the cache's dependencies takes a while.
     let deadline = Instant::now() + Duration::from_secs(300);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !support::listening(port) {
         if let Ok(Some(_)) = server.0.try_wait() {
             let mut err = String::new();
             let _ = server.0.stderr.take().map(|mut e| e.read_to_string(&mut err));
