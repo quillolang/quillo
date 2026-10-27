@@ -27,6 +27,9 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # File-level copyleft, met by using the crates unchanged: cssparser,
+    # selectors and option-ext, which only `quillo app`'s window (wry) uses.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 
