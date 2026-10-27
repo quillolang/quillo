@@ -829,3 +829,59 @@ fn http_calls_can_refuse_redirects_and_addresses_inside() {
         assert!(!quillo::fetch::public_ip(ip.parse().unwrap()), "{}", ip);
     }
 }
+
+/// Component code runs in the browser too, where `http.*` goes from the page:
+/// while the server renders a component, a call from its code is refused
+/// before it connects, since it would go from the server's own network. A
+/// `server fn` it calls is the server's, and may.
+#[test]
+fn a_components_http_calls_are_not_made_from_the_server() {
+    let (port, hits) = internal_server();
+    let src = format!(
+        "fn load() = http.get(\"http://127.0.0.1:{p}/secret\").body\n\
+         server fn fetched() = http.get(\"http://127.0.0.1:{p}/secret\").body\n\
+         component Leaks() {{ state r = load()\n<p>{{r}}</p> }}\n\
+         component Asks() {{ state r = fetched()\n<p>{{r}}</p> }}\n\
+         route GET /leaks = <Leaks/>\n\
+         route GET /asks = <Asks/>\n",
+        p = port
+    );
+    let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+    it.load_source(&src, "test.qwe").unwrap();
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let r = send(&mut it, "GET", "/leaks", &[], "");
+    assert_eq!(r.status, 500);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
+    let r = send(&mut it, "GET", "/asks", &[], "");
+    assert_eq!(r.status, 200);
+    assert!(String::from_utf8_lossy(&r.body).contains("secret"));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+}
+
+/// `cache` keeps a GET's successful answer for the seconds given, for any
+/// request making the same call; other calls, and failures, go out again.
+#[test]
+fn http_answers_are_kept_only_when_asked() {
+    let (port, hits) = internal_server();
+    let count = || hits.load(std::sync::atomic::Ordering::SeqCst);
+    let run = |src: String| quillo::eval_str(&src).unwrap().repr();
+    let url = format!("http://127.0.0.1:{}/secret", port);
+    let before = count();
+    assert_eq!(run(format!("http.get({:?}, {{}}, {{ cache: 60 }}).body", url)), "\"secret\"");
+    assert_eq!(run(format!("http.get({:?}, {{}}, {{ cache: 60 }}).body", url)), "\"secret\"");
+    assert_eq!(count(), before + 1);
+    // Other headers are another call; no `cache`, the same.
+    run(format!("http.get({:?}, {{ authorization: \"Bearer b\" }}, {{ cache: 60 }})", url));
+    run(format!("http.get({:?})", url));
+    assert_eq!(count(), before + 3);
+    // What did not succeed is not kept.
+    let missing = format!("http://127.0.0.1:{}/go", port);
+    run(format!("http.get({:?}, {{}}, {{ redirects: 0, cache: 60 }})", missing));
+    run(format!("http.get({:?}, {{}}, {{ redirects: 0, cache: 60 }})", missing));
+    assert_eq!(count(), before + 5);
+    // Only GETs are kept.
+    let e = quillo::eval_str(&format!("http.post({:?}, {{ a: 1 }}, {{}}, {{ cache: 60 }})", url)).err().unwrap().to_string();
+    assert!(e.contains("`cache` keeps the answers of GET requests"), "{}", e);
+    let e = quillo::eval_str(&format!("http.get({:?}, {{}}, {{ cache: -1 }})", url)).err().unwrap().to_string();
+    assert!(e.contains("`cache` is seconds"), "{}", e);
+}

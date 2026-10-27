@@ -226,6 +226,28 @@ fn svg_inside_html_draws() {
     assert_eq!(r, want);
 }
 
+/// `http.*` from a component goes from the page, to another site that
+/// allows it (CORS), and not to one that does not; a chosen file is sent as
+/// it is. A variable named PUBLIC_... is written into the page.
+#[test]
+fn components_call_other_sites_from_the_page() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    std::env::set_var("PUBLIC_QUILLO_TEST_TOKEN", "pk_test_123");
+    let r = run_page_with(&chrome, &dir.join("remote.qwe"), free_port(), Some(&dir.join("remote.js")));
+    let want = serde_json::json!({
+        "got": [200, true, { "from": "elsewhere", "n": 2 }],
+        "refused": true,
+        "sent": { "size": 11, "type": "text/plain", "text": "hello, file" },
+        "token": "pk_test_123",
+        "errors": [],
+    });
+    assert_eq!(r, want);
+}
+
 /// Attributes a component takes from data: a spread cannot add handlers,
 /// whatever the key's case or `bind:`, nor replace an attribute written
 /// out; a sandboxed frame's page follows the state; an SVG animation of an

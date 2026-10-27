@@ -118,6 +118,10 @@ pub struct Interp {
     /// State of the components being rendered, innermost last, with the
     /// `live(...)` subscriptions of each.
     islands: Vec<(Map, Map)>,
+    /// While the server renders a component: its code also runs in the
+    /// browser, where `http.*` calls are made (see src/fetch.rs). A
+    /// `server fn` it calls runs on the server, and clears it.
+    pub(crate) in_component: bool,
     /// While a `live` loader runs: the topics (tables, globals) it reads.
     pub reads: Option<std::collections::HashSet<String>>,
     /// The subscription the last `live(...)` call set up, for `state`.
@@ -762,6 +766,7 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
+            in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             last_live: None,
@@ -822,6 +827,7 @@ impl Interp {
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
+            in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             last_live: None,
@@ -1082,6 +1088,7 @@ impl Interp {
         it.depth = self.depth;
         it.allowed = self.allowed;
         it.restrictor = self.restrictor.clone();
+        it.in_component = self.in_component;
         it.current_request = self.current_request.clone().or_else(|| self.pending_request.as_ref().map(|p| p.make()));
         it.tenant = self.tenant.clone();
         it.tenant_named = self.tenant_named;
@@ -2043,6 +2050,7 @@ impl Interp {
             None => None,
         };
         self.depth += 1;
+        let was_component = def.server && std::mem::replace(&mut self.in_component, false);
         let debugging = crate::debug::on();
         if debugging {
             crate::debug::enter(self, &def.name, def.file.clone(), def.line);
@@ -2054,6 +2062,9 @@ impl Interp {
             crate::debug::leave(self);
         }
         self.depth -= 1;
+        if was_component {
+            self.in_component = true;
+        }
         if let Some((mask, who)) = saved {
             self.allowed = mask;
             self.restrictor = who;
@@ -3025,7 +3036,9 @@ impl Interp {
         self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
         let mut body = String::new();
+        let was = std::mem::replace(&mut self.in_component, true);
         let r = self.render_call_into(&c, args, line, &mut body);
+        self.in_component = was;
         let (state, live) = self.islands.pop().unwrap_or_default();
         r?;
         let props = if nested { Map::new() } else { props };

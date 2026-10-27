@@ -660,6 +660,8 @@ struct FnCtx {
     view: bool,
     /// `state` was declared ahead of the code (a body made again whole).
     hoisted: bool,
+    /// A `state` initializer's code, which the server runs as it renders.
+    state_init: bool,
 }
 
 enum Resolved {
@@ -913,6 +915,15 @@ fn has_markup(e: &Expr) -> bool {
     }
 }
 
+/// What variables named `PUBLIC_...` hold may be sent to the browser:
+/// `env("PUBLIC_MAP_TOKEN")`, with the name written out, gives that name.
+pub fn public_env<'a>(callee: &Expr, args: &'a [Expr]) -> Option<&'a str> {
+    match (callee, args.first()) {
+        (Expr::Ident(f, _), Some(Expr::Lit(Lit::Str(n)))) if f == "env" && args.len() <= 2 && n.starts_with("PUBLIC_") => Some(n),
+        _ => None,
+    }
+}
+
 /// Builtins whose results may be private to the server: its environment,
 /// its files, its database, other services.
 const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
@@ -938,32 +949,39 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
     let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
     // Whether `e` uses a private name (other than the `shadowed` ones), its
     // functions' bodies included when `inside` is set.
+    // `env("PUBLIC_...")` is not: each such call is one use of `env` that
+    // does not count.
     let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
         let mut found = false;
+        let (mut envs, mut public) = (0, 0);
         each_expr_in(
             e,
             &mut |x| match x {
+                Expr::Ident(n, _) if n == "env" && !shadowed.contains(n) => envs += 1,
                 Expr::Ident(n, _) if !shadowed.contains(n) => {
                     found |= sources.contains(n.as_str()) || services.contains(n) || vars.contains(n) || fns.contains(n)
                 }
                 Expr::Field(_, n, _) => found |= fns.contains(n),
+                Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
                 _ => {}
             },
             inside,
         );
-        found
+        found || envs > public
     };
     // What a variable's functions use, as before: a function value is made
     // in the browser from its definition, and the server fns it calls stay
     // on the server.
     let uses_in_fns = |e: &Expr, vars: &HashSet<String>| {
         let mut found = false;
-        each_expr(e, &mut |x| {
-            if let Expr::Ident(n, _) = x {
-                found |= sources.contains(n.as_str()) || vars.contains(n);
-            }
+        let (mut envs, mut public) = (0, 0);
+        each_expr(e, &mut |x| match x {
+            Expr::Ident(n, _) if n == "env" => envs += 1,
+            Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || vars.contains(n),
+            Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
+            _ => {}
         });
-        found
+        found || envs > public
     };
     loop {
         let before = vars.len() + fns.len();
@@ -1314,20 +1332,22 @@ impl<'a> Compiler<'a> {
                     Ok(r)
                 } else if b.starts_with("native:") {
                     self.err(format!("`{}` is Rust, which runs on the server, not in the browser; call it from a `server fn`", crate::native::display_name(b)))
+                } else if *b == "env" {
+                    self.err("`env` is not available in the browser; call it from a `server fn`, or read a variable named PUBLIC_... with its name written out: env(\"PUBLIC_MAP_TOKEN\")")
                 } else {
                     self.err(format!("`{}` is not available in the browser; call it from a `server fn`", b))
                 }
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
                 self.globals.insert(name.to_string(), r.clone());
                 Ok(r)
             }
-            Value::Map(m) if matches!(name, "db" | "http" | "udp" | "media") && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
+            Value::Map(m) if matches!(name, "db" | "udp" | "media") && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
                 self.err(format!("`{}` is not available in the browser; use it from a `server fn`", name))
             }
             Value::Func(f) if f.def.server => {
@@ -1465,7 +1485,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -1530,7 +1550,7 @@ impl<'a> Compiler<'a> {
     /// A function or view. Compiled once synchronously; if it turns out to
     /// call the server, again as an `async function`.
     fn function(&mut self, def: &FnDef) -> Result<(String, bool), QuilloError> {
-        if def.effects.as_ref().map_or(false, |e| e.iter().any(|x| x != "time" && x != "random")) {
+        if def.effects.as_ref().map_or(false, |e| e.iter().any(|x| x != "time" && x != "random" && x != "http")) {
             return self.err(format!(
                 "`{}` declares `with {}`, which the browser cannot do; make it a `server fn`",
                 def.name,
@@ -1971,6 +1991,7 @@ impl<'a> Compiler<'a> {
                     let saved_reactive = self.reactive;
                     // The initializer may wait on the server; it runs once.
                     self.new_ctx(None, false);
+                    self.ctx().state_init = true;
                     // Let the initializer see the component's names.
                     let outer = std::mem::take(&mut self.ctxs[0].scopes);
                     self.ctxs.last_mut().unwrap().scopes = outer.clone();
@@ -1979,7 +2000,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -2470,9 +2491,23 @@ impl<'a> Compiler<'a> {
             for a in args {
                 argv.push(self.expr(a)?);
             }
+            if recv == "B.http" {
+                return self.http_call(name, argv);
+            }
             let is_async = self.is_async_name(name);
             let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
             return self.finish_call(name, is_async, call);
+        }
+        if let Some(name) = public_env(callee, args).filter(|_| !self.is_local("env")) {
+            // Written into the bundle as it is now: the name says it is for
+            // everyone to see.
+            return Ok(match std::env::var(name) {
+                Ok(v) => js_str(&v),
+                Err(_) => match args.get(1) {
+                    Some(d) => self.expr(d)?,
+                    None => "null".into(),
+                },
+            });
         }
         let (f, is_async) = self.callee_value(callee)?;
         // The component's own functions, the program's and url() may read
@@ -2501,6 +2536,28 @@ impl<'a> Compiler<'a> {
             format!("W.call({}, [{}])", f, argv.join(", "))
         };
         self.finish_call(&name, is_async, call)
+    }
+
+    /// `http.get(...)` and the rest, which the browser makes once the page
+    /// has arrived: in handlers and the functions they call, not while the
+    /// server renders (see src/fetch.rs).
+    fn http_call(&mut self, name: &str, argv: Vec<String>) -> Result<String, QuilloError> {
+        if !matches!(name, "get" | "delete" | "post" | "put" | "patch" | "request") {
+            return self.err(match name {
+                "stream" => "`http.stream` is the server's; in the browser, `receive(url, f, ...)` in a handler and `listen(url, f)` read a stream".to_string(),
+                _ => format!("`http` has no function `{}`", name),
+            });
+        }
+        let c = self.ctx();
+        if c.component.is_some() || c.state_init {
+            return self.err(format!(
+                "`http.{}` in a component runs in the browser, once the page has arrived, and the server renders \
+                 the component first: call it from an event handler or @mount, or from a `server fn`",
+                name
+            ));
+        }
+        let call = format!("B.http.{}({})", name, argv.join(", "));
+        Ok(self.await_if(true, call))
     }
 
     /// `js` and `js_new` name what they call in the code itself: a name
@@ -2558,6 +2615,10 @@ impl<'a> Compiler<'a> {
             return self.err(format!("`{}` does not call {}: it steps around the checks on the page's functions", f, path));
         }
         Ok(())
+    }
+
+    fn is_local(&self, name: &str) -> bool {
+        self.ctxs.iter().any(|c| c.scopes.iter().any(|s| s.contains_key(name)))
     }
 
     fn is_async_name(&mut self, name: &str) -> bool {
