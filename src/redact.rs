@@ -351,14 +351,18 @@ fn numbers(text: &str) -> Cow<'_, str> {
 }
 
 /// A URL with the values of its sensitive query parameters masked, for
-/// the request log.
+/// the request log, and always a desktop window's launch token.
 pub fn url(u: &str) -> Cow<'_, str> {
     let Some((path, q)) = u.split_once('?') else { return Cow::Borrowed(u) };
     let mut changed = false;
+    let hidden = |k: &str| {
+        let k = crate::server::percent_decode(k, true);
+        k == crate::server::LAUNCH_PARAM || sensitive(&k)
+    };
     let parts: Vec<String> = q
         .split('&')
         .map(|p| match p.split_once('=') {
-            Some((k, v)) if !v.is_empty() && sensitive(&crate::server::percent_decode(k, true)) => {
+            Some((k, v)) if !v.is_empty() && hidden(k) => {
                 changed = true;
                 format!("{}={}", k, MASK)
             }
@@ -392,5 +396,7 @@ mod tests {
         assert_eq!(text("password_reset is a route"), "password_reset is a route");
         assert_eq!(url("/pay?card_number=4111&ok=1"), "/pay?card_number=[redacted]&ok=1");
         assert_eq!(url("/a?b=c"), "/a?b=c");
+        assert_eq!(url("/?a=1&_quillo_launch=0f3a&b=2"), "/?a=1&_quillo_launch=[redacted]&b=2");
+        assert_eq!(url("/?%5Fquillo%5Flaunch=0f3a"), "/?%5Fquillo%5Flaunch=[redacted]");
     }
 }

@@ -1058,6 +1058,15 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
             Parsed::Bad(status, why) => {
                 let line = c.input.split(|b| *b == b'\r').next().unwrap_or(&[]);
                 let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
+                // As the log writes any URL: sensitive values masked.
+                let line = match line.split_once(' ') {
+                    Some((method, rest)) => {
+                        let (target, version) = rest.split_once(' ').unwrap_or((rest, ""));
+                        let sep = if version.is_empty() { "" } else { " " };
+                        format!("{} {}{}{}", method, crate::redact::url(target), sep, version)
+                    }
+                    None => line,
+                };
                 c.input.clear();
                 c.chunked = None;
                 items.push(Item::Bad(status, why, line));

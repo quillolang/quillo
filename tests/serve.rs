@@ -743,3 +743,40 @@ fn live_websockets_are_only_for_the_sites_own_pages() {
     // The long wait without a WebSocket too.
     assert!(raw(srv.port, "GET /_quillo/live?since=1&t=x HTTP/1.1\r\nOrigin: https://evil.example").starts_with("HTTP/1.1 403"));
 }
+
+/// A desktop window's launch token is a secret of the machine's: whatever
+/// the log's form, with query strings or not, and for a request too broken
+/// to answer, the log never shows it.
+#[test]
+fn the_log_never_shows_a_launch_token() {
+    let d = temp_dir("launchlog");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET /hello = \"hi\"\n").unwrap();
+    let token = "5ec12e7c0ffee5ec12e7c0ffee5ec12e7";
+    for flags in [&["--log", "text"][..], &["--log", "json", "--log-query"][..], &["--log", "json"][..]] {
+        let port = port();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(&f)
+            .args(["--port", &port.to_string()])
+            .args(flags)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "server did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(get(port, &format!("/hello?a=1&_quillo_launch={}", token)).1, "hi");
+        // A header line without a colon: refused before it is a request.
+        let bad = raw(port, &format!("GET /hello?_quillo_launch={} HTTP/1.1\r\nno colon here", token));
+        assert!(bad.starts_with("HTTP/1.1 400"), "{}", bad);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(log.contains("/hello") && log.contains("-> 400"), "{:?}: {}", flags, log);
+        assert!(!log.contains(token) && !log.contains(&token[..12]), "{:?}: {}", flags, log);
+    }
+}
