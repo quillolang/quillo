@@ -1,0 +1,75 @@
+[package]
+name = "quillo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# The decimal targets' reference: exact integers of any size.
+num-bigint = "0.4"
+num-traits = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+# Without the JIT, MySQL and WebTransport: none of it is fuzzed, and they
+# would only make the build longer.
+quillo = { path = "..", default-features = false }
+
+# Its own workspace, so the main one's build is not touched.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check"
+path = "fuzz_targets/check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decimal"
+path = "fuzz_targets/decimal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decimal_ops"
+path = "fuzz_targets/decimal_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dates"
+path = "fuzz_targets/dates.rs"
+test = false
+doc = false
+bench = false

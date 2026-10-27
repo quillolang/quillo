@@ -1290,7 +1290,9 @@ udp.send("10.0.0.5", 514, "<14>app started")
   the next packet goes on.
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
   otherwise). A full queue drops its oldest packet, as UDP would; with `--metrics`,
-  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them.
+  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
+  a sender down, so where packets come in bursts faster than the handler takes them,
+  give `queue` room for the largest burst.
 - `udp.send(host, port, data, { from })` sends one packet; `udp.reply(packet, data)` sends
   back to where a packet came from, from the port it came to (as most protocols expect).
   `data` is text, a list of byte values, or any other value as JSON; a packet holds up to
@@ -2072,14 +2074,12 @@ db.migrate()
   (its `parallel` calls' too) go to the same one, so the database reads them together.
   While those connections wait on a slow query, new requests use others, up to
   `pool_size`.
-- TLS is required for a server on another machine, with its certificate checked
-  against the usual public certificate authorities, as hosted Postgres services use. On
-  this machine (`localhost`, `127.0.0.1`, `::1`, a Unix socket) it is used when the
-  server offers it. `?sslmode=` in the URL decides instead: `require`, `prefer` (TLS if
-  offered, which someone on the network can refuse in the server's name) or `disable`
-  (for a database on a private network without TLS, such as a container next to the
-  app). Before, TLS was only preferred everywhere: a URL to another machine whose server
-  has no TLS now needs `?sslmode=disable` to connect.
+- TLS is required for a server on another machine, with its certificate and name
+  checked; on this machine (`localhost`, `127.0.0.1`, `::1`, a Unix socket) it is used
+  when the server offers it. The URL can say otherwise, as libpq's do: see
+  [TLS to the database](#tls-to-the-database) below. Before, TLS was only preferred
+  everywhere: a URL to another machine whose server has no TLS now needs
+  `?sslmode=disable` to connect.
 
 **MySQL and MariaDB** (the `mysql` feature, built in by default; `cargo build
 --no-default-features` leaves it out):
@@ -2099,10 +2099,60 @@ db.migrate()
   tenant, and listed by `db.tenants()`.
 - TLS is required for a server on another machine, with its certificate and name
   checked; on this machine (`localhost`, `127.0.0.1`, `::1`, `?socket=...`) it is not
-  used. `?require_ssl=true` asks for it here too, and `?require_ssl=false` turns it off
-  (a database on a private network without TLS). Further options, as the driver takes
-  them: `verify_ca=false` and `verify_identity=false` (a certificate of your own,
-  checked less), `built_in_roots=false`. Before, TLS was off unless `require_ssl=true`.
+  used unless the URL asks for it. See [TLS to the database](#tls-to-the-database)
+  below. Before, TLS was off unless `require_ssl=true`.
+
+#### TLS to the database
+
+Some hosted databases sign their certificates with a certificate authority (CA) of
+their own: Amazon RDS and Aurora, Google Cloud SQL (the instance's `server-ca.pem`), and
+a company's servers with its private CA. The public CAs that are trusted by default do not know those, so the
+connection fails with `invalid peer certificate: UnknownIssuer` until the URL names
+the CA's certificates (a PEM file, as the service publishes it):
+
+```quillo
+// Amazon RDS and Aurora: their CAs' bundle, saved where the program runs, from
+// https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+db.open("postgres://app@mydb.abc123.eu-west-1.rds.amazonaws.com:5432/app?sslrootcert=/srv/app/global-bundle.pem")
+db.open("mysql://app@mydb.abc123.eu-west-1.rds.amazonaws.com:3306/app?ssl_ca=/srv/app/global-bundle.pem")
+// Or in $DATABASE_URL, with the password: postgres://app:...@...rds.amazonaws.com/app?sslrootcert=...
+```
+
+PostgreSQL reads the options libpq does:
+
+| In the URL | TLS | The server's certificate |
+|---|---|---|
+| `sslmode=verify-full` (the default for another machine) | always | signed by a trusted CA, for the host's name |
+| `sslmode=verify-ca` | always | signed by a CA in `sslrootcert`, for any name |
+| `sslmode=require` | always | not checked, unless `sslrootcert` is given (then as `verify-ca`) |
+| `sslmode=prefer` (the default on this machine) | when the server offers it | as with `require` |
+| `sslmode=disable` | never | |
+
+- `sslrootcert=/path/ca.pem`: the CAs to trust, in PEM, instead of the public ones.
+  `sslrootcert=system` trusts the operating system's CAs (with `verify-full` only).
+- `sslcert=/path/client.crt` and `sslkey=/path/client.key`: a certificate and its key
+  (PEM), for a server that asks for one (`hostssl ... cert` in `pg_hba.conf`).
+- `require` keeps the connection from being read, but not someone in the middle from
+  posing as the server, who then has the queries and the data. Use it only where the
+  network is yours; `verify-ca` with the CA's certificate costs no more. `prefer` is
+  weaker still: someone in the middle can say the server has no TLS.
+- `verify-ca` without `sslrootcert` is refused: any certificate from a public CA, for
+  anyone's site, would pass. Where the server is reached at an address its certificate
+  does not name, `verify-full` with the name in `host` and the address in `hostaddr`
+  (`postgres://db.internal/app?hostaddr=10.0.0.5`) checks the name too.
+
+MySQL and MariaDB take the MySQL driver's options:
+
+- `ssl_ca=/path/ca.pem`: the CAs to trust instead of the public ones (with
+  `built_in_roots=true`, as well as them). It asks for TLS on this machine too.
+- `ssl_server_name=db.example.com`: the name the certificate is checked for, where the
+  host connected to is an address or a tunnel. `verify_identity=false` is refused: the
+  driver checks the name regardless.
+- `verify_ca=false`: the certificate is not checked at all, which has the risk of
+  Postgres's `require` above.
+- `ssl_cert=/path/client.crt` and `ssl_key=/path/client.key`: a client certificate
+  (`REQUIRE X509`).
+- `require_ssl=true` asks for TLS on this machine; `require_ssl=false` turns it off.
 
 **Backups.** `db.backup(path)` copies a SQLite database while it is in use, with SQLite's
 online backup API:

@@ -21,21 +21,73 @@ pub fn is_url(s: &str) -> bool {
 }
 
 /// The connection options of a URL. TLS is required (the server's
-/// certificate checked) for a server on another machine, as the driver
-/// would otherwise send the password in the clear, unless the URL says
-/// `require_ssl=false`.
+/// certificate and name checked) for a server on another machine, as the
+/// driver would otherwise send the password in the clear, unless the URL
+/// says `require_ssl=false`; on this one, when the URL says
+/// `require_ssl=true` or names a CA. The TLS options are read here, as the
+/// driver reads them only with `require_ssl=true`:
+///
+/// - `ssl_ca=/path/ca.pem`: the CAs (PEM) to check the server's certificate
+///   against, instead of the usual public ones (a cloud's own, or a
+///   company's);
+/// - `ssl_server_name=db.example.com`: the name the certificate is checked
+///   for, where the host connected to is another (an address, a tunnel);
+/// - `verify_ca=false`: the certificate is not checked at all (encrypted,
+///   but someone in the middle can pose as the server);
+/// - `built_in_roots=true`: the public CAs as well as those in `ssl_ca`;
+/// - `ssl_cert` and `ssl_key`: a certificate and its key, for servers that
+///   ask for one (`REQUIRE X509`).
 fn opts_of(url: &str) -> Result<Opts, String> {
     // `mariadb://` is the same protocol.
     let url = match url.strip_prefix("mariadb://") {
         Some(rest) => format!("mysql://{}", rest),
         None => url.to_string(),
     };
+    let (base, query) = url.split_once('?').unwrap_or((&url, ""));
+    let (mut require, mut verify_ca, mut verify_identity, mut built_in) = (None, true, true, None);
+    let (mut ca, mut cert, mut key, mut name) = (None, None, None, None);
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let flag = |v: &str| v.parse::<bool>().map_err(|_| format!("{} is true or false, not {:?}", k, v));
+        let path = || std::path::PathBuf::from(crate::server::percent_decode(v, false));
+        match k {
+            "require_ssl" => require = Some(flag(v)?),
+            "verify_ca" => verify_ca = flag(v)?,
+            "verify_identity" => verify_identity = flag(v)?,
+            "ssl_server_name" => name = Some(crate::server::percent_decode(v, false)),
+            "built_in_roots" => built_in = Some(flag(v)?),
+            "ssl_ca" => ca = Some(path()),
+            "ssl_cert" => cert = Some(path()),
+            "ssl_key" => key = Some(path()),
+            _ => rest.push(pair),
+        }
+    }
+    let url = if rest.is_empty() { base.to_string() } else { format!("{}?{}", base, rest.join("&")) };
     let opts = Opts::from_url(&url).map_err(|e| e.to_string())?;
     let remote = opts.socket().is_none() && !crate::pg::local_host(opts.ip_or_hostname());
-    if remote && opts.ssl_opts().is_none() && !url.contains("require_ssl=") {
-        return Ok(OptsBuilder::from_opts(opts).ssl_opts(mysql_async::SslOpts::default()).into());
+    if !require.unwrap_or(remote || ca.is_some()) {
+        return Ok(opts);
     }
-    Ok(opts)
+    // The driver's check of the name alone fails with the rustls it is
+    // built with (it looks for the error's old wording), so the name is
+    // always checked: one the certificate is for is given instead.
+    if !verify_identity && verify_ca {
+        return Err("verify_identity=false is not supported: connect by a name the server's certificate is for, or give that name with ssl_server_name=".into());
+    }
+    let identity = match (cert, key) {
+        (None, None) => None,
+        (Some(c), Some(k)) => Some(mysql_async::ClientIdentity::new(c.into(), k.into())),
+        _ => return Err("ssl_cert and ssl_key go together: a certificate, and its key".into()),
+    };
+    let ssl = mysql_async::SslOpts::default()
+        .with_danger_accept_invalid_certs(!verify_ca)
+        // As the mysql client's --ssl-ca: those CAs, not the public ones too.
+        .with_disable_built_in_roots(!built_in.unwrap_or(ca.is_none()))
+        .with_root_certs(ca.into_iter().map(Into::into).collect())
+        .with_client_identity(identity)
+        .with_danger_tls_hostname_override(name);
+    Ok(OptsBuilder::from_opts(opts).ssl_opts(ssl).into())
 }
 
 fn run<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -326,12 +378,34 @@ mod tests {
     #[test]
     fn tls_is_required_for_a_server_on_another_machine() {
         // What the review saw: TLS off unless `require_ssl=true`.
-        for url in ["mysql://u:p@db.example.com/app", "mariadb://u:p@10.0.0.5:3306/app"] {
+        for url in ["mysql://u:p@db.example.com/app", "mariadb://u:p@10.0.0.5:3306/app", "mysql://u@localhost/app?ssl_ca=/ca.pem"] {
             assert!(opts_of(url).unwrap().ssl_opts().is_some(), "{}", url);
         }
         for url in ["mysql://u:p@db.internal/app?require_ssl=false", "mysql://u@localhost/app", "mysql://u@127.0.0.1:3306/app"] {
             assert!(opts_of(url).unwrap().ssl_opts().is_none(), "{}", url);
         }
+    }
+
+    #[test]
+    fn tls_options_are_read_whether_or_not_tls_is_asked_for() {
+        let ssl = |url: &str| opts_of(url).unwrap().ssl_opts().cloned().unwrap();
+        // Checked fully, against the public CAs, unless the URL says otherwise.
+        let s = ssl("mysql://u@db.example.com/app");
+        assert!(!s.accept_invalid_certs() && !s.skip_domain_validation() && !s.disable_built_in_roots() && s.root_certs().is_empty());
+        // The driver dropped these without `require_ssl=true`.
+        let s = ssl("mysql://u@10.0.0.5/app?ssl_server_name=db.example.com&pool_min=1");
+        assert_eq!(s.tls_hostname_override(), Some("db.example.com"));
+        assert!(ssl("mysql://u@db.example.com/app?verify_ca=false").accept_invalid_certs());
+        assert!(opts_of("mysql://u@10.0.0.5/app?verify_identity=false").unwrap_err().contains("ssl_server_name"));
+        assert!(ssl("mysql://u@10.0.0.5/app?verify_identity=false&verify_ca=false").accept_invalid_certs());
+        // A CA of its own: only it, unless the public ones are asked for too.
+        let s = ssl("mysql://u@db.example.com/app?ssl_ca=%2Fetc%2Fdb%20ca.pem");
+        assert!(s.disable_built_in_roots());
+        assert_eq!(format!("{:?}", s.root_certs()), r#"[Path("/etc/db ca.pem")]"#);
+        assert!(!ssl("mysql://u@db.example.com/app?ssl_ca=/ca.pem&built_in_roots=true").disable_built_in_roots());
+        assert!(ssl("mysql://u@db.example.com/app?ssl_cert=/c.pem&ssl_key=/k.pem").client_identity().is_some());
+        assert!(opts_of("mysql://u@db.example.com/app?ssl_cert=/c.pem").is_err());
+        assert!(opts_of("mysql://u@db.example.com/app?verify_ca=no").is_err());
     }
 
     #[test]

@@ -166,6 +166,8 @@ function decParse(s, rounded) {
     if (mag !== 0n) mag *= p10(-scale);
     scale = 0;
   }
+  // Zero is zero however many zeros are written after the point.
+  if (mag === 0n) scale = Math.min(scale, DEC_SCALE);
   if (scale > 400) return null;
   if (rounded) return decFit(neg, mag, scale, false, "half_even");
   while (scale > DEC_SCALE || mag > DEC_MAX) {

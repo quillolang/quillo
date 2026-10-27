@@ -140,6 +140,11 @@ fn dec_converts_exactly() {
     same("[dec(\"abc\"), dec(\"1.2.3\"), dec(true), dec(\"0.00000000000000000000000000001\")]",
         "[err(\"not a decimal: \\\"abc\\\"\"), err(\"not a decimal: \\\"1.2.3\\\"\"), err(\"cannot convert bool to dec\"), err(\"not a decimal: \\\"0.00000000000000000000000000001\\\"\")]");
     assert_eq!(ev("dec(1e300)"), "err(\"cannot convert float to dec: it is too large, or not a number\")");
+    // Zero, with more zeros after the point than a decimal keeps (the fuzz
+    // target `decimal` found these refused).
+    // One sign in an exponent, as in the browser.
+    same("[is_err(dec(\"1e+-6\")), is_err(dec(\"1e-+6\")), is_err(dec(\"1e--6\")), dec(\"1e+6\"), dec(\"1e-6\"), is_err(dec(\"1e-123456\")), dec(\"0e+123456\")]", "[true, true, true, 1000000m, 0.000001m, true, 0m]");
+    same("[dec(\"0e-7957\"), dec(\"-0.0e-500\"), dec(\"0.00000000000000000000000000000000\")]", "[0.0000000000000000000000000000m, 0.0000000000000000000000000000m, 0.0000000000000000000000000000m]");
     same("[int(12.99m), int(-12.99m), float(12.5m), str(-0.50m), type_of(dec(\"1\"))]", "[12, -12, 12.5, \"-0.50\", \"dec\"]");
 }
 
