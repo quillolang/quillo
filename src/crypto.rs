@@ -119,6 +119,33 @@ pub fn secret_bytes(n: usize) -> Vec<u8> {
     })
 }
 
+/// The shortest signing secret not warned about, in bytes.
+pub const MIN_SECRET: usize = 32;
+
+/// What is wrong with the secrets in the environment (read through `var`),
+/// for a server about to start: a warning for each signing secret shorter
+/// than `MIN_SECRET` (one signed cookie or call is enough to guess a short
+/// one offline), and an error for encryption keys that cannot be used
+/// (AES-256 takes keys of exactly 32 bytes).
+pub fn secret_problems(var: impl Fn(&str) -> Option<String>) -> (Vec<String>, Option<String>) {
+    let mut warnings = Vec::new();
+    for name in ["QUILLO_SECRET", "QUILLO_SERVICE_SECRET", "LIMER_ADMIN_SECRET"] {
+        if let Some(s) = var(name).filter(|s| !s.is_empty()) {
+            if s.len() < MIN_SECRET {
+                warnings.push(format!(
+                    "{} is {} bytes; a signing secret should be at least {} random bytes (`openssl rand -hex 32` makes one)",
+                    name,
+                    s.len(),
+                    MIN_SECRET
+                ));
+            }
+        }
+    }
+    let env = crate::cipher::ENV;
+    let error = var(env).filter(|t| !t.trim().is_empty()).and_then(|t| crate::cipher::keyring(&t).err()).map(|e| format!("{}: {}", env, e));
+    (warnings, error)
+}
+
 pub fn random_bytes(n: usize) -> Option<Vec<u8>> {
     let mut b = vec![0u8; n];
     getrandom::getrandom(&mut b).ok()?;

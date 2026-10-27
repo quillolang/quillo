@@ -885,7 +885,9 @@ route POST /logout { end_session(); redirect("/") }
   session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
-  when the server stops.
+  when the server stops. The server warns when it starts if the secret is shorter than
+  32 bytes, as it does for `QUILLO_SERVICE_SECRET` and `LIMER_ADMIN_SECRET`: a short one
+  can be guessed offline from one signed cookie.
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
@@ -2260,7 +2262,9 @@ let iban = crypto.decrypt(row.iban)?          // the text, or an error value
 - The keys are in `QUILLO_ENCRYPTION_KEYS`: `id:base64key` pairs, separated by commas,
   the current key first: `k2026:3q2+7w...,k2025:Yx9...`. `quillo keygen` (or
   `quillo keygen k2026`) prints a new one; so does `echo "k2026:$(openssl rand -base64 32)"`.
-  Keep them where the program's other secrets are, never in its files.
+  Keep them where the program's other secrets are, never in its files. A program does
+  not start when they are set but cannot be used (a key that is not 32 bytes, an id
+  twice), rather than failing at its first `crypto.encrypt`.
 - A token is `qe1.<key id>.<nonce, ciphertext and tag, base64url>`: it names its key, and
   has a random 96-bit nonce, so the same text encrypts differently each time (equal
   values cannot be found by comparing tokens: keep a `crypto.hmac` of the value beside

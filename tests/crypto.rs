@@ -251,3 +251,58 @@ route POST /hook {
     let r = send(&mut it, "{\"zen\":\"Hello\",\"n\":1.5}", &sig);
     assert_eq!(r.status, 400, "{}", r.text());
 }
+
+/// Secrets in the environment, as a server starting finds them: signing
+/// secrets shorter than 32 bytes are warned about, encryption keys that are
+/// not 32 bytes stop it.
+#[test]
+fn short_secrets_are_warned_about_and_bad_keys_refused() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+    let (w, e) = quillo::crypto::secret_problems(env(&[]));
+    assert!(w.is_empty() && e.is_none());
+    let (w, e) = quillo::crypto::secret_problems(env(&[
+        ("QUILLO_SECRET", "hunter2"),
+        ("QUILLO_SERVICE_SECRET", "0123456789abcdef0123456789abcde"),
+        // 32: enough.
+        ("LIMER_ADMIN_SECRET", "0123456789abcdef0123456789abcdef"),
+    ]));
+    assert_eq!(w.len(), 2, "{:?}", w);
+    assert!(w[0].starts_with("QUILLO_SECRET is 7 bytes") && w[1].starts_with("QUILLO_SERVICE_SECRET is 31 bytes"), "{:?}", w);
+    assert!(e.is_none());
+    // A key of 16 bytes (AES-128's), and one that is not base64.
+    let (_, e) = quillo::crypto::secret_problems(env(&[("QUILLO_ENCRYPTION_KEYS", "k1:AAAAAAAAAAAAAAAAAAAAAA==")]));
+    assert!(e.as_deref().unwrap_or("").contains("is 16 bytes; AES-256 needs 32"), "{:?}", e);
+    let (_, e) = quillo::crypto::secret_problems(env(&[("QUILLO_ENCRYPTION_KEYS", "k1:not base64!")]));
+    assert!(e.is_some());
+    let (_, e) = quillo::crypto::secret_problems(env(&[("QUILLO_ENCRYPTION_KEYS", "k1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")]));
+    assert!(e.is_none(), "{:?}", e);
+}
+
+/// `quillo run` says so on stderr, and does not start with bad keys.
+#[test]
+fn quillo_run_checks_its_secrets_first() {
+    let d = std::env::temp_dir().join(format!("quillo-secrets-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "print(\"ran\")\n").unwrap();
+    let run = |env: &[(&str, &str)]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+            .arg("run")
+            .arg(&f)
+            .env_remove("QUILLO_SECRET")
+            .env_remove("QUILLO_SERVICE_SECRET")
+            .env_remove("LIMER_ADMIN_SECRET")
+            .env_remove("QUILLO_ENCRYPTION_KEYS")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (code, out, err) = run(&[("QUILLO_SECRET", "short")]);
+    assert_eq!((code, out.trim()), (Some(0), "ran"), "{}", err);
+    assert!(err.contains("QUILLO_SECRET is 5 bytes"), "{}", err);
+    let (code, out, err) = run(&[("QUILLO_ENCRYPTION_KEYS", "k1:AAAAAAAAAAAAAAAAAAAAAA==")]);
+    assert_eq!((code, out.as_str()), (Some(2), ""), "{}", err);
+    assert!(err.contains("QUILLO_ENCRYPTION_KEYS: key k1 is 16 bytes"), "{}", err);
+    let _ = std::fs::remove_dir_all(&d);
+}

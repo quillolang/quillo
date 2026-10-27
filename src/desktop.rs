@@ -50,6 +50,9 @@ pub fn main(file: &str, flags: &[String]) -> i32 {
         eprintln!("quillo: `app` serves its own window only; --host, --register and --service are for `run`");
         return 2;
     }
+    if !crate::secrets_ok() {
+        return 2;
+    }
     let token = match quillo::server::launch_token() {
         Ok(t) => t,
         Err(e) => {
