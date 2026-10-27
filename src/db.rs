@@ -493,8 +493,9 @@ fn from_sql(v: ValueRef, is_bool: bool) -> Value {
 }
 
 /// Binds `?` parameters from the arguments, or `:name` parameters from a
-/// single map argument. As with Postgres, every name needs a value and
-/// every key of the map must be a name in the query.
+/// single map argument. As with Postgres and MySQL, every name needs a
+/// value; keys the query does not use are left alone, so one map can serve
+/// queries put together from optional parts.
 fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> {
     if let [Value::Map(m)] = params {
         if stmt.parameter_count() > 0 && stmt.parameter_name(1).is_some() {
@@ -506,7 +507,7 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
                         stmt.raw_bind_parameter(i, to_sql(v)).map_err(|e| e.to_string())?;
                         bound[i - 1] = true;
                     }
-                    None => return Err(format!("the query has no parameter {}", name)),
+                    None => {}
                 }
             }
             if let Some(i) = bound.iter().position(|b| !b) {

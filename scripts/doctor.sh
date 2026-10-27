@@ -100,16 +100,16 @@ else opt "Chrome or Chromium: the browser tests are skipped without it" "install
 
 pg=${QUILLO_TEST_PG_BIN:-}
 if [ -z "$pg" ]; then
-    for d in $(echo "${PATH:-}" | tr ':' ' ') /usr/lib/postgresql/*/bin /opt/homebrew/opt/*/bin /usr/local/opt/*/bin; do
-        [ -x "$d/initdb" ] && [ -x "$d/pg_ctl" ] && { pg=$d; break; }
+    for dir in $(echo "${PATH:-}" | tr ':' ' ') /usr/lib/postgresql/*/bin /opt/homebrew/opt/*/bin /usr/local/opt/*/bin; do
+        [ -x "$dir/initdb" ] && [ -x "$dir/pg_ctl" ] && { pg=$dir; break; }
     done
 fi
 if [ -n "$pg" ] && [ -x "$pg/initdb" ]; then ok "PostgreSQL ($pg)"
 else opt "PostgreSQL (initdb, pg_ctl): its tests are skipped without it" "brew install postgresql, or apt-get install postgresql; or set QUILLO_TEST_PG_BIN"; fi
 
 my=""
-for d in ${QUILLO_TEST_MYSQL_BIN:-/opt/homebrew/bin /usr/local/bin /usr/bin /usr/sbin}; do
-    [ -x "$d/mariadbd" ] && [ -x "$d/mariadb-install-db" ] && { my=$d; break; }
+for dir in ${QUILLO_TEST_MYSQL_BIN:-/opt/homebrew/bin /usr/local/bin /usr/bin /usr/sbin}; do
+    [ -x "$dir/mariadbd" ] && [ -x "$dir/mariadb-install-db" ] && { my=$dir; break; }
 done
 if [ -n "$my" ]; then ok "MariaDB ($my)"
 else opt "MariaDB (mariadbd, mariadb-install-db): its tests are skipped without it" "brew install mariadb, or apt-get install mariadb-server; or set QUILLO_TEST_MYSQL_BIN"; fi
@@ -129,12 +129,28 @@ if [ "$missing" -gt 0 ]; then
 fi
 echo "Everything Quillo needs is here."
 
-[ "${1:-}" = "--build" ] || { echo "Next: cargo build --release   (or: sh scripts/doctor.sh --build)"; exit 0; }
+# A quillo on the PATH older than this checkout's build runs when you type
+# `quillo`, and fails on newer code as if the code were wrong.
+path_quillo() {
+    has quillo || return 0
+    on_path=$(command -v quillo)
+    [ "$on_path" -ef "$1" ] && return 0
+    if [ "$1" -nt "$on_path" ]; then
+        opt "an older quillo is on the PATH: $on_path ($("$on_path" --version 2>/dev/null))" "it runs when you type quillo, not this build: cargo install --path . replaces it"
+    fi
+}
+
+if [ "${1:-}" != "--build" ]; then
+    [ -x "$root/target/release/quillo" ] && path_quillo "$root/target/release/quillo"
+    echo "Next: cargo build --release   (or: sh scripts/doctor.sh --build)"
+    exit 0
+fi
 
 echo
 echo "Building (the first build takes a few minutes)"
 (cd "$root" && cargo build --release) || { printf "${r}The build failed: see the errors above.${n}\n"; exit 1; }
 quillo="$root/target/release/quillo"
+path_quillo "$quillo"
 
 echo
 echo "Running the sample app"

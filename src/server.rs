@@ -561,6 +561,30 @@ impl Interp {
         if let Some(name) = rest.strip_prefix("service/") {
             return crate::service::answer(self, name, req);
         }
+        // `markdown` in a page: made here, so that it is the server's HTML
+        // (see B.markdown in runtime.js). A call from the page's own site,
+        // as a server fn's is.
+        if rest == "markdown" {
+            if req.method != "POST" {
+                return plain(405, "method not allowed\n");
+            }
+            let ctype = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
+            if essence(ctype) != "application/json" {
+                return rpc_error(415, "send JSON (content-type: application/json)");
+            }
+            if cross_site(req) {
+                return rpc_error(403, "only the program's own pages make markdown here");
+            }
+            let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+                Ok(serde_json::Value::Array(a)) if (1..=2).contains(&a.len()) => a.iter().map(Value::from_json).collect(),
+                _ => return rpc_error(400, "the body must be a JSON array: [text, options]"),
+            };
+            return match crate::builtins::markdown(self, args, 0) {
+                Ok(v) => json_response(200, serde_json::json!({ "ok": v.display() })),
+                Err(Ctrl::Error(e)) => rpc_error(400, &e.msg),
+                Err(_) => rpc_error(500, "markdown failed"),
+            };
+        }
         let Some(name) = rest.strip_prefix("rpc/") else {
             return plain(404, "not found\n");
         };

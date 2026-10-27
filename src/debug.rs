@@ -140,6 +140,7 @@ pub fn expr_line(e: &Expr) -> u32 {
         | Expr::Index(_, _, l)
         | Expr::Match(_, _, l)
         | Expr::For(_, _, _, l)
+        | Expr::While(_, _, l)
         | Expr::Reply(_, _, l)
         | Expr::Html(_, l) => *l,
         // An operator's line is where the operator is: the left side may start earlier.
@@ -773,7 +774,7 @@ fn walk(e: &Expr, out: &mut Vec<u32>) {
                 walk(&a.body, out);
             }
         }
-        Expr::For(_, it, body, _) => {
+        Expr::For(_, it, body, _) | Expr::While(it, body, _) => {
             walk(it, out);
             walk(body, out);
         }

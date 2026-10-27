@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "url", "navigate", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -534,7 +534,34 @@ fn runtime_units() -> &'static Runtime {
                 },
             }
         }
-        let by_name = units.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        let mut by_name: HashMap<String, usize> = units.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        // `let a = null, b = 0`: each name it declares needs it (the commas
+        // between declarations, not those inside their values).
+        for (i, (_, text)) in units.iter().enumerate() {
+            let first = text.lines().next().unwrap_or("");
+            if !(first.starts_with("let ") || first.starts_with("const ")) {
+                continue;
+            }
+            let (mut depth, mut quote) = (0i32, None);
+            for (k, c) in first.char_indices() {
+                match (quote, c) {
+                    (Some(q), _) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'' | '`') => quote = Some(c),
+                    (None, '(' | '[' | '{') => depth += 1,
+                    (None, ')' | ']' | '}') => depth -= 1,
+                    (None, ';') if depth == 0 => break,
+                    (None, ',') if depth == 0 => {
+                        let rest = first[k + 1..].trim_start();
+                        let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+                        if !n.is_empty() && rest[n.len()..].trim_start().starts_with('=') {
+                            by_name.entry(n).or_insert(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         Runtime { preamble, units, by_name }
     })
 }
@@ -753,7 +780,7 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
                 expr_assigned(&a.body, out)
             }
         }
-        Expr::For(_, i, b, _) => {
+        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
             f(i);
             f(b)
         }
@@ -821,7 +848,7 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
                 each_expr_in(&a.body, f, fns)
             }
         }
-        Expr::For(_, i, b, _) => {
+        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
             each_expr_in(i, f, fns);
             each_expr_in(b, f, fns)
         }
@@ -1224,7 +1251,7 @@ impl<'a> Compiler<'a> {
                 if CLIENT_BUILTINS.contains(b) {
                     // `parallel` waits for what it calls, and `ask` for an
                     // answer: they are awaited.
-                    let r = (format!("B.{}", b), *b == "parallel" || *b == "ask" || *b == "receive");
+                    let r = (format!("B.{}", b), *b == "parallel" || *b == "ask" || *b == "receive" || *b == "markdown");
                     self.globals.insert(name.to_string(), r.clone());
                     Ok(r)
                 } else if b.starts_with("native:") {
@@ -1235,7 +1262,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "channel")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "channel")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -2177,6 +2204,12 @@ impl<'a> Compiler<'a> {
                 let (head, binds, b) = r?;
                 let inner = format!("const $out = [];\n{} {{ {}$out.push({}); }}\nreturn $out;\n", head, binds, b);
                 self.iife(&inner)
+            }
+            Expr::While(c, body, line) => {
+                self.line = *line;
+                let cv = self.expr(c)?;
+                let b = self.expr(body)?;
+                self.iife(&format!("while (W.truthy({})) {{ {}; }}\nreturn null;\n", cv, b))
             }
             Expr::Block(stmts) => self.block_expr(stmts)?,
             Expr::Lambda(def) => {

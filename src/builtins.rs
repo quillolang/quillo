@@ -55,6 +55,7 @@ pub fn install(env: &Env) {
         ("unwrap", unwrap),
         ("raw", raw),
         ("escape", escape_fn),
+        ("url_encode", url_encode),
         ("env", env_var),
         ("now", now),
         ("sleep", sleep),
@@ -111,10 +112,14 @@ pub fn install(env: &Env) {
         ("navigate", navigate),
         ("publish", publish),
         ("watch", watch),
+        ("unwatched", unwatched),
     ];
     for (name, f) in fns.iter().chain(crate::session::BUILTINS).chain(crate::i18n::BUILTINS).chain(crate::jobs::BUILTINS).chain(crate::stream::BUILTINS) {
         define(env, name, Value::Builtin(name, *f));
     }
+    let mut re = Map::new();
+    crate::re::install(&mut re);
+    define(env, "re", Value::map(re));
     let mut json = Map::new();
     json.insert("parse".into(), Value::Builtin("json.parse", json_parse));
     json.insert("stringify".into(), Value::Builtin("json.stringify", json_stringify));
@@ -606,6 +611,36 @@ fn raw(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 
 fn escape_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(Value::str(escape(&arg(&args, 0).display())))
+}
+
+/// `url_encode(v)`: `v` as text for a URL, every byte but letters, digits
+/// and `-_.~` written `%XX`. A map gives a query string (`a=1&b=x%20y`),
+/// leaving out keys whose value is null. The browser's gives the same.
+fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    fn enc(s: &str, out: &mut String) {
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    let mut out = String::new();
+    match arg(&args, 0) {
+        Value::Map(m) => {
+            for (k, v) in m.iter().filter(|(_, v)| !matches!(v, Value::Nil)) {
+                if !out.is_empty() {
+                    out.push('&');
+                }
+                enc(k, &mut out);
+                out.push('=');
+                enc(&v.display(), &mut out);
+            }
+        }
+        v => enc(&v.display(), &mut out),
+    }
+    Ok(Value::str(out))
 }
 
 fn env_var(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -1265,7 +1300,7 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// and `javascript:` links are blocked, so it is safe for what visitors
 /// write; `markdown(text, { html: true })` keeps the HTML, for text you
 /// wrote yourself.
-fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+pub(crate) fn markdown(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
     let s = s_arg(&args, 0, "markdown", line)?;
     // `{ html: true }` keeps the HTML in the text; `{ inline: true }` keeps
@@ -1457,6 +1492,17 @@ fn watch(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
         it.watch(a.display());
     }
     Ok(Value::Nil)
+}
+
+/// `unwatched(f)`: calls `f`; what it reads (tables, globals, `watch`es)
+/// does not make the running `live` loader run again. For data a loader
+/// needs but should not follow, such as who is signed in.
+fn unwatched(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let f = f_arg(&args, 0, "unwatched", line)?;
+    let outer = it.reads.take();
+    let r = it.call(&f, vec![], line);
+    it.reads = outer;
+    r
 }
 
 // ---- navigation --------------------------------------------------------

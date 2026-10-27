@@ -89,7 +89,7 @@ the browser and on the server.
 |---|---|
 | Null and booleans | `null`, `true`, `false` |
 | Numbers | `42`, `3.14`, `1e-9`, `6.02e23` |
-| Strings | `"strings"` or `'strings'`: plain text, so JSON is easy to write: `'{"a": 1}'` |
+| Strings | `"strings"` or `'strings'`: plain text, so JSON is easy to write: `'{"a": 1}'`. Escapes: `\n \t \r \0 \\ \" \' \` \$ \{ \}`, and `\u00e9` or `\u{1F600}` for any character |
 | Template strings | `` `Hello, ${name}` ``: the only strings that interpolate; they can span lines |
 | Lists | `[1, 2, 3]` |
 | Maps | `{ name: "Ada", "content-type": "text/plain" }`; `{ id }` is short for `{ id: id }` |
@@ -148,6 +148,27 @@ Most expressions read as they would in JavaScript. The differences:
   (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`).
 - `match`, `|`, patterns, `route`, `reply`, `state` and `with` effects have no
   JavaScript equivalent.
+- There is no `break` or `continue`: `return` leaves a loop early.
+- Regular expressions are strings given to `re.*` (`re.find_all(text, "@(\\w+)")`), not
+  `/.../` literals, and take only the syntax both sides read alike (see the standard
+  library).
+
+The built-in functions are free functions taking the list, map or string first (so
+`xs | map(f)` reads left to right), and some differ from JavaScript's methods:
+
+| JavaScript | Quillo |
+|---|---|
+| `xs.map(f)`, `xs.filter(f)`, `xs.find(f)` | `map(xs, f)`, `filter(xs, f)`, `find(xs, f)` (`null` when nothing matches) |
+| `xs.reduce(f, init)` | `reduce(xs, init, f)`: the start value comes before the function |
+| `Math.max(a, b)` | `max([a, b])`: `max`, `min` and `sum` take one list; `max([])` is `null` |
+| `s.replaceAll(a, b)` | `replace(s, a, b)` replaces every occurrence |
+| `s.indexOf(x)` | `index_of(s, x)`: `null`, not `-1`, when it is not there |
+| `parseInt(s)` | `int(s)`: an error value, not `NaN`, for text that is not a number |
+| `s.length` | `len(s)` counts characters: `len("é")` and `len("😀")` are 1 |
+| `xs.sort((a, b) => a.n - b.n)` | `sort_by(xs, (x) => x.n)`; `sort(xs)` sorts numbers as numbers |
+| `x.toFixed(2)` | `round(x, 2)` gives a number |
+| `s.match(/re/g)`, `s.replace(/re/g, ...)` | `re.find_all(s, "re")`, `re.replace(s, "re", ...)`; `re.test`, `re.find`, `re.split` |
+| `encodeURIComponent(s)` | `url_encode(s)`, which also encodes `!'()*`; `url_encode(map)` gives a query string |
 - Text in HTML follows JSX, but `class` (not `className`) and `@click` (not `onClick`).
 
 ### Variables, functions, views
@@ -263,9 +284,14 @@ n > 0 ? "pos" : "neg"
 if n > 0 { "pos" } else if n == 0 { "zero" } else { "neg" }   // also a value
 for x in [1, 2, 3] => x * x                 // a list: [1, 4, 9]
 for [key, value] in { a: 1 } => `${key}=${value}`
+while i < n { i += 1 }                      // null; `return` leaves it early
 match value { ... }
 return x
 ```
+
+`while` runs its block for as long as the condition holds (anything but `null`, `false`
+or an error, as with `if`). Numeric functions with `while` loops are compiled to machine
+code like those with `for` (see [Compiled numbers](#compiled-numbers)).
 
 ### Patterns
 
@@ -387,7 +413,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
 - The server renders it like a view, inside a `<quillo-island>` that carries its props
   and state. The page loads its bundle automatically, and the browser resumes the
-  component from that state, on the server's own elements (see below).
+  component from that state, on the server's own elements (see below). The island is
+  `display: contents`, so it does not change the layout, but it is still an element:
+  a child selector such as `.posts > li` does not reach the component's root element
+  (write `.posts li`, or give the component's root the class).
 - `state count = start` declares state, set once (`~count = start` is the short form).
   After that it is just `count`, and assigning to it (`count += 1`) updates what reads
   it, and nothing else. A component's code runs once. A `let` that reads state or props
@@ -536,7 +565,8 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 `url()` gives `{ path, query, hash }`: of the request on the server, and of the address
 bar in the browser, where what reads it follows it when it changes. Once a
 component has called it, clicks on same-site links inside components change the page
-without reloading; Back and Forward work. `navigate("/path")` does the same from code.
+without reloading; Back and Forward work. `navigate("/path")` does the same from code;
+on a page where no component has called `url()`, it loads that page as a link would.
 (Links with a modifier key, `target`, `download` or `data-reload` work as usual.)
 
 ```quillo
@@ -587,6 +617,29 @@ component Notes(initial: list) {
   on rollback.
 - `publish("topic")` announces anything else, and `watch("topic")` inside a loader
   subscribes to it.
+- What a loader reads includes what the functions it calls read: a `me()` that looks up
+  the `sessions` table makes every loader calling it run again when anyone signs in.
+  `unwatched(() => me())` calls it without following what it reads. Keep what changes
+  often but is not shown (view counts, last-seen times) in a table of its own, so
+  writing it wakes no page.
+- A write to a table wakes every loader that read the table, whatever rows it read:
+  a reply in one thread runs `load_posts` again on every open thread page. To follow
+  one thread only, read the table `unwatched` and watch a topic of its own, which the
+  code that writes publishes:
+
+  ```quillo
+  server fn load_posts(thread: int) {
+      watch(`thread:${thread}`)
+      unwatched(() => db.query("select * from posts where thread = ?", thread))
+  }
+
+  server fn reply_to(thread: int, text: str) {
+      db.exec("insert into posts (thread, text) values (?, ?)", thread, text)
+      publish(`thread:${thread}`)
+  }
+  ```
+- A loader runs again as a call from the page, with the page's cookies, so `session()`
+  inside it is the viewer's session.
 - The server renders the first value; the page keeps one WebSocket open
   (`/_quillo/live`, served by its own thread), down which the server streams each
   change to its topics, and calls the loader again. A WebSocket, because browsers
@@ -1236,6 +1289,19 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 
 - **General:** `print str int float len type_of`
 - **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
+- **Regular expressions:** `re.test(text, pattern)` (true or false), `re.find` (the first
+  match, or null), `re.find_all` (every match), `re.replace(text, pattern, with)` (every
+  match; `with` is text where `$1`, `$<name>`, `$0` and `$$` stand for the groups, the
+  match and `$`, or a function given the match) and `re.split`. A match is
+  `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
+  Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
+  matches line breaks too). They give the same answers on the server and in the
+  browser, so a pattern takes only what both read alike: characters, `.`, `[...]`,
+  `\d \w \s \b` (ASCII digits and word characters, as in JavaScript) and their capitals,
+  `^ $`, `(...)`, `(?:...)`, `(?<name>...)`, `|`, and `* + ? {n} {n,} {n,m}` (lazy with
+  `?`). Lookaround, backreferences and `\p{...}` are errors, found by `quillo check`
+  when the pattern is written in the call. In a string, a backslash is written twice:
+  `"\\d+"`.
 - **Translations:** `t(key, vars)`, `locale()`, `translations`, `locale_from` and
   `with_locale` (see [Translations](#translations)).
 - **Markdown:** `markdown(text)` gives HTML (CommonMark with tables, strikethrough and task
@@ -1243,7 +1309,12 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
   it is safe for what visitors write; `markdown(text, { html: true })` keeps the HTML,
   for text you wrote, and `markdown(text, { inline: true })` keeps only what is inside a
   line (bold, italic, code, links) for a headline or a caption: no paragraph around it, and
-  no headings or lists (their lines, broken by `<br>`).
+  no headings or lists (their lines, broken by `<br>`). It gives an `html` value, shown
+  as it is in markup; `str(markdown(text))` is its text, to store. In a component the
+  server makes it (a request to `/_quillo/markdown`, so the page shows the same HTML,
+  highlighting included), awaited like a `server fn`: call it in an event handler or a
+  `state` initializer, and keep the text in state:
+  `@input={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge`
 - **Math:** `abs round floor ceil sqrt pow`, and the three modules under
@@ -1251,8 +1322,10 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
   (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
-- **Web:** `raw escape env now file redirect respond json.parse json.stringify set_cookie
-  delete_cookie session set_session end_session`
+- **Web:** `raw escape url_encode env now file redirect respond json.parse json.stringify
+  set_cookie delete_cookie session set_session end_session`. `url_encode("a b")` is
+  `a%20b`, and `url_encode({ q, page: 2 })` is a query string (`q=...&page=2`, leaving
+  out keys whose value is null); in the browser too.
 - **Streaming:** `stream(f)` and `events(f)` answer as they go, `http.stream` reads
   another server's answer as it arrives, and `listen` and `receive` read streams in a
   page (see [Streaming](#streaming)).
@@ -1294,8 +1367,11 @@ Safety built in:
 - `quillo check` warns about SQL put together from values (`${x}` or `+`); pass them
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them), and named parameters with
-  `sql_param(name)` — both take only letters, digits and `_`, and SQL made of them,
-  text as written and choices between those is not warned about.
+  `sql_param(name)` — both take only letters, digits and `_`. SQL made of them, text as
+  written, choices between those (`if`, `match`), joins of them with `+`, and `let`s
+  holding them is not warned about:
+  `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
+  `"select * from posts order by " + order`.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 
@@ -1388,7 +1464,7 @@ db.open("mysql://user:pass@host:3306/app")          // MySQL or MariaDB (also ma
 db.exec("create table if not exists todos (id serial primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
 db.query("select * from todos where id > ?", 10)           // a list of maps
-db.one("select * from todos where id = :id", { id })       // a map, or null
+db.one("select * from todos where id = :id", { id })       // a map, or null; keys the SQL does not use are ignored
 db.one("insert into todos (text) values (?) returning id", text)
 db.transaction(() => { ... })                              // all or nothing; nests
 ```
@@ -1630,7 +1706,15 @@ defined, wrong argument counts and types (for builtins too), operators that can 
 work, division by zero, return and error types, effects, view and component props,
 component code that cannot run in a browser, route mistakes, and, as warnings, unused
 variables (name a variable `_x` to keep it) and calls like `last(xs)` where a variable of
-yours named `last` hides the builtin.
+yours named `last` hides the builtin. When a call to a function of your own named like a
+builtin (`notify`, `first`) has the wrong arguments, the error says so: this `notify` is
+the program's own, from line 1, which hides the builtin `notify`.
+
+After a syntax error, `quillo check`, `quillo run` and the language server say which
+quillo they are (`note: this is quillo 0.5.0, built 2026-10-27 at ...`): code written
+for a newer Quillo fails to parse in an older one, such as an old build left on the
+`PATH`. `scripts/doctor.sh` and `doctor.ps1` point out a `quillo` on the `PATH` older
+than the checkout's own build.
 
 It also knows what lists hold and which fields maps have, from what made them: a list
 or map literal, an annotation, `split`, `range`, `merge`, `set`. A lambda given to
@@ -1646,7 +1730,8 @@ not work: an argument `str | null` for a `str` parameter, `count + 1` with `coun
 null`, a `-> str` function that may return null. Checks narrow the type, as in
 TypeScript: after `if x == null { return ... }`, in `x != null ? f(x) : ""`, `x != null &&
 f(x)`, `if x { ... }`, and in the arms of a `match` after `null =>`. As in TypeScript,
-`xs[i]` is an item, not "or null" past the end. Editors get the same warnings with the
+`xs[i]` is an item, not "or null" past the end. A parameter with a default (`page: int =
+1`) is null only if its default may be. Editors get the same warnings with the
 language server's `initializationOptions: { "strictNull": true }`.
 
 ## Concurrency and reloading
@@ -1822,7 +1907,8 @@ up to date the moment something it shows changes.
 A top-level function that only does arithmetic on ints, floats and bools is compiled to
 machine code (with [Cranelift](https://cranelift.dev)) the second time it is called, for
 the types of the arguments it gets: `let`, assignment, `if`, `&&`, `||`, `return`,
-`for` over `range(...)` or `a..b`, and calls of other such functions, itself included.
+`for` over `range(...)` or `a..b`, `while`, and calls of other such functions, itself
+included.
 It then runs as it would have, only faster: `fib(32)` takes 11 ms (Node 11, Bun 21),
 and a loop of ten million steps 29 ms (Node and Bun take about 280 ms for the same
 loop, on doubles).

@@ -249,6 +249,13 @@ fn sql_built_from_values_is_a_warning() {
     clean("fn f(t: str, cols: list) with db = db.exec(`insert into ${sql_name(t)} (${sql_name(cols)}) values (${sql_param(cols)})`, {})");
     clean("fn f(t: str, k: str) with db = db.exec(`alter table ${sql_name(t)} add column ${sql_name(k)} ${k == \"n\" ? \"NUMERIC\" : \"TEXT\"}`)");
     one("fn f(t: str, k: str) with db = db.exec(`alter table ${sql_name(t)} add column ${k}`)", "SQL injection");
+    // Fixed text chosen by `match` or `if`, also through a `let`.
+    clean("fn f(sort: str) with db {\n  let order = match sort { \"new\" => \"t.created desc\", _ => \"score desc\" }\n  db.query(\"select * from t order by \" + order)\n}");
+    clean("fn f(sort: str) with db = db.query(\"select * from t order by \" + (sort == \"new\" ? \"created\" : \"score\") + \" desc\")");
+    clean("let order = \"score desc\"\nfn f() with db = db.query(`select * from t order by ${order}`)");
+    one("fn f(sort: str) with db {\n  let order = sort\n  db.query(\"select * from t order by \" + order)\n}", "SQL injection");
+    one("fn f(sort: str) with db {\n  let order = \"score\"\n  order = sort\n  db.query(\"select * from t order by \" + order)\n}", "SQL injection");
+    one("fn f(order: str) with db = db.query(\"select * from t \" + \"order by \" + order)", "SQL injection");
 }
 
 #[test]
@@ -346,6 +353,10 @@ fn strict_null_warns_where_null_does_not_work() {
     ok("fn f(x) = shout(x)");
     ok("fn f(a: int) = max([a, 1]) + 1");
     ok("fn f() = shout(split(\"a b\", \" \")[1])");
+    // A field with a default is never null, unless the default is.
+    ok("route GET /t ? { q: str = \"\" } = shout(q)");
+    ok("fn f(m) = match m {\n { q: str = \"x\" } => shout(q)\n _ => \"\"\n}");
+    warn("fn f(m) = match m {\n { q: str = null } => shout(q)\n _ => \"\"\n}", "argument `s` of `shout` may be null");
     // Without the option, none of this is reported.
     assert!(diags(&format!("{}fn f() = shout(maybe(2))", pre)).is_empty());
 }
@@ -386,4 +397,33 @@ fn service_calls_are_checked_against_what_the_service_offers() {
     std::fs::write(d.join("a.qwe"), "service b = \"b.qwe\"\nserver fn ping() = b.pong()\n").unwrap();
     std::fs::write(d.join("b.qwe"), "service a = \"a.qwe\"\nserver fn pong() = 1\n").unwrap();
     assert!(diags("service a = \"a.qwe\"\nfn f() = a.ping()").is_empty());
+}
+
+#[test]
+fn errors_say_when_a_name_is_a_keyword_or_hides_a_builtin() {
+    one("server fn reply(t: str) = t", "found `reply`, which is a keyword: pick another name");
+    one("let reply = 1", "`reply` is a keyword, so it cannot be a name here");
+    one("fn notify(user: int, text: str) = user\nfn f() = notify(\"Posted\", \"x\")", "hides the builtin `notify`");
+    // Hiding a builtin is allowed; only a call that goes wrong mentions it.
+    clean("fn first(xs: list) = xs[0]\nprint(first([1]))");
+    // A function of the program's own with no builtin of that name: no note.
+    let d = diags("fn post(text: str) = text\nfn f() = post(1)");
+    assert!(d.len() == 1 && !d[0].contains("hides"), "{:?}", d);
+}
+
+#[test]
+fn while_loops_are_checked() {
+    clean("fn f(n: int) {\n  let i = 0\n  while i < n { i += 1 }\n  i\n}");
+    one("fn f() {\n  while nope { }\n}", "unknown name `nope`");
+    // As with `if`: 0 is true.
+    one("fn f(n: int) {\n  while n { }\n}", "`n` counts as true even when it is 0");
+}
+
+#[test]
+fn patterns_written_out_are_checked() {
+    clean("fn f(s: str) = re.find_all(s, \"@(\\\\w+)\", \"i\")");
+    one("fn f(s: str) = re.test(s, \"(a\")", "`re.test`: `(` without its `)`");
+    one("fn f(s: str) = re.replace(s, \"a\", \"b\", \"x\")", "the flags are");
+    // A pattern made as the program runs is checked then.
+    clean("fn f(s: str, p: str) = re.test(s, p)");
 }

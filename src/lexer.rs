@@ -395,8 +395,35 @@ impl Lexer {
             'r' => '\r',
             '0' => '\0',
             '"' | '\'' | '`' | '\\' | '{' | '}' | '$' => e,
+            'u' => return self.unicode_escape(unterminated),
             other => return Err(QuilloError::new(format!("unknown escape `\\{}` in string", other), self.line)),
         })
+    }
+
+    /// `\u{1F600}` (1 to 6 hex digits) or `\u00e9` (exactly 4), after the `u`.
+    fn unicode_escape(&mut self, unterminated: &dyn Fn() -> QuilloError) -> Result<char, QuilloError> {
+        let line = self.line;
+        let bad = || QuilloError::new("bad escape: write `\\u{1F600}` or `\\u00e9`, in hex", line);
+        let mut hex = String::new();
+        if self.peek_char() == Some('{') {
+            self.bump();
+            loop {
+                match self.bump().ok_or_else(unterminated)? {
+                    '}' => break,
+                    c if c.is_ascii_hexdigit() && hex.len() < 6 => hex.push(c),
+                    _ => return Err(bad()),
+                }
+            }
+        } else {
+            for _ in 0..4 {
+                match self.bump().ok_or_else(unterminated)? {
+                    c if c.is_ascii_hexdigit() => hex.push(c),
+                    _ => return Err(bad()),
+                }
+            }
+        }
+        let n = u32::from_str_radix(&hex, 16).map_err(|_| bad())?;
+        char::from_u32(n).ok_or_else(|| QuilloError::new(format!("`\\u{{{}}}` is not a Unicode character", hex), line))
     }
 
     /// Lexes a "..." or '...' string, starting at the opening quote. Its

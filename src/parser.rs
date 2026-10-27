@@ -14,7 +14,7 @@ pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "route", "use", "return", "if", "then", "else", "match", "for", "in", "and", "or", "not",
-    "true", "false", "null", "nil", "reply", "as", "component",
+    "true", "false", "null", "nil", "reply", "as", "component", "while",
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
 
@@ -134,6 +134,7 @@ impl Parser {
         let t = self.next()?;
         match t.tok {
             Tok::Ident(s) if !KEYWORDS.contains(&s.as_str()) => Ok(s),
+            Tok::Ident(s) => Err(QuilloError::new(format!("expected {}, found `{}`, which is a keyword: pick another name", what, s), t.line)),
             other => Err(QuilloError::new(format!("expected {}, found {}", what, other.describe()), t.line)),
         }
     }
@@ -1066,6 +1067,7 @@ impl Parser {
                 "if" => self.parse_if(),
                 "match" => self.parse_match(line),
                 "for" => self.parse_for(line),
+                "while" => self.parse_while(line),
                 "fn" => Err(QuilloError::new(
                     "anonymous functions are written `(x) => x * 2` (or `x => x * 2`); `fn` is for named functions",
                     line,
@@ -1230,6 +1232,18 @@ impl Parser {
         Ok(Expr::Match(Box::new(subj), arms, line))
     }
 
+    fn parse_while(&mut self, line: u32) -> PResult<Expr> {
+        self.no_bare_arrow += 1;
+        let cond = self.parse_expr();
+        self.no_bare_arrow -= 1;
+        let cond = cond?;
+        if !self.at(&Tok::LBrace)? {
+            return self.err_at("expected `{` after the `while` condition");
+        }
+        let body = self.parse_block()?;
+        Ok(Expr::While(Box::new(cond), Box::new(body), line))
+    }
+
     fn parse_for(&mut self, line: u32) -> PResult<Expr> {
         let pat = self.parse_pattern()?;
         if !self.eat_kw("in")? {
@@ -1309,7 +1323,7 @@ impl Parser {
                 // A record, or another type of the program's own.
                 t if crate::ast::is_type_name(t) => Pattern::Type(k.clone()),
                 t if KEYWORDS.contains(&t) => {
-                    return Err(QuilloError::new(format!("unexpected keyword `{}` in pattern", t), line))
+                    return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", t), line))
                 }
                 _ => Pattern::Bind(k.clone()),
             }),

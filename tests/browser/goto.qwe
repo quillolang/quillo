@@ -1,0 +1,16 @@
+// navigate() on a page where nothing follows url(): the browser loads the
+// page it names. Driven by goto.js.
+
+component Search() {
+    state q = "rust & go"
+    <button id="go" @click={() => navigate(`/results?${url_encode({ q, page: 2, tag: null })}`)}>Search</button>
+}
+
+route GET / = <html><body><Search/></body></html>
+
+route GET /results {
+    let seen = json.stringify({ path: request.path, query: request.query })
+    <html><body><script>{raw(`window.__seen = ${seen}`)}</script><script>{raw(REPORT)}</script></body></html>
+}
+
+let REPORT = "addEventListener('load', () => document.body.setAttribute('data-result', JSON.stringify({ ...window.__seen, reloaded: performance.getEntriesByType('navigation')[0].type === 'navigate', errors: window.__quilloErrors || [] })))"

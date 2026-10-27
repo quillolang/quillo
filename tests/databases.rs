@@ -264,3 +264,32 @@ fn one_transaction_over_several_databases_with_sqlite() {
     assert!(eval(&mut it, "db.atomic([db, other], () => 1)").contains("one SQLite database at most"));
     assert!(eval(&mut it, "db.transaction(() => db.atomic([db], () => 1))").contains("inside a transaction"));
 }
+
+/// What a loader reads inside `unwatched` does not wake it; what it
+/// watches still does.
+#[test]
+fn a_loader_follows_only_what_it_watches() {
+    let d = dir("unwatched");
+    let src = r#"
+db.open("main.db")
+db.exec("create table if not exists posts (id integer primary key, thread int, text text)")
+db.exec("create table if not exists sessions (id text, user int)")
+let views = 0
+fn me() = db.one("select user from sessions limit 1")
+server fn load_posts(thread: int) {
+    let who = unwatched(() => me())
+    watch(`thread:${thread}`)
+    unwatched(() => db.query("select * from posts where thread = ?", thread))
+}
+server fn load_all() = [me(), views, db.query("select * from posts")]
+"#;
+    let mut it = load(&d, src);
+    let topics = |it: &mut Interp, f: &str, args: &str| {
+        let r = request(it, "POST", &format!("/_quillo/rpc/{}", f), &[("Content-Type", "application/json"), ("X-Quillo-Live", "1")], args);
+        let j: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        j["topics"].clone()
+    };
+    assert_eq!(topics(&mut it, "load_posts", "[6]"), serde_json::json!(["thread:6"]));
+    assert_eq!(topics(&mut it, "load_all", "[]"), serde_json::json!(["db:posts", "db:sessions", "var:views"]));
+    assert!(eval(&mut it, "unwatched(1)").contains("`unwatched` expects a function"), "{}", eval(&mut it, "unwatched(1)"));
+}

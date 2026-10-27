@@ -190,7 +190,11 @@ interpreter's exact answers and errors.
 
 ## Getting started
 
-Quillo builds with a stable Rust toolchain, 1.94 or later ([rustup](https://rustup.rs)),
+Each [release](https://github.com/quillolang/quillo/releases) has `quillo` built for
+Linux (x86-64 and ARM), macOS (Apple silicon and Intel) and Windows: unpack it and put
+`quillo` on your `PATH`. A `.sha256` beside each archive checks the download.
+
+To build it yourself: Quillo builds with a stable Rust toolchain, 1.94 or later ([rustup](https://rustup.rs)),
 and a C compiler ([what to install](https://quillolang.org/docs/install/) on macOS, Linux and
 Windows). `scripts/doctor.sh` checks for both, says what to install for anything
 missing, and lists what the tests use (Node, Chrome, PostgreSQL, MariaDB):

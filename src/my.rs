@@ -259,7 +259,7 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Params), String> {
                 }
                 let name = &sql[start..end];
                 let m = named.as_ref().unwrap();
-                values.push(to_my(m.get(name).unwrap_or(&Value::Nil))?);
+                values.push(to_my(m.get(name).ok_or_else(|| format!("no value for :{}", name))?)?);
                 out.push('?');
                 i = end;
                 continue;
@@ -290,5 +290,11 @@ mod tests {
         assert!(matches!(p, Params::Positional(v) if v.len() == 3));
         let (sql, _) = translate("select ? + ?", &[Value::Int(1), Value::Int(2)]).unwrap();
         assert_eq!(sql, "select ? + ?");
+        // Every name needs a value; keys the query does not use are ignored.
+        let mut m = Map::new();
+        m.insert("a".into(), Value::Int(1));
+        m.insert("z".into(), Value::Int(2));
+        assert!(translate("select :a", &[Value::map(m.clone())]).is_ok());
+        assert_eq!(translate("select :a + :b", &[Value::map(m)]).err().unwrap(), "no value for :b");
     }
 }

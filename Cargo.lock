@@ -2879,6 +2879,7 @@ dependencies = [
  "postgres",
  "psm",
  "pulldown-cmark",
+ "regex",
  "rusqlite",
  "rustls",
  "serde_json",

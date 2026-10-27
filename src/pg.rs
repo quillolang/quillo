@@ -582,12 +582,6 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
             }
         });
         if uses_names {
-            for k in m.keys() {
-                let k = k.trim_start_matches([':', '@', '$']);
-                if !names.iter().any(|n| n == k) {
-                    return Err(format!("the query has no parameter :{}", k));
-                }
-            }
             let mut values = Vec::new();
             for n in &names {
                 let v = m.get(n.as_str()).or_else(|| m.get(format!(":{}", n).as_str())).cloned();

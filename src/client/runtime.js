@@ -696,7 +696,8 @@ B.parallel = meta(async (...fs) => {
   return Promise.all(fs.map((f, i) => F(f, "parallel", i + 1)()));
 }, "parallel", null);
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
-B.str = meta((v) => display(v), "str", null);
+// HTML made from text (by raw or markdown) is that text, as on the server.
+B.str = meta((v) => v instanceof Html && v.text !== undefined ? v.text : display(v), "str", null);
 B.int = meta((v) => {
   if (isInt(v)) return v;
   if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
@@ -791,7 +792,24 @@ B.merge = meta((a, b) => Object.assign({}, M(a, "merge"), M(b, "merge", 2)), "me
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);
-B.raw = meta((v) => rawHtml(display(v)), "raw", null);
+const textHtml = (s) => Object.assign(rawHtml(s), { text: s });
+B.raw = meta((v) => textHtml(display(v)), "raw", null);
+// markdown(text, options): the server makes it (/_quillo/markdown), so a page
+// shows the same HTML as the server would, highlighting included; awaited,
+// like a server fn, and as one, an error value when it cannot be reached.
+B.markdown = meta(async (s, o) => {
+  S(s, "markdown");
+  if (!isNil(o) && !isMap(o)) fail(`\`markdown\` expects options as a map, got ${typeName(o)}`);
+  let r, body = null;
+  try {
+    r = await fetch(BASE + "/_quillo/markdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify([s, isNil(o) ? null : toJSON(o)]) });
+    body = await r.json();
+  } catch (e) {
+    return new Err(`markdown could not be made: ${e.message}`);
+  }
+  if (!r.ok || typeof body.ok !== "string") return new Err(`markdown could not be made (${r.status})${body && body.error ? ": " + body.error : ""}`);
+  return textHtml(body.ok);
+}, "markdown", null);
 // ask(message, options) and notify(message, options): a dialog that waits
 // for an answer, and a note that goes by itself. They are markup with q-
 // classes in a host on the page (#q-notices), laid out and styled by the
@@ -971,6 +989,11 @@ const HL = (() => {
 B.highlight = meta((code, lang) => rawHtml(HL(display(code), lang == null ? "" : display(lang))), "highlight", null);
 
 B.escape = meta((v) => display(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]), "escape", null);
+// url_encode(v): as the server's, so links built on either side match.
+const urlPart = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+B.url_encode = meta((v) => isMap(v)
+  ? Object.keys(v).filter((k) => !isNil(v[k])).map((k) => urlPart(k) + "=" + urlPart(display(v[k]))).join("&")
+  : urlPart(display(v)), "url_encode", null);
 B.now = meta(() => Date.now(), "now", null);
 B.random = meta(() => Math.random(), "random", null);
 B.random_int = meta((lo, hi) => {
@@ -1086,6 +1109,227 @@ B.__record = meta((name, v) => {
   if (r.ok) return r.v;
   return new Err(`${name}: ${ownWhyText(ownWhyHere(r.w, { t: td.a ? td.a.t : name }, v))}`);
 }, "__record", null);
+
+// ---- re (src/re.rs, the same matches) ---------------------------------------
+// Patterns are what JavaScript (with the u flag) and the server's regex
+// crate mean the same by; reCheck turns away the rest as translate in
+// re.rs does, with the same reasons. Positions count characters.
+
+function reCheck(p) {
+  const n = p.length;
+  const names = [];
+  const hex = (s) => /^[0-9A-Fa-f]+$/.test(s);
+  // \u escapes: [code point, length] (a surrogate pair counts as one).
+  const unicode = (i) => {
+    const bad = "`\\u` takes four hex digits or {hex}, as in \\u00e9 or \\u{1F600}";
+    if (p[i + 2] === "{") {
+      const end = p.indexOf("}", i + 3);
+      const h = end < 0 ? "" : p.slice(i + 3, end);
+      if (h.length < 1 || h.length > 6 || !hex(h) || parseInt(h, 16) > 0x10ffff || (parseInt(h, 16) >= 0xd800 && parseInt(h, 16) < 0xe000)) throw bad;
+      return [parseInt(h, 16), end + 1 - i];
+    }
+    const h = p.slice(i + 2, i + 6);
+    if (h.length !== 4 || !hex(h)) throw bad;
+    const hi = parseInt(h, 16);
+    if (hi >= 0xd800 && hi < 0xdc00) {
+      const l = p.slice(i + 8, i + 12);
+      if (p[i + 6] === "\\" && p[i + 7] === "u" && l.length === 4 && hex(l) && parseInt(l, 16) >= 0xdc00 && parseInt(l, 16) < 0xe000) {
+        return [0x10000 + ((hi - 0xd800) << 10) + (parseInt(l, 16) - 0xdc00), 12];
+      }
+      throw "half of a surrogate pair on its own";
+    }
+    if (hi >= 0xdc00 && hi < 0xe000) throw "half of a surrogate pair on its own";
+    return [hi, 6];
+  };
+  // An escape: [the character it stands for, or null for a set; length; assertion].
+  const escape = (i, inClass) => {
+    if (i + 1 >= n) throw "the pattern ends with `\\`";
+    const e = p[i + 1];
+    if ("dDwWsS".includes(e)) return [null, 2, false];
+    if (e === "b" || e === "B") { if (inClass) throw "`\\b` cannot go in [...]"; return [null, 2, true]; }
+    const plain = { n: 10, t: 9, r: 13, f: 12, v: 11 };
+    if (e in plain) return [plain[e], 2, false];
+    if (e === "0" && !/[0-9]/.test(p[i + 2] || "")) return [0, 2, false];
+    if (e === "x") {
+      const h = p.slice(i + 2, i + 4);
+      if (h.length !== 2 || !hex(h)) throw "`\\x` takes two hex digits, as in \\x41";
+      return [parseInt(h, 16), 4, false];
+    }
+    if (e === "u") { const [c, len] = unicode(i); return [c, len, false]; }
+    if (/[1-9k]/.test(e)) throw "backreferences (\\1, \\k<name>) are not supported";
+    if (e === "p" || e === "P") throw "Unicode classes (\\p{...}) are not supported";
+    if ("^$\\.*+?()[]{}|/".includes(e) || (e === "-" && inClass)) return [e.codePointAt(0), 2, false];
+    throw `\`\\${String.fromCodePoint(p.codePointAt(i + 1))}\` is not one of the escapes patterns have`;
+  };
+  const cls = (i) => {
+    let j = i + 1;
+    if (p[j] === "^") j++;
+    if (p[j] === "]") throw "an empty class `[]` matches nothing: write `\\[\\]` for the brackets";
+    const item = () => {
+      if (p[j] === "\\") { const [c, len] = escape(j, true); j += len; return c; }
+      if (p[j] === "[") throw "write `\\[` for a `[` in [...]";
+      const c = p[j];
+      if ((c === "&" || c === "~" || c === "-") && p[j + 1] === c) throw `write \`${c}\\${c}\` for two \`${c}\` in [...]`;
+      const cp = p.codePointAt(j);
+      j += cp > 0xffff ? 2 : 1;
+      return cp;
+    };
+    for (;;) {
+      if (j >= n) throw "`[` without its `]`";
+      if (p[j] === "]") return j + 1 - i;
+      const lo = item();
+      if (p[j] === "-" && j + 1 < n && p[j + 1] !== "]") {
+        j++;
+        const hi = item();
+        if (lo === null || hi === null) throw "a range in [...] is between two characters, not \\d, \\w or \\s";
+        if (lo > hi) throw "a range in [...] goes from the lower character to the higher";
+      }
+    }
+  };
+  const quantifier = (i) => {
+    if (p[i] !== "{") return 1;
+    const lone = "`{` on its own: write `\\{`, or repeat with {n}, {n,} or {n,m}";
+    const m = /^\{(\d+)(,(\d*))?\}/.exec(p.slice(i));
+    if (!m) throw lone;
+    const lo = Number(m[1]), hi = m[2] === undefined ? lo : m[3] === "" ? null : Number(m[3]);
+    if (lo > 1000 || (hi !== null && hi > 1000)) throw "repeating more than 1000 times is not supported";
+    if (hi !== null && hi < lo) throw "in {n,m}, n is more than m";
+    return m[0].length;
+  };
+  try {
+    let i = 0, atom = false, depth = 0;
+    while (i < n) {
+      const c = p[i];
+      if (c === "\\") { const [, len, assertion] = escape(i, false); i += len; atom = !assertion; }
+      else if (c === "[") { i += cls(i); atom = true; }
+      else if (c === "(") {
+        if (p[i + 1] === "?") {
+          const a = p[i + 2], b = p[i + 3];
+          if (a === ":") i += 3;
+          else if (a === "<" && b !== undefined && b !== "=" && b !== "!") {
+            const m = /^[A-Za-z0-9_]*/.exec(p.slice(i + 3))[0];
+            if (m === "" || /^[0-9]/.test(m) || p[i + 3 + m.length] !== ">") throw "a group's name is letters, digits and `_`, as in (?<name>...)";
+            if (names.includes(m)) throw `two groups are named \`${m}\``;
+            names.push(m);
+            i += 4 + m.length;
+          } else if (a === "=" || a === "!" || a === "<") throw "lookahead and lookbehind ((?= (?! (?<= (?<!) are not supported";
+          else throw "flags go in the last argument (\"i\", \"m\", \"s\"), not in the pattern";
+        } else i++;
+        depth++;
+        atom = false;
+      } else if (c === ")") { if (depth === 0) throw "`)` without its `(`"; depth--; i++; atom = true; }
+      else if (c === "|" || c === "^" || c === "$") { i++; atom = false; }
+      else if ("*+?{".includes(c)) {
+        const len = quantifier(i);
+        if (!atom) throw `nothing to repeat before \`${c}\``;
+        i += len;
+        if (p[i] === "?") i++;
+        atom = false;
+      } else if (c === "]" || c === "}") throw `\`${c}\` on its own: write \`\\${c}\``;
+      else { i += p.codePointAt(i) > 0xffff ? 2 : 1; atom = true; }
+    }
+    if (depth > 0) throw "`(` without its `)`";
+  } catch (why) {
+    if (typeof why === "string") return why;
+    throw why;
+  }
+  return null;
+}
+
+const reCache = new Map();
+function reOf(p, flags, f, at) {
+  S(p, f, 2);
+  flags = isNil(flags) ? "" : S(flags, f, at);
+  const key = flags + "/" + p;
+  let r = reCache.get(key);
+  if (!r) {
+    if ([...flags].some((c, k) => !"ims".includes(c) || flags.indexOf(c) !== k)) {
+      fail(`\`${f}\`: the flags are \`i\` (any case), \`m\` (^ and $ at each line) and \`s\` (. matches line breaks), each once; got "${flags}"`);
+    }
+    const why = reCheck(p);
+    if (why) fail(`\`${f}\`: ${why}`);
+    if (reCache.size >= 256) reCache.clear();
+    r = new RegExp(p, "gu" + flags);
+    reCache.set(key, r);
+  }
+  return r;
+}
+
+// The matches from left to right (as matchAll; after an empty one, a
+// character later), with positions in UTF-16 (i, j) and in characters.
+function reAll(s, r, most) {
+  const out = [];
+  let pos = 0, at = 0, chars = 0;
+  const count = (to) => { for (; at < to; at++) { const c = s.charCodeAt(at); if (!(c >= 0xdc00 && c < 0xe000 && at > 0 && s.charCodeAt(at - 1) >= 0xd800 && s.charCodeAt(at - 1) < 0xdc00)) chars++; } return chars; };
+  while (pos <= s.length && out.length < most) {
+    r.lastIndex = pos;
+    const m = r.exec(s);
+    if (!m) break;
+    const i = m.index, j = i + m[0].length;
+    out.push({ m, i, j, start: count(i), end: count(j) });
+    pos = j > i ? j : j + (s.codePointAt(j) > 0xffff ? 2 : 1);
+  }
+  return out;
+}
+
+const reValue = (x) => ({
+  text: x.m[0], start: x.start, end: x.end,
+  groups: x.m.slice(1).map((g) => g === undefined ? null : g),
+  named: Object.fromEntries(Object.entries(x.m.groups || {}).map(([k, g]) => [k, g === undefined ? null : g])),
+});
+
+function reExpand(t, x) {
+  const groups = x.m.length - 1;
+  const names = Object.keys(x.m.groups || {});
+  let out = "";
+  for (let k = 0; k < t.length; k++) {
+    const c = t[k];
+    if (c !== "$") { out += c; continue; }
+    const d = t[k + 1];
+    if (d === "$") { out += "$"; k++; }
+    else if (d !== undefined && d >= "0" && d <= "9") {
+      const g = Number(d);
+      if (g > groups) fail(`\`re.replace\`: \`$${g}\`, but the pattern has ${groups} group${groups === 1 ? "" : "s"}`);
+      out += x.m[g] ?? "";
+      k++;
+    } else if (d === "<") {
+      const end = t.indexOf(">", k);
+      if (end < 0) fail("`re.replace`: `$<` without its `>`");
+      const name = t.slice(k + 2, end);
+      if (!names.includes(name)) fail(`\`re.replace\`: no group is named \`${name}\``);
+      out += (x.m.groups && x.m.groups[name]) ?? "";
+      k = end;
+    } else out += "$";
+  }
+  return out;
+}
+
+B.re = {
+  test: (s, p, flags) => { S(s, "re.test"); return reAll(s, reOf(p, flags, "re.test", 3), 1).length > 0; },
+  find: (s, p, flags) => { S(s, "re.find"); const [x] = reAll(s, reOf(p, flags, "re.find", 3), 1); return x ? reValue(x) : null; },
+  find_all: (s, p, flags) => { S(s, "re.find_all"); return reAll(s, reOf(p, flags, "re.find_all", 3), Infinity).map(reValue); },
+  replace: (s, p, w, flags) => {
+    S(s, "re.replace");
+    const r = reOf(p, flags, "re.replace", 4);
+    const fn = typeof w === "function";
+    want(fn || typeof w === "string", "re.replace", "what to put in (a str or a function)", 3, w);
+    if (fn) denied(w);
+    let out = "", last = 0;
+    for (const x of reAll(s, r, Infinity)) {
+      out += s.slice(last, x.i) + (fn ? display(cb(w, "re.replace", reValue(x))) : reExpand(w, x));
+      last = x.j;
+    }
+    return out + s.slice(last);
+  },
+  split: (s, p, flags) => {
+    S(s, "re.split");
+    const out = [];
+    let last = 0;
+    for (const x of reAll(s, reOf(p, flags, "re.split", 3), Infinity)) { out.push(s.slice(last, x.i)); last = x.j; }
+    out.push(s.slice(last));
+    return out;
+  },
+};
 
 // ---- math, stats, vec (src/numeric.rs, the same answers) ------------------
 // The browser cannot tell 2 from 2.0, so ints are numbers that are whole.
@@ -2891,8 +3135,12 @@ function navStart() {
 }
 
 function navigate(to) {
-  navStart();
   const full = withBase(to);
+  // Nothing on the page follows url(): load the page there.
+  if (!Nav.on) {
+    location.assign(full);
+    return null;
+  }
   if (full !== location.pathname + location.search + location.hash) history.pushState(null, "", full);
   window.scrollTo(0, 0);
   navChanged();

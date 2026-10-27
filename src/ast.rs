@@ -60,6 +60,8 @@ pub enum Expr {
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     Match(Box<Expr>, Vec<Arm>, u32),
     For(Pattern, Box<Expr>, Box<Expr>, u32),
+    /// `while cond { body }`: runs the body while the condition holds; null.
+    While(Box<Expr>, Box<Expr>, u32),
     Block(Vec<Stmt>),
     Lambda(Arc<FnDef>),
     /// `reply status [body]`: finish the current request immediately.

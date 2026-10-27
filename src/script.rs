@@ -16,7 +16,7 @@ use crate::value::*;
 const SAFE: &[&str] = &[
     "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains", "starts_with", "ends_with",
     "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "enumerate", "keys", "values", "get", "has",
-    "set", "remove", "merge", "err", "is_err", "unwrap", "escape", "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten",
+    "set", "remove", "merge", "err", "is_err", "unwrap", "escape", "url_encode", "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten",
     "zip", "take", "drop", "index_of", "map", "filter", "find", "any", "all", "reduce", "sort_by", "count", "group_by",
 ];
 
@@ -53,7 +53,7 @@ fn forbidden(e: &Expr) -> Option<&'static str> {
         Expr::Call(f, args, _) => forbidden(f).or_else(|| all(args)),
         Expr::If(c, a, b) => forbidden(c).or_else(|| forbidden(a)).or_else(|| b.as_deref().and_then(forbidden)),
         Expr::Match(x, arms, _) => forbidden(x).or_else(|| arms.iter().find_map(|a| a.guard.as_ref().and_then(forbidden).or_else(|| forbidden(&a.body)))),
-        Expr::For(_, it, body, _) => forbidden(it).or_else(|| forbidden(body)),
+        Expr::For(_, it, body, _) | Expr::While(it, body, _) => forbidden(it).or_else(|| forbidden(body)),
         Expr::Block(stmts) => stmts.iter().find_map(forbidden_stmt),
         Expr::Lambda(def) => def.params.iter().find_map(|p| p.default.as_ref().and_then(forbidden)).or_else(|| forbidden(&def.body)),
         Expr::Reply(..) => Some("a script cannot reply"),

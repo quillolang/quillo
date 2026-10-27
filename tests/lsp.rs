@@ -280,3 +280,37 @@ fn text_with_a_components_name_is_not_the_component() {
     c.notify("exit", Value::Null);
     assert!(c.child.wait().unwrap().success());
 }
+
+/// Text that does not parse may be for a newer Quillo than the server
+/// running: its error says which quillo that is.
+#[test]
+fn a_syntax_error_says_which_quillo_read_it() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-syntax-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.qwe");
+    std::fs::write(&file, "let x = (\n").unwrap();
+    let uri = format!("file://{}", file.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("initialized", json!({}));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "let x = (\n" } }));
+    let d = loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            break m["params"]["diagnostics"].clone();
+        }
+    };
+    let msg = d[0]["message"].as_str().unwrap();
+    assert!(msg.contains("this is quillo ") && msg.contains("newer Quillo"), "{}", msg);
+    // A mistake that parses says nothing of the sort.
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "print(nope)\n" }] }));
+    let d = loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            break m["params"]["diagnostics"].clone();
+        }
+    };
+    assert!(!d[0]["message"].as_str().unwrap().contains("this is quillo"), "{}", d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

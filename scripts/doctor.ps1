@@ -114,7 +114,21 @@ if ($script:missing -gt 0) {
     exit 1
 }
 Write-Host 'Everything Quillo needs is here.'
+
+# A quillo on the PATH older than this checkout's build runs when you type
+# `quillo`, and fails on newer code as if the code were wrong.
+function PathQuillo($built) {
+    $onPath = Get-Command quillo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $onPath -or -not (Test-Path $built)) { return }
+    $p = $onPath.Source
+    if ((Resolve-Path $p).Path -eq (Resolve-Path $built).Path) { return }
+    if ((Get-Item $built).LastWriteTime -gt (Get-Item $p).LastWriteTime) {
+        Opt "an older quillo is on the PATH: $p ($(& $p --version 2>$null))" 'it runs when you type quillo, not this build: cargo install --path . replaces it'
+    }
+}
+
 if (-not $Build) {
+    PathQuillo (Join-Path $root 'target\release\quillo.exe')
     Write-Host 'Next: cargo build --release   (or: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build)'
     exit 0
 }
@@ -127,6 +141,7 @@ $built = $LASTEXITCODE -eq 0
 Pop-Location
 if (-not $built) { Write-Host 'The build failed: see the errors above.' -ForegroundColor Red; exit 1 }
 $quillo = Join-Path $root 'target\release\quillo.exe'
+PathQuillo $quillo
 
 Write-Host ''
 Write-Host 'Running the sample app'

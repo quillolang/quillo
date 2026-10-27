@@ -552,6 +552,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("unwrap", "any", "any"),
     ("raw", "any", "html"),
     ("escape", "any", "str"),
+    ("url_encode", "any", "str"),
     ("env", "str, any=", "any"),
     ("now", "", "int"),
     ("sleep", "num", "null"),
@@ -615,6 +616,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("navigate", "str", "null"),
     ("publish", "any...", "null"),
     ("watch", "any...", "null"),
+    ("unwatched", "fn", "any"),
     ("json.parse", "str", "any"),
     ("json.stringify", "any, any=", "str"),
     ("db.open", "str | fn, map=", "null | error(str)"),
@@ -753,6 +755,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("vec.diff", "list | null", "list"),
     ("vec.argmin", "list | null", "int | null"),
     ("vec.argmax", "list | null", "int | null"),
+    ("re.test", "str, str, str | null=", "bool"),
+    ("re.find", "str, str, str | null=", "map | null"),
+    ("re.find_all", "str, str, str | null=", "list"),
+    ("re.replace", "str, str, str | fn, str | null=", "str"),
+    ("re.split", "str, str, str | null=", "list"),
     ("vec.argsort", "list | null, bool=", "list"),
     ("vec.clip", "list, num | null, num | null=", "list"),
     ("vec.abs", "list", "list"),
@@ -773,15 +780,15 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
-    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "crypto.sha256",
+    &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
-      "delete_cookie", "session", "set_session", "end_session", "markdown", "translations", "locale_from", "with_locale",
+      "delete_cookie", "session", "set_session", "end_session", "translations", "locale_from", "with_locale",
       "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
 
 fn parse_t(s: &str) -> T {
@@ -1028,6 +1035,9 @@ pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: Vec<Symbol>,
     pub references: Vec<Reference>,
+    /// Where a file could not be parsed (file, line): perhaps it is for a
+    /// newer Quillo.
+    pub syntax_errors: Vec<(String, u32)>,
 }
 
 impl Analysis {
@@ -1125,7 +1135,10 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             c.run(order);
             c.state_details();
         }
-        Err(e) => c.diag_at(main, e.line, Severity::Error, e.msg),
+        Err(e) => {
+            c.out.syntax_errors.push((main.to_string(), e.line));
+            c.diag_at(main, e.line, Severity::Error, e.msg)
+        }
     }
     c.finish()
 }
@@ -1187,6 +1200,9 @@ struct Checker {
     /// Checking top-level code as it runs (not a function or route body).
     sequential: bool,
     assigned: HashSet<String>,
+    /// `let`s (file, line, name) never reassigned whose value is SQL text
+    /// a program may put together (see `sql_safe`).
+    sql_texts: HashSet<(Arc<str>, u32, String)>,
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
@@ -1244,6 +1260,7 @@ impl Checker {
             quiet: 0,
             sequential: true,
             assigned: HashSet::new(),
+            sql_texts: HashSet::new(),
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
@@ -1372,7 +1389,10 @@ impl Checker {
                 match text {
                     Ok(src) => match Parser::new(&src).parse_program() {
                         Ok(sub) => self.expand(Arc::new(sub), fname, base, seen, order),
-                        Err(e) => self.diag_at(fname, e.line, Severity::Error, e.msg),
+                        Err(e) => {
+                            self.out.syntax_errors.push((fname.to_string(), e.line));
+                            self.diag_at(fname, e.line, Severity::Error, e.msg)
+                        }
                     },
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
                 }
@@ -1480,6 +1500,7 @@ impl Checker {
                     self.line = *line;
                     self.scopes.clear();
                     let t = self.expr(e);
+                    self.note_sql_text(p, e);
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
                     for (n, t, sig) in binds {
@@ -1543,6 +1564,23 @@ impl Checker {
                 self.globals.insert(name.to_string(), Var { kind: Kind::Global, ..v });
             }
         }
+    }
+
+    /// Remembers `let order = match sort { ... }` when its value is SQL
+    /// text a program may put together, so SQL built with `order` is not
+    /// warned about.
+    fn note_sql_text(&mut self, p: &Pattern, e: &Expr) {
+        if let Pattern::Bind(n) = p {
+            if !self.assigned.contains(n) && sql_safe(e, &|v| self.sql_var(v)) {
+                self.sql_texts.insert((self.file.clone(), self.line, n.clone()));
+            }
+        }
+    }
+
+    /// Whether `name`, where it is used, is a `let` noted by `note_sql_text`.
+    fn sql_var(&self, name: &str) -> bool {
+        let v = self.scopes.iter().rev().find_map(|s| s.get(name)).or_else(|| self.globals.get(name));
+        v.is_some_and(|v| v.kind != Kind::Param && self.sql_texts.contains(&(v.file.clone(), v.line, name.to_string())))
     }
 
     fn record(&mut self, name: &str, v: &Var) {
@@ -1845,6 +1883,7 @@ impl Checker {
             Stmt::Let(p, e, line) => {
                 self.line = *line;
                 let t = self.expr(e);
+                self.note_sql_text(p, e);
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
                 for (n, t, sig) in binds {
@@ -2193,13 +2232,13 @@ impl Checker {
             Pattern::Record(fs) => {
                 for f in fs {
                     let mut ft = T::ANY;
-                    if let Some(d) = &f.default {
-                        self.expr(d);
-                    }
+                    let dt = f.default.as_ref().map(|d| self.expr(d));
                     if f.pat.is_type_test() {
                         ft = type_test_t(&f.pat);
-                        if f.default.is_some() {
-                            ft = ft.union(T::of(NIL));
+                        // A missing or null field takes the default, so it
+                        // is null only if the default may be.
+                        if let Some(dt) = dt {
+                            ft = ft.union(dt);
                         }
                     }
                     let before = out.len();
@@ -2436,6 +2475,15 @@ impl Checker {
                 self.expr(body);
                 self.pop();
                 T::of(LIST)
+            }
+            Expr::While(c, body, line) => {
+                let ct = self.expr(c);
+                self.line = *line;
+                self.js_truthiness(ct, c, Truth::Cond);
+                let mut yes = Vec::new();
+                self.facts(c, true, &mut yes);
+                self.under(yes, |s| s.expr(body));
+                T::of(NIL)
             }
             Expr::Block(stmts) => {
                 self.push();
@@ -2847,6 +2895,19 @@ impl Checker {
         if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
             self.browser_forbidden(&format!("`{}`", full));
         }
+        // A pattern written out is checked now, not when it runs.
+        if m == "re" {
+            let lit = |i: usize| match args.get(i) {
+                Some(Expr::Lit(Lit::Str(s))) => Some(&**s),
+                _ => None,
+            };
+            let flags_at = if f == "replace" { 3 } else { 2 };
+            if let (Some(p), true) = (lit(1), args.get(flags_at).is_none() || lit(flags_at).is_some()) {
+                if let Err(e) = crate::re::compile(p, lit(flags_at).unwrap_or("")) {
+                    self.error(format!("`{}`: {}", full, e));
+                }
+            }
+        }
         let sig = Arc::new(Sig::builtin(&full, p, r));
         self.apply(T::of(FN), Some(sig), argts, args, &full)
     }
@@ -2868,21 +2929,21 @@ impl Checker {
         }
         let n = sig.params.len();
         if args.len() > n && !sig.variadic {
-            self.error(format!("`{}` takes {} argument{}, got {}", name, n, if n == 1 { "" } else { "s" }, args.len()));
+            self.error(format!("`{}` takes {} argument{}, got {}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), hides(&sig, name)));
         }
         for (i, p) in sig.params.iter().enumerate() {
             let what = || if sig.builtin { format!("argument {}", i + 1) } else { format!("argument `{}`", p.name) };
             match args.get(i) {
                 None if !p.optional => {
-                    self.error(format!("missing argument `{}` in call to `{}`", p.name, name));
+                    self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
                     break;
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 => {
-                    self.error(format!("{} of `{}` must be {}, got {}", what(), name, bits_text(p.ty), bits_text(a.bits)));
+                    self.error(format!("{} of `{}` must be {}, got {}{}", what(), name, bits_text(p.ty), bits_text(a.bits), hides(&sig, name)));
                 }
                 Some(a) if p.annotated => {
                     if let Some(why) = mismatch(*a, p.full) {
-                        self.error(format!("{} of `{}` {}", what(), name, why));
+                        self.error(format!("{} of `{}` {}{}", what(), name, why, hides(&sig, name)));
                     } else if self.strict_null && !a.vague() && a.bits & NIL != 0 && a.bits != NIL && p.ty & NIL == 0 {
                         self.warn(format!("{} of `{}` may be null here (it is {}), but it must be {}", what(), name, t_text(*a), bits_text(p.ty)));
                     }
@@ -2891,7 +2952,7 @@ impl Checker {
             }
         }
         if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") {
-            if arg_exprs.first().map_or(false, sql_built_from_values) {
+            if arg_exprs.first().map_or(false, |e| sql_built_from_values(e, &|v| self.sql_var(v))) {
                 self.warn(format!(
                     "`{}` with SQL built from values: a value containing a quote can change the query \
                      (SQL injection); write `?` in the SQL and pass the values after it",
@@ -3284,7 +3345,7 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 walk_expr(&a.body, f)
             }
         }
-        Expr::For(_, i, b, _) => {
+        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
             walk_expr(i, f);
             walk_expr(b, f)
         }
@@ -3361,30 +3422,59 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
 
 /// Whether SQL text is put together from values: `${x}` in a template,
 /// sql`...${x}...`, or `"..." + x`.
-fn sql_built_from_values(e: &Expr) -> bool {
-    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !sql_safe(e)));
+fn sql_built_from_values(e: &Expr, var: &dyn Fn(&str) -> bool) -> bool {
+    let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !sql_safe(e, var)));
     match e {
         Expr::Template(parts) => interpolates(parts),
         Expr::Call(_, args, _) => matches!(args.as_slice(), [Expr::Template(parts)] if interpolates(parts)),
-        Expr::Binary(BinOp::Add, a, b, _) => {
-            let text = |x: &Expr| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_));
-            (text(a) && !matches!(**b, Expr::Lit(_))) || (text(b) && !matches!(**a, Expr::Lit(_))) || sql_built_from_values(a)
+        Expr::Binary(BinOp::Add, ..) => {
+            // `"... where n = '" + n + "'"`: text joined with something
+            // that is not SQL text.
+            let mut parts = Vec::new();
+            add_operands(e, &mut parts);
+            parts.iter().any(|x| matches!(x, Expr::Lit(Lit::Str(_)) | Expr::Template(_)))
+                && parts.iter().any(|x| !matches!(x, Expr::Lit(_)) && !sql_safe(x, var))
         }
         _ => false,
     }
 }
 
+/// For an error in a call of the program's own function named like a
+/// builtin (`notify`, `first`): says that it is not the builtin.
+fn hides(sig: &Sig, name: &str) -> String {
+    match &sig.def {
+        Some(d) if !sig.builtin && BUILTINS.iter().any(|(n, _, _)| *n == name) => {
+            format!(" (this `{}` is the program's own, from line {}, which hides the builtin `{}`)", name, d.line, name)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The operands of `a + b + c`.
+fn add_operands<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Binary(BinOp::Add, a, b, _) => {
+            add_operands(a, out);
+            add_operands(b, out);
+        }
+        _ => out.push(e),
+    }
+}
+
 /// SQL text a program may put together: names made with `sql_name` and
 /// `sql_param` (checked as they are made, so they cannot carry SQL of their
-/// own), text as written, and choices (`if`, `match`) and templates of those.
-fn sql_safe(e: &Expr) -> bool {
+/// own), text as written, choices (`if`, `match`) and joins of those, and
+/// `let`s holding them (`var` says which names are such `let`s).
+fn sql_safe(e: &Expr, var: &dyn Fn(&str) -> bool) -> bool {
     match e {
         Expr::Lit(Lit::Str(_)) => true,
+        Expr::Ident(n, _) => var(n),
         Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param"),
-        Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if sql_safe(e))),
-        Expr::If(_, a, b) => sql_safe(a) && b.as_deref().map_or(true, sql_safe),
-        Expr::Match(_, arms, _) => arms.iter().all(|a| sql_safe(&a.body)),
-        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if sql_safe(e)),
+        Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if sql_safe(e, var))),
+        Expr::Binary(BinOp::Add, a, b, _) => sql_safe(a, var) && sql_safe(b, var),
+        Expr::If(_, a, b) => sql_safe(a, var) && b.as_deref().map_or(true, |b| sql_safe(b, var)),
+        Expr::Match(_, arms, _) => arms.iter().all(|a| sql_safe(&a.body, var)),
+        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if sql_safe(e, var)),
         _ => false,
     }
 }

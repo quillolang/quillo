@@ -1,7 +1,7 @@
 //! Numeric functions compiled to machine code.
 //!
 //! A top-level function whose body only does arithmetic on ints, floats and
-//! bools (with `let`, assignment, `if`, `for` over a range, `return`, and
+//! bools (with `let`, assignment, `if`, `for` over a range, `while`, `return`, and
 //! calls of other such functions) is compiled with Cranelift once it is
 //! called a second time, for the types of the arguments it was called with.
 //! It then runs as the interpreter would run it, only faster. Where the
@@ -208,6 +208,7 @@ fn shape_ok(def: &FnDef) -> bool {
                 };
                 range && expr(body)
             }
+            Expr::While(c, body, _) => expr(c) && expr(body),
             Expr::Call(f, args, _) => matches!(&**f, Expr::Ident(..)) && args.iter().all(expr),
             _ => false,
         }
@@ -426,6 +427,15 @@ impl<'a> Plan<'a> {
                 if let Pattern::Bind(n) = pat {
                     sc.set(n, T::I);
                 }
+                let t = self.stmt_expr(body, sc, ret);
+                sc.stack.pop();
+                t
+            }
+            Expr::While(c, body, _) => {
+                if self.value(c, sc, ret)? != T::B {
+                    return None;
+                }
+                sc.stack.push(Vec::new());
                 let t = self.stmt_expr(body, sc, ret);
                 sc.stack.pop();
                 t
@@ -1008,6 +1018,24 @@ impl Gen<'_, '_> {
                 if !self.ended {
                     let next = self.b.ins().iadd_imm_s(kv, 1);
                     self.b.def_var(k, next);
+                    self.b.ins().jump(head, &[]);
+                }
+                self.ended = false;
+                self.b.switch_to_block(exit);
+                Some(())
+            }
+            Expr::While(c, body, _) => {
+                let (head, step, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().jump(head, &[]);
+                self.b.switch_to_block(head);
+                let cv = self.value(c, ret)?;
+                self.b.ins().brif(cv, step, &[], exit, &[]);
+                self.b.switch_to_block(step);
+                self.sc.stack.push(Vec::new());
+                let r = self.stmt_expr(body, ret);
+                self.sc.stack.pop();
+                r?;
+                if !self.ended {
                     self.b.ins().jump(head, &[]);
                 }
                 self.ended = false;

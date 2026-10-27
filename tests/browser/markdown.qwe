@@ -1,0 +1,25 @@
+// markdown() in a component: the server makes the HTML (/_quillo/markdown),
+// the same as it makes on the server. Driven by markdown.js.
+
+component Composer(start: str) {
+    // State is data: the HTML as text, shown with raw().
+    state preview = str(markdown(start))
+    state brief = str(markdown(start, { inline: true }))
+    state note = ""
+    <div>
+        <textarea id="draft" @input={(e) => {
+            preview = str(markdown(e.value))
+            brief = str(markdown(e.value, { inline: true }))
+        }}>{start}</textarea>
+        <div id="preview">{raw(preview)}</div>
+        <div id="inline">{raw(brief)}</div>
+        <button id="bad" @click={() => { note = str(markdown("x", json.parse("3"))) }}>bad</button>
+    </div>
+}
+
+let START = "**hi** <b>x</b>"
+
+route GET / = <html><body><Composer start={START}/></body></html>
+
+// What the server makes of a text, to compare with the page.
+route GET /server = { block: str(markdown(request.query.t)), inline: str(markdown(request.query.t, { inline: true })) }

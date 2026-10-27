@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const KEYWORDS: &[&str] = &[
-    "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "in",
+    "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "while", "in",
     "true", "false", "null", "reply", "as", "with", "state", "type", "service",
 ];
 const TYPES: &[&str] = &["int", "float", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
@@ -356,6 +356,13 @@ impl Server {
         let mut by_file: HashMap<String, Vec<J>> = HashMap::new();
         by_file.insert(uri.clone(), Vec::new());
         for d in &analysis.diagnostics {
+            // A file that does not parse may be for a newer Quillo than
+            // this server: say which it is.
+            let message = if d.severity == Severity::Error && analysis.syntax_errors.contains(&(d.file.clone(), d.line)) {
+                format!("{}\n({})", d.message, crate::error::which_quillo())
+            } else {
+                d.message.clone()
+            };
             let (duri, range) = if d.file == file {
                 (uri.clone(), diag_range(&text, d.line, &d.message))
             } else {
@@ -371,7 +378,7 @@ impl Server {
                 "range": range,
                 "severity": if d.severity == Severity::Error { 1 } else { 2 },
                 "source": "quillo",
-                "message": d.message,
+                "message": message,
             }));
         }
         for (u, diags) in by_file {

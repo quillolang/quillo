@@ -298,3 +298,113 @@ route GET / = <C start={5} />
     let js = quillo::client::test_script(&it, "C");
     assert!(js.is_ok(), "{:?}", js.err());
 }
+
+#[test]
+fn url_encode_matches_the_server() {
+    if !node_available() {
+        return;
+    }
+    same("", r#"[url_encode("a b&c=d/é!*'()~"), url_encode(42), url_encode({ q: "rust & go", page: 2, tag: null, "a b": true })]"#);
+    let (s, _) = both("", r#"url_encode({ q: "a b", page: 2, tag: null })"#);
+    assert_eq!(s, r#""q=a%20b&page=2""#);
+}
+
+#[test]
+fn while_loops_run_the_same_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    same("fn digits(n: int) {\n let out = []\n let x = n\n while x > 0 {\n out = [x % 10] + out\n x = floor(x / 10)\n }\n out\n}", "[digits(9051), digits(0)]");
+    same("", "let i = 0\nlet log = []\nlet r = while i < 3 {\n log = push(log, i)\n i += 1\n}\n[log, r]");
+    // A server call in the condition is awaited each time round.
+    let echo = "globalThis.fetch = async (url, o) => ({ ok: true, json: async () => ({ ok: JSON.parse(o.body)[0] }) });";
+    let (s, b) = both_with(echo, "server fn echo(x) = x", "let n = 0\nwhile echo(n) < 4 { n += 1 }\nn");
+    assert_eq!((s.as_str(), b.as_str()), ("4", "4"));
+}
+
+/// tests for `re` (src/re.rs and runtime.js): every case gives the same on
+/// both sides, matches and errors alike.
+#[test]
+fn regular_expressions_match_the_same_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    let cases: &[(&str, &str, &str)] = &[
+        // (text, pattern, flags)
+        ("Hi @ana and @bob_2, not a@b.c", r"(?:^|[^\w@])@(\w+)", ""),
+        ("Hi @ana and @Bob", r"@(?<user>[a-z]+)", "i"),
+        ("baaa", "a*", ""),
+        ("", "x*", ""),
+        ("café 😀 naïve", r"\w+", ""),
+        ("café 😀 naïve", r"\b\w+\b", ""),
+        ("a1 b22 c333", r"([a-z])(\d+)", ""),
+        ("one\ntwo\r\nthree", r"^\w+$", "m"),
+        ("one\ntwo\r\nthree", r"^\w+$", ""),
+        ("a\nb\rc\u{2028}d", "a.b", ""),
+        ("a\nb", "a.b", "s"),
+        ("tab\there\u{a0}nbsp\u{3000}wide", r"\S+", ""),
+        ("x😀y😀z", "😀", ""),
+        ("x😀y", "[😀-😂]", ""),
+        ("aaa", "a{2}", ""),
+        ("aaaa", "a{1,2}?", ""),
+        ("ÄäAa", "ä", "i"),
+        ("a.b*c", r"\.|\*", ""),
+        ("price: $40, $5", r"\$(\d+)", ""),
+        ("ab", r"(a)|(b)", ""),
+        ("x-y_z", r"[\w-]+", ""),
+        ("a\u{e9}b", r"é|\u{1F600}|😀", ""),
+        ("[x] {y}", r"\[\w\]|\{\w\}", ""),
+        ("aXbxc", "x", "i"),
+    ];
+    for (s, p, f) in cases {
+        let q = |x: &str| serde_json::to_string(x).unwrap();
+        let body = format!(
+            "let s = {}\nlet p = {}\nlet f = {}\n[re.test(s, p, f), re.find(s, p, f), re.find_all(s, p, f), re.split(s, p, f), re.replace(s, p, \"<$0|$1>\", f), re.replace(s, p, (m) => len(m.text), f)]",
+            q(s), q(p), q(f)
+        );
+        same("", &body);
+    }
+    same("", r#"re.replace("ana bob", "(?<first>\\w)(\\w*)", "$<first>.$2$$")"#);
+    // What either side would read differently is an error on both, for the same reason.
+    for (p, why) in [
+        ("(?=a)", "lookahead"),
+        ("(?<!a)b", "lookbehind"),
+        ("(a)\\1", "backreferences"),
+        ("\\p{L}", "Unicode classes"),
+        ("(?i)a", "flags go in the last argument"),
+        ("[a[b]]", "write `\\[`"),
+        ("[]", "empty class"),
+        ("a**", "nothing to repeat"),
+        ("*a", "nothing to repeat"),
+        ("a{2,1}", "n is more than m"),
+        ("a{,3}", "`{` on its own"),
+        ("a]", "`]` on its own"),
+        ("(a", "`(` without its `)`"),
+        ("a)", "`)` without its `(`"),
+        ("[z-a]", "lower character"),
+        ("[\\d-z]", "between two characters"),
+        ("\\q", "not one of the escapes"),
+        ("\\-", "not one of the escapes"),
+        ("\\uD83D", "surrogate"),
+        ("(?<a>x)(?<a>y)", "two groups are named `a`"),
+        ("a{1001}", "more than 1000"),
+        ("[a&&b]", "two `&`"),
+    ] {
+        let body = format!("re.test(\"abc\", {})", serde_json::to_string(p).unwrap());
+        same_error("", &body, why);
+        let (s, b) = both("", &body);
+        assert_eq!(s, b, "{}", p);
+    }
+    same_error("", "re.test(\"a\", \"a\", \"g\")", "the flags are");
+    same_error("", "re.replace(\"a\", \"(a)\", \"$2\")", "the pattern has 1 group");
+    same_error("", "re.replace(\"a\", \"a\", \"$<x>\")", "no group is named `x`");
+    same_error("", "re.find(\"a\", 1)", "expects a str as argument 2");
+}
+
+#[test]
+fn html_made_from_text_is_that_text_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    same("", r#"[str(raw("<b>x</b>")), len(str(raw("<i>é</i>")))]"#);
+}

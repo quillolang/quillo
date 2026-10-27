@@ -145,3 +145,41 @@ fn a_function_called_again_is_compiled_and_follows_what_it_calls() {
     let got = run(&format!("{}\nfn swap() {{\n    sq = (x) => x * 3\n    use_sq(2)\n}}", defs), &["use_sq(2)", "use_sq(2)", "swap()"]);
     assert_eq!(got, ["5", "5", "7"]);
 }
+
+#[test]
+fn while_loops_compile_and_answer_as_the_interpreter() {
+    let defs = r#"
+fn collatz(n: int) {
+    let steps = 0
+    let x = n
+    while x != 1 {
+        x = x % 2 == 0 ? x / 2 : 3 * x + 1
+        steps += 1
+    }
+    steps
+}
+fn isqrt(n: int) {
+    let r = 0
+    while (r + 1) * (r + 1) <= n { r += 1 }
+    r
+}
+fn first_over(limit: float) {
+    let t = 1.0
+    let k = 0
+    while t <= limit {
+        t = t * 1.5
+        k += 1
+        if k > 100 { return -1 }
+    }
+    k
+}
+fn overflow() {
+    let x = 1
+    while true { x = x * 3 }
+    x
+}
+"#;
+    same(defs, &[("collatz(27)", "111"), ("isqrt(99)", "9"), ("first_over(1000.0)", "18"), ("first_over(1e300)", "-1")]);
+    let got = run(defs, &["overflow()", "overflow()"]);
+    assert!(got.iter().all(|g| g.contains("ERROR") && g.contains("overflow")), "{:?}", got);
+}

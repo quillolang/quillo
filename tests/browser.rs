@@ -321,6 +321,35 @@ fn changes_touch_only_what_shows_them() {
     assert_eq!(r, want);
 }
 
+/// navigate() where nothing follows url() loads the page it names.
+#[test]
+fn navigate_without_a_single_page_app_loads_the_page() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("goto.qwe"), free_port(), Some(&dir.join("goto.js")));
+    let want = serde_json::json!({ "path": "/results", "query": { "q": "rust & go", "page": "2" }, "reloaded": true, "errors": [] });
+    assert_eq!(r, want);
+}
+
+/// markdown() in a component shows what the server makes of the text, as
+/// it is typed.
+#[test]
+fn markdown_in_a_component_is_the_servers() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("markdown.qwe"), free_port(), Some(&dir.join("markdown.js")));
+    assert_eq!(r["first"], "<p><strong>hi</strong> &lt;b&gt;x&lt;/b&gt;</p>\n", "{}", r);
+    assert_eq!(r["same"], serde_json::json!([true, true, true, true]), "{}", r);
+    let errors = r["errors"].as_array().unwrap();
+    assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("`markdown` expects options as a map, got int"), "{}", r);
+}
+
 /// Links pointed at are prefetched: the page they lead to, slow to make, is
 /// there when the link is followed.
 #[test]

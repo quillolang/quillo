@@ -132,11 +132,12 @@ let rows = db.query("select done, n, done = 1 as same from t order by id")
 }
 
 #[test]
-fn sqlite_named_parameters_must_all_be_given() {
+fn sqlite_named_parameters_must_all_be_given_and_others_are_ignored() {
     let r = ev("db.exec(\"create table t (a, b)\")\ndb.exec(\"insert into t values (:a, :b)\", { a: 1 })");
     assert!(r.contains("err(") && r.contains("no value for :b"), "{}", r);
-    let r = ev("db.exec(\"create table t (a)\")\ndb.exec(\"insert into t values (:a)\", { a: 1, z: 2 })");
-    assert!(r.contains("err(") && r.contains("no parameter :z"), "{}", r);
+    // One map for a query put together from optional parts.
+    let r = ev("db.exec(\"create table t (a)\")\ndb.exec(\"insert into t values (:a)\", { a: 1, z: 2 })\ndb.query(\"select a from t\")");
+    assert_eq!(r, "[{ a: 1 }]");
     let r = ev("db.exec(\"create table t (a, b)\")\ndb.exec(\"insert into t values (:a, :a)\", { a: 1 })\ndb.query(\"select a, b from t\")");
     assert_eq!(r, "[{ a: 1, b: 1 }]");
 }

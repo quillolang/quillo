@@ -499,10 +499,14 @@ fn static_errors(path: &Path) -> Result<(), String> {
         eprintln!("{}", d);
     }
     if analysis.errors().next().is_some() {
+        if !analysis.syntax_errors.is_empty() {
+            eprintln!("note: {}", quillo::error::which_quillo());
+        }
         return Err(String::new());
     }
     Ok(())
 }
+
 
 fn check(file: &str, opts: quillo::check::Options) -> i32 {
     let analysis = quillo::check::check_file_opts(Path::new(file), Default::default(), opts);
@@ -512,6 +516,9 @@ fn check(file: &str, opts: quillo::check::Options) -> i32 {
     let errors = analysis.errors().count();
     let warnings = analysis.diagnostics.len() - errors;
     if errors > 0 {
+        if !analysis.syntax_errors.is_empty() {
+            eprintln!("note: {}", quillo::error::which_quillo());
+        }
         eprintln!("quillo: {} error{}{}", errors, if errors == 1 { "" } else { "s" }, plural_warnings(warnings));
         return 1;
     }

@@ -400,3 +400,35 @@ fn record_fields_with_a_union_type_bind_their_name() {
     assert_eq!(ev(src), "[[3], [null], \"no\", \"no\"]");
     assert_eq!(ev("let { n: int | str } = { n: \"a\" }\nn"), "\"a\"");
 }
+
+#[test]
+fn unicode_escapes() {
+    assert_eq!(ev(r#""café""#), "\"café\"");
+    assert_eq!(ev(r#"'\u{1F600}'"#), "\"😀\"");
+    assert_eq!(ev(r#"let n = 2
+`\u{2192} ${n}`"#), "\"→ 2\"");
+    assert_eq!(ev(r#"len("\u{41}B")"#), "2");
+    assert!(ev_err(r#""\u12""#).contains("bad escape"));
+    assert!(ev_err(r#""\u{}""#).contains("bad escape"));
+    assert!(ev_err(r#""\u{1234567}""#).contains("bad escape"));
+    assert!(ev_err(r#""\u{D800}""#).contains("not a Unicode character"));
+}
+
+#[test]
+fn while_loops() {
+    assert_eq!(ev("let i = 0\nlet s = 0\nwhile i < 5 {\n  s += i\n  i += 1\n}\ns"), "10");
+    assert_eq!(ev("let i = 0\nwhile i < 3 { i += 1 }"), "null");
+    assert_eq!(ev("fn find(xs, x) {\n  let i = 0\n  while i < len(xs) {\n    if xs[i] == x { return i }\n    i += 1\n  }\n  null\n}\n[find([4, 5, 6], 6), find([], 1)]"), "[2, null]");
+    // Only null, false and errors end it, as with `if`.
+    assert_eq!(ev("let xs = [1, 2, 3]\nlet n = 0\nwhile first(xs) {\n  xs = drop(xs, 1)\n  n += 1\n}\nn"), "3");
+    assert!(ev_err("while true {").contains("end of input"));
+    assert!(ev_err("let while = 1").contains("keyword"));
+    assert!(ev_err("let i = 0\nwhile i < 2 i += 1").contains("expected `{` after the `while` condition"));
+}
+
+#[test]
+fn while_loops_in_scripts_count_their_steps() {
+    let r = ev(r#"run_script("let i = 0\nwhile true { i += 1 }\ni")"#);
+    assert!(r.contains("err(") && r.contains("steps"), "{}", r);
+    assert_eq!(ev(r#"run_script("let i = 0\nwhile i < 10 { i += 1 }\ni")"#), "10");
+}

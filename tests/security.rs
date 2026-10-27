@@ -60,6 +60,25 @@ route GET /status = redirect("/", 70000)
     assert!(!quillo::server::valid_header("x-a", "b\r\nc"));
 }
 
+/// `/_quillo/markdown` (markdown() in a page) answers as a server fn does:
+/// JSON, from the program's own pages.
+#[test]
+fn markdown_for_pages_is_made_only_for_the_programs_own_pages() {
+    let mut it = app("route GET / = \"hi\"");
+    let json = ("Content-Type", "application/json");
+    let call = |it: &mut Interp, headers: &[(&str, &str)], body: &str| send(it, "POST", "/_quillo/markdown", headers, body);
+    assert_eq!(call(&mut it, &[("Content-Type", "text/plain")], r#"["*a*"]"#).status, 415);
+    assert_eq!(call(&mut it, &[json, ("Sec-Fetch-Site", "cross-site")], r#"["*a*"]"#).status, 403);
+    assert_eq!(call(&mut it, &[json, ("Origin", "https://evil.example")], r#"["*a*"]"#).status, 403);
+    assert_eq!(send(&mut it, "GET", "/_quillo/markdown", &[], "").status, 405);
+    assert_eq!(call(&mut it, &[json], "{}").status, 400);
+    let r = call(&mut it, &[json, ("Sec-Fetch-Site", "same-origin")], r#"["*a* <script>x</script>", { "inline": true }]"#);
+    assert_eq!(r.status, 200);
+    assert_eq!(String::from_utf8_lossy(&r.body), r#"{"ok":"<em>a</em> &lt;script&gt;x&lt;/script&gt;"}"#);
+    let r = call(&mut it, &[json], r#"["x", 3]"#);
+    assert!(r.status == 400 && String::from_utf8_lossy(&r.body).contains("expects options as a map"), "{}", String::from_utf8_lossy(&r.body));
+}
+
 #[test]
 fn server_fns_answer_only_the_programs_own_pages() {
     let mut it = app("server fn add(n: int) -> int = n + 1");

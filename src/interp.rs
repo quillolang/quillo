@@ -1315,6 +1315,15 @@ impl Interp {
             Expr::Index(obj, idx, line) => self.eval_index(obj, idx, env, *line),
             Expr::Match(subj, arms, line) => self.eval_match(subj, arms, env, *line),
             Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line, true),
+            Expr::While(cond, body, line) => {
+                while self.eval(cond, env)?.truthy() {
+                    if self.fuel != u64::MAX {
+                        self.burn(*line)?;
+                    }
+                    self.eval(body, env)?;
+                }
+                Ok(Value::Nil)
+            }
             Expr::Reply(status, body, line) => self.eval_reply(status, body.as_deref(), env, *line),
             Expr::Html(el, _) => self.eval_html(el, env),
         }
