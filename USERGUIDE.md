@@ -1581,6 +1581,8 @@ Safety built in:
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
   path that must take such posts, such as a payment provider's return or a single
   sign-on callback, say so at the top of the program: `allow_cross_site("/sso")`.
+  Nor can such a page open the WebSocket on which pages hear of live changes
+  (`/_quillo/live`), which the browser would otherwise let it do.
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error.

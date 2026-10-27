@@ -1357,6 +1357,13 @@ impl Worker {
             }
         }
         let path = req.url.split('?').next().unwrap_or("");
+        // A WebSocket is not kept to its site by the browser: a page on
+        // another site could open one here and hear the topics changing.
+        // Only the program's own pages connect, as only they call server fns.
+        let waits = (app.watch && path == "/_quillo/events") || path.ends_with("/_quillo/live") || path.ends_with("/_quillo/wt");
+        if waits && cross_site(&req) {
+            return Answer::Respond(plain(403, "only the program's own pages connect\n"));
+        }
         if app.watch && path == "/_quillo/events" {
             return serve_events(app.clone(), req);
         }

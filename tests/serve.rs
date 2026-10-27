@@ -703,3 +703,43 @@ fn passwords_are_hashed_off_the_event_loop() {
         assert_eq!(l.join().unwrap(), (200, "true".into()));
     }
 }
+
+/// `/_quillo/live` over a WebSocket: the browser lets any site open one, so
+/// the server refuses pages of other sites, as it does for server fns. A
+/// page of the site, and a program (no Origin), connect.
+#[test]
+fn live_websockets_are_only_for_the_sites_own_pages() {
+    let d = temp_dir("live-origin");
+    let f = d.join("app.qwe");
+    std::fs::write(&f, "route GET / = `hi`\n").unwrap();
+    let srv = start(&f, &[]);
+    // The status line of a WebSocket handshake with these headers.
+    let open = |extra: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "GET /_quillo/live?t=db%3Anotes HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}\r\n",
+            srv.port, extra
+        )
+        .unwrap();
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while !line.ends_with(b"\r\n") && s.read(&mut b).map_or(false, |n| n == 1) {
+            line.push(b[0]);
+        }
+        String::from_utf8_lossy(&line).trim().to_string()
+    };
+    let other = "Origin: https://evil.example\r\n";
+    assert!(open(other).starts_with("HTTP/1.1 403"), "{}", open(other));
+    assert!(open("Origin: http://localhost:1\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: cross-site\r\n").starts_with("HTTP/1.1 403"));
+    assert!(open("Sec-Fetch-Site: same-site\r\n").starts_with("HTTP/1.1 403"));
+    let own = format!("Origin: http://localhost:{}\r\n", srv.port);
+    assert_eq!(open(&own), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open("Sec-Fetch-Site: same-origin\r\n"), "HTTP/1.1 101 Switching Protocols");
+    assert_eq!(open(""), "HTTP/1.1 101 Switching Protocols");
+    // The long wait without a WebSocket too.
+    assert!(raw(srv.port, "GET /_quillo/live?since=1&t=x HTTP/1.1\r\nOrigin: https://evil.example").starts_with("HTTP/1.1 403"));
+}
