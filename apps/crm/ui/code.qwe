@@ -17,7 +17,9 @@ view CodeEditor(value: str, lang: str, on_change, rows: int = 16, problems: list
                     @keydown={(e) => {
                         if e.key == "Tab" && !e.shiftKey {
                             e.preventDefault()
-                            js("document.execCommand", "insertText", false, "    ")
+                            let t = e.target
+                            t.setRangeText("    ", t.selectionStart, t.selectionEnd, "end")
+                            on_change(t.value)
                         }
                     }}></textarea>
             </div>
