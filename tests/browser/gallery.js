@@ -1,4 +1,4 @@
-// Clicks through the tabs of examples/index.qwe.
+// Clicks through the tabs of tests/programs/index.qwe.
 (async () => {
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));

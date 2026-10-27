@@ -5,7 +5,7 @@
 //! What the waiting threads make, such as rows read from the database, is
 //! mostly freed on an event loop; freeing on another thread is cheap in
 //! mimalloc and costly in the system allocator. On the event loops,
-//! measured on macOS (bench/server), mimalloc answers 5% more small
+//! measured on macOS (quillolang/benchmarks, server/), mimalloc answers 5% more small
 //! requests a second than the system allocator, and 7% more pages that
 //! build lists and HTML. Each block is freed by the allocator that made it;
 //! mimalloc knows its own (`mi_is_in_heap_region`).

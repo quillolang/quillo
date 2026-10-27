@@ -1,4 +1,4 @@
-// examples/life.qwe: generations computed in the browser match the server's,
+// tests/programs/life.qwe: generations computed in the browser match the server's,
 // and `every` runs the game only while it is playing.
 (async () => {
   const out = {};

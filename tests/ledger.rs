@@ -23,7 +23,7 @@ const EACH: usize = 25;
 static AGAIN: Mutex<Vec<(u16, String)>> = Mutex::new(Vec::new());
 
 fn example() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/ledger.qwe")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/ledger.qwe")
 }
 
 /// What became of one transfer: its request, and the final answer.
@@ -110,7 +110,7 @@ fn balances(port: u16) -> HashMap<String, i64> {
 
 /// Asks the database itself, through a program of its own.
 fn ask(target: &str, query: &str) -> String {
-    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"));
+    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs"));
     it.load_source(&format!("db.open(\"{}\")\nfn q() = db.query(\"{}\")\n", target, query), "check.qwe").unwrap();
     let f = quillo::value::lookup(&it.globals, "q").unwrap();
     match it.call(&f, vec![], 0) {
@@ -122,7 +122,7 @@ fn ask(target: &str, query: &str) -> String {
 /// The audit log, through a program of its own: whether its chain holds
 /// (`audit.verify()`), and the entries of the transfers in it.
 fn audited(target: &str) -> (serde_json::Value, Vec<String>) {
-    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"));
+    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs"));
     let src = format!(
         "db.open(\"{}\")\nfn verify() = json.stringify(audit.verify())\nfn entries() = json.stringify(audit.query({{ action: \"ledger.transfer\", limit: 10000 }}) | map((r) => r.details.entry))\n",
         target
@@ -243,7 +243,7 @@ fn postgres() {
 /// The triggers: an entry whose postings do not add up is not posted, and
 /// a posted one does not change.
 fn unbalanced_entries_are_refused_by_the_database(target: &str) {
-    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"));
+    let mut it = Interp::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs"));
     let src = format!(
         r#"db.open("{target}")
 fn unbalanced() = db.transaction(() => {{

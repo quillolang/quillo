@@ -3,7 +3,7 @@
 //! It checks documents as they change (with `crate::check`) and answers
 //! hover, go-to-definition, completion and document-symbol requests from
 //! what the checker records. Any LSP client can use it; the VS Code
-//! extension in `editors/vscode` starts it automatically.
+//! extension (quillolang/editors) starts it automatically.
 
 use crate::check::{self, Analysis, Severity, SymbolKind};
 use serde_json::{json, Value as J};
@@ -480,15 +480,18 @@ impl Server {
         let doc = self.docs.get(&uri)?;
         let (word, _) = word_at(&doc.text, line, col)?;
         let file = uri_to_path(&uri).display().to_string();
+        // The name as used on this line, or defined on it: the same word
+        // elsewhere (text in markup, `<h1>Notes</h1>`, beside `<Notes/>`)
+        // is not it.
+        let here = |l: u32| l as usize == line + 1;
         let r = doc
             .analysis
             .references
             .iter()
-            .find(|r| r.name == word && r.line as usize == line + 1 && r.file == file)
-            .or_else(|| doc.analysis.references.iter().find(|r| r.name == word && r.file == file))
+            .find(|r| r.name == word && here(r.line) && r.file == file)
             .cloned()
             .or_else(|| {
-                doc.analysis.symbols.iter().find(|s| s.name == word).map(|s| check::Reference {
+                doc.analysis.symbols.iter().find(|s| s.name == word && here(s.line) && s.file == file).map(|s| check::Reference {
                     file: s.file.clone(),
                     line: s.line,
                     name: s.name.clone(),

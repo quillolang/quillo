@@ -1,0 +1,25 @@
+// Todos on the server: the record other files see, the query, and the
+// server functions the <Todos> component calls from the browser.
+
+type Todo = { id: int, text: str, done: int }
+
+// Pure, so the server and the browser both use it.
+fn left_of(todos: list<Todo>) -> int = todos | count((t) => t.done == 0)
+
+fn all_todos() -> list<Todo> with db =
+    db.query(sql`select id, text, done from todos order by id`)
+
+// A `server fn` runs on the server; a component calls it like any function,
+// with no API or fetch to write. `! str` is the error it may give back.
+server fn add_todo(text: str) -> list<Todo> ! str with db {
+    let t = trim(text)
+    if t == "" { return err("a todo needs some text") }
+    if len(t) > 200 { return err("keep it under 200 characters") }
+    db.exec("insert into todos (text) values (?)", t)?
+    all_todos()
+}
+
+server fn toggle(id: int) -> list<Todo> with db {
+    db.exec("update todos set done = 1 - done where id = ?", id)
+    all_todos()
+}

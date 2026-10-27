@@ -1,4 +1,4 @@
-// Navigates around examples/spa.qwe without reloading.
+// Navigates around tests/programs/spa.qwe without reloading.
 (async () => {
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));

@@ -1,0 +1,15 @@
+// The frame every page uses: the document and its head, which loads the
+// assets in public/: the icon, the stylesheet and the page's own script.
+
+view Page(title: str, children) =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title}</title>
+            <link rel="icon" href="/static/icons/favicon.svg" type="image/svg+xml"/>
+            <link rel="stylesheet" href="/static/css/style.css"/>
+            <script src="/static/js/app.js"></script>
+        </head>
+        <body>{children}</body>
+    </html>

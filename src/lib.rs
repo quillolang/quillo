@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod db;
 pub mod txn;
 pub mod decimal;
+pub mod debug;
 pub mod error;
 pub mod fetch;
 pub mod highlight;

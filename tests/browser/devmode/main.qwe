@@ -1,0 +1,5 @@
+// Development bundles: each component in a file of its own, named after the
+// .qwe file it is in, with a source map to its lines (see sourcemap.js).
+use "ui/counter.qwe"
+
+route GET / = <html><body><Counter start={5}/></body></html>

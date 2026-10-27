@@ -1,0 +1,9 @@
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; color: #1d1d1f }
+form { display: flex; gap: .5rem }
+input[placeholder] { flex: 1; padding: .4rem .6rem; font: inherit }
+button { padding: .4rem .9rem; font: inherit }
+ul { padding: 0; list-style: none }
+li { padding: .3rem 0 }
+.done { color: #8a8a8e; text-decoration: line-through }
+.problem { color: #b42318 }
+.muted { color: #8a8a8e; font-size: .9rem }

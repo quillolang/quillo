@@ -1,0 +1,28 @@
+// Four pretend sensors, sending readings to tests/programs/telemetry.qwe over UDP.
+//
+//   quillo run tests/programs/sensors.qwe
+//
+// Each sends a JSON reading twice a second: a slow wave, some noise, and now
+// and then a spike. TELEMETRY_HOST and TELEMETRY_PORT say where (127.0.0.1
+// and 9000 unless set).
+
+let host = env("TELEMETRY_HOST") ?? "127.0.0.1"
+let port = int(env("TELEMETRY_PORT") ?? "9000")
+
+let devices = [
+    { id: "boiler", base: 70, swing: 6, period: 40 },
+    { id: "cold-room", base: 3, swing: 1.5, period: 90 },
+    { id: "office", base: 21, swing: 1, period: 120 },
+    { id: "server-rack", base: 34, swing: 4, period: 25 },
+]
+
+print(`sending readings to ${host}:${port} (Ctrl-C to stop)`)
+for tick in range(1, 10000000) {      // about two months, at two a second
+    for d in devices {
+        let wave = math.sin(tick / d.period * 2 * math.pi) * d.swing
+        let noise = (random() - 0.5) * d.swing * 0.3
+        let spike = random() < 0.01 ? d.swing * 2 : 0
+        udp.send(host, port, { id: d.id, v: round(d.base + wave + noise + spike, 2) })
+    }
+    sleep(500)
+}

@@ -1,0 +1,141 @@
+// A virtual list: 1,000,000 rows of 10 columns, 20 on screen at a time.
+//
+//   quillo run tests/programs/virtual.qwe --watch     then open http://localhost:8080
+//
+// Unlike scroll.qwe, every row is reachable from the start: drag the
+// scrollbar anywhere and that part of the table shows. The page holds only
+// the rows on screen, and the browser only the rows around them: when the
+// window leaves what it has, `live` loads the rows there.
+//
+// A browser cannot make an element 32 million pixels tall (Firefox stops near
+// 17 million), so the scrolling area is at most MAX_HEIGHT tall, and a pixel of
+// scrolling stands for several pixels of rows when the table is taller.
+
+db.open(":memory:")
+db.exec("create table people (id integer primary key, first text, last text, email text,
+         city text, country text, age int, plan text, balance text, joined text)")
+db.exec("with recursive n(i) as (select 1 union all select i + 1 from n where i < 1000000),
+  f(a) as (select '[\"Ada\",\"Ben\",\"Chloe\",\"Dev\",\"Elena\",\"Femi\",\"Grace\",\"Hiro\",\"Ines\",\"Jonas\",\"Kemi\",\"Liam\",\"Mei\",\"Noah\",\"Omar\",\"Priya\"]'),
+  l(a) as (select '[\"Okafor\",\"Smith\",\"Tanaka\",\"Garcia\",\"Novak\",\"Silva\",\"Khan\",\"Larsen\",\"Rossi\",\"Dubois\",\"Kim\",\"Moreau\",\"Haddad\"]'),
+  c(a) as (select '[[\"Lagos\",\"Nigeria\"],[\"Lisbon\",\"Portugal\"],[\"Osaka\",\"Japan\"],[\"Lima\",\"Peru\"],[\"Oslo\",\"Norway\"],[\"Pune\",\"India\"],[\"Quebec\",\"Canada\"],[\"Seoul\",\"Korea\"],[\"Lyon\",\"France\"],[\"Cebu\",\"Philippines\"],[\"Austin\",\"USA\"]]')
+  insert into people select i,
+    json_extract(f.a, '$[' || (i % 16) || ']'),
+    json_extract(l.a, '$[' || (i * 7 % 13) || ']'),
+    lower(json_extract(f.a, '$[' || (i % 16) || ']')) || '.' || i || '@example.com',
+    json_extract(c.a, '$[' || (i * 3 % 11) || '][0]'),
+    json_extract(c.a, '$[' || (i * 3 % 11) || '][1]'),
+    18 + (i * 37 % 60),
+    case i % 4 when 0 then 'Free' when 1 then 'Pro' when 2 then 'Team' else 'Enterprise' end,
+    printf('%.2f', (i * 7919 % 100000) / 10.0),
+    date('2015-01-01', '+' || (i * 13 % 3650) || ' days')
+  from n, f, l, c")
+
+let ROW = 32                // height of a row, in px
+let VISIBLE = 20            // rows on screen
+let VIEW = ROW * VISIBLE    // height of the scrolling area, in px
+let CHUNK = 100             // rows the browser holds; a new chunk every CHUNK / 2 rows
+let MAX_HEIGHT = 8000000    // the tallest scrolling area, in px
+
+let COLUMNS = ["#", "First", "Last", "Email", "City", "Country", "Age", "Plan", "Balance", "Joined"]
+let NUMERIC = ["#", "Age", "Balance", "Joined"]
+
+// Rows start..start + n, by primary key: as fast at row 999,000 as at row 0.
+server fn load_rows(start: int, n: int) -> list with db =
+    db.query(sql`select * from people where id > ? order by id limit ?`, start, n)
+
+fn total() with db = db.one("select count(*) as n from people").n
+
+component Table(count: int) {
+    state top = 0
+
+    let height = min([count * ROW, MAX_HEIGHT])
+    // Pixels of rows per pixel of scrolling: 1 until the table is taller than MAX_HEIGHT.
+    let scale = (count * ROW - VIEW) / max([height - VIEW, 1])
+    let y = top * scale
+    let first = max([0, min([count - VISIBLE, floor(y / ROW)])])
+    let offset = y - first * ROW
+    let last = min([count, first + VISIBLE + 1])    // one more, for the row half in view
+
+    // The chunk holding the window: it changes every CHUNK / 2 rows, and `live`
+    // loads it again whenever it does.
+    let start = max([0, floor(first / (CHUNK / 2)) * (CHUNK / 2) - CHUNK / 4])
+    state rows = live(load_rows, start, CHUNK)
+    let held = len(rows) > 0 ? rows[0].id - 1 : 0
+
+    <section.table>
+        <p.stats>
+            Rows <b>{first + 1}</b>–<b>{min([count, first + VISIBLE])}</b> of <b>{count}</b> · <b>{last - first}</b> rows in the page · <b>{len(rows)}</b> in the browser
+        </p>
+        <div.head>{for c in COLUMNS => <span key={c} class={contains(NUMERIC, c) && "num"}>{c}</span>}</div>
+        <div.viewport style={`height: ${VIEW}px`} @scroll={(e) => { top = e.scrollTop }}>
+            <div.spacer style={`height: ${height}px`}>
+                <div.window style={`transform: translateY(${top - offset}px)`}>
+                    {for i in range(first, last) => {
+                        let p = i - held >= 0 && i - held < len(rows) ? rows[i - held] : null
+                        let cls = i % 2 == 1 ? "row odd" : "row"
+                        p == null
+                            ? <div key={i} class={cls} style={`height: ${ROW}px`}>
+                                <span.loading>row {i + 1} · loading…</span>
+                              </div>
+                            : <div key={i} class={cls} style={`height: ${ROW}px`}>
+                                <span.num>{p.id}</span>
+                                <span>{p.first}</span>
+                                <span>{p.last}</span>
+                                <span.email>{p.email}</span>
+                                <span>{p.city}</span>
+                                <span>{p.country}</span>
+                                <span.num>{p.age}</span>
+                                <span class={`plan ${lower(p.plan)}`}>{p.plan}</span>
+                                <span.num>{p.balance}</span>
+                                <span.num>{p.joined}</span>
+                              </div>
+                    }}
+                </div>
+            </div>
+        </div>
+    </section>
+}
+
+let style = css`
+* { box-sizing: border-box; }
+body { font: 14px/1.4 system-ui, sans-serif; max-width: 72rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+.stats { color: #555; margin: 0 0 .75rem; } .stats b { color: #222; font-variant-numeric: tabular-nums; }
+.table { border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+.stats { padding: .75rem 1rem 0; }
+.head, .row { display: grid; grid-template-columns: 5.5rem 5rem 5.5rem minmax(12rem, 2fr) 5rem 6.5rem 3rem 6.5rem 6rem 6.5rem; gap: .75rem; align-items: center; padding: 0 1rem; }
+.head { height: 36px; font-weight: 600; color: #555; background: #f6f7f9; border-block: 1px solid #e5e5e5; }
+.viewport { overflow-y: auto; overflow-x: hidden; position: relative; }
+.spacer { position: relative; }
+.window { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+.row { white-space: nowrap; border-bottom: 1px solid #f0f0f0; }
+.row.odd { background: #fbfbfc; }
+.row span { overflow: hidden; text-overflow: ellipsis; }
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+.email { color: #0b57d0; }
+.loading { grid-column: 1 / -1; color: #aaa; }
+.plan { justify-self: start; padding: 0 .5rem; border-radius: 999px; font-size: 12px; background: #eee; }
+.plan.pro { background: #e3efff; color: #0b57d0; } .plan.team { background: #e6f6ec; color: #137333; }
+.plan.enterprise { background: #f3e8fd; color: #8430ce; }
+@media (prefers-color-scheme: dark) {
+  body { background: #161616; color: #ddd; } .stats, .head { color: #aaa; } .stats b { color: #fff; }
+  .table { border-color: #2c2c2c; } .head { background: #1e1e1e; border-color: #2c2c2c; }
+  .row { border-color: #222; } .row.odd { background: #1a1a1a; } .email { color: #8ab4f8; }
+  .plan { background: #2a2a2a; } .plan.pro { background: #1c2b44; color: #8ab4f8; }
+  .plan.team { background: #17301f; color: #81c995; } .plan.enterprise { background: #2e2140; color: #c58af9; }
+}
+`
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Virtual list</title>
+            <style>{style}</style>
+        </head>
+        <body>
+            <h1>Virtual list</h1>
+            <Table count={total()}/>
+        </body>
+    </html>

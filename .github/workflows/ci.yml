@@ -26,13 +26,26 @@ jobs:
           echo "QUILLO_TEST_MYSQL_BIN=$RUNNER_TEMP/mariadb" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release
+      - name: The environment check, and the sample app it runs
+        run: sh scripts/doctor.sh --build
       - name: Tests (the browser test uses the runner's Chrome)
         run: cargo test
-      - name: Check the examples
-        run: for f in examples/*.qwe; do ./target/release/quillo check "$f"; done
-      - name: VS Code extension
-        working-directory: editors/vscode
-        run: npm ci && npm test && npx vsce package --skip-license
+      - name: Check the sample app and the test programs
+        run: for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
+
+  # scripts/doctor.ps1, run as a Windows user would: in Windows PowerShell 5.1,
+  # then the check alone in PowerShell 7.
+  doctor-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The environment check, and the sample app it runs
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Build
+      - name: The check in PowerShell 7
+        shell: pwsh
+        run: ./scripts/doctor.ps1
 
   # Known vulnerabilities, licences and sources of dependencies (deny.toml).
   deny:

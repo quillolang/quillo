@@ -37,6 +37,8 @@ pub struct Parser {
     /// What `ternary_ahead` found at each `?`, so that nested ternaries are
     /// looked ahead at once each, not again for every one around them.
     ternaries: std::collections::HashMap<(usize, bool), bool>,
+    /// The file being parsed, stamped on its functions and routes.
+    file: Option<Arc<str>>,
 }
 
 fn can_start_expr(t: &Tok) -> bool {
@@ -77,7 +79,13 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default() }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None }
+    }
+
+    /// Records `file` on the functions and routes parsed (see `FnDef::file`).
+    pub fn in_file(mut self, file: Option<Arc<str>>) -> Self {
+        self.file = file;
+        self
     }
 
     // ---- token helpers -------------------------------------------------
@@ -471,7 +479,7 @@ impl Parser {
         } else {
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, hot: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
@@ -495,7 +503,7 @@ impl Parser {
         }
         self.expect(&Tok::RParen, "`)`")?;
         let (body, nesting) = self.measured(|p| p.component_body(&name))?;
-        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, hot: Default::default() })
+        Ok(FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() })
     }
 
     fn component_body(&mut self, name: &str) -> PResult<Expr> {
@@ -765,7 +773,7 @@ impl Parser {
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
-        Ok(RouteDef { method, path, query, body_pat, body, line, uses_request })
+        Ok(RouteDef { method, path, query, body_pat, body, line, file: self.file.clone(), uses_request })
     }
 
     /// Runs `f` with `name => ...` arrows allowed again (inside brackets).
@@ -807,7 +815,7 @@ impl Parser {
         match head {
             Ok(Some((params, ret))) => {
                 let body = self.no_bare_arrow_off(|p| p.measured(Self::parse_arrow_body))?;
-                Ok(Some(arrow(params, ret, body, line)))
+                Ok(Some(arrow(params, ret, body, line, self.file.clone())))
             }
             Err(e) if e.msg.starts_with(TOO_DEEP) => Err(e),
             _ => {
@@ -1175,7 +1183,7 @@ impl Parser {
                         self.next()?;
                         let body = self.measured(Self::parse_arrow_body)?;
                         let params = vec![Param { name: k.clone(), ty: None, default: None }];
-                        return Ok(arrow(params, None, body, line));
+                        return Ok(arrow(params, None, body, line, self.file.clone()));
                     }
                     Ok(Expr::Ident(k.clone(), line))
                 }
@@ -1696,7 +1704,7 @@ impl Parser {
     }
 }
 
-fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line: u32) -> Expr {
+fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line: u32, file: Option<Arc<str>>) -> Expr {
     Expr::Lambda(Arc::new(FnDef {
         name: "<fn>".into(),
         params,
@@ -1708,6 +1716,7 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         line,
         body,
         nesting,
+        file,
         hot: Default::default(),
     }))
 }

@@ -1,4 +1,4 @@
-// examples/spa.qwe: live stock, the cart, and another tab buying.
+// tests/programs/spa.qwe: live stock, the cart, and another tab buying.
 (async () => {
   window.__quilloErrors = [];
   const out = {};

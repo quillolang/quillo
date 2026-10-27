@@ -1,0 +1,111 @@
+// Live telemetry: devices send readings over UDP, pages see them as they come.
+//
+//   quillo run tests/programs/telemetry.qwe --watch     then open http://localhost:8080
+//   quillo run tests/programs/sensors.qwe               (in another terminal: four sensors)
+//
+// Each reading is a UDP packet of JSON, `{"id": "boiler", "v": 71.2}`, sent to
+// port 9000 (any device can: `echo '{"id":"x","v":1}' | nc -u -w0 127.0.0.1 9000`).
+// The server keeps the last minute of each sensor and broadcasts every reading
+// on the channel "readings". Pages open the channel, and get the readings over
+// WebTransport, as UDP datagrams too: a reading lost on the way is simply
+// replaced by the next one, and nothing waits for it.
+
+let KEEP = 120        // readings kept per sensor (a minute, at two a second)
+
+let sensors = {}      // id -> { id, last, history: [values], at }
+let received = 0
+
+udp.listen(9000, (p) => {
+    let r = json.parse(p.text ?? "")
+    if is_err(r) || type_of(r.id) != "str" || type_of(r.v) == "null" { return }
+    received += 1
+    let before = sensors[r.id].history ?? []
+    let history = before + [r.v]
+    let s = { id: r.id, last: r.v, at: p.at, history: len(history) > KEEP ? drop(history, len(history) - KEEP) : history }
+    sensors = set(sensors, r.id, s)
+    channel.broadcast("readings", { id: r.id, v: r.v, at: p.at })
+})
+
+// What a page starts with; the channel brings the rest.
+server fn snapshot() -> list = values(sensors) | sort_by((s) => s.id)
+
+fn spark(history: list, w: int, h: int) -> str {
+    if len(history) < 2 { return "" }
+    let lo = min(history)
+    let hi = max(history)
+    let span = hi - lo == 0 ? 1 : hi - lo
+    let step = w / (KEEP - 1)
+    let start = KEEP - len(history)
+    let points = for [i, v] in enumerate(history) => `${(start + i) * step},${h - (v - lo) / span * h}`
+    join(points, " ")
+}
+
+component Dashboard() {
+    state sensors = snapshot()
+    state rate = 0
+    state count = 0
+
+    channel.open("readings", (r) => {
+        count += 1
+        let found = find(sensors, (s) => s.id == r.id)
+        let history = (found.history ?? []) + [r.v]
+        let s = { id: r.id, last: r.v, at: r.at, history: len(history) > KEEP ? drop(history, len(history) - KEEP) : history }
+        sensors = found == null
+            ? sort_by(sensors + [s], (x) => x.id)
+            : for x in sensors => x.id == r.id ? s : x
+    })
+
+    // Readings a second, worked out from the count every second.
+    every(1000, () => {
+        rate = count
+        count = 0
+    })
+
+    <section.dash>
+        <p.stats><b>{rate}</b> readings a second · <b>{len(sensors)}</b> sensors</p>
+        {len(sensors) == 0
+            ? <p.empty>Waiting for readings on UDP port 9000. Run <code>quillo run tests/programs/sensors.qwe</code>.</p>
+            : <div.cards>
+                {for s in sensors => <article.card key={s.id}>
+                    <header><span.name>{s.id}</span><span.value>{round(s.last, 1)}</span></header>
+                    <svg viewBox={`0 0 240 48`} preserveAspectRatio="none">
+                        <polyline points={spark(s.history, 240, 48)}/>
+                    </svg>
+                </article>}
+              </div>}
+    </section>
+}
+
+let style = css`
+* { box-sizing: border-box; }
+body { font: 15px/1.4 system-ui, sans-serif; max-width: 56rem; margin: 2rem auto; padding: 0 1rem; color: #1f2328; background: #f6f8fa; }
+h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+.stats { color: #57606a; } .stats b { color: #1f2328; font-variant-numeric: tabular-nums; }
+.empty { color: #57606a; } code { background: #eaeef2; padding: .1rem .35rem; border-radius: 4px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 1rem; }
+.card { background: #fff; border: 1px solid #d0d7de; border-radius: 10px; padding: .9rem 1rem .6rem; }
+.card header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: .4rem; }
+.name { color: #57606a; } .value { font-size: 1.6rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+svg { width: 100%; height: 48px; overflow: visible; }
+polyline { fill: none; stroke: #0969da; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+@media (prefers-color-scheme: dark) {
+  body { background: #0d1117; color: #e6edf3; } .stats, .name, .empty { color: #8b949e; } .stats b { color: #e6edf3; }
+  .card { background: #161b22; border-color: #30363d; } code { background: #21262d; } polyline { stroke: #58a6ff; }
+}
+`
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>Telemetry</title>
+            <style>{style}</style>
+        </head>
+        <body>
+            <h1>Telemetry</h1>
+            <Dashboard/>
+        </body>
+    </html>
+
+route GET /stats = { received, sensors: len(keys(sensors)) }

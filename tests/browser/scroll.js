@@ -1,4 +1,4 @@
-// Scrolls examples/scroll.qwe and records what is in the page.
+// Scrolls tests/programs/scroll.qwe and records what is in the page.
 (async () => {
   const out = {};
   const tick = (ms = 50) => new Promise((r) => setTimeout(r, ms));

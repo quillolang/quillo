@@ -1,4 +1,4 @@
-// Clicks through examples/compose.qwe.
+// Clicks through tests/programs/compose.qwe.
 (async () => {
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));

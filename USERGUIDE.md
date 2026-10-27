@@ -8,12 +8,13 @@ Quillo is a single binary, built with Cargo:
 
 ```sh
 cargo build --release
-./target/release/quillo run examples/notes.qwe --watch   # http://127.0.0.1:8080
+./target/release/quillo run app/main.qwe --watch        # the sample app: http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
 ./target/release/quillo keygen                           # a key for crypto.encrypt
 ./target/release/quillo repl
 ./target/release/quillo lsp                              # language server (for editors)
+./target/release/quillo dap                              # debugger (for editors)
 cargo test
 ```
 
@@ -54,7 +55,7 @@ its pages, and closing the window ends the program. It is built only on request:
 
 ```sh
 cargo build --release --features app      # Linux also needs libwebkit2gtk-4.1-dev
-./target/release/quillo app examples/notes.qwe --watch
+./target/release/quillo app app/main.qwe --watch
 ```
 
 It takes the options of `run` except `--host`, `--register` and `--service`, and
@@ -64,23 +65,24 @@ the window's first request carries a token made for this launch and trades it
 for a cookie, and requests without one (other programs, pages of other sites)
 get 403. Links to other sites open in the system's browser.
 
-Editor support: [editors/vscode](editors/vscode) is a VS Code extension (highlighting,
-diagnostics as you type, hover, go to definition, completion, outline, snippets).
-Other editors can run `quillo lsp` directly.
+Editor support: [quillolang/editors](https://github.com/quillolang/editors) has a VS Code extension (highlighting,
+diagnostics as you type, hover, go to definition, completion, outline, snippets, and a
+debugger: see [Debugging](#debugging)). Other editors can run `quillo lsp` and `quillo dap`
+directly.
 
-Examples: [hello.qwe](examples/hello.qwe) (routes), [orders.qwe](examples/orders.qwe)
-(payload-based routing and middleware), [todo.qwe](examples/todo.qwe) (server-rendered
-app with a JSON API), [notes.qwe](examples/notes.qwe) (SQLite and a live component),
-[scroll.qwe](examples/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window),
-[compose.qwe](examples/compose.qwe) (views and components built from each other),
-[layout.qwe](examples/layout.qwe) (a page described as JSON, with a live editor),
-[spa.qwe](examples/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
-[life.qwe](examples/life.qwe) (Conway's Game of Life, run by a timer in the browser),
-[storm.qwe](examples/storm.qwe) (a dashboard under a storm of random changes, tested for leaks),
-[services](examples/services) (a shop that bills through a billing service, in one process or
-split apart), and [index.qwe](examples/index.qwe), which mounts all of them in one server.
+Examples, in [quillolang/examples](https://github.com/quillolang/examples) (cloned as `../quillo-examples` in the commands here): [hello.qwe](https://github.com/quillolang/examples/blob/main/hello.qwe) (routes), [orders.qwe](https://github.com/quillolang/examples/blob/main/orders.qwe)
+(payload-based routing and middleware), [todo.qwe](https://github.com/quillolang/examples/blob/main/todo.qwe) (server-rendered
+app with a JSON API), [notes.qwe](https://github.com/quillolang/examples/blob/main/notes.qwe) (SQLite and a live component),
+[scroll.qwe](https://github.com/quillolang/examples/blob/main/scroll.qwe) (infinite scroll over 100,000 rows, rendering only a window),
+[compose.qwe](https://github.com/quillolang/examples/blob/main/compose.qwe) (views and components built from each other),
+[layout.qwe](https://github.com/quillolang/examples/blob/main/layout.qwe) (a page described as JSON, with a live editor),
+[spa.qwe](https://github.com/quillolang/examples/blob/main/spa.qwe) (a single-page app: client-side navigation, deep links, 404s),
+[life.qwe](https://github.com/quillolang/examples/blob/main/life.qwe) (Conway's Game of Life, run by a timer in the browser),
+[storm.qwe](https://github.com/quillolang/examples/blob/main/storm.qwe) (a dashboard under a storm of random changes, tested for leaks),
+[services](https://github.com/quillolang/examples/tree/main/services) (a shop that bills through a billing service, in one process or
+split apart), and [index.qwe](https://github.com/quillolang/examples/blob/main/index.qwe), which mounts all of them in one server.
 
-A whole application: [apps/crm](apps/crm) is a multi-tenant CRM for merchants, bloggers
+A whole application: [crm](https://github.com/quillolang/apps/tree/main/crm) in [quillolang/apps](https://github.com/quillolang/apps) is a multi-tenant CRM for merchants, bloggers
 and news outlets, with a shop, campaigns, a flow designer, and plugins whose rules run in
 the browser and on the server.
 
@@ -591,7 +593,7 @@ route GET /*rest = <html><body><App/></body></html>       // every path renders 
 Pages load their data with `server fn`s in `state` initializers: on the server while
 rendering, in the browser when you navigate to them. Give a page component a `key` from
 its URL (`key={id}`) so a new product starts with fresh state. See
-[spa.qwe](examples/spa.qwe), which also answers 404 on the server for unknown paths.
+[spa.qwe](https://github.com/quillolang/examples/blob/main/spa.qwe), which also answers 404 on the server for unknown paths.
 
 ### Live data
 
@@ -1365,7 +1367,7 @@ How messages travel:
   dropped because a queue was full.
 
 UDP and channels together pass a device's packets on to pages as they come; see
-[examples/telemetry.qwe](examples/telemetry.qwe).
+[telemetry.qwe](https://github.com/quillolang/examples/blob/main/telemetry.qwe).
 
 ### Media
 
@@ -1484,7 +1486,7 @@ sees paths without the prefix (`url().path` is `/products`, not `/shop/products`
 Its root-relative links and form actions (`href`, `src`, `action`), its redirects, its
 browser bundle, its `server fn` calls, live data and page changes are all moved under the
 prefix. Changes to mounted files are picked up by `--watch`. See
-[index.qwe](examples/index.qwe), which mounts every example.
+[index.qwe](https://github.com/quillolang/examples/blob/main/index.qwe), which mounts every example.
 
 ### Services
 
@@ -1580,7 +1582,7 @@ When a service runs elsewhere, its calls are made to hold up:
   restart, and servers sharing that database make each once; a program with no database
   keeps them in `quillo-system.db` next to it. Checked as the call itself is (`quillo check`).
 
-See [examples/services](examples/services): a shop that bills through a billing service.
+See [services](https://github.com/quillolang/examples/tree/main/services): a shop that bills through a billing service.
 
 ## Standard library
 
@@ -2626,6 +2628,65 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
   `--no-jobs` turns them off on a server. For a database per tenant, loop over your
   tenants inside the job with `with_tenant(name, () => ...)`.
 
+### Debugging
+
+`quillo dap` is a debugger for editors: it speaks the Debug Adapter Protocol on stdin and
+stdout, and runs the program as `quillo run` would. In VS Code, with the extension, press F5
+in a `.qwe` file (or *Quillo: Debug this file*, or the ▶ menu). A `launch.json` entry
+gives the options:
+
+```json
+{
+  "type": "quillo",
+  "request": "launch",
+  "name": "Debug the app",
+  "program": "${workspaceFolder}/main.qwe",
+  "args": ["--watch", "--port", "8080"],
+  "stopOnEntry": false
+}
+```
+
+- **Breakpoints** go on statements, in any file the program loads (`use`d files, mounted
+  programs). One on a line with nothing to run (a blank line, `fn name(...) {`) moves to the
+  next statement in the same function or route; outside any, it is not set.
+- **Conditional breakpoints** stop when their expression is true; a **hit count** stops
+  from that hit on (`3`), or at `== 3`, `> 3`, every `% 3`. **Logpoints** print their message to the
+  debug console, with each `{expression}` in it worked out, and do not stop.
+- **Runtime errors** (the mistakes that make a route answer 500) stop where they happen, with
+  the error and the variables as they were. *Runtime errors*, in the breakpoints list, turns this off.
+- **Stepping**: over, into and out of calls. A frame is a function, a view, a component, a
+  route (`GET /notes/:id`) or a file's top level (`<main>`).
+- **Variables**: the frame's locals, the program's globals (without its functions and the
+  builtins), and the request being answered. Lists and maps open; long lists come in pages.
+- **The debug console** runs code in the stopped frame: expressions, and assignments
+  (`count = 0`) too. Hovering a name shows its value; hovering does not call functions.
+- The program's output (`print`, the request log, errors) shows in the debug console.
+
+When the program stops, all of it stops: no other request runs Quillo code until it goes on
+(waits already under way, for a database or the network, finish meanwhile). Pausing a server
+that is waiting for requests stops the next one to run.
+
+While debugging, views are not cached (`--no-view-cache`), so a breakpoint in one stops each
+time it renders, and functions are not compiled to machine code. `.qwer` functions run as they
+are, without stops. It runs on macOS and Linux; not yet on Windows.
+
+#### In the browser
+
+A component runs in the browser too, after its first render: its event handlers and updates.
+With `"browser": true` in the launch configuration (or `"edge"`), VS Code opens the page in
+Chrome (or Edge) once the server listens, with its JavaScript debugger, in the same session:
+a breakpoint on a line of a `.qwe` file stops on the server and in the browser, wherever that
+line runs. `"url"` names the page to open (by default, the address the server listens on).
+
+This works because in development (`--watch`, or under the debugger) a page's bundle is a
+small loader for files of their own: the runtime (`quillo.js`, as it is written), and each
+component, view and function at `/_quillo/src/<hash>/<file>.qwe/<Name>.js`, with a source map
+from its lines to the `.qwe` file's. The browser's developer tools show them by those names,
+with the `.qwe` source beside them, and a variable a statement declares carries its own name
+(`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
+value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
+production a page's bundle is one minified file, as before.
+
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path -> 200 (0.4ms)`. With `--log json` the
@@ -2791,7 +2852,7 @@ How it runs:
   rest of the program: never let a program's users write them (they write sandboxed
   Quillo with `run_script`).
 
-See [examples/rust.qwe](examples/rust.qwe) and [examples/rust.qwer](examples/rust.qwer).
+See [rust.qwe](https://github.com/quillolang/examples/blob/main/rust.qwe) and [rust.qwer](https://github.com/quillolang/examples/blob/main/rust.qwer).
 
 ## Not built yet
 
@@ -2869,17 +2930,12 @@ src/client.rs      compiles components to JavaScript
 src/client/runtime.js  the browser runtime: values, standard library, signals and markup
 src/island.rs      when a page loads its components' code
 src/lsp.rs         the language server
-editors/vscode/    the VS Code extension
 
-examples/          hello, orders, todo, notes, compose, layout, spa, scroll, virtual, life,
-                   storm, telemetry (with sensors), media, rust (with rust.qwer),
-                   services, ledger (double-entry bookkeeping), and index (most of them
-                   in one server)
-apps/crm/          a whole application: a multi-tenant CRM
-site/              quillolang.org, written in Quillo; its docs are made from this README
+app/               a sample app to start from (main.qwe, lib/, ui/, migrations/, public/)
 tests/             the language, routes, records, effects, the checker, numbers, streams,
                    UDP, Rust (.qwer), services, sessions, uploads, tenants, several
                    databases, the compiler
                    (in Node), the browser (headless Chrome), PostgreSQL and MariaDB
-                   (throwaway servers), the CRM, and the language server
+                   (throwaway servers), and the language server;
+                   tests/programs/ holds the programs they run
 ```

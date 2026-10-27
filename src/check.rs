@@ -1234,6 +1234,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             let mut order = Vec::new();
             c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
             c.run(order);
+            c.state_details();
         }
         Err(e) => c.diag_at(main, e.line, Severity::Error, e.msg),
     }
@@ -1302,6 +1303,10 @@ struct Checker {
     effect_cache: HashMap<usize, u8>,
     /// Functions of `.qwer` files the program uses, with their files.
     natives: Vec<(Arc<str>, crate::native::Export)>,
+    /// Each `state` (by its file, line and name): the types it takes (its
+    /// first value's, and what is assigned to it), and the references to it,
+    /// whose hover text says so once the program is checked.
+    state_types: HashMap<(Arc<str>, u32, String), (T, Vec<usize>)>,
     /// Checking the `live(...)` that sets a component's state.
     live_ok: bool,
     /// The services a program calls (`service billing = "billing.qwe"`): the
@@ -1379,6 +1384,7 @@ impl Checker {
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
             natives: Vec::new(),
+            state_types: HashMap::new(),
             live_ok: false,
             services: HashMap::new(),
             hint: None,
@@ -1718,7 +1724,7 @@ impl Checker {
             Some(s) => s.text(),
             None => {
                 let kw = match v.kind {
-                    Kind::State => "~",
+                    Kind::State => "state ",
                     Kind::Param => "param ",
                     _ => "let ",
                 };
@@ -1729,7 +1735,26 @@ impl Checker {
                 }
             }
         };
+        if v.kind == Kind::State {
+            let at = self.out.references.len();
+            if let Some(e) = self.state_types.get_mut(&(v.file.clone(), v.line, name.to_string())) {
+                e.1.push(at);
+            }
+        }
         self.out.references.push(Reference { file: self.file.to_string(), line: self.line, name: name.to_string(), def, detail });
+    }
+
+    /// Hover text for state: the types it takes over the component, which
+    /// checking itself does not narrow to (an assigned state is `any` there).
+    fn state_details(&mut self) {
+        for ((_, _, name), (t, refs)) in std::mem::take(&mut self.state_types) {
+            let text = format!("state {}: {}", name, t_text(t));
+            for i in refs {
+                if let Some(r) = self.out.references.get_mut(i) {
+                    r.detail = text.clone();
+                }
+            }
+        }
     }
 
     /// Looks a name up, marks it used and records the reference.
@@ -2027,6 +2052,17 @@ impl Checker {
                         if v.kind == Kind::Global && self.in_component().is_some() && v.sig.is_none() {
                             self.browser_global(name, &v);
                         }
+                        if v.kind == Kind::State {
+                            let key = (v.file.clone(), v.line, name.clone());
+                            if let Some(e) = self.state_types.get_mut(&key) {
+                                let now = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::Add => binop_t(BinOp::Add, e.0, rhs).unwrap_or(rhs),
+                                    _ => binop_t(BinOp::Sub, e.0, rhs).unwrap_or(rhs),
+                                };
+                                e.0 = e.0.union(now);
+                            }
+                        }
                         if !matches!(op, AssignOp::Set) {
                             let bop = if matches!(op, AssignOp::Add) { BinOp::Add } else { BinOp::Sub };
                             if binop_t(bop, v.t, rhs).is_none() {
@@ -2135,12 +2171,28 @@ impl Checker {
                 }
                 let is_live = matches!(e, Expr::Call(c, _, _) if matches!(&**c, Expr::Ident(n, _) if n == "live"));
                 self.live_ok = is_live;
-                let t = self.expr(e);
+                let mut t = self.expr(e);
                 self.live_ok = false;
                 if let (Some(f), Some(n)) = (self.fns.last_mut(), saved) {
                     f.nested = n;
                 }
-                self.define(name, if self.assigned.contains(name) { T::ANY } else { t }, None, Kind::State);
+                // `live(load, ...)` holds what `load` gives.
+                if let (true, Expr::Call(_, args, _)) = (is_live, e) {
+                    if let Some(Expr::Ident(f, _)) = args.first() {
+                        let ret = self.scopes.iter().rev().find_map(|s| s.get(f).cloned()).or_else(|| self.globals.get(f).cloned()).and_then(|v| v.sig).and_then(|s| s.ret);
+                        if let Some(r) = ret {
+                            t = r;
+                        }
+                    }
+                }
+                let assigned = self.assigned.contains(name);
+                self.define(name, if assigned { T::ANY } else { t }, None, Kind::State);
+                if self.quiet == 0 {
+                    self.state_types.insert((self.file.clone(), *line, name.clone()), (t, Vec::new()));
+                    // Its declaration hovers too.
+                    let v = Var { t, sig: None, file: self.file.clone(), line: *line, kind: Kind::State, used: false, ready: true };
+                    self.record(name, &v);
+                }
                 T::of(NIL)
             }
         }

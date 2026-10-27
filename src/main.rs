@@ -29,6 +29,9 @@ usage:
                                     QUILLO_ENCRYPTION_KEYS (id:base64key)
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
+  quillo dap                        debugger for editors (the Debug Adapter
+                                    Protocol, on stdio): breakpoints, stepping,
+                                    variables
   quillo <file.qwe>                 same as `quillo run`
 
 options for `run`:
@@ -118,6 +121,8 @@ fn real_main(args: Vec<String>) -> i32 {
             Some(f) => run(f, &args[3..]),
             None => usage(),
         },
+        // A debug adapter for editors, on stdin and stdout (src/debug.rs).
+        Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             match args.iter().skip(2).find(|a| !a.starts_with("--")) {
@@ -404,6 +409,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
 /// Checks and loads the program, ready to serve. `Ok(None)`: it ran and
 /// declared no routes, so there is nothing to serve. `Err` is the exit code.
 fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
+    // Components in files of their own, for the browser's debugger.
+    quillo::client::DEV.store(o.watch || quillo::debug::on(), std::sync::atomic::Ordering::Relaxed);
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     // Signed service calls name the service they are for (see `service::answer`).
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();

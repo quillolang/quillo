@@ -194,10 +194,19 @@ pub struct Interp {
     pub view_cache: Option<Arc<Mutex<crate::viewcache::ViewCache>>>,
     /// The renders being cached, innermost last: what each has read.
     tracks: Vec<crate::viewcache::Track>,
+    /// The calls in progress, while a debugger is attached (src/debug.rs).
+    pub(crate) trace: crate::debug::Trace,
 }
 
 /// Deepest call nesting allowed before a "too much recursion" error.
 pub const MAX_DEPTH: usize = 10_000;
+
+/// A source file's absolute path, as the parser records it on what it
+/// parses (see `FnDef::file`).
+fn source_path(file: &Path) -> Option<Arc<str>> {
+    let p = std::fs::canonicalize(file).ok()?;
+    Some(Arc::from(p.display().to_string()))
+}
 
 pub fn lit_value(l: &Lit) -> Value {
     match l {
@@ -785,6 +794,7 @@ impl Interp {
             spare: String::new(),
             view_cache: crate::viewcache::enabled().then(Default::default),
             tracks: Vec::new(),
+            trace: Default::default(),
         }
     }
 
@@ -846,6 +856,7 @@ impl Interp {
             spare: String::new(),
             view_cache: self.view_cache.clone(),
             tracks: Vec::new(),
+            trace: Default::default(),
         }
     }
 
@@ -1139,23 +1150,37 @@ impl Interp {
 
     /// Parses and runs a program's top level, registering its routes.
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
-        let stmts = Arc::new(Parser::new(src).parse_program().map_err(|e| e.in_file(file))?);
+        let abs = source_path(Path::new(file));
+        let stmts = Arc::new(Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?);
         Arc::make_mut(&mut self.program).push(stmts.clone());
         let env = self.globals.clone();
         let mut last = Value::Nil;
+        let debugging = crate::debug::on();
+        if debugging {
+            crate::debug::enter(self, "<main>", abs, 1);
+        }
+        let r = self.load_stmts(&stmts, &env, file, &mut last);
+        if debugging {
+            crate::debug::leave(self);
+        }
+        r?;
+        self.build_client().map_err(|e| e.in_file(file))?;
+        Ok(last)
+    }
+
+    fn load_stmts(&mut self, stmts: &[Stmt], env: &Env, file: &str, last: &mut Value) -> Result<(), QuilloError> {
         for s in stmts.iter() {
-            match self.exec_stmt(s, &env) {
-                Ok(v) => last = v,
+            match self.exec_stmt(s, env) {
+                Ok(v) => *last = v,
                 Err(Ctrl::Error(e)) => return Err(e.in_file(file)),
                 Err(Ctrl::Return(v)) => {
-                    last = v;
+                    *last = v;
                     break;
                 }
                 Err(Ctrl::Reply(_)) => return Err(QuilloError::new("`reply` used outside of a route", 0).in_file(file)),
             }
         }
-        self.build_client().map_err(|e| e.in_file(file))?;
-        Ok(last)
+        Ok(())
     }
 
     /// Compiles the program's components (and what they use) for the browser.
@@ -1198,7 +1223,15 @@ impl Interp {
         self.load_source(&src, &path.display().to_string())
     }
 
+    #[inline]
     pub fn exec_stmt(&mut self, s: &Stmt, env: &Env) -> Result<Value, Ctrl> {
+        if crate::debug::on() {
+            return crate::debug::stmt(self, s, env);
+        }
+        self.run_stmt(s, env)
+    }
+
+    pub(crate) fn run_stmt(&mut self, s: &Stmt, env: &Env) -> Result<Value, Ctrl> {
         match s {
             Stmt::Expr(e) => self.eval(e, env),
             Stmt::Let(p, e, line) => {
@@ -1274,18 +1307,28 @@ impl Interp {
                 let src = std::fs::read_to_string(&full)
                     .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
-                let stmts = Arc::new(Parser::new(&src).parse_program().map_err(|e| e.in_file(&fname))?);
+                let abs = source_path(&full);
+                let stmts = Arc::new(Parser::new(&src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(&fname))?);
                 Arc::make_mut(&mut self.program).push(stmts.clone());
                 let g = self.globals.clone();
+                let debugging = crate::debug::on();
+                if debugging {
+                    crate::debug::enter(self, path, abs, 1);
+                }
+                let mut r = Ok(Value::Nil);
                 for s in stmts.iter() {
-                    match self.exec_stmt(s, &g) {
-                        Err(Ctrl::Error(e)) => return Err(Ctrl::Error(e.in_file(&fname))),
-                        other => {
-                            other?;
-                        }
+                    if let Err(e) = self.exec_stmt(s, &g) {
+                        r = Err(match e {
+                            Ctrl::Error(e) => Ctrl::Error(e.in_file(&fname)),
+                            other => other,
+                        });
+                        break;
                     }
                 }
-                Ok(Value::Nil)
+                if debugging {
+                    crate::debug::leave(self);
+                }
+                r
             }
             Stmt::Type(td) => {
                 if !Arc::ptr_eq(env, &self.globals) {
@@ -1309,6 +1352,7 @@ impl Interp {
                         line,
                     ),
                     nesting: 0,
+                    file: None,
                     hot: Default::default(),
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
@@ -1487,7 +1531,7 @@ impl Interp {
         for (i, s) in stmts.iter().enumerate() {
             last = match s {
                 // A loop whose list nobody takes makes none.
-                Stmt::Expr(Expr::For(pat, iter, body, line)) if i + 1 < n => self.eval_for(pat, iter, body, &scope, *line, false)?,
+                Stmt::Expr(Expr::For(pat, iter, body, line)) if i + 1 < n && !crate::debug::on() => self.eval_for(pat, iter, body, &scope, *line, false)?,
                 s => self.exec_stmt(s, &scope)?,
             };
         }
@@ -1897,7 +1941,7 @@ impl Interp {
         }
         // Numbers in, a number out: in machine code once it is called again.
         #[cfg(feature = "jit")]
-        if self.fuel == u64::MAX && self.depth < MAX_DEPTH {
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() {
             if let Some(r) = crate::jit::call(c, &args, self.depth) {
                 return r;
             }
@@ -1992,9 +2036,16 @@ impl Interp {
             None => None,
         };
         self.depth += 1;
+        let debugging = crate::debug::on();
+        if debugging {
+            crate::debug::enter(self, &def.name, def.file.clone(), def.line);
+        }
         // Grow the stack on demand, so deep recursion works on any thread,
         // and so that a body that nests deeply has room for it.
         let r = crate::stack::for_nesting(def.nesting, || body(self));
+        if debugging {
+            crate::debug::leave(self);
+        }
         self.depth -= 1;
         if let Some((mask, who)) = saved {
             self.allowed = mask;
@@ -2059,8 +2110,15 @@ impl Interp {
 
     fn call_closure_inner(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Value, Ctrl> {
         let scope = self.bind_args(c, def, args, line)?;
+        if crate::debug::on() {
+            crate::debug::body(self, &def.body, &scope);
+        }
         let r = match self.eval(&def.body, &scope) {
             Ok(v) | Err(Ctrl::Return(v)) => v,
+            Err(Ctrl::Error(e)) if crate::debug::on() => {
+                crate::debug::failed(self, &e, &scope);
+                return Err(Ctrl::Error(e));
+            }
             Err(e) => return Err(e),
         };
         Scope::done(scope);
@@ -2190,9 +2248,16 @@ impl Interp {
         let def = c.def.clone();
         self.enter_call(&def, args.len(), line, |this| {
             let scope = this.bind_args(c, &def, args, line)?;
+            if crate::debug::on() {
+                crate::debug::body(this, &def.body, &scope);
+            }
             let start = out.len();
             match this.render_expr_into(&def.body, &scope, out) {
                 Ok(()) => Ok(()),
+                Err(Ctrl::Error(e)) if crate::debug::on() => {
+                    crate::debug::failed(this, &e, &scope);
+                    Err(Ctrl::Error(e))
+                }
                 // `return` (or `?`) part-way: the result is that value alone.
                 Err(Ctrl::Return(v)) => {
                     out.truncate(start);

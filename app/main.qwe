@@ -1,0 +1,35 @@
+// A small Quillo app to start from: a to-do list, split the way larger
+// programs are. This file is the program: its database, its parts, its routes.
+//
+//   quillo run app/main.qwe --watch     then open http://localhost:8080
+//   quillo check app/main.qwe           checks every file it uses, without running
+//
+// Edit any file while it runs: --watch reloads the program on save.
+//
+//   lib/todos.qwe        the Todo record, queries and server functions
+//   ui/page.qwe          the frame every page uses
+//   ui/todos.qwe         the <Todos> component, run in the browser
+//   migrations/          the database's tables, created once, in order
+//   public/              files served as they are, under /static/:
+//     css/style.css        the stylesheet
+//     js/app.js            the page's own JavaScript, called from <Todos>
+//     icons/favicon.svg    the icon in the browser's tab
+
+db.open("app.db")
+db.migrate("migrations")
+
+use "lib/todos.qwe"
+use "ui/page.qwe"
+use "ui/todos.qwe"
+
+route GET / =
+    <Page title="My Quillo app">
+        <h1>To do</h1>
+        <Todos initial={all_todos()}/>
+    </Page>
+
+// The same data as JSON, and a route with a typed path parameter.
+route GET /api/todos = all_todos()
+route GET /hello/:name = `Hello, ${name}!`
+
+route GET /static/*path = file("public/" + path)
