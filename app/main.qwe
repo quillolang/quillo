@@ -1,80 +1,26 @@
-// A small Quillo app to start from: a page rendered on the server, a component
-// that runs in the browser, server functions it calls, and a SQLite database.
+// A small Quillo app to start from: a to-do list, split the way larger
+// programs are. This file is the program: its database, its parts, its routes.
 //
 //   quillo run app/main.qwe --watch     then open http://localhost:8080
-//   quillo check app/main.qwe           finds mistakes without running it
+//   quillo check app/main.qwe           checks every file it uses, without running
 //
-// Edit this file while it runs: --watch reloads it on save.
+// Edit any file while it runs: --watch reloads the program on save.
+//
+//   lib/todos.qwe        the Todo record, queries and server functions
+//   ui/page.qwe          the frame every page uses
+//   ui/todos.qwe         the <Todos> component, run in the browser
+//   migrations/          the database's tables, created once, in order
+//   public/              files served as they are, under /static/:
+//     css/style.css        the stylesheet
+//     js/app.js            the page's own JavaScript, called from <Todos>
+//     icons/favicon.svg    the icon in the browser's tab
 
 db.open("app.db")
-db.exec("create table if not exists todos (
-    id integer primary key,
-    text text not null,
-    done integer not null default 0
-)")
+db.migrate("migrations")
 
-fn all_todos() with db = db.query(sql`select id, text, done from todos order by id`)
-
-// A `server fn` runs on the server; the component below calls it like any
-// function, with no API or fetch to write.
-server fn add_todo(text: str) -> list ! str with db {
-    let t = trim(text)
-    if t == "" { return err("a todo needs some text") }
-    db.exec("insert into todos (text) values (?)", t)?
-    all_todos()
-}
-
-server fn toggle(id: int) -> list with db {
-    db.exec("update todos set done = 1 - done where id = ?", id)
-    all_todos()
-}
-
-component Todos(initial: list) {
-    state todos = initial
-    state draft = ""
-    state problem = null
-    <section>
-        <form @submit={() => {
-            let r = add_todo(draft)
-            if is_err(r) {
-                problem = r.error
-            } else {
-                todos = r
-                draft = ""
-                problem = null
-            }
-        }}>
-            <input bind:value={draft} placeholder="Something to do" autofocus/>
-            <button>Add</button>
-        </form>
-        {problem && <p.problem>{problem}</p>}
-        <ul>
-            {for t in todos => <li key={t.id}>
-                <label>
-                    <input type="checkbox" checked={t.done == 1} @change={() => { todos = toggle(t.id) }}/>
-                    {t.text}
-                </label>
-            </li>}
-        </ul>
-    </section>
-}
-
-let style = "
-    body { font: 16px system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem }
-    ul { padding: 0; list-style: none }
-    .problem { color: #b42318 }
-"
-
-view Page(title: str, children) =
-    <html>
-        <head>
-            <meta charset="utf-8"/>
-            <meta name="viewport" content="width=device-width, initial-scale=1"/>
-            <title>{title}</title>
-            <style>{style}</style>
-        </head>
-        <body>{children}</body>
-    </html>
+use "lib/todos.qwe"
+use "ui/page.qwe"
+use "ui/todos.qwe"
 
 route GET / =
     <Page title="My Quillo app">
@@ -85,3 +31,5 @@ route GET / =
 // The same data as JSON, and a route with a typed path parameter.
 route GET /api/todos = all_todos()
 route GET /hello/:name = `Hello, ${name}!`
+
+route GET /static/*path = file("public/" + path)

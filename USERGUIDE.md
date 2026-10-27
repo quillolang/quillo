@@ -1973,7 +1973,7 @@ src/client/runtime.js  the browser runtime: values, standard library, signals an
 src/island.rs      when a page loads its components' code
 src/lsp.rs         the language server
 
-app/main.qwe       a sample app to start from
+app/               a sample app to start from (main.qwe, lib/, ui/, migrations/, public/)
 tests/             the language, routes, records, effects, the checker, numbers, streams,
                    UDP, Rust (.qwer), services, sessions, uploads, tenants, several
                    databases, the compiler

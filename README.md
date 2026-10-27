@@ -205,8 +205,19 @@ Run the sample app in [`app/`](app), then check it without running it:
 ./target/release/quillo check app/main.qwe
 ```
 
-`app/main.qwe` is a page, a component, server functions and a SQLite database in one
-file; edit it while it runs to start your own. More programs, each showing one part of
+`app/` is a small to-do app laid out the way larger programs are; edit it while it runs
+to start your own:
+
+```
+app/
+  main.qwe              the program: its database, the files it uses, its routes
+  lib/todos.qwe         the Todo record, queries and server functions
+  ui/page.qwe           the frame every page uses
+  ui/todos.qwe          a component, rendered on the server and run in the browser
+  migrations/           SQL, run once, in order
+  public/               served under /static/: css/, js/ (called from the component), icons/
+```
+ More programs, each showing one part of
 Quillo, are in [quillolang/examples](https://github.com/quillolang/examples).
 
 `cargo install --path .` puts `quillo` on your `PATH` instead.
@@ -219,7 +230,7 @@ diagnostics, completion, go to definition and debugging.
 | Path | What it holds |
 |---|---|
 | [`src/`](src) | The `quillo` binary: interpreter, number compiler, HTTP server, checker, component compiler, database drivers, language server and debug adapter |
-| [`app/`](app) | A sample app to start from |
+| [`app/`](app) | A sample app to start from: several files, migrations, CSS, JavaScript and an icon |
 | [`tests/`](tests) | Integration and browser tests; [`tests/programs`](tests/programs) holds the programs they run |
 
 Everything else has a repository of its own:

@@ -1,0 +1,38 @@
+// <Todos>: rendered on the server, then run in the browser. Adding and ticking
+// call the server functions in lib/todos.qwe without reloading the page, and
+// js(...) calls the page's own script, public/js/app.js.
+
+component Todos(initial: list<Todo>) {
+    state todos = initial
+    state draft = ""
+    state problem = null
+    let show = (list) => {
+        todos = list
+        js("todoApp.showLeft", left_of(list))
+    }
+    <section @mount={() => js("todoApp.showLeft", left_of(todos))}>
+        <form @submit={() => {
+            let r = add_todo(draft)
+            if is_err(r) {
+                problem = r.error
+            } else {
+                show(r)
+                draft = ""
+                problem = null
+            }
+        }}>
+            <input bind:value={draft} placeholder="Something to do" autofocus/>
+            <button>Add</button>
+        </form>
+        {problem && <p.problem>{problem}</p>}
+        <ul>
+            {for t in todos => <li key={t.id} class={t.done == 1 && "done"}>
+                <label>
+                    <input type="checkbox" checked={t.done == 1} @change={() => show(toggle(t.id))}/>
+                    {t.text}
+                </label>
+            </li>}
+        </ul>
+        <p.muted>{left_of(todos)} of {len(todos)} left · press / to type</p>
+    </section>
+}
