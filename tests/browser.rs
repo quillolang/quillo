@@ -226,7 +226,8 @@ fn svg_inside_html_draws() {
 
 /// Attributes a component takes from data: a spread cannot add handlers,
 /// whatever the key's case or `bind:`, nor replace an attribute written
-/// out; a sandboxed frame's page follows the state.
+/// out; a sandboxed frame's page follows the state; an SVG animation of an
+/// href is given no javascript: URL.
 #[test]
 fn spread_attributes_from_data_stay_attributes() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {
@@ -241,6 +242,7 @@ fn spread_attributes_from_data_stay_attributes() {
         "link": ["/ok", "window.clicked = 1", "kept"],
         "linkAttrs": ["action", "href", "id", "method", "onclick", "title"],
         "frame": "<p>second</p>",
+        "anim": ["about:blank#blocked", "about:blank#blocked"],
         "ran": 0,
         "errors": []
     });

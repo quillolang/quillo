@@ -12,6 +12,7 @@
     out.link = [$("#a").getAttribute("href"), $("#a").getAttribute("onclick"), $("#a").getAttribute("title")];
     out.linkAttrs = names($("#a"));
     out.frame = $("#frame").getAttribute("srcdoc");
+    out.anim = [$("#set").getAttribute("to"), $("#anim").getAttribute("values")];
     $("#a").dispatchEvent(new MouseEvent("mouseover"));
     out.ran = window.ran || 0;
     out.errors = window.__quilloErrors || [];

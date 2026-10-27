@@ -4065,6 +4065,11 @@ const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.te
 
 const URL_ATTRS = ["href", "src", "action", "formaction", "poster", "xlink:href", "cite", "background", "data", "codebase"];
 
+// An SVG animation's values go to another attribute (`<set
+// attributeName="href" to={u}>`), perhaps a URL one: they are checked as
+// URLs, each of `values` (split by ;) too, as on the server.
+const animValueAttr = (el, k) => (el.localName === "set" || el.localName === "animate") && /^(to|from|by|values)$/i.test(k);
+
 // javascript: and vbscript: URLs, read as browsers read them.
 function scriptURL(u) {
   const s = String(u).replace(/^[\u0000-\u0020]+/, "").replace(/[\t\n\r]/g, "").slice(0, 11).toLowerCase();
@@ -4087,7 +4092,7 @@ function setProp(el, k, v, old) {
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(v) : display(v);
   // The text the attribute will say, whatever the value's type (html too).
-  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s)) v = s = "about:blank#blocked";
+  if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (old !== v || el.getAttribute(k) !== s) el.setAttribute(k, s);
 }
 

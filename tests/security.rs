@@ -151,6 +151,27 @@ fn url_attributes_are_checked_however_they_are_written() {
 }
 
 #[test]
+fn svg_animations_cannot_give_an_href_a_script_url() {
+    // What the review sent: `<set attributeName="href" to={u}>`; `values`
+    // is a list, any of which may be the URL.
+    let mut it = app(
+        r#"
+route GET /s ? { u: str } = <svg><a>
+    <set attributeName="href" to={u}/>
+    <animate attributeName="xlink:href" values={`/a;${u}`} from={u}/>
+    <animate attributeName="href" {...{ by: u }} begin="0s"/>
+    <text>x</text>
+</a></svg>
+"#,
+    );
+    let body = send(&mut it, "GET", "/s?u=%20JaVaScRiPt:alert(1)", &[], "").text();
+    assert!(!body.to_lowercase().contains("javascript:"), "{}", body);
+    assert_eq!(body.matches("about:blank#blocked").count(), 4, "{}", body);
+    let body = send(&mut it, "GET", "/s?u=/notes", &[], "").text();
+    assert!(body.contains(r#"to="/notes""#) && body.contains(r#"values="/a;/notes""#) && !body.contains("blocked"), "{}", body);
+}
+
+#[test]
 fn html_values_in_url_attributes_are_checked_too() {
     // What the review sent: an `html` value, which was not looked at.
     let mut it = app(
