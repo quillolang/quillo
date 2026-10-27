@@ -1199,7 +1199,9 @@ udp.send("10.0.0.5", 514, "<14>app started")
   the next packet goes on.
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
   otherwise). A full queue drops its oldest packet, as UDP would; with `--metrics`,
-  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them.
+  `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
+  a sender down, so where packets come in bursts faster than the handler takes them,
+  give `queue` room for the largest burst.
 - `udp.send(host, port, data, { from })` sends one packet; `udp.reply(packet, data)` sends
   back to where a packet came from, from the port it came to (as most protocols expect).
   `data` is text, a list of byte values, or any other value as JSON; a packet holds up to
