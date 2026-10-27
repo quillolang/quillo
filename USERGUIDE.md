@@ -1978,7 +1978,6 @@ examples/          hello, orders, todo, notes, compose, layout, spa, scroll, vir
                    storm, telemetry (with sensors), media, rust (with rust.qwer),
                    services, and index (most of them in one server)
 apps/crm/          a whole application: a multi-tenant CRM
-site/              quillolang.org, written in Quillo; its docs are made from this README
 tests/             the language, routes, records, effects, the checker, numbers, streams,
                    UDP, Rust (.qwer), services, sessions, uploads, tenants, several
                    databases, the compiler

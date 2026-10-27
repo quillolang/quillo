@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brand/quillo-logo-256.png" width="96" height="96" alt="Quillo logo">
+  <img src=".github/quillo-logo.png" width="96" height="96" alt="Quillo logo">
 </p>
 
 <h1 align="center">Quillo</h1>
@@ -186,7 +186,7 @@ second time it is called, for the types it gets. `fib(32)` takes 11 ms (as in No
 Bun 21), and a ten-million-step loop 29 ms (Node and Bun: about 280), with the
 interpreter's exact answers and errors.
 
-[bench/README.md](bench/README.md) has how the benchmarks run, and every number.
+[quillolang/benchmarks](https://github.com/quillolang/benchmarks) has how the benchmarks run, and every number.
 
 ## Getting started
 
@@ -218,9 +218,11 @@ diagnostics, completion, go to definition and debugging.
 | [`examples/`](examples) | Small programs, each showing one part of Quillo: routes, a todo app, live notes, a single-page app, infinite scroll, a virtual list of a million rows, the Game of Life, UDP telemetry, a camera stream, Rust in a program, services |
 | [`apps/crm`](apps/crm) | A whole multi-tenant CRM with a shop, campaigns, a page designer and plugins |
 | [`editors/vscode`](editors/vscode) | The VS Code extension |
-| [`site/`](site) | [quillolang.org](https://quillolang.org), written in Quillo |
-| [`bench/`](bench) | The server and UI benchmarks |
 | [`tests/`](tests) | Integration and browser tests |
+
+The website ([quillolang/website](https://github.com/quillolang/website), with the logo
+and banners) and the benchmarks ([quillolang/benchmarks](https://github.com/quillolang/benchmarks))
+have repositories of their own.
 
 ## Documentation
 
