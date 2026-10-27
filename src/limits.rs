@@ -99,9 +99,16 @@ fn table(mysql: bool) -> String {
 
 fn in_db(it: &mut Interp, key: &str, cost: u64, per: i64, t: i64) -> Result<(u64, u64, i64), String> {
     let window = t.div_euclid(per);
-    let run = |it: &mut Interp| -> Result<Vec<Value>, String> {
-        if cost > 0 {
-            crate::db::own_sql(
+    // Inside a transaction on SQLite the count is made after it (see
+    // `db::own_sql`): this call's own cost is not in the rows read.
+    let held = if cost > 0 && crate::db::own_waits(it) { cost } else { 0 };
+    let mut counted = false;
+    let mut run = |it: &mut Interp| -> Result<Vec<Value>, String> {
+        // Held back, the count is made once, even when the table is made
+        // and the rows read again.
+        if cost > 0 && !(held > 0 && counted) {
+            counted = true;
+            crate::db::own_sql_made(
                 it,
                 |mysql| {
                     if mysql {
@@ -111,6 +118,7 @@ fn in_db(it: &mut Interp, key: &str, cost: u64, per: i64, t: i64) -> Result<(u64
                     }
                 },
                 vec![Value::str(key), Value::Int(window), Value::Int(cost as i64), Value::Int((window + 2) * per)],
+                Some(table),
             )?;
         }
         crate::db::own_sql(it, |_| "select w, n from _quillo_limits where k = ? and w >= ?".into(), vec![Value::str(key), Value::Int(window - 1)])
@@ -122,7 +130,7 @@ fn in_db(it: &mut Interp, key: &str, cost: u64, per: i64, t: i64) -> Result<(u64
             run(it)?
         }
     };
-    let (mut now, mut before) = (0, 0);
+    let (mut now, mut before) = (held, 0);
     for r in rows {
         if let Value::Map(m) = r {
             let (w, n) = match (m.get("w"), m.get("n")) {
@@ -130,7 +138,7 @@ fn in_db(it: &mut Interp, key: &str, cost: u64, per: i64, t: i64) -> Result<(u64
                 _ => continue,
             };
             if w == window {
-                now = n;
+                now += n;
             } else if w == window - 1 {
                 before = n;
             }

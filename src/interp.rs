@@ -108,6 +108,9 @@ pub struct Interp {
     pub session: Option<Value>,
     /// What the request set about its answer's headers, and its session's row (see `access`).
     pub access: crate::access::PerRequest,
+    /// Writes to Quillo's own tables held back until the transaction open on
+    /// their SQLite database ends (see `db::own_sql`).
+    pub own_later: Vec<crate::db::Held>,
     /// The locale the code runs in, once worked out (see `i18n`).
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
@@ -724,6 +727,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             access: Default::default(),
+            own_later: Vec::new(),
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
@@ -784,6 +788,7 @@ impl Interp {
             set_cookies: Vec::new(),
             session: None,
             access: Default::default(),
+            own_later: Vec::new(),
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),

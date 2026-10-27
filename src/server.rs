@@ -279,6 +279,7 @@ impl Interp {
         for c in self.set_cookies.drain(..) {
             resp.headers.push(("set-cookie".into(), c));
         }
+        crate::db::own_later(self);
         crate::access::apply(self, req, &mut resp);
         let nonce = crate::access::nonce_attr(self);
         if !self.base.is_empty() {

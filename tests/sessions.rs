@@ -261,3 +261,44 @@ fn ending_sessions_needs_them_in_the_database() {
     let renewed = pair(set_cookies(&r)[0]).to_string();
     assert_eq!(send(&mut it, "GET", "example.com", "/me", Some(&renewed)).text(), r#"{"user":1}"#);
 }
+
+#[test]
+fn sessions_and_rate_limits_are_kept_apart_from_the_programs_transactions() {
+    // On SQLite, with Quillo's tables in the program's database: what a
+    // transaction's function does to sessions and rate limits is not undone
+    // with a try that failed, nor done again by the next.
+    let dir = std::env::temp_dir().join(format!("quillo-db-sessions-tx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut it = Interp::new(&dir);
+    let src = r#"db.open("app.db")
+db.exec("create table if not exists notes (n int)")
+sessions({ store: "db" })
+route POST /in/:id(int) = db.transaction(() => {
+    set_session({ user: id })
+    db.exec("insert into notes values (?)", id)
+    err("refused")
+}).error
+route POST /failed = db.transaction(() => {
+    let ok = rate_limit("k", 3, "1m")
+    db.exec("insert into notes values (0)")
+    err(`refused (${ok})`)
+}).error
+route POST /limited = db.transaction(() => [rate_limit("k", 3, "1m"), rate_limit("k", 3, "1m")])
+route GET /me = session()
+route GET /notes = db.query("select n from notes") | map((r) => r.n)
+"#;
+    it.load_source(src, "app.qwe").unwrap_or_else(|e| panic!("{}", e));
+    let host = "acme.example.com";
+    let r = send(&mut it, "POST", host, "/in/7", None);
+    assert_eq!(r.text(), "refused");
+    // The note is rolled back; the session stays, as the cookie says.
+    let cookie = pair(set_cookies(&r)[0]).to_string();
+    assert_eq!(send(&mut it, "GET", host, "/me", Some(&cookie)).text(), r#"{"user":7}"#);
+    assert_eq!(send(&mut it, "GET", host, "/notes", None).text(), "[]");
+    // A call in a transaction that failed counts, once; two in one, two.
+    assert_eq!(send(&mut it, "POST", host, "/failed", None).text(), "refused (true)");
+    assert_eq!(send(&mut it, "POST", host, "/limited", None).text(), "[true,true]");
+    assert_eq!(send(&mut it, "POST", host, "/limited", None).text(), "[false,false]");
+    let _ = std::fs::remove_dir_all(&dir);
+}

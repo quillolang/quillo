@@ -1093,13 +1093,82 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
 /// Runs `sql(mysql)` on the database of Quillo's own tables (made if
 /// needed, as for calls made later), apart from the program's transactions
 /// and live updates: for sessions and rate limits. Rows for a `select`.
+///
+/// A server database gives it a connection of its own. SQLite has one, so
+/// while a transaction is open on it (`db.transaction`, `idempotent`), a
+/// change would be part of that transaction: rolled back with a try that
+/// failed, made again by the next. So changes wait, and are made once the
+/// transaction has ended (`own_later`), whatever became of it: a session
+/// set or ended, a rate limit counted, as on a server database. Reads and
+/// tables made are not held back.
 pub(crate) fn own_sql(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    own_sql_made(it, sql, params, None)
+}
+
+/// `own_sql`, with what makes the change's table (statements, by
+/// dialect) if it is not there when a held change is made: made inside the
+/// transaction, it went with it if that was rolled back.
+pub(crate) fn own_sql_made(it: &mut Interp, sql: impl Fn(bool) -> String, params: Vec<Value>, make: Option<fn(bool) -> String>) -> Result<Vec<Value>, String> {
     let b = match system_on_for(it, true, true) {
         Some(on) => backend_on(it, on)?,
         None => backend(it)?,
     };
     let text = sql(b.is_mysql());
+    if own_held(&b, &text) {
+        it.own_later.push(Held { make: make.map(|m| m(b.is_mysql())), backend: b, sql: text, params });
+        return Ok(Vec::new());
+    }
     apart(it, &b, text, params)
+}
+
+/// A change to Quillo's own tables waiting for a transaction to end.
+pub struct Held {
+    backend: Arc<Backend>,
+    sql: String,
+    params: Vec<Value>,
+    make: Option<String>,
+}
+
+/// Whether a change to Quillo's own tables waits for a transaction to end.
+fn own_held(b: &Backend, sql: &str) -> bool {
+    let Backend::Sqlite(m) = b else { return false };
+    let verb = sql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or("").to_ascii_lowercase();
+    matches!(verb.as_str(), "insert" | "update" | "delete") && !m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit()
+}
+
+/// Whether `own_sql`'s next change would wait (rate limits count it
+/// themselves then).
+pub(crate) fn own_waits(it: &mut Interp) -> bool {
+    let b = match system_on_for(it, true, true) {
+        Some(on) => backend_on(it, on),
+        None => backend(it),
+    };
+    b.map_or(false, |b| own_held(&b, "insert"))
+}
+
+/// Makes the changes `own_sql` held back, on databases whose transaction
+/// has ended (at the end of each outermost transaction, and of a request).
+pub(crate) fn own_later(it: &mut Interp) {
+    if it.own_later.is_empty() {
+        return;
+    }
+    for h in std::mem::take(&mut it.own_later) {
+        let free = matches!(&*h.backend, Backend::Sqlite(m) if m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit());
+        if !free {
+            it.own_later.push(h);
+            continue;
+        }
+        let mut r = apart(it, &h.backend, h.sql.clone(), h.params.clone());
+        if let (Err(_), Some(make), Backend::Sqlite(m)) = (&r, &h.make, &*h.backend) {
+            r = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(make).map(|_| Vec::new()).map_err(|e| e.to_string());
+            if r.is_ok() {
+                r = apart(it, &h.backend, h.sql, h.params);
+            }
+        }
+        if let Err(e) = r {
+            eprintln!("quillo: Quillo's own tables: {}", e);
+        }
+    }
 }
 
 /// Whether a program uses `db.atomic` (then transactions it left prepared
@@ -1384,6 +1453,9 @@ pub(crate) fn attempt(
                 let _ = run("rollback");
             }
             tx_end(it, mark, commit && ended.is_ok());
+            if outermost {
+                own_later(it);
+            }
             match ended {
                 Err(e) if commit => {
                     let again = immediate && busy(&e);

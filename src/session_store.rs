@@ -62,9 +62,19 @@ fn table(mysql: bool) -> String {
     }
 }
 
+/// The sessions' table and its index, in one go (for a change held back
+/// until a transaction ended: see `db::own_sql`).
+fn table_and_index(mysql: bool) -> String {
+    if mysql {
+        table(true)
+    } else {
+        format!("{}; create index if not exists _quillo_sessions_user on _quillo_sessions (scope, user_id)", table(false))
+    }
+}
+
 /// `sql` on the sessions' table, made the first time it is missing.
 fn run(it: &mut Interp, sql: &str, params: Vec<Value>) -> Result<Vec<Value>, String> {
-    match crate::db::own_sql(it, |_| sql.to_string(), params.clone()) {
+    match crate::db::own_sql_made(it, |_| sql.to_string(), params.clone(), Some(table_and_index)) {
         Ok(rows) => Ok(rows),
         Err(_) => {
             crate::db::own_sql(it, table, Vec::new())?;

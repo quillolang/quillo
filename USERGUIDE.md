@@ -2215,6 +2215,12 @@ program's own tables when there is one database. A program with no database at a
 keeps its calls made later in that file too, so they outlive a restart (its jobs need
 no record: one server runs them).
 
+Sessions and rate limits are apart from the program's transactions: a session set, or a
+call counted, inside `db.transaction` (or `idempotent`) stays when the transaction is
+rolled back, and is not undone by a try that failed. On PostgreSQL and MySQL they use
+a connection of their own; SQLite has one connection, so there their changes are made
+as soon as the transaction has ended.
+
 The answers of [idempotent requests](#idempotent-requests) (`_quillo_idempotency`) are
 the exception: they are kept in the program's database, the tenant's when there is one
 per tenant, so they commit in the same transaction as the work they answer for.
