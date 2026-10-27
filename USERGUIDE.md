@@ -1553,7 +1553,19 @@ Safety built in:
   another case either. Event handler attributes and `srcdoc` take only text written in
   the program (see [HTML literals](#html-literals)). `javascript:` URLs in `href`, `src`
   and the like render as `about:blank#blocked`, whatever the value's type: the text the
-  attribute would say is checked, so `href={markdown(u, { inline: true })}` too.
+  attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
+  the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
+  each of `values`), which may be an `href`.
+- CSS takes data as it is written, by design: `style={...}` is escaped like any
+  attribute and `<style>{x}</style>` has its `</` rewritten, so neither can end the
+  element, but what they say is CSS. CSS runs no script in today's browsers; data put
+  there can still restyle the page (cover it with an overlay,
+  hide or move what is on it) and load URLs (`background: url(https://elsewhere/?...)`,
+  `@import`), which tells another site that the page was viewed and can carry what the
+  style sheet says. Put only values you chose into styles (a colour from a list, a
+  number), or check what users give against what you allow. A policy that keeps loading
+  on the site, such as `csp({ img_src: "'self'", font_src: "'self'" })`, stops the
+  beacons that go through `url()`.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
