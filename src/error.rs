@@ -35,13 +35,27 @@ impl fmt::Display for QuilloError {
 
 impl std::error::Error for QuilloError {}
 
+/// When this process's binary was built, as it was when the process
+/// started: a long-running one (the language server) keeps running the old
+/// code after a rebuild replaces the file.
+static BUILT: std::sync::OnceLock<Option<std::time::SystemTime>> = std::sync::OnceLock::new();
+
+fn exe_modified() -> Option<std::time::SystemTime> {
+    std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()
+}
+
+/// Notes when this binary was built, for `which_quillo` later on.
+pub fn note_start() {
+    BUILT.get_or_init(exe_modified);
+}
+
 /// After a syntax error: which quillo this is, as code written for a newer
 /// one fails to parse here (an old build left on the PATH, say).
 pub fn which_quillo() -> String {
     let exe = std::env::current_exe().ok();
-    let built = exe
-        .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok()?.modified().ok())
+    let now = exe_modified();
+    let then = *BUILT.get_or_init(|| now);
+    let built = then
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| {
             // Days since 1970 to a date (Howard Hinnant's civil_from_days).
@@ -58,5 +72,13 @@ pub fn which_quillo() -> String {
         })
         .unwrap_or_default();
     let at = exe.map(|p| format!(" at {}", p.display())).unwrap_or_default();
+    if then.is_some() && now != then {
+        return format!(
+            "this is quillo {}{}{}, which has been built again since this process started; restart it to use the new build",
+            crate::version(),
+            built,
+            at
+        );
+    }
     format!("this is quillo {}{}{}; code written for a newer Quillo fails to parse like this", crate::version(), built, at)
 }

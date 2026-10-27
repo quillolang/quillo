@@ -248,6 +248,7 @@ impl Server {
     }
 
     pub fn run(&mut self) -> i32 {
+        crate::error::note_start();
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut shutdown = false;
