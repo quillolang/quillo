@@ -2305,7 +2305,9 @@ audit.verify()          // { ok: true, rows: 1234, last: "9f2c..." }, or where i
 - Inside `db.transaction` the row is written in the transaction: a change rolled back
   leaves no row, and one committed always has its row. Give `audit(...)` a `?`, as above,
   and a row that could not be written rolls the change back too. Outside a
-  transaction it is written in one of its own.
+  transaction it is written in one of its own. In a transaction with `retries`, a try
+  rolled back takes its row with it; appends that collide (one tenant's rows take
+  turns) are conflicts like any other, and the transaction runs again.
 - Values under sensitive keys (`password`, `iban`, ... see
   [Sensitive values](#sensitive-values)) are stored as `[redacted]`: keep ids in the
   details, not documents or secrets.
