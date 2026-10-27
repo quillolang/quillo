@@ -99,8 +99,10 @@ pub struct Pool {
     pool: Option<mysql_async::Pool>,
 }
 
-/// A connection.
-pub struct Conn(Option<mysql_async::Conn>);
+/// A connection; and, in a transaction that retries, whether a statement
+/// failed because of another transaction (see `crate::txn`; None: not
+/// watching).
+pub struct Conn(Option<mysql_async::Conn>, Option<bool>);
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -139,13 +141,13 @@ impl Pool {
         }
         let pool = mysql_async::Pool::new(opts);
         let c = run(pool.get_conn()).map_err(|e| e.to_string())?;
-        drop(Conn(Some(c)));
+        drop(Conn(Some(c), None));
         Ok(Pool { pool: Some(pool) })
     }
 
     pub fn checkout(&self) -> Result<Conn, String> {
         let pool = self.pool.as_ref().expect("open");
-        run(pool.get_conn()).map(|c| Conn(Some(c))).map_err(|e| e.to_string())
+        run(pool.get_conn()).map(|c| Conn(Some(c), None)).map_err(|e| e.to_string())
     }
 
     pub fn give_back(&self, c: Conn) {
@@ -186,7 +188,7 @@ impl Conn {
             result.drop_result().await?;
             Ok::<_, mysql_async::Error>(out)
         });
-        r.map_err(|e| e.to_string())
+        r.map_err(|e| self.failed(e))
     }
 
     /// `{ changes, last_id }`. Without parameters the text may hold several
@@ -198,7 +200,7 @@ impl Conn {
             let (sql, params) = translate(sql, params)?;
             run(self.conn().exec_drop(sql, params))
         };
-        r.map_err(|e| e.to_string())?;
+        r.map_err(|e| self.failed(e))?;
         let c = self.conn();
         let mut m = Map::new();
         m.insert("changes".into(), Value::Int(c.affected_rows() as i64));
@@ -208,7 +210,33 @@ impl Conn {
 
     pub fn batch(&mut self, sql: &str) -> Result<(), String> {
         let r = run(self.conn().query_drop(sql));
-        r.map_err(|e| e.to_string())
+        r.map_err(|e| self.failed(e))
+    }
+
+    /// The error's message; a deadlock (1213, which rolls the whole
+    /// transaction back), a lock wait that timed out (1205), a row changed
+    /// since this transaction's snapshot (1020: MariaDB's snapshot
+    /// isolation, on by default since 11.6) or a table made since the
+    /// transaction began (1412) is also noted, when watching, for the
+    /// transaction to run again.
+    fn failed(&mut self, e: mysql_async::Error) -> String {
+        if let (Some(c), mysql_async::Error::Server(s)) = (self.1.as_mut(), &e) {
+            if matches!(s.code, 1213 | 1205 | 1020 | 1412) {
+                *c = true;
+            }
+        }
+        e.to_string()
+    }
+
+    /// Starts (or stops) noting conflicts with other transactions.
+    pub fn watch_conflicts(&mut self, on: bool) {
+        self.1 = on.then_some(false);
+    }
+
+    /// Whether a statement failed because of another transaction since
+    /// `watch_conflicts(true)`.
+    pub fn conflicted(&self) -> bool {
+        self.1 == Some(true)
     }
 }
 

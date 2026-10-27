@@ -81,7 +81,8 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
         for name in it.server_fns.iter() {
-            let _ = writeln!(program, "server[{}] = W.server({});", js_str(name), js_str(name));
+            let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&c.def));
+            let _ = writeln!(program, "server[{}] = W.server({}{});", js_str(name), js_str(name), if idem { ", true" } else { "" });
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
@@ -1324,7 +1325,8 @@ impl<'a> Compiler<'a> {
             Value::Func(f) if f.def.server => {
                 let r = (js.clone(), true);
                 self.globals.insert(name.to_string(), r.clone());
-                self.defs.push(format!("{} = W.server({});", js, js_str(name)));
+                let idem = if crate::idempotency::used_by(&f.def) { ", true" } else { "" };
+                self.defs.push(format!("{} = W.server({}{});", js, js_str(name), idem));
                 Ok(r)
             }
             Value::Func(f) => {
