@@ -8,10 +8,6 @@ updates:
       cargo:
         patterns: ["*"]
         update-types: [minor, patch]
-  - package-ecosystem: npm
-    directory: /editors/vscode
-    schedule:
-      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:
