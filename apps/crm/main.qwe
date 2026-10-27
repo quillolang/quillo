@@ -239,10 +239,8 @@ route POST /login { form: { email: str, password: str } } {
     }
     // A second step: the code, or setting the app up when the workspace asks.
     // Signed in (and in the audit log as such) only once it is passed.
-    if has_two_step(u) || two_step_required() {
-        set_session({ pending: u.id, pending_at: now() })
-        return redirect(has_two_step(u) ? "/login/code" : "/login/setup")
-    }
+    let next = second_step_next(u, "password")
+    if next != null { return next }
     login_ok(who)
     set_session({ user: u.id })
     audit("login", { method: "password" })
@@ -270,8 +268,9 @@ route POST /login/code { form: { code: str } } {
         return redirect("/login/code?problem=wrong")
     }
     login_ok(u.email)
+    let method = session().pending_method ?? "password"
     set_session({ user: u.id })
-    audit("login", { method: "password", second_step: passed })
+    audit("login", { method, second_step: passed })
     put_setting("url", `${SCHEME}://${request.headers.host}`)
     redirect("/app")
 }
@@ -295,8 +294,9 @@ route POST /login/setup { form: { code: str } } {
         return redirect("/login/setup?problem=wrong")
     }
     login_ok(u.email)
+    let method = session().pending_method ?? "password"
     set_session({ user: u.id })
-    audit("login", { method: "password", second_step: "app" })
+    audit("login", { method, second_step: "app" })
     put_setting("url", `${SCHEME}://${request.headers.host}`)
     <RecoveryPage {codes}/>
 }
@@ -318,7 +318,7 @@ route GET /welcome/:token {
         return redirect("/login?problem=expired")
     }
     db.exec("delete from sign_in_tokens where token = ?", token)
-    let next = second_step_next(u)
+    let next = second_step_next(u, "link")
     if next != null { return next }
     set_session({ user: row.user_id })
     audit("login", { method: "link" })

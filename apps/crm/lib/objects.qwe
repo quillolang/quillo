@@ -67,6 +67,15 @@ fn record_title(o: map, fields: list, values: map, id) {
     blank(v) ? `${o.name} ${id ?? "(new)"}` : str(v)
 }
 
+// Whether access `a` hides the field an object's titles are made from.
+fn title_hidden(a: map, o: map, fields: list) {
+    let f = find(fields, (x) => x.key == o.title_field) ?? find(fields, (x) => x.type == "text")
+    f != null && field_level(a, f.key) == "hidden"
+}
+
+// A record whose title must not show: named as one without a title is.
+fn untitled(o: map, r: map, hide: bool) = hide ? set(r, "title", `${o.name} ${r.id}`) : r
+
 fn need_object(key: str) {
     objects_ready()
     object_out(db.one("select * from objects where key = ?", key)) ?? err("No such object")
@@ -247,20 +256,28 @@ server fn link_choices(key: str) {
             | map((c) => { value: str(c.id), label: blank(`${c.first_name}${c.last_name}`) ? c.email : `${trim(`${c.first_name} ${c.last_name}`)} (${c.email})` }) : [],
         person: any(fields, (f) => f.type == "person") ? db.query("select id, name, email from users order by name") | map((x) => { value: str(x.id), label: x.name }) : [],
         company: any(fields, (f) => f.type == "company") ? db.query("select id, name from companies order by name limit 1000") | map((c) => { value: str(c.id), label: c.name }) : [],
-        records: targets | reduce({}, (m, t) => set(m, t, !allows(access_to(u, t).level, "read") ? [] : rec_all(t, 1000)
-            | filter((r) => may_see(u, access_to(u, t), r)) | sort_by((r) => lower(r.title)) | map((r) => { value: str(r.id), label: r.title }))),
+        records: targets | reduce({}, (m, t) => {
+            let at = access_to(u, t)
+            let o = need_object(t)
+            if !allows(at.level, "read") || is_err(o) { return set(m, t, []) }
+            let hide = title_hidden(at, o, object_fields(t))
+            set(m, t, rec_all(t, 1000) | filter((r) => may_see(u, at, r)) | map((r) => untitled(o, r, hide))
+                | sort_by((r) => lower(r.title)) | map((r) => { value: str(r.id), label: r.title }))
+        }),
     }
 }
 
 server fn list_records(key: str, q: str) {
     let u = need_user()?
     let a = need_access(u, key, "read", null)?
+    let o = need_object(key)?
     let words = lower(trim(q))
     let fields = object_fields(key)
+    let hide = title_hidden(a, o, fields)
     rec_all(key, 500)
         | map((r) => set(r, "fields", fill_lookups(fields, r.fields)))
         | filter((r) => may_see(u, a, r))
-        | map((r) => as_seen(a, r))
+        | map((r) => untitled(o, as_seen(a, r), hide))
         | filter((r) => words == "" || contains(lower(r.title), words) || contains(lower(json.stringify(r.fields)), words))
         | map((r) => set(r, "names", link_names(fields, r.fields)))
 }
@@ -273,7 +290,7 @@ server fn get_record(key: str, id: int) {
     let r = set(r0, "fields", fill_lookups(object_fields(key), r0.fields))
     let a = need_access(u, key, "read", r)?
     let o = need_object(key)?
-    let seen = as_seen(a, r)
+    let seen = untitled(o, as_seen(a, r), title_hidden(a, o, object_fields(key)))
     merge(seen, { names: link_names(object_fields(key), seen.fields), linked: records_linking(u, "record", id, key), can: a.level,
         moves: moves_for(u, o, r) | map((t) => remove(remove(t, "groups"), "roles")), comments: open_annotations(key, id) })
 }
@@ -493,10 +510,9 @@ fn records_csv(key: str) {
     let all = object_fields(key)
     let fields = all | filter((f) => field_level(a, f.key) != "hidden")
     // The title is a field's value (see record_title).
-    let tf = find(all, (x) => x.key == o.title_field) ?? find(all, (x) => x.type == "text")
-    let title_hidden = tf != null && field_level(a, tf.key) == "hidden"
+    let hide = title_hidden(a, o, all)
     let rows = sort_by(rec_all(key, 1000000), (r) => r.id) | filter((r) => may_see(u, a, r))
-        | map((r) => csv_row([str(r.id), title_hidden ? "" : r.title] + (fields | map((f) => str(r.fields[f.key] ?? "")))))
+        | map((r) => csv_row([str(r.id), hide ? "" : r.title] + (fields | map((f) => str(r.fields[f.key] ?? "")))))
     audit("records.export", { object: key, rows: len(rows) })
     respond(200, join([csv_row(["id", "title"] + (fields | map((f) => f.key)))] + rows, "\n") + "\n",
         { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename=${key}.csv` })

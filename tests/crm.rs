@@ -1806,6 +1806,15 @@ fn exported_records_leave_out_hidden_fields() {
     let kims = export(&mut crm, &kim);
     assert!(kims.starts_with("id,title,customer,priority,status,details,due\n") && kims.contains("4242"), "{}", kims);
     assert!(!kims.contains("Broken zip"), "{}", kims);
+
+    // Nor do the list, the record, or a link field's choices show a title
+    // made from a field the role hides.
+    let id = r["ok"]["id"].as_i64().unwrap();
+    let listed = rpc(&mut crm, &kim, "list_records", serde_json::json!(["ticket", ""]));
+    assert!(!listed.to_string().contains("Broken zip") && listed["ok"][0]["id"] == id, "{}", listed);
+    let one = rpc(&mut crm, &kim, "get_record", serde_json::json!(["ticket", id]));
+    assert!(!one.to_string().contains("Broken zip") && one["ok"]["id"] == id, "{}", one);
+    assert!(rpc(&mut crm, &sam, "get_record", serde_json::json!(["ticket", id])).to_string().contains("Broken zip"));
 }
 
 /// The link from signing up is a first step, as a password is: an owner
@@ -1840,6 +1849,14 @@ fn a_sign_in_link_still_takes_the_second_step() {
     assert_eq!((status, to.as_deref()), (303, Some("/login/code")));
     assert!(!signed_in(&mut crm, &cookie));
     assert_eq!(crm.send(host, "GET", "/login/code", "", Some(&cookie)).status, 200);
+    // Its code signs in, and the audit log says the first step was the link.
+    let r = crm.form(host, "/login/code", &format!("code={}", app_code("JBSWY3DPEHPK3PXP", time_step())), Some(&cookie));
+    assert_eq!(r.header("location"), Some("/app"));
+    let ada = session_cookie(&r);
+    let rows = crm.rpc(host, "list_audit", serde_json::json!([{}]), Some(&ada));
+    let rows = rows["ok"].as_array().unwrap_or_else(|| panic!("{}", rows)).clone();
+    let login = rows.iter().find(|r| r["action"] == "login").unwrap_or_else(|| panic!("{:?}", rows));
+    assert_eq!((&login["details"]["method"], &login["details"]["second_step"]), (&serde_json::json!("link"), &serde_json::json!("app")), "{:?}", login);
 
     // Without either, the link signs in, once.
     crm.sql("acme", "update users set totp_secret = '' where email = 'ada@acme.test';
