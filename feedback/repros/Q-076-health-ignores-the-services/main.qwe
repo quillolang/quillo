@@ -1,0 +1,13 @@
+// Q-076 `/_quillo/health` is the process's own: the app answers 200 with the service it calls down, there is no readiness of what it calls, and a gateway cannot reach a service's health through it
+// mode: serve
+// flags: --service-url risk=http://127.0.0.1:9
+// get: /_quillo/health
+// get: /_quillo/ready
+// get: /go
+// open-when: GET /_quillo/ready -> 404
+// fixed-when: GET /_quillo/ready -> 503
+// From FEEDBACK10.md §Q-076 (found on af64ac8). risk "runs" at port 9, where nothing answers. `/_quillo/ready` is the suggestion's name.
+
+service risk = "risk.qwe" { timeout: "1s", retries: 0 }
+
+route GET /go = risk.assess(1) ?? "risk did not answer"

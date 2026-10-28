@@ -24,7 +24,9 @@ command line with no program, and a chain of services with a slow link),
 its bundles are keyed and kept), [FEEDBACK8.md](reports/FEEDBACK8.md) (no app: unused
 classes in the five apps, the classes Quillo sets itself, and component CSS that is not
 scoped), [FEEDBACK9.md](reports/FEEDBACK9.md) (no app: whether Quillo keeps its keywords,
-builtins and modules apart from a program's names, on the server and in the browser; how `run` takes its options; `.env` and a service's settings), and
+builtins and modules apart from a program's names, on the server and in the browser; how `run` takes its options; `.env` and a service's settings), [FEEDBACK10.md](reports/FEEDBACK10.md) (no app: one service
+scaled to several copies without changing its code, a copy joining while the app runs, and
+retries behind a balancer, health and API description through a gateway), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
@@ -111,5 +113,9 @@ Node 22 or newer, and Chrome (or `QUILLO_CHROME`); nothing to install.
   `public/` sheets and `` css`...` ``) that nothing in it can write, by file and line. A
   class a template may make (`` `ui-tabs-${v}` ``) is "maybe"; Quillo's own (`q-*`, `hl-*`)
   are read from its runtime. A library's classes (`.leaflet-*`) show as unused.
+- `tools/service-scale/run.sh`: an app and a computing service, run in one process, as one
+  copy, three listed, and behind limer (round-robin, hashed on `x-quillo-call`, a copy joining
+  mid-run): calls a second, which copy answered, and calls that ran twice. `LIMER=` for
+  limer's binary; the limer steps are skipped without it.
 - `tools/drive.mjs test.mjs [--mismatches]`: runs a script that default-exports
   `async ({ browser, page, sleep, ALT, CTRL, META, SHIFT }) => result`.

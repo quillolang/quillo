@@ -1,0 +1,8 @@
+// The app: the same code whether risk is in this process, split, or many copies elsewhere.
+service risk = "risk.qwe" { timeout: env("RISK_TIMEOUT") ?? "5s", retries: 2 }
+
+route GET /go/:n {
+    let slow = int(request.query.slow ?? "0")
+    let r = risk.assess(int(n), 300000, slow)
+    is_err(r) ? `err ${r.error}` : `ok ${r.inst}`
+}
