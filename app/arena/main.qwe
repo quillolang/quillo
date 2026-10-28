@@ -1,0 +1,199 @@
+// Quillo Arena: a real-time multiplayer game, to find where Quillo stands for games.
+//
+//   quillo run app/arena/main.qwe --watch      then open http://localhost:8080
+//
+// Players pick a name, enter a room and steer a dot with the pointer to collect
+// orbs. The server owns the world: a loop moves everyone 20 times a second and sends
+// each room a snapshot on its channel (datagrams over WebTransport). Chat goes on the
+// same channel, reliably. Every minute a round ends: its winners go into SQLite and
+// a live leaderboard. Spectators follow a room's scores over Server-Sent Events.
+// Bots (POST /game/bots/<room>/<n>, from this machine) load a room without browsers;
+// GET /game/stats is what the loop measures.
+
+service /game = "game.qwe"         // named game; its /stats and /bots under /game
+
+let ROOMS = ["north", "south", "east"]
+let W = 1000
+let H = 600
+let TICK_MS = 50
+
+// ---- pages -------------------------------------------------------------------
+
+// The rooms' counts and the winners come from the game; a live loader of another
+// service's data follows a topic the game publishes.
+server fn room_counts() {
+    watch("arena:counts")
+    game.room_counts()
+}
+server fn top_winners() {
+    watch("arena:winners")
+    game.winners()
+}
+
+let arena_css = css`
+body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0d0c14; color: #ecebf3; }
+main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
+a { color: #f3b54a; }
+h1 { margin: 0 0 4px; font-size: 28px; }
+.muted { color: #9a97ad; }
+.rooms { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; padding: 0; list-style: none; }
+.rooms a { display: block; padding: 16px; border: 1px solid #2c2a3c; border-radius: 10px; text-decoration: none; color: inherit; }
+.rooms a:hover { border-color: #f3b54a; }
+.game { display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 14px; }
+canvas { width: 100%; aspect-ratio: 1000 / 600; background: #15131f; border-radius: 10px; cursor: crosshair; touch-action: none; }
+.side { display: grid; gap: 12px; align-content: start; font-size: 14px; }
+.side ol { margin: 0; padding-left: 20px; }
+.chat { height: 180px; overflow: auto; margin: 0; padding: 8px; border: 1px solid #2c2a3c; border-radius: 8px; list-style: none; }
+input, button { font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid #2c2a3c; background: #15131f; color: inherit; }
+button { cursor: pointer; }
+table { border-collapse: collapse; width: 100%; }
+td, th { padding: 6px 8px; border-bottom: 1px solid #2c2a3c; text-align: left; }
+@media (max-width: 760px) { .game { grid-template-columns: minmax(0, 1fr); } }
+`
+
+view Page(title: str, children) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title} · Quillo Arena</title>
+            <style>{arena_css}</style>
+        </head>
+        <body><main>{children}</main></body>
+    </html>
+
+component Lobby() {
+    state c = live(room_counts)
+    <ul.rooms>{for r in ROOMS => <li key={r}><a href={`/room/${r}`}><b>{r}</b><br/>
+        <span.muted>{c[r] ?? 0} playing</span></a> <a href={`/watch/${r}`}>watch</a></li>}</ul>
+}
+
+component Leaderboard() {
+    state rows = live(top_winners)
+    <table>
+        <thead><tr><th>Name</th><th>Room</th><th>Score</th></tr></thead>
+        <tbody>{for w in rows ?? [] => <tr key={`${w.name}${w.at}`}><td>{w.name}</td><td>{w.room}</td><td>{w.score}</td></tr>}</tbody>
+    </table>
+}
+
+route GET / {
+    let name = session().name ?? null
+    <Page title="Lobby">
+        <h1>Quillo Arena</h1>
+        <p.muted>Steer with the pointer, take the orbs. A round ends every minute.</p>
+        {name == null
+            ? <form method="post" action="/name"><input name="name" placeholder="Your name" maxlength="20" required/> <button>Play</button></form>
+            : <p>Playing as <b>{name}</b>.</p>}
+        <Lobby/>
+        <h2>Best of the last rounds</h2>
+        <Leaderboard/>
+    </Page>
+}
+
+route POST /name { form: { name: str } } {
+    let n = slice(trim(name), 0, 20)
+    if n == "" { reply 400 "a name, please" }
+    set_session({ name: n })
+    redirect("/")
+}
+
+// The game: the canvas is drawn from each snapshot as it comes, not through state,
+// so a tick costs one drawing and no diffing.
+component Game(room: str) {
+    state ctx = null
+    state names = {}
+    state scores = []
+    state chat = []
+    state draft = ""
+    state target = [500, 300]
+    state sent = [0, 0]
+    state got = 0
+    let draw = (m) => {
+        ctx.clearRect(0, 0, W, H)
+        ctx.fillStyle = "#f3b54a"
+        for o in m.o {
+            ctx.beginPath()
+            ctx.arc(o[0], o[1], 6, 0, 6.2832)
+            ctx.fill()
+        }
+        for p in m.p {
+            ctx.fillStyle = names[p[0]]?.colour ?? "#b9a8ff"
+            ctx.beginPath()
+            ctx.arc(p[1], p[2], 14, 0, 6.2832)
+            ctx.fill()
+            ctx.fillStyle = "#ecebf3"
+            ctx.fillText(names[p[0]]?.name ?? "", p[1] + 18, p[2] + 4)
+        }
+    }
+    let ch = channel.open(`room-${room}`, (m) => {
+        if m.p != null {
+            got += 1
+            if ctx != null { draw(m) }
+            if got % 10 == 0 {
+                scores = sort_by(m.p, (p) => 0 - p[3]) | take(5) | map((p) => { name: names[p[0]]?.name ?? "?", score: p[3] })
+            }
+        }
+        if m.roster != null { names = reduce(m.roster, {}, (acc, r) => set(acc, r[0], { name: r[1], colour: r[2] })) }
+        if m.chat != null { chat = take(push(chat, m.chat), 50) }
+        if m.round != null { chat = push(chat, { name: "round", text: join(m.round | map((w) => `${w.name} ${w.score}`), ", ") }) }
+    })
+    // Where the pointer is, sent when it changed, 20 times a second at most.
+    if true {
+        every(TICK_MS, () => {
+            if target[0] != sent[0] || target[1] != sent[1] {
+                sent = target
+                ch.send({ t: target })
+            }
+        })
+    }
+    <div.game>
+        <canvas width="1000" height="600" aria-label={`The ${room} room`}
+            @mount={(el) => { ctx = el.getContext("2d") }}
+            @pointermove={(e) => {
+                let r = e.target.getBoundingClientRect()
+                target = [round((e.clientX - r.left) * W / r.width), round((e.clientY - r.top) * H / r.height)]
+            }}></canvas>
+        <div.side>
+            <div><b>{room}</b> <span.muted>· {got} updates</span></div>
+            <ol>{for s in scores => <li>{s.name}: {s.score}</li>}</ol>
+            <ul.chat aria-live="polite">{for [i, c] in enumerate(chat) => <li key={i}><b>{c.name}</b> {c.text}</li>}</ul>
+            <form @submit={() => { ch.send({ chat: draft }, { reliable: true }); draft = "" }}>
+                <input bind:value={draft} placeholder="Say something" maxlength="200" aria-label="Message"/>
+            </form>
+        </div>
+    </div>
+}
+
+route GET /room/:room {
+    if !contains(ROOMS, room) { reply 404 "no such room" }
+    if session().name == null { redirect("/") }
+    <Page title={room}>
+        <p><a href="/">← Lobby</a></p>
+        <Game room={room}/>
+    </Page>
+}
+
+// Spectators: the room's scores twice a second, over Server-Sent Events, for as
+// long as they watch.
+route GET /watch/:room/scores = events((send) => {
+    if !contains(ROOMS, room) { return null }
+    while true {
+        send(game.top(room) ?? [])
+        sleep(500)
+    }
+})
+
+component Watch(room: str) {
+    state rows = []
+    listen(`/watch/${room}/scores`, (s) => { rows = s })
+    <ol>{for r in rows => <li>{r.name}: {r.score}</li>}</ol>
+}
+
+route GET /watch/:room {
+    if !contains(ROOMS, room) { reply 404 "no such room" }
+    <Page title={`Watching ${room}`}>
+        <p><a href="/">← Lobby</a></p>
+        <h1>Watching {room}</h1>
+        <Watch room={room}/>
+    </Page>
+}

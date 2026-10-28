@@ -11,10 +11,12 @@
 // how to run it and how to read what comes out:
 //
 //   // Q-012 `let` with a type's name does not bind it
-//   // mode: run                  check | run | serve | browser | cli
+//   // mode: run                  check | run | serve | browser | cli | script
 //   // args: run --watch          cli: quillo's own arguments, in the repro's folder
 //   // get: /path [header=value]  serve: requests to make (several allowed)
 //   // page: /path                browser: the page to open
+//   // script: steps.sh           script: a shell script in the repro's folder, run with $QUILLO
+//                                 (for what a request cannot show: signals, editing a file)
 //   // probe: return {...}        browser: JavaScript run in the page once it is up
 //   // flags: --no-prefetch        more options for `quillo run` (serve, browser)
 //   // open-when: <builtin        still a bug if the output contains this (any of them)
@@ -58,7 +60,7 @@ const repros = readdirSync(reprosDir)
   .sort((a, b) => a.id.localeCompare(b.id));
 
 function header(file) {
-  const h = { title: "", mode: "run", args: [], get: [], page: "/", probe: null, flags: [], open: [], fixed: [] };
+  const h = { title: "", mode: "run", args: [], get: [], page: "/", probe: null, script: null, flags: [], open: [], fixed: [] };
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (!line.startsWith("//")) break;
     const text = line.slice(2).trim();
@@ -70,6 +72,7 @@ function header(file) {
     else if (key === "get") h.get.push(value.trim());
     else if (key === "page") h.page = value.trim();
     else if (key === "probe") h.probe = value;
+    else if (key === "script") h.script = value.trim();
     else if (key === "flags") h.flags = value.trim().split(/\s+/);
     else if (key === "open-when") h.open.push(value);
     else if (key === "fixed-when") h.fixed.push(value);
@@ -150,6 +153,17 @@ async function output(r) {
       await new Promise((x) => setTimeout(x, 300));
       const q = await page.quillo();
       return JSON.stringify({ probe, ...q, mismatches: page.mismatches, problems: page.problems }, null, 1);
+    });
+  }
+  // Steps a request cannot take (a signal, a file edited while it runs): a script.
+  if (h.mode === "script") {
+    return new Promise((res) => {
+      const p = spawn("sh", [h.script], { cwd: r.dir, env: { ...process.env, QUILLO: quillo } });
+      let out = "";
+      p.stdout.on("data", (d) => (out += d));
+      p.stderr.on("data", (d) => (out += d));
+      const t = setTimeout(() => { p.kill(); out += "\n[killed after 60000 ms]"; }, 60000);
+      p.on("close", () => { clearTimeout(t); res(out); });
     });
   }
   return `unknown mode ${h.mode}`;

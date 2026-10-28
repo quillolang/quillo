@@ -910,7 +910,10 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`; and their fields can be set:
   `el.value = ""`, `el.scrollTop += 100` (only theirs: a map's fields are made anew,
-  with `set` or `{ ...m, name: v }`). `innerHTML`, `outerHTML`, `srcdoc` and `on...` are
+  with `set` or `{ ...m, name: v }`). A plain `fn` may set them too, on a parameter of
+  no declared type that a component hands it (`fn paint(ctx) { ctx.fillStyle = "red" }`,
+  called as `paint(el.getContext("2d"))`), so drawing code is shared by components;
+  run on the server, it is an error there. `innerHTML`, `outerHTML`, `srcdoc` and `on...` are
   not set, and nothing is set to a `javascript:` URL. What runs text as code or HTML is
   refused: `eval`, `Function` and its kin, `setTimeout` and `setInterval`,
   `insertAdjacentHTML`, `document.write`, `DOMParser`, `setAttribute("on...")`, script
@@ -1031,6 +1034,10 @@ component Notes(initial: list) {
   `unwatched(() => me())` calls it without following what it reads. Keep what changes
   often but is not shown (view counts, last-seen times) in a table of its own, so
   writing it wakes no page.
+- A global is one topic, however much of it a loader reads: a loader that shows one
+  field of a map runs again on every write to the map, 20 times a second when a game's
+  loop writes it. Keep what changes that often in a global of its own, apart from what
+  pages show (a room's player count apart from the world it counts).
 - A write to a table wakes every loader that read the table, whatever rows it read:
   a reply in one thread runs `load_posts` again on every open thread page. To follow
   one thread only, read the table `unwatched` and watch a topic of its own, which the
@@ -2070,7 +2077,10 @@ component Board() {
   page left, or closed (for each channel it was in; not when the server itself
   stops). A channel no `channel.on` names may be joined, to hear what the program
   broadcasts on it; what pages send on it goes nowhere. There is no list of who is
-  present beyond `channel.peers` and what `join` and `leave` record.
+  present beyond `channel.peers` and what `join` and `leave` record. What `join`
+  broadcasts on its channel, or sends to the page that is joining, reaches that page
+  too, right after its yes: a roster broadcast as someone enters is the first thing
+  they hear. So does what is broadcast between the yes and the page hearing it.
 - `channel.broadcast(name, value, { except, reliable })` sends to every page in the
   channel and gives how many took it; `channel.send(name, peer, value, { reliable })`
   sends to one (the peer, or its id), and gives whether it was there;
@@ -2365,7 +2375,11 @@ service /billing = "billing.qwe"
   soon, at most 30 s), with a line in the log. `--scale risk=3` runs `risk` as three
   copies (up to 64), called in turn; they share its database, so give it one that
   several processes can open (SQLite on one machine, PostgreSQL across machines). Copies
-  share only that: each has its own global variables, as `--instances` do.
+  share only that: each has its own global variables, as `--instances` do. A service's
+  channels do not cross: pages connect to the app's process, so under `--split` what
+  they send never gets to the service's `channel.on`, and what it broadcasts reaches no
+  page. `--split` warns of a service that uses channels; keep a game's or a chat's
+  channels in the app, or run it in one process.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`; a decimal stays a decimal, its scale and all), so a
   program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
@@ -2599,7 +2613,7 @@ What each does at its edges, where the answer is not what another language would
 | `pow(2, 10)` | an int while it fits, else a float |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
-| `sleep(ms)` | no maximum; other requests run meanwhile |
+| `sleep(ms)` | no maximum; other requests run meanwhile; ends the request or job (status 503) when the server stops or the program is loaded again |
 | `random_int(lo, hi)` | both ends included |
 | `uuid()` | a version 4 UUID |
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
@@ -3766,11 +3780,36 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
 - Jobs are named after their function (`{ name: "..." }` for a lambda, else
   `job-<line>`, or to run one function twice): letters, digits, `_`, `-` and `.`, at
   most 64, and no two alike. Nobody outside the server can start one.
+- A job that runs for ever (a loop with `sleep` in it) is told to end when the server
+  stops, and when `--watch` loads the program again: its `sleep` ends the job, so a
+  new version never runs beside the old one. A job still running when it is due again
+  is said once in the log, not each time.
+- A service's jobs run with the app's when the service shares its process
+  (`POST /_quillo/job/game~end_round` in the log), and in the service's own process
+  under `--split`.
 - Several servers on one database (PostgreSQL, or SQLite shared by processes on one
   machine) run each job once per due time: the first to record it in `_quillo_jobs`
   runs it. Without a database, or with one per tenant, each server runs its jobs;
   `--no-jobs` turns them off on a server. For a database per tenant, loop over your
   tenants inside the job with `with_tenant(name, () => ...)`.
+
+### Ticks: `every` on the server
+
+```quillo
+fn tick() { step(); channel.broadcast("room", snapshot()) }
+every(50, tick)                                 // 20 times a second, on the clock
+```
+
+- `every(ms, f)` at the top of a program runs `f` on the server every `ms`
+  milliseconds, counted from 1970 so that each tick falls on a multiple of `ms`: the
+  loop of a game, a sensor read, a short poll. In a component it is the page's clock
+  instead (see [Components](#components)).
+- A tick is named after its function (`{ name: "..." }` for a lambda, else
+  `every-<line>`), and no two alike. It runs like a job, one at a time: a tick still
+  running when the next is due skips that one, so a slow step slows the loop and never
+  doubles it. Ticks are not logged or counted in `--metrics`, are not recorded in
+  `_quillo_jobs` (each server runs its own), and stop with the server and on a reload.
+- Under a second is what `every` is for; for minutes and hours, `schedule`.
 
 ### The REPL
 

@@ -1,0 +1,15 @@
+// Q-085 `quillo check` refuses a helper `fn` that sets a field of a page object it is given (a canvas context's `fillStyle`), which the browser does: drawing code cannot be shared by components
+// mode: check
+// open-when: cannot set `fillStyle`
+// fixed-when: ok (
+// From FEEDBACK12.md §Q-085 (found on 6887b0b). With --no-check the canvas is painted red.
+
+fn paint(ctx, colour: str) {
+    ctx.fillStyle = colour
+    ctx.fillRect(0, 0, 10, 10)
+}
+
+component A() {
+    <canvas width="10" height="10" @mount={(el) => { paint(el.getContext("2d"), "rgb(255, 0, 0)") }}></canvas>
+}
+route GET / = <html><body><A/></body></html>

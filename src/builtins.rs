@@ -756,8 +756,34 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Value::Float(f) if f >= 0.0 => f as u64,
         other => return fail(line, format!("`sleep` expects milliseconds (a number >= 0), got {}", short_type(&other))),
     };
-    it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(ms)));
-    Ok(Value::Nil)
+    // A wait the server's stopping, or a reload, ends: a job that runs for ever
+    // (a game's loop) then stops there, answered as a `reply` would be, instead
+    // of holding the server for the whole drain and ending as an internal error,
+    // or going on with an old version's code (FEEDBACK12.md, Q-081 and Q-082;
+    // branch feedback12-fixes).
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let retired = it.retired.clone();
+    let ended = it.unlocked(move || loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        if crate::httpd::stopping() {
+            return Some("the server is stopping");
+        }
+        if retired.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some("the program was loaded again");
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(50)));
+    });
+    match ended {
+        None => Ok(Value::Nil),
+        Some(why) => Err(Ctrl::Reply(Arc::new(Response {
+            status: 503,
+            headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
+            body: Body::Value(Value::str(&format!("{}\n", why))),
+        }))),
+    }
 }
 
 fn short_type(v: &Value) -> &'static str {
@@ -1622,7 +1648,13 @@ fn style_noop(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
     Ok(Value::Nil)
 }
 
-fn every(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn every(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // At the top of a program (no request in hand), it runs on the server: a
+    // tick (FEEDBACK12.md, Q-080; branch feedback12-fixes). Met while a page is
+    // made, it is the component's, which runs in the browser.
+    if it.current_request.is_none() && it.pending_request.is_none() && !it.in_component {
+        return crate::jobs::every_at_top(it, &args, line);
+    }
     match (args.first(), args.get(1)) {
         (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
         _ => fail(line, "`every` takes milliseconds and a function: every(100, step)"),

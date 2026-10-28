@@ -39,6 +39,9 @@ pub struct Site {
     pub locale_rule: Option<Value>,
     /// What `schedule` set to run (see `jobs`).
     pub jobs: Vec<std::sync::Arc<crate::jobs::Job>>,
+    /// What `every` at the top set to run on the server (see `jobs`;
+    /// FEEDBACK12.md, Q-080; branch feedback12-fixes).
+    pub ticks: Vec<std::sync::Arc<crate::jobs::Tick>>,
     /// What `udp.listen` listens for (see `udp`).
     pub udp: Vec<std::sync::Arc<crate::udp::Listener>>,
     /// What `channel.on` handles (see `wt`).

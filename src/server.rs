@@ -501,6 +501,15 @@ impl Interp {
         if req.method != "POST" || !is_job_request(req) {
             return plain(404, "not found\n");
         }
+        // A job of a service this process runs, `<service>~<name>`, runs in the
+        // service (FEEDBACK12.md, Q-083; branch feedback12-fixes).
+        if let Some((service, job)) = name.split_once('~') {
+            let found = self.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(service).map(|(_, s)| s.fork());
+            return match found {
+                Some(mut sub) => sub.run_job(job, req, qs),
+                None => plain(404, "no such service\n"),
+            };
+        }
         let Some(job) = self.site.jobs.iter().find(|j| j.name == name).cloned() else {
             return plain(404, "no such job\n");
         };
@@ -509,6 +518,29 @@ impl Interp {
             return plain(200, "run by another server\n");
         }
         match finish(self.call(&job.f, Vec::new(), 0)) {
+            r if r.status >= 500 => r,
+            _ => plain(200, "ok\n"),
+        }
+    }
+
+    /// A tick (`every` at the top of a program), asked for by its thread (see
+    /// `jobs`): run here, never claimed, as each process ticks its own
+    /// (FEEDBACK12.md, Q-080; branch feedback12-fixes).
+    fn run_tick(&mut self, name: &str, req: &HttpRequest) -> HttpResponse {
+        if req.method != "POST" || !is_job_request(req) {
+            return plain(404, "not found\n");
+        }
+        if let Some((service, tick)) = name.split_once('~') {
+            let found = self.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(service).map(|(_, s)| s.fork());
+            return match found {
+                Some(mut sub) => sub.run_tick(tick, req),
+                None => plain(404, "no such service\n"),
+            };
+        }
+        let Some(tick) = self.site.ticks.iter().find(|t| t.name == name).cloned() else {
+            return plain(404, "no such tick\n");
+        };
+        match finish(self.call(&tick.f, Vec::new(), 0)) {
             r if r.status >= 500 => r,
             _ => plain(200, "ok\n"),
         }
@@ -620,6 +652,9 @@ impl Interp {
         }
         if let Some(name) = rest.strip_prefix("job/") {
             return self.run_job(name, req, qs);
+        }
+        if let Some(name) = rest.strip_prefix("tick/") {
+            return self.run_tick(name, req);
         }
         // What pages sent on a channel (see `wt`).
         if let Some(name) = rest.strip_prefix("channel/") {
@@ -1354,6 +1389,11 @@ impl App {
                 if let Some(addr) = addr {
                     start_background(&it, addr);
                 }
+                // The version replaced: its jobs and ticks still running end
+                // at their next `sleep` (FEEDBACK12.md, Q-082; branch feedback12-fixes).
+                if let Loaded::Ready(old) = &*slot.1 {
+                    retire(old);
+                }
                 *slot = (slot.0 + 1, Arc::new(Loaded::Ready(it)));
             }
             Err(e) => {
@@ -1725,8 +1765,11 @@ impl Worker {
         // `later` be sent (only it has the token: others get a 404, logged)
         // (FEEDBACK4.md, Q-043; branch bank-fixes).
         let took = start.elapsed().as_secs_f64();
+        // Nor ticks, which may come 60 times a second: one that fails is
+        // logged (FEEDBACK12.md, Q-080; branch feedback12-fixes).
         let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/")
-            || (req.url == "/_quillo/later" && resp.status == 200);
+            || (req.url == "/_quillo/later" && resp.status == 200)
+            || (req.url.starts_with("/_quillo/tick/") && resp.status == 200);
         if !delivery {
             crate::metrics::answered(resp.status, took);
         }
@@ -1874,6 +1917,22 @@ pub fn log_url(u: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}?{}", path, parts.join("&")))
 }
 
+/// Marks a version of the program as replaced by a reload: itself, what it
+/// mounts, and the services it loaded (a table of the version's own, which they
+/// share, so it is gone through once) (FEEDBACK12.md, Q-082; branch feedback12-fixes).
+fn retire(it: &Interp) {
+    fn mark(it: &Interp) {
+        it.retired.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (_, m) in &it.mounts {
+            mark(m);
+        }
+    }
+    mark(it);
+    for (_, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        mark(s);
+    }
+}
+
 /// Whether a request is the scheduler's (it carries this process's secret).
 fn is_job_request(req: &HttpRequest) -> bool {
     req.headers
@@ -1908,9 +1967,29 @@ fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
     // Also for a program that listens on no port yet: a reload may add one.
     start_udp(app, addr);
     crate::wt::serving(addr);
-    let app = app.clone();
-    crate::jobs::start(addr, move || match &*app.current().1 {
-        Loaded::Ready(it) => it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect(),
+    // The program's jobs and ticks, and those of the services it runs in its
+    // process, as `<service>~<name>` (FEEDBACK12.md, Q-080 and Q-083; branch
+    // feedback12-fixes).
+    let jobs_of = app.clone();
+    crate::jobs::start(addr, move || match &*jobs_of.current().1 {
+        Loaded::Ready(it) => {
+            let mut all: Vec<_> = it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect();
+            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                all.extend(s.site.jobs.iter().map(|j| (format!("{}~{}", service, j.name), j.when.clone())));
+            }
+            all
+        }
+        Loaded::Failed(_) => Vec::new(),
+    });
+    let ticks_of = app.clone();
+    crate::jobs::start_ticks(addr, move || match &*ticks_of.current().1 {
+        Loaded::Ready(it) => {
+            let mut all: Vec<_> = it.site.ticks.iter().map(|t| (t.name.clone(), t.ms)).collect();
+            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                all.extend(s.site.ticks.iter().map(|t| (format!("{}~{}", service, t.name), t.ms)));
+            }
+            all
+        }
         Loaded::Failed(_) => Vec::new(),
     });
 }

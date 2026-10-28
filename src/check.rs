@@ -630,7 +630,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("js_new", "str, any...", "any"),
     ("live", "fn, any...", "any"),
     ("parallel", "any...", "list"),
-    ("every", "num, fn", "null"),
+    ("every", "num, fn, map | null=", "null"),
     ("stream", "fn, map | null=", "response"),
     ("events", "fn, map | null=", "response"),
     ("listen", "str, fn", "null"),
@@ -2151,7 +2151,12 @@ impl Checker {
                 self.line = *line;
                 let t = self.expr(o);
                 self.expr(e);
-                if self.in_component().is_none() {
+                // A function's parameter of no known type may be a page object a
+                // component hands it (`paint(ctx)` setting `ctx.fillStyle`): the
+                // browser sets it, and the server says so if it is ever run there
+                // (FEEDBACK12.md, Q-085; branch feedback12-fixes).
+                let helper = t.vague() && !self.fns.is_empty();
+                if self.in_component().is_none() && !helper {
                     self.error(format!("cannot set `{}`: only the page's objects (an element, an event) have fields that are set, in a component", name));
                 } else if !t.vague() {
                     if t.bits & MAP != 0 {

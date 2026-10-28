@@ -1,0 +1,5 @@
+let heard = 0
+fn tick() { channel.broadcast("svc", { at: now() }) }
+schedule("1s", tick)
+channel.on("svc", (msg, peer) => { heard += 1 })
+route GET /n = { heard }

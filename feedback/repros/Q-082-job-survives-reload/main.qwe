@@ -1,0 +1,16 @@
+// Q-082 Under --watch, a job still running when the program reloads goes on with the old code and the old variables, and the new version's job never starts ("still running; skipped" each second)
+// mode: script
+// script: steps.sh
+// open-when: after: {"n":0
+// fixed-when: /after: \{"n":[1-9]/
+// From FEEDBACK12.md §Q-082 (found on 6887b0b). steps.sh edits a copy of this file while it runs.
+
+let n = 0
+fn game_loop() {
+    while true {
+        sleep(100)
+        n += 1
+    }
+}
+schedule("1s", game_loop)
+route GET / = { n, version: 1 }

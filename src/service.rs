@@ -991,7 +991,7 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
 /// Quillo's own addresses that are not passed on to a service under its
 /// prefix: calls of its functions, and what only its own server or other
 /// services ask of it.
-const NOT_PASSED_ON: &[&str] = &["rpc", "service", "job", "later", "channel", "udp", "wt-ticket", "announce", "metrics"];
+const NOT_PASSED_ON: &[&str] = &["rpc", "service", "job", "tick", "later", "channel", "udp", "wt-ticket", "announce", "metrics"];
 
 /// A request under a service's prefix, when the service runs elsewhere:
 /// passed on to it, without the prefix (as a mounted program sees it).
@@ -1393,6 +1393,26 @@ pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usi
             copies.push((name.clone(), prefix.clone(), file.clone(), port));
         }
         std::env::set_var(env_name(name), urls.join(","));
+    }
+    // A service's channels are out of its pages' reach when it runs apart: the
+    // pages connect to the app's process, and its `channel.on` and broadcasts are
+    // in another. Said, until the processes are bridged (FEEDBACK12.md, Q-087;
+    // branch feedback12-fixes).
+    for (name, _, file) in &services {
+        let src = std::fs::read_to_string(file).unwrap_or_default();
+        let on = src.lines().any(|l| {
+            let code = l.split("//").next().unwrap_or("");
+            code.contains("channel.on(") || code.contains("channel.broadcast(") || code.contains("channel.send(")
+        });
+        if on {
+            eprintln!(
+                "quillo: warning: service {} ({}) uses channels, and with --split its pages cannot reach them: \
+                 what pages send does not get to its `channel.on`, and what it broadcasts reaches no page. \
+                 Run without --split, or keep the channels in the app (FEEDBACK12.md, Q-087)",
+                name,
+                file.display()
+            );
+        }
     }
     let ports: Vec<u16> = copies.iter().map(|c| c.3).collect();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
