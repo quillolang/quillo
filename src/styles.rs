@@ -482,7 +482,9 @@ pub fn set_elsewhere(css: &str) -> Vec<String> {
         let end = rest[at..].find("*/").map_or(rest.len(), |e| at + e);
         let comment = &rest[at + 2..end];
         if let Some(list) = comment.trim().strip_prefix("set elsewhere:") {
-            out.extend(list.split(',').map(|s| s.trim().trim_start_matches('.').to_string()).filter(|s| !s.is_empty()));
+            // Each start is its first word: what follows may say why (FEEDBACK8.md,
+            // Q-065; branch set-elsewhere-words).
+            out.extend(list.split(',').filter_map(|s| s.split_whitespace().next()).map(|s| s.trim_start_matches('.').to_string()).filter(|s| !s.is_empty()));
         }
         rest = &rest[(end + 2).min(rest.len())..];
     }
@@ -526,6 +528,7 @@ mod tests {
         let css = ".a, .b:hover { x: 1 }\n/* .c */\n@media (x) {\n  .d .e[title=\".f\"] { y: 1.5em }\n}\n:global(.g) .h { }";
         assert_eq!(classes_in(css), vec![("a".into(), 0), ("b".into(), 0), ("d".into(), 3), ("e".into(), 3), ("h".into(), 5)]);
         assert_eq!(set_elsewhere("/* set elsewhere: leaflet-, .mapbox */ .x {}"), vec!["leaflet-", "mapbox"]);
+        assert_eq!(set_elsewhere("/* set elsewhere: leaflet- (Leaflet's script sets them) */"), vec!["leaflet-"]);
     }
 
     #[test]
