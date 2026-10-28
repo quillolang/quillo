@@ -1256,6 +1256,10 @@ pub struct App {
     /// Where the server listens, once it does: for background work a
     /// version loaded later may need (see `start_background`).
     addr: Mutex<Option<std::net::SocketAddr>>,
+    /// Stylesheets the program served that changed under `--watch`: how
+    /// many times, and the paths they were asked for at the last time
+    /// (FEEDBACK11.md, Q-078; branch feedback11-fixes).
+    css: Mutex<(u64, Vec<String>)>,
 }
 
 impl App {
@@ -1276,7 +1280,31 @@ impl App {
             launch_token: None,
             reload: false,
             addr: Mutex::new(None),
+            css: Mutex::new((0, Vec::new())),
         }
+    }
+
+    /// The pages swap these stylesheets, as they are.
+    fn css_changed(&self, paths: Vec<String>) {
+        eprintln!("quillo: {} changed: swapped in open pages", paths.join(", "));
+        let mut c = self.css.lock().unwrap_or_else(|e| e.into_inner());
+        *c = (c.0 + 1, paths);
+        drop(c);
+        // Wakes the pages' connections (they wait on `changed`).
+        let _g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+
+    /// The pages refresh, the program as it is: a file it served changed.
+    fn refresh_pages(&self, paths: Vec<String>) {
+        eprintln!("quillo: {} changed: refreshing open pages", paths.join(", "));
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = (slot.0 + 1, slot.1.clone());
+        self.changed.notify_all();
+    }
+
+    fn css_seq(&self) -> (u64, Vec<String>) {
+        self.css.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// What the program's interpreters share.
@@ -1340,14 +1368,19 @@ impl App {
         self.changed.notify_all();
     }
 
-    /// Waits up to `timeout` for a version newer than `seen`.
-    fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
+    /// Waits up to `timeout` for a version newer than `seen`, or a
+    /// stylesheet changed after `css_seen`:
+    /// the version, and the stylesheets' paths when they changed.
+    fn wait_for_change_or_css(&self, seen: u64, css_seen: u64, timeout: Duration) -> (u64, Option<(u64, Vec<String>)>) {
         let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         let (slot, _) = self
             .changed
-            .wait_timeout_while(slot, timeout, |s| s.0 == seen)
+            .wait_timeout_while(slot, timeout, |s| s.0 == seen && self.css.lock().map_or(true, |c| c.0 == css_seen))
             .unwrap_or_else(|e| e.into_inner());
-        slot.0
+        let v = slot.0;
+        drop(slot);
+        let css = self.css_seq();
+        (v, (css.0 != css_seen).then_some(css))
     }
 
     fn watched_files(&self) -> Vec<PathBuf> {
@@ -1363,10 +1396,16 @@ fn mtimes(files: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
     files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect()
 }
 
-/// Polls the program's files and reloads it when one changes.
+/// Polls the program's files and reloads it when one changes. Under
+/// `--watch`, also the files it served (a stylesheet another tool writes,
+/// such as Tailwind's): a stylesheet is swapped in the open pages, and
+/// anything else refreshes them (FEEDBACK11.md, Q-078; branch
+/// feedback11-fixes).
 fn watch(app: Arc<App>) {
     let mut files = app.watched_files();
     let mut seen = mtimes(&files);
+    crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
+    let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let now = mtimes(&files);
@@ -1376,6 +1415,32 @@ fn watch(app: Arc<App>) {
             app.reload();
             files = app.watched_files();
             seen = mtimes(&files);
+            continue;
+        }
+        if !app.watch {
+            continue;
+        }
+        let (mut css, mut other) = (Vec::new(), Vec::new());
+        for (file, path) in crate::statics::served_files() {
+            if files.contains(&file) {
+                continue;
+            }
+            let m = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+            match served.insert(file.clone(), m) {
+                Some(before) if before != m => {
+                    if file.extension().is_some_and(|x| x.eq_ignore_ascii_case("css")) {
+                        css.push(path);
+                    } else {
+                        other.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !other.is_empty() {
+            app.refresh_pages(other);
+        } else if !css.is_empty() {
+            app.css_changed(css);
         }
     }
 }
@@ -1388,9 +1453,14 @@ fn watch(app: Arc<App>) {
 /// too. Where the WebSocket cannot open, the page asks the same URL as a
 /// plain request, which answers after a change or a while, and tries the
 /// WebSocket again after that.
+///
+/// A message `css:["/assets/app.css"]` is a stylesheet the program served
+/// that changed: the page swaps each `<link>` to it for one asked for
+/// afresh, keeping its state (FEEDBACK11.md, Q-078; branch
+/// feedback11-fixes).
 fn dev_script(version: u64) -> String {
     format!(
-        "<script>(()=>{{const v='{}',u='/_quillo/events?v='+v,go=()=>{{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u);s.onopen=()=>o=1;s.onmessage=e=>{{if(e.data!==v)location.reload()}};s.onclose=()=>o?setTimeout(go,1000):fetch(u,{{cache:'no-store'}}).then(r=>r.text()).then(t=>t!==v?location.reload():go(),()=>setTimeout(go,1000))}};go()}})()</script>",
+        "<script>(()=>{{const v='{}';let c=0;const css=j=>{{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){{const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){{u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}}}}};const seen=t=>{{if(t.startsWith('css:')){{const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}}else if(t!==v)location.reload()}};const u=()=>'/_quillo/events?v='+v+'&c='+c,go=()=>{{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{{cache:'no-store'}}).then(r=>r.text()).then(t=>{{seen(t);go()}},()=>setTimeout(go,1000))}};go()}})()</script>",
         version
     )
 }
@@ -1398,27 +1468,44 @@ fn dev_script(version: u64) -> String {
 /// Answers `/_quillo/events[?v=N]` on a thread of its own, so pages waiting
 /// for a change do not hold on to the server's threads.
 fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
-    let seen = req.url.split_once("?v=").and_then(|(_, v)| v.parse::<u64>().ok());
+    let q = parse_urlencoded(req.url.split_once('?').map_or("", |(_, q)| q));
+    let seen = q.get("v").and_then(|v| v.display().parse::<u64>().ok());
+    // The stylesheet changes the page has taken (`css:N:[...]` messages);
+    // none given: the ones so far.
+    let css_seen = q.get("c").and_then(|v| v.display().parse::<u64>().ok()).filter(|c| *c > 0).unwrap_or_else(|| app.css_seq().0);
+    let css_text = |(n, paths): (u64, Vec<String>)| format!("css:{}:{}", n, serde_json::json!(paths));
     waiter("quillo-events", &req.remote.clone(), move |stream| {
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let seen = seen.unwrap_or(0);
+            let mut css_seen = css_seen;
             loop {
-                let v = app.wait_for_change(seen, Duration::from_secs(20));
+                let (v, css) = app.wait_for_change_or_css(seen, css_seen, Duration::from_secs(20));
                 if v != seen {
                     socket.send(&v.to_string());
                     return socket.close();
+                }
+                if let Some(c) = css {
+                    css_seen = c.0;
+                    if !socket.send(&css_text(c)) {
+                        return;
+                    }
+                    continue;
                 }
                 if !socket.ping() {
                     return;
                 }
             }
         }
-        let v = match seen {
-            Some(seen) => app.wait_for_change(seen, Duration::from_secs(25)),
-            None => app.current().0,
+        let (v, css) = match seen {
+            Some(seen) => app.wait_for_change_or_css(seen, css_seen, Duration::from_secs(25)),
+            None => (app.current().0, None),
         };
-        let mut resp = plain(200, &v.to_string());
+        let text = match css {
+            Some(c) if Some(v) == seen => css_text(c),
+            _ => v.to_string(),
+        };
+        let mut resp = plain(200, &text);
         resp.headers.push(("cache-control".into(), "no-store".into()));
         send_on(stream, resp);
     })
