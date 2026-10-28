@@ -94,12 +94,12 @@ component Timeline(project_id: int, today: int) {
                         </marker>
                     </defs>
                     {for d in days => (is_weekend(d) && zoom >= 12) && <rect.weekend key={d} x={x(d)} y={HEAD} width={zoom} height={height - HEAD}/>}
-                    {for d in days => civil_from_days(d).d == 1 && <g key={`m${d}`}>
+                    {for d in days => parts_of(d).day == 1 && <g key={`m${d}`}>
                         <line.month x1={x(d)} x2={x(d)} y1="0" y2={height}/>
-                        <text.month-label x={x(d) + 4} y="14">{MONTHS[civil_from_days(d).m - 1]} {civil_from_days(d).y}</text>
+                        <text.month-label x={x(d) + 4} y="14">{date.format(day_text(d), "MMM YYYY")}</text>
                     </g>}
-                    {for d in days => (zoom >= 30 || (zoom >= 12 && weekday(d) == 0) || (zoom < 12 && civil_from_days(d).d == 15)) &&
-                        <text.day-label key={`d${d}`} x={x(d) + 3} y="34">{zoom >= 30 ? `${WEEKDAYS[weekday(d)][0]} ${civil_from_days(d).d}` : short_day(d, year)}</text>}
+                    {for d in days => (zoom >= 30 || (zoom >= 12 && weekday(d) == 0) || (zoom < 12 && parts_of(d).day == 15)) &&
+                        <text.day-label key={`d${d}`} x={x(d) + 3} y="34">{zoom >= 30 ? date.format(day_text(d), "ddd D")[0] + date.format(day_text(d), " D") : short_day(d, year)}</text>}
                     <line.head-rule x1="0" x2={width} y1={HEAD - 0.5} y2={HEAD - 0.5}/>
                     {for m in ms => <g key={m.id}>
                         <line.ms-line x1={x(m.day) + zoom / 2} x2={x(m.day) + zoom / 2} y1={HEAD} y2={height}/>
