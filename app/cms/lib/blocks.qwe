@@ -50,14 +50,13 @@ fn clean_block(type: str, d) ! str {
 // not in each browser.
 fn shown_block(b) {
     let d = from_json(b.data, {})
-    // Not `let html`: a variable named like a type is not bound (FEEDBACK2.md §2).
-    let rendered = match b.type {
+    let html = match b.type {
         "text" => str(markdown(d.md ?? ""))
         "callout" => str(markdown(d.md ?? ""))
         "quote" => str(markdown(d.text ?? "", { inline: true }))
         _ => ""
     }
-    { id: b.id, type: b.type, data: d, html: rendered, version: b.version, position: b.position }
+    { id: b.id, type: b.type, data: d, html, version: b.version, position: b.position }
 }
 
 fn blocks_of(owner: str) with db =
@@ -119,7 +118,7 @@ server fn move_block(block_id: int, by: int) ! str with db, time {
     let at = index_of(ids, block_id)
     let to = at + (by < 0 ? -1 : 1)
     if to < 0 || to >= len(ids) { return true }
-    let order = for [i, x] in enumerate(ids) => i == at ? ids[to] : i == to ? block_id : x
+    let order = set(set(ids, at, ids[to]), to, block_id)
     db.transaction(() => {
         for [i, x] in enumerate(order) { db.exec("update blocks set position = ? where id = ?", i, x)? }
     })?

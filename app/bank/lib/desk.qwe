@@ -14,8 +14,8 @@
 //      one was chosen. When every part is approved, the clerk submits, and
 //      the services make it so: customer, account, first deposit.
 //
-// Each desk follows one topic, desk:<code>, which every change publishes
-// (Q-038 and Q-039: the services' own changes reach no page by themselves).
+// Each desk follows one topic, desk:<code>, which every change to the
+// session publishes; the services announce what they make of it themselves.
 
 let SECTIONS = {
     open_account: [

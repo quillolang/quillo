@@ -1,7 +1,9 @@
 // The messages service: messages in the customer's app, and email copies.
 // The gateway calls `send` and waits (so the message is there when the
 // page asks), and calls `email` with `later`: kept, and sent when the
-// service can take it, once.
+// service can take it, once. Each change is announced to the customer's
+// pages (cust:<id>); one delivered `later` reaches them on their next load,
+// since no call is waiting for it.
 
 db.open(env("BANK_DATA", ".") + "/messages.db")
 db.migrate("migrations")
@@ -10,12 +12,17 @@ let KINDS = ["payment", "account", "security", "desk"]
 
 server fn send(customer_id: int, kind: str, title: str, body: str = "") -> int ! str with db, time {
     if !contains(KINDS, kind) { return err(`A message is ${join(KINDS, ", ")}`) }
-    db.exec("insert into messages (customer_id, kind, title, body, created) values (?, ?, ?, ?, ?)",
+    let id = db.exec("insert into messages (customer_id, kind, title, body, created) values (?, ?, ?, ?, ?)",
         customer_id, kind, title, body, now()).last_id
+    publish(`cust:${customer_id}`)
+    id
 }
 
-server fn email(customer_id: int, subject: str) -> int with db, time =
-    db.exec("insert into emails (customer_id, subject, sent) values (?, ?, ?)", customer_id, subject, now()).last_id
+server fn email(customer_id: int, subject: str) -> int with db, time {
+    let id = db.exec("insert into emails (customer_id, subject, sent) values (?, ?, ?)", customer_id, subject, now()).last_id
+    publish(`cust:${customer_id}`)
+    id
+}
 
 server fn inbox(customer_id: int, limit: int = 50) -> list with db =
     db.query("select * from messages where customer_id = ? order by id desc limit ?", customer_id, min([limit, 200]))
@@ -23,8 +30,11 @@ server fn inbox(customer_id: int, limit: int = 50) -> list with db =
 server fn unread(customer_id: int) -> int with db =
     db.one("select count(*) as n from messages where customer_id = ? and read = 0", customer_id).n
 
-server fn mark_read(customer_id: int) -> int with db =
-    db.exec("update messages set read = 1 where customer_id = ? and read = 0", customer_id).changes
+server fn mark_read(customer_id: int) -> int with db {
+    let n = db.exec("update messages set read = 1 where customer_id = ? and read = 0", customer_id).changes
+    if n > 0 { publish(`cust:${customer_id}`) }
+    n
+}
 
 server fn emails_of(customer_id: int) -> list with db =
     db.query("select * from emails where customer_id = ? order by id desc limit 20", customer_id)

@@ -27,6 +27,10 @@
 //   ui/objects.qwe     <ObjectDesigner>
 //   ui/pages.qwe       the other screens, and the public site
 //   seed.qwe           the demo, for CMS_DEMO=1
+//
+// Tests (need CMS_DEMO=1, freshly seeded; BASE=http://localhost:8080):
+//
+//   node feedback/tools/drive.mjs app/cms/tests/designers.mjs   the flow and object designers' tables; a block moved
 
 db.open(env("CMS_DB", "cms.db"))
 db.migrate("migrations")

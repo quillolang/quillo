@@ -1,7 +1,9 @@
 // The payments service: a transfer from start to end. It checks the
 // account is the customer's, asks risk, posts to the ledger, and tells both
 // customers: a chain of four services (payments, risk, accounts, messages).
-// Held transfers wait here for a supervisor.
+// Held transfers wait here for a supervisor. A transfer recorded or decided
+// is announced to its customer's pages (cust:<id>) and the staff's (staff);
+// the ledger announces the money it moves itself.
 
 service accounts = "../accounts/accounts.qwe" { timeout: "3s", retries: 1 }
 service risk = "../risk/risk.qwe" { timeout: "3s", retries: 1 }
@@ -23,16 +25,23 @@ fn tell(customer_id: int, title: str, body: str) with http {
 
 fn record(id: int) with db = db.one("select * from transfers where id = ?", id)
 
+fn changed(customer_id: int) {
+    publish(`cust:${customer_id}`)
+    publish("staff")
+}
+
 // Posts a transfer that was decided, and tells both sides.
 fn complete(t, decided_by) -> map ! str with db, time, http {
     let posted = accounts.transfer(t.from_id, t.to_id, t.cents, t.memo, `transfer-${t.id}`)
     if is_err(posted) {
         db.exec("update transfers set status = 'failed', reasons = ?, decided_by = ?, decided_at = ? where id = ?",
             posted.error, decided_by, now(), t.id)
+        changed(t.customer_id)
         return record(t.id)
     }
     db.exec("update transfers set status = 'done', journal_id = ?, decided_by = ?, decided_at = ? where id = ?",
         posted.journal_id, decided_by, now(), t.id)
+    changed(t.customer_id)
     let to = accounts.account(t.to_id) ?? {}
     tell(t.customer_id, `You sent ${shown(t.cents, t.currency)}`, t.memo)
     if to.customer_id != null && to.customer_id != t.customer_id {
@@ -55,6 +64,7 @@ server fn transfer(customer_id: int, from_id: int, to_number: str, cents: int, m
     let id = db.exec(sql`insert into transfers (customer_id, from_id, to_id, to_number, cents, currency, memo, status, reasons, created)
                         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         customer_id, from.id, to.id, to.number, cents, from.currency, trim(memo), status, join(verdict.reasons, "\n"), now()).last_id
+    changed(customer_id)
     if status == "held" {
         tell(customer_id, `Your transfer of ${shown(cents, from.currency)} is being checked`, join(verdict.reasons, ". "))
     }
@@ -74,6 +84,7 @@ server fn decide(id: int, approve: bool, by: str, note: str = "") -> map ! str w
     if !approve {
         db.exec("update transfers set status = 'rejected', reasons = ?, decided_by = ?, decided_at = ? where id = ?",
             trim(note) == "" ? t.reasons : trim(note), by, now(), id)
+        changed(t.customer_id)
         tell(t.customer_id, `Your transfer of ${shown(t.cents, t.currency)} was not made`, trim(note))
         return record(id)
     }

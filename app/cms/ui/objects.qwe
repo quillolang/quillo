@@ -7,14 +7,14 @@ component FieldRow(f, on_problem) {
     state required = f.required == 1
     state options = join(f.options, ", ")
     let dirty = name != f.name || required != (f.required == 1) || options != join(f.options, ", ")
-    <div.f-row role="row">
-        <input value={name} aria-label="Field name" maxlength="40" @input={(e) => { name = e.value }}/>
-        <span.muted>{FIELD_LABELS[f.type]}</span>
-        <label.check><input type="checkbox" checked={required} @change={(e) => { required = e.checked }}/> required</label>
-        {f.type == "choice"
+    <tr>
+        <td><input value={name} aria-label="Field name" maxlength="40" @input={(e) => { name = e.value }}/></td>
+        <td.muted>{FIELD_LABELS[f.type]}</td>
+        <td><label.check><input type="checkbox" checked={required} @change={(e) => { required = e.checked }}/> required</label></td>
+        <td>{f.type == "choice"
             ? <input value={options} aria-label="Choices, comma-separated" @input={(e) => { options = e.value }}/>
-            : <span/>}
-        <span.row-actions>
+            : null}</td>
+        <td><span.row-actions>
             {dirty && <button.btn.small.primary @click={() => on_problem(err_text(edit_field(f.id,
                 { name, type: f.type, required, options: split(options, ",") })))}>Save</button>}
             <button.icon-btn aria-label={`Delete ${f.name}`} @click={() => {
@@ -22,8 +22,8 @@ component FieldRow(f, on_problem) {
                     on_problem(err_text(delete_field(f.id)))
                 }
             }}>✕</button>
-        </span>
-    </div>
+        </span></td>
+    </tr>
 }
 
 component NewField(object_id: int, on_problem) {
@@ -156,10 +156,10 @@ component ObjectDesigner(object_id: int) {
             </section>
             <section.card-box>
                 <h2>Fields</h2>
-                <div.f-table role="table">
-                    {for f in d.fields => <FieldRow key={`${f.id}-${f.name}-${f.required}-${join(f.options, ",")}`} {f} on_problem={set_problem}/>}
-                    <NewField {object_id} on_problem={set_problem}/>
-                </div>
+                <div.table-scroll><table.f-table aria-label="Fields">
+                    <tbody>{for f in d.fields => <FieldRow key={`${f.id}-${f.name}-${f.required}-${join(f.options, ",")}`} {f} on_problem={set_problem}/>}</tbody>
+                </table></div>
+                <NewField {object_id} on_problem={set_problem}/>
             </section>
             <section.card-box>
                 <h2>Forms <span.muted>put them on a page as blocks</span></h2>

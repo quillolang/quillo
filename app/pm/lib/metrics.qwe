@@ -30,9 +30,9 @@ fn running(deltas: list, keys: list, from_day: int, to_day: int) -> list {
     let counts = keys | map((_k) => 0)
     let rows = []
     for d in range(from_day, to_day + 1) {
-        for x in by_day[str(d)] ?? [] {
+        for x in by_day[d] ?? [] {
             let k = index_of(keys, x.col)
-            if k != null { counts = for [j, c] in enumerate(counts) => j == k ? c + x.n : c }
+            if k != null { counts = set(counts, k, counts[k] + x.n) }
         }
         rows = push(rows, { day: d, counts })
     }
@@ -51,8 +51,8 @@ fn burndown_of(m, tasks: list, moves: list, done_cols: list, today_n: int, offse
     let due = parse_day(m.due_day) ?? today_n
     let mine = tasks | filter((t) => t.milestone_id == m.id)
     let by_id = group_by(mine, (t) => t.id)
-    let weight_of = (id) => by_id[str(id)][0].points ?? 1
-    let ms = moves | filter((x) => has(by_id, str(x.task_id)))
+    let weight_of = (id) => by_id[id][0].points ?? 1
+    let ms = moves | filter((x) => has(by_id, x.task_id))
     let until = max([min([today_n, due]), start])
     // Points in each column, per day; the done columns' share is what is done.
     let cols = unique(ms | map((x) => x.column_id))
@@ -177,5 +177,5 @@ fn reports_of(project_id: int, milestone_id, today_n: int, offset: int) with db,
 server fn load_reports(project_id: int, milestone_id: int?) with db, time, random {
     member_of(project_id, "read")?
     watch(`project:${project_id}`)
-    unwatched(() => reports_of(project_id, milestone_id, today(request), tz_offset(request)))
+    unwatched(() => reports_of(project_id, milestone_id, today(), tz_offset()))
 }

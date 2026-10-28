@@ -26,7 +26,7 @@ view Fields(fields: list, values: map, people: list, on_change) =
     <div.form-fields>
         {for f in fields => <label key={f.id} for={`fld-${f.id}`} class={f.type == "yesno" ? "check" : ""}>
             <span>{f.name}{f.required == 1 && f.type != "yesno" && <b.req title="Required">*</b>}</span>
-            <FieldInput {f} value={values[str(f.id)]} {people} on_change={(v) => on_change(f.id, v)}/>
+            <FieldInput {f} value={values[f.id]} {people} on_change={(v) => on_change(f.id, v)}/>
         </label>}
     </div>
 

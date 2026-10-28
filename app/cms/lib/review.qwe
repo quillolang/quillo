@@ -41,7 +41,7 @@ server fn load_threads(article_id: int) with db, time {
         let by_thread = group_by(posts, (p) => p.thread_id)
         threads | map((t) => merge(t, {
             outdated: t.block_now != null && t.block_now > t.block_version,
-            posts: (by_thread[str(t.id)] ?? []) | map((p) => merge(p, { html: str(markdown(p.body)) })),
+            posts: (by_thread[t.id] ?? []) | map((p) => merge(p, { html: str(markdown(p.body)) })),
         }))
     })
 }

@@ -232,7 +232,7 @@ server fn shift_column(project_id: int, column_id: int, by: int) ! str with db, 
     let at = index_of(ids, column_id) ?? err("No such column")?
     let to = at + (by < 0 ? -1 : 1)
     if to < 0 || to >= len(ids) { return true }
-    let order = for [i, id] in enumerate(ids) => i == at ? ids[to] : i == to ? column_id : id
+    let order = set(set(ids, at, ids[to]), to, column_id)
     db.transaction(() => {
         for [i, id] in enumerate(order) { db.exec("update columns set position = ? where id = ?", i, id)? }
     })?

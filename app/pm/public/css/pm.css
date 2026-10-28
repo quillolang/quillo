@@ -346,8 +346,11 @@ table.edit td.num { text-align: center; }
 .q-toast { background: var(--ink); color: var(--bg); padding: 10px 14px; border-radius: 10px; box-shadow: var(--shadow); font-weight: 600; }
 .q-toast.q-danger { background: var(--bad); color: #fff; }
 .q-toast.q-success { background: var(--good); color: #fff; }
-.ctable { display: grid; margin-top: 8px; }
-.crow { display: grid; grid-template-columns: minmax(0, 2fr) 110px 110px 60px 140px; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
-.crow.chead { font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.ctable { width: 100%; margin-top: 8px; border-collapse: collapse; table-layout: fixed; }
+.ctable th:nth-child(2), .ctable th:nth-child(3) { width: 110px; }
+.ctable th:nth-child(4) { width: 60px; }
+.ctable th:nth-child(5) { width: 140px; }
+.crow td, .crow th { padding: 6px 5px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.crow.chead th { font-size: 12.5px; font-weight: 600; color: var(--ink-2); text-align: left; }
 .crow input { width: 100%; }
 .crow .num { text-align: center; font-variant-numeric: tabular-nums; }
