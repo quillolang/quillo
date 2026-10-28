@@ -217,6 +217,8 @@ pub struct Interp {
     /// Bundles for sets of components, by their names: (hash, script).
     /// Shared by every handle on the program, made again when it loads.
     pub bundles: Arc<std::sync::Mutex<crate::client::Bundles>>,
+    /// Components' and views' own CSS, and the pages' sheets made of it.
+    pub styles: Arc<std::sync::Mutex<crate::styles::Styles>>,
     /// A buffer lent to the renderer for building attribute values.
     spare: String,
     /// What views rendered, shared by the workers (see `viewcache`).
@@ -799,6 +801,7 @@ impl Interp {
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             bundles: Default::default(),
+            styles: Default::default(),
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
@@ -867,6 +870,7 @@ impl Interp {
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             bundles: self.bundles.clone(),
+            styles: self.styles.clone(),
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
@@ -1254,13 +1258,14 @@ impl Interp {
         let mut bundles = crate::client::Bundles::default();
         bundles.runtime = runtime;
         self.bundles = Arc::new(std::sync::Mutex::new(bundles));
+        self.styles = Arc::new(std::sync::Mutex::new(crate::styles::Styles::collect(self)?));
         Ok(())
     }
 
     /// The bundle for a page with these components: its address's hash,
-    /// and whether it takes the runtime file. None when it cannot be made
-    /// (the full bundle serves).
-    pub fn bundle_for_page(&self, names: &[String]) -> Option<(String, bool)> {
+    /// whether it takes the runtime file, and the styles it can show. None
+    /// when it cannot be made (the full bundle serves).
+    pub fn bundle_for_page(&self, names: &[String]) -> Option<crate::client::PageRef> {
         let mut sorted = names.to_vec();
         sorted.sort();
         sorted.dedup();
@@ -1278,6 +1283,21 @@ impl Interp {
 
     pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {
         self.bundles.lock().unwrap_or_else(|e| e.into_inner()).by_hash(hash)
+    }
+
+    /// The sheet of the styles a page shows (FEEDBACK8.md, Q-068; branch
+    /// feedback8-fixes): its hash, or none when none of them has a style.
+    pub fn sheet_for_page(&self, ids: &[String]) -> Option<String> {
+        self.styles.lock().unwrap_or_else(|e| e.into_inner()).sheet_for(ids)
+    }
+
+    /// A page's sheet by its hash, or, for one no longer kept, every style.
+    pub fn sheet_by_hash(&self, hash: &str) -> (Arc<String>, bool) {
+        let s = self.styles.lock().unwrap_or_else(|e| e.into_inner());
+        match s.by_hash(hash) {
+            Some(css) => (css, true),
+            None => (Arc::new(s.all()), false),
+        }
     }
 
     /// The runtime file pages' bundles share, when there is one: its hash

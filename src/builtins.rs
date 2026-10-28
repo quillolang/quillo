@@ -111,6 +111,7 @@ pub fn install(env: &Env) {
         ("js", js),
         ("js_new", js),
         ("css", tag_text),
+        ("__style", style_noop),
         ("sql", tag_text),
         ("sql_name", sql_name),
         ("sql_param", sql_param),
@@ -1593,6 +1594,13 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `every(ms, f)` in a component: in the browser, calls `f` every `ms`
 /// milliseconds while the component's renders keep asking for it. Rendering
 /// on the server starts nothing.
+/// `style ...` in a component's or view's body: nothing as the code runs;
+/// the program takes the CSS when it loads (FEEDBACK8.md, Q-067; branch
+/// feedback8-fixes).
+fn style_noop(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Nil)
+}
+
 fn every(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match (args.first(), args.get(1)) {
         (Some(Value::Int(_) | Value::Float(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),

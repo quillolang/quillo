@@ -51,6 +51,23 @@ pub struct Parser {
     ternaries: std::collections::HashMap<(usize, bool), bool>,
     /// The file being parsed, stamped on its functions and routes.
     file: Option<Arc<str>>,
+    /// The component or view whose body is being parsed, for `style`.
+    styling: Option<Styling>,
+    /// The `fn` about to be parsed is a view (`view`, or a capital name).
+    view_next: bool,
+}
+
+/// A component's or view's own CSS (FEEDBACK8.md, Q-067; branch
+/// feedback8-fixes): after `style ...` in its body, each element it writes
+/// carries `data-q-<id>`, on the server and in the browser alike, and its
+/// rules are made to need it.
+struct Styling {
+    owner: String,
+    may: bool,
+    params: Vec<String>,
+    scope: Option<String>,
+    /// Elements written so far: a `style` comes before them.
+    els: u32,
 }
 
 fn can_start_expr(t: &Tok) -> bool {
@@ -91,7 +108,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -257,6 +274,16 @@ impl Parser {
         let line = self.line()?;
         if let Tok::Ident(k) = self.peek()? {
             match k.as_str() {
+                // `style css`...`` (or a name): the CSS of the component or
+                // view this is the body of. Otherwise `style` is a name.
+                "style" => {
+                    let saved = self.save();
+                    self.next()?;
+                    if self.line()? == line && matches!(self.peek()?, Tok::Ident(_) | Tok::Str(_)) {
+                        return self.style_stmt(line);
+                    }
+                    self.restore(saved);
+                }
                 "let" => {
                     self.next()?;
                     let pat = self.parse_binding()?;
@@ -270,6 +297,7 @@ impl Parser {
                     self.next()?;
                     if let Tok::Ident(_) = self.peek()? {
                         let name = self.expect_ident("a function name")?;
+                        self.view_next = view || name.starts_with(|c: char| c.is_uppercase());
                         let def = self.parse_fn_rest(name, line)?;
                         if view || def.name.starts_with(|c: char| c.is_uppercase()) {
                             key_not_a_param(&def)?;
@@ -493,14 +521,57 @@ impl Parser {
         } else {
             None
         };
-        let (body, nesting) = if self.eat(&Tok::Assign)? {
-            self.measured(Self::parse_arrow_body)?
+        let may = std::mem::take(&mut self.view_next);
+        // A helper written inside a styled component or view is part of it.
+        let scope = if may { None } else { self.styling.as_ref().and_then(|s| s.scope.clone()) };
+        let styling = Styling { owner: name.clone(), may, params: params.iter().map(|p| p.name.clone()).collect(), scope, els: 0 };
+        let outer = self.styling.replace(styling);
+        let body = if self.eat(&Tok::Assign)? {
+            self.measured(Self::parse_arrow_body)
         } else if self.at(&Tok::LBrace)? {
-            self.measured(Self::parse_block)?
+            self.measured(Self::parse_block)
         } else {
+            self.styling = outer;
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
+        self.styling = outer;
+        let (body, nesting) = body?;
         Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
+    }
+
+    /// `style <css>` in a component's or view's body: the call of `__style`,
+    /// which does nothing as the code runs; the CSS is taken when the
+    /// program loads (`Interp::styles`).
+    fn style_stmt(&mut self, line: u32) -> PResult<Stmt> {
+        let (owner, params) = match &self.styling {
+            Some(s) if s.may => {
+                if s.els > 0 {
+                    return Err(QuilloError::new(format!("`style` comes before the markup of `{}`", s.owner), line));
+                }
+                (s.owner.clone(), s.params.clone())
+            }
+            _ => return Err(QuilloError::new("`style` belongs in the body of a component or a view", line)),
+        };
+        let e = self.parse_expr()?;
+        let mut read = None;
+        crate::check::walk_expr(&e, &mut |x| {
+            if let Expr::Ident(n, _) = x {
+                if read.is_none() && params.contains(n) {
+                    read = Some(n.clone());
+                }
+            }
+        });
+        if let Some(n) = read {
+            return Err(QuilloError::new(
+                format!("a style is the same for every `{}`, so it cannot read its parameter `{}`; set a class or `style=` on an element instead", owner, n),
+                line,
+            ));
+        }
+        let id = style_id(self.file.as_deref(), &owner);
+        if let Some(s) = &mut self.styling {
+            s.scope = Some(id);
+        }
+        Ok(Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), vec![e], line)))
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
@@ -523,7 +594,11 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen, "`)`")?;
-        let (body, nesting) = self.measured(|p| p.component_body(&name))?;
+        let styling = Styling { owner: name.clone(), may: true, params: params.iter().map(|p| p.name.clone()).collect(), scope: None, els: 0 };
+        let outer = self.styling.replace(styling);
+        let body = self.measured(|p| p.component_body(&name));
+        self.styling = outer;
+        let (body, nesting) = body?;
         let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
@@ -1795,6 +1870,15 @@ impl Parser {
                 "a <textarea> takes its text from value={...} or from what is between its tags, not both",
                 line,
             ));
+        }
+        // An element of a component or view with a style of its own.
+        if let Some(s) = &mut self.styling {
+            s.els += 1;
+            if let Some(scope) = &s.scope {
+                if !tag.starts_with(|c: char| c.is_uppercase()) {
+                    attrs.push((format!("data-q-{}", scope), AttrVal::Bool));
+                }
+            }
         }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
         Ok(HtmlEl { tag, id, classes, attrs, children, line, facts })
