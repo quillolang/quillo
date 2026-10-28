@@ -1,0 +1,17 @@
+// Q-057 `js(...)` of a function that gives a Promise (getUserMedia) gives the Promise, which `type_of` calls a map: nothing waits for it
+// mode: browser
+// probe: await new Promise((r) => setTimeout(r, 300)); return document.getElementById("out").textContent;
+// open-when: kind=map
+// fixed-when: kind=str
+// From FEEDBACK6.md §Q-057 (found on 72f7913).
+
+component Probe() {
+    state shown = "starting"
+    <p id="out" @mount={(el) => {
+        let v = js("later")
+        shown = `kind=${type_of(v)}`
+    }}>{shown}</p>
+}
+
+route GET / = <html><head><script>{raw("window.later = () => Promise.resolve(\"hello\");")}</script></head>
+                    <body><Probe/></body></html>

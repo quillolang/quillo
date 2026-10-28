@@ -1,0 +1,5 @@
+server fn work(ms: int) -> int with time {
+    sleep(ms)
+    print("c: done")
+    1
+}

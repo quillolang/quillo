@@ -1,0 +1,9 @@
+// Q-058 `quillo run --no-check app.qwe` takes the flag for the program: "unknown option `app.qwe`" (`run --watch`: "--watch: cannot read file"); `check` takes flags anywhere
+// mode: cli
+// args: run --no-check Q-058-flag-before-the-program-taken-for-it.qwe
+// open-when: unknown option
+// open-when: cannot read file
+// fixed-when: ran with the flag first
+// From FEEDBACK6.md §Q-058 (found on 72f7913).
+
+print("ran with the flag first")

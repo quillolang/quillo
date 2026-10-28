@@ -1,0 +1,16 @@
+// Q-056 A call to a service given up on (its `timeout`) goes on below: the services it called finish the work after the caller was told it failed; no deadline is passed down
+// mode: serve
+// flags: --split
+// get: /
+// open-when: b: done, c answered
+// fixed-when: gave up
+// From FEEDBACK6.md §Q-056 (found on 72f7913). In one process the timeout is not applied: the call takes 2 s and succeeds.
+
+service b = "b.qwe" { timeout: "1s", retries: 0 }
+
+route GET / {
+    let r = b.work(2000)
+    // Long enough for what b and c do after this to reach the log.
+    sleep(1500)
+    is_err(r) ? `gave up: ${r.error}` : "ok"
+}

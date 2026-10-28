@@ -1,0 +1,8 @@
+// Q-059 `quillo run` in a folder with a main.qwe prints all 45 lines of usage; `quillo run .` says "Is a directory"; `check` and `build` alike
+// mode: cli
+// args: run
+// open-when: usage:
+// fixed-when: ran main.qwe
+// From FEEDBACK6.md §Q-059 (found on 72f7913).
+
+print("ran main.qwe")

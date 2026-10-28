@@ -17,7 +17,9 @@ Reports so far: [FEEDBACK.md](reports/FEEDBACK.md) (a forum), [FEEDBACK2.md](rep
 (a project manager), [FEEDBACK3.md](reports/FEEDBACK3.md) (a newsroom CMS with a flow and
 object designer), [FEEDBACK4.md](reports/FEEDBACK4.md) (a bank made of services, with a
 clerk–client desk view), [FEEDBACK5.md](reports/FEEDBACK5.md) (a booking platform on outside
-maps, weather and places, built with the Quillo UI kit, and the components it lacked), and
+maps, weather and places, built with the Quillo UI kit, and the components it lacked),
+[FEEDBACK6.md](reports/FEEDBACK6.md) (no app: whether Quillo can make a video call, the
+command line with no program, and a chain of services with a slow link), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
@@ -68,7 +70,8 @@ let int = 5
 
 | Line | |
 |---|---|
-| `mode:` | `check` (what `quillo check` says), `run` (what `quillo run` prints), `serve` (responses to `get:` requests, then the server's log), `browser` (the page in headless Chrome: `probe:` result, `remade`, mismatches, console) |
+| `mode:` | `check` (what `quillo check` says), `run` (what `quillo run` prints), `cli` (what quillo prints for the `args:` line, in the repro's folder), `serve` (responses to `get:` requests, then the server's log), `browser` (the page in headless Chrome: `probe:` result, `remade`, mismatches, console) |
+| `args: run --watch` | `cli`: quillo's own arguments, for issues of the command line |
 | `get: /path header=value` | `serve`: a request to make; several allowed |
 | `page: /path` | `browser`: the page to open |
 | `probe: return …` | `browser`: JavaScript run in the page once its components are up; returns JSON |

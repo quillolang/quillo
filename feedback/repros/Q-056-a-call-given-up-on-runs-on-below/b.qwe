@@ -1,0 +1,8 @@
+// The middle of the chain: allows c 3 s, more than its caller allows it.
+service c = "c.qwe" { timeout: "3s", retries: 0 }
+
+server fn work(ms: int) -> int ! str with http {
+    let r = c.work(ms)?
+    print("b: done, c answered")
+    r
+}
