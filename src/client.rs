@@ -2970,20 +2970,34 @@ impl<'a> Compiler<'a> {
         let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
         let mut names = Vec::new();
         pattern_names(pat, &mut names);
-        let (root, key) = match body {
-            Expr::Html(el, _) => (
-                Some(el),
-                el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
-                    ("key", AttrVal::Expr(k)) => Some(k),
-                    _ => None,
-                }),
-            ),
-            _ => (None, None),
+        let key_of = |el: &HtmlEl| {
+            el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
+                ("key", AttrVal::Expr(k)) => Some(k.clone()),
+                _ => None,
+            })
         };
-        let key_js = match key {
+        // A block whose value is one element is keyed by it too, as `=>` is:
+        // `for p in xs { let n = p.name; <li key={n}/> }` (FEEDBACK6.md, Q-055;
+        // branch feedback6-fixes). Its statements before the element run
+        // in the key's function as well, so the key may use them.
+        let (root, key, before) = match body {
+            Expr::Html(el, _) => (Some(&**el), key_of(el), &[][..]),
+            Expr::Block(stmts) => match stmts.split_last() {
+                Some((Stmt::Expr(Expr::Html(el, _)), before)) => (None, key_of(el), before),
+                _ => (None, None, &[][..]),
+            },
+            _ => (None, None, &[][..]),
+        };
+        let key_js = match &key {
             Some(k) => {
                 self.push_scope();
-                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?.0)));
+                // With statements before it: the key is that block's value.
+                let k = if before.is_empty() {
+                    k.clone()
+                } else {
+                    Expr::Block(before.iter().cloned().chain(std::iter::once(Stmt::Expr(k.clone()))).collect())
+                };
+                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(&k)?.0)));
                 self.pop_scope();
                 let (binds, k) = k?;
                 format!("($x) => {{ {}return {}; }}", binds, k)

@@ -467,7 +467,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   that reads them (`if running { every(...) }`). Each place in the markup that shows a
   value follows only that value: changing one row's text changes that text. Assigning
   the value a state already has does nothing.
-- `for` in markup keeps a row for each item: by its `key={...}`, else by its place.
+- `for` in markup keeps a row for each item: by its `key={...}`, else by its place. The
+  key is the row's element's, written after `=>` or as the value of a block
+  (`for p in xs { let n = p.name; <li key={n}>{n}</li> }`, whose statements the key may use).
   `key` is the list's, not passed to the view or component, so neither may take a
   parameter named `key` (a load-time error); an attribute written twice on one element
   is an error too.
