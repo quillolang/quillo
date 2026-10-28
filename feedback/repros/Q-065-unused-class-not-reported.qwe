@@ -1,0 +1,15 @@
+// Q-065 A class the program styles and never writes is not reported: `quillo check` says ok
+// mode: check
+// open-when: /components\)\s*$/
+// fixed-when: never-used
+// From FEEDBACK8.md §Q-065 (found on f15bead). `.card` is written, `.card-lg` is made by a template, `.never-used` by nothing.
+
+let style = css`
+  .card { padding: 8px }
+  .card-lg { padding: 16px }
+  .never-used { color: red }
+`
+
+view Card(size: str = "") = <div class={size == "" ? "card" : `card card-${size}`}>a card</div>
+
+route GET / = <html><head><style>{style}</style></head><body><Card size="lg"/></body></html>

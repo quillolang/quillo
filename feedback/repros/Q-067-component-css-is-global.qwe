@@ -1,0 +1,27 @@
+// Q-067 A component's CSS is the page's: two components that style `.title` restyle each other, and the page's own `.title` too
+// mode: browser
+// probe: return [...document.querySelectorAll("h2")].map((h) => h.id + "=" + getComputedStyle(h).color).join(" ");
+// open-when: card=rgb(0, 0, 200)
+// fixed-when: card=rgb(200, 0, 0)
+// fixed-when: page=rgb(0, 0, 0)
+// From FEEDBACK8.md §Q-067 (found on f15bead). Written first as programs were written then:
+// each component's css`...` next to it, joined into the page's <style>. Since the fix
+// (branch feedback8-fixes) a component's or view's CSS is `style ...` in its body, scoped
+// to its own elements, and the page's sheet is made of the styles it shows.
+
+component Card() {
+    style css`.title { color: rgb(200, 0, 0) }`
+    state n = 0
+    <div.card><h2.title #card>card title</h2><button @click={() => { n += 1 }}>{n}</button></div>
+}
+
+view Panel() {
+    style css`.title { color: rgb(0, 0, 200) }`
+    <section.panel><h2.title #panel>panel title</h2></section>
+}
+
+route GET / = <html><head><title>styles</title></head><body>
+    <Card/>
+    <Panel/>
+    <h2.title #page>the page's own title</h2>
+</body></html>

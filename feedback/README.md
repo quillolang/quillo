@@ -21,7 +21,9 @@ maps, weather and places, built with the Quillo UI kit, and the components it la
 [FEEDBACK6.md](reports/FEEDBACK6.md) (no app: whether Quillo can make a video call, the
 command line with no program, and a chain of services with a slow link),
 [FEEDBACK7.md](reports/FEEDBACK7.md) (no app: how Quillo ships its JavaScript, and how
-its bundles are keyed and kept), and
+its bundles are keyed and kept), [FEEDBACK8.md](reports/FEEDBACK8.md) (no app: unused
+classes in the five apps, the classes Quillo sets itself, and component CSS that is not
+scoped), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
@@ -104,5 +106,9 @@ Node 22 or newer, and Chrome (or `QUILLO_CHROME`); nothing to install.
   runtime throws and records the text or element it wanted and what the server sent.
 - `tools/mismatches.mjs <url> <paths…> [--login "<path> <form> name=value …"]`: visits
   each page and reports anything made again, caught, thrown or logged. Exits 1 if any.
+- `tools/unused-css.mjs <program folder> [--all]`: the classes a program styles (its
+  `public/` sheets and `` css`...` ``) that nothing in it can write, by file and line. A
+  class a template may make (`` `ui-tabs-${v}` ``) is "maybe"; Quillo's own (`q-*`, `hl-*`)
+  are read from its runtime. A library's classes (`.leaflet-*`) show as unused.
 - `tools/drive.mjs test.mjs [--mismatches]`: runs a script that default-exports
   `async ({ browser, page, sleep, ALT, CTRL, META, SHIFT }) => result`.
