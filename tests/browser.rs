@@ -515,6 +515,30 @@ fn and_in_markup_keeps_its_elements() {
     );
 }
 
+/// A component's or view's `style` is its own: two that style `.title`
+/// style only their own, the page's `.title` neither, and a component the
+/// browser makes later has its style too, from the page's sheet
+/// (FEEDBACK8.md, Q-067 and Q-068; branch feedback8-fixes).
+#[test]
+fn styles_are_their_components_own() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("styles.qwe"), free_port(), Some(&dir.join("styles.js")));
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "server": ["rgb(200, 0, 0)", "rgb(0, 0, 200)", "rgb(0, 0, 0)", "rgb(0, 0, 0)"],
+            "browser": ["rgb(0, 128, 0)", "700"],
+            "sheets": ["/_quillo/s/H.css"],
+            "errors": [],
+            "remade": 0,
+        })
+    );
+}
+
 /// A textarea's text between its tags follows state once someone has typed
 /// in it, and a text that never changes leaves what was typed alone.
 #[test]

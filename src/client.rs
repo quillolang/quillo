@@ -83,6 +83,23 @@ fn components_of(it: &Interp, c: &Compiler) -> Vec<String> {
     out
 }
 
+/// The styles of the components and views a compile made (FEEDBACK8.md,
+/// Q-068; branch feedback8-fixes): a page can come to show them.
+fn styles_of(it: &Interp, c: &Compiler) -> Vec<String> {
+    let mut out: Vec<String> = c
+        .globals
+        .keys()
+        .filter_map(|k| match lookup(&it.globals, k) {
+            Some(Value::Func(f)) if matches!(&f.def.body, Expr::Block(ss) if ss.iter().any(|s| style_of(s).is_some())) => {
+                Some(style_id(f.def.file.as_deref(), &f.def.name))
+            }
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The compiled program as one script: `BASE` (when `with_base`), the
 /// markup blocks, the definitions, the `server fn` stubs, and the boot.
 fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> String {
@@ -130,15 +147,16 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
         c = compiled(it, Some(&set))?;
     }
     let (c, boots) = c;
+    let styles = styles_of(it, &c);
     if c.dev {
-        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false });
+        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles });
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok(PageBundle { js, set, split: true });
+            return Ok(PageBundle { js, set, split: true, styles });
         }
     }
-    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false })
+    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles })
 }
 
 pub struct PageBundle {
@@ -147,6 +165,17 @@ pub struct PageBundle {
     pub set: Vec<String>,
     /// It takes the runtime from the runtime file.
     pub split: bool,
+    /// The styles of the components and views it holds.
+    pub styles: Vec<String>,
+}
+
+/// A page's bundle as the page names it.
+#[derive(Clone)]
+pub struct PageRef {
+    pub hash: String,
+    /// It takes the runtime from the runtime file.
+    pub split: bool,
+    pub styles: Vec<String>,
 }
 
 /// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
@@ -270,25 +299,23 @@ pub struct Bundles {
 }
 
 struct Made {
-    hash: String,
+    page: PageRef,
     js: Arc<String>,
-    split: bool,
     used: u64,
 }
 
 pub const KEPT: usize = 256;
 
 impl Bundles {
-    /// The bundle's hash, and whether it needs the runtime file.
-    pub fn hash_for_roots(&mut self, roots: &str) -> Option<(String, bool)> {
+    pub fn hash_for_roots(&mut self, roots: &str) -> Option<PageRef> {
         let set = self.by_roots.get(roots)?.clone();
         self.tick += 1;
         let m = self.by_set.get_mut(&set)?;
         m.used = self.tick;
-        Some((m.hash.clone(), m.split))
+        Some(m.page.clone())
     }
 
-    pub fn keep(&mut self, roots: String, b: PageBundle) -> (String, bool) {
+    pub fn keep(&mut self, roots: String, b: PageBundle) -> PageRef {
         let set = b.set.join(",");
         self.tick += 1;
         if self.by_roots.len() > 4 * KEPT {
@@ -297,21 +324,21 @@ impl Bundles {
         self.by_roots.insert(roots, set.clone());
         if let Some(m) = self.by_set.get_mut(&set) {
             m.used = self.tick;
-            return (m.hash.clone(), m.split);
+            return m.page.clone();
         }
-        let hash = hash_text(&b.js);
-        self.by_set.insert(set, Made { hash: hash.clone(), js: Arc::new(b.js), split: b.split, used: self.tick });
+        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles };
+        self.by_set.insert(set, Made { page: page.clone(), js: Arc::new(b.js), used: self.tick });
         crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while self.by_set.len() > KEPT {
             let Some(old) = self.by_set.iter().min_by_key(|(_, m)| m.used).map(|(k, _)| k.clone()) else { break };
             self.by_set.remove(&old);
             crate::metrics::BUNDLES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-        (hash, b.split)
+        page
     }
 
     pub fn by_hash(&self, hash: &str) -> Option<Arc<String>> {
-        self.by_set.values().find(|m| m.hash == hash).map(|m| m.js.clone())
+        self.by_set.values().find(|m| m.page.hash == hash).map(|m| m.js.clone())
     }
 
     pub fn len(&self) -> usize {
@@ -2162,6 +2189,8 @@ impl<'a> Compiler<'a> {
             pending = Some((body.len(), crate::debug::stmt_line(st)));
             let last = i + 1 == n;
             match st {
+                // The style is sent as the page's sheet, not in the code.
+                Stmt::Expr(_) if style_of(st).is_some() => {}
                 Stmt::Expr(e) if last => {
                     let v = self.markup(e)?;
                     let _ = writeln!(body, "return {};", v);
@@ -2279,6 +2308,7 @@ impl<'a> Compiler<'a> {
     fn stmt_code(&mut self, s: &Stmt, last: bool, body: &mut String, decls: &mut Vec<String>) -> Result<(), QuilloError> {
         {
             match s {
+                Stmt::Expr(_) if style_of(s).is_some() => {}
                 Stmt::Expr(e) => {
                     let v = self.expr(e)?;
                     if last {

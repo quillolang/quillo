@@ -46,6 +46,7 @@ pub mod record;
 pub mod par;
 pub mod service;
 pub mod stream;
+pub mod styles;
 pub mod shared;
 pub mod session;
 pub mod site;

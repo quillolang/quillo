@@ -637,6 +637,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("receive", "str, fn, map | null=", "null | error(str)"),
     ("url", "", "map"),
     ("css", "str", "str"),
+    ("__style", "str", "null"),
     ("sql", "str", "str"),
     ("navigate", "str", "null"),
     ("publish", "any...", "null"),
@@ -1131,6 +1132,9 @@ pub struct Options {
     /// `service` paths made of plain names, as `read_file` takes them. For
     /// code that comes from a program's users (`check_program`).
     pub confined: bool,
+    /// Also warn of classes the program styles and never writes (`quillo
+    /// check`; FEEDBACK8.md, Q-065; branch feedback8-fixes).
+    pub css: bool,
 }
 
 /// How many programs deep `mount` and `service` may lead, and files deep
@@ -1218,6 +1222,11 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             }
             let mut order = Vec::new();
             c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
+            if opts.css {
+                for (file, line, msg) in unused_classes(&order, base_dir) {
+                    c.diag_at(file, line, Severity::Warning, msg);
+                }
+            }
             c.run(order);
             c.state_details();
         }
@@ -1444,7 +1453,7 @@ impl Checker {
     }
 
     fn options(&self) -> Options {
-        Options { strict_null: self.strict_null, confined: self.confined }
+        Options { strict_null: self.strict_null, confined: self.confined, css: false }
     }
 
     /// The file a `use`, `mount` or `service` names; when confined, none
@@ -4020,6 +4029,117 @@ fn called_names(e: &Expr, out: &mut Vec<String>) {
 }
 
 /// Calls `f` on every expression inside `e`, including `e`.
+/// The classes the program's sheets style (`css`...``, and `.css` files
+/// under public/) that nothing in it can write: no text in its code or its
+/// public scripts, no start of a template (`card-${size}` writes any
+/// `card-...`), not set by Quillo, nor by a script a sheet names
+/// (`/* set elsewhere: leaflet- */`). Each with where it is styled.
+fn unused_classes(order: &[Item], base: &Path) -> Vec<(Arc<str>, u32, String)> {
+    let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
+    let mut sheet_args: HashSet<*const Expr> = HashSet::new();
+    let mut written: HashSet<String> = HashSet::new();
+    let mut starts: HashSet<String> = HashSet::new();
+    let words = |s: &str, into: &mut HashSet<String>| {
+        for w in s.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).filter(|w| !w.is_empty()) {
+            into.insert(w.to_string());
+        }
+    };
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| match e {
+            Expr::Call(f, args, line) if matches!(&**f, Expr::Ident(n, _) if n == "css") && args.len() == 1 => {
+                let text = match &args[0] {
+                    Expr::Lit(Lit::Str(s)) => Some(s.to_string()),
+                    Expr::Template(parts) => Some(parts.iter().map(|p| if let TPart::Lit(t) = p { t.as_str() } else { " " }).collect()),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    sheet_args.insert(&args[0] as *const Expr);
+                    sheets.push((it.file.clone(), *line, text));
+                }
+            }
+            Expr::Lit(Lit::Str(s)) if !sheet_args.contains(&(e as *const Expr)) => words(s, &mut written),
+            // `"denied" => ...`: a value the program knows, which it may write.
+            Expr::Match(_, arms, _) => {
+                fn texts(p: &Pattern, out: &mut Vec<String>) {
+                    match p {
+                        Pattern::Lit(Lit::Str(s)) => out.push(s.to_string()),
+                        Pattern::Alt(ps) | Pattern::List(ps, _) => ps.iter().for_each(|q| texts(q, out)),
+                        Pattern::As(q, _) => texts(q, out),
+                        Pattern::Record(fs) => fs.iter().for_each(|f| texts(&f.pat, out)),
+                        _ => {}
+                    }
+                }
+                let mut found = Vec::new();
+                arms.iter().for_each(|a| texts(&a.pat, &mut found));
+                found.iter().for_each(|s| words(s, &mut written));
+            }
+            Expr::Template(parts) if !sheet_args.contains(&(e as *const Expr)) => {
+                for (k, p) in parts.iter().enumerate() {
+                    let TPart::Lit(t) = p else { continue };
+                    words(t, &mut written);
+                    // `card-${size}`: any class starting `card-` may be written.
+                    if matches!(parts.get(k + 1), Some(TPart::Expr(_))) {
+                        let tail: String = t.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+                        if !tail.is_empty() {
+                            starts.insert(tail.chars().rev().collect());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    // What the app's services send it is theirs to say: their text counts.
+    for it in order {
+        if let Stmt::Service(_, _, path, _, _) = &it.stmt {
+            if let Ok(src) = std::fs::read_to_string(base.join(path)) {
+                words(&src, &mut written);
+            }
+        }
+    }
+    // The app's own files under public/: its sheets, and what its scripts write.
+    fn files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth < 8 {
+                files(&p, out, depth + 1);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut public = Vec::new();
+    files(&base.join("public"), &mut public, 0);
+    public.sort();
+    for p in public {
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        match ext {
+            "css" => sheets.push((Arc::from(p.display().to_string()), 1, text)),
+            "js" | "mjs" => words(&text, &mut written),
+            _ => {}
+        }
+    }
+    let elsewhere: Vec<String> = sheets.iter().flat_map(|(_, _, t)| crate::styles::set_elsewhere(t)).collect();
+    let mut out = Vec::new();
+    let mut said = HashSet::new();
+    for (file, line, text) in &sheets {
+        for (class, k) in crate::styles::classes_in(text) {
+            if written.contains(&class)
+                || crate::styles::set_by_quillo(&class)
+                || starts.iter().any(|s| class.starts_with(s.as_str()))
+                || elsewhere.iter().any(|s| class.starts_with(s.as_str()))
+                || !said.insert((class.clone(), file.clone(), line + k))
+            {
+                continue;
+            }
+            out.push((file.clone(), line + k, format!("`.{}` is styled here, but nothing in the program writes it", class)));
+        }
+    }
+    out
+}
+
 pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match e {

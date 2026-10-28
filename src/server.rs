@@ -316,6 +316,9 @@ impl Interp {
                 resp.body.splice(at..at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).into_bytes());
             }
         }
+        // The styles of what the page's bundle can show, or all of them for
+        // the whole program's bundle.
+        let mut bundle_styles: Vec<String> = Vec::new();
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             let mut tags = String::new();
@@ -332,20 +335,44 @@ impl Interp {
                 // it takes the runtime from there (FEEDBACK7.md, Q-064;
                 // branch feedback7-fixes).
                 let srcs = match self.bundle_for_page(&names) {
-                    Some((hash, split)) => {
+                    Some(page) => {
                         let mut s = Vec::new();
-                        if let Some((rt, _)) = self.runtime_file().filter(|_| split) {
+                        if let Some((rt, _)) = self.runtime_file().filter(|_| page.split) {
                             s.push(format!("{}/_quillo/r/{}.js", self.base, rt));
                         }
-                        s.push(format!("{}/_quillo/b/{}.js", self.base, hash));
+                        s.push(format!("{}/_quillo/b/{}.js", self.base, page.hash));
+                        bundle_styles = page.styles;
                         s
                     }
-                    None => vec![format!("{}/_quillo/quillo.js", self.base)],
+                    None => {
+                        bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
+                        vec![format!("{}/_quillo/quillo.js", self.base)]
+                    }
                 };
                 tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));
+            } else {
+                bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
+        }
+        // The page's sheet: the styles of the components and views on it,
+        // and of those its bundle can show, at an address that changes when
+        // they do, in its <head> (FEEDBACK8.md, Q-068; branch
+        // feedback8-fixes).
+        if html && req.method != "HEAD" {
+            let mut ids = crate::styles::ids_in(&resp.body);
+            ids.extend(bundle_styles);
+            if let Some(hash) = self.sheet_for_page(&ids) {
+                let link = format!("<link rel=\"stylesheet\" href=\"{}/_quillo/s/{}.css\">", self.base, hash);
+                let find = |needle: &[u8]| resp.body.windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle));
+                let at = match (find(b"</head>"), find(b"<body")) {
+                    (Some(h), _) => h,
+                    (None, Some(b)) => resp.body[b..].iter().position(|&c| c == b'>').map_or(0, |e| b + e + 1),
+                    (None, None) => 0,
+                };
+                resp.body.splice(at..at, link.into_bytes());
+            }
         }
         resp
     }
@@ -481,6 +508,19 @@ impl Interp {
         // A page's own bundle: its address names its content, so it is kept.
         // One this program did not make (a page from before a reload) gets
         // the whole bundle, which has every component.
+        // A page's sheet; one no longer kept (or from before a reload) is
+        // every style.
+        if let Some(hash) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".css")) {
+            let (css, kept) = self.sheet_by_hash(hash);
+            return HttpResponse {
+                status: 200,
+                headers: vec![
+                    ("content-type".into(), "text/css; charset=utf-8".into()),
+                    ("cache-control".into(), if kept { "public, max-age=31536000, immutable" } else { "no-cache" }.into()),
+                ],
+                body: css.as_bytes().to_vec(),
+            };
+        }
         // The runtime file pages' bundles share; another than this program's
         // (a page from before a reload) gets this one, which does no harm:
         // its bundle is not kept either, so it is sent the whole bundle.

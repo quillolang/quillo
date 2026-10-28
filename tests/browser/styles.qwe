@@ -1,0 +1,34 @@
+// Components' and views' own CSS: scoped to their elements, whether the
+// server made them or the browser did (FEEDBACK8.md, Q-067 and Q-068).
+
+component Inner() {
+    style css`.title { color: rgb(0, 128, 0) }`
+    <h3.title #inner>inner</h3>
+}
+
+component Outer() {
+    style css`
+      .title { color: rgb(200, 0, 0) }
+      .row:hover { color: rgb(1, 2, 3) }
+      :global(body) .shown { font-weight: 700 }
+    `
+    state open = false
+    fn row(n: int) = <li.row #{`row${n}`}>row {n}</li>
+    <div>
+        <h2.title #outer>outer</h2>
+        <ul>{for n in [1, 2] => row(n)}</ul>
+        <button #open @click={() => { open = true }}>open</button>
+        {open ? <div.shown #shown><Inner/></div> : null}
+    </div>
+}
+
+view Panel() {
+    style css`.title { color: rgb(0, 0, 200) }`
+    <section><h2.title #panel>panel</h2></section>
+}
+
+route GET / = <html><head><title>styles</title></head><body>
+    <Outer/>
+    <Panel/>
+    <h2.title #page>page</h2>
+</body></html>

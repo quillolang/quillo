@@ -462,3 +462,21 @@ impl TypeDef {
 pub fn is_type_name(n: &str) -> bool {
     n.chars().next().map_or(false, |c| c.is_ascii_uppercase()) && n.chars().any(|c| c.is_ascii_lowercase())
 }
+
+/// The attribute a component's or view's elements carry when it has a
+/// style of its own (`data-q-<id>`), from its file and name (FEEDBACK8.md,
+/// Q-067; branch feedback8-fixes).
+pub fn style_id(file: Option<&str>, name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (file.unwrap_or(""), name).hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
+/// `style ...` in a body, as the parser writes it: a call of `__style`.
+pub fn style_of(s: &Stmt) -> Option<&Expr> {
+    match s {
+        Stmt::Expr(Expr::Call(f, args, _)) if matches!(&**f, Expr::Ident(n, _) if n == "__style") => args.first(),
+        _ => None,
+    }
+}

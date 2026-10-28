@@ -407,6 +407,38 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
+- A component's or view's own CSS is `style` at the start of its body, before its markup:
+
+  ```quillo
+  component Card() {
+      style css`
+        .title { color: darkred }
+        .title:hover { text-decoration: underline }
+      `
+      state open = false
+      <div.card><h2.title>{...}</h2></div>
+  }
+  ```
+
+  It styles only the elements the component writes, so another component's `.title`, or
+  the page's, is left alone. Each element written in its body (in helpers written there
+  too, and in markup it passes to other components) carries an attribute of its own,
+  `data-q-<id>`, and each rule is made to need it: `.title` is `.title[data-q-3f9a0c12]`,
+  the same on the server and in the browser. `:global(...)` keeps a selector, or the start
+  of one, for the page: `:global(body.dark) .title`, `.map :global(.leaflet-pane)`.
+  `@media`, `@supports`, `@container` and `@layer` are scoped inside; `@keyframes` and
+  `@font-face` are kept as they are. The style is the same for every use of the component,
+  so it cannot read its parameters (set a class or `style=` on an element for that).
+- A page is sent the styles of the components and views on it, and of those its bundle can
+  show, as a sheet of its own in its `<head>`, `/_quillo/s/<hash>.css`, which the browser
+  keeps for good. A `<style>` the page writes is for what is not a component's.
+- `quillo check` warns of a class a sheet styles (`` css`...` ``, a `style`, or a `.css`
+  file under `public/`) that nothing in the program writes: "`.never-used` is styled here,
+  but nothing in the program writes it". Text anywhere in the program counts, and so do
+  its services' and the scripts under `public/`. A template's start counts for every class
+  that begins with it (`` `card-${size}` `` writes any `card-...`), and so do the classes
+  Quillo sets (below). For classes a library's script sets, name their starts in a comment
+  in the sheet: `/* set elsewhere: leaflet- */`.
 - `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
   so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
@@ -535,6 +567,19 @@ route GET / = <html><body><Counter start={5}/></body></html>
   tone, seconds })` shows a note that goes by itself. Both are markup with `q-` classes
   in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
   and styles: keyboard, focus and screen readers are taken care of.
+- The classes and attributes Quillo sets itself, for a sheet to style. No `.qwe` file
+  writes them, so a tool that drops CSS it finds no use for (PurgeCSS and the like) must
+  be told to keep them:
+
+  | Set by | Classes and attributes |
+  |---|---|
+  | `ask` | `q-notices` (the host), `q-backdrop`, `q-dialog`, `q-title`, `q-message`, `q-actions`, `q-cancel`, `q-ok`; `q-open` while shown |
+  | `notify` | `q-notices`, `q-toasts`, `q-toast`, `q-title`, `q-message`, `q-close`; `q-open` while shown |
+  | `ask`, `notify` with `tone` | `q-` and the tone, on the dialog or toast: `q-danger`, `q-success` |
+  | the host's places | the page's `data-notices` on `<body>`, else `dialog-center toasts-top-right`, as classes of `q-notices` |
+  | `highlight(code, lang)` | `hl-k` keywords, `hl-s` strings, `hl-c` comments, `hl-n` numbers and constants, `hl-f` functions called, `hl-t` types and tags, `hl-a` attributes, properties and keys |
+  | `<quillo-media>` | `data-state`: `connecting`, `waiting`, `playing`, `ended`, `unsupported`; one that sends: `starting`, `sending`, `refused`, `ended`, `unsupported` |
+  | a component's `style` | `data-q-<id>` on the elements it writes |
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
   as `2`. While the server renders a component it writes numbers the same way (`8`,
   `1e+21`), so the page it sends is the one the browser would make and is taken up, not

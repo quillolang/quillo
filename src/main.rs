@@ -174,7 +174,7 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
-            with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, ..Default::default() }))
+            with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, css: true, ..Default::default() }))
         }
         Some("build") => with_program(&args[2..], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
