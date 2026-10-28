@@ -261,10 +261,16 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
 /// A call cut short by its `timeout` says so, in those words.
 fn timed_out(o: Opts, url: &str, e: String) -> String {
     if o.timeout_ms > 0 && e.contains("timed out") {
-        format!("{}: took more than {} s (its timeout)", url, o.timeout_ms as f64 / 1000.0)
-    } else {
-        e
+        return format!("{}: took more than {} s (its timeout)", url, o.timeout_ms as f64 / 1000.0);
     }
+    // `public_only` refusing an address happens as the name is resolved, so
+    // the client calls it a failed lookup: say what refused it (FEEDBACK5.md,
+    // Q-052; branch feedback6-fixes).
+    if let Some(at) = e.find(" is not an address on the public internet") {
+        let host = e[..at].rsplit(": ").next().unwrap_or("").trim();
+        return format!("{}: refused by public_only: {} is not on the public internet", url, host);
+    }
+    e
 }
 
 /// Answers kept by `cache`: by method, URL, headers and options, until

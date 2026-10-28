@@ -11,7 +11,8 @@
 // how to run it and how to read what comes out:
 //
 //   // Q-012 `let` with a type's name does not bind it
-//   // mode: run                  check | run | serve | browser
+//   // mode: run                  check | run | serve | browser | cli
+//   // args: run --watch          cli: quillo's own arguments, in the repro's folder
 //   // get: /path [header=value]  serve: requests to make (several allowed)
 //   // page: /path                browser: the page to open
 //   // probe: return {...}        browser: JavaScript run in the page once it is up
@@ -57,7 +58,7 @@ const repros = readdirSync(reprosDir)
   .sort((a, b) => a.id.localeCompare(b.id));
 
 function header(file) {
-  const h = { title: "", mode: "run", get: [], page: "/", probe: null, flags: [], open: [], fixed: [] };
+  const h = { title: "", mode: "run", args: [], get: [], page: "/", probe: null, flags: [], open: [], fixed: [] };
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (!line.startsWith("//")) break;
     const text = line.slice(2).trim();
@@ -65,6 +66,7 @@ function header(file) {
     if (!m) { if (!h.title) h.title = text.replace(/^Q-\d+\s*/, ""); continue; }
     const [, key, value] = m;
     if (key === "mode") h.mode = value.trim();
+    else if (key === "args") h.args = value.trim().split(/\s+/).filter(Boolean);
     else if (key === "get") h.get.push(value.trim());
     else if (key === "page") h.page = value.trim();
     else if (key === "probe") h.probe = value;
@@ -101,8 +103,10 @@ async function serving(r, f) {
   let log = "";
   p.stdout.on("data", (d) => (log += d));
   p.stderr.on("data", (d) => (log += d));
-  for (let i = 0; i < 100 && !/listening on/.test(log) && p.exitCode === null; i++) await new Promise((x) => setTimeout(x, 50));
-  if (!/listening on/.test(log)) { p.kill(); return log; }
+  // On its own port: with --split, its services say they listen first.
+  const up = new RegExp(`listening on \\S+:${port}\\b`);
+  for (let i = 0; i < 100 && !up.test(log) && p.exitCode === null; i++) await new Promise((x) => setTimeout(x, 50));
+  if (!up.test(log)) { p.kill(); return log; }
   try {
     const out = await f(`http://127.0.0.1:${port}`);
     await new Promise((x) => setTimeout(x, 150));
@@ -122,6 +126,8 @@ async function output(r) {
   const h = r.header;
   if (h.mode === "check") return exec(["check", basename(r.file)], r.dir);
   if (h.mode === "run") return exec(["run", basename(r.file), ...h.flags], r.dir);
+  // The command line itself: no program named, a folder, flags in its place.
+  if (h.mode === "cli") return exec(h.args, r.dir, 5000);
   if (h.mode === "serve") {
     return serving(r, async (base) => {
       let out = "";

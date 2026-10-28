@@ -817,10 +817,12 @@ fn http_calls_can_refuse_redirects_and_addresses_inside() {
         "http://0.0.0.0/".to_string(),
     ] {
         let e = run(format!("http.post({:?}, {{ a: 1 }}, {{}}, {{ public_only: true }})", url));
-        assert!(e.starts_with("err(") && e.contains("not an address on the public internet"), "{}: {}", url, e);
+        // The error names the option that refused (FEEDBACK5.md, Q-052;
+        // branch feedback6-fixes).
+        assert!(e.starts_with("err(") && e.contains("refused by public_only") && e.contains("is not on the public internet"), "{}: {}", url, e);
     }
     let e = run(format!("http.stream(\"http://127.0.0.1:{}/secret\", (x) => x, {{ public_only: true }})", port));
-    assert!(e.contains("not an address on the public internet"), "{}", e);
+    assert!(e.contains("refused by public_only"), "{}", e);
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
     for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
         assert!(quillo::fetch::public_ip(ip.parse().unwrap()), "{}", ip);

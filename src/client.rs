@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -799,6 +799,9 @@ struct FnCtx {
     hoisted: bool,
     /// A `state` initializer's code, which the server runs as it renders.
     state_init: bool,
+    /// The function written in an `@event` or `@mount` attribute itself, not
+    /// one inside it: a Promise its `js(...)` gives is waited for here.
+    waits_js: bool,
 }
 
 enum Resolved {
@@ -812,6 +815,12 @@ enum Resolved {
 
 struct Compiler<'a> {
     it: &'a Interp,
+    /// The lambda an `@event` or `@mount` attribute is, while it compiles (by
+    /// its definition, which both of `function`'s passes see).
+    handler: Option<*const FnDef>,
+    /// Compiling what `.then`, `.catch` or `.finally` is called on: a Promise
+    /// is wanted there, not what it gives.
+    keep_promise: bool,
     assigned: HashSet<String>,
     /// Globals read from the server's environment, files or database.
     private: HashSet<String>,
@@ -1295,6 +1304,8 @@ impl<'a> Compiler<'a> {
             views: HashSet::new(),
             view_defs: Vec::new(),
             globals: HashMap::new(),
+            handler: None,
+            keep_promise: false,
             ctxs: Vec::new(),
             counter: 0,
             line: 0,
@@ -1489,7 +1500,7 @@ impl<'a> Compiler<'a> {
             return self.err("`request` is only available on the server; pass what you need as a prop");
         }
         let Some(v) = lookup(&self.it.globals, name) else {
-            return self.err(format!("unknown name `{}`", name));
+            return self.err(format!("unknown name `{}`{}", name, crate::error::removed_note(name)));
         };
         let js = format!("G[{}]", js_str(name));
         match &v {
@@ -1510,7 +1521,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -1655,7 +1666,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -1739,6 +1750,9 @@ impl<'a> Compiler<'a> {
         let saved_line = self.line;
         self.line = def.line;
         self.new_ctx(None, is_async);
+        if self.handler == Some(def as *const FnDef) {
+            self.ctx().waits_js = true;
+        }
         let mut pre = String::new();
         let res = (|| -> Result<(Vec<String>, String), QuilloError> {
             let names = self.params(def, &mut pre, true)?;
@@ -2170,7 +2184,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -2653,7 +2667,10 @@ impl<'a> Compiler<'a> {
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
         let mut argv: Vec<String> = pre.into_iter().collect();
         if let Expr::Field(obj, name, _) = callee {
-            let recv = self.expr(obj)?;
+            let saved = std::mem::replace(&mut self.keep_promise, matches!(name.as_str(), "then" | "catch" | "finally"));
+            let recv = self.expr(obj);
+            self.keep_promise = saved;
+            let recv = recv?;
             let fb = self.fallback(name);
             if fb == "B.js" || fb == "B.js_new" {
                 return self.err(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", name, name));
@@ -2705,6 +2722,14 @@ impl<'a> Compiler<'a> {
         } else {
             format!("W.call({}, [{}])", f, argv.join(", "))
         };
+        // A Promise from the page's function is waited for where code can
+        // wait (an event handler, @mount, a state's initializer), as a
+        // `server fn` is: its rejection an error value (FEEDBACK6.md, Q-057;
+        // branch feedback6-fixes). Elsewhere, and before `.then`, it stays a
+        // Promise.
+        if (f == "B.js" || f == "B.js_new") && !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
+            return self.finish_call(&name, true, format!("W.settle({})", call));
+        }
         self.finish_call(&name, is_async, call)
     }
 
@@ -2945,20 +2970,34 @@ impl<'a> Compiler<'a> {
         let p = if matches!(pat, Pattern::Bind(_)) { None } else { Some(self.pattern(pat)?) };
         let mut names = Vec::new();
         pattern_names(pat, &mut names);
-        let (root, key) = match body {
-            Expr::Html(el, _) => (
-                Some(el),
-                el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
-                    ("key", AttrVal::Expr(k)) => Some(k),
-                    _ => None,
-                }),
-            ),
-            _ => (None, None),
+        let key_of = |el: &HtmlEl| {
+            el.attrs.iter().find_map(|(n, v)| match (n.as_str(), v) {
+                ("key", AttrVal::Expr(k)) => Some(k.clone()),
+                _ => None,
+            })
         };
-        let key_js = match key {
+        // A block whose value is one element is keyed by it too, as `=>` is:
+        // `for p in xs { let n = p.name; <li key={n}/> }` (FEEDBACK6.md, Q-055;
+        // branch feedback6-fixes). Its statements before the element run
+        // in the key's function as well, so the key may use them.
+        let (root, key, before) = match body {
+            Expr::Html(el, _) => (Some(&**el), key_of(el), &[][..]),
+            Expr::Block(stmts) => match stmts.split_last() {
+                Some((Stmt::Expr(Expr::Html(el, _)), before)) => (None, key_of(el), before),
+                _ => (None, None, &[][..]),
+            },
+            _ => (None, None, &[][..]),
+        };
+        let key_js = match &key {
             Some(k) => {
                 self.push_scope();
-                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(k)?.0)));
+                // With statements before it: the key is that block's value.
+                let k = if before.is_empty() {
+                    k.clone()
+                } else {
+                    Expr::Block(before.iter().cloned().chain(std::iter::once(Stmt::Expr(k.clone()))).collect())
+                };
+                let k = self.bind_pattern(pat, "$x", "`for` pattern does not match ").and_then(|binds| Ok((binds, self.reactive_expr(&k)?.0)));
                 self.pop_scope();
                 let (binds, k) = k?;
                 format!("($x) => {{ {}return {}; }}", binds, k)
@@ -3259,7 +3298,12 @@ impl<'a> Compiler<'a> {
             written.push(js_str(name));
             if let Some(ev) = name.strip_prefix('@') {
                 let f = match v {
-                    AttrVal::Expr(e @ Expr::Lambda(_)) => self.expr(e)?,
+                    AttrVal::Expr(e @ Expr::Lambda(d)) => {
+                        let saved = self.handler.replace(&**d as *const FnDef);
+                        let code = self.expr(e);
+                        self.handler = saved;
+                        code?
+                    }
                     AttrVal::Expr(e) => {
                         let (f, r) = self.reactive_expr(e)?;
                         if r {

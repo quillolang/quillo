@@ -654,42 +654,102 @@ impl Interp {
             reqmap.insert("id".into(), Value::str(&**id));
         }
         self.current_request = Some(Value::map(reqmap));
-        // A `live` refresh: also report what the function read.
-        let live = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-live"));
-        let seq = self.shared.live_seq();
-        if live {
-            self.reads = Some(Default::default());
+        // A `live` refresh: also report what the function read. A run made
+        // for another page moments ago, still good, is that page's answer
+        // too; and a page that says what it has is sent what changed
+        // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+        let hdr = |n: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str());
+        let live = hdr("x-quillo-live").is_some();
+        if !live {
+            let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+            self.current_request = None;
+            return match res {
+                Ok(v) | Err(Ctrl::Return(v)) => match v {
+                    Value::Response(r) => render_response(&r),
+                    Value::Err(e) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
+                    v => json_response(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
+                },
+                Err(Ctrl::Reply(r)) => render_response(&r),
+                Err(Ctrl::Error(e)) => {
+                    eprintln!("quillo: error in server fn `{}`: {}", name, e);
+                    rpc_error(500, &format!("internal error in `{}`", name))
+                }
+            };
         }
-        let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
-        let topics = self.reads.take().map(|r| {
-            let mut t: Vec<String> = r.into_iter().collect();
-            t.sort();
-            t
-        });
-        if let Some(t) = &topics {
-            self.shared.track(t);
-        }
-        self.current_request = None;
-        let with_topics = |mut j: serde_json::Value| {
-            if let Some(t) = &topics {
-                j["topics"] = serde_json::json!(t);
-                j["seq"] = serde_json::json!(seq);
-                j["server"] = serde_json::json!(self.shared.id);
+        let had = hdr("x-quillo-had").and_then(crate::livecache::parse_hash);
+        let key = boundary.is_none().then(|| (name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
+        let viewer = {
+            // The address without its port, which each connection has its own of.
+            let mut text = req.remote.parse::<std::net::SocketAddr>().map_or_else(|_| req.remote.clone(), |a| a.ip().to_string());
+            for n in ["cookie", "authorization", "accept-language", "user-agent"] {
+                text.push('\n');
+                text.push_str(hdr(n).unwrap_or(""));
             }
-            j
+            crate::livecache::hash(&text)
         };
-        match res {
-            Ok(v) | Err(Ctrl::Return(v)) => match v {
-                Value::Response(r) => render_response(&r),
-                Value::Err(e) => json_response(200, with_topics(serde_json::json!({ "err": crate::interp::island_json(&e) }))),
-                v => json_response(200, with_topics(serde_json::json!({ "ok": crate::interp::island_json(&v) }))),
-            },
-            Err(Ctrl::Reply(r)) => render_response(&r),
-            Err(Ctrl::Error(e)) => {
-                eprintln!("quillo: error in server fn `{}`: {}", name, e);
-                rpc_error(500, &format!("internal error in `{}`", name))
+        let found = key.as_ref().and_then(|k| {
+            let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.shared(k, viewer, |t, seq| self.shared.unchanged_since(t, seq))
+        });
+        let (answer, topics, seq) = match found {
+            Some(f) => {
+                self.current_request = None;
+                f
             }
+            None => {
+                let seq = self.shared.live_seq();
+                self.reads = Some(Default::default());
+                self.read_request = false;
+                let cookies = self.set_cookies.len();
+                let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+                let mut topics: Vec<String> = self.reads.take().unwrap_or_default().into_iter().collect();
+                topics.sort();
+                self.shared.track(&topics);
+                self.current_request = None;
+                let answer = Arc::new(match res {
+                    Ok(v) | Err(Ctrl::Return(v)) => match v {
+                        Value::Response(r) => return render_response(&r),
+                        Value::Err(e) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
+                        v => crate::livecache::Answer::new(crate::interp::island_json(&v), false),
+                    },
+                    Err(Ctrl::Reply(r)) => return render_response(&r),
+                    Err(Ctrl::Error(e)) => {
+                        eprintln!("quillo: error in server fn `{}`: {}", name, e);
+                        return rpc_error(500, &format!("internal error in `{}`", name));
+                    }
+                });
+                // Not shared: a run that wrote, or set a cookie.
+                if let Some(k) = key {
+                    if self.set_cookies.len() == cookies && self.shared.live_seq() == seq {
+                        let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.share(k, self.read_request.then_some(viewer), seq, topics.clone(), answer.clone());
+                    }
+                }
+                (answer, topics, seq)
+            }
+        };
+        let mut patch = None;
+        if !answer.err {
+            let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.keep(answer.h, answer.value.clone(), answer.text.len());
+            patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value)).map(|p| p.to_string()).filter(|p| p.len() < answer.text.len());
         }
+        let (field, value) = match &patch {
+            Some(p) => ("patch", p.as_str()),
+            None => (if answer.err { "err" } else { "ok" }, answer.text.as_str()),
+        };
+        let mut resp = json_response(200, serde_json::Value::Null);
+        resp.body = format!(
+            "{{\"{}\":{},\"h\":\"{}\",\"topics\":{},\"seq\":{},\"server\":{}}}",
+            field,
+            value,
+            crate::livecache::hash_text(answer.h),
+            serde_json::json!(topics),
+            seq,
+            serde_json::json!(self.shared.id)
+        )
+        .into_bytes();
+        resp
     }
 }
 

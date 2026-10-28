@@ -62,7 +62,7 @@ pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
 }
 
 fn undefined(name: &str, line: u32) -> Ctrl {
-    Ctrl::Error(QuilloError::new(format!("unknown name `{}`", name), line))
+    Ctrl::Error(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line))
 }
 
 /// How strictly a pattern compares values. Query strings, form fields and
@@ -113,6 +113,10 @@ pub struct Interp {
     /// The current request's id (`x-request-id`, given or made), which calls
     /// to services pass on (src/service.rs).
     pub request_id: Option<Arc<str>>,
+    /// When the service call being answered must be done by: its caller's
+    /// time left, which calls it makes in turn may wait no longer than
+    /// (FEEDBACK6.md, Q-056; branch feedback6-fixes).
+    pub deadline: Option<std::time::Instant>,
     /// Whether the program named the tenant (`with_tenant`), rather than a
     /// request's host: only then may its database be made.
     pub tenant_named: bool,
@@ -142,6 +146,9 @@ pub struct Interp {
     pub(crate) in_component: bool,
     /// While a `live` loader runs: the topics (tables, globals) it reads.
     pub reads: Option<std::collections::HashSet<String>>,
+    /// The code read the request (its session, cookies, headers): what it
+    /// made is this viewer's (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    pub read_request: bool,
     /// The subscription the last `live(...)` call set up, for `state`.
     pub last_live: Option<Value>,
     /// Open `db.transaction`s, and changes to announce when they commit.
@@ -784,6 +791,7 @@ impl Interp {
             tenant: None,
             tenant_named: false,
             request_id: None,
+            deadline: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -797,6 +805,7 @@ impl Interp {
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            read_request: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -850,6 +859,7 @@ impl Interp {
             tenant: None,
             tenant_named: false,
             request_id: None,
+            deadline: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -863,6 +873,7 @@ impl Interp {
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            read_request: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -1020,6 +1031,7 @@ impl Interp {
 
     /// The request being handled, as the `request` map (made now if needed).
     pub fn request_value(&mut self) -> Option<Value> {
+        self.read_request = true;
         if self.current_request.is_none() {
             if let Some(p) = &self.pending_request {
                 let mut r = p.make();
@@ -2269,9 +2281,16 @@ impl Interp {
     fn bind_args(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
         if def.server {
+            let was = self.read_request;
             if let Some(req) = self.request_value() {
                 define(&scope, "request", req.clone());
                 self.mark_impure();
+            }
+            // `request` given to a server fn is read only if its code names
+            // it: a live loader that does not is shared between viewers
+            // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+            if self.reads.is_some() && !was && !crate::parser::names_request(&def.body) {
+                self.read_request = false;
             }
         }
         let mut it = args.into_iter();

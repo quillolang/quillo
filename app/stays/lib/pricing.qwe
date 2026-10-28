@@ -45,9 +45,9 @@ fn night_price(listing, day: str, custom: map) -> int =
 // Why a stay of these dates and guests cannot be booked, or null.
 fn stay_problem(listing, start: str, end: str, guests: int, today: str) {
     if !is_day(start) || !is_day(end) { return "Choose the dates of your stay" }
-    let n = days_between(start, end)
-    if days_between(today, start) < 0 { return "Those dates have passed" }
-    if days_between(today, start) > 365 { return "Bookings open a year ahead" }
+    let n = date.days_between(start, end)
+    if date.days_between(today, start) < 0 { return "Those dates have passed" }
+    if date.days_between(today, start) > 365 { return "Bookings open a year ahead" }
     if n <= 0 { return "The day you leave comes after the day you arrive" }
     if n < listing.min_nights { return `This place takes stays of ${plural(listing.min_nights, "night")} or more` }
     if n > listing.max_nights { return `This place takes stays of at most ${plural(listing.max_nights, "night")}` }
@@ -153,8 +153,8 @@ fn card_problem(number: str, expiry: str, cvc: str, today: str) {
     let mm = int(m.groups[0])
     let yy = 2000 + int(m.groups[1])
     if mm < 1 || mm > 12 { return "Expiry as MM/YY" }
-    let p = day_parts(today)
-    if yy < p.y || (yy == p.y && mm < p.m) { return "That card has expired" }
+    let p = date.parts(today)
+    if yy < p.year || (yy == p.year && mm < p.month) { return "That card has expired" }
     if !re.test(trim(cvc), "^[0-9]{3,4}$") { return "The 3 digits on the back" }
     if digits == "4000000000000002" { return "Your bank declined this card" }
     null

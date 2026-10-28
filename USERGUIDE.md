@@ -467,7 +467,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   that reads them (`if running { every(...) }`). Each place in the markup that shows a
   value follows only that value: changing one row's text changes that text. Assigning
   the value a state already has does nothing.
-- `for` in markup keeps a row for each item: by its `key={...}`, else by its place.
+- `for` in markup keeps a row for each item: by its `key={...}`, else by its place. The
+  key is the row's element's, written after `=>` or as the value of a block
+  (`for p in xs { let n = p.name; <li key={n}>{n}</li> }`, whose statements the key may use).
   `key` is the list's, not passed to the view or component, so neither may take a
   parameter named `key` (a load-time error); an attribute written twice on one element
   is an error too.
@@ -627,6 +629,15 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   find ways through (a library function that writes HTML, a function of the page
   reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
   out of what `js` calls, as you would in JavaScript.
+- A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
+  waited for where code can wait, as a `server fn` call is: in an event handler, in
+  `@mount`, and in a `state` initializer: `let cam = js("navigator.mediaDevices.getUserMedia",
+  { video: true })` is the stream, or an error value if it was refused. Elsewhere (a
+  function `map` calls, a statement that runs again), and with `.then`, `.catch` or
+  `.finally` after it, it stays a Promise: `js("load").then((x) => { data = x })`.
+  `type_of` calls one `promise`.
+- A name the page does not have (a library's `<script>` left out) gives an error value,
+  `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps
@@ -730,6 +741,18 @@ component Notes(initial: list) {
   `X-Forwarded-For`, which a client can write).
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
+- One change wakes every page showing it, and they all ask at once. A loader's run
+  is shared by the pages that ask, within two seconds, for the same function with the
+  same arguments while nothing it read has changed: fifty open boards run `load_board`
+  once. A run that read the request (`session()`, cookies, headers, the locale) is
+  shared only by the same viewer's pages (their tabs), wherever in the run it read it.
+  A run that wrote, or set a cookie, is not shared.
+- A page is sent what changed in the value, not the whole value again: the server keeps
+  the values pages have (up to 64 MB), and answers a page with a patch to its own.
+  Lists of rows are matched by their `id`, so a card moved or renamed on a board of
+  3,000 costs that card. The patch applies to what the server last sent, so changes the
+  page made to the state meanwhile (a card shown moved before the server says so) are
+  replaced as before.
 
 #### Several servers
 
@@ -1378,8 +1401,8 @@ UDP and channels together pass a device's packets on to pages as they come; see
 
 ### Media
 
-A program can take a camera's or an encoder's stream as RTP and play it in its pages,
-a fraction of a second behind:
+A program can take a camera's or an encoder's stream as RTP, or a page's camera, and
+play it in its pages, a fraction of a second behind:
 
 ```quillo
 media.rtp("cam", { video: 5004, audio: 5006 })
@@ -1393,7 +1416,9 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   -f rtp rtp://127.0.0.1:5004 -map 0:a -c:a libopus -f rtp rtp://127.0.0.1:5006
 ```
 
-- `media.rtp(name, { video, audio, host })` is written at the top of a program. Video is
+- `media.rtp(name, { video, audio, host })` makes a stream: at the top of a program, or
+  while it runs (a route, a channel's handler: a stream for each room), once for a name
+  (asked again, it is the same stream). Video is
   H.264 and audio Opus, each on a port of its own (`{ port: 5004, codec: "h264" }` says
   so in full). The packets never reach Quillo code: the server puts them back in order,
   makes frames of them (it reads single NAL units, STAP-A and FU-A), and passes each on
@@ -1402,8 +1427,8 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   script for it (4.5 KB compressed), which decodes with the browser's own decoders
   (WebCodecs) and draws on a canvas. `controls` adds a button for sound, and `muted`
   starts without it (browsers play sound only after a click on the page). Its
-  `data-state` is `connecting`, `waiting`, `playing` or `unsupported` (no WebCodecs),
-  for styling.
+  `data-state` is `connecting`, `waiting`, `playing`, `ended` or `unsupported` (no
+  WebCodecs), for styling.
 - Frames travel on the page's channel connection: over WebTransport, a stream per
   track; else over the WebSocket. The server keeps the video since the last keyframe, so
   a page that starts watching shows a picture at once. A page that falls behind skips
@@ -1413,6 +1438,36 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   seconds (the camera stopped, the connection is down), `data-state` is `waiting`.
 - `media.streams()` gives each stream's viewers and, per track, `frames`, `fps`, `kbps`
   and `lost` packets.
+- **Pages send too.** `media.on(name, { publish })` lets pages send stream `name` (or
+  every stream a name ending in `*` starts: `"call:*"`), and
+  `<quillo-media publish="call:42">` sends the page's camera and microphone to it, for
+  every `<quillo-media stream="call:42">` to play. The browser encodes them with WebCodecs
+  (H.264 baseline and Opus, what the relay passes on) and sends the frames on its channel
+  connection; the server passes them on as it does RTP, decoding nothing. `publish(peer)`
+  says which pages may, as a channel's `join` does (with the page's `session()`); without
+  it, any page may. A video call is a stream per person:
+
+  ```quillo
+  media.on("call:*", { publish: (peer) => session().user != null })
+
+  component Call(room: str, me: str, others: list) {
+      <div>
+          <quillo-media publish={`call:${room}:${me}`}/>
+          {for p in others => <quillo-media key={p} stream={`call:${room}:${p}`}/>}
+      </div>
+  }
+  ```
+
+  `no-video` or `no-audio` leaves one out. Given a MediaStream as its `source` (a
+  canvas's, the screen's: `el.source = js("navigator.mediaDevices.getDisplayMedia")` in
+  `@mount`), it sends that instead of the camera. Its `data-state` is `starting`,
+  `sending`, `refused` (no camera, or `publish` said no), `ended` or `unsupported`, and
+  `el.mediaStats` counts what it encoded and sent. Each person's picture goes once to the
+  server, which sends it on to everyone watching (what video services call an SFU); there
+  is no TURN relay for networks that block UDP, where the WebSocket carries it.
+- `media.close(name)` ends a stream: it stops taking RTP, lets its ports go (for another
+  stream to take), and tells its pages, whose `data-state` turns `ended`. It gives true if
+  there was such a stream.
 - Audio and video are each played as they come, so they are in step within about a
   tenth of a second. The camera's encoder decides the picture: keyframes every second
   or two (`-g 60` at 30 fps) let pages that start watching (or fall behind) catch up
@@ -1602,7 +1657,14 @@ When a service runs elsewhere, its calls are made to hold up:
   ```
 
   Those are the defaults, except `timeout` (10 s). Durations are `"500ms"`, `"2s"`,
-  `"1m"`, or milliseconds.
+  `"1m"`, or milliseconds. A try that runs out says so: `service billing: took more
+  than 2 s (its timeout)`. They apply when a service runs elsewhere (`--split`, or at an
+  address); in one process a call is a function's, which runs to its end.
+- **A chain gives up together.** Each call carries the time its caller still waits for
+  it, and the calls the service makes in turn wait no longer than that (their own
+  `timeout` when it is shorter). So when the first link gives up, the ones below stop
+  waiting too instead of finishing work nobody waits for; a call with no time left is
+  not made. What a service is already doing runs to its end.
 - **One id for a request, everywhere.** Each request has an id: the `x-request-id` it came
   with (a proxy's, a load balancer's), or one made for it. Its answer carries it, the
   JSON log shows it (`"rid"`), the code sees it (`request.id`), and every call to a
@@ -1983,6 +2045,69 @@ Making a list one item at a time is the interpreter's work, though: `map(range(n
 => ...)` over a million takes about 1.4 times Python's list comprehension. Built with
 `vec` instead (`vec.div(vec.mod(vec.mul(vec.arange(n), k), m), 1000.0)`), the same list
 takes a fifteenth of the comprehension's time.
+
+### Dates and times
+
+There is no date type: a date is its ISO 8601 text, `"2026-10-27"`, and a date-time is
+RFC 3339 text with its offset, `"2026-10-27T14:30:00Z"` or `"2026-10-27T15:30:00+01:00"`.
+Text like that sorts and compares in time order (date-times when they have the same
+offset: keep them in UTC), and goes through JSON, databases, forms (`<input type="date">`)
+and the browser as it is. The `date` module works on it, on the server and in the browser
+alike, with the same answers:
+
+```quillo
+date.today()                          // "2026-10-27", in UTC; date.today("Europe/Paris")
+date.now()                            // "2026-10-27T14:30:00Z", to the second
+date.add_months("2026-01-31", 1)      // "2026-02-28": the end of the month, not March
+date.to_zone("2026-10-27T14:30:00Z", "Europe/Paris")       // "2026-10-27T15:30:00+01:00"
+date.at("2026-10-27", "17:00", "America/New_York")         // "2026-10-27T17:00:00-04:00"
+date.days_between("2026-11-05", "2026-11-14")              // 9: the nights of a stay
+date.format("2026-10-27", { locale: "de-DE", style: "long" })  // "27. Oktober 2026"
+date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or an error value
+```
+
+- **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time),
+  `date.parts(d)` (`{ year, month, day, weekday }`, weekday 1 for Monday to 7 for Sunday;
+  a date-time adds `hour minute second offset`), `date.weekday(d)`, `date.is_leap_year(year
+  or d)`, `date.days_in_month(d)` or `(year, month)`.
+- **Arithmetic:** `date.add_days(d, n)`, `date.add_months(d, n)` and `date.add_years(d, n)`
+  (a day past the month's end is its last day: `2024-02-29` plus a year is `2025-02-28`),
+  `date.days_between(a, b)` (`b - a`, in days), `date.months_between(a, b)` (whole months:
+  `2026-01-31` to `2026-02-28` is one), `date.start_of_month(d)`, `date.end_of_month(d)`.
+  These take dates; `date.date_in(t, tz)` gives a date-time's date.
+- **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
+  milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
+  way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
+- **Time zones:** `date.to_zone(t, tz)` is the same instant at the zone's offset then
+  (daylight saving included); `date.date_in(t, tz)` its calendar date there;
+  `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go
+  forward is moved forward by the gap, 02:30 becoming 03:30; a time that happens twice
+  when they go back is the first). A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
+  an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
+  reads the system's time zone database, or a copy built into `quillo` where there is none
+  (Windows, small containers); the browser asks its own (`Intl`).
+- **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
+  not), `MMMM MMM` (its name), `DD D`, `dddd ddd` (the weekday's name), `HH H` and `hh h`
+  (24 or 12 hours), `mm ss A` (AM/PM) and `Z` (the offset); anything else, and text in
+  `[brackets]`, is kept as it is. A date-time shows its time as written: `date.to_zone` it
+  first to show another zone's. `date.format(d, { locale, style })` gives a locale's
+  `"short"`, `"medium"` (the default), `"long"` or `"full"` date, and `{ locale, pattern }`
+  the pattern with that language's names. The locales are English (US, and the British
+  style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`), German, French, Spanish,
+  Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
+  forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
+  `date.parse(s, pattern)` reads by a pattern (English names; `YY` is 2000 to 2099; with a
+  time and no `Z`, UTC). Either gives an error value when the text is not a date.
+
+A malformed date (`"2026-02-30"`, `"27/10/2026"`, a number) is an error in every function
+but `date.parse` and `date.valid`. Years are 1 to 9999. `date.today` and `date.now` read
+the clock, so they are the `time` effect, and scripts run with `run_script` have the rest
+of `date` but not them. A program's own variable called `date` hides the module, as with
+the others.
+
+Business days, holidays and the day counts of interest are a program's own: a calendar
+is a list of holidays and the arithmetic above.
 
 ### Database
 

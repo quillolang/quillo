@@ -1,0 +1,17 @@
+// Q-055 `for x in xs { <li key={x}/> }` takes no notice of its key: rows are kept by place, so a row added in front makes every row again
+// mode: browser
+// probe: for (const e of document.querySelectorAll("li")) e.__kept = true; document.getElementById("front").click(); await new Promise((r) => setTimeout(r, 300)); const kept = (id) => [...document.querySelectorAll(`#${id} li`)].filter((e) => e.__kept).length; return { braces: kept("braces"), arrow: kept("arrow") };
+// open-when: /"braces": 0\b/
+// fixed-when: /"braces": 2\b/
+// From FEEDBACK6.md §Q-055 (found on 72f7913).
+
+component Rows() {
+    state items = ["b", "c"]
+    <div>
+        <ul id="braces">{for p in items { <li key={p}>{p}</li> }}</ul>
+        <ul id="arrow">{for p in items => <li key={p}>{p}</li>}</ul>
+        <button id="front" @click={() => { items = ["a"] + items }}>add in front</button>
+    </div>
+}
+
+route GET / = <html><body><Rows/></body></html>

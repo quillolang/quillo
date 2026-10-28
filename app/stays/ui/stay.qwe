@@ -71,7 +71,7 @@ component StayView(id: int, start: str, end: str, guests: int) {
                     <div.reviews>{for r in s.reviews => <Card key={r.created}>
                         <div.row><Avatar name={r.name} size="sm"/><b>{r.name}</b><Rating name={`r${r.created}`} value={r.rating} readonly={true} size="sm"/></div>
                         <p>{r.body}</p>
-                        <span.muted.small>{day_label(day_text(floor(r.created / DAY_MS)))}</span>
+                        <span.muted.small>{day_label(date.date_in(date.from_ms(r.created), "UTC"))}</span>
                     </Card>}</div>
                 </div>
                 <BookingWidget l={s.listing} custom={s.custom} taken={s.taken} closed={s.closed} today={s.today}
@@ -93,7 +93,7 @@ fn clashes(start: str, end: str, taken: list, closed: list) -> list =
 // The prices of the nights to come, as the dates picker shows them under each
 // day: in whole units ("€95"), to fit.
 fn day_prices(l, custom: map, today: str) -> map =
-    nights_of(today, add_days(today, 120)) | reduce({}, (m, d) => set(m, d, re.replace(shown_minor(night_price(l, d, custom), l.currency), "[.,]00$", "")))
+    nights_of(today, date.add_days(today, 120)) | reduce({}, (m, d) => set(m, d, re.replace(shown_minor(night_price(l, d, custom), l.currency), "[.,]00$", "")))
 
 component BookingWidget(l, custom: map, taken: list, closed: list, today: str, start: str, end: str, guests: int,
                         signed_in: bool, mine: bool, on_dates, on_guests) {

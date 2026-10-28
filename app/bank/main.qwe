@@ -27,7 +27,7 @@
 // service reaches the gateway's pages with its answer, split or not.
 //
 //   lib/iban.qwe      account numbers: IBANs with mod-97 check digits
-//   lib/format.qwe    amounts as typed and shown, dates (Quillo has no date module)
+//   lib/format.qwe    amounts as typed and shown, dates
 //   lib/auth.qwe      clients and staff, signing in, the audit log
 //   lib/bank.qwe      the gateway's server fns for clients and staff
 //   lib/desk.qwe      desk sessions: the clerk's form, the client's approvals

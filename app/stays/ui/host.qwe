@@ -47,7 +47,7 @@ component HostDashboard() {
                 : <div.stack>{for s in h.series => <BarChart key={s.name} labels={h.months} values={s.values}
                     label={`Earned in ${s.name}, by month of the stay`} show_label={true} prefix={s.name == "JPY" ? "¥" : "€"} height={200}/>}</div>}
             <h2>Nights booked</h2>
-            <CalendarHeatmap values={h.heat} end={add_days(h.today, 60)} start={add_days(h.today, -180)} week_start="monday" unit="nights booked" label="Nights booked"/>
+            <CalendarHeatmap values={h.heat} end={date.add_days(h.today, 60)} start={date.add_days(h.today, -180)} week_start="monday" unit="nights booked" label="Nights booked"/>
             <h2>Your places</h2>
             <div.results>{for l in h.listings => <Card key={l.id} title={l.title} subtitle={`${l.city} · ${l.price_shown} a night`} href={`/host/listings/${l.id}`}>
                 <img.photo src={l.photo_urls[0]} alt=""/>

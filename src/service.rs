@@ -519,11 +519,20 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             let wait = Duration::from_millis(100 << (attempt - 1)).mul_f64(1.0 + fastrand::f64() / 2.0);
             it.unlocked(move || std::thread::sleep(wait));
         }
+        // No longer than the call this one is part of may still wait
+        // (Q-056): a chain gives up together, not each link on its own.
+        let left = it.deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            return Outcome::Missed(format!("service {}: not called: the call this one is part of has run out of time", name));
+        }
+        let (timeout, theirs) = match left {
+            Some(l) if l < o.timeout => (l, true),
+            _ => (o.timeout, false),
+        };
         let t = now_secs();
         let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
-        let timeout = o.timeout;
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
                 .post(&endpoint)
@@ -532,7 +541,8 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 .set("x-quillo-service", &format!("t={},sig={}", t, sig))
                 .set("x-quillo-to", &to)
                 .set("x-quillo-call", &c)
-                .set("x-quillo-caller", &cl);
+                .set("x-quillo-caller", &cl)
+                .set("x-quillo-deadline", &timeout.as_millis().to_string());
             if !tn.is_empty() {
                 rq = rq.set("x-quillo-tenant", &tn);
             }
@@ -590,8 +600,16 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             }
             Try::NoAnswer(e) => {
                 went_wrong(&url, &o);
-                why = format!("service {}: no answer from {} ({})", name, url, e);
+                why = if e.contains("timed out") {
+                    let secs = timeout.as_secs_f64();
+                    format!("service {}: took more than {} s ({}), at {}", name, (secs * 1000.0).round() / 1000.0, if theirs { "the time its caller had left" } else { "its timeout" }, url)
+                } else {
+                    format!("service {}: no answer from {} ({})", name, url, e)
+                };
                 same = Some(url);
+                if theirs {
+                    break;
+                }
             }
         }
         if attempt < o.retries {
@@ -731,7 +749,12 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     // caller's pages that watch them follow, as they do in one process
     // (FEEDBACK4.md, Q-038; branch bank-fixes).
     it.published = Some(Vec::new());
+    // How long the caller waits for it: what this call's own calls to
+    // services may wait in turn (FEEDBACK6.md, Q-056; branch feedback6-fixes).
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    it.deadline = header("x-quillo-deadline").and_then(|ms| ms.parse::<u64>().ok()).map(|ms| Instant::now() + Duration::from_millis(ms.min(3_600_000)));
     let result = it.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+    it.deadline = None;
     let published = it.published.take().unwrap_or_default();
     // Sent only when there are some: an answer without any is as before.
     let with_published = |mut j: serde_json::Value| {

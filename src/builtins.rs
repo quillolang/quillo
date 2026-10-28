@@ -54,7 +54,8 @@ pub fn install(env: &Env) {
         ("merge", merge),
         // `{ ...m, name: v }` (src/parser.rs), which a variable named merge
         // cannot change.
-        ("__merge", merge),
+        ("__merge", spread_map),
+        ("__concat", spread_list),
         ("err", err),
         ("is_err", is_err),
         ("unwrap", unwrap),
@@ -162,6 +163,9 @@ pub fn install(env: &Env) {
     let mut vec = Map::new();
     crate::numeric::install_vec(&mut vec);
     define(env, "vec", Value::map(vec));
+    let mut date = Map::new();
+    crate::dates::install(&mut date);
+    define(env, "date", Value::map(date));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).
@@ -643,6 +647,33 @@ fn merge(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         m.insert(k.clone(), v.clone());
     }
     Ok(Value::map(m))
+}
+
+// `{ ...m, k: v }` and `[...xs, 3]`, which the parser makes of spreads: an
+// error says what was spread, not these functions' names (FEEDBACK3.md,
+// Q-036; branch feedback6-fixes). Null spreads nothing, in a map or a list.
+fn spread_map(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let mut out = Map::new();
+    for v in args {
+        match v {
+            Value::Map(m) => out.extend(m.iter().map(|(k, v)| (k.clone(), v.clone()))),
+            Value::Nil => {}
+            other => return fail(line, format!("`{{...x}}` spreads a map (or null) into a map, but x is {}", other.type_name())),
+        }
+    }
+    Ok(Value::map(out))
+}
+
+fn spread_list(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let mut out = Vec::new();
+    for v in args {
+        match v {
+            Value::List(l) => out.extend(l.iter().cloned()),
+            Value::Nil => {}
+            other => return fail(line, format!("`[...x]` spreads a list (or null) into a list, but x is {}", other.type_name())),
+        }
+    }
+    Ok(Value::list(out))
 }
 
 // ---- errors ------------------------------------------------------------
@@ -1546,6 +1577,15 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     info.insert("f".into(), Value::str(&name));
     info.insert("a".into(), Value::list(rest));
     info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
+    // The value's hash, kept: the page's first refresh can be a patch
+    // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    if let Ok(v) = &r {
+        if !matches!(v, Value::Err(_)) {
+            let a = crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false));
+            it.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner()).keep(a.h, a.value.clone(), a.text.len());
+            info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));
+        }
+    }
     it.last_live = Some(Value::map(info));
     r
 }

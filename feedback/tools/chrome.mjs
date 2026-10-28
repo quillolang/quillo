@@ -4,6 +4,11 @@
 // exceptions, console errors, and components the browser had to make again
 // because the server's HTML did not match ("mismatches").
 //
+// CHROME_FLAGS adds flags of Chrome's own: a fake camera and microphone, and
+// sound without a click, for a page that sends media
+// (--use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+// --autoplay-policy=no-user-gesture-required).
+//
 //   import { launch } from "./chrome.mjs"
 //   const browser = await launch({ mismatches: true })
 //   const page = await browser.page()
@@ -42,7 +47,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
   const chromePath = findChrome();
   if (!chromePath) throw new Error("no Chrome found: set QUILLO_CHROME");
   const chrome = spawn(chromePath, ["--headless=new", "--remote-debugging-port=0",
-    `--user-data-dir=${mkdtempSync(join(tmpdir(), "quillo-cdp-"))}`, "--no-first-run",
+    `--user-data-dir=${mkdtempSync(join(tmpdir(), "quillo-cdp-"))}`, "--no-first-run", ...(process.env.CHROME_FLAGS || "").split(/\s+/).filter(Boolean),
     `--window-size=${width},${height}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   const wsUrl = await new Promise((res, rej) => {
     let buf = "";

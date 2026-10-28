@@ -57,12 +57,12 @@ use "seed.qwe"
 
 if env("STAYS_DEMO", "") == "1" { seed_demo() }
 
-route GET / = <HomePage me={me()} today={today_day()}/>
+route GET / = <HomePage me={me()} today={date.today()}/>
 
 route GET /s ? { where: str = "", start: str = "", end: str = "", guests: int = 2 } {
     let f = { where: trim(where), start, end, guests: max([1, guests]) }
     <Shell me={me()} title={f.where == "" ? "Search" : f.where} maps={true} wide={true}>
-        <SearchApp first_filters={f} first={search_stays(f)} today={today_day()}/>
+        <SearchApp first_filters={f} first={search_stays(f)} today={date.today()}/>
     </Shell>
 }
 

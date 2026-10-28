@@ -570,7 +570,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("set", "map | list | null, any, any=", "map | list"),
     ("remove", "list | map | null, any", "list | map"),
     ("merge", "map | null, map | null", "map"),
-    ("__merge", "map | null, map | null", "map"),
+    ("__merge", "map | null...", "map"),
+    ("__concat", "list | null...", "list"),
     ("err", "any=", "error(any)"),
     ("is_err", "any", "bool"),
     ("unwrap", "any", "any"),
@@ -686,7 +687,32 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.broadcast", "str, any, map | null=", "int"),
     ("channel.peers", "str", "list"),
     ("channel.open", "str, fn, map | null=", "map"),
+    // src/dates.rs (FEEDBACK2.md, Q-027; branch feedback6-fixes)
+    ("date.today", "str | null=", "str"),
+    ("date.now", "str | null=", "str"),
+    ("date.parse", "str, str | null=", "str | error(str)"),
+    ("date.valid", "any", "bool"),
+    ("date.of", "int, int, int", "str"),
+    ("date.parts", "str", "map"),
+    ("date.weekday", "str", "int"),
+    ("date.is_leap_year", "int | str", "bool"),
+    ("date.days_in_month", "int | str, int=", "int"),
+    ("date.add_days", "str, int", "str"),
+    ("date.add_months", "str, int", "str"),
+    ("date.add_years", "str, int", "str"),
+    ("date.days_between", "str, str", "int"),
+    ("date.months_between", "str, str", "int"),
+    ("date.start_of_month", "str", "str"),
+    ("date.end_of_month", "str", "str"),
+    ("date.to_zone", "str, str | null=", "str"),
+    ("date.date_in", "str, str | null=", "str"),
+    ("date.at", "str, str | null=, str | null=", "str"),
+    ("date.format", "str, str | map", "str"),
+    ("date.ms", "str", "int"),
+    ("date.from_ms", "int, str | null=", "str"),
     ("media.rtp", "str, map", "null"),
+    ("media.close", "str", "bool"),
+    ("media.on", "str, map | null=", "null"),
     ("media.streams", "", "list"),
     // src/money.rs
     ("money.of", "dec | int | str, str, str=", "map | error(str)"),
@@ -822,9 +848,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "money", "re"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "money", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -1543,6 +1569,13 @@ impl Checker {
         }
     }
 
+    /// `lib/a.qwe:1`: a place in the program, from the main file's folder.
+    fn shown_at(&self, f: &str, l: u32) -> String {
+        let dir = Path::new(&*self.main).parent().unwrap_or(Path::new(""));
+        let short = Path::new(f).strip_prefix(dir).unwrap_or(Path::new(f));
+        format!("{}:{}", short.strip_prefix(".").unwrap_or(short).display(), l)
+    }
+
     /// Before `name`, defined at the top level of `file`, is added: one
     /// the program already has is an error, wherever it is (the second
     /// would replace the first everywhere), and a function taking a
@@ -1562,11 +1595,7 @@ impl Checker {
         if is_let && g.sig.is_none() && !g.used && g.file == *file {
             return;
         }
-        let at = |f: &str, l: u32| {
-            let dir = Path::new(&*self.main).parent().unwrap_or(Path::new(""));
-            let short = Path::new(f).strip_prefix(dir).unwrap_or(Path::new(f));
-            format!("{}:{}", short.strip_prefix(".").unwrap_or(short).display(), l)
-        };
+        let at = |f: &str, l: u32| self.shown_at(f, l);
         let msg = format!("`{}` is defined twice, at {} and {}: the second replaces the first everywhere, so rename one", name, at(&g.file, g.line), at(file, line));
         self.diag_at(file.clone(), line, Severity::Error, msg);
     }
@@ -1859,7 +1888,8 @@ impl Checker {
                 if name == "request" {
                     self.error("`request` only exists in routes and `server fn`s; pass what you need as an argument");
                 } else if !self.unparsed_names.contains(name) {
-                    self.error(format!("unknown name `{}`{}", name, self.suggest(name)));
+                    let removed = crate::error::removed_note(name);
+                    self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
                 }
                 (T::ANY, None)
             }
@@ -2646,6 +2676,24 @@ impl Checker {
                     }
                 }
                 match &**rhs {
+                    // `xs | find(f) != null` is `xs | (find(f) != null)`: `|`
+                    // binds looser than an operator, which a call's errors
+                    // would not say (FEEDBACK5.md, Q-051; branch feedback6-fixes).
+                    Expr::Binary(op, inner, _, _) if matches!(&**inner, Expr::Call(..) | Expr::Ident(..)) && !matches!(op, BinOp::Range) => {
+                        let f = match &**inner {
+                            Expr::Call(c, _, _) => callee_name(c),
+                            other => callee_name(other),
+                        };
+                        let sym = match op {
+                            BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*", BinOp::Div => "/", BinOp::Mod => "%",
+                            BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<", BinOp::Le => "<=", BinOp::Gt => ">",
+                            BinOp::Ge => ">=", BinOp::And => "&&", BinOp::Or => "||", BinOp::Range => "..",
+                        };
+                        self.error(format!(
+                            "`xs | {f}(...) {sym} ...` reads as `xs | ({f}(...) {sym} ...)`: `|` binds looser than `{sym}`, so put the pipe in parentheses: `(xs | {f}(...)) {sym} ...`"
+                        ));
+                        T::ANY
+                    }
                     Expr::Call(callee, args, l) => {
                         self.line = *l;
                         self.call(callee, args, Some(v))
@@ -3190,7 +3238,7 @@ impl Checker {
         }
         self.line = line;
         let Some((_, p, r)) = BUILTINS.iter().find(|(n, _, _)| *n == full) else {
-            self.error(format!("`{}` has no function `{}`", m, f));
+            self.error(format!("`{}` has no function `{}`{}", m, f, crate::error::removed_note(&full)));
             return T::ANY;
         };
         if !self.quiet_mode() {
@@ -3531,7 +3579,25 @@ impl Checker {
     /// and the result type.
     fn apply(&mut self, ft: T, sig: Option<Arc<Sig>>, args: Vec<T>, arg_exprs: &[Expr], name: &str) -> T {
         if ft.bits != 0 && ft.bits & FN == 0 {
-            self.error(format!("cannot call `{}`: it is {}, not a function", name, bits_text(ft.bits)));
+            // A top-level variable with a builtin's name takes it from every
+            // file: say whose it is, here and where it is made (FEEDBACK3.md,
+            // Q-035; branch feedback6-fixes).
+            let hidden = self.globals.get(name).filter(|g| &*g.file != "<builtin>" && matches!(g.kind, Kind::Global)).map(|g| (g.file.clone(), g.line));
+            match hidden {
+                Some((file, line)) if BUILTINS.iter().any(|(n, _, _)| *n == name) => {
+                    let at = self.shown_at(&file, line);
+                    self.error(format!(
+                        "cannot call `{}`: it is {}, the program's variable from {}, which hides the builtin `{}` in every file",
+                        name, bits_text(ft.bits), at, name
+                    ));
+                    let here = self.shown_at(&self.file.clone(), self.line);
+                    self.diag_at(file, line, Severity::Warning, format!(
+                        "`{}` hides the builtin `{}` in every file of the program, and {} calls the builtin: pick another name",
+                        name, name, here
+                    ));
+                }
+                _ => self.error(format!("cannot call `{}`: it is {}, not a function", name, bits_text(ft.bits))),
+            }
             return T::ANY;
         }
         let Some(sig) = sig else { return T::ANY };
@@ -3548,6 +3614,11 @@ impl Checker {
                 None if !p.optional => {
                     self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
                     break;
+                }
+                Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 && matches!(name, "__merge" | "__concat") => {
+                    // A spread, which the parser made a call of (Q-036).
+                    let (form, of) = if name == "__merge" { ("{...x}", "a map") } else { ("[...x]", "a list") };
+                    self.error(format!("`{}` spreads {} (or null), but x is {}", form, of, bits_text(a.bits)));
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 => {
                     self.error(format!("{} of `{}` must be {}, got {}{}", what(), name, bits_text(p.ty), bits_text(a.bits), hides(&sig, name)));
@@ -3923,7 +3994,7 @@ fn callee_name(e: &Expr) -> String {
     match e {
         Expr::Ident(n, _) => n.clone(),
         Expr::Field(_, n, _) => n.clone(),
-        _ => "this function".into(),
+        _ => "this value".into(),
     }
 }
 

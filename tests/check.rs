@@ -470,8 +470,12 @@ fn patterns_written_out_are_checked() {
 fn only_unknown_syntax_may_be_for_a_newer_quillo() {
     let newer = |src: &str| !check_source(src, "t.qwe", Path::new(".")).syntax_errors.is_empty();
     assert!(newer("let x = 1 # 2"));
-    assert!(newer("fn f() => 1"));
+    assert!(newer("let x = 1 as int"));
     assert!(newer("let s = \"\\q\""));
+    // A message that says what was expected, with no word it does not know,
+    // is a mistake, not newer code (FEEDBACK.md, Q-008; branch feedback6-fixes).
+    assert!(!newer("fn f() => 1"));
+    assert!(!newer("let x = [1, 2"));
     assert!(!newer("fn reply(x) = x"));
     assert!(!newer("let reply = 1"));
     assert!(!newer("fn f() { g() = 1 }"));

@@ -1,0 +1,28 @@
+// Q-028 Live data sends the loader's whole value again, and runs the loader once per open page
+// mode: browser
+// probe: const frame = document.createElement("iframe"); frame.src = "/"; document.body.appendChild(frame); await new Promise((r) => frame.onload = r); await new Promise((r) => setTimeout(r, 1500)); const sizes = []; for (const w of [window, frame.contentWindow]) { const f = w.fetch; w.fetch = async (...a) => { const r = await f.apply(w, a); if (String(a[0]).includes("/rpc/load_rows")) sizes.push((await r.clone().text()).length); return r; }; } document.getElementById("rename").click(); await new Promise((r) => setTimeout(r, 1500)); const two = frame.contentDocument; return { here: document.getElementById("r7").textContent, there: two.getElementById("r7").textContent, one_run: document.getElementById("stamp").textContent == two.getElementById("stamp").textContent, biggest: Math.max(...sizes), answers: sizes.length };
+// open-when: /"one_run": false|"biggest": \d{5,}/
+// fixed-when: /"here": "Renamed",\s*"there": "Renamed",\s*"one_run": true,\s*"biggest": \d{1,3},/
+// From FEEDBACK2.md §Live data sends the whole value again (found on 896e758).
+// Two pages show 3,000 rows; one row is renamed. Each page used to run the
+// loader and get all 3,000 rows again (about 90 KB); now one run serves
+// both, and each gets the one row that changed.
+
+let rows = for i in range(3000) => { id: i, title: `Row ${i}` }
+
+server fn load_rows() with random = { stamp: random(), rows }
+
+server fn rename(id: int) {
+    rows = for r in rows => r.id == id ? merge(r, { title: "Renamed" }) : r
+}
+
+component Rows() {
+    state data = live(load_rows)
+    <div>
+        <p id="stamp">{data.stamp}</p>
+        <button id="rename" @click={() => rename(7)}>rename row 7</button>
+        <ul>{for r in take(data.rows, 10) => <li id={`r${r.id}`} key={r.id}>{r.title}</li>}</ul>
+    </div>
+}
+
+route GET / = <html><body><Rows/></body></html>

@@ -63,35 +63,35 @@ fn seed_demo() with db, time, random {
             ids[p[0] - 1], p[1], p[2], p[3], p[4], p[5], p[6], p[3] == "Kyoto" ? "JPY" : "EUR", p[7], p[8], p[9], p[10],
             max([1, ceil(p[10] / 2)]), max([1, ceil(p[10] / 2)]), 1, p[11], descriptions[i % 4], p[12], p[13], p[14], floor(wobble(i + 7) * 360), t0 - 300 * DAY_MS)
     }
-    let today = today_day()
+    let today = date.today()
     // Past stays, with reviews: guests Sam and Lee in turn.
     let words = ["Lovely place, exactly as described. The host was quick to answer.", "Great location, a bit noisy on Saturday night.", "Spotless, and the view is even better than the pictures.", "Comfortable beds and a kitchen with everything. Would stay again."]
     for i in range(0, 24) {
         let listing_id = i % 16 + 1
         let l = db.one("select * from listings where id = ?", listing_id)
-        let start = add_days(today, -20 - i * 7)
-        let end = add_days(start, max([l.min_nights, 2 + i % 3]))
+        let start = date.add_days(today, -20 - i * 7)
+        let end = date.add_days(start, max([l.min_nights, 2 + i % 3]))
         let guest = ids[4 + i % 2]
         let b = seed_booking(l, guest, start, end, 2, "confirmed", t0 - (40 + i * 7) * DAY_MS)
         db.exec("insert into reviews (booking_id, listing_id, guest_id, rating, body, created) values (?, ?, ?, ?, ?, ?)",
-            b, listing_id, guest, 3 + floor(wobble(i) * 3), words[i % 4], day_number(end) * DAY_MS + 3600000)
+            b, listing_id, guest, 3 + floor(wobble(i) * 3), words[i % 4], date.ms(end) + 3600000)
     }
     // Stays to come: Sam in Alfama in two weeks; Lee in Kyoto next month.
-    seed_booking(db.one("select * from listings where id = 1"), ids[4], add_days(today, 14), add_days(today, 18), 2, "confirmed", t0 - DAY_MS)
-    seed_booking(db.one("select * from listings where id = 14"), ids[5], add_days(today, 30), add_days(today, 34), 3, "confirmed", t0 - 2 * DAY_MS)
+    seed_booking(db.one("select * from listings where id = 1"), ids[4], date.add_days(today, 14), date.add_days(today, 18), 2, "confirmed", t0 - DAY_MS)
+    seed_booking(db.one("select * from listings where id = 14"), ids[5], date.add_days(today, 30), date.add_days(today, 34), 3, "confirmed", t0 - 2 * DAY_MS)
     // A request waiting for Ana: Lee in Graça (not instant), 20 hours left to answer.
-    let r = seed_booking(db.one("select * from listings where id = 2"), ids[5], add_days(today, 21), add_days(today, 25), 2, "requested", t0 - 4 * 3600000)
+    let r = seed_booking(db.one("select * from listings where id = 2"), ids[5], date.add_days(today, 21), date.add_days(today, 25), 2, "requested", t0 - 4 * 3600000)
     db.exec("update bookings set respond_by = ? where id = ?", t0 + 20 * 3600000, r)
     // Ana's prices: New Year's Eve dearer, and a week closed in December.
-    for d in nights_of(add_days(today, 40), add_days(today, 47)) { db.exec("insert into blocked_nights (listing_id, day) values (1, ?)", d) }
-    db.exec("insert into night_prices (listing_id, day, price) values (1, ?, 25000)", `${day_parts(today).y}-12-31`)
+    for d in nights_of(date.add_days(today, 40), date.add_days(today, 47)) { db.exec("insert into blocked_nights (listing_id, day) values (1, ?)", d) }
+    db.exec("insert into night_prices (listing_id, day, price) values (1, ?, 25000)", `${date.parts(today).year}-12-31`)
     // Activities, with times for 28 days.
     for [i, a] in enumerate(SEED_ACTIVITIES) {
         let aid = db.exec("insert into activities (title, kind, city, lat, lng, currency, price, minutes, description, hue) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], floor(wobble(i + 30) * 360)).last_id
         for k in range(0, 28) {
             for t in a[9] {
-                db.exec("insert into activity_slots (activity_id, day, time, capacity, taken) values (?, ?, ?, ?, ?)", aid, add_days(today, k), t, a[10], k == 1 && i == 1 ? a[10] : floor(wobble(k * 31 + i) * a[10] / 2))
+                db.exec("insert into activity_slots (activity_id, day, time, capacity, taken) values (?, ?, ?, ?, ?)", aid, date.add_days(today, k), t, a[10], k == 1 && i == 1 ? a[10] : floor(wobble(k * 31 + i) * a[10] / 2))
             }
         }
     }
