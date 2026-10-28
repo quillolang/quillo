@@ -20,6 +20,8 @@ usage:
   quillo check <file.qwe>           check a program without running it
                [--strict-null]      and warn where a value may be null and
                                     null does not work
+  quillo docs <file.qwe>            the program's API as OpenAPI 3: its routes,
+                                    and its server fns' contracts
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
@@ -55,6 +57,12 @@ options for `run`:
                  QUILLO_SERVICE_SECRET, the same on every service
   --base PATH    the path the program is served under (/shop), as a mounted
                  program is: its links and redirects carry it
+  --describe     answer GET /_quillo/describe with the program's API (as
+                 `quillo docs` writes it)
+  --scale NAME=N with --split: run service NAME as N copies, taking calls in
+                 turn (they share its database)
+  --join URL     with --as-service: join the app at URL as one more copy of
+                 this service, while it runs; leaves when stopped
   --as-service   serve the program as a service: its server fns answer only
                  other services' signed calls, not pages (--split sets it)
   --service-name NAME
@@ -115,12 +123,13 @@ fn main() {
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--scale", "--join",
 ];
 
 /// Options of `run`, `app`, `build` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--metrics", "--strict-null",
+    "--no-jobs", "--metrics", "--strict-null", "--describe",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -211,6 +220,18 @@ fn real_main(args: Vec<String>) -> i32 {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, css: true, ..Default::default() }))
         }
+        // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
+        // branch feedback10-fixes).
+        Some("docs") => with_program(&args[2..], |f, _| match quillo::describe::of_source(Path::new(f)) {
+            Ok(doc) => {
+                println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        }),
         Some("build") => with_program(&args[2..], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
@@ -281,6 +302,10 @@ struct RunOptions {
     service_name: Option<String>,
     /// The `.env` to read, when not the one beside the program (`--env-file`).
     env_file: Option<String>,
+    /// Copies of a service under `--split` (`--scale risk=3`).
+    scale: Vec<(String, usize)>,
+    /// The app this copy of a service joins (`--join http://app:8080`).
+    join: Option<String>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -301,6 +326,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         as_service: false,
         service_name: None,
         env_file: None,
+        scale: Vec::new(),
+        join: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -342,6 +369,18 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             },
             ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
             ("--env-file", Some(v)) => o.env_file = Some(v.clone()),
+            ("--scale", Some(v)) => match v.split_once('=').map(|(n, c)| (n, c.parse::<usize>())) {
+                Some((name, Ok(n))) if !name.is_empty() && (1..=64).contains(&n) => o.scale.push((name.to_string(), n)),
+                _ => {
+                    eprintln!("quillo: --scale is a service and how many copies of it, 1 to 64: --scale risk=3");
+                    return Err(2);
+                }
+            },
+            ("--join", Some(v)) if v.starts_with("http://") || v.starts_with("https://") => o.join = Some(v.trim_end_matches('/').to_string()),
+            ("--join", Some(_)) => {
+                eprintln!("quillo: --join is the address of the app to join: --join http://app:8080");
+                return Err(2);
+            }
             ("--base", Some(v)) => {
                 let b = v.trim_end_matches('/');
                 if !b.starts_with('/') || b.contains("//") || b.contains('?') {
@@ -382,6 +421,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--no-jobs", _) => {
                 quillo::jobs::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            ("--describe", _) => {
+                quillo::describe::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }
@@ -498,6 +542,10 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
 /// pool it joined, finishes the requests in progress and exits; a second
 /// one exits at once.
 fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
+    stop_on_signal_with(member, None)
+}
+
+fn stop_on_signal_with(member: Option<quillo::cluster::Membership>, joining: Option<std::sync::Arc<quillo::service::Joining>>) {
     let again = std::sync::atomic::AtomicBool::new(false);
     let _ = ctrlc::set_handler(move || {
         if again.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -506,6 +554,9 @@ fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
         eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
         if let Some(m) = &member {
             m.leave();
+        }
+        if let Some(j) = &joining {
+            j.leave();
         }
         quillo::httpd::stop();
     });
@@ -575,13 +626,17 @@ fn run(file: &str, flags: &[String]) -> i32 {
         eprintln!("quillo: --register needs limer's admin secret in $LIMER_ADMIN_SECRET (and limer configured with it)");
         return 2;
     }
+    if !o.scale.is_empty() && !o.split {
+        eprintln!("quillo: --scale goes with --split: quillo run app.qwe --split --scale risk=3");
+        return 2;
+    }
     // Each service its own process: started first, told where the others are.
     let _split = if o.split {
         if o.instances > 1 || o.register.is_some() {
             eprintln!("quillo: --split does not go with --instances or --register");
             return 2;
         }
-        match quillo::service::split(path, o.watch, o.static_check) {
+        match quillo::service::split(path, o.watch, o.static_check, &o.scale) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("quillo: {}", e);
@@ -614,7 +669,24 @@ fn run(file: &str, flags: &[String]) -> i32 {
         app.cluster_key = Some(m.key());
         quillo::cluster::join(app.shared(), m);
     }
-    stop_on_signal(member);
+    // One more copy of a service, joining an app as it runs (FEEDBACK10.md,
+    // Q-074; branch feedback10-fixes).
+    let joining = match &o.join {
+        Some(url) if o.as_service => {
+            let Ok(port) = port.parse::<u16>() else {
+                eprintln!("quillo: --join needs a numeric --port");
+                return 2;
+            };
+            let service = o.service_name.clone().unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            Some(quillo::service::Joining::start(url.clone(), service, port))
+        }
+        Some(_) => {
+            eprintln!("quillo: --join is for a copy of a service: quillo run risk.qwe --as-service --join http://app:8080");
+            return 2;
+        }
+        None => None,
+    };
+    stop_on_signal_with(member, joining);
     match quillo::server::serve(app, &format!("{}:{}", host, port), o.workers) {
         Ok(()) => 0,
         Err(e) => {

@@ -72,13 +72,172 @@ pub fn env_name(name: &str) -> String {
 }
 
 /// Where service `name` runs, when not in this process: its addresses
-/// (`http://a:8081,http://b:8081`, the same service on several servers).
+/// (`http://a:8081,http://b:8081`, the same service on several servers),
+/// and the copies that joined while the program runs.
 pub fn urls_of(shared: &crate::shared::Shared, name: &str) -> Vec<String> {
+    let mut urls = configured_urls(shared, name);
+    for u in joined_urls(name) {
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    urls
+}
+
+/// The addresses service `name` was given (`--service-url`, `QUILLO_SERVICE_...`).
+pub fn configured_urls(shared: &crate::shared::Shared, name: &str) -> Vec<String> {
     let given = match shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
         Some(u) => u.clone(),
         None => std::env::var(env_name(name)).unwrap_or_default(),
     };
     given.split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect()
+}
+
+// ---- copies that join (`--join`) -------------------------------------------------------------
+
+/// How long a joined copy is kept without a heartbeat.
+const JOINED_FOR: Duration = Duration::from_secs(15);
+/// How often a copy says it is still there.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// The copies of each service that joined this process, and when each was
+/// last heard from (FEEDBACK10.md, Q-074; branch feedback10-fixes).
+fn joined() -> &'static Mutex<HashMap<String, HashMap<String, Instant>>> {
+    static J: OnceLock<Mutex<HashMap<String, HashMap<String, Instant>>>> = OnceLock::new();
+    J.get_or_init(Default::default)
+}
+
+/// The copies of service `name` that joined and are still heard from.
+pub fn joined_urls(name: &str) -> Vec<String> {
+    let mut j = joined().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(copies) = j.get_mut(name) else { return Vec::new() };
+    copies.retain(|_, at| at.elapsed() < JOINED_FOR);
+    let mut urls: Vec<String> = copies.keys().cloned().collect();
+    urls.sort();
+    urls
+}
+
+/// `POST /_quillo/join` on the app: a copy of one of its services joining
+/// (or, `leave: true`, leaving), signed with the services' secret. Its
+/// address is the connection's, with the port it gives, as limer takes it.
+pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
+    if req.method != "POST" {
+        return refused(405, "joining is a POST");
+    }
+    let Some(secret) = secret() else {
+        return refused(403, "joining needs QUILLO_SERVICE_SECRET, on both sides");
+    };
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let sig = header("x-quillo-service").unwrap_or("");
+    let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
+    let Some(nonce) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
+        return refused(401, "a join carries its nonce (x-quillo-call)");
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return refused(400, "the body is JSON: {\"service\": ..., \"port\": ...}");
+    };
+    let service = body["service"].as_str().unwrap_or("").to_string();
+    let port = body["port"].as_u64().filter(|p| (1..=65535).contains(p));
+    let expected = signature(&secret, t, "_join", &service, "", nonce, &req.body);
+    if now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
+        return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
+    }
+    {
+        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains_key(nonce) {
+            return refused(409, "this join was sent before");
+        }
+        seen.insert(nonce.to_string(), (Instant::now(), None));
+    }
+    let Some(port) = port else { return refused(400, "a join gives the copy's port") };
+    if !it.declared_services.iter().any(|n| *n == service) {
+        return refused(404, &format!("this program has no service `{}`", service));
+    }
+    let ip = req.remote.parse::<std::net::SocketAddr>().map(|a| a.ip()).or_else(|_| req.remote.parse::<std::net::IpAddr>());
+    let Ok(ip) = ip else { return refused(400, "the copy's address is not known") };
+    let url = match ip {
+        std::net::IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
+        v4 => format!("http://{}:{}", v4, port),
+    };
+    let mut j = joined().lock().unwrap_or_else(|e| e.into_inner());
+    let copies = j.entry(service.clone()).or_default();
+    if body["leave"].as_bool() == Some(true) {
+        if copies.remove(&url).is_some() {
+            eprintln!("quillo: service {}: {} left", service, url);
+        }
+    } else if copies.insert(url.clone(), Instant::now()).is_none() {
+        eprintln!("quillo: service {}: {} joined", service, url);
+    }
+    json(200, serde_json::json!({ "service": service, "at": url }))
+}
+
+/// A copy of a service joining an app (`quillo run risk.qwe --as-service
+/// --join http://app:8080`): it says it is there every few seconds, and
+/// that it is leaving when it stops.
+pub struct Joining {
+    app: String,
+    service: String,
+    port: u16,
+    leaving: std::sync::atomic::AtomicBool,
+}
+
+impl Joining {
+    pub fn start(app: String, service: String, port: u16) -> Arc<Joining> {
+        let j = Arc::new(Joining { app, service, port, leaving: Default::default() });
+        let beat = j.clone();
+        std::thread::spawn(move || {
+            let mut was_in = false;
+            while !beat.leaving.load(Ordering::SeqCst) {
+                match beat.post(false) {
+                    Ok(()) if !was_in => {
+                        eprintln!("quillo: joined {} as a copy of `{}`", beat.app, beat.service);
+                        was_in = true;
+                    }
+                    Err(e) if was_in || !e.is_empty() => {
+                        if was_in {
+                            eprintln!("quillo: cannot reach {} to stay a copy of `{}`: {}", beat.app, beat.service, e);
+                        } else {
+                            eprintln!("quillo: cannot join {} as a copy of `{}`: {}", beat.app, beat.service, e);
+                        }
+                        was_in = false;
+                    }
+                    _ => {}
+                }
+                std::thread::sleep(HEARTBEAT);
+            }
+        });
+        j
+    }
+
+    /// Leaves the app, so it sends no more calls here (when the copy stops).
+    pub fn leave(&self) {
+        self.leaving.store(true, Ordering::SeqCst);
+        match self.post(true) {
+            Ok(()) => eprintln!("quillo: left {} (`{}`)", self.app, self.service),
+            Err(e) => eprintln!("quillo: cannot leave {}: {} (it drops this copy when the heartbeat stops)", self.app, e),
+        }
+    }
+
+    fn post(&self, leave: bool) -> Result<(), String> {
+        let secret = secret().ok_or("QUILLO_SERVICE_SECRET is not set")?;
+        let body = serde_json::json!({ "service": self.service, "port": self.port, "leave": leave }).to_string();
+        let t = now_secs();
+        let nonce = new_id(16);
+        let sig = signature(&secret, t, "_join", &self.service, "", &nonce, body.as_bytes());
+        let r = agent()
+            .post(&format!("{}/_quillo/join", self.app))
+            .timeout(Duration::from_secs(3))
+            .set("content-type", "application/json")
+            .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+            .set("x-quillo-call", &nonce)
+            .send_string(&body);
+        match r {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, resp)) => Err(format!("{} {}", code, resp.into_string().unwrap_or_default().trim())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 /// One address of service `name`, for passing its routes on: the next that
@@ -382,10 +541,22 @@ impl Outcome {
 /// not given: the same id for each try, so the call runs once).
 #[allow(clippy::too_many_arguments)]
 fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: Option<String>, line: u32) -> Outcome {
-    let urls = urls_of(&it.shared, name);
-    if urls.is_empty() {
-        return local(it, name, f, args, tenant, rid, line);
+    let configured = configured_urls(&it.shared, name);
+    let joined = joined_urls(name);
+    if configured.is_empty() {
+        // Here, and in turn with the copies that joined (FEEDBACK10.md,
+        // Q-074; branch feedback10-fixes); here again if none answers.
+        static TURN: AtomicUsize = AtomicUsize::new(0);
+        if joined.is_empty() || TURN.fetch_add(1, Ordering::Relaxed) % (joined.len() + 1) == 0 {
+            return local(it, name, f, args, tenant, rid, line);
+        }
+        return match remote(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), call.unwrap_or_else(|| new_id(16))) {
+            Outcome::Missed(_) => local(it, name, f, args, tenant, rid, line),
+            ran => ran,
+        };
     }
+    let mut urls = configured;
+    urls.extend(joined.into_iter().filter(|u| !urls.contains(u)).collect::<Vec<_>>());
     remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)))
 }
 
@@ -452,6 +623,15 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
             err(format!("service {}: internal error in `{}`", name, f))
         }
     }
+}
+
+/// Each service's functions as this program's copy of it declares them
+/// (`describe::contract`): sent with each call, so a service deployed apart
+/// from its caller says when they disagree (FEEDBACK10.md, Q-077; branch
+/// feedback10-fixes).
+fn contracts() -> &'static Mutex<HashMap<(String, String), String>> {
+    static C: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+    C.get_or_init(Default::default)
 }
 
 fn agent() -> &'static ureq::Agent {
@@ -533,6 +713,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
+        let mine = contracts().lock().unwrap_or_else(|e| e.into_inner()).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
                 .post(&endpoint)
@@ -543,6 +724,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 .set("x-quillo-call", &c)
                 .set("x-quillo-caller", &cl)
                 .set("x-quillo-deadline", &timeout.as_millis().to_string());
+            if !mine.is_empty() {
+                rq = rq.set("x-quillo-contract", &mine);
+            }
             if !tn.is_empty() {
                 rq = rq.set("x-quillo-tenant", &tn);
             }
@@ -701,7 +885,28 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
             }
         }
     }
+    // Copies of this service behind a balancer each have their own memory:
+    // what they answered is kept in the database they share too, so a call
+    // sent again to another copy is answered as it was, not run again
+    // (FEEDBACK10.md, Q-073; branch feedback10-fixes).
+    let now_ms = now_secs() as i64 * 1000;
+    let shared = crate::db::call_claim(it, c, now_ms, now_ms - SEEN_FOR.as_millis() as i64);
+    match shared {
+        Some(crate::db::Claim::Done(status, body)) => {
+            let r = HttpResponse { status, headers: vec![("content-type".into(), "application/json".into())], body: body.into_bytes() };
+            seen().lock().unwrap_or_else(|e| e.into_inner()).insert(c.to_string(), (Instant::now(), Some(r.clone())));
+            return r;
+        }
+        Some(crate::db::Claim::Running) => {
+            seen().lock().unwrap_or_else(|e| e.into_inner()).remove(c);
+            return refused(503, "this call is still running");
+        }
+        Some(crate::db::Claim::Mine) | None => {}
+    }
     let r = run_call(it, f, tenant, req);
+    if shared.is_some() {
+        crate::db::call_done(it, c, r.status, &String::from_utf8_lossy(&r.body));
+    }
     let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
     // A call that did not run (a busy server) may be sent again.
     if r.status >= 502 {
@@ -728,6 +933,12 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
+    // The caller's copy of this service, deployed apart, may say otherwise.
+    let theirs = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-contract")).map(|(_, v)| v.as_str());
+    let ours = crate::describe::contract(&c.def);
+    if let Some(theirs) = theirs.filter(|t| *t != ours) {
+        return refused(409, &format!("`{}` here is `{}`; the caller's copy of this service says `{}`", f, ours, theirs));
+    }
     let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
         Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
@@ -833,11 +1044,20 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
 /// (once per process) unless it runs elsewhere; under its prefix, its
 /// routes are served (here, or passed on to it).
 pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, options: Option<&Value>, line: u32) -> R {
+    if !it.declared_services.iter().any(|n| n == name) {
+        Arc::make_mut(&mut it.declared_services).push(name.to_string());
+    }
     if let Some(o) = options {
         set_opts(name, o, line)?;
     }
     let full = it.base_dir.join(file);
     let defs = offered(&full).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
+    {
+        let mut c = contracts().lock().unwrap_or_else(|e| e.into_inner());
+        for d in &defs {
+            c.insert((name.to_string(), d.name.clone()), crate::describe::contract(d));
+        }
+    }
     let ns = namespace(it, name, &defs, line)?;
     if let Some(url) = url_of(&it.shared, name) {
         if let Some(p) = prefix {
@@ -1149,21 +1369,35 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
 /// `quillo run app.qwe --split`: each service the app declares (and those
 /// they declare) runs as a process of its own, on a port of its own, its
 /// log lines marked with its name; the app (and each service) is told
-/// where the others are, and they sign their calls with one secret.
-pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, String> {
+/// where the others are, and they sign their calls with one secret. With
+/// `--scale risk=3`, a service runs as that many copies, each on a port of
+/// its own, taking calls in turn and sharing its database (FEEDBACK10.md,
+/// Q-075; branch feedback10-fixes).
+pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usize)]) -> Result<Split, String> {
     let services = declared(path)?;
+    if let Some((name, _)) = scale.iter().find(|(n, _)| !services.iter().any(|(s, _, _)| s == n)) {
+        let names: Vec<&str> = services.iter().map(|(s, _, _)| s.as_str()).collect();
+        return Err(format!("--scale {}: no service `{}` (the app declares {})", name, name, if names.is_empty() { "none".to_string() } else { names.join(", ") }));
+    }
     if std::env::var("QUILLO_SERVICE_SECRET").map_or(true, |s| s.is_empty()) {
         std::env::set_var("QUILLO_SERVICE_SECRET", crate::crypto::hex(&crate::crypto::secret_bytes(32)));
     }
-    let mut ports = Vec::new();
-    for (name, _, _) in &services {
-        let port = free_port().map_err(|e| e.to_string())?;
-        std::env::set_var(env_name(name), format!("http://127.0.0.1:{}", port));
-        ports.push(port);
+    // Each copy of each service: its name, prefix, file and port.
+    let mut copies = Vec::new();
+    for (name, prefix, file) in &services {
+        let n = scale.iter().find(|(s, _)| s == name).map_or(1, |(_, n)| *n);
+        let mut urls = Vec::new();
+        for _ in 0..n {
+            let port = free_port().map_err(|e| e.to_string())?;
+            urls.push(format!("http://127.0.0.1:{}", port));
+            copies.push((name.clone(), prefix.clone(), file.clone(), port));
+        }
+        std::env::set_var(env_name(name), urls.join(","));
     }
+    let ports: Vec<u16> = copies.iter().map(|c| c.3).collect();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut running = Vec::new();
-    for ((name, prefix, file), port) in services.iter().zip(&ports) {
+    for (name, prefix, file, port) in &copies {
         let mut args: Vec<String> = vec!["run".into(), file.display().to_string(), "--port".into(), port.to_string(), "--as-service".into(), "--service-name".into(), name.clone()];
         if let Some(p) = prefix {
             args.extend(["--base".to_string(), p.clone()]);
@@ -1181,7 +1415,7 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
     let split = Split { services: Arc::new(Mutex::new(running)), stop: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
     // Ready when each answers.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    for ((name, _, _), port) in services.iter().zip(&ports) {
+    for ((name, _, _, _), port) in copies.iter().zip(&ports) {
         while std::net::TcpStream::connect(("127.0.0.1", *port)).is_err() {
             if std::time::Instant::now() > deadline {
                 return Err(format!("service {} did not start (see its lines above)", name));

@@ -222,6 +222,16 @@ impl Interp {
         let path = req.url.split('?').next().unwrap_or("");
         // A service with a prefix that runs elsewhere: passed on to it.
         if let Some((prefix, url)) = self.remote_mounts.iter().find(|(p, _)| path == p.as_str() || path.starts_with(&format!("{}/", p))).cloned() {
+            // Its readiness, for a gateway that routes by path (FEEDBACK10.md,
+            // Q-076; branch feedback10-fixes); Quillo's other addresses are not
+            // passed on.
+            if path == format!("{}/_quillo/ready", prefix) {
+                let name = self.declared_services.iter().find(|n| crate::service::urls_of(&self.shared, n).contains(&url)).cloned();
+                let (ok, detail) = crate::ready::service(self, name.as_deref().unwrap_or(""), &url);
+                let mut r = json_response(if ok { 200 } else { 503 }, detail);
+                r.headers.push(("cache-control".into(), "no-store".into()));
+                return r;
+            }
             return crate::service::pass_on(self, &url, &prefix, req);
         }
         self.pending_stream = None;
@@ -505,9 +515,6 @@ impl Interp {
     }
 
     fn handle_internal(&mut self, rest: &str, req: &HttpRequest, path: &str, qs: &str) -> HttpResponse {
-        // A page's own bundle: its address names its content, so it is kept.
-        // One this program did not make (a page from before a reload) gets
-        // the whole bundle, which has every component.
         // A page's sheet; one no longer kept (or from before a reload) is
         // every style.
         if let Some(hash) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".css")) {
@@ -536,6 +543,9 @@ impl Interp {
                 body: js.as_bytes().to_vec(),
             };
         }
+        // A page's own bundle: its address names its content, so it is kept.
+        // One this program did not make (a page from before a reload) gets
+        // the whole bundle, which has every component.
         if let Some(hash) = rest.strip_prefix("b/").and_then(|r| r.strip_suffix(".js")) {
             let (js, cache) = match self.bundle_by_hash(hash) {
                 Some(js) => (js, "public, max-age=31536000, immutable"),
@@ -584,6 +594,22 @@ impl Interp {
                 ],
                 body: if fresh { Vec::new() } else { self.client_js.as_bytes().to_vec() },
             };
+        }
+        // Whether what the program needs is there (FEEDBACK10.md, Q-076;
+        // branch feedback10-fixes).
+        if rest == "ready" {
+            return ready_response(self);
+        }
+        // A copy of one of its services joining (FEEDBACK10.md, Q-074;
+        // branch feedback10-fixes).
+        if rest == "join" {
+            return crate::service::join_here(self, req);
+        }
+        // The program's API, for a gateway or a reader, under `--describe`
+        // (FEEDBACK10.md, Q-077; branch feedback10-fixes).
+        if rest == "describe" && crate::describe::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            let title = self.base_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            return json_response(200, crate::describe::of_interp(self, &title));
         }
         if rest == "live" {
             // Without waiting; the server's worker threads answer `live`
@@ -1866,6 +1892,14 @@ pub const WORKER_STACK: usize = 16 << 20;
 /// runs by itself (`data-e`, `data-l`) or is the page (`<body>` holds it).
 /// A click or a form sent before the bundle runs waits for it, and is done
 /// then (see `boot` in runtime.js).
+/// `/_quillo/ready`: 200 or 503, and each thing the program needs.
+fn ready_response(it: &mut Interp) -> HttpResponse {
+    let (ok, detail) = crate::ready::report(it);
+    let mut r = json_response(if ok { 200 } else { 503 }, detail);
+    r.headers.push(("cache-control".into(), "no-store".into()));
+    r
+}
+
 fn island_loader(srcs: &[String]) -> String {
     let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
     format!(

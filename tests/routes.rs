@@ -393,6 +393,29 @@ fn bundles_kept_are_bounded() {
     assert!(again.text().contains("widget "));
 }
 
+/// `/_quillo/ready` says whether what the program needs is there: its
+/// database, and the checks it adds (FEEDBACK10.md, Q-076; branch
+/// feedback10-fixes).
+#[test]
+fn ready_says_what_the_program_needs() {
+    let mut it = app(
+        r#"
+db.open(":memory:")
+let balanced = true
+ready("ledger", () => balanced)
+server fn unbalance() { balanced = false }
+route GET / = "home"
+"#,
+    );
+    let r = get(&mut it, "/_quillo/ready");
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&r.text()).unwrap(), serde_json::json!({ "ready": true, "checks": { "database": "ready", "ledger": "ready" } }));
+    rpc(&mut it, "unbalance", "[]");
+    let r = get(&mut it, "/_quillo/ready");
+    assert_eq!((r.status, r.header("cache-control")), (503, Some("no-store")));
+    assert!(r.text().contains(r#""ledger":"not ready""#), "{}", r.text());
+}
+
 #[test]
 fn the_browser_bundle_can_be_revalidated() {
     let mut it = app("component Hi() = <p>hi</p>\nroute GET / = <Hi/>\n");

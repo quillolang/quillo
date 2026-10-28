@@ -1,0 +1,13 @@
+// A service that computes: one copy can do only so many at once.
+db.open(env("RUNS_DB") ?? "runs.db")
+db.exec("create table if not exists runs (n integer, inst text, at integer)")
+
+let INST = uuid()
+
+fn work(size: int) -> int = range(size) | map((x) => (x * 7) % 13) | sum
+
+server fn assess(n: int, size: int = 300000, slow_ms: int = 0) -> map with db, time {
+    db.exec("insert into runs (n, inst, at) values (?, ?, ?)", n, INST, now())
+    if slow_ms > 0 { sleep(slow_ms) }
+    { n, inst: slice(INST, 0, 8), score: work(size) }
+}

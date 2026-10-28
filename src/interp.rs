@@ -201,6 +201,11 @@ pub struct Interp {
     /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
     /// feedback9-fixes). The app's is in the process's environment.
     pub env_file: Arc<std::collections::HashMap<String, String>>,
+    /// The services the program declares, and the checks it adds with
+    /// `ready`, for `/_quillo/ready` (FEEDBACK10.md, Q-076; branch
+    /// feedback10-fixes).
+    pub declared_services: Arc<Vec<String>>,
+    pub ready_checks: Arc<Vec<(String, Value)>>,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -830,6 +835,8 @@ impl Interp {
             remote_mounts: Vec::new(),
             is_service: false,
             env_file: Default::default(),
+            declared_services: Default::default(),
+            ready_checks: Default::default(),
             types: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
@@ -900,6 +907,8 @@ impl Interp {
             remote_mounts: self.remote_mounts.clone(),
             is_service: self.is_service,
             env_file: self.env_file.clone(),
+            declared_services: self.declared_services.clone(),
+            ready_checks: self.ready_checks.clone(),
             types: self.types.clone(),
             stream_out: None,
             pending_stream: None,

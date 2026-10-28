@@ -1,0 +1,13 @@
+{
+    admin 127.0.0.1:19390 {
+        secret {$LIMER_ADMIN_SECRET}
+    }
+}
+:19380 {
+    reverse_proxy {
+        discover risk {
+            allow 127.0.0.0/8
+        }
+        lb_policy POLICY
+    }
+}

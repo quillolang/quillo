@@ -1646,9 +1646,10 @@ service /billing = "billing.qwe"
   (`billing.qwe` is `billing`), or `--service-name billing` when the file is named
   otherwise. It remembers each call's id for longer than a signature lasts, so a call
   sent again, by a retry or by someone who saw it on the network, is answered as it
-  was and not run again. That memory is each process's own: when a service runs at
-  several addresses, use HTTPS (or a private network) between services so calls cannot
-  be seen and sent to another of them. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
+  was and not run again. A service with a database keeps that memory there too
+  (`_quillo_calls`), so copies sharing it answer a call one of them answered, or say it
+  is still running, whichever copy a balancer sends it to. Use HTTPS (or a private
+  network) between services so calls cannot be seen. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
   but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
   `.../job/...`). Run alone, a service is a program served as one:
   `quillo run billing.qwe --base /billing --as-service` (`--base`: the path it is
@@ -1658,7 +1659,9 @@ service /billing = "billing.qwe"
   name, all signed with one secret (32 random bytes from the system, unless
   `QUILLO_SERVICE_SECRET` is set); they stop with it. A service whose process ends
   while the app runs is started again, the same way, after a second (twice as long each
-  time it ends again soon, at most 30 s), with a line in the log.
+  time it ends again soon, at most 30 s), with a line in the log. `--scale risk=3` runs
+  `risk` as three copies, called in turn; they share its database, so give it one that
+  several processes can open (SQLite on one machine, PostgreSQL across machines).
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`; a decimal stays a decimal, its scale and all), so a
   program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
@@ -1701,6 +1704,33 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Several addresses.** `--service-url billing=http://10.0.0.5:8081,http://10.0.0.6:8081`
   (or the same in `QUILLO_SERVICE_BILLING`): the same service on several servers, called
   in turn.
+- **Copies that join.** `quillo run billing.qwe --as-service --join http://app:8080` starts
+  one more copy of `billing` that joins the app while it runs: it says so, signed with
+  `QUILLO_SERVICE_SECRET`, every few seconds, and that it is leaving when stopped (the
+  app drops one it has not heard from in 15 s). Its address is the one it connects from,
+  with its `--port`. The app calls the copies in turn with its own, when `billing` runs
+  in its process (a monolith that takes on copies as it gets busy, without a line of
+  either changed), or with the addresses it was given; each copy has a circuit of its
+  own. Behind a balancer instead (limer's `discover` pool with `--register`), keep a
+  call on one copy (`lb_policy hash header x-quillo-call`) or give the copies a database
+  to share, so a call sent again is not run again.
+- **Ready.** `GET /_quillo/ready` answers 200 when what the program needs is there, 503
+  when not, with each part as JSON: its database (`select 1`), each service it declares
+  (one in its process asked in turn, down its own services; one elsewhere asked at each
+  address, the answer kept two seconds), and checks of its own,
+  `ready("ledger", () => len(accounts.problems() ?? ["down"]) == 0)`. Through the app,
+  `/billing/_quillo/ready` asks a service served under `/billing`. `/_quillo/health` stays
+  the process's own: up or not.
+- **Contracts.** Each call to a service elsewhere carries its function's contract as the
+  caller's copy of the service declares it (`assess(n: int, size?: int) -> map`); a
+  service deployed apart whose own differs refuses the call and says both:
+  ``service risk: 409 `assess` here is `assess(n: int, size: int) -> int`; the caller's
+  copy of this service says `assess(n: int) -> int` ``.
+- **Described.** `quillo docs app.qwe` writes the program's API as OpenAPI 3, from its
+  source: each route's path, query and payload patterns, and each `server fn`'s contract
+  (`x-quillo-server-fns`), with the routes of the services it serves under their
+  prefixes. `quillo run --describe` serves the same at `GET /_quillo/describe`, for a
+  gateway to import.
 - **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
   is tried at the next address, a little later each time. A call sent but not answered in
   time is tried again at the same address, with the same call id: the service remembers
@@ -2693,7 +2723,9 @@ sending it requests. A second Ctrl-C stops it at once.
 
 `GET /_quillo/health` answers `200 ok` while the server is ready for requests, and `503`
 while it is stopping or its program failed to load: give it to a load balancer's health
-check (limer's `health_uri`).
+check (limer's `health_uri`). `GET /_quillo/ready` also says whether what the program
+needs is there, its database and services (see [Services](#services)): for an
+orchestrator's readiness probe.
 
 ### Scheduled jobs
 
