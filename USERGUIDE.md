@@ -741,6 +741,18 @@ component Notes(initial: list) {
   `X-Forwarded-For`, which a client can write).
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
+- One change wakes every page showing it, and they all ask at once. A loader's run
+  is shared by the pages that ask, within two seconds, for the same function with the
+  same arguments while nothing it read has changed: fifty open boards run `load_board`
+  once. A run that read the request (`session()`, cookies, headers, the locale) is
+  shared only by the same viewer's pages (their tabs), wherever in the run it read it.
+  A run that wrote, or set a cookie, is not shared.
+- A page is sent what changed in the value, not the whole value again: the server keeps
+  the values pages have (up to 64 MB), and answers a page with a patch to its own.
+  Lists of rows are matched by their `id`, so a card moved or renamed on a board of
+  3,000 costs that card. The patch applies to what the server last sent, so changes the
+  page made to the state meanwhile (a card shown moved before the server says so) are
+  replaced as before.
 
 #### Several servers
 
