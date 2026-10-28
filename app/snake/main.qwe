@@ -1,0 +1,305 @@
+// Quillo Snake: a multiplayer snake that gets longer with every bite.
+//
+//   quillo run app/snake/main.qwe --port 8090      then open http://localhost:8090
+//
+// The server owns the board. Its loop, a top-level `every`, moves every snake nine
+// times a second and sends the board to every page on the `snake` channel. A snake
+// that eats grows; one that hits a wall, itself or another snake crashes, leaves its
+// body behind as food and starts again, short. Bots keep the board busy when you
+// play alone. Steer with the arrow keys, WASD, or the buttons under the board.
+
+let GW = 40                 // the board, in cells
+let GH = 26
+let CELL = 22               // a cell, in pixels on the canvas
+let TICK_MS = 110
+let FOOD = 14               // food on the board, at least
+let GROW = 2                // cells a bite adds
+let BOTS = 4
+let DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]]
+let KEYS = { ArrowUp: [0, -1], ArrowRight: [1, 0], ArrowDown: [0, 1], ArrowLeft: [-1, 0],
+             w: [0, -1], d: [1, 0], s: [0, 1], a: [-1, 0] }
+
+// ---- the board, on the server ----------------------------------------------------
+
+// The snakes by id (a page's peer id, or botN), and the food by cell.
+let snakes = {}
+let food = {}
+let hues = 0
+let stats = { ticks: 0, step_ms: 0.0, worst_ms: 0.0, bytes: 0 }
+
+fn cell(c: list) = `${c[0]},${c[1]}`
+fn inside(c: list) = c[0] >= 0 && c[1] >= 0 && c[0] < GW && c[1] < GH
+fn opposite(a: list, b: list) = a[0] == 0 - b[0] && a[1] == 0 - b[1]
+
+// A new snake, three cells long, somewhere away from the walls.
+fn fresh(name: str, bot: bool, colour: str, best: int) {
+    let d = DIRS[random_int(0, 3)]
+    let x = random_int(6, GW - 7)
+    let y = random_int(6, GH - 7)
+    // A player's snake waits for its first turn; a bot's goes at once.
+    { name, bot, colour, best, dir: d, turns: [], grow: 0, waiting: !bot,
+      body: [[x, y], [x - d[0], y - d[1]], [x - 2 * d[0], y - 2 * d[1]]] }
+}
+
+fn new_colour() {
+    hues += 1
+    `hsl(${(hues * 137) % 360} 80% 60%)`
+}
+
+fn add_food() {
+    let c = [random_int(0, GW - 1), random_int(0, GH - 1)]
+    food = set(food, cell(c), c)
+}
+
+// Where a player's snake goes next: its first queued turn, unless that turns it back
+// on itself (any way at all, for a snake still waiting to start).
+fn next_dir(s: map) {
+    let t = first(s.turns) ?? s.dir
+    opposite(t, s.dir) && !s.waiting ? s.dir : t
+}
+
+// Where a bot goes next: toward the nearest food, on a cell that is free now.
+fn steer(s: map, taken: map) {
+    let h = s.body[0]
+    let goal = first(sort_by(values(food), (f) => abs(f[0] - h[0]) + abs(f[1] - h[1]))) ?? [GW / 2, GH / 2]
+    let options = DIRS | filter((d) => !opposite(d, s.dir)) | map((d) => {
+        let c = [h[0] + d[0], h[1] + d[1]]
+        let safe = inside(c) && taken[cell(c)] == null
+        { d, cost: (safe ? 0 : 1000) + abs(goal[0] - c[0]) + abs(goal[1] - c[1]) + random_int(0, 1) }
+    })
+    first(sort_by(options, (o) => o.cost)).d
+}
+
+// A snake a cell further on; longer by GROW cells, over the next steps, when it eats.
+fn advance(s: map, taken: map) {
+    let d = s.bot ? steer(s, taken) : next_dir(s)
+    let h = s.body[0]
+    let head = [h[0] + d[0], h[1] + d[1]]
+    let eats = food[cell(head)] != null
+    if eats { food = remove(food, cell(head)) }
+    let grow = s.grow + (eats ? GROW : 0)
+    let body = [head] + (grow > 0 ? s.body : slice(s.body, 0, len(s.body) - 1))
+    { ...s, dir: d, turns: drop(s.turns, 1), body, grow: grow > 0 ? grow - 1 : 0, waiting: false }
+}
+
+// How many snake cells are on each cell.
+fn occupancy(all: map) =
+    reduce(values(all), {}, (o, s) => reduce(s.body, o, (o2, c) => set(o2, cell(c), (o2[cell(c)] ?? 0) + 1)))
+
+// One step: every snake moves a cell; one that eats grows; one whose head is off the
+// board or on another cell of any snake crashes.
+fn step() {
+    let taken = occupancy(snakes)
+    let moved = reduce(keys(snakes), snakes, (m, id) =>
+        set(m, id, m[id].waiting && len(m[id].turns) == 0 ? m[id] : advance(m[id], taken)))
+    let now_on = occupancy(moved)
+    let crashed = keys(moved) | filter((id) => {
+        let h = moved[id].body[0]
+        !inside(h) || now_on[cell(h)] > 1
+    })
+    snakes = moved
+    for id in crashed { crash(id) }
+    while len(keys(food)) < FOOD { add_food() }
+    if len(crashed) > 0 { roster() }
+}
+
+// A crashed snake leaves food where it lay, and starts again.
+fn crash(id: str) {
+    let s = snakes[id]
+    let n = len(s.body)
+    for [i, c] in enumerate(s.body) {
+        if i % 2 == 1 && inside(c) && len(keys(food)) < 120 { food = set(food, cell(c), c) }
+    }
+    snakes = set(snakes, id, fresh(s.name, s.bot, s.colour, max([s.best, n])))
+    if !s.bot { channel.send("snake", id, { crashed: n }, { reliable: true }) }
+}
+
+// What the pages get each step: the snakes' cells and the food.
+fn board() = {
+    s: for id in keys(snakes) => [id, snakes[id].body],
+    f: values(food),
+}
+
+// The loop: a top-level `every` runs on the server, every TICK_MS.
+fn tick() {
+    let t0 = now()
+    step()
+    let b = board()
+    stats = { ...stats, bytes: len(json.stringify(b)) }
+    channel.broadcast("snake", b)
+    let took = float(now() - t0)
+    stats = { ...stats, ticks: stats.ticks + 1, step_ms: took, worst_ms: max([stats.worst_ms, took]) }
+}
+every(TICK_MS, tick)
+
+// Names, colours and best lengths change rarely: they go reliably, on their own.
+fn roster() = channel.broadcast("snake",
+    { roster: for id in keys(snakes) => [id, snakes[id].name, snakes[id].colour, snakes[id].best] },
+    { reliable: true })
+
+fn joined(peer: map) {
+    let name = peer.session.name ?? null
+    if name == null { return false }
+    snakes = set(snakes, peer.id, fresh(name, false, new_colour(), 0))
+    // Both reach the page that is joining (FEEDBACK12.md, Q-086).
+    channel.send("snake", peer, { you: peer.id }, { reliable: true })
+    roster()
+    true
+}
+
+fn left(peer: map) {
+    snakes = remove(snakes, peer.id)
+    roster()
+}
+
+// A page sends the turns it wants; up to three wait for the next steps, so a quick
+// double turn is not lost.
+fn turned(msg, peer: map) {
+    let s = snakes[peer.id]
+    if s == null { return null }
+    match msg {
+        { d: [int, int] as d } if abs(d[0]) + abs(d[1]) == 1 => {
+            snakes = set(snakes, peer.id, { ...s, turns: take(push(s.turns, d), 3) })
+        }
+        _ => null
+    }
+}
+
+channel.on("snake", (msg, peer) => turned(msg, peer), { join: (peer) => joined(peer), leave: (peer) => left(peer) })
+
+for i in range(BOTS) { snakes = set(snakes, `bot${i}`, fresh(`bot ${i + 1}`, true, new_colour(), 0)) }
+while len(keys(food)) < FOOD { add_food() }
+
+// More bots, from this machine: POST /bots/<n>.
+route POST /bots/:n(int) {
+    if request.ip != "127.0.0.1" && request.ip != "::1" { reply 403 "bots are added from this machine" }
+    for _ in range(n) { snakes = set(snakes, `bot${hues}`, fresh(`bot ${hues + 1}`, true, new_colour(), 0)) }
+    roster()
+    { snakes: len(keys(snakes)) }
+}
+route GET /stats = { ...stats, snakes: len(keys(snakes)), longest: max([0] + (values(snakes) | map((s) => len(s.body)))) }
+
+// ---- the page --------------------------------------------------------------------
+
+let snake_css = css`
+body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0b0f14; color: #e8edf2; }
+main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 40px; }
+h1 { margin: 0 0 2px; font-size: 26px; }
+.muted { color: #8b97a5; }
+.game { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 16px; margin-top: 14px; }
+canvas { width: 100%; aspect-ratio: 880 / 572; background: #111821; border-radius: 10px; display: block; }
+.side { display: grid; gap: 12px; align-content: start; font-size: 14px; }
+.side ol { margin: 0; padding-left: 22px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; }
+.note { padding: 8px 10px; border-radius: 8px; background: #2a1820; color: #ffb3c0; }
+.pad { display: grid; grid-template-columns: repeat(3, 52px); gap: 6px; justify-content: center; }
+.pad button:nth-child(1) { grid-column: 2; }
+.pad button:nth-child(2) { grid-column: 1; }
+.pad button:nth-child(3) { grid-column: 3; grid-row: 2; }
+.pad button:nth-child(4) { grid-column: 2; grid-row: 3; }
+input, button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid #263240; background: #111821; color: inherit; }
+button { cursor: pointer; }
+@media (max-width: 800px) { .game { grid-template-columns: minmax(0, 1fr); } }
+`
+
+view Page(title: str, children) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title}</title>
+            <style>{snake_css}</style>
+        </head>
+        <body><main>{children}</main></body>
+    </html>
+
+// The board is drawn from each update as it comes, straight onto the canvas.
+component Snake() {
+    state ctx = null
+    state names = {}
+    state me = null
+    state ranks = []
+    state got = 0
+    state crashed = null
+    state started = false
+    let draw = (m) => {
+        ctx.fillStyle = "#111821"
+        ctx.fillRect(0, 0, GW * CELL, GH * CELL)
+        ctx.fillStyle = "#ff5d73"
+        for f in m.f {
+            ctx.beginPath()
+            ctx.arc(f[0] * CELL + CELL / 2, f[1] * CELL + CELL / 2, CELL / 3, 0, 6.2832)
+            ctx.fill()
+        }
+        for s in m.s {
+            let colour = names[s[0]]?.colour ?? "#7fd1ff"
+            for [i, c] in enumerate(s[1]) {
+                ctx.fillStyle = i == 0 ? "#ffffff" : colour
+                ctx.fillRect(c[0] * CELL + 2, c[1] * CELL + 2, CELL - 4, CELL - 4)
+            }
+            let h = s[1][0]
+            ctx.fillStyle = s[0] == me ? "#ffe066" : "#c9d4df"
+            ctx.font = s[0] == me ? "bold 13px system-ui" : "12px system-ui"
+            ctx.fillText(names[s[0]]?.name ?? "", h[0] * CELL + CELL + 2, h[1] * CELL - 2)
+        }
+    }
+    let ch = channel.open("snake", (m) => {
+        if m.s != null {
+            got += 1
+            if ctx != null { draw(m) }
+            if got % 5 == 0 {
+                ranks = sort_by(m.s, (s) => 0 - len(s[1])) | take(8)
+                    | map((s) => { id: s[0], name: names[s[0]]?.name ?? "?", colour: names[s[0]]?.colour ?? "#888", len: len(s[1]), best: names[s[0]]?.best ?? 0 })
+            }
+        }
+        if m.roster != null { names = reduce(m.roster, {}, (acc, r) => set(acc, r[0], { name: r[1], colour: r[2], best: r[3] })) }
+        if m.you != null { me = m.you }
+        if m.crashed != null { crashed = m.crashed }
+    })
+    let go = (d) => { crashed = null; started = true; ch.send({ d }, { reliable: true }) }
+    <div.game>
+        <canvas width={GW * CELL} height={GH * CELL} aria-label="The snake board"
+            @mount={(el) => {
+                ctx = el.getContext("2d")
+                let on_key = (e) => {
+                    let d = KEYS[e.key]
+                    if d != null { e.preventDefault(); go(d) }
+                }
+                el.ownerDocument.addEventListener("keydown", on_key)
+                () => el.ownerDocument.removeEventListener("keydown", on_key)
+            }}></canvas>
+        <div.side>
+            <div><b>Longest snakes</b> <span.muted>· {got} updates</span></div>
+            <ol>{for r in ranks => <li key={r.id}><span.swatch style={`background:${r.colour}`}></span>{r.id == me ? <b>{r.name}</b> : r.name} {r.len} <span.muted>(best {r.best})</span></li>}</ol>
+            {crashed != null ? <p.note>You crashed at length {crashed}. Steer to go again.</p> : null}
+            {got > 0 && crashed == null && !started ? <p.note>Press an arrow key or a button to start.</p> : null}
+            <p.muted>Arrow keys or WASD to steer. Each bite makes you {GROW} cells longer.</p>
+            <div.pad>
+                <button aria-label="Up" @click={() => go([0, -1])}>↑</button>
+                <button aria-label="Left" @click={() => go([-1, 0])}>←</button>
+                <button aria-label="Right" @click={() => go([1, 0])}>→</button>
+                <button aria-label="Down" @click={() => go([0, 1])}>↓</button>
+            </div>
+        </div>
+    </div>
+}
+
+route GET / {
+    let name = session().name ?? null
+    <Page title="Quillo Snake">
+        <h1>Quillo Snake</h1>
+        {name == null
+            ? <form method="post" action="/name">
+                <p.muted>Eat the red dots to grow. Don't hit the walls, yourself or anyone else.</p>
+                <input name="name" placeholder="Your name" maxlength="16" required/> <button>Play</button>
+              </form>
+            : <div><p.muted>Playing as <b>{name}</b>. Eat the red dots to grow.</p><Snake/></div>}
+    </Page>
+}
+
+route POST /name { form: { name: str } } {
+    let n = slice(trim(name), 0, 16)
+    if n == "" { reply 400 "a name, please" }
+    set_session({ name: n })
+    redirect("/")
+}
