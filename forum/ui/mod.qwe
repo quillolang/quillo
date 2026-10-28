@@ -1,0 +1,85 @@
+// The moderators' queue, live: a report anywhere shows here at once, and a
+// report one moderator handles leaves every moderator's queue.
+
+view ReasonList(reasons: str) {
+    let names = split(reasons, ",")
+    <span.reasons>{for [key, label] in REPORT_REASONS =>
+        count(names, (r) => r == key) > 0 && <span.reason>{label}{count(names, (r) => r == key) > 1 && ` ×${count(names, (r) => r == key)}`}</span>}</span>
+}
+
+component ModQueue(me) {
+    state reports = live(load_reports)
+    state problem = null
+    let act = (r) => {
+        if is_err(r) { problem = r.error } else { problem = null; reports = r }
+    }
+    <section.queue>
+        <Problem text={problem}/>
+        {reports == null || len(reports) == 0
+            ? <Empty><p>✓ Nothing waiting. Reports show up here as they come in.</p></Empty>
+            : <ol.reports>{for r in reports => <li.report key={r.post_id}>
+                <header>
+                    <b>{plural(r.n, "report")}</b> <ReasonList reasons={r.reasons}/>
+                    <span.muted>· first {ago(r.first)}</span>
+                </header>
+                <div.reported>
+                    <div.meta>
+                        <Person name={r.author} hue={r.author_hue}/>
+                        <RoleBadge role={r.author_role}/>
+                        {is_banned(r) && <span.badge.banned>suspended</span>}
+                        <span.muted>in</span> <a href={`/t/${r.thread_id}#p${r.post_id}`}>{r.title}</a>
+                        <span.muted>{ago(r.created)}</span>
+                    </div>
+                    <p>{excerpt(r.body, 400)}</p>
+                    {r.notes != "" && <pre.report-notes>{r.notes}</pre>}
+                </div>
+                <footer.actions>
+                    <button.btn.ghost.small @click={() => act(resolve_reports(r.post_id, "dismiss"))}>Dismiss</button>
+                    <button.btn.danger.small @click={() => {
+                        if ask("Remove this post? Its author sees that a moderator removed it.", { title: "Remove post", ok: "Remove", cancel: "Keep it", tone: "danger" }) {
+                            act(resolve_reports(r.post_id, "remove"))
+                        }
+                    }}>Remove post</button>
+                    {r.author_role == "member" || is_admin(me) && r.author_role == "moderator"
+                        ? <span.suspend>
+                            <span.muted>Suspend {r.author}:</span>
+                            {for d in BAN_DAYS => <button.btn.ghost.small @click={() => {
+                                if ask(`Suspend ${r.author} ${d < 0 ? "until lifted" : `for ${plural(d, "day")}`}? They can still read.`,
+                                        { title: "Suspend", ok: "Suspend", cancel: "Cancel", tone: "danger" }) {
+                                    act(suspend(r.author_id, d))
+                                }
+                            }}>{d < 0 ? "until lifted" : `${d}d`}</button>}
+                            {is_banned(r) && <button.link @click={() => act(suspend(r.author_id, 0))}>Lift</button>}
+                        </span>
+                        : null}
+                </footer>
+            </li>}</ol>}
+    </section>
+}
+
+view ModLog(entries) =
+    <section.box.modlog>
+        <h3>Moderators' log</h3>
+        {len(entries) == 0
+            ? <p.muted>Nothing yet.</p>
+            : <ol>{for e in entries => <li>
+                <Person name={e.actor} hue={e.actor_hue}/>
+                <span>{match e.action {
+                    "remove" => "removed a post by"
+                    "dismiss" => "dismissed reports on a post by"
+                    "delete" => "deleted a post by"
+                    "suspend" => "suspended"
+                    "unsuspend" => "lifted the suspension of"
+                    "role" => "changed the role of"
+                    "pin" => "pinned"
+                    "unpin" => "unpinned"
+                    "lock" => "locked"
+                    "unlock" => "unlocked"
+                    _ => e.action
+                }}</span>
+                {e.whom != null && <a href={`/u/${e.whom}`}>{e.whom}</a>}
+                {e.title != null && <a href={e.post_id != null ? `/t/${e.thread_id}#p${e.post_id}` : `/t/${e.thread_id}`}>{e.title}</a>}
+                {e.note != "" && <span.muted>({e.note})</span>}
+                <span.muted>{ago(e.created)}</span>
+            </li>}</ol>}
+    </section>

@@ -1,0 +1,70 @@
+// Private messages: the inbox and one conversation, both live. A message
+// sent shows on the other person's page, and their inbox count, at once.
+
+component Inbox() {
+    state items = live(load_inbox)
+    {items == null || len(items) == 0
+        ? <Empty><p>No conversations yet.</p><p.muted>Start one from someone's profile.</p></Empty>
+        : <ol.inbox>{for c in items => <li key={c.id} class={c.unread > 0 && "unread"}>
+            <a href={`/messages/${c.name}`}>
+                <Avatar name={c.name} hue={c.hue}/>
+                <div.main>
+                    <b>{c.name}</b> <span.muted>{ago(c.last_at)}</span>
+                    <p>{c.last_mine == 1 && <span.muted>You: </span>}{excerpt(c.last_body, 120)}</p>
+                </div>
+                {c.unread > 0 && <span.count>{c.unread}</span>}
+            </a>
+        </li>}</ol>}
+}
+
+component Conversation(name: str, me) {
+    state data = live(load_messages, name)
+    state draft = ""
+    state sending = false
+    state problem = null
+    let messages = data.messages ?? []
+    let newest = len(messages) > 0 ? last(messages).id : 0
+    // What arrives while the page is open scrolls into view (and loading it marked it read).
+    if newest > 0 { js("forum.scrollChat") }
+    let send = () => {
+        if sending || trim(draft) == "" { return null }
+        sending = true
+        let r = send_message(name, draft)
+        sending = false
+        if is_err(r) {
+            problem = r.error
+        } else {
+            problem = null
+            draft = ""
+            data = r
+            js("forum.scrollChat")
+        }
+    }
+    <div.chat>
+        {data == null
+            ? <Empty>Nobody here goes by that name.</Empty>
+            : <div>
+                <header.chat-head>
+                    <a href="/messages">← Messages</a>
+                    <Person name={data.other.name} hue={data.other.hue}/>
+                    <RoleBadge role={data.other.role}/>
+                </header>
+                <ol.messages #chat @mount={() => { js("forum.scrollChat") }}>
+                    {len(messages) == 0 && <li.muted.center>Say hello to {data.other.name}.</li>}
+                    {for m in messages => <li key={m.id} class={m.user_id == me.id ? "mine" : "theirs"}>
+                        <div.bubble>{raw(m.html)}</div>
+                        <span.muted>{ago(m.created)}</span>
+                    </li>}
+                </ol>
+                <form.chat-form @submit={send}>
+                    <Editor box_id="message-box" value={draft} rows={3} placeholder={`Message ${data.other.name}…`}
+                        on_change={(v) => { draft = v }} on_submit={send}/>
+                    <Problem text={problem}/>
+                    <div.actions>
+                        <button.btn.primary disabled={sending || trim(draft) == ""}>{sending ? "Sending…" : "Send"}</button>
+                        <span.muted>Ctrl + Enter</span>
+                    </div>
+                </form>
+            </div>}
+    </div>
+}

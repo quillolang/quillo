@@ -1,0 +1,261 @@
+// A thread, live: replies, votes, reactions, edits, the accepted answer, the
+// poll and moderators' pins and locks show for everyone as they happen, and
+// so does who is typing a reply. Everything here runs in the browser after
+// the first render.
+
+// The reactions on a post, and the palette to add one.
+component Reactions(post, me, on_posts, on_problem) {
+    state open = false
+    let toggle = (emoji) => {
+        open = false
+        let r = react(post.id, emoji)
+        if is_err(r) { on_problem(r.error) } else { on_posts(r) }
+    }
+    <span.reactions>
+        {for r in post.reactions => <button.react key={r.emoji} class={r.mine == 1 && "on"} title={r.who}
+            disabled={me == null} @click={() => toggle(r.emoji)}>{r.emoji} <b>{r.n}</b></button>}
+        {me != null && <span.react-add>
+            <button.react.add title="React" aria-expanded={open} @click={() => { open = !open }}>☺︎+</button>
+            {open && <span.palette role="menu">{for e in REACTIONS =>
+                <button role="menuitem" title={e} @click={() => toggle(e)}>{e}</button>}</span>}
+        </span>}
+    </span>
+}
+
+// Reporting a post to the moderators: a reason and an optional note.
+component ReportForm(post_id: int, on_done) {
+    state reason = ""
+    state note = ""
+    state problem = null
+    <form.report-form @submit={() => {
+        let r = report_post(post_id, reason, note)
+        if is_err(r) { problem = r.error } else { notify(r, { tone: "success", seconds: 3 }); on_done() }
+    }}>
+        <b>Report this post</b>
+        {for [key, label] in REPORT_REASONS => <label><input type="radio" name={`reason-${post_id}`} checked={reason == key}
+            @change={() => { reason = key }}/> {label}</label>}
+        <input placeholder="Anything moderators should know? (optional)" maxlength="500" bind:value={note}/>
+        <Problem text={problem}/>
+        <div.actions>
+            <button.btn.danger.small disabled={reason == ""}>Report</button>
+            <button.btn.ghost.small type="button" @click={on_done}>Cancel</button>
+        </div>
+    </form>
+}
+
+// One post, with its own editing state. What it changes goes back up
+// through `on_posts`; `on_quote` puts a quote of it in the reply box.
+component Post(post, me, owner_id: int, solution_id, first: bool, first_new: bool, locked: bool,
+               on_posts, on_quote, on_solution, on_thread_gone) {
+    state editing = false
+    state reporting = false
+    state draft = ""
+    state problem = null
+    let mine = me != null && me.id == post.user_id
+    let can_edit = mine || is_mod(me)
+    let is_solution = solution_id == post.id
+    let can_solve = !first && me != null && (me.id == owner_id || is_mod(me))
+    let show = (r) => {
+        if is_err(r) { problem = r.error; false } else { problem = null; true }
+    }
+    let save = () => {
+        let r = edit_post(post.id, draft)
+        if show(r) { editing = false; on_posts(r) }
+    }
+    <li.post #p{post.id} class={`${is_solution ? "solution" : ""} ${first ? "first" : ""} ${first_new ? "first-new" : ""}`}>
+        {first_new && <div.new-divider #new><span>New since your last visit</span></div>}
+        <aside.who>
+            <a href={`/u/${post.name}`}><Avatar name={post.name} hue={post.hue} size="lg"/></a>
+        </aside>
+        <article.card>
+            <header.post-head>
+                <a.name href={`/u/${post.name}`}>{post.name}</a>
+                <RoleBadge role={post.role}/>
+                <span.rep title="Reputation: votes on their posts">★ {compact(post.rep)}</span>
+                <a.when href={`#p${post.id}`}>{ago(post.created)}</a>
+                {post.edited != null && post.deleted == 0 && <span.muted title={`edited ${ago(post.edited)}`}>· edited</span>}
+                {is_solution && <span.badge.solved>✓ Accepted answer</span>}
+            </header>
+            {post.deleted == 1
+                ? <p.deleted>This post was deleted.</p>
+                : post.deleted == 2
+                    ? <p.deleted>This post was removed by a moderator.</p>
+                    : editing
+                        ? <form.edit @submit={save}>
+                            <Editor box_id={`edit-${post.id}`} value={draft} rows={8}
+                                on_change={(v) => { draft = v }} on_submit={save}/>
+                            <div.actions>
+                                <button.btn.primary>Save</button>
+                                <button.btn.ghost type="button" @click={() => { editing = false; problem = null }}>Cancel</button>
+                            </div>
+                        </form>
+                        : <div.body>{raw(post.html)}</div>}
+            <Problem text={problem}/>
+            {reporting && <ReportForm post_id={post.id} on_done={() => { reporting = false }}/>}
+            {post.deleted == 0 && !editing && <footer.post-foot>
+                <button.vote class={post.voted == 1 && "on"} disabled={me == null || mine}
+                    title={me == null ? "Sign in to vote" : mine ? "Your own post" : post.voted == 1 ? "Take back your vote" : "Vote: this helped"}
+                    @click={() => { let r = vote(post.id); if show(r) { on_posts(r) } }}>
+                    ▲ <b>{post.score}</b>
+                </button>
+                <Reactions {post} {me} {on_posts} on_problem={(e) => { problem = e }}/>
+                {me != null && !locked && <button.link @click={() => on_quote(quote_of(post.name, post.body))}>Quote</button>}
+                {can_solve && <button.link class={is_solution && "on"} @click={() => {
+                    let r = mark_solution(post.id)
+                    if show(r) { on_solution(r) }
+                }}>{is_solution ? "Unmark answer" : "✓ Mark as answer"}</button>}
+                <span.spacer/>
+                {me != null && <button.link.icon class={post.bookmarked == 1 && "on"}
+                    title={post.bookmarked == 1 ? "Remove bookmark" : "Bookmark"}
+                    @click={() => { let r = bookmark(post.id); if show(r) { on_posts(r) } }}>{post.bookmarked == 1 ? "★" : "☆"}</button>}
+                {me != null && !mine && <button.link @click={() => { reporting = !reporting }}>Report</button>}
+                {can_edit && <button.link @click={() => { draft = post.body; editing = true }}>Edit</button>}
+                {can_edit && <button.link.danger @click={() => {
+                    let what = first ? "Delete this post and the whole thread?" : "Delete this post?"
+                    if ask(what, { title: "Delete", ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                        let r = delete_post(post.id)
+                        if show(r) {
+                            if r.thread_deleted { on_thread_gone() } else { on_posts(r.posts) }
+                        }
+                    }
+                }}>Delete</button>}
+            </footer>}
+        </article>
+    </li>
+}
+
+// The reply box: Markdown, a preview of it, and Ctrl/⌘+Enter to send.
+component Composer(thread_id: int, draft: str, on_draft, on_posts, on_typing) {
+    state tab = "write"
+    state html = ""
+    state problem = null
+    state sending = false
+    let send = () => {
+        if sending { return null }
+        sending = true
+        let r = post_reply(thread_id, draft)
+        sending = false
+        if is_err(r) {
+            problem = r.error
+        } else {
+            problem = null
+            tab = "write"
+            on_draft("")
+            on_posts(r)
+            notify("Reply posted", { tone: "success", seconds: 2 })
+        }
+    }
+    <form.composer #reply @submit={send}>
+        <div.tabs.small>
+            <button type="button" class={tab == "write" && "on"} @click={() => { tab = "write" }}>Write</button>
+            <button type="button" class={tab == "preview" && "on"} @click={() => {
+                html = preview(draft) ?? ""
+                tab = "preview"
+            }}>Preview</button>
+        </div>
+        {tab == "write"
+            ? <Editor box_id="reply-box" value={draft} {thread_id} placeholder="Write a reply…"
+                on_change={on_draft} on_submit={send} {on_typing}/>
+            : <div.body.preview>{trim(draft) == "" ? <p.muted>Nothing to preview.</p> : raw(html)}</div>}
+        <Problem text={problem}/>
+        <div.actions>
+            <button.btn.primary disabled={sending || trim(draft) == ""}>{sending ? "Posting…" : "Post reply"}</button>
+            <span.muted>Ctrl + Enter</span>
+        </div>
+    </form>
+}
+
+// `last_read` is the last post the reader had seen before opening the page
+// (null if they never had): posts after it are marked new.
+component ThreadView(thread_id: int, me, views: int, last_read: int?) {
+    state thread = live(load_thread, thread_id)
+    state posts = live(load_posts, thread_id)
+    state draft = ""
+    state typers = {}
+    state sent_at = 0
+
+    // Who else is writing a reply here; each name fades after a few seconds.
+    let typing = channel.open("typing", (m) => {
+        if m.thread == thread_id && (me == null || m.name != me.name) { typers = set(typers, m.name, now()) }
+    })
+    every(1000, () => {
+        let fresh = reduce(keys(typers), {}, (acc, k) => now() - get(typers, k) < 4000 ? set(acc, k, get(typers, k)) : acc)
+        if len(keys(fresh)) != len(keys(typers)) { typers = fresh }
+    })
+    let typing_names = keys(typers)
+
+    let mod = is_mod(me)
+    let solution = thread == null ? null : find(posts ?? [], (p) => p.id == thread.solution_id)
+    let unseen = last_read == null || me == null ? [] : (posts ?? []) | filter((p) => p.id > last_read && p.user_id != me.id)
+    let first_new = len(unseen) > 0 ? unseen[0].id : 0
+
+    <div.thread>
+        {thread == null
+            ? <Empty><h2>This thread is gone</h2><p><a href="/">Back to the forum</a></p></Empty>
+            : <div>
+                <header.thread-head>
+                    <nav.crumbs><a href="/">Forum</a> <span>›</span> <CategoryPill slug={thread.cat_slug} name={thread.cat_name} color={thread.cat_color}/></nav>
+                    <h1>
+                        {thread.pinned == 1 && <span.badge.pin title="Pinned">📌</span>}
+                        {thread.locked == 1 && <span.badge.lock title="Locked">🔒</span>}
+                        {thread.title}
+                    </h1>
+                    <div.meta>
+                        {for g in tags_of(thread.tags) => <Tag tag={g}/>}
+                        <span.muted>{plural(thread.replies, "reply", "replies")} · {plural(views, "view")} · started {ago(thread.created)}</span>
+                        {solution != null && <a.badge.solved href={`#p${solution.id}`}>✓ Solved by {solution.name}</a>}
+                        <span.spacer/>
+                        {me != null && <button.btn.ghost.small class={thread.following == 1 && "on"}
+                            title={thread.following == 1 ? "You hear of every reply. Unfollow to mute it." : "Hear of every reply"}
+                            @click={() => { thread = set_following(thread_id, thread.following == 0) ?? thread }}>
+                            {thread.following == 1 ? "🔔 Following" : "🔕 Follow"}
+                        </button>}
+                    </div>
+                    {mod && <div.modbar>
+                        <span>Moderate:</span>
+                        <button.btn.ghost.small @click={() => { thread = set_pinned(thread_id, thread.pinned == 0) ?? thread }}>{thread.pinned == 1 ? "Unpin" : "Pin"}</button>
+                        <button.btn.ghost.small @click={() => { thread = set_locked(thread_id, thread.locked == 0) ?? thread }}>{thread.locked == 1 ? "Unlock" : "Lock"}</button>
+                    </div>}
+                </header>
+
+                {len(unseen) > 0 && <a.unread-jump href={`#p${first_new}`}>{plural(len(unseen), "new reply", "new replies")} since your last visit ↓</a>}
+
+                {solution != null && thread.solution_id != (posts ?? [])[0].id && <a.answer-box href={`#p${solution.id}`}>
+                    <b>✓ Accepted answer</b> from {solution.name}: <span>{excerpt(solution.body, 160)}</span>
+                </a>}
+
+                {thread.has_poll == 1 && <Poll {thread_id} {me} owner_id={thread.user_id}/>}
+
+                <ol.posts>
+                    {for [i, p] in enumerate(posts ?? []) => <Post key={p.id} post={p} {me}
+                        owner_id={thread.user_id} solution_id={thread.solution_id} first={i == 0} first_new={p.id == first_new}
+                        locked={thread.locked == 1}
+                        on_posts={(list) => { posts = list }}
+                        on_quote={(q) => {
+                            draft = draft == "" ? q : draft + "\n\n" + q
+                            js("forum.focusReply")
+                        }}
+                        on_solution={(t) => { thread = t }}
+                        on_thread_gone={() => { navigate(`/c/${thread.cat_slug}`) }}/>}
+                </ol>
+
+                <p.typing aria-live="polite">{len(typing_names) > 0 && `${join(typing_names, ", ")} ${len(typing_names) == 1 ? "is" : "are"} typing…`}</p>
+
+                {thread.locked == 1 && !mod
+                    ? <div.notice>🔒 This thread is locked: no new replies.</div>
+                    : me == null
+                        ? <div.notice><a href={`/login?next=/t/${thread_id}`}>Sign in</a> or <a href="/register">join</a> to reply.</div>
+                        : is_banned(me)
+                            ? <div.notice>You are suspended ({left(me.banned_until)}): you can read, but not reply.</div>
+                            : <Composer {thread_id} {draft}
+                                on_draft={(d) => { draft = d }}
+                                on_posts={(list) => { posts = list }}
+                                on_typing={() => {
+                                    if now() - sent_at > 2500 {
+                                        sent_at = now()
+                                        typing.send({ thread: thread_id })
+                                    }
+                                }}/>}
+              </div>}
+    </div>
+}

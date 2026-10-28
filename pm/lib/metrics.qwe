@@ -1,0 +1,181 @@
+// The reports, worked out from the tasks and their moves: cumulative flow,
+// a milestone's burndown, weekly throughput, cycle times, who has what,
+// and a Monte Carlo forecast of when the open work is done. The numbers
+// come from `stats` and `vec`; the pictures are drawn in ui/charts.qwe.
+
+let FLOW_DAYS = 42
+let WEEKS = 12
+let RUNS = 2000
+
+// The history as changes: each move adds one to the column a task enters
+// and takes one from the column it leaves, on the day it happens (days
+// before `from_day` count as `from_day`). Worked out per task from
+// `group_by`, not by keeping a map of where each task is: values cannot be
+// changed, so `set` copies the map, and a map grown move by move costs the
+// square of the moves (20,000 sets take a second).
+fn deltas_of(moves: list, weight_of, from_day: int, offset: int) -> list =
+    flatten(values(group_by(moves, (x) => x.task_id)) | map((ms) => {
+        let w = weight_of(ms[0].task_id)
+        flatten(for [i, x] in enumerate(ms) => {
+            let d = max([day_of(x.at, offset), from_day])
+            let enter = [{ day: d, col: x.column_id, n: w }]
+            i == 0 ? enter : enter + [{ day: d, col: ms[i - 1].column_id, n: -w }]
+        })
+    }))
+
+// Running totals per day of the changes, for `keys` (column ids):
+// [{ day, counts: [total per key] }].
+fn running(deltas: list, keys: list, from_day: int, to_day: int) -> list {
+    let by_day = group_by(deltas, (x) => x.day)
+    let counts = keys | map((_k) => 0)
+    let rows = []
+    for d in range(from_day, to_day + 1) {
+        for x in by_day[str(d)] ?? [] {
+            let k = index_of(keys, x.col)
+            if k != null { counts = for [j, c] in enumerate(counts) => j == k ? c + x.n : c }
+        }
+        rows = push(rows, { day: d, counts })
+    }
+    rows
+}
+
+// Who held each task at the end of each day: [{ day, counts: [n per column] }].
+// `moves` are sorted by time; each moment is put on the viewer's day.
+fn flow_of(cols: list, moves: list, from_day: int, to_day: int, offset: int) -> list =
+    running(deltas_of(moves, (_id) => 1, from_day, offset), cols | map((c) => c.id), from_day, to_day)
+
+// A milestone's burndown in points (a task without points counts as 1):
+// the scope as it grew, what was left each day, and the ideal line.
+fn burndown_of(m, tasks: list, moves: list, done_cols: list, today_n: int, offset: int) {
+    let start = parse_day(m.start_day) ?? today_n
+    let due = parse_day(m.due_day) ?? today_n
+    let mine = tasks | filter((t) => t.milestone_id == m.id)
+    let by_id = group_by(mine, (t) => t.id)
+    let weight_of = (id) => by_id[str(id)][0].points ?? 1
+    let ms = moves | filter((x) => has(by_id, str(x.task_id)))
+    let until = max([min([today_n, due]), start])
+    // Points in each column, per day; the done columns' share is what is done.
+    let cols = unique(ms | map((x) => x.column_id))
+    let flow = running(deltas_of(ms, weight_of, start, offset), cols, start, until)
+    let done_at = cols | map((c) => contains(done_cols, c))
+    let days = flow | map((r) => {
+        let scope = sum(r.counts)
+        let done = sum(for [k, n] in enumerate(r.counts) => done_at[k] ? n : 0)
+        { day: r.day, scope, left: scope - done }
+    })
+    let first_scope = len(days) > 0 ? days[0].scope : 0
+    {
+        milestone: m,
+        start,
+        due,
+        days,
+        ideal: [{ day: start, left: first_scope }, { day: due, left: 0 }],
+        total: sum(mine | map((t) => t.points ?? 1)),
+        left: len(days) > 0 ? last(days).left : 0,
+    }
+}
+
+// Done per week (count and points), the oldest week first.
+// Weeks before the project's first are left out, but at least four shown.
+fn throughput_of(done: list, today_n: int, first_day: int, offset: int) -> list {
+    let this_week = week_start(today_n)
+    let weeks = min([WEEKS, max([4, floor((this_week - week_start(first_day)) / 7) + 1])])
+    for w in range(weeks) => {
+        let from = this_week - (weeks - 1 - w) * 7
+        let in_week = done | filter((t) => day_of(t.done_at, offset) >= from && day_of(t.done_at, offset) < from + 7)
+        { week: from, count: len(in_week), points: sum(in_week | map((t) => t.points ?? 0)) }
+    }
+}
+
+// Cycle time: from first reaching a "doing" column to reaching "done", in days.
+fn cycle_of(done: list, offset: int) {
+    let items = done
+        | filter((t) => t.started_at != null)
+        | map((t) => ({ id: t.id, num: t.num, title: t.title, day: day_of(t.done_at, offset),
+                        days: round((t.done_at - t.started_at) / DAY_MS, 1) }))
+    let xs = items | map((x) => float(x.days))
+    // stats wants two values or more (stdev of one is an error).
+    let summary = len(xs) >= 2 ? stats.describe(xs) : null
+    let pct = len(xs) >= 2 ? stats.percentile(xs, [50, 85, 95]) : null
+    { items, summary, p50: pct[0], p85: pct[1], p95: pct[2],
+      histogram: len(xs) >= 2 ? stats.histogram(xs, 8) : null }
+}
+
+// How many weeks the open work may take, from what past weeks finished:
+// each run draws a past week's throughput at random until the work is
+// done. The 50th, 85th and 95th percentiles of the runs, as days.
+fn forecast_of(remaining: int, weekly: list<int>, today_n: int) with random {
+    let samples = weekly
+    if remaining == 0 { return { remaining, done: true } }
+    if len(samples) == 0 || sum(samples) == 0 { return { remaining, done: false, weeks: null } }
+    let runs = for _r in range(RUNS) => {
+        let left = remaining
+        let weeks = 0
+        while left > 0 && weeks < 520 {
+            left -= samples[random_int(0, len(samples) - 1)]
+            weeks += 1
+        }
+        weeks
+    }
+    let p = stats.percentile(runs | map((n) => float(n)), [50, 85, 95])
+    let at = (q) => today_n + int(ceil(q * 7))
+    { remaining, done: false, weeks: p, days: [at(p[0]), at(p[1]), at(p[2])] }
+}
+
+fn reports_of(project_id: int, milestone_id, today_n: int, offset: int) with db, random {
+    let cols = columns_of(project_id)
+    let done_cols = cols | filter((c) => c.kind == "done") | map((c) => c.id)
+    let tasks = db.query(sql`
+        select t.id, t.num, t.title, t.points, t.priority, t.created, t.started_at, t.done_at, t.due_day,
+               t.assignee_id, t.milestone_id, t.column_id
+        from tasks t where t.project_id = ?`, project_id)
+    let moves = db.query("select task_id, column_id, at from moves where project_id = ? order by at, id", project_id)
+    let first_day = len(moves) > 0 ? day_of(moves[0].at, offset) : today_n
+    let from_day = max([first_day, today_n - FLOW_DAYS + 1])
+    let is_done = (t) => contains(done_cols, t.column_id)
+    let done = tasks | filter(is_done)
+    let open = tasks | filter((t) => !is_done(t))
+    let blocked_ids = db.query(sql`
+        select distinct d.task_id from deps d join tasks b on b.id = d.blocked_by join columns c on c.id = b.column_id
+        join tasks t on t.id = d.task_id where t.project_id = ? and c.kind != 'done'`, project_id) | map((r) => r.task_id)
+    let milestones = milestones_of(project_id)
+    let m = find(milestones, (x) => x.id == milestone_id) ?? find(milestones, (x) => (parse_day(x.due_day) ?? 0) >= today_n) ?? last(milestones)
+    let tp = throughput_of(done, today_n, first_day, offset)
+    // The forecast's scope: the milestone's open tasks, or the project's.
+    let scope = m == null ? open : open | filter((t) => t.milestone_id == m.id)
+    let people = members_of(project_id)
+    {
+        today: today_n,
+        columns: cols,
+        milestones,
+        milestone: m,
+        summary: {
+            total: len(tasks),
+            done: len(done),
+            open: len(open),
+            overdue: count(open, (t) => t.due_day != null && (parse_day(t.due_day) ?? today_n) < today_n),
+            blocked: count(open, (t) => contains(blocked_ids, t.id)),
+            done_week: count(done, (t) => day_of(t.done_at, offset) >= week_start(today_n)),
+            points_open: sum(open | map((t) => t.points ?? 0)),
+            over_wip: cols | filter((c) => c.wip != null && count(tasks, (t) => t.column_id == c.id) > c.wip) | map((c) => c.name),
+        },
+        flow: flow_of(cols, moves, from_day, today_n, offset),
+        burndown: m == null ? null : burndown_of(m, tasks, moves, done_cols, today_n, offset),
+        throughput: tp,
+        cycle: cycle_of(done, offset),
+        forecast: forecast_of(len(scope), take(reverse(tp), 8) | map((w) => w.count), today_n),
+        workload: people | map((p) => {
+            let theirs = open | filter((t) => t.assignee_id == p.id)
+            { name: p.name, hue: p.hue, count: len(theirs), points: sum(theirs | map((t) => t.points ?? 0)),
+              by_priority: range(5) | map((n) => count(theirs, (t) => t.priority == n)) }
+        }) | sort_by((p) => -p.points),
+        unassigned: count(open, (t) => t.assignee_id == null),
+        priorities: range(5) | map((n) => count(open, (t) => t.priority == n)),
+    }
+}
+
+server fn load_reports(project_id: int, milestone_id: int?) with db, time, random {
+    member_of(project_id, "read")?
+    watch(`project:${project_id}`)
+    unwatched(() => reports_of(project_id, milestone_id, today(request), tz_offset(request)))
+}

@@ -1,0 +1,19 @@
+// Q-030 A <textarea> whose text is written as its children stops following state once someone types in it
+// mode: browser
+// page: /
+// probe: const t = document.getElementById("t"); t.value = "typed"; t.dispatchEvent(new Event("input", { bubbles: true })); await new Promise((r) => setTimeout(r, 100)); document.getElementById("reset").click(); await new Promise((r) => setTimeout(r, 200)); return { shown: t.value, state: document.getElementById("state").textContent }
+// open-when: "shown": "typed"
+// fixed-when: "shown": "reset"
+// From FEEDBACK3.md §3 (found on 896e758). `value={text}` works (the server writes it as the
+// textarea's text); children are taken once, as HTML's default value, and then never again.
+
+component Note() {
+    state text = "first"
+    <div>
+        <textarea #t @input={(e) => { text = e.value }}>{text}</textarea>
+        <button #reset @click={() => { text = "reset" }}>Reset</button>
+        <p #state>{text}</p>
+    </div>
+}
+
+route GET / = <html><body><Note/></body></html>

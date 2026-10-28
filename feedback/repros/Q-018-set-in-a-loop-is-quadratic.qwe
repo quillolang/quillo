@@ -1,0 +1,11 @@
+// Q-018 A map grown with `set` in a loop costs the square of its size
+// mode: run
+// open-when: quadratic
+// fixed-when: linear
+// From FEEDBACK2.md §7 (found on 896e758: 20,000 sets took 992 ms). The bound below is generous.
+
+let t0 = now()
+let m = reduce(range(20000), {}, (acc, i) => set(acc, str(i), true))
+let ms = now() - t0
+print(len(keys(m)))
+print(ms > 250 ? `quadratic: 20000 sets took ${ms} ms` : `linear: 20000 sets took ${ms} ms`)

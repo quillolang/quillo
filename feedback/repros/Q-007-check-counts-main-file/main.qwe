@@ -1,0 +1,9 @@
+// Q-007 quillo check counts only the main file's functions and components
+// mode: check
+// open-when: /ok \(1 routes, 0 functions, 0 components\)/
+// fixed-when: /1 functions, 1 components/
+// From FEEDBACK.md §4 (found on f1695a3).
+
+use "lib/parts.qwe"
+
+route GET / = <html><body><Counter/>{double(2)}</body></html>

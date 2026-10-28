@@ -1,0 +1,11 @@
+// Q-012 `let` and `for` silently do not bind names like int, str, num, list
+// mode: run
+// open-when: <builtin
+// open-when: unknown name `num`
+// fixed-when: [5, "a", 6]
+// From FEEDBACK2.md §2 (found on 896e758).
+
+let int = 5
+let str = "a"
+let num = 6
+print([int, str, num])

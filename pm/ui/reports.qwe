@@ -1,0 +1,116 @@
+// The reports, live: moving a card on the board redraws them for anyone
+// looking. Every chart can be read as a table too.
+
+view ForecastTiles(f, year: int) =
+    f.done
+        ? <p.muted>Nothing is left to do here.</p>
+        : f.weeks == null
+            ? <p.muted>No task was finished in the last eight weeks, so there is nothing to forecast from.</p>
+            : <div.stats>
+                <Stat label="Even odds by" value={short_day(f.days[0], year)} note={`50% of ${RUNS} runs`}/>
+                <Stat label="Likely by" value={short_day(f.days[1], year)} note="85% of runs" tone="accent"/>
+                <Stat label="Almost surely by" value={short_day(f.days[2], year)} note="95% of runs"/>
+              </div>
+
+view FlowTable(flow: list, columns: list, year: int) =
+    <table.data>
+        <thead><tr><th>Day</th>{for c in columns => <th key={c.id}>{c.name}</th>}</tr></thead>
+        <tbody>{for r in reverse(flow) => <tr key={r.day}><td>{short_day(r.day, year)}</td>{for [k, n] in enumerate(r.counts) => <td key={k}>{n}</td>}</tr>}</tbody>
+    </table>
+
+component Reports(project_id: int, milestone: int?) {
+    state chosen = milestone
+    state tables = false
+    state data = live(load_reports, project_id, chosen)
+    let d = data
+    let year = year_of(d.today)
+    let s = d.summary
+    <div.reports>
+        <div.toolbar>
+            <label.inline-label>Milestone
+                <select @change={(e) => { chosen = int(e.value) ?? null }}>
+                    {len(d.milestones) == 0 && <option value="">None yet</option>}
+                    {for m in d.milestones => <option key={m.id} value={m.id} selected={d.milestone.id == m.id}>{m.name}</option>}
+                </select>
+            </label>
+            <span.grow/>
+            <label.inline-label><input type="checkbox" bind:checked={tables}/> Show tables</label>
+        </div>
+
+        <div.stats>
+            <Stat label="Open" value={s.open} note={`${s.points_open} points`}/>
+            <Stat label="Done" value={s.done} note={`${s.done_week} this week`} tone="good"/>
+            <Stat label="Overdue" value={s.overdue} note={s.overdue > 0 ? "past their due day" : "none late"} tone={s.overdue > 0 ? "bad" : ""}/>
+            <Stat label="Blocked" value={s.blocked} note="waiting for others" tone={s.blocked > 0 ? "warn" : ""}/>
+            <Stat label="Cycle time" value={d.cycle.p50 != null ? `${num1(d.cycle.p50)}d` : "–"} note={d.cycle.p85 != null ? `85% within ${num1(d.cycle.p85)}d` : "too few done"}/>
+        </div>
+        {len(s.over_wip) > 0 && <p.warn-note>⚠ Over the work-in-progress limit: {join(s.over_wip, ", ")}</p>}
+
+        <div.report-grid>
+            <section.card-box.span2>
+                <h2>Cumulative flow <span.muted>cards in each column at the end of each day</span></h2>
+                {len(d.flow) > 1 ? <FlowChart flow={d.flow} columns={d.columns} {year}/> : <p.muted>Come back tomorrow: one day is not a flow.</p>}
+                {tables && <FlowTable flow={d.flow} columns={d.columns} {year}/>}
+            </section>
+
+            <section.card-box>
+                <h2>Burndown {d.burndown != null && <span.muted>{d.burndown.milestone.name}: {d.burndown.left} of {d.burndown.total} points left</span>}</h2>
+                {d.burndown == null
+                    ? <p.muted>Add a milestone in Settings, and give tasks to it.</p>
+                    : <BurndownChart b={d.burndown} {year}/>}
+                {tables && d.burndown != null && <table.data>
+                    <thead><tr><th>Day</th><th>Scope</th><th>Left</th></tr></thead>
+                    <tbody>{for x in reverse(d.burndown.days) => <tr key={x.day}><td>{short_day(x.day, year)}</td><td>{x.scope}</td><td>{x.left}</td></tr>}</tbody>
+                </table>}
+            </section>
+
+            <section.card-box>
+                <h2>Forecast <span.muted>{d.forecast.remaining} open {d.milestone != null ? `in ${d.milestone.name}` : "tasks"}, at past weeks' pace</span></h2>
+                <ForecastTiles f={d.forecast} {year}/>
+                {d.milestone != null && d.forecast.days != null &&
+                    <p class={(parse_day(d.milestone.due_day) ?? 0) >= d.forecast.days[1] ? "good-note" : "warn-note"}>
+                        {d.milestone.name} is due {short_day(parse_day(d.milestone.due_day) ?? 0, year)}:
+                        {(parse_day(d.milestone.due_day) ?? 0) >= d.forecast.days[1] ? " on track (85%)." : " at risk: fewer than 85% of runs finish by then."}
+                    </p>}
+            </section>
+
+            <section.card-box>
+                <h2>Throughput <span.muted>tasks finished each week</span></h2>
+                <ThroughputChart weeks={d.throughput} {year}/>
+                {tables && <table.data>
+                    <thead><tr><th>Week of</th><th>Tasks</th><th>Points</th></tr></thead>
+                    <tbody>{for w in reverse(d.throughput) => <tr key={w.week}><td>{short_day(w.week, year)}</td><td>{w.count}</td><td>{w.points}</td></tr>}</tbody>
+                </table>}
+            </section>
+
+            <section.card-box>
+                <h2>Cycle time <span.muted>days from started to done</span></h2>
+                {len(d.cycle.items) < 2
+                    ? <p.muted>Finish a few more tasks to see how long they take.</p>
+                    : <CycleChart cycle={d.cycle} from_day={d.today - 41} to_day={d.today} {year}/>}
+                {d.cycle.summary != null && <p.muted>
+                    {d.cycle.summary.count} tasks · mean {num1(d.cycle.summary.mean)}d · median {num1(d.cycle.summary.median)}d ·
+                    95% within {num1(d.cycle.p95)}d · longest {num1(d.cycle.summary.max)}d
+                </p>}
+            </section>
+
+            <section.card-box>
+                <h2>Who has what <span.muted>open tasks, by priority</span></h2>
+                <Workload people={d.workload} unassigned={d.unassigned}/>
+            </section>
+        </div>
+    </div>
+}
+
+// The project's activity, newest first, live.
+component Activity(project_id: int) {
+    state items = live(load_activity, project_id, 200)
+    let year = year_of(day_of(now()))
+    <ol.activity>
+        {for a in items ?? [] => <li key={a.id}>
+            <Avatar name={a.name} hue={a.hue} size="sm"/>
+            <span><b>{a.name}</b> {a.text}</span>
+            <time title={short_day(day_of(a.at), year)}>{ago(a.at, now())}</time>
+        </li>}
+    </ol>
+}

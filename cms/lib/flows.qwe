@@ -1,0 +1,173 @@
+// Flows: the state machines articles and records move through. A flow has
+// steps (each with the role that acts there) and transitions between them
+// (each with the role that may run it). The flow designer edits them; pages
+// showing a flow follow `flow:<id>`.
+
+let STEP_COLORS = ["#64748b", "#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#e87ba4", "#eda100", "#008300"]
+let TRANSITION_KINDS = ["move", "approve", "reject"]
+
+type StepEdit = { name: str, role: str?, approvals: int = 1, color: str = "#64748b" }
+type TransitionEdit = { from_step: int, to_step: int, name: str, role: str, kind: "move" | "approve" | "reject" = "move", needs_resolved: bool = false }
+
+fn flow_changed(flow_id: int) {
+    publish(`flow:${flow_id}`)
+    publish("flows")
+}
+
+fn steps_of(flow_id: int) with db =
+    db.query("select id, name, position, role, approvals, color from steps where flow_id = ? order by position, id", flow_id)
+
+fn transitions_of(flow_id: int) with db = db.query(sql`
+    select id, from_step, to_step, name, role, kind, needs_resolved, position
+    from transitions where flow_id = ? order by from_step, position, id`, flow_id)
+
+fn first_step(flow_id: int) with db =
+    db.one("select id, name from steps where flow_id = ? order by position, id limit 1", flow_id)
+
+fn step_row(step_id: int) with db = unwatched(() =>
+    db.one("select s.id, s.flow_id, s.name, s.role, s.approvals, f.kind from steps s join flows f on f.id = s.flow_id where s.id = ?", step_id))
+
+// A step with no transition out of it is where the flow ends.
+fn is_final(step_id: int, transitions: list) -> bool = !any(transitions, (t) => t.from_step == step_id && t.kind != "reject")
+
+// How many articles or records are at each step of a flow: a step with any
+// cannot be deleted.
+fn usage_of(flow_id: int) with db {
+    let articles = db.query("select step_id, count(*) as n from articles where flow_id = ? group by step_id", flow_id)
+    let objects = db.query("select id from objects where flow_id = ?", flow_id)
+    let records = flatten(objects | map((o) =>
+        db.query(`select state as step_id, count(*) as n from ${sql_name(`obj_${o.id}`)} group by state`)))
+    articles + records
+}
+
+fn count_at(usage: list, step_id: int) -> int = sum(usage | filter((u) => u.step_id == step_id) | map((u) => u.n))
+
+server fn load_flows() with db, time {
+    acting(["designer", "writer", "reviewer", "publisher"])?
+    watch("flows")
+    unwatched(() => db.query(sql`
+        select f.id, f.name, f.kind,
+               (select count(*) from steps s where s.flow_id = f.id) as steps,
+               (select count(*) from articles a where a.flow_id = f.id) as articles,
+               (select count(*) from objects o where o.flow_id = f.id) as objects
+        from flows f order by f.kind, f.name collate nocase`))
+}
+
+server fn load_flow(flow_id: int) with db, time {
+    acting()?
+    watch(`flow:${flow_id}`)
+    unwatched(() => {
+        let f = db.one("select id, name, kind from flows where id = ?", flow_id) ?? err("No such flow")?
+        { flow: f, steps: steps_of(flow_id), transitions: transitions_of(flow_id), usage: usage_of(flow_id) }
+    })
+}
+
+// A new flow starts with two steps and one way between them.
+server fn create_flow(name: str, kind: str) ! str with db, time {
+    acting(["designer"])?
+    let n = trim(name)
+    if len(n) < 2 || len(n) > 50 { return err("A flow's name is 2 to 50 characters") }
+    if kind != "article" && kind != "object" { return err("A flow is for articles or for objects") }
+    let id = db.transaction(() => {
+        let id = db.exec("insert into flows (name, kind, created) values (?, ?, ?)", n, kind, now())?.last_id
+        let first_role = kind == "article" ? "writer" : "designer"
+        let a = db.exec("insert into steps (flow_id, name, position, role, color) values (?, ?, 0, ?, ?)",
+            id, kind == "article" ? "Draft" : "New", first_role, STEP_COLORS[0])?.last_id
+        let b = db.exec("insert into steps (flow_id, name, position, role, color) values (?, ?, 1, null, ?)",
+            id, kind == "article" ? "Published" : "Done", STEP_COLORS[3])?.last_id
+        db.exec("insert into transitions (flow_id, from_step, to_step, name, role, kind) values (?, ?, ?, ?, ?, 'move')",
+            id, a, b, kind == "article" ? "Publish" : "Finish", first_role)?
+        id
+    })?
+    flow_changed(id)
+    id
+}
+
+server fn rename_flow(flow_id: int, name: str) ! str with db, time {
+    acting(["designer"])?
+    let n = trim(name)
+    if len(n) < 2 || len(n) > 50 { return err("A flow's name is 2 to 50 characters") }
+    db.exec("update flows set name = ? where id = ?", n, flow_id)?
+    flow_changed(flow_id)
+    true
+}
+
+fn check_step(s: StepEdit) ! str {
+    if len(trim(s.name)) == 0 || len(s.name) > 30 { return err("A step's name is 1 to 30 characters") }
+    if s.role != null && !contains(ROLES, s.role) { return err(`No such role: ${s.role}`) }
+    if s.approvals < 1 || s.approvals > 9 { return err("Approvals needed are 1 to 9") }
+    if !re.test(s.color, "^#[0-9a-fA-F]{6}$") { return err("A colour is written #rrggbb") }
+    true
+}
+
+server fn save_step(flow_id: int, step_id: int?, s: StepEdit) ! str with db, time {
+    acting(["designer"])?
+    check_step(s)?
+    if step_id == null {
+        let pos = db.one("select coalesce(max(position), -1) + 1 as n from steps where flow_id = ?", flow_id).n
+        db.exec("insert into steps (flow_id, name, position, role, approvals, color) values (?, ?, ?, ?, ?, ?)",
+            flow_id, trim(s.name), pos, s.role, s.approvals, s.color)?
+    } else {
+        let r = db.exec("update steps set name = ?, role = ?, approvals = ?, color = ? where id = ? and flow_id = ?",
+            trim(s.name), s.role, s.approvals, s.color, step_id, flow_id)?
+        if r.changes == 0 { return err("That step was deleted") }
+    }
+    flow_changed(flow_id)
+    true
+}
+
+server fn delete_step(flow_id: int, step_id: int) ! str with db, time {
+    acting(["designer"])?
+    let steps = steps_of(flow_id)
+    if len(steps) <= 2 { return err("A flow needs at least two steps") }
+    let n = count_at(usage_of(flow_id), step_id)
+    if n > 0 { return err(`${plural(n, "item")} ${n == 1 ? "is" : "are"} at this step: move ${n == 1 ? "it" : "them"} on first`) }
+    if db.one("select 1 from forms f join transitions t on t.id = f.transition_id where t.from_step = ? or t.to_step = ?", step_id, step_id) != null {
+        return err("A transaction form uses this step: delete the form first")
+    }
+    db.exec("delete from steps where id = ? and flow_id = ?", step_id, flow_id)?
+    flow_changed(flow_id)
+    true
+}
+
+// The steps in a new order (from dragging them in the designer). The first
+// step is where new articles and records start.
+server fn order_steps(flow_id: int, ids: list<int>) ! str with db, time {
+    acting(["designer"])?
+    let have = steps_of(flow_id) | map((s) => s.id) | sort
+    if sort(ids) != have { return err("The flow's steps changed meanwhile: try again") }
+    db.transaction(() => {
+        for [i, id] in enumerate(ids) { db.exec("update steps set position = ? where id = ?", i, id)? }
+    })?
+    flow_changed(flow_id)
+    true
+}
+
+server fn save_transition(flow_id: int, transition_id: int?, t: TransitionEdit) ! str with db, time {
+    acting(["designer"])?
+    let n = trim(t.name)
+    if len(n) == 0 || len(n) > 30 { return err("A transition's name is 1 to 30 characters") }
+    if !contains(ROLES, t.role) { return err(`No such role: ${t.role}`) }
+    let ids = steps_of(flow_id) | map((s) => s.id)
+    if !contains(ids, t.from_step) || !contains(ids, t.to_step) { return err("Both ends must be steps of this flow") }
+    if t.from_step == t.to_step { return err("A transition goes to another step") }
+    if transition_id == null {
+        db.exec(sql`insert into transitions (flow_id, from_step, to_step, name, role, kind, needs_resolved)
+                    values (?, ?, ?, ?, ?, ?, ?)`, flow_id, t.from_step, t.to_step, n, t.role, t.kind, t.needs_resolved ? 1 : 0)?
+    } else {
+        db.exec(sql`update transitions set from_step = ?, to_step = ?, name = ?, role = ?, kind = ?, needs_resolved = ?
+                    where id = ? and flow_id = ?`, t.from_step, t.to_step, n, t.role, t.kind, t.needs_resolved ? 1 : 0, transition_id, flow_id)?
+    }
+    flow_changed(flow_id)
+    true
+}
+
+server fn delete_transition(flow_id: int, transition_id: int) ! str with db, time {
+    acting(["designer"])?
+    if db.one("select 1 from forms where transition_id = ?", transition_id) != null {
+        return err("A transaction form runs this transition: delete the form first")
+    }
+    db.exec("delete from transitions where id = ? and flow_id = ?", transition_id, flow_id)?
+    flow_changed(flow_id)
+    true
+}

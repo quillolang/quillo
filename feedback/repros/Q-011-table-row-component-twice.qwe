@@ -1,0 +1,15 @@
+// Q-011 A component that is a table row shows twice: dead rows in the table, live ones above it
+// mode: browser
+// page: /
+// probe: return { inTable: document.querySelectorAll("table tr").length, outside: document.querySelectorAll("body > quillo-island tr").length }
+// open-when: "outside": 2
+// fixed-when: "inTable": 2
+// fixed-when: "remade": 0
+// From FEEDBACK2.md §1 (found on 896e758). The same goes for <option> in <select>.
+
+component Line(name: str) {
+    state on = false
+    <tr><td>{name}</td><td><button @click={() => { on = !on }}>{on ? "on" : "off"}</button></td></tr>
+}
+
+route GET / = <html><body><table><tbody><Line name="a"/><Line name="b"/></tbody></table></body></html>

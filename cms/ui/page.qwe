@@ -1,0 +1,74 @@
+// The frames: the public site, and the desk staff work in, whose menu
+// follows the roles someone holds. Plus the small views used everywhere.
+
+view Avatar(name: str, hue: int, size: str = "md") =
+    <span class={`avatar ${size}`} style={`--hue: ${hue}`} title={name} aria-label={name}>{upper(slice(name, 0, 1))}</span>
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view RoleChip(role) = role != null && <span class={`role r-${role}`}>{role}</span>
+
+view StepPill(name: str, color: str) = <span.step-pill style={`--c: ${color}`}>{name}</span>
+
+let DESK_LINKS = [
+    ["/desk", "Desk", []],
+    ["/desk/articles", "Articles", []],
+    ["/desk/pages", "Pages", []],
+    ["/desk/objects", "Objects", ["designer"]],
+    ["/desk/flows", "Flows", ["designer"]],
+    ["/desk/people", "People", ["admin"]],
+]
+
+view DeskNav(me, on: str) =
+    <nav.desk-nav aria-label="Desk">
+        {for [href, label, roles] in DESK_LINKS => (len(roles) == 0 || has_any(me, roles)) &&
+            <a key={href} href={href} class={on == label && "on"} aria-current={on == label && "page"}>{label}</a>}
+    </nav>
+
+view Head(title: str) =
+    <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1"/>
+        <title>{title}</title>
+        <link rel="icon" href="/static/icons/favicon.svg" type="image/svg+xml"/>
+        <link rel="stylesheet" href="/static/css/cms.css"/>
+        <script src="/static/js/cms.js"></script>
+    </head>
+
+view Desk(title: str, me, on: str, children, wide: bool = false) =
+    <html lang="en">
+        <Head title={`${title} · Newsroom desk`}/>
+        <body.desk data-notices="dialog-center toasts-bottom-right">
+            <header.top>
+                <a.brand href="/desk"><span.logo>N</span> Newsroom <span.muted>desk</span></a>
+                <DeskNav {me} {on}/>
+                <span.grow/>
+                <a.muted href="/" title="The public site">Site ↗</a>
+                <span.who><Avatar name={me.name} hue={me.hue} size="sm"/> {me.name}
+                    {for r in me.roles => <RoleChip key={r} role={r}/>}</span>
+                <form.inline method="post" action="/logout"><button.link>Sign out</button></form>
+            </header>
+            <main class={wide ? "page wide" : "page"}>{children}</main>
+        </body>
+    </html>
+
+view Site(title: str, me, children) =
+    <html lang="en">
+        <Head title={title == "Newsroom" ? title : `${title} · Newsroom`}/>
+        <body.site>
+            <header.masthead>
+                <a.brand href="/"><span.logo>N</span> Newsroom</a>
+                <span.grow/>
+                {me != null ? <a.btn.ghost href="/desk">Desk</a> : <a.btn.ghost href="/login">Staff sign-in</a>}
+            </header>
+            <main.page.read>{children}</main>
+        </body>
+    </html>
+
+view NotAllowed(me, what: str) =
+    <Desk title="Not allowed" {me} on="">
+        <section.card-box><h1>Not for you</h1><p>{what}</p><p><a href="/desk">Back to the desk</a></p></section>
+    </Desk>
+
+view NotFound(me, what: str) =
+    <Site title="Not found" {me}><section.card-box><h1>Not here</h1><p>{what}</p><p><a href="/">The front page</a></p></section></Site>

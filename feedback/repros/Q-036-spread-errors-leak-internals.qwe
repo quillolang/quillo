@@ -1,0 +1,8 @@
+// Q-036 Spread's errors name its internals: `__merge` for a list spread into a map, "cannot add" for null in a list
+// mode: run
+// open-when: __merge
+// fixed-when: /spread/
+// Found reviewing fe10f8c (Q-017's fix). `[...null, 1]` says "cannot add list and null".
+
+let xs = [1, 2]
+print({ ...xs })

@@ -1,0 +1,48 @@
+// The frame every page uses, and the small views used everywhere.
+
+view Avatar(name: str, hue: int, size: str = "md") =
+    <span class={`avatar ${size}`} style={`--hue: ${hue}`} title={name} aria-hidden="true">{upper(slice(name, 0, 1))}</span>
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view PriorityIcon(p: int) = p > 0 &&
+    <span class={`prio p${p}`} title={`${PRIORITIES[p]} priority`}>
+        {match p { 4 => "!!", 3 => "↑", 2 => "=", _ => "↓" }}
+    </span>
+
+view LabelChip(l) = <span.chip style={`--c: ${l.color}`}>{l.name}</span>
+
+view TopBar(me, project) =
+    <header.top>
+        <a.brand href="/"><span.logo>◧</span><span>Lanes</span></a>
+        {project != null && <span.crumb>/ <a href={`/p/${project.key}`}><i.dot style={`--c: ${project.color}`}/>{project.name}</a></span>}
+        <span.grow/>
+        {me != null
+            ? <nav.me>
+                <a.who href="/"><Avatar name={me.name} hue={me.hue} size="sm"/> {me.name}</a>
+                <form.inline method="post" action="/logout"><button.link>Sign out</button></form>
+              </nav>
+            : <nav.me><a.btn.ghost href="/login">Sign in</a><a.btn.primary href="/register">Join</a></nav>}
+    </header>
+
+view ProjectTabs(pkey: str, on: str) =
+    <nav.tabs aria-label="Project">
+        {for [path, label] in [["", "Board"], ["/timeline", "Timeline"], ["/reports", "Reports"], ["/activity", "Activity"], ["/settings", "Settings"]] =>
+            <a key={label} href={`/p/${pkey}${path}`} class={on == label && "on"} aria-current={on == label && "page"}>{label}</a>}
+    </nav>
+
+view Page(title: str, me, children, project = null, wide: bool = false) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title == "Lanes" ? title : `${title} · Lanes`}</title>
+            <link rel="icon" href="/static/icons/favicon.svg" type="image/svg+xml"/>
+            <link rel="stylesheet" href="/static/css/pm.css"/>
+            <script src="/static/js/pm.js"></script>
+        </head>
+        <body data-notices="dialog-center toasts-bottom-right">
+            <TopBar {me} {project}/>
+            <main class={wide ? "page wide" : "page"}>{children}</main>
+        </body>
+    </html>

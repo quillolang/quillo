@@ -1,0 +1,103 @@
+// Calendar days, without a date library: Quillo has none since 0.5.0, so
+// days are counted here. A day is an int, the days since 1970-01-01 (so
+// 2026-10-28 is 20754), and is kept as 'YYYY-MM-DD' text in the database.
+// All pure, so components use them in the browser too.
+//
+// The conversions are Howard Hinnant's days_from_civil and civil_from_days,
+// with floor() for the integer divisions (Quillo's `/` is exact division).
+
+let DAY_MS = 86_400_000
+let MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+fn days_from_civil(y: int, m: int, d: int) -> int {
+    let yy = m <= 2 ? y - 1 : y
+    let era = floor(yy / 400)
+    let yoe = yy - era * 400
+    let mp = (m + 9) % 12
+    let doy = floor((153 * mp + 2) / 5) + d - 1
+    let doe = yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(n: int) -> { y: int, m: int, d: int } {
+    let z = n + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m, d }
+}
+
+fn is_leap(y: int) -> bool = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+
+fn days_in_month(y: int, m: int) -> int =
+    m == 2 ? (is_leap(y) ? 29 : 28) : (m == 4 || m == 6 || m == 9 || m == 11 ? 30 : 31)
+
+fn pad2(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// "2026-10-28" is 20754; anything else is an error value. Only real days:
+// "2026-02-30" is refused, not moved on to March.
+fn parse_day(text) -> int ! str {
+    if type_of(text) != "str" { return err("A day is written YYYY-MM-DD") }
+    let m = re.find(trim(text), "^(\\d{4})-(\\d{2})-(\\d{2})$") ?? err(`Not a day: ${text}`)?
+    let y = int(m.groups[0])
+    let mo = int(m.groups[1])
+    let d = int(m.groups[2])
+    if mo < 1 || mo > 12 || d < 1 || d > days_in_month(y, mo) { return err(`No such day: ${text}`) }
+    days_from_civil(y, mo, d)
+}
+
+// The day as text, or null for null: for optional days read from the database.
+fn day_or_null(text) = text == null || text == "" ? null : parse_day(text) ?? null
+
+fn day_text(n: int) -> str {
+    let c = civil_from_days(n)
+    `${c.y}-${pad2(c.m)}-${pad2(c.d)}`
+}
+
+// Monday is 0. 1970-01-01 was a Thursday.
+fn weekday(n: int) -> int = ((n + 3) % 7 + 7) % 7
+
+fn week_start(n: int) -> int = n - weekday(n)
+
+fn is_weekend(n: int) -> bool = weekday(n) >= 5
+
+// "Oct 28", or "Oct 28, 2027" in another year than `year`.
+fn short_day(n: int, year: int? = null) -> str {
+    let c = civil_from_days(n)
+    year == null || c.y == year ? `${MONTHS[c.m - 1]} ${c.d}` : `${MONTHS[c.m - 1]} ${c.d}, ${c.y}`
+}
+
+fn year_of(n: int) -> int = civil_from_days(n).y
+
+// The day a moment falls on, in UTC shifted by `offset_min` minutes east
+// (the viewer's time zone, as the browser reports it).
+fn day_of(ms: int, offset_min: int = 0) -> int = floor((ms + offset_min * 60_000) / DAY_MS)
+
+// Working days from a to b, both counted: weekends left out.
+fn work_days(a: int, b: int) -> int =
+    b < a ? 0 : count(range(a, b + 1), (n) => !is_weekend(n))
+
+// "3d overdue", "due today", "due tomorrow", "due in 5d", "due Nov 30".
+fn due_label(due: int, today: int) -> str {
+    let d = due - today
+    if d < 0 { return `${-d}d overdue` }
+    if d == 0 { return "due today" }
+    if d == 1 { return "due tomorrow" }
+    if d < 14 { return `due in ${d}d` }
+    `due ${short_day(due, year_of(today))}`
+}
+
+// "just now", "5m ago", "3h ago", "2d ago", or the day.
+fn ago(t: int, now_ms: int) -> str {
+    let s = floor((now_ms - t) / 1000)
+    if s < 45 { return "just now" }
+    if s < 3600 { return `${max([floor(s / 60), 1])}m ago` }
+    if s < 86400 { return `${floor(s / 3600)}h ago` }
+    if s < 86400 * 14 { return `${floor(s / 86400)}d ago` }
+    short_day(day_of(t))
+}

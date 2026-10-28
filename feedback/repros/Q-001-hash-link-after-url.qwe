@@ -1,0 +1,25 @@
+// Q-001 A link to a spot on the page scrolls to the top once a component has read url()
+// mode: browser
+// page: /
+// probe: document.getElementById("jump").click(); await new Promise((r) => setTimeout(r, 400)); return { target: !!document.querySelector(":target"), atTop: scrollY < 100 }
+// open-when: "atTop": true
+// fixed-when: "target": true
+// fixed-when: "atTop": false
+// From BUGREPORT1.md (found on 9abef4a).
+
+view Body(note: str) =
+    <div>
+        <p id="top">{note}</p>
+        <div style="height:1500px"></div>
+        <a id="jump" href="#target">Jump to the target</a>
+        <div style="height:2500px"></div>
+        <h2 id="target">Target</h2>
+        <div style="height:2000px"></div>
+    </div>
+
+component Routed() {
+    let u = url()
+    <Body note={`path ${u.path} hash [${u.hash}]`}/>
+}
+
+route GET / = <html><body><Routed/></body></html>

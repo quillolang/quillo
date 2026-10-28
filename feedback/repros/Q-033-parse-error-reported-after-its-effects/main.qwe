@@ -1,0 +1,10 @@
+// Q-033 A parse error in a used file is reported after the errors it causes (unknown names in other files)
+// mode: check
+// open-when: /^main\.qwe:\d+: error: unknown name/
+// fixed-when: /^\.\/lib\/broken\.qwe/
+// From FEEDBACK3.md §6 (found on 896e758): "unknown name `ArticleRoom`" came first; the cause,
+// a parse error in ui/article.qwe, second.
+
+use "lib/broken.qwe"
+
+route GET / = <html><body><Room/></body></html>

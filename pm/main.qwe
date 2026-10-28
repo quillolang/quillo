@@ -1,0 +1,160 @@
+// Lanes: project management on Quillo. Kanban boards that update live for
+// everyone (drag and drop, swimlanes, WIP limits, filters, keyboard moves),
+// tasks with checklists, comments, labels, points, days and dependencies, a
+// timeline (Gantt) whose bars are dragged to reschedule, milestones, and
+// reports drawn from the board's history: cumulative flow, burndown,
+// throughput, cycle time, workload and a Monte Carlo forecast.
+//
+//   quillo run pm/main.qwe --watch                then open http://localhost:8080
+//   PM_DEMO=1 quillo run pm/main.qwe --watch      the same, with people, projects and six weeks of history
+//   quillo check pm/main.qwe
+//
+//   lib/dates.qwe       calendar days, counted by hand (Quillo has no date module)
+//   lib/auth.qwe        joining, signing in, sessions, the viewer's time zone
+//   lib/projects.qwe    projects, members and roles, columns, labels, milestones
+//   lib/tasks.qwe       tasks: the live board, moves, fields, checklist, comments, dependencies
+//   lib/metrics.qwe     the reports' numbers: flow, burndown, throughput, cycle time, forecast
+//   ui/page.qwe         the frame every page uses
+//   ui/charts.qwe       SVG charts as components, with tooltips
+//   ui/board.qwe        <Board>: the Kanban board
+//   ui/task.qwe         <TaskPanel>: one task, beside the board
+//   ui/timeline.qwe     <Timeline>: the Gantt chart
+//   ui/reports.qwe      <Reports> and <Activity>
+//   ui/settings.qwe     <Settings>: columns, milestones, labels, people
+//   ui/pages.qwe        the other pages
+//   seed.qwe            the demo, for PM_DEMO=1
+
+db.open(env("PM_DB", "pm.db"))
+db.migrate("migrations")
+
+use "lib/dates.qwe"
+use "lib/auth.qwe"
+use "lib/projects.qwe"
+use "lib/tasks.qwe"
+use "lib/metrics.qwe"
+use "ui/page.qwe"
+use "ui/charts.qwe"
+use "ui/board.qwe"
+use "ui/task.qwe"
+use "ui/timeline.qwe"
+use "ui/reports.qwe"
+use "ui/settings.qwe"
+use "ui/pages.qwe"
+use "seed.qwe"
+
+if env("PM_DEMO", "") == "1" { seed_demo() }
+
+schedule("1h", clear_sessions)
+
+// The project and the viewer's role in it, or a 404 page: someone outside a
+// project cannot tell it from one that does not exist.
+fn project_for(u, key: str) with db {
+    let p = project_by_key(key)
+    let role = p == null ? null : role_in(p.id, u.id)
+    if role == null { reply 404 <NotFoundPage me={u} what="There is no such project, or you are not in it."/> }
+    merge(p, { role })
+}
+
+route GET / {
+    let u = me()
+    if u == null { return <Landing/> }
+    <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today(request)} form={{}} problem={null}/>
+}
+
+route POST /projects {
+    let u = signed_in("/")
+    let f = request.form
+    let key = create_project(u, NewProject({ name: f.name ?? "", key: f.key ?? "", about: f.about ?? "", color: f.color ?? "" }))
+    if is_err(key) {
+        reply 422 <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today(request)} form={f} problem={key.error}/>
+    }
+    redirect(`/p/${key}`)
+}
+
+route GET /p/:key ? { task: int = 0 } {
+    let u = signed_in(`/p/${key}`)
+    let p = project_for(u, key)
+    let open = task > 0 && task_row(task).project_id == p.id ? task : null
+    <ProjectPage me={u} project={p} tab="Board"><Board project_id={p.id} today={today(request)} open_id={open}/></ProjectPage>
+}
+
+route GET /p/:key/timeline {
+    let u = signed_in(`/p/${key}/timeline`)
+    let p = project_for(u, key)
+    <ProjectPage me={u} project={p} tab="Timeline"><Timeline project_id={p.id} today={today(request)}/></ProjectPage>
+}
+
+route GET /p/:key/reports ? { m: int = 0 } {
+    let u = signed_in(`/p/${key}/reports`)
+    let p = project_for(u, key)
+    <ProjectPage me={u} project={p} tab="Reports"><Reports project_id={p.id} milestone={m > 0 ? m : null}/></ProjectPage>
+}
+
+route GET /p/:key/activity {
+    let u = signed_in(`/p/${key}/activity`)
+    let p = project_for(u, key)
+    <ProjectPage me={u} project={p} tab="Activity"><Activity project_id={p.id}/></ProjectPage>
+}
+
+route GET /p/:key/settings {
+    let u = signed_in(`/p/${key}/settings`)
+    let p = project_for(u, key)
+    <ProjectPage me={u} project={p} tab="Settings"><Settings project_id={p.id} today={today(request)}/></ProjectPage>
+}
+
+// Every task as CSV, for a spreadsheet.
+route GET /p/:key/tasks.csv {
+    let u = signed_in(`/p/${key}`)
+    let p = project_for(u, key)
+    let cell = (v) => {
+        let s = v == null ? "" : str(v)
+        // A leading = + - @ would run as a formula in a spreadsheet.
+        let safe = re.test(s, "^[=+\\-@\\t\\r]") ? `'${s}` : s
+        `"${replace(safe, "\"", "\"\"")}"`
+    }
+    stream((send) => {
+        send("ref,title,status,assignee,priority,points,start,due,created,done\n")
+        for t in db.query(sql`
+            select t.num, t.title, c.name as status, u.name as assignee, t.priority, t.points, t.start_day, t.due_day, t.created, t.done_at
+            from tasks t join columns c on c.id = t.column_id left join users u on u.id = t.assignee_id
+            where t.project_id = ? order by t.num`, p.id) {
+            send(join([cell(`${p.key}-${t.num}`), cell(t.title), cell(t.status), cell(t.assignee), cell(PRIORITIES[t.priority]),
+                cell(t.points), cell(t.start_day), cell(t.due_day), cell(day_text(day_of(t.created))),
+                cell(t.done_at == null ? null : day_text(day_of(t.done_at)))], ",") + "\n")
+        }
+    }, { type: "text/csv; charset=utf-8", headers: { "content-disposition": `attachment; filename="${p.key}-tasks.csv"` } })
+}
+
+// ---- accounts ------------------------------------------------------------
+
+route GET /login ? { next: str = "/" } = <AuthPage mode="login" next={safe_next(next)} form={{}} problem={null}/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.who ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <AuthPage mode="login" next={safe_next(f.next)} form={f} problem={r.error}/> }
+    redirect(safe_next(f.next))
+}
+
+route GET /register ? { next: str = "/" } = <AuthPage mode="register" next={safe_next(next)} form={{}} problem={null}/>
+
+route POST /register {
+    let f = request.form
+    let r = register(f.name ?? "", f.email ?? "", f.password ?? "")
+    if is_err(r) { reply 422 <AuthPage mode="register" next={safe_next(f.next)} form={f} problem={r.error}/> }
+    redirect(safe_next(f.next))
+}
+
+route POST /logout {
+    sign_out()
+    redirect("/")
+}
+
+route GET /static/*path = file("public/" + path)
+
+// The board as JSON, for scripts.
+route GET /api/p/:key {
+    let u = me() ?? reply 401 { error: "sign in first" }
+    let p = project_for(u, key)
+    board_of(p.id, p.role, u.id)
+}

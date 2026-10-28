@@ -1,0 +1,90 @@
+// Moderation: anyone signed in may report a post; moderators see open
+// reports in a queue (/mod), live, and dismiss them, remove the post or
+// suspend its author. What moderators do goes in a log they all see.
+
+let REPORT_REASONS = [["spam", "Spam or advertising"], ["rude", "Rude or abusive"], ["off-topic", "Off topic"], ["other", "Something else"]]
+
+// Suspensions offered, in days; -1 is until lifted, 0 lifts one.
+let BAN_DAYS = [1, 7, 30, -1]
+let FOREVER = 253402300799000
+
+fn log_mod(actor_id: int, action: str, user_id, thread_id, post_id, note: str) with db, time =
+    db.exec("insert into mod_log (actor_id, action, user_id, thread_id, post_id, note, created) values (?, ?, ?, ?, ?, ?, ?)",
+        actor_id, action, user_id, thread_id, post_id, note, now())
+
+server fn report_post(post_id: int, reason: str, note: str) -> str ! str with db, time {
+    let u = acting()?
+    if !any(REPORT_REASONS, (r) => r[0] == reason) { return err("Pick a reason") }
+    let p = db.one("select user_id, deleted from posts where id = ?", post_id)
+    if p == null || p.deleted != 0 { return err("That post is gone") }
+    if p.user_id == u.id { return err("That is your own post") }
+    let r = db.exec("insert or ignore into reports (post_id, user_id, reason, note, created) values (?, ?, ?, ?, ?)",
+        post_id, u.id, reason, slice(trim(note), 0, 500), now())
+    if r.changes == 0 { return err("You have already reported this post") }
+    publish("reports")
+    "Thanks: a moderator will take a look"
+}
+
+// Open reports, one entry for each post reported, oldest first.
+server fn load_reports() with db, time {
+    let u = viewer()
+    if !is_mod(u) { return [] }
+    watch("reports")
+    unwatched(() => db.query(sql`
+        select p.id as post_id, p.thread_id, p.body, p.created, t.title,
+               a.id as author_id, a.name as author, a.hue as author_hue, a.role as author_role, a.banned_until,
+               count(*) as n, group_concat(r.reason, ',') as reasons,
+               coalesce(group_concat(case when r.note != '' then ru.name || ': ' || r.note end, char(10)), '') as notes,
+               min(r.created) as first
+        from reports r
+        join posts p on p.id = r.post_id join threads t on t.id = p.thread_id
+        join users a on a.id = p.user_id join users ru on ru.id = r.user_id
+        where r.status = 'open'
+        group by p.id order by first limit 100`))
+}
+
+// How many posts wait in the queue: the count by the moderator's link.
+server fn load_open_reports() -> int with db, time {
+    if !is_mod(viewer()) { return 0 }
+    watch("reports")
+    unwatched(() => db.one("select count(distinct post_id) as n from reports where status = 'open'").n)
+}
+
+// Closes a post's open reports: "dismiss" leaves the post, "remove" takes it down.
+server fn resolve_reports(post_id: int, action: str) ! str with db, time {
+    let u = acting()?
+    if !is_mod(u) { return err("Moderators only") }
+    if action != "dismiss" && action != "remove" { return err("Dismiss or remove") }
+    let p = db.one("select thread_id, user_id, deleted from posts where id = ?", post_id)
+    if p == null { return err("That post is gone") }
+    if action == "remove" && p.deleted == 0 { take_down(post_id, p.thread_id, 2) }
+    db.exec("update reports set status = ?, resolved_by = ?, resolved_at = ? where post_id = ? and status = 'open'",
+        action == "remove" ? "removed" : "dismissed", u.id, now(), post_id)
+    log_mod(u.id, action == "remove" ? "remove" : "dismiss", p.user_id, p.thread_id, post_id, "")
+    publish("reports")
+    load_reports()
+}
+
+// Suspends someone for `days` (-1: until lifted), or lifts it (0). Moderators
+// cannot suspend moderators or admins; admins can suspend moderators.
+server fn suspend(user_id: int, days: int) ! str with db, time {
+    let u = acting()?
+    if !is_mod(u) { return err("Moderators only") }
+    if days != 0 && !contains(BAN_DAYS, days) { return err("Pick how long") }
+    let target = db.one("select id, name, role from users where id = ?", user_id)
+    if target == null { return err("Nobody has that id") }
+    if target.id == u.id { return err("Not yourself") }
+    if target.role == "admin" || (target.role == "moderator" && !is_admin(u)) { return err("Only an admin suspends a moderator, and nobody an admin") }
+    let until = days == 0 ? null : days < 0 ? FOREVER : now() + days * DAY
+    db.exec("update users set banned_until = ? where id = ?", until, user_id)
+    log_mod(u.id, days == 0 ? "unsuspend" : "suspend", user_id, null, null, days == 0 ? "" : days < 0 ? "until lifted" : plural(days, "day"))
+    publish("reports")
+    load_reports()
+}
+
+fn mod_log_recent() with db = db.query(sql`
+    select l.action, l.note, l.created, l.thread_id, l.post_id,
+           a.name as actor, a.hue as actor_hue, w.name as whom, t.title
+    from mod_log l join users a on a.id = l.actor_id
+    left join users w on w.id = l.user_id left join threads t on t.id = l.thread_id
+    order by l.id desc limit 50`)

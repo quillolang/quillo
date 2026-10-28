@@ -1,0 +1,10 @@
+// Q-016 Run-time errors name a line but not the file, in a program of several files
+// mode: serve
+// get: /err
+// open-when: /error: line \d+:/
+// fixed-when: /rows\.qwe:\d+/
+// From FEEDBACK2.md §5 (found on 896e758).
+
+use "lib/rows.qwe"
+
+route GET /err = helper(5)

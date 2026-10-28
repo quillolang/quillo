@@ -1,0 +1,16 @@
+// Q-015 A view parameter named `key` collides with a list's key; quillo check says nothing
+// mode: serve
+// get: /
+// open-when: GET / -> 500
+// fixed-when: /GET \/ -> 200|cannot take a parameter named `key`/
+// From FEEDBACK2.md §4 (found on 896e758). Fixed either way: the page works, or `key` as a parameter
+// is an error (fe10f8c: "<Row> cannot take a parameter named `key`").
+
+view Row(key: str, label: str) = <li>{key}: {label}</li>
+
+component Keyed() {
+    state xs = [{ id: 1, name: "a" }]
+    <ul>{for x in xs => <Row key={x.id} label={x.name}/>}</ul>
+}
+
+route GET / = <html><body><Keyed/></body></html>

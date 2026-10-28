@@ -1,0 +1,8 @@
+// Q-005 A function named like a builtin replaces it for the whole program, without a warning
+// mode: check
+// fixed-when: /warning.*len/
+// From FEEDBACK.md §2 (found on f1695a3).
+
+fn len(x) = 99
+
+print(len([1]))

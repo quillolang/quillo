@@ -1,0 +1,294 @@
+// The forum's pages, as views: what each route shows. Forms post to routes
+// as plain HTML forms, so joining, signing in and starting a thread work
+// before any script has loaded.
+
+view Sidebar(cats, tags, people, totals) =
+    <aside.side>
+        <section.box>
+            <h3>Community</h3>
+            <dl.totals>
+                <div><dt>Threads</dt><dd>{compact(totals.threads)}</dd></div>
+                <div><dt>Posts</dt><dd>{compact(totals.posts)}</dd></div>
+                <div><dt>People</dt><dd>{compact(totals.people)}</dd></div>
+            </dl>
+            {totals.newest != null && <p.muted>Welcome to our newest member, <a href={`/u/${totals.newest}`}>{totals.newest}</a>.</p>}
+        </section>
+        {len(people) > 0 && <section.box>
+            <h3>Most helpful</h3>
+            <ol.people>{for p in people => <li><Person name={p.name} hue={p.hue}/><span.muted>★ {p.rep}</span></li>}</ol>
+        </section>}
+        {len(tags) > 0 && <section.box>
+            <h3>Tags</h3>
+            <div.cloud>{for g in tags => <a.tag href={`/tag/${g.tag}`}>#{g.tag} <span>{g.n}</span></a>}</div>
+        </section>}
+        <section.box>
+            <h3>Categories</h3>
+            <ul.cats-mini>{for c in cats => <li><CategoryPill slug={c.slug} name={c.name} color={c.color}/><span.muted>{c.threads}</span></li>}</ul>
+        </section>
+    </aside>
+
+view HomePage(me, cats, side, sort: str, page: int) =
+    <Page title="Quillo Forum" {me}>
+        {me == null && <section.hero>
+            <h1>Talk about what you build.</h1>
+            <p>Ask for help, show your work, and follow every reply live. Posts are Markdown,
+            code is highlighted, and the answer that solved a question goes to the top.</p>
+            <a.btn.primary href="/register">Join the forum</a> <a.btn.ghost href="/login">Sign in</a>
+        </section>}
+        <div.layout>
+            <main>
+                <div.cats>{for c in cats => <CategoryCard {c}/>}</div>
+                <h2.section-title>Recent discussions</h2>
+                <ThreadList category_id={null} tag={null} {sort} {page} base="/" signed_in={me != null}/>
+            </main>
+            {side}
+        </div>
+    </Page>
+
+view CategoryPage(me, cat, side, sort: str, page: int) =
+    <Page title={cat.name} {me}>
+        <div.layout>
+            <main>
+                <header.cat-head style={`--c: ${cat.color}`}>
+                    <nav.crumbs><a href="/">Forum</a> <span>›</span></nav>
+                    <h1>{cat.name}</h1>
+                    <p>{cat.about}</p>
+                    <a.btn.primary href={`/new?c=${cat.slug}`}>New thread in {cat.name}</a>
+                </header>
+                <ThreadList category_id={cat.id} tag={null} {sort} {page} base={`/c/${cat.slug}`} signed_in={me != null}/>
+            </main>
+            {side}
+        </div>
+    </Page>
+
+view TagPage(me, tag: str, side, sort: str, page: int) =
+    <Page title={`#${tag}`} {me}>
+        <div.layout>
+            <main>
+                <header.cat-head>
+                    <nav.crumbs><a href="/">Forum</a> <span>›</span></nav>
+                    <h1>#{tag}</h1>
+                </header>
+                <ThreadList category_id={null} {tag} {sort} {page} base={`/tag/${tag}`} signed_in={me != null}/>
+            </main>
+            {side}
+        </div>
+    </Page>
+
+view ThreadPage(me, thread, views: int, last_read: int?) =
+    <Page title={thread.title} {me}>
+        <ThreadView thread_id={thread.id} {me} {views} {last_read}/>
+    </Page>
+
+view NewThreadPage(me, cats, form, problem) =
+    <Page title="New thread" {me}>
+        <main.narrow>
+            <h1>Start a thread</h1>
+            <Problem text={problem}/>
+            <form.stack method="post" action="/new">
+                <label>Category
+                    <select name="category" required>
+                        {for c in cats => <option value={c.slug} selected={form.category == c.slug}>{c.name}</option>}
+                    </select>
+                </label>
+                <label>Title
+                    <input name="title" value={form.title ?? ""} required minlength="5" maxlength="120" placeholder="What is it about?" autofocus/>
+                </label>
+                <div.field>Post <span.muted>Markdown: **bold**, `code`, ```lang blocks, @name mentions</span>
+                    <Editor box_id="new-body" name="body" value={form.body ?? ""} rows={12} required={true}/>
+                </div>
+                <label>Tags <span.muted>up to five, separated by commas</span>
+                    <input name="tags" value={form.tags ?? ""} placeholder="rust, databases"/>
+                </label>
+                <details.box.poll-form open={(form.poll_question ?? "") != ""}>
+                    <summary>📊 Add a poll</summary>
+                    <label>Question
+                        <input name="poll_question" value={form.poll_question ?? ""} maxlength="200" placeholder="Which do you use?"/>
+                    </label>
+                    <label>Options <span.muted>one a line, two to ten</span>
+                        <textarea name="poll_options" rows="4" placeholder={"SQLite\nPostgreSQL\nMySQL"}>{form.poll_options ?? ""}</textarea>
+                    </label>
+                    <div.row-fields>
+                        <label.check><input type="checkbox" name="poll_multiple" checked={form.poll_multiple == "on"}/> Allow several choices</label>
+                        <label>Closes
+                            <select name="poll_days">
+                                {for d in POLL_DAYS => <option value={str(d)} selected={(form.poll_days ?? "0") == str(d)}>{d == 0 ? "never" : `in ${plural(d, "day")}`}</option>}
+                            </select>
+                        </label>
+                    </div>
+                </details>
+                <div.actions><button.btn.primary>Post thread</button> <a.btn.ghost href="/">Cancel</a></div>
+            </form>
+        </main>
+    </Page>
+
+view AuthPage(me, mode: str, next: str, form, problem) =
+    <Page title={mode == "login" ? "Sign in" : "Join"} {me}>
+        <main.auth>
+            <h1>{mode == "login" ? "Welcome back" : "Join the forum"}</h1>
+            <Problem text={problem}/>
+            <form.stack method="post" action={mode == "login" ? "/login" : "/register"}>
+                <input type="hidden" name="next" value={next}/>
+                {mode == "login"
+                    ? <label>Name or email <input name="who" value={form.who ?? ""} required autofocus autocomplete="username"/></label>
+                    : [
+                        <label>Name <span.muted>3–20 letters, digits or _</span>
+                            <input name="name" value={form.name ?? ""} required minlength="3" maxlength="20" autofocus autocomplete="username"/></label>,
+                        <label>Email <input name="email" type="email" value={form.email ?? ""} required autocomplete="email"/></label>,
+                    ]}
+                <label>Password <input name="password" type="password" required minlength={mode == "login" ? null : "8"}
+                    autocomplete={mode == "login" ? "current-password" : "new-password"}/></label>
+                <button.btn.primary>{mode == "login" ? "Sign in" : "Create account"}</button>
+            </form>
+            <p.muted>{mode == "login"
+                ? [<span>New here? </span>, <a href="/register">Join</a>]
+                : [<span>Have an account? </span>, <a href="/login">Sign in</a>]}</p>
+        </main>
+    </Page>
+
+view ProfilePage(me, p, posts) =
+    <Page title={p.name} {me}>
+        <main.profile>
+            <header.profile-head>
+                <Avatar name={p.name} hue={p.hue} size="xl"/>
+                <div>
+                    <h1>{p.name} <RoleBadge role={p.role}/> {is_banned(p) && <span.badge.banned>suspended</span>}</h1>
+                    <p.muted>Joined {ago(p.created)}</p>
+                    {p.bio != "" && <p.bio>{p.bio}</p>}
+                </div>
+            </header>
+            <dl.totals.wide>
+                <div><dt>Reputation</dt><dd>★ {compact(p.rep)}</dd></div>
+                <div><dt>Posts</dt><dd>{compact(p.posts)}</dd></div>
+                <div><dt>Threads</dt><dd>{compact(p.threads)}</dd></div>
+                <div><dt>Solutions</dt><dd>✓ {compact(p.solutions)}</dd></div>
+            </dl>
+            <div.profile-actions>
+                {me != null && me.id != p.id && <a.btn.primary href={`/messages/${p.name}`}>✉ Message</a>}
+                {me != null && me.id == p.id && [
+                    <a.btn.ghost href="/bookmarks">☆ Bookmarks</a>,
+                    <a.btn.ghost href="/messages">✉ Messages</a>,
+                    <a.btn.ghost href="/?sort=following">🔔 Following</a>,
+                    <form.inline.phone-only method="post" action="/logout"><button.btn.ghost>Sign out</button></form>,
+                ]}
+            </div>
+            {me != null && me.id == p.id && <details.box>
+                <summary>Edit your profile</summary>
+                <form.stack method="post" action="/settings">
+                    <label>About you <textarea name="bio" rows="3" maxlength="500">{p.bio}</textarea></label>
+                    <div.actions>
+                        <button.btn.primary>Save</button>
+                    </div>
+                </form>
+                <form.inline method="post" action="/logout?everywhere=1"><button.link.danger>Sign out on every device</button></form>
+            </details>}
+            {is_mod(me) && me.id != p.id && (p.role == "member" || is_admin(me) && p.role == "moderator") && <form.inline.box method="post" action={`/u/${p.name}/suspend`}>
+                <label>{is_banned(p) ? `Suspended, ${left(p.banned_until)}` : "Suspend"}
+                    <select name="days">
+                        {for d in BAN_DAYS => <option value={str(d)}>{d < 0 ? "until lifted" : `for ${plural(d, "day")}`}</option>}
+                        {is_banned(p) && <option value="0" selected>lift it</option>}
+                    </select>
+                </label>
+                <button.btn.ghost.small>Apply</button>
+            </form>}
+            {is_admin(me) && me.id != p.id && <form.inline.box method="post" action={`/u/${p.name}/role`}>
+                <label>Role
+                    <select name="role">{for r in ["member", "moderator", "admin"] => <option value={r} selected={p.role == r}>{r}</option>}</select>
+                </label>
+                <button.btn.ghost.small>Change</button>
+            </form>}
+            <h2.section-title>Recent posts</h2>
+            {len(posts) == 0
+                ? <Empty>No posts yet.</Empty>
+                : <ol.activity>{for x in posts => <li>
+                    <a.title href={`/t/${x.thread_id}#p${x.id}`}>{x.title}</a> <span.muted>{ago(x.created)}</span>
+                    <div.body.clip>{raw(x.html)}</div>
+                </li>}</ol>}
+        </main>
+    </Page>
+
+view NotificationsPage(me, items) =
+    <Page title="Notifications" {me}>
+        <main.narrow>
+            <h1>Notifications</h1>
+            {len(items) == 0
+                ? <Empty>Nothing yet. Replies to your threads, @mentions and accepted answers show up here.</Empty>
+                : <ol.notes>{for n in items => <li class={n.read == 0 && "unread"}>
+                    <Avatar name={n.actor} hue={n.actor_hue} size="sm"/>
+                    <a href={`/t/${n.thread_id}${n.post_id != null ? `#p${n.post_id}` : ""}`}>
+                        <b>{n.actor}</b> {match n.kind {
+                            "reply" => "replied in"
+                            "mention" => "mentioned you in"
+                            "solution" => "accepted your answer in"
+                            _ => "posted in"
+                        }} <b>{n.title}</b>
+                    </a>
+                    <span.muted>{ago(n.created)}</span>
+                </li>}</ol>}
+        </main>
+    </Page>
+
+view SearchPage(me, q: str, page: int, found) =
+    <Page title={q == "" ? "Search" : `“${q}”`} {me} {q}>
+        <main.narrow>
+            <h1>Search</h1>
+            <form.searchbig action="/search" method="get">
+                <input name="q" type="search" value={q} placeholder="Words to find" autofocus/>
+                <button.btn.primary>Search</button>
+            </form>
+            {q != "" && (len(found.results) == 0
+                ? <Empty>Nothing matches “{q}”.</Empty>
+                : <ol.results>{for r in found.results => <li>
+                    <a.title href={`/t/${r.thread_id}#p${r.id}`}>{r.title}</a>
+                    <p.snippet>{marked(r.snippet)}</p>
+                    <span.muted><Person name={r.name} hue={r.hue}/> · {ago(r.created)}</span>
+                </li>}</ol>)}
+            {found.more && <nav.pager><span/><a.btn.ghost href={`/search?q=${url_encode(q)}&page=${page + 1}`}>More results →</a></nav>}
+        </main>
+    </Page>
+
+view BookmarksPage(me, items) =
+    <Page title="Bookmarks" {me}>
+        <main.narrow>
+            <h1>☆ Bookmarks</h1>
+            {len(items) == 0
+                ? <Empty>Nothing saved yet. Press ☆ on any post to keep it here.</Empty>
+                : <ol.activity>{for x in items => <li>
+                    <a.title href={`/t/${x.thread_id}#p${x.id}`}>{x.title}</a>
+                    <span.muted><Person name={x.name} hue={x.hue}/> · {ago(x.created)} · saved {ago(x.saved)}</span>
+                    <p>{excerpt(x.body, 240)}</p>
+                </li>}</ol>}
+        </main>
+    </Page>
+
+view MessagesPage(me) =
+    <Page title="Messages" {me}>
+        <main.narrow>
+            <h1>✉ Messages</h1>
+            <Inbox/>
+        </main>
+    </Page>
+
+view ConversationPage(me, name: str) =
+    <Page title={`Messages with ${name}`} {me}>
+        <main.narrow>
+            <Conversation {name} {me}/>
+        </main>
+    </Page>
+
+view ModPage(me, log) =
+    <Page title="Moderation" {me}>
+        <div.layout>
+            <main>
+                <h1>🛡 Moderation</h1>
+                <p.muted>Posts people reported, oldest first. This list updates by itself.</p>
+                <ModQueue {me}/>
+            </main>
+            <aside.side><ModLog entries={log}/></aside>
+        </div>
+    </Page>
+
+view NotFoundPage(me, what: str) =
+    <Page title="Not found" {me}>
+        <main.narrow><Empty><h1>Not found</h1><p>{what}</p><p><a href="/">Back to the forum</a></p></Empty></main>
+    </Page>

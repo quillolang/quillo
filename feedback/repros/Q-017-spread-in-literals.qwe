@@ -1,0 +1,10 @@
+// Q-017 `{ ...m, k: v }` (in the guide) and `[...xs]` do not parse
+// mode: run
+// open-when: found `..`
+// fixed-when: { a: 1, b: 2 }
+// fixed-when: [1, 2]
+// From FEEDBACK2.md §6 (found on 896e758). The guide shows the map form at "a map's fields are made anew".
+
+let m = { a: 1 }
+print({ ...m, b: 2 })
+print([...[1], 2])

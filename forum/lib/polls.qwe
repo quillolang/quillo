@@ -1,0 +1,87 @@
+// Polls: a thread may start with one. One choice or several, open for good
+// or for some days; results show once you have voted, or it has closed, and
+// follow every vote live (each poll has its topic, `poll:<thread id>`).
+
+let POLL_DAYS = [0, 1, 3, 7, 30]
+
+// The poll in a new-thread form, or null when its fields are empty.
+fn parse_poll(f) ! str {
+    let question = trim(f.poll_question ?? "")
+    let options = split(f.poll_options ?? "", "\n") | map((o) => trim(o)) | filter((o) => o != "") | unique
+    if question == "" && len(options) == 0 { return null }
+    if len(question) < 3 || len(question) > 200 { return err("A poll's question is 3 to 200 characters") }
+    if len(options) < 2 { return err("A poll needs at least two options, one a line") }
+    if len(options) > 10 { return err("A poll has at most ten options") }
+    if any(options, (o) => len(o) > 100) { return err("Keep each poll option under 100 characters") }
+    let days = int(f.poll_days ?? "0") ?? 0
+    {
+        question,
+        options,
+        multiple: f.poll_multiple == "on",
+        days: contains(POLL_DAYS, days) ? days : 0,
+    }
+}
+
+fn save_poll(thread_id: int, poll) with db, time {
+    db.exec("insert into polls (thread_id, question, multiple, closes_at) values (?, ?, ?, ?)",
+        thread_id, poll.question, poll.multiple ? 1 : 0, poll.days > 0 ? now() + poll.days * DAY : null)
+    for [i, o] in enumerate(poll.options) =>
+        db.exec("insert into poll_options (thread_id, position, text) values (?, ?, ?)", thread_id, i, o)
+}
+
+// The poll with each option's votes and the reader's choices, or null.
+server fn load_poll(thread_id: int) with db, time {
+    watch(`poll:${thread_id}`)
+    let u = viewer()
+    unwatched(() => {
+        let p = db.one("select question, multiple, closes_at from polls where thread_id = ?", thread_id)
+        if p == null { return null }
+        let options = db.query(sql`
+            select o.id, o.text,
+                   (select count(*) from poll_votes v where v.option_id = o.id) as votes,
+                   exists (select 1 from poll_votes v where v.option_id = o.id and v.user_id = :me) as mine
+            from poll_options o where o.thread_id = :thread order by o.position`, { thread: thread_id, me: u.id ?? 0 })
+        let voters = db.one("select count(distinct user_id) as n from poll_votes where thread_id = ?", thread_id).n
+        {
+            question: p.question,
+            multiple: p.multiple == 1,
+            closes_at: p.closes_at,
+            closed: p.closes_at != null && p.closes_at <= now(),
+            options,
+            voters,
+            voted: any(options, (o) => o.mine == 1),
+        }
+    })
+}
+
+// Votes for `option_ids` (one, unless the poll takes several), in place of
+// any earlier vote.
+server fn vote_poll(thread_id: int, option_ids: list<int>) ! str with db, time {
+    let u = acting()?
+    let p = db.one("select multiple, closes_at from polls where thread_id = ?", thread_id)
+    if p == null { return err("There is no poll here") }
+    if p.closes_at != null && p.closes_at <= now() { return err("This poll has closed") }
+    let ids = unique(option_ids)
+    if len(ids) == 0 { return err("Pick an option first") }
+    if p.multiple == 0 && len(ids) > 1 { return err("Pick one option") }
+    let valid = db.query("select id from poll_options where thread_id = ?", thread_id) | map((o) => o.id)
+    if !all(ids, (id) => contains(valid, id)) { return err("That is not one of this poll's options") }
+    db.transaction(() => {
+        db.exec("delete from poll_votes where thread_id = ? and user_id = ?", thread_id, u.id)
+        for id in ids => db.exec("insert into poll_votes (thread_id, option_id, user_id, created) values (?, ?, ?, ?)",
+            thread_id, id, u.id, now())
+    })
+    publish(`poll:${thread_id}`)
+    load_poll(thread_id)
+}
+
+// The thread's author or a moderator closes the poll now.
+server fn close_poll(thread_id: int) ! str with db, time {
+    let u = acting()?
+    let t = db.one("select user_id from threads where id = ?", thread_id)
+    if t == null { return err("This thread is gone") }
+    if t.user_id != u.id && !is_mod(u) { return err("Only the thread's author closes its poll") }
+    db.exec("update polls set closes_at = ? where thread_id = ?", now(), thread_id)
+    publish(`poll:${thread_id}`)
+    load_poll(thread_id)
+}

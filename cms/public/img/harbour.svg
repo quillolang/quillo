@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 360" role="img" aria-label="Boats in a harbour at dusk">
+  <defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1e3a8a"/><stop offset="1" stop-color="#f59e0b"/></linearGradient></defs>
+  <rect width="800" height="240" fill="url(#sky)"/><rect y="240" width="800" height="120" fill="#0f2a4a"/>
+  <g fill="#0b1324"><path d="M120 240h140l-20 22H140z"/><path d="M188 240V140l50 90z"/><path d="M420 240h180l-26 26H446z"/><path d="M505 240V110l70 116z"/></g>
+  <g fill="#fde68a"><circle cx="660" cy="80" r="3"/><circle cx="690" cy="95" r="2"/><circle cx="720" cy="70" r="3"/></g>
+</svg>

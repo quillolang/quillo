@@ -1,0 +1,11 @@
+// Q-035 A top-level `let int` in one file takes the builtin int() from every file, with no warning where it is defined
+// mode: check
+// open-when: /^main\.qwe:\d+: error: cannot call `int`: it is int, not a function\n/
+// fixed-when: /lib\/a\.qwe:1/
+// Found reviewing fe10f8c (Q-012's fix: `let` binds type names). A function with a builtin's
+// name gets "hides the builtin" where it is defined; a top-level variable gets nothing there, and
+// the error where the builtin is called does not say where the variable is.
+
+use "lib/a.qwe"
+
+print(int("3") + 1)

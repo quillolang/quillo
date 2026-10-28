@@ -1,0 +1,147 @@
+// Newsroom: a CMS for a publishing house. Articles are made of blocks and
+// move through a flow (Draft → Review → Approval → Published by default):
+// writers write, reviewers and publishers approve (each step can need
+// several people) or send back. Reviewers give feedback on single blocks,
+// live, from as many desks as are open; the author answers; reviewers close
+// it. Designers draw the flows, and make objects: tables with fields, a
+// state machine, forms that make records, transaction forms (the only way a
+// record changes state), and lists; and build desk pages from those blocks.
+//
+//   quillo run cms/main.qwe --watch                 then open http://localhost:8080
+//   CMS_DEMO=1 quillo run cms/main.qwe --watch      with people, articles in review, and an ad desk
+//   quillo check cms/main.qwe
+//
+//   lib/text.qwe       times, slugs, calendar days (Quillo has no date module)
+//   lib/auth.qwe       people, roles, sessions
+//   lib/flows.qwe      flows: steps, transitions, the designer's server fns
+//   lib/blocks.qwe     blocks: types, checking, editing with versions
+//   lib/articles.qwe   articles through their flow: approvals, sending back, publishing
+//   lib/review.qwe     feedback threads on blocks, and who is on the article now
+//   lib/objects.qwe    objects: tables made at run time, fields, forms, lists, transactions
+//   lib/pages.qwe      desk pages built from blocks
+//   ui/page.qwe        the desk's and the site's frames
+//   ui/blocks.qwe      <BlockList>, <BlockEdit>: blocks shown and edited
+//   ui/data.qwe        <ListBlock>, <FormBlock>, <TransactionBlock>
+//   ui/article.qwe     <ArticleRoom>: writing and review, live
+//   ui/flows.qwe       <FlowDesigner> and the flow diagram
+//   ui/objects.qwe     <ObjectDesigner>
+//   ui/pages.qwe       the other screens, and the public site
+//   seed.qwe           the demo, for CMS_DEMO=1
+
+db.open(env("CMS_DB", "cms.db"))
+db.migrate("migrations")
+
+use "lib/text.qwe"
+use "lib/auth.qwe"
+use "lib/flows.qwe"
+use "lib/blocks.qwe"
+use "lib/articles.qwe"
+use "lib/review.qwe"
+use "lib/objects.qwe"
+use "lib/pages.qwe"
+use "ui/page.qwe"
+use "ui/blocks.qwe"
+use "ui/data.qwe"
+use "ui/article.qwe"
+use "ui/flows.qwe"
+use "ui/objects.qwe"
+use "ui/pages.qwe"
+use "seed.qwe"
+
+seed_flows()
+if env("CMS_DEMO", "") == "1" { seed_demo() }
+
+schedule("1h", clear_sessions)
+
+// ---- the public site --------------------------------------------------------
+
+route GET / = <FrontPage me={me()} articles={published()}/>
+
+route GET /news/:slug {
+    let a = db.one("select id, title, slug, author_id, published_at from articles where slug = ? and published_at is not null", slug)
+        ?? reply 404 <NotFound me={me()} what="There is no such story, or it is not published."/>
+    let author = db.one("select name from users where id = ?", a.author_id).name
+    <NewsPage me={me()} {a} {author} blocks={blocks_of(owner_key("article", a.id))}/>
+}
+
+// ---- the desk ----------------------------------------------------------------
+
+route GET /desk {
+    let u = signed_in("/desk")
+    <Desk title="Desk" me={u} on="Desk"><DeskHome me={u}/></Desk>
+}
+
+route GET /desk/articles {
+    let u = signed_in("/desk/articles")
+    <Desk title="Articles" me={u} on="Articles" wide={true}><ArticlesBoard me={u}/></Desk>
+}
+
+route GET /desk/a/:id(int) {
+    let u = signed_in(`/desk/a/${id}`)
+    let a = article_row(id) ?? reply 404 <NotAllowed me={u} what="There is no such article, or it was deleted."/>
+    <Desk title={a.title} me={u} on="Articles" wide={true}><ArticleRoom article_id={id}/></Desk>
+}
+
+route GET /desk/flows {
+    let u = needs("/desk/flows", ["designer"])
+    <Desk title="Flows" me={u} on="Flows"><FlowsPage/></Desk>
+}
+
+route GET /desk/flows/:id(int) {
+    let u = needs(`/desk/flows/${id}`, ["designer"])
+    <Desk title="Flow" me={u} on="Flows" wide={true}><FlowDesigner flow_id={id}/></Desk>
+}
+
+route GET /desk/objects {
+    let u = needs("/desk/objects", ["designer"])
+    <Desk title="Objects" me={u} on="Objects"><ObjectsPage/></Desk>
+}
+
+route GET /desk/objects/:id(int) {
+    let u = needs(`/desk/objects/${id}`, ["designer"])
+    <Desk title="Object" me={u} on="Objects" wide={true}><ObjectDesigner object_id={id}/></Desk>
+}
+
+route GET /desk/pages {
+    let u = signed_in("/desk/pages")
+    <Desk title="Pages" me={u} on="Pages"><PagesPage me={u}/></Desk>
+}
+
+route GET /desk/p/:slug {
+    let u = signed_in(`/desk/p/${slug}`)
+    let p = db.one("select id, title, roles from pages where slug = ?", slug) ?? reply 404 <NotAllowed me={u} what="There is no such page."/>
+    if !may_see_page(u, p) { reply 403 <NotAllowed me={u} what="This page is for other roles."/> }
+    <Desk title={p.title} me={u} on="Pages" wide={true}><PageScreen page_id={p.id}/></Desk>
+}
+
+route GET /desk/people {
+    let u = needs("/desk/people", ["admin"])
+    <Desk title="People" me={u} on="People"><People/></Desk>
+}
+
+// ---- accounts ----------------------------------------------------------------
+
+route GET /login ? { next: str = "/desk" } = <AuthPage mode="login" next={safe_next(next)} form={{}} problem={null}/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.who ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <AuthPage mode="login" next={safe_next(f.next)} form={f} problem={r.error}/> }
+    redirect(safe_next(f.next))
+}
+
+route GET /register = <AuthPage mode="register" next="/desk" form={{}} problem={null}/>
+
+route POST /register {
+    let f = request.form
+    let r = register(f.name ?? "", f.email ?? "", f.password ?? "")
+    if is_err(r) { reply 422 <AuthPage mode="register" next="/desk" form={f} problem={r.error}/> }
+    redirect("/desk")
+}
+
+route POST /logout {
+    sign_out()
+    redirect("/")
+}
+
+route GET /static/*path = file("public/" + path)

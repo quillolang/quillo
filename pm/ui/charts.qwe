@@ -1,0 +1,241 @@
+// Charts drawn as SVG by components, so they follow live data and show a
+// tooltip under the pointer. No chart library: the shapes are worked out
+// here, from the numbers lib/metrics.qwe gives. Colours are CSS variables
+// (--s1 ... --s8, the series slots, in fixed order; see public/css/pm.css).
+
+let CW = 640
+let CH = 240
+let PL = 40
+let PR = 14
+let PT = 14
+let PB = 28
+
+// A round step for about `n` ticks up to `top`: 1, 2 or 5 times a power of ten.
+fn nice_step(top, n: int = 4) {
+    if top <= 0 { return 1 }
+    let raw = top / n
+    let p = pow(10, floor(math.log10(raw)))
+    let f = raw / p
+    let s = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10
+    max([s * p, 1])
+}
+
+fn axis_of(top) {
+    let step = nice_step(top)
+    let hi = max([ceil(top / step) * step, step])
+    { hi, ticks: range(0, int(hi / step) + 1) | map((i) => i * step) }
+}
+
+fn r1(x) = round(x, 1)
+
+// x of item i of n across the plot; y of value v with `hi` at the top.
+fn xi(i: int, n: int, w = CW) = r1(PL + (n <= 1 ? 0 : i * (w - PL - PR) / (n - 1)))
+fn yv(v, hi) = r1(CH - PB - v * (CH - PT - PB) / hi)
+
+// A number for people to read, with at most one decimal. Written the same on
+// the server and in the browser: a whole float is "8.0" on the server but "8"
+// in the browser, and a page whose text differs is made again on load.
+fn num1(x) -> str {
+    let r = round(float(x), 1)
+    r == floor(r) ? str(int(r)) : str(r)
+}
+
+fn compact_num(n) = n >= 1000 ? `${num1(n / 1000)}K` : num1(n)
+
+view YAxis(ticks: list, hi, w = CW) =
+    <g.axis>
+        {for t in ticks => <g key={t}>
+            <line.grid x1={PL} x2={w - PR} y1={yv(t, hi)} y2={yv(t, hi)}/>
+            <text.tick x={PL - 6} y={yv(t, hi) + 4} text-anchor="end">{compact_num(t)}</text>
+        </g>}
+    </g>
+
+// Day labels under the plot, about six of them.
+view XDays(days: list, year: int, w = CW) {
+    let n = len(days)
+    let every = max([ceil(n / 6), 1])
+    <g.axis>
+        <line.base x1={PL} x2={w - PR} y1={CH - PB} y2={CH - PB}/>
+        {for [i, d] in enumerate(days) => i % every == 0 &&
+            <text.tick key={d} x={xi(i, n, w)} y={CH - 8} text-anchor="middle">{short_day(d, year)}</text>}
+    </g>
+}
+
+view Legend(items: list) =
+    <ul.legend>
+        {for it in items => <li key={it.label}><i class={`sw ${it.cls}`}/>{it.label}</li>}
+    </ul>
+
+// Where a tooltip sits over the chart: x as a share of the width.
+fn tip_style(x, w = CW) -> str {
+    let pct = r1(x / w * 100)
+    pct > 60 ? `right: ${r1(100 - pct + 2)}%` : `left: ${r1(pct + 2)}%`
+}
+
+// ---- cumulative flow -----------------------------------------------------
+
+// Stacked bands, the last column (done) at the bottom: each band's height is
+// how many cards were in that column at the end of the day.
+component FlowChart(flow: list, columns: list, year: int) {
+    state hover = null
+    let W = 1280
+    let n = len(flow)
+    let order = reverse(range(len(columns)))
+    let totals = flow | map((r) => sum(r.counts))
+    let ax = axis_of(max(totals) ?? 1)
+    // below[k][i]: what lies under band k on day i.
+    let below = for [j, k] in enumerate(order) => flow | map((r) => sum(take(r.counts | reverse, j)))
+    let band = (j, k) => {
+        let top = for [i, r] in enumerate(flow) => `${xi(i, n, W)},${yv(below[j][i] + r.counts[k], ax.hi)}`
+        let bottom = for [i, r] in enumerate(flow) => `${xi(i, n, W)},${yv(below[j][i], ax.hi)}`
+        `M${join(top, " L")} L${join(reverse(bottom), " L")} Z`
+    }
+    let days = flow | map((r) => r.day)
+    <figure.chart>
+        <div.plot>
+            <svg viewBox={`0 0 ${W} ${CH}`} role="img" aria-label="Cumulative flow: cards in each column, day by day"
+                 @mouseleave={() => { hover = null }}>
+                <YAxis ticks={ax.ticks} hi={ax.hi} w={W}/>
+                {n > 1 && for [j, k] in enumerate(order) => <path key={columns[k].id} class={`band s${k % 8 + 1}`} d={band(j, k)}/>}
+                <XDays {days} {year} w={W}/>
+                {hover != null && <line.cross x1={xi(hover, n, W)} x2={xi(hover, n, W)} y1={PT} y2={CH - PB}/>}
+                {for [i, d] in enumerate(days) => <rect.hit key={d} x={xi(i, n, W) - (W - PL - PR) / max([n - 1, 1]) / 2} y={PT}
+                    width={(W - PL - PR) / max([n - 1, 1])} height={CH - PT - PB} @mouseenter={() => { hover = i }}/>}
+            </svg>
+            {hover != null && <div.tip style={tip_style(xi(hover, n, W), W)}>
+                <b>{short_day(flow[hover].day, year)}</b>
+                {for [k, c] in enumerate(columns) => <span key={c.id}><i class={`sw s${k % 8 + 1}`}/>{c.name} <b>{flow[hover].counts[k]}</b></span>}
+            </div>}
+        </div>
+        <Legend items={for [k, c] in enumerate(columns) => { label: c.name, cls: `s${k % 8 + 1}` }}/>
+    </figure>
+}
+
+// ---- burndown ------------------------------------------------------------
+
+component BurndownChart(b, year: int) {
+    state hover = null
+    let span = range(b.start, b.due + 1)
+    let n = len(span)
+    let ax = axis_of(max(b.days | map((d) => d.scope)) ?? 1)
+    let x = (day) => xi(day - b.start, n)
+    let line = (key) => join(b.days | map((d) => `${x(d.day)},${yv(d[key], ax.hi)}`), " L")
+    <figure.chart>
+        <div.plot>
+            <svg viewBox={`0 0 ${CW} ${CH}`} role="img" aria-label={`Burndown of ${b.milestone.name}`}
+                 @mouseleave={() => { hover = null }}>
+                <YAxis ticks={ax.ticks} hi={ax.hi}/>
+                <XDays days={span} {year}/>
+                <path.ideal d={`M${x(b.ideal[0].day)},${yv(b.ideal[0].left, ax.hi)} L${x(b.ideal[1].day)},${yv(0, ax.hi)}`}/>
+                {len(b.days) > 0 && <path.line.s4 d={`M${line("scope")}`}/>}
+                {len(b.days) > 0 && <path.line.s1 d={`M${line("left")}`}/>}
+                {len(b.days) > 0 && <circle.dot.s1 cx={x(last(b.days).day)} cy={yv(last(b.days).left, ax.hi)} r="4"/>}
+                {hover != null && <line.cross x1={x(b.days[hover].day)} x2={x(b.days[hover].day)} y1={PT} y2={CH - PB}/>}
+                {for [i, d] in enumerate(b.days) => <rect.hit key={d.day} x={x(d.day) - (CW - PL - PR) / max([n - 1, 1]) / 2} y={PT}
+                    width={(CW - PL - PR) / max([n - 1, 1])} height={CH - PT - PB} @mouseenter={() => { hover = i }}/>}
+            </svg>
+            {hover != null && <div.tip style={tip_style(x(b.days[hover].day))}>
+                <b>{short_day(b.days[hover].day, year)}</b>
+                <span><i.sw.s1/>Left <b>{b.days[hover].left}</b></span>
+                <span><i.sw.s4/>Scope <b>{b.days[hover].scope}</b></span>
+            </div>}
+        </div>
+        <Legend items={[{ label: "Points left", cls: "s1" }, { label: "Scope", cls: "s4" }, { label: "Ideal", cls: "ideal" }]}/>
+    </figure>
+}
+
+// ---- throughput ----------------------------------------------------------
+
+component ThroughputChart(weeks: list, year: int) {
+    state hover = null
+    let n = len(weeks)
+    let ax = axis_of(max(weeks | map((w) => w.count)) ?? 1)
+    let slot = (CW - PL - PR) / n
+    let bw = min([24, slot * 0.6])
+    let cx = (i) => r1(PL + slot * i + slot / 2)
+    <figure.chart>
+        <div.plot>
+            <svg viewBox={`0 0 ${CW} ${CH}`} role="img" aria-label="Tasks finished each week" @mouseleave={() => { hover = null }}>
+                <YAxis ticks={ax.ticks} hi={ax.hi}/>
+                <line.base x1={PL} x2={CW - PR} y1={CH - PB} y2={CH - PB}/>
+                {for [i, w] in enumerate(weeks) => <g key={w.week}>
+                    {w.count > 0 && <path class={`bar s1 ${hover == i ? "on" : ""}`} d={bar_path(cx(i) - bw / 2, yv(w.count, ax.hi), bw, CH - PB)}/>}
+                    {w.count > 0 && <text.cap x={cx(i)} y={yv(w.count, ax.hi) - 5} text-anchor="middle">{w.count}</text>}
+                    {i % 2 == (n - 1) % 2 && <text.tick x={cx(i)} y={CH - 8} text-anchor="middle">{short_day(w.week, year)}</text>}
+                    <rect.hit x={PL + slot * i} y={PT} width={slot} height={CH - PT - PB} @mouseenter={() => { hover = i }}/>
+                </g>}
+            </svg>
+            {hover != null && <div.tip style={tip_style(cx(hover))}>
+                <b>Week of {short_day(weeks[hover].week, year)}</b>
+                <span>{weeks[hover].count} tasks · {weeks[hover].points} points</span>
+            </div>}
+        </div>
+    </figure>
+}
+
+// A column with a 4px rounded top and a square foot on the baseline.
+fn bar_path(x, y, w, base) {
+    let r = min([4, w / 2, (base - y) / 2])
+    `M${r1(x)},${r1(base)} V${r1(y + r)} Q${r1(x)},${r1(y)} ${r1(x + r)},${r1(y)} H${r1(x + w - r)} Q${r1(x + w)},${r1(y)} ${r1(x + w)},${r1(y + r)} V${r1(base)} Z`
+}
+
+// ---- cycle time ----------------------------------------------------------
+
+// Each finished task as a dot: when it finished, and how many days it took
+// from starting. Lines at the 50th and 85th percentiles.
+component CycleChart(cycle, from_day: int, to_day: int, year: int) {
+    state hover = null
+    let items = cycle.items | filter((t) => t.day >= from_day)
+    let span = range(from_day, to_day + 1)
+    let n = len(span)
+    let ax = axis_of(max((items | map((t) => t.days)) + [cycle.p85 ?? 1]) ?? 1)
+    let x = (day) => xi(day - from_day, n)
+    <figure.chart>
+        <div.plot>
+            <svg viewBox={`0 0 ${CW} ${CH}`} role="img" aria-label="Cycle time of each finished task" @mouseleave={() => { hover = null }}>
+                <YAxis ticks={ax.ticks} hi={ax.hi}/>
+                <XDays days={span} {year}/>
+                {cycle.p50 != null && <g>
+                    <line.pct x1={PL} x2={CW - PR} y1={yv(cycle.p50, ax.hi)} y2={yv(cycle.p50, ax.hi)}/>
+                    <text.pct-label x={CW - PR - 2} y={yv(cycle.p50, ax.hi) - 4} text-anchor="end">50% · {num1(cycle.p50)}d</text>
+                    <line.pct x1={PL} x2={CW - PR} y1={yv(cycle.p85, ax.hi)} y2={yv(cycle.p85, ax.hi)}/>
+                    <text.pct-label x={CW - PR - 2} y={yv(cycle.p85, ax.hi) - 4} text-anchor="end">85% · {num1(cycle.p85)}d</text>
+                </g>}
+                {for [i, t] in enumerate(items) => <circle key={t.id} class={`dot s1 ${hover == i ? "on" : ""}`}
+                    cx={x(t.day)} cy={yv(t.days, ax.hi)} r={hover == i ? 6 : 4} @mouseenter={() => { hover = i }}/>}
+            </svg>
+            {hover != null && hover < len(items) && <div.tip style={tip_style(x(items[hover].day))}>
+                <b>#{items[hover].num} {items[hover].title}</b>
+                <span>{num1(items[hover].days)} days · done {short_day(items[hover].day, year)}</span>
+            </div>}
+        </div>
+    </figure>
+}
+
+// ---- who has what --------------------------------------------------------
+
+// Open points per person, split by priority: HTML bars, widest first.
+view Workload(people: list, unassigned: int) {
+    let top = max(people | map((p) => p.count)) ?? 0
+    <div.workload>
+        {for p in people => <div.wl-row key={p.name}>
+            <span.wl-name><Avatar name={p.name} hue={p.hue} size="sm"/> {p.name}</span>
+            <span.wl-bar style={`width: ${top == 0 ? 0 : round(p.count / top * 100)}%`}>
+                {for k in reverse(range(5)) => p.by_priority[k] > 0 &&
+                    <i key={k} class={`seg p${k}`} style={`flex-grow: ${p.by_priority[k]}`}
+                       title={`${PRIORITIES[k]}: ${p.by_priority[k]}`}/>}
+            </span>
+            <span.wl-num><b>{p.points}</b> pts · {p.count}</span>
+        </div>}
+        {unassigned > 0 && <p.muted>{unassigned} open {unassigned == 1 ? "task has" : "tasks have"} nobody on {unassigned == 1 ? "it" : "them"}.</p>}
+        <Legend items={for k in reverse(range(5)) => { label: PRIORITIES[k], cls: `p${k}` }}/>
+    </div>
+}
+
+// A number with its label, and a line under it.
+view Stat(label: str, value, note = null, tone: str = "") =
+    <div class={`stat ${tone}`}>
+        <span.stat-label>{label}</span>
+        <b.stat-value>{value}</b>
+        {note != null && <span.stat-note>{note}</span>}
+    </div>

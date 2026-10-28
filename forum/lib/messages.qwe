@@ -1,0 +1,100 @@
+// Private messages: one conversation for each pair of people, live on both
+// sides. A conversation's page follows `dm:<id>-<id>` (the pair, smaller id
+// first), and each person's inbox and its unread count follow `inbox:<id>`.
+
+let MESSAGES_A_MINUTE = 30
+
+fn pair_topic(a: int, b: int) -> str = a < b ? `dm:${a}-${b}` : `dm:${b}-${a}`
+
+fn conversation_of(a: int, b: int) with db =
+    db.one("select id from conversations where a_id = ? and b_id = ?", min([a, b]), max([a, b]))
+
+// Everyone's conversations, newest first, with the last message and how many
+// the reader has not read.
+server fn load_inbox() with db, time {
+    let u = viewer()
+    if u == null { return [] }
+    watch(`inbox:${u.id}`)
+    unwatched(() => db.query(sql`
+        select c.id, c.last_at, o.name, o.hue, m.body as last_body, m.user_id = :me as last_mine,
+               (select count(*) from messages x
+                 where x.conversation_id = c.id and x.user_id != :me
+                   and x.id > coalesce((select r.last_id from message_reads r where r.user_id = :me and r.conversation_id = c.id), 0)) as unread
+        from conversations c
+        join users o on o.id = case when c.a_id = :me then c.b_id else c.a_id end
+        join messages m on m.id = (select max(id) from messages where conversation_id = c.id)
+        where c.a_id = :me or c.b_id = :me
+        order by c.last_at desc limit 100`, { me: u.id }))
+}
+
+// How many conversations have something unread: the count by the envelope.
+server fn load_unread_messages() -> int with db, time {
+    let u = viewer()
+    if u == null { return 0 }
+    watch(`inbox:${u.id}`)
+    unwatched(() => db.one(sql`
+        select count(*) as n from conversations c
+        where (c.a_id = :me or c.b_id = :me)
+          and exists (select 1 from messages x
+                       where x.conversation_id = c.id and x.user_id != :me
+                         and x.id > coalesce((select r.last_id from message_reads r where r.user_id = :me and r.conversation_id = c.id), 0))`,
+        { me: u.id }).n)
+}
+
+// The conversation with `name`: who they are and the last 200 messages.
+// Loading it marks it read, so what arrives while the page is open is not
+// counted as unread.
+server fn load_messages(name: str) with db, time {
+    let u = viewer()
+    if u == null { return null }
+    let other = db.one("select id, name, hue, role from users where name = ?", name)
+    if other == null { return null }
+    watch(pair_topic(u.id, other.id))
+    let c = conversation_of(u.id, other.id)
+    let messages = c == null ? [] : unwatched(() => db.query(sql`
+        select * from (
+            select m.id, m.user_id, m.html, m.created from messages m
+            where m.conversation_id = ? order by m.id desc limit 200
+        ) order by id`, c.id))
+    if len(messages) > 0 { read_up_to(u.id, c.id, last(messages).id) }
+    { other, messages }
+}
+
+server fn send_message(to: str, body: str) ! str with db, time {
+    let u = acting()?
+    let other = db.one("select id from users where name = ?", to)
+    if other == null { return err("Nobody here goes by that name") }
+    if other.id == u.id { return err("That is you") }
+    check_body(body)?
+    if !rate_limit(`messages:${u.id}`, MESSAGES_A_MINUTE, "1m") { return err("Slow down a little, then send again") }
+    db.transaction(() => {
+        let a = min([u.id, other.id])
+        let b = max([u.id, other.id])
+        db.exec("insert or ignore into conversations (a_id, b_id, created, last_at) values (?, ?, ?, ?)", a, b, now(), now())
+        let c = conversation_of(a, b)
+        let m = db.exec("insert into messages (conversation_id, user_id, body, html, created) values (?, ?, ?, ?, ?)",
+            c.id, u.id, body, render(body), now()).last_id
+        db.exec("update conversations set last_at = ? where id = ?", now(), c.id)
+        mark_messages_read(u.id, c.id, m)
+        m
+    })
+    publish(pair_topic(u.id, other.id))
+    publish(`inbox:${u.id}`)
+    publish(`inbox:${other.id}`)
+    load_messages(to)
+}
+
+fn mark_messages_read(user_id: int, conversation_id: int, last_id: int) with db = db.exec(sql`
+    insert into message_reads (user_id, conversation_id, last_id) values (?, ?, ?)
+    on conflict (user_id, conversation_id) do update set last_id = max(last_id, excluded.last_id)`,
+    user_id, conversation_id, last_id)
+
+// Marks the conversation read up to `last_id`, and tells the reader's inbox
+// and envelope when that changed anything.
+fn read_up_to(user_id: int, conversation_id: int, last_id: int) with db {
+    let before = (db.one("select last_id from message_reads where user_id = ? and conversation_id = ?", user_id, conversation_id) ?? {}).last_id
+    if before == null || before < last_id {
+        mark_messages_read(user_id, conversation_id, last_id)
+        publish(`inbox:${user_id}`)
+    }
+}

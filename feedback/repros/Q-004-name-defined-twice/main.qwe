@@ -1,0 +1,10 @@
+// Q-004 A second definition of a name (in another file) silently replaces the first
+// mode: check
+// open-when: /main\.qwe: ok/
+// fixed-when: /helper/
+// From FEEDBACK.md §2 (found on f1695a3).
+
+use "lib/x.qwe"
+use "lib/y.qwe"
+
+print(helper())

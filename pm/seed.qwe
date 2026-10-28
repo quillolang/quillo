@@ -1,0 +1,138 @@
+// The demo (PM_DEMO=1): four people, two projects, and six weeks of
+// history in the first, made up the same way every time, so the reports
+// have something to show. Everyone's password is password123.
+
+let SEED_PEOPLE = ["ada", "grace", "linus", "margaret"]
+let SEED_TITLES = [
+    "Audit the current site's pages", "Pick the type scale", "Navigation: mobile menu", "Hero section", "Pricing page layout",
+    "Contact form with spam check", "Image pipeline: AVIF and WebP", "Blog index and pagination", "Search across docs",
+    "Dark mode tokens", "Footer and sitemap", "Cookie banner, done properly", "Redirects from the old URLs",
+    "Lighthouse budget in CI", "Accessibility pass: forms", "Accessibility pass: colour contrast", "404 and 500 pages",
+    "Newsletter sign-up", "Case study template", "Team page photos", "Analytics without cookies", "Open Graph images",
+    "Docs: getting started", "Docs: API reference layout", "Changelog page", "Status page link", "RSS feed",
+    "Fix the jumpy header on Safari", "Typos on the about page", "Load fonts without layout shift", "Preview deploys for PRs",
+    "Staging password", "Sitemap.xml", "Robots.txt rules", "Pricing toggle: monthly/yearly", "FAQ accordion",
+    "Testimonials carousel", "Logo wall", "Careers page", "Legal pages review", "Translations: French", "Translations: German",
+    "Print stylesheet for docs", "Copy review with marketing", "Launch checklist", "Load test the contact form",
+    "Error tracking", "Uptime alerts", "Old blog posts: fix images", "Canonical URLs",
+]
+let SEED_COMMENTS = [
+    "I can take this one after the review.", "Blocked on copy from marketing, I'll ping them.",
+    "Looks good on my phone 👍", "Can we keep this under **100 KB**?", "Moved to review, have a look when you can.",
+    "Found an edge case with long names: see the screenshot in the thread.",
+]
+
+let SEED_RNG = 20261028
+
+// The same numbers every time: a linear congruential generator.
+fn seed_rand(n: int) -> int {
+    SEED_RNG = (SEED_RNG * 1103515245 + 12345) % 2147483648
+    floor(SEED_RNG / 65536) % n
+}
+
+fn seed_demo() with db, time, random {
+    if db.one("select count(*) as n from users").n > 0 { return null }
+    print("PM_DEMO: making the demo people, projects and history")
+    let hash = crypto.hash_password("password123")
+    let hues = [210, 25, 150, 300]
+    let ids = for [i, name] in enumerate(SEED_PEOPLE) =>
+        db.exec("insert into users (name, email, password_hash, hue, created) values (?, ?, ?, ?, ?)",
+            name, `${name}@example.com`, hash, hues[i], now() - 60 * DAY_MS).last_id
+    let ada = { id: ids[0], name: "ada", hue: 210 }
+    let grace = { id: ids[1], name: "grace", hue: 25 }
+    create_project(ada, NewProject({ name: "Website relaunch", key: "WEB", about: "The new marketing site and docs, live before the conference.", color: "#4f46e5" }))
+    create_project(grace, NewProject({ name: "Mobile app", key: "MOB", about: "iOS and Android, one codebase.", color: "#059669" }))
+    let web = project_by_key("WEB").id
+    let mob = project_by_key("MOB").id
+    db.exec("insert into members (project_id, user_id, role) values (?, ?, 'editor'), (?, ?, 'editor'), (?, ?, 'viewer')",
+        web, ids[1], web, ids[2], web, ids[3])
+    db.exec("insert into members (project_id, user_id, role) values (?, ?, 'editor')", mob, ids[0])
+    db.transaction(() => seed_history(web, ids))
+    db.transaction(() => seed_small(mob, [ids[0], ids[1]]))
+}
+
+// Six weeks of a project: tasks made over five weeks, each moving along the
+// columns at its own pace, finished ones mostly the older ones.
+fn seed_history(pid: int, people: list<int>) with db, time {
+    let cols = columns_of(pid)
+    let col_ids = cols | map((c) => c.id)
+    let labels = labels_of(pid) | map((l) => l.id)
+    let now_ms = now()
+    let today_n = day_of(now_ms)
+    let begin = now_ms - 42 * DAY_MS
+    db.exec("update projects set created = ? where id = ?", begin, pid)
+    db.exec("update activity set at = ? where project_id = ?", begin, pid)
+    let ms = for [name, a, b] in [["Beta", today_n - 40, today_n - 12], ["Launch", today_n - 11, today_n + 10], ["Polish", today_n + 11, today_n + 32]] =>
+        db.exec("insert into milestones (project_id, name, start_day, due_day) values (?, ?, ?, ?)", pid, name, day_text(a), day_text(b)).last_id
+    let task_ids = []
+    let n = 0
+    while n < len(SEED_TITLES) {
+        let made = begin + seed_rand(36) * DAY_MS + seed_rand(9 * 3600) * 1000 + 8 * 3600 * 1000
+        let points = [1, 2, 3, 3, 5, 5, 8][seed_rand(7)]
+        let who = seed_rand(5) < 4 ? people[seed_rand(3)] : null
+        let first_col = seed_rand(3) == 0 ? 0 : 1
+        let milestone = made < now_ms - 28 * DAY_MS ? ms[0] : made < now_ms - 10 * DAY_MS ? ms[1] : seed_rand(2) == 0 ? ms[1] : ms[2]
+        let tnum = n + 1
+        let tid = db.exec(sql`insert into tasks (project_id, num, title, column_id, position, priority, assignee_id, points,
+                                  milestone_id, created, created_by, updated)
+                              values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            pid, tnum, SEED_TITLES[n], col_ids[first_col], n, seed_rand(5), who, points, milestone, made, people[0], made).last_id
+        db.exec("insert into moves (project_id, task_id, column_id, at) values (?, ?, ?, ?)", pid, tid, col_ids[first_col], made)
+        db.exec("insert into activity (project_id, task_id, user_id, at, text) values (?, ?, ?, ?, ?)",
+            pid, tid, people[0], made, `created WEB-${tnum} ${SEED_TITLES[n]}`)
+        // Along the columns: each step takes half a day to four days, longer for bigger tasks.
+        let at = made
+        let stage = first_col
+        let started = null
+        let done = null
+        let going = true
+        while going && stage < len(col_ids) - 1 && seed_rand(10) < 8 {
+            let wait = (12 + seed_rand(72) + points * seed_rand(10)) * 3600 * 1000
+            if at + wait > now_ms { going = false } else {
+                at += wait
+                stage += 1
+                db.exec("insert into moves (project_id, task_id, column_id, at) values (?, ?, ?, ?)", pid, tid, col_ids[stage], at)
+                db.exec("insert into activity (project_id, task_id, user_id, at, text) values (?, ?, ?, ?, ?)",
+                    pid, tid, who ?? people[0], at, `moved WEB-${tnum} to ${cols[stage].name}`)
+                if cols[stage].kind == "doing" && started == null { started = at }
+                if cols[stage].kind == "done" { done = at }
+            }
+        }
+        // Days: planned from when it was made, about a day per point.
+        let start_n = day_of(made) + seed_rand(4)
+        let due_n = start_n + points + seed_rand(4)
+        db.exec(sql`update tasks set column_id = ?, started_at = ?, done_at = ?, updated = ?, start_day = ?, due_day = ? where id = ?`,
+            col_ids[stage], started ?? done, done, at, day_text(start_n), day_text(due_n), tid)
+        if seed_rand(3) == 0 { db.exec("insert into task_labels (task_id, label_id) values (?, ?)", tid, labels[seed_rand(len(labels))]) }
+        if seed_rand(4) == 0 {
+            db.exec("insert into checklist (task_id, text, done, position) values (?, 'Design', 1, 0), (?, 'Build', ?, 1), (?, 'Check on phones', 0, 2)",
+                tid, tid, done != null ? 1 : 0, tid)
+        }
+        if seed_rand(4) == 0 {
+            db.exec("insert into comments (task_id, user_id, body, created) values (?, ?, ?, ?)",
+                tid, people[seed_rand(3)], SEED_COMMENTS[seed_rand(len(SEED_COMMENTS))], min([at + 3600 * 1000, now_ms]))
+        }
+        task_ids = push(task_ids, tid)
+        n += 1
+    }
+    db.exec("update projects set next_num = ? where id = ?", len(SEED_TITLES) + 1, pid)
+    // A few tasks wait for others.
+    for [a, b] in [[45, 44], [45, 14], [26, 23], [13, 2], [50, 46], [40, 41], [24, 23]] {
+        db.exec("insert or ignore into deps (task_id, blocked_by) values (?, ?)", task_ids[a - 1], task_ids[b - 1])
+    }
+    // Positions within each column, by number.
+    for c in col_ids {
+        let in_col = db.query("select id from tasks where column_id = ? order by priority desc, num", c)
+        for [i, t] in enumerate(in_col) { db.exec("update tasks set position = ? where id = ?", i, t.id) }
+    }
+}
+
+fn seed_small(pid: int, people: list<int>) with db, time {
+    for [i, title] in enumerate(["Sign-in screen", "Push notifications", "Offline mode", "App icon", "Store listing"]) {
+        let col = columns_of(pid)[i % 3].id
+        let id = db.exec(sql`insert into tasks (project_id, num, title, column_id, position, priority, assignee_id, points, created, created_by, updated)
+                             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, pid, i + 1, title, col, i, 2, people[i % 2], 3, now(), people[1], now()).last_id
+        db.exec("insert into moves (project_id, task_id, column_id, at) values (?, ?, ?, ?)", pid, id, col, now())
+    }
+    db.exec("update projects set next_num = 6 where id = ?", pid)
+}

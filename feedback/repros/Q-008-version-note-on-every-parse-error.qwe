@@ -1,0 +1,9 @@
+// Q-008 The "code written for a newer Quillo" note follows parse errors that have nothing to do with versions
+// mode: check
+// open-when: newer Quillo
+// fixed-when: to close the list
+// From FEEDBACK.md §5 (found on f1695a3). On 896e758 the two examples given there (`fn reply`,
+// `e.target.value = ""`) have messages of their own, but a plain typo still gets the note,
+// and so does `{ ...m }` (FEEDBACK2.md §6).
+
+let x = [1, 2

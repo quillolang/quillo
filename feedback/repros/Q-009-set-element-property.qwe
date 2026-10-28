@@ -1,0 +1,14 @@
+// Q-009 A component cannot set a page object's field (el.value = ...)
+// mode: browser
+// page: /
+// probe: return document.getElementById("q").value
+// open-when: only variables can be assigned to
+// fixed-when: "probe": "set by @mount"
+// From FEEDBACK.md §6 (found on f1695a3).
+
+component Box() {
+    state n = 0
+    <input #q @mount={(el) => { el.value = "set by @mount" }}/>
+}
+
+route GET / = <html><body><Box/></body></html>

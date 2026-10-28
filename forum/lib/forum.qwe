@@ -1,0 +1,493 @@
+// The forum's data: categories, threads, posts, votes, reactions, follows,
+// bookmarks, what each person has read, notifications and search, with the
+// server fns pages call from the browser. Loaders named load_* back
+// `live(...)` state: pages showing them follow every change.
+//
+// A thread's page follows a topic of its own (`thread:<id>`), not the posts
+// table, so a reply in one thread loads no other thread again; whatever
+// changes a thread or its posts calls `changed(id)`. Likewise each person's
+// bell follows `user:<id>`.
+
+let PAGE = 20
+let MAX_BODY = 20000
+let SLOW_DOWN_MS = 5000
+let NEW_DAYS = 7
+let REACTIONS = ["👍", "❤️", "😂", "🎉", "🤔", "👀"]
+
+fn changed(thread_id: int) = publish(`thread:${thread_id}`)
+
+// ---- categories --------------------------------------------------------
+
+fn categories() with db = db.query(sql`
+    select c.id, c.slug, c.name, c.about, c.color,
+           (select count(*) from threads t where t.category_id = c.id and t.deleted = 0) as threads,
+           (select count(*) from posts p join threads t on t.id = p.thread_id
+             where t.category_id = c.id and t.deleted = 0 and p.deleted = 0) as posts,
+           (select max(t.last_post_at) from threads t where t.category_id = c.id and t.deleted = 0) as active
+    from categories c order by c.position, c.id`)
+
+fn category(slug: str) with db = db.one("select id, slug, name, about, color from categories where slug = ?", slug)
+
+// ---- thread lists ------------------------------------------------------
+
+// Threads, newest activity first ("latest"), newest first ("new"), most
+// voted ("top") or only those the reader follows ("following"); in one
+// category or all (null), with one tag or any (null). Pinned threads come
+// first only within a category. For someone signed in, each says what is
+// unread in it.
+server fn load_threads(category_id: int?, tag: str?, sort: str, page: int) with db, time {
+    let u = viewer()
+    let rows = db.query(sql`
+        select t.id, t.title, t.created, t.last_post_at, t.replies, t.pinned, t.locked,
+               t.solution_id is not null as solved,
+               c.slug as cat_slug, c.name as cat_name, c.color as cat_color,
+               u.name as author, u.hue as author_hue,
+               lu.name as last_name, lu.hue as last_hue,
+               (select count(*) from votes v join posts p on p.id = v.post_id
+                 where p.thread_id = t.id and p.deleted = 0) as score,
+               coalesce((select group_concat(g.tag, ',') from tags g where g.thread_id = t.id), '') as tags
+        from threads t
+        join categories c on c.id = t.category_id
+        join users u on u.id = t.user_id
+        join users lu on lu.id = t.last_user_id
+        where t.deleted = 0
+          and (:cat is null or t.category_id = :cat)
+          and (:tag is null or exists (select 1 from tags g where g.thread_id = t.id and g.tag = :tag))
+          and (:sort != 'following' or exists (select 1 from follows f where f.thread_id = t.id and f.user_id = :me))
+        order by case when :cat is null then 0 else t.pinned end desc,
+                 case :sort when 'new' then t.created when 'top' then score else t.last_post_at end desc,
+                 t.last_post_at desc
+        limit :limit offset :offset`,
+        { cat: category_id, tag, sort, me: u.id ?? 0, limit: PAGE + 1, offset: (max([page, 1]) - 1) * PAGE })
+    let threads = take(rows, PAGE)
+    { threads: with_unread(u, threads), more: len(rows) > PAGE }
+}
+
+// Marks each thread with what the reader has not seen: `fresh` when they
+// never opened a recent thread someone else started, else `unread` posts
+// since their last visit and the first of them. Not followed: reading a
+// thread changes `reads`, which no list should load again for.
+fn with_unread(u, threads: list) with db, time {
+    if u == null || len(threads) == 0 { return threads }
+    let seen = unwatched(() => db.query(sql`
+        select t.id,
+               r.last_post_id is null and t.user_id != :me and t.created > :since as fresh,
+               case when r.last_post_id is null then 0 else
+                   (select count(*) from posts p where p.thread_id = t.id and p.deleted = 0 and p.id > r.last_post_id) end as unread,
+               (select min(p.id) from posts p where p.thread_id = t.id and p.deleted = 0 and p.id > coalesce(r.last_post_id, 0)) as first_unread
+        from threads t left join reads r on r.thread_id = t.id and r.user_id = :me
+        where t.id in (select value from json_each(:ids))`,
+        { me: u.id, since: now() - NEW_DAYS * DAY, ids: json.stringify(threads | map((t) => t.id)) }))
+    threads | map((t) => {
+        let s = find(seen, (x) => x.id == t.id)
+        merge(t, { fresh: s.fresh ?? 0, unread: s.unread ?? 0, first_unread: s.first_unread })
+    })
+}
+
+fn popular_tags() with db = db.query(sql`
+    select g.tag, count(*) as n from tags g join threads t on t.id = g.thread_id
+    where t.deleted = 0 group by g.tag order by n desc, g.tag limit 16`)
+
+// ---- one thread --------------------------------------------------------
+
+// The thread, with whether the reader follows it and whether it has a poll.
+server fn load_thread(id: int) with db, time {
+    watch(`thread:${id}`)
+    let u = viewer()
+    unwatched(() => db.one(sql`
+        select t.id, t.title, t.user_id, t.created, t.replies, t.pinned, t.locked, t.solution_id,
+               c.slug as cat_slug, c.name as cat_name, c.color as cat_color,
+               coalesce((select group_concat(g.tag, ',') from tags g where g.thread_id = t.id), '') as tags,
+               exists (select 1 from follows f where f.thread_id = t.id and f.user_id = :me) as following,
+               exists (select 1 from polls p where p.thread_id = t.id) as has_poll
+        from threads t join categories c on c.id = t.category_id
+        where t.id = :id and t.deleted = 0`, { id, me: u.id ?? 0 }))
+}
+
+// Its posts, each with its author, score, reactions, and whether the reader
+// voted for it or bookmarked it. A post's `deleted` is 1 when its author
+// deleted it and 2 when a moderator removed it. Loading them marks them
+// seen, so replies that arrive while the page is open are not unread.
+server fn load_posts(thread_id: int) with db, time {
+    watch(`thread:${thread_id}`)
+    let u = viewer()
+    let me_id = u.id ?? 0
+    unwatched(() => {
+        let posts = db.query(sql`
+            select p.id, p.user_id, p.created, p.edited, p.deleted,
+                   case when p.deleted != 0 then '' else p.body end as body,
+                   case when p.deleted != 0 then '' else p.html end as html,
+                   u.name, u.role, u.hue,
+                   (select count(*) from votes v join posts pp on pp.id = v.post_id
+                     where pp.user_id = u.id and pp.deleted = 0) as rep,
+                   (select count(*) from votes v where v.post_id = p.id) as score,
+                   exists (select 1 from votes v where v.post_id = p.id and v.user_id = :me) as voted,
+                   exists (select 1 from bookmarks b where b.post_id = p.id and b.user_id = :me) as bookmarked
+            from posts p join users u on u.id = p.user_id
+            where p.thread_id = :thread
+            order by p.id limit 1000`, { thread: thread_id, me: me_id })
+        let reactions = db.query(sql`
+            select r.post_id, r.emoji, count(*) as n, max(r.user_id = :me) as mine, group_concat(ru.name, ', ') as who
+            from reactions r join users ru on ru.id = r.user_id join posts p on p.id = r.post_id
+            where p.thread_id = :thread
+            group by r.post_id, r.emoji order by min(r.created)`, { thread: thread_id, me: me_id })
+        if u != null && len(posts) > 0 { mark_seen(u.id, thread_id, last(posts).id) }
+        posts | map((p) => set(p, "reactions", reactions | filter((r) => r.post_id == p.id)))
+    })
+}
+
+// Counted when the page is opened (never when a link is only prefetched).
+fn count_view(thread_id: int) with db = db.exec(
+    "insert into thread_views (thread_id, n) values (?, 1) on conflict (thread_id) do update set n = n + 1", thread_id)
+
+fn views_of(thread_id: int) with db = (db.one("select n from thread_views where thread_id = ?", thread_id) ?? { n: 0 }).n
+
+// ---- what each person has read -------------------------------------------
+
+// The last post `user_id` had seen in the thread before now, or null if they
+// never opened it.
+fn last_read(user_id: int, thread_id: int) with db =
+    (db.one("select last_post_id from reads where user_id = ? and thread_id = ?", user_id, thread_id) ?? {}).last_post_id
+
+fn mark_seen(user_id: int, thread_id: int, post_id: int) with db = db.exec(sql`
+    insert into reads (user_id, thread_id, last_post_id) values (?, ?, ?)
+    on conflict (user_id, thread_id) do update set last_post_id = max(last_post_id, excluded.last_post_id)`,
+    user_id, thread_id, post_id)
+
+
+// ---- writing -----------------------------------------------------------
+
+// Markdown to HTML, with @mentions of people who exist linked to them.
+fn render(body: str) -> str with db = str(markdown(link_mentions(body, existing(mentioned(body)))))
+
+fn existing(names: list<str>) -> list<str> with db =
+    len(names) == 0 ? [] : db.query("select lower(name) as name from users where lower(name) in (select value from json_each(?))",
+        json.stringify(names)) | map((r) => r.name)
+
+server fn preview(body: str) -> str with db = render(body)
+
+fn check_body(body: str) ! str {
+    if trim(body) == "" { return err("Write something first") }
+    if len(body) > MAX_BODY { return err(`Keep it under ${MAX_BODY} characters`) }
+    body
+}
+
+// One post every few seconds each, so a stuck key or a script cannot flood a thread.
+fn check_pace(u) ! str with db, time {
+    let last = db.one("select max(created) as t from posts where user_id = ?", u.id).t
+    if last != null && now() - last < SLOW_DOWN_MS { return err("Slow down a little, then post again") }
+    u
+}
+
+fn notify_user(user_id: int, kind: str, actor_id: int, thread_id: int, post_id) with db, time {
+    if user_id != actor_id {
+        db.exec("insert into notifications (user_id, kind, actor_id, thread_id, post_id, created) values (?, ?, ?, ?, ?, ?)",
+            user_id, kind, actor_id, thread_id, post_id, now())
+        publish(`user:${user_id}`)
+    }
+}
+
+// Everyone following the thread hears of a reply, but once: not those it
+// already notified (a mention), nor its author.
+fn notify_followers(thread_id: int, actor_id: int, post_id: int) with db, time {
+    let rows = db.query(sql`
+        select f.user_id from follows f
+        where f.thread_id = ? and f.user_id != ?
+          and not exists (select 1 from notifications n where n.post_id = ? and n.user_id = f.user_id)`,
+        thread_id, actor_id, post_id)
+    for r in rows => notify_user(r.user_id, "reply", actor_id, thread_id, post_id)
+}
+
+fn follow(user_id: int, thread_id: int) with db, time =
+    db.exec("insert or ignore into follows (user_id, thread_id, created) values (?, ?, ?)", user_id, thread_id, now())
+
+fn notify_mentions(body: str, actor_id: int, thread_id: int, post_id: int) with db, time {
+    let names = mentioned(body)
+    if len(names) > 0 {
+        for r in db.query("select id from users where lower(name) in (select value from json_each(?))", json.stringify(names)) =>
+            notify_user(r.id, "mention", actor_id, thread_id, post_id)
+    }
+}
+
+fn add_post(u, thread_id: int, body: str) with db, time {
+    let p = db.exec("insert into posts (thread_id, user_id, body, html, created) values (?, ?, ?, ?, ?)",
+        thread_id, u.id, body, render(body), now())
+    notify_mentions(body, u.id, thread_id, p.last_id)
+    p.last_id
+}
+
+// A new thread, with a poll if `poll` is one (see parse_poll in lib/polls.qwe).
+fn create_thread(u, category_id: int, title: str, body: str, tags_text: str, poll) -> int ! str with db, time {
+    if is_banned(u) { return err(`You are suspended: ${left(u.banned_until)}`) }
+    let t = trim(title)
+    if len(t) < 5 || len(t) > 120 { return err("A title is 5 to 120 characters") }
+    check_body(body)?
+    if db.one("select 1 from categories where id = ?", category_id) == null { return err("Pick a category") }
+    if db.one("select 1 from categories where id = ? and slug = 'announcements'", category_id) != null && !is_mod(u) {
+        return err("Only moderators post announcements")
+    }
+    check_pace(u)?
+    db.transaction(() => {
+        let id = db.exec("insert into threads (category_id, user_id, title, created, last_post_at, last_user_id) values (?, ?, ?, ?, ?, ?)",
+            category_id, u.id, t, now(), now(), u.id).last_id
+        let first = add_post(u, id, body)
+        for tag in parse_tags(tags_text) => db.exec("insert into tags (thread_id, tag) values (?, ?)", id, tag)
+        if poll != null { save_poll(id, poll) }
+        follow(u.id, id)
+        mark_seen(u.id, id, first)
+        id
+    })
+}
+
+server fn post_reply(thread_id: int, body: str) -> list ! str with db, time {
+    let u = acting()?
+    let t = db.one("select id, user_id, locked from threads where id = ? and deleted = 0", thread_id)
+    if t == null { return err("This thread is gone") }
+    if t.locked == 1 && !is_mod(u) { return err("This thread is locked") }
+    check_body(body)?
+    check_pace(u)?
+    db.transaction(() => {
+        let id = add_post(u, thread_id, body)
+        db.exec("update threads set replies = replies + 1, last_post_at = ?, last_user_id = ? where id = ?", now(), u.id, thread_id)
+        notify_followers(thread_id, u.id, id)
+        follow(u.id, thread_id)
+        mark_seen(u.id, thread_id, id)
+    })
+    changed(thread_id)
+    load_posts(thread_id)
+}
+
+// The post, if `u` may change it: its author, or a moderator.
+fn own_post(u, post_id: int) ! str with db {
+    let p = db.one("select id, thread_id, user_id, deleted from posts where id = ?", post_id)
+    if p == null || p.deleted == 1 { return err("That post is gone") }
+    if p.user_id != u.id && !is_mod(u) { return err("That is not yours to change") }
+    p
+}
+
+server fn edit_post(post_id: int, body: str) -> list ! str with db, time {
+    let u = acting()?
+    let p = own_post(u, post_id)?
+    check_body(body)?
+    db.exec("update posts set body = ?, html = ?, edited = ? where id = ?", body, render(body), now(), post_id)
+    changed(p.thread_id)
+    load_posts(p.thread_id)
+}
+
+// Deleting a thread's first post deletes the thread; the answer says which.
+server fn delete_post(post_id: int) -> map ! str with db, time {
+    let u = acting()?
+    let p = own_post(u, post_id)?
+    if p.user_id != u.id { log_mod(u.id, "delete", p.user_id, p.thread_id, post_id, "") }
+    let gone = take_down(post_id, p.thread_id, 1)
+    { thread_deleted: gone, posts: gone ? [] : load_posts(p.thread_id) }
+}
+
+// Takes a post down: `how` is 1 when its author deleted it, 2 when a
+// moderator removed it. Taking down a thread's first post takes down the
+// thread; the answer says whether it did.
+fn take_down(post_id: int, thread_id: int, how: int) -> bool with db, time {
+    let first = db.one("select min(id) as id from posts where thread_id = ?", thread_id).id
+    db.transaction(() => {
+        db.exec("update posts set deleted = ? where id = ?", how, post_id)
+        if first == post_id {
+            db.exec("update threads set deleted = 1 where id = ?", thread_id)
+        } else {
+            db.exec("update threads set replies = max(replies - 1, 0), solution_id = nullif(solution_id, ?) where id = ?", post_id, thread_id)
+        }
+    })
+    changed(thread_id)
+    first == post_id
+}
+
+// A vote, or taking it back.
+server fn vote(post_id: int) -> list ! str with db, time {
+    let u = acting()?
+    let p = db.one("select thread_id, user_id, deleted from posts where id = ?", post_id)
+    if p == null || p.deleted == 1 { return err("That post is gone") }
+    if p.user_id == u.id { return err("You cannot vote for your own post") }
+    let gone = db.exec("delete from votes where post_id = ? and user_id = ?", post_id, u.id).changes
+    if gone == 0 { db.exec("insert into votes (post_id, user_id, created) values (?, ?, ?)", post_id, u.id, now()) }
+    changed(p.thread_id)
+    load_posts(p.thread_id)
+}
+
+// A reaction, or taking it back.
+server fn react(post_id: int, emoji: str) -> list ! str with db, time {
+    let u = acting()?
+    if !contains(REACTIONS, emoji) { return err("Pick one of the reactions offered") }
+    let p = db.one("select thread_id, deleted from posts where id = ?", post_id)
+    if p == null || p.deleted != 0 { return err("That post is gone") }
+    let gone = db.exec("delete from reactions where post_id = ? and user_id = ? and emoji = ?", post_id, u.id, emoji).changes
+    if gone == 0 {
+        db.exec("insert into reactions (post_id, user_id, emoji, created) values (?, ?, ?, ?)", post_id, u.id, emoji, now())
+    }
+    changed(p.thread_id)
+    load_posts(p.thread_id)
+}
+
+// A bookmark, or taking it away. Only the reader sees it, so nothing is announced.
+server fn bookmark(post_id: int) -> list ! str with db, time {
+    let u = acting()?
+    let p = db.one("select thread_id from posts where id = ? and deleted = 0", post_id)
+    if p == null { return err("That post is gone") }
+    let gone = db.exec("delete from bookmarks where post_id = ? and user_id = ?", post_id, u.id).changes
+    if gone == 0 { db.exec("insert into bookmarks (post_id, user_id, created) values (?, ?, ?)", post_id, u.id, now()) }
+    load_posts(p.thread_id)
+}
+
+fn bookmarks_of(user_id: int) with db = db.query(sql`
+    select p.id, p.thread_id, p.body, p.created, t.title, u.name, u.hue, b.created as saved
+    from bookmarks b join posts p on p.id = b.post_id join threads t on t.id = p.thread_id join users u on u.id = p.user_id
+    where b.user_id = ? and p.deleted = 0 and t.deleted = 0
+    order by b.created desc limit 200`, user_id)
+
+// Following a thread, or not (which mutes its replies).
+server fn set_following(thread_id: int, on: bool) ! str with db, time {
+    let u = acting()?
+    if on {
+        follow(u.id, thread_id)
+    } else {
+        db.exec("delete from follows where user_id = ? and thread_id = ?", u.id, thread_id)
+    }
+    load_thread(thread_id)
+}
+
+// The thread's author (or a moderator) marks the answer that solved it, or unmarks it.
+server fn mark_solution(post_id: int) ! str with db, time {
+    let u = acting()?
+    let p = db.one("select p.thread_id, p.user_id, t.user_id as owner, t.solution_id from posts p join threads t on t.id = p.thread_id where p.id = ? and p.deleted = 0", post_id)
+    if p == null { return err("That post is gone") }
+    if p.owner != u.id && !is_mod(u) { return err("Only the thread's author marks its solution") }
+    if p.solution_id == post_id {
+        db.exec("update threads set solution_id = null where id = ?", p.thread_id)
+    } else {
+        db.exec("update threads set solution_id = ? where id = ?", post_id, p.thread_id)
+        notify_user(p.user_id, "solution", u.id, p.thread_id, post_id)
+    }
+    changed(p.thread_id)
+    load_thread(p.thread_id)
+}
+
+server fn set_pinned(thread_id: int, on: bool) ! str with db, time {
+    let u = acting()?
+    if !is_mod(u) { return err("Moderators only") }
+    db.exec("update threads set pinned = ? where id = ?", on ? 1 : 0, thread_id)
+    log_mod(u.id, on ? "pin" : "unpin", null, thread_id, null, "")
+    changed(thread_id)
+    load_thread(thread_id)
+}
+
+server fn set_locked(thread_id: int, on: bool) ! str with db, time {
+    let u = acting()?
+    if !is_mod(u) { return err("Moderators only") }
+    db.exec("update threads set locked = ? where id = ?", on ? 1 : 0, thread_id)
+    log_mod(u.id, on ? "lock" : "unlock", null, thread_id, null, "")
+    changed(thread_id)
+    load_thread(thread_id)
+}
+
+// ---- notifications -----------------------------------------------------
+
+server fn load_unread() -> int with db, time {
+    let u = viewer()
+    if u == null { return 0 }
+    watch(`user:${u.id}`)
+    unwatched(() => db.one("select count(*) as n from notifications where user_id = ? and read = 0", u.id).n)
+}
+
+fn notifications_of(user_id: int) with db = db.query(sql`
+    select n.id, n.kind, n.created, n.read, n.thread_id, n.post_id,
+           a.name as actor, a.hue as actor_hue, t.title
+    from notifications n join users a on a.id = n.actor_id join threads t on t.id = n.thread_id
+    where n.user_id = ? and t.deleted = 0
+    order by n.id desc limit 50`, user_id)
+
+fn mark_read(user_id: int) with db {
+    db.exec("update notifications set read = 1 where user_id = ? and read = 0", user_id)
+    publish(`user:${user_id}`)
+}
+
+// ---- people ------------------------------------------------------------
+
+fn profile(name: str) with db = db.one(sql`
+    select u.id, u.name, u.role, u.hue, u.bio, u.created, u.banned_until,
+           (select count(*) from posts p join threads t on t.id = p.thread_id
+             where p.user_id = u.id and p.deleted = 0 and t.deleted = 0) as posts,
+           (select count(*) from threads t where t.user_id = u.id and t.deleted = 0) as threads,
+           (select count(*) from votes v join posts p on p.id = v.post_id
+             where p.user_id = u.id and p.deleted = 0) as rep,
+           (select count(*) from threads t where t.solution_id in (select id from posts where user_id = u.id)) as solutions
+    from users u where u.name = ?`, name)
+
+fn posts_of(user_id: int) with db = db.query(sql`
+    select p.id, p.thread_id, p.html, p.created, t.title
+    from posts p join threads t on t.id = p.thread_id
+    where p.user_id = ? and p.deleted = 0 and t.deleted = 0
+    order by p.id desc limit 15`, user_id)
+
+fn top_people() with db = db.query(sql`
+    select u.name, u.hue, count(v.post_id) as rep
+    from users u join posts p on p.user_id = u.id and p.deleted = 0 join votes v on v.post_id = p.id
+    group by u.id order by rep desc, u.name limit 5`)
+
+fn totals() with db = db.one(sql`
+    select (select count(*) from users) as people,
+           (select count(*) from threads where deleted = 0) as threads,
+           (select count(*) from posts p join threads t on t.id = p.thread_id where p.deleted = 0 and t.deleted = 0) as posts,
+           (select name from users order by id desc limit 1) as newest`)
+
+fn set_bio(user_id: int, bio: str) with db = db.exec("update users set bio = ? where id = ?", slice(trim(bio), 0, 500), user_id)
+
+fn set_role(actor, name: str, role: "member" | "moderator" | "admin") with db, time {
+    let target = db.one("select id from users where name = ?", name)
+    if target != null {
+        db.exec("update users set role = ? where id = ?", role, target.id)
+        log_mod(actor.id, "role", target.id, null, null, role)
+    }
+}
+
+// People whose names start with `prefix`, for @mention suggestions: those
+// already in the thread first.
+server fn find_people(prefix: str, thread_id: int?) with db {
+    let p = lower(trim(prefix))
+    if len(p) == 0 || len(p) > 20 || !only_chars(p, NAME_CHARS) { return [] }
+    db.query(sql`
+        select u.name, u.hue,
+               exists (select 1 from posts x where x.user_id = u.id and x.thread_id = :thread) as here
+        from users u
+        where substr(lower(u.name), 1, length(:p)) = :p
+        order by here desc, length(u.name), u.name limit 6`, { p, thread: thread_id ?? 0 })
+}
+
+// ---- search ------------------------------------------------------------
+
+// Each word as a prefix, all of them required: `quil serv` finds "Quillo servers".
+fn fts_query(q: str) -> str =
+    split(q, " ")
+        | map((w) => replace(trim(w), "\"", ""))
+        | filter((w) => w != "")
+        | take(8)
+        | map((w) => `"${w}"*`)
+        | join(" ")
+
+let MARK_OPEN = "[[[mark]]]"
+let MARK_CLOSE = "[[[/mark]]]"
+
+// Posts matching `q`, best first, with the words found marked in a snippet.
+fn search(q: str, page: int) with db {
+    let fq = fts_query(q)
+    if fq == "" { return { results: [], more: false } }
+    let rows = db.query(sql`
+        select p.id, p.thread_id, p.created, t.title, u.name, u.hue,
+               snippet(search, 1, :open, :close, '…', 24) as snippet
+        from search s join posts p on p.id = s.rowid join threads t on t.id = p.thread_id join users u on u.id = p.user_id
+        where search match :q and p.deleted = 0 and t.deleted = 0
+        order by bm25(search, 4.0, 1.0) limit :limit offset :offset`,
+        { q: fq, open: MARK_OPEN, close: MARK_CLOSE, limit: PAGE + 1, offset: (max([page, 1]) - 1) * PAGE })
+    if is_err(rows) { return { results: [], more: false } }
+    { results: take(rows, PAGE), more: len(rows) > PAGE }
+}
+
+// The snippet as HTML: its text escaped, then only our marks made <mark>.
+fn marked(snippet: str) = raw(replace(replace(escape(snippet), MARK_OPEN, "<mark>"), MARK_CLOSE, "</mark>"))

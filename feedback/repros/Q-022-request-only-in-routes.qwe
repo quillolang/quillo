@@ -1,0 +1,12 @@
+// Q-022 `request` cannot be read in a helper, though session() can: a helper reading a cookie must be passed `request`
+// mode: serve
+// get: / cookie=tz=480
+// open-when: only exists in routes
+// open-when: unknown name `cookie`
+// fixed-when: /GET \/ -> 200\n480/
+// From FEEDBACK2.md §10 (found on 896e758). `request` in helpers stays a design choice; the fix
+// asked for was `cookie(name)`, which reads one in any function the request runs (fe10f8c).
+
+fn tz() = cookie("tz") ?? "0"
+
+route GET / = tz()

@@ -1,0 +1,17 @@
+// Q-020 `return` is not allowed where an expression goes (a match arm, after ??), though `reply` is
+// mode: check
+// open-when: unexpected keyword `return`
+// fixed-when: ok (
+// From FEEDBACK2.md §9 (found on 896e758).
+
+fn pick(x) = match x {
+    1 => return "one"
+    _ => "other"
+}
+
+fn first_word(s: str) {
+    let m = re.find(s, "\\w+") ?? return null
+    m.text
+}
+
+print([pick(1), first_word("hi there")])

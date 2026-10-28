@@ -1,0 +1,187 @@
+// Articles and their way through a flow. At each step, the people with the
+// step's role act: writers write and submit, reviewers and publishers
+// approve or send back. An "approve" transition waits for the step's number
+// of approvals from different people (never the author's own); a "reject"
+// sends the article back at once and approvals start over (a new round).
+// A transition marked needs_resolved waits until no feedback is open.
+//
+// Pages showing an article follow `article:<id>` (its blocks, step and
+// history); lists of articles follow `articles`.
+
+fn article_row(id: int) with db = unwatched(() =>
+    db.one("select id, title, slug, flow_id, step_id, author_id, round, created, updated, published_at from articles where id = ?", id))
+
+fn article_changed(id: int) {
+    publish(`article:${id}`)
+    publish("articles")
+}
+
+fn log_article(article_id: int, user_id: int, text: str) with db, time =
+    db.exec("insert into article_log (article_id, user_id, at, text) values (?, ?, ?, ?)", article_id, user_id, now(), text)
+
+// The article's text is open to change while it is at a writers' step, to its author.
+fn article_editable(a, u) -> bool with db {
+    let s = step_row(a.step_id)
+    s != null && s.role == "writer" && (a.author_id == u.id || has_role(u, "admin"))
+}
+
+fn open_threads(article_id: int) with db =
+    unwatched(() => db.one("select count(*) as n from threads where article_id = ? and status = 'open'", article_id).n)
+
+fn approvals_at(a, step_id: int) with db = unwatched(() => db.query(sql`
+    select u.id, u.name, u.hue from approvals p join users u on u.id = p.user_id
+    where p.article_id = ? and p.step_id = ? and p.round = ? order by p.at`, a.id, step_id, a.round))
+
+// What `u` may do with the article now: each way out of its step, and
+// whether they may take it, or why not.
+fn actions_for(a, u, step, transitions: list) with db {
+    let open = open_threads(a.id)
+    let approved = approvals_at(a, a.step_id)
+    transitions | filter((t) => t.from_step == a.step_id) | map((t) => {
+        let mine = any(approved, (p) => p.id == u.id)
+        let why = !has_role(u, t.role) ? `for ${t.role}s`
+            : step.role == "writer" && a.author_id != u.id && !has_role(u, "admin") ? "for the author"
+            : t.kind == "approve" && step.role != "writer" && a.author_id == u.id ? "not on your own article"
+            : t.kind == "approve" && mine ? "you approved"
+            : t.needs_resolved == 1 && open > 0 ? `${plural(open, "open thread")} first`
+            : null
+        { id: t.id, name: t.name, kind: t.kind, to_step: t.to_step, allowed: why == null, why,
+          approvals: t.kind == "approve" ? approved : [], needed: t.kind == "approve" ? step.approvals : 1 }
+    })
+}
+
+server fn load_article(article_id: int) with db, time {
+    let u = acting()?
+    let a = article_row(article_id) ?? err("This article was deleted")?
+    watch(`article:${article_id}`)
+    watch(`flow:${a.flow_id}`)
+    unwatched(() => {
+        let steps = steps_of(a.flow_id)
+        let transitions = transitions_of(a.flow_id)
+        let step = find(steps, (s) => s.id == a.step_id)
+        let author = db.one("select id, name, hue from users where id = ?", a.author_id)
+        {
+            article: a,
+            author,
+            me: u,
+            step,
+            steps: steps | map((s) => merge(s, { approved: approvals_at(a, s.id) | map((p) => p.name) })),
+            transitions,
+            actions: actions_for(a, u, step, transitions),
+            editable: article_editable(a, u),
+            may_comment: has_any(u, ["reviewer", "publisher"]) && !is_final(a.step_id, transitions),
+            blocks: blocks_of(owner_key("article", article_id)),
+            log: db.query(sql`select l.at, l.text, u.name from article_log l join users u on u.id = l.user_id
+                              where l.article_id = ? order by l.at desc, l.id desc limit 40`, article_id),
+        }
+    })
+}
+
+// Runs a transition on the article. Gives the step it is at afterwards.
+server fn act(article_id: int, transition_id: int, note: str = "") ! str with db, time {
+    let u = acting()?
+    let a = article_row(article_id) ?? err("This article was deleted")?
+    let t = unwatched(() => db.one("select * from transitions where id = ? and flow_id = ?", transition_id, a.flow_id)) ?? err("No such transition")?
+    if t.from_step != a.step_id { return err("The article moved on meanwhile") }
+    let step = step_row(a.step_id)
+    let action = find(actions_for(a, u, step, [t]), (x) => x.id == t.id)
+    if !action.allowed { return err(`${t.name}: ${action.why}`) }
+    if t.kind == "reject" && trim(note) == "" { return err("Say why it goes back") }
+    let to = step_row(t.to_step)
+    let moved = db.transaction(() => {
+        if t.kind == "approve" {
+            db.exec("insert or ignore into approvals (article_id, step_id, round, user_id, at) values (?, ?, ?, ?, ?)",
+                a.id, a.step_id, a.round, u.id, now())?
+            let n = db.one("select count(*) as n from approvals where article_id = ? and step_id = ? and round = ?", a.id, a.step_id, a.round).n
+            log_article(a.id, u.id, `approved at ${step.name} (${n} of ${step.approvals})`)
+            if n < step.approvals { return false }
+        }
+        let final = is_final(t.to_step, transitions_of(a.flow_id))
+        db.exec(sql`update articles set step_id = ?, updated = ?, round = round + ?,
+                       published_at = case when ? then ? else null end where id = ?`,
+            t.to_step, now(), t.kind == "reject" ? 1 : 0, final, now(), a.id)?
+        log_article(a.id, u.id, t.kind == "reject" ? `sent it back to ${to.name}: ${trim(note)}` : `${lower(t.name)}: now at ${to.name}`)
+        true
+    })?
+    article_changed(a.id)
+    moved ? to.name : step.name
+}
+
+fn unique_slug(title: str) with db {
+    let base = slugify(title) != "" ? slugify(title) : "article"
+    let taken = db.query("select slug from articles where slug = ? or slug like ?", base, `${base}-%`) | map((r) => r.slug)
+    if !contains(taken, base) { return base }
+    let n = find(range(2, len(taken) + 3), (i) => !contains(taken, `${base}-${i}`))
+    `${base}-${n}`
+}
+
+server fn create_article(title: str, flow_id: int?) ! str with db, time {
+    let u = acting(["writer"])?
+    let t = trim(title)
+    if len(t) < 3 || len(t) > 160 { return err("A headline is 3 to 160 characters") }
+    let flow = flow_id == null
+        ? db.one("select id from flows where kind = 'article' order by id limit 1")
+        : db.one("select id from flows where id = ? and kind = 'article'", flow_id)
+    if flow == null { return err("There is no flow for articles yet: a designer makes one") }
+    let start = first_step(flow.id)
+    let id = db.transaction(() => {
+        let id = db.exec(sql`insert into articles (title, slug, flow_id, step_id, author_id, created, updated)
+                             values (?, ?, ?, ?, ?, ?, ?)`, t, unique_slug(t), flow.id, start.id, u.id, now(), now())?.last_id
+        db.exec("insert into blocks (owner, position, type, data, updated, updated_by) values (?, 0, 'text', ?, ?, ?)",
+            owner_key("article", id), json.stringify({ md: "" }), now(), u.id)?
+        log_article(id, u.id, "started it")
+        id
+    })?
+    article_changed(id)
+    id
+}
+
+server fn retitle(article_id: int, title: str) ! str with db, time {
+    let u = acting()?
+    let a = article_row(article_id) ?? err("This article was deleted")?
+    if !article_editable(a, u) { return err("You cannot change this now") }
+    let t = trim(title)
+    if len(t) < 3 || len(t) > 160 { return err("A headline is 3 to 160 characters") }
+    db.exec("update articles set title = ?, updated = ? where id = ?", t, now(), a.id)?
+    article_changed(a.id)
+    true
+}
+
+server fn delete_article(article_id: int) ! str with db, time {
+    let u = acting()?
+    let a = article_row(article_id) ?? err("This article was already deleted")?
+    if !article_editable(a, u) { return err("Only its author deletes an article, while it is a draft") }
+    db.transaction(() => {
+        db.exec("delete from blocks where owner = ?", owner_key("article", a.id))?
+        db.exec("delete from articles where id = ?", a.id)?
+    })?
+    article_changed(a.id)
+    true
+}
+
+// Every article, newest first, with where it is and what is open on it.
+server fn load_articles() with db, time {
+    acting()?
+    watch("articles")
+    unwatched(() => db.query(sql`
+        select a.id, a.title, a.slug, a.step_id, a.author_id, a.updated, a.published_at, a.round,
+               s.name as step, s.role as step_role, s.color as step_color, s.approvals as needed,
+               u.name as author, u.hue as author_hue,
+               (select count(*) from threads t where t.article_id = a.id and t.status = 'open') as open_threads,
+               (select count(*) from approvals p where p.article_id = a.id and p.step_id = a.step_id and p.round = a.round) as approvals
+        from articles a join steps s on s.id = a.step_id join users u on u.id = a.author_id
+        order by a.updated desc`))
+}
+
+// The front page: published articles, newest first, with their first text.
+fn published() with db = db.query(sql`
+    select a.id, a.title, a.slug, a.published_at, u.name as author,
+           (select b.data from blocks b where b.owner = 'article:' || a.id and b.type = 'text' order by b.position limit 1) as lead
+    from articles a join users u on u.id = a.author_id
+    where a.published_at is not null order by a.published_at desc limit 50`)
+    | map((a) => merge(a, { lead: excerpt(from_json(a.lead, {}).md ?? "") }))
+
+fn excerpt(md: str) -> str {
+    let s = trim(re.replace(re.replace(md, "[#*_`>\\[\\]]", ""), "\\s+", " "))
+    len(s) > 220 ? slice(s, 0, 220) + "…" : s
+}

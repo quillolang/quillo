@@ -1,0 +1,61 @@
+// Pages: what designers build from blocks for the desk (an ad desk, an
+// invoices board): lists, forms and transactions beside text. A page can be
+// kept to some roles. Pages showing one follow its owner topic, `page:<id>`.
+
+fn page_row(id: int) with db = unwatched(() => db.one("select id, title, slug, roles from pages where id = ?", id))
+
+fn may_see_page(u, p) -> bool {
+    let roles = from_json(p.roles, [])
+    u != null && (len(roles) == 0 || has_any(u, roles))
+}
+
+server fn load_pages() with db, time {
+    let u = acting()?
+    watch("pages")
+    unwatched(() => db.query("select id, title, slug, roles from pages order by title collate nocase")
+        | filter((p) => may_see_page(u, p))
+        | map((p) => merge(p, { roles: from_json(p.roles, []), blocks: db.one("select count(*) as n from blocks where owner = ?", owner_key("page", p.id)).n })))
+}
+
+server fn create_page(title: str) ! str with db, time {
+    acting(["designer"])?
+    let t = trim(title)
+    if len(t) < 2 || len(t) > 80 { return err("A page's title is 2 to 80 characters") }
+    let slug = slugify(t)
+    if slug == "" { return err("Give the page a title with letters or digits") }
+    if db.one("select 1 from pages where slug = ?", slug) != null { return err(`There is already a page at /desk/p/${slug}`) }
+    let id = db.exec("insert into pages (title, slug, created) values (?, ?, ?)", t, slug, now())?.last_id
+    publish("pages")
+    id
+}
+
+server fn set_page_roles(page_id: int, roles: list<str>) ! str with db, time {
+    acting(["designer"])?
+    if !all(roles, (r) => contains(ROLES, r)) { return err("No such role") }
+    db.exec("update pages set roles = ? where id = ?", json.stringify(roles), page_id)?
+    publish("pages")
+    publish(owner_key("page", page_id))
+    true
+}
+
+server fn delete_page(page_id: int) ! str with db, time {
+    acting(["designer"])?
+    db.transaction(() => {
+        db.exec("delete from blocks where owner = ?", owner_key("page", page_id))?
+        db.exec("delete from pages where id = ?", page_id)?
+    })?
+    publish("pages")
+    true
+}
+
+server fn load_page(page_id: int) with db, time {
+    let u = acting()?
+    let p = page_row(page_id) ?? err("This page was deleted")?
+    if !may_see_page(u, p) { return err("This page is for other roles") }
+    watch(owner_key("page", page_id))
+    unwatched(() => ({
+        page: merge(p, { roles: from_json(p.roles, []) }),
+        blocks: blocks_of(owner_key("page", page_id)),
+        editable: has_role(u, "designer"),
+    }))
+}

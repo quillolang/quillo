@@ -1,0 +1,209 @@
+// The board, live: cards move for everyone as they are dragged, made or
+// changed. Cards are dragged between columns (and, with swimlanes, between
+// people or priorities), or moved with Alt+← and Alt+→ from the keyboard.
+// A card opens in <TaskPanel> (ui/task.qwe) beside the board.
+
+let LANES = [["none", "No lanes"], ["assignee", "By person"], ["priority", "By priority"]]
+
+// What a card says, for the search box: its ref, title and assignee.
+fn matches(t, key: str, q: str) -> bool {
+    let s = lower(trim(q))
+    s == "" || contains(lower(t.title), s) || contains(lower(`${key}-${t.num}`), s) || contains(lower(t.assignee ?? ""), s)
+}
+
+// The lanes, given how the board is split: a value each, and a title.
+fn lanes_of(mode: str, members: list) -> list = match mode {
+    "assignee" => (members | map((m) => ({ value: m.id, title: m.name, hue: m.hue }))) + [{ value: null, title: "Nobody", hue: null }]
+    "priority" => reverse(range(5)) | map((p) => ({ value: p, title: PRIORITIES[p], hue: null }))
+    _ => [{ value: "all", title: "", hue: null }]
+}
+
+fn in_lane(t, mode: str, lane) -> bool = match mode {
+    "assignee" => t.assignee_id == lane
+    "priority" => t.priority == lane
+    _ => true
+}
+
+view TaskCard(t, pkey: str, labels: list, today: int, dragging: bool, drop_before: bool, editable: bool,
+              on_open, on_drag, on_over, on_end, on_key) {
+    let due = day_or_null(t.due_day)
+    let done = t.done_at != null
+    <li class={`card ${dragging ? "dragging" : ""} ${drop_before ? "drop-before" : ""} ${t.blockers > 0 ? "blocked" : ""}`}
+        id={`card-${t.id}`} draggable={editable ? "true" : "false"} tabindex="0"
+        aria-label={`${pkey}-${t.num} ${t.title}`}
+        @dragstart={on_drag} @dragover={on_over} @dragend={on_end}
+        @click={on_open} @keydown={on_key}>
+        <div.card-top>
+            <span.ref>{pkey}-{t.num}</span>
+            <PriorityIcon p={t.priority}/>
+            {t.blockers > 0 && <span.badge.blocked title={`Waiting for ${t.blockers} unfinished ${t.blockers == 1 ? "task" : "tasks"}`}>⛔ blocked</span>}
+            <span.grow/>
+            {t.points != null && <span.points title="Points">{t.points}</span>}
+        </div>
+        <p.card-title>{t.title}</p>
+        {len(t.label_ids) > 0 && <div.chips>{for l in labels | filter((l) => contains(t.label_ids, l.id)) => <LabelChip key={l.id} {l}/>}</div>}
+        <div.card-foot>
+            {due != null && !done && <span class={`due ${due < today ? "late" : due - today <= 2 ? "soon" : ""}`}>{due_label(due, today)}</span>}
+            {t.checks > 0 && <span.meta class={t.checked == t.checks && "all"} title="Checklist">☑ {t.checked}/{t.checks}</span>}
+            {t.comments > 0 && <span.meta title="Comments">💬 {t.comments}</span>}
+            <span.grow/>
+            {t.assignee != null && <Avatar name={t.assignee} hue={t.assignee_hue} size="sm"/>}
+        </div>
+    </li>
+}
+
+component Board(project_id: int, today: int, open_id: int?) {
+    state board = live(load_board, project_id)
+    state q = ""
+    state who = "all"
+    state label = 0
+    state lanes = "none"
+    state dragging = null
+    state over = null
+    state open = open_id
+    state adding = null
+    state draft = ""
+    state problem = null
+    let b = board
+    let key = b.project.key
+    let editable = can_edit(b.role)
+    let shown = (t) => matches(t, key, q)
+        && (who == "all" || (who == "me" && t.assignee_id == b.me) || (who == "none" && t.assignee_id == null))
+        && (label == 0 || contains(t.label_ids, label))
+    let cards_in = (col_id, lane) => b.tasks
+        | filter((t) => t.column_id == col_id && in_lane(t, lanes, lane) && shown(t))
+        | sort_by((t) => t.position)
+    let count_in = (col_id) => count(b.tasks, (t) => t.column_id == col_id)
+
+    // Where a dragged card lands: before the card it is over, or after the
+    // lane's last card. Its index counts every card in the column but itself.
+    let drop = (col_id, lane) => {
+        let id = dragging
+        let target = over
+        dragging = null
+        over = null
+        if id == null { return null }
+        let t = find(b.tasks, (x) => x.id == id)
+        let others = b.tasks | filter((x) => x.column_id == col_id && x.id != id) | sort_by((x) => x.position) | map((x) => x.id)
+        let lane_ids = b.tasks | filter((x) => x.column_id == col_id && x.id != id && in_lane(x, lanes, lane)) | sort_by((x) => x.position) | map((x) => x.id)
+        let index = target != null && target.before != null
+            ? index_of(others, target.before) ?? len(others)
+            : len(lane_ids) > 0 ? (index_of(others, last(lane_ids)) ?? len(others)) + 1 : len(others)
+        if t.column_id == col_id && index == index_of(b.tasks | filter((x) => x.column_id == col_id) | sort_by((x) => x.position) | map((x) => x.id), id) && in_lane(t, lanes, lane) {
+            return null
+        }
+        let before = b.tasks
+        board = merge(b, { tasks: moved(b.tasks, id, col_id, index) })
+        if lanes != "none" && !in_lane(t, lanes, lane) {
+            let field = lanes == "assignee" ? "assignee_id" : "priority"
+            let r = edit_task(id, field, lane)
+            if is_err(r) { notify(r.error, { tone: "danger" }) }
+        }
+        let r = move_task(id, col_id, index)
+        if is_err(r) {
+            notify(r.error, { title: "Not moved", tone: "danger", seconds: 6 })
+            board = merge(board, { tasks: before })
+        } else {
+            board = merge(board, { tasks: r })
+        }
+    }
+
+    // Alt+← and Alt+→ move a focused card a column over; Enter opens it.
+    let key_on = (t, e) => {
+        if e.key == "Enter" { open = t.id; return null }
+        if !e.altKey || (e.key != "ArrowLeft" && e.key != "ArrowRight") || !editable { return null }
+        e.preventDefault()
+        let ids = b.columns | map((c) => c.id)
+        let at = index_of(ids, t.column_id) + (e.key == "ArrowLeft" ? -1 : 1)
+        if at < 0 || at >= len(ids) { return null }
+        let r = move_task(t.id, ids[at], 999_999)
+        if is_err(r) { notify(r.error, { tone: "danger" }) } else {
+            board = merge(board, { tasks: r })
+            js("pm.focus", `card-${t.id}`)
+        }
+    }
+
+    let add = (col_id) => {
+        let text = trim(draft)
+        if text == "" { adding = null; return null }
+        let r = create_task(project_id, col_id, text)
+        if is_err(r) { problem = r.error } else { draft = ""; problem = null }
+    }
+
+    <div.board-wrap class={open != null && "with-panel"}>
+        <div.board-main>
+            <div.toolbar>
+                <input.search type="search" placeholder="Filter cards…" aria-label="Filter cards" bind:value={q}/>
+                <select aria-label="Whose cards" @change={(e) => { who = e.value }}>
+                    <option value="all" selected={who == "all"}>Everyone</option>
+                    <option value="me" selected={who == "me"}>Mine</option>
+                    <option value="none" selected={who == "none"}>Nobody's</option>
+                </select>
+                <select aria-label="Label" @change={(e) => { label = int(e.value) ?? 0 }}>
+                    <option value="0">Any label</option>
+                    {for l in b.labels => <option key={l.id} value={l.id} selected={label == l.id}>{l.name}</option>}
+                </select>
+                <select aria-label="Swimlanes" @change={(e) => { lanes = e.value }}>
+                    {for [v, text] in LANES => <option key={v} value={v} selected={lanes == v}>{text}</option>}
+                </select>
+                <span.grow/>
+                <span.muted>{len(b.tasks)} cards · Alt+←/→ moves the focused card</span>
+            </div>
+            <Problem text={problem}/>
+            {for lane in lanes_of(lanes, b.members) => <section.lane key={str(lane.value)}>
+                {lanes != "none" && <h3.lane-title>
+                    {lane.hue != null && <Avatar name={lane.title} hue={lane.hue} size="sm"/>} {lane.title}
+                    <span.muted>{count(b.tasks, (t) => in_lane(t, lanes, lane.value) && shown(t))}</span>
+                </h3>}
+                <div.columns>
+                    {for c in b.columns => <section key={c.id} class={`col kind-${c.kind} ${over != null && over.col == c.id && over.lane == lane.value ? "over" : ""}`}
+                        @dragover={(e) => {
+                            e.preventDefault()
+                            // Over the column itself, not a card (cards stop the event).
+                            if over == null || over.col != c.id || over.lane != lane.value || over.before != null {
+                                over = { col: c.id, lane: lane.value, before: null }
+                            }
+                        }}
+                        @drop={(e) => { e.preventDefault(); drop(c.id, lane.value) }}>
+                        <header.col-head>
+                            <h2>{c.name}</h2>
+                            <span class={`count ${c.wip != null && count_in(c.id) > c.wip ? "over-wip" : ""}`}
+                                  title={c.wip != null ? `Work-in-progress limit: ${c.wip}` : "Cards in this column"}>
+                                {count_in(c.id)}{c.wip != null && ` / ${c.wip}`}
+                            </span>
+                        </header>
+                        <ul.cards>
+                            {for t in cards_in(c.id, lane.value) =>
+                                <TaskCard key={t.id} {t} pkey={key} labels={b.labels} {today} {editable}
+                                    dragging={dragging == t.id}
+                                    drop_before={over != null && over.before == t.id && dragging != t.id}
+                                    on_open={() => { open = t.id }}
+                                    on_drag={(e) => { dragging = t.id; e.dataTransfer.setData("text/plain", `${key}-${t.num}`); e.dataTransfer.effectAllowed = "move" }}
+                                    on_over={(e) => {
+                                        e.preventDefault()
+                                        e.stopPropagation()
+                                        if over == null || over.before != t.id { over = { col: c.id, lane: lane.value, before: t.id } }
+                                    }}
+                                    on_end={() => { dragging = null; over = null }}
+                                    on_key={(e) => key_on(t, e)}/>}
+                        </ul>
+                        {editable && lane.value == "all" && (adding == c.id
+                            ? <form.quick-add @submit={() => add(c.id)}>
+                                <textarea rows="2" placeholder="What needs doing?" bind:value={draft} autofocus
+                                    @keydown={(e) => {
+                                        if e.key == "Enter" && !e.shiftKey { e.preventDefault(); add(c.id) }
+                                        if e.key == "Escape" { adding = null; draft = "" }
+                                    }}></textarea>
+                                <div.actions>
+                                    <button.btn.primary.small>Add card</button>
+                                    <button.btn.ghost.small type="button" @click={() => { adding = null; draft = "" }}>Cancel</button>
+                                </div>
+                              </form>
+                            : <button.add-card @click={() => { adding = c.id; draft = ""; problem = null }}>+ Add a card</button>)}
+                    </section>}
+                </div>
+            </section>}
+        </div>
+        {open != null && <TaskPanel key={open} task_id={open} {today} board={b} on_close={() => { open = null }}/>}
+    </div>
+}

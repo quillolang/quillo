@@ -1,0 +1,72 @@
+// Accounts: joining, signing in and out. The session cookie holds a random
+// id; the sessions table says whose it is, so signing out ends it for good.
+// Also the viewer's time zone, which the browser reports in a cookie.
+
+let SESSION_DAYS = 30
+
+type Me = { id: int, name: str, hue: int }
+
+fn user_of_session(sid) with db, time {
+    if sid == null { return null }
+    db.one(sql`select u.id, u.name, u.hue from sessions s join users u on u.id = s.user_id
+               where s.id = ? and s.expires > ?`, sid, now())
+}
+
+fn me() with db, time = user_of_session(session().sid)
+
+// For loaders: who is asking, without following the sessions table.
+fn viewer() with db, time = unwatched(() => me())
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+fn acting() ! str with db, time = me() ?? err("Sign in first")
+
+// Minutes east of UTC, from the `tz` cookie public/js/pm.js sets. Quillo
+// has no time zones, so without it "today" is UTC's. Routes and server fns
+// pass their `request`: other functions cannot read it.
+fn tz_offset(req) -> int {
+    let n = int(req.cookies.tz ?? "0") ?? 0
+    n >= -720 && n <= 840 ? n : 0
+}
+
+fn today(req) -> int = day_of(now(), tz_offset(req))
+
+fn start_session(user_id: int) with db, time, random {
+    let sid = crypto.token()
+    db.exec("insert into sessions (id, user_id, created, expires) values (?, ?, ?, ?)",
+        sid, user_id, now(), now() + SESSION_DAYS * DAY_MS)
+    set_session({ sid }, { max_age: SESSION_DAYS * 86400 })
+}
+
+fn valid_name(name: str) -> bool = re.test(name, "^[A-Za-z0-9_]{3,20}$")
+
+fn register(name: str, email: str, password: str) ! str with db, time, random {
+    let n = trim(name)
+    let e = lower(trim(email))
+    if !valid_name(n) { return err("A name is 3 to 20 letters, digits or _") }
+    if !re.test(e, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") || len(e) > 200 { return err("That email does not look right") }
+    if len(password) < 8 { return err("Use at least 8 characters for the password") }
+    if db.one("select 1 from users where name = ? or email = ?", n, e) != null {
+        return err("That name or email is already taken")
+    }
+    let r = db.exec("insert into users (name, email, password_hash, hue, created) values (?, ?, ?, ?, ?)",
+        n, e, crypto.hash_password(password), random_int(0, 359), now())?
+    start_session(r.last_id)
+}
+
+fn sign_in(who: str, password: str) ! str with db, time, random {
+    let u = db.one("select id, password_hash from users where name = ? or email = ?", trim(who), lower(trim(who)))
+    let hash = u.password_hash ?? crypto.hash_password("not anyone's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong name or password") }
+    start_session(u.id)
+}
+
+fn sign_out() with db, time {
+    let sid = session().sid
+    if sid != null { db.exec("delete from sessions where id = ?", sid) }
+    end_session()
+}
+
+fn clear_sessions() with db, time = db.exec("delete from sessions where expires < ?", now())

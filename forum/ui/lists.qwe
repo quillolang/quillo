@@ -1,0 +1,67 @@
+// Lists of threads and categories. <ThreadList> is live: a new thread, a
+// reply or a vote anywhere shows on every open list at once. For someone
+// signed in, threads with something they have not seen stand out.
+
+view CategoryCard(c) =
+    <a.cat href={`/c/${c.slug}`} style={`--c: ${c.color}`}>
+        <h3>{c.name}</h3>
+        <p>{c.about}</p>
+        <span.cat-meta>{plural(c.threads, "thread")} · {plural(c.posts, "post")}{c.active != null && ` · active ${ago(c.active)}`}</span>
+    </a>
+
+view SortTabs(base: str, sort: str, signed_in: bool) =
+    <nav.tabs aria-label="Sort threads">
+        {for [key, label] in [["latest", "Latest"], ["new", "New"], ["top", "Top"], ["following", "Following"]] =>
+            (key != "following" || signed_in) &&
+            <a href={`${base}?sort=${key}`} class={sort == key && "on"} aria-current={sort == key && "page"}>{label}</a>}
+    </nav>
+
+view Pager(base: str, sort: str, page: int, more: bool) =
+    (page > 1 || more) && <nav.pager>
+        {page > 1 ? <a.btn.ghost href={`${base}?sort=${sort}&page=${page - 1}`}>← Newer</a> : <span/>}
+        <span.muted>Page {page}</span>
+        {more ? <a.btn.ghost href={`${base}?sort=${sort}&page=${page + 1}`}>Older →</a> : <span/>}
+    </nav>
+
+view ThreadRow(t, show_category: bool) =
+    <li.row class={`${t.pinned == 1 ? "pinned" : ""} ${(t.fresh ?? 0) == 1 || (t.unread ?? 0) > 0 ? "unseen" : ""}`}>
+        <Avatar name={t.author} hue={t.author_hue}/>
+        <div.main>
+            <a.title href={(t.unread ?? 0) > 0 ? `/t/${t.id}#p${t.first_unread}` : `/t/${t.id}`}>
+                {t.pinned == 1 && <span.badge.pin title="Pinned">📌</span>}
+                {t.locked == 1 && <span.badge.lock title="Locked">🔒</span>}
+                {t.solved == 1 && <span.badge.solved>✓ Solved</span>}
+                {t.title}
+                {(t.fresh ?? 0) == 1 && <span.badge.new>new</span>}
+                {(t.unread ?? 0) > 0 && <span.badge.new title="Replies since your last visit">{t.unread} new</span>}
+            </a>
+            <div.meta>
+                {show_category && <CategoryPill slug={t.cat_slug} name={t.cat_name} color={t.cat_color}/>}
+                {for g in tags_of(t.tags) => <Tag tag={g}/>}
+                <span>by <a href={`/u/${t.author}`}>{t.author}</a> {ago(t.created)}</span>
+            </div>
+        </div>
+        <div.stat title="Votes"><b>{t.score}</b><span>votes</span></div>
+        <div.stat title="Replies"><b>{compact(t.replies)}</b><span>replies</span></div>
+        <div.last>
+            <Avatar name={t.last_name} hue={t.last_hue} size="sm"/>
+            <span>{ago(t.last_post_at)}</span>
+        </div>
+    </li>
+
+component ThreadList(category_id: int?, tag: str?, sort: str, page: int, base: str, signed_in: bool) {
+    state data = live(load_threads, category_id, tag, sort, page)
+    <section.threads>
+        <div.list-head>
+            <SortTabs {base} {sort} {signed_in}/>
+        </div>
+        {data == null
+            ? <Empty>Loading…</Empty>
+            : len(data.threads) == 0
+                ? sort == "following"
+                    ? <Empty><p>You are not following any threads here.</p><p.muted>Start one or reply, or press Follow on a thread, and it shows up here.</p></Empty>
+                    : <Empty><p>No threads here yet.</p><a.btn.primary href="/new">Start the first one</a></Empty>
+                : <ol.list>{for t in data.threads => <ThreadRow key={t.id} {t} show_category={category_id == null}/>}</ol>}
+        {data != null && <Pager {base} {sort} {page} more={data.more}/>}
+    </section>
+}

@@ -1,0 +1,9 @@
+// Q-019 set(m, 5, x) is accepted and get(m, 5) works, but m[5] is an error
+// mode: run
+// open-when: cannot index map with int
+// fixed-when: five
+// From FEEDBACK2.md §8 (found on 896e758).
+
+let m = set({}, 5, "five")
+print(get(m, 5))
+print(m[5])
