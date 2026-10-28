@@ -113,6 +113,10 @@ pub struct Interp {
     /// The current request's id (`x-request-id`, given or made), which calls
     /// to services pass on (src/service.rs).
     pub request_id: Option<Arc<str>>,
+    /// When the service call being answered must be done by: its caller's
+    /// time left, which calls it makes in turn may wait no longer than
+    /// (FEEDBACK6.md, Q-056; branch feedback6-fixes).
+    pub deadline: Option<std::time::Instant>,
     /// Whether the program named the tenant (`with_tenant`), rather than a
     /// request's host: only then may its database be made.
     pub tenant_named: bool,
@@ -784,6 +788,7 @@ impl Interp {
             tenant: None,
             tenant_named: false,
             request_id: None,
+            deadline: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,
@@ -850,6 +855,7 @@ impl Interp {
             tenant: None,
             tenant_named: false,
             request_id: None,
+            deadline: None,
             upload_body: None,
             set_cookies: Vec::new(),
             session: None,

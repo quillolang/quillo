@@ -1613,7 +1613,14 @@ When a service runs elsewhere, its calls are made to hold up:
   ```
 
   Those are the defaults, except `timeout` (10 s). Durations are `"500ms"`, `"2s"`,
-  `"1m"`, or milliseconds.
+  `"1m"`, or milliseconds. A try that runs out says so: `service billing: took more
+  than 2 s (its timeout)`. They apply when a service runs elsewhere (`--split`, or at an
+  address); in one process a call is a function's, which runs to its end.
+- **A chain gives up together.** Each call carries the time its caller still waits for
+  it, and the calls the service makes in turn wait no longer than that (their own
+  `timeout` when it is shorter). So when the first link gives up, the ones below stop
+  waiting too instead of finishing work nobody waits for; a call with no time left is
+  not made. What a service is already doing runs to its end.
 - **One id for a request, everywhere.** Each request has an id: the `x-request-id` it came
   with (a proxy's, a load balancer's), or one made for it. Its answer carries it, the
   JSON log shows it (`"rid"`), the code sees it (`request.id`), and every call to a
