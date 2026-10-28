@@ -2,10 +2,10 @@
 // mode: browser
 // page: /
 // open-when: "remade": 1
-// fixed-when: "remade": 0
+// fixed-when: cannot go inside a <p>
 // From FEEDBACK3.md §1 (found on 896e758). The same family as Q-011: what the server writes is
-// re-parsed by the browser into another tree, and nothing says so. Fixed too if `quillo check`
-// refuses the markup (then this repro does not start: it reads "changed").
+// re-parsed by the browser into another tree, and nothing says so. Fixed by `quillo check`
+// refusing the markup, so the program does not start.
 
 component Byline(name: str) {
     state n = 0

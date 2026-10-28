@@ -1,7 +1,7 @@
 // Q-029 SQL built from sql_name(...) is warned about as injection when the name is kept in a variable or made by a helper
 // mode: check
 // open-when: SQL built from values
-// fixed-when: /components\)$/m
+// fixed-when: /components\)\s*$/
 // From FEEDBACK3.md §2 (found on 896e758). The guide says SQL made of sql_name "(also kept in a
 // variable)" is not warned about; it is, when sql_name is given a template string, or when a
 // helper returns it. In cms/, all 14 of `quillo check`'s warnings are this.
