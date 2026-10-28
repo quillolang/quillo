@@ -288,13 +288,15 @@ fn a_syntax_error_says_which_quillo_read_it() {
     let dir = std::env::temp_dir().join(format!("quillo-lsp-syntax-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("main.qwe");
-    std::fs::write(&file, "let x = (\n").unwrap();
+    // A word this Quillo does not know: an unclosed `(` is only a mistake
+    // (FEEDBACK.md, Q-008; branch feedback6-fixes).
+    std::fs::write(&file, "let x = 1 as int\n").unwrap();
     let uri = format!("file://{}", file.display());
     let mut c = Client::start();
     let mut notes = Vec::new();
     c.request("initialize", json!({ "capabilities": {} }), &mut notes);
     c.notify("initialized", json!({}));
-    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "let x = (\n" } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "let x = 1 as int\n" } }));
     let d = loop {
         let m = c.recv();
         if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {

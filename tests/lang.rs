@@ -451,7 +451,9 @@ fn spread_in_maps_and_lists() {
     assert_eq!(ev("let xs = [1, 2]\n[[...xs, 3], [0, ...xs, ...xs], [...xs], [...[]], 0..3]"), "[[1, 2, 3], [0, 1, 2, 1, 2], [1, 2], [], [0, 1, 2]]");
     // A variable named like the builtin spread uses changes nothing.
     assert_eq!(ev("let merge = 5\nlet m = { a: 1 }\n{ ...m, b: merge }"), "{ a: 1, b: 5 }");
-    assert!(ev_err("[...1]").contains("cannot add"));
+    // The error names the spread, not the `+` it was made of (Q-036;
+    // branch feedback6-fixes).
+    assert!(ev_err("[...1]").contains("`[...x]` spreads a list (or null) into a list, but x is int"));
 }
 
 #[test]
