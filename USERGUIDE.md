@@ -24,7 +24,7 @@ mistyped option is told the nearest one there is:
 | Option | |
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1) |
-| `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages |
+| `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
 | `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
 | `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
@@ -45,6 +45,7 @@ mistyped option is told the nearest one there is:
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 | `--env-file F` | the settings file to read, instead of the `.env` beside the program |
+| `--with CMD` | run a command beside the program, in its folder, its lines marked with its name, stopped with it (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
 
 The `.env` beside the program is read into its environment as it starts: `KEY=value`
 lines (`export` allowed, `#` for comments, values in `"..."` with `\n`, or `'...'` as
@@ -439,6 +440,18 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `@media`, `@supports`, `@container` and `@layer` are scoped inside; `@keyframes` and
   `@font-face` are kept as they are. The style is the same for every use of the component,
   so it cannot read its parameters (set a class or `style=` on an element for that).
+- `style_with("npx postcss")`, at the top level, passes every component's and view's
+  `style` through a command that reads CSS and writes CSS, as the program loads and before
+  the styles are scoped: PostCSS with Tailwind's plugin (and its config beside the
+  program) makes `@apply`, `theme()` and nesting work in a component's own CSS. All the
+  styles go through it at once; what it made is kept while the CSS is the same, and a
+  command that fails stops the program loading, with what it said.
+- With Tailwind's CLI for the page's own sheet: `quillo run main.qwe --watch --with
+  "npx tailwindcss -i src/app.css -o public/app.css --watch"`, the sheet served with
+  `file()`. Tailwind finds classes written out in strings and attributes (`class="px-3"`,
+  `ok ? "text-green-700" : "text-red-700"`); a class made from parts (`` `bg-${color}` ``)
+  is found by neither it nor Quillo. Under `--watch`, each time it writes the sheet the
+  open pages take it as they are.
 - A page is sent the styles of the components and views on it, and of those its bundle can
   show, as a sheet of its own in its `<head>`, `/_quillo/s/<hash>.css`, which the browser
   keeps for good. A `<style>` the page writes is for what is not a component's.

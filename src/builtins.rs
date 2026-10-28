@@ -113,6 +113,7 @@ pub fn install(env: &Env) {
         ("css", tag_text),
         ("__style", style_noop),
         ("ready", crate::ready::add_check),
+        ("style_with", style_with),
         ("sql", tag_text),
         ("sql_name", sql_name),
         ("sql_param", sql_param),
@@ -844,6 +845,13 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let Some(Value::Map(h)) = req.get("headers") else { return None };
         h.get(name).map(|v| v.display())
     };
+    if crate::statics::WATCH_SERVED.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(Value::Map(req)) = it.request_value() {
+            if let Some(path) = req.get("path") {
+                crate::statics::served(&full, &path.display());
+            }
+        }
+    }
     let fresh = match asked("if-none-match", it) {
         Some(v) => crate::statics::matches(&v, &info.etag),
         None => asked("if-modified-since", it).map_or(false, |v| v == info.last_modified),
@@ -1595,6 +1603,18 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `every(ms, f)` in a component: in the browser, calls `f` every `ms`
 /// milliseconds while the component's renders keep asking for it. Rendering
 /// on the server starts nothing.
+/// `style_with("npx postcss")`: the command each component's and view's
+/// `style` goes through when the program loads, before it is scoped
+/// (FEEDBACK11.md, Q-079; branch feedback11-fixes). At the top level.
+fn style_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let cmd = s_arg(&args, 0, "style_with", line)?;
+    if cmd.trim().is_empty() {
+        return fail(line, "`style_with` takes the command to run, like style_with(\"npx postcss\")");
+    }
+    it.style_with = Some(cmd.to_string());
+    Ok(Value::Nil)
+}
+
 /// `style ...` in a component's or view's body: nothing as the code runs;
 /// the program takes the CSS when it loads (FEEDBACK8.md, Q-067; branch
 /// feedback8-fixes).

@@ -206,6 +206,9 @@ pub struct Interp {
     /// feedback10-fixes).
     pub declared_services: Arc<Vec<String>>,
     pub ready_checks: Arc<Vec<(String, Value)>>,
+    /// The command components' styles go through (`style_with`; FEEDBACK11.md,
+    /// Q-079; branch feedback11-fixes).
+    pub style_with: Option<String>,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -837,6 +840,7 @@ impl Interp {
             env_file: Default::default(),
             declared_services: Default::default(),
             ready_checks: Default::default(),
+            style_with: None,
             types: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
@@ -909,6 +913,7 @@ impl Interp {
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
             ready_checks: self.ready_checks.clone(),
+            style_with: self.style_with.clone(),
             types: self.types.clone(),
             stream_out: None,
             pending_stream: None,

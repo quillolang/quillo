@@ -29,6 +29,30 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Under `--watch`, the files the program has served with `file()`, and the
+/// path each was asked for at: a change to one refreshes the pages, and a
+/// stylesheet is swapped in them as they are (FEEDBACK11.md, Q-078; branch
+/// feedback11-fixes).
+pub static WATCH_SERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SERVED: Mutex<Option<HashMap<PathBuf, String>>> = Mutex::new(None);
+
+/// Notes that `file` went out at `path`, while `--watch` looks.
+pub fn served(file: &Path, path: &str) {
+    if !WATCH_SERVED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut s = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let m = s.get_or_insert_with(HashMap::new);
+    if m.len() < 10_000 {
+        m.insert(file.to_path_buf(), path.to_string());
+    }
+}
+
+/// The files served so far, with the path each was asked for at.
+pub fn served_files() -> Vec<(PathBuf, String)> {
+    SERVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Vec::new(), |m| m.iter().map(|(f, p)| (f.clone(), p.clone())).collect())
+}
+
 static FILES: Mutex<Option<Lru<(PathBuf, u64, u128)>>> = Mutex::new(None);
 static GZIP: Mutex<Option<Lru<(String, u64)>>> = Mutex::new(None);
 

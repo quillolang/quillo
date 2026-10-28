@@ -61,6 +61,9 @@ options for `run`:
                  `quillo docs` writes it)
   --scale NAME=N with --split: run service NAME as N copies, taking calls in
                  turn (they share its database)
+  --with CMD     run CMD beside the program, in its folder, its lines marked,
+                 stopped with it (`--with \"npx tailwindcss -i src/app.css -o
+                 public/app.css --watch\"`); may be given more than once
   --join URL     with --as-service: join the app at URL as one more copy of
                  this service, while it runs; leaves when stopped
   --as-service   serve the program as a service: its server fns answer only
@@ -123,7 +126,7 @@ fn main() {
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
-    "--scale", "--join",
+    "--scale", "--join", "--with",
 ];
 
 /// Options of `run`, `app`, `build` and `check` that take no value.
@@ -306,6 +309,8 @@ struct RunOptions {
     scale: Vec<(String, usize)>,
     /// The app this copy of a service joins (`--join http://app:8080`).
     join: Option<String>,
+    /// Commands run beside the program and stopped with it (`--with`).
+    with: Vec<String>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -328,6 +333,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         env_file: None,
         scale: Vec::new(),
         join: None,
+        with: Vec::new(),
     };
     let mut i = 0;
     while i < flags.len() {
@@ -369,6 +375,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             },
             ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
             ("--env-file", Some(v)) => o.env_file = Some(v.clone()),
+            ("--with", Some(v)) if !v.trim().is_empty() => o.with.push(v.clone()),
             ("--scale", Some(v)) => match v.split_once('=').map(|(n, c)| (n, c.parse::<usize>())) {
                 Some((name, Ok(n))) if !name.is_empty() && (1..=64).contains(&n) => o.scale.push((name.to_string(), n)),
                 _ => {
@@ -541,6 +548,57 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
 /// The first Ctrl-C or SIGTERM stops the server gracefully: it leaves the
 /// pool it joined, finishes the requests in progress and exits; a second
 /// one exits at once.
+/// Commands run beside the program (`quillo run main.qwe --watch --with
+/// "npx tailwindcss -i src/app.css -o public/app.css --watch"`): each in the
+/// program's folder, in a process group of its own, its lines marked with
+/// its first word; stopped, group and all, when the program stops
+/// (FEEDBACK11.md, Q-079; branch feedback11-fixes).
+mod with {
+    use std::io::{BufRead, Read};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static RUNNING: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+
+    pub fn start(cmd: &str, dir: &Path) -> Result<(), String> {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(cmd).current_dir(dir).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        let mut child = c.spawn().map_err(|e| e.to_string())?;
+        let tag = cmd.split_whitespace().find(|w| !w.contains('=') && *w != "npx" && *w != "bunx").unwrap_or("with").rsplit('/').next().unwrap_or("with").to_string();
+        eprintln!("quillo: started `{}` beside the program", cmd);
+        for out in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
+            let tag = tag.clone();
+            std::thread::spawn(move || {
+                for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                    eprintln!("[{}] {}", tag, l);
+                }
+            });
+        }
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(child);
+        Ok(())
+    }
+
+    /// Stops each command and what it started.
+    pub fn stop_all() {
+        let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        for child in running.iter_mut() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        running.clear();
+    }
+}
+
 fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
     stop_on_signal_with(member, None)
 }
@@ -558,6 +616,7 @@ fn stop_on_signal_with(member: Option<quillo::cluster::Membership>, joining: Opt
         if let Some(j) = &joining {
             j.leave();
         }
+        with::stop_all();
         quillo::httpd::stop();
     });
 }
@@ -614,6 +673,16 @@ fn run(file: &str, flags: &[String]) -> i32 {
     if let Err(e) = quillo::dotenv::load_into_process(&env_file.0, env_file.1) {
         eprintln!("quillo: {}", e);
         return 2;
+    }
+    // What runs beside the program (FEEDBACK11.md, Q-079; branch
+    // feedback11-fixes): started in its folder, stopped with it.
+    let dir = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    for cmd in &o.with {
+        if let Err(e) = with::start(cmd, dir) {
+            eprintln!("quillo: --with {:?}: {}", cmd, e);
+            with::stop_all();
+            return 1;
+        }
     }
     warn_of_secrets();
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());

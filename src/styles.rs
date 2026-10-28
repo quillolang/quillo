@@ -40,7 +40,8 @@ struct Sheet {
 impl Styles {
     /// Every component's and view's style, taken when the program loads.
     pub fn collect(it: &mut Interp) -> Result<Styles, QuilloError> {
-        let mut by_id = BTreeMap::new();
+        // Each style's CSS as written, then made (`style_with`), then scoped.
+        let mut written: BTreeMap<String, (String, String, u32)> = BTreeMap::new();
         let env = it.globals.clone();
         for (_, v) in scope_vars(&it.globals) {
             let Value::Func(f) = v else { continue };
@@ -58,10 +59,15 @@ impl Styles {
                     Err(Ctrl::Error(e)) => return Err(e),
                     Err(_) => return Err(QuilloError::new(format!("`style` in `{}` must be CSS text", f.def.name), f.def.line)),
                 };
-                let scoped: &mut String = by_id.entry(id.clone()).or_default();
-                scoped.push_str(&scope(&css, &id));
+                let entry = written.entry(id.clone()).or_insert_with(|| (f.def.name.clone(), String::new(), f.def.line));
+                entry.1.push_str(&css);
+                entry.1.push('\n');
             }
         }
+        if let Some(cmd) = it.style_with.clone() {
+            made_with(&cmd, &it.base_dir, &mut written)?;
+        }
+        let by_id = written.into_iter().map(|(id, (_, css, _))| (id.clone(), scope(&css, &id))).collect();
         Ok(Styles { by_id, ..Default::default() })
     }
 
@@ -106,6 +112,83 @@ impl Styles {
     pub fn all(&self) -> String {
         self.by_id.values().map(|s| s.as_str()).collect()
     }
+}
+
+/// The program's styles passed through the command it names with
+/// `style_with` (PostCSS with Tailwind's plugin, say), so `@apply` and
+/// `theme()` work in a component's `style` (FEEDBACK11.md, Q-079; branch
+/// feedback11-fixes). The command reads CSS and writes CSS. All the styles
+/// go through it at once, each after a `/*! quillo-style <id> */` mark,
+/// which such tools keep; if the marks do not come back, each style goes
+/// through on its own. What it made is kept, so loading again with the same
+/// CSS does not run it again.
+fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (String, String, u32)>) -> Result<(), QuilloError> {
+    static MADE: std::sync::Mutex<Option<HashMap<u64, String>>> = std::sync::Mutex::new(None);
+    let key = |text: &str| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (cmd, text).hash(&mut h);
+        h.finish()
+    };
+    let run = |input: &str| -> Result<String, String> {
+        if let Some(out) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key(input)) {
+            return Ok(out.clone());
+        }
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().ok_or("no stdin")?;
+        let text = input.to_string();
+        let feeder = std::thread::spawn(move || stdin.write_all(text.as_bytes()));
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let _ = feeder.join();
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(err.lines().filter(|l| !l.trim().is_empty()).take(6).collect::<Vec<_>>().join("\n"));
+        }
+        let made = String::from_utf8_lossy(&out.stdout).into_owned();
+        MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key(input), made.clone());
+        Ok(made)
+    };
+    if styles.is_empty() {
+        return Ok(());
+    }
+    let mark = |id: &str| format!("/*! quillo-style {} */", id);
+    let all: String = styles.iter().map(|(id, (_, css, _))| format!("{}\n{}\n", mark(id), css)).collect();
+    let whole = run(&all).map_err(|e| QuilloError::new(format!("style_with `{}` failed: {}", cmd, e), 0))?;
+    // Split where the marks are, in the order they went in.
+    let ids: Vec<String> = styles.keys().cloned().collect();
+    let mut at: Vec<usize> = Vec::new();
+    for id in &ids {
+        match whole.find(&mark(id)) {
+            Some(i) if at.last().map_or(true, |l| i > *l) => at.push(i),
+            _ => {
+                at.clear();
+                break;
+            }
+        }
+    }
+    if at.len() == ids.len() {
+        for (k, id) in ids.iter().enumerate() {
+            let from = at[k] + mark(id).len();
+            let to = at.get(k + 1).copied().unwrap_or(whole.len());
+            if let Some(s) = styles.get_mut(id) {
+                s.1 = whole[from..to].to_string();
+            }
+        }
+        return Ok(());
+    }
+    for (_, (name, css, line)) in styles.iter_mut() {
+        *css = run(css).map_err(|e| QuilloError::new(format!("style_with `{}` failed on `{}`'s style: {}", cmd, name, e), *line))?;
+    }
+    Ok(())
 }
 
 /// The ids of the styles whose elements are in `html` (`data-q-<id>`).
@@ -443,6 +526,26 @@ mod tests {
         let css = ".a, .b:hover { x: 1 }\n/* .c */\n@media (x) {\n  .d .e[title=\".f\"] { y: 1.5em }\n}\n:global(.g) .h { }";
         assert_eq!(classes_in(css), vec![("a".into(), 0), ("b".into(), 0), ("d".into(), 3), ("e".into(), 3), ("h".into(), 5)]);
         assert_eq!(set_elsewhere("/* set elsewhere: leaflet-, .mapbox */ .x {}"), vec!["leaflet-", "mapbox"]);
+    }
+
+    #[test]
+    fn styles_go_through_the_command_named() {
+        let styles = || {
+            let mut m = BTreeMap::new();
+            m.insert("aaaa0001".to_string(), ("Card".to_string(), ".t { @apply bold; }\n".to_string(), 1));
+            m.insert("bbbb0002".to_string(), ("Panel".to_string(), ".u { @apply bold; color: red }\n".to_string(), 5));
+            m
+        };
+        let dir = std::env::temp_dir();
+        for cmd in ["sed 's/@apply bold;/font-weight: 700;/'", "sed 's/@apply bold;/font-weight: 700;/' | grep -v quillo-style"] {
+            let mut s = styles();
+            made_with(cmd, &dir, &mut s).unwrap();
+            assert_eq!(s["aaaa0001"].1.trim(), ".t { font-weight: 700; }", "{}", cmd);
+            assert_eq!(s["bbbb0002"].1.trim(), ".u { font-weight: 700; color: red }", "{}", cmd);
+        }
+        let mut s = styles();
+        let e = made_with("echo 'no @apply here' >&2; exit 1", &dir, &mut s).unwrap_err();
+        assert!(e.msg.contains("no @apply here"), "{}", e.msg);
     }
 
     #[test]
