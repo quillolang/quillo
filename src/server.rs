@@ -679,7 +679,8 @@ impl Interp {
         let had = hdr("x-quillo-had").and_then(crate::livecache::parse_hash);
         let key = boundary.is_none().then(|| (name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
         let viewer = {
-            let mut text = req.remote.clone();
+            // The address without its port, which each connection has its own of.
+            let mut text = req.remote.parse::<std::net::SocketAddr>().map_or_else(|_| req.remote.clone(), |a| a.ip().to_string());
             for n in ["cookie", "authorization", "accept-language", "user-agent"] {
                 text.push('\n');
                 text.push_str(hdr(n).unwrap_or(""));

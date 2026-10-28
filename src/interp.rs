@@ -2281,9 +2281,16 @@ impl Interp {
     fn bind_args(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
         if def.server {
+            let was = self.read_request;
             if let Some(req) = self.request_value() {
                 define(&scope, "request", req.clone());
                 self.mark_impure();
+            }
+            // `request` given to a server fn is read only if its code names
+            // it: a live loader that does not is shared between viewers
+            // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+            if self.reads.is_some() && !was && !crate::parser::names_request(&def.body) {
+                self.read_request = false;
             }
         }
         let mut it = args.into_iter();

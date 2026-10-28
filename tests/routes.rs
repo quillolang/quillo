@@ -391,6 +391,58 @@ server fn tx_fail() = db.transaction(() => {
     assert_eq!(changed_since(&mut it, seq, "db:notes")["changed"], serde_json::json!([]));
 }
 
+fn live_as(it: &mut Interp, name: &str, viewer: &str, had: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut headers = vec![
+        ("Host".to_string(), "localhost".to_string()),
+        ("Content-Type".into(), "application/json".into()),
+        ("X-Quillo-Live".into(), "1".into()),
+        ("Cookie".into(), format!("who={}", viewer)),
+    ];
+    if let Some(h) = had {
+        headers.push(("X-Quillo-Had".into(), h.as_str().unwrap().into()));
+    }
+    let r = it.handle(&HttpRequest { method: "POST".into(), url: format!("/_quillo/rpc/{}", name), headers, body: b"[]".to_vec(), remote: "127.0.0.1:50000".into() });
+    serde_json::from_str(&r.text()).unwrap()
+}
+
+/// One change wakes every page, and they all ask: one run serves them, and
+/// each is sent what changed (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+#[test]
+fn live_runs_are_shared_and_answers_are_patches() {
+    let mut it = app(
+        r#"
+let rows = for i in range(500) => { id: i, title: `Row ${i}` }
+let count = 0
+server fn load_rows() with random = { stamp: random(), rows }
+server fn mine() with random = { stamp: random(), who: request.headers["cookie"] }
+server fn counted() with random { count += 1; random() }
+server fn rename(id: int) { rows = for r in rows => r.id == id ? merge(r, { title: "Renamed" }) : r }
+"#,
+    );
+    // Not the viewer's: one run for both.
+    let a = live_as(&mut it, "load_rows", "a", None);
+    let b = live_as(&mut it, "load_rows", "b", None);
+    assert_eq!(a["ok"]["stamp"], b["ok"]["stamp"]);
+    assert_eq!(a["h"], b["h"]);
+    // The viewer's: one run each, and the same viewer's pages share theirs.
+    let ma = live_as(&mut it, "mine", "a", None);
+    let mb = live_as(&mut it, "mine", "b", None);
+    assert_ne!(ma["ok"]["stamp"], mb["ok"]["stamp"]);
+    assert_eq!(live_as(&mut it, "mine", "a", None)["ok"]["stamp"], ma["ok"]["stamp"]);
+    // A run that writes is never shared.
+    assert_ne!(live_as(&mut it, "counted", "a", None)["ok"], live_as(&mut it, "counted", "b", None)["ok"]);
+    // After a change, a page that says what it has is sent a patch to it.
+    rpc(&mut it, "rename", "[7]");
+    let p = live_as(&mut it, "load_rows", "a", Some(&a["h"]));
+    assert!(p.get("ok").is_none() && p["patch"].to_string().len() < 200, "{}", p);
+    let whole = live_as(&mut it, "load_rows", "c", None);
+    assert_eq!(quillo::livecache::apply(&a["ok"], &p["patch"]), whole["ok"]);
+    assert_eq!(whole["ok"]["rows"][7]["title"], "Renamed");
+    assert_eq!(p["h"], whole["h"]);
+    // The same value again: "the same".
+    assert_eq!(live_as(&mut it, "load_rows", "a", Some(&p["h"]))["patch"], serde_json::json!({ "$=": 1 }));
+}
+
 #[test]
 fn live_state_is_rendered_with_its_subscription() {
     let mut it = app(

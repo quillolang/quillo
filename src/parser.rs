@@ -2028,7 +2028,7 @@ fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {
 }
 
 /// Whether `e` mentions `request` anywhere (closures included).
-fn names_request(e: &Expr) -> bool {
+pub(crate) fn names_request(e: &Expr) -> bool {
     let mut found = false;
     crate::check::walk_expr(e, &mut |x| {
         if let Expr::Ident(n, _) = x {
