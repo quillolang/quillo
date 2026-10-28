@@ -1,0 +1,230 @@
+/* Quillo Bank: the customers' app (a phone) and the staff's desk. Light and dark. */
+
+:root {
+    --bg: #f4f6f3;
+    --surface: #ffffff;
+    --surface-2: #eef2ee;
+    --text: #14211b;
+    --muted: #5f6f67;
+    --line: #dde4de;
+    --brand: #0b3d2e;
+    --brand-2: #15684d;
+    --gold: #c9971c;
+    --accent: #15684d;
+    --accent-ink: #ffffff;
+    --good: #12805a;
+    --good-bg: #e3f4ec;
+    --warn: #a86b00;
+    --warn-bg: #fff3d6;
+    --danger: #c43c3c;
+    --danger-bg: #fbe7e7;
+    --shadow: 0 1px 2px rgb(16 32 24 / .06), 0 2px 8px rgb(16 32 24 / .05);
+    --radius: 14px;
+    color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0c1411;
+        --surface: #131e19;
+        --surface-2: #1a2822;
+        --text: #e5eee9;
+        --muted: #94a69d;
+        --line: #263731;
+        --brand: #0e2c22;
+        --brand-2: #2f9b74;
+        --gold: #e9c46a;
+        --accent: #3fb68b;
+        --accent-ink: #06130e;
+        --good: #48c995;
+        --good-bg: #123526;
+        --warn: #f0b44c;
+        --warn-bg: #33270e;
+        --danger: #f07c7c;
+        --danger-bg: #3a1919;
+        --shadow: 0 1px 2px rgb(0 0 0 / .5);
+        color-scheme: dark;
+    }
+}
+
+* { box-sizing: border-box }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15.5px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif }
+a { color: var(--accent) }
+h1 { font-size: 1.5rem; margin: .2rem 0 .8rem; letter-spacing: -.01em }
+h2 { font-size: 1.05rem; margin: 1.4rem 0 .6rem }
+h3 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 1rem 0 .4rem }
+.muted { color: var(--muted); font-size: .9em }
+.center { text-align: center }
+.big { font-size: 1.9rem; font-weight: 750; letter-spacing: -.02em; margin: .2rem 0 }
+.logo { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--brand); color: var(--gold); font: 700 1.1rem Georgia, serif }
+.brand { display: flex; align-items: center; gap: .55rem; color: inherit; text-decoration: none; font-weight: 700 }
+.brand small { font-weight: 500; color: var(--muted) }
+
+/* buttons and forms */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; padding: .6rem 1rem; border-radius: 11px; border: 1px solid transparent; font: inherit; font-weight: 650; cursor: pointer; text-decoration: none; white-space: nowrap }
+.btn.primary { background: var(--accent); color: var(--accent-ink) }
+.btn.primary:disabled { opacity: .45; cursor: default }
+.btn.ghost { background: transparent; border-color: var(--line); color: var(--text) }
+.btn.ghost:hover { background: var(--surface-2) }
+.btn.danger { background: var(--danger); color: #fff }
+.btn.ghost.danger { background: transparent; color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent) }
+.btn.small { padding: .32rem .7rem; font-size: .85rem; border-radius: 9px }
+.btn.wide { width: 100% }
+.link { background: none; border: 0; color: var(--muted); font: inherit; cursor: pointer; padding: 0 }
+form.inline { display: inline }
+.stack { display: grid; gap: .9rem }
+.stack label, label.field { display: grid; gap: .3rem; font-weight: 600; font-size: .92rem }
+input, select, textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: .6rem .75rem; width: 100% }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px }
+.actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center }
+.problem { background: var(--danger-bg); color: var(--danger); border-radius: 10px; padding: .55rem .8rem; margin: .4rem 0; font-weight: 550 }
+.field-problem { color: var(--danger); font-weight: 500; font-size: .85rem }
+.payee { color: var(--good); font-weight: 600; font-size: .9rem }
+.empty { text-align: center; color: var(--muted); padding: 2.5rem 1rem; border: 1px dashed var(--line); border-radius: var(--radius); background: var(--surface) }
+.status { display: inline-block; line-height: 1.4; font-size: .75rem; font-weight: 700; padding: .12rem .55rem; border-radius: 999px; white-space: nowrap }
+.status.done { background: var(--good-bg); color: var(--good) }
+.status.held, .status.deciding { background: var(--warn-bg); color: var(--warn) }
+.status.denied, .status.rejected, .status.failed { background: var(--danger-bg); color: var(--danger) }
+.reasons { margin: .3rem 0; padding-left: 1.1rem; color: var(--warn); font-size: .88rem }
+.in { color: var(--good) } .out { color: var(--text) }
+
+/* ---- the customers' app ---- */
+body.client { min-height: 100vh; padding-bottom: 76px }
+.app-head { position: sticky; top: 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; padding: .7rem 1rem; background: var(--brand); color: #fff }
+.app-head .brand { color: #fff }
+.app-head .link { color: #cfe3d9 }
+main.app { max-width: 520px; margin: 0 auto; padding: 1rem }
+.tabs { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; display: grid; grid-template-columns: repeat(4, 1fr); background: var(--surface); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom) }
+.tab { position: relative; display: grid; justify-items: center; gap: .1rem; padding: .5rem 0 .55rem; color: var(--muted); text-decoration: none; font-size: .72rem; font-weight: 600 }
+.tab .icon { font-size: 1.25rem; line-height: 1 }
+.tab.on { color: var(--accent) }
+.tab .dot { position: absolute; top: .3rem; left: calc(50% + .45rem); min-width: 18px; height: 18px; border-radius: 9px; background: var(--danger); color: #fff; font-size: .68rem; display: grid; place-items: center; padding: 0 4px }
+.hello { background: linear-gradient(135deg, var(--brand), var(--brand-2)); color: #fff; border-radius: 18px; padding: 1.1rem 1.2rem; box-shadow: var(--shadow) }
+.hello .muted { color: #cfe3d9 }
+.hello .total { font-size: 2rem; font-weight: 750; margin: .1rem 0; letter-spacing: -.02em }
+.cards { list-style: none; padding: 0; margin: 0; display: grid; gap: .7rem }
+.card { display: grid; gap: .15rem; padding: 1rem 1.1rem; background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); color: var(--text); text-decoration: none; border: 1px solid var(--line) }
+.card .kind { color: var(--muted); font-size: .85rem; font-weight: 600 }
+.card .balance { font-size: 1.35rem }
+.card .number { font: .8rem ui-monospace, monospace; color: var(--muted) }
+.card.frozen { opacity: .7; border-style: dashed }
+.rows { list-style: none; padding: 0; margin: 0; display: grid; gap: .5rem }
+.rows li { display: flex; justify-content: space-between; gap: .8rem; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .65rem .85rem }
+.invite { background: var(--warn-bg); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); border-radius: var(--radius); padding: .9rem 1rem; margin-top: 1rem }
+.invite p { margin: .3rem 0 .6rem }
+.account-head { text-align: center; padding: .5rem 0 1rem }
+.account-head .number { font: .9rem ui-monospace, monospace; color: var(--muted) }
+.account-head .back { display: block; text-align: left; text-decoration: none; margin-bottom: .5rem }
+.statement { list-style: none; padding: 0; margin: 0; background: var(--surface); border-radius: var(--radius); border: 1px solid var(--line); overflow: hidden }
+.statement li { display: flex; justify-content: space-between; gap: .8rem; padding: .7rem .9rem; border-top: 1px solid var(--line) }
+.statement li:first-child { border-top: 0 }
+.statement li > div { display: grid }
+.statement .amounts { text-align: right }
+.statement.small li { padding: .35rem .6rem; font-size: .88rem }
+.login { padding-top: 1rem }
+.result { text-align: center; background: var(--surface); border-radius: 18px; padding: 1.5rem 1.2rem; box-shadow: var(--shadow) }
+.result.done h1, .result.done h2 { color: var(--good) }
+.result.held h1 { color: var(--warn) }
+.result.denied h1 { color: var(--danger) }
+.result .actions { justify-content: center; margin-top: 1rem }
+.messages { list-style: none; padding: 0; margin: 0; display: grid; gap: .6rem }
+.messages li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .75rem .9rem; display: grid; gap: .2rem }
+.messages li.unread { border-left: 4px solid var(--accent) }
+.messages p { margin: 0 }
+
+/* ---- desk sessions ---- */
+.part { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: .9rem 1rem; margin: .8rem 0; box-shadow: var(--shadow) }
+.part > header { display: flex; justify-content: space-between; align-items: center; gap: .6rem }
+.part h2 { margin: 0 }
+.part.approved { border-color: color-mix(in srgb, var(--good) 45%, transparent) }
+.part.declined, .part.changed { border-color: color-mix(in srgb, var(--danger) 45%, transparent) }
+.part.pending { border-color: color-mix(in srgb, var(--warn) 50%, transparent) }
+.part > footer { display: flex; justify-content: space-between; align-items: center; gap: .6rem; margin-top: .7rem }
+.part .hint { color: var(--muted); font-size: .85rem }
+.part dl { margin: .5rem 0 0; display: grid; gap: .3rem }
+.part dl > div { display: grid; grid-template-columns: 9rem 1fr; gap: .5rem; padding: .25rem .4rem; border-radius: 8px; transition: background .6s }
+.part dl > div.lit { background: color-mix(in srgb, var(--gold) 30%, transparent) }
+.part dt { color: var(--muted); font-size: .88rem }
+.part dd { margin: 0; font-weight: 600; overflow-wrap: anywhere }
+.terms { font-size: .9rem; color: var(--muted) }
+.badge { font-size: .74rem; font-weight: 700; padding: .12rem .55rem; border-radius: 999px; white-space: nowrap; background: var(--surface-2); color: var(--muted) }
+.badge.approved { background: var(--good-bg); color: var(--good) }
+.badge.pending { background: var(--warn-bg); color: var(--warn) }
+.badge.declined, .badge.changed { background: var(--danger-bg); color: var(--danger) }
+.note { background: var(--danger-bg); color: var(--danger); padding: .45rem .7rem; border-radius: 9px; margin: .5rem 0 0 }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .7rem; margin-top: .6rem }
+.ask { position: sticky; top: 64px; z-index: 5; background: var(--surface); border: 2px solid var(--warn); border-radius: var(--radius); padding: 1rem; margin: .8rem 0; box-shadow: 0 8px 28px rgb(0 0 0 / .18); display: grid; gap: .6rem }
+.ask dl { margin: 0; display: grid; gap: .25rem }
+.ask dl > div { display: grid; grid-template-columns: 8rem 1fr; gap: .5rem }
+.ask dt { color: var(--muted); font-size: .88rem }
+.ask dd { margin: 0; font-weight: 650 }
+.pin { background: var(--surface); border: 2px solid var(--accent); border-radius: var(--radius); padding: 1rem; margin: .8rem 0 }
+.ok { color: var(--good); font-weight: 700 }
+.desk-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap }
+.code-box { display: grid; justify-items: end; gap: .1rem; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: .6rem .9rem }
+.code-box span { font-size: .8rem; color: var(--muted) }
+.code { font: 700 2rem ui-monospace, monospace; letter-spacing: .15em; color: var(--brand-2) }
+.joined { color: var(--good) !important; font-weight: 700 }
+.waiting { color: var(--warn) !important; font-weight: 700 }
+.submit { position: sticky; bottom: 0; background: var(--bg); padding: .8rem 0; border-top: 1px solid var(--line); display: grid; gap: .5rem }
+.missing { margin: 0; padding-left: 1.1rem; color: var(--muted); font-size: .9rem }
+.ready { color: var(--good); font-weight: 700; margin: 0 }
+.finished { background: var(--good-bg); border-radius: var(--radius); padding: 1rem 1.2rem; margin: 1rem 0 }
+.finished.cancelled { background: var(--surface-2) }
+
+/* ---- the staff's desk ---- */
+body.staff { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh }
+.side { background: var(--brand); color: #e5efe9; padding: 1rem; display: flex; flex-direction: column; gap: 1.2rem; position: sticky; top: 0; height: 100vh }
+.side .brand { color: #fff }
+.side-nav { display: grid; gap: .2rem }
+.side-nav a { color: #cfe3d9; text-decoration: none; padding: .45rem .6rem; border-radius: 9px; font-weight: 600 }
+.side-nav a.on, .side-nav a:hover { background: rgb(255 255 255 / .1); color: #fff }
+.new-desk { display: grid; gap: .45rem; background: rgb(255 255 255 / .06); padding: .7rem; border-radius: 12px }
+.new-desk h3 { color: #cfe3d9; margin: 0 }
+.who { margin-top: auto; display: grid; gap: .2rem; font-size: .9rem }
+.who .role { color: var(--gold); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em }
+.who .link { color: #cfe3d9; text-align: left }
+main.desk { padding: 1.4rem 1.8rem 3rem; max-width: 1200px; width: 100% }
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: .8rem }
+.kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: .8rem 1rem; display: grid; gap: .15rem; box-shadow: var(--shadow) }
+.kpi span { color: var(--muted); font-size: .8rem; font-weight: 600 }
+.kpi b { font-size: 1.35rem; letter-spacing: -.01em }
+.kpi small { color: var(--muted) }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem }
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem 1.1rem; box-shadow: var(--shadow) }
+.box h2 { margin-top: 0 }
+.box .rows li { background: var(--surface-2); border: 0 }
+.held-list { list-style: none; padding: 0; margin: 0; display: grid; gap: .7rem }
+.held-row { display: grid; grid-template-columns: 1fr 230px; gap: .8rem; background: var(--warn-bg); border-radius: 12px; padding: .7rem .8rem }
+.decide { display: grid; gap: .4rem }
+table { width: 100%; border-collapse: collapse; font-size: .92rem }
+th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line) }
+th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em }
+table.list { background: var(--surface); border-radius: var(--radius); overflow: hidden; margin-top: 1rem }
+.activity { list-style: none; padding: 0; margin: 0; display: grid; gap: .45rem; font-size: .9rem }
+.search { display: flex; gap: .5rem; max-width: 640px }
+.accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 1rem; margin-top: 1rem }
+.accounts header { display: flex; justify-content: space-between; gap: .5rem }
+.accounts .balance { font-size: 1.2rem }
+.accounts .frozen { opacity: .75; border-style: dashed }
+.inline-form { display: flex; gap: .4rem; align-items: center }
+.inline-form input { width: 9rem; padding: .32rem .5rem }
+.desk-buttons { display: flex; gap: .4rem; flex-wrap: wrap }
+.desk-clerk .part { box-shadow: none }
+body.staff-login { display: grid; place-items: center; min-height: 100vh; background: var(--brand) }
+body.staff-login .login { background: var(--surface); padding: 2rem; border-radius: 18px; width: min(380px, 92vw) }
+
+/* notices from ask() and notify() */
+.q-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / .45); display: grid; place-items: center; z-index: 50 }
+.q-dialog { background: var(--surface); color: var(--text); border-radius: 16px; padding: 1.2rem 1.3rem; width: min(420px, 92vw); border: 1px solid var(--line) }
+.q-dialog button { font: inherit; font-weight: 650; padding: .45rem .9rem; border-radius: 9px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text); cursor: pointer; margin-left: .5rem }
+.q-toasts { position: fixed; bottom: 86px; left: 50%; transform: translateX(-50%); display: grid; gap: .5rem; z-index: 60 }
+body.staff .q-toasts { left: auto; right: 1rem; transform: none; bottom: 1rem }
+.q-toast { background: var(--text); color: var(--bg); padding: .6rem 1rem; border-radius: 10px; font-weight: 650 }
+
+@media (max-width: 900px) {
+    body.staff { grid-template-columns: 1fr }
+    .side { position: static; height: auto }
+    .columns { grid-template-columns: 1fr }
+    .held-row { grid-template-columns: 1fr }
+    main.desk { padding: 1rem }
+}

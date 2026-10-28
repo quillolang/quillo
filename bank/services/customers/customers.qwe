@@ -1,0 +1,94 @@
+// The customers service: who the bank's customers are, and their sign-in:
+// an 8-digit customer number and a 6-digit PIN that only they know (they
+// choose it on their own phone, at the desk). Five wrong PINs lock the
+// sign-in for 15 minutes; Quillo has no rate limits of its own, so the
+// count is kept here.
+
+db.open(env("BANK_DATA", ".") + "/customers.db")
+db.migrate("migrations")
+
+let MAX_TRIES = 5
+let LOCK_MS = 15 * 60000
+let FIELDS = ["first_name", "last_name", "birth_date", "email", "phone", "street", "city", "postcode", "country"]
+
+fn public(c) = c == null ? null : remove(remove(remove(c, "pin_hash"), "failed_pins"), "locked_until")
+
+fn clean(p: map) -> map = reduce(FIELDS, {}, (acc, f) => set(acc, f, trim(str(get(p, f) ?? ""))))
+
+// What is wrong with a customer's details, or null.
+fn details_problem(d: map) -> str? {
+    if d.first_name == "" || d.last_name == "" { return "First and last name, please" }
+    if !re.test(d.birth_date, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return "Date of birth as YYYY-MM-DD" }
+    if d.email != "" && !re.test(d.email, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return "That email does not look right" }
+    null
+}
+
+// `number` is for demo data only; customers get a random one.
+server fn create(details: map, pin_hash: str?, number: str = "") -> map ! str with db, time, random {
+    let d = clean(details)
+    let problem = details_problem(d)
+    if problem != null { return err(problem) }
+    let id = db.transaction(() => {
+        // A number nobody has: random, so it says nothing about how many customers there are.
+        let number = number != "" ? number : str(random_int(10000000, 99999999))
+        if db.one("select 1 from customers where number = ?", number) != null { return err("Try again") }
+        db.exec(sql`insert into customers (number, first_name, last_name, birth_date, email, phone, street, city, postcode, country, pin_hash, created, updated)
+                    values (:number, :first_name, :last_name, :birth_date, :email, :phone, :street, :city, :postcode, :country, :pin_hash, :now, :now)`,
+            merge(d, { number, pin_hash, now: now() })).last_id
+    })?
+    public(db.one("select * from customers where id = ?", id))
+}
+
+server fn update(id: int, details: map) -> map ! str with db, time {
+    let d = clean(details)
+    let problem = details_problem(d)
+    if problem != null { return err(problem) }
+    let r = db.exec(sql`update customers set first_name = :first_name, last_name = :last_name, birth_date = :birth_date,
+                        email = :email, phone = :phone, street = :street, city = :city, postcode = :postcode,
+                        country = :country, updated = :now where id = :id`, merge(d, { id, now: now() }))
+    if r.changes == 0 { return err("No such customer") }
+    public(db.one("select * from customers where id = ?", id))
+}
+
+server fn customer(id: int) with db = public(db.one("select * from customers where id = ?", id))
+
+server fn by_number(number: str) with db = public(db.one("select * from customers where number = ?", trim(number)))
+
+// By name, number, email or phone: for the staff's search box.
+server fn search(q: str) -> list with db {
+    let t = trim(q)
+    if len(t) < 2 { return [] }
+    let like = "%" + replace(replace(lower(t), "%", ""), "_", "") + "%"
+    db.query(sql`select * from customers
+                 where lower(first_name || ' ' || last_name) like :q or number = :t or lower(email) like :q or phone like :q
+                 order by last_name, first_name limit 25`, { q: like, t }) | map(public)
+}
+
+server fn how_many() -> int with db = db.one("select count(*) as n from customers").n
+
+// The customer whose number and PIN these are, or why not.
+server fn sign_in(number: str, pin: str) -> map ! str with db, time, random {
+    let c = db.one("select * from customers where number = ?", trim(number))
+    // Hash anyway for an unknown number, so the time taken says nothing.
+    let hash = c.pin_hash ?? crypto.hash_password("not anyone's PIN")
+    if c != null && c.locked_until != null && c.locked_until > now() {
+        return err("Too many wrong PINs: try again in a few minutes")
+    }
+    if c == null || c.pin_hash == null || !crypto.verify_password(pin, hash) {
+        if c != null {
+            let tries = c.failed_pins + 1
+            db.exec("update customers set failed_pins = ?, locked_until = ? where id = ?",
+                tries >= MAX_TRIES ? 0 : tries, tries >= MAX_TRIES ? now() + LOCK_MS : null, c.id)
+        }
+        return err("Wrong customer number or PIN")
+    }
+    db.exec("update customers set failed_pins = 0, locked_until = null where id = ?", c.id)
+    public(c)
+}
+
+server fn set_pin(id: int, pin_hash: str) ! str with db, time {
+    if db.exec("update customers set pin_hash = ?, updated = ? where id = ?", pin_hash, now(), id).changes == 0 {
+        return err("No such customer")
+    }
+    true
+}

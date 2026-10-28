@@ -1,0 +1,83 @@
+// Amounts and times for people: pure functions, used on the server and in
+// pages in the browser alike.
+
+let CURRENCIES = ["EUR", "USD", "GBP"]
+let LOCALE = "en-IE"
+
+// An amount as someone types it ("1 234,50", "1,234.50", "12") in a
+// currency, as `money`, or an error value saying what is wrong.
+fn parse_amount(text: str, currency: str) {
+    let t = replace(replace(trim(text), " ", ""), "\u{a0}", "")
+    if t == "" { return err("Enter an amount") }
+    if !re.test(t, "^[0-9][0-9.,]*$") { return err("An amount is digits, with a point or comma for cents") }
+    // Accepted, and nothing else (a typo is refused, never read as another amount):
+    //   1234   1234.5   1234,50                        digits, one mark, 1 or 2 decimals
+    //   1,234  1.234.567                               thousands only: groups of three
+    //   1,234.50   1.234,50                            thousands, then the other mark
+    //   0.001                                          more decimals: refused by money.of
+    let grouped = (sep: str) => `[1-9][0-9]{0,2}(?:${sep == "." ? "\\." : ","}[0-9]{3})+`
+    let plain = re.test(t, "^[0-9]+$") ? t
+        : re.test(t, "^[0-9]+[.,][0-9]+$") && !re.test(t, `^${grouped(".")}$`) && !re.test(t, `^${grouped(",")}$`) ? replace(t, ",", ".")
+        : re.test(t, `^${grouped(",")}$`) ? replace(t, ",", "")
+        : re.test(t, `^${grouped(".")}$`) ? replace(t, ".", "")
+        : re.test(t, `^${grouped(",")}\\.[0-9]+$`) ? replace(t, ",", "")
+        : re.test(t, `^${grouped(".")},[0-9]+$`) ? replace(replace(t, ".", ""), ",", ".")
+        : null
+    if plain == null { return err("Write the amount like 1234.50, 1,234.50 or 1.234,50") }
+    let m = money.of(plain, currency)
+    if is_err(m) { return err(`At most ${money.minor_units(currency)} decimals for ${currency}`) }
+    if m.amount <= 0m { return err("Enter more than nothing") }
+    m
+}
+
+// Minor units of a currency, as people read them: "€1,234.50".
+fn shown(cents: int, currency: str) -> str = money.format(money.from_minor(cents, currency), LOCALE)
+
+// The same with a sign for statements: "+€20.00", "−€5.00".
+fn signed(cents: int, currency: str) -> str = cents < 0 ? "−" + shown(-cents, currency) : "+" + shown(cents, currency)
+
+// ---- times ------------------------------------------------------------------
+
+// Quillo has no date module (removed in 205d7cd), so a timestamp becomes a
+// calendar date here: days since 1970 to year, month, day (Howard Hinnant's
+// civil_from_days), in UTC.
+fn civil(t: int) -> map {
+    let z = floor(t / 86400000) + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { year: yoe + era * 400 + (m <= 2 ? 1 : 0), month: m, day: d }
+}
+
+let MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+fn two(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// "28 Oct 2026"
+fn day_text(t: int) -> str {
+    let c = civil(t)
+    `${c.day} ${MONTHS[c.month - 1]} ${c.year}`
+}
+
+// "14:05", UTC
+fn clock(t: int) -> str {
+    let ms = t % 86400000
+    `${two(floor(ms / 3600000))}:${two(floor(ms % 3600000 / 60000))}`
+}
+
+// "just now", "5 min ago", "14:05" today, else "28 Oct 2026".
+fn when(t: int) -> str {
+    let s = floor((now() - t) / 1000)
+    if s < 45 { return "just now" }
+    if s < 3600 { return `${max([floor(s / 60), 1])} min ago` }
+    if floor(t / 86400000) == floor(now() / 86400000) { return clock(t) }
+    day_text(t)
+}
+
+fn day_start(t: int) -> int = t - t % 86400000
+
+fn plural(n: int, word: str, words: str = "") -> str = n == 1 ? `1 ${word}` : `${n} ${words != "" ? words : word + "s"}`

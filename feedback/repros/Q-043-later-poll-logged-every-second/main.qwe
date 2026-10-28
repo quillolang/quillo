@@ -1,0 +1,17 @@
+// Q-043 A program with a service logs "POST /_quillo/later -> 200" about once a second, idle
+// mode: serve
+// get: /
+// open-when: POST /_quillo/later
+// fixed-when: GET / -> 200
+// From FEEDBACK4.md (found on 5d2e21e). The background sender of `later` calls asks the program
+// itself, over HTTP, each second, and the request log shows each one: 86,400 lines a day of
+// nothing. Without a `service` there are none. (The route waits 2.5 s so the log has some.)
+
+service helper = "helper.qwe"
+
+fn slowly() -> str with time {
+    sleep(2500)
+    "x"
+}
+
+route GET / = slowly()

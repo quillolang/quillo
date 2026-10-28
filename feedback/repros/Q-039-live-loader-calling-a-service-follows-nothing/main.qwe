@@ -1,0 +1,26 @@
+// Q-039 A live loader that gets its data from a service follows only the service's name, so the page never updates, without a word
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 300)); document.getElementById("spend").click(); await new Promise((r) => setTimeout(r, 1500)); return { shown: document.getElementById("bal").textContent, topics: document.querySelector("[data-l]").dataset.l }
+// open-when: "shown": "100"
+// fixed-when: "shown": "90"
+// From FEEDBACK4.md (found on 5d2e21e). The loader's topics are ["var:ledger"]: the variable
+// holding the service, which never changes. Not even the page that spent sees the new balance.
+// `quillo check` says nothing; a warning that such a loader follows nothing (watch a topic and
+// publish it after the calls that change it) would have saved the probe.
+
+service ledger = "ledger.qwe"
+
+server fn load() -> int with http = ledger.get() ?? -1
+
+server fn spend() with http = ledger.spend(10)
+
+component Balance() {
+    state bal = live(load)
+    <div>
+        <p id="bal">{bal}</p>
+        <button id="spend" @click={() => { spend() }}>spend</button>
+    </div>
+}
+
+route GET / = <html><body><Balance/></body></html>

@@ -1,0 +1,53 @@
+// Demo data, for BANK_DEMO=1: two staff, three customers with accounts and
+// some history, made through the services as real use would make it (so a
+// transfer here takes the whole chain). Only an empty bank is filled. Every
+// demo password is "password" and every PIN 246810: never turn this on for
+// a bank people really use.
+
+fn seed_staff(username: str, name: str, role: str) with db, time, random =
+    db.exec("insert into staff (username, name, role, password_hash, created) values (?, ?, ?, ?, ?)",
+        username, name, role, crypto.hash_password("password"), now())
+
+fn seed_customer(number: str, first: str, last: str, birth: str, city: str, country: str) with http, random {
+    let pin = crypto.hash_password("246810")
+    let c = customers.create({
+        first_name: first, last_name: last, birth_date: birth, email: `${lower(first)}@example.com`,
+        phone: "+353 1 555 0100", street: "1 Main Street", postcode: "D01", city, country,
+    }, pin, number)
+    if is_err(c) { print(`BANK_DEMO: ${first}: ${c.error}`) }
+    c
+}
+
+fn seed_account(c, kind: str, currency: str, name: str, cents: int) with http, random {
+    let a = accounts.open_account(c.id, kind, currency, name)?
+    if cents > 0 { accounts.deposit(a.id, cents, "Opening deposit", `seed-${a.id}`)? }
+    a
+}
+
+fn seed_demo() with db, http, time, random {
+    if db.one("select count(*) as n from staff").n > 0 { return null }
+    let existing = customers.how_many()
+    if is_err(existing) {
+        print(`BANK_DEMO: the customers service does not answer (${existing.error}); no demo data`)
+        return null
+    }
+    print("BANK_DEMO: adding staff (password: password) and customers (PIN 246810)")
+    seed_staff("maria", "Maria Keane", "clerk")
+    seed_staff("omar", "Omar Haddad", "supervisor")
+    if existing > 0 { return null }
+    let ada = seed_customer("10000001", "Ada", "Lovelace", "1985-12-10", "Dublin", "Ireland")?
+    let ben = seed_customer("10000002", "Ben", "Okafor", "1992-04-03", "Cork", "Ireland")?
+    let chloe = seed_customer("10000003", "Chloé", "Martin", "1978-07-21", "Lyon", "France")?
+    let ada1 = seed_account(ada, "checking", "EUR", "Everyday", 245000)?
+    seed_account(ada, "savings", "EUR", "Rainy day", 1000000)?
+    let ben1 = seed_account(ben, "checking", "EUR", "Everyday", 82050)?
+    let chloe1 = seed_account(chloe, "checking", "EUR", "Compte courant", 1530000)?
+    seed_account(chloe, "checking", "USD", "Dollars", 120000)?
+    // History, through the chain: a small one goes through, a large first
+    // payment to someone new waits for a supervisor.
+    payments.transfer(ada.id, ada1.id, ben1.number, 4250, "Concert tickets")
+    payments.transfer(ben.id, ben1.id, ada1.number, 1500, "Coffee, thanks!")
+    payments.transfer(chloe.id, chloe1.id, ada1.number, 1250000, "Deposit for the flat")
+    messages.send(ada.id, "security", "Welcome to the new app", "Sign in with your customer number and PIN.")
+    null
+}

@@ -1,0 +1,18 @@
+// Q-040 With a service declared before a `use` of a file the service also uses, the program does not start: the browser code lacks the file's functions
+// mode: serve
+// get: /
+// open-when: unknown name `shout`
+// fixed-when: CLICKED!
+// From FEEDBACK4.md (found on 5d2e21e). `quillo check` passes. Moving the `use` line above the
+// `service` line makes it start; the guide says "the order of `use` lines does not matter".
+// The bank's lib/iban.qwe (used by the gateway's pages and by the accounts service) hit it.
+
+service greeter = "svc/greeter.qwe"
+use "lib/text.qwe"
+
+component Hi() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{shout("clicked")} {n}</button>
+}
+
+route GET / = <html><body><Hi/></body></html>

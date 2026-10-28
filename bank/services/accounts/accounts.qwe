@@ -1,0 +1,153 @@
+// The accounts service: the bank's ledger. Accounts, and a journal of
+// entries whose postings add up to zero: a transfer takes from one account
+// and gives to another; a cash deposit gives to the customer's account and
+// takes from the vault (the bank's own account in that currency). Every
+// entry is one transaction, so money is never half moved, and an entry
+// posted twice with the same `ref` is posted once.
+//
+// Amounts are whole minor units (cents): the callers turn them into
+// `money` for people to read.
+
+use "../../lib/iban.qwe"
+
+db.open(env("BANK_DATA", ".") + "/accounts.db")
+db.migrate("migrations")
+
+let KINDS = ["checking", "savings"]
+let BANK_PART = "0001"
+
+fn day_start(t: int) -> int = t - t % 86400000
+
+fn row(id: int) with db = db.one("select * from accounts where id = ?", id)
+
+// ---- accounts -------------------------------------------------------------
+
+// The bank's own account in a currency, made the first time it is needed.
+fn vault_of(currency: str) -> int with db, time {
+    let v = db.one("select id from accounts where customer_id = 0 and kind = 'vault' and currency = ?", currency)
+    if v != null { return v.id }
+    new_account(0, "vault", currency, `Vault ${currency}`)
+}
+
+fn new_account(customer_id: int, kind: str, currency: str, name: str) -> int with db, time {
+    let next = db.one("select coalesce(max(id), 0) + 1 as n from accounts").n
+    let part = BANK_PART + slice(`000000000000${next}`, -12)
+    db.exec("insert into accounts (number, customer_id, kind, currency, name, opened) values (?, ?, ?, ?, ?, ?)",
+        iban_of(part), customer_id, kind, currency, name, now()).last_id
+}
+
+server fn open_account(customer_id: int, kind: str, currency: str, name: str) -> map ! str with db, time {
+    if customer_id <= 0 { return err("An account is for a customer") }
+    if !contains(KINDS, kind) { return err(`An account is ${join(KINDS, " or ")}`) }
+    if is_err(money.zero(currency)) { return err(`${currency} is not a currency`) }
+    let label = trim(name) == "" ? (kind == "savings" ? "Savings" : "Everyday account") : trim(name)
+    let id = db.transaction(() => new_account(customer_id, kind, currency, label))
+    row(id)
+}
+
+server fn account(id: int) with db = row(id)
+
+server fn by_number(number: str) with db = db.one("select * from accounts where number = ?", iban_clean(number))
+
+server fn of_customer(customer_id: int) -> list with db =
+    db.query("select * from accounts where customer_id = ? and status != 'closed' order by id", customer_id)
+
+server fn set_status(id: int, status: str) ! str with db {
+    if !contains(["open", "frozen", "closed"], status) { return err("open, frozen or closed") }
+    let a = row(id) ?? err("No such account")?
+    if status == "closed" && a.balance != 0 { return err("Only an empty account can be closed") }
+    db.exec("update accounts set status = ? where id = ?", status, id)
+    row(id)
+}
+
+// ---- posting ----------------------------------------------------------------
+
+// Posts one entry: `legs` are { account_id, amount } adding up to zero. All
+// accounts in one currency, open (the vault always is), and none of the
+// customers' left below zero. With a `ref` already posted, gives that entry
+// again instead (a retry of the same request).
+fn post(kind: str, memo: str, ref: str?, legs: list) -> map ! str with db, time {
+    if sum(legs | map((l) => l.amount)) != 0 { return err("An entry must add up to zero") }
+    if any(legs, (l) => l.amount == 0) { return err("An amount of nothing") }
+    db.transaction(() => {
+        if ref != null {
+            let before = db.one("select id from journal where ref = ?", ref)
+            if before != null { return { journal_id: before.id, again: true } }
+        }
+        let accounts = legs | map((l) => row(l.account_id))
+        if any(accounts, (a) => a == null) { return err("No such account") }
+        if len(unique(accounts | map((a) => a.currency))) != 1 { return err("Money moves between accounts of one currency") }
+        for a in accounts => if a.customer_id != 0 && a.status != "open" {
+            return err(`Account ${iban_pretty(a.number)} is ${a.status}`)
+        }
+        let j = db.exec("insert into journal (kind, memo, ref, created) values (?, ?, ?, ?)", kind, memo, ref, now()).last_id
+        for l in legs => {
+            let a = row(l.account_id)
+            let after = a.balance + l.amount
+            if a.customer_id != 0 && after < 0 { return err("Insufficient funds") }
+            db.exec("update accounts set balance = ? where id = ?", after, a.id)
+            db.exec("insert into postings (journal_id, account_id, amount, balance_after, created) values (?, ?, ?, ?, ?)",
+                j, a.id, l.amount, after, now())
+        }
+        { journal_id: j, again: false }
+    })
+}
+
+server fn transfer(from_id: int, to_id: int, cents: int, memo: str, ref: str) -> map ! str with db, time {
+    if cents <= 0 { return err("A transfer is of more than nothing") }
+    if from_id == to_id { return err("That is the same account") }
+    post("transfer", memo, ref, [{ account_id: from_id, amount: -cents }, { account_id: to_id, amount: cents }])
+}
+
+server fn deposit(account_id: int, cents: int, memo: str, ref: str) -> map ! str with db, time {
+    if cents <= 0 { return err("A deposit is of more than nothing") }
+    let a = row(account_id) ?? err("No such account")?
+    post("deposit", memo, ref, [{ account_id, amount: cents }, { account_id: vault_of(a.currency), amount: -cents }])
+}
+
+server fn withdraw(account_id: int, cents: int, memo: str, ref: str) -> map ! str with db, time {
+    if cents <= 0 { return err("A withdrawal is of more than nothing") }
+    let a = row(account_id) ?? err("No such account")?
+    post("withdrawal", memo, ref, [{ account_id, amount: -cents }, { account_id: vault_of(a.currency), amount: cents }])
+}
+
+// ---- reading ----------------------------------------------------------------
+
+// The account's postings, newest first, with what the entry was and the
+// other side of a transfer.
+server fn statement(account_id: int, limit: int = 50) -> list with db = db.query(sql`
+    select p.id, p.amount, p.balance_after, p.created, j.kind, j.memo, j.id as journal_id,
+           (select a.number from postings q join accounts a on a.id = q.account_id
+             where q.journal_id = p.journal_id and q.account_id != p.account_id and a.customer_id != 0 limit 1) as other
+    from postings p join journal j on j.id = p.journal_id
+    where p.account_id = :account
+    order by p.id desc limit :limit`, { account: account_id, limit: min([max([limit, 1]), 500]) })
+
+// What a customer's accounts sent out since the start of today (UTC).
+server fn outflow_today(customer_id: int) -> int with db, time = db.one(sql`
+    select coalesce(-sum(p.amount), 0) as n from postings p join accounts a on a.id = p.account_id
+    join journal j on j.id = p.journal_id
+    where a.customer_id = ? and p.amount < 0 and j.kind = 'transfer' and p.created >= ?`, customer_id, day_start(now())).n
+
+// Whether `from_id` has sent money to `to_id` before.
+server fn paid_before(from_id: int, to_id: int) -> bool with db = db.one(sql`
+    select exists (select 1 from postings f join postings t on t.journal_id = f.journal_id
+                   where f.account_id = ? and f.amount < 0 and t.account_id = ? and t.amount > 0) as yes`, from_id, to_id).yes == 1
+
+// For the staff dashboard: customers' money by currency, and how many accounts.
+server fn totals() -> list with db = db.query(sql`
+    select currency, count(*) as accounts, coalesce(sum(balance), 0) as balance,
+           sum(case when status = 'frozen' then 1 else 0 end) as frozen
+    from accounts where customer_id != 0 and status != 'closed' group by currency order by currency`)
+
+server fn opened_since(t: int) -> int with db = db.one("select count(*) as n from accounts where customer_id != 0 and opened >= ?", t).n
+
+// The ledger's two rules, checked: every entry adds up to zero, and each
+// account's balance is the sum of its postings. Empty when both hold.
+server fn problems() -> list with db {
+    let entries = db.query("select journal_id from postings group by journal_id having sum(amount) != 0") | map((r) => `entry ${r.journal_id} does not add up to zero`)
+    let balances = db.query(sql`
+        select a.number from accounts a
+        where a.balance != coalesce((select sum(amount) from postings p where p.account_id = a.id), 0)`) | map((r) => `${r.number}'s balance is not the sum of its postings`)
+    entries + balances
+}

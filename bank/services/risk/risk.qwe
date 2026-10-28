@@ -1,0 +1,32 @@
+// The risk service: decides whether a transfer goes through at once, waits
+// for a supervisor, or is refused. It keeps nothing of its own: it asks the
+// ledger (the third link of the chain a transfer makes: gateway, payments,
+// risk, accounts).
+
+service accounts = "../accounts/accounts.qwe" { timeout: "3s", retries: 1 }
+
+// In minor units: 10,000.00 a transfer and 5,000.00 a day before review,
+// and a first transfer to someone of 1,000.00 or more.
+let REVIEW_ABOVE = 1000000
+let DAILY_LIMIT = 500000
+let NEW_PAYEE_REVIEW = 100000
+
+// { decision: "approve" | "review" | "deny", reasons: [...] }
+server fn assess(customer_id: int, from_id: int, to_id: int, cents: int) -> map ! str with http {
+    let from = accounts.account(from_id)? ?? err("No such account")?
+    let to = accounts.account(to_id)? ?? err("No such account")?
+    if from.status != "open" { return { decision: "deny", reasons: [`Your account is ${from.status}`] } }
+    if to.status != "open" { return { decision: "deny", reasons: ["The receiving account cannot take payments"] } }
+    if from.currency != to.currency { return { decision: "deny", reasons: [`Transfers are in one currency: ${from.currency} to ${to.currency}`] } }
+    if cents > from.balance { return { decision: "deny", reasons: ["Insufficient funds"] } }
+    let today = accounts.outflow_today(customer_id)?
+    let known = accounts.paid_before(from_id, to_id)?
+    let reasons = [
+        cents >= REVIEW_ABOVE ? "A large amount" : null,
+        today + cents > DAILY_LIMIT ? "Over today's limit" : null,
+        !known && cents >= NEW_PAYEE_REVIEW ? "A large first payment to this account" : null,
+    ] | filter((r) => r != null)
+    { decision: len(reasons) > 0 ? "review" : "approve", reasons }
+}
+
+server fn limits() -> map = { review_above: REVIEW_ABOVE, daily_limit: DAILY_LIMIT, new_payee_review: NEW_PAYEE_REVIEW }

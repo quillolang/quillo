@@ -1,0 +1,202 @@
+// The staff's pages: the dashboard (live: figures, transfers held for a
+// supervisor, desk sessions, what everyone did), customers, and one customer.
+
+view StaffLoginPage(next: str, problem) =
+    <html lang="en">
+        <Head title="Staff sign in"/>
+        <body.staff-login>
+            <form.stack.login method="post" action="/staff/login">
+                <a.brand href="/staff"><Logo/> <span>Quillo Bank <small>staff</small></span></a>
+                <h1>Sign in</h1>
+                <Problem text={problem}/>
+                <input type="hidden" name="next" value={next}/>
+                <label>Username <input name="username" required autocomplete="username" autofocus/></label>
+                <label>Password <input name="password" type="password" required autocomplete="current-password"/></label>
+                <button.btn.primary.wide>Sign in</button>
+            </form>
+        </body>
+    </html>
+
+view Kpi(label: str, value, note = null) =
+    <div.kpi><span>{label}</span><b>{value}</b>{note != null && <small>{note}</small>}</div>
+
+// A held transfer, with the supervisor's two answers.
+component HeldRow(t, me) {
+    state note = ""
+    state problem = null
+    let decide = (yes: bool) => {
+        if !yes && trim(note) == "" { problem = "Say why, for the customer"; return null }
+        let r = decide_transfer(t.id, yes, note)
+        if is_err(r) { problem = r.error } else { problem = null }
+    }
+    <li.held-row>
+        <div>
+            <b>{t.shown}</b> to {t.to_pretty} <span.muted>· #{t.id} · {when(t.created)}</span>
+            <ul.reasons>{for r in t.reasons_list => <li>{r}</li>}</ul>
+            {t.memo != "" && <p.muted>“{t.memo}”</p>}
+        </div>
+        {is_supervisor(me)
+            ? <div.decide>
+                <input placeholder="Note for the customer (to reject)" value={note} @input={(e) => { note = e.value }}/>
+                <div.actions>
+                    <button.btn.primary.small @click={() => decide(true)}>Approve</button>
+                    <button.btn.danger.small @click={() => decide(false)}>Reject</button>
+                </div>
+                <Problem text={problem}/>
+              </div>
+            : <span.muted>A supervisor decides</span>}
+    </li>
+}
+
+component Dashboard(me) {
+    state d = live(load_dashboard)
+    {d == null
+        ? <Empty>Loading…</Empty>
+        : <div.dashboard>
+            <h1>Today</h1>
+            <section.kpis>
+                <Kpi label="Customers" value={d.customers}/>
+                {for t in d.totals => <Kpi key={t.currency} label={`Deposits, ${t.currency}`} value={t.shown} note={`${plural(t.accounts, "account")}${t.frozen > 0 ? `, ${t.frozen} frozen` : ""}`}/>}
+                <Kpi label="Opened today" value={d.opened_today} note="accounts"/>
+                <Kpi label="Held" value={len(d.held)} note="transfers waiting"/>
+                <Kpi label="Ledger" value={len(d.ledger_problems) == 0 ? "✓ Adds up" : "✗ Problems"} note={len(d.ledger_problems) == 0 ? "every entry, every balance" : d.ledger_problems[0]}/>
+            </section>
+            <div.columns>
+                <section.box>
+                    <h2>Held for a supervisor</h2>
+                    {len(d.held) == 0
+                        ? <p.muted>Nothing waiting.</p>
+                        : <ul.held-list>{for t in d.held => <HeldRow key={t.id} {t} {me}/>}</ul>}
+                </section>
+                <section.box>
+                    <h2>Desk sessions</h2>
+                    {len(d.desks) == 0
+                        ? <p.muted>None open. Start one on the left.</p>
+                        : <ul.rows>{for k in d.desks => <li key={k.code}>
+                            <a href={`/staff/desk/${k.code}`}><b>{k.code}</b> {get(KIND_TITLES, k.kind)}</a>
+                            <span.muted>{k.clerk} · {k.joined == 1 ? "phone joined" : "waiting for the phone"} · {when(k.updated)}</span>
+                        </li>}</ul>}
+                </section>
+            </div>
+            <div.columns>
+                <section.box>
+                    <h2>Transfers today</h2>
+                    {len(d.today) == 0 ? <p.muted>None yet.</p> : <table>
+                        <thead><tr><th>Status</th><th>Count</th><th>Amount</th></tr></thead>
+                        <tbody>{for r in d.today => <tr key={`${r.status}-${r.currency}`}><td><Status status={r.status}/></td><td>{r.n}</td><td>{r.shown}</td></tr>}</tbody>
+                    </table>}
+                    <h3>Latest</h3>
+                    <ul.rows>{for t in d.recent => <li key={t.id}>
+                        <span><b>{t.shown}</b> → {t.to_pretty}</span>
+                        <span><Status status={t.status}/> <span.muted>{when(t.created)}</span></span>
+                    </li>}</ul>
+                </section>
+                <section.box>
+                    <h2>Activity</h2>
+                    <ol.activity>{for a in d.activity => <li key={a.id}>
+                        <b>{a.actor}</b> <span>{a.action}</span> <span.muted>{a.detail}</span> <span.muted>{when(a.created)}</span>
+                    </li>}</ol>
+                </section>
+            </div>
+        </div>}
+}
+
+view DashboardPage(me) =
+    <StaffShell {me} title="Dashboard" nav="dashboard"><Dashboard {me}/></StaffShell>
+
+view CustomersPage(me, q: str, found: list) =
+    <StaffShell {me} title="Customers" nav="customers">
+        <h1>Customers</h1>
+        <form.search method="get" action="/staff/customers">
+            <input name="q" value={q} placeholder="Name, customer number, email or phone" autofocus/>
+            <button.btn.primary>Search</button>
+        </form>
+        {q != "" && len(found) == 0 && <Empty>Nobody matches “{q}”.</Empty>}
+        {len(found) > 0 && <table.list>
+            <thead><tr><th>Number</th><th>Name</th><th>Born</th><th>City</th><th>Email</th></tr></thead>
+            <tbody>{for c in found => <tr>
+                <td><a href={`/staff/customers/${c.number}`}>{c.number}</a></td>
+                <td>{c.first_name} {c.last_name}</td><td>{c.birth_date}</td><td>{c.city}</td><td>{c.email}</td>
+            </tr>}</tbody>
+        </table>}
+    </StaffShell>
+
+// Cash paid in at the counter.
+component CashIn(account_id: int, currency: str) {
+    state amount = ""
+    state problem = null
+    <form.inline-form @submit={() => {
+        let r = cash_in(account_id, amount)
+        if is_err(r) { problem = r.error } else { problem = null; amount = ""; notify("Paid in", { tone: "success", seconds: 2 }) }
+    }}>
+        <input value={amount} inputmode="decimal" placeholder={`Cash in, ${currency}`} @input={(e) => { amount = e.value }}/>
+        <button.btn.ghost.small>Pay in</button>
+        <Problem text={problem}/>
+    </form>
+}
+
+component CustomerView(number: str, me) {
+    state v = live(load_customer, number)
+    state problem = null
+    {v == null
+        ? <Empty>Not here.</Empty>
+        : <div.customer>
+            <header.desk-head>
+                <div>
+                    <h1>{v.customer.first_name} {v.customer.last_name}</h1>
+                    <p.muted>Customer {v.customer.number} · born {v.customer.birth_date} · {v.customer.email} · {v.customer.phone}</p>
+                    <p.muted>{v.customer.street}, {v.customer.postcode} {v.customer.city}, {v.customer.country}</p>
+                </div>
+                <div.desk-buttons>
+                    {for k in [["withdrawal", "Cash withdrawal"], ["update", "New details"], ["open_account", "Another account"]] =>
+                        <form.inline method="post" action="/staff/desk">
+                            <input type="hidden" name="kind" value={k[0]}/>
+                            <input type="hidden" name="number" value={v.customer.number}/>
+                            <button.btn.ghost.small>{k[1]}</button>
+                        </form>}
+                </div>
+            </header>
+            <Problem text={problem}/>
+            <section.accounts>{for a in v.accounts => <article.box key={a.id} class={a.status}>
+                <header>
+                    <div><b>{a.name}</b> <span.muted>{a.kind} · {a.pretty}</span></div>
+                    <b.balance>{a.shown}</b>
+                </header>
+                <div.actions>
+                    {a.status == "open"
+                        ? <button.btn.ghost.small @click={() => {
+                            if ask(`Freeze ${a.pretty}? No money moves in or out until it is unfrozen.`, { title: "Freeze", ok: "Freeze", cancel: "Keep it open", tone: "danger" }) {
+                                let r = set_account_status(a.id, "frozen")
+                                problem = is_err(r) ? r.error : null
+                            }
+                        }}>Freeze</button>
+                        : <button.btn.ghost.small @click={() => {
+                            let r = set_account_status(a.id, "open")
+                            problem = is_err(r) ? r.error : null
+                        }}>Unfreeze</button>}
+                    {a.status == "open" ? <CashIn account_id={a.id} currency={a.currency}/> : null}
+                </div>
+                <ol.statement.small>{for l in a.lines => <li key={l.id}>
+                    <span>{l.memo == "" ? l.kind : l.memo} <span.muted>{when(l.created)}</span></span>
+                    <b class={l.amount < 0 ? "out" : "in"}>{l.signed}</b>
+                </li>}</ol>
+            </article>}</section>
+            <div.columns>
+                <section.box>
+                    <h2>Transfers</h2>
+                    <ul.rows>{for t in v.transfers => <li key={t.id}>
+                        <span><b>{t.shown}</b> → {t.to_pretty} <span.muted>{t.memo}</span></span>
+                        <span><Status status={t.status}/> <span.muted>{when(t.created)}</span></span>
+                    </li>}</ul>
+                </section>
+                <section.box>
+                    <h2>Emails sent</h2>
+                    <p.muted>Sent later, by the messages service.</p>
+                    <ul.rows>{for e in v.emails => <li key={e.id}><span>{e.subject}</span> <span.muted>{when(e.sent)}</span></li>}</ul>
+                </section>
+            </div>
+        </div>}
+}
+
+view CustomerPage(me, number: str) =
+    <StaffShell {me} title="Customer" nav="customers"><CustomerView {number} {me}/></StaffShell>

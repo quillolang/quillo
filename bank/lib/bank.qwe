@@ -1,0 +1,188 @@
+// The gateway's own server fns for clients and staff: each reads from the
+// services and changes through them, and announces what changed itself
+// (cust:<id> for a customer's pages, staff for the dashboard), since what
+// the services change reaches no page by itself (Q-038, Q-039).
+
+fn cust_changed(customer_id) {
+    if customer_id != null { publish(`cust:${customer_id}`) }
+    publish("staff")
+}
+
+// An account as pages show it.
+fn account_view(a) = merge(a, {
+    pretty: iban_pretty(a.number),
+    shown: shown(a.balance, a.currency),
+})
+
+fn transfer_view(t) = merge(t, {
+    shown: shown(t.cents, t.currency),
+    to_pretty: iban_pretty(t.to_number),
+    reasons_list: t.reasons == "" ? [] : split(t.reasons, "\n"),
+})
+
+// ---- the client -------------------------------------------------------------
+
+// Everything the client's home shows, kept live.
+server fn load_home() with http, db {
+    let c = session().customer
+    if c == null { return null }
+    watch(`cust:${c}`)
+    unwatched(() => {
+        let me = customers.customer(c) ?? null
+        if me == null { return null }
+        // A service that does not answer is said so, not shown as "no accounts".
+        let found = accounts.of_customer(c)
+        let accts = is_err(found) ? [] : found | map(account_view)
+        {
+            me: { first_name: me.first_name, number: me.number },
+            down: is_err(found),
+            accounts: accts,
+            totals: accts | group_by((a) => a.currency) | keys | map((cur) => {
+                currency: cur,
+                shown: shown(sum(accts | filter((a) => a.currency == cur) | map((a) => a.balance)), cur),
+            }),
+            transfers: (payments.of_customer(c, 5) ?? []) | map(transfer_view),
+            unread: messages.unread(c) ?? 0,
+        }
+    })
+}
+
+// One of the client's accounts with its statement, or null.
+server fn load_account(id: int) with http {
+    let c = session().customer
+    if c == null { return null }
+    watch(`cust:${c}`)
+    unwatched(() => {
+        let a = accounts.account(id)
+        if is_err(a) { return { down: true } }
+        if a == null || a.customer_id != c { return null }
+        { account: account_view(a), lines: (accounts.statement(id, 100) ?? []) | map((l) => merge(l, {
+            signed: signed(l.amount, a.currency),
+            after: shown(l.balance_after, a.currency),
+            other_pretty: l.other == null ? null : iban_pretty(l.other),
+        })) }
+    })
+}
+
+server fn load_unread() -> int with http {
+    let c = session().customer
+    if c == null { return 0 }
+    watch(`cust:${c}`)
+    unwatched(() => messages.unread(c) ?? 0)
+}
+
+server fn load_inbox() -> list with http {
+    let c = session().customer
+    if c == null { return [] }
+    watch(`cust:${c}`)
+    unwatched(() => messages.inbox(c) ?? [])
+}
+
+server fn read_inbox() with http {
+    let c = acting_client()?
+    if (messages.mark_read(c.id) ?? 0) > 0 { cust_changed(c.id) }
+    true
+}
+
+// A transfer: the chain is gateway, payments, risk, accounts, messages.
+server fn send_money(from_id: int, to_number: str, amount: str, memo: str) ! str with http, db, time {
+    let c = acting_client()?
+    let problem = iban_problem(to_number)
+    if problem != null { return err(problem) }
+    let from = accounts.account(from_id)? ?? err("Choose one of your accounts")?
+    let m = parse_amount(amount, from.currency)?
+    let t = payments.transfer(c.id, from_id, iban_clean(to_number), money.to_minor(m), trim(memo))?
+    // The receiving customer's pages too.
+    let to = accounts.account(t.to_id) ?? null
+    cust_changed(c.id)
+    if to != null && to.customer_id != c.id { cust_changed(to.customer_id) }
+    if t.status != "done" { log(`${c.first_name} ${c.last_name}`, "transfer", `${shown(t.cents, t.currency)} ${t.status}: ${replace(t.reasons, "\n", "; ")}`) }
+    transfer_view(t)
+}
+
+// Who an account number belongs to, as far as the client may know: the
+// first name and an initial, for "you are paying ..." before they send.
+server fn payee_of(number: str) with http {
+    if iban_problem(number) != null { return null }
+    let a = accounts.by_number(iban_clean(number)) ?? null
+    if a == null || a.status != "open" { return null }
+    let c = customers.customer(a.customer_id) ?? null
+    c == null ? null : { name: `${c.first_name} ${slice(c.last_name, 0, 1)}.`, currency: a.currency }
+}
+
+// ---- staff --------------------------------------------------------------------
+
+server fn load_dashboard() with db, http, time {
+    watch("staff")
+    if staff() == null { return null }
+    unwatched(() => {
+        let since = day_start(now())
+        let today = payments.today(since) ?? []
+        {
+            customers: customers.how_many() ?? 0,
+            totals: (accounts.totals() ?? []) | map((t) => merge(t, { shown: shown(t.balance, t.currency) })),
+            opened_today: accounts.opened_since(since) ?? 0,
+            today: today | map((r) => merge(r, { shown: shown(r.cents, r.currency) })),
+            held: (payments.held() ?? []) | map(transfer_view),
+            recent: (payments.recent(12) ?? []) | map(transfer_view),
+            desks: open_desks(),
+            activity: db.query("select * from audit order by id desc limit 20"),
+            ledger_problems: accounts.problems() ?? ["the accounts service is not answering"],
+        }
+    })
+}
+
+// A supervisor's decision on a held transfer.
+server fn decide_transfer(id: int, approve: bool, note: str) ! str with db, http, time {
+    let s = acting_staff()?
+    if !is_supervisor(s) { return err("Supervisors decide held transfers") }
+    let t = payments.decide(id, approve, s.name, note)?
+    log(s.name, approve ? "approve" : "reject", `transfer #${id}, ${shown(t.cents, t.currency)}: ${t.status}`)
+    let to = accounts.account(t.to_id) ?? null
+    cust_changed(t.customer_id)
+    if to != null { cust_changed(to.customer_id) }
+    transfer_view(t)
+}
+
+server fn find_customers(q: str) -> list with db, http {
+    if staff() == null { return [] }
+    customers.search(q) ?? []
+}
+
+// A customer as staff see them: details, accounts with statements, transfers.
+server fn load_customer(number: str) with db, http {
+    if staff() == null { return null }
+    let c = customers.by_number(number) ?? null
+    if c == null { return null }
+    watch(`cust:${c.id}`)
+    unwatched(() => {
+        let accts = (accounts.of_customer(c.id) ?? []) | map(account_view)
+        {
+            customer: c,
+            accounts: accts | map((a) => merge(a, { lines: (accounts.statement(a.id, 8) ?? []) | map((l) => merge(l, { signed: signed(l.amount, a.currency) })) })),
+            transfers: (payments.of_customer(c.id, 10) ?? []) | map(transfer_view),
+            emails: messages.emails_of(c.id) ?? [],
+        }
+    })
+}
+
+server fn set_account_status(id: int, status: str) ! str with db, http, time {
+    let s = acting_staff()?
+    let a = accounts.set_status(id, status)?
+    log(s.name, status == "frozen" ? "freeze" : status, `${iban_pretty(a.number)}`)
+    cust_changed(a.customer_id)
+    if status == "frozen" { messages.send(a.customer_id, "security", `Your account ${iban_pretty(a.number)} is frozen`, "Call us or visit a branch.") }
+    account_view(a)
+}
+
+// Cash in at the counter: no client approval (it only adds money).
+server fn cash_in(id: int, amount: str) ! str with db, http, time, random {
+    let s = acting_staff()?
+    let a = accounts.account(id)? ?? err("No such account")?
+    let m = parse_amount(amount, a.currency)?
+    accounts.deposit(id, money.to_minor(m), `Cash at the desk (${s.name})`, `cash-${uuid()}`)?
+    messages.send(a.customer_id, "account", `${money.format(m, LOCALE)} was paid in`, `At the desk with ${s.name}.`)
+    log(s.name, "deposit", `${money.format(m, LOCALE)} into ${iban_pretty(a.number)}`)
+    cust_changed(a.customer_id)
+    true
+}

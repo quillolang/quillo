@@ -65,8 +65,11 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
     ws.send(JSON.stringify({ id, method, params, sessionId }));
   });
 
-  async function page(url = "about:blank") {
-    const { result: { targetId } } = await send("Target.createTarget", { url: "about:blank" });
+  // `page(url, { own: true })`: a tab in a browser context of its own (its
+  // own cookies), for a second person; `phone: true` sizes it as a phone.
+  async function page(url = "about:blank", { own = false, phone = false } = {}) {
+    const context = own ? (await send("Target.createBrowserContext", {})).result.browserContextId : undefined;
+    const { result: { targetId } } = await send("Target.createTarget", { url: "about:blank", ...(context ? { browserContextId: context } : {}) });
     const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true });
     const s = (method, params) => send(method, params, sessionId);
     const problems = [];
@@ -99,6 +102,7 @@ export async function launch({ width = 1440, height = 1000, mismatches = false }
     await s("Runtime.enable");
     await s("Page.enable");
     await s("Log.enable");
+    if (phone) await s("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
     if (mismatches) {
       await s("Debugger.enable");
       await s("Debugger.setPauseOnExceptions", { state: "all" });

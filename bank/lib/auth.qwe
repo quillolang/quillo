@@ -1,0 +1,52 @@
+// Who is using the gateway: a client (signed in with their customer number
+// and PIN, checked by the customers service) or a member of staff (a clerk
+// or a supervisor, kept here). One browser may be both, as in a demo; the
+// session keeps each apart.
+
+let STAFF_ROLES = ["clerk", "supervisor"]
+
+type Client = { id: int, number: str, first_name: str, last_name: str }
+
+// The signed-in client, or null. Asks the customers service each time, so a
+// customer removed there is signed out here.
+fn client() with http = session().customer == null ? null : customers.customer(session().customer) ?? null
+
+fn staff() with db = session().staff == null ? null : db.one("select id, username, name, role from staff where id = ?", session().staff)
+
+fn is_supervisor(s) -> bool = s != null && s.role == "supervisor"
+
+// For routes: the client, or off to sign in and back.
+fn client_or_login(back: str) with http = client() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+fn staff_or_login(back: str) with db = staff() ?? reply 303 redirect(`/staff/login?next=${url_encode(back)}`)
+
+// For server fns: who acts, or an error the page shows.
+fn acting_client() with http = client() ?? err("Sign in first")
+
+fn acting_staff() with db = staff() ?? err("Staff only: sign in first")
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+fn client_sign_in(number: str, pin: str) ! str with http {
+    let c = customers.sign_in(trim(number), trim(pin))?
+    set_session(merge(session(), { customer: c.id }))
+    c
+}
+
+fn staff_sign_in(username: str, password: str) ! str with db, random {
+    let s = db.one("select * from staff where username = ?", trim(username))
+    let hash = s.password_hash ?? crypto.hash_password("not anyone's password")
+    if !crypto.verify_password(password, hash) || s == null { return err("Wrong username or password") }
+    set_session(merge(session(), { staff: s.id }))
+    s
+}
+
+fn sign_out(who: str) {
+    let s = remove(session(), who)
+    if len(keys(s)) == 0 { end_session() } else { set_session(s) }
+}
+
+fn log(actor: str, action: str, detail: str = "") with db, time {
+    db.exec("insert into audit (actor, action, detail, created) values (?, ?, ?, ?)", actor, action, detail, now())
+    publish("staff")
+}

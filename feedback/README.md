@@ -15,7 +15,8 @@ never seen.
 
 Reports so far: [FEEDBACK.md](../FEEDBACK.md) (a forum), [FEEDBACK2.md](../FEEDBACK2.md)
 (a project manager), [FEEDBACK3.md](../FEEDBACK3.md) (a newsroom CMS with a flow and
-object designer), and [BUGREPORT1.md](../BUGREPORT1.md).
+object designer), [FEEDBACK4.md](../FEEDBACK4.md) (a bank made of services, with a
+clerk–client desk view), and [BUGREPORT1.md](../BUGREPORT1.md).
 
 ## Each run
 

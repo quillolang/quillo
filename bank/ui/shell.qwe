@@ -1,0 +1,100 @@
+// The two frames: the customers' app, made for a phone (a header, the page,
+// a tab bar at the bottom), and the staff's desk (a sidebar and the page).
+// And the small views both use.
+
+view Head(title: str) =
+    <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+        <meta name="theme-color" content="#0b3d2e"/>
+        <title>{title} · Quillo Bank</title>
+        <link rel="icon" href="/static/icons/bank.svg" type="image/svg+xml"/>
+        <link rel="stylesheet" href="/static/css/bank.css"/>
+    </head>
+
+view Logo() = <span.logo aria-hidden="true">Q</span>
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view Empty(children) = <div.empty>{children}</div>
+
+view Tab(href: str, label: str, icon: str, on: bool, children = null) =
+    <a.tab href={href} class={on && "on"} aria-current={on && "page"}>
+        <span.icon aria-hidden="true">{icon}</span>
+        <span>{label}</span>
+        {children}
+    </a>
+
+// Unread messages, live: on the Messages tab.
+component UnreadDot(initial: int) {
+    state n = live(load_unread)
+    let count = n ?? initial
+    {count > 0 && <span.dot aria-label={`${count} unread`}>{count > 9 ? "9+" : count}</span>}
+}
+
+view ClientShell(me, title: str, tab: str, children) =
+    <html lang="en">
+        <Head {title}/>
+        <body.client data-notices="dialog-center toasts-bottom-center">
+            <header.app-head>
+                <a.brand href="/"><Logo/> <span>Quillo Bank</span></a>
+                {me != null && <form.inline method="post" action="/logout"><button.link>Sign out</button></form>}
+            </header>
+            <main.app>{children}</main>
+            {me != null && <nav.tabs aria-label="Sections">
+                <Tab href="/" label="Home" icon="⌂" on={tab == "home"}/>
+                <Tab href="/transfer" label="Transfer" icon="⇄" on={tab == "transfer"}/>
+                <Tab href="/messages" label="Messages" icon="✉" on={tab == "messages"}><UnreadDot initial={load_unread()}/></Tab>
+                <Tab href="/desk" label="At the desk" icon="☺" on={tab == "desk"}/>
+            </nav>}
+        </body>
+    </html>
+
+view StaffShell(me, title: str, nav: str, children) =
+    <html lang="en">
+        <Head {title}/>
+        <body.staff data-notices="dialog-center toasts-bottom-right">
+            <aside.side>
+                <a.brand href="/staff"><Logo/> <span>Quillo Bank <small>staff</small></span></a>
+                <nav.side-nav>
+                    <a href="/staff" class={nav == "dashboard" && "on"}>Dashboard</a>
+                    <a href="/staff/customers" class={nav == "customers" && "on"}>Customers</a>
+                </nav>
+                <form.new-desk method="post" action="/staff/desk">
+                    <h3>New desk session</h3>
+                    <select name="kind" aria-label="What for">
+                        <option value="open_account">Open an account</option>
+                        <option value="withdrawal">Cash withdrawal</option>
+                        <option value="update">New details</option>
+                    </select>
+                    <input name="number" placeholder="Customer number (if a customer)" inputmode="numeric" aria-label="Customer number"/>
+                    <button.btn.primary>Start</button>
+                </form>
+                <div.who>
+                    <b>{me.name}</b> <span.role>{me.role}</span>
+                    <form.inline method="post" action="/staff/logout"><button.link>Sign out</button></form>
+                </div>
+            </aside>
+            <main.desk>{children}</main>
+        </body>
+    </html>
+
+view StaffNotFound(me, what: str) =
+    <StaffShell {me} title="Not found" nav="">
+        <Empty><h2>Not here</h2><p>{what}</p><p><a href="/staff">Back to the dashboard</a></p></Empty>
+    </StaffShell>
+
+view ClientNotFound(me, what: str) =
+    <ClientShell {me} title="Not found" tab="">
+        <Empty><h2>Not here</h2><p>{what}</p><p><a href="/">Home</a></p></Empty>
+    </ClientShell>
+
+view Status(status: str) = <span class={`status ${status}`}>{match status {
+    "done" => "Sent"
+    "held" => "Being checked"
+    "deciding" => "Being checked"
+    "denied" => "Refused"
+    "rejected" => "Not made"
+    "failed" => "Failed"
+    _ => status
+}}</span>
