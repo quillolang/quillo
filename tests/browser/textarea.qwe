@@ -1,0 +1,13 @@
+// A <textarea>'s text between its tags: it follows state when that changes,
+// and what was typed stays when it does not. Driven by textarea.js.
+
+component Note(start: str) {
+    state text = "first"
+    <div>
+        <textarea id="follows" @input={(e) => { text = e.value }}>{text}</textarea>
+        <button id="reset" @click={() => { text = "reset" }}>Reset</button>
+        <textarea id="fixed">{start}</textarea>
+    </div>
+}
+
+route GET / = <html><body><Note start="from the server"/></body></html>

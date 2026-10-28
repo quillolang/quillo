@@ -321,7 +321,7 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if self.peeked.is_none() {
-                        self.lx.skip_inline_ws();
+                        self.lx.skip_spaces();
                         let prefix = if self.lx.peek_char() == Some('/') {
                             let mut p = String::new();
                             while let Some(c) = self.lx.peek_char() {
@@ -388,7 +388,7 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if self.peeked.is_none() {
-                        self.lx.skip_inline_ws();
+                        self.lx.skip_spaces();
                         if self.lx.peek_char() == Some('/') {
                             let mut prefix = String::new();
                             while let Some(c) = self.lx.peek_char() {
@@ -571,11 +571,17 @@ impl Parser {
         let saved = self.save();
         self.next()?;
         if let Tok::Ident(n) = self.peek()? {
-            if !KEYWORDS.contains(&n.as_str()) {
-                self.next()?;
-                if self.at(&Tok::Assign)? {
-                    return Ok(Some(n));
+            let line = self.line()?;
+            self.next()?;
+            if self.at(&Tok::Assign)? {
+                // `state reply = ...`: a state meant, with a keyword for its name.
+                if KEYWORDS.contains(&n.as_str()) {
+                    return Err(QuilloError::new(
+                        format!("expected a state name, found `{}`, which is a keyword: pick another name", n),
+                        line,
+                    ));
                 }
+                return Ok(Some(n));
             }
         }
         self.restore(saved);
@@ -711,7 +717,7 @@ impl Parser {
             ));
         }
         // The path is read character by character: `/users/:id(int)/*rest`.
-        self.lx.skip_inline_ws();
+        self.lx.skip_spaces();
         if self.lx.peek_char() != Some('/') {
             return Err(QuilloError::new("expected a path starting with `/` after the method", self.lx.line));
         }
@@ -1752,9 +1758,22 @@ impl Parser {
                         self.lx.bump();
                         children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
                     }
+                    // `{/* a note */}`: a comment, as in JSX.
+                    (Some('{'), _) if self.braced_comment_len() > 0 => {
+                        for _ in 0..self.braced_comment_len() {
+                            self.lx.bump();
+                        }
+                    }
                     (Some('{'), _) => {
                         push_text(&mut children, &mut text);
                         children.push(HtmlChild::Expr(self.parse_braced_expr()?));
+                    }
+                    // A line of markup starting with `//` is a comment, not
+                    // text for the page (`{"//"}` writes the characters).
+                    (Some('/'), Some('/')) if text.contains('\n') && text.rsplit('\n').next().map_or(false, |l| l.trim().is_empty()) => {
+                        while !matches!(self.lx.peek_char(), Some('\n') | None) {
+                            self.lx.bump();
+                        }
                     }
                     (Some('}'), _) => {
                         return self.html_err(format!("unexpected `}}` inside <{}> (write {{\"}}\"}} for the character)", tag))
@@ -1770,8 +1789,44 @@ impl Parser {
                 }
             }
         }
+        // `<textarea>{text}</textarea>` follows `text` in the browser (see
+        // `textareaFollows` in the runtime); with `value={...}` as well, one
+        // of the two would be lost.
+        if tag == "textarea" && !children.is_empty() && attrs.iter().any(|(n, _)| n == "value" || n == "bind:value") {
+            return Err(QuilloError::new(
+                "a <textarea> takes its text from value={...} or from what is between its tags, not both",
+                line,
+            ));
+        }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
         Ok(HtmlEl { tag, id, classes, attrs, children, line, facts })
+    }
+
+    /// How many characters `{/* ... */}` takes, starting at its `{`, or 0
+    /// when what is ahead is not one (only spaces may stand around the
+    /// comment; the comment may hold `}`).
+    fn braced_comment_len(&self) -> usize {
+        let at = |i: usize| self.lx.peek_char_at(i);
+        let mut i = 1;
+        while matches!(at(i), Some(' ' | '\t' | '\r' | '\n')) {
+            i += 1;
+        }
+        if !(at(i) == Some('/') && at(i + 1) == Some('*')) {
+            return 0;
+        }
+        i += 2;
+        loop {
+            match (at(i), at(i + 1)) {
+                (Some('*'), Some('/')) => break,
+                (Some(_), _) => i += 1,
+                (None, _) => return 0,
+            }
+        }
+        i += 2;
+        while matches!(at(i), Some(' ' | '\t' | '\r' | '\n')) {
+            i += 1;
+        }
+        if at(i) == Some('}') { i + 1 } else { 0 }
     }
 
     fn read_interp_name(&mut self) -> PResult<Expr> {

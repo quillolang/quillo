@@ -312,9 +312,10 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     // decimals and ints past 2^53, which any value from the server may be
     // (3.5 KB), and the checks on what is handed to the page's functions
     // (an event's element's methods, say: 400 bytes), and components that
-    // are a table's rows (800 bytes); what says why a page was made again is
+    // are a table's rows (800 bytes), and a textarea that follows the text
+    // between its tags (200 bytes); what says why a page was made again is
     // in development bundles only, and newlines that change nothing go.
-    assert!(js.len() < js2.len() && js.len() < 30_500, "{} vs {}", js.len(), js2.len());
+    assert!(js.len() < js2.len() && js.len() < 30_800, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }

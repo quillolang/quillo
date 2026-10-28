@@ -498,6 +498,28 @@ fn markdown_in_a_component_is_the_servers() {
     assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("`markdown` expects options as a map, got int"), "{}", r);
 }
 
+/// A textarea's text between its tags follows state once someone has typed
+/// in it, and a text that never changes leaves what was typed alone.
+#[test]
+fn a_textarea_follows_the_text_between_its_tags() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("textarea.qwe"), free_port(), Some(&dir.join("textarea.js")));
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "first": ["first", "from the server"],
+            "typed": ["typed", "typed too"],
+            "reset": ["reset", "typed too"],
+            "errors": [],
+            "remade": 0,
+        })
+    );
+}
+
 /// Links pointed at are prefetched: the page they lead to, slow to make, is
 /// there when the link is followed.
 #[test]

@@ -553,3 +553,66 @@ fn http_to_a_host_from_a_value_is_worth_a_word() {
     // In the browser the server's network is not where it goes.
     clean("component C() {\n ~u = \"\"\n ~r = null\n <button @click={() => { r = http.get(u) }}>{r}</button>\n}");
 }
+
+/// A keyword as a state's name says so, as it does for `fn` and `let`.
+#[test]
+fn a_keyword_as_a_state_name() {
+    one("component C() {\n    state reply = \"\"\n    <p>{reply}</p>\n}", "2 expected a state name, found `reply`, which is a keyword");
+    // `state` is still a name of its own.
+    clean("let state = 1\nprint(state + 1)");
+}
+
+/// SQL names from `sql_name` stay safe in a variable, whatever its argument
+/// is made of, and through the program's functions that only return them.
+#[test]
+fn sql_names_from_helpers_and_templates() {
+    clean("fn f(id: int) with db {\n    let table = sql_name(`obj_${id}`)\n    db.query(`select * from ${table}`)\n}");
+    clean("fn table_of(id: int) -> str = sql_name(`obj_${id}`)\nfn count_of(id: int) with db = db.one(`select count(*) as n from ${table_of(id)}`)");
+    clean("fn tbl(id: int) = sql_name(`obj_${id}`)\nfn u(id: int) = tbl(id)\nfn f(id: int) with db = db.query(`select * from ${u(id)}`)");
+    clean("fn tbl(id: int) {\n    if id < 0 { return sql_name(\"none\") }\n    let n = sql_name(`obj_${id}`)\n    n\n}\nfn f(id: int) with db = db.query(`select * from ${tbl(id)}`)");
+    // A helper that can return text from a value is not safe.
+    one("fn tbl(name: str) = name\nfn f(n: str) with db = db.query(`select * from ${tbl(n)}`)", "SQL injection");
+    one("fn tbl(id: int, raw: str) = id > 0 ? sql_name(`obj_${id}`) : raw\nfn f(n: str) with db = db.query(`select * from ${tbl(1, n)}`)", "SQL injection");
+    one("fn tbl(raw: str) {\n    if raw == \"\" { return raw }\n    sql_name(\"a\")\n}\nfn f(n: str) with db = db.query(`select * from ${tbl(n)}`)", "SQL injection");
+}
+
+/// Markup the browser's HTML parser would not keep as written.
+#[test]
+fn markup_the_browser_restructures() {
+    one("view V() = <p>a <div>b</div></p>", "1 <div> cannot go inside a <p>");
+    one("view V() = <p><span>a <ul><li>b</li></ul></span></p>", "<ul> cannot go inside a <p>");
+    one("view V(on: bool) = <p>{on && <section>s</section>}</p>", "<section> cannot go inside a <p>");
+    one("view V() = <a href=\"/a\">a <a href=\"/b\">b</a></a>", "<a> cannot go inside an <a>");
+    one("view V() = <form><form></form></form>", "<form> cannot go inside a <form>");
+    // A view or component counts as its outer element.
+    one("view Box() = <div>x</div>\nview V() = <p>a <Box/></p>", "<Box>, whose outer element is a <div>, cannot go inside a <p>");
+    one("component Live() {\n    state n = 0\n    <div>{n}</div>\n}\nview V() = <p><Live/></p>", "<Live>, whose outer element is a <div>");
+    // Fine: inline content in a <p>, a <div> in a <button>, a view that may be a link.
+    clean("view Chip() = <span>c</span>\nview V() = <p><b>a</b> <Chip/> <button><div>b</div></button></p>");
+    clean("view L(link: bool) = link ? <a href=\"/\">l</a> : <span>l</span>\nview V() = <a href=\"/x\"><L link={false}/></a>");
+    clean("view V() = <div><p>a</p><div><section>b</section></div></div>");
+}
+
+/// A file that cannot be parsed is reported first, and the names it
+/// defines are not also reported as unknown where they are used.
+#[test]
+fn a_parse_error_comes_before_what_it_causes() {
+    let d = std::env::temp_dir().join(format!("quillo-parse-first-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("ui")).unwrap();
+    std::fs::write(d.join("ui/room.qwe"), "view Row(a) = <li>{a}</li>\n\ncomponent Room(id: int) {\n    state n = 0\n    <div>{n</div>\n}\n").unwrap();
+    std::fs::write(d.join("main.qwe"), "use \"ui/room.qwe\"\nroute GET / = <Room id={1}/>\nprint(nowhere)\n").unwrap();
+    let a = quillo::check::check_file(&d.join("main.qwe"));
+    let msgs: Vec<String> = a.diagnostics.iter().map(|d| format!("{}:{} {}", d.file.rsplit('/').next().unwrap(), d.line, d.message)).collect();
+    assert!(msgs[0].starts_with("room.qwe:5 "), "{:#?}", msgs);
+    assert!(!msgs.iter().any(|m| m.contains("`Room`")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m.contains("unknown name `nowhere`")), "{:#?}", msgs);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A route's wildcard starts with `/*`, which is not a comment there.
+#[test]
+fn a_wildcard_route_is_not_a_comment() {
+    clean("route GET /*rest = rest");
+    clean("route GET /files/*path = path");
+}
+

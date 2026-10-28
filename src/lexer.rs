@@ -129,11 +129,14 @@ pub struct Lexer {
     pub stack: Vec<char>,
     /// The last token produced, used to decide whether a newline ends a statement.
     pub last: Option<Tok>,
+    /// A `/* ... */` comment just skipped held a line break (on this line):
+    /// it ends a statement as that line break would have.
+    comment_newline: Option<u32>,
 }
 
 impl Lexer {
     pub fn new(src: &str, line: u32) -> Self {
-        Lexer { chars: Arc::new(src.chars().collect()), pos: 0, line, stack: Vec::new(), last: None }
+        Lexer { chars: Arc::new(src.chars().collect()), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None }
     }
 
     pub fn peek_char(&self) -> Option<char> {
@@ -157,7 +160,9 @@ impl Lexer {
         s.chars().enumerate().all(|(i, c)| self.peek_char_at(i) == Some(c))
     }
 
-    /// Skips spaces, tabs and `//` comments, but not newlines.
+    /// Skips spaces, tabs, `//` comments and `/* ... */` comments, but not
+    /// newlines (a `/* */` comment over several lines is noted in
+    /// `comment_newline`).
     pub fn skip_inline_ws(&mut self) {
         loop {
             match self.peek_char() {
@@ -172,8 +177,33 @@ impl Lexer {
                         self.bump();
                     }
                 }
+                Some('/') if self.peek_char_at(1) == Some('*') => {
+                    let line = self.line;
+                    self.bump();
+                    self.bump();
+                    // Up to `*/`, or the end of the text (then what was
+                    // being parsed is reported unfinished).
+                    while self.peek_char().is_some() && !(self.peek_char() == Some('*') && self.peek_char_at(1) == Some('/')) {
+                        self.bump();
+                    }
+                    if self.peek_char().is_some() {
+                        self.bump();
+                        self.bump();
+                    }
+                    if self.line != line && self.comment_newline.is_none() {
+                        self.comment_newline = Some(line);
+                    }
+                }
                 _ => break,
             }
+        }
+    }
+
+    /// Skips spaces and tabs only: before a path, where `/*` starts a
+    /// wildcard (`route GET /*rest`), not a comment.
+    pub fn skip_spaces(&mut self) {
+        while matches!(self.peek_char(), Some(' ' | '\t' | '\r')) {
+            self.bump();
         }
     }
 
@@ -186,6 +216,7 @@ impl Lexer {
                 break;
             }
         }
+        self.comment_newline = None;
     }
 
     pub fn word_ahead(&self) -> String {
@@ -251,8 +282,9 @@ impl Lexer {
     pub fn next_token(&mut self) -> Result<Token, QuilloError> {
         loop {
             self.skip_inline_ws();
-            if self.peek_char() == Some('\n') {
-                let line = self.line;
+            let crossed = self.comment_newline.take();
+            if crossed.is_some() || self.peek_char() == Some('\n') {
+                let line = crossed.unwrap_or(self.line);
                 self.skip_all_ws();
                 if self.newline_significant() {
                     self.last = Some(Tok::Newline);

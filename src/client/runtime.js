@@ -3440,6 +3440,13 @@ function nodesOf(list, out = []) {
   return out;
 }
 
+// A <textarea>'s text is only its first value: once someone types, the box
+// stops showing it. When the text between its tags changes, the box shows
+// the new text; when it does not, what was typed stays.
+function textareaFollows(el) {
+  if (el && el.localName === "textarea" && el.value !== el.textContent) el.value = el.textContent;
+}
+
 function removeNodes(list) {
   for (const n of nodesOf(list)) if (n.parentNode) n.parentNode.removeChild(n);
 }
@@ -3469,7 +3476,10 @@ function dynApply(x) {
   const one = r.nodes.length === 1 ? r.nodes[0] : null;
   if (one && one.nodeType === 3 && !one.__part && isText(x)) {
     const t = display(x);
-    if (one.data !== t) one.data = t;
+    if (one.data !== t) {
+      one.data = t;
+      textareaFollows(one.parentNode);
+    }
     return;
   }
   removeNodes(r.nodes);
@@ -3478,6 +3488,7 @@ function dynApply(x) {
   const p = r.end.parentNode;
   if (p) for (const n of got) p.insertBefore(n, r.end);
   r.nodes = got;
+  textareaFollows(p);
 }
 
 // An element's only content, following `get`: its children, without markers.
@@ -3502,13 +3513,17 @@ function dynAllApply(x) {
   const t = el.firstChild;
   if (t && t === el.lastChild && t.nodeType === 3 && !t.__part && isText(x)) {
     const s = display(x);
-    if (t.data !== s) t.data = s;
+    if (t.data !== s) {
+      t.data = s;
+      textareaFollows(el);
+    }
     return;
   }
   const got = [];
   put(x, { claim: false, svg }, got);
   if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
   el.replaceChildren(...got);
+  textareaFollows(el);
 }
 
 // What is left of an element's children after taking it up: empty text

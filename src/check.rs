@@ -1294,6 +1294,15 @@ struct Checker {
     line: u32,
     out: Analysis,
     reported: HashSet<(Arc<str>, u32, String)>,
+    /// Where `use`d files could not be parsed: reported first, as they
+    /// cause the errors after them.
+    parse_errors: HashSet<(Arc<str>, u32)>,
+    /// The names those files seem to define (read from their text): not
+    /// reported as unknown, since the file that defines them is broken.
+    unparsed_names: HashSet<String>,
+    /// The program's functions that give only SQL-safe text (each result
+    /// `sql_name(...)`, say): calling one is as safe as `sql_name` itself.
+    sql_name_fns: HashSet<String>,
     /// What is known of variables' text for the SQL warning, innermost
     /// last: the depth of the scope each was made in, its name, and what
     /// it holds (see `SqlVar`).
@@ -1368,6 +1377,9 @@ impl Checker {
             line: 0,
             out: Analysis::default(),
             reported: HashSet::new(),
+            parse_errors: HashSet::new(),
+            unparsed_names: HashSet::new(),
+            sql_name_fns: HashSet::new(),
             sql_vars: Vec::new(),
             next_sql: SqlVar::Other,
             url_vars: Vec::new(),
@@ -1376,7 +1388,12 @@ impl Checker {
     }
 
     fn finish(mut self) -> Analysis {
-        self.out.diagnostics.sort_by(|a, b| (a.file != *self.file, &a.file, a.line).cmp(&(b.file != *self.file, &b.file, b.line)));
+        // A file that could not be parsed first: what follows may be its doing.
+        let parse = &self.parse_errors;
+        let key = |d: &Diagnostic| !parse.iter().any(|(f, l)| **f == *d.file && *l == d.line);
+        self.out.diagnostics.sort_by(|a, b| {
+            (key(a), a.file != *self.file, &a.file, a.line).cmp(&(key(b), b.file != *self.file, &b.file, b.line))
+        });
         self.out
     }
 
@@ -1512,6 +1529,8 @@ impl Checker {
                             if crate::error::may_be_newer_syntax(&e.msg) {
                                 self.out.syntax_errors.push((fname.to_string(), e.line));
                             }
+                            self.parse_errors.insert((fname.clone(), e.line));
+                            self.unparsed_names.extend(names_in_text(&src));
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
                         }
                     },
@@ -1555,6 +1574,21 @@ impl Checker {
         for it in &order {
             collect_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned);
         }
+        // Helpers such as `fn table_of(id) = sql_name(`obj_${id}`)`, found
+        // again until no more are: one may call another.
+        let defs: Vec<&FnDef> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some(&**d) } else { None }).collect();
+        loop {
+            let found: Vec<String> = defs
+                .iter()
+                .filter(|d| !d.component && !self.sql_name_fns.contains(&d.name) && gives_sql_safe(&d.body, &self.sql_name_fns))
+                .map(|d| d.name.clone())
+                .collect();
+            if found.is_empty() {
+                break;
+            }
+            self.sql_name_fns.extend(found);
+        }
+        self.check_nesting(&order);
         for (file, e) in std::mem::take(&mut self.natives) {
             let sig = native_sig(&e, &file);
             let short = file.rsplit('/').next().unwrap_or(&file).to_string();
@@ -1823,7 +1857,7 @@ impl Checker {
             None => {
                 if name == "request" {
                     self.error("`request` only exists in routes and `server fn`s; pass what you need as an argument");
-                } else {
+                } else if !self.unparsed_names.contains(name) {
                     self.error(format!("unknown name `{}`{}", name, self.suggest(name)));
                 }
                 (T::ANY, None)
@@ -3347,6 +3381,7 @@ impl Checker {
         match e {
             Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Built,
             Expr::Template(parts) => interpolates(parts),
+            Expr::Call(f, _, _) if self.sql_safe_call(f) => false,
             Expr::Call(f, args, _) => match args.as_slice() {
                 [Expr::Template(parts)] => interpolates(parts),
                 [Expr::List(items), rest @ ..] if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
@@ -3387,7 +3422,7 @@ impl Checker {
             Expr::Lit(_) => true,
             Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Safe,
             Expr::Call(f, args, _) => {
-                matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param")
+                self.sql_safe_call(f)
                     || (is_join(f) && matches!(args.as_slice(), [Expr::List(items), rest @ ..] if items.iter().chain(rest).all(|x| self.sql_safe(x))))
             }
             Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(e) if self.sql_safe(e))),
@@ -3397,6 +3432,45 @@ impl Checker {
             Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.sql_safe(e)),
             _ => false,
         }
+    }
+
+    /// Markup the browser's HTML parser would not keep as written: a `<div>`
+    /// (or other block) inside a `<p>`, which the parser ends first; `<a>`
+    /// in `<a>`; `<form>` in `<form>`. The page is then not what the server
+    /// sent, and the components in it are made again in the browser. A view
+    /// or component counts as its outer element (`<Presence>` as its `<div>`).
+    fn check_nesting(&mut self, order: &[Item]) {
+        let views: HashMap<&str, &FnDef> = order
+            .iter()
+            .filter_map(|it| match &it.stmt {
+                Stmt::Fn(d) if d.name.starts_with(|c: char| c.is_uppercase()) => Some((d.name.as_str(), &**d)),
+                _ => None,
+            })
+            .collect();
+        let mut found = Vec::new();
+        for it in order {
+            // The walk meets an element before the ones inside it, so those
+            // are already marked (by address) when it reaches them.
+            let mut inside: HashSet<*const HtmlEl> = HashSet::new();
+            walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| {
+                if let Expr::Html(el, _) = e {
+                    if !inside.contains(&(&**el as *const HtmlEl)) {
+                        let mut stack = vec![el.tag.to_ascii_lowercase()];
+                        nesting_in(el, &mut stack, &views, &mut inside, &mut |line, msg| found.push((it.file.clone(), line, msg)));
+                    }
+                }
+            });
+        }
+        for (file, line, msg) in found {
+            self.diag_at(file, line, Severity::Error, msg);
+        }
+    }
+
+    /// Whether calling `f` gives SQL-safe text: `sql_name`, `sql_param`, or
+    /// a function of the program that only returns such text.
+    fn sql_safe_call(&self, f: &Expr) -> bool {
+        matches!(f, Expr::Ident(n, _) if !self.is_local(n)
+            && (n == "sql_name" || n == "sql_param" || self.sql_name_fns.contains(n)))
     }
 
     /// A call of something of type `ft`: arguments, effects, browser rules
@@ -3995,4 +4069,225 @@ fn edit_distance(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev[b.len()]
+}
+
+/// The names a file seems to define at its top level, read from its text
+/// line by line: what is left when it cannot be parsed (`fn name`, `server
+/// fn name`, `view Name`, `component Name`, `let name`, `type Name`).
+fn names_in_text(src: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in src.lines() {
+        let mut words = line.split(|c: char| c.is_whitespace() || c == '(' || c == '=' || c == '<' || c == ':')
+            .filter(|w| !w.is_empty());
+        let mut first = words.next();
+        if first == Some("server") {
+            first = words.next();
+        }
+        if !matches!(first, Some("fn" | "view" | "component" | "let" | "type")) {
+            continue;
+        }
+        if let Some(name) = words.next() {
+            if name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Whether a function's body only gives SQL-safe text: its result and each
+/// `return` is `sql_name(...)` or `sql_param(...)` (whatever their
+/// arguments), text as written, a call of a function in `safe`, or a
+/// variable bound to one of those in the same block; or choices and joins
+/// of them.
+fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
+    fn ok(e: &Expr, safe: &HashSet<String>, vars: &HashSet<String>) -> bool {
+        match e {
+            Expr::Lit(Lit::Str(_)) => true,
+            Expr::Ident(n, _) => vars.contains(n),
+            Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n)),
+            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(x) if ok(x, safe, vars))),
+            Expr::Binary(BinOp::Add, a, b, _) => ok(a, safe, vars) && ok(b, safe, vars),
+            Expr::If(_, a, b) => ok(a, safe, vars) && b.as_deref().map_or(false, |b| ok(b, safe, vars)),
+            Expr::Match(_, arms, _) => !arms.is_empty() && arms.iter().all(|a| ok(&a.body, safe, vars)),
+            Expr::Block(stmts) => {
+                let vars = block_vars(stmts, safe, vars);
+                match stmts.last() {
+                    Some(Stmt::Expr(x)) => ok(x, safe, &vars),
+                    Some(Stmt::Return(Some(x))) => ok(x, safe, &vars),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    // The variables a block binds to safe text, up to its end.
+    fn block_vars(stmts: &[Stmt], safe: &HashSet<String>, outer: &HashSet<String>) -> HashSet<String> {
+        let mut vars = outer.clone();
+        for st in stmts {
+            if let Stmt::Let(Pattern::Bind(n), x, _) = st {
+                if ok(x, safe, &vars) {
+                    vars.insert(n.clone());
+                } else {
+                    vars.remove(n);
+                }
+            }
+        }
+        vars
+    }
+    // Every `return`, wherever it is (in an `if`, a loop, after `??`), with
+    // what its own block bound before it.
+    let mut returns_ok = true;
+    walk_expr(body, &mut |x| {
+        if let Expr::Block(stmts) = x {
+            let mut vars = HashSet::new();
+            for st in stmts {
+                match st {
+                    Stmt::Let(Pattern::Bind(n), v, _) => {
+                        if ok(v, safe, &vars) {
+                            vars.insert(n.clone());
+                        } else {
+                            vars.remove(n);
+                        }
+                    }
+                    Stmt::Return(Some(r)) if !ok(r, safe, &vars) => returns_ok = false,
+                    _ => {}
+                }
+            }
+        }
+    });
+    returns_ok && ok(body, safe, &HashSet::new())
+}
+
+/// Elements before which the HTML parser ends an open `<p>` ("close a p
+/// element", in the HTML standard's parsing rules).
+const CLOSES_P: &[&str] = &[
+    "address", "article", "aside", "blockquote", "center", "details", "dialog", "dir", "div", "dl", "dd", "dt",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup",
+    "hr", "li", "listing", "main", "menu", "nav", "ol", "p", "pre", "search", "section", "summary", "table", "ul",
+    "xmp",
+];
+
+/// Elements past which an outer `<p>` is out of the parser's reach.
+const P_SCOPE_ENDS: &[&str] = &["button", "table", "td", "th", "caption", "template", "object", "marquee", "applet", "svg", "math"];
+
+/// The elements an expression puts on the page where it stands: itself,
+/// either branch of `if` or `? :`, each `match` arm, a `for`'s body, a
+/// block's last value, the right of `&&`, `||` and `??`, a list's items.
+fn markup_roots<'a>(e: &'a Expr, out: &mut Vec<&'a HtmlEl>) {
+    match e {
+        Expr::Html(el, _) => out.push(el),
+        Expr::If(_, a, b) => {
+            markup_roots(a, out);
+            if let Some(b) = b {
+                markup_roots(b, out)
+            }
+        }
+        Expr::Match(_, arms, _) => arms.iter().for_each(|a| markup_roots(&a.body, out)),
+        Expr::For(_, _, body, _) => markup_roots(body, out),
+        Expr::Block(stmts) => {
+            if let Some(Stmt::Expr(x)) = stmts.last() {
+                markup_roots(x, out)
+            }
+        }
+        Expr::Binary(BinOp::And | BinOp::Or, _, b, _) => markup_roots(b, out),
+        Expr::Coalesce(a, b) => {
+            markup_roots(a, out);
+            markup_roots(b, out)
+        }
+        Expr::List(items) => items.iter().for_each(|x| markup_roots(x, out)),
+        _ => {}
+    }
+}
+
+/// The outer elements' tags a view or component renders (a view whose
+/// outer element is another view's, that one's), at most a few deep.
+fn outer_tags(name: &str, views: &HashMap<&str, &FnDef>, depth: u32, out: &mut Vec<String>) {
+    let Some(d) = views.get(name) else { return };
+    if depth > 6 {
+        return;
+    }
+    let mut roots = Vec::new();
+    markup_roots(&d.body, &mut roots);
+    for r in roots {
+        if r.facts.component {
+            outer_tags(&r.tag, views, depth + 1, out)
+        } else {
+            out.push(r.tag.to_ascii_lowercase())
+        }
+    }
+}
+
+/// Checks the elements inside `el` (whose tag, and its ancestors', are on
+/// `stack`) against the rules of `Checker::check_nesting`.
+fn nesting_in(
+    el: &HtmlEl,
+    stack: &mut Vec<String>,
+    views: &HashMap<&str, &FnDef>,
+    inside: &mut HashSet<*const HtmlEl>,
+    report: &mut dyn FnMut(u32, String),
+) {
+    let mut kids: Vec<&HtmlEl> = Vec::new();
+    for c in &el.children {
+        match c {
+            HtmlChild::El(k) => kids.push(k),
+            HtmlChild::Expr(x) => {
+                let mut roots = Vec::new();
+                markup_roots(x, &mut roots);
+                for r in roots {
+                    inside.insert(r as *const HtmlEl);
+                    kids.push(r);
+                }
+            }
+        }
+    }
+    for k in kids {
+        let tags = if k.facts.component {
+            let mut t = Vec::new();
+            outer_tags(&k.tag, views, 0, &mut t);
+            t
+        } else {
+            vec![k.tag.to_ascii_lowercase()]
+        };
+        let problems: Vec<String> = tags.iter().filter_map(|t| nesting_problem(stack, t)).collect();
+        // A view or component whose outer element depends on its arguments
+        // (`link ? <a> : <span>`) counts only when every one it can be is wrong.
+        if !problems.is_empty() && problems.len() == tags.len() {
+            let what = if k.facts.component { format!("<{}>, whose outer element is a <{}>,", k.tag, tags[0]) } else { format!("<{}>", tags[0]) };
+            report(k.line, format!("{} {}", what, problems[0]));
+        }
+        if !k.facts.component {
+            // An element that ends the <p> is not inside it: what it holds
+            // is checked without the <p> (a <ul>'s <li> is not wrong too).
+            let tag = k.tag.to_ascii_lowercase();
+            let mut inner: Vec<String> = stack.clone();
+            if CLOSES_P.contains(&tag.as_str()) {
+                if let Some(at) = inner.iter().rposition(|a| a == "p" || P_SCOPE_ENDS.contains(&a.as_str())) {
+                    if inner[at] == "p" {
+                        inner.truncate(at);
+                    }
+                }
+            }
+            inner.push(tag);
+            nesting_in(k, &mut inner, views, inside, report);
+        }
+    }
+}
+
+/// What is wrong with an element `tag` inside the elements on `stack`, if
+/// anything: the end of a message that starts by naming it.
+fn nesting_problem(stack: &[String], tag: &str) -> Option<String> {
+    let open_p = CLOSES_P.contains(&tag)
+        && stack.iter().rev().take_while(|a| !P_SCOPE_ENDS.contains(&a.as_str())).any(|a| a == "p");
+    if open_p {
+        Some("cannot go inside a <p>: the browser ends the <p> before it, so the page is not what was written, and its components are made again in the browser; make the <p> a <div>, or use a <span>".into())
+    } else if tag == "a" && stack.iter().any(|a| a == "a") {
+        Some("cannot go inside an <a>: the browser ends the outer link before it, so the page is not what was written".into())
+    } else if tag == "form" && stack.iter().any(|a| a == "form") {
+        Some("cannot go inside a <form>: the browser drops the inner <form>, so its fields belong to the outer one".into())
+    } else {
+        None
+    }
 }
