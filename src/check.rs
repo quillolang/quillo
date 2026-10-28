@@ -2651,6 +2651,24 @@ impl Checker {
                     }
                 }
                 match &**rhs {
+                    // `xs | find(f) != null` is `xs | (find(f) != null)`: `|`
+                    // binds looser than an operator, which a call's errors
+                    // would not say (FEEDBACK5.md, Q-051; branch feedback6-fixes).
+                    Expr::Binary(op, inner, _, _) if matches!(&**inner, Expr::Call(..) | Expr::Ident(..)) && !matches!(op, BinOp::Range) => {
+                        let f = match &**inner {
+                            Expr::Call(c, _, _) => callee_name(c),
+                            other => callee_name(other),
+                        };
+                        let sym = match op {
+                            BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*", BinOp::Div => "/", BinOp::Mod => "%",
+                            BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<", BinOp::Le => "<=", BinOp::Gt => ">",
+                            BinOp::Ge => ">=", BinOp::And => "&&", BinOp::Or => "||", BinOp::Range => "..",
+                        };
+                        self.error(format!(
+                            "`xs | {f}(...) {sym} ...` reads as `xs | ({f}(...) {sym} ...)`: `|` binds looser than `{sym}`, so put the pipe in parentheses: `(xs | {f}(...)) {sym} ...`"
+                        ));
+                        T::ANY
+                    }
                     Expr::Call(callee, args, l) => {
                         self.line = *l;
                         self.call(callee, args, Some(v))
@@ -3951,7 +3969,7 @@ fn callee_name(e: &Expr) -> String {
     match e {
         Expr::Ident(n, _) => n.clone(),
         Expr::Field(_, n, _) => n.clone(),
-        _ => "this function".into(),
+        _ => "this value".into(),
     }
 }
 
