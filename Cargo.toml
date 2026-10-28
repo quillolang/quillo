@@ -21,7 +21,7 @@ libc = "0.2"
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"], optional = true }
 httparse = "1"
 # Rust in a program: `.qwer` files, built and loaded (src/native.rs).
-libloading = "0.8"
+libloading = "0.9"
 corosensei = "0.3"
 psm = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
