@@ -295,7 +295,9 @@ route GET /own = <html><head><script src="/_quillo/quillo.js" defer></script></h
     // stopped the page loading it. Markdown cannot write the element either.
     for note in ["see%20/_quillo/quillo.js", "![x](/_quillo/quillo.js)", "%3Cscript%20src=%22/_quillo/quillo.js%22%3E"] {
         let page = send(&mut it, "GET", &format!("/c?note={}", note), &[], "").text();
-        assert!(page.contains("t.src=\"/_quillo/b/"), "{} -> {}", note, page);
+        // The loader names the page's bundle (after the runtime file: FEEDBACK7.md,
+        // Q-064; branch feedback7-fixes).
+        assert!(page.contains("for(const s of [\"/_quillo/r/") && page.contains(",\"/_quillo/b/"), "{} -> {}", note, page);
     }
     // A page that loads it itself is left as it is.
     let page = send(&mut it, "GET", "/own", &[], "").text();

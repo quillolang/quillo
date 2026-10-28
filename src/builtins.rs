@@ -734,9 +734,9 @@ fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(Value::str(out))
 }
 
-fn env_var(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn env_var(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = s_arg(&args, 0, "env", line)?;
-    Ok(std::env::var(&*name).map(Value::str).unwrap_or_else(|_| arg(&args, 1)))
+    Ok(crate::dotenv::var(&it.env_file, &name).map(Value::str).unwrap_or_else(|| arg(&args, 1)))
 }
 
 fn now(_: &mut Interp, _: Vec<Value>, _: u32) -> R {

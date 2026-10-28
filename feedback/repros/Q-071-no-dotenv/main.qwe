@@ -1,0 +1,7 @@
+// Q-071 A `.env` beside the program is not read: `env("QUILLO_REPRO_071")` is null, in one process and in a service `--split` starts; nor can a service be given settings of its own
+// mode: run
+// open-when: key=none
+// fixed-when: key=from-dotenv
+// From FEEDBACK9.md §Q-071 (found on 2ad2502). The .env beside this file sets QUILLO_REPRO_071.
+
+print(`key=${env("QUILLO_REPRO_071") ?? "none"}`)

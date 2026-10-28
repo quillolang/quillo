@@ -854,9 +854,12 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
             None => {
                 it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
+                // Its own settings, beside its file (FEEDBACK9.md, Q-071).
+                let own = crate::dotenv::read(&dir.join(".env"));
                 let mut sub = Interp::with_shared(dir, it.shared.clone());
                 sub.services = it.services.clone();
                 sub.is_service = true;
+                sub.env_file = std::sync::Arc::new(own);
                 let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
                 it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
                 loaded?;

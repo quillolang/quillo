@@ -23,7 +23,8 @@ command line with no program, and a chain of services with a slow link),
 [FEEDBACK7.md](reports/FEEDBACK7.md) (no app: how Quillo ships its JavaScript, and how
 its bundles are keyed and kept), [FEEDBACK8.md](reports/FEEDBACK8.md) (no app: unused
 classes in the five apps, the classes Quillo sets itself, and component CSS that is not
-scoped), and
+scoped), [FEEDBACK9.md](reports/FEEDBACK9.md) (no app: whether Quillo keeps its keywords,
+builtins and modules apart from a program's names, on the server and in the browser; how `run` takes its options; `.env` and a service's settings), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
