@@ -2,7 +2,7 @@
 """Time the chain: N transfers back and forth (gateway, payments, risk,
 accounts, messages), then the pages that read the most.
 
-    python3 bank/tests/scale.py http://localhost:8080 1000
+    python3 app/bank/tests/scale.py http://localhost:8080 1000
 
 Needs BANK_DEMO=1. Prints milliseconds: the median and the 95th percentile."""
 

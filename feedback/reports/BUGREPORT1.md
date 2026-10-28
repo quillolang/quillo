@@ -1,7 +1,7 @@
 # Same-page links jump to the top once a page reads `url()`
 
 **Fixed** in d2c2aa4 ("Links and navigate() to a spot on a page go there as the browser
-does, :target and all"). This is issue Q-001 in [feedback/INDEX.md](feedback/INDEX.md).
+does, :target and all"). This is issue Q-001 in [feedback/INDEX.md](../INDEX.md).
 
 Once any component on a page has called `url()`, clicking a link to a spot on the same
 page (`<a href="#target">`) inside a component scrolls to the top of the page, not to
@@ -69,7 +69,7 @@ middle of the window, at a scroll position of 1203, before the click.
 
 ## Cause
 
-`navStart()` ([src/client/runtime.js:2871](src/client/runtime.js#L2871)) handles every
+`navStart()` ([src/client/runtime.js:2871](../../src/client/runtime.js#L2871)) handles every
 same-site link inside a `quillo-island`. It skips links with modifier keys, `target`,
 `download` or `data-reload`, and links outside the program or under `/_quillo/`. It does
 not skip links that differ from the current address only in the hash. Those go to
@@ -120,5 +120,5 @@ because the element does not exist before that.
 ## Test files
 
 The program above is the repro, as
-[feedback/repros/Q-001-hash-link-after-url.qwe](feedback/repros/Q-001-hash-link-after-url.qwe),
+[feedback/repros/Q-001-hash-link-after-url.qwe](../repros/Q-001-hash-link-after-url.qwe),
 run by `node feedback/run.mjs Q-001`.

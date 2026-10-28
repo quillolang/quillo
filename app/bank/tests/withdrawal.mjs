@@ -2,7 +2,7 @@
 // phone: the session is offered on their home screen, live; they approve
 // the amount; the money leaves their account while they look.
 //
-//   BASE=http://localhost:8080 node feedback/tools/drive.mjs bank/tests/withdrawal.mjs
+//   BASE=http://localhost:8080 node feedback/tools/drive.mjs app/bank/tests/withdrawal.mjs
 
 export default async ({ browser, sleep }) => {
   const base = process.env.BASE;

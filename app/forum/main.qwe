@@ -4,9 +4,9 @@
 // tracking and notifications, private messages, tags, full-text search, a
 // moderators' report queue with suspensions, and who is typing.
 //
-//   quillo run forum/main.qwe --watch                  then open http://localhost:8080
-//   FORUM_DEMO=1 quillo run forum/main.qwe --watch     the same, with people and threads to look at
-//   quillo check forum/main.qwe
+//   quillo run app/forum/main.qwe --watch                  then open http://localhost:8080
+//   FORUM_DEMO=1 quillo run app/forum/main.qwe --watch     the same, with people and threads to look at
+//   quillo check app/forum/main.qwe
 //
 //   lib/text.qwe         times, counts, names and tags (on the server and in the browser)
 //   lib/mentions.qwe     @mentions in posts, found with a regular expression (`re`)

@@ -1,7 +1,7 @@
 // A new customer opens an account at the desk: the clerk (Maria) on a
 // desktop, the client on a phone, each in a browser of their own.
 //
-//   BASE=http://localhost:8080 node feedback/tools/drive.mjs bank/tests/desk.mjs
+//   BASE=http://localhost:8080 node feedback/tools/drive.mjs app/bank/tests/desk.mjs
 //
 // Needs BANK_DEMO=1 (Maria). Returns the checks, each true or the value found.
 

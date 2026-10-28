@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hostile calls to the bank's server fns, as each kind of visitor.
 
-    python3 bank/tests/hostile.py http://localhost:8080
+    python3 app/bank/tests/hostile.py http://localhost:8080
 
 Needs BANK_DEMO=1, freshly seeded. Prints each check and its answer."""
 

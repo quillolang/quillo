@@ -5,9 +5,9 @@
 // reports drawn from the board's history: cumulative flow, burndown,
 // throughput, cycle time, workload and a Monte Carlo forecast.
 //
-//   quillo run pm/main.qwe --watch                then open http://localhost:8080
-//   PM_DEMO=1 quillo run pm/main.qwe --watch      the same, with people, projects and six weeks of history
-//   quillo check pm/main.qwe
+//   quillo run app/pm/main.qwe --watch                then open http://localhost:8080
+//   PM_DEMO=1 quillo run app/pm/main.qwe --watch      the same, with people, projects and six weeks of history
+//   quillo check app/pm/main.qwe
 //
 //   lib/dates.qwe       calendar days, counted by hand (Quillo has no date module)
 //   lib/auth.qwe        joining, signing in, sessions, the viewer's time zone

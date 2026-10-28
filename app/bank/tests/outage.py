@@ -2,7 +2,7 @@
 """A desk session submitted while the ledger is down, then again once it is
 back: it carries on from where it stopped, with no second customer.
 
-    python3 bank/tests/outage.py http://localhost:8080 <kill-accounts> <start-accounts>
+    python3 app/bank/tests/outage.py http://localhost:8080 <kill-accounts> <start-accounts>
 
 The two commands stop and start the accounts service (run split, with a
 QUILLO_SERVICE_SECRET set, so a restarted service is trusted). Needs

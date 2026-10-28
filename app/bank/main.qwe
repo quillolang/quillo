@@ -2,10 +2,10 @@
 // a dashboard for its staff, and desk sessions where a clerk fills in a
 // form while the client follows it on their phone and approves each part.
 //
-//   quillo run bank/main.qwe --watch                    one process: every service in it
-//   quillo run bank/main.qwe --split                    a process for each service
-//   BANK_DEMO=1 quillo run bank/main.qwe --watch        with staff, customers and history
-//   quillo check bank/main.qwe
+//   quillo run app/bank/main.qwe --watch                    one process: every service in it
+//   quillo run app/bank/main.qwe --split                    a process for each service
+//   BANK_DEMO=1 quillo run app/bank/main.qwe --watch        with staff, customers and history
+//   quillo check app/bank/main.qwe
 //
 // Then http://localhost:8080 is the customers' app (on a phone, or a narrow
 // window), and /staff the staff's side. Demo sign-ins: staff maria (clerk)
@@ -38,12 +38,12 @@
 //
 // Tests (need BANK_DEMO=1, freshly seeded; BASE=http://localhost:8080):
 //
-//   node feedback/tools/drive.mjs bank/tests/desk.mjs         a new customer at the desk, clerk and phone
-//   node feedback/tools/drive.mjs bank/tests/transfers.mjs    transfers, held and decided, live on three screens
-//   node feedback/tools/drive.mjs bank/tests/withdrawal.mjs   a customer's withdrawal, offered on their phone
-//   python3 bank/tests/hostile.py $BASE                       every server fn called out of turn
-//   python3 bank/tests/outage.py $BASE <stop> <start>         the ledger down mid-submit (run --split)
-//   python3 bank/tests/scale.py $BASE 1000                    the chain, timed
+//   node feedback/tools/drive.mjs app/bank/tests/desk.mjs         a new customer at the desk, clerk and phone
+//   node feedback/tools/drive.mjs app/bank/tests/transfers.mjs    transfers, held and decided, live on three screens
+//   node feedback/tools/drive.mjs app/bank/tests/withdrawal.mjs   a customer's withdrawal, offered on their phone
+//   python3 app/bank/tests/hostile.py $BASE                       every server fn called out of turn
+//   python3 app/bank/tests/outage.py $BASE <stop> <start>         the ledger down mid-submit (run --split)
+//   python3 app/bank/tests/scale.py $BASE 1000                    the chain, timed
 
 db.open(env("BANK_DATA", ".") + "/bank.db")
 db.migrate("migrations")

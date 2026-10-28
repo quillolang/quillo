@@ -1,7 +1,7 @@
 // Money between people, live: Ada and Ben on their phones, Omar (a
 // supervisor) at his desk, each in a browser of their own.
 //
-//   BASE=http://localhost:8080 node feedback/tools/drive.mjs bank/tests/transfers.mjs
+//   BASE=http://localhost:8080 node feedback/tools/drive.mjs app/bank/tests/transfers.mjs
 //
 // Needs BANK_DEMO=1, freshly seeded.
 

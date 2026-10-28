@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| App | [bank/](bank), "Quillo Bank": 2,095 lines of Quillo in 16 files, plus 144 of SQL and 230 of CSS. Five services, each a program with its own database (customers, accounts: a double-entry ledger, payments, risk, messages), called in chains through a gateway: a transfer goes gateway → payments → risk → accounts → messages. A phone app for customers (balances, statements, transfers checked as they are typed, messages), a dashboard for staff (figures, transfers held for a supervisor, desk sessions, activity, ledger health), and desk sessions: a clerk fills in a form at the counter while the client follows it live on their phone, approves each part, and chooses their PIN where the clerk cannot see it. |
+| App | [bank/](../../app/bank), "Quillo Bank": 2,095 lines of Quillo in 16 files, plus 144 of SQL and 230 of CSS. Five services, each a program with its own database (customers, accounts: a double-entry ledger, payments, risk, messages), called in chains through a gateway: a transfer goes gateway → payments → risk → accounts → messages. A phone app for customers (balances, statements, transfers checked as they are typed, messages), a dashboard for staff (figures, transfers held for a supervisor, desk sessions, activity, ledger health), and desk sessions: a clerk fills in a form at the counter while the client follows it live on their phone, approves each part, and chooses their PIN where the clerk cannot see it. |
 | Quillo | 0.5.0 (5d2e21e) |
 | Model | Claude Opus 5.5 |
-| Tested with | `quillo check`; probes of the risky parts before building; headless Chrome with up to three people signed in at once, each in a browser of their own (`bank/tests/*.mjs`: 55 checks); hostile calls to every server fn as each kind of visitor (`bank/tests/hostile.py`: 49); a service killed in the middle of a desk session and of a transfer (`bank/tests/outage.py`: 10); 1,000 transfers through the whole chain (`bank/tests/scale.py`); all of it in one process and with `--split`; `feedback/tools/mismatches.mjs` on every page, as a client and as staff |
+| Tested with | `quillo check`; probes of the risky parts before building; headless Chrome with up to three people signed in at once, each in a browser of their own (`app/bank/tests/*.mjs`: 55 checks); hostile calls to every server fn as each kind of visitor (`app/bank/tests/hostile.py`: 49); a service killed in the middle of a desk session and of a transfer (`app/bank/tests/outage.py`: 10); 1,000 transfers through the whole chain (`app/bank/tests/scale.py`); all of it in one process and with `--split`; `feedback/tools/mismatches.mjs` on every page, as a client and as staff |
 
 What worked well: services. Five programs, each with its own database, called in chains
 four deep, worked the first time and gave the same answers in one process and with
@@ -65,7 +65,7 @@ also explains less visible costs: every `{x && <b>...</b>}` in the bank's pages 
 rebuilt on each live update. The first guess (a reload echoing an older value over newer
 typing) was wrong: the field already kept its own draft. Only marking the input element
 (`el.__mine = true`) and finding it gone showed that the element itself was replaced.
-Repro: [feedback/repros/Q-041-and-in-markup-remakes-its-elements.qwe](feedback/repros/Q-041-and-in-markup-remakes-its-elements.qwe).
+Repro: [feedback/repros/Q-041-and-in-markup-remakes-its-elements.qwe](../repros/Q-041-and-in-markup-remakes-its-elements.qwe).
 
 **Workaround in the bank:** every piece of markup holding inputs or components is chosen with
 `cond ? <x> : null` (ui/desk.qwe, ui/staff.qwe, with a comment saying why).
@@ -93,7 +93,7 @@ and every balance stays as it was. Nothing says so, in either process's log.
 
 The guide says a program "behaves the same whichever way it runs", and this is where it
 does not: an app tested in one process (the default) breaks when it is deployed split.
-Repro: [feedback/repros/Q-038-publish-in-a-service-lost-when-split/](feedback/repros/Q-038-publish-in-a-service-lost-when-split)
+Repro: [feedback/repros/Q-038-publish-in-a-service-lost-when-split/](../repros/Q-038-publish-in-a-service-lost-when-split)
 (with `--split`; without it, the same page shows the new balance).
 
 **Workaround in the bank:** the gateway watches topics of its own (`cust:<id>`, `desk:<code>`,
@@ -126,7 +126,7 @@ What a loader reads is recorded: here only the global `ledger`, which never chan
 in the service are announced in the service, not to this program, so `bal` is its first
 value for good, even on the page that made the change. In a program made of services this
 is every loader. Repro:
-[feedback/repros/Q-039-live-loader-calling-a-service-follows-nothing/](feedback/repros/Q-039-live-loader-calling-a-service-follows-nothing).
+[feedback/repros/Q-039-live-loader-calling-a-service-follows-nothing/](../repros/Q-039-live-loader-calling-a-service-follows-nothing).
 
 **Workaround:** as for Q-038: `watch` a topic of the gateway's own in each loader, and
 `unwatched(...)` around the service calls.
@@ -152,7 +152,7 @@ code of the gateway's components lacks the file's functions and the program stop
 with the `use` lines first, it runs. `quillo check` passes both. The guide says "the order
 of `use` lines does not matter". A minimal case (a service and a component sharing one
 helper) was needed to see the order mattered at all. Repro:
-[feedback/repros/Q-040-service-before-use-breaks-browser-code/](feedback/repros/Q-040-service-before-use-breaks-browser-code).
+[feedback/repros/Q-040-service-before-use-breaks-browser-code/](../repros/Q-040-service-before-use-breaks-browser-code).
 
 **Workaround in the bank:** the `use` lines come first in main.qwe, with a comment.
 
@@ -175,7 +175,7 @@ print(range(0, 7 / 2))                                    // ok in quillo check;
 `/` of two ints is a float in Quillo (JavaScript's habit, unlike Python's `//` or Rust's
 ints), and `range`, `slice` and the like take ints. The checker knows both and could say
 so; written in a helper that runs only for some pages, this reaches users. Repro:
-[feedback/repros/Q-044-int-divided-passed-as-int.qwe](feedback/repros/Q-044-int-divided-passed-as-int.qwe).
+[feedback/repros/Q-044-int-divided-passed-as-int.qwe](../repros/Q-044-int-divided-passed-as-int.qwe).
 
 **Suggestion:** type `int / int` as a float in the checker and report it where an int is
 taken ("`/` gives a float: `floor(x / 4)`").
@@ -190,7 +190,7 @@ The sender of `later` calls asks the program itself, over HTTP, every second, an
 request log shows each one: 6 lines in 6 idle seconds, about 86,000 a day, with or without
 any `later` call made. A program without a `service` has none. It buries the requests
 people make. Repro:
-[feedback/repros/Q-043-later-poll-logged-every-second/](feedback/repros/Q-043-later-poll-logged-every-second).
+[feedback/repros/Q-043-later-poll-logged-every-second/](../repros/Q-043-later-poll-logged-every-second).
 
 **Suggestion:** leave Quillo's own `/_quillo/later` out of the request log (as the prefetch
 refusals now are), or poll only when something is waiting.
