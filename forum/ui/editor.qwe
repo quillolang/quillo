@@ -108,7 +108,12 @@ component Editor(box_id: str, value: str = "", name: str? = null, rows: int = 6,
                 <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 5h16v14H4zM4 15l4-4 4 4 3-3 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="15.5" cy="9" r="1.5" fill="currentColor"/></svg>
                 Image
                 <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden
-                    @change={(e) => upload(e.target.files[0])}/>
+                    @change={(e) => {
+                        let f = e.target.files[0]
+                        // Cleared, so picking the same image again is a change too.
+                        e.target.value = ""
+                        upload(f)
+                    }}/>
             </label>
             {uploading > 0 && <span.muted>Uploading…</span>}
             <span.hint>Markdown · @name · paste or drop images</span>

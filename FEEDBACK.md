@@ -7,6 +7,26 @@ moderators' report queue with suspensions. Everything below was checked on
 **quillo 0.5.0 (f1695a3)**, most severe first. Issues from earlier versions of this note
 that are now fixed are left out.
 
+## Status on 1cf047c
+
+Rechecked on **quillo 0.5.0 (1cf047c)**, with each issue's repro (`node feedback/run.mjs`)
+and the forum's 43 browser checks, run with prefetching on.
+
+| § | Issue | Status |
+|---|---|---|
+| 1 | Refused prefetch answered 204, so links to routes that write do nothing (Q-002); each refusal logged as an error (Q-003) | fixed: answered 503, and not logged |
+| 2 | A second definition silently replaces the first (Q-004); a function named like a builtin replaces it (Q-005) | fixed: an error naming both places; a warning |
+| 3 | `use` underdocumented (Q-006) | fixed: "Files of a program" in the guide. The editor's per-file checking was not rechecked |
+| 4 | `quillo check` counts only the main file (Q-007) | fixed: `25 routes, 138 functions, 14 components, in 18 files` |
+| 5 | The "newer Quillo" note follows every parse error (Q-008) | **open** |
+| 6 | A component cannot set an element's field (Q-009) | fixed. The forum now clears its image picker, so the same image can be picked twice |
+| 7 | `e.preventDefault()`, and writing in a loader, missing from the guide (Q-010) | fixed in the guide |
+| 8 | A removed builtin is just an `unknown name` (Q-037) | **open**, new: see §8 |
+
+The forum needed one change for 1cf047c: `rate_limit` was removed (205d7cd), so its two
+limits (images an hour, messages a minute) now count rows in its own `uploads` and
+`messages` tables.
+
 What worked well: `server fn` removed the API layer, and `live` with `watch`,
 `unwatched` and `publish` gave each thread, inbox and poll its own topic, so a reply
 wakes only the pages showing that thread. `quillo check` caught every effect mistake
@@ -131,3 +151,21 @@ not possible and what to do instead.
   posts and messages read inside their loaders instead, which works, since a loader
   runs again with the reader's cookies. That pattern is worth a sentence in Live data.
   Today it also runs into item 1, since the loader's write refuses the prefetch.
+
+## 8. A removed builtin is reported as an unknown name
+
+205d7cd removed rate limits, the date module and more, "for programs to do as they need".
+The forum, built before that, stopped with no hint of why:
+
+```
+forum/lib/uploads.qwe:15: error: unknown name `rate_limit`
+```
+
+`date.today()` is worse: `unknown name date (did you mean take?)`. Someone who learned
+Quillo from an older guide, or an AI model that saw one, will meet these.
+
+**Suggestion:** keep a short list of removed names, and say so in the error:
+"`rate_limit` was removed in 0.5.0: count requests in your own table" or "the date
+module was removed in 0.5.0: dates are ISO text, as databases give them, and sort as
+strings". Repro:
+[feedback/repros/Q-037-removed-builtin-unknown-name.qwe](feedback/repros/Q-037-removed-builtin-unknown-name.qwe).

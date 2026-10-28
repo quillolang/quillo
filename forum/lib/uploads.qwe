@@ -12,7 +12,9 @@ let MEDIA_NAME = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\
 server fn upload_image(file: map) ! str with db, time, random, fs {
     let u = acting()?
     if file.size > MAX_IMAGE_BYTES { return err("Images up to 8 MB") }
-    if !rate_limit(`uploads:${u.id}`, IMAGES_AN_HOUR, "1h") { return err("That is a lot of images for one hour; try again later") }
+    // Counted from the uploads table: Quillo has no rate limits of its own.
+    let recent = db.one("select count(*) as n from uploads where user_id = ? and created > ?", u.id, now() - 3600000).n
+    if recent >= IMAGES_AN_HOUR { return err("That is a lot of images for one hour; try again later") }
     let id = uuid()
     let tmp = save_upload(file, `uploads/incoming/${id}`)?
     let info = image.info(tmp)

@@ -66,7 +66,9 @@ server fn send_message(to: str, body: str) ! str with db, time {
     if other == null { return err("Nobody here goes by that name") }
     if other.id == u.id { return err("That is you") }
     check_body(body)?
-    if !rate_limit(`messages:${u.id}`, MESSAGES_A_MINUTE, "1m") { return err("Slow down a little, then send again") }
+    // Counted from the messages themselves: Quillo has no rate limits of its own.
+    let sent = db.one("select count(*) as n from messages where user_id = ? and created > ?", u.id, now() - 60000).n
+    if sent >= MESSAGES_A_MINUTE { return err("Slow down a little, then send again") }
     db.transaction(() => {
         let a = min([u.id, other.id])
         let b = max([u.id, other.id])
