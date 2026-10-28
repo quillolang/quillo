@@ -1,0 +1,9 @@
+// Q-072 `quillo check` passes a `service` option the loader refuses (`{ timout: "2s" }`): the program then does not start
+// mode: check
+// open-when: ok (1 routes
+// fixed-when: no option `timout`
+// From FEEDBACK9.md §Q-072 (found on 2ad2502). `quillo run` says: service billing: no option `timout` (timeout, retries, failures, cooldown).
+
+service billing = "billing.qwe" { timout: "2s" }
+
+route GET / = `${billing.total() ?? 0}`

@@ -1,0 +1,9 @@
+// Q-069 A variable named like a module (`let json`, `let db`) hides the module in every file: `quillo check` passes, and the call fails at run time with "str has no method `stringify`"
+// mode: check
+// open-when: ok (1 routes
+// fixed-when: /json.{0,40}hides/
+// From FEEDBACK9.md §Q-069 (found on 2ad2502). Q-035's fix warns for a builtin function (`let print`), not for a module.
+
+use "config.qwe"
+
+route GET / = json.stringify({ settings: "loaded" })

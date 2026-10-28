@@ -1,0 +1,2 @@
+// A setting, named as one would name it.
+let json = "settings.json"

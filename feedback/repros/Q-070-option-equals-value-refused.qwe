@@ -1,0 +1,8 @@
+// Q-070 `quillo run app.qwe --port=8081` is "unknown option `--port=8081`", for every option; a typo (`--prot`) is not told the option it meant
+// mode: cli
+// args: run Q-070-option-equals-value-refused.qwe --port=18997
+// open-when: unknown option `--port=18997`
+// fixed-when: listening on http://127.0.0.1:18997
+// From FEEDBACK9.md §Q-070 (found on 2ad2502).
+
+route GET / = "hi"
