@@ -28,10 +28,19 @@ Each fix is commented in the code with its issue and the branch.
 | Q-078 | Under `--watch`, the files the program served with `file()` are watched with its own. A stylesheet that changes is swapped in the open pages: each `<link>` to its path is replaced by one asked for afresh (`?quillo=<time>`), the old one taken out once the new one has loaded, on the `--watch` connection (`css:N:["/assets/app.css"]`), so the page keeps its state; any other file served refreshes them. The report's probe again, the sheet rewritten as Tailwind's `--watch` writes it: `font-weight` 400 → 700 in under 1.5 s, `window.__mark` kept, a component's count (2) kept, one `<link>`; ``quillo: /assets/app.css changed: swapped in open pages`` in the log (src/server.rs `watch`, `dev_script`, `serve_events`; src/statics.rs `served`) |
 | Q-079 | The suggestion's first two steps. `quillo run main.qwe --watch --with "npx tailwindcss -i src/app.css -o public/app.css --watch"`: a command run beside the program, in its folder, in a process group of its own, its lines marked with its name (`[tailwindcss] ...`), stopped with the program, group and all; more than one `--with` for several. And `style_with("npx postcss")` at the top level: every component's and view's `style` goes through the command (CSS in, CSS out) as the program loads, before it is scoped, so `@apply` and `theme()` work in a component's own CSS with PostCSS and Tailwind's plugin. All the styles go through at once, each after a `/*! quillo-style <id> */` mark such tools keep (each on its own when the marks do not come back); what it made is kept while the CSS is the same; a command that fails stops the program loading with what it said (src/main.rs `with`, src/styles.rs `made_with`; a unit test with `sed` standing in for PostCSS) |
 
+The shorthand question, answered afterwards with Tailwind 3.4.17 (`npx tailwindcss
+--content "./*.qwe"`) on a program written with it: Tailwind's scanner finds the
+shorthand's classes (`<div.flex.p-4.gap-2.items-center.bg-blue-600>`: all five), those in
+`class="..."`, both sides of a `? :`, and the variants `sm:p-2` and `md:flex-row`; not
+`` `border-${tone}-500` ``, made from parts, as expected; and not `w-1/3` written right
+before `/>` (`<i.w-1/3/>`, read as `w-1/3/`): a space before `/>` is enough. Running it
+showed a silent bug, fixed on branch shorthand-colon: `<em.hover:underline>` was
+`<em class="hover" :underline>`, the `:` taken as the start of an attribute, so Tailwind's
+`.hover\:underline:hover` styled nothing. The shorthand now takes `:` before a letter or a
+digit and `/` before a digit: `class="hover:underline"`, `class="md:flex w-1/2"`.
+
 Not done: the third step, utility classes made by Quillo itself, which the report leaves as
-a decision for later; and whether Tailwind's scanner finds Quillo's shorthand classes
-(`<div.flex.p-4>`), which needs Tailwind run, as before. The guide says a class made from
-parts is found by neither.
+a decision for later.
 
 ## Seen again
 
