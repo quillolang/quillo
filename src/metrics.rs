@@ -26,6 +26,8 @@ static LATENCY_MICROS: AtomicU64 = AtomicU64::new(0);
 pub static IN_PROGRESS: AtomicI64 = AtomicI64::new(0);
 /// Open client connections.
 pub static CONNECTIONS: AtomicI64 = AtomicI64::new(0);
+/// Pages' bundles kept in memory (FEEDBACK7.md, Q-063; branch feedback7-fixes).
+pub static BUNDLES: AtomicI64 = AtomicI64::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
 
 /// Starts the clock for `quillo_uptime_seconds`.
@@ -75,6 +77,8 @@ pub fn render() -> String {
     let _ = writeln!(s, "quillo_channel_pages {}", crate::wt::connected());
     s.push_str("# HELP quillo_channel_dropped_total Channel messages dropped because a queue was full.\n# TYPE quillo_channel_dropped_total counter\n");
     let _ = writeln!(s, "quillo_channel_dropped_total {}", crate::wt::DROPPED.load(Relaxed));
+    s.push_str("# HELP quillo_bundles Pages' bundles kept in memory, one per set of components.\n# TYPE quillo_bundles gauge\n");
+    let _ = writeln!(s, "quillo_bundles {}", BUNDLES.load(Relaxed));
     s.push_str("# HELP quillo_uptime_seconds Seconds since the server started.\n# TYPE quillo_uptime_seconds gauge\n");
     let _ = writeln!(s, "quillo_uptime_seconds {:.0}", STARTED.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
     s

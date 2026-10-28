@@ -229,11 +229,14 @@ route GET /bare = <Counter/>
     assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2,&quot;text&quot;:&quot;n&quot;}">"#), "{}", page);
     assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></quillo-island>"), "{}", page);
     // The bundle loads when it is needed (a loader, last in the body).
+    // The runtime file first, then the page's own (FEEDBACK7.md, Q-064;
+    // branch feedback7-fixes).
     let tail = &page[page.rfind("<script").unwrap()..];
-    assert!(tail.contains("t.src=\"/_quillo/b/") && tail.ends_with("</script></body></html>"), "{}", page);
+    let srcs = scripts_of(tail);
+    assert!(srcs[0].starts_with("/_quillo/r/") && srcs[1].starts_with("/_quillo/b/") && tail.ends_with("</script></body></html>"), "{}", page);
     // Without a </body>, the loader goes at the end.
     let bare = get(&mut it, "/bare").text();
-    assert!(bare.contains("t.src=\"/_quillo/b/") && bare.ends_with("})()</script>"), "{}", bare);
+    assert!(scripts_of(&bare)[1].starts_with("/_quillo/b/") && bare.ends_with("})()</script>"), "{}", bare);
     let js = get(&mut it, "/_quillo/quillo.js");
     assert_eq!(js.header("content-type"), Some("text/javascript; charset=utf-8"));
     assert!(js.text().contains("W.component(\"Counter\""));
@@ -324,6 +327,70 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     assert!(js.len() < js2.len() && js.len() < 31_800, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
+}
+
+/// The scripts a page loads, in order.
+fn scripts_of(page: &str) -> Vec<String> {
+    let at = page.find("for(const s of ").map(|i| i + "for(const s of ".len()).expect(page);
+    let end = page[at..].find(']').unwrap() + at + 1;
+    serde_json::from_str(&page[at..end]).unwrap()
+}
+
+/// Ten optional widgets: the page at /0110000001 shows W1, W2 and W9.
+const WIDGETS: &str = r#"
+component W(n: int) {
+    state c = 0
+    <button @click={() => { c += 1 }}>widget {n}: {c}</button>
+}
+component W0() = <W n={0}/>
+component W1() = <W n={1}/>
+component W2() = <W n={2}/>
+component W3() = <W n={3}/>
+component W4() = <W n={4}/>
+component W5() = <W n={5}/>
+component W6() = <W n={6}/>
+component W7() = <W n={7}/>
+component W8() = <W n={8}/>
+component W9() = <W n={9}/>
+fn on(bits: str, i: int) = slice(bits, i, i + 1) == "1"
+route GET /:bits = <html><body>
+    {on(bits, 0) ? <W0/> : null}{on(bits, 1) ? <W1/> : null}{on(bits, 2) ? <W2/> : null}{on(bits, 3) ? <W3/> : null}{on(bits, 4) ? <W4/> : null}
+    {on(bits, 5) ? <W5/> : null}{on(bits, 6) ? <W6/> : null}{on(bits, 7) ? <W7/> : null}{on(bits, 8) ? <W8/> : null}{on(bits, 9) ? <W9/> : null}
+</body></html>
+"#;
+
+/// The runtime is a file every page shares, and a page's bundle is its
+/// own code (FEEDBACK7.md, Q-064; branch feedback7-fixes).
+#[test]
+fn pages_share_the_runtime_file() {
+    let mut it = app(WIDGETS);
+    let one = scripts_of(&get(&mut it, "/1000000000").text());
+    let other = scripts_of(&get(&mut it, "/0100000000").text());
+    assert_eq!(one.len(), 2, "{:?}", one);
+    assert!(one[0].starts_with("/_quillo/r/") && one[1].starts_with("/_quillo/b/"), "{:?}", one);
+    assert_eq!(one[0], other[0]);
+    assert_ne!(one[1], other[1]);
+    let rt = get(&mut it, &one[0]);
+    assert_eq!(rt.header("cache-control"), Some("public, max-age=31536000, immutable"));
+    assert!(rt.text().contains("window.__quillo_rt"));
+    let b = get(&mut it, &one[1]).text();
+    assert!(b.len() < 3_000 && b.contains("widget ") && b.contains("window.__quillo_rt"), "{} bytes", b.len());
+}
+
+/// However many sets of components pages are made of, the server keeps a
+/// bounded number of bundles; a page naming one no longer kept is sent
+/// the whole program's (FEEDBACK7.md, Q-063; branch feedback7-fixes).
+#[test]
+fn bundles_kept_are_bounded() {
+    let mut it = app(WIDGETS);
+    let first = scripts_of(&get(&mut it, "/1000000000").text()).pop().unwrap();
+    for n in 1..1024u32 {
+        get(&mut it, &format!("/{:010b}", n));
+    }
+    assert!(it.bundles.lock().unwrap().len() <= quillo::client::KEPT);
+    let again = get(&mut it, &first);
+    assert_eq!((again.status, again.header("cache-control")), (200, Some("no-cache")));
+    assert!(again.text().contains("widget "));
 }
 
 #[test]
@@ -509,9 +576,10 @@ route GET /where = url().path
     let page = get(&mut it, "/shop").text();
     assert!(page.contains(r#"<a href="/shop/items?x=1">"#) && page.contains(r#"href="//cdn.example/x.js""#), "{}", page);
     assert!(page.contains(r#"action="/shop/buy""#) && page.contains(r#"<a href="/shop/inside">"#), "{}", page);
-    let at = page.find(r#"t.src="/shop/_quillo/b/"#).expect(&page) + r#"t.src=""#.len();
-    let src = page[at..at + page[at..].find('"').unwrap()].to_string();
-    assert!(get(&mut it, &src).text().contains("BASE = \"/shop\""));
+    // `BASE` is set in the runtime file the page's bundle takes (Q-064).
+    let srcs = scripts_of(&page);
+    assert!(srcs[0].starts_with("/shop/_quillo/r/") && srcs[1].starts_with("/shop/_quillo/b/"), "{:?}", srcs);
+    assert!(get(&mut it, &srcs[0]).text().contains("BASE = \"/shop\""));
     assert!(get(&mut it, "/shop/_quillo/quillo.js").text().contains("BASE = \"/shop\""));
     assert_eq!(get(&mut it, "/shop/where").text(), "/where");
     let r = send(&mut it, "POST", "/shop/buy", None, "");
