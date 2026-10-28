@@ -114,6 +114,16 @@ fn components_must_run_in_the_browser() {
     one("component C() = <p>{reply 404}</p>", "`reply` only works on the server");
     one("server fn save(x) = x\ncomponent C() = <p>{save(1)}</p>", "`save` waits on the server");
     one("component C() { ~n = 0\n<input bind:value={zz}/> }", "unknown name `zz`");
+    // `http` goes from the page, once it has arrived: from handlers.
+    one("component C() = <p>{http.get(\"https://x.test/\").status}</p>", "`http.get` in <C> runs in the browser");
+    one("component C() { ~r = http.get(\"https://x.test/\")\n<p>{r}</p> }", "`http.get` in <C> runs in the browser");
+    one("fn load() = http.get(\"https://x.test/\").json\ncomponent C() { ~r = load()\n<p>{r}</p> }", "`load` calls `http`");
+    one("component C() = <button @click={() => http.stream(\"https://x.test/\", (p) => p)}>x</button>", "`http.stream` is the server's");
+    clean("fn load(q) = http.post(\"https://x.test/\", { q: q }).json\ncomponent C() {\n ~r = null\n <button @click={() => { r = load(1) }}>{r}</button>\n}");
+    clean("component C() {\n ~r = null\n <input type=\"file\" @change={(e) => { r = http.put(\"https://bucket.test/k\", e.target.files[0]).status }}/>\n}");
+    // Variables named PUBLIC_... say the browser may see them.
+    clean("component C() = <p>{env(\"PUBLIC_MAP_TOKEN\") ?? \"none\"}</p>");
+    one("component C() = <p>{env(\"MAP_TOKEN\")}</p>", "name the variable PUBLIC_");
     clean(
         "let title = \"Todos\"\nserver fn save(x: str) -> list = [x]\nserver fn load() -> list = []\n\
          component C(start: int = 0) {\n ~n = start\n ~items = load()\n ~draft = \"\"\n\
@@ -520,4 +530,26 @@ fn newer_forms_check_clean() {
     clean("let num = 5\nfor str in [\"a\"] { print(str) }\nprint(num + 1)");
     clean("route GET /tz = cookie(\"tz\") ?? \"UTC\"");
     one("component C() = <p>{cookie(\"tz\")}</p>", "`cookie` is not available in the browser");
+}
+
+#[test]
+fn http_to_a_host_from_a_value_is_worth_a_word() {
+    let warn = "the host `http.";
+    // The host written in the program, whatever follows it.
+    clean("server fn a(id: int) = http.get(`https://api.test/users/${id}`)");
+    clean("server fn a(id: int) = http.get(\"https://api.test/users/\" + str(id))");
+    clean("let API = env(\"API_URL\") ?? \"https://api.test\"\nserver fn a(id: int) = http.get(`${API}/users/${id}`)");
+    clean("let API = env(\"API_URL\") ?? \"https://api.test\"\nserver fn a(id: int) = http.get(API + \"/users/\" + str(id))");
+    clean("server fn a(id: int) {\n let url = `https://api.test/u/${id}`\n http.get(url)\n}");
+    clean("server fn a(id: int) = http.request(\"GET\", if id > 0 { \"https://a.test/\" } else { \"https://b.test/\" })");
+    // From a value: said either way, it is the program's choice.
+    one("server fn a(u: str) = http.get(u)", warn);
+    one("route GET /p = http.post(request.query.u, { a: 1 })", warn);
+    one("server fn a(h: str) = http.get(`https://${h}/x`)", warn);
+    one("server fn a(p: str) = http.get(\"https://api.test\" + p)", warn);
+    one("server fn a(u: str) {\n let url = u + \"/x\"\n http.get(url)\n}", warn);
+    clean("server fn a(u: str) = http.get(u, {}, { public_only: true })");
+    clean("server fn a(u: str) = http.request(\"POST\", u, null, {}, { public_only: false })");
+    // In the browser the server's network is not where it goes.
+    clean("component C() {\n ~u = \"\"\n ~r = null\n <button @click={() => { r = http.get(u) }}>{r}</button>\n}");
 }

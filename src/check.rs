@@ -1239,6 +1239,8 @@ struct FnCtx {
     component: Option<String>,
     /// Inside a lambda or local fn of a component (event handlers).
     nested: bool,
+    /// A component's `state` initializer, which the server runs as it renders.
+    state_init: bool,
     /// What the function gives back other than at the end of its body:
     /// values of `return`, and the errors `?` passes on.
     exits: T,
@@ -1298,6 +1300,10 @@ struct Checker {
     sql_vars: Vec<(usize, String, SqlVar)>,
     /// What the variable `define` makes next holds (set by `let`).
     next_sql: SqlVar,
+    /// Variables holding a URL whose host is written in the program (see
+    /// `url_fixed`), as `sql_vars` is kept, and the next one's.
+    url_vars: Vec<(usize, String, bool)>,
+    next_url: bool,
 }
 
 /// What a variable holds, as far as SQL goes.
@@ -1364,6 +1370,8 @@ impl Checker {
             reported: HashSet::new(),
             sql_vars: Vec::new(),
             next_sql: SqlVar::Other,
+            url_vars: Vec::new(),
+            next_url: false,
         }
     }
 
@@ -1663,6 +1671,8 @@ impl Checker {
                         if !self.assigned.contains(n) {
                             let k = self.sql_kind(e);
                             self.sql_vars.push((0, n.clone(), k));
+                            let u = self.url_fixed(e);
+                            self.url_vars.push((0, n.clone(), u));
                         }
                     }
                     for (n, t, sig) in binds {
@@ -1709,6 +1719,9 @@ impl Checker {
         while self.sql_vars.last().map_or(false, |(d, _, _)| *d > depth) {
             self.sql_vars.pop();
         }
+        while self.url_vars.last().map_or(false, |(d, _, _)| *d > depth) {
+            self.url_vars.pop();
+        }
         if let Some(scope) = self.scopes.pop() {
             for (name, v) in scope {
                 if v.kind == Kind::Let && !v.used && !name.starts_with('_') && self.quiet == 0 {
@@ -1721,6 +1734,8 @@ impl Checker {
     fn define(&mut self, name: &str, t: T, sig: Option<Arc<Sig>>, kind: Kind) {
         let sql = std::mem::replace(&mut self.next_sql, SqlVar::Other);
         self.sql_vars.push((self.scopes.len(), name.to_string(), sql));
+        let url = std::mem::replace(&mut self.next_url, false);
+        self.url_vars.push((self.scopes.len(), name.to_string(), url));
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
         match self.scopes.last_mut() {
             Some(s) => {
@@ -1800,7 +1815,7 @@ impl Checker {
                 if v.kind == Kind::Global && &*v.file != "<builtin>" {
                     self.browser_global(name, &v);
                 }
-                if v.kind == Kind::Global && (name == "db" || name == "http") && &*v.file == "<builtin>" {
+                if v.kind == Kind::Global && name == "db" && &*v.file == "<builtin>" {
                     self.browser_forbidden(&format!("`{}`", name));
                 }
                 (v.t, v.sig)
@@ -1881,6 +1896,7 @@ impl Checker {
             restrictor: d.effects.as_ref().map(|e| (d.name.clone(), e.clone())),
             component: d.component.then(|| d.name.clone()),
             nested: false,
+            state_init: false,
             exits: T::NEVER,
         });
         self.push();
@@ -1979,6 +1995,7 @@ impl Checker {
             restrictor: None,
             component: None,
             nested: false,
+            state_init: false,
             exits: T::NEVER,
         });
         self.push();
@@ -2037,13 +2054,16 @@ impl Checker {
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
                 let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
+                let url = matches!(p, Pattern::Bind(_)) && self.url_fixed(e);
                 for (n, t, sig) in binds {
                     let kind = if matches!(p, Pattern::Bind(_)) { Kind::Let } else { Kind::Bound };
                     let t = if self.assigned.contains(&n) { T::ANY } else { t };
                     self.next_sql = sql;
+                    self.next_url = url;
                     self.define(&n, t, sig, kind);
                 }
                 self.next_sql = SqlVar::Other;
+                self.next_url = false;
                 T::of(NIL)
             }
             // `el.value = x`: a field of one of the page's objects, which only
@@ -2077,6 +2097,10 @@ impl Checker {
                     if let Some(v) = self.sql_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
                         v.2 = k;
                     }
+                }
+                let url = matches!(op, AssignOp::Set) && self.url_fixed(e);
+                if let Some(v) = self.url_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
+                    v.2 = url;
                 }
                 let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
                 match found {
@@ -2204,6 +2228,7 @@ impl Checker {
                 let saved = self.fns.last().map(|f| f.nested);
                 if let Some(f) = self.fns.last_mut() {
                     f.nested = true;
+                    f.state_init = true;
                 }
                 let is_live = matches!(e, Expr::Call(c, _, _) if matches!(&**c, Expr::Ident(n, _) if n == "live"));
                 self.live_ok = is_live;
@@ -2211,6 +2236,7 @@ impl Checker {
                 self.live_ok = false;
                 if let (Some(f), Some(n)) = (self.fns.last_mut(), saved) {
                     f.nested = n;
+                    f.state_init = false;
                 }
                 // `live(load, ...)` holds what `load` gives.
                 if let (true, Expr::Call(_, args, _)) = (is_live, e) {
@@ -2263,6 +2289,7 @@ impl Checker {
             restrictor,
             component,
             nested: true,
+            state_init: false,
             exits: T::NEVER,
         });
         let saved_seq = self.sequential;
@@ -2311,6 +2338,7 @@ impl Checker {
             restrictor: None,
             component: None,
             nested: false,
+            state_init: false,
             exits: T::NEVER,
         });
         self.push();
@@ -3119,6 +3147,7 @@ impl Checker {
 
     fn module_call(&mut self, m: &str, f: &str, args: &[Expr], pre: Option<T>) -> T {
         let line = self.line;
+        let piped = pre.is_some();
         let full = if f.is_empty() { m.to_string() } else { format!("{}.{}", m, f) };
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
@@ -3139,7 +3168,12 @@ impl Checker {
             });
         }
         // A page opens channels; the rest of `channel` is the server's.
-        if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
+        // `http` calls go from the page too, once it has arrived.
+        if m == "http" && f != "stream" {
+            self.http_rules(f, args, piped);
+        } else if full == "http.stream" && self.in_component().is_some() {
+            self.error("`http.stream` is the server's; in the browser, `receive(url, f, ...)` in a handler and `listen(url, f)` read a stream");
+        } else if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
             self.browser_forbidden(&format!("`{}`", full));
         }
         // A pattern written out is checked now, not when it runs.
@@ -3174,6 +3208,105 @@ impl Checker {
     }
 
     /// What the variable `name` holds, as far as SQL goes.
+    /// `http.get(...)` and the rest. In a component they are made by the
+    /// browser, from handlers: the server renders the component first, and
+    /// runs its `state` initializers. Elsewhere, a URL whose host comes from
+    /// a value may be a visitor's, who could then reach the server's own
+    /// network: a word, unless the call says `public_only` either way.
+    fn http_rules(&mut self, f: &str, args: &[Expr], piped: bool) {
+        if let Some(c) = self.in_component() {
+            let (nested, init) = self.fns.last().map_or((false, false), |x| (x.nested, x.state_init));
+            if !nested || init {
+                self.error(format!(
+                    "`http.{}` in <{}> runs in the browser, once the page has arrived, and the server renders <{}> first: \
+                     call it from an event handler or @mount, or from a `server fn`",
+                    f, c, c
+                ));
+            }
+            return;
+        }
+        let (url_at, opts_at) = match f {
+            "get" | "delete" => (0, 2),
+            "post" | "put" | "patch" => (0, 3),
+            "request" => (1, 4),
+            _ => return,
+        };
+        if piped {
+            return;
+        }
+        let says = match args.get(opts_at) {
+            Some(Expr::Map(fields)) => fields.iter().any(|(k, _)| k == "public_only"),
+            Some(_) => true,
+            None => false,
+        };
+        if let Some(url) = args.get(url_at) {
+            if !says && !self.url_fixed(url) {
+                self.warn(format!(
+                    "the host `http.{}` goes to comes from a value: if a visitor can choose it, they can reach this \
+                     server's own network (localhost, a cloud's metadata service). Pass {{ public_only: true }} as its options \
+                     (or public_only: false, when it is meant to reach inside)",
+                    f
+                ));
+            }
+        }
+    }
+
+    /// Whether the host a URL goes to is written in the program: text as
+    /// written, a template or `+` that starts with `scheme://host/` (or with
+    /// such a URL and then `/`, `?` or `#`), the environment's setting, or a
+    /// variable holding one of those.
+    fn url_fixed(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(Lit::Str(_)) => true,
+            Expr::Ident(n, _) => self.url_vars.iter().rev().find(|(_, v, _)| v == n).map_or(false, |v| v.2),
+            Expr::Field(base, _, _) => self.url_fixed(base),
+            Expr::Map(fields) => fields.iter().all(|(_, v)| self.url_fixed(v)),
+            Expr::Call(f, args, _) => matches!(&**f, Expr::Ident(n, _) if n == "env") && matches!(args.first(), Some(Expr::Lit(_))),
+            Expr::Coalesce(a, b) => self.url_fixed(a) && self.url_fixed(b),
+            Expr::Template(parts) => match parts.as_slice() {
+                [TPart::Expr(x)] => self.url_fixed(x),
+                _ => parts.iter().all(|p| matches!(p, TPart::Lit(_))) || self.url_starts_fixed(e),
+            },
+            Expr::Binary(BinOp::Add, ..) => self.url_starts_fixed(e),
+            Expr::If(_, a, b) => self.url_fixed(a) && b.as_deref().map_or(true, |b| self.url_fixed(b)),
+            Expr::Match(_, arms, _) => arms.iter().all(|a| self.url_fixed(&a.body)),
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.url_fixed(e)),
+            _ => false,
+        }
+    }
+
+    /// Whether text starts with a host written in the program, ended (by
+    /// `/`, `?` or `#`), so that what follows cannot change it: in
+    /// `"https://api.example.com" + q`, q could be "@elsewhere".
+    fn url_starts_fixed(&self, e: &Expr) -> bool {
+        let host_written = |t: &str| {
+            let l = t.get(..8).unwrap_or(t).to_ascii_lowercase();
+            let rest = if l.starts_with("https://") { &t[8..] } else if l.starts_with("http://") { &t[7..] } else { return false };
+            rest.find(['/', '?', '#']).map_or(false, |i| i > 0)
+        };
+        let path = |e: &Expr| matches!(e, Expr::Lit(Lit::Str(t)) if t.starts_with(['/', '?', '#']));
+        match e {
+            Expr::Lit(Lit::Str(t)) => host_written(t),
+            Expr::Template(parts) => match parts.as_slice() {
+                [TPart::Lit(t), ..] => host_written(t),
+                [TPart::Expr(x), TPart::Lit(t), ..] => self.url_fixed(x) && t.starts_with(['/', '?', '#']),
+                _ => false,
+            },
+            Expr::Binary(BinOp::Add, ..) => {
+                let mut terms = Vec::new();
+                let mut cur = e;
+                while let Expr::Binary(BinOp::Add, a, b, _) = cur {
+                    terms.push(&**b);
+                    cur = a;
+                }
+                terms.push(cur);
+                terms.reverse();
+                self.url_starts_fixed(terms[0]) || (self.url_fixed(terms[0]) && terms.get(1).map_or(false, |t| path(t)))
+            }
+            _ => false,
+        }
+    }
+
     fn sql_var(&self, name: &str) -> SqlVar {
         self.sql_vars.iter().rev().find(|(_, n, _)| n == name).map_or(SqlVar::Other, |v| v.2)
     }
@@ -3336,14 +3469,24 @@ impl Checker {
         }
         // The browser.
         if let Some(c) = self.in_component() {
-            if sig.builtin && BROWSER_ONLY_SERVER.contains(&sig.name.as_str()) {
-                self.error(format!("`{}` is not available in the browser, where <{}> also runs; use a `server fn`", sig.name, c));
+            let public = sig.name == "env" && matches!(arg_exprs.first(), Some(Expr::Lit(Lit::Str(n))) if n.starts_with("PUBLIC_"));
+            if sig.builtin && BROWSER_ONLY_SERVER.contains(&sig.name.as_str()) && !public {
+                let hint = if sig.name == "env" { " (or name the variable PUBLIC_..., which says the browser may see it)" } else { "" };
+                self.error(format!("`{}` is not available in the browser, where <{}> also runs; use a `server fn`{}", sig.name, c, hint));
             }
             if let Some(f) = &sig.native {
                 let f = f.rsplit('/').next().unwrap_or(f).to_string();
                 self.error(format!("`{}` is Rust ({}), which runs on the server, not in <{}>; call it from a `server fn`", sig.name, f, c));
             }
             let nested = self.fns.last().map_or(false, |f| f.nested);
+            let init = self.fns.last().map_or(false, |f| f.state_init);
+            if !sig.builtin && !sig.server && !sig.component && (!nested || init) && self.fn_effects(&sig) & crate::ast::effect_bit("http") != 0 {
+                self.error(format!(
+                    "`{}` calls `http`, which in <{}> runs in the browser, once the page has arrived, and the server renders <{}> first: \
+                     call it from an event handler or @mount, or make it a `server fn`",
+                    name, c, c
+                ));
+            }
             if sig.server && !nested {
                 self.error(format!(
                     "`{}` waits on the server, so <{}> can only call it from an event handler (@click={{() => {{ ... }}}}) or to set state: state x = {}(...)",

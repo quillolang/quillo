@@ -164,6 +164,18 @@ fn compile_errors_name_what_cannot_run_in_the_browser() {
         ("let key = env(\"HOME\")\ncomponent C() = <p>{key}</p>", "`key` is read from the server's environment"),
         ("let home = env(\"HOME\") ?? \"\"\nlet shown = upper(home)\ncomponent C() = <p>{shown}</p>", "`shown` is read from"),
         ("let rows = db.query(\"select 1\")\ncomponent C() = <p>{len(rows)}</p>", "`rows` is read from"),
+        // `http` goes from the page once it has arrived: in handlers, not
+        // while the server renders.
+        ("component C() = <p>{http.get(\"https://x.test/\").status}</p>", "`http.get` in a component runs in the browser"),
+        ("component C() { state r = http.get(\"https://x.test/\")\n<p>{r}</p> }", "`http.get` in a component runs in the browser"),
+        ("component C() { state r = null\n<button @click={() => { r = http.get(\"https://x.test/\") }}>{r}</button> }", ""),
+        ("fn load(q) with http = http.post(\"https://x.test/\", { q: q }).json\ncomponent C() { state r = null\n<button @click={() => { r = load(1) }}>{r}</button> }", ""),
+        ("component C() = <button @click={() => http.stream(\"https://x.test/\", (p) => p)}>x</button>", "`http.stream` is the server's"),
+        // Variables named PUBLIC_... are for the browser; the rest are not.
+        ("component C() = <p>{env(\"PUBLIC_MAP_TOKEN\") ?? \"none\"}</p>", ""),
+        ("let TOKEN = env(\"PUBLIC_MAP_TOKEN\") ?? \"none\"\ncomponent C() = <p>{TOKEN}</p>", ""),
+        ("let TOKEN = env(\"PUBLIC_MAP_TOKEN\", env(\"HOME\"))\ncomponent C() = <p>{TOKEN}</p>", "`TOKEN` is read from"),
+        ("let name = \"PUBLIC_MAP_TOKEN\"\ncomponent C() = <p>{env(name)}</p>", "`env` is not available in the browser"),
     ];
     for (src, want) in cases {
         let r = Interp::new(".").load_source(src, "c.qwe");
@@ -545,4 +557,82 @@ fn spread_return_and_names_that_are_types_run_the_same_in_the_browser() {
     same("", "let x = 1\nlet int = x + 1\nlet num = 5\nlet out = []\nfor str in [\"a\"] { out = push(out, str) }\n[int, num, out, match 3 { int => \"an int\", _ => \"no\" }]");
     same("", "let m = set({}, 5, \"five\")\nlet xs = [1, 2, 3]\n[m[5], m[6], set(xs, 1, 9), set(xs, -1, 0), xs]");
     same_error("", "set([1, 2, 3], 3, 0)", "index 3 is outside a list of 3");
+}
+
+/// A server on this machine for `http.*` calls: `/json` answers JSON,
+/// `/echo` what it was sent and as what, `/missing` 404.
+fn echo_server() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut s = s;
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            // The headers, then as much body as they say.
+            let (head, body) = loop {
+                let n = s.read(&mut buf).unwrap_or(0);
+                req.extend_from_slice(&buf[..n]);
+                if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..i]).to_string();
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    while req.len() < i + 4 + len {
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    break (head, String::from_utf8_lossy(&req[i + 4..]).to_string());
+                }
+                if n == 0 {
+                    break (String::new(), String::new());
+                }
+            };
+            let line = head.lines().next().unwrap_or("").to_string();
+            let ctype = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-type:").map(|v| v.trim().to_string())).unwrap_or_default();
+            let (status, text) = if line.starts_with("GET /json ") {
+                ("200 OK", "{\"n\": 1, \"xs\": [1, 2.5, null]}".to_string())
+            } else if line.contains(" /echo ") {
+                let method = line.split(' ').next().unwrap_or("");
+                ("200 OK", serde_json::json!({ "method": method, "type": ctype, "body": body }).to_string())
+            } else {
+                ("404 Not Found", "nothing here".to_string())
+            };
+            let answer = format!(
+                "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                text.len(),
+                text
+            );
+            let _ = s.write_all(answer.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn http_calls_answer_the_same_in_the_browser() {
+    if !node_available() {
+        return;
+    }
+    let base = format!("http://127.0.0.1:{}", echo_server());
+    let defs = format!("let BASE = \"{}\"", base);
+    let (server, browser) = both(&defs, "let r = http.get(BASE + \"/json\")\n[r.status, r.ok, r.json, r.headers[\"content-type\"]]");
+    assert_eq!(server, browser);
+    assert_eq!(server, "[200, true, { n: 1, xs: [1, 2.5, null] }, \"text/plain\"]");
+    let (server, browser) = both(&defs, "http.post(BASE + \"/echo\", { a: 1 }).json");
+    assert_eq!(server, browser);
+    assert_eq!(server, "{ method: \"POST\", type: \"application/json\", body: \"{\\\"a\\\":1}\" }");
+    same(&defs, "let r = http.get(BASE + \"/json\")\n[r.status, r.ok, r.json, r.body]");
+    same(&defs, "let r = http.get(BASE + \"/missing\", { accept: \"text/plain\" })\n[r.status, r.ok, r.json, r.body]");
+    // Maps are sent as JSON, text as text.
+    same(&defs, "http.post(BASE + \"/echo\", { a: [1, \"x\"] }).json");
+    same(&defs, "http.put(BASE + \"/echo\", \"hi\").json");
+    same(&defs, "http.patch(BASE + \"/echo\", \"hi\", { \"content-type\": \"text/csv\" }).json");
+    same(&defs, "http.request(\"delete\", BASE + \"/echo\").json.method");
+    same(&defs, "http.delete(BASE + \"/echo\").json.method");
+    // Not reached: an error value either way.
+    same(&defs, "[is_err(http.get(\"http://127.0.0.1:1/x\")), http.get(\"ftp://x.test/\").error]");
 }

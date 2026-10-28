@@ -484,8 +484,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)).
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
-  (and in `quillo check`): `request`, `db`, `http`, `env`, files, `reply`, or a global
-  the server changes (pass it as a prop instead).
+  (and in `quillo check`): `request`, `db`, `env` (but for variables named `PUBLIC_...`),
+  files, `reply`, or a global the server changes (pass it as a prop instead). `http.*`
+  runs in the browser, from event handlers (see [What the browser can reach](#what-the-browser-can-reach)).
 - Each page loads a bundle of its own, `/_quillo/b/<hash>.js`: the components it was
   rendered with, what they use, and the parts of the runtime they reach, minified (a
   small component is about 25 KB, 8 KB gzipped). Its address changes with its
@@ -827,11 +828,45 @@ sends the call again when its answer does not come back, and the server runs it 
 
 Components and server code share a file, but not what they can touch:
 
-- A component cannot use `db`, `request`, `env`, `http`, files, Rust (`.qwer`) functions,
+- A component cannot use `db`, `request`, `env`, files, Rust (`.qwer`) functions,
   or a global the server changes: that is an error when the program loads, and in the
   editor. Top-level values that come from them (`let KEY = env("STRIPE_KEY")`,
   `let CONFIG = load_config()`) are not written into the browser's bundle either, which
   anyone can download: a component that uses one is an error, and asks a `server fn`.
+- An environment variable named `PUBLIC_...` is for the browser: `env("PUBLIC_MAP_TOKEN")`,
+  with the name written out, works in a component and in a top-level value it uses, and
+  is written into the bundle as it was when the program loaded. That suits the keys
+  services hand out for pages to use (a map's token, a search-only key, an error
+  reporter's address); a secret keeps its own name, and stays on the server.
+- `http.get`, `http.post` and the rest work in a component's event handlers, `@mount`
+  and the functions they call: the request goes from the page, with the browser's rules
+  rather than the server's. The other site must allow this one (CORS: it answers with
+  `access-control-allow-origin`), or the call is an error value; the page's cookies are
+  not sent to it; and it reaches what the visitor's machine can, such as a service on
+  their own computer or network, not what the server can. Nothing goes through the
+  server, which suits a site that limits each visitor, one that answers by where the
+  visitor is, a visitor's own token kept in the page, and large files:
+
+  ```quillo
+  server fn upload_url(name: str) -> str {
+      let me = session().user ?? reply 401 "Log in first"
+      presign_put(me, name)                              // your bucket's signed URL
+  }
+
+  component Upload() {
+      state done = false
+      <input type="file" @change={(e) => {
+          let f = e.target.files[0]
+          done = http.put(upload_url(f.name), f).ok      // the file, as it is, to the bucket
+      }}/>
+  }
+  ```
+
+  A file from an input is sent as it is, with its own type. While the server renders a
+  component and runs its `state` initializers, nothing goes out: an `http.*` call there
+  is an error (when the program loads where it can be seen, as the page renders where
+  it cannot), since it would come from the server's network. Ask a `server fn` for what
+  the first render needs. Answers from another site show only the headers it allows.
 - A `server fn` is the way in, and it is a public address. Anyone can send
   `POST /_quillo/rpc/<name>` with any arguments, from a script or the browser's console,
   signed in or not; refusing other sites' pages stops other sites, not people. So each
@@ -848,6 +883,11 @@ Components and server code share a file, but not what they can touch:
 - What a `server fn` returns, and the props a page gives a component, reach the browser
   in full: `db.one("select * from users where id = ?", id)` sends `password_hash` too.
   Select the columns the page shows.
+- A `server fn` that calls another site for the browser passes on what it is given: with
+  a URL it takes from its arguments, anyone could have it fetch any address the server
+  reaches. Write the host in the code (`` `https://api.example.com/users/${id}` ``), or
+  pass `{ public_only: true }` (see [HTTP client](#http-client)); `quillo check` warns
+  when neither is so.
 
 ## Routes
 
@@ -1188,7 +1228,8 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   line goes past 16 MiB without ending). The map also takes
   `redirects` and `public_only` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
-  request and calls `f` with what the answer streams, until it ends; `listen(url,
+  request (a file from an input as `body` goes as it is) and calls `f` with what the
+  answer streams, until it ends; `listen(url,
   f)` in a component's code follows a stream for as long as the code that called it
   stands (and opens it again if the connection drops):
 
@@ -1637,7 +1678,15 @@ Safety built in:
   (`/_quillo/live`), which the browser would otherwise let it do.
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
-  (`let CONFIG = load_config()`); a component that uses one is a load-time error.
+  (`let CONFIG = load_config()`); a component that uses one is a load-time error. Only
+  variables named `PUBLIC_...`, read with the name written out, are.
+- `http.*` in a component goes from the visitor's browser, never from the server, so it
+  cannot reach the server's own network: while the server renders a component, a call
+  from its code is an error before anything connects.
+- `quillo check` warns about an `http.*` call on the server whose host comes from a
+  value, which could let a visitor reach the server's own network (localhost, a private
+  network, a cloud's metadata service), unless its options say `public_only` (see
+  [HTTP client](#http-client)).
 - `quillo check` warns about SQL put together from values (`${x}`, `+`, or
   `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
   connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
@@ -2247,6 +2296,36 @@ http.request("PUT", url, body, { authorization: `Bearer ${token}` })
 
 Every HTTP status is a response; failing to connect is an error value.
 `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+Text is sent as `text/plain`, HTML as `text/html`, other values as JSON, unless the
+headers give a `content-type`.
+
+Options come after the headers (in `http.stream`, in its map):
+
+```quillo
+http.get(url, {}, { redirects: 0 })                 // a redirect is the answer, not followed
+http.post(url, body, {}, { public_only: true })     // only addresses on the public internet
+http.get(`https://api.example.com/rates`, { authorization: key }, { cache: 60 })
+```
+
+- `redirects`: how many to follow, from 0 to 20 (5 unless given).
+- `public_only: true` connects only to the public internet: not this machine, a private
+  network, or a cloud's metadata service (`169.254.169.254`), however the address is
+  written, checked on the address the name gives as it connects (and again for each
+  redirect). Use it whenever someone else may choose the URL. `quillo check` warns about
+  a call whose host comes from a value (a parameter, `request`, text put together before
+  the host ends) unless its options say `public_only`, either way: `false` says the call
+  is meant to reach inside.
+- `cache: seconds` (a GET's, up to a day) keeps a successful answer and gives it again to
+  the same call, the same URL, headers and options, from any request, until then. Calls
+  to a site that limits how often it is asked, or that charges for each, then go out once
+  for everyone: `cache: 60` on the rates above asks once a minute however many pages
+  show them. Failures are not kept. At most 64 MiB of answers are, those that end soonest
+  going first.
+
+In a component, the same calls go from the page (see [What the browser can reach](#what-the-browser-can-reach)):
+`redirects: 0` makes a redirect an error value there, and `public_only` and `cache` are
+the server's. A service that needs the visitor's address, called from the server, can be
+given `request.ip`.
 
 ## Checking
 
@@ -2711,7 +2790,7 @@ src/crypto.rs      crypto: hashes, signatures, tokens, passwords
 src/imaging.rs     image: what an image file is, and new files made from it
 src/highlight.rs   highlight(code, lang): source code as HTML
 src/i18n.rs        translations
-src/fetch.rs       http: the HTTP client, and http.stream
+src/fetch.rs       http: the HTTP client, its cache, and http.stream
 
 Databases
 src/db.rs          db: SQLite, connections, tenants, transactions, and the shared API

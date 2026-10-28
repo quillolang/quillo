@@ -982,6 +982,61 @@ async function readStream(res, f, who, signal) {
   }
 }
 
+// A request's body: text as it is, a file (an input's, a Blob) as its
+// bytes, with its own type, and other values as JSON.
+function bodyInit(init, body) {
+  const has = (k) => Object.keys(init.headers).some((h) => h.toLowerCase() === k);
+  if (typeof Blob !== "undefined" && body instanceof Blob) init.body = body;
+  else if (typeof body === "string") {
+    init.body = body;
+    if (!has("content-type")) init.headers["content-type"] = "text/plain; charset=utf-8";
+  } else if (body instanceof Html && body.text !== undefined) {
+    init.body = body.text;
+    if (!has("content-type")) init.headers["content-type"] = "text/html; charset=utf-8";
+  } else {
+    init.body = jsonText(body);
+    if (!has("content-type")) init.headers["content-type"] = "application/json";
+  }
+}
+
+// `http.get(url, headers, options)` and the rest, in the browser: the
+// request goes from the page, as `fetch` makes it (the other site must
+// allow this one, by CORS; cookies go only to this site), and gives
+// `{ status, ok, headers, body, json }` as on the server, or an error value
+// when it could not be made. Options: `redirects: 0` keeps a redirect from
+// being followed (it is then an error value, as the browser shows it no
+// further); `public_only` and `cache` are the server's (src/fetch.rs).
+// `at`: the place of the URL among the call's arguments.
+async function httpCall(fname, method, url, body, headers, opts, at) {
+  S(url, fname, at);
+  headers = M(headers, fname, at + (fname === "http.get" || fname === "http.delete" ? 1 : 2));
+  opts = M(opts, fname, at + (fname === "http.get" || fname === "http.delete" ? 2 : 3));
+  if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url)) return new Err(`http: not an http(s) URL: ${url}`);
+  const init = { method, headers: {} };
+  for (const k of Object.keys(headers)) init.headers[k] = display(headers[k]);
+  if (!isNil(body)) bodyInit(init, body);
+  if (opts.redirects === 0) init.redirect = "manual";
+  let res;
+  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("http: " + e.message); }
+  if (res.type === "opaqueredirect") return new Err(`http: ${url} redirects, and redirects: 0 does not follow it`);
+  let text;
+  try { text = await res.text(); } catch (e) { return new Err("http: " + e.message); }
+  const hs = {};
+  res.headers.forEach((v, k) => { hs[k] = v; });
+  let json = null;
+  try { json = fromJSON(JSON.parse(text)); } catch (e) { json = null; }
+  return { status: res.status, ok: res.ok, headers: hs, body: text, json };
+}
+
+B.http = {
+  get: meta((url, headers, opts) => httpCall("http.get", "GET", url, null, headers, opts, 1), "http.get", null),
+  delete: meta((url, headers, opts) => httpCall("http.delete", "DELETE", url, null, headers, opts, 1), "http.delete", null),
+  post: meta((url, body, headers, opts) => httpCall("http.post", "POST", url, body, headers, opts, 1), "http.post", null),
+  put: meta((url, body, headers, opts) => httpCall("http.put", "PUT", url, body, headers, opts, 1), "http.put", null),
+  patch: meta((url, body, headers, opts) => httpCall("http.patch", "PATCH", url, body, headers, opts, 1), "http.patch", null),
+  request: meta((method, url, body, headers, opts) => httpCall("http.request", S(method, "http.request").toUpperCase(), url, body, headers, opts, 2), "http.request", null),
+};
+
 // `receive(url, f, { method, body, headers })` in a handler: sends the
 // request and calls f with what the answer streams, until it ends (or f
 // gives false). An error value if it could not be had.
@@ -991,10 +1046,7 @@ B.receive = meta(async (url, f, opts) => {
   opts = M(opts, "receive", 3);
   const init = { method: opts.method ? S(opts.method, "receive").toUpperCase() : (isNil(opts.body) ? "GET" : "POST"), headers: {} };
   if (isMap(opts.headers)) for (const k of Object.keys(opts.headers)) init.headers[k] = display(opts.headers[k]);
-  if (!isNil(opts.body)) {
-    if (typeof opts.body === "string") init.body = opts.body;
-    else { init.body = jsonText(opts.body); init.headers["content-type"] = init.headers["content-type"] || "application/json"; }
-  }
+  if (!isNil(opts.body)) bodyInit(init, opts.body);
   let res;
   try { res = await fetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
   if (!res.ok) return new Err(`receive: ${res.status} ${await res.text().catch(() => "")}`.trim());

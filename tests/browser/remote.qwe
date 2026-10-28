@@ -1,0 +1,31 @@
+// A page calling another site with `http.*`: the page is on 127.0.0.1 and
+// calls this same server as localhost, another site to the browser, so CORS
+// decides. A chosen file goes as it is, with its type. Driven by remote.js.
+
+allow_cross_site("/store")
+
+let OPEN = { "access-control-allow-origin": "*" }
+
+route GET /data = respond(200, { from: "elsewhere", n: 2 }, OPEN)
+route GET /closed = { from: "elsewhere" }
+route POST /store = respond(200, { size: len(request.body), type: request.headers["content-type"], text: request.body }, OPEN)
+
+component Remote() {
+    state base = ""
+    state got = null
+    state closed = null
+    state sent = null
+    <div>
+        <input id="base" bind:value={base}/>
+        <button id="get" @click={() => { let r = http.get(base + "/data")
+            got = [r.status, r.ok, r.json] }}>get</button>
+        <button id="closed" @click={() => { closed = is_err(http.get(base + "/closed")) }}>closed</button>
+        <input id="file" type="file" @change={(e) => { sent = http.post(base + "/store", e.target.files[0]).json }}/>
+        <p id="got">{json.stringify(got)}</p>
+        <p id="refused">{json.stringify(closed)}</p>
+        <p id="sent">{json.stringify(sent)}</p>
+        <p id="token">{env("PUBLIC_QUILLO_TEST_TOKEN") ?? "unset"}</p>
+    </div>
+}
+
+route GET / = <html><body><Remote/></body></html>

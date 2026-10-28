@@ -7,6 +7,7 @@
 //! http.request("PUT", url, body, { authorization: "Bearer ..." })
 //! http.stream(url, (piece) => ..., { method, body, headers })
 //! http.post(url, body, {}, { redirects: 0, public_only: true })
+//! http.get(url, {}, { cache: 60 })
 //! ```
 //!
 //! Options, after the headers (in `http.stream`'s map): `redirects`, how
@@ -14,6 +15,12 @@
 //! addresses on the public internet. That is checked on the addresses the
 //! host name gives when the connection is made (and again for a redirect),
 //! so a name cannot be looked up as public and then connect inside.
+//! `cache`, for a GET: seconds a successful answer is kept and given again
+//! to the same call (same URL, headers and options), by any request.
+//!
+//! In a component, these run in the browser (src/client/runtime.js). While
+//! the server renders one, a call from its code is a mistake: it would be
+//! made from the server's network, with what the page gave it.
 //!
 //! `http.stream` hands over the answer as it arrives: each event of an event
 //! stream (its data, parsed as JSON when it is, and its name), each line of
@@ -30,7 +37,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type R = Result<Value, Ctrl>;
 
@@ -56,9 +63,14 @@ pub fn install(m: &mut Map) {
 struct Opts {
     redirects: u32,
     public_only: bool,
+    /// Seconds to keep a GET's successful answer (0: not kept).
+    cache: u32,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0 };
+
+/// The longest `cache`: a day.
+const MAX_CACHE_SECS: i64 = 86_400;
 
 fn opts_of(v: Option<&Value>, fname: &str, line: u32) -> Result<Opts, Ctrl> {
     let m = match v {
@@ -76,7 +88,28 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32) -> Result<Opts, Ctrl> {
         Some(Value::Bool(b)) => *b,
         Some(other) => return fail(line, format!("`{}`: `public_only` is true or false, got {}", fname, other.type_name())),
     };
-    Ok(Opts { redirects, public_only })
+    let cache = match m.get("cache") {
+        None | Some(Value::Nil) => 0,
+        Some(Value::Int(n)) if (0..=MAX_CACHE_SECS).contains(n) => *n as u32,
+        Some(other) => return fail(line, format!("`{}`: `cache` is seconds, a whole number from 0 to {}, got {}", fname, MAX_CACHE_SECS, other.display())),
+    };
+    Ok(Opts { redirects, public_only, cache })
+}
+
+/// The server's own network is not where a component's calls go (see the
+/// top of this file).
+fn not_in_component(it: &Interp, fname: &str, line: u32) -> Result<(), Ctrl> {
+    if it.in_component {
+        return fail(
+            line,
+            format!(
+                "`{}` in a component runs in the browser, once the page has arrived; while the server renders the \
+                 component it is not called: call it from an event handler or @mount, or from a `server fn`",
+                fname
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Whether `ip` is on the public internet: not this machine, a private or
@@ -141,10 +174,10 @@ fn resolve_public(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
 /// The agent for calls with these options (`stream`: for `http.stream`,
 /// which has no limit on the whole answer, only on a silence in it).
 fn agent(o: Opts, stream: bool) -> ureq::Agent {
-    static AGENTS: OnceLock<Mutex<HashMap<(Opts, bool), ureq::Agent>>> = OnceLock::new();
+    static AGENTS: OnceLock<Mutex<HashMap<(u32, bool, bool), ureq::Agent>>> = OnceLock::new();
     let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     agents
-        .entry((o, stream))
+        .entry((o.redirects, o.public_only, stream))
         .or_insert_with(|| {
             let b = ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
@@ -157,6 +190,7 @@ fn agent(o: Opts, stream: bool) -> ureq::Agent {
         .clone()
 }
 
+#[derive(Clone)]
 struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
@@ -192,8 +226,83 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     Ok(Reply { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
 }
 
+/// Answers kept by `cache`: by method, URL, headers and options, until
+/// when, and their size. At most `CACHE_BYTES` of bodies are kept; past
+/// that, those that end soonest go first.
+struct Cached {
+    until: Instant,
+    reply: Reply,
+    size: usize,
+}
+
+const CACHE_BYTES: usize = 64 << 20;
+
+fn cache() -> std::sync::MutexGuard<'static, (HashMap<String, Cached>, usize)> {
+    static CACHE: OnceLock<Mutex<(HashMap<String, Cached>, usize)>> = OnceLock::new();
+    CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cache_key(o: Opts, method: &str, url: &str, headers: &[(String, String)]) -> String {
+    let mut hs: Vec<String> = headers.iter().map(|(k, v)| format!("{}:{}", k.to_ascii_lowercase(), v)).collect();
+    hs.sort();
+    format!("{} {} {} {}\n{}", method, url, o.redirects, o.public_only, hs.join("\n"))
+}
+
+fn cached(key: &str) -> Option<Reply> {
+    let mut c = cache();
+    let fresh = c.0.get(key).map(|e| e.until > Instant::now());
+    match fresh {
+        Some(true) => c.0.get(key).map(|e| e.reply.clone()),
+        Some(false) => {
+            if let Some(e) = c.0.remove(key) {
+                c.1 -= e.size;
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+fn keep(key: String, secs: u32, reply: &Reply) {
+    let size = key.len() + reply.body.len() + reply.headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+    if size > CACHE_BYTES / 4 {
+        return;
+    }
+    let mut c = cache();
+    let now = Instant::now();
+    let (map, total) = &mut *c;
+    if let Some(old) = map.remove(&key) {
+        *total -= old.size;
+    }
+    if *total + size > CACHE_BYTES {
+        map.retain(|_, e| {
+            let keep = e.until > now;
+            if !keep {
+                *total -= e.size;
+            }
+            keep
+        });
+        let mut ends: Vec<(Instant, String)> = map.iter().map(|(k, e)| (e.until, k.clone())).collect();
+        ends.sort();
+        for (_, k) in ends {
+            if *total + size <= CACHE_BYTES {
+                break;
+            }
+            if let Some(e) = map.remove(&k) {
+                *total -= e.size;
+            }
+        }
+    }
+    *total += size;
+    map.insert(key, Cached { until: now + Duration::from_secs(secs as u64), reply: reply.clone(), size });
+}
+
 fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Value, headers: &Value, opts: Option<&Value>, line: u32) -> R {
+    not_in_component(it, fname, line)?;
     let o = opts_of(opts, fname, line)?;
+    if o.cache > 0 && method != "GET" {
+        return fail(line, format!("`{}`: `cache` keeps the answers of GET requests, not {}", fname, method));
+    }
     let Value::Str(url) = url else {
         return fail(line, format!("`{}` expects a URL string, got {}", fname, url.type_name()));
     };
@@ -211,11 +320,23 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
         Value::Html(h) => Some(("text/html; charset=utf-8", h.as_bytes().to_vec())),
         other => Some(("application/json", other.json_text().into_bytes())),
     };
-    let (method, url) = (method.to_string(), url.to_string());
-    let res = it.unlocked(move || send(o, &method, &url, &hdrs, payload));
-    let reply = match res {
-        Ok(r) => r,
-        Err(e) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
+    let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs));
+    let reply = match key.as_deref().and_then(cached) {
+        Some(r) => r,
+        None => {
+            let (method, url) = (method.to_string(), url.to_string());
+            let res = it.unlocked(move || send(o, &method, &url, &hdrs, payload));
+            let reply = match res {
+                Ok(r) => r,
+                Err(e) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
+            };
+            if let Some(key) = key {
+                if (200..300).contains(&reply.status) {
+                    keep(key, o.cache, &reply);
+                }
+            }
+            reply
+        }
     };
     let json = serde_json::from_str::<serde_json::Value>(&reply.body).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
     let mut m = Map::new();
@@ -408,6 +529,7 @@ fn pieces(p: &mut Pending, kind: Kind, end: bool) -> Result<Vec<Vec<Value>>, Str
 /// headers }` once the answer has ended (with `body`, unread by `f`, when it
 /// is not a success), or an error value when it could not be had.
 fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    not_in_component(it, "http.stream", line)?;
     let Value::Str(url) = a(&args, 0) else {
         return fail(line, format!("`http.stream` expects a URL string, got {}", a(&args, 0).type_name()));
     };
@@ -424,6 +546,9 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::err(Value::str(format!("http: not an http(s) URL: {}", url))));
     }
     let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line)?;
+    if o.cache > 0 {
+        return fail(line, "`http.stream`: `cache` keeps whole answers, of `http.get`");
+    }
     let body = opts.get("body").cloned().unwrap_or(Value::Nil);
     let method = match opts.get("method") {
         Some(Value::Str(m)) => m.to_ascii_uppercase(),
