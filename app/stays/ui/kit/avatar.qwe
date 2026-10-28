@@ -59,7 +59,8 @@ fn avatar_hue(name: str) -> int {
 }
 
 view Avatar(name: str = "", src: str? = null, size: str = "md", status: str? = null, shape: str = "circle",
-            class: str? = null) =
+            class: str? = null) {
+    style global avatar_css
     <span class={ui_cls(["ui-avatar", `ui-avatar-c${avatar_hue(name)}`, size != "md" && `ui-avatar-${size}`,
                          shape == "square" && "ui-avatar-square", class])}
           role="img" aria-label={status != null ? `${name} (${status})` : name}>
@@ -67,8 +68,10 @@ view Avatar(name: str = "", src: str? = null, size: str = "md", status: str? = n
         {src != null && <img src={src} alt="" loading="lazy" data-initials={avatar_initials(name)}/>}
         {status != null && <span class={`ui-avatar-status ui-avatar-${status}`}></span>}
     </span>
+}
 
 view AvatarGroup(people: list, max: int = 4, size: str = "md", label: str? = null, class: str? = null) {
+    style global avatar_css
     let shown = len(people) > max ? take(people, max) : people
     let rest = len(people) - len(shown)
     <span class={ui_cls(["ui-avatar-group", class])} role="group" aria-label={label}>

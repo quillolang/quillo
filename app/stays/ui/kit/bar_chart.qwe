@@ -143,6 +143,7 @@ view BarChart(labels: list, values: list? = null, series: list? = null, stacked:
               horizontal: bool = false, value_labels: bool = false, prefix: str = "", suffix: str = "",
               decimals: int? = null, max: num? = null, height: int = 240, label: str = "Bar chart",
               show_label: bool = false, class: str? = null) {
+    style global bar_chart_css
     let sets = series ?? [{ name: label, values: values ?? [] }]
     let n = len(labels)
     let at = (s, i) => s.values[i] ?? 0

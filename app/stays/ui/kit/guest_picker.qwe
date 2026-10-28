@@ -71,6 +71,7 @@ fn guest_picker_summary(kinds: list, counts: map) -> str {
 
 component GuestPicker(name: str? = null, label: str = "Guests", value: map = {}, max_guests: int? = null,
                       pets: bool = true, kinds: list? = null, on_change = null, class: str? = null) {
+    style global guest_picker_css
     let all = (kinds ?? guest_picker_kinds) | filter((k) => pets || k.key != "pets")
     state counts = all | reduce({}, (m, k) => set(m, k.key, get(value, k.key) ?? k.min))
     let guests = sum(all | filter((k) => k.guest) | map((k) => get(counts, k.key)))

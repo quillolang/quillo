@@ -37,6 +37,7 @@ let badge_css = css`
 
 view Badge(tone: str = "neutral", variant: str = "soft", dot: bool = false, count: int? = null,
            max: int = 99, label: str? = null, size: str = "md", class: str? = null, children) {
+    style global badge_css
     let shown = count == null ? null : (count > max ? `${max}+` : str(count))
     <span class={ui_cls(["ui-badge", `ui-badge-${tone}`, `ui-badge-${variant}`, dot && "ui-badge-dot",
                          count != null && "ui-badge-count", size != "md" && `ui-badge-${size}`, class])}>

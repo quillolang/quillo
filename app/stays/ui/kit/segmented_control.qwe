@@ -37,6 +37,7 @@ let segmented_control_css = css`
 
 view SegmentedControl(name: str, options: list = [], value: str? = null, label: str? = null, size: str = "md",
                       full: bool = false, disabled: bool = false, on_change = null, class: str? = null) {
+    style global segmented_control_css
     let opts = options | map((o) => type_of(o) == "str" ? { label: o, value: o } : o)
     let picked = value ?? (len(opts) > 0 ? opts[0].value : null)
     <div class={ui_cls(["ui-segmented", size == "sm" && "ui-segmented-sm", full && "ui-segmented-full", class])}

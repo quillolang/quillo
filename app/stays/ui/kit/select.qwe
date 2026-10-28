@@ -61,6 +61,7 @@ view Select(name: str? = null, label: str? = null, value: str | num | list | nul
             placeholder: str? = null, hint: str? = null, error: str? = null, required: bool = false,
             disabled: bool = false, field: str? = null, size: str = "md", options: list = [],
             groups: list = [], multiple: bool = false, rows: int? = null, on_change = null, class: str? = null) {
+    style global select_css
     let id = field ?? `select-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`
     let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
     let chosen = value == null ? [] : type_of(value) == "list" ? value | map((v) => str(v)) : [str(value)]

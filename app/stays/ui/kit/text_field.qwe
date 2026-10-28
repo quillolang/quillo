@@ -49,6 +49,7 @@ view TextField(name: str? = null, label: str? = null, value: str | num | null = 
                autocomplete: str? = null, pattern: str? = null, min: str | num | null = null,
                max: str | num | null = null, maxlength: int? = null, readonly: bool = false,
                on_input = null, on_change = null, class: str? = null) {
+    style global text_field_css
     let id = field ?? `text-field-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`
     let described = ui_cls([prefix != null && `${id}-prefix`, suffix != null && `${id}-suffix`,
                             hint != null && `${id}-hint`, error != null && `${id}-error`])

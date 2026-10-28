@@ -637,7 +637,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("receive", "str, fn, map | null=", "null | error(str)"),
     ("url", "", "map"),
     ("css", "str", "str"),
-    ("__style", "str", "null"),
+    ("__style", "str, bool | null=", "null"),
     ("ready", "str, fn", "null"),
     ("style_with", "str", "null"),
     ("sql", "str", "str"),

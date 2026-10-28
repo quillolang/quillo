@@ -25,6 +25,7 @@ let divider_css = css`
 `
 
 view Divider(label: str? = null, vertical: bool = false, spacing: str = "md", class: str? = null) {
+    style global divider_css
     let cls = ui_cls(["ui-divider", vertical && "ui-divider-v", label != null && "ui-divider-label",
                       spacing != "md" && `ui-divider-${spacing}`, class])
     label != null

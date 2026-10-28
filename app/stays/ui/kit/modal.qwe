@@ -39,6 +39,7 @@ let modal_css = css`
 
 component Modal(title: str, trigger: str? = null, open: bool = false, size: str = "md",
                 dismissable: bool = true, on_close = null, children) {
+    style global modal_css
     state dlg = null
     if open && dlg != null && !dlg.open { dlg.showModal() }
     if !open && dlg != null && dlg.open && trigger == null { dlg.close() }

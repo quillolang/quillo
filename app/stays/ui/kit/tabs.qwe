@@ -65,10 +65,13 @@ let tabs_css = css`
 
 fn tabs_slug(text: str) -> str = re.replace(lower(text), "[^a-z0-9]+", "-")
 
-view Tabs(variant: str = "line", label: str? = null, id: str? = null, class: str? = null, children) =
+view Tabs(variant: str = "line", label: str? = null, id: str? = null, class: str? = null, children) {
+    style global tabs_css
     <div class={ui_cls(["ui-tabs", `ui-tabs-${variant}`, class])} id={id} role="group" aria-label={label}>{children}</div>
+}
 
 view Tab(group: str, label: str, selected: bool = false, id: str? = null, children) {
+    style global tabs_css
     let tid = id ?? `${group}-${tabs_slug(label)}`
     [
         <input.ui-tabs-radio type="radio" name={group} id={tid} checked={selected} form="ui-tabs-none"/>,
@@ -79,6 +82,7 @@ view Tab(group: str, label: str, selected: bool = false, id: str? = null, childr
 
 component TabBar(id: str, labels: list = [], selected: int = 0, variant: str = "line", label: str? = null,
                  on_change = null, children) {
+    style global tabs_css
     state at = selected
     let pick = (i: int) => {
         at = i

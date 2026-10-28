@@ -475,8 +475,16 @@ pub fn style_id(file: Option<&str>, name: &str) -> String {
 
 /// `style ...` in a body, as the parser writes it: a call of `__style`.
 pub fn style_of(s: &Stmt) -> Option<&Expr> {
+    style_parts(s).map(|(e, _)| e)
+}
+
+/// `style_of`, and whether it is `style global` (its selectors left as
+/// written; FEEDBACK8.md, Q-068; branch style-global).
+pub fn style_parts(s: &Stmt) -> Option<(&Expr, bool)> {
     match s {
-        Stmt::Expr(Expr::Call(f, args, _)) if matches!(&**f, Expr::Ident(n, _) if n == "__style") => args.first(),
+        Stmt::Expr(Expr::Call(f, args, _)) if matches!(&**f, Expr::Ident(n, _) if n == "__style") => {
+            args.first().map(|e| (e, matches!(args.get(1), Some(Expr::Lit(Lit::Bool(true))))))
+        }
         _ => None,
     }
 }

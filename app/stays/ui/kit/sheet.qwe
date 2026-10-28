@@ -56,6 +56,7 @@ let sheet_css = css`
 
 component Sheet(title: str, trigger: str? = null, open: bool = false, snap: str = "half", width: int = 640,
                 dismissable: bool = true, on_close = null, children) {
+    style global sheet_css
     state dlg = null
     state full = snap == "full"
     state sy = null

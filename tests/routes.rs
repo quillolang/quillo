@@ -416,6 +416,15 @@ route GET / = "home"
     assert!(r.text().contains(r#""ledger":"not ready""#), "{}", r.text());
 }
 
+/// Tailwind's variants and fractions in the shorthand: a `:` was taken for
+/// an attribute, silently (FEEDBACK11.md, Q-079; branch shorthand-colon).
+#[test]
+fn shorthand_classes_take_variants_and_fractions() {
+    let mut it = app("route GET / = <div.md:flex.w-1/2><em.hover:underline>a</em><i.w-1/3/><b.x :y>b</b></div>\n");
+    let page = get(&mut it, "/").text();
+    assert!(page.contains(r#"<div class="md:flex w-1/2"><em class="hover:underline">a</em><i class="w-1/3"></i>"#), "{}", page);
+}
+
 #[test]
 fn the_browser_bundle_can_be_revalidated() {
     let mut it = app("component Hi() = <p>hi</p>\nroute GET / = <Hi/>\n");

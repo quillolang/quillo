@@ -46,6 +46,7 @@ a.ui-card:focus-visible { outline: none; box-shadow: var(--ui-focus); border-col
 
 view Card(title: str? = null, subtitle: str? = null, href: str? = null, variant: str = "outline",
           padding: str = "md", header = null, footer = null, class: str? = null, children) {
+    style global card_css
     let cls = ui_cls(["ui-card", variant != "outline" && `ui-card-${variant}`,
                       padding != "md" && `ui-card-pad-${padding}`, class])
     let body = [

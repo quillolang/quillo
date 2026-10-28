@@ -40,6 +40,7 @@ let tooltip_css = css`
 `
 
 view Tooltip(text: str, placement: str = "top", field: str? = null, class: str? = null, children) {
+    style global tooltip_css
     let id = field ?? `tooltip-${re.replace(lower(text), "[^a-z0-9]+", "-")}`
     <span class={ui_cls(["ui-tooltip", `ui-tooltip-${placement}`, class])} aria-describedby={id}>
         {children}

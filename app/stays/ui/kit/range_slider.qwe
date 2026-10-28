@@ -62,6 +62,7 @@ component RangeSlider(name: str? = null, label: str? = null, min: num = 0, max: 
                       low: num? = null, high: num? = null, gap: num = 0, prefix: str = "", format: str = "",
                       names: list? = null, show_value: bool = true, hint: str? = null, disabled: bool = false,
                       field: str? = null, on_change = null, on_commit = null, class: str? = null) {
+    style global range_slider_css
     state a = low ?? min
     state b = high ?? max
     state top = "b"

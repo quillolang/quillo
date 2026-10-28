@@ -46,6 +46,7 @@ fn stat_path(values: list) -> str {
 
 view Stat(label: str, value, delta: num? = null, delta_suffix: str = "", good: str = "up",
           hint: str? = null, trend: list? = null, card: bool = true, class: str? = null) {
+    style global stat_css
     let mood = delta == null ? null : delta == 0 ? "flat" : ((delta > 0) == (good != "down") ? "good" : "bad")
     let shown = delta == null ? "" : `${delta > 0 ? "+" : ""}${delta}${delta_suffix}`
     <div class={ui_cls(["ui-stat", mood != null && `ui-stat-${mood}`, !card && "ui-stat-bare", class])}>

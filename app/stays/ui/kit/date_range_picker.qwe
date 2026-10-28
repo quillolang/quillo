@@ -221,6 +221,7 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
                           hint: str? = null, error: str? = null, disabled: bool = false, field: str? = null,
                           size: str = "md", disabled_dates: list = [], day_labels: map = {}, min_nights: int? = null,
                           on_change = null, class: str? = null) {
+    style global date_range_picker_css
     let lo = date_range_picker_parse(min)
     let hi = date_range_picker_parse(max)
     let first_a = date_range_picker_parse(start)

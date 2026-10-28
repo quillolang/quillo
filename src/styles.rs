@@ -13,7 +13,7 @@
 //! its bundle can show, as a sheet of its own, `/_quillo/s/<hash>.css`,
 //! which the browser keeps for good (its address changes with it).
 
-use crate::ast::{style_id, style_of, Expr};
+use crate::ast::{style_id, style_parts, Expr};
 use crate::error::QuilloError;
 use crate::interp::{Ctrl, Interp};
 use crate::value::{scope_vars, Value};
@@ -40,14 +40,17 @@ struct Sheet {
 impl Styles {
     /// Every component's and view's style, taken when the program loads.
     pub fn collect(it: &mut Interp) -> Result<Styles, QuilloError> {
-        // Each style's CSS as written, then made (`style_with`), then scoped.
+        // Each style's CSS as written, then made (`style_with`), then scoped
+        // (or, for `style global`, kept as written), by component: its id,
+        // and the style's place among the component's.
         let mut written: BTreeMap<String, (String, String, u32)> = BTreeMap::new();
+        let mut parts: Vec<(String, String, bool)> = Vec::new();
         let env = it.globals.clone();
         for (_, v) in scope_vars(&it.globals) {
             let Value::Func(f) = v else { continue };
             let Expr::Block(stmts) = &f.def.body else { continue };
             let id = style_id(f.def.file.as_deref(), &f.def.name);
-            for e in stmts.iter().filter_map(style_of) {
+            for (k, (e, global)) in stmts.iter().filter_map(style_parts).enumerate() {
                 let css = match it.eval(e, &env) {
                     Ok(Value::Str(s)) => s.to_string(),
                     Ok(other) => {
@@ -59,15 +62,21 @@ impl Styles {
                     Err(Ctrl::Error(e)) => return Err(e),
                     Err(_) => return Err(QuilloError::new(format!("`style` in `{}` must be CSS text", f.def.name), f.def.line)),
                 };
-                let entry = written.entry(id.clone()).or_insert_with(|| (f.def.name.clone(), String::new(), f.def.line));
-                entry.1.push_str(&css);
-                entry.1.push('\n');
+                let key = format!("{}-{}", id, k);
+                written.insert(key.clone(), (f.def.name.clone(), css, f.def.line));
+                parts.push((key, id.clone(), global));
             }
         }
         if let Some(cmd) = it.style_with.clone() {
             made_with(&cmd, &it.base_dir, &mut written)?;
         }
-        let by_id = written.into_iter().map(|(id, (_, css, _))| (id.clone(), scope(&css, &id))).collect();
+        let mut by_id: BTreeMap<String, String> = BTreeMap::new();
+        for (key, id, global) in parts {
+            let css = &written[&key].1;
+            let out = by_id.entry(id.clone()).or_default();
+            out.push_str(&if global { css.clone() } else { scope(css, &id) });
+            out.push('\n');
+        }
         Ok(Styles { by_id, ..Default::default() })
     }
 
@@ -94,7 +103,7 @@ impl Styles {
             s.used = self.tick;
             return Some(s.hash.clone());
         }
-        let css: String = ids.iter().map(|i| self.by_id[*i].as_str()).collect();
+        let css = unique(ids.iter().map(|i| self.by_id[*i].as_str()));
         let hash = crate::client::hash_text(&css);
         self.sheets.insert(key, Sheet { hash: hash.clone(), css: Arc::new(css), used: self.tick });
         while self.sheets.len() > KEPT {
@@ -110,7 +119,7 @@ impl Styles {
 
     /// Every style: for a page that names a sheet no longer kept.
     pub fn all(&self) -> String {
-        self.by_id.values().map(|s| s.as_str()).collect()
+        unique(self.by_id.values().map(|s| s.as_str()))
     }
 }
 
@@ -189,6 +198,13 @@ fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (St
         *css = run(css).map_err(|e| QuilloError::new(format!("style_with `{}` failed on `{}`'s style: {}", cmd, name, e), *line))?;
     }
     Ok(())
+}
+
+/// The styles, each once: components that share a stylesheet with `style
+/// global` (a library's companions: Tabs and Tab) give the same text.
+fn unique<'a>(styles: impl Iterator<Item = &'a str>) -> String {
+    let mut seen = std::collections::HashSet::new();
+    styles.filter(|s| seen.insert(*s)).collect()
 }
 
 /// The ids of the styles whose elements are in `html` (`data-q-<id>`).
@@ -482,7 +498,9 @@ pub fn set_elsewhere(css: &str) -> Vec<String> {
         let end = rest[at..].find("*/").map_or(rest.len(), |e| at + e);
         let comment = &rest[at + 2..end];
         if let Some(list) = comment.trim().strip_prefix("set elsewhere:") {
-            out.extend(list.split(',').map(|s| s.trim().trim_start_matches('.').to_string()).filter(|s| !s.is_empty()));
+            // Each start is its first word: what follows may say why (FEEDBACK8.md,
+            // Q-065; branch set-elsewhere-words).
+            out.extend(list.split(',').filter_map(|s| s.split_whitespace().next()).map(|s| s.trim_start_matches('.').to_string()).filter(|s| !s.is_empty()));
         }
         rest = &rest[(end + 2).min(rest.len())..];
     }
@@ -526,6 +544,7 @@ mod tests {
         let css = ".a, .b:hover { x: 1 }\n/* .c */\n@media (x) {\n  .d .e[title=\".f\"] { y: 1.5em }\n}\n:global(.g) .h { }";
         assert_eq!(classes_in(css), vec![("a".into(), 0), ("b".into(), 0), ("d".into(), 3), ("e".into(), 3), ("h".into(), 5)]);
         assert_eq!(set_elsewhere("/* set elsewhere: leaflet-, .mapbox */ .x {}"), vec!["leaflet-", "mapbox"]);
+        assert_eq!(set_elsewhere("/* set elsewhere: leaflet- (Leaflet's script sets them) */"), vec!["leaflet-"]);
     }
 
     #[test]

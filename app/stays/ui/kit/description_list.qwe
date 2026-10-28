@@ -31,15 +31,19 @@ let description_list_css = css`
 }
 `
 
-view DescriptionItem(term: str, detail = null, children) =
+view DescriptionItem(term: str, detail = null, children) {
+    style global description_list_css
     <div.ui-dl-item>
         <dt>{term}</dt>
         <dd>{detail != null ? detail : children}</dd>
     </div>
+}
 
 view DescriptionList(items: list = [], layout: str = "stacked", dividers: bool = true,
-                     class: str? = null, children) =
+                     class: str? = null, children) {
+    style global description_list_css
     <dl class={ui_cls(["ui-dl", `ui-dl-${layout}`, dividers && "ui-dl-lines", class])}>
         {for it in items => <DescriptionItem term={it.term} detail={it.detail}/>}
         {children}
     </dl>
+}

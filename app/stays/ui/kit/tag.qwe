@@ -50,6 +50,7 @@ a.ui-tag:focus-visible, button.ui-tag:focus-visible { outline: none; box-shadow:
 
 view Tag(tone: str = "neutral", href: str? = null, dot: bool = false, size: str = "md", removable: bool = false,
          label: str? = null, selected: bool = false, on_remove = null, on_click = null, class: str? = null, children) {
+    style global tag_css
     let cls = ui_cls(["ui-tag", `ui-tag-${tone}`, size != "md" && `ui-tag-${size}`, selected && "ui-tag-selected", class])
     let body = [dot && <span.ui-tag-dot aria-hidden="true"></span>, <span.ui-tag-text>{children}</span>]
     href != null && !removable

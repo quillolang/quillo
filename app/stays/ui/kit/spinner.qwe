@@ -34,9 +34,11 @@ let spinner_css = css`
 `
 
 view Spinner(size: str = "md", label: str = "Loading", show_label: bool = false, tone: str = "accent",
-             class: str? = null) =
+             class: str? = null) {
+    style global spinner_css
     <span class={ui_cls(["ui-spinner", size != "md" && `ui-spinner-${size}`,
                          tone != "accent" && `ui-spinner-${tone}`, class])} role="status">
         <span.ui-spinner-ring aria-hidden="true"></span>
         <span class={show_label ? "ui-spinner-label" : "ui-sr"}>{label}</span>
     </span>
+}

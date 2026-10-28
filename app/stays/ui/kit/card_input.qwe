@@ -91,6 +91,7 @@ fn card_input_month(z: int) -> int {
 
 component CardInput(name: str? = null, label: str = "Card", today: str? = null, hint: str? = null, error: str? = null,
                     disabled: bool = false, on_change = null, class: str? = null) {
+    style global card_input_css
     state number = ""
     state expiry = ""
     state cvc = ""

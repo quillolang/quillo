@@ -48,6 +48,7 @@ let chip_group_css = css`
 view ChipGroup(name: str, options: list = [], multiple: bool = false, value: str? = null, values: list = [],
                label: str? = null, hide_label: bool = false, size: str = "md", disabled: bool = false,
                required: bool = false, on_change = null, class: str? = null) {
+    style global chip_group_css
     let picked = multiple ? values | map((v) => str(v)) : (value != null ? [str(value)] : [])
     <fieldset class={ui_cls(["ui-chips", size == "sm" && "ui-chips-sm", class])} disabled={disabled}
               role={multiple ? null : "radiogroup"} aria-label={hide_label ? label : null}>

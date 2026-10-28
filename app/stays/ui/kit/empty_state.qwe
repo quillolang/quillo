@@ -47,10 +47,12 @@ fn empty_state_icon(name: str) {
 }
 
 view EmptyState(title: str, icon: str? = "inbox", actions = null, size: str = "md", align: str = "center",
-                class: str? = null, children) =
+                class: str? = null, children) {
+    style global empty_state_css
     <div class={ui_cls(["ui-empty", size != "md" && `ui-empty-${size}`, align == "start" && "ui-empty-start", class])}>
         {icon != null && <div.ui-empty-icon>{empty_state_icon(icon)}</div>}
         <p.ui-empty-title>{title}</p>
         <div.ui-empty-text>{children}</div>
         {actions != null && <div.ui-empty-actions>{actions}</div>}
     </div>
+}
