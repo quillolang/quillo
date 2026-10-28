@@ -485,3 +485,29 @@ fn maps_built_in_a_loop_are_not_copied_each_time() {
     assert_eq!(ev("fn f() {\n let m = {}\n for i in range(3) { m = set(m, str(i), len(m)) }\n m\n}\nf()"), "{ \"0\": 0, \"1\": 1, \"2\": 2 }");
     assert_eq!(ev("let outer = { n: 0 }\nlet adds = [1, 2] | map((k) => set(outer, str(k), k))\n[outer, adds]"), "[{ n: 0 }, [{ n: 0, \"1\": 1 }, { n: 0, \"2\": 2 }]]");
 }
+
+/// Comments: `/* ... */` anywhere in code, and in markup a line starting
+/// with `//` or a `{/* ... */}`. Text with `//` in it otherwise stays text.
+#[test]
+fn comments_in_code_and_markup() {
+    assert_eq!(ev("1 /* one */ + /* two */ 2"), "3");
+    // A comment over several lines still ends the statement before it.
+    assert_eq!(ev("let a = 1 /* a\nnote */\nlet b = 2\na + b"), "3");
+    assert_eq!(
+        ev("<div>\n    // a note, naming <Card> and {x}\n    <p>x</p>\n    {/* with } and <b> inside */}\n    {/*\n      over lines\n    */}\n</div>"),
+        "<div><p>x</p></div>"
+    );
+    assert_eq!(ev(r#"<p>see https://example.com // mid-line, so text</p>"#), "<p>see https://example.com // mid-line, so text</p>");
+    assert_eq!(ev(r#"<p>{"//"} on purpose</p>"#), "<p>// on purpose</p>");
+    assert_eq!(ev("<p>{1 /* inside */ + 1}</p>"), "<p>2</p>");
+}
+
+/// A textarea's text between its tags is its value, so it follows state.
+#[test]
+fn textarea_children_are_its_value() {
+    assert_eq!(ev(r#"let t = "a < b"
+<textarea>{t}</textarea>"#), "<textarea>a &lt; b</textarea>");
+    assert_eq!(ev(r#"let n = 2
+<textarea>Item {n}</textarea>"#), "<textarea>Item 2</textarea>");
+    assert!(ev_err(r#"<textarea value={"a"}>{"b"}</textarea>"#).contains("not both"));
+}

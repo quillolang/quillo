@@ -416,6 +416,21 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
+- Comments: in markup, a line starting with `//` is a comment, and so is `{/* ... */}`,
+  as in JSX; in code, `//` to the end of the line and `/* ... */` anywhere. `//` after
+  other text on a line is text (`https://...`), and `{"//"}` writes the characters.
+- `<textarea>{text}</textarea>`: the box shows `text`, and shows it again whenever
+  `text` changes, even after someone has typed in it; while `text` stays the same,
+  what was typed stays (a starting text from a prop). `<textarea value={text}>` holds
+  the box to `text` instead, as with any input: typing that the state does not take is
+  undone. Write one or the other, not both.
+- The browser re-parses what the server sends, and some markup does not survive that:
+  it ends a `<p>` before a `<div>`, `<ul>`, `<section>` or other block, ends a link
+  before an `<a>` inside it, and drops a `<form>` inside a `<form>`. The page is then
+  not what was written, and its components are made again in the browser. `quillo check`
+  reports these as errors, a view or component counting as its outer element
+  (`<p><Presence/></p>` when `Presence` is a `<div>`); one that may be either
+  (`link ? <a> : <span>`) is let through.
 
 ## Components
 
@@ -1694,12 +1709,17 @@ Safety built in:
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
   the program's database is MySQL), and named parameters with
-  `sql_param(name)` — both take only letters, digits and `_`. SQL made of them, text as
-  written (also kept in a variable), choices between those (`if`, `match`) and joins of
-  them with `+` is not warned about:
+  `sql_param(name)` (or a list: `sql_param(["title", "body"])` is `:title, :body`) —
+  both take only letters, digits and `_`, whatever their argument is made of
+  (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
+  variable), choices between those (`if`, `match`), joins of them with `+`, and calls of
+  the program's own functions that only return such text
+  (`` fn table_of(id: int) = sql_name(`obj_${id}`) ``) is not warned about:
   `let order = match sort { "new" => "created desc", _ => "score desc" }` and then
-  `"select * from posts order by " + order`. It is a warning, not a proof: SQL built in
-  another function, or in a list made with `map`, is not followed.
+  `"select * from posts order by " + order`. A run-time set of columns, from a map `row`:
+  `` `insert into t (${sql_name(keys(row))}) values (${sql_param(keys(row))})` `` with
+  `row` as the parameters, or `` `update t set (${sql_name(cols)}) = (${sql_param(cols)})` ``.
+  It is a warning, not a proof: SQL built in a list made with `map` is not followed.
 - Inside `db.transaction` on SQLite, `sleep` and `http` calls hold up other requests
   instead of letting them write into the open transaction.
 
@@ -1733,6 +1753,8 @@ level off: `flatten(flatten(xs))` for two.
 - Paths are from the main file's folder, not from the file that writes them:
   `lib/b.qwe` writes `use "lib/c.qwe"`.
 - A file `use`d twice, or by several files, runs once.
+- A file that cannot be parsed is reported first, since what follows may be its doing,
+  and the names it defines are not also reported as unknown where they are used.
 
 ### Decimals
 
