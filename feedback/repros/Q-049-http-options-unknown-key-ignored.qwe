@@ -1,0 +1,12 @@
+// Q-049 `http.get`'s options take only redirects, public_only and cache: `{ timeout: 2 }` is ignored without a word (by `quillo check` and at run time), and a call cannot be made to give up sooner than Quillo's own 10 s to connect and 60 s in all
+// mode: check
+// open-when: /ok \(0 routes/
+// fixed-when: unknown option `timout`
+// From FEEDBACK5.md (found on ae6a6e5). In app/stays, Overpass (places around a stay) answered in 34 s:
+// `http.get(url, headers, { timeout: 5 })` waited the 34 s all the same (an 8 s httpbin delay with
+// timeout: 2 took 8.3 s). src/fetch.rs read only "redirects", "public_only" and "cache"; the 10 s
+// and 60 s limits were not in the guide. Fixed on stays-fixes: `timeout` is an option, and another
+// key (here misspelled) is an error, in `quillo check` and at run time.
+
+fn places(url: str) with http = http.get(url, { "User-Agent": "repro/1" }, { timeout: 2, public_only: true })
+fn typo(url: str) with http = http.get(url, {}, { timout: 2, public_only: true })

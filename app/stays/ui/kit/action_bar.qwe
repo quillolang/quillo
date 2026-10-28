@@ -1,0 +1,47 @@
+// ActionBar: a page's main action, with a line or two about it ("€95 a night,
+// 5–9 Nov" and Reserve), kept in reach on a phone: under 720px wide it is fixed to
+// the bottom of the screen, above the page, and leaves room for itself at the end
+// of the page. Wider, it sits where it is placed, or is left out when the page
+// already shows the action there (wide="hidden").
+//
+//   <ActionBar text="€95 a night" detail="5 – 9 Nov · 2 guests" wide="hidden">
+//       <Button href="#book">Reserve</Button>
+//   </ActionBar>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// text: the first line, in bold. detail: a quieter second line. children: the
+// action (a Button, a form with one). wide: "inline" (default) or "hidden", on
+// screens wider than 720px. label: what screen readers call it ("Actions").
+
+let action_bar_css = css`
+.ui-action-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.35 var(--ui-font);
+}
+.ui-action-bar-text { display: grid; min-width: 0; }
+.ui-action-bar-text b { font-size: 16px; font-weight: 650; }
+.ui-action-bar-text span { overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-action-bar-do { display: flex; flex: none; gap: 8px; }
+.ui-action-bar-space { display: none; }
+@media (min-width: 721px) { .ui-action-bar-wide-hidden, .ui-action-bar-wide-hidden + .ui-action-bar-space { display: none; } }
+@media (max-width: 720px) {
+  .ui-action-bar {
+    position: fixed; z-index: 40; left: 0; right: 0; bottom: 0; border-width: 1px 0 0; border-radius: 0;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); box-shadow: 0 -6px 20px rgb(0 0 0 / .08);
+  }
+  .ui-action-bar-space { display: block; height: calc(72px + env(safe-area-inset-bottom)); }
+}
+`
+
+view ActionBar(text: str? = null, detail: str? = null, wide: str = "inline", label: str = "Actions",
+               class: str? = null, children) = [
+    <section class={ui_cls(["ui-action-bar", wide == "hidden" && "ui-action-bar-wide-hidden", class])} aria-label={label}>
+        <div.ui-action-bar-text>
+            {text != null ? <b>{text}</b> : null}
+            {detail != null ? <span>{detail}</span> : null}
+        </div>
+        <div.ui-action-bar-do>{children}</div>
+    </section>,
+    <div.ui-action-bar-space aria-hidden="true"></div>,
+]

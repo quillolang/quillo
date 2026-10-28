@@ -1,0 +1,74 @@
+// Theme: the colours, type and shapes every component reads, as CSS variables.
+// Every component needs this file. Put `theme_css` first in the page's style:
+//
+//   use "ui/theme.qwe"
+//   use "ui/button.qwe"
+//   ... <head><style>{theme_css + button_css}</style></head>
+//
+// Light by default, dark when the system asks for it. `class="ui-dark"` or
+// `class="ui-light"` on any element fixes the theme inside it. Change a variable
+// on :root (or any element) to restyle everything under it:
+//
+//   :root { --ui-accent: #0a7d55; --ui-radius: 4px; }
+//
+// `ui-root` on <body> also sets the page's font, colours and box sizing.
+
+let theme_css = css`
+:root, .ui-light {
+  --ui-font: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ui-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ui-bg: #ffffff;
+  --ui-surface: #ffffff;
+  --ui-subtle: #f4f4f7;
+  --ui-fg: #17161f;
+  --ui-muted: #5e5c6e;
+  --ui-border: #dcdbe4;
+  --ui-strong: #b9b7c6;
+  --ui-accent: #5b4bdb;
+  --ui-accent-fg: #ffffff;
+  --ui-accent-soft: #ecebfd;
+  --ui-success: #18794e;
+  --ui-success-soft: #e3f5ec;
+  --ui-warning: #a35200;
+  --ui-warning-soft: #fdf0dc;
+  --ui-danger: #c62a2f;
+  --ui-danger-soft: #fdeaea;
+  --ui-info: #0b6bcb;
+  --ui-info-soft: #e5f1fc;
+  --ui-overlay: rgba(15, 14, 24, .45);
+  --ui-shadow: 0 1px 2px rgba(15, 14, 24, .06), 0 4px 12px rgba(15, 14, 24, .08);
+  --ui-shadow-lg: 0 12px 40px rgba(15, 14, 24, .18);
+  --ui-focus: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 35%, transparent);
+  --ui-radius: 10px;
+  --ui-radius-sm: 6px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not(.ui-light) {
+    --ui-bg: #0f0e17; --ui-surface: #17161f; --ui-subtle: #201f2b; --ui-fg: #ecebf3;
+    --ui-muted: #a3a0b7; --ui-border: #2e2c3d; --ui-strong: #45435a; --ui-accent: #b9a8ff;
+    --ui-accent-fg: #17132e; --ui-accent-soft: #2a2550; --ui-success: #4cc38a;
+    --ui-success-soft: #12301f; --ui-warning: #f3b54a; --ui-warning-soft: #33250c;
+    --ui-danger: #ff6b6b; --ui-danger-soft: #3a1618; --ui-info: #6cb6ff; --ui-info-soft: #10263d;
+    --ui-overlay: rgba(0, 0, 0, .6); --ui-shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 12px rgba(0, 0, 0, .3);
+    --ui-shadow-lg: 0 12px 40px rgba(0, 0, 0, .5);
+    color-scheme: dark;
+  }
+}
+.ui-dark {
+  --ui-bg: #0f0e17; --ui-surface: #17161f; --ui-subtle: #201f2b; --ui-fg: #ecebf3;
+  --ui-muted: #a3a0b7; --ui-border: #2e2c3d; --ui-strong: #45435a; --ui-accent: #b9a8ff;
+  --ui-accent-fg: #17132e; --ui-accent-soft: #2a2550; --ui-success: #4cc38a;
+  --ui-success-soft: #12301f; --ui-warning: #f3b54a; --ui-warning-soft: #33250c;
+  --ui-danger: #ff6b6b; --ui-danger-soft: #3a1618; --ui-info: #6cb6ff; --ui-info-soft: #10263d;
+  --ui-overlay: rgba(0, 0, 0, .6); --ui-shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 12px rgba(0, 0, 0, .3);
+  --ui-shadow-lg: 0 12px 40px rgba(0, 0, 0, .5);
+  color-scheme: dark;
+}
+.ui-root { margin: 0; font: 15px/1.5 var(--ui-font); background: var(--ui-bg); color: var(--ui-fg); }
+.ui-root *, .ui-root *::before, .ui-root *::after { box-sizing: border-box; }
+.ui-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+`
+
+// The classes given, without the empty ones: ui_cls(["ui-btn", big && "ui-big", class]).
+fn ui_cls(parts: list) -> str = parts | filter((p) => p != null && p != false && p != "") | join(" ")

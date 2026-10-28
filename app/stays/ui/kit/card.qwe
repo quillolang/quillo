@@ -1,0 +1,63 @@
+// Card: a surface that holds one thing: a summary, a form, a product. A link
+// to somewhere when it has an href, the whole card clickable.
+//
+//   <Card title="Storage" subtitle="12 of 50 GB used"> <Progress value={24}/> </Card>
+//   <Card title="Quillo docs" href="/docs">Guides and the language reference.</Card>
+//   <Card title="Team" header={<Badge>3 seats</Badge>} footer={<Button>Invite</Button>}> ... </Card>
+//
+// title, subtitle: its heading (an <h3>) and the line under it.
+// header: HTML at the end of the heading's row (a badge, a menu); footer: HTML
+// in a bar along its bottom (actions). Neither may hold links or buttons when
+// the card has an href, since it is a link itself.
+// variant: "outline" (default), "elevated" (a shadow) or "subtle" (a tinted background).
+// padding: "none", "sm", "md" (default) or "lg".
+
+let card_css = css`
+.ui-card {
+  --ui-card-pad: 20px;
+  display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 15px/1.5 var(--ui-font);
+}
+.ui-card-elevated { border-color: transparent; box-shadow: var(--ui-shadow); }
+.ui-card-subtle { background: var(--ui-subtle); border-color: transparent; }
+.ui-card-pad-none { --ui-card-pad: 0; }
+.ui-card-pad-sm { --ui-card-pad: 12px; }
+.ui-card-pad-lg { --ui-card-pad: 28px; }
+.ui-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: var(--ui-card-pad) var(--ui-card-pad) 0; }
+.ui-card-title { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.35; }
+.ui-card-sub { margin: 2px 0 0; color: var(--ui-muted); font-size: 14px; }
+.ui-card-body { flex: 1; padding: var(--ui-card-pad); }
+.ui-card-head + .ui-card-body { padding-top: 10px; }
+.ui-card-body:empty { display: none; }
+.ui-card-body > :first-child { margin-top: 0; }
+.ui-card-body > :last-child { margin-bottom: 0; }
+.ui-card-head:has(+ .ui-card-body:empty) { padding-bottom: var(--ui-card-pad); }
+.ui-card-foot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px;
+  padding: 12px var(--ui-card-pad); border-top: 1px solid var(--ui-border);
+}
+.ui-card-pad-none .ui-card-foot { padding: 12px; }
+a.ui-card { text-decoration: none; transition: border-color .15s, box-shadow .15s, transform .15s; }
+a.ui-card:hover { border-color: var(--ui-strong); box-shadow: var(--ui-shadow); }
+a.ui-card:hover .ui-card-title { color: var(--ui-accent); }
+a.ui-card:focus-visible { outline: none; box-shadow: var(--ui-focus); border-color: var(--ui-accent); }
+@media (prefers-reduced-motion: reduce) { a.ui-card { transition: none; } }
+`
+
+view Card(title: str? = null, subtitle: str? = null, href: str? = null, variant: str = "outline",
+          padding: str = "md", header = null, footer = null, class: str? = null, children) {
+    let cls = ui_cls(["ui-card", variant != "outline" && `ui-card-${variant}`,
+                      padding != "md" && `ui-card-pad-${padding}`, class])
+    let body = [
+        (title != null || subtitle != null || header != null) && <div.ui-card-head>
+            <div>
+                {title != null && <h3.ui-card-title>{title}</h3>}
+                {subtitle != null && <p.ui-card-sub>{subtitle}</p>}
+            </div>
+            {header}
+        </div>,
+        <div.ui-card-body>{children}</div>,
+        footer != null && <div.ui-card-foot>{footer}</div>
+    ]
+    href != null ? <a class={cls} href={href}>{body}</a> : <article class={cls}>{body}</article>
+}

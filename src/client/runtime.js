@@ -238,8 +238,7 @@ function foreignName(name) {
 function foreignCall(o, name, args) {
   foreignName(name);
   const f = o[name];
-  guardCall(`\`${name}\``, f, args, name);
-  return fromPage(Reflect.apply(f, o, args));
+  return fromPage(Reflect.apply(f, o, guardCall(`\`${name}\``, f, args, name)));
 }
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
@@ -318,6 +317,41 @@ function guardCall(what, f, args, name) {
     if (k.startsWith("on") || k === "srcdoc") fail(`${what} does not set ${k}: it runs text as code`);
   }
   guardArgs(what, args, 0);
+  return lenient(args, 0);
+}
+// A function of the program's handed to the page is called the page's way:
+// JavaScript passes callbacks more arguments than they use (Leaflet's
+// `on("click", f)` passes the event), so it is given only as many as it
+// takes, not refused for the rest. In lists and maps too (a library's
+// options); those are copied when one changes (FEEDBACK5.md, Q-050; branch
+// stays-fixes).
+const lenientFns = new WeakMap();
+function lenient(v, depth) {
+  if (typeof v === "function") {
+    // The page's own functions and builtins (`$p` null) take what they are given.
+    if (pageFns.has(v) || v.$p === null) return v;
+    // The same wrapper each time, so `off("click", f)` finds what `on` was given.
+    let w = lenientFns.get(v);
+    if (!w) {
+      const f = v;
+      w = function (...a) { return f.apply(this, a.slice(0, f.length)); };
+      lenientFns.set(v, w);
+    }
+    return w;
+  }
+  if (v === null || typeof v !== "object" || depth >= 16 || foreign(v)) return v;
+  if (Array.isArray(v)) {
+    let out = v;
+    v.forEach((x, i) => { const y = lenient(x, depth + 1); if (y !== x) { if (out === v) out = v.slice(); out[i] = y; } });
+    return out;
+  }
+  if (!isMap(v)) return v;
+  let out = v;
+  for (const k of Object.keys(v)) {
+    const y = lenient(v[k], depth + 1);
+    if (y !== v[k]) { if (out === v) out = { ...v }; out[k] = y; }
+  }
+  return out;
 }
 // What is handed to the page's functions: no javascript: URL (in a list or
 // a map too, which turn into it as text), no function above, no map that
@@ -1005,19 +1039,26 @@ function bodyInit(init, body) {
 // `{ status, ok, headers, body, json }` as on the server, or an error value
 // when it could not be made. Options: `redirects: 0` keeps a redirect from
 // being followed (it is then an error value, as the browser shows it no
-// further); `public_only` and `cache` are the server's (src/fetch.rs).
+// further); `public_only` and `cache` are the server's (src/fetch.rs);
+// `timeout`: seconds the call may take, as on the server. Any other option
+// is an error (FEEDBACK5.md, Q-049; branch stays-fixes).
 // `at`: the place of the URL among the call's arguments.
+const HTTP_OPTIONS = ["redirects", "public_only", "cache", "timeout"];
 async function httpCall(fname, method, url, body, headers, opts, at) {
   S(url, fname, at);
   headers = M(headers, fname, at + (fname === "http.get" || fname === "http.delete" ? 1 : 2));
   opts = M(opts, fname, at + (fname === "http.get" || fname === "http.delete" ? 2 : 3));
+  for (const k of Object.keys(opts)) if (!HTTP_OPTIONS.includes(k)) fail(`\`${fname}\`: unknown option \`${k}\` (the options are ${HTTP_OPTIONS.join(", ")})`);
+  const secs = opts.timeout;
+  if (!isNil(secs) && !(typeof secs === "number" && secs > 0 && secs <= 300)) fail(`\`${fname}\`: \`timeout\` is seconds, more than 0 and up to 300, got ${display(secs)}`);
   if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url)) return new Err(`http: not an http(s) URL: ${url}`);
   const init = { method, headers: {} };
   for (const k of Object.keys(headers)) init.headers[k] = display(headers[k]);
   if (!isNil(body)) bodyInit(init, body);
   if (opts.redirects === 0) init.redirect = "manual";
+  if (!isNil(secs) && typeof AbortSignal !== "undefined" && AbortSignal.timeout) init.signal = AbortSignal.timeout(Math.max(1, Math.round(secs * 1000)));
   let res;
-  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("http: " + e.message); }
+  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("http: " + (e && e.name === "TimeoutError" ? `${url} took more than ${secs} s` : e.message)); }
   if (res.type === "opaqueredirect") return new Err(`http: ${url} redirects, and redirects: 0 does not follow it`);
   let text;
   try { text = await res.text(); } catch (e) { return new Err("http: " + e.message); }
@@ -1489,14 +1530,12 @@ B.js = meta((path, ...args) => {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
   }
-  guardCall(`\`js\`: ${path}`, v, args);
-  return fromPage(Reflect.apply(v, owner, args));
+  return fromPage(Reflect.apply(v, owner, guardCall(`\`js\`: ${path}`, v, args)));
 }, "js", null);
 B.js_new = meta((path, ...args) => {
   const [, v] = jsPath(path, "js_new");
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
-  guardCall(`\`js_new\`: ${path}`, v, args);
-  return fromPage(Reflect.construct(v, args));
+  return fromPage(Reflect.construct(v, guardCall(`\`js_new\`: ${path}`, v, args)));
 }, "js_new", null);
 
 // Translations: the page's locale and its text (see src/i18n.rs).
@@ -4526,14 +4565,31 @@ function resume(el) {
   hydrating = null;
   // What was typed before it was taken up: the component hears it now.
   for (const f of el.querySelectorAll("input, textarea, select")) {
-    const changed = f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked
-      : f.tagName === "SELECT" ? [...f.options].some((o) => o.selected !== o.defaultSelected)
-      : f.value !== f.defaultValue;
-    if (changed) {
+    if (!asParsed(f)) {
       f.dispatchEvent(new Event("input", { bubbles: true }));
       f.dispatchEvent(new Event("change", { bubbles: true }));
     }
   }
+}
+
+// Whether a field still shows what the page gave it, as the browser made it:
+// a range's value snapped to its step or into min..max, a select with no
+// option chosen on its first one. Only a field that does not was typed in
+// (or restored by the browser) before its component was taken up
+// (FEEDBACK5.md, Q-048; branch stays-fixes).
+function asParsed(f) {
+  if (f.type === "checkbox" || f.type === "radio") return f.checked === f.defaultChecked;
+  if (f.tagName === "SELECT") {
+    const opts = [...f.options];
+    if (opts.every((o) => o.selected === o.defaultSelected)) return true;
+    return !f.multiple && f.size <= 1 && !opts.some((o) => o.defaultSelected) && f.selectedIndex === 0;
+  }
+  if (f.value === f.defaultValue) return true;
+  if (f.tagName !== "INPUT") return false;
+  const p = document.createElement("input");
+  for (const a of ["type", "min", "max", "step"]) if (f.hasAttribute(a)) p.setAttribute(a, f.getAttribute(a));
+  p.setAttribute("value", f.defaultValue);
+  return f.value === p.value;
 }
 
 function wake(e) {
@@ -4546,8 +4602,11 @@ function boot() {
   // handled: it reaches the component).
   for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
   const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
+  // An island runs by itself when one inside it does: the inner one starts
+  // with its outer one (FEEDBACK5.md, Q-046; branch stays-fixes).
+  const byItself = (i) => i.hasAttribute("data-e") || i.hasAttribute("data-l");
   for (const island of outer) {
-    if (island.hasAttribute("data-e") || island.hasAttribute("data-l") || island.parentElement === document.body) resume(island);
+    if (byItself(island) || island.parentElement === document.body || [...island.querySelectorAll(ISLANDS)].some(byItself)) resume(island);
   }
   // The island someone reached for, which brought the bundle, and the one
   // that has the focus.

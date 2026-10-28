@@ -1,0 +1,156 @@
+// The home page and the search: filters, results and a map (the kit's
+// MapView) that follow each other. A search goes to the server when the place,
+// the dates or the guests change; the price (once a thumb is let go), kinds,
+// amenities and sort are applied in the browser to what came back.
+
+let CITIES = [
+    { name: "Lisbon", says: "Hills, trams and tiles", hue: 20 },
+    { name: "Porto", says: "Port wine by the river", hue: 200 },
+    { name: "Barcelona", says: "Gaudí and the sea", hue: 330 },
+    { name: "Dublin", says: "Pubs, parks and poetry", hue: 140 },
+    { name: "Kyoto", says: "Temples and gardens, in yen", hue: 280 },
+]
+
+view HomePage(me, today: str) =
+    <Shell {me} title="Stays and things to do" wide={true}>
+        <section.hero>
+            <h1>Stay somewhere, and see what's around</h1>
+            <p.muted>Places to stay with the weather for your dates, places to eat, and things to do nearby.</p>
+            <form.search-bar method="get" action="/s">
+                <TextField name="where" label="Where" placeholder="Lisbon, Kyoto, an address…" required={true} value="Lisbon"/>
+                <DateRangePicker label="Dates" names={["start", "end"]} min={today} today={today}/>
+                <NumberInput name="guests" label="Guests" value={2} min={1} max={16}/>
+                <Button type="submit">Search</Button>
+            </form>
+        </section>
+        <section.page>
+            <h2>Where to</h2>
+            <div.cities>{for c in CITIES => <a.city key={c.name} href={`/s?where=${c.name}`}>
+                <img src={`/pics/city/${c.hue}.svg`} alt="" loading="lazy"/>
+                <b>{c.name}</b><span>{c.says}</span>
+            </a>}</div>
+        </section>
+    </Shell>
+
+// The query of a search, for the address bar and the places' links.
+fn search_query(f: map) -> str =
+    [["where", f.where], ["start", f.start], ["end", f.end], ["guests", f.guests]]
+        | filter((p) => p[1] != null && p[1] != "")
+        | map((p) => `${p[0]}=${url_encode(str(p[1]))}`)
+        | join("&")
+
+fn stay_href(id: int, f: map) -> str {
+    let q = search_query({ start: f.start, end: f.end, guests: f.guests })
+    q == "" ? `/stays/${id}` : `/stays/${id}?${q}`
+}
+
+// What of the results the browser-side filters let through, and in which order.
+fn shown_results(found, lo, hi, kinds: list, wanted: list, instant: bool, sort: str) {
+    let cur = found.currency
+    let rows = (found.results ?? [])
+        | filter((l) => l.currency != cur || ((lo == null || l.night >= lo) && (hi == null || l.night <= hi)))
+        | filter((l) => len(kinds) == 0 || contains(kinds, l.kind))
+        | filter((l) => all(wanted, (a) => contains(l.amenity_keys, a)))
+        | filter((l) => !instant || l.instant_book == 1)
+    match sort {
+        "cheap" => rows | sort_by((l) => l.night)
+        "rated" => rows | sort_by((l) => -(l.rating.avg ?? 0))
+        _ => rows | sort_by((l) => l.km)
+    }
+}
+
+fn toggled(xs: list, v: str, on: bool) -> list = on ? unique(xs + [v]) : xs | filter((x) => x != v)
+
+component SearchApp(first_filters: map, first: map, today: str) {
+    state f = first_filters
+    state found = first
+    state busy = false
+    state seq = 0
+    state picked = 0
+    state lo = null
+    state hi = null
+    state kinds = []
+    state wanted = []
+    state instant = false
+    state sort = "near"
+    let rows = shown_results(found, lo, hi, kinds, wanted, instant, sort)
+    let unit = money.minor_units(found.currency ?? "EUR")
+    let scale = pow(10, unit)
+    let step = unit == 0 ? 1000 : 5
+    let top = ceil((found.price_top ?? 10000) / scale)
+    // Each search is numbered; an answer to an older one, come late, is dropped.
+    let run = (next) => {
+        f = next
+        seq += 1
+        let mine = seq
+        busy = true
+        let r = search_stays(next)
+        if mine == seq {
+            found = r
+            busy = false
+            lo = null
+            hi = null
+            js("history.replaceState", null, "", `/s?${search_query(next)}`)
+        }
+    }
+    <div.search-layout>
+        <div.search-list>
+            <form.filters @submit={(e) => { run(merge(f, { where: e.form.where })) }}>
+                <div.row>
+                    <TextField name="where" label="Where" value={f.where} class="grow"/>
+                    <Button type="submit" loading={busy}>Search</Button>
+                </div>
+                <div.row>
+                    <DateRangePicker label="Dates" start={f.start} end={f.end} min={today} today={today}
+                        on_change={(a, b) => { if a == null || b != null { run(merge(f, { start: a ?? "", end: b ?? "" })) } }}/>
+                    <NumberInput label="Guests" value={f.guests} min={1} max={16} on_change={(n) => { if n != null { run(merge(f, { guests: n })) } }}/>
+                </div>
+                <RangeSlider label={`A night${found.dated == true ? ", for your dates" : ""}`} min={0} max={top} {step}
+                    low={lo == null ? 0 : lo / scale} high={hi == null ? top : hi / scale}
+                    prefix={found.currency == "JPY" ? "¥" : "€"}
+                    on_commit={(a, b) => { lo = a * scale; hi = b * scale }}/>
+                <ChipGroup name="kinds" label="Kind of place" multiple={true} values={kinds} size="sm"
+                    options={KINDS | map((k) => { label: upper(slice(k, 0, 1)) + slice(k, 1), value: k })}
+                    on_change={(v, on) => { kinds = toggled(kinds, v, on) }}/>
+                <ChipGroup name="amenities" label="Has" multiple={true} values={wanted} size="sm"
+                    options={["wifi", "kitchen", "workspace", "ac", "parking", "pets", "pool"] | map((k) => { label: get(AMENITIES, k), value: k })}
+                    on_change={(v, on) => { wanted = toggled(wanted, v, on) }}/>
+                <div.spread>
+                    <Switch label="Instant book" checked={instant} on_change={(on) => { instant = on }}/>
+                    <SegmentedControl name="sort" value={sort} size="sm"
+                        options={[{ label: "Nearest", value: "near" }, { label: "Cheapest", value: "cheap" }, { label: "Best rated", value: "rated" }]}
+                        on_change={(v) => { sort = v }}/>
+                </div>
+            </form>
+            {found.problem != null
+                ? <Alert tone="warning" title="Nothing to show">{found.problem}</Alert>
+                : <div>
+                    <p.muted id="count">{plural(len(rows), "place")} {found.place.local == true ? "in" : "near"} {found.place.name}{found.dated == true ? `, ${range_label(f.start, f.end)}` : ""}</p>
+                    {len(rows) == 0
+                        ? <EmptyState title="No places match" icon="search">Try other dates, or fewer filters.</EmptyState>
+                        : <div.results>{for l in rows => <ResultCard key={l.id} l={l} href={stay_href(l.id, f)} on={picked == l.id}/>}</div>}
+                </div>}
+        </div>
+        <div.search-map>
+            {found.problem == null
+                ? <MapView label="Places on the map" center={[found.place.lat, found.place.lng]} height={560} {picked}
+                    markers={rows | map((l) => { id: l.id, lat: l.lat, lng: l.lng, text: l.night_shown, title: l.title })}
+                    on_pick={(id) => { picked = id }}/>
+                : null}
+        </div>
+    </div>
+}
+
+view ResultCard(l, href: str, on: bool) =
+    <a.result href={href} class={on ? "picked" : null} id={`result-${l.id}`}>
+        <img src={l.photo_urls[0]} alt="" loading="lazy"/>
+        <div.line>
+            <b>{l.title}</b>
+            {l.rating.avg != null ? <span.small>★ {l.rating.avg} ({l.rating.count})</span> : <Badge size="sm">New</Badge>}
+        </div>
+        <div.muted.small>{upper(slice(l.kind, 0, 1)) + slice(l.kind, 1)} · {plural(l.max_guests, "guest")} · {l.km} km away</div>
+        <div.line.price>
+            <span><b>{l.night_shown}</b> night</span>
+            {l.total_shown != null ? <span.muted.small>{l.total_shown} total</span> : null}
+        </div>
+    </a>

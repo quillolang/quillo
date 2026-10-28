@@ -1,0 +1,128 @@
+// GuestPicker: how many people (and pets) are coming, as a button that says so
+// ("3 guests, 1 infant") and opens a counter for each: adults, children, infants
+// and pets. Adults and children count as guests, against max_guests; infants and
+// pets are said apart. It is a <details>, so it opens without a script; Escape or
+// Done closes it.
+//
+//   <GuestPicker name="who" value={{ adults: 2 }} max_guests={4} on_change={(c) => { who = c }}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// value: the counts to start with ({ adults: 2, children: 1 }); the others start at
+// their least. max_guests: the most adults and children together. pets: false
+// leaves pets out. kinds: other counters, a list of { key, label, one, many, hint,
+// min, max, guest } (guest: counts towards max_guests). label: what it is called
+// ("Guests"). name: a plain <form> gets each count as `name`_<key> (who_adults).
+// on_change(counts): inside one of your components, given every count, as a map.
+
+let guest_picker_css = css`
+.ui-guest-picker { position: relative; display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-guest-picker-label { font-size: 13px; font-weight: 500; }
+.ui-guest-picker > details > summary {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 220px; height: 38px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); cursor: pointer; list-style: none;
+}
+.ui-guest-picker > details > summary::-webkit-details-marker { display: none; }
+.ui-guest-picker > details > summary::after {
+  content: ""; width: 7px; height: 7px; margin-top: -4px; border: solid var(--ui-muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg);
+}
+.ui-guest-picker > details[open] > summary::after { margin-top: 4px; transform: rotate(-135deg); }
+.ui-guest-picker > details > summary:hover { border-color: var(--ui-strong); }
+.ui-guest-picker > details > summary:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-guest-picker-pop {
+  position: absolute; z-index: 30; top: 100%; left: 0; width: max-content; min-width: 100%; max-width: calc(100vw - 32px); margin-top: 4px;
+  padding: 6px 16px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow-lg);
+}
+.ui-guest-picker-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 10px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-guest-picker-row:last-of-type { border-bottom: 0; }
+.ui-guest-picker-what { display: grid; }
+.ui-guest-picker-what b { font-weight: 500; }
+.ui-guest-picker-what span { font-size: 12px; color: var(--ui-muted); }
+.ui-guest-picker-count { display: flex; align-items: center; gap: 10px; }
+.ui-guest-picker-count output { min-width: 20px; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-guest-picker-step {
+  display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-fg); font: 18px/1 var(--ui-font); cursor: pointer;
+}
+.ui-guest-picker-step:hover:not(:disabled) { border-color: var(--ui-strong); }
+.ui-guest-picker-step:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-guest-picker-step:disabled { opacity: .35; cursor: not-allowed; }
+.ui-guest-picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 10px; font-size: 12px; color: var(--ui-muted); }
+.ui-guest-picker-done { padding: 5px 12px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-fg); color: var(--ui-bg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-guest-picker-done:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+let guest_picker_kinds = [
+    { key: "adults", label: "Adults", one: "guest", many: "guests", hint: "13 or older", min: 1, max: 16, guest: true },
+    { key: "children", label: "Children", one: "guest", many: "guests", hint: "Ages 2 to 12", min: 0, max: 10, guest: true },
+    { key: "infants", label: "Infants", one: "infant", many: "infants", hint: "Under 2", min: 0, max: 5, guest: false },
+    { key: "pets", label: "Pets", one: "pet", many: "pets", hint: "Assistance animals need not be counted", min: 0, max: 5, guest: false },
+]
+
+// "3 guests, 1 infant": the guests together, then each other kind there is.
+fn guest_picker_summary(kinds: list, counts: map) -> str {
+    let n = sum(kinds | filter((k) => k.guest) | map((k) => get(counts, k.key) ?? 0))
+    let say = (c: int, k) => `${c} ${c == 1 ? k.one : k.many}`
+    let guests = kinds | find((k) => k.guest)
+    let rest = kinds | filter((k) => !k.guest && (get(counts, k.key) ?? 0) > 0) | map((k) => say(get(counts, k.key), k))
+    join((guests != null ? [say(n, guests)] : []) + rest, ", ")
+}
+
+component GuestPicker(name: str? = null, label: str = "Guests", value: map = {}, max_guests: int? = null,
+                      pets: bool = true, kinds: list? = null, on_change = null, class: str? = null) {
+    let all = (kinds ?? guest_picker_kinds) | filter((k) => pets || k.key != "pets")
+    state counts = all | reduce({}, (m, k) => set(m, k.key, get(value, k.key) ?? k.min))
+    let guests = sum(all | filter((k) => k.guest) | map((k) => get(counts, k.key)))
+    let id = `guest-picker-${name ?? re.replace(lower(label), "[^a-z0-9]+", "-")}`
+    // Kept within the counter's limits and max_guests here, not only by the
+    // buttons: clicks can come faster than the buttons are disabled.
+    let step = (k, by: int) => {
+        let c = get(counts, k.key) + by
+        let room = by > 0 && k.guest && max_guests != null && guests >= max_guests
+        if c >= k.min && c <= k.max && !room {
+            counts = set(counts, k.key, c)
+            on_change && on_change(counts)
+        }
+    }
+    <div class={ui_cls(["ui-guest-picker", class])}>
+        <span.ui-guest-picker-label id={`${id}-label`}>{label}</span>
+        <details @keydown={(e) => {
+            if e.key == "Escape" {
+                let d = e.target.closest("details")
+                if d.open {
+                    e.preventDefault()
+                    d.open = false
+                    d.querySelector("summary").focus()
+                }
+            }
+        }}>
+            <summary aria-labelledby={`${id}-label ${id}-text`}><span id={`${id}-text`}>{guest_picker_summary(all, counts)}</span></summary>
+            <div.ui-guest-picker-pop role="group" aria-labelledby={`${id}-label`}>
+                {for k in all => {
+                    let c = get(counts, k.key)
+                    let full = k.guest && max_guests != null && guests >= max_guests
+                    <div.ui-guest-picker-row key={k.key} data-kind={k.key}>
+                        <div.ui-guest-picker-what><b id={`${id}-${k.key}`}>{k.label}</b><span>{k.hint}</span></div>
+                        <div.ui-guest-picker-count>
+                            <button.ui-guest-picker-step type="button" aria-label={`Fewer ${lower(k.label)}`} disabled={c <= k.min}
+                                    @click={() => step(k, -1)}>−</button>
+                            <output aria-labelledby={`${id}-${k.key}`} aria-live="polite">{c}</output>
+                            <button.ui-guest-picker-step type="button" aria-label={`More ${lower(k.label)}`} disabled={c >= k.max || full}
+                                    @click={() => step(k, 1)}>+</button>
+                        </div>
+                    </div>
+                }}
+                <div.ui-guest-picker-foot>
+                    <span>{max_guests != null ? `${max_guests} guests at most, not counting infants.` : ""}</span>
+                    <button.ui-guest-picker-done type="button" @click={(e) => {
+                        let d = e.target.closest("details")
+                        d.open = false
+                        d.querySelector("summary").focus()
+                    }}>Done</button>
+                </div>
+            </div>
+        </details>
+        {name != null ? [for k in all => <input type="hidden" key={k.key} name={`${name}_${k.key}`} value={str(get(counts, k.key))}/>] : null}
+    </div>
+}

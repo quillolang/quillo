@@ -1,0 +1,585 @@
+// The server fns of the platform: searching, a place's page, holding and
+// paying for nights, cancelling, the host's calendar and requests, reviews,
+// saved places, and activities nearby with their time slots.
+//
+// Pages follow topics: listing:<id> (its calendar: what is taken), user:<id>
+// (a guest's trips, a host's requests), slots:<activity id> (places left).
+//
+// Nights are taken by rows of booking_nights, unique for a place and a day:
+// a hold takes them for 10 minutes while the guest pays; a request to book
+// keeps them for a day while the host decides; a confirmed booking keeps them.
+// Holds and requests that run out are swept each minute, and before each hold.
+
+let HOLD_MS = 10 * 60000
+let RESPOND_MS = 24 * 3600000
+let SEARCH_KM = 25.0
+
+let AMENITIES = {
+    wifi: "Wi-Fi", kitchen: "Kitchen", washer: "Washer", ac: "Air conditioning", heating: "Heating",
+    workspace: "Desk to work at", parking: "Free parking", pool: "Pool", balcony: "Balcony",
+    view: "Sea or city view", lift: "Lift", pets: "Pets welcome", crib: "Cot", fireplace: "Fireplace",
+}
+
+let KINDS = ["apartment", "house", "cabin", "room"]
+
+// ---- rows as pages show them ------------------------------------------------------
+
+fn listing_row(id: int) with db = db.one("select * from listings where id = ? and active = 1", id)
+
+fn listing_view(l) = merge(l, {
+    amenity_keys: l.amenities == "" ? [] : split(l.amenities, ","),
+    price_shown: shown_minor(l.base_price, l.currency),
+    weekend_shown: shown_minor(l.weekend_price, l.currency),
+    policy: get(POLICIES, l.cancel_policy),
+    photo_urls: range(0, l.photos) | map((n) => `/pics/${l.id}/${n}.svg`),
+    zone: (get(CITY_ZONES, l.city) ?? { name: "UTC" }).name,
+})
+
+fn rating_of(listing_id: int) with db {
+    let r = db.one("select count(*) as n, avg(rating) as avg from reviews where listing_id = ?", listing_id)
+    { count: r.n, avg: r.n == 0 ? null : round(r.avg * 10) / 10 }
+}
+
+// What the host set for each night: prices and closed nights, from `from` on.
+fn custom_prices(listing_id: int, from: str, to: str) with db =
+    db.query("select day, price from night_prices where listing_id = ? and day >= ? and day < ?", listing_id, from, to)
+        | reduce({}, (m, r) => set(m, r.day, r.price))
+
+// ---- holds running out ---------------------------------------------------------
+
+// Holds past their 10 minutes, and requests the host left for a day, let
+// their nights go. Each place and person concerned is told.
+fn sweep() with db, time {
+    let lapsed = db.query("select id, listing_id, guest_id, status from bookings where (status = 'held' and held_until < ?) or (status = 'requested' and respond_by < ?)", now(), now())
+    for b in lapsed {
+        db.transaction(() => {
+            let done = db.exec("update bookings set status = 'expired', decided = ? where id = ? and status = ?", now(), b.id, b.status)?
+            if done.changes == 1 { db.exec("delete from booking_nights where booking_id = ?", b.id)? }
+        })
+        publish(`listing:${b.listing_id}`)
+        publish(`user:${b.guest_id}`)
+        publish(`user:${host_of(b.listing_id)}`)
+    }
+    len(lapsed)
+}
+
+fn host_of(listing_id: int) with db = db.one("select host_id from listings where id = ?", listing_id).host_id
+
+schedule("1m", sweep)
+
+// ---- searching --------------------------------------------------------------------
+
+// Where a search is: a city we have places in answers at once, from them;
+// anything else asks Nominatim (which may take a second, or fail).
+fn search_place(where_text: str) with http, db, time {
+    let text = trim(split(where_text, ",")[0])
+    let c = db.one("select city, country, avg(lat) as lat, avg(lng) as lng from listings where active = 1 and city = ? collate nocase group by city", text)
+    if c != null { return { name: c.city, city: c.city, country: c.country, lat: c.lat, lng: c.lng, local: true } }
+    geocode(where_text)
+}
+
+// A search: { where, start, end, guests, lo, hi, kinds, amenities, instant, sort }.
+// Gives { place, currency, results, bounds, problem }. Prices are a night,
+// with the dates' own prices and discounts when dates are given.
+server fn search_stays(f: map) with http, db, time {
+    let where_text = trim(f.where ?? "")
+    if where_text == "" { return { problem: "Where to? Type a city", results: [] } }
+    let place = search_place(where_text)
+    if is_err(place) { return { problem: place.error, results: [] } }
+    let dated = is_day(f.start) && is_day(f.end) && days_between(f.start, f.end) > 0
+    let guests = max([1, int(f.guests ?? 1) ?? 1])
+    let dlat = SEARCH_KM / 111.0
+    let dlng = SEARCH_KM / (111.0 * math.cos(math.radians(place.lat)))
+    let rows = db.query("select * from listings where active = 1 and lat between ? and ? and lng between ? and ? and max_guests >= ?",
+        place.lat - dlat, place.lat + dlat, place.lng - dlng, place.lng + dlng, guests)
+    let free = dated
+        ? db.query("select distinct listing_id from booking_nights where day >= ? and day < ? union select distinct listing_id from blocked_nights where day >= ? and day < ?", f.start, f.end, f.start, f.end)
+            | map((r) => r.listing_id)
+        : []
+    let today = today_day()
+    let kinds = f.kinds ?? []
+    let wanted = f.amenities ?? []
+    let found = rows
+        | filter((l) => !contains(free, l.id))
+        | filter((l) => len(kinds) == 0 || contains(kinds, l.kind))
+        | filter((l) => all(wanted, (a) => contains(split(l.amenities, ","), a)))
+        | filter((l) => f.instant != true || l.instant_book == 1)
+        | map((l) => {
+            let km = metres(place.lat, place.lng, l.lat, l.lng) / 1000
+            let q = dated && stay_problem(l, f.start, f.end, guests, today) == null ? quote(l, f.start, f.end, guests, custom_prices(l.id, f.start, f.end)) : null
+            let night = q != null ? money.to_minor(q.per_night) : l.base_price
+            merge(listing_view(l), {
+                km: round(km * 10) / 10,
+                night,
+                night_shown: shown_minor(night, l.currency),
+                total_shown: q != null ? shown_money(q.total) : null,
+                fits: !dated || q != null,
+                rating: rating_of(l.id),
+            })
+        })
+        | filter((l) => l.km <= SEARCH_KM && l.fits)
+    // The price range is in the currency most places here have; places in
+    // another currency are not filtered by it (no exchange rates here).
+    let currency = len(found) == 0 ? "EUR" : { let by = found | group_by((l) => l.currency); (keys(by) | sort_by((c) => -len(get(by, c))))[0] }
+    let priced = found | filter((l) => l.currency != currency || ((f.lo == null || l.night >= f.lo) && (f.hi == null || l.night <= f.hi)))
+    let sorted = match f.sort ?? "near" {
+        "cheap" => priced | sort_by((l) => l.night)
+        "rated" => priced | sort_by((l) => -(l.rating.avg ?? 0))
+        _ => priced | sort_by((l) => l.km)
+    }
+    {
+        place, currency, results: sorted, problem: null,
+        dated,
+        price_top: max([10000] + (found | filter((l) => l.currency == currency) | map((l) => l.night))),
+    }
+}
+
+// ---- a place's page ----------------------------------------------------------------
+
+// Everything a place's page shows, kept live: other guests' holds and bookings
+// close nights while it is open.
+server fn load_stay(id: int) with db, time {
+    watch(`listing:${id}`)
+    let l = listing_row(id)
+    if l == null { return null }
+    let u = me()
+    let today = local_day(l.city, now())
+    let until = add_days(today, 366)
+    let host = db.one("select id, name, hue, created from users where id = ?", l.host_id)
+    {
+        listing: listing_view(l),
+        today,
+        host,
+        custom: custom_prices(id, today, until),
+        taken: db.query("select day from booking_nights where listing_id = ? and day >= ? order by day", id, today) | map((r) => r.day),
+        closed: db.query("select day from blocked_nights where listing_id = ? and day >= ? order by day", id, today) | map((r) => r.day),
+        rating: rating_of(id),
+        reviews: db.query("select r.rating, r.body, r.created, u.name, u.hue from reviews r join users u on u.id = r.guest_id where r.listing_id = ? order by r.id desc limit 20", id),
+        saved: u != null && db.one("select 1 as y from saved where user_id = ? and listing_id = ?", u.id, id) != null,
+        mine: u != null && u.id == l.host_id,
+        signed_in: u != null,
+    }
+}
+
+// The weather for a place's stay dates, or the next days: { zone, days, beyond, stale }.
+server fn weather_for(id: int, start: str, end: str) with http, db, time {
+    let l = listing_row(id)
+    if l == null { return err("No such place") }
+    let w = forecast(l.lat, l.lng)
+    if is_err(w) { return w }
+    let wanted = is_day(start) && is_day(end) ? nights_of(start, end) + [end] : []
+    let days = len(wanted) == 0 ? take(w.days, 7) : w.days | filter((d) => contains(wanted, d.day))
+    {
+        zone: w.zone,
+        stale: w.stale ?? false,
+        days: days | map((d) => merge(merge(d, weather_of(d.code)), { when: day_label(d.day) })),
+        // Days of the stay past the forecast's 16.
+        beyond: len(wanted) - len(days),
+    }
+}
+
+server fn around_stay(id: int) with http, db, time {
+    let l = listing_row(id)
+    if l == null { return err("No such place") }
+    places_near(l.lat, l.lng)
+}
+
+// ---- holding nights, paying ------------------------------------------------------------
+
+// Hold the nights for 10 minutes while the guest pays: the booking's id.
+server fn hold_stay(id: int, start: str, end: str, guests: int) with db, time {
+    let u = acting()?
+    let l = listing_row(id)
+    if l == null { return err("This place is not taking bookings") }
+    if l.host_id == u.id { return err("This is your own place") }
+    let problem = stay_problem(l, start, end, guests, local_day(l.city, now()))
+    if problem != null { return err(problem) }
+    let rec = quote_record(quote(l, start, end, guests, custom_prices(id, start, end)))
+    sweep()
+    let b = db.transaction({ retries: 5 }, () => {
+        let closed = db.one("select day from blocked_nights where listing_id = ? and day >= ? and day < ? order by day", id, start, end)
+        if closed != null { return err(`The host has closed the night of ${day_label(closed.day)}`) }
+        let taken = db.one("select day from booking_nights where listing_id = ? and day >= ? and day < ? order by day", id, start, end)
+        if taken != null { return err(`Someone has just booked the night of ${day_label(taken.day)}`) }
+        let made = db.exec("insert into bookings (listing_id, guest_id, start_day, end_day, guests, status, held_until, currency, total, breakdown, created) values (?, ?, ?, ?, ?, 'held', ?, ?, ?, ?, ?)",
+            id, u.id, start, end, guests, now() + HOLD_MS, l.currency, rec.total, json.stringify(rec), now())?
+        for d in nights_of(start, end) {
+            // The unique key is the last word, should two holds pass the check above together.
+            let r = db.exec("insert into booking_nights (booking_id, listing_id, day) values (?, ?, ?)", made.last_id, id, d)
+            if is_err(r) {
+                return err(db.error_kind(r) == "unique" ? `Someone has just booked the night of ${day_label(d)}` : r.error)
+            }
+        }
+        made.last_id
+    })
+    if !is_err(b) { publish(`listing:${id}`) }
+    b
+}
+
+// A booking as its guest sees it, live.
+server fn load_booking(id: int) with db, time {
+    let u = me()
+    if u == null { return null }
+    watch(`user:${u.id}`)
+    let b = db.one("select * from bookings where id = ? and guest_id = ?", id, u.id)
+    if b == null { return null }
+    let l = db.one("select * from listings where id = ?", b.listing_id)
+    let rec = json.parse(b.breakdown)
+    merge(b, {
+        listing: listing_view(l),
+        lines: rec.lines | map((x) => merge(x, { shown: shown_minor(x.minor, rec.currency) })),
+        total_shown: shown_minor(b.total, b.currency),
+        dates: range_label(b.start_day, b.end_day),
+        nights: len(rec.nights),
+        check_in_at: local_moment(l.city, b.start_day, l.check_in),
+        now: now(),
+    })
+}
+
+// Let go of a hold the guest does not want.
+server fn release_hold(id: int) with db, time {
+    let u = acting()?
+    let b = db.one("select listing_id from bookings where id = ? and guest_id = ? and status = 'held'", id, u.id)
+    if b == null { return null }
+    db.transaction(() => {
+        db.exec("update bookings set status = 'expired', decided = ? where id = ?", now(), id)?
+        db.exec("delete from booking_nights where booking_id = ?", id)?
+    })?
+    publish(`listing:${b.listing_id}`)
+    publish(`user:${u.id}`)
+    null
+}
+
+// A card as the checkout sends it: anything else is a 400, by the fn's types.
+type PaymentCard = { number: str, expiry: str, cvc: str }
+
+// Pay for a hold: confirmed at once for an instant booking, else a request
+// the host has a day to answer. No money moves: the card is only checked.
+server fn pay_booking(id: int, card: PaymentCard) with db, time {
+    let u = acting()?
+    let b = db.one("select * from bookings where id = ? and guest_id = ?", id, u.id)
+    if b == null { return err("No such booking") }
+    if b.status != "held" { return err("This booking has been paid for already") }
+    let l = db.one("select * from listings where id = ?", b.listing_id)
+    if b.held_until < now() {
+        sweep()
+        return err("Your 10 minutes ran out and the nights were let go. Choose your dates again")
+    }
+    let problem = card_problem(card.number, card.expiry, card.cvc, local_day(l.city, now()))
+    if problem != null { return err(problem) }
+    let digits = re.replace(card.number, "[ -]", "")
+    let instant = l.instant_book == 1
+    let done = db.exec("update bookings set status = ?, card_last4 = ?, held_until = null, respond_by = ?, decided = ? where id = ? and status = 'held' and held_until >= ?",
+        instant ? "confirmed" : "requested", slice(digits, len(digits) - 4, len(digits)), instant ? null : now() + RESPOND_MS, instant ? now() : null, id, now())?
+    if done.changes == 0 { return err("Your 10 minutes ran out and the nights were let go. Choose your dates again") }
+    publish(`listing:${l.id}`)
+    publish(`user:${u.id}`)
+    publish(`user:${l.host_id}`)
+    instant ? "confirmed" : "requested"
+}
+
+// ---- trips, cancelling, reviews ----------------------------------------------------------
+
+server fn load_trips() with db, time {
+    let u = me()
+    if u == null { return null }
+    watch(`user:${u.id}`)
+    let today = today_day()
+    let rows = db.query("select b.*, l.title, l.city, l.hue, l.check_in, l.check_out, l.cancel_policy, (select count(*) from reviews r where r.booking_id = b.id) as reviewed from bookings b join listings l on l.id = b.listing_id where b.guest_id = ? and b.status != 'held' order by b.start_day", u.id)
+        | map((b) => merge(b, {
+            dates: range_label(b.start_day, b.end_day),
+            total_shown: shown_minor(b.total, b.currency),
+            refund_shown: b.refund == null ? null : shown_minor(b.refund, b.currency),
+            photo: `/pics/${b.listing_id}/0.svg`,
+            reviewable: b.status == "confirmed" && b.end_day <= today && b.reviewed == 0,
+            cancellable: (b.status == "confirmed" || b.status == "requested") && b.end_day > today,
+        }))
+    {
+        upcoming: rows | filter((b) => (b.status == "confirmed" || b.status == "requested") && b.end_day > today),
+        past: rows | filter((b) => b.status == "confirmed" && b.end_day <= today) | reverse,
+        other: rows | filter((b) => b.status != "confirmed" && b.status != "requested") | reverse,
+    }
+}
+
+fn refund_now(b, l) with time =
+    b.status == "requested"
+        ? { minor: b.total, why: "The host had not accepted yet: all of it" }
+        : refund_of(l.cancel_policy, json.parse(b.breakdown), b.created, local_moment(l.city, b.start_day, l.check_in), now())
+
+// What cancelling now would give back, to ask before doing it.
+server fn cancel_preview(id: int) with db, time {
+    let u = acting()?
+    let b = db.one("select * from bookings where id = ? and guest_id = ?", id, u.id)
+    if b == null { return err("No such booking") }
+    let l = db.one("select * from listings where id = ?", b.listing_id)
+    let r = refund_now(b, l)
+    merge(r, { shown: shown_minor(r.minor, b.currency), of: shown_minor(b.total, b.currency) })
+}
+
+server fn cancel_booking(id: int) with db, time {
+    let u = acting()?
+    let b = db.one("select * from bookings where id = ? and guest_id = ?", id, u.id)
+    if b == null { return err("No such booking") }
+    if b.status != "confirmed" && b.status != "requested" { return err("This booking is not one you can cancel") }
+    let l = db.one("select * from listings where id = ?", b.listing_id)
+    if local_moment(l.city, b.end_day, l.check_out) < now() { return err("This stay is over") }
+    // Worked out again now: the policy's line may have passed since the preview.
+    let r = refund_now(b, l)
+    db.transaction(() => {
+        db.exec("update bookings set status = 'cancelled', refund = ?, decided = ? where id = ? and status = ?", r.minor, now(), id, b.status)?
+        // Only the nights not stayed come free.
+        db.exec("delete from booking_nights where booking_id = ? and day >= ?", id, local_day(l.city, now()))?
+    })?
+    publish(`listing:${l.id}`)
+    publish(`user:${u.id}`)
+    publish(`user:${l.host_id}`)
+    merge(r, { shown: shown_minor(r.minor, b.currency) })
+}
+
+server fn leave_review(booking_id: int, rating: int, body: str) with db, time {
+    let u = acting()?
+    let b = db.one("select * from bookings where id = ? and guest_id = ? and status = 'confirmed'", booking_id, u.id)
+    if b == null { return err("Only a stay you made can be reviewed") }
+    if b.end_day > today_day() { return err("Reviews open on the day you leave") }
+    if rating < 1 || rating > 5 { return err("From 1 to 5 stars") }
+    if len(trim(body)) < 10 { return err("A few words for the next guests (10 characters or more)") }
+    let r = db.exec("insert into reviews (booking_id, listing_id, guest_id, rating, body, created) values (?, ?, ?, ?, ?, ?)", booking_id, b.listing_id, u.id, rating, trim(body), now())
+    if db.error_kind(r) == "unique" { return err("You have reviewed this stay already") }
+    r?
+    publish(`listing:${b.listing_id}`)
+    publish(`user:${u.id}`)
+    null
+}
+
+server fn toggle_saved(listing_id: int) with db, time {
+    let u = acting()?
+    let gone = db.exec("delete from saved where user_id = ? and listing_id = ?", u.id, listing_id)?
+    if gone.changes == 0 { db.exec("insert into saved (user_id, listing_id, created) values (?, ?, ?)", u.id, listing_id, now())? }
+    publish(`listing:${listing_id}`)
+    gone.changes == 0
+}
+
+// ---- hosting -------------------------------------------------------------------------
+
+// The host's dashboard, live: requests to answer, who comes next, what each
+// place earned by month (a series for each currency: euros and yen are not
+// added together), and how full the places were each day.
+server fn load_host() with db, time {
+    let u = me()
+    if u == null || u.hosts != 1 { return null }
+    watch(`user:${u.id}`)
+    let today = today_day()
+    let listings = db.query("select * from listings where host_id = ? order by id", u.id) | map(listing_view)
+    let booked = db.query("select b.*, l.title, l.city, g.name as guest, g.hue as guest_hue from bookings b join listings l on l.id = b.listing_id join users g on g.id = b.guest_id where l.host_id = ? and b.status in ('confirmed', 'requested') order by b.start_day", u.id)
+        | map((b) => merge(b, { dates: range_label(b.start_day, b.end_day), total_shown: shown_minor(b.total, b.currency) }))
+    let months = range(0, 6) | map((i) => {
+        let p = day_parts(today)
+        let k = p.m - 6 + i
+        let y = k < 1 ? p.y - 1 : p.y
+        let m = k < 1 ? k + 12 : k
+        { key: `${y}-${two(m)}`, label: MONTH_NAMES[m - 1] }
+    })
+    let confirmed = booked | filter((b) => b.status == "confirmed")
+    let earned = db.query("select b.currency, substr(b.start_day, 1, 7) as month, sum(b.total - coalesce(b.refund, 0)) as minor from bookings b join listings l on l.id = b.listing_id where l.host_id = ? and b.status in ('confirmed', 'cancelled') group by 1, 2", u.id)
+    let currencies = earned | map((e) => e.currency) | unique
+    let nights = db.query("select n.day, count(*) as c from booking_nights n join listings l on l.id = n.listing_id join bookings b on b.id = n.booking_id where l.host_id = ? and b.status = 'confirmed' and n.day >= ? group by n.day", u.id, add_days(today, -180))
+    {
+        listings,
+        requests: booked | filter((b) => b.status == "requested"),
+        upcoming: confirmed | filter((b) => b.end_day > today) | take(10),
+        months: months | map((m) => m.label),
+        series: currencies | map((c) => {
+            name: c,
+            values: months | map((m) => {
+                let e = earned | find((x) => x.currency == c && x.month == m.key)
+                e == null ? 0 : money.to_minor(cash(e.minor, c)) / pow(10, money.minor_units(c))
+            }),
+        }),
+        heat: nights | reduce({}, (acc, n) => set(acc, n.day, n.c)),
+        today,
+        this_month: currencies | map((c) => {
+            let e = earned | find((x) => x.currency == c && x.month == slice(today, 0, 7))
+            { currency: c, shown: shown_minor(e.minor ?? 0, c) }
+        }),
+    }
+}
+
+server fn decide_request(id: int, accept: bool) with db, time {
+    let u = acting_host()?
+    let b = db.one("select b.*, l.host_id from bookings b join listings l on l.id = b.listing_id where b.id = ?", id)
+    if b == null || b.host_id != u.id { return err("No such request") }
+    if b.status != "requested" { return err(b.status == "expired" ? "This request ran out before you answered" : "This request has been answered") }
+    db.transaction(() => {
+        let done = db.exec("update bookings set status = ?, decided = ?, refund = ? where id = ? and status = 'requested' and respond_by >= ?",
+            accept ? "confirmed" : "declined", now(), accept ? null : b.total, id, now())?
+        if done.changes == 0 { return err("This request ran out before you answered") }
+        if !accept { db.exec("delete from booking_nights where booking_id = ?", id)? }
+    })?
+    publish(`listing:${b.listing_id}`)
+    publish(`user:${u.id}`)
+    publish(`user:${b.guest_id}`)
+    null
+}
+
+// A month of a host's place, live: { days: [{ day, price, shown, state }] }
+// where state is free, closed, held, requested or booked.
+server fn load_calendar(id: int, month: str) with db, time {
+    let u = me()
+    let l = listing_row(id)
+    if u == null || l == null || l.host_id != u.id { return null }
+    watch(`listing:${id}`)
+    let first = `${month}-01`
+    if !is_day(first) { return null }
+    let p = day_parts(first)
+    let end = add_days(first, month_days(p.y, p.m))
+    let custom = custom_prices(id, first, end)
+    let closed = db.query("select day from blocked_nights where listing_id = ? and day >= ? and day < ?", id, first, end) | map((r) => r.day)
+    let taken = db.query("select n.day, b.status, g.name from booking_nights n join bookings b on b.id = n.booking_id join users g on g.id = b.guest_id where n.listing_id = ? and n.day >= ? and n.day < ?", id, first, end)
+        | reduce({}, (m, r) => set(m, r.day, r))
+    {
+        listing: listing_view(l),
+        month,
+        title: `${MONTH_NAMES[p.m - 1]} ${p.y}`,
+        lead: weekday(first) - 1,
+        today: local_day(l.city, now()),
+        days: nights_of(first, end) | map((d) => {
+            let t = get(taken, d)
+            let price = night_price(l, d, custom)
+            {
+                day: d,
+                n: day_parts(d).d,
+                price,
+                shown: shown_minor(price, l.currency),
+                custom: has(custom, d),
+                state: t != null ? (t.status == "confirmed" ? "booked" : t.status) : contains(closed, d) ? "closed" : "free",
+                guest: t.name ?? null,
+            }
+        }),
+    }
+}
+
+// Close, open or price nights of a host's place. Booked nights stay as they
+// are: { changed, skipped }.
+server fn set_nights(id: int, days: list, action: str, price: str) with db, time {
+    let u = acting_host()?
+    let l = listing_row(id)
+    if l == null || l.host_id != u.id { return err("Not your place") }
+    let wanted = days | filter((d) => is_day(d)) | unique
+    if len(wanted) == 0 { return err("Pick some nights first") }
+    if len(wanted) > 366 { return err("At most a year at a time") }
+    let minor = action == "price" ? money.of(trim(price), l.currency) : null
+    if is_err(minor) { return err(`A price in ${l.currency}, as ${l.currency == "JPY" ? "18000" : "95.00"}`) }
+    let booked = db.query("select day from booking_nights where listing_id = ?", id) | map((r) => r.day)
+    let free = wanted | filter((d) => !contains(booked, d))
+    db.transaction(() => {
+        for d in free {
+            match action {
+                "close" => db.exec("insert or ignore into blocked_nights (listing_id, day) values (?, ?)", id, d)?
+                "open" => db.exec("delete from blocked_nights where listing_id = ? and day = ?", id, d)?
+                "price" => db.exec("insert into night_prices (listing_id, day, price) values (?, ?, ?) on conflict (listing_id, day) do update set price = excluded.price", id, d, money.to_minor(minor))?
+                "usual" => db.exec("delete from night_prices where listing_id = ? and day = ?", id, d)?
+                _ => return err("Close, open, price or usual")
+            }
+        }
+    })?
+    publish(`listing:${id}`)
+    { changed: len(free), skipped: len(wanted) - len(free) }
+}
+
+// A new place: where it is comes from its address (Nominatim), or from the
+// pin the host moved on the map.
+server fn add_listing(f: map) with http, db, time, random {
+    let u = acting()?
+    let title = trim(f.title ?? "")
+    if len(title) < 5 { return err("A title of 5 characters or more") }
+    if !contains(KINDS, f.kind) { return err("What kind of place is it?") }
+    let city = trim(f.city ?? "")
+    if !has(CITY_ZONES, city) { return err(`Places can be listed in ${join(keys(CITY_ZONES), ", ")} for now`) }
+    let currency = city == "Kyoto" ? "JPY" : "EUR"
+    let base = money.of(trim(str(f.base ?? "")), currency)
+    let weekend = money.of(trim(str(f.weekend ?? f.base ?? "")), currency)
+    let cleaning = money.of(trim(str(f.cleaning ?? "0")), currency)
+    if is_err(base) || is_err(weekend) || is_err(cleaning) { return err(`Prices in ${currency}${currency == "JPY" ? ", in whole yen" : ""}`) }
+    let lat = float(f.lat) ?? null
+    let lng = float(f.lng) ?? null
+    let spot = lat != null && lng != null ? { lat, lng } : geocode(`${f.address}, ${city}`)
+    if is_err(spot) { return err(`The address was not found: ${spot.error}. Move the pin on the map instead`) }
+    let guests = int(f.guests ?? 2) ?? 2
+    if guests < 1 || guests > 16 { return err("From 1 to 16 guests") }
+    let id = db.transaction(() => {
+        db.exec("update users set hosts = 1 where id = ?", u.id)?
+        db.exec("insert into listings (host_id, title, kind, city, country, address, lat, lng, currency, base_price, weekend_price, cleaning_fee, max_guests, bedrooms, beds, baths, amenities, description, instant_book, cancel_policy, min_nights, hue, created) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            u.id, title, f.kind, city, city == "Kyoto" ? "Japan" : city == "Barcelona" ? "Spain" : city == "Dublin" ? "Ireland" : "Portugal",
+            trim(f.address ?? ""), spot.lat, spot.lng, currency, money.to_minor(base), money.to_minor(weekend), money.to_minor(cleaning),
+            guests, max([1, ceil(guests / 2)]), max([1, ceil(guests / 2)]), 1,
+            join((f.amenities ?? []) | filter((a) => has(AMENITIES, a)), ","), trim(f.description ?? ""),
+            f.instant == true ? 1 : 0, has(POLICIES, f.policy) ? f.policy : "moderate", max([1, int(f.min_nights ?? 1) ?? 1]),
+            random_int(0, 359), now())?.last_id
+    })?
+    publish(`user:${u.id}`)
+    id
+}
+
+// ---- activities --------------------------------------------------------------------
+
+// Activities within 20 km of a place, with their slots on the days of the
+// stay, and the forecast for each slot's day if one is kept (outdoor ones say
+// when rain is likely). Live, so it must not wait on Open-Meteo.
+server fn activities_near(id: int, start: str, end: str) with db, time {
+    let l = listing_row(id)
+    if l == null { return [] }
+    let today = local_day(l.city, now())
+    let from = is_day(start) && start >= today ? start : today
+    let to = is_day(end) && end > from ? end : add_days(from, 7)
+    let w = forecast_kept(l.lat, l.lng)
+    let weather = w == null ? {} : w.days | reduce({}, (m, d) => set(m, d.day, d))
+    db.query("select * from activities where currency = ?", l.currency)
+        | map((a) => merge(a, { km: round(metres(l.lat, l.lng, a.lat, a.lng) / 100) / 10 }))
+        | filter((a) => a.km <= 20)
+        | sort_by((a) => a.km)
+        | map((a) => {
+            watch(`slots:${a.id}`)
+            merge(a, {
+                price_shown: shown_minor(a.price, a.currency),
+                slots: db.query("select * from activity_slots where activity_id = ? and day >= ? and day <= ? order by day, time", a.id, from, to)
+                    | map((s) => {
+                        let d = get(weather, s.day)
+                        merge(s, {
+                            label: `${day_label(s.day)} ${s.time}`,
+                            left: s.capacity - s.taken,
+                            rain: d.rain ?? null,
+                            wet: (a.kind == "outdoors" || a.kind == "water") && (d.rain ?? 0) >= 60,
+                        })
+                    }),
+            })
+        })
+}
+
+server fn book_activity(slot_id: int, people: int) with db, time {
+    let u = acting()?
+    if people < 1 || people > 10 { return err("From 1 to 10 people") }
+    let s = db.one("select s.*, a.price, a.currency, a.title from activity_slots s join activities a on a.id = s.activity_id where s.id = ?", slot_id)
+    if s == null { return err("No such time") }
+    if s.day < today_day() { return err("That time has passed") }
+    let id = db.transaction(() => {
+        // Places left are counted by the database, not read and written back.
+        let took = db.exec("update activity_slots set taken = taken + ? where id = ? and taken + ? <= capacity", people, slot_id, people)?
+        if took.changes == 0 { return err(s.capacity - s.taken <= 0 ? "That time is full" : `Only ${plural(s.capacity - s.taken, "place")} left at that time`) }
+        db.exec("insert into activity_bookings (slot_id, user_id, people, total, currency, created) values (?, ?, ?, ?, ?, ?)", slot_id, u.id, people, s.price * people, s.currency, now())?.last_id
+    })?
+    publish(`slots:${s.activity_id}`)
+    publish(`user:${u.id}`)
+    { id, title: s.title, total_shown: shown_minor(s.price * people, s.currency) }
+}
+
+// ---- the outside services' status -------------------------------------------------------
+
+server fn load_outside() with db, time {
+    let since = now() - 24 * 3600000
+    {
+        services: db.query("select service, count(*) as calls, sum(case when status between 200 and 299 then 0 else 1 end) as failed, avg(ms) as avg_ms, max(ms) as max_ms, max(created) as last from outside_calls where created >= ? group by service order by service", since)
+            | map((s) => merge(s, { avg_ms: round(s.avg_ms) })),
+        kept: db.query("select service, count(*) as n from outside group by service order by service"),
+        recent: db.query("select service, status, ms, url, created from outside_calls order by id desc limit 15"),
+    }
+}

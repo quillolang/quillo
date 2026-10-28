@@ -206,7 +206,7 @@ mod dev {
                     let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok()).clone();
                     with_map(&p.code, src, content.as_deref())
                 }
-                None => format!("\"use strict\";\n{}", p.code.replace(MARK, "")),
+                None => format!("\"use strict\";\n{}", unmarked(&p.code)),
             };
             order.push(p.path.clone());
             files.insert(p.path, text);
@@ -245,6 +245,15 @@ mod dev {
             js_str(&format!("{}/_quillo/src/{}/", it.base, hash)),
             list.join(", ")
         )
+    }
+
+    /// `code` without its line marks, each with the line it names: a piece
+    /// with no source file to map them to (a constant made from its
+    /// definition, `let star = <svg>...</svg>`). Taking out only the marks
+    /// left their numbers in the code: `59return W.t(...)` (FEEDBACK5.md,
+    /// Q-047; branch stays-fixes).
+    fn unmarked(code: &str) -> String {
+        code.split(MARK).enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, part)| part).collect()
     }
 
     /// The global `G["name"] = ...` defines, if it is one.
@@ -418,6 +427,14 @@ mod dev {
             // Line 2 (after "use strict") col 0 → source line 3 (index 2); line 4: col 7 → 5, col 12 → 6.
             assert_eq!(map["mappings"], ";AAEA;;OAEA,KACA");
             assert_eq!(map["sources"][0], "file:///app/main.qwe");
+        }
+
+        // A piece with no file to map to loses its marks with their lines
+        // (FEEDBACK5.md, Q-047; branch stays-fixes).
+        #[test]
+        fn marks_go_with_their_lines() {
+            let code = format!("G[\"star\"] = (function () {{\n{m}59{m}return W.t($b1, []);\n}})();\n", m = MARK);
+            assert_eq!(unmarked(&code), "G[\"star\"] = (function () {\nreturn W.t($b1, []);\n})();\n");
         }
 
         #[test]
@@ -1223,6 +1240,39 @@ fn lit_js(l: &Lit) -> String {
     }
 }
 
+/// A top-level constant's value as JavaScript, for the bundle. JSON would
+/// do but for decimals (text in JSON) and ints past 2^53 (rounded): those
+/// are written as the literals `lit_js` gives, wherever they are inside
+/// lists and maps (FEEDBACK5.md, Q-045; branch stays-fixes).
+fn value_js(v: &Value) -> String {
+    fn exact(v: &Value) -> bool {
+        match v {
+            Value::Dec(_) => false,
+            Value::Int(n) => n.unsigned_abs() <= (1 << 53) - 1,
+            Value::List(l) => l.iter().all(exact),
+            Value::Map(m) => m.values().all(exact),
+            _ => true,
+        }
+    }
+    if exact(v) {
+        return v.to_json().to_string();
+    }
+    match v {
+        Value::Dec(d) => format!("new W.Dec({}n, {})", d.mantissa(), d.scale()),
+        Value::Int(n) => format!("{}n", n),
+        Value::List(l) => format!("[{}]", l.iter().map(value_js).collect::<Vec<_>>().join(",")),
+        // `"__proto__": x` in a literal would set the object's prototype.
+        Value::Map(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, x)| if &**k == "__proto__" { format!("[{}]:{}", js_str(k), value_js(x)) } else { format!("{}:{}", js_str(k), value_js(x)) })
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_json().to_string(),
+    }
+}
+
 impl<'a> Compiler<'a> {
     fn new(it: &'a Interp) -> Self {
         let mut assigned = HashSet::new();
@@ -1545,7 +1595,7 @@ impl<'a> Compiler<'a> {
                     }
                     return self.err(format!("`{}` is {}, which cannot be sent to the browser", name, bad));
                 }
-                self.defs.push(format!("{} = {};", js, other.to_json()));
+                self.defs.push(format!("{} = {};", js, value_js(other)));
                 let r = (js, false);
                 self.globals.insert(name.to_string(), r.clone());
                 Ok(r)

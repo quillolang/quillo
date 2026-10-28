@@ -1,0 +1,220 @@
+// MonthCalendar: a month of days, each with a state and a short text, for a
+// calendar someone edits: a host's nights (free, closed, booked) with their price,
+// a team's rota, a room's bookings. Click a day to pick it (again to let it go),
+// shift-click to pick every day from the last one clicked; then act on the days
+// picked. The arrow keys move between days, Enter or Space picks, PageUp and
+// PageDown turn the month.
+//
+//   <MonthCalendar month="2026-12" today="2026-11-20" selected={picked}
+//                  days={[{ day: "2026-12-24", state: "closed" }, { day: "2026-12-26", state: "booked", note: "Ana" }]}
+//                  labels={prices} on_select={(days) => { picked = days }}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// month: "YYYY-MM" shown first. days: a list of { day, state?, note? }: state is
+// any word, given as a class (ui-month-calendar-<state>; free, closed, booked and
+// held are styled), note a second line ("Ana", "2 left"). labels: a map of day to
+// a short text (a price). today: the day marked, and before which days cannot be
+// picked (the browser's own date by default); past: true lets them be picked.
+// selected: the days picked ("YYYY-MM-DD" each). week_start: 1 (Monday) or 0.
+// name: a plain <form> gets the days picked in it, comma-separated.
+// label: what screen readers call the calendar ("Calendar").
+// on_select(days): inside one of your components, given the days picked in order;
+// with it, the days shown picked are `selected`, as you keep them (set it to [] to
+// clear them); without it, the calendar keeps them itself.
+// on_month(month): told the "YYYY-MM" shown when the month is turned.
+
+let month_calendar_css = css`
+.ui-month-calendar { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-month-calendar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ui-month-calendar-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-month-calendar-nav {
+  display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); cursor: pointer;
+}
+.ui-month-calendar-nav svg { width: 18px; height: 18px; }
+.ui-month-calendar-nav:hover { border-color: var(--ui-strong); }
+.ui-month-calendar-nav:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-month-calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.ui-month-calendar-wd { padding: 2px 0; font-size: 12px; font-weight: 500; color: var(--ui-muted); text-align: center; }
+.ui-month-calendar-day {
+  display: grid; align-content: space-between; gap: 2px; min-height: 64px; min-width: 0; padding: 6px; text-align: left;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 12px/1.25 var(--ui-font); cursor: pointer;
+}
+.ui-month-calendar-day b { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-month-calendar-day span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-month-calendar-label { font-weight: 500; }
+.ui-month-calendar-note { color: var(--ui-muted); }
+.ui-month-calendar-day:hover:not(:disabled) { border-color: var(--ui-strong); }
+.ui-month-calendar-day:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-month-calendar-day:disabled { opacity: .5; cursor: not-allowed; }
+.ui-month-calendar-today b { color: var(--ui-accent); }
+.ui-month-calendar-closed {
+  background: repeating-linear-gradient(45deg, var(--ui-surface), var(--ui-surface) 6px, var(--ui-subtle) 6px, var(--ui-subtle) 8px);
+}
+.ui-month-calendar-closed .ui-month-calendar-label { text-decoration: line-through; color: var(--ui-muted); }
+.ui-month-calendar-booked { background: var(--ui-success-soft); border-color: transparent; }
+.ui-month-calendar-held { background: var(--ui-warning-soft); border-color: transparent; }
+.ui-month-calendar-day[aria-pressed="true"] { border-color: var(--ui-accent); box-shadow: inset 0 0 0 1px var(--ui-accent); }
+.ui-month-calendar-foot { margin: 0; font-size: 13px; color: var(--ui-muted); }
+@media (max-width: 520px) {
+  .ui-month-calendar-day { min-height: 52px; padding: 4px; font-size: 11px; }
+  .ui-month-calendar-note { display: none; }
+}
+`
+
+let month_calendar_months = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+                             "October", "November", "December"]
+let month_calendar_weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+// DatePicker's date helpers, so that the file works on its own: a date is a day
+// number, the days since 1970-01-01.
+fn month_calendar_days(y: int, m: int, d: int) -> int {
+    let yy = m <= 2 ? y - 1 : y
+    let era = floor(yy / 400)
+    let yoe = yy - era * 400
+    let doy = floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+    era * 146097 + yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy - 719468
+}
+
+fn month_calendar_civil(z: int) {
+    let zz = z + 719468
+    let era = floor(zz / 146097)
+    let doe = zz - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m: m, d: doy - floor((153 * mp + 2) / 5) + 1 }
+}
+
+fn month_calendar_month_len(y: int, m: int) -> int =
+    m == 2 ? (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) ? 29 : 28) : [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+
+fn month_calendar_weekday(z: int) -> int = ((z % 7) + 11) % 7
+
+fn month_calendar_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+fn month_calendar_iso(z: int) -> str {
+    let c = month_calendar_civil(z)
+    `${c.y}-${month_calendar_pad(c.m)}-${month_calendar_pad(c.d)}`
+}
+
+fn month_calendar_parse(text: str?) {
+    let t = trim(text ?? "")
+    if !re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") { return null }
+    let y = int(slice(t, 0, 4))
+    let m = int(slice(t, 5, 7))
+    let d = int(slice(t, 8, 10))
+    m >= 1 && m <= 12 && d >= 1 && d <= month_calendar_month_len(y, m) ? month_calendar_days(y, m, d) : null
+}
+
+// "2026-12" moved by k months: "2027-01" for k = 1.
+fn month_calendar_turn(month: str, k: int) -> str {
+    let first = month_calendar_parse(`${month}-01`) ?? 0
+    let c = month_calendar_civil(first)
+    let i = c.y * 12 + c.m - 1 + k
+    `${floor(i / 12)}-${month_calendar_pad(i - floor(i / 12) * 12 + 1)}`
+}
+
+component MonthCalendar(month: str, days: list = [], labels: map = {}, selected: list = [], today: str? = null,
+                        past: bool = false, week_start: int = 1, name: str? = null, label: str = "Calendar",
+                        on_select = null, on_month = null, class: str? = null) {
+    state own_month = month
+    state own_picked = selected
+    state last = null
+    state now_d = month_calendar_parse(today) ?? floor(now() / 86400000)
+    let shown = on_month != null ? month : own_month
+    let picked = on_select != null ? selected : own_picked
+    let first = month_calendar_parse(`${shown}-01`) ?? month_calendar_parse(`${month}-01`) ?? now_d
+    let c = month_calendar_civil(first)
+    let n = month_calendar_month_len(c.y, c.m)
+    let lead = (month_calendar_weekday(first) - week_start + 7) % 7
+    let order = range(7) | map((i) => (i + week_start) % 7)
+    let by_day = days | reduce({}, (m, d) => set(m, d.day, d))
+    let open = (z: int) => past || z >= now_d
+    let title = `${month_calendar_months[c.m - 1]} ${c.y}`
+    let choose = (next: list) => {
+        let sorted = next | unique | sort
+        own_picked = sorted
+        on_select && on_select(sorted)
+    }
+    let turn = (k: int) => {
+        let to = month_calendar_turn(shown, k)
+        own_month = to
+        on_month && on_month(to)
+    }
+    let focus_day = (e, z: int) => {
+        let root = e.target.closest(".ui-month-calendar")
+        js("requestAnimationFrame", (t) => {
+            let cell = root.querySelector(`[data-day="${month_calendar_iso(z)}"]`)
+            cell && cell.focus()
+        })
+    }
+    <div class={ui_cls(["ui-month-calendar", class])} role="group" aria-label={label}>
+        <div.ui-month-calendar-head>
+            <button.ui-month-calendar-nav type="button" aria-label="Previous month" @click={() => turn(-1)}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                     stroke-linejoin="round" aria-hidden="true"><path d="M12 5l-5 5 5 5"/></svg>
+            </button>
+            <h2 aria-live="polite">{title}</h2>
+            <button.ui-month-calendar-nav type="button" aria-label="Next month" @click={() => turn(1)}>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                     stroke-linejoin="round" aria-hidden="true"><path d="M8 5l5 5-5 5"/></svg>
+            </button>
+        </div>
+        <div.ui-month-calendar-grid
+             @keydown={(e) => {
+                 let at = month_calendar_parse(e.target.dataset.day ?? "")
+                 let to = at == null ? null : match e.key {
+                     "ArrowLeft" => at - 1
+                     "ArrowRight" => at + 1
+                     "ArrowUp" => at - 7
+                     "ArrowDown" => at + 7
+                     _ => null
+                 }
+                 if to != null {
+                     e.preventDefault()
+                     if to < first { turn(-1) }
+                     if to >= first + n { turn(1) }
+                     focus_day(e, to)
+                 }
+                 if e.key == "PageUp" || e.key == "PageDown" {
+                     e.preventDefault()
+                     turn(e.key == "PageUp" ? -1 : 1)
+                 }
+             }}>
+            {for d in order => <span.ui-month-calendar-wd key={`wd${d}`} aria-hidden="true">{slice(month_calendar_weekdays[d], 0, 3)}</span>}
+            {for i in range(lead) => <span key={`pad${i}`} aria-hidden="true"></span>}
+            {for z in range(first, first + n) => {
+                let iso = month_calendar_iso(z)
+                let info = get(by_day, iso) ?? {}
+                let state_word = info.state ?? "free"
+                let text = get(labels, iso)
+                let on = contains(picked, iso)
+                let said = [`${month_calendar_weekdays[month_calendar_weekday(z)]} ${month_calendar_civil(z).d} ${month_calendar_months[c.m - 1]}`,
+                            state_word, text, info.note] | filter((x) => x != null) | join(", ")
+                <button key={iso} type="button" data-day={iso} disabled={!open(z)} aria-pressed={on ? "true" : "false"}
+                        class={ui_cls(["ui-month-calendar-day", `ui-month-calendar-${state_word}`, z == now_d && "ui-month-calendar-today"])}
+                        aria-label={said}
+                        @click={(e) => {
+                            if e.shiftKey && last != null {
+                                let a = last < z ? last : z
+                                let b = last < z ? z : last
+                                choose(picked + (range(a, b + 1) | filter((x) => open(x)) | map((x) => month_calendar_iso(x))))
+                            } else {
+                                choose(on ? picked | filter((p) => p != iso) : picked + [iso])
+                            }
+                            last = z
+                        }}>
+                    <b>{month_calendar_civil(z).d}</b>
+                    <span.ui-month-calendar-label>{text ?? ""}</span>
+                    <span.ui-month-calendar-note>{info.note ?? (state_word == "free" ? "" : state_word)}</span>
+                </button>
+            }}
+        </div>
+        <p.ui-month-calendar-foot aria-live="polite">{len(picked) == 0 ? "No days picked." : len(picked) == 1 ? "1 day picked." : `${len(picked)} days picked.`}</p>
+        {name != null ? <input type="hidden" name={name} value={join(picked, ",")}/> : null}
+    </div>
+}

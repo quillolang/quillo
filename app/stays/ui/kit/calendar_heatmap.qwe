@@ -1,0 +1,168 @@
+// CalendarHeatmap: a year of daily counts as a grid of weeks, each day shaded by
+// how much happened on it, as on a contributions page. Hovering a day names it.
+//
+//   <CalendarHeatmap values={commits_by_day} end="2026-10-28" unit="commits"/>
+//   <CalendarHeatmap values={{ "2026-03-14": 4, "2026-03-15": 1 }} tone="success" week_start="monday"/>
+//
+// values: a map from ISO dates ("2026-03-14") to numbers; a day not in it counts
+// as 0. end: the last day shown (by default the latest day in values, else today,
+// in UTC); start: the first (a year before end, 365 days in all). Each column is
+// a week, Sunday first, or Monday with week_start="monday". The days that had
+// something get one of four shades, by their share of the busiest day; the legend
+// under it goes from less to more. unit: what is counted, in the plural
+// ("contributions"); a day of 1 drops its final "s". tone: "accent" (default),
+// "success", "info", "warning" or "danger". total: the line above it, "1,204
+// contributions in the last year" (true). label: what it shows, for screen
+// readers, who hear the total and the busiest day. On a narrow screen it scrolls
+// sideways, starting at the latest weeks.
+
+let calendar_heatmap_css = css`
+.ui-ch { display: grid; gap: 8px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); --t: var(--ui-accent); }
+.ui-ch-success { --t: var(--ui-success); }
+.ui-ch-info { --t: var(--ui-info); }
+.ui-ch-warning { --t: var(--ui-warning); }
+.ui-ch-danger { --t: var(--ui-danger); }
+.ui-ch-total { margin: 0; font-size: 14px; }
+.ui-ch-scroll { overflow-x: auto; overflow-y: hidden; direction: rtl; }
+.ui-ch-scroll:focus-visible { outline: none; border-radius: var(--ui-radius-sm); box-shadow: var(--ui-focus); }
+.ui-ch-svg { display: block; width: 100%; height: auto; margin-right: auto; direction: ltr; }
+.ui-ch-svg text { fill: var(--ui-muted); font: 9px var(--ui-font); }
+.ui-ch-day { stroke: transparent; stroke-width: 1; }
+.ui-ch-day:hover { stroke: var(--ui-fg); }
+.ui-ch-l0 { fill: color-mix(in srgb, var(--ui-border) 55%, var(--ui-subtle)); }
+.ui-ch-l1 { fill: color-mix(in srgb, var(--t) 30%, var(--ui-subtle)); }
+.ui-ch-l2 { fill: color-mix(in srgb, var(--t) 52%, var(--ui-subtle)); }
+.ui-ch-l3 { fill: color-mix(in srgb, var(--t) 76%, var(--ui-subtle)); }
+.ui-ch-l4 { fill: var(--t); }
+.ui-ch-legend { display: flex; align-items: center; justify-content: flex-end; gap: 3px; color: var(--ui-muted); }
+.ui-ch-legend svg { width: 10px; height: 10px; }
+.ui-ch-legend span:first-child { margin-right: 4px; }
+.ui-ch-legend span:last-child { margin-left: 4px; }
+`
+
+let calendar_heatmap_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let calendar_heatmap_weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn calendar_heatmap_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn calendar_heatmap_group(n: int) -> str =
+    n < 1000 ? str(n) : calendar_heatmap_group(floor(n / 1000)) + "," + calendar_heatmap_pad(n % 1000, 3)
+
+// A count as it reads, to two decimals at most: 1204 is "1,204", 2.5 is "2.5".
+fn calendar_heatmap_num(v: num) -> str {
+    let cents = round(abs(v) * 100)
+    let frac = cents % 100
+    let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${calendar_heatmap_pad(frac, 2)}`)
+    `${v < 0 && cents > 0 ? "-" : ""}${calendar_heatmap_group(floor(cents / 100))}${tail}`
+}
+
+// The day number of a date, counted from 1970-01-01 (day 0).
+fn calendar_heatmap_day(y: int, m: int, d: int) -> int {
+    let yy = m <= 2 ? y - 1 : y
+    let era = floor(yy / 400)
+    let yoe = yy - era * 400
+    let doy = floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+    era * 146097 + yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy - 719468
+}
+
+// The date of a day number: { y, m, d }.
+fn calendar_heatmap_date(n: int) -> map {
+    let z = n + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m, d: doy - floor((153 * mp + 2) / 5) + 1 }
+}
+
+// The day number of an ISO date ("2026-03-14", or the start of a date-time), or null.
+fn calendar_heatmap_parse(s: str) -> int? {
+    let p = re.find(s, "^(\\d{4})-(\\d{2})-(\\d{2})")
+    p == null ? null : calendar_heatmap_day(int(p.groups[0]), int(p.groups[1]), int(p.groups[2]))
+}
+
+// A day number as an ISO date, "2026-03-14".
+fn calendar_heatmap_iso(n: int) -> str {
+    let t = calendar_heatmap_date(n)
+    `${t.y}-${calendar_heatmap_pad(t.m, 2)}-${calendar_heatmap_pad(t.d, 2)}`
+}
+
+// A day number as people read it: "Mar 14, 2026".
+fn calendar_heatmap_show(n: int) -> str {
+    let t = calendar_heatmap_date(n)
+    `${calendar_heatmap_months[t.m - 1]} ${t.d}, ${t.y}`
+}
+
+view CalendarHeatmap(values: map = {}, end: str? = null, start: str? = null, week_start: str = "sunday",
+                     unit: str = "contributions", tone: str = "accent", total: bool = true,
+                     label: str = "Activity", class: str? = null) {
+    let known = keys(values) | map((k) => calendar_heatmap_parse(k)) | filter((d) => d != null)
+    let last = (end != null ? calendar_heatmap_parse(end) : null)
+        ?? (len(known) > 0 ? max(known) : floor(now() / 86400000))
+    let first0 = start != null ? calendar_heatmap_parse(start) : null
+    let first = first0 != null && first0 <= last ? first0 : last - 364
+    let monday = week_start == "monday"
+    let row = (n) => (n + (monday ? 3 : 4)) % 7                   // 1970-01-01 was a Thursday
+    let origin = first - row(first)                               // the first column's first day
+    let weeks = floor((last - origin) / 7) + 1
+    let at = (n) => {
+        let v = values[calendar_heatmap_iso(n)]
+        type_of(v) == "int" || type_of(v) == "float" ? v : 0
+    }
+    let days = range(first, last + 1)
+    let counts = days | map(at)
+    let top = max([0] + counts)
+    let sum_all = sum(counts)
+    let busiest = top > 0 ? find(days, (n) => at(n) == top) : null
+    let level = (v) => v <= 0 || top <= 0 ? 0 : (ceil(v * 4 / top) > 4 ? 4 : ceil(v * 4 / top))
+    let one = ends_with(unit, "s") ? slice(unit, 0, -1) : unit
+    let says = (v) => `${v == 0 ? "No" : calendar_heatmap_num(v)} ${v == 1 ? one : unit}`
+    let left = 30
+    let pitch = 13
+    let width = left + weeks * pitch
+    let height = 18 + 7 * pitch
+    // A month's name over the week its first day falls in (or over the first week, from the
+    // middle of a month), unless the next one is too close.
+    let month_day = (c) => find(range(origin + c * 7, origin + c * 7 + 7),
+                                (n) => n >= first && n <= last && calendar_heatmap_date(n).d == 1)
+    let marks = range(weeks)
+        | map((c) => { c, day: month_day(c) ?? (c == 0 && calendar_heatmap_date(first).d <= 14 ? first : null) })
+        | filter((m) => m.day != null)
+    let named = marks | filter((m) => {
+        let next = find(marks, (o) => o.c > m.c)
+        next == null ? m.c <= weeks - 3 : next.c - m.c >= 3
+    })
+    let range_text = start == null ? "in the last year"
+        : `from ${calendar_heatmap_show(first)} to ${calendar_heatmap_show(last)}`
+    <figure class={ui_cls(["ui-ch", tone != "accent" && `ui-ch-${tone}`, class])}>
+        {total && <p.ui-ch-total>{calendar_heatmap_num(sum_all)} {sum_all == 1 ? one : unit} {range_text}</p>}
+        <div.ui-ch-scroll>
+            <svg.ui-ch-svg viewBox={`0 0 ${width} ${height}`} style={`min-width: ${floor(width * 0.8)}px; max-width: ${floor(width * 1.3)}px`} role="img"
+                 aria-label={`${label}: ${calendar_heatmap_num(sum_all)} ${sum_all == 1 ? one : unit} ${range_text}` +
+                             (busiest != null ? `; the busiest day was ${calendar_heatmap_show(busiest)}, with ${calendar_heatmap_num(top)}` : "")}>
+                {for m in named => <text x={str(left + m.c * pitch)} y="10">{calendar_heatmap_months[calendar_heatmap_date(m.day).m - 1]}</text>}
+                {for r in (monday ? [0, 2, 4] : [1, 3, 5]) =>
+                    <text x="0" y={str(18 + r * pitch + 8)}>{calendar_heatmap_weekdays[(r + (monday ? 1 : 0)) % 7]}</text>}
+                {for n in days => {
+                    let v = at(n)
+                    <rect class={`ui-ch-day ui-ch-l${level(v)}`} x={str(left + floor((n - origin) / 7) * pitch)}
+                          y={str(18 + row(n) * pitch)} width="10" height="10" rx="2" data-date={calendar_heatmap_iso(n)}>
+                        <title>{says(v)} on {calendar_heatmap_weekdays[(n + 4) % 7]}, {calendar_heatmap_show(n)}</title>
+                    </rect>
+                }}
+            </svg>
+        </div>
+        <div.ui-ch-legend aria-hidden="true">
+            <span>Less</span>
+            {for l in range(5) => <svg viewBox="0 0 10 10"><rect class={`ui-ch-l${l}`} width="10" height="10" rx="2"/></svg>}
+            <span>More</span>
+        </div>
+    </figure>
+}

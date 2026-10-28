@@ -1,0 +1,50 @@
+// SegmentedControl: a row of choices where one is picked, shown as a pill with the
+// picked one raised. It is a group of real radio buttons, so it works in a plain
+// <form> (sends `name` = the picked value) and with the arrow keys.
+//
+//   <SegmentedControl name="view" options={["Day", "Week", "Month"]} value="Week"/>
+//   <SegmentedControl name="plan" label="Billing" value={plan} on_change={(v) => { plan = v }}
+//                     options={[{ label: "Monthly", value: "m" }, { label: "Yearly", value: "y" }]}/>
+//
+// name: the radios' name, unique on the page. options: strings, or maps of
+// { label, value }. value: the one picked (the first if none).
+// label: what screen readers call the group. size: "sm" or "md" (default).
+// full: as wide as its container, the segments sharing it. disabled: all of it.
+// on_change(value): inside one of your components, called with the value picked.
+
+let segmented_control_css = css`
+.ui-segmented {
+  display: inline-flex; justify-self: start; gap: 2px; padding: 3px; border-radius: calc(var(--ui-radius-sm) + 3px);
+  background: var(--ui-subtle); border: 1px solid var(--ui-border); font: 500 14px/1 var(--ui-font); color: var(--ui-muted);
+}
+.ui-segmented-full { display: flex; justify-self: stretch; }
+.ui-segmented-full .ui-segmented-opt { flex: 1 1 0; }
+.ui-segmented-opt { position: relative; display: flex; cursor: pointer; }
+.ui-segmented-opt input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.ui-segmented-opt span {
+  flex: 1; display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 14px;
+  border-radius: var(--ui-radius-sm); white-space: nowrap; transition: background .15s, color .15s, box-shadow .15s;
+}
+.ui-segmented-opt:hover span { color: var(--ui-fg); }
+.ui-segmented-opt input:checked + span { background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); }
+.ui-segmented-opt input:focus-visible + span { box-shadow: var(--ui-focus); }
+.ui-segmented-opt input:checked:focus-visible + span { box-shadow: var(--ui-shadow), var(--ui-focus); }
+.ui-segmented-sm .ui-segmented-opt span { height: 24px; padding: 0 10px; font-size: 13px; }
+.ui-segmented:has(input:disabled) { opacity: .55; }
+.ui-segmented:has(input:disabled) .ui-segmented-opt { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-segmented-opt span { transition: none; } }
+`
+
+view SegmentedControl(name: str, options: list = [], value: str? = null, label: str? = null, size: str = "md",
+                      full: bool = false, disabled: bool = false, on_change = null, class: str? = null) {
+    let opts = options | map((o) => type_of(o) == "str" ? { label: o, value: o } : o)
+    let picked = value ?? (len(opts) > 0 ? opts[0].value : null)
+    <div class={ui_cls(["ui-segmented", size == "sm" && "ui-segmented-sm", full && "ui-segmented-full", class])}
+         role="radiogroup" aria-label={label}>
+        {for o in opts => <label.ui-segmented-opt>
+            <input type="radio" name={name} value={o.value} checked={o.value == picked} disabled={disabled}
+                   @change={(e) => { on_change && on_change(e.value) }}/>
+            <span>{o.label}</span>
+        </label>}
+    </div>
+}

@@ -1,0 +1,133 @@
+// Quillo Stays: places to stay, with the weather for the dates, places to eat
+// and see around them, and activities nearby to book, from outside services.
+//
+//   quillo run app/stays/main.qwe --watch                       asks the real services
+//   STAYS_DEMO=1 quillo run app/stays/main.qwe --watch          with hosts, places, bookings and activities
+//   STAYS_OFFLINE=1 STAYS_DEMO=1 quillo run app/stays/main.qwe  made-up answers instead of the services, for tests
+//   quillo check app/stays/main.qwe
+//
+// Demo sign-ins (password "password"): guests sam@stays.test and lee@stays.test;
+// hosts ana@stays.test (Lisbon, Porto), jordi@stays.test (Barcelona),
+// aoife@stays.test (Dublin) and kenji@stays.test (Kyoto, in yen).
+//
+// The outside services (lib/outside.qwe), each answer kept for a while in the
+// database and every call logged (/status):
+//
+//   Nominatim     where an address or a city is (one call a second at most)
+//   Open-Meteo    16 days of forecast
+//   Overpass      places to eat, see and do around a place; Photon when it does not answer
+//   OSM tiles     the maps, drawn by Leaflet (from cdnjs) in the browser
+//
+//   lib/dates.qwe     calendar days and time zones by hand (Quillo has neither)
+//   lib/pricing.qwe   a stay's price and a cancellation's refund, in `money`; cards
+//   lib/outside.qwe   the outside services, their cache and their log
+//   lib/auth.qwe      users, signing in
+//   lib/stays.qwe     the server fns: search, holds, payments, cancelling, hosting, activities
+//   ui/kit.qwe        the Quillo UI kit's components, vendored (ui/kit/)
+//   ui/shell.qwe      the frame of every page, and the pictures, drawn
+//   ui/search.qwe     the home page, the search with its map
+//   ui/stay.qwe       a place's page
+//   ui/trips.qwe      paying, trips, saved places
+//   ui/host.qwe       hosting: dashboard, calendar, a new place; the services' status
+//   ui/account.qwe    signing in and up
+//   seed.qwe          demo data, for STAYS_DEMO=1
+//
+// Tests (STAYS_OFFLINE=1 STAYS_DEMO=1, freshly seeded; BASE=http://localhost:8080):
+//
+//   node feedback/tools/drive.mjs app/stays/tests/book.mjs        search, book, pay, cancel; a race for the same nights
+//   node feedback/tools/drive.mjs app/stays/tests/host.mjs        requests answered live, the calendar, a new place
+//   python3 app/stays/tests/hostile.py $BASE                      server fns called out of turn, 20 holds at once
+
+db.open(env("STAYS_DATA", ".") + "/stays.db")
+db.migrate("migrations")
+
+use "lib/dates.qwe"
+use "lib/pricing.qwe"
+use "lib/outside.qwe"
+use "lib/auth.qwe"
+use "lib/stays.qwe"
+use "ui/kit.qwe"
+use "ui/shell.qwe"
+use "ui/search.qwe"
+use "ui/stay.qwe"
+use "ui/trips.qwe"
+use "ui/host.qwe"
+use "ui/account.qwe"
+use "seed.qwe"
+
+if env("STAYS_DEMO", "") == "1" { seed_demo() }
+
+route GET / = <HomePage me={me()} today={today_day()}/>
+
+route GET /s ? { where: str = "", start: str = "", end: str = "", guests: int = 2 } {
+    let f = { where: trim(where), start, end, guests: max([1, guests]) }
+    <Shell me={me()} title={f.where == "" ? "Search" : f.where} maps={true} wide={true}>
+        <SearchApp first_filters={f} first={search_stays(f)} today={today_day()}/>
+    </Shell>
+}
+
+route GET /stays/:id(int) ? { start: str = "", end: str = "", guests: int = 2 } {
+    if listing_row(id) == null { reply 404 <NotFound me={me()} what="No place has that number, or it is not taking bookings."/> }
+    <StayPage me={me()} {id} start={is_day(start) ? start : ""} end={is_day(end) ? end : ""} guests={max([1, guests])}/>
+}
+
+route GET /checkout/:id(int) = <CheckoutPage me={me_or_login(`/checkout/${id}`)} {id}/>
+
+route GET /trips = <TripsPage me={me_or_login("/trips")}/>
+
+route GET /saved {
+    let u = me_or_login("/saved")
+    let rows = db.query("select l.* from saved s join listings l on l.id = s.listing_id where s.user_id = ? order by s.created desc", u.id)
+        | map((l) => merge(listing_view(l), { km: 0, night: l.base_price, night_shown: shown_minor(l.base_price, l.currency), total_shown: null, rating: rating_of(l.id) }))
+    <SavedPage me={u} {rows}/>
+}
+
+route GET /host = <HostPage me={me_or_login("/host")}/>
+
+route GET /host/new = <NewListingPage me={me_or_login("/host/new")}/>
+
+route GET /host/listings/:id(int) ? { month: str = "" } {
+    let u = me_or_login(`/host/listings/${id}`)
+    let l = listing_row(id)
+    if l == null || l.host_id != u.id { reply 404 <NotFound me={u} what="That is not one of your places."/> }
+    let m = re.test(month, "^[0-9]{4}-[0-9]{2}$") && is_day(`${month}-01`) ? month : slice(local_day(l.city, now()), 0, 7)
+    <HostCalendarPage me={u} {id} month={m}/>
+}
+
+route GET /status = <StatusPage me={me()}/>
+
+route GET /login ? { next: str = "/" } = <LoginPage next={safe_next(next)} problem={null} email=""/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.email ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <LoginPage next={safe_next(f.next)} problem={r.error} email={f.email ?? ""}/> }
+    redirect(safe_next(f.next))
+}
+
+route GET /signup ? { next: str = "/" } = <SignupPage next={safe_next(next)} problem={null} name="" email=""/>
+
+route POST /signup {
+    let f = request.form
+    let r = sign_up(f.name ?? "", f.email ?? "", f.password ?? "")
+    if is_err(r) { reply 422 <SignupPage next={safe_next(f.next)} problem={r.error} name={f.name ?? ""} email={f.email ?? ""}/> }
+    redirect(safe_next(f.next))
+}
+
+route POST /logout {
+    sign_out()
+    redirect("/")
+}
+
+// ---- pictures, drawn --------------------------------------------------------------
+
+route GET /pics/icon.svg = respond(200, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#e0484f"/><text x="16" y="23" text-anchor="middle" font-family="system-ui" font-weight="800" font-size="20" fill="#fff">Q</text></svg>`, { "content-type": "image/svg+xml", "cache-control": "max-age=86400" })
+
+route GET /pics/city/:file = respond(200, picture_svg(int(replace(file, ".svg", "")) ?? 0, 1, ""), { "content-type": "image/svg+xml", "cache-control": "max-age=86400" })
+
+route GET /pics/:id(int)/:file {
+    let n = int(replace(file, ".svg", "")) ?? 0
+    let l = db.one("select hue, title from listings where id = ?", id)
+    if l == null { reply 404 "no such picture" }
+    respond(200, picture_svg(l.hue, n % 5, l.title), { "content-type": "image/svg+xml", "cache-control": "max-age=86400" })
+}

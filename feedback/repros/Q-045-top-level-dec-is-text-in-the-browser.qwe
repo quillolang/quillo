@@ -1,0 +1,27 @@
+// Q-045 A top-level `let x = 0.12m` is a dec on the server and the text "0.12" in browser code: `money.mul(m, x)` fails there, and only the console says so
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { types: document.getElementById("types").textContent, out: document.getElementById("out").textContent }
+// open-when: "types": "str dec"
+// fixed-when: "types": "dec dec"
+// From FEEDBACK5.md (found on ae6a6e5). In app/stays, lib/pricing.qwe's SERVICE_FEE = 0.12m: the
+// booking widget works out a stay's price in the browser and showed none (the click handler stopped
+// at the first money.mul). The same literal inside the component is a dec. The server renders
+// "dec dec", so nothing is made again and no mismatch is reported.
+
+let FEE = 0.12m
+
+component Fee() {
+    state shown = ""
+    let local = 0.12m
+    <div>
+        <p id="types">{type_of(FEE)} {type_of(local)}</p>
+        <button id="go" @click={() => {
+            let m = money.from_minor(10000, "EUR")
+            shown = `${money.format(money.mul(m, local, "half_up"), "en-IE")} / ${money.format(money.mul(m, FEE, "half_up"), "en-IE")}`
+        }}>go</button>
+        <p id="out">{shown}</p>
+    </div>
+}
+
+route GET / = <html><body><Fee/></body></html>

@@ -1,0 +1,80 @@
+// Navbar: the bar along the top of a site: its name, its main links and room
+// for actions. When it is narrow (under 720px) the links fold into a menu
+// button, a native <details>, so it needs no script.
+//
+//   <Navbar brand="Acme" links={[{ label: "Docs", href: "/docs" }, { label: "Blog", href: "/blog" }]}
+//           current={request.path}>
+//       <Button size="sm" href="/login">Sign in</Button>
+//   </Navbar>
+//
+// brand, brand_href ("/"): the site's name and where it goes. logo: HTML before
+// the name (an <img> or <svg>).
+// links: a list of { label, href }; the one whose href is `current` is marked
+// aria-current="page". label: what screen readers call the navigation ("Main").
+// children: actions at the right end (buttons, an avatar).
+// sticky: it stays at the top as the page scrolls.
+
+let navbar_css = css`
+.ui-navbar {
+  container: ui-navbar / inline-size; position: relative; z-index: 10;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font);
+}
+.ui-navbar-sticky { position: sticky; top: 0; }
+.ui-navbar-in { display: flex; align-items: center; gap: 24px; height: 60px; padding: 0 20px; }
+.ui-navbar-brand {
+  display: inline-flex; align-items: center; gap: 8px; flex: none;
+  color: var(--ui-fg); font-weight: 650; font-size: 16px; text-decoration: none; border-radius: var(--ui-radius-sm);
+}
+.ui-navbar-brand :is(img, svg) { height: 26px; width: auto; }
+.ui-navbar a:focus-visible, .ui-navbar summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-navbar-nav ul, .ui-navbar-menu ul { display: flex; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-navbar-nav a, .ui-navbar-menu li a {
+  display: block; padding: 6px 10px; border-radius: var(--ui-radius-sm);
+  color: var(--ui-muted); font-size: 14px; font-weight: 500; text-decoration: none; white-space: nowrap;
+}
+.ui-navbar-nav a:hover, .ui-navbar-menu li a:hover { color: var(--ui-fg); background: var(--ui-subtle); }
+.ui-navbar-nav a[aria-current="page"], .ui-navbar-menu a[aria-current="page"] { color: var(--ui-fg); background: var(--ui-subtle); }
+.ui-navbar-end { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.ui-navbar-menu { display: none; }
+.ui-navbar-menu summary {
+  display: grid; place-items: center; width: 38px; height: 38px; border-radius: var(--ui-radius-sm);
+  color: var(--ui-fg); cursor: pointer; list-style: none;
+}
+.ui-navbar-menu summary::-webkit-details-marker { display: none; }
+.ui-navbar-menu summary:hover, .ui-navbar-menu[open] summary { background: var(--ui-subtle); }
+.ui-navbar-menu[open] .ui-navbar-open, .ui-navbar-menu:not([open]) .ui-navbar-close { display: none; }
+.ui-navbar-menu nav {
+  position: absolute; top: 100%; left: 0; right: 0; padding: 8px 12px 12px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-bg); box-shadow: var(--ui-shadow);
+}
+.ui-navbar-menu ul { flex-direction: column; }
+.ui-navbar-menu li a { padding: 10px 12px; font-size: 15px; }
+@container ui-navbar (max-width: 720px) {
+  .ui-navbar-in { gap: 12px; padding: 0 12px 0 16px; }
+  .ui-navbar-nav { display: none; }
+  .ui-navbar-menu { display: block; }
+}
+`
+
+view Navbar(brand: str = "", brand_href: str = "/", logo = null, links: list = [], current: str? = null,
+            label: str = "Main", sticky: bool = false, class: str? = null, children) {
+    let items = for l in links =>
+        <li><a href={l.href} aria-current={current != null && l.href == current ? "page" : null}>{l.label}</a></li>
+    <header class={ui_cls(["ui-navbar", sticky && "ui-navbar-sticky", class])}>
+        <div.ui-navbar-in>
+            {(brand != "" || logo != null) && <a.ui-navbar-brand href={brand_href}>{logo}{brand}</a>}
+            {len(links) > 0 && <nav.ui-navbar-nav aria-label={label}><ul>{items}</ul></nav>}
+            <div.ui-navbar-end>{children}</div>
+            {len(links) > 0 && <details.ui-navbar-menu>
+                <summary aria-label="Menu">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" aria-hidden="true">
+                        <path class="ui-navbar-open" d="M4 6h16M4 12h16M4 18h16"/>
+                        <path class="ui-navbar-close" d="M18 6 6 18M6 6l12 12"/>
+                    </svg>
+                </summary>
+                <nav aria-label={label}><ul>{items}</ul></nav>
+            </details>}
+        </div>
+    </header>
+}

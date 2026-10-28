@@ -1,0 +1,75 @@
+// TextField: a labelled one-line input, with help text and an error message.
+// It is a real <input>, so it works in a plain <form> and with the browser's own
+// validation and autofill.
+//
+//   <TextField name="email" label="Email" type="email" required={true} autocomplete="email"/>
+//   <TextField name="site" label="Website" prefix="https://" placeholder="example.com"/>
+//   <TextField name="weight" label="Weight" type="number" suffix="kg" min={0} error="Too heavy"/>
+//
+// type: "text" (default), "email", "url", "tel", "number", "date", "time", ...
+// value, placeholder, autocomplete, pattern, min, max, maxlength, readonly: go to
+// the <input> as they are. prefix / suffix: short text inside the box ("https://", "kg").
+// hint: a line of help under it. error: a message under it in red; it also marks
+// the input aria-invalid. field: the input's id (default "text-field-" + name).
+// size: "sm" or "md" (default). on_input(value) on each key, on_change(value) when
+// it is left changed: both are given the text, inside one of your components.
+
+let text_field_css = css`
+.ui-text-field { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-text-field-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-text-field-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-text-field-box {
+  display: flex; align-items: center; height: 38px; padding: 0 12px; gap: 8px;
+  background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-text-field-box:hover { border-color: var(--ui-strong); }
+.ui-text-field-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-text-field-box input {
+  flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent;
+  color: var(--ui-fg); font: 14px var(--ui-font);
+}
+.ui-text-field-box input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-text-field-affix { flex: none; color: var(--ui-muted); white-space: nowrap; user-select: none; }
+.ui-text-field-sm .ui-text-field-box { height: 30px; padding: 0 10px; }
+.ui-text-field-sm .ui-text-field-box input { font-size: 13px; }
+.ui-text-field-invalid .ui-text-field-box, .ui-text-field-invalid .ui-text-field-box:hover { border-color: var(--ui-danger); }
+.ui-text-field-invalid .ui-text-field-box:focus-within { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-text-field-hint, .ui-text-field-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-text-field-error { color: var(--ui-danger); }
+.ui-text-field-disabled { opacity: .55; }
+.ui-text-field-disabled .ui-text-field-box, .ui-text-field-disabled input { cursor: not-allowed; }
+.ui-text-field-disabled .ui-text-field-box:hover { border-color: var(--ui-border); }
+@media (prefers-reduced-motion: reduce) { .ui-text-field-box { transition: none; } }
+`
+
+view TextField(name: str? = null, label: str? = null, value: str | num | null = null, placeholder: str? = null,
+               hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
+               field: str? = null, size: str = "md", type: str = "text", prefix: str? = null, suffix: str? = null,
+               autocomplete: str? = null, pattern: str? = null, min: str | num | null = null,
+               max: str | num | null = null, maxlength: int? = null, readonly: bool = false,
+               on_input = null, on_change = null, class: str? = null) {
+    let id = field ?? `text-field-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([prefix != null && `${id}-prefix`, suffix != null && `${id}-suffix`,
+                            hint != null && `${id}-hint`, error != null && `${id}-error`])
+    <div class={ui_cls(["ui-text-field", size == "sm" && "ui-text-field-sm", error != null && "ui-text-field-invalid",
+                        disabled && "ui-text-field-disabled", class])}>
+        {label != null && <label.ui-text-field-label for={id}>
+            {label}{required && <span.ui-text-field-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-text-field-box>
+            {prefix != null && <span.ui-text-field-affix id={`${id}-prefix`}>{prefix}</span>}
+            <input id={id} type={type} name={name} value={value} placeholder={placeholder} required={required}
+                   disabled={disabled} readonly={readonly} autocomplete={autocomplete} pattern={pattern}
+                   min={min} max={max} maxlength={maxlength}
+                   inputmode={type == "number" ? "decimal" : null}
+                   aria-invalid={error != null ? "true" : null}
+                   aria-describedby={described != "" ? described : null}
+                   @input={(e) => { on_input && on_input(e.value) }}
+                   @change={(e) => { on_change && on_change(e.value) }}/>
+            {suffix != null && <span.ui-text-field-affix id={`${id}-suffix`}>{suffix}</span>}
+        </div>
+        {hint != null && <p.ui-text-field-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-text-field-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

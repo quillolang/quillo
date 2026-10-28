@@ -1,0 +1,20 @@
+// Q-047 Under --watch, markup kept in a top-level `let` compiles to browser code with its line number glued to a `return` ("3return W.t(...)"): a SyntaxError, and every component that shows it stops working
+// mode: browser
+// flags: --watch
+// page: /
+// probe: document.getElementById("b").click(); await new Promise((r) => setTimeout(r, 800)); return { stars: document.querySelectorAll("#b svg").length }
+// open-when: "stars": 2
+// fixed-when: "stars": 3
+// From FEEDBACK5.md (found on ae6a6e5). The UI kit's rating.qwe keeps its star as
+// `let rating_star = <svg>...</svg>` (line 59): with --watch, /_quillo/src/.../program-48.js was
+// `59return W.t($b117, []);`, and every <Rating> on app/stays' place page was dead ("$b117 is not
+// defined"). Without --watch the bundle is right and the click adds a star.
+
+let star = <svg viewBox="0 0 24 24"><path d="M12 2l3 7h7l-6 4 2 7-6-4-6 4 2-7-6-4h7z"/></svg>
+
+component Stars(n: int) {
+    state k = n
+    <button id="b" @click={() => { k += 1 }}>{for i in range(0, k) => <span key={i}>{star}</span>}</button>
+}
+
+route GET / = <html><body><Stars n={2}/></body></html>

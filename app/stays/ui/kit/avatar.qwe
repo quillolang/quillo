@@ -1,0 +1,79 @@
+// Avatar: a person's picture, or their initials on a colour of their own.
+//
+//   <Avatar name="Ada Lovelace" src="/img/ada.jpg" status="online"/>
+//   <Avatar name="Grace Hopper" size="lg"/>                    shows "GH"
+//   <AvatarGroup people={team} max={4}/>                       four, then "+3"
+//
+// name: whose it is; it gives the initials (the first and last words' first
+// letters, or a single word's first two) and the colour, the same one every time
+// for a name. src: a picture; the initials show while it loads, and if it fails.
+// size: "xs" (24px), "sm" (32px), "md" (40px, default), "lg" (56px) or "xl"
+// (72px). status: "online", "away", "busy" or "offline", a dot on its corner,
+// also said to screen readers. shape: "circle" (default) or "square".
+// AvatarGroup: people is a list of { name, src? }, overlapped; past max
+// the rest are counted in a "+N". label names the group for screen readers.
+
+let avatar_css = css`
+.ui-avatar {
+  position: relative; display: inline-grid; place-items: center; flex: none; vertical-align: middle;
+  width: var(--s); height: var(--s); border-radius: 50%; --s: 40px; --h: #6e56cf;
+  background: color-mix(in srgb, var(--h) 24%, var(--ui-bg)); color: color-mix(in srgb, var(--h) 70%, var(--ui-fg));
+  font: 600 calc(var(--s) * .38)/1 var(--ui-font); letter-spacing: .02em; user-select: none;
+}
+.ui-avatar-square { border-radius: calc(var(--s) * .22); }
+.ui-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: inherit;
+  object-fit: cover; color: transparent; font-size: 0; }
+.ui-avatar img::after { content: attr(data-initials); position: absolute; inset: 0; display: grid; place-items: center;
+  border-radius: inherit; background: color-mix(in srgb, var(--h) 24%, var(--ui-bg));
+  color: color-mix(in srgb, var(--h) 70%, var(--ui-fg)); font: 600 calc(var(--s) * .38)/1 var(--ui-font); }
+.ui-avatar-xs { --s: 24px; }
+.ui-avatar-sm { --s: 32px; }
+.ui-avatar-lg { --s: 56px; }
+.ui-avatar-xl { --s: 72px; }
+.ui-avatar-c0 { --h: #e5484d; } .ui-avatar-c1 { --h: #f76b15; } .ui-avatar-c2 { --h: #ad7f00; }
+.ui-avatar-c3 { --h: #30a46c; } .ui-avatar-c4 { --h: #12a594; } .ui-avatar-c5 { --h: #0090ff; }
+.ui-avatar-c6 { --h: #6e56cf; } .ui-avatar-c7 { --h: #d6409f; }
+.ui-avatar-status { position: absolute; right: 0; bottom: 0; width: max(8px, calc(var(--s) * .27));
+  height: max(8px, calc(var(--s) * .27)); border-radius: 50%; border: 2px solid var(--ui-bg); background: var(--ui-strong); }
+.ui-avatar-online { background: var(--ui-success); }
+.ui-avatar-away { background: var(--ui-warning); }
+.ui-avatar-busy { background: var(--ui-danger); }
+.ui-avatar-group { display: inline-flex; align-items: center; }
+.ui-avatar-group > .ui-avatar { box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-avatar-group > .ui-avatar + .ui-avatar { margin-left: calc(var(--s) * -.28); }
+.ui-avatar-more { background: var(--ui-subtle); color: var(--ui-muted); font-size: calc(var(--s) * .32); }
+`
+
+// The initials of a name: "Ada Lovelace" is "AL", "Plato" is "PL", "" is "?".
+fn avatar_initials(name: str) -> str {
+    let words = split(trim(name), " ") | filter((w) => w != "")
+    let letters = len(words) == 0 ? "?" : (len(words) == 1 ? slice(words[0], 0, 2) : words[0][0] + words[-1][0])
+    upper(letters)
+}
+
+// One of the eight colours, chosen from the name's letters, so a name always gets the same.
+fn avatar_hue(name: str) -> int {
+    let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    let codes = split(lower(name), "") | map((c) => (index_of(chars, c) ?? 36) + 1)
+    floor(reduce(codes, 5381, (h, c) => (h * 33 + c) % 1000003) / 13) % 8
+}
+
+view Avatar(name: str = "", src: str? = null, size: str = "md", status: str? = null, shape: str = "circle",
+            class: str? = null) =
+    <span class={ui_cls(["ui-avatar", `ui-avatar-c${avatar_hue(name)}`, size != "md" && `ui-avatar-${size}`,
+                         shape == "square" && "ui-avatar-square", class])}
+          role="img" aria-label={status != null ? `${name} (${status})` : name}>
+        <span aria-hidden="true">{avatar_initials(name)}</span>
+        {src != null && <img src={src} alt="" loading="lazy" data-initials={avatar_initials(name)}/>}
+        {status != null && <span class={`ui-avatar-status ui-avatar-${status}`}></span>}
+    </span>
+
+view AvatarGroup(people: list, max: int = 4, size: str = "md", label: str? = null, class: str? = null) {
+    let shown = len(people) > max ? take(people, max) : people
+    let rest = len(people) - len(shown)
+    <span class={ui_cls(["ui-avatar-group", class])} role="group" aria-label={label}>
+        {for p in shown => <Avatar name={p.name ?? ""} src={p.src} size={size}/>}
+        {rest > 0 && <span class={ui_cls(["ui-avatar", "ui-avatar-more", size != "md" && `ui-avatar-${size}`])}
+                           role="img" aria-label={`and ${rest} more`}>+{rest}</span>}
+    </span>
+}

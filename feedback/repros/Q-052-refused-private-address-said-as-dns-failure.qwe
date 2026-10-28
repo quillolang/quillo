@@ -1,0 +1,10 @@
+// Q-052 An address `public_only` refuses is reported as "Dns Failed: resolve dns name '127.0.0.1:9'", though nothing was looked up: an IP and its port, said as a failed name lookup
+// mode: run
+// open-when: Dns Failed: resolve dns name '127.0.0.1:9'
+// fixed-when: public_only
+// From FEEDBACK5.md (found on ae6a6e5). app/stays was pointed at a dead Overpass server to try its
+// fallback; the log said "Dns Failed" for 127.0.0.1:9 and for 203.0.113.1 (a documentation
+// address). The refusal itself is right (and instant): the words send one to check DNS. Saying that
+// `public_only` refused a private address, and which, would point at the cause.
+
+print(http.get("http://127.0.0.1:9/x", {}, { public_only: true }))

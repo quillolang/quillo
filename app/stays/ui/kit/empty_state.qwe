@@ -1,0 +1,56 @@
+// EmptyState: what to show where a list or a page has nothing in it yet, and
+// what to do about it.
+//
+//   <EmptyState icon="inbox" title="No messages yet">
+//       When someone writes to you, it shows up here.
+//   </EmptyState>
+//   <EmptyState icon="search" title="No results for “invoice 42”"
+//               actions={<Button variant="outline" href="?">Clear the search</Button>}>
+//       Try fewer words, or check the spelling.
+//   </EmptyState>
+//
+// icon: "inbox" (default), "search", "folder", "chart", or null for none.
+// title: the headline. children: a sentence or two under it.
+// actions: HTML under the text, usually a Button or two.
+// size: "sm" (for inside a card or a table) or "md" (default). Centred by default;
+// align="start" lines it up on the left.
+
+let empty_state_css = css`
+.ui-empty { display: grid; justify-items: center; gap: 6px; padding: 40px 24px; text-align: center;
+  font: 14px/1.5 var(--ui-font); color: var(--ui-muted); }
+.ui-empty-start { justify-items: start; text-align: left; }
+.ui-empty-icon { display: grid; place-items: center; width: 56px; height: 56px; margin-bottom: 8px;
+  border-radius: 50%; background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-empty-icon svg { width: 26px; height: 26px; }
+.ui-empty-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--ui-fg); }
+.ui-empty-text { max-width: 42ch; }
+.ui-empty-text > * { margin: 0; }
+.ui-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 12px; }
+.ui-empty-start .ui-empty-actions { justify-content: flex-start; }
+.ui-empty-sm { padding: 24px 16px; }
+.ui-empty-sm .ui-empty-icon { width: 44px; height: 44px; }
+.ui-empty-sm .ui-empty-icon svg { width: 20px; height: 20px; }
+.ui-empty-sm .ui-empty-title { font-size: 15px; }
+`
+
+// The built-in icons, drawn in currentColor on a 24 by 24 grid.
+fn empty_state_icon(name: str) {
+    let parts = match name {
+        "search" => [<circle cx="11" cy="11" r="6.5"/>, <path d="M16 16l4.5 4.5"/>]
+        "folder" => [<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>]
+        "chart" => [<path d="M4 20h16"/>, <path d="M7 16v-4M12 16V7M17 16v-6"/>]
+        _ => [<path d="M3.5 13.5l2.6-7.1a2 2 0 0 1 1.9-1.4h8a2 2 0 0 1 1.9 1.4l2.6 7.1v4a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>,
+              <path d="M3.5 13.5h4.5l1.5 2.5h5l1.5-2.5h4.5"/>]
+    }
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+         stroke-linejoin="round" aria-hidden="true">{parts}</svg>
+}
+
+view EmptyState(title: str, icon: str? = "inbox", actions = null, size: str = "md", align: str = "center",
+                class: str? = null, children) =
+    <div class={ui_cls(["ui-empty", size != "md" && `ui-empty-${size}`, align == "start" && "ui-empty-start", class])}>
+        {icon != null && <div.ui-empty-icon>{empty_state_icon(icon)}</div>}
+        <p.ui-empty-title>{title}</p>
+        <div.ui-empty-text>{children}</div>
+        {actions != null && <div.ui-empty-actions>{actions}</div>}
+    </div>

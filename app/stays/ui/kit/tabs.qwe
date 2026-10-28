@@ -1,0 +1,110 @@
+// Tabs: panels of content behind a row of labels, one panel showing at a time.
+// Built from radio buttons and CSS, so they need no JavaScript, take any HTML from
+// the server, and keep their place when someone comes back with the Back button.
+//
+//   <Tabs>
+//       <Tab group="install" label="macOS" selected={true}><pre>brew install quillo</pre></Tab>
+//       <Tab group="install" label="Linux"><pre>curl -fsSL https://quillolang.org/install.sh | sh</pre></Tab>
+//   </Tabs>
+//
+// Tab: label (the tab's text), selected (the one showing first; the first tab if
+// none is), children (its panel). group: the same name for every Tab of one Tabs,
+// unique on the page: it is what ties them together. id: the tab's own id
+// (group + "-" + its label by default). The arrow keys move between tabs.
+// Tabs: variant "line" (default) or "pill"; label: what screen readers call the
+// row. The radios belong to no form, so a form around the tabs does not send them.
+//
+// TabBar is the same row driven by your component's state, as real ARIA tabs:
+//
+//   <TabBar id="files" labels={["Code", "Preview"]} selected={tab} on_change={(i) => { tab = i }}>
+//       {tab == 0 ? <pre>{code}</pre> : <Preview {code}/>}
+//   </TabBar>
+//
+// labels: the tabs' text. selected: the index showing first. children: the panel
+// of the selected tab. on_change(index): called with the tab picked. id: a prefix
+// for the tabs' ids, unique on the page. variant as for Tabs.
+
+let tabs_css = css`
+.ui-tabs { position: relative; display: flex; flex-wrap: wrap; align-items: flex-end; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-tabs-radio { position: absolute; top: 0; left: 0; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.ui-tabs-tab {
+  order: 0; display: inline-flex; align-items: center; height: 38px; padding: 0 14px; border: 0; background: none;
+  color: var(--ui-muted); font: 500 14px/1 var(--ui-font); white-space: nowrap; cursor: pointer; user-select: none;
+  transition: color .15s, background .15s, box-shadow .15s, border-color .15s;
+}
+.ui-tabs-tab:hover { color: var(--ui-fg); }
+.ui-tabs-panel { order: 1; display: none; width: 100%; padding-top: 16px; }
+.ui-tabs-panel > :first-child { margin-top: 0; }
+.ui-tabs-panel > :last-child { margin-bottom: 0; }
+.ui-tabs-radio:checked + .ui-tabs-tab + .ui-tabs-panel,
+.ui-tabs:not(:has(> .ui-tabs-radio:checked)) > .ui-tabs-panel:first-of-type,
+.ui-tabbar-panel { display: block; }
+.ui-tabs-radio:focus-visible + .ui-tabs-tab, .ui-tabs-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+
+.ui-tabs-line::after { content: ""; order: 0; flex: 1 0 0; align-self: stretch; border-bottom: 1px solid var(--ui-border); }
+.ui-tabs-line .ui-tabs-tab { border-bottom: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm) var(--ui-radius-sm) 0 0; }
+.ui-tabs-line .ui-tabs-radio:checked + .ui-tabs-tab,
+.ui-tabs-line:not(:has(> .ui-tabs-radio:checked)) > .ui-tabs-tab:first-of-type,
+.ui-tabs-line .ui-tabs-tab[aria-selected="true"] { color: var(--ui-fg); box-shadow: inset 0 -2px 0 var(--ui-accent); }
+.ui-tabs-line .ui-tabs-radio:checked:focus-visible + .ui-tabs-tab,
+.ui-tabs-line .ui-tabs-tab[aria-selected="true"]:focus-visible { box-shadow: inset 0 -2px 0 var(--ui-accent), var(--ui-focus); }
+
+.ui-tabs-pill { gap: 4px; }
+.ui-tabs-pill .ui-tabs-tab { height: 32px; border-radius: 999px; }
+.ui-tabs-pill .ui-tabs-tab:hover { background: var(--ui-subtle); }
+.ui-tabs-pill .ui-tabs-radio:checked + .ui-tabs-tab,
+.ui-tabs-pill:not(:has(> .ui-tabs-radio:checked)) > .ui-tabs-tab:first-of-type,
+.ui-tabs-pill .ui-tabs-tab[aria-selected="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+
+.ui-tabbar-list { display: flex; flex-wrap: wrap; width: 100%; }
+.ui-tabs-line .ui-tabbar-list::after { content: ""; flex: 1 0 0; align-self: stretch; border-bottom: 1px solid var(--ui-border); }
+.ui-tabs-pill .ui-tabbar-list { gap: 4px; }
+.ui-tabs-line.ui-tabbar::after { display: none; }
+@media (prefers-reduced-motion: reduce) { .ui-tabs-tab { transition: none; } }
+`
+
+fn tabs_slug(text: str) -> str = re.replace(lower(text), "[^a-z0-9]+", "-")
+
+view Tabs(variant: str = "line", label: str? = null, id: str? = null, class: str? = null, children) =
+    <div class={ui_cls(["ui-tabs", `ui-tabs-${variant}`, class])} id={id} role="group" aria-label={label}>{children}</div>
+
+view Tab(group: str, label: str, selected: bool = false, id: str? = null, children) {
+    let tid = id ?? `${group}-${tabs_slug(label)}`
+    [
+        <input.ui-tabs-radio type="radio" name={group} id={tid} checked={selected} form="ui-tabs-none"/>,
+        <label.ui-tabs-tab for={tid}>{label}</label>,
+        <div.ui-tabs-panel>{children}</div>,
+    ]
+}
+
+component TabBar(id: str, labels: list = [], selected: int = 0, variant: str = "line", label: str? = null,
+                 on_change = null, children) {
+    state at = selected
+    let pick = (i: int) => {
+        at = i
+        on_change && on_change(i)
+    }
+    <div class={ui_cls(["ui-tabs", "ui-tabbar", `ui-tabs-${variant}`])}>
+        <div.ui-tabbar-list role="tablist" aria-label={label} @keydown={(e) => {
+            let n = len(labels)
+            let to = match e.key {
+                "ArrowRight" => (at + 1) % n
+                "ArrowLeft" => (at + n - 1) % n
+                "Home" => 0
+                "End" => n - 1
+                _ => null
+            }
+            if to != null {
+                e.preventDefault()
+                pick(to)
+                e.target.parentElement.children[to].focus()
+            }
+        }}>
+            {for [i, t] in enumerate(labels) => <button.ui-tabs-tab type="button" role="tab" id={`${id}-tab-${i}`}
+                    aria-selected={i == at ? "true" : "false"} aria-controls={`${id}-panel`}
+                    tabindex={i == at ? "0" : "-1"} @click={() => { pick(i) }}>{t}</button>}
+        </div>
+        <div.ui-tabs-panel.ui-tabbar-panel id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${at}`}
+             tabindex="0">{children}</div>
+    </div>
+}

@@ -1,0 +1,161 @@
+// What a stay costs, and what comes back when it is cancelled. Pure
+// functions over `money` (so yen have no cents and euros two), used by the
+// server for the price it charges and by the booking widget for the price it
+// shows as dates change: both must agree to the cent.
+//
+// A quote, for a place, its nights and its guests:
+//
+//   each night       the host's price for that day, else the weekend price on
+//                    Friday and Saturday nights, else the usual one
+//   length discount  10% off the nights for a week or more, 25% for 28 nights
+//   cleaning         once a stay
+//   service fee      12% of nights and cleaning, the platform's
+//   tourist tax      by city, a person a night (children free is not modelled),
+//                    up to a number of nights (Lisbon: 7)
+//
+// Prices in the database are in minor units (cents, or yen), as ints.
+
+let SERVICE_FEE = 0.12m
+let WEEK_OFF = 0.10m
+let MONTH_OFF = 0.25m
+
+// A person a night, in the city's currency's minor units, for at most `cap` nights.
+let CITY_TAX = {
+    Lisbon: { per: 400, cap: 7, name: "Lisbon tourist tax" },
+    Porto: { per: 300, cap: 7, name: "Porto tourist tax" },
+    Barcelona: { per: 550, cap: 7, name: "Catalonia tourist tax" },
+    Kyoto: { per: 200, cap: 0, name: "Kyoto accommodation tax" },
+}
+
+// How amounts are written for each currency.
+let CURRENCY_LOCALE = { EUR: "en-IE", JPY: "ja-JP", GBP: "en-GB", USD: "en-US" }
+
+fn locale_of(currency: str) -> str = get(CURRENCY_LOCALE, currency) ?? "en-US"
+
+fn cash(minor: int, currency: str) = money.from_minor(minor, currency)
+
+fn shown_money(m) -> str = money.format(m, locale_of(m.currency))
+
+fn shown_minor(minor: int, currency: str) -> str = shown_money(cash(minor, currency))
+
+// The price of one night, before discounts.
+fn night_price(listing, day: str, custom: map) -> int =
+    get(custom, day) ?? (weekend_night(day) ? listing.weekend_price : listing.base_price)
+
+// Why a stay of these dates and guests cannot be booked, or null.
+fn stay_problem(listing, start: str, end: str, guests: int, today: str) {
+    if !is_day(start) || !is_day(end) { return "Choose the dates of your stay" }
+    let n = days_between(start, end)
+    if days_between(today, start) < 0 { return "Those dates have passed" }
+    if days_between(today, start) > 365 { return "Bookings open a year ahead" }
+    if n <= 0 { return "The day you leave comes after the day you arrive" }
+    if n < listing.min_nights { return `This place takes stays of ${plural(listing.min_nights, "night")} or more` }
+    if n > listing.max_nights { return `This place takes stays of at most ${plural(listing.max_nights, "night")}` }
+    if guests < 1 { return "At least one guest" }
+    if guests > listing.max_guests { return `This place sleeps ${plural(listing.max_guests, "guest")} at most` }
+    null
+}
+
+// The price of a stay: { nights: [{ day, price }], lines: [{ label, amount, kind }], total, per_night, currency }.
+// Amounts are money. `custom` is the host's prices by day.
+fn quote(listing, start: str, end: str, guests: int, custom: map) {
+    let cur = listing.currency
+    let days = nights_of(start, end)
+    let n = len(days)
+    let nightly = days | map((d) => { day: d, price: night_price(listing, d, custom) })
+    let nights_total = cash(sum(nightly | map((x) => x.price)), cur)
+    let off = n >= 28 ? MONTH_OFF : n >= 7 ? WEEK_OFF : 0m
+    let discount = money.mul(nights_total, off, "half_up")
+    let cleaning = cash(listing.cleaning_fee, cur)
+    let subtotal = money.add(money.sub(nights_total, discount), cleaning)
+    let fee = money.mul(subtotal, SERVICE_FEE, "half_up")
+    let tax_rule = get(CITY_TAX, listing.city)
+    let taxed_nights = tax_rule == null ? 0 : (tax_rule.cap > 0 ? min([n, tax_rule.cap]) : n)
+    let tax = tax_rule == null ? money.zero(cur) : cash(tax_rule.per * guests * taxed_nights, cur)
+    let total = money.add(money.add(subtotal, fee), tax)
+    let lines = [
+        { kind: "nights", label: `${plural(n, "night")}`, amount: nights_total },
+        off > 0m ? { kind: "discount", label: n >= 28 ? "Monthly stay discount (25%)" : "Weekly stay discount (10%)", amount: money.neg(discount) } : null,
+        listing.cleaning_fee > 0 ? { kind: "cleaning", label: "Cleaning", amount: cleaning } : null,
+        { kind: "fee", label: "Service fee", amount: fee },
+        tax_rule != null ? { kind: "tax", label: `${tax_rule.name} (${plural(guests, "guest")} × ${plural(taxed_nights, "night")})`, amount: tax } : null,
+    ] | filter((l) => l != null)
+    {
+        currency: cur,
+        nights: nightly,
+        lines,
+        total,
+        per_night: n == 0 ? money.zero(cur) : money.allocate(money.sub(nights_total, discount), n)[0],
+    }
+}
+
+// The quote as JSON keeps: amounts in minor units, so it reads back the same.
+fn quote_record(q) = {
+    currency: q.currency,
+    total: money.to_minor(q.total),
+    lines: q.lines | map((l) => { kind: l.kind, label: l.label, minor: money.to_minor(l.amount) }),
+    nights: q.nights,
+}
+
+// ---- cancelling -----------------------------------------------------------------
+
+let POLICIES = {
+    flexible: { title: "Flexible", says: "Full refund until 1 day before check-in. After that, the nights not yet stayed, less one, come back." },
+    moderate: { title: "Moderate", says: "Full refund until 5 days before check-in. After that, half of the nights not yet stayed." },
+    strict: { title: "Strict", says: "Full refund within 48 hours of booking, if check-in is 14 days away or more. Half until 7 days before. Then nothing." },
+}
+
+// What comes back of a booking cancelled at `at` (ms), its check-in being at
+// `check_in_at` (ms, the place's check-in time): { minor, why }. The service
+// fee comes back only with a full refund; the tourist tax for nights not
+// stayed always does.
+fn refund_of(policy: str, record, booked_at: int, check_in_at: int, at: int) {
+    let hours = (check_in_at - at) / 3600000
+    let full = record.total
+    let by_kind = (k) => sum(record.lines | filter((l) => l.kind == k) | map((l) => l.minor))
+    let fee = by_kind("fee")
+    let tax = by_kind("tax")
+    let stay = full - fee - tax
+    let n = len(record.nights)
+    let nights_left = hours >= 0 ? n : max([0, n - ceil(-hours / 24)])
+    // The nights' share of the stay, by money.allocate, so the shares add up.
+    let shares = n == 0 ? [] : money.allocate(cash(stay, record.currency), n) | map((m) => money.to_minor(m))
+    let tail_sum = (k) => k <= 0 ? 0 : sum(slice(shares, n - k, n))
+    let tax_left = n == 0 ? 0 : tax * nights_left / n
+    match policy {
+        "flexible" => hours >= 24 ? { minor: full, why: "Cancelled a day or more before check-in: all of it" }
+            : { minor: tail_sum(max([0, nights_left - 1])) + floor(tax_left), why: "Cancelled within a day of check-in: the nights not yet stayed, less one" }
+        "moderate" => hours >= 120 ? { minor: full, why: "Cancelled 5 days or more before check-in: all of it" }
+            : { minor: floor(tail_sum(nights_left) / 2) + floor(tax_left), why: "Cancelled within 5 days of check-in: half of the nights not yet stayed" }
+        _ => (at - booked_at <= 48 * 3600000 && hours >= 14 * 24) ? { minor: full, why: "Cancelled within 48 hours of booking: all of it" }
+            : hours >= 7 * 24 ? { minor: floor(stay / 2) + tax, why: "Cancelled 7 days or more before check-in: half of the stay" }
+            : { minor: floor(tax_left), why: "Cancelled within 7 days of check-in: only the tax for nights not stayed" }
+    }
+}
+
+// ---- cards (made up: no money moves) ------------------------------------------
+
+// The Luhn check digit test, as card numbers have.
+fn luhn_ok(digits: str) -> bool {
+    let ds = split(digits, "") | reverse | map((c) => int(c))
+    let total = enumerate(ds) | map((p) => p[0] % 2 == 1 ? (p[1] * 2 > 9 ? p[1] * 2 - 9 : p[1] * 2) : p[1]) | sum
+    total % 10 == 0
+}
+
+// A card as typed: null when it would be charged, else why not. 4000 0000 0000 0002
+// is declined, as test cards are; an expiry in the past is refused.
+fn card_problem(number: str, expiry: str, cvc: str, today: str) {
+    let digits = re.replace(number, "[ -]", "")
+    if !re.test(digits, "^[0-9]{13,19}$") { return "A card number is 13 to 19 digits" }
+    if !luhn_ok(digits) { return "That card number has a typo" }
+    let m = re.find(trim(expiry), "^([0-9]{2}) ?/ ?([0-9]{2})$")
+    if m == null { return "Expiry as MM/YY" }
+    let mm = int(m.groups[0])
+    let yy = 2000 + int(m.groups[1])
+    if mm < 1 || mm > 12 { return "Expiry as MM/YY" }
+    let p = day_parts(today)
+    if yy < p.y || (yy == p.y && mm < p.m) { return "That card has expired" }
+    if !re.test(trim(cvc), "^[0-9]{3,4}$") { return "The 3 digits on the back" }
+    if digits == "4000000000000002" { return "Your bank declined this card" }
+    null
+}

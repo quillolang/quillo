@@ -1,0 +1,94 @@
+// Select: a labelled drop-down, on the browser's own <select>, so it works in a
+// plain <form>, with the keyboard and with each phone's own picker.
+//
+//   <Select name="country" label="Country" placeholder="Choose one" options={["France", "Japan", "Peru"]}/>
+//   <Select name="plan" label="Plan" value="team"
+//           options={[{ label: "Free", value: "free" }, { label: "Team", value: "team" },
+//                     { label: "Enterprise", value: "ent", disabled: true }]}/>
+//   <Select name="tz" label="Time zone" groups={[{ label: "Europe", options: ["Paris", "Rome"] },
+//                                                { label: "Asia", options: ["Tokyo"] }]}/>
+//
+// options: a list of strings, or of { label, value, disabled? }. groups: a list of
+// { label, options }, shown under their headings (after any plain options).
+// value: the chosen value; with multiple={true}, a list of them, and it shows as a
+// list box (rows: how many lines). placeholder: a first line that cannot be chosen,
+// shown until something is. hint, error, required, disabled, field (the id,
+// default "select-" + name) and size ("sm" or "md") are as in TextField.
+// on_change(value): inside one of your components, given the chosen value (a list
+// of them when multiple).
+
+let select_css = css`
+.ui-select { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-select-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-select-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-select-box { position: relative; display: block; }
+.ui-select-box::after {
+  content: ""; position: absolute; right: 14px; top: 50%; width: 7px; height: 7px; margin-top: -6px;
+  border: solid var(--ui-muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); pointer-events: none;
+}
+.ui-select select {
+  appearance: none; display: block; width: 100%; height: 38px; padding: 0 36px 0 12px;
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font);
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); cursor: pointer;
+  text-overflow: ellipsis; transition: border-color .15s, box-shadow .15s;
+}
+.ui-select select:hover { border-color: var(--ui-strong); }
+.ui-select select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-select select:has(option[value=""]:checked) { color: var(--ui-muted); }
+.ui-select option { color: var(--ui-fg); background: var(--ui-surface); }
+.ui-select option:disabled { color: var(--ui-muted); }
+.ui-select-multi .ui-select-box::after { display: none; }
+.ui-select-multi select { height: auto; padding: 4px; }
+.ui-select-multi option { padding: 5px 8px; border-radius: 4px; }
+.ui-select-multi option:checked { background: var(--ui-accent-soft); color: var(--ui-fg); }
+.ui-select-sm select { height: 30px; padding: 0 30px 0 10px; font-size: 13px; }
+.ui-select-sm .ui-select-box::after { right: 11px; width: 6px; height: 6px; margin-top: -5px; }
+.ui-select-invalid select, .ui-select-invalid select:hover { border-color: var(--ui-danger); }
+.ui-select-invalid select:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-select-hint, .ui-select-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-select-error { color: var(--ui-danger); }
+.ui-select-disabled { opacity: .55; }
+.ui-select-disabled select { cursor: not-allowed; }
+.ui-select-disabled select:hover { border-color: var(--ui-border); }
+@media (prefers-reduced-motion: reduce) { .ui-select select { transition: none; } }
+`
+
+// An option as { label, value, disabled }, from a string or a map.
+fn select_option(o) = type_of(o) == "map" ? { label: o.label ?? str(o.value), value: str(o.value ?? o.label), disabled: o.disabled ?? false }
+                                          : { label: str(o), value: str(o), disabled: false }
+
+view Select(name: str? = null, label: str? = null, value: str | num | list | null = null,
+            placeholder: str? = null, hint: str? = null, error: str? = null, required: bool = false,
+            disabled: bool = false, field: str? = null, size: str = "md", options: list = [],
+            groups: list = [], multiple: bool = false, rows: int? = null, on_change = null, class: str? = null) {
+    let id = field ?? `select-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let chosen = value == null ? [] : type_of(value) == "list" ? value | map((v) => str(v)) : [str(value)]
+    let opt = (o) => {
+        let it = select_option(o)
+        <option value={it.value} disabled={it.disabled} selected={contains(chosen, it.value)}>{it.label}</option>
+    }
+    <div class={ui_cls(["ui-select", size == "sm" && "ui-select-sm", multiple && "ui-select-multi",
+                        error != null && "ui-select-invalid", disabled && "ui-select-disabled", class])}>
+        {label != null && <label.ui-select-label for={id}>
+            {label}{required && <span.ui-select-req aria-hidden="true">*</span>}
+        </label>}
+        <span.ui-select-box>
+            <select id={id} name={name} required={required} disabled={disabled} multiple={multiple}
+                    size={rows} aria-invalid={error != null ? "true" : null}
+                    aria-describedby={described != "" ? described : null}
+                    @change={(e) => {
+                        on_change && on_change(multiple
+                            ? js("Array.from", e.target.selectedOptions) | map((o) => o.value)
+                            : e.value)
+                    }}>
+                {placeholder != null && !multiple
+                    && <option value="" disabled selected={len(chosen) == 0}>{placeholder}</option>}
+                {for o in options => opt(o)}
+                {for g in groups => <optgroup label={g.label}>{for o in g.options => opt(o)}</optgroup>}
+            </select>
+        </span>
+        {hint != null && <p.ui-select-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-select-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

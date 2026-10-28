@@ -1,0 +1,241 @@
+// The outside services the platform leans on, and how it copes when they
+// do not answer:
+//
+//   Nominatim (OpenStreetMap)   where a place is: one call a second at most, by
+//                               its usage policy, with a User-Agent saying who asks
+//   Open-Meteo                  the weather: 16 days of forecast, by the place's time zone
+//   Overpass (OpenStreetMap)    places to eat, see and do around a stay; often "at
+//                               capacity", so Photon (komoot) answers instead
+//
+// Each answer is kept in the `outside` table for a while (a place for a month,
+// the weather for half an hour, places around for a day), so a page asks each
+// service once for everyone, and still has an answer when the service is
+// down: an old one, said to be old. Every call is logged in `outside_calls`.
+//
+// Each call has a time to answer in (Overpass 8 s, then Photon is asked), and
+// pages never wait for these while they render: the stay page asks for the
+// weather and places after it shows.
+//
+// STAYS_OFFLINE=1 answers from made-up data instead, for tests and trains.
+
+let USER_AGENT = "QuilloStays/0.1 (a demo of the Quillo language)"
+let OFFLINE = env("STAYS_OFFLINE", "") == "1"
+// Another Overpass server (or one that does not answer, to try Photon).
+let OVERPASS = env("STAYS_OVERPASS", "https://overpass-api.de/api/interpreter")
+
+let KEEP = { geocode: 30 * 86400000, weather: 30 * 60000, places: 86400000 }
+
+fn round_to(x: float, digits: int) -> float = round(x * pow(10, digits)) / pow(10, digits)
+
+// ---- the cache and the log -------------------------------------------------------
+
+fn kept(key: str) with db = db.one("select body, fetched from outside where key = ?", key)
+
+fn keep(key: str, service: str, value) with db, time =
+    db.exec(sql`insert into outside (key, service, body, fetched) values (?, ?, ?, ?)
+                on conflict (key) do update set body = excluded.body, fetched = excluded.fetched`,
+        key, service, json.stringify(value), now())
+
+fn logged(service: str, url: str, status: int, ms: int) with db, time =
+    db.exec("insert into outside_calls (service, url, status, ms, created) values (?, ?, ?, ?, ?)", service, url, status, ms, now())
+
+// A GET to an outside service, given `secs` to answer: its JSON, or an
+// error value saying why.
+fn fetch_json(service: str, url: str, secs: int) with http, db, time {
+    let t = now()
+    // Every url here is built from one of the hosts above: public_only says so.
+    let r = http.get(url, { "User-Agent": USER_AGENT, "Accept": "application/json" }, { public_only: true, timeout: secs })
+    logged(service, url, is_err(r) ? 0 : r.status, now() - t)
+    if is_err(r) { return err(`${service} did not answer (${r.error})`) }
+    if !r.ok { return err(`${service} answered ${r.status}`) }
+    r.json ?? err(`${service} answered something that is not JSON`)
+}
+
+// The answer kept for `key` if it is fresh enough; else a new one from `ask`;
+// else, when the service fails, the old one marked `stale`.
+fn through_cache(key: str, service: str, fresh_answer) with http, db, time {
+    let k = kept(key)
+    if k != null && now() - k.fetched < get(KEEP, service) {
+        return merge(json.parse(k.body), { cached: true })
+    }
+    let fresh = fresh_answer()
+    if !is_err(fresh) {
+        keep(key, service, fresh)
+        return fresh
+    }
+    if k != null { return merge(json.parse(k.body), { stale: true, stale_since: k.fetched }) }
+    fresh
+}
+
+// Nominatim asks for one call a second at most; Quillo has no rate limit
+// (removed in 205d7cd), so the last call's time is read from the log.
+fn nominatim_wait() with db, time {
+    let last = db.one("select max(created) as t from outside_calls where service = 'nominatim'").t
+    if last != null && now() - last < 1100 { sleep(1100 - (now() - last)) }
+}
+
+// ---- where a place is -----------------------------------------------------------
+
+// { name, lat, lng, city, country }, or an error value.
+fn geocode(q: str) with http, db, time {
+    let text = trim(q)
+    if len(text) < 2 { return err("Where to? Type a city or an address") }
+    if OFFLINE { return offline_place(text) }
+    through_cache(`geocode:${lower(text)}`, "geocode", () => {
+        nominatim_wait()
+        let found = fetch_json("nominatim", `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${url_encode(text)}`, 5)?
+        if len(found) == 0 { return err(`Nowhere called “${text}” was found`) }
+        let p = found[0]
+        let a = p.address ?? {}
+        {
+            name: p.name ?? text,
+            lat: float(p.lat),
+            lng: float(p.lon),
+            city: a.city ?? a.town ?? a.village ?? p.name ?? text,
+            country: a.country ?? "",
+        }
+    })
+}
+
+// ---- the weather -------------------------------------------------------------
+
+// What a WMO weather code says, and a picture for it.
+fn weather_of(code: int) -> map = match code {
+    0 => { label: "Clear", icon: "☀️" }
+    1 | 2 => { label: "Partly cloudy", icon: "⛅" }
+    3 => { label: "Cloudy", icon: "☁️" }
+    45 | 48 => { label: "Fog", icon: "🌫️" }
+    51 | 53 | 55 | 56 | 57 => { label: "Drizzle", icon: "🌦️" }
+    61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => { label: "Rain", icon: "🌧️" }
+    71 | 73 | 75 | 77 | 85 | 86 => { label: "Snow", icon: "❄️" }
+    95 | 96 | 99 => { label: "Thunderstorms", icon: "⛈️" }
+    _ => { label: "Unknown", icon: "❔" }
+}
+
+// 16 days of forecast at a place: { zone, offset_s, days: [{ day, code, hi, lo, rain }] }.
+// Days are the place's own (Open-Meteo works out its time zone).
+fn forecast(lat: float, lng: float) with http, db, time {
+    if OFFLINE { return offline_forecast(lat, lng) }
+    let la = round_to(lat, 2)
+    let lo = round_to(lng, 2)
+    through_cache(`weather:${la},${lo}`, "weather", () => {
+        let w = fetch_json("open-meteo", `https://api.open-meteo.com/v1/forecast?latitude=${la}&longitude=${lo}&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=16`, 5)?
+        let d = w.daily ?? err("Open-Meteo sent no days")?
+        {
+            zone: w.timezone ?? "UTC",
+            offset_s: w.utc_offset_seconds ?? 0,
+            days: range(0, len(d.time)) | map((i) => {
+                day: d.time[i],
+                code: d.weather_code[i] ?? -1,
+                hi: d.temperature_2m_max[i],
+                lo: d.temperature_2m_min[i],
+                rain: d.precipitation_probability_max[i],
+            }),
+        }
+    })
+}
+
+// ---- places around ----------------------------------------------------------------
+
+let PLACE_KINDS = {
+    restaurant: "food", cafe: "food", bar: "nightlife", pub: "nightlife", fast_food: "food", bakery: "food",
+    museum: "culture", gallery: "culture", attraction: "culture", viewpoint: "outdoors", artwork: "culture",
+    park: "outdoors", garden: "outdoors", beach_resort: "outdoors", beach: "outdoors", playground: "outdoors",
+    theatre: "culture", cinema: "culture", ice_cream: "food",
+}
+
+// Metres between two points on the Earth (haversine). SQLite here has no
+// trigonometry (FEEDBACK5.md), so this is done in Quillo.
+fn metres(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float {
+    let r = 6371000.0
+    let p1 = math.radians(a_lat)
+    let p2 = math.radians(b_lat)
+    let dp = math.radians(b_lat - a_lat)
+    let dl = math.radians(b_lng - a_lng)
+    let h = math.sin(dp / 2) * math.sin(dp / 2) + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2)
+    2 * r * math.asin(math.sqrt(h))
+}
+
+fn place_row(name: str, kind_key: str, lat: float, lng: float, from_lat: float, from_lng: float) {
+    let m = metres(from_lat, from_lng, lat, lng)
+    {
+        name, lat, lng,
+        what: replace(kind_key, "_", " "),
+        kind: get(PLACE_KINDS, kind_key) ?? "culture",
+        metres: round(m),
+        walk_min: max([1, round(m / 80)]),
+    }
+}
+
+// Places to eat, see and do within about a kilometre: { source, places }, the
+// nearest first, at most 8 of each kind.
+fn places_near(lat: float, lng: float) with http, db, time {
+    if OFFLINE { return offline_places(lat, lng) }
+    let la = round_to(lat, 3)
+    let lo = round_to(lng, 3)
+    through_cache(`places:${la},${lo}`, "places", () => {
+        let rows = overpass(la, lo) ?? photon_places(la, lo)
+        if is_err(rows) { return rows }
+        let sorted = rows.places | sort_by((p) => p.metres)
+        let kept_rows = sorted | group_by((p) => p.kind) | values | map((g) => take(g, 8)) | flatten | sort_by((p) => p.metres)
+        { source: rows.source, places: kept_rows }
+    })
+}
+
+fn overpass(lat: float, lng: float) with http, db, time {
+    let q = `[out:json][timeout:8];(node(around:1200,${lat},${lng})[amenity~"^(restaurant|cafe|bar|pub|fast_food|ice_cream)$"][name];node(around:1200,${lat},${lng})[tourism~"^(museum|gallery|attraction|viewpoint|artwork)$"][name];node(around:1200,${lat},${lng})[leisure~"^(park|garden|beach_resort|playground)$"][name];);out 120;`
+    let j = fetch_json("overpass", `${OVERPASS}?data=${url_encode(q)}`, 8)?
+    let rows = (j.elements ?? []) | map((e) => {
+        let t = e.tags ?? {}
+        place_row(t.name ?? "", t.amenity ?? t.tourism ?? t.leisure ?? "attraction", e.lat, e.lon, lat, lng)
+    }) | filter((p) => p.name != "")
+    { source: "OpenStreetMap (Overpass)", places: rows }
+}
+
+// Photon, by kind, when Overpass does not answer.
+fn photon_places(lat: float, lng: float) with http, db, time {
+    let asks = [["restaurant", "amenity:restaurant"], ["cafe", "amenity:cafe"], ["museum", "tourism:museum"], ["park", "leisure:park"], ["bar", "amenity:bar"], ["viewpoint", "tourism:viewpoint"]]
+    let found = asks | map((a) => {
+        let j = fetch_json("photon", `https://photon.komoot.io/api/?q=${a[0]}&lat=${lat}&lon=${lng}&limit=8&osm_tag=${url_encode(a[1])}`, 4)
+        is_err(j) ? [] : (j.features ?? []) | map((f) => place_row(f.properties.name ?? "", a[0], f.geometry.coordinates[1], f.geometry.coordinates[0], lat, lng))
+    }) | flatten | filter((p) => p.name != "" && p.metres <= 2500)
+    if len(found) == 0 { return err("Neither Overpass nor Photon answered: no places around for now") }
+    { source: "OpenStreetMap (Photon)", places: found }
+}
+
+// ---- offline, for tests ---------------------------------------------------------
+
+let OFFLINE_PLACES = {
+    lisbon: { name: "Lisbon", lat: 38.7139, lng: -9.1394, city: "Lisbon", country: "Portugal" },
+    porto: { name: "Porto", lat: 41.1496, lng: -8.611, city: "Porto", country: "Portugal" },
+    barcelona: { name: "Barcelona", lat: 41.3874, lng: 2.1686, city: "Barcelona", country: "Spain" },
+    dublin: { name: "Dublin", lat: 53.3498, lng: -6.2603, city: "Dublin", country: "Ireland" },
+    kyoto: { name: "Kyoto", lat: 35.0116, lng: 135.7681, city: "Kyoto", country: "Japan" },
+}
+
+fn offline_place(text: str) {
+    let key = lower(trim(split(text, ",")[0]))
+    get(OFFLINE_PLACES, key) ?? err(`Nowhere called “${text}” was found`)
+}
+
+fn offline_forecast(lat: float, lng: float) with time {
+    let today = today_day()
+    { zone: "Europe/Lisbon", offset_s: 0, days: range(0, 16) | map((i) => {
+        day: add_days(today, i), code: [0, 2, 3, 61, 0, 80, 2][i % 7], hi: 20 + i % 5, lo: 12 + i % 3, rain: [0, 10, 30, 80, 5, 60, 20][i % 7],
+    }) }
+}
+
+fn offline_places(lat: float, lng: float) = {
+    source: "made up (STAYS_OFFLINE=1)",
+    places: [["Tasca do Chico", "restaurant", 0.002, 0.001], ["Café Central", "cafe", -0.001, 0.002], ["Museu da Cidade", "museum", 0.004, -0.003],
+             ["Jardim da Estrela", "park", -0.005, -0.004], ["Miradouro", "viewpoint", 0.006, 0.002], ["Bar do Rio", "bar", -0.003, 0.005]]
+        | map((p) => place_row(p[0], p[1], lat + p[2], lng + p[3], lat, lng)) | sort_by((p) => p.metres),
+}
+
+// The forecast if one is kept, fresh or not, without asking Open-Meteo: for
+// what renders on the server, which must not wait on a service.
+fn forecast_kept(lat: float, lng: float) with db, time {
+    if OFFLINE { return offline_forecast(lat, lng) }
+    let k = kept(`weather:${round_to(lat, 2)},${round_to(lng, 2)}`)
+    k == null ? null : json.parse(k.body)
+}

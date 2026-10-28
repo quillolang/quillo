@@ -1,0 +1,84 @@
+// Meter: a measurement within a known range, as a labelled bar coloured by whether
+// the value is good, so-so or bad, as the HTML <meter> does (role="meter").
+// For how far a task has got, use Progress.
+//
+//   <Meter label="Disk used" value={72} unit=" GB" max={100} high={80} optimum={0}/>
+//   <Meter label="Battery" value={18} unit="%" low={20} high={60} optimum={100}/>
+//   <Meter label="Password strength" value={3} max={4} segments={4} value_text="Good"/>
+//
+// value: the measurement, between min (0) and max (100). low and high split the
+// range in three, and optimum says which part is best: the value is green there,
+// amber in the part next to it and red in the part furthest from it (a value
+// between low and high is amber on either side when the best part is an end). With
+// none of the three, it takes tone: "accent" (default), "neutral", "success",
+// "warning", "danger" or "info". unit: after the value ("%", " GB");
+// value_text: what to show and say instead ("Good", "72 of 100 GB").
+// show_value: the value beside the label (true). label: what it measures.
+// segments: the bar cut into that many pieces (for a score of 4, say). marks: thin
+// lines on the bar at low and high (true when they are given). size: "sm", "md"
+// (default) or "lg".
+
+let meter_css = css`
+.ui-meter { display: grid; gap: 6px; min-width: 0; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); --t: var(--ui-accent); }
+.ui-meter-neutral { --t: var(--ui-muted); }
+.ui-meter-success, .ui-meter-good { --t: var(--ui-success); }
+.ui-meter-warning, .ui-meter-fair { --t: var(--ui-warning); }
+.ui-meter-danger, .ui-meter-poor { --t: var(--ui-danger); }
+.ui-meter-info { --t: var(--ui-info); }
+.ui-meter-head { display: flex; justify-content: space-between; gap: 12px; }
+.ui-meter-value { color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-meter-good .ui-meter-value, .ui-meter-fair .ui-meter-value, .ui-meter-poor .ui-meter-value { color: var(--t); font-weight: 600; }
+.ui-meter-track { position: relative; display: flex; gap: 3px; height: 8px; }
+.ui-meter-sm .ui-meter-track { height: 4px; }
+.ui-meter-lg .ui-meter-track { height: 12px; }
+.ui-meter-seg { position: relative; flex: 1; overflow: hidden; border-radius: 999px; background: var(--ui-subtle);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-border) 60%, transparent); }
+.ui-meter-fill { display: block; height: 100%; border-radius: inherit; background: var(--t); transition: width .3s ease; }
+.ui-meter-mark { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--ui-bg); }
+@media (prefers-reduced-motion: reduce) { .ui-meter-fill { transition: none; } }
+`
+
+// A number as text, whole ones without ".0", to two decimals at most.
+fn meter_num(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// Which part of the range v is in: 0 below low, 1 between, 2 above high.
+fn meter_part(v: num, low: num, high: num) -> int = v < low ? 0 : (v > high ? 2 : 1)
+
+view Meter(value: num, min: num = 0, max: num = 100, low: num? = null, high: num? = null,
+           optimum: num? = null, label: str? = null, unit: str = "", value_text: str? = null,
+           show_value: bool = true, segments: int = 1, marks: bool = true, tone: str = "accent",
+           size: str = "md", class: str? = null) {
+    let span = max - min > 0 ? max - min : 1
+    let v = value < min ? min : (value > max ? max : value)
+    let lo = low ?? min
+    let hi = high ?? max
+    let judged = low != null || high != null || optimum != null
+    let best = meter_part(optimum ?? (min + max) / 2, lo, hi)
+    let here = meter_part(v, lo, hi)
+    let mood = !judged ? null : (here == best ? "good" : ((best == 1 || abs(here - best) == 1) ? "fair" : "poor"))
+    let pct = (v - min) * 100 / span
+    let n = segments < 1 ? 1 : segments
+    let text = value_text ?? `${meter_num(value)}${unit}`
+    let at = (x) => meter_num((x - min) * 100 / span)
+    <div class={ui_cls(["ui-meter", mood != null ? `ui-meter-${mood}` : `ui-meter-${tone}`,
+                        size != "md" && `ui-meter-${size}`, class])}>
+        {(label != null || show_value) && <div.ui-meter-head aria-hidden="true">
+            <span>{label}</span>
+            {show_value && <span.ui-meter-value>{text}</span>}
+        </div>}
+        <div.ui-meter-track role="meter" aria-label={label} aria-valuemin={meter_num(min)} aria-valuemax={meter_num(max)}
+                            aria-valuenow={meter_num(v)} aria-valuetext={text}>
+            {for i in range(n) => {
+                let part = pct * n - i * 100
+                <span.ui-meter-seg>
+                    <span.ui-meter-fill style={`width: ${meter_num(part < 0 ? 0 : (part > 100 ? 100 : part))}%`}></span>
+                </span>
+            }}
+            {marks && n == 1 && low != null && low > min && low < max && <span.ui-meter-mark style={`left: ${at(low)}%`}></span>}
+            {marks && n == 1 && high != null && high > min && high < max && <span.ui-meter-mark style={`left: ${at(high)}%`}></span>}
+        </div>
+    </div>
+}

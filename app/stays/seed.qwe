@@ -1,0 +1,107 @@
+// Demo data, for STAYS_DEMO=1: hosts and their places in five cities (Kyoto's
+// in yen), two guests, past stays with reviews, stays to come, a request
+// waiting for Ana, and activities with times for the next four weeks. The
+// same every time (no random): tests count on it. Only an empty site is filled.
+// Every demo password is "password".
+
+// A number from 0 to 1, the same for the same seed.
+fn wobble(seed: int) -> float {
+    let x = math.sin(seed * 12.9898) * 43758.5453
+    x - floor(x)
+}
+
+let SEED_HOSTS = [
+    ["ana@stays.test", "Ana Ribeiro", 1], ["jordi@stays.test", "Jordi Puig", 1], ["aoife@stays.test", "Aoife Byrne", 1],
+    ["kenji@stays.test", "Kenji Mori", 1], ["sam@stays.test", "Sam Taylor", 0], ["lee@stays.test", "Lee Park", 0],
+]
+
+// [host, title, kind, city, country, lat, lng, base, weekend, cleaning, guests, amenities, instant, policy, min nights]
+let SEED_PLACES = [
+    [1, "Alfama flat with river view", "apartment", "Lisbon", "Portugal", 38.7114, -9.1305, 9500, 12000, 3500, 4, "wifi,kitchen,washer,view,balcony", 1, "moderate", 2],
+    [1, "Tiled house in Graça", "house", "Lisbon", "Portugal", 38.7171, -9.1312, 14000, 17500, 5000, 6, "wifi,kitchen,washer,workspace,heating,pets", 0, "strict", 3],
+    [1, "Bairro Alto studio", "apartment", "Lisbon", "Portugal", 38.7130, -9.1460, 7000, 9000, 2500, 2, "wifi,kitchen,ac", 1, "flexible", 1],
+    [1, "Room by the Estrela garden", "room", "Lisbon", "Portugal", 38.7145, -9.1600, 4500, 5500, 0, 2, "wifi,workspace", 1, "flexible", 1],
+    [1, "Belém loft near the tower", "apartment", "Lisbon", "Portugal", 38.6975, -9.2050, 11000, 13500, 4000, 4, "wifi,kitchen,parking,ac,lift", 1, "moderate", 2],
+    [1, "Ribeira townhouse", "house", "Porto", "Portugal", 41.1408, -8.6131, 12000, 15000, 4500, 5, "wifi,kitchen,washer,view", 1, "moderate", 2],
+    [1, "Cedofeita studio", "apartment", "Porto", "Portugal", 41.1530, -8.6200, 6000, 7500, 2000, 2, "wifi,kitchen,workspace", 1, "flexible", 1],
+    [2, "Eixample flat with balcony", "apartment", "Barcelona", "Spain", 41.3930, 2.1620, 13000, 16000, 5000, 4, "wifi,kitchen,ac,balcony,lift", 1, "strict", 2],
+    [2, "Gràcia room", "room", "Barcelona", "Spain", 41.4030, 2.1560, 5500, 6500, 0, 2, "wifi,ac", 0, "moderate", 1],
+    [2, "Barceloneta beach flat", "apartment", "Barcelona", "Spain", 41.3790, 2.1890, 16000, 21000, 6000, 4, "wifi,kitchen,ac,view,pool", 1, "strict", 3],
+    [3, "Georgian flat on Merrion Square", "apartment", "Dublin", "Ireland", 53.3399, -6.2490, 15000, 18000, 5000, 4, "wifi,kitchen,heating,workspace", 1, "moderate", 2],
+    [3, "Cottage in Howth", "cabin", "Dublin", "Ireland", 53.3860, -6.0650, 11000, 14000, 4000, 4, "wifi,kitchen,fireplace,parking,view,pets", 0, "strict", 2],
+    [3, "Stoneybatter room", "room", "Dublin", "Ireland", 53.3530, -6.2840, 5000, 6000, 0, 1, "wifi,heating", 1, "flexible", 1],
+    [4, "Machiya townhouse in Higashiyama", "house", "Kyoto", "Japan", 34.9980, 135.7800, 28000, 34000, 6000, 4, "wifi,kitchen,heating,ac", 1, "moderate", 2],
+    [4, "Gion studio", "apartment", "Kyoto", "Japan", 35.0036, 135.7750, 14000, 18000, 3000, 2, "wifi,ac,workspace", 1, "flexible", 1],
+    [4, "Arashiyama cabin by the bamboo", "cabin", "Kyoto", "Japan", 35.0170, 135.6710, 22000, 26000, 5000, 3, "wifi,heating,view,parking", 0, "strict", 2],
+]
+
+// [title, kind, city, lat, lng, currency, price, minutes, description, times, capacity]
+let SEED_ACTIVITIES = [
+    ["Tram 28 and the miradouros, on foot", "culture", "Lisbon", 38.7120, -9.1330, "EUR", 2500, 150, "The old trams' route, walked, with stops at the viewpoints and the stories behind the tiles.", ["10:00", "15:00"], 12],
+    ["Pastel de nata class", "food", "Lisbon", 38.7100, -9.1400, "EUR", 4500, 120, "Make the custard tarts from the pastry up, and eat them warm.", ["11:00", "17:00"], 8],
+    ["Sunset sail on the Tagus", "water", "Lisbon", 38.6960, -9.1920, "EUR", 6000, 120, "Two hours on a sailboat past the bridge and Belém, a glass of wine included.", ["18:00"], 10],
+    ["Sintra day hike", "outdoors", "Lisbon", 38.7880, -9.3900, "EUR", 5500, 420, "Palaces and the forest between them, on trails, with a guide.", ["09:00"], 14],
+    ["Port cellars and tasting", "food", "Porto", 41.1370, -8.6130, "EUR", 3500, 90, "Across the bridge to Gaia's cellars: how port is made, and four to taste.", ["11:00", "16:00"], 15],
+    ["Douro river kayak", "water", "Porto", 41.1400, -8.6300, "EUR", 4000, 150, "Paddle under the six bridges.", ["10:00"], 8],
+    ["Gaudí in a morning", "culture", "Barcelona", 41.4036, 2.1744, "EUR", 4000, 180, "Sagrada Família and Casa Batlló with an architect.", ["09:30"], 12],
+    ["Tapas crawl in the Gothic quarter", "food", "Barcelona", 41.3830, 2.1760, "EUR", 5500, 180, "Four bars, eight tapas, the old town at night.", ["19:30"], 10],
+    ["Cliff walk from Howth", "outdoors", "Dublin", 53.3790, -6.0580, "EUR", 2000, 180, "Around the head, seals and lighthouses, back for chowder.", ["10:00"], 15],
+    ["Literary pub crawl", "culture", "Dublin", 53.3440, -6.2630, "EUR", 1800, 150, "Joyce, Beckett and Behan, in the pubs they drank in.", ["19:00"], 20],
+    ["Tea ceremony in a machiya", "culture", "Kyoto", 35.0000, 135.7790, "JPY", 5000, 60, "The way of tea, in an old wooden townhouse.", ["10:00", "14:00"], 6],
+    ["Fushimi Inari at dawn", "outdoors", "Kyoto", 34.9671, 135.7727, "JPY", 3500, 180, "Up through the thousand gates before the crowds.", ["06:00"], 10],
+]
+
+fn seed_demo() with db, time, random {
+    if db.one("select count(*) as n from users").n > 0 { return null }
+    let hash = crypto.hash_password("password")
+    let t0 = now()
+    let ids = SEED_HOSTS | map((h) => db.exec("insert into users (email, name, password_hash, hosts, hue, created) values (?, ?, ?, ?, ?, ?)",
+        h[0], h[1], hash, h[2], floor(wobble(len(h[0])) * 360), t0 - 400 * DAY_MS).last_id)
+    let descriptions = ["Light all day, on a quiet street, five minutes from a tram.", "Old walls, new kitchen, a bed you will not want to leave.", "Close to everything, and quiet at night.", "A place to come back to after a long day out."]
+    for [i, p] in enumerate(SEED_PLACES) {
+        db.exec("insert into listings (host_id, title, kind, city, country, address, lat, lng, currency, base_price, weekend_price, cleaning_fee, max_guests, bedrooms, beds, baths, amenities, description, instant_book, cancel_policy, min_nights, hue, created) values (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ids[p[0] - 1], p[1], p[2], p[3], p[4], p[5], p[6], p[3] == "Kyoto" ? "JPY" : "EUR", p[7], p[8], p[9], p[10],
+            max([1, ceil(p[10] / 2)]), max([1, ceil(p[10] / 2)]), 1, p[11], descriptions[i % 4], p[12], p[13], p[14], floor(wobble(i + 7) * 360), t0 - 300 * DAY_MS)
+    }
+    let today = today_day()
+    // Past stays, with reviews: guests Sam and Lee in turn.
+    let words = ["Lovely place, exactly as described. The host was quick to answer.", "Great location, a bit noisy on Saturday night.", "Spotless, and the view is even better than the pictures.", "Comfortable beds and a kitchen with everything. Would stay again."]
+    for i in range(0, 24) {
+        let listing_id = i % 16 + 1
+        let l = db.one("select * from listings where id = ?", listing_id)
+        let start = add_days(today, -20 - i * 7)
+        let end = add_days(start, max([l.min_nights, 2 + i % 3]))
+        let guest = ids[4 + i % 2]
+        let b = seed_booking(l, guest, start, end, 2, "confirmed", t0 - (40 + i * 7) * DAY_MS)
+        db.exec("insert into reviews (booking_id, listing_id, guest_id, rating, body, created) values (?, ?, ?, ?, ?, ?)",
+            b, listing_id, guest, 3 + floor(wobble(i) * 3), words[i % 4], day_number(end) * DAY_MS + 3600000)
+    }
+    // Stays to come: Sam in Alfama in two weeks; Lee in Kyoto next month.
+    seed_booking(db.one("select * from listings where id = 1"), ids[4], add_days(today, 14), add_days(today, 18), 2, "confirmed", t0 - DAY_MS)
+    seed_booking(db.one("select * from listings where id = 14"), ids[5], add_days(today, 30), add_days(today, 34), 3, "confirmed", t0 - 2 * DAY_MS)
+    // A request waiting for Ana: Lee in Graça (not instant), 20 hours left to answer.
+    let r = seed_booking(db.one("select * from listings where id = 2"), ids[5], add_days(today, 21), add_days(today, 25), 2, "requested", t0 - 4 * 3600000)
+    db.exec("update bookings set respond_by = ? where id = ?", t0 + 20 * 3600000, r)
+    // Ana's prices: New Year's Eve dearer, and a week closed in December.
+    for d in nights_of(add_days(today, 40), add_days(today, 47)) { db.exec("insert into blocked_nights (listing_id, day) values (1, ?)", d) }
+    db.exec("insert into night_prices (listing_id, day, price) values (1, ?, 25000)", `${day_parts(today).y}-12-31`)
+    // Activities, with times for 28 days.
+    for [i, a] in enumerate(SEED_ACTIVITIES) {
+        let aid = db.exec("insert into activities (title, kind, city, lat, lng, currency, price, minutes, description, hue) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], floor(wobble(i + 30) * 360)).last_id
+        for k in range(0, 28) {
+            for t in a[9] {
+                db.exec("insert into activity_slots (activity_id, day, time, capacity, taken) values (?, ?, ?, ?, ?)", aid, add_days(today, k), t, a[10], k == 1 && i == 1 ? a[10] : floor(wobble(k * 31 + i) * a[10] / 2))
+            }
+        }
+    }
+    print(`STAYS_DEMO: ${len(SEED_PLACES)} places, ${len(SEED_ACTIVITIES)} activities, 27 bookings`)
+}
+
+fn seed_booking(l, guest: int, start: str, end: str, guests: int, status: str, created: int) with db {
+    let rec = quote_record(quote(l, start, end, guests, {}))
+    let id = db.exec("insert into bookings (listing_id, guest_id, start_day, end_day, guests, status, currency, total, breakdown, card_last4, created, decided) values (?, ?, ?, ?, ?, ?, ?, ?, ?, '4242', ?, ?)",
+        l.id, guest, start, end, guests, status, l.currency, rec.total, json.stringify(rec), created, created).last_id
+    for d in nights_of(start, end) { db.exec("insert into booking_nights (booking_id, listing_id, day) values (?, ?, ?)", id, l.id, d) }
+    id
+}

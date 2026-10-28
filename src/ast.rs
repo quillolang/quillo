@@ -130,6 +130,10 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
+    // Reads an error value it is given; asks the database nothing.
+    if name == "db.error_kind" {
+        return 0;
+    }
     let e = if name.starts_with("db.") || name == "idempotent" {
         "db"
     } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {

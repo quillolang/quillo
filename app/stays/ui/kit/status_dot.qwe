@@ -1,0 +1,42 @@
+// StatusDot: a coloured dot with a word, for the state of a person or a service.
+//
+//   <StatusDot status="online"/>                             a green dot, "Online"
+//   <StatusDot status="error" label="API down" pulse={true}/>
+//   <StatusDot status="away" show_label={false}/>            the dot alone, still said
+//
+// status: "online", "away", "busy" or "offline" for people; "ok", "warning",
+// "error", "info" or "unknown" for things. Green is online and ok, amber away and
+// warning, red busy and error, blue info, grey offline and unknown. label: the word
+// beside it (the status, capitalized, by default). show_label: false keeps only the
+// dot; screen readers still hear the label. pulse: a ring that keeps spreading from
+// the dot, for something live or urgent (still with reduced motion). size: "sm",
+// "md" (default) or "lg".
+
+let status_dot_css = css`
+.ui-sd { display: inline-flex; align-items: center; gap: 7px; vertical-align: middle; font: 14px/1.4 var(--ui-font);
+  color: var(--ui-fg); --t: var(--ui-strong); --d: 8px; }
+.ui-sd-sm { --d: 6px; gap: 5px; font-size: 13px; }
+.ui-sd-lg { --d: 10px; gap: 8px; font-size: 15px; }
+.ui-sd-online, .ui-sd-ok { --t: var(--ui-success); }
+.ui-sd-away, .ui-sd-warning { --t: var(--ui-warning); }
+.ui-sd-busy, .ui-sd-error { --t: var(--ui-danger); }
+.ui-sd-info { --t: var(--ui-info); }
+.ui-sd-dot { position: relative; flex: none; width: var(--d); height: var(--d); border-radius: 50%; background: var(--t); }
+.ui-sd-offline .ui-sd-dot, .ui-sd-unknown .ui-sd-dot { background: transparent; box-shadow: inset 0 0 0 2px var(--t); }
+.ui-sd-pulse .ui-sd-dot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--t);
+  animation: ui-sd-pulse 1.6s ease-out infinite; }
+@keyframes ui-sd-pulse { from { transform: scale(1); opacity: .6; } to { transform: scale(2.6); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .ui-sd-pulse .ui-sd-dot::after { animation: none; transform: scale(1.9); opacity: .25; }
+}
+`
+
+view StatusDot(status: str = "online", label: str? = null, show_label: bool = true, pulse: bool = false,
+               size: str = "md", class: str? = null) {
+    let said = label ?? upper(slice(status, 0, 1)) + slice(status, 1)
+    <span class={ui_cls(["ui-sd", `ui-sd-${status}`, size != "md" && `ui-sd-${size}`, pulse && "ui-sd-pulse", class])}
+          role={show_label ? null : "img"} aria-label={show_label ? null : said} title={show_label ? null : said}>
+        <span.ui-sd-dot aria-hidden="true"></span>
+        {show_label && <span.ui-sd-label>{said}</span>}
+    </span>
+}

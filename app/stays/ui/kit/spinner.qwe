@@ -1,0 +1,42 @@
+// Spinner: something is loading. Screen readers hear its label once (role="status").
+//
+//   <Spinner/>
+//   <Spinner size="lg" label="Loading invoices"/>
+//   <Spinner size="sm" show_label={true} label="Saving"/>
+//
+// size: "sm", "md" (default) or "lg"; it is drawn in the text's size units, so it
+// also follows font-size. label: what is loading ("Loading" by default), hidden
+// unless show_label. tone: "accent" (default), "neutral" or any other tone; inside
+// a button, tone="current" takes the text's colour. With reduced motion it pulses
+// slowly instead of turning.
+
+let spinner_css = css`
+.ui-spinner { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle;
+  font: 14px/1.4 var(--ui-font); color: var(--ui-muted); --t: var(--ui-accent); --s: 20px; }
+.ui-spinner-ring {
+  flex: none; width: var(--s); height: var(--s); border-radius: 50%;
+  border: max(2px, calc(var(--s) / 9)) solid color-mix(in srgb, var(--t) 18%, transparent);
+  border-top-color: var(--t); animation: ui-spinner-turn .75s linear infinite;
+}
+.ui-spinner-sm { --s: 14px; font-size: 13px; }
+.ui-spinner-lg { --s: 32px; }
+.ui-spinner-neutral { --t: var(--ui-muted); }
+.ui-spinner-success { --t: var(--ui-success); }
+.ui-spinner-warning { --t: var(--ui-warning); }
+.ui-spinner-danger { --t: var(--ui-danger); }
+.ui-spinner-info { --t: var(--ui-info); }
+.ui-spinner-current { --t: currentColor; color: inherit; }
+@keyframes ui-spinner-turn { to { transform: rotate(360deg); } }
+@keyframes ui-spinner-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .ui-spinner-ring { animation: ui-spinner-pulse 2s ease-in-out infinite; border-color: var(--t); }
+}
+`
+
+view Spinner(size: str = "md", label: str = "Loading", show_label: bool = false, tone: str = "accent",
+             class: str? = null) =
+    <span class={ui_cls(["ui-spinner", size != "md" && `ui-spinner-${size}`,
+                         tone != "accent" && `ui-spinner-${tone}`, class])} role="status">
+        <span.ui-spinner-ring aria-hidden="true"></span>
+        <span class={show_label ? "ui-spinner-label" : "ui-sr"}>{label}</span>
+    </span>

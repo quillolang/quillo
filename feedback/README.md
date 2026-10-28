@@ -16,7 +16,9 @@ never seen.
 Reports so far: [FEEDBACK.md](reports/FEEDBACK.md) (a forum), [FEEDBACK2.md](reports/FEEDBACK2.md)
 (a project manager), [FEEDBACK3.md](reports/FEEDBACK3.md) (a newsroom CMS with a flow and
 object designer), [FEEDBACK4.md](reports/FEEDBACK4.md) (a bank made of services, with a
-clerk–client desk view), and [BUGREPORT1.md](reports/BUGREPORT1.md).
+clerk–client desk view), [FEEDBACK5.md](reports/FEEDBACK5.md) (a booking platform on outside
+maps, weather and places, built with the Quillo UI kit, and the components it lacked), and
+[BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
 

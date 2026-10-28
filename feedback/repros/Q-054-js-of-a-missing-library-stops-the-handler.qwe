@@ -1,0 +1,19 @@
+// Q-054 `js("L.map", el)` when the page has no Leaflet stops the handler with a console error: no error value, so a component cannot see that a library is missing and say so
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 1500)); return { said: document.getElementById("said").textContent }
+// open-when: "said": "waiting"
+// fixed-when: "said": "err:
+// From FEEDBACK5.md (found on e045b8b, while adding MapView to quillolang/components). A map
+// component on a page that forgot Leaflet's <script> can only stay empty: the console says
+// "quillo: `js`: L.map is not defined on this page", and the code after the call never runs.
+
+component NoLib() {
+    state said = "waiting"
+    <p id="said" @mount={(el) => {
+        let m = js("L.map", el)
+        said = is_err(m) ? `err: ${m.error}` : m == null ? "null" : "made"
+    }}>{said}</p>
+}
+
+route GET / = <html><body><NoLib/></body></html>

@@ -652,6 +652,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "map | fn, fn=", "any"),
+    ("db.error_kind", "any", "str | null"),
     ("idempotent", "map | fn, fn=", "any"),
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
@@ -3248,6 +3249,22 @@ impl Checker {
     /// a value may be a visitor's, who could then reach the server's own
     /// network: a word, unless the call says `public_only` either way.
     fn http_rules(&mut self, f: &str, args: &[Expr], piped: bool) {
+        // An option written in the call that is not one: an error before
+        // the program runs, as it is when it runs (FEEDBACK5.md, Q-049;
+        // branch stays-fixes).
+        let opts_at = match f {
+            "get" | "delete" => Some(2),
+            "post" | "put" | "patch" => Some(3),
+            "request" => Some(4),
+            _ => None,
+        };
+        if let (false, Some(Expr::Map(fields))) = (piped, opts_at.and_then(|i| args.get(i))) {
+            for (k, _) in fields {
+                if !["redirects", "public_only", "cache", "timeout"].contains(&k.as_str()) {
+                    self.error(format!("`http.{}`: unknown option `{}` (the options are redirects, public_only, cache, timeout)", f, k));
+                }
+            }
+        }
         if let Some(c) = self.in_component() {
             let (nested, init) = self.fns.last().map_or((false, false), |x| (x.nested, x.state_init));
             if !nested || init {

@@ -1,0 +1,64 @@
+// Modal: a dialog over the page, on the browser's own <dialog>, so focus stays in
+// it, Escape closes it and screen readers announce it.
+//
+//   <Modal title="Invite people" trigger="Invite">
+//       <p>They get an email with a link.</p>
+//   </Modal>
+//
+// trigger: the text of a button that opens it (styled as a Button when
+// button_css is on the page). Inside one of your components, open it from your
+// own state instead: <Modal title="..." open={editing} on_close={() => { editing = false }}>.
+// size: "sm", "md" (default) or "lg". Clicking outside it closes it, unless
+// dismissable={false}.
+
+let modal_css = css`
+.ui-modal-host { display: contents; }
+.ui-modal {
+  width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 64px); padding: 0;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.5 var(--ui-font);
+}
+.ui-modal-sm { width: min(380px, calc(100vw - 32px)); }
+.ui-modal-lg { width: min(760px, calc(100vw - 32px)); }
+.ui-modal::backdrop { background: var(--ui-overlay); }
+.ui-modal[open] { animation: ui-modal-in .16s ease-out; }
+@keyframes ui-modal-in { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+.ui-modal-box { padding: 20px 22px 22px; }
+.ui-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.ui-modal-head h2 { margin: 0; font-size: 18px; font-weight: 600; line-height: 1.3; }
+.ui-modal-x {
+  flex: none; width: 30px; height: 30px; margin: -4px -6px 0 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); font-size: 20px; line-height: 1; cursor: pointer;
+}
+.ui-modal-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-modal-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-modal-body > :first-child { margin-top: 0; }
+.ui-modal-body > :last-child { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .ui-modal[open] { animation: none; } }
+`
+
+component Modal(title: str, trigger: str? = null, open: bool = false, size: str = "md",
+                dismissable: bool = true, on_close = null, children) {
+    state dlg = null
+    if open && dlg != null && !dlg.open { dlg.showModal() }
+    if !open && dlg != null && dlg.open && trigger == null { dlg.close() }
+    <div.ui-modal-host>
+        {trigger != null && <button.ui-btn.ui-btn-outline type="button" aria-haspopup="dialog"
+                                    @click={() => dlg.showModal()}>{trigger}</button>}
+        <dialog class={ui_cls(["ui-modal", size != "md" && `ui-modal-${size}`])} aria-label={title}
+                @mount={(el) => {
+                    dlg = el
+                    if open { el.showModal() }
+                }}
+                @close={() => { on_close && on_close() }}
+                @click={(e) => { if dismissable && e.target.tagName == "DIALOG" { dlg.close() } }}>
+            <div.ui-modal-box>
+                <div.ui-modal-head>
+                    <h2>{title}</h2>
+                    <button.ui-modal-x type="button" aria-label="Close" @click={() => dlg.close()}>×</button>
+                </div>
+                <div.ui-modal-body>{children}</div>
+            </div>
+        </dialog>
+    </div>
+}

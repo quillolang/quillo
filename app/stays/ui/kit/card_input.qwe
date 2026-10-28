@@ -1,0 +1,172 @@
+// CardInput: a payment card as people type it: the number in groups (4-6-5 for
+// American Express, fours for the others), its brand from its first digits, the
+// expiry as MM/YY and the security code. A number with a typo (its Luhn check
+// digit is wrong), a month past or a code too short is said once the field is left.
+// It takes no payment: it gives what was typed to your code, which hands it on.
+//
+//   <CardInput name="card" on_change={(c) => { card = c }}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// name: a plain <form> gets `name`_number (digits only), `name`_expiry ("MM/YY") and
+// `name`_cvc. label: what it is called ("Card"). today: "YYYY-MM-DD" a card must
+// not have expired by (the date today by default). hint, error, disabled as for
+// every field; error is shown as well as its own.
+// on_change(card): inside one of your components, given { number, expiry, cvc,
+// brand, complete } as each is typed: brand is "visa", "mastercard", "amex",
+// "discover" or null; complete, whether all three are whole and right.
+
+let card_input_css = css`
+.ui-card-input { display: grid; gap: 6px; min-width: 0; max-width: 420px; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-card-input-legend { padding: 0; margin-bottom: 2px; font-size: 13px; font-weight: 500; }
+.ui-card-input-box { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-card-input-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-card-input-invalid .ui-card-input-box { border-color: var(--ui-danger); }
+.ui-card-input-number { position: relative; grid-column: 1 / -1; border-bottom: 1px solid var(--ui-border); }
+.ui-card-input-box input {
+  box-sizing: border-box; width: 100%; height: 40px; margin: 0; padding: 0 12px; border: 0; background: transparent; color: var(--ui-fg);
+  font: 15px var(--ui-font); font-variant-numeric: tabular-nums; letter-spacing: .02em;
+}
+.ui-card-input-box input:focus { outline: none; }
+.ui-card-input-box input:disabled { opacity: .55; cursor: not-allowed; }
+.ui-card-input-number input { padding-right: 96px; }
+.ui-card-input-expiry { border-right: 1px solid var(--ui-border); }
+.ui-card-input-brand {
+  position: absolute; top: 50%; right: 10px; transform: translateY(-50%); padding: 2px 6px; border-radius: 4px;
+  background: var(--ui-subtle); color: var(--ui-muted); font: 600 11px/1.4 var(--ui-font); text-transform: uppercase; letter-spacing: .04em;
+}
+.ui-card-input-brand-visa { background: #1a1f71; color: #fff; }
+.ui-card-input-brand-mastercard { background: #eb001b; color: #fff; }
+.ui-card-input-brand-amex { background: #2e77bc; color: #fff; }
+.ui-card-input-brand-discover { background: #ff6000; color: #fff; }
+.ui-card-input-hint, .ui-card-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-card-input-error { color: var(--ui-danger); }
+`
+
+let card_input_brands = { visa: "Visa", mastercard: "Mastercard", amex: "Amex", discover: "Discover" }
+
+fn card_input_brand(d: str) =
+    re.test(d, "^3[47]") ? "amex" : re.test(d, "^4") ? "visa"
+    : re.test(d, "^(5[1-5]|2(2[2-9]|[3-6][0-9]|7[01]|720))") ? "mastercard"
+    : re.test(d, "^6(011|5)") ? "discover" : null
+
+// The lengths a brand's numbers have.
+fn card_input_lengths(brand) -> list = match brand {
+    "amex" => [15]
+    "visa" => [13, 16, 19]
+    "discover" => [16, 19]
+    _ => [16]
+}
+
+// "4242 4242 4242 4242"; "3782 822463 10005" for American Express.
+fn card_input_group(d: str, brand) -> str {
+    let cuts = brand == "amex" ? [0, 4, 10, 15] : [0, 4, 8, 12, 16, 20]
+    range(len(cuts) - 1) | map((i) => slice(d, cuts[i], cuts[i + 1])) | filter((p) => p != "") | join(" ")
+}
+
+// The Luhn check, as card numbers carry it in their last digit.
+fn card_input_luhn(d: str) -> bool {
+    let ds = split(d, "") | reverse | map((c) => int(c))
+    let total = sum(enumerate(ds) | map((p) => p[0] % 2 == 1 ? (p[1] * 2 > 9 ? p[1] * 2 - 9 : p[1] * 2) : p[1]))
+    len(d) > 0 && total % 10 == 0
+}
+
+// "1227" as typed: "12/27"; "4" is April, "04/".
+fn card_input_expiry(d: str) -> str {
+    let e = len(d) > 0 && int(slice(d, 0, 1)) > 1 ? `0${d}` : d
+    len(e) <= 2 ? (len(e) == 2 && len(d) < len(e) ? `${e}/` : e) : `${slice(e, 0, 2)}/${slice(e, 2, 4)}`
+}
+
+// The year and month of a day number (days since 1970), as year * 12 + month - 1.
+fn card_input_month(z: int) -> int {
+    let zz = z + 719468
+    let era = floor(zz / 146097)
+    let doe = zz - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let m = mp < 10 ? mp + 3 : mp - 9
+    (yoe + era * 400 + (m <= 2 ? 1 : 0)) * 12 + m - 1
+}
+
+component CardInput(name: str? = null, label: str = "Card", today: str? = null, hint: str? = null, error: str? = null,
+                    disabled: bool = false, on_change = null, class: str? = null) {
+    state number = ""
+    state expiry = ""
+    state cvc = ""
+    state left = []
+    let this_month = today != null && re.test(today, "^\\d{4}-\\d{2}")
+        ? int(slice(today, 0, 4)) * 12 + int(slice(today, 5, 7)) - 1
+        : card_input_month(floor(now() / 86400000))
+    let brand = card_input_brand(number)
+    let cvc_len = brand == "amex" ? 4 : 3
+    let shown_exp = card_input_expiry(expiry)
+    let mm = len(shown_exp) == 5 ? int(slice(shown_exp, 0, 2)) : 0
+    let yy = len(shown_exp) == 5 ? 2000 + int(slice(shown_exp, 3, 5)) : 0
+    let number_ok = contains(card_input_lengths(brand), len(number)) && card_input_luhn(number)
+    let expiry_ok = mm >= 1 && mm <= 12 && yy * 12 + mm - 1 >= this_month
+    let cvc_ok = len(cvc) == cvc_len
+    let problems = [
+        contains(left, "number") && number != "" && !number_ok
+            ? (contains(card_input_lengths(brand), len(number)) ? "That card number has a typo." : "That card number is too short.") : null,
+        contains(left, "expiry") && expiry != "" && !expiry_ok
+            ? (len(shown_exp) < 5 ? "The expiry as MM/YY." : mm < 1 || mm > 12 ? "The month from 01 to 12." : "That card has expired.") : null,
+        contains(left, "cvc") && cvc != "" && !cvc_ok ? `The security code is ${cvc_len} digits.` : null,
+    ] | filter((p) => p != null)
+    let id = `card-input-${name ?? "card"}`
+    let described = ui_cls([hint != null && `${id}-hint`, (len(problems) > 0 || error != null) && `${id}-error`])
+    let tell = () => {
+        on_change && on_change({ number, expiry: card_input_expiry(expiry), cvc, brand, complete: number_ok && expiry_ok && cvc_ok })
+    }
+    let digits = (text: str, most: int) => slice(re.replace(text, "[^0-9]", ""), 0, most)
+    let leave = (what: str) => { if !contains(left, what) { left = left + [what] } }
+    <fieldset class={ui_cls(["ui-card-input", (len(problems) > 0 || error != null) && "ui-card-input-invalid", class])} disabled={disabled}>
+        <legend.ui-card-input-legend>{label}</legend>
+        <div.ui-card-input-box>
+            <div.ui-card-input-number>
+                <input type="text" id={`${id}-number`} inputmode="numeric" autocomplete="cc-number" placeholder="1234 1234 1234 1234"
+                       aria-label="Card number" value={card_input_group(number, brand)}
+                       aria-invalid={contains(left, "number") && number != "" && !number_ok ? "true" : null}
+                       aria-describedby={described != "" ? described : null}
+                       @input={(e) => {
+                           number = digits(e.value, card_input_brand(digits(e.value, 19)) == "amex" ? 15 : 19)
+                           e.value = card_input_group(number, card_input_brand(number))
+                           tell()
+                       }}
+                       @blur={() => leave("number")}/>
+                {brand != null ? <span class={ui_cls(["ui-card-input-brand", `ui-card-input-brand-${brand}`])}>{get(card_input_brands, brand)}</span> : null}
+            </div>
+            <div.ui-card-input-expiry>
+                <input type="text" id={`${id}-expiry`} inputmode="numeric" autocomplete="cc-exp" placeholder="MM/YY"
+                       aria-label="Expiry, as MM/YY" value={shown_exp}
+                       aria-invalid={contains(left, "expiry") && expiry != "" && !expiry_ok ? "true" : null}
+                       @input={(e) => {
+                           // Deleting the slash deletes the digit before it.
+                           let typed = digits(e.value, 4)
+                           expiry = len(e.value) < len(shown_exp) && ends_with(shown_exp, "/") ? slice(typed, 0, len(typed) - 1) : typed
+                           e.value = card_input_expiry(expiry)
+                           tell()
+                       }}
+                       @blur={() => leave("expiry")}/>
+            </div>
+            <div>
+                <input type="text" id={`${id}-cvc`} inputmode="numeric" autocomplete="cc-csc" placeholder={brand == "amex" ? "1234" : "123"}
+                       aria-label="Security code" value={cvc}
+                       aria-invalid={contains(left, "cvc") && cvc != "" && !cvc_ok ? "true" : null}
+                       @input={(e) => {
+                           cvc = digits(e.value, 4)
+                           e.value = cvc
+                           tell()
+                       }}
+                       @blur={() => leave("cvc")}/>
+            </div>
+        </div>
+        {name != null ? <input type="hidden" name={`${name}_number`} value={number}/> : null}
+        {name != null ? <input type="hidden" name={`${name}_expiry`} value={len(shown_exp) == 5 ? shown_exp : ""}/> : null}
+        {name != null ? <input type="hidden" name={`${name}_cvc`} value={cvc}/> : null}
+        {hint != null ? <p.ui-card-input-hint id={`${id}-hint`}>{hint}</p> : null}
+        {len(problems) > 0 || error != null
+            ? <p.ui-card-input-error id={`${id}-error`} role="alert">{join(problems + (error != null ? [error] : []), " ")}</p>
+            : null}
+    </fieldset>
+}
