@@ -627,6 +627,15 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   find ways through (a library function that writes HTML, a function of the page
   reached inside data the page gave back, a `blob:` page opened in a frame). Keep data
   out of what `js` calls, as you would in JavaScript.
+- A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
+  waited for where code can wait, as a `server fn` call is: in an event handler, in
+  `@mount`, and in a `state` initializer: `let cam = js("navigator.mediaDevices.getUserMedia",
+  { video: true })` is the stream, or an error value if it was refused. Elsewhere (a
+  function `map` calls, a statement that runs again), and with `.then`, `.catch` or
+  `.finally` after it, it stays a Promise: `js("load").then((x) => { data = x })`.
+  `type_of` calls one `promise`.
+- A name the page does not have (a library's `<script>` left out) gives an error value,
+  `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
 
 ### Single-page apps

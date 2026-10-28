@@ -799,6 +799,9 @@ struct FnCtx {
     hoisted: bool,
     /// A `state` initializer's code, which the server runs as it renders.
     state_init: bool,
+    /// The function written in an `@event` or `@mount` attribute itself, not
+    /// one inside it: a Promise its `js(...)` gives is waited for here.
+    waits_js: bool,
 }
 
 enum Resolved {
@@ -812,6 +815,12 @@ enum Resolved {
 
 struct Compiler<'a> {
     it: &'a Interp,
+    /// The lambda an `@event` or `@mount` attribute is, while it compiles (by
+    /// its definition, which both of `function`'s passes see).
+    handler: Option<*const FnDef>,
+    /// Compiling what `.then`, `.catch` or `.finally` is called on: a Promise
+    /// is wanted there, not what it gives.
+    keep_promise: bool,
     assigned: HashSet<String>,
     /// Globals read from the server's environment, files or database.
     private: HashSet<String>,
@@ -1295,6 +1304,8 @@ impl<'a> Compiler<'a> {
             views: HashSet::new(),
             view_defs: Vec::new(),
             globals: HashMap::new(),
+            handler: None,
+            keep_promise: false,
             ctxs: Vec::new(),
             counter: 0,
             line: 0,
@@ -1655,7 +1666,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn new_ctx(&mut self, component: Option<String>, is_async: bool) {
-        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false });
+        self.ctxs.push(FnCtx { scopes: vec![HashMap::new()], temps: 0, is_async, needs_async: false, component, view: false, hoisted: false, state_init: false, waits_js: false });
     }
 
     fn temps_decl(n: usize) -> String {
@@ -1739,6 +1750,9 @@ impl<'a> Compiler<'a> {
         let saved_line = self.line;
         self.line = def.line;
         self.new_ctx(None, is_async);
+        if self.handler == Some(def as *const FnDef) {
+            self.ctx().waits_js = true;
+        }
         let mut pre = String::new();
         let res = (|| -> Result<(Vec<String>, String), QuilloError> {
             let names = self.params(def, &mut pre, true)?;
@@ -2170,7 +2184,7 @@ impl<'a> Compiler<'a> {
                     let mut init_ctx = self.ctxs.pop().unwrap();
                     let mut init = first?;
                     if init_ctx.needs_async {
-                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true });
+                        self.ctxs.push(FnCtx { scopes: outer.clone(), temps: 0, is_async: true, needs_async: false, component: None, view: false, hoisted: false, state_init: true, waits_js: false });
                         self.ctxs.last_mut().unwrap().scopes.push(HashMap::new());
                         let again = self.expr(e);
                         init_ctx = self.ctxs.pop().unwrap();
@@ -2653,7 +2667,10 @@ impl<'a> Compiler<'a> {
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
         let mut argv: Vec<String> = pre.into_iter().collect();
         if let Expr::Field(obj, name, _) = callee {
-            let recv = self.expr(obj)?;
+            let saved = std::mem::replace(&mut self.keep_promise, matches!(name.as_str(), "then" | "catch" | "finally"));
+            let recv = self.expr(obj);
+            self.keep_promise = saved;
+            let recv = recv?;
             let fb = self.fallback(name);
             if fb == "B.js" || fb == "B.js_new" {
                 return self.err(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", name, name));
@@ -2705,6 +2722,14 @@ impl<'a> Compiler<'a> {
         } else {
             format!("W.call({}, [{}])", f, argv.join(", "))
         };
+        // A Promise from the page's function is waited for where code can
+        // wait (an event handler, @mount, a state's initializer), as a
+        // `server fn` is: its rejection an error value (FEEDBACK6.md, Q-057;
+        // branch feedback6-fixes). Elsewhere, and before `.then`, it stays a
+        // Promise.
+        if (f == "B.js" || f == "B.js_new") && !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
+            return self.finish_call(&name, true, format!("W.settle({})", call));
+        }
         self.finish_call(&name, is_async, call)
     }
 
@@ -3259,7 +3284,12 @@ impl<'a> Compiler<'a> {
             written.push(js_str(name));
             if let Some(ev) = name.strip_prefix('@') {
                 let f = match v {
-                    AttrVal::Expr(e @ Expr::Lambda(_)) => self.expr(e)?,
+                    AttrVal::Expr(e @ Expr::Lambda(d)) => {
+                        let saved = self.handler.replace(&**d as *const FnDef);
+                        let code = self.expr(e);
+                        self.handler = saved;
+                        code?
+                    }
                     AttrVal::Expr(e) => {
                         let (f, r) = self.reactive_expr(e)?;
                         if r {

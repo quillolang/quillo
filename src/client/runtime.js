@@ -407,6 +407,8 @@ function typeName(v) {
   if (Array.isArray(v)) return "list";
   if (v instanceof Err) return "error";
   if (v instanceof Html) return "html";
+  // A Promise from the page's code is not a map (FEEDBACK6.md, Q-057; branch feedback6-fixes).
+  if (typeof Promise !== "undefined" && v instanceof Promise) return "promise";
   return "map";
 }
 
@@ -1533,19 +1535,23 @@ B.index_of = meta((c, x) => {
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
 // `js("Chart.register", ...)`: a function of the page's scripts, found from
 // the page's globals by its dotted path; `js_new` for a class.
+// A name the page does not have is an error value, which code can check and
+// say on the page (a library's <script> left out), not an error that stops it
+// (FEEDBACK5.md, Q-054; branch feedback6-fixes).
 function jsPath(path, f) {
   S(path, f);
   let owner = globalThis, v = globalThis;
   for (const p of path.split(".")) {
     foreignName(p);
-    if (v === null || v === undefined || !(p in Object(v))) fail(`\`${f}\`: ${path} is not defined on this page`);
+    if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page`)];
     owner = v;
     v = v[p];
   }
-  return [owner, v];
+  return [owner, v, null];
 }
 B.js = meta((path, ...args) => {
-  const [owner, v] = jsPath(path, "js");
+  const [owner, v, missing] = jsPath(path, "js");
+  if (missing) return missing;
   if (typeof v !== "function") {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
@@ -1553,7 +1559,8 @@ B.js = meta((path, ...args) => {
   return fromPage(Reflect.apply(v, owner, guardCall(`\`js\`: ${path}`, v, args)));
 }, "js", null);
 B.js_new = meta((path, ...args) => {
-  const [, v] = jsPath(path, "js_new");
+  const [, v, missing] = jsPath(path, "js_new");
+  if (missing) return missing;
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
   return fromPage(Reflect.construct(v, guardCall(`\`js_new\`: ${path}`, v, args)));
 }, "js_new", null);
@@ -4684,6 +4691,12 @@ const G = {};
 const C = {};
 const W = {};
 W.Err = Err;
+// What `js(...)` gave, waited for if it is a Promise (see `call` in
+// src/client.rs): what it settles to, or its rejection as an error value.
+W.settle = async (v) => {
+  if (v === null || typeof v !== "object" || typeof v.then !== "function" || foreign(v) && !(v instanceof Promise)) return v;
+  try { return fromPage(await v); } catch (e) { return new Err("js: " + (e && e.message || String(e))); }
+};
 W.Dec = Dec;
 W.Ret = Ret;
 W.fail = fail;
