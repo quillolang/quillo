@@ -1577,6 +1577,15 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     info.insert("f".into(), Value::str(&name));
     info.insert("a".into(), Value::list(rest));
     info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
+    // The value's hash, kept: the page's first refresh can be a patch
+    // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    if let Ok(v) = &r {
+        if !matches!(v, Value::Err(_)) {
+            let a = crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false));
+            it.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner()).keep(a.h, a.value.clone(), a.text.len());
+            info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));
+        }
+    }
     it.last_live = Some(Value::map(info));
     r
 }

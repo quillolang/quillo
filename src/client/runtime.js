@@ -3661,10 +3661,15 @@ function idemKey() {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+// `live` is the subscription refreshing, if one is: it says what it has
+// (`h`, the hash of `base`, its last value from the server) and the answer
+// may be a patch to that (FEEDBACK2.md, Q-028; branch feedback6-fixes).
 async function rpcRaw(name, args, live, idem) {
   let r;
   const headers = { "content-type": "application/json" };
+  const had = live && live.h, base = live && live.base;
   if (live) headers["x-quillo-live"] = "1";
+  if (had) headers["x-quillo-had"] = had;
   if (idem) headers["idempotency-key"] = idemKey();
   // Files (from an <input type=file>) go as parts of a multipart body, the
   // other arguments as JSON beside them.
@@ -3697,10 +3702,36 @@ async function rpcRaw(name, args, live, idem) {
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
   let body = null;
-  try { body = untagDeep(await r.json()); } catch (_) {}
+  try { body = await r.json(); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
   if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
-  const value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
-  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "" };
+  let value = null;
+  if (body && hasOwn(body, "patch")) {
+    if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);
+    value = livePatched(base, body.patch);
+  } else value = body && hasOwn(body, "err") ? new Err(body.err) : body && hasOwn(body, "ok") ? body.ok : null;
+  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "", h: (body && body.h) || "" };
+}
+
+// A live value made from the last one and what changed (the format is in
+// src/livecache.rs). What did not change is the same object as before.
+function livePatched(old, p) {
+  if (hasOwn(p, "$=")) return old;
+  if (hasOwn(p, "$v")) return untagDeep(p.$v);
+  const put = (o, k, v) => Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+  if (hasOwn(p, "$m")) {
+    const o = {}, gone = new Set(p.$x || []);
+    for (const k of Object.keys(old)) if (!gone.has(k)) put(o, k, hasOwn(p.$m, k) ? livePatched(old[k], p.$m[k]) : old[k]);
+    for (const k of Object.keys(p.$m)) if (!hasOwn(old, k)) put(o, k, livePatched(undefined, p.$m[k]));
+    return o;
+  }
+  const out = [];
+  for (const op of p.$l) {
+    if (typeof op === "number") out.push(old[op]);
+    else if (Array.isArray(op)) for (let i = 0; i < op[1]; i++) out.push(old[op[0] + i]);
+    else if (hasOwn(op, "$p")) out.push(livePatched(old[op.$p], op.d));
+    else out.push(untagDeep(op.$v));
+  }
+  return out;
 }
 
 async function rpc(name, args, idem) {
@@ -3798,12 +3829,14 @@ async function liveRefresh(sub) {
   // Only the latest load counts: an older one may answer last.
   const n = (sub.loads = (sub.loads || 0) + 1);
   try {
-    const { value, topics, seq, server, failed } = await rpcRaw(sub.fname, sub.args, true);
+    const { value, topics, seq, server, failed, h } = await rpcRaw(sub.fname, sub.args, sub);
     if (n !== sub.loads) return;
     // Keep showing the last good data; the next change tries again.
     if (failed) { report(value.error); return; }
     liveSeen(seq, server);
     sub.topics = topics;
+    sub.h = value instanceof Err ? "" : h;
+    sub.base = value;
     sub.sig.set(value);
     liveRestart();
   } catch (e) {
@@ -5433,7 +5466,7 @@ function liveSig(inst, name, fname, args) {
   const info = inst.liveInfo && inst.liveInfo[name];
   const had = hasOwn(inst.s0, name);
   const sig = new Sig(had ? inst.s0[name] : null);
-  const sub = { inst, sig, name, fname, args: null, topics: info ? info.t : [] };
+  const sub = { inst, sig, name, fname, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined };
   Live.subs.add(sub);
   onCleanup(() => { Live.subs.delete(sub); liveRestart(); });
   let first = true;

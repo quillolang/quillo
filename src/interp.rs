@@ -146,6 +146,9 @@ pub struct Interp {
     pub(crate) in_component: bool,
     /// While a `live` loader runs: the topics (tables, globals) it reads.
     pub reads: Option<std::collections::HashSet<String>>,
+    /// The code read the request (its session, cookies, headers): what it
+    /// made is this viewer's (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    pub read_request: bool,
     /// The subscription the last `live(...)` call set up, for `state`.
     pub last_live: Option<Value>,
     /// Open `db.transaction`s, and changes to announce when they commit.
@@ -802,6 +805,7 @@ impl Interp {
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            read_request: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -869,6 +873,7 @@ impl Interp {
             in_component: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
+            read_request: false,
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
@@ -1026,6 +1031,7 @@ impl Interp {
 
     /// The request being handled, as the `request` map (made now if needed).
     pub fn request_value(&mut self) -> Option<Value> {
+        self.read_request = true;
         if self.current_request.is_none() {
             if let Some(p) = &self.pending_request {
                 let mut r = p.make();

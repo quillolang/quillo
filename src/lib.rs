@@ -29,6 +29,7 @@ pub mod interp;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod lexer;
+pub mod livecache;
 pub mod metrics;
 pub mod migrate;
 pub mod money;

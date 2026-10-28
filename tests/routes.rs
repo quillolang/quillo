@@ -318,8 +318,10 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     // and callbacks the page calls with more arguments than they take
     // (500 bytes: FEEDBACK5.md, Q-046, Q-048, Q-050; branch stays-fixes);
     // what says why a page was made again is in development bundles only,
-    // and newlines that change nothing go.
-    assert!(js.len() < js2.len() && js.len() < 31_200, "{} vs {}", js.len(), js2.len());
+    // and newlines that change nothing go; an island inside another whose
+    // state no longer fits is made again by itself, the others resumed
+    // (250 bytes: Q-014; branch feedback6-fixes).
+    assert!(js.len() < js2.len() && js.len() < 31_800, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }
@@ -403,7 +405,9 @@ route GET / = <List p="> "/>
 "#,
     );
     let page = get(&mut it, "/").text();
-    assert!(page.contains(r#"data-l="{&quot;xs&quot;:{&quot;f&quot;:&quot;load&quot;,&quot;a&quot;:[&quot;&gt; &quot;],&quot;t&quot;:[&quot;var:items&quot;]}}""#), "{}", page);
+    // With the value's hash, which the first refresh may be a patch to
+    // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    assert!(page.contains(r#"data-l="{&quot;xs&quot;:{&quot;f&quot;:&quot;load&quot;,&quot;a&quot;:[&quot;&gt; &quot;],&quot;t&quot;:[&quot;var:items&quot;],&quot;h&quot;:&quot;"#), "{}", page);
     assert!(page.contains("<li>&gt; a</li>"), "{}", page);
     let js = get(&mut it, "/_quillo/quillo.js").text();
     assert!(js.contains(r#"W.live($i, "xs", "load", () => [$p.p])"#), "{}", js);

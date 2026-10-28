@@ -140,6 +140,9 @@ pub struct Shared {
     peers: Mutex<Vec<std::sync::Weak<Shared>>>,
     /// Where services run that do not run here (`--service-url name=url`).
     pub service_urls: Mutex<std::collections::HashMap<String, String>>,
+    /// Live loaders' runs shared between pages, and the values pages have,
+    /// for patches (FEEDBACK2.md, Q-028; branch feedback6-fixes).
+    pub live_cache: Mutex<crate::livecache::LiveCache>,
 }
 
 impl Shared {
@@ -152,6 +155,7 @@ impl Shared {
             outbox: Mutex::new(None),
             peers: Mutex::new(Vec::new()),
             service_urls: Mutex::new(std::collections::HashMap::new()),
+            live_cache: Mutex::new(Default::default()),
         }
     }
 
