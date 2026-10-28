@@ -1544,6 +1544,13 @@ impl Checker {
         }
     }
 
+    /// `lib/a.qwe:1`: a place in the program, from the main file's folder.
+    fn shown_at(&self, f: &str, l: u32) -> String {
+        let dir = Path::new(&*self.main).parent().unwrap_or(Path::new(""));
+        let short = Path::new(f).strip_prefix(dir).unwrap_or(Path::new(f));
+        format!("{}:{}", short.strip_prefix(".").unwrap_or(short).display(), l)
+    }
+
     /// Before `name`, defined at the top level of `file`, is added: one
     /// the program already has is an error, wherever it is (the second
     /// would replace the first everywhere), and a function taking a
@@ -1563,11 +1570,7 @@ impl Checker {
         if is_let && g.sig.is_none() && !g.used && g.file == *file {
             return;
         }
-        let at = |f: &str, l: u32| {
-            let dir = Path::new(&*self.main).parent().unwrap_or(Path::new(""));
-            let short = Path::new(f).strip_prefix(dir).unwrap_or(Path::new(f));
-            format!("{}:{}", short.strip_prefix(".").unwrap_or(short).display(), l)
-        };
+        let at = |f: &str, l: u32| self.shown_at(f, l);
         let msg = format!("`{}` is defined twice, at {} and {}: the second replaces the first everywhere, so rename one", name, at(&g.file, g.line), at(file, line));
         self.diag_at(file.clone(), line, Severity::Error, msg);
     }
@@ -3533,7 +3536,25 @@ impl Checker {
     /// and the result type.
     fn apply(&mut self, ft: T, sig: Option<Arc<Sig>>, args: Vec<T>, arg_exprs: &[Expr], name: &str) -> T {
         if ft.bits != 0 && ft.bits & FN == 0 {
-            self.error(format!("cannot call `{}`: it is {}, not a function", name, bits_text(ft.bits)));
+            // A top-level variable with a builtin's name takes it from every
+            // file: say whose it is, here and where it is made (FEEDBACK3.md,
+            // Q-035; branch feedback6-fixes).
+            let hidden = self.globals.get(name).filter(|g| &*g.file != "<builtin>" && matches!(g.kind, Kind::Global)).map(|g| (g.file.clone(), g.line));
+            match hidden {
+                Some((file, line)) if BUILTINS.iter().any(|(n, _, _)| *n == name) => {
+                    let at = self.shown_at(&file, line);
+                    self.error(format!(
+                        "cannot call `{}`: it is {}, the program's variable from {}, which hides the builtin `{}` in every file",
+                        name, bits_text(ft.bits), at, name
+                    ));
+                    let here = self.shown_at(&self.file.clone(), self.line);
+                    self.diag_at(file, line, Severity::Warning, format!(
+                        "`{}` hides the builtin `{}` in every file of the program, and {} calls the builtin: pick another name",
+                        name, name, here
+                    ));
+                }
+                _ => self.error(format!("cannot call `{}`: it is {}, not a function", name, bits_text(ft.bits))),
+            }
             return T::ANY;
         }
         let Some(sig) = sig else { return T::ANY };
