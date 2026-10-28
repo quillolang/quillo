@@ -10,12 +10,13 @@ never seen.
 | [INDEX.md](INDEX.md) | every known issue, once, with its kind, where it was seen, and its status |
 | [repros/](repros) | a runnable repro for each issue that can have one |
 | [run.mjs](run.mjs) | runs the repros against the current build: open, fixed or changed |
-| [TEMPLATE.md](TEMPLATE.md) | the shape of a report (`FEEDBACKn.md` at the repository's root) |
+| [TEMPLATE.md](TEMPLATE.md) | the shape of a report (`reports/FEEDBACKn.md`) |
 | [tools/](tools) | headless Chrome, for driving pages and catching what fails silently |
 
-Reports so far: [FEEDBACK.md](../FEEDBACK.md) (a forum), [FEEDBACK2.md](../FEEDBACK2.md)
-(a project manager), [FEEDBACK3.md](../FEEDBACK3.md) (a newsroom CMS with a flow and
-object designer), and [BUGREPORT1.md](../BUGREPORT1.md).
+Reports so far: [FEEDBACK.md](reports/FEEDBACK.md) (a forum), [FEEDBACK2.md](reports/FEEDBACK2.md)
+(a project manager), [FEEDBACK3.md](reports/FEEDBACK3.md) (a newsroom CMS with a flow and
+object designer), [FEEDBACK4.md](reports/FEEDBACK4.md) (a bank made of services, with a
+clerk–client desk view), and [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
 
@@ -28,7 +29,7 @@ object designer), and [BUGREPORT1.md](../BUGREPORT1.md).
    runs into anyway: how often models trip on the same thing is the signal.
 4. **Probe before building on something risky.** Write a few lines and run them
    first, in the server and in the browser.
-5. **Build the app** in a folder of its own at the repository's root.
+5. **Build the app** in a folder of its own in `app/` (`app/<name>/`), beside the sample to-do app.
 6. **Test it the way a person uses it**, in headless Chrome with real mouse and key
    events (`tools/`), not only with `quillo check`. Look hardest for what fails
    *without a word*:
@@ -38,7 +39,7 @@ object designer), and [BUGREPORT1.md](../BUGREPORT1.md).
    - Empty data, one item, many items (thousands of rows), two tabs at once, a
      viewer who may not change things, someone outside, hostile calls to `server fn`s
      (`POST /_quillo/rpc/<name>`), odd input (dates, long text, markup, formulas).
-7. **Write the report** from [TEMPLATE.md](TEMPLATE.md) as the next `FEEDBACKn.md`.
+7. **Write the report** from [TEMPLATE.md](TEMPLATE.md) as the next `reports/FEEDBACKn.md`.
    Every finding comes with a repro checked on the version named at the top.
 8. **Update the index:**
    - add the app to **Seen** for each known issue it hit;

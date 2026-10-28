@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| App | [cms/](cms), "Newsroom": 3,274 lines in 20 files (17 of Quillo). Articles made of blocks move through a flow of steps, each controlled by a role (writer, reviewer, publisher); a step can need several approvals. Reviewers give feedback on single blocks, live, from several desks at once; the author answers; reviewers close it. Designers draw flows, and make objects (tables created at run time) with fields, a state machine, create forms, transaction forms (the only way a record changes state) and lists, then build desk pages from those blocks. |
+| App | [cms/](../../app/cms), "Newsroom": 3,274 lines in 20 files (17 of Quillo). Articles made of blocks move through a flow of steps, each controlled by a role (writer, reviewer, publisher); a step can need several approvals. Reviewers give feedback on single blocks, live, from several desks at once; the author answers; reviewers close it. Designers draw flows, and make objects (tables created at run time) with fields, a state machine, create forms, transaction forms (the only way a record changes state) and lists, then build desk pages from those blocks. |
 | Quillo | 0.5.0 (896e758) |
 | Model | Claude Opus 5.5 |
 | Tested with | `quillo check`; headless Chrome with three desks signed in as different people at once; `feedback/tools/mismatches.mjs` on 17 pages for three roles; hostile and simultaneous server-fn calls |
@@ -23,7 +23,7 @@ work), and `--watch` kept serving the last good version when an edit broke the p
 
 ## Seen again
 
-Known issues this app ran into (see [feedback/INDEX.md](feedback/INDEX.md)):
+Known issues this app ran into (see [feedback/INDEX.md](../INDEX.md)):
 
 | ID | Where it bit | Attempts |
 |---|---|---|

@@ -1,0 +1,242 @@
+// The two sides of a desk session, both live on desk:<code>:
+//
+// Markup holding inputs or components is chosen with `? :`, never `&&`:
+// `cond && <x>` makes <x> again whenever anything it reads changes, so a box
+// being typed in loses its focus and text (FEEDBACK4.md, Q-041).
+//
+//   <DeskClerk>   the clerk's form: fields, "ask the client" per part, what
+//                 the client answered, and Submit once all is approved.
+//   <DeskClient>  the client's phone: the code to join, then the form as the
+//                 clerk fills it in (a field just changed lights up), the
+//                 questions to approve, and the PIN to choose.
+
+let OPTIONS = {
+    kind: [["checking", "Checking (everyday)"], ["savings", "Savings"]],
+    currency: [["EUR", "Euro"], ["USD", "US dollar"], ["GBP", "Pound sterling"]],
+}
+
+view StateBadge(state: str) = <span class={`badge ${replace(state, " ", "-")}`}>{match state {
+    "approved" => "✓ Approved"
+    "pending" => "Waiting for the client"
+    "declined" => "✗ Not right"
+    "changed" => "Changed since approved"
+    "stale" => "Asked again since"
+    _ => "Not asked yet"
+}}</span>
+
+// ---- the clerk --------------------------------------------------------------
+
+// One field. What the clerk types is kept here as well as sent, so the
+// form never shows an older answer from the server over newer typing.
+component ClerkField(code: str, field: str, label: str, value: str, accounts: list, on_problem) {
+    state draft = null
+    let shown = draft ?? value
+    let save = (v) => {
+        draft = v
+        let r = desk_set(code, field, v)
+        if is_err(r) { on_problem(r.error) }
+    }
+    <label.field>
+        <span>{label}</span>
+        {get(OPTIONS, field) != null
+            ? <select @change={(e) => save(e.value)}>
+                {for o in get(OPTIONS, field) => <option value={o[0]} selected={o[0] == shown}>{o[1]}</option>}
+              </select>
+            : field == "account_id"
+                ? <select @change={(e) => save(e.value)}>
+                    <option value="" selected={shown == ""}>Choose…</option>
+                    {for a in accounts => <option value={str(a.id)} selected={str(a.id) == shown}>{a.label}</option>}
+                  </select>
+                : <input value={shown} name={field}
+                    type={field == "birth_date" ? "date" : field == "email" ? "email" : "text"}
+                    inputmode={field == "deposit" || field == "amount" ? "decimal" : null}
+                    autocomplete="off" @input={(e) => save(e.value)}/>}
+    </label>
+}
+
+component DeskClerk(code: str) {
+    state desk = live(load_desk, code, "clerk")
+    state problem = null
+    state busy = false
+    let act = (r) => {
+        if is_err(r) { problem = r.error; false } else { problem = null; true }
+    }
+    {desk == null
+        ? <Empty>This session is not here.</Empty>
+        : <div.desk-clerk>
+            <header.desk-head>
+                <div>
+                    <h1>{desk.title}</h1>
+                    <p.muted>{desk.customer != null ? `For ${desk.customer.name}, customer ${desk.customer.number}` : "A new customer"} · with you, {desk.clerk}</p>
+                </div>
+                <div.code-box>
+                    <span>Code for the client's phone</span>
+                    <b.code>{desk.code}</b>
+                    <span class={desk.joined ? "joined" : "waiting"}>{desk.joined ? "● Phone joined" : "○ Waiting for the phone"}</span>
+                </div>
+            </header>
+            {desk.status == "done" && <section.finished>
+                <h2>✓ Done</h2>
+                {desk.progress.account_number != null && <p>Account <b>{iban_pretty(desk.progress.account_number)}</b>{desk.progress.customer_number != null && `, customer number ${desk.progress.customer_number}`}.</p>}
+                {desk.progress.amount != null && <p>Paid out <b>{desk.progress.amount}</b> from {iban_pretty(desk.progress.account_number)}.</p>}
+                <a.btn.ghost href="/staff">Back to the dashboard</a>
+            </section>}
+            {desk.status == "cancelled" && <section.finished.cancelled><h2>Cancelled</h2><a.btn.ghost href="/staff">Back to the dashboard</a></section>}
+            {desk.status == "open" ? <div>
+                <Problem text={problem}/>
+                {for s in desk.sections => <section.part key={s.id} class={s.state}>
+                    <header>
+                        <h2>{s.title}</h2>
+                        <StateBadge state={s.state}/>
+                    </header>
+                    {s.id == "terms"
+                        ? <p.terms>{TERMS}</p>
+                        : <div.fields>{for f in s.fields => <ClerkField key={f[0]} {code} field={f[0]} label={f[1]}
+                            value={str(get(desk.data, f[0]) ?? "")} accounts={desk.accounts} on_problem={(e) => { problem = e }}/>}</div>}
+                    {s.state == "declined" && s.ask.note != "" && <p.note>The client says: “{s.ask.note}”</p>}
+                    <footer>
+                        {s.problem != null && <span.hint>{s.problem}</span>}
+                        <button.btn.ghost.small disabled={!desk.joined || s.problem != null || s.state == "pending"}
+                            title={!desk.joined ? "The client's phone has not joined yet" : ""}
+                            @click={() => { act(desk_ask(code, s.id)) }}>
+                            {s.state == "not asked" ? "Ask the client to confirm" : "Ask again"}
+                        </button>
+                    </footer>
+                </section>}
+                {desk.new_customer && <section.part class={desk.pin_set ? "approved" : "not-asked"}>
+                    <header><h2>PIN</h2><span class={`badge ${desk.pin_set ? "approved" : "not-asked"}`}>{desk.pin_set ? "✓ Chosen on the phone" : "The client chooses it on their phone"}</span></header>
+                    <p.muted>You never see it: only that it was chosen.</p>
+                </section>}
+                <footer.submit>
+                    {len(desk.missing) > 0
+                        ? <ul.missing>{for m in desk.missing => <li>{m}</li>}</ul>
+                        : <p.ready>Everything is approved.</p>}
+                    <div.actions>
+                        <button.btn.primary disabled={len(desk.missing) > 0 || busy} @click={() => {
+                            busy = true
+                            let r = desk_submit(code)
+                            busy = false
+                            if act(r) { notify("Done", { tone: "success", seconds: 3 }) }
+                        }}>{busy ? "Working…" : desk.kind == "withdrawal" ? "Pay out" : desk.kind == "update" ? "Save the new details" : "Open the account"}</button>
+                        {desk.joined && <button.btn.ghost @click={() => {
+                            if ask("Let the client's phone go? Their approvals are kept; questions still waiting are taken back.", { title: "Another phone", ok: "Let it go", cancel: "Keep it" }) { act(desk_release(code)) }
+                        }}>Another phone</button>}
+                        <button.btn.ghost.danger @click={() => {
+                            if ask("Cancel this session?", { title: "Cancel", ok: "Cancel it", cancel: "Keep it", tone: "danger" }) { act(desk_cancel(code)) }
+                        }}>Cancel</button>
+                    </div>
+                </footer>
+            </div> : null}
+        </div>}
+}
+
+// ---- the client -------------------------------------------------------------
+
+// One question from the clerk: what to confirm, and the two answers.
+component AskCard(ask, title: str) {
+    state saying = false
+    state note = ""
+    state problem = null
+    let answer = (yes: bool) => {
+        let r = desk_answer(ask.id, yes, note)
+        if is_err(r) { problem = r.error } else { problem = null; saying = false }
+    }
+    <div.ask>
+        <b>Please check: {title}</b>
+        <dl>{for row in ask.shown => <div>{row[0] != "" && <dt>{row[0]}</dt>}<dd>{row[1] == "" ? "—" : row[1]}</dd></div>}</dl>
+        {saying
+            ? <div.stack>
+                <textarea placeholder="What is not right?" @input={(e) => { note = e.value }}>{note}</textarea>
+                <div.actions>
+                    <button.btn.danger @click={() => answer(false)}>Tell the clerk</button>
+                    <button.btn.ghost @click={() => { saying = false }}>Back</button>
+                </div>
+              </div>
+            : <div.actions>
+                <button.btn.primary @click={() => answer(true)}>{title == "Terms and conditions" ? "I agree" : "Yes, that's right"}</button>
+                <button.btn.ghost @click={() => { saying = true }}>Something's wrong</button>
+              </div>}
+        <Problem text={problem}/>
+    </div>
+}
+
+component PinChooser(code: str) {
+    state pin = ""
+    state again = ""
+    state problem = null
+    <form.stack.pin @submit={() => {
+        let r = desk_pin(code, pin, again)
+        if is_err(r) { problem = r.error } else { problem = null; pin = ""; again = "" }
+    }}>
+        <b>Choose your PIN</b>
+        <p.muted>Six digits, to sign in to this app. Only you see it, here.</p>
+        <input type="password" inputmode="numeric" maxlength="6" placeholder="PIN" value={pin} autocomplete="new-password" @input={(e) => { pin = e.value }}/>
+        <input type="password" inputmode="numeric" maxlength="6" placeholder="The same again" value={again} autocomplete="new-password" @input={(e) => { again = e.value }}/>
+        <Problem text={problem}/>
+        <button.btn.primary.wide>Set my PIN</button>
+    </form>
+}
+
+component DeskClient(code: str, signed_in: bool) {
+    state current = code
+    state typed = code
+    state desk = live(load_desk, current, "client")
+    state problem = null
+    // Fields the clerk just changed light up for a moment.
+    state seen = {}
+    state lit = {}
+    if desk != null {
+        let changed = keys(desk.data) | filter((k) => get(seen, k) != null && get(seen, k) != get(desk.data, k))
+        if len(changed) > 0 { lit = reduce(changed, lit, (m, k) => set(m, k, now())) }
+        seen = desk.data
+    }
+    every(700, () => {
+        let fresh = reduce(keys(lit), {}, (m, k) => now() - get(lit, k) < 2500 ? set(m, k, get(lit, k)) : m)
+        if len(keys(fresh)) != len(keys(lit)) { lit = fresh }
+    })
+    {desk == null
+        ? <form.stack.join @submit={() => {
+            let r = desk_join(typed)
+            if is_err(r) { problem = r.error } else { problem = null; current = r }
+        }}>
+            <h1>At the desk</h1>
+            <p>Your clerk has a 6-digit code on their screen. Type it here to follow your form on this phone.</p>
+            <input value={typed} inputmode="numeric" maxlength="6" placeholder="Code" autocomplete="off" @input={(e) => { typed = e.value }}/>
+            <Problem text={problem}/>
+            <button.btn.primary.wide>Join</button>
+            {!signed_in && <p.muted>Already a customer? <a href="/login?next=/desk">Sign in</a> first.</p>}
+          </form>
+        : <div.desk-client>
+            <header>
+                <p.muted>With {desk.clerk} · session {desk.code}</p>
+                <h1>{desk.title}</h1>
+            </header>
+            {desk.status == "done" && <section.result.done>
+                <h2>✓ All done</h2>
+                {desk.progress.customer_number != null && desk.new_customer && <p>Your customer number is <b.big>{desk.progress.customer_number}</b>. Sign in with it and the PIN you chose.</p>}
+                {desk.progress.account_number != null && desk.kind == "open_account" && <p>Your account: <b>{iban_pretty(desk.progress.account_number)}</b></p>}
+                {desk.progress.amount != null && <p>{desk.progress.amount} paid out.</p>}
+                <a.btn.primary href={signed_in ? "/" : "/login"}>{signed_in ? "Home" : "Sign in"}</a>
+            </section>}
+            {desk.status == "cancelled" && <Empty>The clerk ended this session.</Empty>}
+            {desk.status == "open" ? <div>
+                {for s in desk.sections => s.state == "pending" ? <AskCard key={s.ask.id} ask={s.ask} title={s.title}/> : null}
+                {desk.new_customer && !desk.pin_set ? <PinChooser code={desk.code}/> : null}
+                {desk.new_customer && desk.pin_set && <p.ok>✓ PIN chosen</p>}
+                {for s in desk.sections => <section.part key={s.id} class={s.state}>
+                    <header><h2>{s.title}</h2><StateBadge state={s.state}/></header>
+                    {s.id == "terms"
+                        ? <p.terms>{TERMS}</p>
+                        : <dl>{for f in s.fields => <div key={f[0]} class={get(lit, f[0]) != null && "lit"}>
+                            <dt>{f[1]}</dt>
+                            <dd>{f[0] == "account_id"
+                                ? (find(desk.accounts, (a) => str(a.id) == str(get(desk.data, f[0]))).label ?? "—")
+                                : (str(get(desk.data, f[0]) ?? "") == "" ? "—" : str(get(desk.data, f[0])))}</dd>
+                        </div>}</dl>}
+                </section>}
+            </div> : null}
+        </div>}
+}
+
+view DeskClerkPage(me, code: str) =
+    <StaffShell {me} title={`Desk ${code}`} nav=""><DeskClerk {code}/></StaffShell>

@@ -1,0 +1,200 @@
+// The customers' pages: home, an account's statement, a transfer, messages.
+// Live: a transfer received, a held one decided or a message shows at once.
+
+view ClientLoginPage(next: str, problem, number: str) =
+    <ClientShell me={null} title="Sign in" tab="">
+        <section.login>
+            <h1>Welcome back</h1>
+            <p.muted>Your customer number is on your welcome letter and your card.</p>
+            <Problem text={problem}/>
+            <form.stack method="post" action="/login">
+                <input type="hidden" name="next" value={next}/>
+                <label>Customer number
+                    <input name="number" value={number} inputmode="numeric" autocomplete="username" required maxlength="8" autofocus/>
+                </label>
+                <label>PIN
+                    <input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required maxlength="6"/>
+                </label>
+                <button.btn.primary.wide>Sign in</button>
+            </form>
+            <p.muted.center>New to Quillo Bank? Visit a branch: a clerk opens your account with you, on your phone. <a href="/desk">At the desk</a></p>
+        </section>
+    </ClientShell>
+
+// A desk session a clerk started for this customer, offered at once.
+component DeskInvite() {
+    state desks = live(desks_for_me)
+    state problem = null
+    {len(desks ?? []) > 0 && <section.invite>
+        {for d in desks => <div key={d.code}>
+            <b>{d.clerk} started a session with you</b>
+            <p>{get(KIND_TITLES, d.kind)}. Join to follow it and approve it on this phone.</p>
+            <button.btn.primary @click={() => {
+                let r = desk_join(d.code)
+                if is_err(r) { problem = r.error } else { navigate(`/desk?code=${d.code}`) }
+            }}>Join</button>
+        </div>}
+        <Problem text={problem}/>
+    </section>}
+}
+
+component Home() {
+    state home = live(load_home)
+    {home == null
+        ? <Empty>Loading…</Empty>
+        : <div>
+            <section.hello>
+                <p.muted>Hello, {home.me.first_name}</p>
+                {for t in home.totals => <p.total key={t.currency}>{t.shown}</p>}
+            </section>
+            <DeskInvite/>
+            <section>
+                <h2>Accounts</h2>
+                {home.down ? <p.problem>Your accounts cannot be shown right now. Your money is safe: try again in a minute.</p> : null}
+                <ul.cards>{for a in home.accounts => <li key={a.id}>
+                    <a.card href={`/accounts/${a.id}`} class={a.status}>
+                        <span.kind>{a.name}{a.status == "frozen" && " · frozen"}</span>
+                        <b.balance>{a.shown}</b>
+                        <span.number>{a.pretty}</span>
+                    </a>
+                </li>}</ul>
+                {len(home.accounts) == 0 && !home.down && <Empty>No accounts yet.</Empty>}
+            </section>
+            <section>
+                <h2>Recent transfers</h2>
+                {len(home.transfers) == 0
+                    ? <p.muted>None yet. <a href="/transfer">Send money</a></p>
+                    : <ul.rows>{for t in home.transfers => <li key={t.id}>
+                        <div><b>{t.shown}</b> to {t.to_pretty}<br/><span.muted>{t.memo == "" ? "No reference" : t.memo} · {when(t.created)}</span></div>
+                        <Status status={t.status}/>
+                    </li>}</ul>}
+            </section>
+        </div>}
+}
+
+view HomePage(me) =
+    <ClientShell {me} title="Home" tab="home"><Home/></ClientShell>
+
+component Statement(id: int) {
+    state acct = live(load_account, id)
+    {acct == null
+        ? <Empty>This account is not here any more.</Empty>
+        : acct.down == true
+        ? <p.problem>This account cannot be shown right now. Your money is safe: try again in a minute.</p>
+        : <div>
+            <section.account-head class={acct.account.status}>
+                <a.back href="/">← Accounts</a>
+                <h1>{acct.account.name}</h1>
+                <p.big>{acct.account.shown}</p>
+                <p.number>{acct.account.pretty}</p>
+                {acct.account.status == "frozen" && <p.problem>This account is frozen: no payments in or out. Call us or visit a branch.</p>}
+                <a.btn.primary href={`/transfer?from=${id}`}>Send from this account</a>
+            </section>
+            <ol.statement>{for l in acct.lines => <li key={l.id}>
+                <div>
+                    <b>{l.memo == "" ? l.kind : l.memo}</b>
+                    <span.muted>{l.other_pretty != null ? `${l.amount < 0 ? "To" : "From"} ${l.other_pretty} · ` : ""}{day_text(l.created)} {clock(l.created)}</span>
+                </div>
+                <div.amounts>
+                    <b class={l.amount < 0 ? "out" : "in"}>{l.signed}</b>
+                    <span.muted>{l.after}</span>
+                </div>
+            </li>}</ol>
+            {len(acct.lines) == 0 && <Empty>Nothing yet.</Empty>}
+        </div>}
+}
+
+view AccountPage(me, id: int) =
+    <ClientShell {me} title="Account" tab="home"><Statement {id}/></ClientShell>
+
+// A transfer: the account number is checked as it is typed (its check
+// digits, in the browser), the payee's name shown before sending, and the
+// amount read as the client writes it.
+component TransferForm(accounts: list, from: int, to: str) {
+    state from_id = from != 0 ? from : (accounts[0].id ?? 0)
+    state number = to
+    state amount = ""
+    state memo = ""
+    state payee = null
+    state sending = false
+    state result = null
+    state problem = null
+    let acct = find(accounts, (a) => a.id == from_id)
+    let number_problem = trim(number) == "" ? null : iban_problem(number)
+    let parsed = trim(amount) == "" || acct == null ? null : parse_amount(amount, acct.currency)
+    let too_much = parsed != null && !is_err(parsed) && money.to_minor(parsed) > acct.balance
+    let ready = acct != null && trim(number) != "" && number_problem == null && parsed != null && !is_err(parsed) && !too_much
+    let look_up = (n) => {
+        payee = null
+        if iban_problem(n) == null { payee = payee_of(n) }
+    }
+    {result != null
+        ? <section.result class={result.status}>
+            <h1>{match result.status { "done" => "Sent", "held" => "Being checked", _ => "Not sent" }}</h1>
+            <p.big>{result.shown}</p>
+            <p>to {result.to_pretty}{result.memo != "" && ` · ${result.memo}`}</p>
+            {result.status == "held" && <p>For your safety, a colleague checks this transfer before it goes. You will get a message when it is decided.</p>}
+            {len(result.reasons_list) > 0 && <ul.reasons>{for r in result.reasons_list => <li>{r}</li>}</ul>}
+            <div.actions>
+                <a.btn.primary href="/">Home</a>
+                <button.btn.ghost @click={() => { result = null; amount = ""; memo = "" }}>Another transfer</button>
+            </div>
+          </section>
+        : <form.stack.transfer @submit={() => {
+            if !ready || sending { return null }
+            sending = true
+            let r = send_money(from_id, number, amount, memo)
+            sending = false
+            if is_err(r) { problem = r.error } else { problem = null; result = r }
+        }}>
+            <h1>Send money</h1>
+            <label>From
+                <select @change={(e) => { from_id = int(e.value) ?? from_id }}>
+                    {for a in accounts => <option value={str(a.id)} selected={a.id == from_id}>{a.name} · {a.shown}</option>}
+                </select>
+            </label>
+            <label>To account number
+                <input value={number} placeholder="QB00 0000 0000 0000 0000" autocomplete="off" spellcheck="false"
+                    @input={(e) => { number = e.value; look_up(e.value) }}/>
+                {number_problem != null && <span.field-problem>{number_problem}</span>}
+                {payee != null && <span.payee>Paying {payee.name}{acct != null && payee.currency != acct.currency && ` (in ${payee.currency}: transfers are in one currency)`}</span>}
+                {number_problem == null && trim(number) != "" && payee == null && <span.muted>No account has that number at this bank</span>}
+            </label>
+            <label>Amount{acct != null && ` in ${acct.currency}`}
+                <input value={amount} inputmode="decimal" placeholder="0.00" @input={(e) => { amount = e.value }}/>
+                {parsed != null && is_err(parsed) && <span.field-problem>{parsed.error}</span>}
+                {too_much && <span.field-problem>More than the {acct.shown} in this account</span>}
+                {parsed != null && !is_err(parsed) && !too_much && <span.muted>{money.format(parsed, LOCALE)}</span>}
+            </label>
+            <label>Reference <span.muted>optional</span>
+                <input value={memo} maxlength="140" @input={(e) => { memo = e.value }}/>
+            </label>
+            <Problem text={problem}/>
+            <button.btn.primary.wide disabled={!ready || sending}>{sending ? "Sending…" : "Send"}</button>
+        </form>}
+}
+
+view TransferPage(me, accounts: list, from: int, to: str) =
+    <ClientShell {me} title="Transfer" tab="transfer">
+        {len(accounts) == 0 ? <Empty>You have no account to send from.</Empty> : <TransferForm {accounts} {from} {to}/>}
+    </ClientShell>
+
+component Inbox() {
+    state items = live(load_inbox)
+    <section>
+        <h1 @mount={() => { read_inbox() }}>Messages</h1>
+        {len(items ?? []) == 0
+            ? <Empty>Nothing yet.</Empty>
+            : <ul.messages>{for m in items => <li key={m.id} class={`${m.kind} ${m.read == 0 ? "unread" : ""}`}>
+                <b>{m.title}</b>
+                {m.body != "" && <p>{m.body}</p>}
+                <span.muted>{when(m.created)}</span>
+            </li>}</ul>}
+    </section>
+}
+
+view MessagesPage(me) =
+    <ClientShell {me} title="Messages" tab="messages"><Inbox/></ClientShell>
+
+view DeskClientPage(me, code: str) =
+    <ClientShell {me} title="At the desk" tab="desk"><DeskClient {code} signed_in={me != null}/></ClientShell>

@@ -1,0 +1,21 @@
+// Q-041 `cond && <markup>` in a component makes its elements again whenever anything it reads changes: an input in it loses focus and what was typed
+// mode: browser
+// page: /
+// probe: for (const id of ["t", "a", "i"]) document.getElementById(id).__mine = true; document.getElementById("bump").click(); await new Promise((r) => setTimeout(r, 300)); return Object.fromEntries(["t", "a", "i"].map((id) => [id, document.getElementById(id).__mine ? "kept" : "made again"]))
+// open-when: "a": "made again"
+// fixed-when: "a": "kept"
+// From FEEDBACK4.md (found on 5d2e21e). `? :` and `if` keep their elements while the same branch
+// is chosen; `&&` does not. In the bank, the clerk's form sat in `{desk.status == "open" && <div>}`:
+// each live reload (one per keystroke) made every input again, so typing "Grace" gave "Gr".
+
+component Form() {
+    state data = { other: 0 }
+    <div>
+        <button id="bump" @click={() => { data = set(data, "other", data.other + 1) }}>bump</button>
+        <div>{data.other >= 0 ? <div><input id="t"/> {data.other}</div> : <p>never</p>}</div>
+        <div>{data.other >= 0 && <div><input id="a"/> {data.other}</div>}</div>
+        <div>{if data.other >= 0 { <div><input id="i"/> {data.other}</div> } else { null }}</div>
+    </div>
+}
+
+route GET / = <html><body><Form/></body></html>

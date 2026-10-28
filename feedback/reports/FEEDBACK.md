@@ -1,6 +1,6 @@
 # Feedback from building a forum in Quillo
 
-Notes from [forum/](forum), a forum of about 3,200 lines: accounts, live threads, votes,
+Notes from [forum/](../../app/forum), a forum of about 3,200 lines: accounts, live threads, votes,
 reactions, accepted answers, polls, @mentions with suggestions, following, bookmarks,
 unread tracking, notifications, private messages, image uploads, full-text search, and a
 moderators' report queue with suspensions. Everything below was checked on
@@ -37,12 +37,12 @@ before the program ran. `re`, `save_upload`, `image.info`/`image.convert` and
 
 Pointing at a link prefetches it. Chrome and Edge do this with speculation rules. A
 route that writes (the forum counts a thread's views, and marks its posts read) has its
-prefetch refused with **204** ([src/server.rs:297](src/server.rs#L297)). The browser
+prefetch refused with **204** ([src/server.rs:297](../../src/server.rs#L297)). The browser
 takes any 2xx as a prefetch that worked, so the click is answered with that empty 204,
 and a 204 to a navigation leaves the browser where it was. Nothing happens, and the
 server never sees the click.
 
-[USERGUIDE.md:1240](USERGUIDE.md#L1240) promises the opposite: "The page is then made,
+[USERGUIDE.md:1240](../../USERGUIDE.md#L1240) promises the opposite: "The page is then made,
 as usual, when the link is followed." Every forum thread link was dead until the forum
 was run with `--no-prefetch`.
 
@@ -168,4 +168,4 @@ Quillo from an older guide, or an AI model that saw one, will meet these.
 "`rate_limit` was removed in 0.5.0: count requests in your own table" or "the date
 module was removed in 0.5.0: dates are ISO text, as databases give them, and sort as
 strings". Repro:
-[feedback/repros/Q-037-removed-builtin-unknown-name.qwe](feedback/repros/Q-037-removed-builtin-unknown-name.qwe).
+[feedback/repros/Q-037-removed-builtin-unknown-name.qwe](../repros/Q-037-removed-builtin-unknown-name.qwe).

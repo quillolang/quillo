@@ -1,0 +1,3 @@
+// A service that uses the same file the app does.
+use "../lib/text.qwe"
+server fn hello() -> str = shout("from the service")

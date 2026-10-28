@@ -1,0 +1,1 @@
+fn shout(s: str) -> str = upper(s) + "!"

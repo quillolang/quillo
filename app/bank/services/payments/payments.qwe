@@ -1,0 +1,94 @@
+// The payments service: a transfer from start to end. It checks the
+// account is the customer's, asks risk, posts to the ledger, and tells both
+// customers: a chain of four services (payments, risk, accounts, messages).
+// Held transfers wait here for a supervisor.
+
+service accounts = "../accounts/accounts.qwe" { timeout: "3s", retries: 1 }
+service risk = "../risk/risk.qwe" { timeout: "3s", retries: 1 }
+service messages = "../messages/messages.qwe" { timeout: "2s" }
+
+db.open(env("BANK_DATA", ".") + "/payments.db")
+db.migrate("migrations")
+
+fn shown(cents: int, currency: str) -> str = money.format(money.from_minor(cents, currency), "en-IE")
+
+// A message to a customer: at once if the messages service answers, else
+// kept and sent when it does (`later`), so it is never lost. A message sent
+// later shows when the page next loads: nothing tells open pages it came.
+fn tell(customer_id: int, title: str, body: str) with http {
+    if is_err(messages.send(customer_id, "payment", title, body)) {
+        messages.later.send(customer_id, "payment", title, body)
+    }
+}
+
+fn record(id: int) with db = db.one("select * from transfers where id = ?", id)
+
+// Posts a transfer that was decided, and tells both sides.
+fn complete(t, decided_by) -> map ! str with db, time, http {
+    let posted = accounts.transfer(t.from_id, t.to_id, t.cents, t.memo, `transfer-${t.id}`)
+    if is_err(posted) {
+        db.exec("update transfers set status = 'failed', reasons = ?, decided_by = ?, decided_at = ? where id = ?",
+            posted.error, decided_by, now(), t.id)
+        return record(t.id)
+    }
+    db.exec("update transfers set status = 'done', journal_id = ?, decided_by = ?, decided_at = ? where id = ?",
+        posted.journal_id, decided_by, now(), t.id)
+    let to = accounts.account(t.to_id) ?? {}
+    tell(t.customer_id, `You sent ${shown(t.cents, t.currency)}`, t.memo)
+    if to.customer_id != null && to.customer_id != t.customer_id {
+        tell(to.customer_id, `You received ${shown(t.cents, t.currency)}`, t.memo)
+        messages.later.email(to.customer_id, `You received ${shown(t.cents, t.currency)}`)
+    }
+    record(t.id)
+}
+
+// A customer's transfer from one of their accounts to an account number.
+server fn transfer(customer_id: int, from_id: int, to_number: str, cents: int, memo: str) -> map ! str with db, time, http {
+    if cents <= 0 { return err("Enter an amount") }
+    if len(memo) > 140 { return err("Keep the reference under 140 characters") }
+    let from = accounts.account(from_id)? ?? err("No such account")?
+    if from.customer_id != customer_id { return err("That is not your account") }
+    let to = accounts.by_number(to_number)? ?? err("No account has that number at this bank")?
+    if to.id == from.id { return err("That is the same account") }
+    let verdict = risk.assess(customer_id, from.id, to.id, cents)?
+    let status = match verdict.decision { "approve" => "pending", "review" => "held", _ => "denied" }
+    let id = db.exec(sql`insert into transfers (customer_id, from_id, to_id, to_number, cents, currency, memo, status, reasons, created)
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        customer_id, from.id, to.id, to.number, cents, from.currency, trim(memo), status, join(verdict.reasons, "\n"), now()).last_id
+    if status == "held" {
+        tell(customer_id, `Your transfer of ${shown(cents, from.currency)} is being checked`, join(verdict.reasons, ". "))
+    }
+    if status != "pending" { return record(id) }
+    complete(record(id), null)
+}
+
+server fn held() -> list with db = db.query("select * from transfers where status = 'held' order by id")
+
+// A supervisor's decision on a held transfer.
+server fn decide(id: int, approve: bool, by: str, note: str = "") -> map ! str with db, time, http {
+    let t = record(id) ?? err("No such transfer")?
+    if t.status != "held" { return err(`That transfer is ${t.status} already`) }
+    // Claimed first, so two supervisors deciding at once decide once.
+    let claimed = db.exec("update transfers set status = 'deciding' where id = ? and status = 'held'", id).changes
+    if claimed == 0 { return err("Someone else is deciding it") }
+    if !approve {
+        db.exec("update transfers set status = 'rejected', reasons = ?, decided_by = ?, decided_at = ? where id = ?",
+            trim(note) == "" ? t.reasons : trim(note), by, now(), id)
+        tell(t.customer_id, `Your transfer of ${shown(t.cents, t.currency)} was not made`, trim(note))
+        return record(id)
+    }
+    complete(t, by)
+}
+
+server fn of_customer(customer_id: int, limit: int = 20) -> list with db =
+    db.query("select * from transfers where customer_id = ? order by id desc limit ?", customer_id, min([limit, 100]))
+
+server fn transfer_record(id: int) with db = record(id)
+
+// For the dashboard: today's transfers by status, with their sum by currency.
+server fn today(since: int) -> list with db = db.query(sql`
+    select status, currency, count(*) as n, sum(cents) as cents from transfers
+    where created >= ? group by status, currency order by status`, since)
+
+server fn recent(limit: int = 15) -> list with db =
+    db.query("select * from transfers order by id desc limit ?", min([limit, 100]))

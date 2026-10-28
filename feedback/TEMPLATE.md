@@ -1,7 +1,7 @@
 # Feedback from building <what> in Quillo
 
 <!--
-Copy to the repository's root as FEEDBACKn.md (the next number). Before writing,
+Copy to feedback/reports/ as FEEDBACKn.md (the next number). Before writing,
 read feedback/INDEX.md: an issue already there is "seen again", not new.
 Delete these comments when done.
 -->

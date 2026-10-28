@@ -1,6 +1,6 @@
 # Feedback from building a project manager in Quillo
 
-Notes from [pm/](pm), "Lanes", a project manager of about 3,000 lines: accounts,
+Notes from [pm/](../../app/pm), "Lanes", a project manager of about 3,000 lines: accounts,
 projects with owners, editors and viewers, a live Kanban board (drag and drop between
 columns and swimlanes, WIP limits, filters, Alt+←/→ to move a card), tasks with
 checklists, comments, labels, points, days and dependencies, a Gantt timeline whose
@@ -119,7 +119,7 @@ route GET / = <html><body><Score v={8.04}/></body></html>
 The server sends `<p>8.0 days`; the browser shows `8 days`; `__quilloRemade` is 1.
 
 The reports page did this with any whole percentile ("95% within 8.0d"). Finding it
-took a DevTools breakpoint inside `claimText` in the runtime. [USERGUIDE.md:501](USERGUIDE.md#L501)
+took a DevTools breakpoint inside `claimText` in the runtime. [USERGUIDE.md:501](../../USERGUIDE.md#L501)
 says a whole float prints as `2` in the browser, but not that this undoes resuming.
 
 **Fix:** print a float in HTML text and attributes the same way on both sides. The
@@ -164,7 +164,7 @@ errors are `line 5` (in `main.qwe`) and `line 3` (in `lib/rows.qwe`), side by si
 
 ## 6. `{ ...m, name: v }` is in the guide, but there is no spread in maps or lists
 
-[USERGUIDE.md:585](USERGUIDE.md#L585): "a map's fields are made anew, with `set` or
+[USERGUIDE.md:585](../../USERGUIDE.md#L585): "a map's fields are made anew, with `set` or
 `{ ...m, name: v }`". Neither that nor `[...xs, 3]` parses:
 
 ```
@@ -217,7 +217,7 @@ that keys are text and numbers are converted.
 
 ## 9. `return` leaves the function from inside `for … =>`, and is not an expression
 
-- [USERGUIDE.md:154](USERGUIDE.md#L154): "There is no `break` or `continue`: `return`
+- [USERGUIDE.md:154](../../USERGUIDE.md#L154): "There is no `break` or `continue`: `return`
   leaves a loop early." Inside a list comprehension it leaves the whole function:
 
   ```quillo
@@ -264,14 +264,14 @@ leaves the function, from a loop too; to skip items, `filter` first."
 The date module went in 0.5.0 (205d7cd: "Finance support is exact decimals and money;
 the rest is the program's"). A project manager has days everywhere: start and due days,
 milestones, "overdue", weeks for throughput, a calendar for the timeline.
-[pm/lib/dates.qwe](pm/lib/dates.qwe) is 100 lines of Hinnant's `days_from_civil` and
+[pm/lib/dates.qwe](../../app/pm/lib/dates.qwe) is 100 lines of Hinnant's `days_from_civil` and
 `civil_from_days` with `floor` for every integer division, plus parsing, weekdays, week
 starts and labels. It is the same on both sides, which matters: the timeline drags in
 the browser and saves on the server.
 
 There are no time zones. The server knows only UTC, so "today" is UTC's: at UTC+8,
 "overdue" and the burndown's last day are a day behind until 08:00. The app's
-[pm/public/js/pm.js](pm/public/js/pm.js) sets a `tz` cookie from
+[pm/public/js/pm.js](../../app/pm/public/js/pm.js) sets a `tz` cookie from
 `getTimezoneOffset()`, and every route and server fn passes `request` to `today(req)`.
 The first page a browser ever loads is made before the cookie exists, in UTC.
 

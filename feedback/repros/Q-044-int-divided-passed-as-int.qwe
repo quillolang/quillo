@@ -1,0 +1,11 @@
+// Q-044 `quillo check` lets `n / 4` (always a float) through where a builtin takes an int: an error only at run time
+// mode: check
+// open-when: /ok \(0 routes/
+// fixed-when: expects an int
+// From FEEDBACK4.md (found on 5d2e21e). In the bank's lib/iban.qwe, grouping an account number
+// in fours: `range(0, (len(c) + 3) / 4)`. `/` of two ints is a float in Quillo; `range` takes
+// ints; the program stopped at run time. `floor(...)` fixed it.
+
+fn groups(s: str) -> list = range(0, (len(s) + 3) / 4)
+
+print(range(0, 7 / 2))

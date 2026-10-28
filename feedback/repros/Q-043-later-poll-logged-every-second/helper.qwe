@@ -1,0 +1,1 @@
+server fn hi() -> str = "hi"

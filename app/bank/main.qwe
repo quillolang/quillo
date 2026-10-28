@@ -1,0 +1,173 @@
+// Quillo Bank: a bank made of services, with a phone app for its customers,
+// a dashboard for its staff, and desk sessions where a clerk fills in a
+// form while the client follows it on their phone and approves each part.
+//
+//   quillo run app/bank/main.qwe --watch                    one process: every service in it
+//   quillo run app/bank/main.qwe --split                    a process for each service
+//   BANK_DEMO=1 quillo run app/bank/main.qwe --watch        with staff, customers and history
+//   quillo check app/bank/main.qwe
+//
+// Then http://localhost:8080 is the customers' app (on a phone, or a narrow
+// window), and /staff the staff's side. Demo sign-ins: staff maria (clerk)
+// and omar (supervisor), password "password"; customers 10000001 (Ada),
+// 10000002 (Ben) and 10000003 (Chloé), PIN 246810.
+//
+// The services, each a program with its own database (services/<name>/):
+//
+//   customers   who the customers are, and their sign-in (number and PIN)
+//   accounts    the ledger: accounts, and double-entry postings in minor units
+//   payments    a transfer from end to end: asks risk, posts, tells both sides
+//   risk        approve, review or deny, asking the ledger
+//   messages    messages in the app, and email copies sent later
+//
+// A transfer is a chain: this gateway, payments, risk, accounts, messages.
+// Pages follow topics of the gateway's own (cust:<id>, desk:<code>, staff),
+// published after each call that changes something: a service's own
+// changes reach no page by themselves (FEEDBACK4.md, Q-038 and Q-039).
+//
+//   lib/iban.qwe      account numbers: IBANs with mod-97 check digits
+//   lib/format.qwe    amounts as typed and shown, dates (Quillo has no date module)
+//   lib/auth.qwe      clients and staff, signing in, the audit log
+//   lib/bank.qwe      the gateway's server fns for clients and staff
+//   lib/desk.qwe      desk sessions: the clerk's form, the client's approvals
+//   ui/shell.qwe      the two frames: the phone app and the staff's desk
+//   ui/client.qwe     the customers' pages
+//   ui/staff.qwe      the staff's pages
+//   ui/desk.qwe       <DeskClerk> and <DeskClient>, live
+//   seed.qwe          demo data, for BANK_DEMO=1
+//
+// Tests (need BANK_DEMO=1, freshly seeded; BASE=http://localhost:8080):
+//
+//   node feedback/tools/drive.mjs app/bank/tests/desk.mjs         a new customer at the desk, clerk and phone
+//   node feedback/tools/drive.mjs app/bank/tests/transfers.mjs    transfers, held and decided, live on three screens
+//   node feedback/tools/drive.mjs app/bank/tests/withdrawal.mjs   a customer's withdrawal, offered on their phone
+//   python3 app/bank/tests/hostile.py $BASE                       every server fn called out of turn
+//   python3 app/bank/tests/outage.py $BASE <stop> <start>         the ledger down mid-submit (run --split)
+//   python3 app/bank/tests/scale.py $BASE 1000                    the chain, timed
+
+db.open(env("BANK_DATA", ".") + "/bank.db")
+db.migrate("migrations")
+
+// The `use` lines come before the `service` lines: a file a service also
+// uses (lib/iban.qwe) is otherwise left out of the pages' browser code
+// (FEEDBACK4.md, Q-040).
+use "lib/iban.qwe"
+use "lib/format.qwe"
+use "lib/auth.qwe"
+use "lib/bank.qwe"
+use "lib/desk.qwe"
+use "ui/shell.qwe"
+use "ui/client.qwe"
+use "ui/staff.qwe"
+use "ui/desk.qwe"
+use "seed.qwe"
+
+service customers = "services/customers/customers.qwe" { timeout: "3s", retries: 1 }
+service accounts = "services/accounts/accounts.qwe" { timeout: "3s", retries: 1 }
+service payments = "services/payments/payments.qwe" { timeout: "5s", retries: 1 }
+service risk = "services/risk/risk.qwe" { timeout: "3s", retries: 1 }
+service messages = "services/messages/messages.qwe" { timeout: "2s" }
+
+if env("BANK_DEMO", "") == "1" { seed_demo() }
+
+// ---- the customers' app ------------------------------------------------------
+
+route GET / {
+    let c = client_or_login("/")
+    <HomePage me={c}/>
+}
+
+route GET /login ? { next: str = "/" } = <ClientLoginPage next={safe_next(next)} problem={null} number=""/>
+
+route POST /login {
+    let f = request.form
+    let r = client_sign_in(f.number ?? "", f.pin ?? "")
+    if is_err(r) { reply 401 <ClientLoginPage next={safe_next(f.next)} problem={r.error} number={f.number ?? ""}/> }
+    redirect(safe_next(f.next))
+}
+
+route POST /logout {
+    sign_out("customer")
+    redirect("/login")
+}
+
+route GET /accounts/:id(int) {
+    let c = client_or_login(`/accounts/${id}`)
+    if load_account(id) == null { reply 404 <ClientNotFound me={c} what="That is not one of your accounts."/> }
+    <AccountPage me={c} {id}/>
+}
+
+route GET /transfer ? { from: int = 0, to: str = "" } {
+    let c = client_or_login("/transfer")
+    let accts = (accounts.of_customer(c.id) ?? []) | filter((a) => a.status == "open") | map(account_view)
+    <TransferPage me={c} accounts={accts} from={from} to={to}/>
+}
+
+route GET /messages {
+    let c = client_or_login("/messages")
+    <MessagesPage me={c}/>
+}
+
+// The client's side of a desk session: the code, then the live form.
+route GET /desk ? { code: str = "" } {
+    let c = client()
+    <DeskClientPage me={c} code={trim(code)}/>
+}
+
+// ---- the staff's side -----------------------------------------------------
+
+route GET /staff {
+    let s = staff_or_login("/staff")
+    <DashboardPage me={s}/>
+}
+
+route GET /staff/login ? { next: str = "/staff" } = <StaffLoginPage next={safe_next(next)} problem={null}/>
+
+route POST /staff/login {
+    let f = request.form
+    let r = staff_sign_in(f.username ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <StaffLoginPage next={safe_next(f.next)} problem={r.error}/> }
+    redirect(safe_next(f.next))
+}
+
+route POST /staff/logout {
+    sign_out("staff")
+    redirect("/staff/login")
+}
+
+route GET /staff/customers ? { q: str = "" } {
+    let s = staff_or_login("/staff/customers")
+    <CustomersPage me={s} q={trim(q)} found={find_customers(q)}/>
+}
+
+route GET /staff/customers/:number {
+    let s = staff_or_login(`/staff/customers/${number}`)
+    if load_customer(number) == null { reply 404 <StaffNotFound me={s} what="No customer has that number."/> }
+    <CustomerPage me={s} {number}/>
+}
+
+route POST /staff/desk {
+    let s = staff_or_login("/staff")
+    let code = desk_start(request.form.kind ?? "", request.form.number ?? "")
+    if is_err(code) { reply 422 <StaffNotFound me={s} what={code.error}/> }
+    redirect(`/staff/desk/${code}`)
+}
+
+route GET /staff/desk/:code {
+    let s = staff_or_login(`/staff/desk/${code}`)
+    if desk_row(code) == null { reply 404 <StaffNotFound me={s} what="No desk session has that code."/> }
+    <DeskClerkPage me={s} {code}/>
+}
+
+// ---- files, and health ------------------------------------------------------
+
+route GET /static/*path = file("public/" + path)
+
+// For a load balancer: whether the services answer, and the ledger adds up.
+route GET /health {
+    let problems = accounts.problems()
+    let up = { customers: !is_err(customers.how_many()), accounts: !is_err(problems), payments: !is_err(payments.held()), messages: !is_err(messages.unread(0)) }
+    let ok = all(values(up), (v) => v) && len(problems ?? []) == 0
+    if !ok { reply 503 { ok, up, ledger: problems ?? [] } }
+    { ok, up, ledger: problems }
+}

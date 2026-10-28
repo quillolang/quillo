@@ -1,0 +1,41 @@
+// Account numbers: IBANs with the bank's own code, QB, as countries have
+// theirs. "QB" + two check digits + a 16-digit account part, 20 characters,
+// checked with ISO 7064's mod 97 like any IBAN. Pure functions: the
+// services use them, and so do pages in the browser (a typo in an account
+// number is caught as it is typed).
+
+let IBAN_COUNTRY = "QB"
+let LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// "QB" as digits: Q is 26, B is 11 (A is 10).
+fn iban_letters(s: str) -> str =
+    join(split(s, "") | map((c) => contains(LETTERS, c) ? str(index_of(LETTERS, c) + 10) : c), "")
+
+// The remainder of a long number written in digits, divided by 97, taken a
+// digit at a time so it never outgrows an int.
+fn mod97(digits: str) -> int = reduce(split(digits, ""), 0, (r, d) => (r * 10 + (int(d) ?? 0)) % 97)
+
+fn iban_of(account_part: str) -> str {
+    let check = 98 - mod97(account_part + iban_letters(IBAN_COUNTRY) + "00")
+    `${IBAN_COUNTRY}${check < 10 ? "0" : ""}${check}${account_part}`
+}
+
+// "qb12 3456 ..." as the bank stores it: capitals, no spaces.
+fn iban_clean(text: str) -> str = upper(replace(replace(trim(text), " ", ""), "-", ""))
+
+// Why an account number is wrong, or null when it is right.
+fn iban_problem(text: str) -> str? {
+    let s = iban_clean(text)
+    if s == "" { return "Enter an account number" }
+    if !starts_with(s, IBAN_COUNTRY) { return `Our account numbers start with ${IBAN_COUNTRY}` }
+    if len(s) != 20 { return `An account number has 20 characters (this has ${len(s)})` }
+    if !re.test(slice(s, 2), "^[0-9]+$") { return "After QB, an account number is digits only" }
+    let moved = slice(s, 4) + iban_letters(slice(s, 0, 2)) + slice(s, 2, 4)
+    mod97(moved) == 1 ? null : "That account number has a typo: its check digits do not match"
+}
+
+// "QB12 3456 7890 1234 5678": in groups of four, as printed on cards.
+fn iban_pretty(s: str) -> str {
+    let c = iban_clean(s)
+    join(range(0, floor((len(c) + 3) / 4)) | map((i) => slice(c, i * 4, i * 4 + 4)), " ")
+}

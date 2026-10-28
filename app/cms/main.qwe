@@ -7,9 +7,9 @@
 // state machine, forms that make records, transaction forms (the only way a
 // record changes state), and lists; and build desk pages from those blocks.
 //
-//   quillo run cms/main.qwe --watch                 then open http://localhost:8080
-//   CMS_DEMO=1 quillo run cms/main.qwe --watch      with people, articles in review, and an ad desk
-//   quillo check cms/main.qwe
+//   quillo run app/cms/main.qwe --watch                 then open http://localhost:8080
+//   CMS_DEMO=1 quillo run app/cms/main.qwe --watch      with people, articles in review, and an ad desk
+//   quillo check app/cms/main.qwe
 //
 //   lib/text.qwe       times, slugs, calendar days (Quillo has no date module)
 //   lib/auth.qwe       people, roles, sessions

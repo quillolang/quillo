@@ -1,0 +1,367 @@
+// Desk sessions: a clerk fills in a form at the counter while the client
+// follows it on their own phone, live, and approves each part when asked.
+//
+//   1. The clerk starts a session (opening an account, a cash withdrawal,
+//      or new details) and reads its 6-digit code to the client.
+//   2. The client types the code on their phone (or, already a customer and
+//      signed in, sees the session offered at once) and joins: that phone,
+//      and only that one, is the client's side from then on.
+//   3. As the clerk types, the phone shows it. The clerk asks the client to
+//      confirm a part; the client approves it, or says what is wrong.
+//      Changing a part after it was approved undoes the approval: the
+//      approval was of what the client saw.
+//   4. A new customer chooses a PIN on the phone; the clerk sees only that
+//      one was chosen. When every part is approved, the clerk submits, and
+//      the services make it so: customer, account, first deposit.
+//
+// Each desk follows one topic, desk:<code>, which every change publishes
+// (Q-038 and Q-039: the services' own changes reach no page by themselves).
+
+let SECTIONS = {
+    open_account: [
+        { id: "personal", title: "About you", fields: [["first_name", "First name"], ["last_name", "Last name"], ["birth_date", "Date of birth"], ["email", "Email"], ["phone", "Phone"]] },
+        { id: "address", title: "Your address", fields: [["street", "Street and number"], ["postcode", "Postcode"], ["city", "City"], ["country", "Country"]] },
+        { id: "account", title: "Your new account", fields: [["kind", "Kind"], ["currency", "Currency"], ["account_name", "Name"]] },
+        { id: "deposit", title: "First deposit, in cash", fields: [["deposit", "Amount"]] },
+        { id: "terms", title: "Terms and conditions", fields: [] },
+    ],
+    withdrawal: [
+        { id: "withdrawal", title: "Cash withdrawal", fields: [["account_id", "From"], ["amount", "Amount"]] },
+    ],
+    update: [
+        { id: "personal", title: "About you", fields: [["first_name", "First name"], ["last_name", "Last name"], ["birth_date", "Date of birth"], ["email", "Email"], ["phone", "Phone"]] },
+        { id: "address", title: "Your address", fields: [["street", "Street and number"], ["postcode", "Postcode"], ["city", "City"], ["country", "Country"]] },
+    ],
+}
+
+let KIND_TITLES = { open_account: "Opening an account", withdrawal: "Cash withdrawal", update: "New details" }
+
+let TERMS = "I have read the account terms and the fee schedule, my details are true, and the bank may check them."
+
+let PROFILE_FIELDS = ["first_name", "last_name", "birth_date", "email", "phone", "street", "city", "postcode", "country"]
+
+fn sections_of(kind: str) -> list = get(SECTIONS, kind) ?? []
+
+fn fields_of(kind: str) -> list = sections_of(kind) | map((s) => s.fields) | flatten | map((f) => f[0])
+
+fn desk_row(code: str) with db = db.one("select * from desks where code = ?", code)
+
+fn desk_changed(d) {
+    publish(`desk:${d.code}`)
+    publish("staff")
+    if d.customer_id != null { publish(`cust:${d.customer_id}`) }
+}
+
+// What the client confirms of a section: its fields' labels and values, as
+// they are now (the account to withdraw from by its number, not its id).
+fn shown_of(kind: str, section: str, data: map, accounts: list) -> list {
+    if section == "terms" { return [["", TERMS]] }
+    let s = find(sections_of(kind), (x) => x.id == section)
+    (s.fields ?? []) | map((f) => {
+        let v = get(data, f[0]) ?? ""
+        let label = f[0] == "account_id" ? (find(accounts, (a) => str(a.id) == str(v)).label ?? "") : str(v)
+        [f[1], label]
+    })
+}
+
+// "2026-10-28": today's date, for the age check (Quillo has no date module).
+fn today_text() -> str with time {
+    let c = civil(now())
+    `${c.year}-${two(c.month)}-${two(c.day)}`
+}
+
+// What is wrong with a section's values before the client is asked, or null.
+fn section_problem(kind: str, section: str, data: map, accounts: list) -> str? with time {
+    let v = (k) => trim(str(get(data, k) ?? ""))
+    match section {
+        "personal" => {
+            if v("first_name") == "" || v("last_name") == "" { return "First and last name, please" }
+            let b = v("birth_date")
+            if !re.test(b, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return "Date of birth as YYYY-MM-DD" }
+            let t = today_text()
+            let adult = `${int(slice(t, 0, 4)) - 18}${slice(t, 4)}`
+            if b > t { return "A date of birth in the future" }
+            if b > adult { return "Account holders are 18 or older" }
+            if v("email") != "" && !re.test(v("email"), "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return "That email does not look right" }
+            null
+        }
+        "address" => v("street") == "" || v("city") == "" || v("country") == "" ? "Street, city and country, please" : null
+        "account" => !contains(["checking", "savings"], v("kind")) ? "Checking or savings"
+            : !contains(CURRENCIES, v("currency")) ? `One of ${join(CURRENCIES, ", ")}` : null
+        "deposit" => {
+            let m = parse_amount(v("deposit"), v("currency") == "" ? "EUR" : v("currency"))
+            is_err(m) ? m.error : null
+        }
+        "withdrawal" => {
+            let a = find(accounts, (x) => str(x.id) == v("account_id"))
+            if a == null { return "Choose the account" }
+            let m = parse_amount(v("amount"), a.currency)
+            if is_err(m) { return m.error }
+            money.to_minor(m) > a.balance ? `More than the balance, ${shown(a.balance, a.currency)}` : null
+        }
+        _ => null
+    }
+}
+
+// The customer's accounts, for a withdrawal: { id, label, currency, balance }.
+fn accounts_for(customer_id) with http =
+    customer_id == null ? [] : (accounts.of_customer(customer_id) ?? [])
+        | filter((a) => a.status == "open")
+        | map((a) => { id: a.id, number: a.number, currency: a.currency, balance: a.balance,
+                       label: `${a.name} · ${iban_pretty(a.number)} · ${shown(a.balance, a.currency)}` })
+
+// ---- loading ----------------------------------------------------------------
+
+// Whether this browser is the desk's client: the phone that joined, or the
+// customer it is for, signed in.
+fn is_desk_client(d) with http {
+    let s = session()
+    (d.client_token != null && s.desk == d.code && s.desk_token == d.client_token)
+        || (d.customer_id != null && s.customer == d.customer_id && d.client_token != null && s.desk_token == d.client_token)
+}
+
+// The desk as one side sees it: `side` is "clerk" or "client". Null when
+// this browser is neither.
+server fn load_desk(code: str, side: str) with db, http, time {
+    watch(`desk:${code}`)
+    unwatched(() => {
+        let d = desk_row(code)
+        if d == null { return null }
+        if side == "clerk" && staff() == null { return null }
+        if side == "client" && !is_desk_client(d) { return null }
+        let data = json.parse(d.data)
+        let accounts = d.kind == "withdrawal" ? accounts_for(d.customer_id) : []
+        let asks = db.query("select * from desk_asks where desk_id = ? order by id", d.id)
+        let sections = sections_of(d.kind) | map((s) => {
+            let last = asks | filter((a) => a.section == s.id) | last
+            let now_shown = json.stringify(shown_of(d.kind, s.id, data, accounts))
+            let state = last == null ? "not asked"
+                : last.status == "approved" && last.shown != now_shown ? "changed"
+                : last.status
+            merge(s, { state, ask: last == null ? null : merge(last, { shown: json.parse(last.shown) }),
+                       problem: section_problem(d.kind, s.id, data, accounts) })
+        })
+        let clerk = db.one("select name from staff where id = ?", d.clerk_id)
+        let customer = d.customer_id == null ? null : customers.customer(d.customer_id) ?? null
+        {
+            code: d.code, kind: d.kind, title: get(KIND_TITLES, d.kind), status: d.status,
+            clerk: clerk.name ?? "", data, sections, accounts,
+            customer: customer == null ? null : { number: customer.number, name: `${customer.first_name} ${customer.last_name}` },
+            joined: d.client_token != null,
+            // Still true once submitting made the customer: they chose a PIN here.
+            new_customer: d.kind == "open_account" && (d.customer_id == null || d.pin_hash != null),
+            pin_set: d.pin_hash != null,
+            progress: json.parse(d.progress),
+            missing: missing_of(d, sections),
+            updated: d.updated,
+        }
+    })
+}
+
+// What stands between the desk and submitting it.
+fn missing_of(d, sections: list) -> list {
+    let parts = sections | filter((s) => s.state != "approved") | map((s) => `${s.title}: ${s.state == "changed" ? "changed since the client approved it" : s.state}`)
+    let pin = d.kind == "open_account" && d.customer_id == null && d.pin_hash == null ? ["The client's PIN: not chosen yet"] : []
+    let phone = d.client_token == null ? ["The client's phone: not joined yet"] : []
+    phone + parts + pin
+}
+
+// Open desks: for the staff's list, or the ones offered to a customer.
+fn open_desks() with db = db.query(sql`
+    select d.code, d.kind, d.customer_id, d.client_token is not null as joined, d.updated, s.name as clerk
+    from desks d join staff s on s.id = d.clerk_id where d.status = 'open' order by d.id desc limit 30`)
+
+server fn desks_for_me() -> list with db, http {
+    let c = session().customer
+    if c == null { return [] }
+    watch(`cust:${c}`)
+    unwatched(() => db.query(sql`
+        select d.code, d.kind, s.name as clerk from desks d join staff s on s.id = d.clerk_id
+        where d.customer_id = ? and d.status = 'open' order by d.id desc`, c))
+}
+
+// ---- the clerk's side -----------------------------------------------------------
+
+fn clerk_desk(code: str) ! str with db {
+    let s = acting_staff()?
+    let d = desk_row(code) ?? err("No such desk session")?
+    if d.status != "open" { return err(`This session is ${d.status}`) }
+    { staff: s, desk: d }
+}
+
+// A new desk session; `customer_number` for an existing customer.
+server fn desk_start(kind: str, customer_number: str) -> str ! str with db, time, random, http {
+    let s = acting_staff()?
+    if get(SECTIONS, kind) == null { return err("Open an account, a withdrawal, or new details") }
+    let number = trim(customer_number)
+    let c = number == "" ? null : customers.by_number(number)? ?? err("No customer has that number")?
+    if kind != "open_account" && c == null { return err("A withdrawal or new details are for a customer: enter their number") }
+    let prefill = c == null ? { kind: "checking", currency: "EUR" }
+        : merge(reduce(PROFILE_FIELDS, {}, (m, f) => set(m, f, get(c, f) ?? "")), { kind: "checking", currency: "EUR" })
+    let code = db.transaction(() => {
+        let code = str(random_int(100000, 999999))
+        if db.one("select 1 from desks where code = ? and status = 'open'", code) != null { return err("Try again") }
+        // An old, closed session with the same code makes room.
+        db.exec("delete from desk_asks where desk_id in (select id from desks where code = ?)", code)
+        db.exec("delete from desks where code = ?", code)
+        db.exec("insert into desks (code, kind, clerk_id, customer_id, data, created, updated) values (?, ?, ?, ?, ?, ?, ?)",
+            code, kind, s.id, c.id ?? null, json.stringify(prefill), now(), now())
+        code
+    })?
+    log(s.name, "desk", `${get(KIND_TITLES, kind)}, session ${code}${c == null ? "" : ` for ${c.first_name} ${c.last_name}`}`)
+    desk_changed(desk_row(code))
+    code
+}
+
+server fn desk_set(code: str, field: str, value: str) ! str with db, time, http {
+    let cd = clerk_desk(code)?
+    if !contains(fields_of(cd.desk.kind), field) { return err("No such field here") }
+    if len(value) > 200 { return err("That is long for one field") }
+    let data = set(json.parse(cd.desk.data), field, value)
+    db.exec("update desks set data = ?, updated = ? where id = ?", json.stringify(data), now(), cd.desk.id)
+    desk_changed(cd.desk)
+    true
+}
+
+// Asks the client to confirm a section as it is now.
+server fn desk_ask(code: str, section: str) ! str with db, time, http {
+    let cd = clerk_desk(code)?
+    let d = cd.desk
+    if find(sections_of(d.kind), (s) => s.id == section) == null { return err("No such part") }
+    if d.client_token == null { return err("The client's phone has not joined yet") }
+    let data = json.parse(d.data)
+    let accounts = d.kind == "withdrawal" ? accounts_for(d.customer_id) : []
+    let problem = section_problem(d.kind, section, data, accounts)
+    if problem != null { return err(problem) }
+    db.transaction(() => {
+        db.exec("update desk_asks set status = 'stale' where desk_id = ? and section = ? and status = 'pending'", d.id, section)
+        db.exec("insert into desk_asks (desk_id, section, shown, asked) values (?, ?, ?, ?)",
+            d.id, section, json.stringify(shown_of(d.kind, section, data, accounts)), now())
+    })
+    desk_changed(d)
+    true
+}
+
+// Lets another phone join (the client's phone was lost, or the wrong one).
+server fn desk_release(code: str) ! str with db, time, http {
+    let cd = clerk_desk(code)?
+    db.exec("update desks set client_token = null, pin_hash = null, updated = ? where id = ?", now(), cd.desk.id)
+    db.exec("update desk_asks set status = 'stale' where desk_id = ? and status = 'pending'", cd.desk.id)
+    log(cd.staff.name, "desk", `session ${code}: the client's phone let go`)
+    desk_changed(cd.desk)
+    true
+}
+
+server fn desk_cancel(code: str) ! str with db, time, http {
+    let cd = clerk_desk(code)?
+    db.exec("update desks set status = 'cancelled', updated = ? where id = ?", now(), cd.desk.id)
+    log(cd.staff.name, "desk", `session ${code} cancelled`)
+    desk_changed(cd.desk)
+    true
+}
+
+fn save_progress(d, p: map) with db, time =
+    db.exec("update desks set progress = ?, updated = ? where id = ?", json.stringify(p), now(), d.id)
+
+// Makes it so: a step at a time, each remembered, so a step that failed is
+// tried again without doing the ones before it twice.
+server fn desk_submit(code: str) ! str with db, time, http {
+    let cd = clerk_desk(code)?
+    let d = cd.desk
+    let seen = load_desk(code, "clerk")?
+    if len(seen.missing) > 0 { return err(`Not yet: ${seen.missing[0]}`) }
+    let data = seen.data
+    let p = json.parse(d.progress)
+    let result = match d.kind {
+        "open_account" => {
+            let cid = p.customer_id ?? d.customer_id ?? customers.create(reduce(PROFILE_FIELDS, {}, (m, f) => set(m, f, get(data, f) ?? "")), d.pin_hash)?.id
+            let p1 = set(p, "customer_id", cid)
+            save_progress(d, p1)
+            db.exec("update desks set customer_id = ? where id = ?", cid, d.id)
+            let aid = p1.account_id ?? accounts.open_account(cid, data.kind, data.currency, data.account_name ?? "")?.id
+            let p2 = set(p1, "account_id", aid)
+            save_progress(d, p2)
+            let m = parse_amount(data.deposit, data.currency)?
+            accounts.deposit(aid, money.to_minor(m), "First deposit, at the desk", `desk-${code}-deposit`)?
+            let acct = accounts.account(aid)?
+            let c = customers.customer(cid)?
+            messages.send(cid, "account", `Welcome! Your ${data.kind} account ${iban_pretty(acct.number)} is open`, `Opened at the desk with ${cd.staff.name}.`)
+            messages.later.email(cid, "Your new account is open")
+            { customer_number: c.number, account_number: acct.number, account_id: aid }
+        }
+        "withdrawal" => {
+            let a = find(seen.accounts, (x) => str(x.id) == str(data.account_id)) ?? err("Choose the account")?
+            let m = parse_amount(data.amount, a.currency)?
+            accounts.withdraw(a.id, money.to_minor(m), "Cash at the desk", `desk-${code}-withdrawal`)?
+            messages.send(d.customer_id, "account", `You took out ${money.format(m, LOCALE)} in cash`, `At the desk with ${cd.staff.name}.`)
+            { account_number: a.number, amount: money.format(m, LOCALE) }
+        }
+        _ => {
+            customers.update(d.customer_id, reduce(PROFILE_FIELDS, {}, (m, f) => set(m, f, get(data, f) ?? "")))?
+            messages.send(d.customer_id, "security", "Your details were changed", `At the desk with ${cd.staff.name}.`)
+            { updated: true }
+        }
+    }
+    save_progress(d, merge(p, merge(result, { done: true })))
+    db.exec("update desks set status = 'done', updated = ? where id = ?", now(), d.id)
+    log(cd.staff.name, "desk", `session ${code} done: ${get(KIND_TITLES, d.kind)}`)
+    desk_changed(desk_row(code))
+    result
+}
+
+// ---- the client's side ----------------------------------------------------------
+
+server fn desk_join(code: str) ! str with db, time, random, http {
+    let d = desk_row(trim(code)) ?? err("No session has that code: check it with the clerk")?
+    if d.status != "open" { return err("That session is over") }
+    let me = session().customer
+    if d.customer_id != null && me != d.customer_id {
+        return err("This session is for a customer: sign in first, as them")
+    }
+    if d.client_token != null && session().desk_token != d.client_token {
+        return err("Another phone joined this session. Ask the clerk to let it go")
+    }
+    let token = d.client_token ?? crypto.token()
+    db.exec("update desks set client_token = ?, updated = ? where id = ?", token, now(), d.id)
+    set_session(merge(session(), { desk: d.code, desk_token: token }))
+    desk_changed(d)
+    d.code
+}
+
+fn client_desk(code: str) ! str with db, http {
+    let d = desk_row(code) ?? err("No such session")?
+    if !is_desk_client(d) { return err("This phone is not the one that joined") }
+    if d.status != "open" { return err(`This session is ${d.status}`) }
+    d
+}
+
+server fn desk_answer(ask_id: int, approve: bool, note: str) ! str with db, time, http {
+    let a = db.one("select * from desk_asks where id = ?", ask_id) ?? err("No such question")?
+    let d0 = db.one("select code from desks where id = ?", a.desk_id)
+    let d = client_desk(d0.code)?
+    if a.status != "pending" { return err("That question was answered or taken back") }
+    // What was asked must still be what the form says.
+    let accounts = d.kind == "withdrawal" ? accounts_for(d.customer_id) : []
+    if json.stringify(shown_of(d.kind, a.section, json.parse(d.data), accounts)) != a.shown {
+        db.exec("update desk_asks set status = 'stale' where id = ?", a.id)
+        desk_changed(d)
+        return err("The clerk changed this since you were asked: look again")
+    }
+    if !approve && trim(note) == "" { return err("Say what is wrong, so the clerk can fix it") }
+    db.exec("update desk_asks set status = ?, note = ?, answered = ? where id = ?",
+        approve ? "approved" : "declined", slice(trim(note), 0, 300), now(), a.id)
+    desk_changed(d)
+    true
+}
+
+// A new customer's PIN, chosen on their phone: only its hash is kept.
+server fn desk_pin(code: str, pin: str, again: str) ! str with db, time, random, http {
+    let d = client_desk(code)?
+    if d.kind != "open_account" || d.customer_id != null { return err("No PIN to choose here") }
+    if !re.test(pin, "^[0-9]{6}$") { return err("A PIN is 6 digits") }
+    if pin != again { return err("The two PINs are not the same") }
+    if len(unique(split(pin, ""))) == 1 || contains("0123456789 9876543210", pin) { return err("That PIN is too easy to guess") }
+    db.exec("update desks set pin_hash = ?, updated = ? where id = ?", crypto.hash_password(pin), now(), d.id)
+    desk_changed(d)
+    true
+}
