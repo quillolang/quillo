@@ -6,9 +6,11 @@
 //! Code that cannot run in a browser (`request`, `db`, a global the server
 //! changes, ...) is a load-time error that names the component.
 //!
-//! A page gets a bundle of its own: the components it was rendered with and
-//! what they use (`bundle_for`), at `/_quillo/b/<hash>.js`, kept by the
-//! browser for good since its address changes with its content. A page with
+//! A page gets a bundle of its own: the components it was rendered with,
+//! those they show, and what they use (`bundle_for`), at
+//! `/_quillo/b/<hash>.js`, kept by the browser for good since its address
+//! changes with its content. The runtime is a file of its own beside it,
+//! `/_quillo/r/<hash>.js`, the same for every page (`runtime_file`). A page with
 //! no components loads no script, and one with components loads it when it
 //! is needed (`island_loader` in server.rs, `island.rs`). The runtime resumes
 //! each component on the server's elements (`Inst.adopt` in runtime.js):
@@ -41,15 +43,16 @@ const CLIENT_BUILTINS: &[&str] = &[
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
-    bundle_of(it, None)
+    let c = compiled(it, None)?;
+    if c.0.dev {
+        return Ok(dev::bundle(it, &c.0, c.1));
+    }
+    Ok(assemble("(function () {", &program_text(it, &c.0, c.1, true), "})();"))
 }
 
-/// The bundle for a page: these components and what they use, no more.
-pub fn bundle_for(it: &Interp, roots: &[String]) -> Result<String, QuilloError> {
-    bundle_of(it, Some(roots))
-}
-
-fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloError> {
+/// The program compiled for the browser, from `roots` (all its components
+/// when none), and whether it has any.
+fn compiled<'a>(it: &'a Interp, roots: Option<&[String]>) -> Result<(Compiler<'a>, bool), QuilloError> {
     let mut c = Compiler::new(it);
     let mut names: Vec<(String, Arc<FnDef>)> = Vec::new();
     for (name, v) in scope_vars(&it.globals) {
@@ -59,15 +62,32 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
             }
         }
     }
-    names.sort_by_key(|(_, d)| d.line);
+    // In an order that depends only on which they are (FEEDBACK7.md, Q-062;
+    // branch feedback7-fixes).
+    names.sort_by(|(a, x), (b, y)| (&x.file, x.line, a).cmp(&(&y.file, y.line, b)));
     for (name, _) in &names {
         c.global(name, 0)?;
     }
-    if c.dev {
-        return Ok(dev::bundle(it, &c, !names.is_empty()));
-    }
+    Ok((c, !names.is_empty()))
+}
+
+/// The components a compile made: the roots and every one they show.
+fn components_of(it: &Interp, c: &Compiler) -> Vec<String> {
+    let mut out: Vec<String> = c
+        .globals
+        .keys()
+        .filter(|k| matches!(lookup(&it.globals, k), Some(Value::Func(f)) if f.def.component))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// The compiled program as one script: `BASE` (when `with_base`), the
+/// markup blocks, the definitions, the `server fn` stubs, and the boot.
+fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> String {
     let mut program = String::new();
-    if !it.base.is_empty() {
+    if with_base && !it.base.is_empty() {
         let _ = writeln!(program, "BASE = {};", js_str(&it.base));
     }
     for b in &c.blocks {
@@ -86,12 +106,223 @@ fn bundle_of(it: &Interp, roots: Option<&[String]>) -> Result<String, QuilloErro
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
-    if !names.is_empty() {
+    if boots {
         program.push_str(
             "if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n",
         );
     }
-    Ok(assemble("(function () {", &program, "})();"))
+    program
+}
+
+/// A page's bundle: the components it was rendered with, every component
+/// they show (all of which it can come to show without loading more), and
+/// what they use. Two pages with the same components get the same bundle,
+/// whichever of them each rendered (FEEDBACK7.md, Q-062; branch
+/// feedback7-fixes). With the program's runtime file, the bundle is the
+/// program's code alone, which takes the runtime from it (Q-064).
+pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Result<PageBundle, QuilloError> {
+    let mut c = compiled(it, Some(roots))?;
+    let set = components_of(it, &c.0);
+    let mut sorted_roots = roots.to_vec();
+    sorted_roots.sort();
+    sorted_roots.dedup();
+    if set != sorted_roots {
+        c = compiled(it, Some(&set))?;
+    }
+    let (c, boots) = c;
+    if c.dev {
+        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false });
+    }
+    if let Some(rt) = rt {
+        if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
+            return Ok(PageBundle { js, set, split: true });
+        }
+    }
+    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false })
+}
+
+pub struct PageBundle {
+    pub js: String,
+    /// The components it holds, sorted: its key.
+    pub set: Vec<String>,
+    /// It takes the runtime from the runtime file.
+    pub split: bool,
+}
+
+/// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
+/// page's bundle shares, so the browser downloads it once rather than once
+/// for each set of components (FEEDBACK7.md, Q-064; branch feedback7-fixes).
+/// It holds what the whole program uses, and hands the bundles the names
+/// they take from it as `window.__quillo_rt`; inside its function, they do
+/// not meet the page's own scripts' names.
+pub struct RuntimeFile {
+    pub hash: String,
+    pub js: Arc<String>,
+    keep: Vec<bool>,
+    exported: HashSet<String>,
+}
+
+/// The program's runtime file, or none in development (whose bundles load
+/// the runtime as it is written).
+pub fn runtime_file(it: &Interp) -> Result<Option<RuntimeFile>, QuilloError> {
+    let (c, boots) = compiled(it, None)?;
+    if c.dev {
+        return Ok(None);
+    }
+    let program = program_text(it, &c, boots, false);
+    let rt = runtime_units();
+    let keep = shake(rt, &program);
+    let wanted: HashSet<String> = names_in(&program).into_iter().collect();
+    let mut exported: Vec<String> = rt
+        .by_name
+        .iter()
+        .filter(|(n, &i)| keep[i] && !n.contains('.') && wanted.contains(*n))
+        .map(|(n, _)| n.clone())
+        .collect();
+    exported.sort();
+    let mut js = String::from("(function () {\n");
+    minify_into(&rt.preamble, &mut js);
+    for (i, (_, text)) in rt.units.iter().enumerate() {
+        if keep[i] {
+            minify_into(text, &mut js);
+        }
+    }
+    if !it.base.is_empty() {
+        let _ = writeln!(js, "BASE = {};", js_str(&it.base));
+    }
+    let _ = writeln!(js, "window.__quillo_rt = {{ {} }};", exported.join(", "));
+    js.push_str("})();\n");
+    let hash = hash_text(&js);
+    Ok(Some(RuntimeFile { hash, js: Arc::new(js), keep, exported: exported.into_iter().collect() }))
+}
+
+impl RuntimeFile {
+    /// A page's program as a bundle that takes the runtime from this file,
+    /// or none if it needs something the file does not have (it then
+    /// carries its own runtime).
+    fn wrap(&self, program: &str) -> Option<String> {
+        let rt = runtime_units();
+        let need = shake(rt, program);
+        if need.iter().zip(&self.keep).any(|(n, k)| *n && !*k) {
+            return None;
+        }
+        // The program's own top-level names are its own.
+        let declared: HashSet<String> = program
+            .lines()
+            .filter_map(|l| ["const ", "let ", "function ", "class ", "async function "].iter().find_map(|p| l.strip_prefix(p)))
+            .map(|r| r.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect())
+            .collect();
+        let mut used: Vec<String> = names_in(program)
+            .into_iter()
+            .filter(|n| !n.contains('.') && rt.by_name.contains_key(n) && !declared.contains(n))
+            .collect();
+        used.sort();
+        used.dedup();
+        // A name it does not have, or one the program assigns (which a copy
+        // would not pass on), and the bundle carries its own runtime.
+        if used.iter().any(|n| !self.exported.contains(n) || assigns(program, n)) {
+            return None;
+        }
+        let mut out = format!("(function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "));
+        minify_into(program, &mut out);
+        out.push_str("})(window.__quillo_rt);\n");
+        Some(out)
+    }
+}
+
+/// Whether `js` assigns to the variable `name` (`name = `, `name += `...).
+fn assigns(js: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    js.match_indices(name).any(|(i, _)| {
+        let before = js[..i].chars().next_back();
+        if before.map_or(false, |c| ident(c) || c == '.') {
+            return false;
+        }
+        let rest = &js[i + name.len()..];
+        if rest.chars().next().map_or(false, ident) {
+            return false;
+        }
+        // `=`, `+=`, `??=`..., not `==`, `=>`, `<=`, `!=`.
+        let op = rest.trim_start().trim_start_matches(|c| "+-*/%&|^?".contains(c));
+        op.starts_with('=') && !op.starts_with("==") && !op.starts_with("=>")
+    })
+}
+
+pub fn hash_text(js: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    js.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// The bundles made for pages, by the set of components they hold, and the
+/// runtime file they share. At most `KEPT` sets are kept, the one used
+/// longest ago going first: a page that names a bundle no longer kept is
+/// sent the whole program's, and one asked for again is made again
+/// (FEEDBACK7.md, Q-063; branch feedback7-fixes).
+#[derive(Default)]
+pub struct Bundles {
+    pub runtime: Option<Arc<RuntimeFile>>,
+    /// The components a page rendered, sorted and joined, to its set's key.
+    by_roots: HashMap<String, String>,
+    by_set: HashMap<String, Made>,
+    tick: u64,
+}
+
+struct Made {
+    hash: String,
+    js: Arc<String>,
+    split: bool,
+    used: u64,
+}
+
+pub const KEPT: usize = 256;
+
+impl Bundles {
+    /// The bundle's hash, and whether it needs the runtime file.
+    pub fn hash_for_roots(&mut self, roots: &str) -> Option<(String, bool)> {
+        let set = self.by_roots.get(roots)?.clone();
+        self.tick += 1;
+        let m = self.by_set.get_mut(&set)?;
+        m.used = self.tick;
+        Some((m.hash.clone(), m.split))
+    }
+
+    pub fn keep(&mut self, roots: String, b: PageBundle) -> (String, bool) {
+        let set = b.set.join(",");
+        self.tick += 1;
+        if self.by_roots.len() > 4 * KEPT {
+            self.by_roots.clear();
+        }
+        self.by_roots.insert(roots, set.clone());
+        if let Some(m) = self.by_set.get_mut(&set) {
+            m.used = self.tick;
+            return (m.hash.clone(), m.split);
+        }
+        let hash = hash_text(&b.js);
+        self.by_set.insert(set, Made { hash: hash.clone(), js: Arc::new(b.js), split: b.split, used: self.tick });
+        crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        while self.by_set.len() > KEPT {
+            let Some(old) = self.by_set.iter().min_by_key(|(_, m)| m.used).map(|(k, _)| k.clone()) else { break };
+            self.by_set.remove(&old);
+            crate::metrics::BUNDLES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        (hash, b.split)
+    }
+
+    pub fn by_hash(&self, hash: &str) -> Option<Arc<String>> {
+        self.by_set.values().find(|m| m.hash == hash).map(|m| m.js.clone())
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_set.len()
+    }
+}
+
+impl Drop for Bundles {
+    fn drop(&mut self) {
+        crate::metrics::BUNDLES.fetch_sub(self.by_set.len() as i64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Where a statement's line is written into compiled code in development:
@@ -487,16 +718,7 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
 /// The parts of the runtime `program` needs, then the program, minified.
 fn assemble(open: &str, program: &str, close: &str) -> String {
     let rt = runtime_units();
-    let mut keep = vec![false; rt.units.len()];
-    let mut todo: Vec<String> = names_in(program);
-    while let Some(n) = todo.pop() {
-        if let Some(&i) = rt.by_name.get(&n) {
-            if !keep[i] {
-                keep[i] = true;
-                todo.extend(names_in(&rt.units[i].1));
-            }
-        }
-    }
+    let keep = shake(rt, program);
     let mut out = String::with_capacity(program.len() + 16 * 1024);
     out.push_str(open);
     out.push('\n');
@@ -510,6 +732,21 @@ fn assemble(open: &str, program: &str, close: &str) -> String {
     out.push_str(close);
     out.push('\n');
     out
+}
+
+/// Which of the runtime's declarations `program` needs, with what they need.
+fn shake(rt: &Runtime, program: &str) -> Vec<bool> {
+    let mut keep = vec![false; rt.units.len()];
+    let mut todo: Vec<String> = names_in(program);
+    while let Some(n) = todo.pop() {
+        if let Some(&i) = rt.by_name.get(&n) {
+            if !keep[i] {
+                keep[i] = true;
+                todo.extend(names_in(&rt.units[i].1));
+            }
+        }
+    }
+    keep
 }
 
 /// The runtime cut into its top-level declarations (`function f`, `const x`,

@@ -19,7 +19,9 @@ object designer), [FEEDBACK4.md](reports/FEEDBACK4.md) (a bank made of services,
 clerk–client desk view), [FEEDBACK5.md](reports/FEEDBACK5.md) (a booking platform on outside
 maps, weather and places, built with the Quillo UI kit, and the components it lacked),
 [FEEDBACK6.md](reports/FEEDBACK6.md) (no app: whether Quillo can make a video call, the
-command line with no program, and a chain of services with a slow link), and
+command line with no program, and a chain of services with a slow link),
+[FEEDBACK7.md](reports/FEEDBACK7.md) (no app: how Quillo ships its JavaScript, and how
+its bundles are keyed and kept), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

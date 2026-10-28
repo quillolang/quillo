@@ -505,11 +505,18 @@ route GET / = <html><body><Counter start={5}/></body></html>
   (and in `quillo check`): `request`, `db`, `env` (but for variables named `PUBLIC_...`),
   files, `reply`, or a global the server changes (pass it as a prop instead). `http.*`
   runs in the browser, from event handlers (see [What the browser can reach](#what-the-browser-can-reach)).
-- Each page loads a bundle of its own, `/_quillo/b/<hash>.js`: the components it was
-  rendered with, what they use, and the parts of the runtime they reach, minified (a
-  small component is about 25 KB, 8 KB gzipped). Its address changes with its
-  content, so the browser keeps it for good; a page with no components loads no
-  script.
+- Each page loads two scripts, minified, whose addresses change with their content, so
+  the browser keeps them for good:
+  - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
+    reach (about 30 KB, 10 KB gzipped, for a small program). Every page of the program
+    loads the same one, so the browser downloads it once.
+  - `/_quillo/b/<hash>.js`, the page's own code: the components it was rendered with,
+    every component they can show, and what they use. Pages with the same components
+    share it, whichever of them each showed.
+
+  A page with no components loads no script. The server keeps the bundles of the last
+  256 sets of components pages were made of (`quillo_bundles` under `--metrics`); a
+  page that names one no longer kept is sent the whole program's.
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
   when someone reaches for a component (hovers, touches or focuses it). What they
   typed and clicked before it came is kept and done then. A component that runs by

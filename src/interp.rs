@@ -216,7 +216,7 @@ pub struct Interp {
     pub island_names: Vec<String>,
     /// Bundles for sets of components, by their names: (hash, script).
     /// Shared by every handle on the program, made again when it loads.
-    pub bundles: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, Arc<String>)>>>,
+    pub bundles: Arc<std::sync::Mutex<crate::client::Bundles>>,
     /// A buffer lent to the renderer for building attribute values.
     spare: String,
     /// What views rendered, shared by the workers (see `viewcache`).
@@ -798,7 +798,7 @@ impl Interp {
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
-            bundles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            bundles: Default::default(),
             current_request: None,
             pending_request: None,
             islands: Vec::new(),
@@ -1250,32 +1250,40 @@ impl Interp {
     /// Compiles the program's components (and what they use) for the browser.
     pub fn build_client(&mut self) -> Result<(), QuilloError> {
         self.client_js = Arc::new(crate::client::bundle(self)?);
-        self.bundles = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let runtime = crate::client::runtime_file(self)?.map(Arc::new);
+        let mut bundles = crate::client::Bundles::default();
+        bundles.runtime = runtime;
+        self.bundles = Arc::new(std::sync::Mutex::new(bundles));
         Ok(())
     }
 
-    /// The bundle for a page with these components: its address's hash, made
-    /// once per set. None when it cannot be made (the full bundle serves).
-    pub fn bundle_for_page(&self, names: &[String]) -> Option<String> {
+    /// The bundle for a page with these components: its address's hash,
+    /// and whether it takes the runtime file. None when it cannot be made
+    /// (the full bundle serves).
+    pub fn bundle_for_page(&self, names: &[String]) -> Option<(String, bool)> {
         let mut sorted = names.to_vec();
         sorted.sort();
+        sorted.dedup();
         let key = sorted.join(",");
-        if let Some((hash, _)) = self.bundles.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return Some(hash.clone());
-        }
-        let js = crate::client::bundle_for(self, &sorted).ok()?;
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            js.hash(&mut h);
-            format!("{:016x}", h.finish())
+        let runtime = {
+            let mut b = self.bundles.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hash) = b.hash_for_roots(&key) {
+                return Some(hash);
+            }
+            b.runtime.clone()
         };
-        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (hash.clone(), Arc::new(js)));
-        Some(hash)
+        let made = crate::client::bundle_for(self, &sorted, runtime.as_deref()).ok()?;
+        Some(self.bundles.lock().unwrap_or_else(|e| e.into_inner()).keep(key, made))
     }
 
     pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {
-        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).values().find(|(h, _)| h == hash).map(|(_, js)| js.clone())
+        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).by_hash(hash)
+    }
+
+    /// The runtime file pages' bundles share, when there is one: its hash
+    /// and its code.
+    pub fn runtime_file(&self) -> Option<(String, Arc<String>)> {
+        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).runtime.as_ref().map(|r| (r.hash.clone(), r.js.clone()))
     }
 
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {

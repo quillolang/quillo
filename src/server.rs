@@ -328,11 +328,21 @@ impl Interp {
             // use), at an address that changes when it does.
             if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
                 let names = std::mem::take(&mut self.island_names);
-                let src = match self.bundle_for_page(&names) {
-                    Some(hash) => format!("{}/_quillo/b/{}.js", self.base, hash),
-                    None => format!("{}/_quillo/quillo.js", self.base),
+                // Its bundle, after the runtime file every page shares when
+                // it takes the runtime from there (FEEDBACK7.md, Q-064;
+                // branch feedback7-fixes).
+                let srcs = match self.bundle_for_page(&names) {
+                    Some((hash, split)) => {
+                        let mut s = Vec::new();
+                        if let Some((rt, _)) = self.runtime_file().filter(|_| split) {
+                            s.push(format!("{}/_quillo/r/{}.js", self.base, rt));
+                        }
+                        s.push(format!("{}/_quillo/b/{}.js", self.base, hash));
+                        s
+                    }
+                    None => vec![format!("{}/_quillo/quillo.js", self.base)],
                 };
-                tags.push_str(&format!("<script>{}</script>", island_loader(&src)));
+                tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
@@ -471,6 +481,21 @@ impl Interp {
         // A page's own bundle: its address names its content, so it is kept.
         // One this program did not make (a page from before a reload) gets
         // the whole bundle, which has every component.
+        // The runtime file pages' bundles share; another than this program's
+        // (a page from before a reload) gets this one, which does no harm:
+        // its bundle is not kept either, so it is sent the whole bundle.
+        if let Some(hash) = rest.strip_prefix("r/").and_then(|r| r.strip_suffix(".js")) {
+            let (js, cache) = match self.runtime_file() {
+                Some((h, js)) if h == hash => (js, "public, max-age=31536000, immutable"),
+                Some((_, js)) => (js, "no-cache"),
+                None => (Arc::new(String::new()), "no-cache"),
+            };
+            return HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), cache.into())],
+                body: js.as_bytes().to_vec(),
+            };
+        }
         if let Some(hash) = rest.strip_prefix("b/").and_then(|r| r.strip_suffix(".js")) {
             let (js, cache) = match self.bundle_by_hash(hash) {
                 Some(js) => (js, "public, max-age=31536000, immutable"),
@@ -1801,12 +1826,13 @@ pub const WORKER_STACK: usize = 16 << 20;
 /// runs by itself (`data-e`, `data-l`) or is the page (`<body>` holds it).
 /// A click or a form sent before the bundle runs waits for it, and is done
 /// then (see `boot` in runtime.js).
-fn island_loader(src: &str) -> String {
-    let src = serde_json::to_string(src).unwrap_or_default().replace("</", "<\\/");
+fn island_loader(srcs: &[String]) -> String {
+    let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
     format!(
         concat!(
             "(()=>{{const d=document,q=window.__quillo_q=[];let go=0;",
-            "const load=()=>{{if(go)return;go=1;const t=d.createElement(\"script\");t.src={};t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}};",
+            // In order: the runtime file first, when there is one.
+            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");t.src=s;t.async=false;t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}}}};",
             "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island,[data-qi]\");",
             "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{window.__quillo_at=e.target;load()}}}},{{capture:true,passive:true}});",
             "for(const v of[\"click\",\"submit\"])d.addEventListener(v,(e)=>{{if(!window.__quillo_booted&&isl(e)){{e.preventDefault();e.stopPropagation();q.push(e);load()}}}},true);",
