@@ -60,15 +60,27 @@ pub fn note_start() {
 }
 
 /// Whether a parse error could be code for a newer Quillo: something this
-/// one does not know (`expected …, found …`, an unknown character or
-/// escape), not a rule it names (`reply` is a keyword, only variables can
-/// be assigned to), which a newer Quillo would refuse as well.
+/// one does not know (an unknown character or escape, a keyword where it
+/// does not expect one, a word where it expects something else: a keyword
+/// it does not have yet), not a rule it names (`reply` is a keyword) nor a
+/// typo (a bracket left open, the end of the file, a stray comma), which a
+/// newer Quillo would refuse as well (FEEDBACK.md §5, Q-008; branch
+/// feedback6-fixes).
 pub fn may_be_newer_syntax(msg: &str) -> bool {
-    (msg.starts_with("expected ") && !msg.contains("which is a keyword"))
-        || msg.starts_with("unexpected character")
-        || msg.starts_with("unexpected keyword")
-        || msg.starts_with("unknown escape")
-        || msg.starts_with("bad escape")
+    if msg.starts_with("unexpected character") || msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
+        return true;
+    }
+    if !msg.starts_with("expected ") || msg.contains("which is a keyword") {
+        return false;
+    }
+    // `expected X, found `word``: a word this Quillo does not know as syntax.
+    match msg.rsplit_once("found `") {
+        Some((_, rest)) => {
+            let word = rest.split('`').next().unwrap_or("");
+            !word.is_empty() && word.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && word.chars().all(|c| c.is_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
 }
 
 /// After a syntax error: which quillo this is, as code written for a newer
