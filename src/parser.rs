@@ -1160,7 +1160,7 @@ impl Parser {
                 })
             }
             Tok::LBracket => self.no_bare_arrow_off(|p| {
-                // `[...xs, 3]` is `xs + [3]`: lists between the spreads.
+                // `[...xs, 3]` is `__concat(xs, [3])`: lists between the spreads.
                 let mut parts: Vec<Expr> = Vec::new();
                 let mut items = Vec::new();
                 while !p.at(&Tok::RBracket)? {
@@ -1183,8 +1183,7 @@ impl Parser {
                 if !items.is_empty() {
                     parts.push(Expr::List(items));
                 }
-                // A list to start from, so that `[...xs]` is a list too.
-                Ok(parts.into_iter().fold(Expr::List(Vec::new()), |a, b| Expr::Binary(BinOp::Add, Box::new(a), Box::new(b), line)))
+                Ok(Expr::Call(Box::new(Expr::Ident("__concat".into(), line)), parts, line))
             }),
             Tok::LBrace => self.no_bare_arrow_off(|p| {
                 if p.brace_is_map()? {
@@ -1307,8 +1306,7 @@ impl Parser {
                     parts.push(Expr::Map(entries));
                 }
                 let line = self.lx.line;
-                let merge = |a: Expr, b: Expr| Expr::Call(Box::new(Expr::Ident("__merge".into(), line)), vec![a, b], line);
-                return Ok(parts.into_iter().fold(Expr::Map(Vec::new()), merge));
+                return Ok(Expr::Call(Box::new(Expr::Ident("__merge".into(), line)), parts, line));
             }
             if self.eat_spread()? {
                 if !entries.is_empty() {

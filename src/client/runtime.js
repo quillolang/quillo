@@ -1263,7 +1263,27 @@ B.remove = meta((c, k) => {
   return m;
 }, "remove", null);
 B.merge = meta((a, b) => ({ ...M(a, "merge"), ...M(b, "merge", 2) }), "merge", null);
-B.__merge = B.merge;
+// Spreads, which the parser makes calls of (FEEDBACK3.md, Q-036; branch
+// feedback6-fixes): null spreads nothing; anything else that is not a map
+// (a list) is said as the spread it is.
+B.__merge = meta((...ms) => {
+  const out = {};
+  for (const m of ms) {
+    if (isNil(m)) continue;
+    if (!isMap(m)) fail(`\`{...x}\` spreads a map (or null) into a map, but x is ${typeName(m)}`);
+    Object.assign(out, m);
+  }
+  return out;
+}, "__merge", null);
+B.__concat = meta((...ls) => {
+  const out = [];
+  for (const l of ls) {
+    if (isNil(l)) continue;
+    if (!Array.isArray(l)) fail(`\`[...x]\` spreads a list (or null) into a list, but x is ${typeName(l)}`);
+    for (const x of l) out.push(x);
+  }
+  return out;
+}, "__concat", null);
 B.err = meta((v = null) => new Err(v), "err", null);
 B.is_err = meta((v) => v instanceof Err, "is_err", null);
 B.unwrap = meta((v) => { if (v instanceof Err) fail(`unwrap of an error: ${display(v.error)}`); return v; }, "unwrap", null);

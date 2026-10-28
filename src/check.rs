@@ -570,7 +570,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("set", "map | list | null, any, any=", "map | list"),
     ("remove", "list | map | null, any", "list | map"),
     ("merge", "map | null, map | null", "map"),
-    ("__merge", "map | null, map | null", "map"),
+    ("__merge", "map | null...", "map"),
+    ("__concat", "list | null...", "list"),
     ("err", "any=", "error(any)"),
     ("is_err", "any", "bool"),
     ("unwrap", "any", "any"),
@@ -3549,6 +3550,11 @@ impl Checker {
                 None if !p.optional => {
                     self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
                     break;
+                }
+                Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 && matches!(name, "__merge" | "__concat") => {
+                    // A spread, which the parser made a call of (Q-036).
+                    let (form, of) = if name == "__merge" { ("{...x}", "a map") } else { ("[...x]", "a list") };
+                    self.error(format!("`{}` spreads {} (or null), but x is {}", form, of, bits_text(a.bits)));
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 => {
                     self.error(format!("{} of `{}` must be {}, got {}{}", what(), name, bits_text(p.ty), bits_text(a.bits), hides(&sig, name)));

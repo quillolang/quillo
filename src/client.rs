@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
