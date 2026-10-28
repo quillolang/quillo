@@ -1938,6 +1938,18 @@ impl Parser {
                     buf.push(c);
                     self.lx.bump();
                 }
+                // Tailwind's variants and fractions: `<em.hover:underline>`,
+                // `<div.md:flex>`, `<div.w-1/2>`. A `:` was taken for the start
+                // of an attribute, silently (FEEDBACK11.md, Q-079; branch
+                // shorthand-colon).
+                Some(':') if !buf.is_empty() && self.lx.peek_char_at(1).is_some_and(|c| c.is_alphanumeric()) => {
+                    buf.push(':');
+                    self.lx.bump();
+                }
+                Some('/') if !buf.is_empty() && self.lx.peek_char_at(1).is_some_and(|c| c.is_ascii_digit()) => {
+                    buf.push('/');
+                    self.lx.bump();
+                }
                 Some('{') => {
                     if !buf.is_empty() {
                         parts.push(TPart::Lit(std::mem::take(&mut buf)));
