@@ -452,6 +452,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `ok ? "text-green-700" : "text-red-700"`); a class made from parts (`` `bg-${color}` ``)
   is found by neither it nor Quillo. Under `--watch`, each time it writes the sheet the
   open pages take it as they are.
+- `style global card_css` is the component's CSS with its selectors as written, not made to
+  need its attribute: for a library whose classes are its own already (the UI kit's are all
+  `ui-...`), whose rules may reach into what the caller passes in (`.ui-card-body >
+  :first-child`). It is still sent only to pages that show the component, and companions
+  that share one stylesheet (`Tabs` and `Tab`, each `style global tabs_css`) send it once.
 - A page is sent the styles of the components and views on it, and of those its bundle can
   show, as a sheet of its own in its `<head>`, `/_quillo/s/<hash>.css`, which the browser
   keeps for good. A `<style>` the page writes is for what is not a component's.
@@ -1010,16 +1015,63 @@ route METHOD /path/:param/:typed(int)/*rest [? { query pattern }] [{ request pat
 route METHOD /path { ... block ... }
 ```
 
-- **Methods:** `GET POST PUT PATCH DELETE OPTIONS HEAD ANY`. A `HEAD` request is served by the `GET` route without a body.
-- **Path params** become variables. `:id(int)` only matches what parses as an int (also `float`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path.
+- **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
+  `HEAD` request is served by the `GET` route: the route runs (what it does, it does),
+  and the body is dropped. A `route HEAD` is accepted but never matches. An `OPTIONS`
+  request reaches only a route declared `OPTIONS` (or `ANY`); nothing answers CORS
+  preflights by itself, and no `access-control-*` header is written for you.
+- **Path params** become variables. `:id(int)` only matches what parses as an int (also
+  `float`, `dec`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path; `*`
+  alone names it `rest`. The path is split at `/`, empty pieces dropped, so `/users`,
+  `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
+  a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
-- **Request pattern:** matched against the `request` map. Fields: `json`, `form`, `files`, `headers`, `cookies`, `query`, `params`, `method`, `path`, `body`, `ip`. JSON is matched strictly: the string `"7"` is not an int. Form fields, headers and cookies are converted like query values. `{ json: User }` takes the body as a [record](#records).
-- **Reserved:** paths under `/_quillo/` belong to Quillo (the browser bundle, server fn calls, `--watch`).
+- **Request pattern:** matched against the `request` map. Its fields, and all of them:
+  `method`, `path`, `query`, `params`, `headers`, `cookies`, `body`, `json`, `form`,
+  `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
+  are `tenant()` and `locale()`. JSON is matched strictly: the string `"7"` is not an
+  int. Form fields, headers and cookies are converted like query values. `{ json: User }`
+  takes the body as a [record](#records). A pattern on the host is a pattern on the
+  headers: `{ headers: { host: "api.example.com" } }`.
+- **What the request holds.** `headers` has its names in lower case, and a header sent
+  twice keeps the last; only the last `Cookie` header is read, its values
+  percent-decoded. `query` and `form` keep the last of a key given twice (`a=1&a=2` is
+  `{ a: "2" }`): no lists, and `a[b]` is a key named so. `json` is the body parsed when
+  the content type is `application/json` (or `...+json`), or when there is none and the
+  body starts with `{` or `[`; otherwise, and for JSON that does not parse, it is
+  `null`. `body` is the body as text: bytes that are not UTF-8 are replaced, so a binary
+  body cannot be read as it was (there is no bytes value in the language), and for a
+  multipart body it is empty. `id` is the request's id (see [Services](#services)).
+- **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
+  there is listed under [What a route cannot do](#what-a-route-cannot-do)).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
+  Routes are declared at the top level of a file: `quillo check` refuses one inside a
+  function or a block.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method, and 400 when a route matched the path and method but
-none of its patterns matched.
+none of its patterns matched. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+`DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
+coming from another site is refused with 403 (see `allow_cross_site` under
+[Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
+your own; since `ANY` matches every method, no path then answers 405 or 400.
+
+The statuses the server answers by itself:
+
+| Status | When |
+|---|---|
+| 400 | a malformed request line, header or chunked body; a route matched the path and method but no pattern; a `server fn` call whose body is not a JSON array |
+| 403 | a cross-site form post, `server fn` call or live connection; a desktop app's window token missing |
+| 404 | no route; an unknown `/_quillo/` path; a `file()` path refused |
+| 405 | the path is known, the method is not |
+| 409, 422 | an [idempotent request](#idempotent-requests) running, or sent again with another body |
+| 413 | a body larger than `--max-body` |
+| 415 | a `server fn` call without `content-type: application/json` |
+| 416 | a `Range` past the end of a file |
+| 431 | a request head over 64 KiB, or more than 100 headers |
+| 500 | a runtime error in the route (the body is `internal error`; the message is on stderr, and on the page under `--watch`) |
+| 501 | a `transfer-encoding` other than `chunked` |
+| 503 | the server stopping or its program failed to load; a prefetch refused; too many files being sent or pages waiting (with `retry-after: 5`) |
 
 ### Uploads
 
@@ -1038,12 +1090,16 @@ route POST /avatar {
 ```
 
 - `save_upload(file, path)` writes the file under the program's folder (making folders
-  as needed; a path that leads outside is refused) and gives the path back, or an error
-  value. `read_upload(file)` gives a text file's contents.
+  as needed) and gives the path back; `read_upload(file)` gives a text file's contents.
+  Both give an error value when the request has no files, or the record is not one of
+  this request's; a path that leads outside the folder is a runtime error.
 - `filename` is what the browser sent, without any folders; name saved files yourself
-  (as above) rather than trusting it.
-- The whole request counts against `--max-body` (10 MiB by default): raise it for larger
-  files.
+  (as above) rather than trusting it. The record also carries `start` and `end`, the
+  file's place in the body.
+- A multipart body may hold up to 1,000 parts; a text field given twice keeps the last.
+- The body counts against `--max-body` (10 MiB by default): raise it for larger files.
+  The request's head (its line and headers) has limits of its own, 64 KiB and 100
+  headers, answered 431.
 
 From a component, a file goes to a `server fn` as an argument: pass it the input's file,
 and the function gets the same `{ field, filename, type, size }` record a form's upload
@@ -1155,12 +1211,22 @@ route POST /logout { end_session(); redirect("/") }
 - `set_cookie(name, value, { max_age, path, domain, http_only, secure, same_site })` and
   `delete_cookie(name, { path, domain })` add `Set-Cookie` to the response, whatever
   the route returns. Cookies are `HttpOnly`, `SameSite=Lax`, `Path=/` and `Secure` by
-  default. `Secure` is left out with `--watch` and in desktop apps, which are served
+  default. `max_age` is seconds or a duration (`"30d"`: `s`, `m`, `h`, `d`, `w`, `y`);
+  `path` must start with `/`; `domain` takes letters, digits, `.` and `-`; `same_site`
+  is `"Lax"`, `"Strict"` or `"None"`, and `"None"` makes the cookie `Secure` whatever
+  was asked, since browsers take it no other way. Values are percent-encoded. A cookie
+  set twice in one request is sent once, the last. In a mounted program, or under
+  `--base`, the default `Path` is the prefix.
+  `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
   such as limer in front). `request.cookies` has what the browser sent, and
   `cookie(name)` one of them (or null), in any function the request runs, as
   `session()` is: a helper that reads the visitor's time zone from a cookie need not be
-  handed `request` by every caller.
+  handed `request` by every caller. Outside a request (a job, a script), `session()` is
+  `{}` and `cookie(name)` is null.
+- `set_session` takes only `max_age`; `set_session(null)` ends the session too. The
+  cookie's value is the session as JSON, with its expiry, base64url-encoded and signed,
+  so a session over about 3,900 bytes is a runtime error.
 
 ### What a route returns
 
@@ -1176,6 +1242,22 @@ route POST /logout { end_session(); redirect("/") }
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
+| a runtime error | 500 `text/plain`, `internal error` |
+
+- `respond(status, body, headers)` takes a status from 100 to 599; header names are
+  written in lower case, and a name or value with a control character (a line break) is
+  a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
+  the server's, whatever is given. `redirect(url, status)` takes 300 to 399.
+- Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
+  `x-request-id` and `x-content-type-options: nosniff`.
+- Text answers are gzipped for browsers that accept it: a 200 with a body of 1 KiB or
+  more whose type is `text/*` or names `json`, `javascript` or `svg`, with `vary:
+  accept-encoding`. Not when the route set `content-encoding`, not streams, not partial
+  files (206). There is no brotli.
+- A header cannot be added from a helper: what `respond`, `stream` and `events` are given
+  is the answer's. Cookies are the exception: `set_cookie` anywhere in the request joins
+  it. `reply status respond(...)` keeps the `respond`'s headers and body with the new
+  status.
 
 `reply status [body]` ends the request right away, from anywhere: inside a
 helper, a pipeline stage or a `??` fallback. This is how middleware works:
@@ -1219,14 +1301,16 @@ server fn transfer(from: str, to: str, amount: str) =
 curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bob", "amount": "12.50"}'
 ```
 
-- The client makes up the key (a UUID; 1 to 255 visible characters), and sends the
-  same one when it sends the request again. A request with the key and another method,
-  path, query or body is refused with 422. One that comes while the first is still
-  running gets 409, and should be sent again a moment later. Neither runs.
+- The client makes up the key (a UUID; 1 to 255 visible characters, else 400), and sends
+  the same one when it sends the request again. A request with the key and another
+  method, path, query or body is refused with 422. One that comes while the first is
+  still running gets 409, and should be sent again a moment later. Neither runs.
 - The answer kept is the status, the headers (not `Set-Cookie`) and the body; a request
-  again gets it with `Idempotent-Replayed: true`. Answers are kept 24 hours, then the key
-  is new again: `{ max_age: "7d" }` (seconds, or a duration as for cookies) keeps them
-  longer. Expired ones are deleted as requests come.
+  again gets it with `Idempotent-Replayed: true`. A streamed answer (`stream`, `events`)
+  cannot be kept. Answers are kept 24 hours, then the key is new again: `{ max_age:
+  "7d" }` (seconds, or a duration as for cookies, up to 366 days) keeps them longer.
+  Expired ones are deleted as requests come. When the database that keeps them cannot
+  be reached, the request is answered 503.
 - Keys belong to the tenant, the mount point and the user: `session().user`, or the
   `user` option for a request that names its caller otherwise (`{ user:
   token.owner }`). The same key from another user is another request, and cannot read
@@ -1285,8 +1369,8 @@ keep it in their cache for 30 seconds, which the server allows for this.
   database, files, other servers) but not write: `db.exec` or SQL that writes, assigning
   a global variable, cookies and sessions, files, `publish`, `http.post` and the like,
   and calls to services stop it, and it is answered "not prefetched" (503, which the
-  browser drops, and which is not logged). The page is then made, as usual, when the
-  link is followed. So a `GET` that does something (a
+  browser drops; the request log shows it as any 503, with no error line). The page is
+  then made, as usual, when the link is followed. So a `GET` that does something (a
   logout link, a counter) is never done by pointing at it.
 - **What is left alone:** links to other sites, with `target` or `download`, to the
   same page (`#section`), those a page's components follow themselves (see
@@ -1555,13 +1639,21 @@ route GET /assets/*path = file("public/" + path)
 route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that change with content
 ```
 
-- Each file goes out with an `ETag` and `Last-Modified`. A browser asking with a
-  current copy (`If-None-Match`, `If-Modified-Since`) gets a `304` with no body.
+- Each file goes out with an `ETag` (a weak one, from the file's size and time) and
+  `Last-Modified`. A browser asking with a current copy (`If-None-Match`, or an
+  `If-Modified-Since` equal to it) gets a `304` with no body.
+- The type comes from the extension: `html htm css js mjs json map webmanifest xml txt
+  md csv svg png jpg jpeg gif webp avif ico mp4 webm mp3 ogg wav wasm woff2 woff ttf
+  otf pdf zip`; anything else is `application/octet-stream`. `file()` is also the only
+  way to send bytes as they are: a route's other answers are text, HTML or JSON, so a
+  file made in the program (a PDF, an image from `image.convert`) is written under the
+  program's folder and served from there.
 - `Cache-Control` is `no-cache` (keep it, but ask each time) unless `cache` is given:
   seconds, or `"10m"`, `"12h"`, `"30d"`, `"1y"`, which allows keeping it that long
   without asking (`immutable`). Use it for files whose name changes with their content.
-- `Range: bytes=…` gets a `206` with only those bytes (audio and video seeking); a range
-  past the end gets a `416`.
+- `Range: bytes=…` gets a `206` with only those bytes (audio and video seeking; `If-Range`
+  is honoured); a range past the end gets a `416`, and several ranges at once the whole
+  file.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
   disk. Larger ones are sent from disk as they are written, on a thread of their own
   with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
@@ -1569,8 +1661,9 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
   seconds, and any send stops after an hour: a browser or player goes on from there
   with a `Range` request. Behind a proxy every visitor shares the proxy's address and so
-  its 8 places; limit clients at the proxy instead. The gzipped copy of a text file is
-  kept too, rather than compressed again for each request.
+  its 8 places; limit clients at the proxy instead. The gzipped copy of a text file up
+  to 1 MiB is kept too (32 MiB of them in all), rather than compressed again for each
+  request.
 - Paths with `..`, or starting at `/`, get a `404`.
 
 ### Translations
@@ -1591,15 +1684,22 @@ view Header(user) = <header>
   "cart": { "items": { "one": "{count} article", "other": "{count} articles" } } }
 ```
 
+- The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
+  as `en`, `pt-BR` or `zh-Hant`.
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
-  (`fr-CA` is served by `fr`, `pt` by `pt-BR`), else the default:
-  `translations(dir, { default: "en" })`, or `en` when there is one. `locale()` gives it.
+  (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `*` does not), else
+  the default: `translations(dir, { default: "en" })`, or `en` when there is one, or
+  else the first locale by name. `locale()` gives it.
 - Nested keys are written with dots. A key missing in a locale comes from the default
   locale; a key missing there shows as itself.
 - `{name}` is replaced by that value. An entry of plural forms (`zero one two few many
-  other`) picks the form for `count` by the language's rules (English, French, Russian,
-  Polish, Czech, Arabic, Hebrew, Japanese and others).
+  other`) picks the form for `count` by the language's rules, which are built in:
+  English and the languages that count as it, French, Portuguese and Hindi (where 0 is
+  singular), Russian, Ukrainian and Belarusian, Serbian, Croatian and Bosnian, Polish,
+  Czech and Slovak, Arabic, Hebrew, and `other` alone for Japanese, Chinese, Korean,
+  Thai, Vietnamese, Indonesian, Malay and their kin. A `count` that is not a whole
+  number takes `other`.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
   wrote in them. In that form the values put in (`{name}`) are still escaped, on the
   server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
@@ -1625,7 +1725,12 @@ The mounted program runs unchanged, with its own globals and its own database, a
 sees paths without the prefix (`url().path` is `/products`, not `/shop/products`).
 Its root-relative links and form actions (`href`, `src`, `action`), its redirects, its
 browser bundle, its `server fn` calls, live data and page changes are all moved under the
-prefix. Changes to mounted files are picked up by `--watch`. See
+prefix. Its cookies are set for the prefix (`Path=/shop`), its session cookie is
+`quillo_session` and is signed for that mount, so the two programs' sessions never pass
+for each other. Its file paths count from its own folder; the services it declares are
+shared with the program that mounts it. `/_quillo/health` and `/_quillo/metrics` are
+the process's, at the root only. `mount`, like `service`, is written at the top level.
+Changes to mounted files are picked up by `--watch`. See
 [index.qwe](https://github.com/quillolang/examples/blob/main/index.qwe), which mounts every example.
 
 ### Services

@@ -552,6 +552,20 @@ impl Parser {
             }
             _ => return Err(QuilloError::new("`style` belongs in the body of a component or a view", line)),
         };
+        // `style global ...`: sent with the component, its selectors as written
+        // (a library whose classes are its own already, such as the UI kit's
+        // `ui-`). `global` alone is a name like any other (FEEDBACK8.md, Q-068;
+        // branch style-global).
+        let mut global = false;
+        if matches!(self.peek()?, Tok::Ident(w) if w == "global") {
+            let saved = self.save();
+            self.next()?;
+            if self.line()? == line && matches!(self.peek()?, Tok::Ident(_) | Tok::Str(_)) {
+                global = true;
+            } else {
+                self.restore(saved);
+            }
+        }
         let e = self.parse_expr()?;
         let mut read = None;
         crate::check::walk_expr(&e, &mut |x| {
@@ -571,7 +585,11 @@ impl Parser {
         if let Some(s) = &mut self.styling {
             s.scope = Some(id);
         }
-        Ok(Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), vec![e], line)))
+        let mut args = vec![e];
+        if global {
+            args.push(Expr::Lit(Lit::Bool(true)));
+        }
+        Ok(Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line)))
     }
 
     /// `int`, `str?`, or a union: `int | str | null`.
