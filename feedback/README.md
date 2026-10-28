@@ -26,7 +26,8 @@ classes in the five apps, the classes Quillo sets itself, and component CSS that
 scoped), [FEEDBACK9.md](reports/FEEDBACK9.md) (no app: whether Quillo keeps its keywords,
 builtins and modules apart from a program's names, on the server and in the browser; how `run` takes its options; `.env` and a service's settings), [FEEDBACK10.md](reports/FEEDBACK10.md) (no app: one service
 scaled to several copies without changing its code, a copy joining while the app runs, and
-retries behind a balancer, health and API description through a gateway), and
+retries behind a balancer, health and API description through a gateway), [FEEDBACK11.md](reports/FEEDBACK11.md) (no app:
+Tailwind and CSS tools beside Quillo, and `--watch` with a generated stylesheet), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
