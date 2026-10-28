@@ -74,6 +74,7 @@ view Rating(name: str = "rating", label: str? = null, value: num? = null, max: i
             labels: list = [], readonly: bool = false, count: int? = null, size: str = "md",
             hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
             field: str? = null, on_change = null, class: str? = null) {
+    style global rating_css
     let id = field ?? `rating-${name}`
     let size_cls = size != "md" && `ui-rating-${size}`
     let word = (n: num) => {

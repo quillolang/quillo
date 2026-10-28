@@ -58,6 +58,7 @@ let navbar_css = css`
 
 view Navbar(brand: str = "", brand_href: str = "/", logo = null, links: list = [], current: str? = null,
             label: str = "Main", sticky: bool = false, class: str? = null, children) {
+    style global navbar_css
     let items = for l in links =>
         <li><a href={l.href} aria-current={current != null && l.href == current ? "page" : null}>{l.label}</a></li>
     <header class={ui_cls(["ui-navbar", sticky && "ui-navbar-sticky", class])}>

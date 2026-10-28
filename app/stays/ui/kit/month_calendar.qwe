@@ -121,6 +121,7 @@ fn month_calendar_turn(month: str, k: int) -> str {
 component MonthCalendar(month: str, days: list = [], labels: map = {}, selected: list = [], today: str? = null,
                         past: bool = false, week_start: int = 1, name: str? = null, label: str = "Calendar",
                         on_select = null, on_month = null, class: str? = null) {
+    style global month_calendar_css
     state own_month = month
     state own_picked = selected
     state last = null

@@ -35,7 +35,9 @@ let action_bar_css = css`
 `
 
 view ActionBar(text: str? = null, detail: str? = null, wide: str = "inline", label: str = "Actions",
-               class: str? = null, children) = [
+               class: str? = null, children) {
+    style global action_bar_css
+    [
     <section class={ui_cls(["ui-action-bar", wide == "hidden" && "ui-action-bar-wide-hidden", class])} aria-label={label}>
         <div.ui-action-bar-text>
             {text != null ? <b>{text}</b> : null}
@@ -45,3 +47,4 @@ view ActionBar(text: str? = null, detail: str? = null, wide: str = "inline", lab
     </section>,
     <div.ui-action-bar-space aria-hidden="true"></div>,
 ]
+}

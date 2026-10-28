@@ -33,7 +33,8 @@ let switch_css = css`
 `
 
 view Switch(name: str? = null, label: str = "", hint: str? = null, checked: bool = false,
-            value: str? = null, disabled: bool = false, size: str = "md", on_change = null, class: str? = null) =
+            value: str? = null, disabled: bool = false, size: str = "md", on_change = null, class: str? = null) {
+    style global switch_css
     <label class={ui_cls(["ui-switch", size == "sm" && "ui-switch-sm", class])}>
         <input type="checkbox" role="switch" name={name} value={value} checked={checked} disabled={disabled}
                @change={(e) => { on_change && on_change(e.checked) }}/>
@@ -43,3 +44,4 @@ view Switch(name: str? = null, label: str = "", hint: str? = null, checked: bool
             {hint != null && <span.ui-switch-hint>{hint}</span>}
         </span>}
     </label>
+}

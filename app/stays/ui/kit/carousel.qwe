@@ -59,6 +59,7 @@ let carousel_css = css`
 `
 
 component Carousel(label: str = "Carousel", autoplay: num = 0, loop: bool = true, id: str = "ui-carousel", children) {
+    style global carousel_css
     state at = 0
     state count = 0
     state track = null
@@ -148,5 +149,7 @@ component Carousel(label: str = "Carousel", autoplay: num = 0, loop: bool = true
     </section>
 }
 
-view CarouselSlide(label: str? = null, class: str? = null, children) =
+view CarouselSlide(label: str? = null, class: str? = null, children) {
+    style global carousel_css
     <div class={ui_cls(["ui-carousel-slide", class])} role="group" aria-roledescription="slide" aria-label={label}>{children}</div>
+}

@@ -57,6 +57,7 @@ fn countdown_parse(s: str) -> int? {
 
 component Countdown(to: str? = null, seconds: int? = null, label: str? = null, ended: str = "Ended",
                     variant: str = "boxes", size: str = "md", on_end = null, class: str? = null) {
+    style global countdown_css
     state target = to != null ? (countdown_parse(to) ?? now()) : now() + (seconds ?? 0) * 1000
     state at = now()
     let left = target > at ? ceil((target - at) / 1000) : 0

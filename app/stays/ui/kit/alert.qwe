@@ -64,7 +64,8 @@ fn alert_icon(tone: str) {
 }
 
 view Alert(tone: str = "info", title: str? = null, variant: str = "soft", icon: bool = true,
-           dismissable: bool = false, on_dismiss = null, class: str? = null, id: str? = null, children) =
+           dismissable: bool = false, on_dismiss = null, class: str? = null, id: str? = null, children) {
+    style global alert_css
     <div class={ui_cls(["ui-alert", `ui-alert-${tone}`, `ui-alert-${variant}`, class])} id={id}
          role={tone == "danger" || tone == "warning" ? "alert" : "status"}>
         {icon && alert_icon(tone)}
@@ -75,9 +76,11 @@ view Alert(tone: str = "info", title: str? = null, variant: str = "soft", icon: 
         {dismissable && <button.ui-alert-x type="button" aria-label="Dismiss"
                                 @click={() => { on_dismiss && on_dismiss() }}>×</button>}
     </div>
+}
 
 component DismissibleAlert(tone: str = "info", title: str? = null, variant: str = "soft",
                            icon: bool = true, class: str? = null, id: str? = null, children) {
+    style global alert_css
     state shown = true
     <div class="ui-alert-host">
         {shown && <Alert tone={tone} title={title} variant={variant} icon={icon} class={class} id={id}

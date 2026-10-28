@@ -40,7 +40,8 @@ let steps_css = css`
 }
 `
 
-view Steps(steps: list = [], current: int = 0, vertical: bool = false, label: str = "Progress", class: str? = null) =
+view Steps(steps: list = [], current: int = 0, vertical: bool = false, label: str = "Progress", class: str? = null) {
+    style global steps_css
     <ol class={ui_cls(["ui-steps", vertical && "ui-steps-vertical", class])} aria-label={label}>
         {for [i, s] in enumerate(steps) => {
             let text = type_of(s) == "str" ? s : s.label
@@ -59,3 +60,4 @@ view Steps(steps: list = [], current: int = 0, vertical: bool = false, label: st
             </li>
         }}
     </ol>
+}

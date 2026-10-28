@@ -71,6 +71,7 @@ component MapView(center: list, zoom: int = 13, markers: list = [], picked = nul
                   pin: list? = null, height: int = 320, label: str = "Map",
                   tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png", attribution: str = "© OpenStreetMap",
                   on_pick = null, on_pin = null, class: str? = null) {
+    style global map_view_css
     state leaflet = null
     state layer = null
     state pin_marker = null

@@ -32,6 +32,7 @@ let skeleton_css = css`
 
 view Skeleton(shape: str = "text", lines: int = 1, width: str? = null, height: str? = null,
               class: str? = null) {
+    style global skeleton_css
     let tall = height ?? (shape == "circle" ? width : null)
     let size = ui_cls([width != null && `width: ${width};`, tall != null && `height: ${tall};`])
     let style = size != "" ? size : null
@@ -42,7 +43,8 @@ view Skeleton(shape: str = "text", lines: int = 1, width: str? = null, height: s
         : <span class={ui_cls(["ui-skeleton", `ui-skeleton-${shape}`, class])} style={style} aria-hidden="true"></span>
 }
 
-view SkeletonCard(class: str? = null) =
+view SkeletonCard(class: str? = null) {
+    style global skeleton_css
     <div class={ui_cls(["ui-skeleton-card", class])} aria-hidden="true">
         <div.ui-skeleton-card-head>
             <Skeleton shape="circle"/>
@@ -51,3 +53,4 @@ view SkeletonCard(class: str? = null) =
         <Skeleton shape="rect" height="96px"/>
         <Skeleton lines={3}/>
     </div>
+}

@@ -44,6 +44,7 @@ view Button(variant: str = "solid", tone: str = "accent", size: str = "md", href
              type: str = "button", name: str? = null, value: str? = null, disabled: bool = false,
              loading: bool = false, full: bool = false, label: str? = null, class: str? = null,
              id: str? = null, on_click = null, children) {
+    style global button_css
     let cls = ui_cls(["ui-btn", `ui-btn-${variant}`, tone != "accent" && `ui-btn-${tone}`,
                       size != "md" && `ui-btn-${size}`, full && "ui-btn-full", class])
     let body = [loading && <span.ui-btn-spin aria-hidden="true"></span>, children]

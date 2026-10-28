@@ -34,7 +34,8 @@ let timeline_css = css`
 .ui-timeline-body { margin: 2px 0 0; color: var(--ui-muted); }
 `
 
-view Timeline(items: list, class: str? = null) =
+view Timeline(items: list, class: str? = null) {
+    style global timeline_css
     <ol class={ui_cls(["ui-timeline", class])}>
         {for it in items => <li class={ui_cls(["ui-timeline-item", it.tone != null && `ui-timeline-${it.tone}`])}>
             <span.ui-timeline-dot aria-hidden="true"></span>
@@ -47,3 +48,4 @@ view Timeline(items: list, class: str? = null) =
             </div>
         </li>}
     </ol>
+}

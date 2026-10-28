@@ -30,7 +30,8 @@ let price_breakdown_css = css`
 `
 
 view PriceBreakdown(lines: list = [], total: str? = null, total_label: str = "Total", title: str? = null,
-                    note: str? = null, class: str? = null) =
+                    note: str? = null, class: str? = null) {
+    style global price_breakdown_css
     <div class={ui_cls(["ui-price-breakdown", class])}>
         {title != null ? <h3.ui-price-breakdown-title>{title}</h3> : null}
         <dl.ui-price-breakdown-lines>
@@ -44,3 +45,4 @@ view PriceBreakdown(lines: list = [], total: str? = null, total_label: str = "To
         </dl>
         {note != null ? <p.ui-price-breakdown-note>{note}</p> : null}
     </div>
+}

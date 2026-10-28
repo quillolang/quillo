@@ -48,4 +48,6 @@ use "ui/kit/guest_picker.qwe"
 use "ui/kit/card_input.qwe"
 use "ui/kit/action_bar.qwe"
 
-let kit_css = theme_css + button_css + card_css + badge_css + date_range_picker_css + number_input_css + range_slider_css + chip_group_css + rating_css + carousel_css + lightbox_css + steps_css + countdown_css + stat_css + bar_chart_css + calendar_heatmap_css + modal_css + empty_state_css + skeleton_css + tabs_css + avatar_css + alert_css + text_field_css + select_css + text_area_css + switch_css + segmented_control_css + description_list_css + spinner_css + navbar_css + meter_css + timeline_css + tooltip_css + sheet_css + status_dot_css + tag_css + divider_css + map_view_css + month_calendar_css + time_slots_css + price_breakdown_css + guest_picker_css + card_input_css + action_bar_css
+// The page's own sheet: the theme. Each component brings its own CSS
+// (`style global`), sent only to the pages that show it (FEEDBACK8.md, Q-068).
+let kit_css = theme_css

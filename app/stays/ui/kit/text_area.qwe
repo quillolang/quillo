@@ -51,6 +51,7 @@ component TextArea(name: str? = null, label: str? = null, value: str = "", place
                    hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
                    field: str? = null, size: str = "md", rows: int = 3, maxlength: int? = null,
                    autogrow: bool = false, on_input = null, on_change = null, class: str? = null) {
+    style global text_area_css
     state text = value
     state grow_js = false
     let id = field ?? `text-area-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`

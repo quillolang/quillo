@@ -60,6 +60,7 @@ let lightbox_css = css`
 
 component Lightbox(images: list = [], label: str = "Images", size: int = 140, ratio: str = "1", loop: bool = true,
                    class: str? = null) {
+    style global lightbox_css
     state dlg = null
     state at = 0
     state sx = null

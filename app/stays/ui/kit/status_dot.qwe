@@ -33,6 +33,7 @@ let status_dot_css = css`
 
 view StatusDot(status: str = "online", label: str? = null, show_label: bool = true, pulse: bool = false,
                size: str = "md", class: str? = null) {
+    style global status_dot_css
     let said = label ?? upper(slice(status, 0, 1)) + slice(status, 1)
     <span class={ui_cls(["ui-sd", `ui-sd-${status}`, size != "md" && `ui-sd-${size}`, pulse && "ui-sd-pulse", class])}
           role={show_label ? null : "img"} aria-label={show_label ? null : said} title={show_label ? null : said}>

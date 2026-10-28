@@ -103,6 +103,7 @@ fn calendar_heatmap_show(n: int) -> str {
 view CalendarHeatmap(values: map = {}, end: str? = null, start: str? = null, week_start: str = "sunday",
                      unit: str = "contributions", tone: str = "accent", total: bool = true,
                      label: str = "Activity", class: str? = null) {
+    style global calendar_heatmap_css
     let known = keys(values) | map((k) => calendar_heatmap_parse(k)) | filter((d) => d != null)
     let last = (end != null ? calendar_heatmap_parse(end) : null)
         ?? (len(known) > 0 ? max(known) : floor(now() / 86400000))

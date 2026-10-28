@@ -51,6 +51,7 @@ view Meter(value: num, min: num = 0, max: num = 100, low: num? = null, high: num
            optimum: num? = null, label: str? = null, unit: str = "", value_text: str? = null,
            show_value: bool = true, segments: int = 1, marks: bool = true, tone: str = "accent",
            size: str = "md", class: str? = null) {
+    style global meter_css
     let span = max - min > 0 ? max - min : 1
     let v = value < min ? min : (value > max ? max : value)
     let lo = low ?? min

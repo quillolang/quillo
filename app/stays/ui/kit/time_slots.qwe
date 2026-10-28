@@ -46,7 +46,8 @@ fn time_slots_meta(s) -> str {
 }
 
 view TimeSlots(name: str = "slot", label: str? = null, slots: list = [], value = null, empty: str = "No times",
-               on_pick = null, class: str? = null) =
+               on_pick = null, class: str? = null) {
+    style global time_slots_css
     <fieldset class={ui_cls(["ui-time-slots", class])} role="radiogroup">
         {label != null ? <legend.ui-time-slots-legend>{label}</legend> : null}
         {len(slots) == 0
@@ -64,3 +65,4 @@ view TimeSlots(name: str = "slot", label: str? = null, slots: list = [], value =
                 </label>}
             </div>}
     </fieldset>
+}
