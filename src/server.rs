@@ -600,6 +600,12 @@ impl Interp {
         if rest == "ready" {
             return ready_response(self);
         }
+        // The program's API, for a gateway or a reader, under `--describe`
+        // (FEEDBACK10.md, Q-077; branch feedback10-fixes).
+        if rest == "describe" && crate::describe::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            let title = self.base_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            return json_response(200, crate::describe::of_interp(self, &title));
+        }
         if rest == "live" {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.

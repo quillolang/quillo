@@ -20,6 +20,8 @@ usage:
   quillo check <file.qwe>           check a program without running it
                [--strict-null]      and warn where a value may be null and
                                     null does not work
+  quillo docs <file.qwe>            the program's API as OpenAPI 3: its routes,
+                                    and its server fns' contracts
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
@@ -55,6 +57,8 @@ options for `run`:
                  QUILLO_SERVICE_SECRET, the same on every service
   --base PATH    the path the program is served under (/shop), as a mounted
                  program is: its links and redirects carry it
+  --describe     answer GET /_quillo/describe with the program's API (as
+                 `quillo docs` writes it)
   --as-service   serve the program as a service: its server fns answer only
                  other services' signed calls, not pages (--split sets it)
   --service-name NAME
@@ -120,7 +124,7 @@ const VALUE_OPTIONS: &[&str] = &[
 /// Options of `run`, `app`, `build` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--metrics", "--strict-null",
+    "--no-jobs", "--metrics", "--strict-null", "--describe",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -211,6 +215,18 @@ fn real_main(args: Vec<String>) -> i32 {
             let strict_null = args.iter().any(|a| a == "--strict-null");
             with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, css: true, ..Default::default() }))
         }
+        // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
+        // branch feedback10-fixes).
+        Some("docs") => with_program(&args[2..], |f, _| match quillo::describe::of_source(Path::new(f)) {
+            Ok(doc) => {
+                println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        }),
         Some("build") => with_program(&args[2..], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
@@ -382,6 +398,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--no-jobs", _) => {
                 quillo::jobs::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            ("--describe", _) => {
+                quillo::describe::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }

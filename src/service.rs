@@ -454,6 +454,15 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     }
 }
 
+/// Each service's functions as this program's copy of it declares them
+/// (`describe::contract`): sent with each call, so a service deployed apart
+/// from its caller says when they disagree (FEEDBACK10.md, Q-077; branch
+/// feedback10-fixes).
+fn contracts() -> &'static Mutex<HashMap<(String, String), String>> {
+    static C: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -533,6 +542,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
+        let mine = contracts().lock().unwrap_or_else(|e| e.into_inner()).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
                 .post(&endpoint)
@@ -543,6 +553,9 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                 .set("x-quillo-call", &c)
                 .set("x-quillo-caller", &cl)
                 .set("x-quillo-deadline", &timeout.as_millis().to_string());
+            if !mine.is_empty() {
+                rq = rq.set("x-quillo-contract", &mine);
+            }
             if !tn.is_empty() {
                 rq = rq.set("x-quillo-tenant", &tn);
             }
@@ -728,6 +741,12 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
+    // The caller's copy of this service, deployed apart, may say otherwise.
+    let theirs = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-quillo-contract")).map(|(_, v)| v.as_str());
+    let ours = crate::describe::contract(&c.def);
+    if let Some(theirs) = theirs.filter(|t| *t != ours) {
+        return refused(409, &format!("`{}` here is `{}`; the caller's copy of this service says `{}`", f, ours, theirs));
+    }
     let args = match serde_json::from_slice::<serde_json::Value>(&req.body) {
         Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect::<Vec<_>>(),
         _ => return refused(400, "the body must be a JSON array of arguments"),
@@ -841,6 +860,12 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
     }
     let full = it.base_dir.join(file);
     let defs = offered(&full).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
+    {
+        let mut c = contracts().lock().unwrap_or_else(|e| e.into_inner());
+        for d in &defs {
+            c.insert((name.to_string(), d.name.clone()), crate::describe::contract(d));
+        }
+    }
     let ns = namespace(it, name, &defs, line)?;
     if let Some(url) = url_of(&it.shared, name) {
         if let Some(p) = prefix {

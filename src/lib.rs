@@ -11,6 +11,7 @@ pub mod dates;
 pub mod db;
 pub mod txn;
 pub mod decimal;
+pub mod describe;
 pub mod dotenv;
 pub mod debug;
 pub mod error;

@@ -1,0 +1,12 @@
+// Q-077 Nothing describes a program's API: its routes' payloads and its server fns' types are known to `quillo check`, and served to no one (no OpenAPI, no service contract)
+// mode: serve
+// flags: --describe
+// get: /_quillo/describe
+// open-when: GET /_quillo/describe -> 404
+// fixed-when: /"\/signup"[\s\S]*"name"/
+// From FEEDBACK10.md §Q-077 (found on af64ac8). `/_quillo/describe` is the suggestion's name;
+// it is served under `--describe`, as the suggestion has it (off unless asked, like --metrics).
+
+route POST /signup { form: { name: str, age: int } } = `welcome ${request.form.name}`
+
+server fn total(cents: int, currency: str = "EUR") -> int = cents
