@@ -1,0 +1,61 @@
+// Steps: how far along a process someone is: the steps done, this one, and those to come.
+//
+//   <Steps steps={["Account", "Billing", "Confirm"]} current={1}/>
+//   <Steps vertical={true} current={2} steps={[{ label: "Ordered", hint: "May 2" },
+//          { label: "Shipped", hint: "May 3" }, { label: "Out for delivery" }, { label: "Delivered" }]}/>
+//
+// steps: strings, or maps of { label, hint? } (a second, quieter line).
+// current: the index of this step, from 0; those before it show a check mark.
+// Set it to len(steps) when everything is done. vertical: one under another,
+// for timelines and narrow places. label: what screen readers call it ("Progress").
+
+let steps_css = css`
+.ui-steps { display: flex; margin: 0; padding: 0; list-style: none; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); counter-reset: ui-steps; }
+.ui-steps-item { position: relative; flex: 1 1 0; min-width: 0; display: grid; justify-items: start; gap: 8px; padding-right: 12px; }
+.ui-steps-item:last-child { flex: none; padding-right: 0; }
+.ui-steps-item:not(:last-child)::after {
+  content: ""; position: absolute; top: 13px; left: 36px; right: 8px; height: 2px; border-radius: 2px; background: var(--ui-border);
+}
+.ui-steps-done:not(:last-child)::after { background: var(--ui-accent); }
+.ui-steps-mark {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%;
+  border: 2px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-muted);
+  font: 600 13px/1 var(--ui-font); font-variant-numeric: tabular-nums;
+}
+.ui-steps-done .ui-steps-mark { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-steps-current .ui-steps-mark { border-color: var(--ui-accent); color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-steps-mark svg { width: 14px; height: 14px; }
+.ui-steps-text { display: grid; gap: 1px; }
+.ui-steps-label { font-weight: 500; }
+.ui-steps-upcoming .ui-steps-label { color: var(--ui-muted); }
+.ui-steps-hint { color: var(--ui-muted); font-size: 13px; }
+.ui-steps-vertical { flex-direction: column; }
+.ui-steps-vertical .ui-steps-item { grid-template-columns: 28px 1fr; align-items: start; gap: 12px; padding: 0 0 22px; }
+.ui-steps-vertical .ui-steps-item:last-child { padding-bottom: 0; }
+.ui-steps-vertical .ui-steps-item:not(:last-child)::after { top: 34px; bottom: 6px; left: 13px; right: auto; width: 2px; height: auto; }
+.ui-steps-vertical .ui-steps-text { padding-top: 3px; }
+@media (max-width: 600px) {
+  .ui-steps:not(.ui-steps-vertical) .ui-steps-hint { display: none; }
+  .ui-steps:not(.ui-steps-vertical) .ui-steps-label { font-size: 13px; }
+}
+`
+
+view Steps(steps: list = [], current: int = 0, vertical: bool = false, label: str = "Progress", class: str? = null) =
+    <ol class={ui_cls(["ui-steps", vertical && "ui-steps-vertical", class])} aria-label={label}>
+        {for [i, s] in enumerate(steps) => {
+            let text = type_of(s) == "str" ? s : s.label
+            let phase = i < current ? "done" : i == current ? "current" : "upcoming"
+            <li class={`ui-steps-item ui-steps-${phase}`} aria-current={phase == "current" ? "step" : null}>
+                <span.ui-steps-mark aria-hidden="true">
+                    {phase == "done"
+                        ? <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2"
+                               stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-7"/></svg>
+                        : i + 1}
+                </span>
+                <span.ui-steps-text>
+                    <span.ui-steps-label>{text}{phase == "done" && <span.ui-sr> (done)</span>}</span>
+                    {type_of(s) == "map" && s.hint != null && <span.ui-steps-hint>{s.hint}</span>}
+                </span>
+            </li>
+        }}
+    </ol>

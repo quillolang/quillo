@@ -1,0 +1,54 @@
+// Button: a button, or a link that looks like one.
+//
+//   <Button>Save</Button>
+//   <Button variant="outline" href="/docs">Read the docs</Button>
+//   <Button tone="danger" type="submit" name="action" value="delete">Delete</Button>
+//
+// variant: "solid" (default), "soft", "outline" or "ghost".
+// tone: "accent" (default), "neutral" or "danger".
+// size: "sm", "md" (default) or "lg". full: as wide as its container.
+// href makes it an <a>; otherwise type ("button", "submit", "reset"), name, value
+// and disabled go to the <button>. loading shows a spinner and disables it.
+// on_click(): inside one of your components, what a click does.
+
+let button_css = css`
+.ui-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: .5em;
+  height: 38px; padding: 0 16px; border: 1px solid transparent; border-radius: var(--ui-radius-sm);
+  font: 500 14px/1 var(--ui-font); text-decoration: none; white-space: nowrap; cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
+  --b: var(--ui-accent); --bf: var(--ui-accent-fg); --bs: var(--ui-accent-soft);
+}
+.ui-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-btn[disabled], .ui-btn[aria-disabled="true"] { opacity: .55; cursor: not-allowed; pointer-events: none; }
+.ui-btn-neutral { --b: var(--ui-fg); --bf: var(--ui-bg); --bs: var(--ui-subtle); }
+.ui-btn-danger { --b: var(--ui-danger); --bf: #fff; --bs: var(--ui-danger-soft); }
+.ui-btn-solid { background: var(--b); color: var(--bf); }
+.ui-btn-solid:hover { background: color-mix(in srgb, var(--b) 88%, var(--ui-fg)); }
+.ui-btn-soft { background: var(--bs); color: var(--b); }
+.ui-btn-soft:hover { background: color-mix(in srgb, var(--bs) 80%, var(--b)); }
+.ui-btn-outline { background: transparent; color: var(--b); border-color: var(--ui-border); }
+.ui-btn-outline:hover { border-color: var(--b); background: var(--bs); }
+.ui-btn-ghost { background: transparent; color: var(--b); }
+.ui-btn-ghost:hover { background: var(--bs); }
+.ui-btn-sm { height: 30px; padding: 0 11px; font-size: 13px; }
+.ui-btn-lg { height: 46px; padding: 0 22px; font-size: 16px; }
+.ui-btn-full { display: flex; width: 100%; }
+.ui-btn-spin { width: 1em; height: 1em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: ui-btn-spin .7s linear infinite; }
+@keyframes ui-btn-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ui-btn-spin { animation-duration: 2s; } }
+`
+
+view Button(variant: str = "solid", tone: str = "accent", size: str = "md", href: str? = null,
+             type: str = "button", name: str? = null, value: str? = null, disabled: bool = false,
+             loading: bool = false, full: bool = false, label: str? = null, class: str? = null,
+             on_click = null, children) {
+    let cls = ui_cls(["ui-btn", `ui-btn-${variant}`, tone != "accent" && `ui-btn-${tone}`,
+                      size != "md" && `ui-btn-${size}`, full && "ui-btn-full", class])
+    let body = [loading && <span.ui-btn-spin aria-hidden="true"></span>, children]
+    href != null
+        ? <a class={cls} href={href} aria-label={label} aria-disabled={disabled ? "true" : null}>{body}</a>
+        : <button class={cls} type={type} name={name} value={value} disabled={disabled || loading}
+                  aria-label={label} aria-busy={loading ? "true" : null}
+                  @click={() => { on_click && on_click() }}>{body}</button>
+}

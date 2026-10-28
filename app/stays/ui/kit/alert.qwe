@@ -1,0 +1,86 @@
+// Alert: a message in the flow of the page, with an icon for its tone.
+//
+//   <Alert tone="success" title="Saved">Your changes are live.</Alert>
+//   <Alert tone="danger" variant="solid" title="Payment failed">The card was declined.</Alert>
+//   <DismissibleAlert tone="info" title="New: exports">Download any report as CSV.</DismissibleAlert>
+//
+// tone: "info" (default), "neutral", "accent", "success", "warning" or "danger".
+// Warning and danger are announced at once (role="alert"); the others politely
+// (role="status").
+// variant: "soft" (default), "outline" or "solid". title: a bold first line.
+// icon: false leaves the tone's icon out.
+// dismissable shows a close button that calls on_dismiss(), inside one of your
+// components: <Alert dismissable={true} on_dismiss={() => { shown = false }}>.
+// DismissibleAlert takes the same props (but on_dismiss) and hides itself, so it
+// works placed straight in a page.
+
+let alert_css = css`
+.ui-alert-host { display: contents; }
+.ui-alert {
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px;
+  border: 1px solid transparent; border-radius: var(--ui-radius-sm);
+  font: 14px/1.5 var(--ui-font); color: var(--ui-fg);
+  --t: var(--ui-info); --ts: var(--ui-info-soft);
+}
+.ui-alert-neutral { --t: var(--ui-muted); --ts: var(--ui-subtle); }
+.ui-alert-accent { --t: var(--ui-accent); --ts: var(--ui-accent-soft); }
+.ui-alert-success { --t: var(--ui-success); --ts: var(--ui-success-soft); }
+.ui-alert-warning { --t: var(--ui-warning); --ts: var(--ui-warning-soft); }
+.ui-alert-danger { --t: var(--ui-danger); --ts: var(--ui-danger-soft); }
+.ui-alert-soft { background: var(--ts); border-color: color-mix(in srgb, var(--t) 22%, transparent); }
+.ui-alert-outline { background: var(--ui-surface); border-color: color-mix(in srgb, var(--t) 55%, var(--ui-border)); }
+.ui-alert-solid { background: var(--t); color: var(--ui-bg); }
+.ui-alert-neutral.ui-alert-solid { background: var(--ui-fg); }
+.ui-alert-icon { flex: none; width: 20px; height: 20px; color: var(--t); }
+.ui-alert-solid .ui-alert-icon { color: inherit; }
+.ui-alert-body { flex: 1; min-width: 0; }
+.ui-alert-title { margin: 0; font-weight: 600; }
+.ui-alert a { color: inherit; font-weight: 500; text-underline-offset: 2px; }
+.ui-alert-text > :first-child { margin-top: 0; }
+.ui-alert-text > :last-child { margin-bottom: 0; }
+.ui-alert-title + .ui-alert-text { margin-top: 2px; color: color-mix(in srgb, currentColor 82%, transparent); }
+.ui-alert-x {
+  flex: none; display: grid; place-items: center; width: 26px; height: 26px; margin: -3px -5px -3px 0;
+  border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit;
+  font-size: 20px; line-height: 1; opacity: .7; cursor: pointer;
+}
+.ui-alert-x:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
+.ui-alert-x:focus-visible { outline: none; opacity: 1; box-shadow: var(--ui-focus); }
+`
+
+// The icon for each tone, drawn in currentColor.
+fn alert_icon(tone: str) {
+    let path = match tone {
+        "success" => <path d="M7 10.5l2 2 4-4.5"/>
+        "warning" => <path d="M10 7v4M10 14h.01"/>
+        "danger" => <path d="M7.5 7.5l5 5M12.5 7.5l-5 5"/>
+        _ => <path d="M10 9v5M10 6h.01"/>
+    }
+    let shape = tone == "warning"
+        ? <path d="M8.6 3.2L2.3 14.5a1.6 1.6 0 0 0 1.4 2.4h12.6a1.6 1.6 0 0 0 1.4-2.4L11.4 3.2a1.6 1.6 0 0 0-2.8 0z"/>
+        : <circle cx="10" cy="10" r="7.5"/>
+    <svg class="ui-alert-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{shape}{path}</svg>
+}
+
+view Alert(tone: str = "info", title: str? = null, variant: str = "soft", icon: bool = true,
+           dismissable: bool = false, on_dismiss = null, class: str? = null, children) =
+    <div class={ui_cls(["ui-alert", `ui-alert-${tone}`, `ui-alert-${variant}`, class])}
+         role={tone == "danger" || tone == "warning" ? "alert" : "status"}>
+        {icon && alert_icon(tone)}
+        <div.ui-alert-body>
+            {title != null && <p.ui-alert-title>{title}</p>}
+            <div.ui-alert-text>{children}</div>
+        </div>
+        {dismissable && <button.ui-alert-x type="button" aria-label="Dismiss"
+                                @click={() => { on_dismiss && on_dismiss() }}>×</button>}
+    </div>
+
+component DismissibleAlert(tone: str = "info", title: str? = null, variant: str = "soft",
+                           icon: bool = true, class: str? = null, children) {
+    state shown = true
+    <div class="ui-alert-host">
+        {shown && <Alert tone={tone} title={title} variant={variant} icon={icon} class={class}
+                         dismissable={true} on_dismiss={() => { shown = false }}>{children}</Alert>}
+    </div>
+}

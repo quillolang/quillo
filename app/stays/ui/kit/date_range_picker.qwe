@@ -1,0 +1,439 @@
+// DateRangePicker: a span of days, from a first to a last, picked on two months
+// side by side or with a preset ("Last 7 days", "This month"). Click the first day
+// then the last; between the two clicks the days that would be chosen are shown
+// as the pointer (or the focus) moves. The calendars work like DatePicker's: the
+// arrow keys by day and week, PageUp / PageDown by month, Home / End, Enter or
+// Space to pick, Escape to close. A plain <form> gets "YYYY-MM-DD" as
+// `name`_start and `name`_end.
+//
+//   <DateRangePicker name="stay" label="Your stay" start="2026-12-20" end="2026-12-27"/>
+//   <DateRangePicker name="report" label="Period" max="2026-12-31"
+//                    presets={[{ label: "Q4 2026", start: "2026-10-01", end: "2026-12-31" }]}/>
+//   <DateRangePicker label="Dates" on_change={(a, b) => { range = [a, b] }}/>
+//
+// start, end: "YYYY-MM-DD" to start with. min, max: the first and last days that
+// can be chosen. presets: a list of { label, start, end } shown beside the
+// calendars; by default Today, Last 7 days, Last 30 days, This month, Last month
+// and This year, counted from today ([] for none). names: the two names sent,
+// [start name, end name] (`name`_start and `name`_end; ["stay[start]",
+// "stay[end]"] works too). week_start: the first column (1, Monday; 0 for Sunday).
+// today: the day counted from and marked (the browser's own date by default).
+// placeholder: the button's text while nothing is chosen ("Choose dates").
+// name, label, hint, error, disabled, field (the button's id, "date-range-picker-"
+// + name by default) and size ("sm" or "md") as for every field.
+// on_change(start, end): inside one of your components, given both "YYYY-MM-DD"
+// once the last day is picked (or both null when cleared).
+
+let date_range_picker_css = css`
+.ui-date-range-picker { position: relative; display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-date-range-picker-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-date-range-picker-trigger {
+  display: flex; align-items: center; gap: 8px; width: fit-content; min-width: 240px; max-width: 100%; height: 38px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 14px var(--ui-font); text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s;
+}
+.ui-date-range-picker-trigger svg { flex: none; width: 18px; height: 18px; color: var(--ui-muted); }
+.ui-date-range-picker-trigger:hover { border-color: var(--ui-strong); }
+.ui-date-range-picker-trigger:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-date-range-picker-trigger:disabled { opacity: .55; cursor: not-allowed; }
+.ui-date-range-picker-empty { color: var(--ui-muted); }
+.ui-date-range-picker-invalid .ui-date-range-picker-trigger { border-color: var(--ui-danger); }
+.ui-date-range-picker-pop {
+  position: absolute; z-index: 30; top: 100%; left: 0; width: max-content; max-width: calc(100vw - 32px); margin-top: 4px;
+  padding: 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow-lg);
+}
+.ui-date-range-picker-pop[hidden] { display: none; }
+.ui-date-range-picker-body { display: flex; gap: 16px; }
+.ui-date-range-picker-presets { display: flex; flex-direction: column; gap: 2px; min-width: 120px; padding-right: 12px; border-right: 1px solid var(--ui-border); }
+.ui-date-range-picker-preset {
+  padding: 6px 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg);
+  font: 13px var(--ui-font); text-align: left; white-space: nowrap; cursor: pointer;
+}
+.ui-date-range-picker-preset:hover { background: var(--ui-subtle); }
+.ui-date-range-picker-preset[aria-pressed="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); font-weight: 500; }
+.ui-date-range-picker-preset:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-date-range-picker-months { display: flex; flex-wrap: wrap; gap: 20px; }
+.ui-date-range-picker-month { width: 252px; max-width: 100%; }
+.ui-date-range-picker-head { display: flex; align-items: center; justify-content: center; position: relative; height: 30px; margin-bottom: 4px; }
+.ui-date-range-picker-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-date-range-picker-nav {
+  position: absolute; top: 0; display: inline-grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-date-range-picker-nav svg { width: 18px; height: 18px; }
+.ui-date-range-picker-prev { left: 0; }
+.ui-date-range-picker-next { right: 0; }
+.ui-date-range-picker-nav:hover:not([aria-disabled="true"]) { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-date-range-picker-nav:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-date-range-picker-nav[aria-disabled="true"] { opacity: .35; cursor: not-allowed; }
+.ui-date-range-picker-grid { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.ui-date-range-picker-grid th { padding: 4px 0; font-size: 12px; font-weight: 500; color: var(--ui-muted); text-align: center; }
+.ui-date-range-picker-grid td { padding: 1px 0; text-align: center; }
+.ui-date-range-picker-day { height: 34px; font-size: 13px; font-variant-numeric: tabular-nums; cursor: pointer; outline: none; }
+.ui-date-range-picker-day:hover { background: var(--ui-subtle); border-radius: var(--ui-radius-sm); }
+.ui-date-range-picker-day:focus { box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-date-range-picker-today { font-weight: 700; color: var(--ui-accent); }
+.ui-date-range-picker-in, .ui-date-range-picker-day.ui-date-range-picker-in:hover { background: var(--ui-accent-soft); color: var(--ui-fg); border-radius: 0; }
+.ui-date-range-picker-preview { background: color-mix(in srgb, var(--ui-accent-soft) 60%, transparent); box-shadow: inset 0 1px 0 var(--ui-accent), inset 0 -1px 0 var(--ui-accent); }
+.ui-date-range-picker-edge, .ui-date-range-picker-day.ui-date-range-picker-edge:hover { background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; }
+.ui-date-range-picker-first { border-radius: var(--ui-radius-sm) 0 0 var(--ui-radius-sm); }
+.ui-date-range-picker-last { border-radius: 0 var(--ui-radius-sm) var(--ui-radius-sm) 0; }
+.ui-date-range-picker-first.ui-date-range-picker-last { border-radius: var(--ui-radius-sm); }
+.ui-date-range-picker-day[aria-disabled="true"] { color: var(--ui-muted); opacity: .45; cursor: not-allowed; background: none; }
+.ui-date-range-picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--ui-border); font-size: 13px; color: var(--ui-muted); }
+.ui-date-range-picker-clear {
+  padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer;
+}
+.ui-date-range-picker-clear:hover { border-color: var(--ui-strong); }
+.ui-date-range-picker-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-date-range-picker-hint, .ui-date-range-picker-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-date-range-picker-error { color: var(--ui-danger); }
+.ui-date-range-picker-sm .ui-date-range-picker-trigger { height: 30px; min-width: 200px; font-size: 13px; }
+@media (max-width: 640px) {
+  .ui-date-range-picker-body { flex-direction: column; gap: 10px; }
+  .ui-date-range-picker-presets { flex-direction: row; flex-wrap: wrap; padding: 0 0 10px; border-right: 0; border-bottom: 1px solid var(--ui-border); }
+  .ui-date-range-picker-month { width: 100%; }
+  .ui-date-range-picker-pop { right: 0; width: auto; max-width: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-date-range-picker-trigger { transition: none; } }
+`
+
+let date_range_picker_months = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+                                "October", "November", "December"]
+let date_range_picker_weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+// The date helpers are DatePicker's, so that each file works on its own: a date is
+// a day number, the days since 1970-01-01.
+fn date_range_picker_days(y: int, m: int, d: int) -> int {
+    let yy = m <= 2 ? y - 1 : y
+    let era = floor(yy / 400)
+    let yoe = yy - era * 400
+    let doy = floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+    era * 146097 + yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy - 719468
+}
+
+fn date_range_picker_civil(z: int) {
+    let zz = z + 719468
+    let era = floor(zz / 146097)
+    let doe = zz - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m: m, d: doy - floor((153 * mp + 2) / 5) + 1 }
+}
+
+fn date_range_picker_month_len(y: int, m: int) -> int =
+    m == 2 ? (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) ? 29 : 28) : [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+
+fn date_range_picker_weekday(z: int) -> int = ((z % 7) + 11) % 7
+
+fn date_range_picker_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+fn date_range_picker_iso(z: int) -> str {
+    let c = date_range_picker_civil(z)
+    `${c.y}-${date_range_picker_pad(c.m)}-${date_range_picker_pad(c.d)}`
+}
+
+fn date_range_picker_parse(text: str?) {
+    let t = trim(text ?? "")
+    if !re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") { return null }
+    let y = int(slice(t, 0, 4))
+    let m = int(slice(t, 5, 7))
+    let d = int(slice(t, 8, 10))
+    m >= 1 && m <= 12 && d >= 1 && d <= date_range_picker_month_len(y, m) ? date_range_picker_days(y, m, d) : null
+}
+
+// The first day of the month `k` months after the one holding day z.
+fn date_range_picker_month(z: int, k: int) -> int {
+    let c = date_range_picker_civil(z)
+    let i = c.m - 1 + k
+    date_range_picker_days(c.y + floor(i / 12), i - floor(i / 12) * 12 + 1, 1)
+}
+
+fn date_range_picker_add_months(z: int, k: int) -> int {
+    let c = date_range_picker_civil(z)
+    let f = date_range_picker_civil(date_range_picker_month(z, k))
+    let n = date_range_picker_month_len(f.y, f.m)
+    date_range_picker_days(f.y, f.m, c.d > n ? n : c.d)
+}
+
+fn date_range_picker_month_end(z: int) -> int {
+    let c = date_range_picker_civil(z)
+    date_range_picker_days(c.y, c.m, date_range_picker_month_len(c.y, c.m))
+}
+
+fn date_range_picker_weeks(first: int, week_start: int) -> list {
+    let c = date_range_picker_civil(first)
+    let n = date_range_picker_month_len(c.y, c.m)
+    let lead = (date_range_picker_weekday(first) - week_start + 7) % 7
+    range(ceil((lead + n) / 7)) | map((w) => range(7) | map((i) => {
+        let at = w * 7 + i - lead
+        at >= 0 && at < n ? first + at : null
+    }))
+}
+
+fn date_range_picker_long(z: int) -> str {
+    let c = date_range_picker_civil(z)
+    `${date_range_picker_weekdays[date_range_picker_weekday(z)]} ${c.d} ${date_range_picker_months[c.m - 1]} ${c.y}`
+}
+
+// "2 Nov – 8 Nov 2026", or with both years when they differ.
+fn date_range_picker_span(a: int, b: int) -> str {
+    let x = date_range_picker_civil(a)
+    let y = date_range_picker_civil(b)
+    let short = (c) => `${c.d} ${slice(date_range_picker_months[c.m - 1], 0, 3)}`
+    x.y == y.y ? `${short(x)} – ${short(y)} ${y.y}` : `${short(x)} ${x.y} – ${short(y)} ${y.y}`
+}
+
+// The presets offered when none are given, counted from day t.
+fn date_range_picker_presets(t: int) -> list {
+    let c = date_range_picker_civil(t)
+    let this_month = date_range_picker_days(c.y, c.m, 1)
+    let last_month = date_range_picker_month(t, -1)
+    [
+        { label: "Today", start: t, end: t },
+        { label: "Last 7 days", start: t - 6, end: t },
+        { label: "Last 30 days", start: t - 29, end: t },
+        { label: "This month", start: this_month, end: t },
+        { label: "Last month", start: last_month, end: this_month - 1 },
+        { label: "This year", start: date_range_picker_days(c.y, 1, 1), end: t },
+    ]
+}
+
+component DateRangePicker(name: str? = null, label: str? = null, start: str? = null, end: str? = null,
+                          min: str? = null, max: str? = null, presets: list? = null, names: list? = null,
+                          week_start: int = 1, today: str? = null, placeholder: str = "Choose dates",
+                          hint: str? = null, error: str? = null, disabled: bool = false, field: str? = null,
+                          size: str = "md", on_change = null, class: str? = null) {
+    let lo = date_range_picker_parse(min)
+    let hi = date_range_picker_parse(max)
+    let first_a = date_range_picker_parse(start)
+    let first_b = date_range_picker_parse(end)
+    let both = first_a != null && first_b != null && first_a <= first_b
+    // from_d / to_d: the range chosen, shown and sent; a / b: the one being picked in the calendars.
+    state from_d = both ? first_a : null
+    state to_d = both ? first_b : null
+    state a = both ? first_a : null
+    state b = both ? first_b : null
+    state now_d = date_range_picker_parse(today) ?? floor(now() / 86400000)
+    state at = both ? first_a : date_range_picker_parse(today) ?? floor(now() / 86400000)
+    state left = date_range_picker_month(both ? first_a : date_range_picker_parse(today) ?? floor(now() / 86400000), 0)
+    state open = false
+    state hover = null
+    let id = field ?? `date-range-picker-${name ?? re.replace(lower(label ?? "dates"), "[^a-z0-9]+", "-")}`
+    let sent = names ?? (name != null ? [`${name}_start`, `${name}_end`] : [null, null])
+    let offered = presets != null
+        ? presets | map((p) => { label: p.label, start: date_range_picker_parse(p.start), end: date_range_picker_parse(p.end) })
+                  | filter((p) => p.start != null && p.end != null)
+        : date_range_picker_presets(now_d)
+    let right = date_range_picker_month(left, 1)
+    let left_end = date_range_picker_month_end(right)
+    let order = range(7) | map((i) => (i + week_start) % 7)
+    let picking = a != null && b == null
+    let tip = picking ? (hover ?? at) : null
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let allowed = (z: int) => (lo == null || z >= lo) && (hi == null || z <= hi)
+    let kept = (z: int) => lo != null && z < lo ? lo : hi != null && z > hi ? hi : z
+    let root_of = (e) => e.target.closest(".ui-date-range-picker")
+    let focus_day = (root) => {
+        js("requestAnimationFrame", (t = null) => {
+            let cell = root.querySelector(`[data-day="${at}"]`)
+            cell && cell.focus()
+        })
+    }
+    // Moves the focus to day z, turning the months so that it shows.
+    let go = (e, z: int) => {
+        let to = kept(z)
+        at = to
+        if to < left { left = date_range_picker_month(to, 0) }
+        if to > left_end { left = date_range_picker_month(to, -1) }
+        if picking { hover = null }
+        focus_day(root_of(e))
+    }
+    let done = (e, x, y) => {
+        a = x
+        b = y
+        from_d = x
+        to_d = y
+        hover = null
+        open = false
+        root_of(e).querySelector(".ui-date-range-picker-trigger").focus()
+        on_change && on_change(x == null ? null : date_range_picker_iso(x), y == null ? null : date_range_picker_iso(y))
+    }
+    let pick = (e, z: int) => {
+        if allowed(z) {
+            at = z
+            if !picking {
+                a = z
+                b = null
+                hover = null
+            } else if z < a {
+                a = z
+            } else {
+                done(e, a, z)
+            }
+        }
+    }
+    let show = (e) => {
+        if today == null {
+            let d = js_new("Date")
+            now_d = date_range_picker_days(d.getFullYear(), d.getMonth() + 1, d.getDate())
+        }
+        a = from_d
+        b = to_d
+        hover = null
+        at = kept(from_d ?? now_d)
+        left = date_range_picker_month(at, 0)
+        open = true
+        focus_day(root_of(e))
+    }
+    let status = a == null ? "Pick the first day."
+        : b == null ? `From ${date_range_picker_long(a)}: now pick the last day.`
+        : `${b - a + 1} ${b == a ? "day" : "days"}: ${date_range_picker_span(a, b)}.`
+    <div class={ui_cls(["ui-date-range-picker", size == "sm" && "ui-date-range-picker-sm",
+                        error != null && "ui-date-range-picker-invalid", class])}
+         @focusout={(e) => {
+             let root = root_of(e)
+             if open && root != null && !(e.relatedTarget != null && root.contains(e.relatedTarget)) { open = false }
+         }}
+         @keydown={(e) => {
+             if e.key == "Escape" && open {
+                 e.preventDefault()
+                 open = false
+                 root_of(e).querySelector(".ui-date-range-picker-trigger").focus()
+             }
+         }}>
+        {label != null && <label.ui-date-range-picker-label id={`${id}-label`} for={id}>{label}</label>}
+        <button.ui-date-range-picker-trigger type="button" id={id} disabled={disabled} aria-haspopup="dialog"
+                aria-expanded={open ? "true" : "false"} aria-controls={`${id}-dialog`}
+                aria-labelledby={label != null ? `${id}-label ${id}-text` : null}
+                aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                @click={(e) => { if open { open = false } else { show(e) } }}>
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="14" height="12.5" rx="2"/>
+                <path d="M3 8.5h14M7 2.8v3.4M13 2.8v3.4"/></svg>
+            <span id={`${id}-text`} class={from_d == null ? "ui-date-range-picker-empty" : null}>
+                {from_d != null && to_d != null ? date_range_picker_span(from_d, to_d) : placeholder}
+            </span>
+        </button>
+        <div.ui-date-range-picker-pop id={`${id}-dialog`} role="dialog" aria-modal="false"
+             aria-label={label != null ? `${label}: choose dates` : "Choose dates"} hidden={!open}>
+            <div.ui-date-range-picker-body>
+                {len(offered) > 0 && <div.ui-date-range-picker-presets role="group" aria-label="Presets">
+                    {for p in offered => <button.ui-date-range-picker-preset type="button" key={p.label}
+                            aria-pressed={p.start == a && p.end == b ? "true" : "false"}
+                            disabled={!allowed(p.start) || !allowed(p.end)}
+                            @click={(e) => {
+                                at = p.start
+                                left = date_range_picker_month(p.start, 0)
+                                done(e, p.start, p.end)
+                            }}>{p.label}</button>}
+                </div>}
+                <div.ui-date-range-picker-months @pointerleave={() => { hover = null }}>
+                    {for [k, first] in enumerate([left, right]) => <div.ui-date-range-picker-month key={k}>
+                        <div.ui-date-range-picker-head>
+                            {k == 0 && <button.ui-date-range-picker-nav.ui-date-range-picker-prev type="button"
+                                    aria-label="Previous month" aria-disabled={lo != null && left <= lo ? "true" : null}
+                                    @click={() => {
+                                        if lo == null || left > lo {
+                                            left = date_range_picker_month(left, -1)
+                                            at = kept(date_range_picker_add_months(at, -1))
+                                        }
+                                    }}>
+                                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                                     stroke-linejoin="round" aria-hidden="true"><path d="M12 5l-5 5 5 5"/></svg>
+                            </button>}
+                            <h2 id={`${id}-m${k}`} aria-live={k == 0 ? "polite" : null}>
+                                {date_range_picker_months[date_range_picker_civil(first).m - 1]} {date_range_picker_civil(first).y}
+                            </h2>
+                            {k == 1 && <button.ui-date-range-picker-nav.ui-date-range-picker-next type="button"
+                                    aria-label="Next month" aria-disabled={hi != null && left_end >= hi ? "true" : null}
+                                    @click={() => {
+                                        if hi == null || left_end < hi {
+                                            left = date_range_picker_month(left, 1)
+                                            at = kept(date_range_picker_add_months(at, 1))
+                                        }
+                                    }}>
+                                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                                     stroke-linejoin="round" aria-hidden="true"><path d="M8 5l5 5-5 5"/></svg>
+                            </button>}
+                        </div>
+                        <table.ui-date-range-picker-grid role="grid" aria-labelledby={`${id}-m${k}`}
+                               @keydown={(e) => {
+                                   let back = (date_range_picker_weekday(at) - week_start + 7) % 7
+                                   let to = match e.key {
+                                       "ArrowLeft" => at - 1
+                                       "ArrowRight" => at + 1
+                                       "ArrowUp" => at - 7
+                                       "ArrowDown" => at + 7
+                                       "Home" => at - back
+                                       "End" => at + 6 - back
+                                       "PageUp" => date_range_picker_add_months(at, e.shiftKey ? -12 : -1)
+                                       "PageDown" => date_range_picker_add_months(at, e.shiftKey ? 12 : 1)
+                                       _ => null
+                                   }
+                                   if to != null {
+                                       e.preventDefault()
+                                       go(e, to)
+                                   }
+                                   if e.key == "Enter" || e.key == " " {
+                                       e.preventDefault()
+                                       pick(e, at)
+                                       if open { focus_day(root_of(e)) }
+                                   }
+                               }}>
+                            <thead><tr>{for d in order => <th scope="col" abbr={date_range_picker_weekdays[d]}>{slice(date_range_picker_weekdays[d], 0, 2)}</th>}</tr></thead>
+                            <tbody>
+                                {for week in date_range_picker_weeks(first, week_start) => <tr>
+                                    {for z in week => z == null
+                                        ? <td role="gridcell"></td>
+                                        : {
+                                            let lo_end = a ?? z
+                                            let hi_end = b ?? tip ?? a ?? z
+                                            let inside = a != null && z >= lo_end && z <= hi_end
+                                            let edge = z == a || z == b
+                                            <td role="gridcell" data-day={z} tabindex={z == at ? "0" : "-1"}
+                                                class={ui_cls(["ui-date-range-picker-day", z == now_d && "ui-date-range-picker-today",
+                                                               inside && "ui-date-range-picker-in",
+                                                               inside && picking && !edge && "ui-date-range-picker-preview",
+                                                               edge && "ui-date-range-picker-edge",
+                                                               inside && (z == lo_end || date_range_picker_weekday(z) == week_start) && "ui-date-range-picker-first",
+                                                               inside && (z == hi_end || date_range_picker_weekday(z) == (week_start + 6) % 7) && "ui-date-range-picker-last"])}
+                                                aria-label={date_range_picker_long(z)}
+                                                aria-selected={a != null && z >= a && z <= (b ?? a) ? "true" : null}
+                                                aria-current={z == now_d ? "date" : null} aria-disabled={allowed(z) ? null : "true"}
+                                                @pointerenter={() => { if picking { hover = z } }}
+                                                @click={(e) => {
+                                                    pick(e, z)
+                                                    if open { focus_day(root_of(e)) }
+                                                }}>{date_range_picker_civil(z).d}</td>
+                                        }}
+                                </tr>}
+                            </tbody>
+                        </table>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-date-range-picker-foot>
+                <span aria-live="polite">{status}</span>
+                <button.ui-date-range-picker-clear type="button" @click={(e) => {
+                    a = null
+                    b = null
+                    hover = null
+                    if from_d != null {
+                        from_d = null
+                        to_d = null
+                        on_change && on_change(null, null)
+                    }
+                }}>Clear</button>
+            </div>
+        </div>
+        {sent[0] != null && <input type="hidden" name={sent[0]} value={from_d != null ? date_range_picker_iso(from_d) : ""}/>}
+        {sent[1] != null && <input type="hidden" name={sent[1]} value={to_d != null ? date_range_picker_iso(to_d) : ""}/>}
+        {hint != null && <p.ui-date-range-picker-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-date-range-picker-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

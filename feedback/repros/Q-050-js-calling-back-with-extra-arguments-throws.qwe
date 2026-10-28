@@ -1,0 +1,24 @@
+// Q-050 A Quillo function handed to a JavaScript library throws when the library calls it with more arguments than it declares (`() => ...` given an event): JavaScript callbacks ignore extra arguments, and libraries count on it
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 1500)); return { said: document.getElementById("said").textContent }
+// open-when: "said": "threw"
+// fixed-when: "said": "called"
+// From FEEDBACK5.md (found on ae6a6e5). In app/stays, Leaflet calls an `on("click", f)` handler
+// with the event: `marker.on("click", () => { picked = id })` threw "QuilloError: `<fn>` takes 0
+// arguments, got 1" inside Leaflet, at each click, and the pick never happened. The guide's
+// `@event={fn}` says the function *may* take the event; a function handed to `js` may not omit it.
+// Writing `(e) => ...` works.
+
+component Callback() {
+    state said = "waiting"
+    <p id="said" @mount={(el) => {
+        let r = js("callWithEvent", () => { said = "called" })
+        if said != "called" { said = "threw" }
+    }}>{said}</p>
+}
+
+let PAGE_JS = "window.callWithEvent = (f) => { try { f({ type: 'click' }); } catch (e) { console.log(String(e)); } };"
+
+route GET / = <html><head><script>{raw(PAGE_JS)}</script></head>
+    <body><Callback/></body></html>

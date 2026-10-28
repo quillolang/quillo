@@ -1,0 +1,30 @@
+// Signing in and signing up: plain forms, posted, that work without the
+// page's script.
+
+view LoginPage(next: str, problem, email: str) =
+    <Shell me={null} title="Sign in">
+        <Card title="Sign in" class="narrow">
+            <form.stack method="post" action="/login">
+                <input type="hidden" name="next" value={next}/>
+                {problem != null ? <Alert tone="danger">{problem}</Alert> : null}
+                <TextField name="email" label="Email" type="email" value={email} required={true} autocomplete="email"/>
+                <TextField name="password" label="Password" type="password" required={true} autocomplete="current-password"/>
+                <Button type="submit" full={true}>Sign in</Button>
+                <p.muted.small>New here? <a href={`/signup?next=${url_encode(next)}`}>Sign up</a>. Demo: sam@stays.test, password "password".</p>
+            </form>
+        </Card>
+    </Shell>
+
+view SignupPage(next: str, problem, name: str, email: str) =
+    <Shell me={null} title="Sign up">
+        <Card title="Sign up" class="narrow">
+            <form.stack method="post" action="/signup">
+                <input type="hidden" name="next" value={next}/>
+                {problem != null ? <Alert tone="danger">{problem}</Alert> : null}
+                <TextField name="name" label="Your name" value={name} required={true} autocomplete="name"/>
+                <TextField name="email" label="Email" type="email" value={email} required={true} autocomplete="email"/>
+                <TextField name="password" label="Password" type="password" required={true} hint="8 characters or more" autocomplete="new-password"/>
+                <Button type="submit" full={true}>Sign up</Button>
+            </form>
+        </Card>
+    </Shell>

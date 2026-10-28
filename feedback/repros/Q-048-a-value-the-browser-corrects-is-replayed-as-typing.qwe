@@ -1,0 +1,23 @@
+// Q-048 A range input whose value the browser corrects (snapped to its step, or into min..max) is taken on resume for something typed before the script came: its @input runs, with nobody touching it
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 1500)); return { out: document.getElementById("out").textContent }
+// open-when: "out": "150 after 1 events"
+// fixed-when: "out": "152 after 0 events"
+// From FEEDBACK5.md (found on ae6a6e5). In app/stays the kit's RangeSlider for a night's price had
+// max 152 (the dearest place, €151.67, rounded up) and step 5. The browser makes the input's value
+// 150, Quillo's resume dispatches an `input` event (isTrusted false) to catch up with "what was
+// typed", RangeSlider calls on_change(0, 150), and the search silently left out the dearest place:
+// the server's page listed 4 places, the browser 3, and nothing was counted as made again.
+
+component Pick() {
+    state v = 152
+    state events = 0
+    every(3600000, () => null)
+    <div>
+        <input id="r" type="range" min="0" max="152" step="5" value={v} @input={(e) => { v = int(e.value); events += 1 }}/>
+        <p id="out">{v} after {events} events</p>
+    </div>
+}
+
+route GET / = <html><body><main><Pick/></main></body></html>

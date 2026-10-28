@@ -1,0 +1,45 @@
+// DescriptionList: terms and what they are, as on a details page: "Status: Paid".
+//
+//   <DescriptionList layout="columns" items={[
+//       { term: "Customer", detail: "Northwind Traders" },
+//       { term: "Plan", detail: "Business, yearly" },
+//   ]}/>
+//   <DescriptionList>
+//       <DescriptionItem term="Status"><Badge tone="success">Paid</Badge></DescriptionItem>
+//       <DescriptionItem term="Email" detail="ada@example.com"/>
+//   </DescriptionList>
+//
+// items: a list of { term, detail } with text details; children: DescriptionItems,
+// whose detail can be any HTML (their children). Both may be given; items come first.
+// layout: "stacked" (default: each term over its detail) or "columns" (the term on
+// the left, the detail on the right, stacked again where it is narrow).
+// dividers: lines between the items (true by default). It is a real <dl>.
+
+let description_list_css = css`
+.ui-dl { margin: 0; container-type: inline-size; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-dl-item { display: grid; gap: 2px; padding: 10px 0; }
+.ui-dl-item:first-child { padding-top: 0; }
+.ui-dl-item:last-child { padding-bottom: 0; }
+.ui-dl-lines .ui-dl-item + .ui-dl-item { border-top: 1px solid var(--ui-border); }
+.ui-dl dt { color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-dl dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.ui-dl-columns .ui-dl-item { grid-template-columns: minmax(120px, 1fr) 2fr; gap: 16px; align-items: baseline; }
+.ui-dl-columns dt { font-size: 14px; }
+@container (max-width: 440px) {
+  .ui-dl-columns .ui-dl-item { grid-template-columns: 1fr; gap: 2px; }
+  .ui-dl-columns dt { font-size: 13px; }
+}
+`
+
+view DescriptionItem(term: str, detail = null, children) =
+    <div.ui-dl-item>
+        <dt>{term}</dt>
+        <dd>{detail != null ? detail : children}</dd>
+    </div>
+
+view DescriptionList(items: list = [], layout: str = "stacked", dividers: bool = true,
+                     class: str? = null, children) =
+    <dl class={ui_cls(["ui-dl", `ui-dl-${layout}`, dividers && "ui-dl-lines", class])}>
+        {for it in items => <DescriptionItem term={it.term} detail={it.detail}/>}
+        {children}
+    </dl>

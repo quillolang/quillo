@@ -1,0 +1,92 @@
+// Countdown: the days, hours, minutes and seconds left until a moment, ticking
+// each second in the browser, then saying it has ended. The server writes the time
+// left when it makes the page, so it reads right before any script runs.
+//
+//   <Countdown to="2026-12-31T23:59:59Z" label="Sale ends in"/>
+//   <Countdown seconds={600} variant="inline" label="Your seat is held for" ended="Seat released"/>
+//
+// to: the moment, an ISO date-time ("2026-12-31T23:59:59Z", "2026-12-31T18:00+02:00",
+// or a date, "2026-12-31", which is its midnight); without an offset it is UTC.
+// seconds: instead of to, a number of seconds from when the page is made.
+// label: what it counts down to, shown above it and read by screen readers (role
+// "timer"; they are told when it ends). ended: what it says once the time is up
+// ("Ended"). variant: "boxes" (default), a box per unit, or "inline", "2d 04:12:09"
+// in the line of text. Days show while there is at least one. size: "sm", "md"
+// (default) or "lg". on_end: called once, with nothing, when it reaches zero, when
+// the Countdown is inside one of your components.
+
+let countdown_css = css`
+.ui-cd { display: inline-grid; gap: 6px; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-cd-label { color: var(--ui-muted); }
+.ui-cd-units { display: flex; gap: 8px; }
+.ui-cd-unit { display: grid; justify-items: center; gap: 2px; min-width: 58px; padding: 8px 6px 6px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-cd-num { font-size: 24px; font-weight: 650; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.ui-cd-name { color: var(--ui-muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.ui-cd-sm .ui-cd-unit { min-width: 44px; padding: 5px 4px 4px; }
+.ui-cd-sm .ui-cd-num { font-size: 17px; }
+.ui-cd-sm .ui-cd-name { font-size: 10px; }
+.ui-cd-lg .ui-cd-unit { min-width: 76px; padding: 12px 8px 8px; }
+.ui-cd-lg .ui-cd-num { font-size: 34px; }
+.ui-cd-inline { display: inline-flex; align-items: baseline; gap: 6px; font-size: inherit; }
+.ui-cd-clock { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-cd-ended { font-weight: 600; color: var(--ui-muted); }
+`
+
+// n (a whole number, 0 or more) with two digits at least: 7 is "07".
+fn countdown_two(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// The milliseconds since 1970 of an ISO date or date-time, or null if it is not one.
+fn countdown_parse(s: str) -> int? {
+    let m = re.find(trim(s), "^(\\d{4})-(\\d{2})-(\\d{2})(?:[T ](\\d{2}):(\\d{2})(?::(\\d{2}))?(?:\\.\\d+)?)?\\s*(Z|z|[+-]\\d{2}:?\\d{2})?$")
+    if m == null { return null }
+    let g = (i) => int(m.groups[i] ?? "0") ?? 0
+    let y = g(0)
+    let mo = g(1)
+    let yy = mo <= 2 ? y - 1 : y
+    let era = floor(yy / 400)
+    let yoe = yy - era * 400
+    let doy = floor((153 * ((mo + 9) % 12) + 2) / 5) + g(2) - 1
+    let day = era * 146097 + yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy - 719468
+    let zone = m.groups[6] ?? "Z"
+    let digits = replace(zone, ":", "")
+    let offset = upper(zone) == "Z" ? 0
+        : (starts_with(zone, "-") ? -1 : 1) * ((int(slice(digits, 1, 3)) ?? 0) * 60 + (int(slice(digits, 3, 5)) ?? 0))
+    ((day * 24 + g(3)) * 60 + g(4) - offset) * 60000 + g(5) * 1000
+}
+
+component Countdown(to: str? = null, seconds: int? = null, label: str? = null, ended: str = "Ended",
+                    variant: str = "boxes", size: str = "md", on_end = null, class: str? = null) {
+    state target = to != null ? (countdown_parse(to) ?? now()) : now() + (seconds ?? 0) * 1000
+    state at = now()
+    let left = target > at ? ceil((target - at) / 1000) : 0
+    let done = left <= 0
+    if !done {
+        every(1000, () => {
+            at = now()
+            if at >= target && on_end != null { on_end() }
+        })
+    }
+    let d = floor(left / 86400)
+    let h = floor(left % 86400 / 3600)
+    let mi = floor(left % 3600 / 60)
+    let s = left % 60
+    let units = (d > 0 ? [[d, "Days", "day"]] : []) + [[h, "Hours", "hour"], [mi, "Minutes", "minute"], [s, "Seconds", "second"]]
+    let spoken = join(units | filter((u) => u[0] > 0 || u[2] == "second") | map((u) => `${u[0]} ${u[2]}${u[0] == 1 ? "" : "s"}`), ", ")
+    <div class={ui_cls(["ui-cd", variant == "inline" && "ui-cd-inline", size != "md" && `ui-cd-${size}`, done && "ui-cd-done", class])}
+         role="timer" aria-label={label}>
+        {label != null && <span.ui-cd-label aria-hidden="true">{label}</span>}
+        {done
+            ? <span.ui-cd-ended>{ended}</span>
+            : (variant == "inline"
+                ? <span.ui-cd-clock aria-hidden="true">{d > 0 ? `${d}d ` : ""}{countdown_two(h)}:{countdown_two(mi)}:{countdown_two(s)}</span>
+                : <span.ui-cd-units aria-hidden="true">
+                      {for u in units => <span.ui-cd-unit key={u[1]}>
+                          <span.ui-cd-num>{u[2] == "day" ? str(u[0]) : countdown_two(u[0])}</span>
+                          <span.ui-cd-name>{u[1]}</span>
+                      </span>}
+                  </span>)}
+        {!done && <span.ui-sr>{spoken}</span>}
+        <span.ui-sr aria-live="polite">{done ? ended : ""}</span>
+    </div>
+}

@@ -1,0 +1,35 @@
+// Divider: a line between parts of a page, across or upright, with a label in
+// its middle if it is given one.
+//
+//   <Divider/>
+//   <Divider label="or"/>
+//   <div style="display: flex"> <a>Edit</a> <Divider vertical={true}/> <a>Share</a> </div>
+//
+// vertical: an upright line, as tall as the row it is in. spacing: "sm", "md"
+// (default) or "lg", the room around it.
+
+let divider_css = css`
+.ui-divider { flex: none; margin: 16px 0; border: 0; border-top: 1px solid var(--ui-border); }
+.ui-divider-v { align-self: stretch; min-height: 1em; margin: 0 12px; border-top: 0; border-left: 1px solid var(--ui-border); }
+.ui-divider-label {
+  display: flex; align-items: center; gap: 12px; border: 0;
+  color: var(--ui-muted); font: 500 12px/1.4 var(--ui-font); letter-spacing: .02em; white-space: nowrap;
+}
+.ui-divider-label::before, .ui-divider-label::after { content: ""; flex: 1; border-top: 1px solid var(--ui-border); }
+.ui-divider-label.ui-divider-v { flex-direction: column; gap: 6px; border: 0; }
+.ui-divider-label.ui-divider-v::before, .ui-divider-label.ui-divider-v::after { border-top: 0; border-left: 1px solid var(--ui-border); }
+.ui-divider-sm { margin-block: 8px; }
+.ui-divider-lg { margin-block: 28px; }
+.ui-divider-v.ui-divider-sm { margin: 0 6px; }
+.ui-divider-v.ui-divider-lg { margin: 0 20px; }
+`
+
+view Divider(label: str? = null, vertical: bool = false, spacing: str = "md", class: str? = null) {
+    let cls = ui_cls(["ui-divider", vertical && "ui-divider-v", label != null && "ui-divider-label",
+                      spacing != "md" && `ui-divider-${spacing}`, class])
+    label != null
+        ? <div class={cls}><span>{label}</span></div>
+        : vertical
+            ? <div class={cls} role="separator" aria-orientation="vertical"></div>
+            : <hr class={cls}/>
+}

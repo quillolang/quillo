@@ -1,0 +1,48 @@
+// Tooltip: a short note shown beside something while it is hovered or focused.
+// CSS only: it needs no script, and the pointer can move onto the note.
+//
+//   <Tooltip text="Copy the link"><Button variant="ghost" label="Copy">⧉</Button></Tooltip>
+//   <Tooltip text="Sent to everyone on the team" placement="bottom"><span tabindex="0">12 seen</span></Tooltip>
+//
+// text: what it says (keep it short; it is plain text). placement: "top"
+// (default), "bottom", "left" or "right". What it wraps (children) should be
+// something that takes focus, such as a button or a link, so keyboard users see it
+// too. field: the note's id (default "tooltip-" + the text), which the wrapper's
+// aria-describedby points to.
+// For anything someone must read or click, use a Popover instead.
+
+let tooltip_css = css`
+.ui-tooltip { position: relative; display: inline-flex; vertical-align: middle; }
+.ui-tooltip-tip {
+  position: absolute; z-index: 50; display: none; width: max-content; max-width: min(240px, 70vw); padding: 6px 9px;
+  border-radius: var(--ui-radius-sm); background: var(--ui-fg); color: var(--ui-bg); box-shadow: var(--ui-shadow);
+  font: 500 12px/1.4 var(--ui-font); text-align: center; white-space: normal;
+  --ui-tooltip-gap: 8px;
+}
+.ui-tooltip-tip::before { content: ""; position: absolute; inset: calc(-1 * var(--ui-tooltip-gap)); }
+.ui-tooltip-tip::after { content: ""; position: absolute; width: 8px; height: 8px; background: inherit; transform: rotate(45deg); }
+.ui-tooltip:hover > .ui-tooltip-tip, .ui-tooltip:focus-within > .ui-tooltip-tip {
+  display: block; animation: ui-tooltip-in .12s ease-out .15s both;
+}
+@keyframes ui-tooltip-in { from { opacity: 0; translate: var(--ui-tooltip-from); } }
+.ui-tooltip-top > .ui-tooltip-tip { bottom: calc(100% + var(--ui-tooltip-gap)); left: 50%; transform: translateX(-50%); --ui-tooltip-from: 0 4px; }
+.ui-tooltip-bottom > .ui-tooltip-tip { top: calc(100% + var(--ui-tooltip-gap)); left: 50%; transform: translateX(-50%); --ui-tooltip-from: 0 -4px; }
+.ui-tooltip-left > .ui-tooltip-tip { right: calc(100% + var(--ui-tooltip-gap)); top: 50%; transform: translateY(-50%); --ui-tooltip-from: 4px 0; }
+.ui-tooltip-right > .ui-tooltip-tip { left: calc(100% + var(--ui-tooltip-gap)); top: 50%; transform: translateY(-50%); --ui-tooltip-from: -4px 0; }
+.ui-tooltip-top > .ui-tooltip-tip::after { top: 100%; left: 50%; margin: -4px 0 0 -4px; }
+.ui-tooltip-bottom > .ui-tooltip-tip::after { bottom: 100%; left: 50%; margin: 0 0 -4px -4px; }
+.ui-tooltip-left > .ui-tooltip-tip::after { left: 100%; top: 50%; margin: -4px 0 0 -4px; }
+.ui-tooltip-right > .ui-tooltip-tip::after { right: 100%; top: 50%; margin: -4px -4px 0 0; }
+@media (prefers-reduced-motion: reduce) {
+  .ui-tooltip:hover > .ui-tooltip-tip, .ui-tooltip:focus-within > .ui-tooltip-tip { animation: none; }
+}
+@media (hover: none) { .ui-tooltip:hover:not(:focus-within) > .ui-tooltip-tip { display: none; } }
+`
+
+view Tooltip(text: str, placement: str = "top", field: str? = null, class: str? = null, children) {
+    let id = field ?? `tooltip-${re.replace(lower(text), "[^a-z0-9]+", "-")}`
+    <span class={ui_cls(["ui-tooltip", `ui-tooltip-${placement}`, class])} aria-describedby={id}>
+        {children}
+        <span.ui-tooltip-tip role="tooltip" id={id}>{text}</span>
+    </span>
+}

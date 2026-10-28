@@ -1,0 +1,152 @@
+// Carousel: slides shown one at a time, with buttons to the previous and next,
+// a dot for each, swiping (the track scroll-snaps, so swiping works before any
+// script loads), and the arrow keys, Home and End. It can move on by itself; then
+// it stops while the pointer or the focus is on it, has a button to stop it, and
+// does not move at all for people who ask their system for less motion. Screen
+// readers hear it as a carousel, and which slide shows when it changes.
+//
+//   <Carousel label="Featured stories" autoplay={6}>
+//       <CarouselSlide label="Spring sale"><img src="/a.jpg" alt="..."/></CarouselSlide>
+//       <CarouselSlide label="New arrivals"> ... </CarouselSlide>
+//   </Carousel>
+//
+// children: CarouselSlides (or any elements, one per slide). label: what screen
+// readers call it. autoplay: seconds between slides when it moves by itself (0, off).
+// loop: next after the last goes to the first, and back (true). id: the track's
+// id ("ui-carousel"); give each one on a page its own.
+// CarouselSlide: label (its name for screen readers, after "2 of 5"), children.
+
+let carousel_css = css`
+.ui-carousel { position: relative; display: grid; gap: 10px; min-width: 0; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-carousel-view { position: relative; min-width: 0; }
+.ui-carousel-track {
+  position: relative; display: flex; overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory;
+  scroll-behavior: smooth; scrollbar-width: none; border-radius: var(--ui-radius); outline: none;
+}
+.ui-carousel-track::-webkit-scrollbar { display: none; }
+.ui-carousel-track:focus-visible { box-shadow: var(--ui-focus); }
+.ui-carousel-track > *, .ui-carousel-track > quillo-raw > * { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; scroll-snap-stop: always; }
+.ui-carousel-slide > img { display: block; width: 100%; height: auto; }
+.ui-carousel-nav {
+  position: absolute; top: 50%; z-index: 1; display: grid; place-items: center; width: 38px; height: 38px; margin-top: -19px;
+  padding: 0; border: 1px solid var(--ui-border); border-radius: 50%; background: color-mix(in srgb, var(--ui-surface) 88%, transparent);
+  color: var(--ui-fg); box-shadow: var(--ui-shadow); cursor: pointer; transition: background .15s, opacity .15s;
+}
+.ui-carousel-nav svg { width: 18px; height: 18px; }
+.ui-carousel-nav:hover { background: var(--ui-surface); }
+.ui-carousel-nav:focus-visible, .ui-carousel-dot:focus-visible, .ui-carousel-play:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-carousel-nav:disabled { opacity: 0; pointer-events: none; }
+.ui-carousel-prev { left: 10px; }
+.ui-carousel-next { right: 10px; }
+.ui-carousel-bar { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 24px; }
+.ui-carousel-dots { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; }
+.ui-carousel-dot {
+  display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; cursor: pointer;
+}
+.ui-carousel-dot::before {
+  content: ""; width: 8px; height: 8px; border-radius: 999px; background: var(--ui-strong); transition: width .2s, background .2s;
+}
+.ui-carousel-dot:hover::before { background: var(--ui-muted); }
+.ui-carousel-dot[aria-current="true"]::before { width: 20px; background: var(--ui-accent); }
+.ui-carousel-play {
+  display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid var(--ui-border);
+  border-radius: 50%; background: var(--ui-surface); color: var(--ui-fg); cursor: pointer;
+}
+.ui-carousel-play svg { width: 14px; height: 14px; }
+@media (max-width: 480px) { .ui-carousel-nav { width: 32px; height: 32px; margin-top: -16px; } .ui-carousel-prev { left: 6px; } .ui-carousel-next { right: 6px; } }
+@media (prefers-reduced-motion: reduce) { .ui-carousel-track { scroll-behavior: auto; } .ui-carousel-dot::before, .ui-carousel-nav { transition: none; } }
+`
+
+component Carousel(label: str = "Carousel", autoplay: num = 0, loop: bool = true, id: str = "ui-carousel", children) {
+    state at = 0
+    state count = 0
+    state track = null
+    state slides = []
+    state aim = null
+    state playing = autoplay > 0
+    state held = false
+    state still = false
+    let go = (i: int) => {
+        if count > 0 {
+            let to = loop ? (i % count + count) % count : (i < 0 ? 0 : i >= count ? count - 1 : i)
+            if to != at {
+                aim = to
+                at = to
+                track.scrollTo({ left: slides[to].offsetLeft, behavior: still ? "instant" : "smooth" })
+            }
+        }
+    }
+    if playing && !held && !still && count > 1 { every(autoplay * 1000, () => { go(at + 1) }) }
+    <section.ui-carousel aria-roledescription="carousel" aria-label={label}
+             @pointerenter={() => { held = true }}
+             @pointerleave={() => { held = false }}
+             @focusin={() => { held = true }}
+             @focusout={(e) => { if e.relatedTarget == null || !e.target.closest(".ui-carousel").contains(e.relatedTarget) { held = false } }}
+             @keydown={(e) => {
+                 let to = match e.key {
+                     "ArrowLeft" => at - 1
+                     "ArrowRight" => at + 1
+                     "Home" => 0
+                     "End" => count - 1
+                     _ => null
+                 }
+                 if to != null && e.target.tagName != "INPUT" && e.target.tagName != "TEXTAREA" && e.target.tagName != "SELECT" {
+                     e.preventDefault()
+                     go(to)
+                 }
+             }}>
+        <div.ui-carousel-view>
+            <div.ui-carousel-track id={id} tabindex="0" aria-label="Slides"
+                 @mount={(el) => {
+                     track = el
+                     still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                     // (In a page, the browser keeps the children in a <quillo-raw>: the slides are in it.)
+                     slides = js("Array.from", el.querySelectorAll(":scope > :not(quillo-raw), :scope > quillo-raw > *"))
+                     count = len(slides)
+                     for [i, s] in enumerate(slides) => {
+                         let name = s.getAttribute("aria-label")
+                         s.setAttribute("aria-label", name != null && name != "" ? `${i + 1} of ${count}: ${name}` : `${i + 1} of ${count}`)
+                     }
+                 }}
+                 @scroll={(e) => {
+                     let i = round(e.scrollLeft / e.clientWidth)
+                     if aim == null { at = i } else if i == aim { aim = null }
+                 }}>
+                {children}
+            </div>
+            <button.ui-carousel-nav.ui-carousel-prev type="button" aria-label="Previous slide" aria-controls={id}
+                    disabled={!loop && at == 0} @click={() => { go(at - 1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+            </button>
+            <button.ui-carousel-nav.ui-carousel-next type="button" aria-label="Next slide" aria-controls={id}
+                    disabled={!loop && count > 0 && at == count - 1} @click={() => { go(at + 1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+            </button>
+        </div>
+        <div.ui-carousel-bar>
+            {autoplay > 0 && <button.ui-carousel-play type="button" aria-controls={id}
+                    aria-label={playing && !still ? "Stop slide rotation" : "Start slide rotation"}
+                    title={playing && !still ? "Stop slide rotation" : "Start slide rotation"}
+                    @click={() => {
+                        if still { still = false; playing = true } else { playing = !playing }
+                    }}>
+                {playing && !still
+                    ? <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 5h3v14H7zM14 5h3v14h-3z"/></svg>
+                    : <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>}
+            </button>}
+            <div.ui-carousel-dots role="group" aria-label="Choose a slide">
+                {for i in range(0, count) => <button.ui-carousel-dot type="button" key={i} aria-label={`Slide ${i + 1}`}
+                        aria-controls={id} aria-current={i == at ? "true" : null} @click={() => { go(i) }}></button>}
+            </div>
+        </div>
+        <div.ui-sr aria-live={playing && !held && !still ? "off" : "polite"} aria-atomic="true">
+            {count > 0 ? `Slide ${at + 1} of ${count}` : ""}
+        </div>
+    </section>
+}
+
+view CarouselSlide(label: str? = null, class: str? = null, children) =
+    <div class={ui_cls(["ui-carousel-slide", class])} role="group" aria-roledescription="slide" aria-label={label}>{children}</div>

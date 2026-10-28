@@ -1,0 +1,233 @@
+// BarChart: bars for categories, up or across, one series or several side by side
+// or stacked, on an axis with round ticks. CSS only: hovering a category shows its
+// values, and screen readers get the numbers as a table.
+//
+//   <BarChart label="Orders by day" labels={["Mon", "Tue", "Wed"]} values={[120, 180, 95]}/>
+//   <BarChart label="Revenue" labels={quarters} prefix="$" stacked={true}
+//             series={[{ name: "Online", values: [42000, 51000] }, { name: "Stores", values: [30500, 28000] }]}/>
+//   <BarChart label="Top pages" labels={pages} values={views} horizontal={true} value_labels={true}/>
+//
+// labels: the categories, in order. values: one series' numbers, one per label; or
+// series: a list of { name, values } (up to eight, each in a colour of its own, with
+// a legend). A missing or null value counts as 0; values below 0 hang under the
+// zero line. stacked: series piled up in one bar per category instead of side by
+// side. horizontal: bars run across, with the labels on the left (better for long
+// labels or many categories). value_labels: each bar's value (or a stack's total)
+// at its end. prefix and suffix: around every value shown ("$", "%"; the axis takes
+// the prefix); decimals: digits after the point, always (2 for money), instead of up
+// to two as needed. max: the axis' top, instead of the highest value rounded up.
+// height: the plot's height in pixels when the bars stand up (240). label: what the
+// chart shows; it names it for screen readers and captions the table they hear.
+// show_label also writes it above the chart.
+
+let bar_chart_css = css`
+.ui-bc { --ui-bc-1: light-dark(#2a78d6, #3987e5); --ui-bc-2: light-dark(#eb6834, #d95926);
+  --ui-bc-3: light-dark(#1baf7a, #199e70); --ui-bc-4: light-dark(#eda100, #c98500);
+  --ui-bc-5: light-dark(#e87ba4, #d55181); --ui-bc-6: light-dark(#008300, #008300);
+  --ui-bc-7: light-dark(#6250d6, #9085e9); --ui-bc-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-bc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-bc-s1 { --c: var(--ui-bc-1); } .ui-bc-s2 { --c: var(--ui-bc-2); } .ui-bc-s3 { --c: var(--ui-bc-3); }
+.ui-bc-s4 { --c: var(--ui-bc-4); } .ui-bc-s5 { --c: var(--ui-bc-5); } .ui-bc-s6 { --c: var(--ui-bc-6); }
+.ui-bc-s7 { --c: var(--ui-bc-7); } .ui-bc-s8 { --c: var(--ui-bc-8); }
+.ui-bc-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-bc-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-bc-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+.ui-bc-v { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-top: 8px; }
+.ui-bc-y { position: relative; min-width: 24px; }
+.ui-bc-y span, .ui-bc-hx span { position: absolute; color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-bc-y span { right: 0; transform: translateY(50%); }
+.ui-bc-plot { position: relative; }
+.ui-bc-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-bc-grid.ui-bc-zero { background: var(--ui-strong); }
+.ui-bc-cols { position: absolute; inset: 0; display: flex; }
+.ui-bc-col { position: relative; flex: 1; min-width: 0; border-radius: 4px; }
+.ui-bc-col:hover { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-bc-bars { position: absolute; inset: 0 16%; display: flex; justify-content: center; gap: 2px; }
+.ui-bc-slot { position: relative; flex: 1; max-width: 44px; }
+.ui-bc-bar { position: absolute; left: 0; right: 0; bottom: var(--a); height: var(--b); min-height: 1px;
+  background: var(--c); border-radius: 4px 4px 0 0; }
+.ui-bc-neg { border-radius: 0 0 4px 4px; }
+.ui-bc-mid { border-radius: 0; height: max(1px, calc(var(--b) - 2px)); }
+.ui-bc-val { position: absolute; left: 50%; bottom: calc(var(--a) + 3px); transform: translateX(-50%);
+  color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-bc-val.ui-bc-under { bottom: auto; top: calc(100% - var(--a) + 3px); }
+.ui-bc-x { display: flex; margin-top: 6px; }
+.ui-bc-x span { flex: 1; min-width: 0; padding: 0 2px; overflow: hidden; color: var(--ui-muted); text-align: center;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ui-bc-tip { position: absolute; z-index: 20; top: 0; left: 50%; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; transform: translate(-50%, -100%); pointer-events: none; }
+.ui-bc-col:first-child .ui-bc-tip { left: 0; transform: translateY(-100%); }
+.ui-bc-col:last-child .ui-bc-tip { left: auto; right: 0; transform: translateY(-100%); }
+.ui-bc-col:hover .ui-bc-tip, .ui-bc-row:hover .ui-bc-tip { display: block; }
+.ui-bc-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-bc-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-bc-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-bc-h { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); column-gap: 10px; align-items: center; }
+.ui-bc-rl { max-width: 16em; overflow: hidden; color: var(--ui-muted); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.ui-bc-hgrid { position: relative; grid-column: 2; align-self: stretch; }
+.ui-bc-hgrid .ui-bc-grid { top: 0; bottom: 0; left: var(--a); right: auto; width: 1px; height: auto; }
+.ui-bc-row { position: relative; grid-column: 2; display: grid; gap: 2px; padding: 5px 0; border-radius: 4px; }
+.ui-bc-row:hover { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-bc-row .ui-bc-slot { max-width: none; height: 14px; }
+.ui-bc-row .ui-bc-bar { top: 0; bottom: 0; left: var(--a); width: var(--b); height: auto; min-width: 1px; border-radius: 0 4px 4px 0; }
+.ui-bc-row .ui-bc-neg { border-radius: 4px 0 0 4px; }
+.ui-bc-row .ui-bc-mid { border-radius: 0; height: auto; width: max(1px, calc(var(--b) - 2px)); }
+.ui-bc-row .ui-bc-val { top: 50%; bottom: auto; left: calc(var(--a) + 5px); transform: translateY(-50%); }
+.ui-bc-row .ui-bc-val.ui-bc-under { left: auto; right: calc(100% - var(--a) + 5px); }
+.ui-bc-row .ui-bc-tip { top: 0; left: auto; right: 0; transform: translateY(-100%); }
+.ui-bc-hx { position: relative; grid-column: 2; height: 16px; margin-top: 4px; }
+.ui-bc-hx span { top: 0; transform: translateX(-50%); }
+.ui-bc-hx span:first-child { transform: none; }
+.ui-bc-hx span:last-child:not(:first-child) { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn bar_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn bar_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : bar_chart_group(floor(n / 1000)) + "," + bar_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn bar_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${bar_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${bar_chart_group(floor(units / scale))}${tail}`
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn bar_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? bar_chart_num(v)
+        : `${v < 0 ? "-" : ""}${bar_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A percentage for CSS, to two decimals.
+fn bar_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The highest of a list of numbers (the view's `max` prop hides the builtin).
+fn bar_chart_max(xs: list) -> num = max(xs)
+
+// The axis from lo to hi (lo <= 0 <= hi), widened to round ticks: about four steps of 1, 2, 2.5 or 5 x 10^n.
+fn bar_chart_scale(lo: num, hi: num) -> map {
+    let span = hi - lo == 0 ? 1 : hi - lo
+    let raw = span / 4
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b = hi - lo == 0 ? a + 4 : ceil(hi / step - 0.000001)
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+view BarChart(labels: list, values: list? = null, series: list? = null, stacked: bool = false,
+              horizontal: bool = false, value_labels: bool = false, prefix: str = "", suffix: str = "",
+              decimals: int? = null, max: num? = null, height: int = 240, label: str = "Bar chart",
+              show_label: bool = false, class: str? = null) {
+    let sets = series ?? [{ name: label, values: values ?? [] }]
+    let n = len(labels)
+    let at = (s, i) => s.values[i] ?? 0
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${bar_chart_num(abs(v), decimals)}${suffix}`
+    let ups = for i in range(n) => sum(for s in sets => (at(s, i) > 0 ? at(s, i) : 0))
+    let downs = for i in range(n) => sum(for s in sets => (at(s, i) < 0 ? at(s, i) : 0))
+    let all_values = flatten(for s in sets => for i in range(n) => at(s, i))
+    let top = bar_chart_max([0] + (stacked ? ups : all_values))
+    let low = min([0] + (stacked ? downs : all_values))
+    let sc = bar_chart_scale(low, max != null && max > top ? max : top)
+    let pos = (v) => (v - sc.lo) * 100 / (sc.hi - sc.lo)
+    // A bar from the zero line (or from `base`, in a stack) to v: --a where it starts, --b its length.
+    let bar = (j, v, base, mid) => {
+        let from = pos(v < 0 ? base + v : base)
+        let to = pos(v < 0 ? base : base + v)
+        <span class={ui_cls(["ui-bc-bar", `ui-bc-s${j % 8 + 1}`, v < 0 && "ui-bc-neg", mid && "ui-bc-mid"])}
+              style={`--a: ${bar_chart_pct(from)}%; --b: ${bar_chart_pct(to - from)}%`} data-value={str(v)}></span>
+    }
+    // A value's label, at the end of the bar that reaches `end`.
+    let val = (v, end) => <span class={ui_cls(["ui-bc-val", end < 0 && "ui-bc-under"])}
+                                style={`--a: ${bar_chart_pct(pos(end))}%`}>{fmt(v)}</span>
+    let slots = (i) => stacked
+        ? [<span.ui-bc-slot>
+              {for [j, s] in enumerate(sets) => {
+                  let v = at(s, i)
+                  let before = sum(for k in range(j) => (((at(sets[k], i) < 0) == (v < 0)) ? at(sets[k], i) : 0))
+                  let later = any(range(j + 1, len(sets)), (k) => at(sets[k], i) != 0 && ((at(sets[k], i) < 0) == (v < 0)))
+                  v != 0 && bar(j, v, before, later)
+              }}
+              {value_labels && val(ups[i] + downs[i], ups[i] > 0 || downs[i] == 0 ? ups[i] : downs[i])}
+          </span>]
+        : (for [j, s] in enumerate(sets) => <span.ui-bc-slot>
+              {at(s, i) != 0 && bar(j, at(s, i), 0, false)}
+              {value_labels && val(at(s, i), at(s, i))}
+          </span>)
+    let tip = (i) => <span.ui-bc-tip>
+        <strong>{labels[i]}</strong>
+        {for [j, s] in enumerate(sets) => <p>
+            {len(sets) > 1 && <span class={`ui-bc-key ui-bc-s${j % 8 + 1}`}></span>}
+            {len(sets) > 1 ? s.name : label}<b>{fmt(at(s, i))}</b>
+        </p>}
+        {stacked && len(sets) > 1 && <p>Total<b>{fmt(ups[i] + downs[i])}</b></p>}
+    </span>
+    <figure class={ui_cls(["ui-bc", class])} aria-label={label}>
+        {show_label && <figcaption.ui-bc-title>{label}</figcaption>}
+        {len(sets) > 1 && <ul.ui-bc-legend aria-hidden="true">
+            {for [j, s] in enumerate(sets) => <li><span class={`ui-bc-key ui-bc-s${j % 8 + 1}`}></span>{s.name}</li>}
+        </ul>}
+        {horizontal
+            ? <div.ui-bc-h aria-hidden="true">
+                  <div.ui-bc-hgrid style={`grid-row: 1 / span ${n > 0 ? n : 1}`}>
+                      {for t in sc.ticks => <span class={ui_cls(["ui-bc-grid", t == 0 && "ui-bc-zero"])}
+                                                  style={`--a: ${bar_chart_pct(pos(t))}%`}></span>}
+                  </div>
+                  {for i in range(n) => [
+                      <span.ui-bc-rl style={`grid-row: ${i + 1}`} title={str(labels[i])}>{labels[i]}</span>,
+                      <div.ui-bc-row style={`grid-row: ${i + 1}`}>{slots(i)}{tip(i)}</div>
+                  ]}
+                  <div.ui-bc-hx>
+                      {for t in sc.ticks => <span style={`left: ${bar_chart_pct(pos(t))}%`}>{t < 0 ? "-" : ""}{prefix}{bar_chart_short(abs(t))}</span>}
+                  </div>
+              </div>
+            : <div.ui-bc-v aria-hidden="true">
+                  <div.ui-bc-y style={`height: ${height}px`}>
+                      {for t in sc.ticks => <span style={`bottom: ${bar_chart_pct(pos(t))}%`}>{t < 0 ? "-" : ""}{prefix}{bar_chart_short(abs(t))}</span>}
+                  </div>
+                  <div.ui-bc-plot style={`height: ${height}px`}>
+                      {for t in sc.ticks => <span class={ui_cls(["ui-bc-grid", t == 0 && "ui-bc-zero"])}
+                                                  style={`bottom: ${bar_chart_pct(pos(t))}%`}></span>}
+                      <div.ui-bc-cols>
+                          {for i in range(n) => <div.ui-bc-col><span.ui-bc-bars>{slots(i)}</span>{tip(i)}</div>}
+                      </div>
+                  </div>
+                  <span></span>
+                  <div.ui-bc-x>{for l in labels => <span title={str(l)}>{l}</span>}</div>
+              </div>}
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th>{for s in sets => <th scope="col">{len(sets) > 1 ? s.name : "Value"}</th>}</tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{labels[i]}</th>
+                    {for s in sets => <td>{fmt(at(s, i))}</td>}
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

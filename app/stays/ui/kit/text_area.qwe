@@ -1,0 +1,98 @@
+// TextArea: a labelled box for several lines of text, which can count what is
+// typed against a limit and grow with its content. It is a real <textarea>, so
+// it works in a plain <form>; without JavaScript it is a fixed box.
+//
+//   <TextArea name="bio" label="Bio" rows={4} maxlength={280} hint="Shown on your profile."/>
+//   <TextArea name="note" label="Note" autogrow={true} on_input={(v) => { note = v }}/>
+//
+// rows: its height in lines (default 3; with autogrow, the least it shows).
+// maxlength: the limit, with a "12 / 280" count under it that screen readers hear.
+// autogrow: it grows with what is typed (CSS field-sizing where the browser has it,
+// otherwise from the content's height on each key).
+// hint, error, required, disabled, placeholder, field (the id, default
+// "text-area-" + name) and size ("sm" or "md") are as in TextField.
+// on_input(value) on each key, on_change(value) when it is left changed: both are
+// given the text, inside one of your components.
+
+let text_area_css = css`
+.ui-text-area { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-text-area-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-text-area-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-text-area textarea {
+  display: block; width: 100%; min-height: 38px; padding: 8px 12px; resize: vertical;
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font);
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-text-area textarea::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-text-area textarea:hover { border-color: var(--ui-strong); }
+.ui-text-area textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-text-area-sm textarea { padding: 5px 10px; font-size: 13px; }
+.ui-text-area-grow textarea {
+  field-sizing: content; resize: none; overflow: hidden;
+  min-height: calc(var(--ui-text-area-rows, 3) * 1.5em + 18px); max-height: 60vh;
+}
+.ui-text-area-invalid textarea, .ui-text-area-invalid textarea:hover { border-color: var(--ui-danger); }
+.ui-text-area-invalid textarea:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-text-area-foot { display: flex; align-items: baseline; gap: 12px; }
+.ui-text-area-foot > div { flex: 1; display: grid; gap: 4px; }
+.ui-text-area-hint, .ui-text-area-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-text-area-error { color: var(--ui-danger); }
+.ui-text-area-count { flex: none; margin-left: auto; font-size: 12px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-text-area-near { color: var(--ui-warning); }
+.ui-text-area-full { color: var(--ui-danger); font-weight: 500; }
+.ui-text-area-disabled { opacity: .55; }
+.ui-text-area-disabled textarea { cursor: not-allowed; }
+.ui-text-area-disabled textarea:hover { border-color: var(--ui-border); }
+@media (prefers-reduced-motion: reduce) { .ui-text-area textarea { transition: none; } }
+`
+
+component TextArea(name: str? = null, label: str? = null, value: str = "", placeholder: str? = null,
+                   hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
+                   field: str? = null, size: str = "md", rows: int = 3, maxlength: int? = null,
+                   autogrow: bool = false, on_input = null, on_change = null, class: str? = null) {
+    state text = value
+    state grow_js = false
+    let id = field ?? `text-area-${name ?? re.replace(lower(label ?? "field"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`,
+                            maxlength != null && `${id}-count`])
+    let used = len(text)
+    <div class={ui_cls(["ui-text-area", size == "sm" && "ui-text-area-sm", autogrow && "ui-text-area-grow",
+                        error != null && "ui-text-area-invalid", disabled && "ui-text-area-disabled", class])}
+         style={autogrow ? `--ui-text-area-rows: ${rows}` : null}>
+        {label != null && <label.ui-text-area-label for={id}>
+            {label}{required && <span.ui-text-area-req aria-hidden="true">*</span>}
+        </label>}
+        <textarea id={id} name={name} rows={rows} placeholder={placeholder} required={required}
+                  disabled={disabled} maxlength={maxlength}
+                  aria-invalid={error != null ? "true" : null}
+                  aria-describedby={described != "" ? described : null}
+                  @mount={(el) => {
+                      grow_js = autogrow && !js("CSS.supports", "field-sizing: content")
+                      if grow_js { text_area_fit(el) }
+                  }}
+                  @input={(e) => {
+                      text = e.value
+                      if grow_js { text_area_fit(e.target) }
+                      on_input && on_input(e.value)
+                  }}
+                  @change={(e) => { on_change && on_change(e.value) }}>{text}</textarea>
+        {(hint != null || error != null || maxlength != null) && <div.ui-text-area-foot>
+            <div>
+                {hint != null && <p.ui-text-area-hint id={`${id}-hint`}>{hint}</p>}
+                {error != null && <p.ui-text-area-error id={`${id}-error`} role="alert">{error}</p>}
+            </div>
+            {maxlength != null && <span id={`${id}-count`} aria-live="polite"
+                class={ui_cls(["ui-text-area-count", used >= maxlength && "ui-text-area-full",
+                               used < maxlength && used >= maxlength * 0.9 && "ui-text-area-near"])}>
+                {used} / {maxlength}
+            </span>}
+        </div>}
+    </div>
+}
+
+// Sets a textarea's height to its content's, for browsers without field-sizing.
+fn text_area_fit(el) {
+    el.style.setProperty("height", "auto")
+    el.style.setProperty("height", `${el.scrollHeight + 2}px`)
+}

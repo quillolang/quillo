@@ -1,0 +1,118 @@
+// Rating: stars to give a score, or to show one. To give one it is a group of
+// real radio buttons drawn as stars (CSS does the rest, so it needs no script): a
+// plain <form> sends the chosen number as `name`, the arrow keys move along the
+// stars, and hovering shows what a click would give. Read-only, it is a picture
+// of the score that screen readers hear as "4.5 out of 5 stars".
+//
+//   <Rating name="stars" label="Your rating" required={true}/>
+//   <Rating name="score" label="How was it?" value={3.5} half={true}
+//           labels={["Awful", "Poor", "OK", "Good", "Great"]}/>
+//   <Rating value={4.3} readonly={true} count={128}/>
+//
+// value: the score to start with (or to show). max: how many stars (5). half: also
+// half stars (0.5, 1.5, ...), for a click on a star's left half. labels: a word for
+// each star (screen readers hear it, and it shows on hover).
+// readonly: only shows `value`, any fraction of a star filled; count: a number of
+// ratings shown after it, "(128)". size: "sm", "md" (default) or "lg".
+// name ("rating"), label, hint, error, required, disabled and field (the ids'
+// start, "rating-" + name by default) as for every field.
+// on_change(value): inside one of your components, given the number chosen.
+
+let rating_css = css`
+.ui-rating { --ui-rating-size: 24px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-rating-sm { --ui-rating-size: 16px; }
+.ui-rating-lg { --ui-rating-size: 32px; }
+.ui-rating-legend { padding: 0; margin-bottom: 6px; font-size: 13px; font-weight: 500; }
+.ui-rating-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-rating-stars { position: relative; display: inline-flex; align-items: center; }
+.ui-rating-stars input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.ui-rating-piece {
+  display: block; flex: none; width: var(--ui-rating-size); height: var(--ui-rating-size); overflow: hidden;
+  color: var(--ui-strong); cursor: pointer; border-radius: 3px; transition: color .12s, transform .12s;
+}
+.ui-rating-piece svg { display: block; width: var(--ui-rating-size); height: var(--ui-rating-size); padding: 1px; }
+.ui-rating-gap { margin-right: 4px; }
+.ui-rating-half .ui-rating-piece { width: calc(var(--ui-rating-size) / 2); }
+.ui-rating-half .ui-rating-right svg { margin-left: calc(var(--ui-rating-size) / -2); }
+.ui-rating-stars:not(:has(.ui-rating-piece:hover)) input:checked + .ui-rating-piece,
+.ui-rating-stars:not(:has(.ui-rating-piece:hover)) .ui-rating-piece:has(~ input:checked),
+.ui-rating:not(:disabled) .ui-rating-piece:hover,
+.ui-rating:not(:disabled) .ui-rating-piece:has(~ .ui-rating-piece:hover) { color: var(--ui-warning); }
+.ui-rating:not(:disabled) .ui-rating-piece:hover { transform: scale(1.08); }
+.ui-rating-stars input:focus-visible + .ui-rating-piece { box-shadow: var(--ui-focus); }
+.ui-rating-invalid .ui-rating-piece { color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-strong)); }
+.ui-rating-hint, .ui-rating-error { margin: 6px 0 0; font-size: 13px; color: var(--ui-muted); }
+.ui-rating-error { color: var(--ui-danger); }
+.ui-rating:disabled { opacity: .55; }
+.ui-rating:disabled .ui-rating-piece { cursor: not-allowed; }
+.ui-rating-show { display: inline-flex; align-items: center; gap: 6px; font: 14px/1 var(--ui-font); color: var(--ui-muted); }
+.ui-rating-show .ui-rating-shown { --ui-rating-size: 18px; display: inline-flex; gap: 2px; }
+.ui-rating-show.ui-rating-sm .ui-rating-shown { --ui-rating-size: 14px; }
+.ui-rating-show.ui-rating-lg .ui-rating-shown { --ui-rating-size: 26px; }
+.ui-rating-one { position: relative; width: var(--ui-rating-size); height: var(--ui-rating-size); color: var(--ui-strong); }
+.ui-rating-one svg { display: block; width: var(--ui-rating-size); height: var(--ui-rating-size); }
+.ui-rating-fill { position: absolute; inset: 0 auto 0 0; overflow: hidden; color: var(--ui-warning); }
+.ui-rating-num { color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-rating-piece { transition: none; } }
+`
+
+let rating_star = <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5L2.6 9.4l6.5-.9z"/>
+</svg>
+
+// "4", "4.5": a score as it is said and sent.
+fn rating_num(n: num) -> str = n == floor(n) ? str(floor(n)) : str(n)
+
+// How much of star i (from 0) a score of v fills, from 0 to 1.
+fn rating_fill(v: num, i: int) -> num = v - i < 0 ? 0 : v - i > 1 ? 1 : v - i
+
+// The scores that can be chosen: 1..max, or 0.5..max in halves.
+fn rating_steps(max: int, half: bool) -> list =
+    half ? range(1, max * 2 + 1) | map((i) => i / 2) : range(1, max + 1)
+
+view Rating(name: str = "rating", label: str? = null, value: num? = null, max: int = 5, half: bool = false,
+            labels: list = [], readonly: bool = false, count: int? = null, size: str = "md",
+            hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
+            field: str? = null, on_change = null, class: str? = null) {
+    let id = field ?? `rating-${name}`
+    let size_cls = size != "md" && `ui-rating-${size}`
+    let word = (n: num) => {
+        let w = labels[ceil(n) - 1]
+        let stars = `${rating_num(n)} ${n == 1 ? "star" : "stars"}`
+        w != null && n == ceil(n) ? `${w}, ${stars}` : stars
+    }
+    if readonly {
+        let v = value ?? 0
+        return <span class={ui_cls(["ui-rating-show", size_cls, class])}>
+            <span.ui-rating-shown role="img" aria-label={`${rating_num(v)} out of ${max} stars${count != null ? `, ${count} ratings` : ""}`}>
+                {for i in range(max) => <span.ui-rating-one>
+                    {rating_star}
+                    <span.ui-rating-fill style={`width: ${round(rating_fill(v, i) * 100, 1)}%`}>{rating_star}</span>
+                </span>}
+            </span>
+            <span aria-hidden="true"><span.ui-rating-num>{rating_num(v)}</span>{count != null && ` (${count})`}</span>
+        </span>
+    }
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    <fieldset class={ui_cls(["ui-rating", size_cls, half && "ui-rating-half", error != null && "ui-rating-invalid", class])}
+              id={id} disabled={disabled} aria-describedby={described != "" ? described : null}>
+        {label != null && <legend.ui-rating-legend>
+            {label}{required && <span.ui-rating-req aria-hidden="true">*</span>}
+        </legend>}
+        <div.ui-rating-stars>
+            {for n in rating_steps(max, half) => [
+                <input type="radio" id={`${id}-${replace(rating_num(n), ".", "-")}`} name={name} value={rating_num(n)}
+                       checked={value != null && n == value} required={required} aria-label={word(n)}
+                       aria-invalid={error != null ? "true" : null}
+                       @change={() => { on_change && on_change(n) }}/>,
+                <label for={`${id}-${replace(rating_num(n), ".", "-")}`} title={word(n)}
+                       class={ui_cls(["ui-rating-piece", half && n != ceil(n) && "ui-rating-left",
+                                      half && n == ceil(n) && "ui-rating-right", n == ceil(n) && n < max && "ui-rating-gap"])}>
+                    {rating_star}
+                </label>,
+            ]}
+        </div>
+        {hint != null && <p.ui-rating-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-rating-error id={`${id}-error`} role="alert">{error}</p>}
+    </fieldset>
+}

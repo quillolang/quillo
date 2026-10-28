@@ -1,0 +1,67 @@
+// Stat: one number that matters, with how it changed: a KPI tile.
+//
+//   <Stat label="Revenue" value="$48,210" delta={12.5} delta_suffix="%" hint="vs last month"/>
+//   <Stat label="Churn" value="2.1%" delta={-0.4} delta_suffix=" pts" good="down"/>
+//   <Stat label="Signups" value="1,284" trend={[820, 932, 901, 1034, 1190, 1284]}/>
+//
+// label: what it counts. value: the number, as it should read (format it first).
+// delta: the change, a number: above 0 shows ↑ and green, below ↓ and red, 0 grey;
+// good="down" when going down is good (costs, churn), which swaps the colours.
+// delta_suffix: after the change ("%", " pts"). hint: a line under it.
+// trend: numbers to draw as a small line beside the value, oldest first, in the
+// delta's colour (the accent without one). card: false drops the border, for a
+// Stat inside a Card.
+
+let stat_css = css`
+.ui-stat { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; align-content: start; min-width: 0; padding: 16px 18px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  font: 14px/1.4 var(--ui-font); color: var(--ui-fg); --t: var(--ui-accent); }
+.ui-stat-bare { padding: 0; border: 0; background: none; }
+.ui-stat-label { margin: 0; color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-stat-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
+.ui-stat-value { flex: none; margin: 0; font-size: 28px; font-weight: 650; line-height: 1.15; letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums; }
+.ui-stat-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 13px; color: var(--ui-muted); }
+.ui-stat-delta { display: inline-flex; align-items: center; gap: 2px; padding: 1px 7px 1px 5px; border-radius: 999px;
+  font-weight: 600; font-variant-numeric: tabular-nums; color: var(--t); background: color-mix(in srgb, var(--t) 13%, transparent); }
+.ui-stat-good { --t: var(--ui-success); }
+.ui-stat-bad { --t: var(--ui-danger); }
+.ui-stat-flat { --t: var(--ui-muted); }
+.ui-stat-trend { flex: 1 1 0; min-width: 28px; max-width: 72px; height: 28px; margin-bottom: 4px; overflow: visible; color: var(--t); }
+.ui-stat-trend path { fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+`
+
+// The trend's line in a 72 by 28 box, as SVG path data.
+fn stat_path(values: list) -> str {
+    let pts = len(values) == 1 ? [values[0], values[0]] : values
+    let lo = min(pts)
+    let span = max(pts) - lo
+    let at = (n) => {
+        let r = round(n * 10) / 10
+        r == floor(r) ? str(floor(r)) : str(r)
+    }
+    let step = 70 / (len(pts) - 1)
+    "M" + join(for [i, v] in enumerate(pts) => `${at(1 + i * step)},${at(span == 0 ? 14 : 26 - (v - lo) * 24 / span)}`, " L")
+}
+
+view Stat(label: str, value, delta: num? = null, delta_suffix: str = "", good: str = "up",
+          hint: str? = null, trend: list? = null, card: bool = true, class: str? = null) {
+    let mood = delta == null ? null : delta == 0 ? "flat" : ((delta > 0) == (good != "down") ? "good" : "bad")
+    let shown = delta == null ? "" : `${delta > 0 ? "+" : ""}${delta}${delta_suffix}`
+    <div class={ui_cls(["ui-stat", mood != null && `ui-stat-${mood}`, !card && "ui-stat-bare", class])}>
+        <p.ui-stat-label>{label}</p>
+        <div.ui-stat-row>
+            <p.ui-stat-value>{value}</p>
+            {trend != null && len(trend) > 0 && <svg.ui-stat-trend viewBox="0 0 72 28" preserveAspectRatio="none" aria-hidden="true">
+                <path d={stat_path(trend)} vector-effect="non-scaling-stroke"/>
+            </svg>}
+        </div>
+        {(delta != null || hint != null) && <div.ui-stat-foot>
+            {delta != null && <span.ui-stat-delta>
+                <span aria-hidden="true">{delta > 0 ? "↑" : (delta < 0 ? "↓" : "→")}</span>
+                {shown}
+            </span>}
+            {hint != null && <span>{hint}</span>}
+        </div>}
+    </div>
+}

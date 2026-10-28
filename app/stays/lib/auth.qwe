@@ -1,0 +1,43 @@
+// Who is here: guests and hosts are both users (a user hosts once they list
+// a place). Signed in by email and password; the session keeps the user's id.
+
+type User = { id: int, email: str, name: str, hosts: int, hue: int }
+
+fn me() with db = session().user == null ? null : db.one("select id, email, name, hosts, hue from users where id = ?", session().user)
+
+// For routes: the user, or off to sign in and back.
+fn me_or_login(back: str) with db = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+// For server fns: who acts, or an error the page shows.
+fn acting() with db = me() ?? err("Sign in first")
+
+fn acting_host() with db {
+    let u = acting()?
+    if u.hosts != 1 { return err("Only hosts can do that") }
+    u
+}
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+fn sign_in(email: str, password: str) with db, random {
+    let u = db.one("select * from users where email = ?", trim(email))
+    let hash = u.password_hash ?? crypto.hash_password("not anyone's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong email or password") }
+    set_session({ user: u.id })
+    u
+}
+
+fn sign_up(name: str, email: str, password: str) with db, time, random {
+    let n = trim(name)
+    let e = lower(trim(email))
+    if len(n) < 2 { return err("Your name, as hosts will see it") }
+    if !re.test(e, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return err("An email address, to send your bookings to") }
+    if len(password) < 8 { return err("A password of 8 characters or more") }
+    if db.one("select id from users where email = ?", e) != null { return err("That email has an account: sign in instead") }
+    let id = db.exec("insert into users (email, name, password_hash, hue, created) values (?, ?, ?, ?, ?)",
+        e, n, crypto.hash_password(password), random_int(0, 359), now())?.last_id
+    set_session({ user: id })
+    id
+}
+
+fn sign_out() = end_session()

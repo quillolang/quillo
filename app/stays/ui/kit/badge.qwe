@@ -1,0 +1,48 @@
+// Badge: a small label for a status or a count, shaped as a pill.
+//
+//   <Badge tone="success" dot={true}>Active</Badge>
+//   <Badge tone="warning" variant="outline">Trial</Badge>
+//   <Badge tone="danger" variant="solid" count={128} label="unread messages"/>
+//
+// tone: "neutral" (default), "accent", "success", "warning", "danger" or "info".
+// variant: "soft" (default), "solid" or "outline". dot: a status dot before the text.
+// count: shows a number instead of children; above max (99) it shows "99+".
+// label: what the count is, for screen readers ("128 unread messages").
+// size: "sm" or "md" (default). For labels people add or remove, use Tag.
+
+let badge_css = css`
+.ui-badge {
+  display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px;
+  border: 1px solid transparent; border-radius: 999px; vertical-align: middle;
+  font: 500 12px/1 var(--ui-font); white-space: nowrap; font-variant-numeric: tabular-nums;
+  --t: var(--ui-muted); --ts: var(--ui-subtle);
+}
+.ui-badge-accent { --t: var(--ui-accent); --ts: var(--ui-accent-soft); }
+.ui-badge-success { --t: var(--ui-success); --ts: var(--ui-success-soft); }
+.ui-badge-warning { --t: var(--ui-warning); --ts: var(--ui-warning-soft); }
+.ui-badge-danger { --t: var(--ui-danger); --ts: var(--ui-danger-soft); }
+.ui-badge-info { --t: var(--ui-info); --ts: var(--ui-info-soft); }
+.ui-badge-soft { background: var(--ts); color: var(--t); }
+.ui-badge-neutral.ui-badge-soft { color: var(--ui-fg); }
+.ui-badge-solid { background: var(--t); color: var(--ui-bg); }
+.ui-badge-neutral.ui-badge-solid { background: var(--ui-fg); }
+.ui-badge-outline { border-color: color-mix(in srgb, var(--t) 45%, var(--ui-border)); color: var(--t); }
+.ui-badge-neutral.ui-badge-outline { color: var(--ui-fg); border-color: var(--ui-border); }
+.ui-badge-dot::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--t); }
+.ui-badge-solid.ui-badge-dot::before { background: currentColor; }
+.ui-badge-count { min-width: 22px; justify-content: center; padding: 0 6px; }
+.ui-badge-sm { height: 18px; padding: 0 7px; font-size: 11px; }
+.ui-badge-sm.ui-badge-count { min-width: 18px; padding: 0 5px; }
+`
+
+view Badge(tone: str = "neutral", variant: str = "soft", dot: bool = false, count: int? = null,
+           max: int = 99, label: str? = null, size: str = "md", class: str? = null, children) {
+    let shown = count == null ? null : (count > max ? `${max}+` : str(count))
+    <span class={ui_cls(["ui-badge", `ui-badge-${tone}`, `ui-badge-${variant}`, dot && "ui-badge-dot",
+                         count != null && "ui-badge-count", size != "md" && `ui-badge-${size}`, class])}>
+        {count != null
+            ? [<span aria-hidden={label != null ? "true" : null}>{shown}</span>,
+               label != null && <span.ui-sr>{count} {label}</span>]
+            : children}
+    </span>
+}

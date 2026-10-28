@@ -1,0 +1,291 @@
+// A place's page: its pictures, what it has, its calendar (live: nights
+// others hold or book close while it is open), the booking widget (the price
+// worked out in the browser by lib/pricing.qwe, as the server will charge
+// it), the weather for the dates, places around on a map, activities nearby
+// with their times, and reviews.
+//
+// The dates are the page's: the widget, the calendar, the weather and the
+// activities all follow them. The weather and the places around are asked for
+// once the page shows, never while the server renders it: Overpass can take
+// half a minute, and http.get cannot be told to give up sooner (FEEDBACK5.md).
+
+view StayPage(me, id: int, start: str, end: str, guests: int) =
+    <Shell {me} title="A place to stay" maps={true}>
+        <StayView {id} {start} {end} {guests}/>
+    </Shell>
+
+fn cap(s: str) -> str = upper(slice(s, 0, 1)) + slice(s, 1)
+
+component StayView(id: int, start: str, end: str, guests: int) {
+    state s = live(load_stay, id)
+    state a = start
+    state b = end
+    state g = guests
+    state problem = null
+    {s == null
+        ? <EmptyState title="This place is not taking bookings" icon="search" actions={<Button href="/">Search again</Button>}/>
+        : <div>
+            <div.stay-head>
+                <h1>{s.listing.title}</h1>
+                <div.spread>
+                    <div.row.muted>
+                        {s.rating.avg != null ? <span>★ {s.rating.avg} · {plural(s.rating.count, "review")}</span> : <Badge>New</Badge>}
+                        <span>{s.listing.city}, {s.listing.country}</span>
+                        {s.listing.instant_book == 1 ? <Badge tone="success">Instant book</Badge> : <Badge tone="info">Host accepts each request</Badge>}
+                    </div>
+                    {s.signed_in && !s.mine
+                        ? <Button variant="ghost" class="save" on_click={() => {
+                            let r = toggle_saved(id)
+                            if is_err(r) { problem = r.error } else { notify(r ? "Saved" : "Removed from saved", { seconds: 2 }) }
+                        }}>{s.saved ? "♥ Saved" : "♡ Save"}</Button>
+                        : null}
+                </div>
+            </div>
+            <Carousel label="Pictures" id="stay-photos">
+                {for [i, u] in enumerate(s.listing.photo_urls) => <CarouselSlide key={u} label={`Picture ${i + 1}`}><img.photo src={u} alt={`${s.listing.title}, picture ${i + 1}`}/></CarouselSlide>}
+            </Carousel>
+            <Lightbox label="All pictures" size={96} ratio="16/9" images={s.listing.photo_urls | map((u) => { src: u, alt: s.listing.title, thumb: u })}/>
+            <Problem text={problem}/>
+            <div.stay-grid>
+                <div>
+                    <div.row>
+                        <Avatar name={s.host.name}/>
+                        <div><b>{cap(s.listing.kind)} hosted by {s.host.name}</b><div.muted>{plural(s.listing.max_guests, "guest")} · {plural(s.listing.bedrooms, "bedroom")} · {plural(s.listing.beds, "bed")} · {plural(s.listing.baths, "bath")}</div></div>
+                    </div>
+                    <p>{s.listing.description}</p>
+                    <DescriptionList layout="inline" items={[
+                        { term: "Check-in", detail: `from ${s.listing.check_in}, ${s.listing.zone}` },
+                        { term: "Check-out", detail: `by ${s.listing.check_out}` },
+                        { term: "Stays", detail: `${plural(s.listing.min_nights, "night")} to ${plural(s.listing.max_nights, "night")}` },
+                        { term: "Cancelling", detail: `${s.listing.policy.title}: ${s.listing.policy.says}` },
+                    ]}/>
+                    <h2>What this place has</h2>
+                    <ul.amenities>{for k in s.listing.amenity_keys => <li key={k}>✓ {get(AMENITIES, k) ?? k}</li>}</ul>
+                    <h2>When it's free</h2>
+                    <p.muted.small>Pick the day you arrive, then the day you leave. Crossed out: taken or closed.</p>
+                    <Availability today={s.today} taken={s.taken} closed={s.closed} start={a} end={b}
+                        on_pick={(x, y) => { a = x; b = y }}/>
+                    <h2>Weather</h2>
+                    <Weather key={`${a}|${b}`} {id} start={a} end={b}/>
+                    <h2>Around</h2>
+                    <Around {id} lat={s.listing.lat} lng={s.listing.lng}/>
+                    <h2>Things to do nearby</h2>
+                    <Activities key={`${a}|${b}`} {id} start={a} end={b} signed_in={s.signed_in}/>
+                    <h2>{s.rating.count == 0 ? "No reviews yet" : `★ ${s.rating.avg} · ${plural(s.rating.count, "review")}`}</h2>
+                    <div.reviews>{for r in s.reviews => <Card key={r.created}>
+                        <div.row><Avatar name={r.name} size="sm"/><b>{r.name}</b><Rating name={`r${r.created}`} value={r.rating} readonly={true} size="sm"/></div>
+                        <p>{r.body}</p>
+                        <span.muted.small>{day_label(day_text(floor(r.created / DAY_MS)))}</span>
+                    </Card>}</div>
+                </div>
+                <BookingWidget l={s.listing} custom={s.custom} taken={s.taken} closed={s.closed} today={s.today}
+                    start={a} end={b} guests={g} signed_in={s.signed_in} mine={s.mine}
+                    on_dates={(x, y) => { a = x; b = y }} on_guests={(n) => { g = n }}/>
+            </div>
+        </div>}
+}
+
+view Problem(text) = text != null && text != "" ? <Alert tone="danger">{text}</Alert> : null
+
+// The nights of a stay that are taken or closed.
+fn clashes(start: str, end: str, taken: list, closed: list) -> list =
+    is_day(start) && is_day(end) ? nights_of(start, end) | filter((d) => contains(taken, d) || contains(closed, d)) : []
+
+component BookingWidget(l, custom: map, taken: list, closed: list, today: str, start: str, end: str, guests: int,
+                        signed_in: bool, mine: bool, on_dates, on_guests) {
+    state busy = false
+    state problem = null
+    let dated = is_day(start) && is_day(end)
+    let why = dated ? stay_problem(l, start, end, guests, today) : null
+    let clash = clashes(start, end, taken, closed)
+    let q = dated && why == null && len(clash) == 0 ? quote(l, start, end, guests, custom) : null
+    <aside.widget id="widget">
+        <div><span.big>{q != null ? shown_money(q.per_night) : l.price_shown}</span> <span.muted>a night{q != null && q.per_night != null ? ", on average" : ""}</span></div>
+        <DateRangePicker key={`${start}|${end}`} label="Dates" start={is_day(start) ? start : null} end={is_day(end) ? end : null} min={today} today={today}
+            on_change={(x, y) => { if x != null && y != null { on_dates(x, y) } }}/>
+        <NumberInput label="Guests" value={guests} min={1} max={l.max_guests} on_change={(n) => { if n != null { on_guests(n) } }}/>
+        {why != null ? <p.problem id="why">{why}</p> : null}
+        {len(clash) > 0 ? <p.problem id="clash">Not free: {join(clash | take(3) | map(day_label), ", ")}{len(clash) > 3 ? ` and ${len(clash) - 3} more` : ""}</p> : null}
+        {q != null
+            ? <ul.lines id="quote">
+                {for x in q.lines => <li key={x.kind} class={x.kind}><span>{x.label}</span><span>{shown_money(x.amount)}</span></li>}
+                <li.total><span>Total</span><span id="quote-total">{shown_money(q.total)}</span></li>
+            </ul>
+            : null}
+        <Problem text={problem}/>
+        {mine
+            ? <Button href={`/host/listings/${l.id}`} variant="outline" full={true}>Your place: open its calendar</Button>
+            : <Button full={true} class="reserve" loading={busy} disabled={q == null && signed_in} on_click={() => {
+                if !signed_in {
+                    navigate(`/login?next=${url_encode(`/stays/${l.id}?start=${start}&end=${end}&guests=${guests}`)}`)
+                    return null
+                }
+                busy = true
+                problem = null
+                let r = hold_stay(l.id, start, end, guests)
+                busy = false
+                if is_err(r) { problem = r.error } else { navigate(`/checkout/${r}`) }
+            }}>{!signed_in ? "Sign in to book" : l.instant_book == 1 ? "Reserve" : "Request to book"}</Button>}
+        <p.muted.small>{l.instant_book == 1 ? "Booked as soon as you pay." : "The host has a day to accept; until then nothing is charged for good."} Nights are held for you for 10 minutes while you pay.</p>
+    </aside>
+}
+
+// Three months of nights: what is taken or closed, and the dates chosen.
+// Clicking a day starts a stay, a second click ends it. (The kit's
+// DateRangePicker cannot show nights that are taken: FEEDBACK5.md.)
+component Availability(today: str, taken: list, closed: list, start: str, end: str, on_pick) {
+    state first = null
+    let p = day_parts(today)
+    let months = range(0, 3) | map((i) => {
+        let k = p.m - 1 + i
+        { y: p.y + floor(k / 12), m: k % 12 + 1 }
+    })
+    let a = first ?? start
+    let b = first != null ? null : end
+    <div.months id="availability">{for mo in months => {
+        let d1 = `${mo.y}-${two(mo.m)}-01`
+        <div.month key={d1}>
+            <h4>{MONTH_NAMES[mo.m - 1]} {mo.y}</h4>
+            <div.grid>
+                {for w in WEEKDAY_NAMES => <span.wd key={w}>{slice(w, 0, 2)}</span>}
+                {for i in range(0, weekday(d1) - 1) => <span key={`pad${i}`}></span>}
+                {for d in nights_of(d1, add_days(d1, month_days(mo.y, mo.m))) => {
+                    let off = contains(taken, d) || contains(closed, d)
+                    let past = d < today
+                    let inside = is_day(a) && is_day(b) && d > a && d < b
+                    let edge = d == a || d == b
+                    <span key={d} data-day={d} role="button" tabindex={past ? null : "0"}
+                        class={ui_cls(["d", off && "taken", past && "past", inside && (off ? "clash" : "in"), edge && "edge"])}
+                        @click={() => {
+                            if past { return null }
+                            if first == null || d <= first {
+                                first = d
+                            } else {
+                                let from = first
+                                first = null
+                                on_pick(from, d)
+                            }
+                        }}>{day_parts(d).d}</span>
+                }}
+            </div>
+        </div>
+    }}</div>
+}
+
+// The forecast for the dates (or the next week), asked for once the page shows.
+component Weather(id: int, start: str, end: str) {
+    state w = null
+    state failed = null
+    <div id="weather" @mount={(el) => {
+        let r = weather_for(id, start, end)
+        if is_err(r) { failed = r.error } else { w = r }
+    }}>
+        {failed != null
+            ? <Alert tone="warning" title="No forecast for now">{failed}</Alert>
+            : w == null
+            ? <div.weather>{for i in range(0, 5) => <Skeleton key={i} shape="rect" width="84px" height="120px"/>}</div>
+            : <div>
+                {w.stale ? <Alert tone="info">Open-Meteo is not answering: this forecast is from earlier.</Alert> : null}
+                {len(w.days) == 0
+                    ? <p.muted>Your dates are more than 16 days away: forecasts start 16 days ahead.</p>
+                    : <div.weather>{for d in w.days => <div.day key={d.day}>
+                        <div.small>{d.when}</div>
+                        <div.icon aria-hidden="true">{d.icon}</div>
+                        <div.small>{d.label}</div>
+                        <div><b>{round(d.hi)}°</b> <span.muted>{round(d.lo)}°</span></div>
+                        <div.small.muted>{d.rain == null ? "" : `${d.rain}% rain`}</div>
+                    </div>}</div>}
+                {w.beyond > 0 && len(w.days) > 0 ? <p.muted.small>{plural(w.beyond, "day")} of your stay are too far ahead for a forecast.</p> : null}
+                <p.muted.small>Forecast by Open-Meteo, in {w.zone} time.</p>
+            </div>}
+    </div>
+}
+
+let PLACE_GROUPS = [
+    { label: "All", value: "all" }, { label: "Eat", value: "food" }, { label: "See", value: "culture" },
+    { label: "Outdoors", value: "outdoors" }, { label: "Nightlife", value: "nightlife" },
+]
+
+// Places around, on a list and a map, asked for once the page shows.
+component Around(id: int, lat: float, lng: float) {
+    state found = null
+    state failed = null
+    state kind = "all"
+    state leaflet = null
+    state layer = null
+    let rows = found == null ? [] : found.places | filter((p) => kind == "all" || p.kind == kind)
+    if leaflet != null && layer != null {
+        layer.clearLayers()
+        for p in rows {
+            let m = js("L.marker", [p.lat, p.lng], { icon: js("L.divIcon", { className: `place-pin ${p.kind}`, iconSize: null }) })
+            m.bindTooltip(escape(`${p.name} · ${p.what} · ${p.walk_min} min`))
+            layer.addLayer(m)
+        }
+    }
+    <div id="around">
+        <SegmentedControl name="around-kind" value={kind} size="sm" options={PLACE_GROUPS} on_change={(v) => { kind = v }}/>
+        <div.places>
+            <div>
+                {failed != null
+                    ? <Alert tone="warning" title="No places for now">{failed}</Alert>
+                    : found == null
+                    ? <div.stack><Spinner label="Asking OpenStreetMap" show_label={true}/><Skeleton lines={6}/></div>
+                    : len(rows) == 0
+                    ? <p.muted>Nothing of this kind within a kilometre.</p>
+                    : <ul>{for p in rows => <li key={`${p.name}${p.lat}`}>
+                        <span><b>{p.name}</b> <span.muted.small>{p.what}</span></span>
+                        <span.muted.small>{p.walk_min} min walk</span>
+                    </li>}</ul>}
+                {found != null ? <p.muted.small>From {found.source}{found.stale == true ? ", kept from earlier" : ""}.</p> : null}
+            </div>
+            <div.map id="around-map" @mount={(el) => {
+                let m = js("L.map", el, { scrollWheelZoom: false })
+                m.setView([lat, lng], 15)
+                js("L.tileLayer", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m)
+                js("L.marker", [lat, lng], { icon: js("L.divIcon", { className: "home-pin", iconSize: null }), zIndexOffset: 1000 }).addTo(m).bindTooltip("The place")
+                layer = js("L.layerGroup").addTo(m)
+                leaflet = m
+                let r = around_stay(id)
+                if is_err(r) { failed = r.error } else { found = r }
+                () => m.remove()
+            }}></div>
+        </div>
+    </div>
+}
+
+// Activities near the place on the days of the stay, with places left at
+// each time, live.
+component Activities(id: int, start: str, end: str, signed_in: bool) {
+    state acts = live(activities_near, id, start, end)
+    state slot = null
+    state people = 2
+    state problem = null
+    state done = null
+    <div.activities id="activities">
+        {len(acts ?? []) == 0
+            ? <p.muted>No activities nearby on these days.</p>
+            : null}
+        {for act in acts ?? [] => <Card key={act.id} title={act.title} subtitle={`${cap(act.kind)} · ${act.minutes} min · ${act.price_shown} a person · ${act.km} km`}>
+            <p.small>{act.description}</p>
+            {len(act.slots) == 0
+                ? <p.muted.small>No times on these days.</p>
+                : <div.slots>{for t in act.slots => <button.slot key={t.id} type="button" disabled={t.left <= 0}
+                    class={ui_cls([t.wet && "wet", slot == t.id && "on"])} data-slot={t.id}
+                    @click={() => { slot = t.id; problem = null; done = null }}>
+                    <b>{t.label}</b><br/>
+                    <span.muted>{t.left <= 0 ? "Full" : `${t.left} left`}{t.rain != null ? ` · ${t.rain}% rain` : ""}{t.wet ? " · may be wet" : ""}</span>
+                </button>}</div>}
+            {(act.slots | find((t) => t.id == slot)) != null
+                ? <div.row>
+                    <NumberInput label="People" value={people} min={1} max={10} on_change={(n) => { if n != null { people = n } }}/>
+                    <Button class="book-activity" disabled={!signed_in} on_click={() => {
+                        let r = book_activity(slot, people)
+                        if is_err(r) { problem = r.error } else { done = `Booked: ${r.title}, ${r.total_shown}`; slot = null }
+                    }}>{signed_in ? "Book" : "Sign in to book"}</Button>
+                </div>
+                : null}
+        </Card>}
+        <Problem text={problem}/>
+        {done != null ? <Alert tone="success" class="activity-done">{done}</Alert> : null}
+    </div>
+}

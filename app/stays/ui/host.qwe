@@ -1,0 +1,234 @@
+// The host's side: a dashboard (requests to answer before they run out, who
+// comes next, earnings by month for each currency, how full the places were),
+// a place's calendar (close, open and price nights, several at once), a new
+// place (its address found on the map, the pin moved by hand), and the
+// outside services' status.
+
+view HostPage(me) = <Shell {me} title="Hosting" here="/host"><HostDashboard/></Shell>
+
+component HostDashboard() {
+    state h = live(load_host)
+    state problem = null
+    {h == null
+        ? <EmptyState title="You host no places yet" icon="search" actions={<Button href="/host/new">List a place</Button>}/>
+        : <div>
+            <div.spread><h1>Hosting</h1><Button href="/host/new">List a place</Button></div>
+            <Problem text={problem}/>
+            <div.stats>
+                <Stat label="Requests to answer" value={len(h.requests)}/>
+                <Stat label="Coming up" value={len(h.upcoming)}/>
+                {for e in h.this_month => <Stat key={e.currency} label={`This month, ${e.currency}`} value={e.shown}/>}
+                <Stat label="Places" value={len(h.listings)}/>
+            </div>
+            <h2>Requests</h2>
+            {len(h.requests) == 0 ? <p.muted>None waiting.</p> : null}
+            <div.stack>{for r in h.requests => <div.request key={r.id} data-request={r.id}>
+                <Avatar name={r.guest}/>
+                <div>
+                    <b>{r.guest}</b> would like <b>{r.title}</b>
+                    <div.muted.small>{r.dates} · {plural(r.guests, "guest")} · {r.total_shown}</div>
+                    <div.small>Answer within <Countdown seconds={max([0, ceil((r.respond_by - now()) / 1000)])} variant="inline" size="sm" ended="too late"/></div>
+                </div>
+                <div.row>
+                    <Button size="sm" class="accept" on_click={() => { let x = decide_request(r.id, true); if is_err(x) { problem = x.error } }}>Accept</Button>
+                    <Button size="sm" variant="outline" class="decline" on_click={() => { let x = decide_request(r.id, false); if is_err(x) { problem = x.error } }}>Decline</Button>
+                </div>
+            </div>}</div>
+            <h2>Coming up</h2>
+            {len(h.upcoming) == 0 ? <p.muted>Nobody booked yet.</p> : <Timeline items={h.upcoming | map((b) => {
+                title: `${b.guest} · ${b.title}`,
+                time: b.dates,
+                body: `${plural(b.guests, "guest")} · ${b.total_shown}`,
+                tone: "success",
+            })}/>}
+            <h2>Earnings</h2>
+            {len(h.series) == 0
+                ? <p.muted>Nothing earned yet.</p>
+                : <div.stack>{for s in h.series => <BarChart key={s.name} labels={h.months} values={s.values}
+                    label={`Earned in ${s.name}, by month of the stay`} show_label={true} prefix={s.name == "JPY" ? "¥" : "€"} height={200}/>}</div>}
+            <h2>Nights booked</h2>
+            <CalendarHeatmap values={h.heat} end={add_days(h.today, 60)} start={add_days(h.today, -180)} week_start="monday" unit="nights booked" label="Nights booked"/>
+            <h2>Your places</h2>
+            <div.results>{for l in h.listings => <Card key={l.id} title={l.title} subtitle={`${l.city} · ${l.price_shown} a night`} href={`/host/listings/${l.id}`}>
+                <img.photo src={l.photo_urls[0]} alt=""/>
+            </Card>}</div>
+        </div>}
+}
+
+view HostCalendarPage(me, id: int, month: str) =
+    <Shell {me} title="Calendar" here="/host"><HostCalendar {id} first_month={month}/></Shell>
+
+fn month_after(month: str, k: int) -> str {
+    let p = day_parts(`${month}-01`)
+    let n = p.y * 12 + p.m - 1 + k
+    `${floor(n / 12)}-${two(n % 12 + 1)}`
+}
+
+// A month of the place's nights. Click to pick nights, shift-click for a run
+// of them; then close, open or price what is picked.
+component HostCalendar(id: int, first_month: str) {
+    state month = first_month
+    state cal = live(load_calendar, id, month)
+    state picked = []
+    state last = null
+    state price = ""
+    state said = null
+    state problem = null
+    let act = (action) => {
+        let r = set_nights(id, picked, action, price)
+        if is_err(r) { problem = r.error; return null }
+        problem = null
+        said = `${plural(r.changed, "night")} changed${r.skipped > 0 ? `; ${plural(r.skipped, "booked night")} left as they are` : ""}`
+        picked = []
+    }
+    {cal == null
+        ? <EmptyState title="Not your place" icon="search"/>
+        : <div>
+            <a href="/host">← Hosting</a>
+            <h1>{cal.listing.title}</h1>
+            <div.spread>
+                <div.row>
+                    <Button variant="ghost" class="prev" on_click={() => { month = month_after(month, -1); picked = [] }}>←</Button>
+                    <h2 id="month-title">{cal.title}</h2>
+                    <Button variant="ghost" class="next" on_click={() => { month = month_after(month, 1); picked = [] }}>→</Button>
+                </div>
+                <span.muted>Usually {cal.listing.price_shown}, {cal.listing.weekend_shown} on Friday and Saturday nights</span>
+            </div>
+            <div.cal id="host-cal">
+                {for w in WEEKDAY_NAMES => <span.wd key={w}>{w}</span>}
+                {for i in range(0, cal.lead) => <span key={`pad${i}`}></span>}
+                {for d in cal.days => <button key={d.day} type="button" data-day={d.day}
+                    class={ui_cls([d.state, d.custom && "custom", contains(picked, d.day) && "sel", d.day < cal.today && "past"])}
+                    disabled={d.day < cal.today}
+                    @click={(e) => {
+                        if e.shiftKey && last != null {
+                            let from = last < d.day ? last : d.day
+                            let to = last < d.day ? d.day : last
+                            picked = unique(picked + nights_of(from, add_days(to, 1)))
+                        } else {
+                            picked = contains(picked, d.day) ? picked | filter((x) => x != d.day) : picked + [d.day]
+                        }
+                        last = d.day
+                    }}>
+                    <b>{d.n}</b>
+                    <span.p>{d.shown}</span>
+                    <span.muted>{d.state == "free" ? "" : d.guest ?? d.state}</span>
+                </button>}
+            </div>
+            <div.row style="margin-top: 16px">
+                <span id="picked-count">{plural(len(picked), "night")} picked</span>
+                <Button variant="outline" class="close-nights" disabled={len(picked) == 0} on_click={() => act("close")}>Close</Button>
+                <Button variant="outline" class="open-nights" disabled={len(picked) == 0} on_click={() => act("open")}>Open</Button>
+                <TextField label="Price a night" name="price" value={price} size="sm" prefix={cal.listing.currency == "JPY" ? "¥" : "€"} on_input={(v) => { price = v }}/>
+                <Button class="price-nights" disabled={len(picked) == 0} on_click={() => act("price")}>Set price</Button>
+                <Button variant="ghost" disabled={len(picked) == 0} on_click={() => act("usual")}>Usual price</Button>
+            </div>
+            <Problem text={problem}/>
+            {said != null ? <p.muted id="said">{said}</p> : null}
+        </div>}
+}
+
+view NewListingPage(me) = <Shell {me} title="List a place" here="/host" maps={true}><NewListing/></Shell>
+
+let CITY_CENTRES = {
+    Lisbon: [38.7139, -9.1394], Porto: [41.1496, -8.611], Barcelona: [41.3874, 2.1686],
+    Dublin: [53.3498, -6.2603], Kyoto: [35.0116, 135.7681],
+}
+
+component NewListing() {
+    state city = "Lisbon"
+    state pin = null
+    state leaflet = null
+    state marker = null
+    state problem = null
+    state busy = false
+    state amenities = ["wifi", "kitchen"]
+    // Another city: the map goes there, and the pin is placed again.
+    if leaflet != null { leaflet.setView(get(CITY_CENTRES, city), 13) }
+    <form.new-form id="new-listing" @submit={(e) => {
+        busy = true
+        let r = add_listing(merge(e.form, {
+            amenities, instant: e.form.instant == "on",
+            lat: pin == null ? null : pin[0], lng: pin == null ? null : pin[1],
+        }))
+        busy = false
+        if is_err(r) { problem = r.error } else { navigate(`/host/listings/${r}`) }
+    }}>
+        <h1>List a place</h1>
+        <TextField name="title" label="Title" required={true} placeholder="Sunny flat by the river"/>
+        <div.two>
+            <Select name="kind" label="Kind" options={KINDS}/>
+            <Select name="city" label="City" value={city} options={keys(CITY_ZONES)} on_change={(v) => { city = v }}/>
+        </div>
+        <TextField name="address" label="Address" hint="Found on the map when you save, unless you place the pin yourself" on_change={(v) => {
+            // Nominatim from the browser: one call a second, as its policy asks.
+            let r = http.get(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${url_encode(`${v}, ${city}`)}`)
+            if !is_err(r) && r.ok && len(r.json) > 0 && marker != null {
+                pin = [float(r.json[0].lat), float(r.json[0].lon)]
+                marker.setLatLng(pin)
+                leaflet.setView(pin, 16)
+            }
+        }}/>
+        <div.map id="new-map" style="height: 280px" @mount={(el) => {
+            let m = js("L.map", el)
+            m.setView(get(CITY_CENTRES, city), 13)
+            js("L.tileLayer", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m)
+            let mk = js("L.marker", get(CITY_CENTRES, city), { draggable: true }).addTo(m)
+            mk.on("dragend", (e) => {
+                let at = mk.getLatLng()
+                pin = [at.lat, at.lng]
+            })
+            m.on("click", (e) => {
+                pin = [e.latlng.lat, e.latlng.lng]
+                mk.setLatLng(pin)
+            })
+            marker = mk
+            leaflet = m
+            () => m.remove()
+        }}></div>
+        <p.muted.small id="pin">{pin == null ? "Click the map or drag the pin to place it exactly." : `Pin at ${round(pin[0] * 10000) / 10000}, ${round(pin[1] * 10000) / 10000}`}</p>
+        <div.two>
+            <TextField name="base" label="A night" required={true} prefix={city == "Kyoto" ? "¥" : "€"} placeholder={city == "Kyoto" ? "18000" : "95.00"}/>
+            <TextField name="weekend" label="Friday and Saturday nights" prefix={city == "Kyoto" ? "¥" : "€"}/>
+        </div>
+        <div.two>
+            <TextField name="cleaning" label="Cleaning, once" value="0" prefix={city == "Kyoto" ? "¥" : "€"}/>
+            <TextField name="guests" label="Guests" type="number" value="2" min="1" max="16"/>
+        </div>
+        <ChipGroup name="amenity" label="What it has" multiple={true} values={amenities} size="sm"
+            options={keys(AMENITIES) | map((k) => { label: get(AMENITIES, k), value: k })}
+            on_change={(v, on) => { amenities = toggled(amenities, v, on) }}/>
+        <TextArea name="description" label="About the place" rows={4}/>
+        <div.two>
+            <Select name="policy" label="Cancelling" value="moderate" options={keys(POLICIES) | map((k) => { label: get(POLICIES, k).title, value: k })}/>
+            <TextField name="min_nights" label="Fewest nights" type="number" value="1" min="1"/>
+        </div>
+        <Switch name="instant" label="Instant book" hint="Guests book without waiting for you"/>
+        <Problem text={problem}/>
+        <Button type="submit" loading={busy}>List it</Button>
+    </form>
+}
+
+view StatusPage(me) = <Shell {me} title="Status" here="/status"><OutsideStatus/></Shell>
+
+component OutsideStatus() {
+    state o = live(load_outside)
+    <div>
+        <h1>Outside services</h1>
+        <p.muted>The maps, weather and places services this site asks, over the last day. Answers are kept: a place for a month, the weather for half an hour, places around for a day.</p>
+        <div.stats>{for s in o.services => <Stat key={s.service} label={s.service} value={`${s.avg_ms} ms`} hint={`${plural(s.calls, "call")}, ${s.failed} failed, slowest ${s.max_ms} ms`}/>}</div>
+        {len(o.services) == 0 ? <p.muted>No calls yet.</p> : null}
+        <h2>Kept answers</h2>
+        <div.row>{for k in o.kept => <Badge key={k.service}>{k.service}: {k.n}</Badge>}</div>
+        <h2>Latest calls</h2>
+        <table.plain>
+            <thead><tr><th>Service</th><th>Status</th><th>Time</th><th>Address</th></tr></thead>
+            <tbody>{for c in o.recent => <tr key={c.created + c.ms}>
+                <td>{c.service}</td>
+                <td><StatusDot status={c.status >= 200 && c.status < 300 ? "online" : "busy"} label={str(c.status)}/></td>
+                <td>{c.ms} ms</td>
+                <td.url title={c.url}>{c.url}</td>
+            </tr>}</tbody>
+        </table>
+    </div>
+}

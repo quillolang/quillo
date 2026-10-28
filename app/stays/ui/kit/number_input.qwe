@@ -1,0 +1,98 @@
+// NumberInput: a labelled number box with − and + buttons around it. It is a real
+// <input type="number">, so it works in a plain <form>, and ArrowUp / ArrowDown
+// step it; what is typed is kept between min and max when it is left.
+//
+//   <NumberInput name="guests" label="Guests" value={2} min={1} max={12}/>
+//   <NumberInput name="qty" label="Quantity" value={qty} min={0} on_change={(n) => { qty = n }}/>
+//
+// value: where it starts (null: empty). min, max: the limits (none by default);
+// the buttons are disabled at them. step: how much a button or arrow adds (1).
+// placeholder, hint, error, required, disabled, field (the id, default
+// "number-input-" + name) and size ("sm" or "md") as in TextField.
+// on_change(value): inside one of your components, given the number (null when
+// it is emptied), after each step or when what was typed is left.
+
+let number_input_css = css`
+.ui-number-input { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-number-input-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-number-input-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-number-input-box {
+  display: flex; align-items: stretch; height: 38px; width: 180px; max-width: 100%;
+  background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  overflow: hidden; transition: border-color .15s, box-shadow .15s;
+}
+.ui-number-input-box:hover { border-color: var(--ui-strong); }
+.ui-number-input-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-number-input-box input {
+  flex: 1; min-width: 0; padding: 0 8px; border: 0; outline: none; background: transparent;
+  color: var(--ui-fg); font: 14px var(--ui-font); text-align: center; font-variant-numeric: tabular-nums;
+  appearance: textfield; -moz-appearance: textfield;
+}
+.ui-number-input-box input::-webkit-inner-spin-button, .ui-number-input-box input::-webkit-outer-spin-button { appearance: none; margin: 0; }
+.ui-number-input-box input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-number-input-step {
+  flex: none; width: 36px; border: 0; background: var(--ui-subtle); color: var(--ui-fg);
+  font: 500 16px/1 var(--ui-font); cursor: pointer; transition: background .15s, color .15s;
+}
+.ui-number-input-step:first-child { border-right: 1px solid var(--ui-border); }
+.ui-number-input-step:last-child { border-left: 1px solid var(--ui-border); }
+.ui-number-input-step:hover:not(:disabled) { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-number-input-step:disabled { color: var(--ui-muted); opacity: .5; cursor: not-allowed; }
+.ui-number-input-sm .ui-number-input-box { height: 30px; width: 140px; }
+.ui-number-input-sm .ui-number-input-box input { font-size: 13px; }
+.ui-number-input-sm .ui-number-input-step { width: 28px; font-size: 14px; }
+.ui-number-input-invalid .ui-number-input-box, .ui-number-input-invalid .ui-number-input-box:hover { border-color: var(--ui-danger); }
+.ui-number-input-invalid .ui-number-input-box:focus-within { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-number-input-hint, .ui-number-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-number-input-error { color: var(--ui-danger); }
+.ui-number-input-disabled { opacity: .55; }
+.ui-number-input-disabled .ui-number-input-box:hover { border-color: var(--ui-border); }
+.ui-number-input-disabled input { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-number-input-box, .ui-number-input-step { transition: none; } }
+`
+
+// n kept between lo and hi (either may be null), and rounded to step's decimals.
+fn number_input_clamp(n: num, lo: num?, hi: num?, step: num) {
+    let places = len(split(str(step), ".")[1] ?? "")
+    let r = places > 0 ? round(n, places) : n
+    lo != null && r < lo ? lo : hi != null && r > hi ? hi : r
+}
+
+component NumberInput(name: str? = null, label: str? = null, value: num? = null, placeholder: str? = null,
+                      hint: str? = null, error: str? = null, required: bool = false, disabled: bool = false,
+                      field: str? = null, size: str = "md", min: num? = null, max: num? = null, step: num = 1,
+                      on_change = null, class: str? = null) {
+    state n = value
+    state shown = 0
+    let id = field ?? `number-input-${name ?? re.replace(lower(label ?? "number"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let set_to = (x) => {
+        let c = x == null ? null : number_input_clamp(x, min, max, step)
+        n = c
+        // The box may show what was typed (150) when n was already the limit (100):
+        // `shown` changing puts n back in it.
+        shown += 1
+        on_change && on_change(c)
+    }
+    <div class={ui_cls(["ui-number-input", size == "sm" && "ui-number-input-sm", error != null && "ui-number-input-invalid",
+                        disabled && "ui-number-input-disabled", class])}>
+        {label != null && <label.ui-number-input-label for={id}>
+            {label}{required && <span.ui-number-input-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-number-input-box>
+            <button.ui-number-input-step type="button" tabindex="-1" aria-label="Decrease" aria-controls={id}
+                    disabled={disabled || (min != null && n != null && n <= min)}
+                    @click={() => set_to((n ?? (min ?? 0) + step) - step)}>−</button>
+            <input type="number" id={id} name={name} value={shown >= 0 ? n : null} min={min} max={max} step={step}
+                   inputmode="decimal" placeholder={placeholder} required={required} disabled={disabled}
+                   aria-invalid={error != null ? "true" : null}
+                   aria-describedby={described != "" ? described : null}
+                   @change={(e) => { set_to(e.value == "" || is_err(float(e.value)) ? null : float(e.value)) }}/>
+            <button.ui-number-input-step type="button" tabindex="-1" aria-label="Increase" aria-controls={id}
+                    disabled={disabled || (max != null && n != null && n >= max)}
+                    @click={() => set_to((n ?? (min ?? 0) - step) + step)}>+</button>
+        </div>
+        {hint != null && <p.ui-number-input-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-number-input-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

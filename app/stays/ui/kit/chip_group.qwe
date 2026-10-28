@@ -1,0 +1,77 @@
+// ChipGroup: a row of chips to pick from, as filters are picked: one of them
+// (status: open, closed) or any number (topics). Each chip is a real radio button
+// or checkbox, so a plain <form> sends what is picked, and the keyboard works as it
+// does for those (Tab and Space; the arrow keys between the chips of a single one).
+//
+//   <ChipGroup name="status" label="Status" value="open"
+//              options={[{ label: "Open", value: "open", count: 12 }, { label: "Closed", value: "closed", count: 40 }]}/>
+//   <ChipGroup name="topic" label="Topics" multiple={true} values={["design"]}
+//              options={["design", "frontend", "backend"]} on_change={(v, on) => { ... }}/>
+//
+// name: the inputs' name. options: strings, or { label, value, count?, disabled? };
+// count shows a number after the label (how many results it would give).
+// multiple: any number picked (checkboxes); else one (radio buttons). value: the
+// one picked, or values: the ones picked when multiple. label: the group's legend,
+// shown above it unless hide_label (then only screen readers hear it). size: "sm" or
+// "md". disabled, required (a single group: one must be picked to send the form).
+// on_change(value) for a single group, on_change(value, checked) when multiple:
+// inside one of your components, given the chip's value (and whether it is now on).
+
+let chip_group_css = css`
+.ui-chips { min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-chips-legend { padding: 0; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
+.ui-chips-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-chip { position: relative; display: inline-flex; cursor: pointer; }
+.ui-chip input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.ui-chip-face {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font-weight: 500; white-space: nowrap;
+  transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
+}
+.ui-chip:hover .ui-chip-face { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-chip-check { display: none; width: 14px; height: 14px; margin-left: -4px; flex: none; }
+.ui-chip-count {
+  min-width: 20px; padding: 1px 6px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-muted);
+  font-size: 12px; font-variant-numeric: tabular-nums; text-align: center;
+}
+.ui-chip input:checked + .ui-chip-face { border-color: color-mix(in srgb, var(--ui-accent) 50%, var(--ui-border)); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-chip input:checked + .ui-chip-face .ui-chip-check { display: block; }
+.ui-chip input:checked + .ui-chip-face .ui-chip-count { background: var(--ui-surface); color: var(--ui-accent); }
+.ui-chip input:focus-visible + .ui-chip-face { box-shadow: var(--ui-focus); }
+.ui-chip input:disabled + .ui-chip-face { opacity: .5; }
+.ui-chip:has(input:disabled) { cursor: not-allowed; }
+.ui-chips-sm .ui-chip-face { height: 26px; padding: 0 10px; font-size: 13px; gap: 5px; }
+.ui-chips-sm .ui-chip-count { min-width: 18px; padding: 0 5px; font-size: 11px; }
+@media (prefers-reduced-motion: reduce) { .ui-chip-face { transition: none; } }
+`
+
+view ChipGroup(name: str, options: list = [], multiple: bool = false, value: str? = null, values: list = [],
+               label: str? = null, hide_label: bool = false, size: str = "md", disabled: bool = false,
+               required: bool = false, on_change = null, class: str? = null) {
+    let picked = multiple ? values | map((v) => str(v)) : (value != null ? [str(value)] : [])
+    <fieldset class={ui_cls(["ui-chips", size == "sm" && "ui-chips-sm", class])} disabled={disabled}
+              role={multiple ? null : "radiogroup"} aria-label={hide_label ? label : null}>
+        {label != null && !hide_label && <legend.ui-chips-legend>{label}</legend>}
+        <div.ui-chips-list>
+            {for o in options => {
+                let it = type_of(o) == "map" ? o : { label: str(o), value: str(o) }
+                let v = str(it.value ?? it.label)
+                <label.ui-chip>
+                    <input type={multiple ? "checkbox" : "radio"} name={name} value={v} checked={contains(picked, v)}
+                           disabled={get(it, "disabled") == true} required={required && !multiple}
+                           @change={(e) => {
+                               if on_change != null {
+                                   if multiple { on_change(e.value, e.checked) } else { on_change(e.value) }
+                               }
+                           }}/>
+                    <span.ui-chip-face>
+                        <svg.ui-chip-check viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7"/></svg>
+                        <span>{it.label ?? v}</span>
+                        {get(it, "count") != null && <span.ui-chip-count>{get(it, "count")}</span>}
+                    </span>
+                </label>
+            }}
+        </div>
+    </fieldset>
+}

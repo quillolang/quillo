@@ -1,0 +1,108 @@
+// RangeSlider: a range between two values on one track, such as a price from
+// $40 to $250. Each thumb is the browser's own <input type="range">, so each works
+// with the arrow keys, PageUp / PageDown, Home and End and with screen readers,
+// and a plain <form> sends `name`_min and `name`_max. A thumb stops at the other
+// one: they cannot cross.
+//
+//   <RangeSlider name="price" label="Price" min={0} max={500} step={10} low={40} high={250} prefix="$"/>
+//   <RangeSlider name="age" label="Age" min={18} max={99} low={25} high={40} gap={1}
+//                on_change={(lo, hi) => { ages = [lo, hi] }}/>
+//
+// min, max, step: as on a range input (0, 100, 1). low, high: where the thumbs start
+// (min and max by default). gap: the least distance between them (0).
+// prefix / format: text before / after each number shown ("$", "%", " km").
+// names: the two names sent, [min name, max name] (`name`_min and `name`_max).
+// show_value: false hides the numbers. hint, disabled and field (the ids' start,
+// "range-slider-" + name by default) as for every field.
+// on_change(low, high): inside one of your components, given both numbers, as a
+// thumb moves.
+
+let range_slider_css = css`
+.ui-range-slider { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-range-slider-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ui-range-slider-label { padding: 0; font-size: 13px; font-weight: 500; }
+.ui-range-slider-value { font-size: 13px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-range-slider-track { position: relative; height: 22px; margin: 0 2px; }
+.ui-range-slider-track::before, .ui-range-slider-fill {
+  content: ""; position: absolute; top: 8px; height: 6px; border-radius: 999px;
+}
+.ui-range-slider-track::before { left: 0; right: 0; background: var(--ui-subtle); box-shadow: inset 0 0 0 1px var(--ui-border); }
+.ui-range-slider-fill { left: var(--lo); right: calc(100% - var(--hi)); background: var(--ui-accent); }
+.ui-range-slider input {
+  position: absolute; inset: 0; width: 100%; height: 22px; margin: 0; appearance: none; background: transparent;
+  pointer-events: none;
+}
+.ui-range-slider input:focus { outline: none; }
+.ui-range-slider input::-webkit-slider-runnable-track { height: 22px; background: transparent; }
+.ui-range-slider input::-moz-range-track { background: transparent; }
+.ui-range-slider input::-webkit-slider-thumb {
+  appearance: none; pointer-events: auto; width: 18px; height: 18px; margin-top: 2px; border-radius: 50%; cursor: grab;
+  background: var(--ui-surface); border: 2px solid var(--ui-accent); box-shadow: var(--ui-shadow); transition: transform .12s, box-shadow .15s;
+}
+.ui-range-slider input::-moz-range-thumb {
+  pointer-events: auto; width: 14px; height: 14px; border-radius: 50%; cursor: grab;
+  background: var(--ui-surface); border: 2px solid var(--ui-accent); box-shadow: var(--ui-shadow);
+}
+.ui-range-slider input:active::-webkit-slider-thumb { cursor: grabbing; transform: scale(1.1); }
+.ui-range-slider input:focus-visible::-webkit-slider-thumb { box-shadow: var(--ui-focus); }
+.ui-range-slider input:focus-visible::-moz-range-thumb { box-shadow: var(--ui-focus); }
+.ui-range-slider-top { z-index: 1; }
+.ui-range-slider-scale { display: flex; justify-content: space-between; font-size: 12px; color: var(--ui-muted); }
+.ui-range-slider-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-range-slider:disabled { opacity: .55; }
+.ui-range-slider:disabled input::-webkit-slider-thumb { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-range-slider input::-webkit-slider-thumb { transition: none; } }
+`
+
+// Where n is along min..max, as a CSS percentage.
+fn range_slider_at(n: num, lo: num, hi: num) -> str = hi > lo ? `${round((n - lo) * 100 / (hi - lo), 3)}%` : "0%"
+
+component RangeSlider(name: str? = null, label: str? = null, min: num = 0, max: num = 100, step: num = 1,
+                      low: num? = null, high: num? = null, gap: num = 0, prefix: str = "", format: str = "",
+                      names: list? = null, show_value: bool = true, hint: str? = null, disabled: bool = false,
+                      field: str? = null, on_change = null, class: str? = null) {
+    state a = low ?? min
+    state b = high ?? max
+    state top = "b"
+    let id = field ?? `range-slider-${name ?? re.replace(lower(label ?? "range"), "[^a-z0-9]+", "-")}`
+    let sent = names ?? (name != null ? [`${name}_min`, `${name}_max`] : [null, null])
+    let show = (n: num) => `${prefix}${n}${format}`
+    let what = label ?? "Range"
+    let moved = (e, which: str) => {
+        let v = float(e.value)
+        if which == "a" {
+            let kept = v > b - gap ? b - gap : v
+            if kept != v { e.target.value = kept }
+            a = kept
+        } else {
+            let kept = v < a + gap ? a + gap : v
+            if kept != v { e.target.value = kept }
+            b = kept
+        }
+        // The thumb last moved stays on top, so two thumbs at one end can still be parted.
+        top = which
+        on_change && on_change(a, b)
+    }
+    <fieldset class={ui_cls(["ui-range-slider", class])} id={id} disabled={disabled}
+              aria-labelledby={label != null ? `${id}-label` : null} aria-describedby={hint != null ? `${id}-hint` : null}>
+        {(label != null || show_value) && <div.ui-range-slider-head>
+            {label != null && <span.ui-range-slider-label id={`${id}-label`}>{label}</span>}
+            {show_value && <output.ui-range-slider-value id={`${id}-out`} for={`${id}-min ${id}-max`} aria-live="polite">
+                {show(a)} – {show(b)}
+            </output>}
+        </div>}
+        <div.ui-range-slider-track style={`--lo: ${range_slider_at(a, min, max)}; --hi: ${range_slider_at(b, min, max)}`}>
+            <span.ui-range-slider-fill aria-hidden="true"></span>
+            <input type="range" id={`${id}-min`} name={sent[0]} min={min} max={max} step={step} value={a}
+                   class={top == "a" ? "ui-range-slider-top" : null}
+                   aria-label={`${what}, lowest`} aria-valuetext={show(a)}
+                   @input={(e) => moved(e, "a")}/>
+            <input type="range" id={`${id}-max`} name={sent[1]} min={min} max={max} step={step} value={b}
+                   class={top == "b" ? "ui-range-slider-top" : null}
+                   aria-label={`${what}, highest`} aria-valuetext={show(b)}
+                   @input={(e) => moved(e, "b")}/>
+        </div>
+        <div.ui-range-slider-scale aria-hidden="true"><span>{show(min)}</span><span>{show(max)}</span></div>
+        {hint != null && <p.ui-range-slider-hint id={`${id}-hint`}>{hint}</p>}
+    </fieldset>
+}

@@ -1,0 +1,129 @@
+// Sheet: a panel that rises from the bottom of the screen, as on a phone, half the
+// screen tall or all of it. Its handle (a button: click, Enter, or drag it) and the
+// arrow beside the title switch between the two; dragging it down from half closes
+// it. It is the browser's own <dialog>, so focus stays in it and Escape closes it;
+// so does a click above it, unless dismissable={false}.
+//
+//   <Sheet title="Share" trigger="Share">
+//       <p>Send the link to …</p>
+//   </Sheet>
+//   <Sheet title="Directions" open={showing} snap="full" on_close={() => { showing = false }}> ... </Sheet>
+//
+// title: its heading, and its name for screen readers. trigger: the text of a button
+// that opens it (styled as a Button when button_css is on the page). Inside one of
+// your components, open it from your own state instead: open={...} and on_close().
+// snap: the height it opens at, "half" (default) or "full". width: how wide it may
+// be on a large screen, in pixels (640).
+
+let sheet_css = css`
+.ui-sheet-host { display: contents; }
+.ui-sheet {
+  box-sizing: border-box; inset: auto 0 0 0; width: min(var(--w, 640px), 100vw); max-width: 100vw; height: var(--h); max-height: 100dvh;
+  margin: 0 auto; padding: 0; overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0;
+  border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0; background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); font: 15px/1.5 var(--ui-font); transition: height .22s cubic-bezier(.2, .8, .2, 1);
+  --h: 50dvh;
+}
+.ui-sheet-full { --h: calc(100dvh - 16px); }
+.ui-sheet-dragging { transition: none; }
+.ui-sheet::backdrop { background: var(--ui-overlay); }
+.ui-sheet[open] { display: flex; flex-direction: column; animation: ui-sheet-up .26s cubic-bezier(.2, .8, .2, 1); }
+@keyframes ui-sheet-up { from { transform: translateY(100%); } }
+.ui-sheet-grip {
+  display: grid; place-items: center; flex: none; width: 100%; height: 22px; padding: 0; border: 0; background: transparent;
+  cursor: grab; touch-action: none;
+}
+.ui-sheet-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); transition: background .15s, width .15s; }
+.ui-sheet-grip:hover span { width: 48px; background: var(--ui-muted); }
+.ui-sheet-grip:focus-visible { outline: none; }
+.ui-sheet-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sheet-dragging .ui-sheet-grip { cursor: grabbing; }
+.ui-sheet-head { display: flex; align-items: center; gap: 8px; flex: none; padding: 0 12px 10px 20px; border-bottom: 1px solid var(--ui-border); }
+.ui-sheet-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-sheet-btn {
+  display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-sheet-btn:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-sheet-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sheet-btn svg { width: 18px; height: 18px; transition: transform .2s; }
+.ui-sheet-full .ui-sheet-size svg { transform: rotate(180deg); }
+.ui-sheet-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 20px 24px; overscroll-behavior: contain; }
+.ui-sheet-body > :first-child { margin-top: 0; }
+.ui-sheet-body > :last-child { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .ui-sheet, .ui-sheet-btn svg { transition: none; } .ui-sheet[open] { animation: none; } }
+`
+
+component Sheet(title: str, trigger: str? = null, open: bool = false, snap: str = "half", width: int = 640,
+                dismissable: bool = true, on_close = null, children) {
+    state dlg = null
+    state full = snap == "full"
+    state sy = null
+    state dy = 0
+    state moved = false
+    if open && dlg != null && !dlg.open {
+        full = snap == "full"
+        dlg.showModal()
+    }
+    if !open && dlg != null && dlg.open && trigger == null { dlg.close() }
+    let show = () => {
+        full = snap == "full"
+        dlg.showModal()
+    }
+    let base = full ? "calc(100dvh - 16px)" : "50dvh"
+    <div.ui-sheet-host>
+        {trigger != null && <button.ui-btn.ui-btn-outline type="button" aria-haspopup="dialog" @click={show}>{trigger}</button>}
+        <dialog class={ui_cls(["ui-sheet", full && "ui-sheet-full", sy != null && "ui-sheet-dragging"])} aria-label={title}
+                style={sy != null ? `--w: ${width}px; --h: max(80px, min(calc(100dvh - 16px), calc(${base} - ${dy}px)))` : `--w: ${width}px`}
+                @mount={(el) => {
+                    dlg = el
+                    if open { el.showModal() }
+                }}
+                @close={() => {
+                    moved = false
+                    on_close && on_close()
+                }}
+                @click={(e) => {
+                    if dismissable && e.target.tagName == "DIALOG" && !moved { dlg.close() }
+                    if e.target.tagName == "DIALOG" { moved = false }
+                }}
+                @pointermove={(e) => { if sy != null { dy = e.clientY - sy } }}
+                @pointerup={() => {
+                    if sy != null {
+                        moved = abs(dy) > 6
+                        if dy < -60 { full = true }
+                        if dy > 60 { if full { full = false } else { dlg.close() } }
+                        sy = null
+                        dy = 0
+                    }
+                }}
+                @pointercancel={() => { sy = null; dy = 0 }}>
+            <button.ui-sheet-grip type="button" aria-label={full ? "Make it half the screen" : "Make it the full screen"}
+                    @pointerdown={(e) => {
+                        sy = e.clientY
+                        dy = 0
+                        moved = false
+                    }}
+                    @click={() => {
+                        if moved { moved = false } else { full = !full }
+                    }}
+                    @keydown={(e) => {
+                        if e.key == "ArrowUp" { e.preventDefault(); full = true }
+                        if e.key == "ArrowDown" { e.preventDefault(); if full { full = false } else { dlg.close() } }
+                    }}><span aria-hidden="true"></span></button>
+            <div.ui-sheet-head>
+                <h2>{title}</h2>
+                <button.ui-sheet-btn.ui-sheet-size type="button" aria-label="Full height"
+                        aria-pressed={full ? "true" : "false"} @click={() => { full = !full }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg>
+                </button>
+                <button.ui-sheet-btn type="button" aria-label="Close" @click={() => dlg.close()}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-sheet-body>{children}</div>
+        </dialog>
+    </div>
+}

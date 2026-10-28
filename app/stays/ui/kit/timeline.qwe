@@ -1,0 +1,49 @@
+// Timeline: what happened, in order, down a line of dots: an order's history, a
+// changelog, an activity feed.
+//
+//   <Timeline items={[
+//       { title: "Order placed", time: "Mar 3, 9:12", datetime: "2026-03-03T09:12" },
+//       { title: "Payment received", time: "Mar 3, 9:13", tone: "success" },
+//       { title: "Shipped", time: "Mar 4", body: "UPS 1Z999AA10123456784", tone: "accent" },
+//   ]}/>
+//
+// items: a list of { title, time, body?, tone?, datetime? }, in the order to show
+// them. time: when, as it should read ("2 hours ago"); datetime: the same in ISO
+// form for machines (<time datetime>), when time is not. body: a line or two of
+// detail. tone: the dot's colour, "neutral" (default), "accent", "success",
+// "warning", "danger" or "info". It is an <ol>, so screen readers count the steps.
+
+let timeline_css = css`
+.ui-timeline { margin: 0; padding: 0; list-style: none; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-timeline-item { position: relative; display: grid; grid-template-columns: 22px 1fr; gap: 10px; padding-bottom: 18px;
+  --t: var(--ui-strong); }
+.ui-timeline-item:last-child { padding-bottom: 0; }
+.ui-timeline-item::before { content: ""; position: absolute; left: 10px; top: 18px; bottom: -2px; width: 2px;
+  border-radius: 1px; background: var(--ui-border); }
+.ui-timeline-item:last-child::before { display: none; }
+.ui-timeline-dot { width: 12px; height: 12px; margin: 5px 0 0 5px; border-radius: 50%; background: var(--ui-surface);
+  border: 2.5px solid var(--t); }
+.ui-timeline-accent { --t: var(--ui-accent); }
+.ui-timeline-success { --t: var(--ui-success); }
+.ui-timeline-warning { --t: var(--ui-warning); }
+.ui-timeline-danger { --t: var(--ui-danger); }
+.ui-timeline-info { --t: var(--ui-info); }
+.ui-timeline-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 12px; }
+.ui-timeline-title { font-weight: 600; }
+.ui-timeline-head time { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-timeline-body { margin: 2px 0 0; color: var(--ui-muted); }
+`
+
+view Timeline(items: list, class: str? = null) =
+    <ol class={ui_cls(["ui-timeline", class])}>
+        {for it in items => <li class={ui_cls(["ui-timeline-item", it.tone != null && `ui-timeline-${it.tone}`])}>
+            <span.ui-timeline-dot aria-hidden="true"></span>
+            <div>
+                <div.ui-timeline-head>
+                    <span.ui-timeline-title>{it.title}</span>
+                    {it.time != null && <time datetime={it.datetime}>{it.time}</time>}
+                </div>
+                {it.body != null && <p.ui-timeline-body>{it.body}</p>}
+            </div>
+        </li>}
+    </ol>

@@ -1,0 +1,11 @@
+// Q-051 `xs | find(f) != null` is `xs | (find(f) != null)`: three errors about `find`'s arguments, the last "cannot call `this function`: it is bool", and none says that `|` binds looser than `!=`
+// mode: check
+// open-when: this function
+// fixed-when: parenthes
+// From FEEDBACK5.md (found on ae6a6e5). app/stays' activities show a booking form when the slot
+// picked is one of the activity's: `{act.slots | find((t) => t.id == slot) != null ? ... : null}`.
+// `quillo check` gave "argument 1 of `find` must be list | null, got fn", "missing argument `arg2`
+// in call to `find`" and "cannot call `this function`: it is bool, not a function". Writing
+// `(act.slots | find(...)) != null` works. In JavaScript, `xs.find(f) != null` needs no brackets.
+
+fn has_slot(slots: list, id: int) -> bool = slots | find((t) => t.id == id) != null

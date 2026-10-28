@@ -1,0 +1,53 @@
+// Skeleton: grey shapes where content will be, while it loads. Hidden from screen
+// readers (aria-hidden): say what is loading elsewhere, with a Spinner's label or
+// aria-busy on the region.
+//
+//   <Skeleton lines={3}/>
+//   <Skeleton shape="circle" width="48px"/>
+//   <Skeleton shape="rect" height="160px"/>
+//   <SkeletonCard/>
+//
+// shape: "text" (default), "rect" or "circle". lines: rows of text, the last one
+// shorter. width and height: any CSS length; text is as wide as its container,
+// a rect 100% by 120px, a circle 40px across (height defaults to width).
+// The shimmer stops with reduced motion. SkeletonCard: an avatar, two lines and a
+// picture, the shape of a typical card.
+
+let skeleton_css = css`
+.ui-skeleton { display: block; border-radius: var(--ui-radius-sm);
+  background: linear-gradient(90deg, var(--ui-subtle) 0%, color-mix(in srgb, var(--ui-subtle) 55%, var(--ui-strong)) 50%, var(--ui-subtle) 100%);
+  background-size: 200% 100%; animation: ui-skeleton-shine 1.4s ease-in-out infinite; }
+.ui-skeleton-lines { display: grid; gap: 8px; }
+.ui-skeleton-line { height: .8em; border-radius: 4px; font-size: 15px; }
+.ui-skeleton-line:last-child:not(:first-child) { width: 62%; }
+.ui-skeleton-rect { width: 100%; height: 120px; }
+.ui-skeleton-circle { width: 40px; height: 40px; border-radius: 50%; flex: none; }
+.ui-skeleton-card { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-skeleton-card-head { display: flex; align-items: center; gap: 12px; }
+.ui-skeleton-card-head > :last-child { flex: 1; }
+@keyframes ui-skeleton-shine { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .ui-skeleton { animation: none; background: var(--ui-subtle); } }
+`
+
+view Skeleton(shape: str = "text", lines: int = 1, width: str? = null, height: str? = null,
+              class: str? = null) {
+    let tall = height ?? (shape == "circle" ? width : null)
+    let size = ui_cls([width != null && `width: ${width};`, tall != null && `height: ${tall};`])
+    let style = size != "" ? size : null
+    shape == "text"
+        ? <div class={ui_cls(["ui-skeleton-lines", class])} style={style} aria-hidden="true">
+              {for i in range(lines < 1 ? 1 : lines) => <span.ui-skeleton.ui-skeleton-line></span>}
+          </div>
+        : <span class={ui_cls(["ui-skeleton", `ui-skeleton-${shape}`, class])} style={style} aria-hidden="true"></span>
+}
+
+view SkeletonCard(class: str? = null) =
+    <div class={ui_cls(["ui-skeleton-card", class])} aria-hidden="true">
+        <div.ui-skeleton-card-head>
+            <Skeleton shape="circle"/>
+            <Skeleton lines={2}/>
+        </div>
+        <Skeleton shape="rect" height="96px"/>
+        <Skeleton lines={3}/>
+    </div>

@@ -1,0 +1,124 @@
+// Lightbox: a grid of thumbnails that opens each image over the whole screen, with
+// its caption and "3 / 12", the next and previous a button, an arrow key or a swipe
+// away. It is the browser's own <dialog>, so Escape closes it; focus then goes back
+// to the thumbnail of the image last seen.
+//
+//   <Lightbox label="Kitchen renovation" images={[
+//       { src: "/photos/before.jpg", thumb: "/photos/before-sm.jpg", alt: "The old kitchen", caption: "Before: March" },
+//       { src: "/photos/after.jpg", thumb: "/photos/after-sm.jpg", alt: "The new kitchen", caption: "After: June" },
+//   ]}/>
+//
+// images: a list of { src, alt, thumb?, caption? }: src is the full image, thumb a
+// smaller one for the grid (src when there is none), alt what it shows (for screen
+// readers; also the name of its thumbnail), caption a line shown under it.
+// label: the gallery's name ("Images"). size: the thumbnails' width at least, in
+// pixels (140); they fill the row. ratio: their shape ("1", "4/3", "16/9"...).
+// loop (true): next from the last goes to the first.
+
+let lightbox_css = css`
+.ui-lb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(var(--s, 140px), 100%), 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-lb-thumb {
+  display: block; width: 100%; padding: 0; overflow: hidden; border: 0; border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); cursor: zoom-in; aspect-ratio: var(--r, 1);
+}
+.ui-lb-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .25s; }
+.ui-lb-thumb:hover img { transform: scale(1.04); }
+.ui-lb-thumb:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--ui-bg), 0 0 0 5px var(--ui-accent); }
+.ui-lb {
+  width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0;
+  background: color-mix(in srgb, var(--ui-bg) 94%, transparent); color: var(--ui-fg); font: 14px/1.4 var(--ui-font);
+}
+.ui-lb[open] { display: grid; grid-template-rows: auto 1fr auto; animation: ui-lb-in .18s ease-out; }
+.ui-lb::backdrop { background: var(--ui-overlay); backdrop-filter: blur(4px); }
+@keyframes ui-lb-in { from { opacity: 0; } }
+.ui-lb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px 10px 18px; }
+.ui-lb-count { margin: 0; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-lb-stage { position: relative; display: grid; place-items: center; min-height: 0; padding: 0 64px; touch-action: pan-y; }
+.ui-lb-stage img {
+  display: block; max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--ui-radius-sm);
+  box-shadow: var(--ui-shadow-lg); user-select: none; -webkit-user-drag: none;
+}
+.ui-lb-cap { margin: 0; padding: 12px 18px 18px; text-align: center; color: var(--ui-fg); }
+.ui-lb-btn {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); cursor: pointer;
+}
+.ui-lb-btn:hover:not(:disabled) { background: var(--ui-subtle); }
+.ui-lb-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-lb-btn:disabled { opacity: .35; cursor: default; }
+.ui-lb-btn svg { width: 20px; height: 20px; }
+.ui-lb-prev, .ui-lb-next { position: absolute; top: 50%; transform: translateY(-50%); }
+.ui-lb-prev { left: 12px; }
+.ui-lb-next { right: 12px; }
+.ui-lb-x { width: 40px; height: 40px; box-shadow: none; }
+@media (max-width: 600px) {
+  .ui-lb-stage { padding: 0 8px; }
+  .ui-lb-prev, .ui-lb-next { top: auto; bottom: 8px; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-lb[open] { animation: none; } .ui-lb-thumb img { transition: none; } }
+`
+
+component Lightbox(images: list = [], label: str = "Images", size: int = 140, ratio: str = "1", loop: bool = true,
+                   class: str? = null) {
+    state dlg = null
+    state at = 0
+    state sx = null
+    let n = len(images)
+    let cur = images[at] ?? { src: "", alt: "" }
+    let go = (i: int) => {
+        if n > 0 { at = loop ? (i + n) % n : max([0, min([i, n - 1])]) }
+    }
+    let show = (i: int) => {
+        at = i
+        dlg.showModal()
+    }
+    <div class={class}>
+        <ul.ui-lb-grid aria-label={label} style={`--s: ${size}px; --r: ${ratio}`}>
+            {for [i, im] in enumerate(images) => <li key={im.src}>
+                <button.ui-lb-thumb type="button" data-i={i} aria-haspopup="dialog" @click={() => { show(i) }}>
+                    <img src={get(im, "thumb") ?? im.src} alt={im.alt} loading="lazy"/>
+                </button>
+            </li>}
+        </ul>
+        <dialog.ui-lb aria-label={label} aria-roledescription="image viewer"
+                @mount={(el) => { dlg = el }}
+                @close={(e) => {
+                    let thumb = e.target.parentElement.querySelector(`.ui-lb-thumb[data-i="${at}"]`)
+                    thumb && thumb.focus()
+                }}
+                @keydown={(e) => {
+                    if e.key == "ArrowRight" { e.preventDefault(); go(at + 1) }
+                    if e.key == "ArrowLeft" { e.preventDefault(); go(at - 1) }
+                    if e.key == "Home" { e.preventDefault(); go(0) }
+                    if e.key == "End" { e.preventDefault(); go(n - 1) }
+                }}>
+            <div.ui-lb-top>
+                <p.ui-lb-count aria-live="polite" aria-atomic="true">{at + 1} / {n}</p>
+                <button.ui-lb-btn.ui-lb-x type="button" aria-label="Close" @click={() => dlg.close()}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-lb-stage
+                 @click={(e) => { if e.target.classList.contains("ui-lb-stage") { dlg.close() } }}
+                 @pointerdown={(e) => { sx = e.clientX }}
+                 @pointerup={(e) => {
+                     if sx != null && abs(e.clientX - sx) > 50 { go(e.clientX < sx ? at + 1 : at - 1) }
+                     sx = null
+                 }}>
+                <img src={cur.src} alt={cur.alt} draggable="false"/>
+                <button.ui-lb-btn.ui-lb-prev type="button" aria-label="Previous image" disabled={!loop && at == 0}
+                        @click={() => { go(at - 1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+                </button>
+                <button.ui-lb-btn.ui-lb-next type="button" aria-label="Next image" disabled={!loop && at == n - 1}
+                        @click={() => { go(at + 1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+                </button>
+            </div>
+            <p.ui-lb-cap>{get(cur, "caption") ?? cur.alt}</p>
+        </dialog>
+    </div>
+}

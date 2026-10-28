@@ -1,0 +1,65 @@
+// Tag: a chip for something people pick, add or filter by: a label on an issue,
+// a topic, an active filter. (A status or a count is a Badge.)
+//
+//   <Tag>design</Tag>
+//   <Tag tone="accent" href="/topics/rust">rust</Tag>
+//   <Tag tone="success" dot={true}>shipped</Tag>
+//   <Tag removable={true} label="design" on_remove={() => { tags = tags | filter((t) => t != "design") }}>design</Tag>
+//
+// tone: "neutral" (default), "accent", "success", "warning", "danger" or "info".
+// href makes it a link. dot: a coloured dot before the text. size: "sm" or "md".
+// removable shows a × button that calls on_remove(), inside one of your
+// components; label is the tag's text for its name ("Remove design").
+// selected: shown as chosen (a filter that is on), with aria-pressed when
+// on_click is given: on_click() makes the whole tag a toggle button.
+
+let tag_css = css`
+.ui-tag {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; max-width: 100%;
+  border: 1px solid color-mix(in srgb, var(--t) 22%, var(--ui-border)); border-radius: var(--ui-radius-sm);
+  background: var(--ts); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); text-decoration: none;
+  vertical-align: middle; white-space: nowrap; --t: var(--ui-strong); --ts: var(--ui-subtle);
+}
+.ui-tag-accent { --t: var(--ui-accent); --ts: var(--ui-accent-soft); }
+.ui-tag-success { --t: var(--ui-success); --ts: var(--ui-success-soft); }
+.ui-tag-warning { --t: var(--ui-warning); --ts: var(--ui-warning-soft); }
+.ui-tag-danger { --t: var(--ui-danger); --ts: var(--ui-danger-soft); }
+.ui-tag-info { --t: var(--ui-info); --ts: var(--ui-info-soft); }
+.ui-tag:not(.ui-tag-neutral) { color: color-mix(in srgb, var(--t) 80%, var(--ui-fg)); }
+.ui-tag-text { overflow: hidden; text-overflow: ellipsis; }
+.ui-tag-link { display: inline-flex; align-items: center; gap: inherit; min-width: 0; color: inherit; text-decoration: none; border-radius: 3px; }
+.ui-tag-link:hover { text-decoration: underline; }
+.ui-tag-link:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tag-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--t); }
+.ui-tag-neutral .ui-tag-dot { background: var(--ui-muted); }
+a.ui-tag, button.ui-tag { cursor: pointer; transition: border-color .15s, background .15s; }
+button.ui-tag { font: 500 13px/1 var(--ui-font); }
+a.ui-tag:hover, button.ui-tag:hover { border-color: color-mix(in srgb, var(--t) 60%, var(--ui-border)); }
+a.ui-tag:focus-visible, button.ui-tag:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tag-selected { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-tag-sm { height: 22px; padding: 0 8px; font-size: 12px; gap: 5px; }
+.ui-tag-x {
+  display: grid; place-items: center; width: 18px; height: 18px; margin-right: -5px; padding: 0; border: 0;
+  border-radius: 4px; background: transparent; color: inherit; font-size: 15px; line-height: 1; opacity: .6; cursor: pointer;
+}
+.ui-tag-x:hover { opacity: 1; background: color-mix(in srgb, currentColor 14%, transparent); }
+.ui-tag-x:focus-visible { outline: none; opacity: 1; box-shadow: var(--ui-focus); }
+.ui-tag-sm .ui-tag-x { width: 16px; height: 16px; margin-right: -4px; }
+@media (prefers-reduced-motion: reduce) { a.ui-tag, button.ui-tag { transition: none; } }
+`
+
+view Tag(tone: str = "neutral", href: str? = null, dot: bool = false, size: str = "md", removable: bool = false,
+         label: str? = null, selected: bool = false, on_remove = null, on_click = null, class: str? = null, children) {
+    let cls = ui_cls(["ui-tag", `ui-tag-${tone}`, size != "md" && `ui-tag-${size}`, selected && "ui-tag-selected", class])
+    let body = [dot && <span.ui-tag-dot aria-hidden="true"></span>, <span.ui-tag-text>{children}</span>]
+    href != null && !removable
+        ? <a class={cls} href={href}>{body}</a>
+        : on_click != null && !removable
+            ? <button class={cls} type="button" aria-pressed={selected ? "true" : "false"}
+                      @click={() => { on_click() }}>{body}</button>
+            : <span class={cls}>
+                  {href != null ? <a.ui-tag-link href={href}>{body}</a> : body}
+                  {removable && <button.ui-tag-x type="button" aria-label={label != null ? `Remove ${label}` : "Remove"}
+                                        @click={() => { on_remove && on_remove() }}>×</button>}
+              </span>
+}

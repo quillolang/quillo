@@ -1,0 +1,145 @@
+// Paying for a hold, the guest's trips (cancelling with the refund shown
+// first, reviews after a stay), and saved places.
+
+view CheckoutPage(me, id: int) =
+    <Shell {me} title="Confirm and pay">
+        <Checkout {id}/>
+    </Shell>
+
+component Checkout(id: int) {
+    state b = live(load_booking, id)
+    state number = ""
+    state expiry = ""
+    state cvc = ""
+    state busy = false
+    state problem = null
+    state ran_out = false
+    let step = b == null ? 0 : b.status == "held" ? 1 : 2
+    {b == null
+        ? <EmptyState title="No such booking" icon="search" actions={<Button href="/trips">Your trips</Button>}/>
+        : <div>
+            <Steps steps={["Dates", "Pay", b.status == "requested" ? "Host accepts" : "Booked"]} current={step}/>
+            <div.checkout>
+                <section>
+                    {match b.status {
+                        "held" => <div.stack>
+                            <h1>Confirm and pay</h1>
+                            {ran_out
+                                ? <Alert tone="warning" title="Your 10 minutes ran out">The nights were let go. <a href={`/stays/${b.listing_id}?start=${b.start_day}&end=${b.end_day}&guests=${b.guests}`}>Choose them again</a></Alert>
+                                : <div.row>
+                                    <span>Nights held for you for</span>
+                                    <Countdown seconds={max([0, ceil((b.held_until - b.now) / 1000)])} variant="inline" size="sm" ended="no longer" on_end={() => { ran_out = true }}/>
+                                </div>}
+                            <form.stack id="pay" @submit={(e) => {
+                                busy = true
+                                problem = null
+                                let r = pay_booking(id, { number, expiry, cvc })
+                                busy = false
+                                if is_err(r) { problem = r.error }
+                            }}>
+                                <TextField label="Card number" name="number" value={number} autocomplete="cc-number" placeholder="4242 4242 4242 4242" on_input={(v) => { number = v }}/>
+                                <div.row>
+                                    <TextField label="Expiry" name="expiry" value={expiry} autocomplete="cc-exp" placeholder="MM/YY" on_input={(v) => { expiry = v }}/>
+                                    <TextField label="CVC" name="cvc" value={cvc} autocomplete="cc-csc" placeholder="123" on_input={(v) => { cvc = v }}/>
+                                </div>
+                                <Problem text={problem}/>
+                                <Button type="submit" loading={busy} disabled={ran_out} full={true}>{b.listing.instant_book == 1 ? `Pay ${b.total_shown}` : `Request, ${b.total_shown}`}</Button>
+                                <p.muted.small>A demo: no money moves. 4242 4242 4242 4242 works; 4000 0000 0000 0002 is declined.</p>
+                            </form>
+                            <Button variant="ghost" on_click={() => {
+                                release_hold(id)
+                                navigate(`/stays/${b.listing_id}`)
+                            }}>Let the nights go</Button>
+                        </div>
+                        "confirmed" => <Alert tone="success" title="Booked" class="booked">See you on {day_label(b.start_day)} from {b.listing.check_in}. Card ending {b.card_last4}. <a href="/trips">Your trips</a></Alert>
+                        "requested" => <Alert tone="info" title="Request sent" class="requested">The host has until <Countdown seconds={max([0, ceil((b.respond_by - b.now) / 1000)])} variant="inline" size="sm"/> to accept. Your nights are kept meanwhile. <a href="/trips">Your trips</a></Alert>
+                        "declined" => <Alert tone="warning" title="The host declined">Nothing was charged. <a href="/">Search again</a></Alert>
+                        "expired" => <Alert tone="warning" title="This booking ran out" class="expired">The nights were let go. <a href={`/stays/${b.listing_id}`}>Choose them again</a></Alert>
+                        _ => <Alert tone="neutral" title="Cancelled">{b.refund != null ? `Refund: ${b.refund}` : ""}</Alert>
+                    }}
+                </section>
+                <Card title={b.listing.title} subtitle={`${b.dates} · ${plural(b.guests, "guest")}`}>
+                    <img.photo src={b.listing.photo_urls[0]} alt=""/>
+                    <ul.lines>
+                        {for x in b.lines => <li key={x.kind} class={x.kind}><span>{x.label}</span><span>{x.shown}</span></li>}
+                        <li.total><span>Total</span><span id="checkout-total">{b.total_shown}</span></li>
+                    </ul>
+                    <p.muted.small>{b.listing.policy.title} cancelling: {b.listing.policy.says}</p>
+                </Card>
+            </div>
+        </div>}
+}
+
+let TRIP_STATUS = {
+    confirmed: { tone: "success", label: "Booked" },
+    requested: { tone: "info", label: "Waiting for the host" },
+    declined: { tone: "warning", label: "Declined" },
+    cancelled: { tone: "neutral", label: "Cancelled" },
+    expired: { tone: "neutral", label: "Ran out" },
+}
+
+view TripsPage(me) = <Shell {me} title="Trips" here="/trips"><Trips/></Shell>
+
+component Trips() {
+    state t = live(load_trips)
+    state reviewing = null
+    state stars = 5
+    state words = ""
+    state problem = null
+    {t == null
+        ? <EmptyState title="Sign in to see your trips" icon="search"/>
+        : <div>
+            <h1>Trips</h1>
+            <Problem text={problem}/>
+            <h2>Coming up</h2>
+            {len(t.upcoming) == 0 ? <p.muted>Nothing booked. <a href="/">Find a place</a></p> : null}
+            {for b in t.upcoming => <TripRow key={b.id} {b}>
+                <Button variant="outline" tone="danger" size="sm" class="cancel" on_click={() => {
+                    let p = cancel_preview(b.id)
+                    if is_err(p) { problem = p.error; return null }
+                    let yes = ask(`${p.why}. You get back ${p.shown} of ${p.of}.`, { title: "Cancel this stay?", ok: "Cancel the stay", cancel: "Keep it", tone: "danger" })
+                    if yes {
+                        let r = cancel_booking(b.id)
+                        if is_err(r) { problem = r.error } else { notify(`Cancelled: ${r.shown} back`, { tone: "success" }) }
+                    }
+                }}>Cancel</Button>
+            </TripRow>}
+            <h2>Where you've been</h2>
+            {len(t.past) == 0 ? <p.muted>No stays yet.</p> : null}
+            {for b in t.past => <TripRow key={b.id} {b}>
+                {b.reviewable
+                    ? (reviewing == b.id
+                        ? <form.stack @submit={(e) => {
+                            let r = leave_review(b.id, stars, words)
+                            if is_err(r) { problem = r.error } else { reviewing = null; words = ""; problem = null }
+                        }}>
+                            <Rating name={`stars-${b.id}`} label="Stars" value={stars} on_change={(v) => { stars = v }}/>
+                            <TextArea name="body" label="For the next guests" value={words} on_input={(v) => { words = v }}/>
+                            <Button type="submit" size="sm">Post review</Button>
+                        </form>
+                        : <Button size="sm" variant="outline" on_click={() => { reviewing = b.id }}>Review</Button>)
+                    : <span.muted.small>{b.reviewed > 0 ? "Reviewed" : ""}</span>}
+            </TripRow>}
+            {len(t.other) > 0 ? <h2>Cancelled and declined</h2> : null}
+            {for b in t.other => <TripRow key={b.id} {b}><span.muted.small>{b.refund_shown != null ? `${b.refund_shown} back` : ""}</span></TripRow>}
+        </div>}
+}
+
+view TripRow(b, children) =
+    <div.trip data-trip={b.id}>
+        <img src={b.photo} alt=""/>
+        <div>
+            <a href={`/stays/${b.listing_id}`}><b>{b.title}</b></a>
+            <div.muted.small>{b.city} · {b.dates} · {plural(b.guests, "guest")} · {b.total_shown}</div>
+            <Badge tone={(get(TRIP_STATUS, b.status) ?? { tone: "neutral" }).tone} size="sm">{(get(TRIP_STATUS, b.status) ?? { label: b.status }).label}</Badge>
+        </div>
+        <div.actions>{children}</div>
+    </div>
+
+view SavedPage(me, rows: list) =
+    <Shell {me} title="Saved" here="/saved">
+        <h1>Saved</h1>
+        {len(rows) == 0
+            ? <EmptyState title="Nothing saved yet" icon="search" actions={<Button href="/">Explore</Button>}>Tap ♡ Save on a place to keep it here.</EmptyState>
+            : <div.results>{for l in rows => <ResultCard key={l.id} l={l} href={`/stays/${l.id}`} on={false}/>}</div>}
+    </Shell>

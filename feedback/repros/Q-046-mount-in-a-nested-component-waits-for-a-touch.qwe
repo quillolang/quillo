@@ -1,0 +1,23 @@
+// Q-046 A component that runs by itself (`@mount`, `live`, `every`) inside another component does not start when the page is idle, as the guide says: only once someone hovers, touches or focuses the outer one
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 2500)); return { inner: document.getElementById("inner").textContent }
+// open-when: "inner": "waiting"
+// fixed-when: "inner": "mounted"
+// From FEEDBACK5.md (found on ae6a6e5). In app/stays the search page's map (Leaflet, started in an
+// `@mount`) is in <StaysMap> inside <SearchApp>: the map stayed empty, with no tiles and no pins,
+// until the mouse passed over the page. The same with `live(...)` or `every(...)` in the inner
+// component. It starts at once when it is at the top (or the outer one runs by itself), and when
+// the outer one is <body>'s own child (an "app"), which hides the problem in small examples.
+
+component Inner(id: str) {
+    state said = "waiting"
+    <p id={id} @mount={(el) => { said = "mounted" }}>{said}</p>
+}
+
+component Outer() {
+    state n = 0
+    <div><button @click={() => { n += 1 }}>{n}</button><Inner id="inner"/></div>
+}
+
+route GET / = <html><body><main><Outer/></main></body></html>
