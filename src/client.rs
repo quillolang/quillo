@@ -496,7 +496,8 @@ fn assemble(open: &str, program: &str, close: &str) -> String {
 }
 
 /// The runtime cut into its top-level declarations (`function f`, `const x`,
-/// `class C`, `B.name = ...`, `W.name = ...`), in order.
+/// `class C`, `B.name = ...`, `W.name = ...`), in order, without the lines
+/// for development.
 struct Runtime {
     preamble: String,
     units: Vec<(String, String)>,
@@ -508,7 +509,9 @@ fn runtime_units() -> &'static Runtime {
     RT.get_or_init(|| {
         let mut preamble = String::new();
         let mut units: Vec<(String, String)> = Vec::new();
-        for line in RUNTIME.lines() {
+        // Lines ending `// dev` are for development bundles only, which
+        // take the runtime as it is written.
+        for line in RUNTIME.lines().filter(|l| !l.trim_end().ends_with("// dev")) {
             let decl = ["async function ", "function ", "class ", "const ", "let "]
                 .iter()
                 .find_map(|p| line.strip_prefix(p))
@@ -626,13 +629,130 @@ fn event_name(ev: &str) -> &str {
 
 /// Drops comment lines, blank lines and indentation.
 fn minify_into(js: &str, out: &mut String) {
+    let mut scan = Scan::default();
     for line in js.lines() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with("//") {
+        if scan.code() && (t.is_empty() || t.starts_with("//")) {
             continue;
         }
-        out.push_str(t);
-        out.push('\n');
+        out.push_str(if scan.code() { t } else { line });
+        // A newline after `;`, `{` or `,` in code changes nothing: the
+        // statement there is ended, or goes on, either way.
+        if !(scan.line(t) && t.ends_with([';', '{', ','])) {
+            out.push('\n');
+        }
+    }
+}
+
+/// Whether code ends with a keyword after which `/` starts a regular
+/// expression (`return /x/`), not a division.
+fn after_keyword(code: &[u8]) -> bool {
+    let t = std::str::from_utf8(code).unwrap_or("").trim_end();
+    let word = t.rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).next().unwrap_or("");
+    matches!(word, "return" | "typeof" | "case" | "in" | "of" | "delete" | "void" | "throw" | "new" | "else" | "do" | "yield" | "await")
+}
+
+/// Where a scan of JavaScript is at the end of a line: in code (and how
+/// many `${` of templates deep), or inside a template that goes on.
+#[derive(Default)]
+struct Scan {
+    /// Template literals open, innermost last: the brace depth inside each
+    /// one's current `${...}`, or None while in its text.
+    templates: Vec<Option<u32>>,
+}
+
+impl Scan {
+    fn code(&self) -> bool {
+        self.templates.is_empty()
+    }
+
+    /// Scans a line; whether it ends in code, outside any string, template,
+    /// regular expression or comment, and the scan is sure of it. A
+    /// comment, or a `/` it cannot place, makes it unsure.
+    fn line(&mut self, l: &str) -> bool {
+        let b = l.as_bytes();
+        let mut i = 0;
+        // The last character of code before here, to tell a regular
+        // expression's `/` from a division's.
+        let mut prev = b' ';
+        while i < b.len() {
+            let c = b[i];
+            match self.templates.last_mut() {
+                // A template's text.
+                Some(None) => {
+                    match c {
+                        b'\\' => i += 1,
+                        b'`' => {
+                            self.templates.pop();
+                            prev = b'`';
+                        }
+                        b'$' if b.get(i + 1) == Some(&b'{') => {
+                            *self.templates.last_mut().unwrap() = Some(0);
+                            i += 1;
+                            prev = b'{';
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                    continue;
+                }
+                Some(Some(depth)) if c == b'}' => {
+                    if *depth == 0 {
+                        *self.templates.last_mut().unwrap() = None;
+                    } else {
+                        *depth -= 1;
+                    }
+                    prev = b'}';
+                    i += 1;
+                    continue;
+                }
+                Some(Some(depth)) if c == b'{' => {
+                    *depth += 1;
+                    prev = b'{';
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            match c {
+                b'"' | b'\'' => {
+                    i += 1;
+                    while i < b.len() && b[i] != c {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    if i >= b.len() {
+                        return false;
+                    }
+                    prev = c;
+                }
+                b'`' => self.templates.push(None),
+                b'/' if matches!(b.get(i + 1), Some(b'/' | b'*')) => return false,
+                b'/' if b"(,=:[!&|?{};+-*%<>~^".contains(&prev) || prev == b' ' && i == 0 || after_keyword(&b[..i]) => {
+                    // A regular expression, to its closing `/`.
+                    let mut class = false;
+                    i += 1;
+                    while i < b.len() && (class || b[i] != b'/') {
+                        match b[i] {
+                            b'\\' => i += 1,
+                            b'[' => class = true,
+                            b']' => class = false,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if i >= b.len() {
+                        return false;
+                    }
+                    prev = b'/';
+                }
+                b'/' if prev.is_ascii_alphanumeric() || b")]}_$\"'`".contains(&prev) => prev = b'/',
+                b'/' => return false,
+                b' ' | b'\t' => {}
+                _ => prev = c,
+            }
+            i += 1;
+        }
+        self.code()
     }
 }
 
@@ -3129,5 +3249,51 @@ fn fixed(e: &Expr) -> Option<&Lit> {
     match e {
         Expr::Lit(l) => Some(l),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod minify_tests {
+    fn min(js: &str) -> String {
+        let mut out = String::new();
+        super::minify_into(js, &mut out);
+        out
+    }
+
+    /// The whole runtime, as production bundles take it (without the lines
+    /// for development), minified: still JavaScript.
+    #[test]
+    fn the_minified_runtime_is_still_javascript() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let rt = super::runtime_units();
+        let mut js = String::new();
+        super::minify_into(&rt.preamble, &mut js);
+        for (_, text) in &rt.units {
+            super::minify_into(text, &mut js);
+        }
+        assert!(!js.contains("// dev"));
+        let f = std::env::temp_dir().join(format!("quillo-runtime-{}.js", std::process::id()));
+        std::fs::write(&f, &js).unwrap();
+        let out = std::process::Command::new("node").arg("--check").arg(&f).output().unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn newlines_go_only_where_they_change_nothing() {
+        // After `;`, `{` and `,` in code: joined, indentation and comment
+        // lines gone.
+        assert_eq!(min("function f(a,\n    b) {\n  // why\n  let x = 1;\n  return x\n}\n"), "function f(a,b) {let x = 1;return x\n}\n");
+        // A newline that may end a statement stays.
+        assert_eq!(min("let a = b\n(c)\n"), "let a = b\n(c)\n");
+        // A template that goes on over lines keeps its text, indentation and
+        // all, and what looks like a comment in it.
+        assert_eq!(min("const t = `a;\n  // b,\n  ${x};\n  c`;\nf();\n"), "const t = `a;\n  // b,\n  ${x};\n  c`;f();");
+        assert_eq!(min("const t = `${ { a: 1 }.a },\n`;\ng();\n"), "const t = `${ { a: 1 }.a },\n`;g();");
+        // Strings, regular expressions and comments with quotes, backticks
+        // and slashes in them; a line ending in a comment keeps its newline.
+        assert_eq!(min("const q = \"`\";\nconst r = /[`/]x/g;\nreturn /`;/.test(s);\nx = a / b;\nf(); // a,\ng();\n"), "const q = \"`\";const r = /[`/]x/g;return /`;/.test(s);x = a / b;f(); // a,\ng();");
     }
 }

@@ -6,7 +6,8 @@
 // Where the program is mounted ("" at the root); the bundle sets it.
 let BASE = "";
 // Development (`--watch`): a page the browser makes again, rather than
-// taking up the server's HTML, says why.
+// taking up the server's HTML, says why. Lines ending `// dev` say it, and
+// are left out of production bundles (see `runtime_units` in client.rs).
 let DEV = false;
 const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !== "/" ? BASE + u : u);
 
@@ -3346,8 +3347,11 @@ const isText = (x) => typeof x === "string" || typeof x === "number" || x instan
 let claiming = 0;
 
 class Mismatch extends Error {}
-// What the page has where the code expected something else, for Mismatch.
-const onPage = (n) => !n ? "nothing" : n.nodeType === 3 ? JSON.stringify(n.data.slice(0, 80)) : n.nodeType === 1 ? `<${n.localName}>` : "a comment";
+// With --watch, what was being taken up last: the page's node, and what
+// the browser makes there. A Mismatch is thrown right after, so it is what
+// differed (see `resume`).
+let wanted = null; // dev
+const onPage = (n) => !n ? "nothing" : n.nodeType === 3 ? JSON.stringify(n.data.slice(0, 80)) : n.nodeType === 1 ? `<${n.localName}>` : "a comment"; // dev
 
 // The page's text node at `c.n`, taken up as text `t`: split where the
 // browser joined it with text after it; an empty one is made.
@@ -3358,11 +3362,11 @@ function claimText(c, t) {
     return e;
   }
   const n = c.n;
-  if (n && n.nodeType === 3) {
-    if (n.data === t) { c.n = n.nextSibling; return n; }
-    if (n.data.startsWith(t)) { c.n = n.splitText(t.length); return n; }
-  }
-  throw new Mismatch(`the server wrote ${onPage(n)}, the browser ${JSON.stringify(t.slice(0, 80))}`);
+  if (DEV) wanted = [n, JSON.stringify(t.slice(0, 80))]; // dev
+  if (!n || n.nodeType !== 3) throw new Mismatch("text");
+  if (n.data === t) { c.n = n.nextSibling; return n; }
+  if (n.data.startsWith(t)) { c.n = n.splitText(t.length); return n; }
+  throw new Mismatch("text");
 }
 
 // The nodes for value `v` (text, markup, a list of them), into `out`.
@@ -3460,8 +3464,9 @@ function dynAllApply(x) {
 function rest(el, n) {
   while (n) {
     const next = n.nextSibling;
+    if (DEV) wanted = [n, "nothing"]; // dev
     if (n.nodeType === 3 && n.data === "") el.removeChild(n);
-    else throw new Mismatch(`the server wrote ${onPage(n)} after what the browser makes`);
+    else throw new Mismatch("extra");
     n = next;
   }
 }
@@ -3561,7 +3566,8 @@ const inner = (tp, svg) => (svg || tp[0] === "svg") && tp[0] !== "foreignObject"
 
 // The page's element `el` taken up as template `tp`.
 function claimEl(tp, el, vals, svg) {
-  if (!el || el.nodeType !== 1 || el.localName.toLowerCase() !== String(tp[0]).toLowerCase()) throw new Mismatch(`the server wrote ${onPage(el)}, the browser <${tp[0]}>`);
+  if (DEV) wanted = [el, `<${tp[0]}>`]; // dev
+  if (!el || el.nodeType !== 1 || el.localName.toLowerCase() !== String(tp[0]).toLowerCase()) throw new Mismatch("element");
   claiming++;
   try { for (const h of tp[3]) hole(el, h[0], h[1], vals[h[2]], svg, h[2]); } finally { claiming--; }
   const kids = tp[2], sv = inner(tp, svg);
@@ -3725,7 +3731,8 @@ function rawHtml(html) {
       c.p.insertBefore(wrap, c.n);
       for (let i = 0; i < t.content.childNodes.length; i++) {
         const m = wrap.nextSibling;
-        if (!m) throw new Mismatch("the server wrote other HTML than raw(...) makes in the browser");
+        if (DEV) wanted = [null, "raw(...)'s HTML"]; // dev
+        if (!m) throw new Mismatch("raw");
         wrap.appendChild(m);
       }
       c.n = wrap.nextSibling;
@@ -4278,13 +4285,22 @@ class Inst extends Scope {
 // own root element, marked data-qi.
 const ISLANDS = "quillo-island,[data-qi]";
 const ownRoot = (el) => el.localName !== "quillo-island";
-const TABLE_PARTS = new Set(["tr", "td", "th", "thead", "tbody", "tfoot", "caption", "colgroup", "option", "optgroup"]);
+// The parts src/island.rs lists (a text node's localName is undefined).
+const TABLE_PART = /^(t[rdh]|thead|tbody|tfoot|caption|colgroup|option|optgroup)$/;
+// A <quillo-island> the page makes, which stands anywhere.
+function wrapper(name) {
+  const w = document.createElement("quillo-island");
+  w.style.display = "contents";
+  w.dataset.c = name;
+  w.__q = true;
+  return w;
+}
 // A component the page made in wrapper `w`: when its markup is one table
 // or select part, that element becomes the island, as the server writes it
 // (src/island.rs), so a row is a row of its table (`tbody.rows`, CSS).
 function asOwnRoot(w, inst) {
   const r = w.firstChild;
-  if (!r || r !== w.lastChild || r.nodeType !== 1 || !TABLE_PARTS.has(r.localName)) return w;
+  if (!r || r !== w.lastChild || !TABLE_PART.test(r.localName)) return w;
   r.setAttribute("data-qi", "");
   r.dataset.c = w.dataset.c;
   r.__q = true;
@@ -4298,14 +4314,11 @@ function island(def, props, h, c) {
   let el;
   if (c.claim) {
     el = c.n;
-    if (!el || el.nodeType !== 1 || !el.matches(ISLANDS) || el.dataset.c !== def.$name) throw new Mismatch(`the server wrote ${onPage(el)}, the browser <${def.$name}>`);
+    if (DEV) wanted = [el, `<${def.$name}>`]; // dev
+    if (!el || el.nodeType !== 1 || !el.matches(ISLANDS) || el.dataset.c !== def.$name) throw new Mismatch("component");
     el.__q = true;
     c.n = el.nextSibling;
-  } else {
-    el = document.createElement("quillo-island");
-    el.style.display = "contents";
-    el.dataset.c = def.$name;
-  }
+  } else el = wrapper(def.$name);
   inst.el = el;
   run(inst, el, c.claim);
   return c.claim ? el : asOwnRoot(el, inst);
@@ -4326,7 +4339,8 @@ function run(inst, el, claim) {
       const after = el.nextSibling;
       const c = { p: el.parentNode, n: el, claim: true, svg: false };
       put(view, c, []);
-      if (c.n !== after) throw new Mismatch(`the server wrote ${onPage(c.n)} after what the browser makes`);
+      if (DEV) wanted = [c.n, "nothing"]; // dev
+      if (c.n !== after) throw new Mismatch("extra");
     } else if (claim) {
       const c = { p: el, n: el.firstChild, claim: true, svg: false };
       put(view, c, []);
@@ -4423,7 +4437,7 @@ function resume(el) {
     if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
   } catch (e) {
     if (!(e instanceof Mismatch)) report(e);
-    else if (DEV) console.warn(`quillo: <${el.dataset.c}> was made again, not taken up from the server's HTML: ${e.message}`);
+    else if (DEV && wanted) console.warn(`quillo: <${el.dataset.c}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
     ok = false;
   }
   if (!ok) {
@@ -4432,22 +4446,15 @@ function resume(el) {
     dispose(inst);
     hydrating = queue();
     if (ownRoot(el)) {
-      // Made by the page, a <quillo-island> stands anywhere.
-      const w = document.createElement("quillo-island");
-      w.style.display = "contents";
-      w.dataset.c = el.dataset.c;
-      w.__q = true;
+      const w = wrapper(el.dataset.c);
       el.replaceWith(w);
       el = w;
     } else el.replaceChildren();
     inst = new Inst(def, props, state, liveInfo);
     inst.el = el;
     run(inst, el, false);
-    if (el.localName === "quillo-island" && el.dataset.c) {
-      const w = el;
-      el = asOwnRoot(w, inst);
-      if (el !== w) w.replaceWith(el);
-    }
+    const r = asOwnRoot(el, inst);
+    if (r !== el) { el.replaceWith(r); el = r; }
   }
   hydrating = null;
   // What was typed before it was taken up: the component hears it now.

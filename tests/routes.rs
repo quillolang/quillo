@@ -312,8 +312,9 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     // decimals and ints past 2^53, which any value from the server may be
     // (3.5 KB), and the checks on what is handed to the page's functions
     // (an event's element's methods, say: 400 bytes), and components that
-    // are a table's rows, and what says why a page was made again (1.5 KB).
-    assert!(js.len() < js2.len() && js.len() < 32_000, "{} vs {}", js.len(), js2.len());
+    // are a table's rows (800 bytes); what says why a page was made again is
+    // in development bundles only, and newlines that change nothing go.
+    assert!(js.len() < js2.len() && js.len() < 30_500, "{} vs {}", js.len(), js2.len());
     // No comments or indentation.
     assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
 }
@@ -532,7 +533,8 @@ route GET / = <html><body><List/></body></html>
     let page = get(&mut it, "/").text();
     let at = page.find("/_quillo/b/").expect(&page);
     let js = get(&mut it, &page[at..at + page[at..].find('"').unwrap()]).text();
-    let rows = js.lines().find(|l| l.contains("W.each(")).expect("the loop follows its list");
+    // `tidy` is defined before the component, not in its loop.
+    let rows = &js[js.find("W.each(").expect("the loop follows its list")..];
     assert!(!rows.contains("zzparam"), "{}", rows);
 }
 
