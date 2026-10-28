@@ -2999,6 +2999,17 @@ B.date = {
     const z = dtZone(tz, f, 3), i = dtLocalInstant(z, day * 86400 + sec);
     return dtStampText(i, "", dtOffsetAt(z, i)) ?? dtOutOfRange(f);
   },
+  ms: (v) => {
+    const [z, t] = dtEitherArg(v, "date.ms", 1);
+    if (!t) return z * 86400000;
+    const frac = (t.frac || "").replace(/^\./, "");
+    return dtInstant(t) * 1000 + Number((frac + "000").slice(0, 3));
+  },
+  from_ms: (n, tz) => {
+    dtInt(n, "date.from_ms", 1);
+    const z = dtZone(tz, "date.from_ms", 2), instant = Math.floor(n / 1000);
+    return dtStampText(instant, "", dtOffsetAt(z, instant)) ?? dtOutOfRange("date.from_ms");
+  },
   format: (v, how) => {
     const f = "date.format", [z, t] = dtEitherArg(v, f, 1);
     let pattern, n = dtEn;

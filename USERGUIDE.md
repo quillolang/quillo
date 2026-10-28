@@ -2063,6 +2063,9 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `date.days_between(a, b)` (`b - a`, in days), `date.months_between(a, b)` (whole months:
   `2026-01-31` to `2026-02-28` is one), `date.start_of_month(d)`, `date.end_of_month(d)`.
   These take dates; `date.date_in(t, tz)` gives a date-time's date.
+- **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
+  milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
+  way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
 - **Time zones:** `date.to_zone(t, tz)` is the same instant at the zone's offset then
   (daylight saving included); `date.date_in(t, tz)` its calendar date there;
   `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go

@@ -708,6 +708,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("date.date_in", "str, str | null=", "str"),
     ("date.at", "str, str | null=, str | null=", "str"),
     ("date.format", "str, str | map", "str"),
+    ("date.ms", "str", "int"),
+    ("date.from_ms", "int, str | null=", "str"),
     ("media.rtp", "str, map", "null"),
     ("media.close", "str", "bool"),
     ("media.on", "str, map | null=", "null"),

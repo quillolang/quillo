@@ -52,6 +52,8 @@ const FNS: &[(&str, BuiltinFn)] = &[
     ("date.date_in", date_in),
     ("date.at", at),
     ("date.format", format),
+    ("date.ms", ms),
+    ("date.from_ms", from_ms),
 ];
 
 /// The clock's functions, which a sandboxed script does without.
@@ -501,6 +503,32 @@ fn local_instant(z: &Zone, local: i64) -> i64 {
 
 fn clock() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `date.ms(t)`: a date-time (or a date, at its midnight in UTC) as
+/// milliseconds since 1970, what `now()` gives; `date.from_ms(ms, tz)` the
+/// other way, to the second. A program keeps times as `now()` does and shows
+/// them with this module (FEEDBACK2.md, Q-027; branch feedback6-fixes).
+fn ms(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (z, t) = either_arg(&args, 0, "date.ms", line)?;
+    Ok(Value::Int(match t {
+        Some(t) => {
+            let frac = t.frac.trim_start_matches('.');
+            let milli = format!("{:0<3}", &frac[..frac.len().min(3)]).parse::<i64>().unwrap_or(0);
+            t.instant() * 1000 + milli
+        }
+        None => z * 86_400_000,
+    }))
+}
+
+fn from_ms(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let n = int_arg(&args, 0, "date.from_ms", line)?;
+    let z = zone(&args, 1, "date.from_ms", line)?;
+    let instant = n.div_euclid(1000);
+    match stamp_text(instant, "", offset_at(&z, instant)) {
+        Some(s) => Ok(Value::str(s)),
+        None => out_of_range("date.from_ms", line),
+    }
 }
 
 fn today(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
