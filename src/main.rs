@@ -32,7 +32,8 @@ usage:
 
 The program is the first argument that is not an option, wherever the options
 stand. Left out, or a folder, it is that folder's main.qwe: `quillo run` in a
-program's folder runs it.
+program's folder runs it. An option's value follows it, or `=`: `--port 8081`
+or `--port=8081`.
 
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
@@ -113,8 +114,29 @@ fn main() {
 /// is its value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open",
+    "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
 ];
+
+/// Options of `run`, `app`, `build` and `check` that take no value.
+const FLAG_OPTIONS: &[&str] = &[
+    "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
+    "--no-jobs", "--metrics", "--strict-null",
+];
+
+/// What an unknown option was probably meant to be: the nearest known one
+/// (FEEDBACK9.md, Q-070; branch feedback9-fixes).
+fn meant(option: &str) -> String {
+    if option == "-p" {
+        return " (the port is `--port`)".to_string();
+    }
+    let near = VALUE_OPTIONS
+        .iter()
+        .chain(FLAG_OPTIONS)
+        .map(|o| (quillo::check::edit_distance(option, o), *o))
+        .filter(|(d, o)| *d <= 2.max(o.len() / 4))
+        .min();
+    near.map_or_else(String::new, |(_, o)| format!(" (did you mean `{}`?)", o))
+}
 
 /// The program a command names and the options around it, wherever they
 /// stand: the first argument that is neither an option nor an option's
@@ -126,6 +148,19 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // `--port=8081` is `--port 8081`, for each option that takes a value
+        // (FEEDBACK9.md, Q-070; branch feedback9-fixes).
+        if let Some((name, value)) = a.split_once('=').filter(|(n, _)| n.starts_with("--")) {
+            if VALUE_OPTIONS.contains(&name) {
+                flags.push(name.to_string());
+                flags.push(value.to_string());
+                i += 1;
+                continue;
+            }
+            if FLAG_OPTIONS.contains(&name) {
+                return Err(format!("`{}` takes no value: write `{}` alone", name, name));
+            }
+        }
         if a.starts_with('-') {
             flags.push(a.clone());
             if VALUE_OPTIONS.contains(&a.as_str()) {
@@ -244,6 +279,8 @@ struct RunOptions {
     as_service: bool,
     /// The service this is, when not its file's name (`--service-name`).
     service_name: Option<String>,
+    /// The `.env` to read, when not the one beside the program (`--env-file`).
+    env_file: Option<String>,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -263,6 +300,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         split: false,
         as_service: false,
         service_name: None,
+        env_file: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -303,6 +341,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 }
             },
             ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
+            ("--env-file", Some(v)) => o.env_file = Some(v.clone()),
             ("--base", Some(v)) => {
                 let b = v.trim_end_matches('/');
                 if !b.starts_with('/') || b.contains("//") || b.contains('?') {
@@ -389,8 +428,12 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            ("-h" | "--help", _) => {
+                println!("{}", USAGE);
+                return Err(0);
+            }
             (other, _) => {
-                eprintln!("quillo: unknown option `{}`", other);
+                eprintln!("quillo: unknown option `{}`{}", other, meant(other.split('=').next().unwrap_or(other)));
                 return Err(2);
             }
         }
@@ -511,6 +554,16 @@ fn run(file: &str, flags: &[String]) -> i32 {
         Ok(o) => o,
         Err(code) => return code,
     };
+    // The program's `.env`, before anything reads the environment
+    // (FEEDBACK9.md, Q-071; branch feedback9-fixes).
+    let env_file = match &o.env_file {
+        Some(f) => (std::path::PathBuf::from(f), true),
+        None => (Path::new(file).parent().unwrap_or(Path::new(".")).join(".env"), false),
+    };
+    if let Err(e) = quillo::dotenv::load_into_process(&env_file.0, env_file.1) {
+        eprintln!("quillo: {}", e);
+        return 2;
+    }
     warn_of_secrets();
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));

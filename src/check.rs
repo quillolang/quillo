@@ -1721,6 +1721,9 @@ impl Checker {
                     if let Some(g) = self.globals.get_mut(name) {
                         g.ready = true;
                     }
+                    // Its options (Q-072).
+                    self.scopes.clear();
+                    self.stmt(&it.stmt, false);
                 }
                 Stmt::Route(r) => {
                     self.out.symbols.push(Symbol {
@@ -2253,10 +2256,34 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Service(_, _, _, _, line) => {
+            Stmt::Service(name, _, _, opts, line) => {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`service` must be at the top level");
+                }
+                // The options the loader takes, known here too (FEEDBACK9.md,
+                // Q-072; branch feedback9-fixes).
+                const OPTIONS: [&str; 4] = ["timeout", "retries", "failures", "cooldown"];
+                match opts {
+                    Some(Expr::Map(fields)) => {
+                        for (k, v) in fields {
+                            if !OPTIONS.contains(&k.as_str()) {
+                                let near = OPTIONS.iter().map(|o| (edit_distance(k, o), *o)).filter(|(d, _)| *d <= 2).min();
+                                let hint = near.map_or_else(|| " (timeout, retries, failures, cooldown)".to_string(), |(_, o)| format!(" (did you mean `{}`?)", o));
+                                self.error(format!("service {}: no option `{}`{}", name, k, hint));
+                            }
+                            self.expr(v);
+                            self.line = *line;
+                        }
+                    }
+                    Some(e) => {
+                        let t = self.expr(e);
+                        self.line = *line;
+                        if t.bits != 0 && t.bits & MAP == 0 {
+                            self.error(format!("service {}: its options are a map, like {{ timeout: \"2s\", retries: 2 }}", name));
+                        }
+                    }
+                    None => {}
                 }
                 T::of(NIL)
             }
@@ -2940,7 +2967,28 @@ impl Checker {
                     return self.service_call(m, name, args, pre);
                 }
                 if MODULES.contains(&m.as_str()) && !self.is_local(m) {
-                    return self.module_call(m, name, args, pre);
+                    // A top-level variable named like a module takes it from
+                    // every file (FEEDBACK9.md, Q-069; branch feedback9-fixes).
+                    let hidden = self.globals.get(m.as_str()).filter(|g| &*g.file != "<builtin>" && matches!(g.kind, Kind::Global)).map(|g| (g.file.clone(), g.line, g.t.bits));
+                    // A map of the program's own (`let stats = { load: ... }`)
+                    // is what `stats.load()` means: its function is called.
+                    let own_map = matches!(hidden, Some((_, _, bits)) if bits & MAP != 0);
+                    if let Some((file, at, _)) = hidden.filter(|_| !own_map) {
+                        let made = self.shown_at(&file, at);
+                        let here = self.shown_at(&self.file.clone(), line);
+                        self.error(format!(
+                            "`{}.{}`: `{}` is the program's variable from {}, which hides the module `{}` in every file: rename the variable",
+                            m, name, m, made, m
+                        ));
+                        self.diag_at(file, at, Severity::Warning, format!(
+                            "`{}` hides the module `{}` in every file of the program, and {} calls `{}.{}`: pick another name",
+                            m, m, here, m, name
+                        ));
+                        return T::ANY;
+                    }
+                    if !own_map {
+                        return self.module_call(m, name, args, pre);
+                    }
                 }
             }
             // `conn.query(sql)` on a connection from `db.connect`.
@@ -2953,6 +3001,17 @@ impl Checker {
             }
             let recv = self.expr(obj);
             self.line = line;
+            // `let json = ...` in a function, then `json.stringify(...)`: the
+            // variable, not the module, whose method this is not (Q-069).
+            if let Expr::Ident(m, _) = &**obj {
+                if MODULES.contains(&m.as_str()) && recv.bits != 0 && recv.bits & MAP == 0 {
+                    self.error(format!(
+                        "`{}.{}`: `{}` here is {}, a variable, which hides the module `{}`: rename the variable",
+                        m, name, m, bits_text(recv.bits), m
+                    ));
+                    return T::ANY;
+                }
+            }
             let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
             let sig = found.as_ref().and_then(|v| v.sig.clone()).filter(|_| recv.bits & MAP == 0);
             let mut all = vec![recv];
@@ -4322,7 +4381,7 @@ fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     }
 }
 
-fn edit_distance(a: &str, b: &str) -> usize {
+pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();

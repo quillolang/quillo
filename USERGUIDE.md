@@ -18,7 +18,8 @@ cargo test
 ```
 
 `quillo run` checks the program, executes its top level and, if it declared any routes,
-serves them:
+serves them. An option's value follows it, or `=` (`--port 8081`, `--port=8081`); a
+mistyped option is told the nearest one there is:
 
 | Option | |
 |---|---|
@@ -43,6 +44,15 @@ serves them:
 | `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
+| `--env-file F` | the settings file to read, instead of the `.env` beside the program |
+
+The `.env` beside the program is read into its environment as it starts: `KEY=value`
+lines (`export` allowed, `#` for comments, values in `"..."` with `\n`, or `'...'` as
+written), for `env("API_KEY")` and for Quillo's own settings (`PORT`, `QUILLO_SECRET`). A
+variable the environment already has wins, so a `.env` left on a server cannot override
+what production sets. A service reads the `.env` beside its own file as well, in one
+process and under `--split` alike: its values come before the app's file's (the app's
+reach it too), and after the environment's. Keep `.env` out of version control.
 
 ### Desktop apps
 

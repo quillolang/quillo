@@ -198,6 +198,9 @@ pub struct Interp {
     /// Loaded as a service (src/service.rs): its server fns are called by
     /// other services, signed, never by browsers (`/_quillo/rpc`).
     pub is_service: bool,
+    /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
+    /// feedback9-fixes). The app's is in the process's environment.
+    pub env_file: Arc<std::collections::HashMap<String, String>>,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -826,6 +829,7 @@ impl Interp {
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
             is_service: false,
+            env_file: Default::default(),
             types: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
@@ -895,6 +899,7 @@ impl Interp {
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
             is_service: self.is_service,
+            env_file: self.env_file.clone(),
             types: self.types.clone(),
             stream_out: None,
             pending_stream: None,
@@ -1971,6 +1976,13 @@ impl Interp {
         let mut db_on = None;
         let f = if let Expr::Field(obj, name, _) = callee {
             let recv = self.eval(obj, env)?;
+            // `json.stringify(...)` where a variable named `json` hides the
+            // module (FEEDBACK9.md, Q-069; branch feedback9-fixes).
+            if let Expr::Ident(m, _) = &**obj {
+                if crate::check::MODULES.contains(&m.as_str()) && !matches!(recv, Value::Map(_)) {
+                    return fail(line, format!("`{}.{}`: `{}` is a variable here ({}), which hides the module `{}`: rename the variable", m, name, m, recv.type_name(), m));
+                }
+            }
             let method = match &recv {
                 Value::Map(m) => {
                     db_on = crate::db::conn_of(&recv, name);
