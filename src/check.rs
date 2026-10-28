@@ -1859,7 +1859,8 @@ impl Checker {
                 if name == "request" {
                     self.error("`request` only exists in routes and `server fn`s; pass what you need as an argument");
                 } else if !self.unparsed_names.contains(name) {
-                    self.error(format!("unknown name `{}`{}", name, self.suggest(name)));
+                    let removed = crate::error::removed_note(name);
+                    self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
                 }
                 (T::ANY, None)
             }
@@ -3190,7 +3191,7 @@ impl Checker {
         }
         self.line = line;
         let Some((_, p, r)) = BUILTINS.iter().find(|(n, _, _)| *n == full) else {
-            self.error(format!("`{}` has no function `{}`", m, f));
+            self.error(format!("`{}` has no function `{}`{}", m, f, crate::error::removed_note(&full)));
             return T::ANY;
         };
         if !self.quiet_mode() {

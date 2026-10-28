@@ -54,6 +54,33 @@ fn exe_modified() -> Option<std::time::SystemTime> {
     std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()
 }
 
+/// Builtins Quillo had and removed in 0.5.0 (205d7cd, "for programs to do
+/// as they need"), with what a program does instead: a program written
+/// before then is told so, not that the name is unknown (FEEDBACK.md, Q-037;
+/// branch feedback6-fixes).
+const REMOVED: &[(&[&str], &str)] = &[
+    (&["rate_limit", "rate_limit_reset"], "count attempts in a table of the program's own, as app/bank's customers service counts wrong PINs"),
+    (&["audit", "audit.actor", "audit.query", "audit.verify"], "write what happened to a table of the program's own"),
+    (&["idempotent"], "keep each request's id in a table with a unique key, and answer the first answer again"),
+    (&["db.backup"], "back up with the database's own tools (sqlite3's .backup, pg_dump)"),
+    (&["crypto.encrypt", "crypto.decrypt", "crypto.reencrypt", "crypto.totp_secret", "crypto.totp_uri", "crypto.totp_verify", "crypto.recovery_codes", "crypto.verify_recovery_code"],
+        "write it in Rust, in a .qwer file the program uses"),
+    (&["crypto.verify_webhook"], "compare crypto.hmac(secret, body) with the signature using crypto.equal"),
+    (&["csp", "csp_nonce", "security_headers"], "set the headers on the response (respond(status, body, headers)) or at the proxy in front"),
+    (&["redact"], "leave what must not be logged out of what is printed"),
+    (&["sessions", "end_sessions", "user_sessions", "renew_session"], "sessions are signed cookies; keep a table of the program's own to end them early"),
+];
+
+/// ` — removed from Quillo in 0.5.0 (205d7cd): <what to do instead>`, for a
+/// name that was a builtin, or nothing.
+pub fn removed_note(name: &str) -> String {
+    REMOVED
+        .iter()
+        .find(|(names, _)| names.contains(&name))
+        .map(|(_, instead)| format!(": Quillo removed it in 0.5.0 (205d7cd); {}", instead))
+        .unwrap_or_default()
+}
+
 /// Notes when this binary was built, for `which_quillo` later on.
 pub fn note_start() {
     BUILT.get_or_init(exe_modified);

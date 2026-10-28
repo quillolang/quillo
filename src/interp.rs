@@ -62,7 +62,7 @@ pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
 }
 
 fn undefined(name: &str, line: u32) -> Ctrl {
-    Ctrl::Error(QuilloError::new(format!("unknown name `{}`", name), line))
+    Ctrl::Error(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line))
 }
 
 /// How strictly a pattern compares values. Query strings, form fields and

@@ -1489,7 +1489,7 @@ impl<'a> Compiler<'a> {
             return self.err("`request` is only available on the server; pass what you need as a prop");
         }
         let Some(v) = lookup(&self.it.globals, name) else {
-            return self.err(format!("unknown name `{}`", name));
+            return self.err(format!("unknown name `{}`{}", name, crate::error::removed_note(name)));
         };
         let js = format!("G[{}]", js_str(name));
         match &v {
