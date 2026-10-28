@@ -324,9 +324,10 @@ fn split_top(s: &str, sep: char) -> Vec<&str> {
 
 /// The classes Quillo sets itself, which a program styles without
 /// writing (FEEDBACK8.md, Q-066): `ask`'s and `notify`'s (`q-`, and the
-/// places `data-notices` takes by default) and `highlight`'s (`hl-`).
+/// places `data-notices` names, `dialog-...` and `toasts-...`, which a
+/// sheet styles for whichever a page picks) and `highlight`'s (`hl-`).
 pub fn set_by_quillo(class: &str) -> bool {
-    class.starts_with("q-") || class.starts_with("hl-") || class == "dialog-center" || class == "toasts-top-right"
+    ["q-", "hl-", "dialog-", "toasts-"].iter().any(|p| class.starts_with(p))
 }
 
 /// The classes `css`'s selectors style, each with the lines before it; not
