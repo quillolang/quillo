@@ -30,6 +30,10 @@ usage:
                                     variables
   quillo <file.qwe>                 same as `quillo run`
 
+The program is the first argument that is not an option, wherever the options
+stand. Left out, or a folder, it is that folder's main.qwe: `quillo run` in a
+program's folder runs it.
+
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
   --host H       address to listen on (default 127.0.0.1)
@@ -105,23 +109,74 @@ fn main() {
     std::process::exit(child.join().unwrap_or(1));
 }
 
+/// Options of `run`, `app` and `build` that take a value: the word after one
+/// is its value, not the program.
+const VALUE_OPTIONS: &[&str] = &[
+    "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
+    "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open",
+];
+
+/// The program a command names and the options around it, wherever they
+/// stand: the first argument that is neither an option nor an option's
+/// value. A folder, or no program at all, is that folder's main.qwe, and
+/// nothing else (FEEDBACK6.md, Q-058 and Q-059; branch feedback6-fixes).
+fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut program = None;
+    let mut flags = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            flags.push(a.clone());
+            if VALUE_OPTIONS.contains(&a.as_str()) {
+                if let Some(v) = args.get(i + 1) {
+                    flags.push(v.clone());
+                    i += 1;
+                }
+            }
+        } else if program.is_none() {
+            program = Some(a.clone());
+        } else {
+            flags.push(a.clone());
+        }
+        i += 1;
+    }
+    let named = program.unwrap_or_else(|| ".".to_string());
+    if Path::new(&named).is_dir() {
+        let main = Path::new(&named).join("main.qwe");
+        if !main.is_file() {
+            return Err(if named == "." {
+                "no program: name a .qwe file, or add a main.qwe here".to_string()
+            } else {
+                format!("no program: {} has no main.qwe; name a .qwe file", named)
+            });
+        }
+        return Ok((if named == "." { "main.qwe".to_string() } else { main.to_string_lossy().into_owned() }, flags));
+    }
+    Ok((named, flags))
+}
+
+/// `program_and_flags`, or the line that says why there is none (exit 2).
+fn with_program(args: &[String], f: impl FnOnce(&str, &[String]) -> i32) -> i32 {
+    match program_and_flags(args) {
+        Ok((program, flags)) => f(&program, &flags),
+        Err(e) => {
+            eprintln!("quillo: {}", e);
+            2
+        }
+    }
+}
+
 fn real_main(args: Vec<String>) -> i32 {
     match args.get(1).map(String::as_str) {
-        Some("run") => match args.get(2) {
-            Some(f) => run(f, &args[3..]),
-            None => usage(),
-        },
+        Some("run") => with_program(&args[2..], run),
         // A debug adapter for editors, on stdin and stdout (src/debug.rs).
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
         Some("check") => {
             let strict_null = args.iter().any(|a| a == "--strict-null");
-            match args.iter().skip(2).find(|a| !a.starts_with("--")) {
-                Some(f) => check(f, quillo::check::Options { strict_null, ..Default::default() }),
-                None => usage(),
-            }
+            with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, ..Default::default() }))
         }
-        Some("build") => match args.get(2) {
-            Some(f) => match quillo::native::build_all(Path::new(f)) {
+        Some("build") => with_program(&args[2..], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
                         println!("built {}", l.display());
@@ -135,9 +190,7 @@ fn real_main(args: Vec<String>) -> i32 {
                     eprintln!("quillo: {}", e);
                     1
                 }
-            },
-            None => usage(),
-        },
+        }),
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
@@ -155,10 +208,7 @@ fn real_main(args: Vec<String>) -> i32 {
 
 #[cfg(feature = "app")]
 fn app(args: &[String]) -> i32 {
-    match args.get(2) {
-        Some(f) => desktop::main(f, &args[3..]),
-        None => usage(),
-    }
+    with_program(&args[2..], desktop::main)
 }
 
 #[cfg(not(feature = "app"))]
@@ -580,6 +630,10 @@ fn repl() -> i32 {
     let stdin = io::stdin();
     let mut buf = String::new();
     println!("Quillo {} — enter expressions; Ctrl-D exits", quillo::version());
+    // The program here, which `quillo run` serves (FEEDBACK6.md, Q-059; branch feedback6-fixes).
+    if Path::new("main.qwe").is_file() {
+        println!("main.qwe is here: `quillo run` serves it");
+    }
     loop {
         print!("{}", if buf.is_empty() { "quillo> " } else { "....> " });
         let _ = io::stdout().flush();
