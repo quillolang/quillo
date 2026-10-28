@@ -1,0 +1,17 @@
+// Q-060 A page cannot send its camera or microphone: media goes one way, from RTP to pages
+// mode: browser
+// page: /
+// probe: await customElements.whenDefined("quillo-media"); const c = document.createElement("canvas"); c.width = 160; c.height = 120; const g = c.getContext("2d"); let i = 0; setInterval(() => { g.fillStyle = "hsl(" + (i++ * 9 % 360) + ",80%,50%)"; g.fillRect(0, 0, 160, 120); }, 33); document.getElementById("me").source = c.captureStream(30); for (let t = 0; t < 40 && !(document.getElementById("them").mediaStats?.video > 5); t++) await new Promise((r) => setTimeout(r, 200)); return { playing: (document.getElementById("them").mediaStats?.video ?? 0) > 5 }
+// open-when: "playing": false
+// fixed-when: "playing": true
+// From FEEDBACK6.md §Q-060 (found on 72f7913). `media.rtp` took RTP from a camera or an encoder and
+// pages only watched. Fixed on feedback6-fixes: `media.on(name, { publish })` lets pages send a
+// stream, and `<quillo-media publish="name">` sends the camera and microphone (or a MediaStream
+// given as its `source`, a canvas's here), encoded with WebCodecs, to every page watching.
+
+media.on("call:*")
+
+route GET / = <html><body>
+    <quillo-media id="me" publish="call:1" no-audio/>
+    <quillo-media id="them" stream="call:1"/>
+</body></html>

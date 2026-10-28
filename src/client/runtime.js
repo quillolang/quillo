@@ -2598,7 +2598,7 @@ B.vec = {
 // and reliable ones on a stream), else a WebSocket. It is opened again when
 // it drops, and the channels joined again.
 
-const Chan = { subs: new Map(), media: new Map(), joined: new Set(), waiting: new Map(), conn: null, running: false, wt: true };
+const Chan = { subs: new Map(), media: new Map(), joined: new Set(), refused: new Set(), waiting: new Map(), conn: null, running: false, wt: true };
 
 B.channel = {
   open: meta((name, f, opts) => {
@@ -2713,6 +2713,20 @@ async function chanTransport(info, q) {
       out.write(f).catch(() => {});
     },
     closed: t.closed.then(() => {}, () => {}),
+    // A frame this page sends (`<quillo-media publish>`): a stream of its
+    // own per track, each frame after its length.
+    putFrame(b, track) {
+      if (!this.tracks) this.tracks = new Map();
+      let w = this.tracks.get(track);
+      if (!w) {
+        w = t.createUnidirectionalStream().then((s) => s.getWriter());
+        this.tracks.set(track, w);
+      }
+      const f = new Uint8Array(4 + b.length);
+      new DataView(f.buffer).setUint32(0, b.length);
+      f.set(b, 4);
+      w.then((wr) => wr.write(f)).catch(() => {});
+    },
   };
   (async () => {
     const rd = t.datagrams.readable.getReader();
@@ -2810,7 +2824,7 @@ function chanSocket(q) {
     s.binaryType = "arraybuffer";
     let ended;
     const closed = new Promise((r) => (ended = r));
-    s.onopen = () => ok({ via: "websocket", put: (text) => s.send(text), closed });
+    s.onopen = () => ok({ via: "websocket", put: (text) => s.send(text), putFrame: (b) => s.send(b), closed });
     s.onmessage = (m) => { if (typeof m.data === "string") chanGot(m.data); else chanFrame(new Uint8Array(m.data)); };
     s.onclose = () => { ended(); no(new Error("closed")); };
   });
@@ -2823,7 +2837,14 @@ function chanGot(text) {
   const [k, name, v] = m, subs = Chan.subs.get(name);
   if (!subs) return;
   if (k === "j") {
-    if (!v) { console.warn("quillo: the server did not let this page join channel " + name); return; }
+    if (!v) {
+      // Refused, or let go (`media.close` of a stream this page sends).
+      Chan.joined.delete(name);
+      Chan.refused.add(name);
+      if (!name.startsWith("media:")) console.warn("quillo: the server did not let this page join channel " + name);
+      return;
+    }
+    Chan.refused.delete(name);
     Chan.joined.add(name);
     const w = Chan.waiting.get(name) || [];
     Chan.waiting.delete(name);
@@ -2854,13 +2875,187 @@ function mediaDefine() {
   if (typeof customElements === "undefined" || customElements.get("quillo-media")) return;
   customElements.define("quillo-media", class extends HTMLElement {
     connectedCallback() {
-      if (!this.player) this.player = mediaPlayer(this);
+      if (!this.player) this.player = this.hasAttribute("publish") ? mediaPublisher(this) : mediaPlayer(this);
+    }
+    // What `publish` sends, instead of the camera and microphone: a
+    // MediaStream the page has (a canvas's, a screen's).
+    get source() { return this._source || null; }
+    set source(s) {
+      this._source = s;
+      if (this.player && this.player.use) this.player.use(s);
     }
     disconnectedCallback() {
       if (this.player) this.player.stop();
       this.player = null;
     }
   });
+}
+
+// ---- <quillo-media publish> --------------------------------------------------------
+// `<quillo-media publish="call:42">` sends this page's camera and microphone
+// (or the MediaStream given as its `source`) to stream call:42, which every
+// `<quillo-media stream="call:42">` plays: encoded in the browser with
+// WebCodecs (H.264 baseline and Opus, what the relay passes on), sent on the
+// page's channel connection. The program says who may send it (`media.on`):
+// the page joins the channel media:<name> first (FEEDBACK6.md, Q-060; branch
+// feedback6-fixes). `data-state`: starting, sending, refused (the camera, or
+// the program, said no), ended, unsupported.
+
+function mediaPublisher(el) {
+  const name = el.getAttribute("publish") || "";
+  const channel = "media:" + name;
+  const st = { video: 0, audio: 0, sent: 0, bytes: 0 };
+  el.mediaStats = st;
+  if (!el.style.display) el.style.display = "inline-block";
+  if (typeof VideoEncoder === "undefined") {
+    el.dataset.state = "unsupported";
+    el.textContent = "This browser cannot send video.";
+    return { stop() {} };
+  }
+  el.dataset.state = "starting";
+  const preview = document.createElement("video");
+  preview.muted = true;
+  preview.autoplay = true;
+  preview.playsInline = true;
+  preview.style.cssText = "display:block;width:100%;height:auto;background:#000";
+  el.replaceChildren(preview);
+  const label = new TextEncoder().encode(name);
+  const wire = (kind, key, ts, data) => {
+    const b = new Uint8Array(7 + label.length + data.byteLength);
+    b[0] = label.length;
+    b.set(label, 1);
+    b[1 + label.length] = kind;
+    b[2 + label.length] = key ? 1 : 0;
+    new DataView(b.buffer).setUint32(3 + label.length, ts >>> 0);
+    b.set(new Uint8Array(data), 7 + label.length);
+    return b;
+  };
+  const send = (kind, key, ts, chunk) => {
+    const data = new ArrayBuffer(chunk.byteLength);
+    chunk.copyTo(data);
+    if (!Chan.conn || !Chan.conn.putFrame || !Chan.joined.has(channel)) return;
+    Chan.conn.putFrame(wire(kind, key, ts, data), kind);
+    st.sent++;
+    st.bytes += data.byteLength;
+  };
+  // Joined as a channel is, so the server knows this page may send.
+  let subs = Chan.subs.get(channel);
+  if (!subs) {
+    subs = new Set();
+    Chan.subs.set(channel, subs);
+    Chan.refused.delete(channel);
+    if (Chan.conn) Chan.conn.put(JSON.stringify(["j", channel]), true);
+  }
+  const sub = { f: () => {} };
+  subs.add(sub);
+  chanStart();
+  let stopped = false, own = null, venc = null, aenc = null, timer = null, readers = [];
+  const watching = setInterval(() => {
+    if (Chan.refused.has(channel)) el.dataset.state = st.sent ? "ended" : "refused";
+  }, 500);
+  const halt = () => {
+    clearInterval(timer);
+    timer = null;
+    for (const r of readers) r.cancel().catch(() => {});
+    readers = [];
+    for (const e of [venc, aenc]) if (e && e.state !== "closed") e.close();
+    venc = aenc = null;
+    if (own) for (const t of own.getTracks()) t.stop();
+    own = null;
+  };
+  const video = (track) => {
+    const set = track.getSettings();
+    const w = (set.width || 640) & ~1, h = (set.height || 480) & ~1;
+    venc = new VideoEncoder({
+      output: (chunk) => { st.video++; send(1, chunk.type === "key", Math.round(chunk.timestamp * 0.09), chunk); },
+      error: () => { venc = null; },
+    });
+    venc.configure({ codec: "avc1.42E01F", width: w, height: h, bitrate: 1500000, framerate: 30, latencyMode: "realtime", avc: { format: "annexb" } });
+    let n = 0;
+    const encode = (frame) => {
+      // A keyframe every 2 seconds, so a page that starts watching shows a picture soon.
+      if (venc && venc.state === "configured" && venc.encodeQueueSize < 3) venc.encode(frame, { keyFrame: n++ % 60 === 0 });
+      frame.close();
+    };
+    if (typeof MediaStreamTrackProcessor === "function") {
+      const rd = new MediaStreamTrackProcessor({ track }).readable.getReader();
+      readers.push(rd);
+      (async () => {
+        for (;;) {
+          const { value, done } = await rd.read();
+          if (done || stopped) { if (value) value.close(); return; }
+          encode(value);
+        }
+      })().catch(() => {});
+    } else {
+      // Without track processors: the preview drawn on a canvas, 30 times a second.
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const g = c.getContext("2d"), t0 = performance.now();
+      timer = setInterval(() => {
+        if (preview.readyState < 2) return;
+        g.drawImage(preview, 0, 0, w, h);
+        encode(new VideoFrame(c, { timestamp: Math.round((performance.now() - t0) * 1000) }));
+      }, 1000 / 30);
+    }
+  };
+  const audio = (track) => {
+    if (typeof AudioEncoder === "undefined" || typeof MediaStreamTrackProcessor !== "function") return;
+    const rd = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    readers.push(rd);
+    (async () => {
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done || stopped) { if (value) value.close(); return; }
+        if (!aenc) {
+          aenc = new AudioEncoder({
+            output: (chunk) => { st.audio++; send(2, true, Math.round(chunk.timestamp * 0.048), chunk); },
+            error: () => { aenc = null; },
+          });
+          aenc.configure({ codec: "opus", sampleRate: value.sampleRate, numberOfChannels: Math.min(value.numberOfChannels, 2), bitrate: 64000 });
+        }
+        if (aenc.state === "configured") aenc.encode(value);
+        value.close();
+      }
+    })().catch(() => {});
+  };
+  const use = (src) => {
+    halt();
+    if (stopped || !src) return;
+    preview.srcObject = src;
+    const v = src.getVideoTracks()[0], a = src.getAudioTracks()[0];
+    if (v) video(v);
+    if (a) audio(a);
+    el.dataset.state = "sending";
+  };
+  // The camera, unless the page gives a source first (in @mount, say).
+  setTimeout(async () => {
+    if (stopped || el._source) { if (el._source) use(el._source); return; }
+    try {
+      const want = { video: !el.hasAttribute("no-video") && { width: 1280, height: 720 }, audio: !el.hasAttribute("no-audio") };
+      const src = await navigator.mediaDevices.getUserMedia(want);
+      if (stopped || el._source) { for (const t of src.getTracks()) t.stop(); return; }
+      use(src);
+      own = src;
+    } catch (e) {
+      // No camera here, or not allowed; a source the page gives still goes.
+      if (!el._source) el.dataset.state = "refused";
+    }
+  }, 0);
+  return {
+    use,
+    stop() {
+      stopped = true;
+      halt();
+      clearInterval(watching);
+      subs.delete(sub);
+      if (subs.size || Chan.subs.get(channel) !== subs) return;
+      Chan.subs.delete(channel);
+      Chan.joined.delete(channel);
+      if (Chan.conn) Chan.conn.put(JSON.stringify(["l", channel]), true);
+    },
+  };
 }
 
 function mediaPlayer(el) {

@@ -40,7 +40,7 @@ pub const AUDIO: u8 = 2;
 pub const END: u8 = 0;
 
 pub fn install(m: &mut Map) {
-    let fns: &[(&'static str, BuiltinFn)] = &[("media.rtp", rtp), ("media.streams", streams), ("media.close", close)];
+    let fns: &[(&'static str, BuiltinFn)] = &[("media.rtp", rtp), ("media.streams", streams), ("media.close", close), ("media.on", on)];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("media.").into(), Value::Builtin(name, *f));
     }
@@ -131,6 +131,8 @@ pub struct Stream {
     video: Stats,
     audio: Stats,
     ports: Mutex<Vec<u16>>,
+    /// Pages send it (`<quillo-media publish>`), rather than RTP to ports.
+    from_pages: AtomicBool,
 }
 
 fn streams_map() -> &'static Mutex<HashMap<String, Arc<Stream>>> {
@@ -149,6 +151,7 @@ fn stream(name: &str) -> Arc<Stream> {
                 video: Stats::default(),
                 audio: Stats::default(),
                 ports: Mutex::new(Vec::new()),
+                from_pages: AtomicBool::new(false),
             })
         })
         .clone()
@@ -595,6 +598,69 @@ fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Nil)
 }
 
+// ---- pages that send ------------------------------------------------------------
+
+/// A frame a page sent (`<quillo-media publish="name">`), as the server sends
+/// frames to pages: `[name length][name][kind][key][timestamp]`, then H.264
+/// (Annex B) or Opus. The page has joined the stream's channel, `media:<name>`
+/// (see `on`), which src/wt.rs checks before this. The frame goes to every
+/// page watching, as one from RTP does (FEEDBACK6.md, Q-060; branch
+/// feedback6-fixes).
+pub fn from_page(wire: Vec<u8>) {
+    let Some(&n) = wire.first() else { return };
+    let n = n as usize;
+    if wire.len() < 7 + n || !matches!(wire[1 + n], VIDEO | AUDIO) {
+        return;
+    }
+    let Ok(name) = std::str::from_utf8(&wire[1..1 + n]) else { return };
+    let s = stream(name);
+    s.from_pages.store(true, Relaxed);
+    let (kind, key) = (wire[1 + n], wire[2 + n] == 1);
+    s.push(Frame { kind, key, wire });
+}
+
+/// The stream a frame from a page is for, to check the page may send it.
+pub fn frame_stream(wire: &[u8]) -> Option<&str> {
+    let n = *wire.first()? as usize;
+    std::str::from_utf8(wire.get(1..1 + n)?).ok()
+}
+
+/// `media.on(name, { publish })`: pages may send stream `name` (a name ending
+/// in `*`: every stream it starts), with `<quillo-media publish="name">`.
+/// `publish(peer)` says which may, as a channel's `join` does: the page
+/// joins the channel `media:<name>`, and only a page that did is taken frames
+/// from. Without `publish`, any page may.
+fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let name = match args.first() {
+        Some(Value::Str(s)) if crate::wt::name_ok(s.trim_end_matches('*')) && s.len() <= 58 => s.to_string(),
+        other => return fail(line, format!("`media.on` takes a stream's name first (or one ending in `*`), got {}", other.map_or("nothing".into(), |v| v.repr()))),
+    };
+    let mut publish = None;
+    match args.get(1) {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(o)) => {
+            for (k, v) in o.iter() {
+                match (k.as_str(), v) {
+                    ("publish", f @ (Value::Func(_) | Value::Builtin(..))) => publish = Some(f.clone()),
+                    ("publish", _) => return fail(line, "`media.on`: `publish` is a function of the page that wants to send"),
+                    (other, _) => return fail(line, format!("`media.on` has no option `{}` (it takes publish)", other)),
+                }
+            }
+        }
+        Some(v) => return fail(line, format!("`media.on` takes options as a map, got {}", v.type_name())),
+    }
+    fn nothing(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+        Ok(Value::Nil)
+    }
+    let channel = format!("media:{}", name);
+    let site = std::sync::Arc::make_mut(&mut it.site);
+    if site.channels.iter().any(|h| h.name == channel) {
+        return fail(line, format!("`media.on`: the program already takes stream {:?} from pages", name));
+    }
+    site.channels.push(Arc::new(crate::wt::Handler { name: channel, f: Value::Builtin("media.on.frames", nothing), join: publish, leave: None }));
+    Ok(Value::Nil)
+}
+
 /// `media.close(name)`: the stream stops taking RTP, its ports are let go,
 /// and the pages watching it are told it ended; true if there was one. A
 /// stream made while the program runs (one a room, a call) need not hold its
@@ -618,6 +684,8 @@ fn close(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     while Instant::now() < until && !closing.iter().all(|t| lock(t).released) {
         std::thread::sleep(Duration::from_millis(5));
     }
+    // Pages sending it stop being taken from (they join again to send).
+    crate::wt::leave_all(&format!("media:{}", s.name));
     let end = Arc::new(Frame::new(&s.name, END, false, 0, &[]));
     for v in lock(&s.viewers).drain(..) {
         v.sink.take(&end);
@@ -628,7 +696,7 @@ fn close(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `media.streams()`: each stream, with its viewers and its tracks' rates.
 fn streams(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
-    let mut all: Vec<Arc<Stream>> = lock(streams_map()).values().filter(|s| !lock(&s.ports).is_empty()).cloned().collect();
+    let mut all: Vec<Arc<Stream>> = lock(streams_map()).values().filter(|s| !lock(&s.ports).is_empty() || s.from_pages.load(Relaxed)).cloned().collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Value::list(
         all.iter()

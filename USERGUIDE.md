@@ -1389,8 +1389,8 @@ UDP and channels together pass a device's packets on to pages as they come; see
 
 ### Media
 
-A program can take a camera's or an encoder's stream as RTP and play it in its pages,
-a fraction of a second behind:
+A program can take a camera's or an encoder's stream as RTP, or a page's camera, and
+play it in its pages, a fraction of a second behind:
 
 ```quillo
 media.rtp("cam", { video: 5004, audio: 5006 })
@@ -1426,6 +1426,33 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   seconds (the camera stopped, the connection is down), `data-state` is `waiting`.
 - `media.streams()` gives each stream's viewers and, per track, `frames`, `fps`, `kbps`
   and `lost` packets.
+- **Pages send too.** `media.on(name, { publish })` lets pages send stream `name` (or
+  every stream a name ending in `*` starts: `"call:*"`), and
+  `<quillo-media publish="call:42">` sends the page's camera and microphone to it, for
+  every `<quillo-media stream="call:42">` to play. The browser encodes them with WebCodecs
+  (H.264 baseline and Opus, what the relay passes on) and sends the frames on its channel
+  connection; the server passes them on as it does RTP, decoding nothing. `publish(peer)`
+  says which pages may, as a channel's `join` does (with the page's `session()`); without
+  it, any page may. A video call is a stream per person:
+
+  ```quillo
+  media.on("call:*", { publish: (peer) => session().user != null })
+
+  component Call(room: str, me: str, others: list) {
+      <div>
+          <quillo-media publish={`call:${room}:${me}`}/>
+          {for p in others => <quillo-media key={p} stream={`call:${room}:${p}`}/>}
+      </div>
+  }
+  ```
+
+  `no-video` or `no-audio` leaves one out. Given a MediaStream as its `source` (a
+  canvas's, the screen's: `el.source = js("navigator.mediaDevices.getDisplayMedia")` in
+  `@mount`), it sends that instead of the camera. Its `data-state` is `starting`,
+  `sending`, `refused` (no camera, or `publish` said no), `ended` or `unsupported`, and
+  `el.mediaStats` counts what it encoded and sent. Each person's picture goes once to the
+  server, which sends it on to everyone watching (what video services call an SFU); there
+  is no TURN relay for networks that block UDP, where the WebSocket carries it.
 - `media.close(name)` ends a stream: it stops taking RTP, lets its ports go (for another
   stream to take), and tells its pages, whose `data-state` turns `ended`. It gives true if
   there was such a stream.

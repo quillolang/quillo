@@ -486,7 +486,10 @@ fn args_for(f: &Value, mut args: Vec<Value>) -> Vec<Value> {
 /// The channel's handler: in the program, or in one it mounts (with the
 /// mounts' indexes to reach it).
 fn find(it: &Interp, name: &str) -> Option<(Arc<Handler>, Option<Vec<usize>>)> {
-    if let Some(h) = it.site.channels.iter().find(|h| h.name == name) {
+    // `media.on("call:*")` handles every `media:call:...` (a channel's own
+    // name cannot hold a `*`).
+    let matches = |h: &Handler| h.name == name || h.name.strip_suffix('*').is_some_and(|p| name.starts_with(p));
+    if let Some(h) = it.site.channels.iter().find(|h| matches(h)) {
         return Some((h.clone(), None));
     }
     for (i, (_, sub)) in it.mounts.iter().enumerate() {
@@ -844,6 +847,34 @@ mod quic {
             })
         };
         tokio::pin!(reader);
+        // Frames the page sends (`<quillo-media publish>`): a stream of its
+        // own per track, each frame after its length.
+        let sending = {
+            let (conn, peer) = (conn.clone(), peer.clone());
+            tokio::spawn(async move {
+                while let Ok(opening) = conn.accept_uni().await {
+                    let peer = peer.clone();
+                    tokio::spawn(async move {
+                        let mut inn = opening;
+                        let mut len = [0u8; 4];
+                        loop {
+                            if inn.read_exact(&mut len).await.is_err() {
+                                return;
+                            }
+                            let n = u32::from_be_bytes(len) as usize;
+                            if n > MAX_MESSAGE {
+                                return;
+                            }
+                            let mut buf = vec![0u8; n];
+                            if inn.read_exact(&mut buf).await.is_err() {
+                                return;
+                            }
+                            frame_from_page(&peer, buf);
+                        }
+                    });
+                }
+            })
+        };
         loop {
             tokio::select! {
                 d = conn.receive_datagram() => match d {
@@ -872,6 +903,7 @@ mod quic {
         }
         disconnect(&peer);
         frames.abort();
+        sending.abort();
         conn.close(0u32.into(), b"");
     }
 
@@ -913,6 +945,7 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             loop {
                 match reader.next() {
                     Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
+                    Ok(crate::ws::Message::Binary(b)) => frame_from_page(&peer, b),
                     Ok(crate::ws::Message::Close) | Err(_) => break,
                     Ok(_) => {}
                 }
@@ -945,6 +978,30 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
     }
     disconnect(&peer);
     socket.close();
+}
+
+/// A frame a page sends to a stream (`<quillo-media publish>`): taken only
+/// from a page that joined the stream's channel, `media:<name>` (FEEDBACK6.md,
+/// Q-060; branch feedback6-fixes).
+pub fn frame_from_page(p: &Arc<Peer>, wire: Vec<u8>) {
+    let Some(name) = crate::media::frame_stream(&wire) else { return };
+    if !lock(&p.rooms).contains(&format!("media:{}", name)) {
+        return;
+    }
+    crate::media::from_page(wire);
+}
+
+/// Every page leaves `channel`, as if it had not joined: what `media.close`
+/// does to the pages sending a stream.
+pub fn leave_all(channel: &str) {
+    let members: Vec<u64> = lock(&hub().rooms).remove(channel).map(|m| m.into_iter().collect()).unwrap_or_default();
+    let peers = lock(&hub().peers);
+    for id in members {
+        if let Some(p) = peers.get(&id) {
+            lock(&p.rooms).remove(channel);
+            p.put(Out::Text { json: serde_json::json!(["j", channel, false]).to_string(), reliable: true });
+        }
+    }
 }
 
 /// Pages connected now, for `--metrics`.

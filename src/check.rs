@@ -689,6 +689,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.open", "str, fn, map | null=", "map"),
     ("media.rtp", "str, map", "null"),
     ("media.close", "str", "bool"),
+    ("media.on", "str, map | null=", "null"),
     ("media.streams", "", "list"),
     // src/money.rs
     ("money.of", "dec | int | str, str, str=", "map | error(str)"),
