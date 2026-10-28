@@ -1,0 +1,27 @@
+// Q-062 Two pages whose bundles hold the same code get two bundles: the key is the components rendered, and the order they compile in follows it
+// mode: serve
+// get: /
+// get: /products
+// fixed-when: /\/_quillo\/b\/([0-9a-f]+)\.js[\s\S]*GET \/products ->[\s\S]*\/_quillo\/b\/\1\.js/
+// From FEEDBACK7.md §Q-062 (found on cc273cc). Open until both pages name the same bundle.
+
+component Home() {
+    state n = 0
+    <button @click={() => { n += 1 }}>home {n}</button>
+}
+
+component Product() {
+    state n = 0
+    <button @click={() => { n += 1 }}>product {n}</button>
+}
+
+// Both branches are in App's code, so both are in its bundle, whichever is shown.
+component App() {
+    <div>{match url().path {
+        "/" => <Home/>
+        _ => <Product/>
+    }}</div>
+}
+
+route GET / = <html><body><App/></body></html>
+route GET /products = <html><body><App/></body></html>
