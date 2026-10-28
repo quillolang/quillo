@@ -728,11 +728,16 @@ fn tx_begin(it: &mut Interp) -> usize {
 fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
     if !committed {
         it.pending.truncate(mark);
+        it.pending_raw.truncate(mark);
     }
     it.tx_depth -= 1;
     if it.tx_depth == 0 {
         let topics = std::mem::take(&mut it.pending);
         it.shared.publish(&topics);
+        // What a service sends back with its answer: only what committed
+        // (FEEDBACK4.md, Q-038; branch bank-fixes).
+        let raw = std::mem::take(&mut it.pending_raw);
+        it.note_published(raw);
     }
 }
 

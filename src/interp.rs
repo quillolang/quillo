@@ -82,6 +82,10 @@ pub struct Interp {
     pub routes: Arc<Vec<Arc<RouteDef>>>,
     pub base_dir: Arc<Path>,
     pub(crate) loaded: Arc<HashSet<PathBuf>>,
+    /// Files of programs this one mounts or calls as services: watched
+    /// with its own (`--watch`), but not its own, so a file both `use`
+    /// is still run here (FEEDBACK4.md, Q-040; branch bank-fixes).
+    pub(crate) watched: Arc<HashSet<PathBuf>>,
     pub shared: Arc<Shared>,
     /// The services this version of the program loaded (see `shared::Services`).
     pub(crate) services: Arc<crate::shared::Services>,
@@ -143,6 +147,13 @@ pub struct Interp {
     /// Open `db.transaction`s, and changes to announce when they commit.
     pub tx_depth: usize,
     pub pending: Vec<String>,
+    /// The same topics as `pending`, as the program wrote them (before the
+    /// tenant and mount point are added): what a service sends back.
+    pub(crate) pending_raw: Vec<String>,
+    /// While answering another service's call: the topics announced, sent
+    /// back with the answer for the caller to announce to its own pages
+    /// (FEEDBACK4.md, Q-038; branch bank-fixes).
+    pub(crate) published: Option<Vec<String>>,
     /// Open SQLite transactions. SQLite has one connection, shared by every
     /// request, so while one is open the lock is kept (see `unlocked`).
     pub sqlite_tx: usize,
@@ -758,6 +769,7 @@ impl Interp {
             routes: Arc::new(Vec::new()),
             base_dir: Arc::from(base_dir.into().as_path()),
             loaded: Arc::new(HashSet::new()),
+            watched: Arc::new(HashSet::new()),
             shared,
             services: Default::default(),
             depth: 0,
@@ -788,6 +800,8 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            pending_raw: Vec::new(),
+            published: None,
             sqlite_tx: 0,
             db: Arc::new(std::sync::Mutex::new(None)),
             db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -821,6 +835,7 @@ impl Interp {
             routes: self.routes.clone(),
             base_dir: self.base_dir.clone(),
             loaded: self.loaded.clone(),
+            watched: self.watched.clone(),
             shared: self.shared.clone(),
             services: self.services.clone(),
             depth: 0,
@@ -851,6 +866,8 @@ impl Interp {
             last_live: None,
             tx_depth: 0,
             pending: Vec::new(),
+            pending_raw: Vec::new(),
+            published: None,
             sqlite_tx: 0,
             db: self.db.clone(),
             db_conns: self.db_conns.clone(),
@@ -876,9 +893,10 @@ impl Interp {
         }
     }
 
-    /// The source files this program has loaded (the main file and `use`d files).
+    /// The source files this program has loaded (the main file and `use`d
+    /// files), and those of the programs it mounts or calls as services.
     pub fn files(&self) -> Vec<PathBuf> {
-        self.loaded.iter().cloned().collect()
+        self.loaded.iter().chain(self.watched.iter()).cloned().collect()
     }
 
     /// Announces changes to `topics`, after the current transaction commits.
@@ -886,11 +904,28 @@ impl Interp {
         self.mark_impure();
         // Each program has its own topics (two mounted apps may both have
         // a `notes` table).
+        let raw = topics.clone();
         let topics: Vec<String> = topics.into_iter().map(|t| self.scope_topic(t)).collect();
         if self.tx_depth > 0 {
             self.pending.extend(topics);
+            self.pending_raw.extend(raw);
         } else {
             self.shared.publish(&topics);
+            self.note_published(raw);
+        }
+    }
+
+    /// While answering a service call, keeps the topics just announced
+    /// that the caller's pages may watch: those the program names itself,
+    /// not its own tables (`db:`) or variables (`var:`), which the caller
+    /// does not share (FEEDBACK4.md, Q-038; branch bank-fixes).
+    pub(crate) fn note_published(&mut self, raw: Vec<String>) {
+        if let Some(out) = &mut self.published {
+            for t in raw {
+                if !(t.starts_with("db:") || t.starts_with("db@") || t.starts_with("var:")) && !out.contains(&t) {
+                    out.push(t);
+                }
+            }
         }
     }
 
@@ -1411,8 +1446,10 @@ impl Interp {
                 // What a service mounts is part of the service.
                 sub.is_service = self.is_service;
                 sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
-                // Watch the mounted program's files too.
-                Arc::make_mut(&mut self.loaded).extend(sub.files());
+                // Watch the mounted program's files too: watched, not loaded,
+                // so a file both `use` still runs here (FEEDBACK4.md, Q-040;
+                // branch bank-fixes).
+                Arc::make_mut(&mut self.watched).extend(sub.files());
                 self.mounts.retain(|(p, _)| p != prefix);
                 self.mounts.push((prefix.clone(), sub));
                 Ok(Value::Nil)

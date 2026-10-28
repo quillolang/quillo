@@ -564,10 +564,20 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
             Try::Answer(status, text) => {
                 went_well(&url);
                 log_call(name, f, &url, status, start, attempt + 1, &rid);
+                let answer = serde_json::from_str::<serde_json::Value>(&text).ok().filter(|_| status == 200);
+                // What the call published there is announced here too, for
+                // pages of this program watching it (FEEDBACK4.md, Q-038;
+                // branch bank-fixes).
+                if let Some(topics) = answer.as_ref().and_then(|j| j["published"].as_array()) {
+                    let topics: Vec<String> = topics.iter().filter_map(|t| t.as_str().map(String::from)).collect();
+                    if !topics.is_empty() {
+                        it.publish(topics);
+                    }
+                }
                 return Outcome::Ran(match status {
-                    200 => match serde_json::from_str::<serde_json::Value>(&text) {
-                        Ok(j) if j.get("ok").is_some() => from_wire(&j["ok"]),
-                        Ok(j) if j.get("err").is_some() => Value::err(from_wire(&j["err"])),
+                    200 => match answer {
+                        Some(j) if j.get("ok").is_some() => from_wire(&j["ok"]),
+                        Some(j) if j.get("err").is_some() => Value::err(from_wire(&j["err"])),
                         _ => Value::err(Value::str(format!("service {}: an answer that is not one", name))),
                     },
                     _ => Value::err(Value::str(format!("service {}: {} {}", name, status, reason(&text)))),
@@ -717,11 +727,24 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
         m.insert("id".into(), Value::str(&**id));
         it.current_request = Some(Value::map(m));
     }
-    match it.call_closure(&c, args.into_iter().map(Some).collect(), 0) {
+    // The topics this call publishes go back with the answer, so the
+    // caller's pages that watch them follow, as they do in one process
+    // (FEEDBACK4.md, Q-038; branch bank-fixes).
+    it.published = Some(Vec::new());
+    let result = it.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+    let published = it.published.take().unwrap_or_default();
+    // Sent only when there are some: an answer without any is as before.
+    let with_published = |mut j: serde_json::Value| {
+        if !published.is_empty() {
+            j["published"] = serde_json::json!(published);
+        }
+        j
+    };
+    match result {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
-            Value::Err(e) => json(200, serde_json::json!({ "err": to_wire(&e) })),
-            v => json(200, serde_json::json!({ "ok": to_wire(&v) })),
+            Value::Err(e) => json(200, with_published(serde_json::json!({ "err": to_wire(&e) }))),
+            v => json(200, with_published(serde_json::json!({ "ok": to_wire(&v) }))),
         },
         Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
         Err(Ctrl::Error(e)) => {
@@ -819,7 +842,9 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
             }
         };
         if let Some(svc) = svc {
-            Arc::make_mut(&mut it.loaded).extend(svc.files());
+            // Watched, not loaded: a file the service and this program both
+            // `use` still runs here (FEEDBACK4.md, Q-040; branch bank-fixes).
+            Arc::make_mut(&mut it.watched).extend(svc.files());
             if let Some(p) = prefix {
                 let mut m = svc;
                 m.base = format!("{}{}", it.base, p);
@@ -998,22 +1023,101 @@ pub fn start_deliveries(addr: std::net::SocketAddr) {
 
 // ---- running split ---------------------------------------------------------------------
 
-/// The processes `--split` started: stopped with it.
+/// The processes `--split` started: kept running while it runs (one that
+/// ends is started again, see `supervise`), and stopped with it.
 pub struct Split {
-    children: Vec<std::process::Child>,
+    services: Arc<Mutex<Vec<Running>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A service's process, and how to start it again.
+struct Running {
+    name: String,
+    exe: PathBuf,
+    args: Vec<String>,
+    child: std::process::Child,
+    started: Instant,
+    /// Before the next start, after it ended: longer each time it ends soon.
+    wait: Duration,
+    again_at: Option<Instant>,
 }
 
 impl Drop for Split {
     fn drop(&mut self) {
-        for c in self.children.iter_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
+        self.stop.store(true, Ordering::SeqCst);
+        for r in self.services.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            let _ = r.child.kill();
+            let _ = r.child.wait();
         }
     }
 }
 
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+/// Starts a service's process, its log lines marked with its name.
+fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process::Child, String> {
+    let mut child = std::process::Command::new(exe)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start service {}: {}", name, e))?;
+    for out in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
+        let tag = name.to_string();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                eprintln!("[{}] {}", tag, l);
+            }
+        });
+    }
+    Ok(child)
+}
+
+/// Watches the services `--split` started: one whose process ends while the
+/// app runs is started again, the same way (same port, same secret), after
+/// a second, then twice as long each time it ends again soon (at most 30 s),
+/// and from a second again once it has run for a minute. Before, a service
+/// that died stayed away until the whole app was restarted (FEEDBACK4.md,
+/// Q-042; branch bank-fixes).
+fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    let _ = std::thread::Builder::new().name("quillo-split".into()).spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if stop.load(Ordering::SeqCst) || crate::httpd::stopping() {
+            return;
+        }
+        let now = Instant::now();
+        for r in services.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            match r.again_at {
+                None => {
+                    if let Ok(Some(status)) = r.child.try_wait() {
+                        if now.duration_since(r.started) >= Duration::from_secs(60) {
+                            r.wait = Duration::from_secs(1);
+                        }
+                        eprintln!("quillo: service {} stopped ({}); starting it again in {} s", r.name, status, r.wait.as_secs());
+                        r.again_at = Some(now + r.wait);
+                    }
+                }
+                Some(at) if now >= at => match start_service(&r.exe, &r.args, &r.name) {
+                    Ok(child) => {
+                        eprintln!("quillo: service {} started again", r.name);
+                        r.child = child;
+                        r.started = now;
+                        r.again_at = None;
+                        r.wait = (r.wait * 2).min(Duration::from_secs(30));
+                    }
+                    Err(e) => {
+                        eprintln!("quillo: {}", e);
+                        r.wait = (r.wait * 2).min(Duration::from_secs(30));
+                        r.again_at = Some(now + r.wait);
+                    }
+                },
+                Some(_) => {}
+            }
+        }
+    });
 }
 
 /// `quillo run app.qwe --split`: each service the app declares (and those
@@ -1032,32 +1136,23 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
         ports.push(port);
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut split = Split { children: Vec::new() };
+    let mut running = Vec::new();
     for ((name, prefix, file), port) in services.iter().zip(&ports) {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("run").arg(file).args(["--port", &port.to_string(), "--as-service", "--service-name", name]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut args: Vec<String> = vec!["run".into(), file.display().to_string(), "--port".into(), port.to_string(), "--as-service".into(), "--service-name".into(), name.clone()];
         if let Some(p) = prefix {
-            cmd.args(["--base", p]);
+            args.extend(["--base".to_string(), p.clone()]);
         }
         if watch {
-            cmd.arg("--watch");
+            args.push("--watch".into());
         }
         if !static_check {
-            cmd.arg("--no-check");
+            args.push("--no-check".into());
         }
-        let mut child = cmd.spawn().map_err(|e| format!("cannot start service {}: {}", name, e))?;
-        for out in [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)].into_iter().flatten() {
-            let tag = name.clone();
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                    eprintln!("[{}] {}", tag, l);
-                }
-            });
-        }
+        let child = start_service(&exe, &args, name)?;
         eprintln!("quillo: service {} ({}) on http://127.0.0.1:{}{}", name, file.display(), port, prefix.as_ref().map_or(String::new(), |p| format!(", served under {}", p)));
-        split.children.push(child);
+        running.push(Running { name: name.clone(), exe: exe.clone(), args, child, started: Instant::now(), wait: Duration::from_secs(1), again_at: None });
     }
+    let split = Split { services: Arc::new(Mutex::new(running)), stop: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
     // Ready when each answers.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     for ((name, _, _), port) in services.iter().zip(&ports) {
@@ -1068,5 +1163,6 @@ pub fn split(path: &Path, watch: bool, static_check: bool) -> Result<Split, Stri
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    supervise(split.services.clone(), split.stop.clone());
     Ok(split)
 }

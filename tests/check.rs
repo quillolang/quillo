@@ -616,3 +616,39 @@ fn a_wildcard_route_is_not_a_comment() {
     clean("route GET /files/*path = path");
 }
 
+
+/// `range(0, n / 4)`: `/` gives an int only when it divides evenly, so a
+/// call that takes an int works for some `n` and stops for others
+/// (FEEDBACK4.md, Q-044; branch bank-fixes).
+#[test]
+fn a_division_where_an_int_is_taken_is_warned_about() {
+    one("fn g(s: str) -> list = range(0, (len(s) + 3) / 4)", "1 warning: argument 2 of `range` must be an int, and `/` gives one only when it divides evenly");
+    one("fn g(xs: list) = xs | take(len(xs) / 2)", "argument 2 of `take` must be an int");
+    clean("fn g(s: str) -> list = range(0, floor((len(s) + 3) / 4))");
+    clean("fn g(n: int) -> list = range(0, n * 2)");
+    clean("print(slice(\"abcdef\", 0, 6 / 2))");
+    clean("fn g(x: float) -> float = x / 2");
+}
+
+/// A `live` loader that only calls a service follows nothing that changes
+/// (FEEDBACK4.md, Q-039; branch bank-fixes).
+#[test]
+fn a_live_loader_that_only_calls_a_service_is_warned_about() {
+    let d = std::env::temp_dir().join(format!("quillo-live-service-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("ledger.qwe"), "let balance = 100\nserver fn current() -> int = balance\n").unwrap();
+    let app = |loader: &str| format!(
+        "service ledger = \"ledger.qwe\"\n{}\ncomponent Balance() {{\n    state bal = live(load)\n    <p>{{bal}}</p>\n}}\nroute GET / = <html><body><Balance/></body></html>\n",
+        loader
+    );
+    let warnings = |src: String| {
+        std::fs::write(d.join("main.qwe"), src).unwrap();
+        quillo::check::check_file(&d.join("main.qwe")).diagnostics.iter().map(|x| x.message.clone()).collect::<Vec<_>>()
+    };
+    let w = warnings(app("server fn load() -> int with http = ledger.current() ?? -1"));
+    assert!(w.iter().any(|m| m.contains("`load` gets its data from the service `ledger`")), "{:#?}", w);
+    // Watching a topic, or reading the database too: not warned about.
+    assert!(warnings(app("server fn load() -> int with http {\n    watch(\"ledger\")\n    ledger.current() ?? -1\n}")).is_empty());
+    assert!(warnings(app("server fn load() -> int with http, db = (ledger.current() ?? 0) + db.one(\"select 1 as n\").n")).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}

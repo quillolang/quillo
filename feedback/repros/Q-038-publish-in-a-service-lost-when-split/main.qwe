@@ -14,7 +14,7 @@ service ledger = "ledger.qwe"
 
 server fn load() -> int with http {
     watch("ledger")
-    ledger.get() ?? -1
+    ledger.current() ?? -1
 }
 
 server fn spend() with http = ledger.spend(10)

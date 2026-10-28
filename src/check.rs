@@ -3466,6 +3466,43 @@ impl Checker {
         }
     }
 
+    /// The service a `live` loader gets its data from, when that is all it
+    /// reads: it calls a service, and neither `watch`es a topic nor reads
+    /// the database, nor calls a function of the program that might. Such a
+    /// loader follows only the variable holding the service, which never
+    /// changes (FEEDBACK4.md, Q-039; branch bank-fixes).
+    fn follows_only_a_service(&self, f: &str) -> Option<String> {
+        let def = self.globals.get(f)?.sig.clone()?.def.clone()?;
+        let mut service = None;
+        let mut other = false;
+        walk_expr(&def.body, &mut |e| match e {
+            Expr::Call(c, _, _) => match &**c {
+                Expr::Ident(n, _) if n == "watch" => other = true,
+                Expr::Ident(n, _) => {
+                    let program_fn = self.globals.get(n).and_then(|v| v.sig.clone()).map_or(false, |s| !s.builtin && s.def.is_some());
+                    if program_fn {
+                        other = true;
+                    }
+                }
+                Expr::Field(o, _, _) => match &**o {
+                    Expr::Ident(n, _) if n == "db" => other = true,
+                    Expr::Ident(n, _) if self.services.contains_key(n) => service = Some(n.clone()),
+                    Expr::Field(inner, later, _) if later == "later" => {
+                        if let Expr::Ident(n, _) = &**inner {
+                            if self.services.contains_key(n) {
+                                service = Some(n.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            _ => {}
+        });
+        if other { None } else { service }
+    }
+
     /// Whether calling `f` gives SQL-safe text: `sql_name`, `sql_param`, or
     /// a function of the program that only returns such text.
     fn sql_safe_call(&self, f: &Expr) -> bool {
@@ -3499,8 +3536,23 @@ impl Checker {
                     self.error(format!("{} of `{}` must be {}, got {}{}", what(), name, bits_text(p.ty), bits_text(a.bits), hides(&sig, name)));
                 }
                 Some(a) if p.annotated => {
+                    // `range(0, n / 4)`: a whole number only when `/` divides
+                    // evenly, so it works for some `n` and stops for others
+                    // (FEEDBACK4.md, Q-044; branch bank-fixes).
+                    let written = arg_exprs.get(i.wrapping_sub(args.len() - arg_exprs.len()));
+                    let divided = match written {
+                        Some(Expr::Binary(BinOp::Div, x, y, _)) => {
+                            !matches!((&**x, &**y), (Expr::Lit(Lit::Int(m)), Expr::Lit(Lit::Int(n))) if *n != 0 && m % n == 0)
+                        }
+                        _ => false,
+                    };
                     if let Some(why) = mismatch(*a, p.full) {
                         self.error(format!("{} of `{}` {}{}", what(), name, why, hides(&sig, name)));
+                    } else if divided && p.ty & INT != 0 && p.ty & FLOAT == 0 && a.bits & FLOAT != 0 {
+                        self.warn(format!(
+                            "{} of `{}` must be an int, and `/` gives one only when it divides evenly (`7 / 2` is 3.5): write `floor(...)` or `round(...)`",
+                            what(), name
+                        ));
                     } else if self.strict_null && !a.vague() && a.bits & NIL != 0 && a.bits != NIL && p.ty & NIL == 0 {
                         self.warn(format!("{} of `{}` may be null here (it is {}), but it must be {}", what(), name, t_text(*a), bits_text(p.ty)));
                     }
@@ -3574,6 +3626,12 @@ impl Checker {
                     let is_server = self.globals.get(f).and_then(|v| v.sig.clone()).map_or(true, |s| s.server || s.def.is_none() && !s.builtin);
                     if !is_server {
                         self.error(format!("`live` needs a server fn: `{}` is not one", f));
+                    }
+                    if let Some(service) = self.follows_only_a_service(f) {
+                        self.warn(format!(
+                            "`{}` gets its data from the service `{}`, whose changes reach no page by themselves, so this state never changes: `watch(\"topic\")` in `{}`, and `publish(\"topic\")` where it changes (in the service, or here after the call)",
+                            f, service, f
+                        ));
                     }
                 }
                 Some(_) => self.error("`live` needs a server fn by name: state items = live(load_items, ...)"),

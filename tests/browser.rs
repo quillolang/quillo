@@ -498,6 +498,23 @@ fn markdown_in_a_component_is_the_servers() {
     assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("`markdown` expects options as a map, got int"), "{}", r);
 }
 
+/// `cond && <markup>` keeps its elements while `cond` stays true: an input
+/// in it keeps its focus and text as the page updates (FEEDBACK4.md, Q-041;
+/// branch bank-fixes).
+#[test]
+fn and_in_markup_keeps_its_elements() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("and_markup.qwe"), free_port(), Some(&dir.join("and_markup.js")));
+    assert_eq!(
+        r,
+        serde_json::json!({ "same": true, "focused": true, "value": "Grace", "typed": "Grace", "ticked": true, "closed": true, "errors": [] })
+    );
+}
+
 /// A textarea's text between its tags follows state once someone has typed
 /// in it, and a text that never changes leaves what was typed alone.
 #[test]

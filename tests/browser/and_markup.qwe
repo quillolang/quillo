@@ -1,0 +1,18 @@
+// `cond && <markup>` keeps its elements while `cond` stays true, as `if`
+// and `? :` do: typing in an input inside one survives the page updating
+// (FEEDBACK4.md, Q-041; branch bank-fixes). Driven by and_markup.js.
+
+component Form() {
+    state open = true
+    state ticks = 0
+    state typed = ""
+    every(100, () => { ticks += 1 })
+    <div>
+        <p id="ticks">{ticks}</p>
+        {open && <div><input id="box" @input={(e) => { typed = e.value }}/> {ticks}</div>}
+        <p id="typed">{typed}</p>
+        <button id="close" @click={() => { open = false }}>close</button>
+    </div>
+}
+
+route GET / = <html><body><Form/></body></html>

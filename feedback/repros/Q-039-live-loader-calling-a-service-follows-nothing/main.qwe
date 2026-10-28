@@ -1,17 +1,16 @@
 // Q-039 A live loader that gets its data from a service follows only the service's name, so the page never updates, without a word
-// mode: browser
-// page: /
-// probe: await new Promise((r) => setTimeout(r, 300)); document.getElementById("spend").click(); await new Promise((r) => setTimeout(r, 1500)); return { shown: document.getElementById("bal").textContent, topics: document.querySelector("[data-l]").dataset.l }
-// open-when: "shown": "100"
-// fixed-when: "shown": "90"
+// mode: check
+// open-when: /components\)\s*$/
+// fixed-when: reach no page by themselves
 // From FEEDBACK4.md (found on 5d2e21e). The loader's topics are ["var:ledger"]: the variable
-// holding the service, which never changes. Not even the page that spent sees the new balance.
-// `quillo check` says nothing; a warning that such a loader follows nothing (watch a topic and
-// publish it after the calls that change it) would have saved the probe.
+// holding the service, which never changes, so not even the page that spent sees the new
+// balance. Fixed by `quillo check` saying so (branch bank-fixes): such a loader must `watch` a
+// topic, which the service (or the caller, after the call) publishes; since the same branch, a
+// service's publish reaches the caller's pages split too (Q-038).
 
 service ledger = "ledger.qwe"
 
-server fn load() -> int with http = ledger.get() ?? -1
+server fn load() -> int with http = ledger.current() ?? -1
 
 server fn spend() with http = ledger.spend(10)
 

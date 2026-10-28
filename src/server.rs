@@ -1483,8 +1483,12 @@ impl Worker {
         // the program's business, so it is not logged.
         // Nor are the batches of UDP packets handed to the program: they are
         // counted as packets (see `udp`), not requests.
+        // Nor the scheduler's own call each second, asking that calls made
+        // `later` be sent (only it has the token: others get a 404, logged)
+        // (FEEDBACK4.md, Q-043; branch bank-fixes).
         let took = start.elapsed().as_secs_f64();
-        let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/");
+        let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/")
+            || (req.url == "/_quillo/later" && resp.status == 200);
         if !delivery {
             crate::metrics::answered(resp.status, took);
         }
