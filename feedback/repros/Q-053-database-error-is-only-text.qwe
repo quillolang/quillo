@@ -1,0 +1,15 @@
+// Q-053 A database error is only its text: a unique key's failure is told from an outage by matching words that differ by database
+// mode: run
+// open-when: has no function `error_kind`
+// fixed-when: unique not_null none
+// From FEEDBACK5.md (found on ae6a6e5). app/stays' hold_stay told "someone has just booked that
+// night" from other failures with `contains(r.error, "UNIQUE")`: SQLite's words; PostgreSQL says
+// "duplicate key value violates unique constraint", MySQL "Duplicate entry". Fixed on stays-fixes
+// with db.error_kind(e): "unique", "foreign_key", "not_null", "check", "conflict" or null.
+
+db.open(":memory:")
+db.exec("create table t (a int primary key, b text not null)")
+db.exec("insert into t values (1, 'x')")
+let taken = db.exec("insert into t values (1, 'y')")
+let empty = db.exec("insert into t values (2, null)")
+print(db.error_kind(taken), db.error_kind(empty), db.error_kind(err("UNIQUE, but not the database's")) ?? "none")

@@ -23,6 +23,14 @@
 // + name by default) and size ("sm" or "md") as for every field.
 // on_change(start, end): inside one of your components, given both "YYYY-MM-DD"
 // once the last day is picked (or both null when cleared).
+// disabled_dates: days that cannot be picked, crossed out ("YYYY-MM-DD" each), as
+// DatePicker's; a range cannot run across one. day_labels: a short text under each
+// day it names ({ "2026-12-24": "€140" }: prices, say). min_nights: counts nights
+// instead of days, for a stay: the end is the day one leaves, at least min_nights
+// after the start, and it may be a disabled day (its night is not part of the stay).
+//
+//   <DateRangePicker name="stay" label="Dates" min_nights={2} disabled_dates={booked}
+//                    day_labels={prices}/>
 
 let date_range_picker_css = css`
 .ui-date-range-picker { position: relative; display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
@@ -81,6 +89,10 @@ let date_range_picker_css = css`
 .ui-date-range-picker-last { border-radius: 0 var(--ui-radius-sm) var(--ui-radius-sm) 0; }
 .ui-date-range-picker-first.ui-date-range-picker-last { border-radius: var(--ui-radius-sm); }
 .ui-date-range-picker-day[aria-disabled="true"] { color: var(--ui-muted); opacity: .45; cursor: not-allowed; background: none; }
+.ui-date-range-picker-off { text-decoration: line-through; }
+.ui-date-range-picker-note { display: block; font-size: 10px; line-height: 1.1; color: var(--ui-muted); text-decoration: none; }
+.ui-date-range-picker-noted .ui-date-range-picker-day { height: 42px; line-height: 1.2; }
+.ui-date-range-picker-edge .ui-date-range-picker-note { color: inherit; }
 .ui-date-range-picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--ui-border); font-size: 13px; color: var(--ui-muted); }
 .ui-date-range-picker-clear {
   padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: transparent;
@@ -207,7 +219,8 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
                           min: str? = null, max: str? = null, presets: list? = null, names: list? = null,
                           week_start: int = 1, today: str? = null, placeholder: str = "Choose dates",
                           hint: str? = null, error: str? = null, disabled: bool = false, field: str? = null,
-                          size: str = "md", on_change = null, class: str? = null) {
+                          size: str = "md", disabled_dates: list = [], day_labels: map = {}, min_nights: int? = null,
+                          on_change = null, class: str? = null) {
     let lo = date_range_picker_parse(min)
     let hi = date_range_picker_parse(max)
     let first_a = date_range_picker_parse(start)
@@ -236,6 +249,18 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
     let tip = picking ? (hover ?? at) : null
     let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
     let allowed = (z: int) => (lo == null || z >= lo) && (hi == null || z <= hi)
+    let blocked = disabled_dates | map((t) => date_range_picker_parse(t)) | filter((z) => z != null)
+    let nights = min_nights != null
+    let free = (z: int) => allowed(z) && !contains(blocked, z)
+    // While the end is picked: the first disabled day after the start, which the
+    // range cannot pass (in nights, it may end on it).
+    let after = picking ? blocked | filter((z) => z > a) | sort : []
+    let wall = len(after) > 0 ? after[0] : null
+    let end_ok = (z: int) => allowed(z) && (wall == null || (nights ? z <= wall : z < wall))
+        && (nights ? z - a >= min_nights : !contains(blocked, z))
+    let can = (z: int) => picking && z >= a ? end_ok(z) : free(z)
+    // No disabled day inside x..y (but the last, in nights).
+    let clear_span = (x: int, y: int) => len(blocked | filter((z) => z >= x && (nights ? z < y : z <= y))) == 0
     let kept = (z: int) => lo != null && z < lo ? lo : hi != null && z > hi ? hi : z
     let root_of = (e) => e.target.closest(".ui-date-range-picker")
     let focus_day = (root) => {
@@ -264,16 +289,17 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
         on_change && on_change(x == null ? null : date_range_picker_iso(x), y == null ? null : date_range_picker_iso(y))
     }
     let pick = (e, z: int) => {
-        if allowed(z) {
+        if picking && z >= a {
+            if end_ok(z) {
+                at = z
+                done(e, a, z)
+            }
+        } else if free(z) {
             at = z
+            a = z
             if !picking {
-                a = z
                 b = null
                 hover = null
-            } else if z < a {
-                a = z
-            } else {
-                done(e, a, z)
             }
         }
     }
@@ -291,10 +317,14 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
         focus_day(root_of(e))
     }
     let status = a == null ? "Pick the first day."
-        : b == null ? `From ${date_range_picker_long(a)}: now pick the last day.`
+        : b == null ? (nights ? `From ${date_range_picker_long(a)}: now pick the day it ends, ${min_nights} ${min_nights == 1 ? "night" : "nights"} or more later.`
+                              : `From ${date_range_picker_long(a)}: now pick the last day.`)
+        : nights ? `${b - a} ${b - a == 1 ? "night" : "nights"}: ${date_range_picker_span(a, b)}.`
         : `${b - a + 1} ${b == a ? "day" : "days"}: ${date_range_picker_span(a, b)}.`
+    // The preview stops where the range would have to stop.
+    let reach = tip != null && wall != null && tip > wall ? (nights ? wall : wall - 1) : tip
     <div class={ui_cls(["ui-date-range-picker", size == "sm" && "ui-date-range-picker-sm",
-                        error != null && "ui-date-range-picker-invalid", class])}
+                        error != null && "ui-date-range-picker-invalid", len(keys(day_labels)) > 0 && "ui-date-range-picker-noted", class])}
          @focusout={(e) => {
              let root = root_of(e)
              if open && root != null && !(e.relatedTarget != null && root.contains(e.relatedTarget)) { open = false }
@@ -325,7 +355,7 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
                 {len(offered) > 0 && <div.ui-date-range-picker-presets role="group" aria-label="Presets">
                     {for p in offered => <button.ui-date-range-picker-preset type="button" key={p.label}
                             aria-pressed={p.start == a && p.end == b ? "true" : "false"}
-                            disabled={!allowed(p.start) || !allowed(p.end)}
+                            disabled={!allowed(p.start) || !allowed(p.end) || !clear_span(p.start, p.end)}
                             @click={(e) => {
                                 at = p.start
                                 left = date_range_picker_month(p.start, 0)
@@ -392,24 +422,26 @@ component DateRangePicker(name: str? = null, label: str? = null, start: str? = n
                                         ? <td role="gridcell"></td>
                                         : {
                                             let lo_end = a ?? z
-                                            let hi_end = b ?? tip ?? a ?? z
+                                            let hi_end = b ?? reach ?? a ?? z
                                             let inside = a != null && z >= lo_end && z <= hi_end
                                             let edge = z == a || z == b
+                                            let note = get(day_labels, date_range_picker_iso(z))
                                             <td role="gridcell" data-day={z} tabindex={z == at ? "0" : "-1"}
                                                 class={ui_cls(["ui-date-range-picker-day", z == now_d && "ui-date-range-picker-today",
+                                                               contains(blocked, z) && "ui-date-range-picker-off",
                                                                inside && "ui-date-range-picker-in",
                                                                inside && picking && !edge && "ui-date-range-picker-preview",
                                                                edge && "ui-date-range-picker-edge",
                                                                inside && (z == lo_end || date_range_picker_weekday(z) == week_start) && "ui-date-range-picker-first",
                                                                inside && (z == hi_end || date_range_picker_weekday(z) == (week_start + 6) % 7) && "ui-date-range-picker-last"])}
-                                                aria-label={date_range_picker_long(z)}
+                                                aria-label={contains(blocked, z) ? `${date_range_picker_long(z)}, unavailable` : date_range_picker_long(z)}
                                                 aria-selected={a != null && z >= a && z <= (b ?? a) ? "true" : null}
-                                                aria-current={z == now_d ? "date" : null} aria-disabled={allowed(z) ? null : "true"}
+                                                aria-current={z == now_d ? "date" : null} aria-disabled={can(z) || z == a ? null : "true"}
                                                 @pointerenter={() => { if picking { hover = z } }}
                                                 @click={(e) => {
                                                     pick(e, z)
                                                     if open { focus_day(root_of(e)) }
-                                                }}>{date_range_picker_civil(z).d}</td>
+                                                }}>{date_range_picker_civil(z).d}{note != null ? <span.ui-date-range-picker-note>{note}</span> : null}</td>
                                         }}
                                 </tr>}
                             </tbody>

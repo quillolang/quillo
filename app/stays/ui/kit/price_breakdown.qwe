@@ -1,0 +1,46 @@
+// PriceBreakdown: what a price is made of, a line each, and the total: nights,
+// a discount, fees, taxes. The amounts are text, already written in their
+// currency (money.format does it), so they line up whatever the currency.
+//
+//   <PriceBreakdown total="€552.80" lines={[
+//       { label: "4 nights", amount: "€430.00" },
+//       { label: "Weekly stay discount", amount: "−€43.00", tone: "success" },
+//       { label: "Service fee", amount: "€55.80", hint: "12% of the nights and cleaning" }]}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// lines: a list of { label, amount, tone?, hint? }. tone: "success" (a discount, in
+// green), "muted" or "danger". hint: a quieter line under the label.
+// total: the total's amount (left out, no total line). total_label: "Total".
+// title: a heading above the lines. note: a small line under the total.
+
+let price_breakdown_css = css`
+.ui-price-breakdown { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-price-breakdown-title { margin: 0; font-size: 15px; font-weight: 600; }
+.ui-price-breakdown-lines { display: grid; gap: 6px; margin: 0; }
+.ui-price-breakdown-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.ui-price-breakdown-line dt { min-width: 0; }
+.ui-price-breakdown-line dd { margin: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-price-breakdown-hint { display: block; font-size: 12px; color: var(--ui-muted); }
+.ui-price-breakdown-success dd, .ui-price-breakdown-success dt { color: var(--ui-success); }
+.ui-price-breakdown-muted dd, .ui-price-breakdown-muted dt { color: var(--ui-muted); }
+.ui-price-breakdown-danger dd, .ui-price-breakdown-danger dt { color: var(--ui-danger); }
+.ui-price-breakdown-total { padding-top: 8px; border-top: 1px solid var(--ui-border); font-weight: 700; font-size: 15px; }
+.ui-price-breakdown-note { margin: 0; font-size: 12px; color: var(--ui-muted); }
+`
+
+view PriceBreakdown(lines: list = [], total: str? = null, total_label: str = "Total", title: str? = null,
+                    note: str? = null, class: str? = null) =
+    <div class={ui_cls(["ui-price-breakdown", class])}>
+        {title != null ? <h3.ui-price-breakdown-title>{title}</h3> : null}
+        <dl.ui-price-breakdown-lines>
+            {for l in lines => <div key={l.label} class={ui_cls(["ui-price-breakdown-line", l.tone != null && `ui-price-breakdown-${l.tone}`])}>
+                <dt>{l.label}{l.hint != null ? <span.ui-price-breakdown-hint>{l.hint}</span> : null}</dt>
+                <dd>{l.amount}</dd>
+            </div>}
+            {total != null
+                ? <div.ui-price-breakdown-line.ui-price-breakdown-total><dt>{total_label}</dt><dd>{total}</dd></div>
+                : null}
+        </dl>
+        {note != null ? <p.ui-price-breakdown-note>{note}</p> : null}
+    </div>

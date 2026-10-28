@@ -58,11 +58,6 @@ component HostDashboard() {
 view HostCalendarPage(me, id: int, month: str) =
     <Shell {me} title="Calendar" here="/host"><HostCalendar {id} first_month={month}/></Shell>
 
-fn month_after(month: str, k: int) -> str {
-    let p = day_parts(`${month}-01`)
-    let n = p.y * 12 + p.m - 1 + k
-    `${floor(n / 12)}-${two(n % 12 + 1)}`
-}
 
 // A month of the place's nights. Click to pick nights, shift-click for a run
 // of them; then close, open or price what is picked.
@@ -70,7 +65,6 @@ component HostCalendar(id: int, first_month: str) {
     state month = first_month
     state cal = live(load_calendar, id, month)
     state picked = []
-    state last = null
     state price = ""
     state said = null
     state problem = null
@@ -86,41 +80,17 @@ component HostCalendar(id: int, first_month: str) {
         : <div>
             <a href="/host">← Hosting</a>
             <h1>{cal.listing.title}</h1>
-            <div.spread>
-                <div.row>
-                    <Button variant="ghost" class="prev" on_click={() => { month = month_after(month, -1); picked = [] }}>←</Button>
-                    <h2 id="month-title">{cal.title}</h2>
-                    <Button variant="ghost" class="next" on_click={() => { month = month_after(month, 1); picked = [] }}>→</Button>
-                </div>
-                <span.muted>Usually {cal.listing.price_shown}, {cal.listing.weekend_shown} on Friday and Saturday nights</span>
-            </div>
-            <div.cal id="host-cal">
-                {for w in WEEKDAY_NAMES => <span.wd key={w}>{w}</span>}
-                {for i in range(0, cal.lead) => <span key={`pad${i}`}></span>}
-                {for d in cal.days => <button key={d.day} type="button" data-day={d.day}
-                    class={ui_cls([d.state, d.custom && "custom", contains(picked, d.day) && "sel", d.day < cal.today && "past"])}
-                    disabled={d.day < cal.today}
-                    @click={(e) => {
-                        if e.shiftKey && last != null {
-                            let from = last < d.day ? last : d.day
-                            let to = last < d.day ? d.day : last
-                            picked = unique(picked + nights_of(from, add_days(to, 1)))
-                        } else {
-                            picked = contains(picked, d.day) ? picked | filter((x) => x != d.day) : picked + [d.day]
-                        }
-                        last = d.day
-                    }}>
-                    <b>{d.n}</b>
-                    <span.p>{d.shown}</span>
-                    <span.muted>{d.state == "free" ? "" : d.guest ?? d.state}</span>
-                </button>}
-            </div>
+            <p.muted>Usually {cal.listing.price_shown}, {cal.listing.weekend_shown} on Friday and Saturday nights. Click nights to pick them, shift-click for a run.</p>
+            <MonthCalendar label="Nights" {month} today={cal.today} selected={picked}
+                days={cal.days | map((d) => { day: d.day, state: d.custom && d.state == "free" ? "priced" : d.state, note: d.guest })}
+                labels={cal.days | reduce({}, (m, d) => set(m, d.day, d.shown))}
+                on_select={(days) => { picked = days }} on_month={(m) => { month = m }}/>
             <div.row style="margin-top: 16px">
                 <span id="picked-count">{plural(len(picked), "night")} picked</span>
-                <Button variant="outline" class="close-nights" disabled={len(picked) == 0} on_click={() => act("close")}>Close</Button>
-                <Button variant="outline" class="open-nights" disabled={len(picked) == 0} on_click={() => act("open")}>Open</Button>
+                <Button variant="outline" id="close-nights" disabled={len(picked) == 0} on_click={() => act("close")}>Close</Button>
+                <Button variant="outline" id="open-nights" disabled={len(picked) == 0} on_click={() => act("open")}>Open</Button>
                 <TextField label="Price a night" name="price" value={price} size="sm" prefix={cal.listing.currency == "JPY" ? "¥" : "€"} on_input={(v) => { price = v }}/>
-                <Button class="price-nights" disabled={len(picked) == 0} on_click={() => act("price")}>Set price</Button>
+                <Button id="price-nights" disabled={len(picked) == 0} on_click={() => act("price")}>Set price</Button>
                 <Button variant="ghost" disabled={len(picked) == 0} on_click={() => act("usual")}>Usual price</Button>
             </div>
             <Problem text={problem}/>
@@ -137,14 +107,12 @@ let CITY_CENTRES = {
 
 component NewListing() {
     state city = "Lisbon"
+    state center = get(CITY_CENTRES, "Lisbon")
+    state zoom = 13
     state pin = null
-    state leaflet = null
-    state marker = null
     state problem = null
     state busy = false
     state amenities = ["wifi", "kitchen"]
-    // Another city: the map goes there, and the pin is placed again.
-    if leaflet != null { leaflet.setView(get(CITY_CENTRES, city), 13) }
     <form.new-form id="new-listing" @submit={(e) => {
         busy = true
         let r = add_listing(merge(e.form, {
@@ -158,34 +126,19 @@ component NewListing() {
         <TextField name="title" label="Title" required={true} placeholder="Sunny flat by the river"/>
         <div.two>
             <Select name="kind" label="Kind" options={KINDS}/>
-            <Select name="city" label="City" value={city} options={keys(CITY_ZONES)} on_change={(v) => { city = v }}/>
+            <Select name="city" label="City" value={city} options={keys(CITY_ZONES)}
+                on_change={(v) => { city = v; center = get(CITY_CENTRES, v); zoom = 13; pin = null }}/>
         </div>
         <TextField name="address" label="Address" hint="Found on the map when you save, unless you place the pin yourself" on_change={(v) => {
             // Nominatim from the browser: one call a second, as its policy asks.
-            let r = http.get(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${url_encode(`${v}, ${city}`)}`)
-            if !is_err(r) && r.ok && len(r.json) > 0 && marker != null {
+            let r = http.get(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${url_encode(`${v}, ${city}`)}`, {}, { timeout: 5 })
+            if !is_err(r) && r.ok && len(r.json) > 0 {
                 pin = [float(r.json[0].lat), float(r.json[0].lon)]
-                marker.setLatLng(pin)
-                leaflet.setView(pin, 16)
+                center = pin
+                zoom = 16
             }
         }}/>
-        <div.map id="new-map" style="height: 280px" @mount={(el) => {
-            let m = js("L.map", el)
-            m.setView(get(CITY_CENTRES, city), 13)
-            js("L.tileLayer", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m)
-            let mk = js("L.marker", get(CITY_CENTRES, city), { draggable: true }).addTo(m)
-            mk.on("dragend", (e) => {
-                let at = mk.getLatLng()
-                pin = [at.lat, at.lng]
-            })
-            m.on("click", (e) => {
-                pin = [e.latlng.lat, e.latlng.lng]
-                mk.setLatLng(pin)
-            })
-            marker = mk
-            leaflet = m
-            () => m.remove()
-        }}></div>
+        <MapView label="Where it is" {center} {zoom} height={280} pin={pin ?? center} on_pin={(lat, lng) => { pin = [lat, lng] }}/>
         <p.muted.small id="pin">{pin == null ? "Click the map or drag the pin to place it exactly." : `Pin at ${round(pin[0] * 10000) / 10000}, ${round(pin[1] * 10000) / 10000}`}</p>
         <div.two>
             <TextField name="base" label="A night" required={true} prefix={city == "Kyoto" ? "¥" : "€"} placeholder={city == "Kyoto" ? "18000" : "95.00"}/>

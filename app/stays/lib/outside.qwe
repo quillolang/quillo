@@ -12,8 +12,8 @@
 // service once for everyone, and still has an answer when the service is
 // down: an old one, said to be old. Every call is logged in `outside_calls`.
 //
-// http.get cannot be told to give up sooner than Quillo's own 60 s (FEEDBACK5.md),
-// so pages never wait for these while they render: the stay page asks for the
+// Each call has a time to answer in (Overpass 8 s, then Photon is asked), and
+// pages never wait for these while they render: the stay page asks for the
 // weather and places after it shows.
 //
 // STAYS_OFFLINE=1 answers from made-up data instead, for tests and trains.
@@ -39,11 +39,12 @@ fn keep(key: str, service: str, value) with db, time =
 fn logged(service: str, url: str, status: int, ms: int) with db, time =
     db.exec("insert into outside_calls (service, url, status, ms, created) values (?, ?, ?, ?, ?)", service, url, status, ms, now())
 
-// A GET to an outside service: its JSON, or an error value saying why.
-fn fetch_json(service: str, url: str) with http, db, time {
+// A GET to an outside service, given `secs` to answer: its JSON, or an
+// error value saying why.
+fn fetch_json(service: str, url: str, secs: int) with http, db, time {
     let t = now()
     // Every url here is built from one of the hosts above: public_only says so.
-    let r = http.get(url, { "User-Agent": USER_AGENT, "Accept": "application/json" }, { public_only: true })
+    let r = http.get(url, { "User-Agent": USER_AGENT, "Accept": "application/json" }, { public_only: true, timeout: secs })
     logged(service, url, is_err(r) ? 0 : r.status, now() - t)
     if is_err(r) { return err(`${service} did not answer (${r.error})`) }
     if !r.ok { return err(`${service} answered ${r.status}`) }
@@ -82,7 +83,7 @@ fn geocode(q: str) with http, db, time {
     if OFFLINE { return offline_place(text) }
     through_cache(`geocode:${lower(text)}`, "geocode", () => {
         nominatim_wait()
-        let found = fetch_json("nominatim", `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${url_encode(text)}`)?
+        let found = fetch_json("nominatim", `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${url_encode(text)}`, 5)?
         if len(found) == 0 { return err(`Nowhere called “${text}” was found`) }
         let p = found[0]
         let a = p.address ?? {}
@@ -118,7 +119,7 @@ fn forecast(lat: float, lng: float) with http, db, time {
     let la = round_to(lat, 2)
     let lo = round_to(lng, 2)
     through_cache(`weather:${la},${lo}`, "weather", () => {
-        let w = fetch_json("open-meteo", `https://api.open-meteo.com/v1/forecast?latitude=${la}&longitude=${lo}&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=16`)?
+        let w = fetch_json("open-meteo", `https://api.open-meteo.com/v1/forecast?latitude=${la}&longitude=${lo}&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=16`, 5)?
         let d = w.daily ?? err("Open-Meteo sent no days")?
         {
             zone: w.timezone ?? "UTC",
@@ -183,7 +184,7 @@ fn places_near(lat: float, lng: float) with http, db, time {
 
 fn overpass(lat: float, lng: float) with http, db, time {
     let q = `[out:json][timeout:8];(node(around:1200,${lat},${lng})[amenity~"^(restaurant|cafe|bar|pub|fast_food|ice_cream)$"][name];node(around:1200,${lat},${lng})[tourism~"^(museum|gallery|attraction|viewpoint|artwork)$"][name];node(around:1200,${lat},${lng})[leisure~"^(park|garden|beach_resort|playground)$"][name];);out 120;`
-    let j = fetch_json("overpass", `${OVERPASS}?data=${url_encode(q)}`)?
+    let j = fetch_json("overpass", `${OVERPASS}?data=${url_encode(q)}`, 8)?
     let rows = (j.elements ?? []) | map((e) => {
         let t = e.tags ?? {}
         place_row(t.name ?? "", t.amenity ?? t.tourism ?? t.leisure ?? "attraction", e.lat, e.lon, lat, lng)
@@ -195,7 +196,7 @@ fn overpass(lat: float, lng: float) with http, db, time {
 fn photon_places(lat: float, lng: float) with http, db, time {
     let asks = [["restaurant", "amenity:restaurant"], ["cafe", "amenity:cafe"], ["museum", "tourism:museum"], ["park", "leisure:park"], ["bar", "amenity:bar"], ["viewpoint", "tourism:viewpoint"]]
     let found = asks | map((a) => {
-        let j = fetch_json("photon", `https://photon.komoot.io/api/?q=${a[0]}&lat=${lat}&lon=${lng}&limit=8&osm_tag=${url_encode(a[1])}`)
+        let j = fetch_json("photon", `https://photon.komoot.io/api/?q=${a[0]}&lat=${lat}&lon=${lng}&limit=8&osm_tag=${url_encode(a[1])}`, 4)
         is_err(j) ? [] : (j.features ?? []) | map((f) => place_row(f.properties.name ?? "", a[0], f.geometry.coordinates[1], f.geometry.coordinates[0], lat, lng))
     }) | flatten | filter((p) => p.name != "" && p.metres <= 2500)
     if len(found) == 0 { return err("Neither Overpass nor Photon answered: no places around for now") }

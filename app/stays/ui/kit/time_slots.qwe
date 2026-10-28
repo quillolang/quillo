@@ -1,0 +1,66 @@
+// TimeSlots: times to choose one from, with the places left at each: a tour's
+// departures, a class's sessions, a table's sittings. Full ones cannot be chosen.
+// Each is a radio button, so a plain <form> sends the one chosen, and the arrow
+// keys move between them.
+//
+//   <TimeSlots name="slot" label="Times" value={chosen} on_pick={(id) => { chosen = id }}
+//              slots={[{ id: 31, time: "Sat 7 Nov 10:00", left: 4 }, { id: 32, time: "Sat 7 Nov 15:00", left: 0 },
+//                      { id: 33, time: "Sun 8 Nov 10:00", left: 9, detail: "80% rain", tone: "warning" }]}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// slots: a list of { id, time, left?, detail?, tone?, disabled? }. left: places left
+// ("4 left"; 0 is "Full", and cannot be chosen); detail: a second line; tone:
+// "warning" or "danger" marks it (rain on an outdoor tour). value: the id chosen.
+// name: what a <form> sends it as. label: what the group is called, shown and said.
+// empty: what shows when there are no slots ("No times").
+// on_pick(id): inside one of your components, the slot chosen.
+
+let time_slots_css = css`
+.ui-time-slots { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-time-slots-legend { padding: 0; margin-bottom: 2px; font-size: 13px; font-weight: 500; }
+.ui-time-slots-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-time-slots-slot { position: relative; display: block; }
+.ui-time-slots-slot input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.ui-time-slots-box {
+  display: grid; gap: 1px; min-width: 112px; padding: 7px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); cursor: pointer; transition: border-color .15s, box-shadow .15s;
+}
+.ui-time-slots-time { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-time-slots-meta { font-size: 12px; color: var(--ui-muted); }
+.ui-time-slots-slot:hover .ui-time-slots-box { border-color: var(--ui-strong); }
+.ui-time-slots-slot input:focus-visible + .ui-time-slots-box { box-shadow: var(--ui-focus); }
+.ui-time-slots-slot input:checked + .ui-time-slots-box { border-color: var(--ui-accent); background: var(--ui-accent-soft); box-shadow: inset 0 0 0 1px var(--ui-accent); }
+.ui-time-slots-warning .ui-time-slots-box { border-color: var(--ui-warning); }
+.ui-time-slots-warning .ui-time-slots-meta { color: var(--ui-warning); }
+.ui-time-slots-danger .ui-time-slots-box { border-color: var(--ui-danger); }
+.ui-time-slots-danger .ui-time-slots-meta { color: var(--ui-danger); }
+.ui-time-slots-slot input:disabled + .ui-time-slots-box { opacity: .5; cursor: not-allowed; background: var(--ui-subtle); }
+.ui-time-slots-empty { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { .ui-time-slots-box { transition: none; } }
+`
+
+fn time_slots_meta(s) -> str {
+    let places = s.left == null ? null : s.left <= 0 ? "Full" : `${s.left} left`
+    [places, s.detail] | filter((x) => x != null && x != "") | join(" · ")
+}
+
+view TimeSlots(name: str = "slot", label: str? = null, slots: list = [], value = null, empty: str = "No times",
+               on_pick = null, class: str? = null) =
+    <fieldset class={ui_cls(["ui-time-slots", class])} role="radiogroup">
+        {label != null ? <legend.ui-time-slots-legend>{label}</legend> : null}
+        {len(slots) == 0
+            ? <p.ui-time-slots-empty>{empty}</p>
+            : <div.ui-time-slots-list>
+                {for s in slots => <label key={str(s.id)} data-slot={s.id}
+                        class={ui_cls(["ui-time-slots-slot", s.tone != null && `ui-time-slots-${s.tone}`])}>
+                    <input type="radio" name={name} value={str(s.id)} checked={value != null && str(s.id) == str(value)}
+                           disabled={s.disabled == true || (s.left != null && s.left <= 0)}
+                           @change={() => { on_pick && on_pick(s.id) }}/>
+                    <span.ui-time-slots-box>
+                        <span.ui-time-slots-time>{s.time}</span>
+                        {time_slots_meta(s) != "" ? <span.ui-time-slots-meta>{time_slots_meta(s)}</span> : null}
+                    </span>
+                </label>}
+            </div>}
+    </fieldset>

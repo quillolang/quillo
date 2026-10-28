@@ -1984,6 +1984,18 @@ value or replies early. A SQLite path is from the program's folder, not the one 
 runs in, and `quillo run` says which file it opened when it starts
 (`quillo: database /srv/app/app.db`).
 
+**What failed.** `db.error_kind(e)` says what kind of failure a database's error value
+is, the same for SQLite, PostgreSQL and MySQL, whose words for it differ: `"unique"` (a key
+or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"`,
+`"conflict"` (another transaction: the database busy, a deadlock, a serialization
+failure), or null for any other failure and for anything else. It needs no effect.
+
+```quillo
+let r = db.exec("insert into seats (show, seat) values (?, ?)", show, seat)
+if db.error_kind(r) == "unique" { return err("Someone has just taken that seat") }
+r?
+```
+
 **Isolation and retries.** `db.transaction(options, f)` takes the isolation level and
 how many times to run `f` again when the database gives up on it because of another
 transaction:
@@ -2327,6 +2339,7 @@ Options come after the headers (in `http.stream`, in its map):
 http.get(url, {}, { redirects: 0 })                 // a redirect is the answer, not followed
 http.post(url, body, {}, { public_only: true })     // only addresses on the public internet
 http.get(`https://api.example.com/rates`, { authorization: key }, { cache: 60 })
+http.get(url, {}, { timeout: 5 })                   // an error value after 5 seconds
 ```
 
 - `redirects`: how many to follow, from 0 to 20 (5 unless given).
@@ -2343,10 +2356,17 @@ http.get(`https://api.example.com/rates`, { authorization: key }, { cache: 60 })
   for everyone: `cache: 60` on the rates above asks once a minute however many pages
   show them. Failures are not kept. At most 64 MiB of answers are, those that end soonest
   going first.
+- `timeout: seconds` (more than 0, up to 300; `0.5` too) is how long the whole call may
+  take: then it gives an error value (`... took more than 5 s (its timeout)`). Unless given,
+  a call has 10 seconds to connect and 60 in all; `http.stream`, 300 seconds of silence
+  between pieces. A page that waits on a slow service waits that long.
+
+Another option is an error, in `quillo check` when the options are written in the call,
+and when it runs: `{ timout: 5 }` is not ignored.
 
 In a component, the same calls go from the page (see [What the browser can reach](#what-the-browser-can-reach)):
-`redirects: 0` makes a redirect an error value there, and `public_only` and `cache` are
-the server's. A service that needs the visitor's address, called from the server, can be
+`redirects: 0` makes a redirect an error value there, `timeout` is the same, and
+`public_only` and `cache` are the server's. A service that needs the visitor's address, called from the server, can be
 given `request.ip`.
 
 ## Checking

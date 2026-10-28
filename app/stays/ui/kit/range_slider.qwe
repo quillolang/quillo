@@ -15,7 +15,8 @@
 // show_value: false hides the numbers. hint, disabled and field (the ids' start,
 // "range-slider-" + name by default) as for every field.
 // on_change(low, high): inside one of your components, given both numbers, as a
-// thumb moves.
+// thumb moves. on_commit(low, high): the same, once a thumb is let go (the end of a
+// drag, or a key press): for what costs a request, such as a search.
 
 let range_slider_css = css`
 .ui-range-slider { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
@@ -60,7 +61,7 @@ fn range_slider_at(n: num, lo: num, hi: num) -> str = hi > lo ? `${round((n - lo
 component RangeSlider(name: str? = null, label: str? = null, min: num = 0, max: num = 100, step: num = 1,
                       low: num? = null, high: num? = null, gap: num = 0, prefix: str = "", format: str = "",
                       names: list? = null, show_value: bool = true, hint: str? = null, disabled: bool = false,
-                      field: str? = null, on_change = null, class: str? = null) {
+                      field: str? = null, on_change = null, on_commit = null, class: str? = null) {
     state a = low ?? min
     state b = high ?? max
     state top = "b"
@@ -96,11 +97,11 @@ component RangeSlider(name: str? = null, label: str? = null, min: num = 0, max: 
             <input type="range" id={`${id}-min`} name={sent[0]} min={min} max={max} step={step} value={a}
                    class={top == "a" ? "ui-range-slider-top" : null}
                    aria-label={`${what}, lowest`} aria-valuetext={show(a)}
-                   @input={(e) => moved(e, "a")}/>
+                   @input={(e) => moved(e, "a")} @change={() => { on_commit && on_commit(a, b) }}/>
             <input type="range" id={`${id}-max`} name={sent[1]} min={min} max={max} step={step} value={b}
                    class={top == "b" ? "ui-range-slider-top" : null}
                    aria-label={`${what}, highest`} aria-valuetext={show(b)}
-                   @input={(e) => moved(e, "b")}/>
+                   @input={(e) => moved(e, "b")} @change={() => { on_commit && on_commit(a, b) }}/>
         </div>
         <div.ui-range-slider-scale aria-hidden="true"><span>{show(min)}</span><span>{show(max)}</span></div>
         {hint != null && <p.ui-range-slider-hint id={`${id}-hint`}>{hint}</p>}

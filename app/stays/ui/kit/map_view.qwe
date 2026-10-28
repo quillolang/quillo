@@ -1,0 +1,120 @@
+// MapView: a map with markers on it, for places on a list: a price or a name on
+// each, one picked, and a pin that can be dragged to where something is. The map
+// is drawn by Leaflet, which the page loads in its <head>:
+//
+//   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+//   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+//
+//   <MapView center={[38.7139, -9.1394]} markers={[{ id: 1, lat: 38.7114, lng: -9.1305, text: "€95" }]}
+//            picked={chosen} on_pick={(id) => { chosen = id }}/>
+//   <MapView label="Where it is" center={spot} zoom={16} pin={spot} on_pin={(lat, lng) => { spot = [lat, lng] }}/>
+//
+// Asked for by app/stays (quillolang/quillo, FEEDBACK5.md; branch stays-components).
+//
+// center: [lat, lng]; the map moves there when it changes. zoom: 1 to 19 (13).
+// markers: a list of { id, lat, lng, text?, title?, tone? }. With text (a price, a
+// name) the marker is a label; without, a dot, coloured by tone ("accent" by
+// default, "success", "warning", "danger", "info" or "neutral"). title: said on
+// hover and to screen readers. Give new markers and the map draws them again.
+// picked: the id of the marker shown picked. fit: true zooms to show every marker.
+// pin: [lat, lng] of a pin that can be dragged, or moved by a click on the map.
+// height: in pixels (320). label: what screen readers call the map ("Map").
+// tiles, attribution: where the map's tiles come from (OpenStreetMap's) and its credit.
+// on_pick(id): a marker clicked, or chosen with the keyboard (Tab, then Enter).
+// on_pin(lat, lng): where the pin was put. Both inside one of your components.
+// Text given to Leaflet is escaped: a marker's text may come from your users.
+// Without Leaflet on the page the map stays empty, and the console says
+// "L.map is not defined on this page".
+
+let map_view_css = css`
+.ui-map-view { position: relative; isolation: isolate; width: 100%; overflow: hidden; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-subtle); font: 14px/1.4 var(--ui-font); }
+.ui-map-view-map { width: 100%; height: 100%; }
+.ui-map-view .leaflet-container { font: 12px/1.4 var(--ui-font); background: var(--ui-subtle); }
+.ui-map-view-label, .ui-map-view-dot, .ui-map-view-pin { width: 0 !important; height: 0 !important; background: none; border: 0; }
+.ui-map-view-label > span {
+  position: absolute; transform: translate(-50%, -50%); padding: 3px 8px; border: 1px solid var(--ui-border); border-radius: 999px;
+  background: var(--ui-surface); color: var(--ui-fg); font: 600 12px/1.2 var(--ui-font); white-space: nowrap; box-shadow: var(--ui-shadow);
+  cursor: pointer; transition: transform .1s;
+}
+.ui-map-view-label:hover > span { transform: translate(-50%, -50%) scale(1.06); }
+.ui-map-view-label.ui-map-view-picked > span { background: var(--ui-fg); color: var(--ui-bg); border-color: var(--ui-fg); }
+.ui-map-view-dot > span {
+  position: absolute; width: 12px; height: 12px; transform: translate(-50%, -50%); border: 2px solid #fff; border-radius: 50%;
+  background: var(--ui-accent); box-shadow: 0 0 0 1px rgb(0 0 0 / .3); cursor: pointer;
+}
+.ui-map-view-dot-success > span { background: var(--ui-success); }
+.ui-map-view-dot-warning > span { background: var(--ui-warning); }
+.ui-map-view-dot-danger > span { background: var(--ui-danger); }
+.ui-map-view-dot-info > span { background: var(--ui-info); }
+.ui-map-view-dot-neutral > span { background: var(--ui-muted); }
+.ui-map-view-dot.ui-map-view-picked > span { width: 18px; height: 18px; box-shadow: 0 0 0 3px var(--ui-accent-soft), 0 0 0 1px rgb(0 0 0 / .3); }
+.ui-map-view-pin > span {
+  position: absolute; width: 22px; height: 22px; transform: translate(-50%, -50%); border: 3px solid #fff; border-radius: 50%;
+  background: var(--ui-accent); box-shadow: 0 0 0 1px rgb(0 0 0 / .4), var(--ui-shadow); cursor: grab;
+}
+.ui-map-view .leaflet-marker-icon:focus-visible { outline: none; }
+.ui-map-view .leaflet-marker-icon:focus-visible > span { box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-map-view-label > span { transition: none; } }
+`
+
+fn map_view_icon(m, picked) {
+    let on = picked != null && m.id == picked
+    m.text != null
+        ? js("L.divIcon", { className: ui_cls(["ui-map-view-label", on && "ui-map-view-picked"]),
+                            html: `<span>${escape(str(m.text))}</span>`, iconSize: null })
+        : js("L.divIcon", { className: ui_cls(["ui-map-view-dot", `ui-map-view-dot-${m.tone ?? "accent"}`, on && "ui-map-view-picked"]),
+                            html: "<span></span>", iconSize: null })
+}
+
+component MapView(center: list, zoom: int = 13, markers: list = [], picked = null, fit: bool = false,
+                  pin: list? = null, height: int = 320, label: str = "Map",
+                  tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png", attribution: str = "© OpenStreetMap",
+                  on_pick = null, on_pin = null, class: str? = null) {
+    state leaflet = null
+    state layer = null
+    state pin_marker = null
+    // A new center: the map goes there.
+    if leaflet != null { leaflet.setView(center, zoom) }
+    // New markers, or another one picked: drawn again.
+    if leaflet != null && layer != null {
+        layer.clearLayers()
+        for m in markers {
+            let mk = js("L.marker", [m.lat, m.lng], { icon: map_view_icon(m, picked), title: str(m.title ?? m.text ?? ""),
+                                                      alt: str(m.title ?? m.text ?? ""), keyboard: true, riseOnHover: true,
+                                                      zIndexOffset: picked != null && m.id == picked ? 1000 : 0 })
+            mk.on("click", () => { on_pick && on_pick(m.id) })
+            layer.addLayer(mk)
+        }
+        if fit && len(markers) > 0 {
+            leaflet.fitBounds(markers | map((m) => [m.lat, m.lng]), { padding: [32, 32], maxZoom: 16 })
+        }
+    }
+    // The pin follows `pin` when it changes.
+    if pin_marker != null && pin != null { pin_marker.setLatLng(pin) }
+    <div class={ui_cls(["ui-map-view", class])} role="region" aria-label={label} style={`height: ${height}px`}>
+        <div.ui-map-view-map @mount={(el) => {
+            let m = js("L.map", el, { scrollWheelZoom: false })
+            m.setView(center, zoom)
+            js("L.tileLayer", tiles, { maxZoom: 19, attribution: escape(attribution) }).addTo(m)
+            layer = js("L.layerGroup").addTo(m)
+            if pin != null {
+                let p = js("L.marker", pin, { draggable: true, keyboard: true, title: "Drag to move", alt: "Pin", autoPan: true,
+                                              zIndexOffset: 2000,
+                                              icon: js("L.divIcon", { className: "ui-map-view-pin", html: "<span></span>", iconSize: null }) })
+                p.addTo(m)
+                p.on("dragend", () => {
+                    let at = p.getLatLng()
+                    on_pin && on_pin(at.lat, at.lng)
+                })
+                m.on("click", (e) => {
+                    p.setLatLng(e.latlng)
+                    on_pin && on_pin(e.latlng.lat, e.latlng.lng)
+                })
+                pin_marker = p
+            }
+            leaflet = m
+            () => m.remove()
+        }}></div>
+    </div>
+}

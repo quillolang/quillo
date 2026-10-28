@@ -8,7 +8,7 @@
 // Warning and danger are announced at once (role="alert"); the others politely
 // (role="status").
 // variant: "soft" (default), "outline" or "solid". title: a bold first line.
-// icon: false leaves the tone's icon out.
+// icon: false leaves the tone's icon out. id: the element's id.
 // dismissable shows a close button that calls on_dismiss(), inside one of your
 // components: <Alert dismissable={true} on_dismiss={() => { shown = false }}>.
 // DismissibleAlert takes the same props (but on_dismiss) and hides itself, so it
@@ -64,8 +64,8 @@ fn alert_icon(tone: str) {
 }
 
 view Alert(tone: str = "info", title: str? = null, variant: str = "soft", icon: bool = true,
-           dismissable: bool = false, on_dismiss = null, class: str? = null, children) =
-    <div class={ui_cls(["ui-alert", `ui-alert-${tone}`, `ui-alert-${variant}`, class])}
+           dismissable: bool = false, on_dismiss = null, class: str? = null, id: str? = null, children) =
+    <div class={ui_cls(["ui-alert", `ui-alert-${tone}`, `ui-alert-${variant}`, class])} id={id}
          role={tone == "danger" || tone == "warning" ? "alert" : "status"}>
         {icon && alert_icon(tone)}
         <div.ui-alert-body>
@@ -77,10 +77,10 @@ view Alert(tone: str = "info", title: str? = null, variant: str = "soft", icon: 
     </div>
 
 component DismissibleAlert(tone: str = "info", title: str? = null, variant: str = "soft",
-                           icon: bool = true, class: str? = null, children) {
+                           icon: bool = true, class: str? = null, id: str? = null, children) {
     state shown = true
     <div class="ui-alert-host">
-        {shown && <Alert tone={tone} title={title} variant={variant} icon={icon} class={class}
+        {shown && <Alert tone={tone} title={title} variant={variant} icon={icon} class={class} id={id}
                          dismissable={true} on_dismiss={() => { shown = false }}>{children}</Alert>}
     </div>
 }

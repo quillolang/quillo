@@ -8,9 +8,7 @@ view CheckoutPage(me, id: int) =
 
 component Checkout(id: int) {
     state b = live(load_booking, id)
-    state number = ""
-    state expiry = ""
-    state cvc = ""
+    state card = { number: "", expiry: "", cvc: "" }
     state busy = false
     state problem = null
     state ran_out = false
@@ -33,15 +31,11 @@ component Checkout(id: int) {
                             <form.stack id="pay" @submit={(e) => {
                                 busy = true
                                 problem = null
-                                let r = pay_booking(id, { number, expiry, cvc })
+                                let r = pay_booking(id, { number: card.number, expiry: card.expiry, cvc: card.cvc })
                                 busy = false
                                 if is_err(r) { problem = r.error }
                             }}>
-                                <TextField label="Card number" name="number" value={number} autocomplete="cc-number" placeholder="4242 4242 4242 4242" on_input={(v) => { number = v }}/>
-                                <div.row>
-                                    <TextField label="Expiry" name="expiry" value={expiry} autocomplete="cc-exp" placeholder="MM/YY" on_input={(v) => { expiry = v }}/>
-                                    <TextField label="CVC" name="cvc" value={cvc} autocomplete="cc-csc" placeholder="123" on_input={(v) => { cvc = v }}/>
-                                </div>
+                                <CardInput name="card" on_change={(c) => { card = c }}/>
                                 <Problem text={problem}/>
                                 <Button type="submit" loading={busy} disabled={ran_out} full={true}>{b.listing.instant_book == 1 ? `Pay ${b.total_shown}` : `Request, ${b.total_shown}`}</Button>
                                 <p.muted.small>A demo: no money moves. 4242 4242 4242 4242 works; 4000 0000 0000 0002 is declined.</p>
@@ -60,10 +54,8 @@ component Checkout(id: int) {
                 </section>
                 <Card title={b.listing.title} subtitle={`${b.dates} · ${plural(b.guests, "guest")}`}>
                     <img.photo src={b.listing.photo_urls[0]} alt=""/>
-                    <ul.lines>
-                        {for x in b.lines => <li key={x.kind} class={x.kind}><span>{x.label}</span><span>{x.shown}</span></li>}
-                        <li.total><span>Total</span><span id="checkout-total">{b.total_shown}</span></li>
-                    </ul>
+                    <PriceBreakdown class="checkout-total" total={b.total_shown}
+                        lines={b.lines | map((x) => { label: x.label, amount: x.shown, tone: x.kind == "discount" ? "success" : null })}/>
                     <p.muted.small>{b.listing.policy.title} cancelling: {b.listing.policy.says}</p>
                 </Card>
             </div>

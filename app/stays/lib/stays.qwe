@@ -207,7 +207,7 @@ server fn hold_stay(id: int, start: str, end: str, guests: int) with db, time {
             // The unique key is the last word, should two holds pass the check above together.
             let r = db.exec("insert into booking_nights (booking_id, listing_id, day) values (?, ?, ?)", made.last_id, id, d)
             if is_err(r) {
-                return err(contains(r.error, "UNIQUE") ? `Someone has just booked the night of ${day_label(d)}` : r.error)
+                return err(db.error_kind(r) == "unique" ? `Someone has just booked the night of ${day_label(d)}` : r.error)
             }
         }
         made.last_id
@@ -344,7 +344,8 @@ server fn leave_review(booking_id: int, rating: int, body: str) with db, time {
     if rating < 1 || rating > 5 { return err("From 1 to 5 stars") }
     if len(trim(body)) < 10 { return err("A few words for the next guests (10 characters or more)") }
     let r = db.exec("insert into reviews (booking_id, listing_id, guest_id, rating, body, created) values (?, ?, ?, ?, ?, ?)", booking_id, b.listing_id, u.id, rating, trim(body), now())
-    if is_err(r) { return err("You have reviewed this stay already") }
+    if db.error_kind(r) == "unique" { return err("You have reviewed this stay already") }
+    r?
     publish(`listing:${b.listing_id}`)
     publish(`user:${u.id}`)
     null

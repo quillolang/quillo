@@ -1,8 +1,7 @@
-// The home page and the search: filters (the kit's), results and a map
-// (Leaflet) that follow each other. A search goes to the server when the place,
-// the dates or the guests change; the price, kinds, amenities and sort are
-// applied in the browser to what came back (the kit's RangeSlider calls
-// on_change at each step of a drag, and has no "done" event: FEEDBACK5.md).
+// The home page and the search: filters, results and a map (the kit's
+// MapView) that follow each other. A search goes to the server when the place,
+// the dates or the guests change; the price (once a thumb is let go), kinds,
+// amenities and sort are applied in the browser to what came back.
 
 let CITIES = [
     { name: "Lisbon", says: "Hills, trams and tiles", hue: 20 },
@@ -74,19 +73,11 @@ component SearchApp(first_filters: map, first: map, today: str) {
     state wanted = []
     state instant = false
     state sort = "near"
-    // A component that runs by itself inside another one (the map's @mount)
-    // waits for someone to touch the page (FEEDBACK5.md, Q-046), unless the
-    // outer one runs by itself too: this `every`, which does nothing, has the
-    // map drawn as soon as the page is idle.
-    every(3600000, () => null)
     let rows = shown_results(found, lo, hi, kinds, wanted, instant, sort)
     let unit = money.minor_units(found.currency ?? "EUR")
     let scale = pow(10, unit)
-    // The slider's top is a whole number of steps: the browser snaps a range
-    // input's value to its step, and Quillo takes the snapped value for
-    // something typed, calling on_change on its own (FEEDBACK5.md, Q-048).
     let step = unit == 0 ? 1000 : 5
-    let top = ceil((found.price_top ?? 10000) / scale / step) * step
+    let top = ceil((found.price_top ?? 10000) / scale)
     // Each search is numbered; an answer to an older one, come late, is dropped.
     let run = (next) => {
         f = next
@@ -117,7 +108,7 @@ component SearchApp(first_filters: map, first: map, today: str) {
                 <RangeSlider label={`A night${found.dated == true ? ", for your dates" : ""}`} min={0} max={top} {step}
                     low={lo == null ? 0 : lo / scale} high={hi == null ? top : hi / scale}
                     prefix={found.currency == "JPY" ? "¥" : "€"}
-                    on_change={(a, b) => { lo = a * scale; hi = b * scale }}/>
+                    on_commit={(a, b) => { lo = a * scale; hi = b * scale }}/>
                 <ChipGroup name="kinds" label="Kind of place" multiple={true} values={kinds} size="sm"
                     options={KINDS | map((k) => { label: upper(slice(k, 0, 1)) + slice(k, 1), value: k })}
                     on_change={(v, on) => { kinds = toggled(kinds, v, on) }}/>
@@ -142,7 +133,9 @@ component SearchApp(first_filters: map, first: map, today: str) {
         </div>
         <div.search-map>
             {found.problem == null
-                ? <StaysMap center={[found.place.lat, found.place.lng]} rows={rows} picked={picked} on_pick={(id) => { picked = id }}/>
+                ? <MapView label="Places on the map" center={[found.place.lat, found.place.lng]} height={560} {picked}
+                    markers={rows | map((l) => { id: l.id, lat: l.lat, lng: l.lng, text: l.night_shown, title: l.title })}
+                    on_pick={(id) => { picked = id }}/>
                 : null}
         </div>
     </div>
@@ -161,31 +154,3 @@ view ResultCard(l, href: str, on: bool) =
             {l.total_shown != null ? <span.muted.small>{l.total_shown} total</span> : null}
         </div>
     </a>
-
-// The places as price pins on a map: picking one marks its card, and the
-// results' filters change the pins.
-component StaysMap(center: list, rows: list, picked: int, on_pick) {
-    state leaflet = null
-    state layer = null
-    // A new place searched for: the map goes there.
-    if leaflet != null { leaflet.setView(center, 13) }
-    // Again whenever the rows (or the pick) change, once the map is there.
-    if leaflet != null && layer != null {
-        layer.clearLayers()
-        for l in rows {
-            let icon = js("L.divIcon", { className: picked == l.id ? "price-pin on" : "price-pin", html: escape(l.night_shown), iconSize: null })
-            let m = js("L.marker", [l.lat, l.lng], { icon, title: l.title, riseOnHover: true })
-            m.on("click", (e) => { on_pick(l.id) })
-            m.bindTooltip(escape(l.title))
-            layer.addLayer(m)
-        }
-    }
-    <div.map id="stays-map" @mount={(el) => {
-        let m = js("L.map", el, { scrollWheelZoom: false })
-        m.setView(center, 13)
-        js("L.tileLayer", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m)
-        layer = js("L.layerGroup").addTo(m)
-        leaflet = m
-        () => m.remove()
-    }}></div>
-}

@@ -52,6 +52,7 @@ pub fn install(m: &mut Map) {
         ("db.system", system),
         ("db.shards", shards),
         ("db.atomic", atomic),
+        ("db.error_kind", error_kind),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -308,6 +309,43 @@ pub struct TxConn {
 
 fn db_err(e: impl std::fmt::Display) -> Value {
     Value::err(Value::str(format!("db: {}", e)))
+}
+
+/// `db.error_kind(e)`: what kind of failure a database's error value is,
+/// the same for SQLite, PostgreSQL and MySQL, whose words differ: "unique"
+/// (a key or unique column already has the value), "foreign_key",
+/// "not_null", "check", "conflict" (another transaction: busy, a deadlock,
+/// a serialization failure), or null for any other failure and for what is
+/// not a database's error. A program could only match each database's
+/// words itself (FEEDBACK5.md, Q-053; branch stays-fixes).
+fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
+    let kind = match args.first() {
+        Some(Value::Err(e)) => match &**e {
+            Value::Str(s) => s.strip_prefix("db: ").and_then(kind_of),
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(kind.map_or(Value::Nil, Value::str))
+}
+
+/// The kind of a database's message (see `error_kind`).
+fn kind_of(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| m.contains(w));
+    if has(&["unique constraint failed", "violates unique constraint", "duplicate entry", "(1062)"]) {
+        Some("unique")
+    } else if has(&["foreign key constraint failed", "violates foreign key constraint", "a foreign key constraint fails", "(1451)", "(1452)"]) {
+        Some("foreign_key")
+    } else if has(&["not null constraint failed", "violates not-null constraint", "cannot be null", "(1048)"]) {
+        Some("not_null")
+    } else if has(&["check constraint failed", "violates check constraint", "check constraint", "(3819)"]) {
+        Some("check")
+    } else if has(&["database is locked", "database is busy", "could not serialize access", "deadlock detected", "deadlock found", "lock wait timeout", "(1213)", "(1205)"]) {
+        Some("conflict")
+    } else {
+        None
+    }
 }
 
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
@@ -1967,4 +2005,36 @@ pub fn recover(it: &mut Interp) {
         }
     }
     let _ = apart(it, &sys, "delete from _quillo_atomic where at < ?".into(), vec![Value::Int(now - 86_400_000)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_of;
+
+    // Each database's own words for the same failures (FEEDBACK5.md, Q-053;
+    // branch stays-fixes).
+    #[test]
+    fn kinds_of_failures() {
+        let cases = [
+            ("UNIQUE constraint failed: booking_nights.listing_id, booking_nights.day", Some("unique")),
+            ("duplicate key value violates unique constraint \"booking_nights_pkey\" (Key (listing_id, day)=(3, 2026-11-05) already exists.)", Some("unique")),
+            ("Server error: `ERROR 23000 (1062): Duplicate entry '3-2026-11-05' for key 'PRIMARY''", Some("unique")),
+            ("FOREIGN KEY constraint failed", Some("foreign_key")),
+            ("insert or update on table \"bookings\" violates foreign key constraint \"bookings_listing_id_fkey\"", Some("foreign_key")),
+            ("Server error: `ERROR 23000 (1452): Cannot add or update a child row: a foreign key constraint fails'", Some("foreign_key")),
+            ("NOT NULL constraint failed: users.email", Some("not_null")),
+            ("null value in column \"email\" of relation \"users\" violates not-null constraint", Some("not_null")),
+            ("Server error: `ERROR 23000 (1048): Column 'email' cannot be null'", Some("not_null")),
+            ("CHECK constraint failed: rating", Some("check")),
+            ("new row for relation \"reviews\" violates check constraint \"reviews_rating_check\"", Some("check")),
+            ("database is locked", Some("conflict")),
+            ("could not serialize access due to concurrent update", Some("conflict")),
+            ("Server error: `ERROR 40001 (1213): Deadlock found when trying to get lock'", Some("conflict")),
+            ("no such table: listings", None),
+            ("near \"selct\": syntax error", None),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(kind_of(msg), want, "{}", msg);
+        }
+    }
 }

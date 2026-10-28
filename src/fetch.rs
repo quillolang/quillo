@@ -17,6 +17,10 @@
 //! so a name cannot be looked up as public and then connect inside.
 //! `cache`, for a GET: seconds a successful answer is kept and given again
 //! to the same call (same URL, headers and options), by any request.
+//! `timeout`: seconds the whole call may take (up to 300), after which it
+//! gives an error value; unless given, 10 s to connect and 60 s in all
+//! (`http.stream`: 300 s of silence). Any other option is an error, not
+//! ignored (FEEDBACK5.md, Q-049; branch stays-fixes).
 //!
 //! In a component, these run in the browser (src/client/runtime.js). While
 //! the server renders one, a call from its code is a mistake: it would be
@@ -65,9 +69,18 @@ struct Opts {
     public_only: bool,
     /// Seconds to keep a GET's successful answer (0: not kept).
     cache: u32,
+    /// Milliseconds the whole call may take (0: the agent's own limits).
+    timeout_ms: u32,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0 };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0 };
+
+/// The options there are; `http.stream`'s map also has its request's.
+const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout"];
+const STREAM_NAMES: &[&str] = &["method", "body", "headers"];
+
+/// The longest `timeout`, in seconds.
+const MAX_TIMEOUT_SECS: f64 = 300.0;
 
 /// The longest `cache`: a day.
 const MAX_CACHE_SECS: i64 = 86_400;
@@ -93,7 +106,23 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32) -> Result<Opts, Ctrl> {
         Some(Value::Int(n)) if (0..=MAX_CACHE_SECS).contains(n) => *n as u32,
         Some(other) => return fail(line, format!("`{}`: `cache` is seconds, a whole number from 0 to {}, got {}", fname, MAX_CACHE_SECS, other.display())),
     };
-    Ok(Opts { redirects, public_only, cache })
+    let secs = match m.get("timeout") {
+        None | Some(Value::Nil) => None,
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Float(x)) => Some(*x),
+        Some(other) => return fail(line, format!("`{}`: `timeout` is seconds, more than 0 and up to {}, got {}", fname, MAX_TIMEOUT_SECS, other.display())),
+    };
+    let timeout_ms = match secs {
+        None => 0,
+        Some(s) if s > 0.0 && s <= MAX_TIMEOUT_SECS => ((s * 1000.0).round() as u32).max(1),
+        Some(s) => return fail(line, format!("`{}`: `timeout` is seconds, more than 0 and up to {}, got {}", fname, MAX_TIMEOUT_SECS, s)),
+    };
+    let stream = fname == "http.stream";
+    if let Some(k) = m.keys().map(|k| k.as_ref()).find(|k| !OPTION_NAMES.contains(k) && !(stream && STREAM_NAMES.contains(k))) {
+        let known = if stream { [STREAM_NAMES, OPTION_NAMES].concat() } else { OPTION_NAMES.to_vec() };
+        return fail(line, format!("`{}`: unknown option `{}` (the options are {})", fname, k, known.join(", ")));
+    }
+    Ok(Opts { redirects, public_only, cache, timeout_ms })
 }
 
 /// The server's own network is not where a component's calls go (see the
@@ -199,6 +228,9 @@ struct Reply {
 
 fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, Vec<u8>)>) -> Result<Reply, String> {
     let mut req = agent(o, false).request(method, url);
+    if o.timeout_ms > 0 {
+        req = req.timeout(Duration::from_millis(o.timeout_ms as u64));
+    }
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -213,7 +245,7 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     };
     let resp = match res {
         Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(timed_out(o, url, e.to_string())),
     };
     let status = resp.status();
     let headers = resp
@@ -222,8 +254,17 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
         .filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_lowercase(), v.to_string())))
         .collect();
     let mut bytes = Vec::new();
-    resp.into_reader().take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    resp.into_reader().take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| timed_out(o, url, e.to_string()))?;
     Ok(Reply { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
+}
+
+/// A call cut short by its `timeout` says so, in those words.
+fn timed_out(o: Opts, url: &str, e: String) -> String {
+    if o.timeout_ms > 0 && e.contains("timed out") {
+        format!("{}: took more than {} s (its timeout)", url, o.timeout_ms as f64 / 1000.0)
+    } else {
+        e
+    }
 }
 
 /// Answers kept by `cache`: by method, URL, headers and options, until
@@ -388,6 +429,9 @@ type Body = Box<dyn Read + Send + Sync>;
 
 fn open(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, Vec<u8>)>) -> Result<(u16, Vec<(String, String)>, Body), String> {
     let mut req = agent(o, true).request(method, url);
+    if o.timeout_ms > 0 {
+        req = req.timeout(Duration::from_millis(o.timeout_ms as u64));
+    }
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -402,7 +446,7 @@ fn open(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     };
     let resp = match res {
         Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(timed_out(o, url, e.to_string())),
     };
     let headers = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_lowercase(), v.to_string()))).collect();
     Ok((resp.status(), headers, resp.into_reader()))

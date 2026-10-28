@@ -15,11 +15,9 @@
 //
 // Prices in the database are in minor units (cents, or yen), as ints.
 
-// Functions, not constants: a top-level decimal is text in the browser, where
-// the booking widget works out prices (FEEDBACK5.md, Q-045).
-fn service_fee() = 0.12m
-fn week_off() = 0.10m
-fn month_off() = 0.25m
+let SERVICE_FEE = 0.12m
+let WEEK_OFF = 0.10m
+let MONTH_OFF = 0.25m
 
 // A person a night, in the city's currency's minor units, for at most `cap` nights.
 let CITY_TAX = {
@@ -66,11 +64,11 @@ fn quote(listing, start: str, end: str, guests: int, custom: map) {
     let n = len(days)
     let nightly = days | map((d) => { day: d, price: night_price(listing, d, custom) })
     let nights_total = cash(sum(nightly | map((x) => x.price)), cur)
-    let off = n >= 28 ? month_off() : n >= 7 ? week_off() : 0m
+    let off = n >= 28 ? MONTH_OFF : n >= 7 ? WEEK_OFF : 0m
     let discount = money.mul(nights_total, off, "half_up")
     let cleaning = cash(listing.cleaning_fee, cur)
     let subtotal = money.add(money.sub(nights_total, discount), cleaning)
-    let fee = money.mul(subtotal, service_fee(), "half_up")
+    let fee = money.mul(subtotal, SERVICE_FEE, "half_up")
     let tax_rule = get(CITY_TAX, listing.city)
     let taxed_nights = tax_rule == null ? 0 : (tax_rule.cap > 0 ? min([n, tax_rule.cap]) : n)
     let tax = tax_rule == null ? money.zero(cur) : cash(tax_rule.per * guests * taxed_nights, cur)

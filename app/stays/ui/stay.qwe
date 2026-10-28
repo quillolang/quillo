@@ -1,13 +1,13 @@
-// A place's page: its pictures, what it has, its calendar (live: nights
-// others hold or book close while it is open), the booking widget (the price
+// A place's page: its pictures, what it has, the booking widget (its dates
+// picker live: nights others hold or book close while it is open; the price
 // worked out in the browser by lib/pricing.qwe, as the server will charge
 // it), the weather for the dates, places around on a map, activities nearby
 // with their times, and reviews.
 //
 // The dates are the page's: the widget, the calendar, the weather and the
 // activities all follow them. The weather and the places around are asked for
-// once the page shows, never while the server renders it: Overpass can take
-// half a minute, and http.get cannot be told to give up sooner (FEEDBACK5.md).
+// once the page shows, never while the server renders it: Overpass is given
+// 8 seconds before Photon is asked instead.
 
 view StayPage(me, id: int, start: str, end: str, guests: int) =
     <Shell {me} title="A place to stay" maps={true}>
@@ -61,10 +61,6 @@ component StayView(id: int, start: str, end: str, guests: int) {
                     ]}/>
                     <h2>What this place has</h2>
                     <ul.amenities>{for k in s.listing.amenity_keys => <li key={k}>✓ {get(AMENITIES, k) ?? k}</li>}</ul>
-                    <h2>When it's free</h2>
-                    <p.muted.small>Pick the day you arrive, then the day you leave. Crossed out: taken or closed.</p>
-                    <Availability today={s.today} taken={s.taken} closed={s.closed} start={a} end={b}
-                        on_pick={(x, y) => { a = x; b = y }}/>
                     <h2>Weather</h2>
                     <Weather key={`${a}|${b}`} {id} start={a} end={b}/>
                     <h2>Around</h2>
@@ -82,6 +78,9 @@ component StayView(id: int, start: str, end: str, guests: int) {
                     start={a} end={b} guests={g} signed_in={s.signed_in} mine={s.mine}
                     on_dates={(x, y) => { a = x; b = y }} on_guests={(n) => { g = n }}/>
             </div>
+            <ActionBar text={`${s.listing.price_shown} a night`} detail={is_day(a) && is_day(b) ? range_label(a, b) : "Choose your dates"} wide="hidden">
+                <Button href="#widget">{s.listing.instant_book == 1 ? "Reserve" : "Request to book"}</Button>
+            </ActionBar>
         </div>}
 }
 
@@ -91,31 +90,38 @@ view Problem(text) = text != null && text != "" ? <Alert tone="danger">{text}</A
 fn clashes(start: str, end: str, taken: list, closed: list) -> list =
     is_day(start) && is_day(end) ? nights_of(start, end) | filter((d) => contains(taken, d) || contains(closed, d)) : []
 
+// The prices of the nights to come, as the dates picker shows them under each
+// day: in whole units ("€95"), to fit.
+fn day_prices(l, custom: map, today: str) -> map =
+    nights_of(today, add_days(today, 120)) | reduce({}, (m, d) => set(m, d, re.replace(shown_minor(night_price(l, d, custom), l.currency), "[.,]00$", "")))
+
 component BookingWidget(l, custom: map, taken: list, closed: list, today: str, start: str, end: str, guests: int,
                         signed_in: bool, mine: bool, on_dates, on_guests) {
     state busy = false
     state problem = null
     let dated = is_day(start) && is_day(end)
     let why = dated ? stay_problem(l, start, end, guests, today) : null
+    // Dates from the address may cross nights taken since: the picker would
+    // not let them be picked.
     let clash = clashes(start, end, taken, closed)
     let q = dated && why == null && len(clash) == 0 ? quote(l, start, end, guests, custom) : null
     <aside.widget id="widget">
         <div><span.big>{q != null ? shown_money(q.per_night) : l.price_shown}</span> <span.muted>a night{q != null && q.per_night != null ? ", on average" : ""}</span></div>
-        <DateRangePicker key={`${start}|${end}`} label="Dates" start={is_day(start) ? start : null} end={is_day(end) ? end : null} min={today} today={today}
+        <DateRangePicker label="Dates" start={is_day(start) ? start : null} end={is_day(end) ? end : null} min={today} today={today}
+            disabled_dates={taken + closed} day_labels={day_prices(l, custom, today)} min_nights={l.min_nights} presets={[]}
             on_change={(x, y) => { if x != null && y != null { on_dates(x, y) } }}/>
-        <NumberInput label="Guests" value={guests} min={1} max={l.max_guests} on_change={(n) => { if n != null { on_guests(n) } }}/>
+        <GuestPicker value={{ adults: guests }} max_guests={l.max_guests} pets={contains(l.amenity_keys, "pets")}
+            on_change={(c) => { on_guests(max([1, c.adults + c.children])) }}/>
         {why != null ? <p.problem id="why">{why}</p> : null}
         {len(clash) > 0 ? <p.problem id="clash">Not free: {join(clash | take(3) | map(day_label), ", ")}{len(clash) > 3 ? ` and ${len(clash) - 3} more` : ""}</p> : null}
         {q != null
-            ? <ul.lines id="quote">
-                {for x in q.lines => <li key={x.kind} class={x.kind}><span>{x.label}</span><span>{shown_money(x.amount)}</span></li>}
-                <li.total><span>Total</span><span id="quote-total">{shown_money(q.total)}</span></li>
-            </ul>
+            ? <PriceBreakdown class="quote" total={shown_money(q.total)}
+                lines={q.lines | map((x) => { label: x.label, amount: shown_money(x.amount), tone: x.kind == "discount" ? "success" : null })}/>
             : null}
         <Problem text={problem}/>
         {mine
             ? <Button href={`/host/listings/${l.id}`} variant="outline" full={true}>Your place: open its calendar</Button>
-            : <Button full={true} class="reserve" loading={busy} disabled={q == null && signed_in} on_click={() => {
+            : <Button full={true} id="reserve" loading={busy} disabled={q == null && signed_in} on_click={() => {
                 if !signed_in {
                     navigate(`/login?next=${url_encode(`/stays/${l.id}?start=${start}&end=${end}&guests=${guests}`)}`)
                     return null
@@ -128,48 +134,6 @@ component BookingWidget(l, custom: map, taken: list, closed: list, today: str, s
             }}>{!signed_in ? "Sign in to book" : l.instant_book == 1 ? "Reserve" : "Request to book"}</Button>}
         <p.muted.small>{l.instant_book == 1 ? "Booked as soon as you pay." : "The host has a day to accept; until then nothing is charged for good."} Nights are held for you for 10 minutes while you pay.</p>
     </aside>
-}
-
-// Three months of nights: what is taken or closed, and the dates chosen.
-// Clicking a day starts a stay, a second click ends it. (The kit's
-// DateRangePicker cannot show nights that are taken: FEEDBACK5.md.)
-component Availability(today: str, taken: list, closed: list, start: str, end: str, on_pick) {
-    state first = null
-    let p = day_parts(today)
-    let months = range(0, 3) | map((i) => {
-        let k = p.m - 1 + i
-        { y: p.y + floor(k / 12), m: k % 12 + 1 }
-    })
-    let a = first ?? start
-    let b = first != null ? null : end
-    <div.months id="availability">{for mo in months => {
-        let d1 = `${mo.y}-${two(mo.m)}-01`
-        <div.month key={d1}>
-            <h4>{MONTH_NAMES[mo.m - 1]} {mo.y}</h4>
-            <div.grid>
-                {for w in WEEKDAY_NAMES => <span.wd key={w}>{slice(w, 0, 2)}</span>}
-                {for i in range(0, weekday(d1) - 1) => <span key={`pad${i}`}></span>}
-                {for d in nights_of(d1, add_days(d1, month_days(mo.y, mo.m))) => {
-                    let off = contains(taken, d) || contains(closed, d)
-                    let past = d < today
-                    let inside = is_day(a) && is_day(b) && d > a && d < b
-                    let edge = d == a || d == b
-                    <span key={d} data-day={d} role="button" tabindex={past ? null : "0"}
-                        class={ui_cls(["d", off && "taken", past && "past", inside && (off ? "clash" : "in"), edge && "edge"])}
-                        @click={() => {
-                            if past { return null }
-                            if first == null || d <= first {
-                                first = d
-                            } else {
-                                let from = first
-                                first = null
-                                on_pick(from, d)
-                            }
-                        }}>{day_parts(d).d}</span>
-                }}
-            </div>
-        </div>
-    }}</div>
 }
 
 // The forecast for the dates (or the next week), asked for once the page shows.
@@ -206,23 +170,18 @@ let PLACE_GROUPS = [
     { label: "Outdoors", value: "outdoors" }, { label: "Nightlife", value: "nightlife" },
 ]
 
+let PLACE_TONES = { food: "warning", culture: "info", outdoors: "success", nightlife: "danger" }
+
 // Places around, on a list and a map, asked for once the page shows.
 component Around(id: int, lat: float, lng: float) {
     state found = null
     state failed = null
     state kind = "all"
-    state leaflet = null
-    state layer = null
     let rows = found == null ? [] : found.places | filter((p) => kind == "all" || p.kind == kind)
-    if leaflet != null && layer != null {
-        layer.clearLayers()
-        for p in rows {
-            let m = js("L.marker", [p.lat, p.lng], { icon: js("L.divIcon", { className: `place-pin ${p.kind}`, iconSize: null }) })
-            m.bindTooltip(escape(`${p.name} · ${p.what} · ${p.walk_min} min`))
-            layer.addLayer(m)
-        }
-    }
-    <div id="around">
+    <div id="around" @mount={(el) => {
+        let r = around_stay(id)
+        if is_err(r) { failed = r.error } else { found = r }
+    }}>
         <SegmentedControl name="around-kind" value={kind} size="sm" options={PLACE_GROUPS} on_change={(v) => { kind = v }}/>
         <div.places>
             <div>
@@ -238,17 +197,11 @@ component Around(id: int, lat: float, lng: float) {
                     </li>}</ul>}
                 {found != null ? <p.muted.small>From {found.source}{found.stale == true ? ", kept from earlier" : ""}.</p> : null}
             </div>
-            <div.map id="around-map" @mount={(el) => {
-                let m = js("L.map", el, { scrollWheelZoom: false })
-                m.setView([lat, lng], 15)
-                js("L.tileLayer", "https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m)
-                js("L.marker", [lat, lng], { icon: js("L.divIcon", { className: "home-pin", iconSize: null }), zIndexOffset: 1000 }).addTo(m).bindTooltip("The place")
-                layer = js("L.layerGroup").addTo(m)
-                leaflet = m
-                let r = around_stay(id)
-                if is_err(r) { failed = r.error } else { found = r }
-                () => m.remove()
-            }}></div>
+            <MapView label="Places around" center={[lat, lng]} zoom={15} height={340} picked="here"
+                markers={[{ id: "here", lat, lng, text: "The place" }] + (rows | map((p) => {
+                    id: `${p.name}${p.lat}`, lat: p.lat, lng: p.lng, tone: get(PLACE_TONES, p.kind) ?? "accent",
+                    title: `${p.name} · ${p.what} · ${p.walk_min} min`,
+                }))}/>
         </div>
     </div>
 }
@@ -269,16 +222,15 @@ component Activities(id: int, start: str, end: str, signed_in: bool) {
             <p.small>{act.description}</p>
             {len(act.slots) == 0
                 ? <p.muted.small>No times on these days.</p>
-                : <div.slots>{for t in act.slots => <button.slot key={t.id} type="button" disabled={t.left <= 0}
-                    class={ui_cls([t.wet && "wet", slot == t.id && "on"])} data-slot={t.id}
-                    @click={() => { slot = t.id; problem = null; done = null }}>
-                    <b>{t.label}</b><br/>
-                    <span.muted>{t.left <= 0 ? "Full" : `${t.left} left`}{t.rain != null ? ` · ${t.rain}% rain` : ""}{t.wet ? " · may be wet" : ""}</span>
-                </button>}</div>}
+                : <TimeSlots name={`slots-${act.id}`} value={slot} on_pick={(sid) => { slot = sid; problem = null; done = null }}
+                    slots={act.slots | map((t) => {
+                        id: t.id, time: t.label, left: t.left, tone: t.wet ? "warning" : null,
+                        detail: t.rain == null ? null : `${t.rain}% rain${t.wet ? ", may be wet" : ""}`,
+                    })}/>}
             {(act.slots | find((t) => t.id == slot)) != null
                 ? <div.row>
                     <NumberInput label="People" value={people} min={1} max={10} on_change={(n) => { if n != null { people = n } }}/>
-                    <Button class="book-activity" disabled={!signed_in} on_click={() => {
+                    <Button id="book-activity" disabled={!signed_in} on_click={() => {
                         let r = book_activity(slot, people)
                         if is_err(r) { problem = r.error } else { done = `Booked: ${r.title}, ${r.total_shown}`; slot = null }
                     }}>{signed_in ? "Book" : "Sign in to book"}</Button>
@@ -286,6 +238,6 @@ component Activities(id: int, start: str, end: str, signed_in: bool) {
                 : null}
         </Card>}
         <Problem text={problem}/>
-        {done != null ? <Alert tone="success" class="activity-done">{done}</Alert> : null}
+        {done != null ? <Alert tone="success" id="activity-done">{done}</Alert> : null}
     </div>
 }

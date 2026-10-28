@@ -28,6 +28,25 @@ only by a test or by looking at a page, and one under `--watch` that breaks the 
 calendar of nights that are taken, a place search) had to be written by hand (see
 [Components the app needed](#components-the-app-needed)).
 
+## Fixed, on branch stays-fixes
+
+Each fix is commented in the code with its issue and the branch. With them, every
+workaround below came out of app/stays, and its tests (137 checks) pass under `--watch`.
+
+| ID | The fix | The workaround taken out |
+|---|---|---|
+| Q-045 | A top-level constant goes to the browser as JavaScript, not JSON: decimals as `W.Dec`, ints past 2^53 as BigInts, in lists and maps too (src/client.rs, `value_js`) | the rates as functions (`fn service_fee() = 0.12m`) |
+| Q-046 | An island starts at boot when one inside it runs by itself (src/client/runtime.js, `boot`) | `every(3600000, () => null)` in `SearchApp` |
+| Q-047 | A piece of development code with no file to map to loses its line marks with their numbers (src/client.rs, `unmarked`; a unit test) | the tests' "no `--watch`" |
+| Q-048 | On resume, a field counts as typed in only when it differs from what the browser made of the page's value: a range snapped to its step or into min..max, a select with no option chosen (src/client/runtime.js, `asParsed`) | the slider's top rounded to a whole number of steps |
+| Q-049 | `timeout: seconds` (up to 300) for `http.*`, on the server and in the browser; another option is an error, in `quillo check` and at run time; the limits are in the guide (src/fetch.rs, src/check.rs, runtime.js, USERGUIDE.md) | a call that could take 60 s: Overpass is now given 8 s, then Photon is asked |
+| Q-050 | A function of the program's handed to the page (to `js`, `js_new`, a page object's method, in their lists and maps) is called with only as many arguments as it takes, through the same wrapper each time, so `off` finds what `on` was given (src/client/runtime.js, `lenient`) | `(e) =>` where Leaflet's event was not used |
+| Q-053 | `db.error_kind(e)`: "unique", "foreign_key", "not_null", "check", "conflict" or null, for SQLite, PostgreSQL and MySQL alike; no effect needed (src/db.rs, with each database's words in a unit test; USERGUIDE.md) | `contains(r.error, "UNIQUE")` |
+
+The smallest page's browser code grew by 521 bytes (30,586 to 31,107) with Q-046, Q-048 and
+Q-050's code; tests/routes.rs's limit is 31,200 now. Q-051, Q-052 and Q-054 are still open:
+they are messages and a missing error value, with nothing in the app to take out.
+
 ## Seen again
 
 | ID | Where it bit | Attempts |
@@ -36,6 +55,7 @@ calendar of nights that are taken, a place search) had to be written by hand (se
 | Q-028 | A place's live activities (6.5 KB) go again to every page that shows any of them when one slot fills; the place's page itself is 1.6 KB. Fine at this size | – |
 | Q-006 | VS Code still shows `unknown name` for every name from another file (ui/search.qwe: `Shell`, `Button`, `search_stays`...), though `quillo check` on main.qwe is clean | – |
 | Q-041 | Avoided: every part of a page chosen with `? : null`, never `&&`, from the start | 0 |
+| Q-008 | "if the code was written for a newer Quillo, that would explain it" after `route GET /slow { sleep(3000) "late" }` (two statements on one line, my mistake) | 1 |
 | Q-044 | Avoided: `floor`/`ceil` wherever a division meets an int | 0 |
 
 ## New issues
@@ -235,6 +255,21 @@ Repro: [Q-052-refused-private-address-said-as-dns-failure.qwe](../repros/Q-052-r
 
 **Suggestion:** "refused by public_only: 127.0.0.1 is not on the public internet".
 
+### Q-054. `js(...)` of a library the page does not have stops the handler: no error value
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| loud | adding MapView to quillolang/components: a page without Leaflet's `<script>` | 1 |
+
+`js("L.map", el)` on a page that forgot Leaflet stops the `@mount` with "quillo: `js`: L.map
+is not defined on this page" in the console. Nothing after the call runs, so a component
+cannot see the library is missing and say so on the page; the map just stays empty.
+
+Repro: [Q-054-js-of-a-missing-library-stops-the-handler.qwe](../repros/Q-054-js-of-a-missing-library-stops-the-handler.qwe).
+
+**Suggestion:** an error value, as `int("x")` gives one, for a name not on the page; a call
+that throws in the library could stay a run-time error.
+
 ### Q-053. A database error is only its text
 
 | Kind | Detected by | Attempts |
@@ -252,6 +287,18 @@ constraint", MySQL "Duplicate entry". The app checks for `"UNIQUE"` (lib/stays.q
 constraint's name, the same for the three databases.
 
 ## Components the app needed
+
+All of these are now in Quillo UI, on branch stays-components of quillolang/components
+(ac7bcd8, 108 components, all of the kit's tests passing on stays-fixes; 107 on ae6a6e5,
+where MapView's marker clicks meet Q-050): MapView, MonthCalendar, TimeSlots,
+PriceBreakdown, GuestPicker, CardInput and ActionBar, DateRangePicker's `disabled_dates`,
+`day_labels` and `min_nights`, Combobox's `on_input` and `loading`, RangeSlider's
+`on_commit`, and an `id` on Button and Alert. app/stays uses them in place of what it had
+made by hand (its own maps, availability calendar, host calendar, time slots, price lines
+and card fields), and its tests pass with them. One gap left: MapView's height is a number
+of pixels, set on the element, so it cannot fill a column or be smaller on a phone.
+
+What follows is the list as it was on ae6a6e5.
 
 The app uses 37 of the kit's 102 components: Navbar, Button, Card, Badge, Alert, EmptyState,
 Skeleton, Spinner, TextField, TextArea, Select, Switch, NumberInput, RangeSlider, ChipGroup,
@@ -311,6 +358,7 @@ What made the kit's components harder to use than they need be:
 | `route GET /pics/city/:hue(int)` for `/pics/city/20.svg` | the hue is the name | 404: `20.svg` is not an int; my bug | 1 scan |
 | `@mount` for the map inside the search component | the guide's own example | blank map until touched (Q-046); the first probe passed because its outer component was `<body>`'s child | 3 probes |
 | The slider's max as the dearest price rounded up | the range the data has | a place left out with nobody touching anything (Q-048); first suspected the filters' code | 3 runs |
+| "No page scrolls sideways at a phone's width": `scrollWidth - innerWidth` | the usual check | it was 0 while the place's page was 664 px wide on a 390 px phone: a grid column of `1fr` would not shrink below the weather strip, the browser widened the layout and zoomed out, and the check measured the widened page. `innerWidth == 390` tells; the column is `minmax(0, 1fr)` now | 1 screenshot |
 | `localhost` in the Node test tools | as everywhere | Node's `fetch` tried IPv6 (`::1`); Quillo listens on 127.0.0.1 | 1 run |
 | `<script>` with `{` in a repro's page | HTML | braces in markup are expressions; `{raw(JS)}` | 1 run |
 | A User-Agent naming a contact email for Nominatim | its policy asks for contact details | 403 from Nominatim for that text; a plain "QuilloStays/0.1 (...)" works. Quillo's default `quillo/0.5.0` is not one its policy accepts either | 2 probes |
