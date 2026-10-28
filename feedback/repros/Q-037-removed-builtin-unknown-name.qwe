@@ -1,11 +1,10 @@
 // Q-037 A builtin Quillo removed (rate_limit, date.*) is reported as an unknown name, with a wrong guess for date
 // mode: check
-// open-when: unknown name `rate_limit`
-// open-when: did you mean `take`
-// fixed-when: removed
+// open-when: /unknown name `rate_limit`\n/
+// fixed-when: Quillo removed it in 0.5.0
 // From FEEDBACK.md's update (found on 1cf047c). 205d7cd removed rate limits, the date
 // module and more "for programs to do as they need"; the forum, built before it, stopped
-// at `unknown name rate_limit`, and `date.today()` suggests `take`.
+// at `unknown name rate_limit`, and `date.today()` suggested `take`. The date module is
+// back since Q-027's fix (branch feedback6-fixes), so only `rate_limit` is tried here.
 
 print(rate_limit("uploads:1", 30, "1h"))
-print(date.today())
