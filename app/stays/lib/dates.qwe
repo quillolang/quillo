@@ -1,126 +1,49 @@
-// Calendar days, by hand: Quillo has no date module (removed in 205d7cd), and
-// a booking platform is mostly dates. A day is its "YYYY-MM-DD" text, as forms,
-// the database and the UI kit's DateRangePicker give it; arithmetic goes
-// through the number of days since 1970-01-01 (Howard Hinnant's algorithms).
-// Pure functions: the pages use them in the browser too.
+// Calendar days, on Quillo's `date` module: a day is its "YYYY-MM-DD" text,
+// as forms, the database, the UI kit's pickers and the module give it. What
+// is the app's: the nights of a stay, its labels, and each city's time zone,
+// which refunds turn on (check-in at 15:00 is a different moment in winter
+// and in summer). Pure functions: the pages use them in the browser too.
 
-let MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-let WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 let DAY_MS = 86400000
-
-fn leap(y: int) -> bool = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
-
-fn month_days(y: int, m: int) -> int = m == 2 ? (leap(y) ? 29 : 28) : contains([4, 6, 9, 11], m) ? 30 : 31
-
-// "2026-02-30" is not a day; null when the text is not one.
-fn day_parts(text) {
-    if type_of(text) != "str" || !re.test(text, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return null }
-    let y = int(slice(text, 0, 4))
-    let m = int(slice(text, 5, 7))
-    let d = int(slice(text, 8, 10))
-    if m < 1 || m > 12 || d < 1 || d > month_days(y, m) { return null }
-    { y, m, d }
-}
-
-fn is_day(text) -> bool = day_parts(text) != null
-
-// Days since 1970-01-01 (days_from_civil).
-fn day_number(text: str) -> int {
-    let p = day_parts(text)
-    let y = p.m <= 2 ? p.y - 1 : p.y
-    let era = floor(y / 400)
-    let yoe = y - era * 400
-    let doy = floor((153 * (p.m > 2 ? p.m - 3 : p.m + 9) + 2) / 5) + p.d - 1
-    let doe = yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy
-    era * 146097 + doe - 719468
-}
 
 fn two(n: int) -> str = n < 10 ? `0${n}` : str(n)
 
-// The day `n` days after 1970-01-01 (civil_from_days).
-fn day_text(n: int) -> str {
-    let z = n + 719468
-    let era = floor(z / 146097)
-    let doe = z - era * 146097
-    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
-    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
-    let mp = floor((5 * doy + 2) / 153)
-    let d = doy - floor((153 * mp + 2) / 5) + 1
-    let m = mp < 10 ? mp + 3 : mp - 9
-    `${yoe + era * 400 + (m <= 2 ? 1 : 0)}-${two(m)}-${two(d)}`
-}
-
-fn add_days(text: str, n: int) -> str = day_text(day_number(text) + n)
-
-fn days_between(a: str, b: str) -> int = day_number(b) - day_number(a)
+// A day as forms give it: "2026-02-30" is not one.
+fn is_day(text) -> bool = type_of(text) == "str" && len(text) == 10 && date.valid(text)
 
 // The nights of a stay from `start` to the day they leave: ["2026-11-02", ...].
-fn nights_of(start: str, end: str) -> list = range(0, max([days_between(start, end), 0])) | map((i) => add_days(start, i))
-
-// 1 Monday … 7 Sunday. 1970-01-01 was a Thursday.
-fn weekday(text: str) -> int = ((day_number(text) % 7) + 7 + 3) % 7 + 1
+fn nights_of(start: str, end: str) -> list = range(0, max([date.days_between(start, end), 0])) | map((i) => date.add_days(start, i))
 
 // Friday and Saturday nights cost the weekend price.
-fn weekend_night(text: str) -> bool = weekday(text) >= 5 && weekday(text) <= 6
+fn weekend_night(text: str) -> bool = date.weekday(text) >= 5 && date.weekday(text) <= 6
 
-// Today, in UTC (Quillo has no time zones either).
-fn today_day() -> str with time = day_text(floor(now() / DAY_MS))
+// "Mon 2 Nov".
+fn day_label(text: str) -> str = is_day(text) ? date.format(text, "ddd D MMM") : text
 
-// "Mon 2 Nov"; "2 Nov 2027" when not this year.
-fn day_label(text: str) -> str {
-    let p = day_parts(text)
-    if p == null { return text }
-    `${WEEKDAY_NAMES[weekday(text) - 1]} ${p.d} ${MONTH_NAMES[p.m - 1]}`
-}
-
+// "5–9 Nov 2026", or "28 Nov – 3 Dec 2026".
 fn range_label(start: str, end: str) -> str {
-    let a = day_parts(start)
-    let b = day_parts(end)
-    if a == null || b == null { return "" }
-    a.m == b.m && a.y == b.y ? `${a.d}–${b.d} ${MONTH_NAMES[a.m - 1]} ${a.y}` : `${a.d} ${MONTH_NAMES[a.m - 1]} – ${b.d} ${MONTH_NAMES[b.m - 1]} ${b.y}`
+    if !is_day(start) || !is_day(end) { return "" }
+    slice(start, 0, 7) == slice(end, 0, 7)
+        ? `${date.format(start, "D")}–${date.format(end, "D MMM YYYY")}`
+        : `${date.format(start, "D MMM")} – ${date.format(end, "D MMM YYYY")}`
 }
 
 fn plural(n: int, word: str, words: str = "") -> str = n == 1 ? `1 ${word}` : `${n} ${words != "" ? words : word + "s"}`
 
-// ---- time zones, by hand --------------------------------------------------------
+// ---- the cities' time zones ------------------------------------------------------
 
-// Quillo has no time zone database either, and a check-in at 15:00 in Lisbon
-// is a different moment in winter and in summer: refunds turn on it. So each
-// city has its standard offset (minutes east of UTC) and whether it keeps the
-// EU's summer time (from 01:00 UTC on the last Sunday of March to 01:00 UTC on
-// the last Sunday of October).
 let CITY_ZONES = {
-    Lisbon: { std: 0, eu: true, name: "Europe/Lisbon" },
-    Porto: { std: 0, eu: true, name: "Europe/Lisbon" },
-    Barcelona: { std: 60, eu: true, name: "Europe/Madrid" },
-    Dublin: { std: 0, eu: true, name: "Europe/Dublin" },
-    Kyoto: { std: 540, eu: false, name: "Asia/Tokyo" },
+    Lisbon: "Europe/Lisbon",
+    Porto: "Europe/Lisbon",
+    Barcelona: "Europe/Madrid",
+    Dublin: "Europe/Dublin",
+    Kyoto: "Asia/Tokyo",
 }
 
-fn last_sunday(y: int, m: int) -> str {
-    let last = `${y}-${two(m)}-${two(month_days(y, m))}`
-    add_days(last, -(weekday(last) % 7))
-}
+fn zone_of(city: str) -> str = get(CITY_ZONES, city) ?? "UTC"
 
-// Minutes east of UTC in `city` at the moment `ms`.
-fn offset_at(city: str, ms: int) -> int {
-    let z = get(CITY_ZONES, city) ?? { std: 0, eu: false }
-    if !z.eu { return z.std }
-    let y = day_parts(day_text(floor(ms / DAY_MS))).y
-    let from = day_number(last_sunday(y, 3)) * DAY_MS + 3600000
-    let to = day_number(last_sunday(y, 10)) * DAY_MS + 3600000
-    ms >= from && ms < to ? z.std + 60 : z.std
-}
-
-// The moment (ms) it is `clock` ("15:00") on `day` in `city`.
-fn local_moment(city: str, day: str, clock: str) -> int {
-    let parts = split(clock, ":")
-    let naive = day_number(day) * DAY_MS + (int(parts[0]) * 60 + int(parts[1] ?? "0")) * 60000
-    // The offset at the naive moment, then again at the moment it gives:
-    // right on both sides of a change but for the hour that does not exist.
-    let first = naive - offset_at(city, naive) * 60000
-    naive - offset_at(city, first) * 60000
-}
+// The moment (ms, as now() gives) it is `clock` ("15:00") on `day` in `city`.
+fn local_moment(city: str, day: str, clock: str) -> int = date.ms(date.at(day, clock, zone_of(city)))
 
 // The day it is in `city` at `ms`.
-fn local_day(city: str, ms: int) -> str = day_text(floor((ms + offset_at(city, ms) * 60000) / DAY_MS))
+fn local_day(city: str, ms: int) -> str = date.date_in(date.from_ms(ms), zone_of(city))

@@ -32,7 +32,7 @@ fn listing_view(l) = merge(l, {
     weekend_shown: shown_minor(l.weekend_price, l.currency),
     policy: get(POLICIES, l.cancel_policy),
     photo_urls: range(0, l.photos) | map((n) => `/pics/${l.id}/${n}.svg`),
-    zone: (get(CITY_ZONES, l.city) ?? { name: "UTC" }).name,
+    zone: zone_of(l.city),
 })
 
 fn rating_of(listing_id: int) with db {
@@ -86,7 +86,7 @@ server fn search_stays(f: map) with http, db, time {
     if where_text == "" { return { problem: "Where to? Type a city", results: [] } }
     let place = search_place(where_text)
     if is_err(place) { return { problem: place.error, results: [] } }
-    let dated = is_day(f.start) && is_day(f.end) && days_between(f.start, f.end) > 0
+    let dated = is_day(f.start) && is_day(f.end) && date.days_between(f.start, f.end) > 0
     let guests = max([1, int(f.guests ?? 1) ?? 1])
     let dlat = SEARCH_KM / 111.0
     let dlng = SEARCH_KM / (111.0 * math.cos(math.radians(place.lat)))
@@ -96,7 +96,7 @@ server fn search_stays(f: map) with http, db, time {
         ? db.query("select distinct listing_id from booking_nights where day >= ? and day < ? union select distinct listing_id from blocked_nights where day >= ? and day < ?", f.start, f.end, f.start, f.end)
             | map((r) => r.listing_id)
         : []
-    let today = today_day()
+    let today = date.today()
     let kinds = f.kinds ?? []
     let wanted = f.amenities ?? []
     let found = rows
@@ -144,7 +144,7 @@ server fn load_stay(id: int) with db, time {
     if l == null { return null }
     let u = me()
     let today = local_day(l.city, now())
-    let until = add_days(today, 366)
+    let until = date.add_days(today, 366)
     let host = db.one("select id, name, hue, created from users where id = ?", l.host_id)
     {
         listing: listing_view(l),
@@ -284,7 +284,7 @@ server fn load_trips() with db, time {
     let u = me()
     if u == null { return null }
     watch(`user:${u.id}`)
-    let today = today_day()
+    let today = date.today()
     let rows = db.query("select b.*, l.title, l.city, l.hue, l.check_in, l.check_out, l.cancel_policy, (select count(*) from reviews r where r.booking_id = b.id) as reviewed from bookings b join listings l on l.id = b.listing_id where b.guest_id = ? and b.status != 'held' order by b.start_day", u.id)
         | map((b) => merge(b, {
             dates: range_label(b.start_day, b.end_day),
@@ -340,7 +340,7 @@ server fn leave_review(booking_id: int, rating: int, body: str) with db, time {
     let u = acting()?
     let b = db.one("select * from bookings where id = ? and guest_id = ? and status = 'confirmed'", booking_id, u.id)
     if b == null { return err("Only a stay you made can be reviewed") }
-    if b.end_day > today_day() { return err("Reviews open on the day you leave") }
+    if b.end_day > date.today() { return err("Reviews open on the day you leave") }
     if rating < 1 || rating > 5 { return err("From 1 to 5 stars") }
     if len(trim(body)) < 10 { return err("A few words for the next guests (10 characters or more)") }
     let r = db.exec("insert into reviews (booking_id, listing_id, guest_id, rating, body, created) values (?, ?, ?, ?, ?, ?)", booking_id, b.listing_id, u.id, rating, trim(body), now())
@@ -368,21 +368,19 @@ server fn load_host() with db, time {
     let u = me()
     if u == null || u.hosts != 1 { return null }
     watch(`user:${u.id}`)
-    let today = today_day()
+    let today = date.today()
     let listings = db.query("select * from listings where host_id = ? order by id", u.id) | map(listing_view)
     let booked = db.query("select b.*, l.title, l.city, g.name as guest, g.hue as guest_hue from bookings b join listings l on l.id = b.listing_id join users g on g.id = b.guest_id where l.host_id = ? and b.status in ('confirmed', 'requested') order by b.start_day", u.id)
         | map((b) => merge(b, { dates: range_label(b.start_day, b.end_day), total_shown: shown_minor(b.total, b.currency) }))
-    let months = range(0, 6) | map((i) => {
-        let p = day_parts(today)
-        let k = p.m - 6 + i
-        let y = k < 1 ? p.y - 1 : p.y
-        let m = k < 1 ? k + 12 : k
-        { key: `${y}-${two(m)}`, label: MONTH_NAMES[m - 1] }
+    // The last six months, this one last.
+    let months = range(-5, 1) | map((i) => {
+        let first = date.add_months(date.start_of_month(today), i)
+        { key: slice(first, 0, 7), label: date.format(first, "MMM") }
     })
     let confirmed = booked | filter((b) => b.status == "confirmed")
     let earned = db.query("select b.currency, substr(b.start_day, 1, 7) as month, sum(b.total - coalesce(b.refund, 0)) as minor from bookings b join listings l on l.id = b.listing_id where l.host_id = ? and b.status in ('confirmed', 'cancelled') group by 1, 2", u.id)
     let currencies = earned | map((e) => e.currency) | unique
-    let nights = db.query("select n.day, count(*) as c from booking_nights n join listings l on l.id = n.listing_id join bookings b on b.id = n.booking_id where l.host_id = ? and b.status = 'confirmed' and n.day >= ? group by n.day", u.id, add_days(today, -180))
+    let nights = db.query("select n.day, count(*) as c from booking_nights n join listings l on l.id = n.listing_id join bookings b on b.id = n.booking_id where l.host_id = ? and b.status = 'confirmed' and n.day >= ? group by n.day", u.id, date.add_days(today, -180))
     {
         listings,
         requests: booked | filter((b) => b.status == "requested"),
@@ -430,8 +428,7 @@ server fn load_calendar(id: int, month: str) with db, time {
     watch(`listing:${id}`)
     let first = `${month}-01`
     if !is_day(first) { return null }
-    let p = day_parts(first)
-    let end = add_days(first, month_days(p.y, p.m))
+    let end = date.add_months(first, 1)
     let custom = custom_prices(id, first, end)
     let closed = db.query("select day from blocked_nights where listing_id = ? and day >= ? and day < ?", id, first, end) | map((r) => r.day)
     let taken = db.query("select n.day, b.status, g.name from booking_nights n join bookings b on b.id = n.booking_id join users g on g.id = b.guest_id where n.listing_id = ? and n.day >= ? and n.day < ?", id, first, end)
@@ -439,15 +436,15 @@ server fn load_calendar(id: int, month: str) with db, time {
     {
         listing: listing_view(l),
         month,
-        title: `${MONTH_NAMES[p.m - 1]} ${p.y}`,
-        lead: weekday(first) - 1,
+        title: date.format(first, "MMMM YYYY"),
+        lead: date.weekday(first) - 1,
         today: local_day(l.city, now()),
         days: nights_of(first, end) | map((d) => {
             let t = get(taken, d)
             let price = night_price(l, d, custom)
             {
                 day: d,
-                n: day_parts(d).d,
+                n: date.parts(d).day,
                 price,
                 shown: shown_minor(price, l.currency),
                 custom: has(custom, d),
@@ -530,7 +527,7 @@ server fn activities_near(id: int, start: str, end: str) with db, time {
     if l == null { return [] }
     let today = local_day(l.city, now())
     let from = is_day(start) && start >= today ? start : today
-    let to = is_day(end) && end > from ? end : add_days(from, 7)
+    let to = is_day(end) && end > from ? end : date.add_days(from, 7)
     let w = forecast_kept(l.lat, l.lng)
     let weather = w == null ? {} : w.days | reduce({}, (m, d) => set(m, d.day, d))
     db.query("select * from activities where currency = ?", l.currency)
@@ -560,7 +557,7 @@ server fn book_activity(slot_id: int, people: int) with db, time {
     if people < 1 || people > 10 { return err("From 1 to 10 people") }
     let s = db.one("select s.*, a.price, a.currency, a.title from activity_slots s join activities a on a.id = s.activity_id where s.id = ?", slot_id)
     if s == null { return err("No such time") }
-    if s.day < today_day() { return err("That time has passed") }
+    if s.day < date.today() { return err("That time has passed") }
     let id = db.transaction(() => {
         // Places left are counted by the database, not read and written back.
         let took = db.exec("update activity_slots set taken = taken + ? where id = ? and taken + ? <= capacity", people, slot_id, people)?

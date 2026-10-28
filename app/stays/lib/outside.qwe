@@ -219,9 +219,9 @@ fn offline_place(text: str) {
 }
 
 fn offline_forecast(lat: float, lng: float) with time {
-    let today = today_day()
+    let today = date.today()
     { zone: "Europe/Lisbon", offset_s: 0, days: range(0, 16) | map((i) => {
-        day: add_days(today, i), code: [0, 2, 3, 61, 0, 80, 2][i % 7], hi: 20 + i % 5, lo: 12 + i % 3, rain: [0, 10, 30, 80, 5, 60, 20][i % 7],
+        day: date.add_days(today, i), code: [0, 2, 3, 61, 0, 80, 2][i % 7], hi: 20 + i % 5, lo: 12 + i % 3, rain: [0, 10, 30, 80, 5, 60, 20][i % 7],
     }) }
 }
 
