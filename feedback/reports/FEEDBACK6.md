@@ -23,6 +23,40 @@ in them), one where a chain's caller is told a call failed while the work goes o
 it (Q-056), and a video call still needs hand-written WebRTC, because a page cannot send
 its own camera (Q-060).
 
+## Fixed, on branch feedback6-fixes
+
+Each fix is commented in the code with its issue and the branch. This report's seven
+issues, and the ones still open from earlier reports:
+
+| ID | The fix |
+|---|---|
+| Q-055 | `for x in xs { ...; <li key={k}/> }`: a block whose last statement is an element is keyed by that element's `key`, which can use the block's `let`s (src/client.rs, `each`) |
+| Q-056 | A call to a service carries the time its caller has left (`x-quillo-deadline`): a service waits on its own calls no longer than that, a call with no time left is not made ("the call this one is part of has run out of time"), and a timeout says whose time ran out (src/service.rs; USERGUIDE.md, Services) |
+| Q-057 | `js(...)` that gives a Promise is waited for in an event handler, `@mount` and a state's first value, and a rejection is an error value; `.then`, `.catch` and `.finally` still get the Promise, and `type_of` calls it "promise" (src/client.rs, runtime.js `W.settle`) |
+| Q-058 | Options that take a value are known by name, so `quillo run --no-check app.qwe` runs app.qwe (src/main.rs, `program_and_flags`) |
+| Q-059 | `quillo run`, `check`, `build` with no program, or a folder, take its `main.qwe`; without one: "no program: name a .qwe file, or add a main.qwe here". The REPL says when a main.qwe is there |
+| Q-060 | A page sends its camera and microphone: `<quillo-media publish="name">` (or a `source` stream set on it) encodes H.264 and Opus with WebCodecs and sends them over the page's channel connection (WebTransport, else a WebSocket); `media.on(name, { publish })` says who may, `name*` for a family of streams, and pages watch it as any stream (src/media.rs, src/wt.rs, runtime.js `mediaPublisher`; USERGUIDE.md, Media) |
+| Q-061 | `media.close(name)` ends a stream made while the program runs: its UDP ports let go (within a second), its pages told (`data-state="ended"`), true if there was one (src/media.rs) |
+| Q-008 | The "newer Quillo" note follows only an unknown character or escape, an unexpected keyword, or an unknown word; an error that says what was expected (a list not closed, `=>` for `=`) has none (src/error.rs) |
+| Q-014 | A component inside another whose server state no longer fits is made again by itself, and said so in development; the islands around it are resumed (runtime.js, `island`) |
+| Q-027 | The date module is back, the same on the server and in the browser: calendar days, date-times, time zones (IANA, with the database built in), `date.ms` and `date.from_ms` for `now()`'s milliseconds; not business days or day counts (src/dates.rs; USERGUIDE.md, Dates and times). Stays, PM, Bank and CMS dropped their own: stays' lib/dates.qwe is 49 lines (was 126, with the EU's summer time by hand), pm's 65 (was 103), the bank's and the CMS's Hinnant functions are gone |
+| Q-028 | A `live` loader's run is shared by the pages that ask within two seconds with the same arguments while nothing it read changed (by one viewer's pages, when it read the request); and a page is sent a patch to the value it has, rows matched by `id` (src/livecache.rs). Two pages showing 3,000 rows, one renamed: one run instead of two, 201 bytes to each page instead of 90,877 |
+| Q-035 | Calling a builtin that a top-level `let` hides is an error that says where the variable is, with a warning at the `let` |
+| Q-036 | `{...x}` and `[...x]` say what they spread and what `x` was; `null` spreads nothing in both (src/builtins.rs, src/check.rs) |
+| Q-037 | A builtin removed in 0.5.0 says so, and what to use instead, in `quillo check`, at run time and in the browser (src/error.rs, `removed_note`) |
+| Q-051 | `xs \| find(...) != null` is one error, which says `\|` binds looser than `!=` and shows the parentheses |
+| Q-052 | An address `public_only` refuses is reported as "refused by public_only: 127.0.0.1 is not on the public internet" (src/fetch.rs) |
+| Q-054 | `js(...)` of a name the page does not have is an error value, "js: X is not defined on this page", not an exception that stops the handler |
+
+Q-006 needed no change: the language server checks a used file as part of its program (since
+7749d2d) and leaves out names a file that does not parse defines. What VS Code showed for
+Stays came from the `quillo` on the PATH, built from f1695a3, which cannot parse
+lib/stays.qwe (`return` as an expression); the extension starts whichever `quillo` it finds.
+
+The smallest page's browser code is 31,563 bytes, over tests/routes.rs's limit of 31,200
+with Q-014's code (the other fixes' code comes only to pages that use it); the limit is
+31,800 now.
+
 ## Seen again
 
 None. The issues met are all new; [INDEX.md](../INDEX.md) has nothing on keyed lists,
