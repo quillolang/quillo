@@ -246,7 +246,7 @@ fn values_for(form, fields: list, input: map) ! str {
         if is_err(acc) { return acc }
         let f = find(fields, (x) => x.id == fid)
         if f == null { return acc }
-        let v = clean_value(f, input[str(fid)])
+        let v = clean_value(f, input[fid])
         is_err(v) ? v : set(acc, col_of(fid), v)
     })
 }
@@ -308,7 +308,7 @@ fn shown_value(f, v, people: map) -> str = v == null ? "" : match f.type {
     "yesno" => v == 1 ? "Yes" : "No"
     "money" => str(v)
     "date" => day_label(v)
-    "user" => people[str(v)] ?? `#${v}`
+    "user" => people[v] ?? `#${v}`
     "number" => str(v)
     _ => str(v)
 }

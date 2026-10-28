@@ -1,9 +1,5 @@
 // The two sides of a desk session, both live on desk:<code>:
 //
-// Markup holding inputs or components is chosen with `? :`, never `&&`:
-// `cond && <x>` makes <x> again whenever anything it reads changes, so a box
-// being typed in loses its focus and text (FEEDBACK4.md, Q-041).
-//
 //   <DeskClerk>   the clerk's form: fields, "ask the client" per part, what
 //                 the client answered, and Submit once all is approved.
 //   <DeskClient>  the client's phone: the code to join, then the form as the
@@ -82,7 +78,7 @@ component DeskClerk(code: str) {
                 <a.btn.ghost href="/staff">Back to the dashboard</a>
             </section>}
             {desk.status == "cancelled" && <section.finished.cancelled><h2>Cancelled</h2><a.btn.ghost href="/staff">Back to the dashboard</a></section>}
-            {desk.status == "open" ? <div>
+            {desk.status == "open" && <div>
                 <Problem text={problem}/>
                 {for s in desk.sections => <section.part key={s.id} class={s.state}>
                     <header>
@@ -126,7 +122,7 @@ component DeskClerk(code: str) {
                         }}>Cancel</button>
                     </div>
                 </footer>
-            </div> : null}
+            </div>}
         </div>}
 }
 
@@ -219,9 +215,9 @@ component DeskClient(code: str, signed_in: bool) {
                 <a.btn.primary href={signed_in ? "/" : "/login"}>{signed_in ? "Home" : "Sign in"}</a>
             </section>}
             {desk.status == "cancelled" && <Empty>The clerk ended this session.</Empty>}
-            {desk.status == "open" ? <div>
-                {for s in desk.sections => s.state == "pending" ? <AskCard key={s.ask.id} ask={s.ask} title={s.title}/> : null}
-                {desk.new_customer && !desk.pin_set ? <PinChooser code={desk.code}/> : null}
+            {desk.status == "open" && <div>
+                {for s in desk.sections => s.state == "pending" && <AskCard key={s.ask.id} ask={s.ask} title={s.title}/>}
+                {desk.new_customer && !desk.pin_set && <PinChooser code={desk.code}/>}
                 {desk.new_customer && desk.pin_set && <p.ok>✓ PIN chosen</p>}
                 {for s in desk.sections => <section.part key={s.id} class={s.state}>
                     <header><h2>{s.title}</h2><StateBadge state={s.state}/></header>
@@ -234,7 +230,7 @@ component DeskClient(code: str, signed_in: bool) {
                                 : (str(get(desk.data, f[0]) ?? "") == "" ? "—" : str(get(desk.data, f[0])))}</dd>
                         </div>}</dl>}
                 </section>}
-            </div> : null}
+            </div>}
         </div>}
 }
 

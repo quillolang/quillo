@@ -32,13 +32,8 @@ fn r1(x) = round(x, 1)
 fn xi(i: int, n: int, w = CW) = r1(PL + (n <= 1 ? 0 : i * (w - PL - PR) / (n - 1)))
 fn yv(v, hi) = r1(CH - PB - v * (CH - PT - PB) / hi)
 
-// A number for people to read, with at most one decimal. Written the same on
-// the server and in the browser: a whole float is "8.0" on the server but "8"
-// in the browser, and a page whose text differs is made again on load.
-fn num1(x) -> str {
-    let r = round(float(x), 1)
-    r == floor(r) ? str(int(r)) : str(r)
-}
+// A number for people to read, with at most one decimal.
+fn num1(x) = round(float(x), 1)
 
 fn compact_num(n) = n >= 1000 ? `${num1(n / 1000)}K` : num1(n)
 

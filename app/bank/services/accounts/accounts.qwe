@@ -7,6 +7,10 @@
 //
 // Amounts are whole minor units (cents): the callers turn them into
 // `money` for people to read.
+//
+// Each change is announced on the topics of the pages that show it:
+// cust:<customer id> for the customer's own, staff for the staff's dashboard.
+// They reach the gateway's pages with the answer, however the bank runs.
 
 use "../../lib/iban.qwe"
 
@@ -17,6 +21,11 @@ let KINDS = ["checking", "savings"]
 let BANK_PART = "0001"
 
 fn day_start(t: int) -> int = t - t % 86400000
+
+fn changed(customer_ids: list) {
+    for c in unique(customer_ids) => if c != 0 { publish(`cust:${c}`) }
+    publish("staff")
+}
 
 fn row(id: int) with db = db.one("select * from accounts where id = ?", id)
 
@@ -42,6 +51,7 @@ server fn open_account(customer_id: int, kind: str, currency: str, name: str) ->
     if is_err(money.zero(currency)) { return err(`${currency} is not a currency`) }
     let label = trim(name) == "" ? (kind == "savings" ? "Savings" : "Everyday account") : trim(name)
     let id = db.transaction(() => new_account(customer_id, kind, currency, label))
+    changed([customer_id])
     row(id)
 }
 
@@ -57,6 +67,7 @@ server fn set_status(id: int, status: str) ! str with db {
     let a = row(id) ?? err("No such account")?
     if status == "closed" && a.balance != 0 { return err("Only an empty account can be closed") }
     db.exec("update accounts set status = ? where id = ?", status, id)
+    changed([a.customer_id])
     row(id)
 }
 
@@ -69,7 +80,7 @@ server fn set_status(id: int, status: str) ! str with db {
 fn post(kind: str, memo: str, ref: str?, legs: list) -> map ! str with db, time {
     if sum(legs | map((l) => l.amount)) != 0 { return err("An entry must add up to zero") }
     if any(legs, (l) => l.amount == 0) { return err("An amount of nothing") }
-    db.transaction(() => {
+    let posted = db.transaction(() => {
         if ref != null {
             let before = db.one("select id from journal where ref = ?", ref)
             if before != null { return { journal_id: before.id, again: true } }
@@ -90,7 +101,9 @@ fn post(kind: str, memo: str, ref: str?, legs: list) -> map ! str with db, time 
                 j, a.id, l.amount, after, now())
         }
         { journal_id: j, again: false }
-    })
+    })?
+    if !posted.again { changed(legs | map((l) => row(l.account_id).customer_id)) }
+    posted
 }
 
 server fn transfer(from_id: int, to_id: int, cents: int, memo: str, ref: str) -> map ! str with db, time {

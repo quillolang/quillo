@@ -2,7 +2,8 @@
 // an 8-digit customer number and a 6-digit PIN that only they know (they
 // choose it on their own phone, at the desk). Five wrong PINs lock the
 // sign-in for 15 minutes; Quillo has no rate limits of its own, so the
-// count is kept here.
+// count is kept here. A customer made or changed is announced to the
+// staff's pages (staff) and the customer's own (cust:<id>).
 
 db.open(env("BANK_DATA", ".") + "/customers.db")
 db.migrate("migrations")
@@ -36,6 +37,7 @@ server fn create(details: map, pin_hash: str?, number: str = "") -> map ! str wi
                     values (:number, :first_name, :last_name, :birth_date, :email, :phone, :street, :city, :postcode, :country, :pin_hash, :now, :now)`,
             merge(d, { number, pin_hash, now: now() })).last_id
     })?
+    publish("staff")
     public(db.one("select * from customers where id = ?", id))
 }
 
@@ -47,6 +49,8 @@ server fn update(id: int, details: map) -> map ! str with db, time {
                         email = :email, phone = :phone, street = :street, city = :city, postcode = :postcode,
                         country = :country, updated = :now where id = :id`, merge(d, { id, now: now() }))
     if r.changes == 0 { return err("No such customer") }
+    publish(`cust:${id}`)
+    publish("staff")
     public(db.one("select * from customers where id = ?", id))
 }
 

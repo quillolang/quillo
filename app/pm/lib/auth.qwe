@@ -24,14 +24,13 @@ fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(b
 fn acting() ! str with db, time = me() ?? err("Sign in first")
 
 // Minutes east of UTC, from the `tz` cookie public/js/pm.js sets. Quillo
-// has no time zones, so without it "today" is UTC's. Routes and server fns
-// pass their `request`: other functions cannot read it.
-fn tz_offset(req) -> int {
-    let n = int(req.cookies.tz ?? "0") ?? 0
+// has no time zones, so without it "today" is UTC's.
+fn tz_offset() -> int {
+    let n = int(cookie("tz") ?? "0") ?? 0
     n >= -720 && n <= 840 ? n : 0
 }
 
-fn today(req) -> int = day_of(now(), tz_offset(req))
+fn today() -> int with time = day_of(now(), tz_offset())
 
 fn start_session(user_id: int) with db, time, random {
     let sid = crypto.token()

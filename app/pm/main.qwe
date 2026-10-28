@@ -23,6 +23,10 @@
 //   ui/settings.qwe     <Settings>: columns, milestones, labels, people
 //   ui/pages.qwe        the other pages
 //   seed.qwe            the demo, for PM_DEMO=1
+//
+// Tests (need PM_DEMO=1, freshly seeded; BASE=http://localhost:8080):
+//
+//   node feedback/tools/drive.mjs app/pm/tests/settings.mjs     the columns table, renamed and moved; the reports
 
 db.open(env("PM_DB", "pm.db"))
 db.migrate("migrations")
@@ -58,7 +62,7 @@ fn project_for(u, key: str) with db {
 route GET / {
     let u = me()
     if u == null { return <Landing/> }
-    <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today(request)} form={{}} problem={null}/>
+    <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today()} form={{}} problem={null}/>
 }
 
 route POST /projects {
@@ -66,7 +70,7 @@ route POST /projects {
     let f = request.form
     let key = create_project(u, NewProject({ name: f.name ?? "", key: f.key ?? "", about: f.about ?? "", color: f.color ?? "" }))
     if is_err(key) {
-        reply 422 <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today(request)} form={f} problem={key.error}/>
+        reply 422 <HomePage me={u} projects={my_projects(u.id)} work={my_work(u.id)} today={today()} form={f} problem={key.error}/>
     }
     redirect(`/p/${key}`)
 }
@@ -75,13 +79,13 @@ route GET /p/:key ? { task: int = 0 } {
     let u = signed_in(`/p/${key}`)
     let p = project_for(u, key)
     let open = task > 0 && task_row(task).project_id == p.id ? task : null
-    <ProjectPage me={u} project={p} tab="Board"><Board project_id={p.id} today={today(request)} open_id={open}/></ProjectPage>
+    <ProjectPage me={u} project={p} tab="Board"><Board project_id={p.id} today={today()} open_id={open}/></ProjectPage>
 }
 
 route GET /p/:key/timeline {
     let u = signed_in(`/p/${key}/timeline`)
     let p = project_for(u, key)
-    <ProjectPage me={u} project={p} tab="Timeline"><Timeline project_id={p.id} today={today(request)}/></ProjectPage>
+    <ProjectPage me={u} project={p} tab="Timeline"><Timeline project_id={p.id} today={today()}/></ProjectPage>
 }
 
 route GET /p/:key/reports ? { m: int = 0 } {
@@ -99,7 +103,7 @@ route GET /p/:key/activity {
 route GET /p/:key/settings {
     let u = signed_in(`/p/${key}/settings`)
     let p = project_for(u, key)
-    <ProjectPage me={u} project={p} tab="Settings"><Settings project_id={p.id} today={today(request)}/></ProjectPage>
+    <ProjectPage me={u} project={p} tab="Settings"><Settings project_id={p.id} today={today()}/></ProjectPage>
 }
 
 // Every task as CSV, for a spreadsheet.

@@ -21,9 +21,10 @@
 //   messages    messages in the app, and email copies sent later
 //
 // A transfer is a chain: this gateway, payments, risk, accounts, messages.
-// Pages follow topics of the gateway's own (cust:<id>, desk:<code>, staff),
-// published after each call that changes something: a service's own
-// changes reach no page by themselves (FEEDBACK4.md, Q-038 and Q-039).
+// Pages follow topics: cust:<id> (a customer's pages) and staff (the
+// dashboard), which each service publishes when it changes something, and
+// desk:<code>, the gateway's own desk sessions. A topic published by a
+// service reaches the gateway's pages with its answer, split or not.
 //
 //   lib/iban.qwe      account numbers: IBANs with mod-97 check digits
 //   lib/format.qwe    amounts as typed and shown, dates (Quillo has no date module)
@@ -48,9 +49,12 @@
 db.open(env("BANK_DATA", ".") + "/bank.db")
 db.migrate("migrations")
 
-// The `use` lines come before the `service` lines: a file a service also
-// uses (lib/iban.qwe) is otherwise left out of the pages' browser code
-// (FEEDBACK4.md, Q-040).
+service customers = "services/customers/customers.qwe" { timeout: "3s", retries: 1 }
+service accounts = "services/accounts/accounts.qwe" { timeout: "3s", retries: 1 }
+service payments = "services/payments/payments.qwe" { timeout: "5s", retries: 1 }
+service risk = "services/risk/risk.qwe" { timeout: "3s", retries: 1 }
+service messages = "services/messages/messages.qwe" { timeout: "2s" }
+
 use "lib/iban.qwe"
 use "lib/format.qwe"
 use "lib/auth.qwe"
@@ -61,12 +65,6 @@ use "ui/client.qwe"
 use "ui/staff.qwe"
 use "ui/desk.qwe"
 use "seed.qwe"
-
-service customers = "services/customers/customers.qwe" { timeout: "3s", retries: 1 }
-service accounts = "services/accounts/accounts.qwe" { timeout: "3s", retries: 1 }
-service payments = "services/payments/payments.qwe" { timeout: "5s", retries: 1 }
-service risk = "services/risk/risk.qwe" { timeout: "3s", retries: 1 }
-service messages = "services/messages/messages.qwe" { timeout: "2s" }
 
 if env("BANK_DEMO", "") == "1" { seed_demo() }
 

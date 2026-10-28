@@ -50,7 +50,7 @@ component Home() {
             <DeskInvite/>
             <section>
                 <h2>Accounts</h2>
-                {home.down ? <p.problem>Your accounts cannot be shown right now. Your money is safe: try again in a minute.</p> : null}
+                {home.down && <p.problem>Your accounts cannot be shown right now. Your money is safe: try again in a minute.</p>}
                 <ul.cards>{for a in home.accounts => <li key={a.id}>
                     <a.card href={`/accounts/${a.id}`} class={a.status}>
                         <span.kind>{a.name}{a.status == "frozen" && " · frozen"}</span>

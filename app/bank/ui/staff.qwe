@@ -174,7 +174,7 @@ component CustomerView(number: str, me) {
                             let r = set_account_status(a.id, "open")
                             problem = is_err(r) ? r.error : null
                         }}>Unfreeze</button>}
-                    {a.status == "open" ? <CashIn account_id={a.id} currency={a.currency}/> : null}
+                    {a.status == "open" && <CashIn account_id={a.id} currency={a.currency}/>}
                 </div>
                 <ol.statement.small>{for l in a.lines => <li key={l.id}>
                     <span>{l.memo == "" ? l.kind : l.memo} <span.muted>{when(l.created)}</span></span>

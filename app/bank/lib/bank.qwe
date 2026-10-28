@@ -1,12 +1,6 @@
 // The gateway's own server fns for clients and staff: each reads from the
-// services and changes through them, and announces what changed itself
-// (cust:<id> for a customer's pages, staff for the dashboard), since what
-// the services change reaches no page by itself (Q-038, Q-039).
-
-fn cust_changed(customer_id) {
-    if customer_id != null { publish(`cust:${customer_id}`) }
-    publish("staff")
-}
+// services and changes through them. The services announce what they change
+// (cust:<id> for a customer's pages, staff for the dashboard).
 
 // An account as pages show it.
 fn account_view(a) = merge(a, {
@@ -80,7 +74,7 @@ server fn load_inbox() -> list with http {
 
 server fn read_inbox() with http {
     let c = acting_client()?
-    if (messages.mark_read(c.id) ?? 0) > 0 { cust_changed(c.id) }
+    messages.mark_read(c.id)
     true
 }
 
@@ -92,10 +86,6 @@ server fn send_money(from_id: int, to_number: str, amount: str, memo: str) ! str
     let from = accounts.account(from_id)? ?? err("Choose one of your accounts")?
     let m = parse_amount(amount, from.currency)?
     let t = payments.transfer(c.id, from_id, iban_clean(to_number), money.to_minor(m), trim(memo))?
-    // The receiving customer's pages too.
-    let to = accounts.account(t.to_id) ?? null
-    cust_changed(c.id)
-    if to != null && to.customer_id != c.id { cust_changed(to.customer_id) }
     if t.status != "done" { log(`${c.first_name} ${c.last_name}`, "transfer", `${shown(t.cents, t.currency)} ${t.status}: ${replace(t.reasons, "\n", "; ")}`) }
     transfer_view(t)
 }
@@ -138,9 +128,6 @@ server fn decide_transfer(id: int, approve: bool, note: str) ! str with db, http
     if !is_supervisor(s) { return err("Supervisors decide held transfers") }
     let t = payments.decide(id, approve, s.name, note)?
     log(s.name, approve ? "approve" : "reject", `transfer #${id}, ${shown(t.cents, t.currency)}: ${t.status}`)
-    let to = accounts.account(t.to_id) ?? null
-    cust_changed(t.customer_id)
-    if to != null { cust_changed(to.customer_id) }
     transfer_view(t)
 }
 
@@ -170,7 +157,6 @@ server fn set_account_status(id: int, status: str) ! str with db, http, time {
     let s = acting_staff()?
     let a = accounts.set_status(id, status)?
     log(s.name, status == "frozen" ? "freeze" : status, `${iban_pretty(a.number)}`)
-    cust_changed(a.customer_id)
     if status == "frozen" { messages.send(a.customer_id, "security", `Your account ${iban_pretty(a.number)} is frozen`, "Call us or visit a branch.") }
     account_view(a)
 }
@@ -183,6 +169,5 @@ server fn cash_in(id: int, amount: str) ! str with db, http, time, random {
     accounts.deposit(id, money.to_minor(m), `Cash at the desk (${s.name})`, `cash-${uuid()}`)?
     messages.send(a.customer_id, "account", `${money.format(m, LOCALE)} was paid in`, `At the desk with ${s.name}.`)
     log(s.name, "deposit", `${money.format(m, LOCALE)} into ${iban_pretty(a.number)}`)
-    cust_changed(a.customer_id)
     true
 }

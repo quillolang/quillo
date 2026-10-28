@@ -96,27 +96,27 @@ component TransitionRow(flow_id: int, t, steps: list, kind: str, on_problem) {
     let step_select = (value, label, on) => <select aria-label={label} @change={(e) => on(int(e.value) ?? 0)}>
         {for s in steps => <option key={s.id} value={s.id} selected={s.id == value}>{s.name}</option>}
     </select>
-    <div class={`tr-row ${t == null ? "new" : ""}`} role="row">
-        {step_select(from, "From", (v) => { from = v })}
-        <span.arrow>→</span>
-        {step_select(to, "To", (v) => { to = v })}
-        <input value={name} placeholder={t == null ? "New transition" : "Name"} aria-label="Name" maxlength="30" @input={(e) => { name = e.value }}/>
-        <select aria-label="Role" @change={(e) => { role = e.value }}>
+    <tr class={t == null ? "new" : null}>
+        <td>{step_select(from, "From", (v) => { from = v })}</td>
+        <td.arrow>→</td>
+        <td>{step_select(to, "To", (v) => { to = v })}</td>
+        <td><input value={name} placeholder={t == null ? "New transition" : "Name"} aria-label="Name" maxlength="30" @input={(e) => { name = e.value }}/></td>
+        <td><select aria-label="Role" @change={(e) => { role = e.value }}>
             {for r in ROLES => <option key={r} value={r} selected={role == r}>{r}</option>}
-        </select>
-        {kind == "article"
+        </select></td>
+        <td>{kind == "article"
             ? <select aria-label="Kind" @change={(e) => { how = e.value }}>
                 {for k in TRANSITION_KINDS => <option key={k} value={k} selected={how == k}>{KIND_LABELS[k]}</option>}
               </select>
-            : <span/>}
-        {kind == "article"
+            : null}</td>
+        <td>{kind == "article"
             ? <label.check title="Not while feedback is open"><input type="checkbox" checked={resolved} @change={(e) => { resolved = e.checked }}/> resolved</label>
-            : <span/>}
-        <span.row-actions>
+            : null}</td>
+        <td><span.row-actions>
             {dirty && <button.btn.small.primary disabled={trim(name) == ""} @click={save}>{t == null ? "Add" : "Save"}</button>}
             {t != null && <button.icon-btn aria-label="Delete transition" @click={() => on_problem(err_text(delete_transition(flow_id, t.id)))}>✕</button>}
-        </span>
-    </div>
+        </span></td>
+    </tr>
 }
 
 component FlowDesigner(flow_id: int) {
@@ -164,13 +164,15 @@ component FlowDesigner(flow_id: int) {
             </section>
             <section.card-box>
                 <h2>Transitions <span.muted>who may move things from one step to another</span></h2>
-                <div.tr-table role="table">
-                    <div.tr-row.head role="row"><span>From</span><span/><span>To</span><span>Name</span><span>Role</span>
-                        <span>{d.flow.kind == "article" ? "Kind" : ""}</span><span>{d.flow.kind == "article" ? "Needs" : ""}</span><span/></div>
-                    {for t in d.transitions => <TransitionRow key={`${t.id}-${t.from_step}-${t.to_step}-${t.name}-${t.role}-${t.kind}-${t.needs_resolved}`}
-                        {flow_id} {t} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>}
-                    <TransitionRow key={`new-${len(d.transitions)}-${len(d.steps)}`} {flow_id} t={null} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>
-                </div>
+                <div.table-scroll><table.tr-table aria-label="Transitions">
+                    <thead><tr><th>From</th><th aria-label="to"></th><th>To</th><th>Name</th><th>Role</th>
+                        <th>{d.flow.kind == "article" ? "Kind" : ""}</th><th>{d.flow.kind == "article" ? "Needs" : ""}</th><th aria-label="Actions"></th></tr></thead>
+                    <tbody>
+                        {for t in d.transitions => <TransitionRow key={`${t.id}-${t.from_step}-${t.to_step}-${t.name}-${t.role}-${t.kind}-${t.needs_resolved}`}
+                            {flow_id} {t} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>}
+                        <TransitionRow key={`new-${len(d.transitions)}-${len(d.steps)}`} {flow_id} t={null} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>
+                    </tbody>
+                </table></div>
             </section>
         </div>}
     </div>
