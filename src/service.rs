@@ -833,6 +833,9 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
 /// (once per process) unless it runs elsewhere; under its prefix, its
 /// routes are served (here, or passed on to it).
 pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, options: Option<&Value>, line: u32) -> R {
+    if !it.declared_services.iter().any(|n| n == name) {
+        Arc::make_mut(&mut it.declared_services).push(name.to_string());
+    }
     if let Some(o) = options {
         set_opts(name, o, line)?;
     }

@@ -112,6 +112,7 @@ pub fn install(env: &Env) {
         ("js_new", js),
         ("css", tag_text),
         ("__style", style_noop),
+        ("ready", crate::ready::add_check),
         ("sql", tag_text),
         ("sql_name", sql_name),
         ("sql_param", sql_param),
