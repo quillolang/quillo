@@ -51,7 +51,10 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
     // Its services.
     let names: Vec<String> = it.declared_services.to_vec();
     for name in names {
-        let urls = crate::service::urls_of(&it.shared, &name);
+        // Given addresses; or the service here, with the copies that joined
+        // it (FEEDBACK10.md, Q-074).
+        let configured = crate::service::configured_urls(&it.shared, &name);
+        let urls = if configured.is_empty() { Vec::new() } else { crate::service::urls_of(&it.shared, &name) };
         if !urls.is_empty() {
             let at: Vec<(String, bool)> = it.unlocked(|| urls.iter().map(|u| (u.clone(), remote_ready(u))).collect());
             let ok = at.iter().any(|(_, r)| *r);
@@ -60,9 +63,14 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
             continue;
         }
         let local = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(&name).map(|(_, s)| s.fork());
+        let joined = crate::service::joined_urls(&name);
         match local {
             Some(mut svc) if depth < DEPTH => {
-                let (ok, detail) = report_at(&mut svc, depth + 1);
+                let (ok, mut detail) = report_at(&mut svc, depth + 1);
+                if !joined.is_empty() {
+                    let at: Vec<(String, bool)> = it.unlocked(|| joined.iter().map(|u| (u.clone(), remote_ready(u))).collect());
+                    detail["copies"] = J::Object(at.into_iter().map(|(u, r)| (u, json!(if r { "ready" } else { "down" }))).collect());
+                }
                 put(format!("service {}", name), ok, detail);
             }
             Some(_) => put(format!("service {}", name), true, json!("ready")),

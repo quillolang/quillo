@@ -287,3 +287,26 @@ fn name_schema(n: &str) -> J {
         other => json!({ "x-quillo-type": other }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_contract_and_a_document() {
+        let src = "route GET /users/:id(int) ? { full: bool = false } = id\nroute POST /signup { form: { name: str, age: int | null } } = 1\nserver fn assess(n: int, size: int = 3) -> map ! str = { n }\n";
+        let dir = std::env::temp_dir().join(format!("quillo-describe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("api.qwe");
+        std::fs::write(&file, src).unwrap();
+        let doc = of_source(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(doc["x-quillo-server-fns"]["assess"]["contract"], "assess(n: int, size?: int) -> map ! str");
+        let get = &doc["paths"]["/users/{id}"]["get"];
+        assert_eq!(get["parameters"][0], json!({ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }));
+        assert_eq!(get["parameters"][1]["required"], false);
+        let form = &doc["paths"]["/signup"]["post"]["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"];
+        assert_eq!(form["required"], json!(["name"]));
+        assert_eq!(form["properties"]["age"], json!({ "type": "integer", "nullable": true }));
+    }
+}

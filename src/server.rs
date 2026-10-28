@@ -600,6 +600,11 @@ impl Interp {
         if rest == "ready" {
             return ready_response(self);
         }
+        // A copy of one of its services joining (FEEDBACK10.md, Q-074;
+        // branch feedback10-fixes).
+        if rest == "join" {
+            return crate::service::join_here(self, req);
+        }
         // The program's API, for a gateway or a reader, under `--describe`
         // (FEEDBACK10.md, Q-077; branch feedback10-fixes).
         if rest == "describe" && crate::describe::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {

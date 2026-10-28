@@ -1340,6 +1340,70 @@ pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &
     }
 }
 
+// ---- calls a service answered, shared by its copies (src/service.rs) ----------------------
+
+/// What another copy of the service did with a call (FEEDBACK10.md, Q-073;
+/// branch feedback10-fixes).
+pub(crate) enum Claim {
+    /// This copy runs it.
+    Mine,
+    /// Another copy answered it: the status and the body.
+    Done(u16, String),
+    /// Another copy is running it.
+    Running,
+}
+
+fn calls_table(it: &mut Interp, on: Option<usize>) -> bool {
+    let sql = if kind_on(it, on) {
+        "create table if not exists _quillo_calls (id varchar(64) primary key, at bigint not null, status integer not null, answer text not null)"
+    } else {
+        "create table if not exists _quillo_calls (id text primary key, at bigint not null, status integer not null, answer text not null)"
+    };
+    matches!(exec_on(it, on, vec![Value::str(sql)]), Ok(Value::Map(_)))
+}
+
+/// Takes call `id` for this copy, unless a copy sharing the database has:
+/// the database is where copies of a service behind a balancer, each with
+/// its own memory, see what the others answered. None without a database.
+pub(crate) fn call_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: i64) -> Option<Claim> {
+    let on = system_on(it, false)?;
+    if !calls_table(it, on) {
+        return None;
+    }
+    // Now and then, what no copy remembers any longer.
+    if fastrand::u8(..) == 0 {
+        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_calls where at < ?"), Value::Int(forget_before)]);
+    }
+    let sql = "insert into _quillo_calls (id, at, status, answer) values (?, ?, 0, '')";
+    if matches!(exec_on(it, on, vec![Value::str(sql), Value::str(id), Value::Int(now_ms)]), Ok(Value::Map(_))) {
+        return Some(Claim::Mine);
+    }
+    let rows = query_on(it, on, vec![Value::str("select status, answer from _quillo_calls where id = ?"), Value::str(id)]);
+    match rows {
+        Ok(Value::List(rows)) => match rows.first() {
+            Some(Value::Map(r)) => match (r.get("status"), r.get("answer")) {
+                (Some(Value::Int(s)), Some(Value::Str(a))) if *s > 0 => Some(Claim::Done(*s as u16, a.to_string())),
+                _ => Some(Claim::Running),
+            },
+            // Gone between the two (forgotten): this copy runs it.
+            _ => Some(Claim::Mine),
+        },
+        _ => None,
+    }
+}
+
+/// The answer to a call this copy claimed; one that did not run (a busy
+/// server) is let go, to be sent again.
+pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
+    let Some(on) = system_on(it, false) else { return };
+    if status >= 502 {
+        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_calls where id = ?"), Value::str(id)]);
+    } else {
+        let sql = "update _quillo_calls set status = ?, answer = ? where id = ?";
+        let _ = exec_on(it, on, vec![Value::str(sql), Value::Int(status as i64), Value::str(answer), Value::str(id)]);
+    }
+}
+
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
     if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err(crate::interp::PREFETCH_REFUSED.into());
