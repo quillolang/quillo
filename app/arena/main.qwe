@@ -17,12 +17,6 @@ let W = 1000
 let H = 600
 let TICK_MS = 50
 
-// The game's loop, started from here: a service's own `schedule` does not run in
-// the app's process (FEEDBACK12.md, Q-086). One process only: split, the service's
-// own job runs it.
-fn start_game() = game.run_loop()
-schedule("1s", start_game)
-
 // ---- pages -------------------------------------------------------------------
 
 // The rooms' counts and the winners come from the game; a live loader of another
@@ -143,8 +137,6 @@ component Game(room: str) {
         if m.chat != null { chat = take(push(chat, m.chat), 50) }
         if m.round != null { chat = push(chat, { name: "round", text: join(m.round | map((w) => `${w.name} ${w.score}`), ", ") }) }
     })
-    // Who is here, once joined (the roster sent as this page joined came too early).
-    ch.send({ hello: 1 }, { reliable: true })
     // Where the pointer is, sent when it changed, 20 times a second at most.
     if true {
         every(TICK_MS, () => {

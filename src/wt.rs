@@ -246,11 +246,44 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
 
 /// The page took the channel's answer to its asking to join.
 fn joined(ch: &str, p: &Arc<Peer>, yes: bool) {
+    let held = lock(joining()).remove(&(ch.to_string(), p.id)).unwrap_or_default();
     if yes && lock(&hub().peers).contains_key(&p.id) {
         lock(&p.rooms).insert(ch.to_string());
         lock(&hub().rooms).entry(ch.to_string()).or_default().insert(p.id);
     }
     p.put(Out::Text { json: serde_json::json!(["j", ch, yes]).to_string(), reliable: true });
+    if yes {
+        for out in held {
+            p.put(out);
+        }
+    }
+}
+
+/// Pages being let into a channel: from the moment its `join` is called to
+/// the moment the page hears yes, what is broadcast (or sent to them) on it
+/// waits here, and goes to them after the yes. A roster broadcast from `join`
+/// reaches the page that is joining too (FEEDBACK12.md, Q-086; branch
+/// feedback12-fixes).
+fn joining() -> &'static Mutex<HashMap<(String, u64), Vec<Out>>> {
+    static J: OnceLock<Mutex<HashMap<(String, u64), Vec<Out>>>> = OnceLock::new();
+    J.get_or_init(Default::default)
+}
+
+/// At most this many messages wait for a page that is joining.
+const HELD: usize = 256;
+
+/// Holds `json` for the pages joining `ch` (all of them, or the one `only`);
+/// how many it was held for.
+fn hold(ch: &str, json: &str, reliable: bool, only: Option<u64>, except: Option<u64>) -> i64 {
+    let mut j = lock(joining());
+    let mut n = 0;
+    for ((c, id), q) in j.iter_mut() {
+        if c == ch && only.is_none_or(|o| o == *id) && Some(*id) != except && q.len() < HELD {
+            q.push(Out::Text { json: json.to_string(), reliable });
+            n += 1;
+        }
+    }
+    n
 }
 
 fn message(ch: &str, v: &Value) -> String {
@@ -443,6 +476,9 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
         let res = match kind {
             "j" => match &h.join {
                 Some(f) => {
+                    if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
+                        lock(joining()).insert((name.to_string(), id), Vec::new());
+                    }
                     let r = it.call(f, args_for(f, vec![peer]), 0);
                     let yes = matches!(&r, Ok(v) | Err(Ctrl::Return(v)) if v.truthy());
                     verdicts.push(yes);
@@ -603,6 +639,8 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = lock(&hub().peers).get(&id).cloned();
     Ok(Value::Bool(match p {
         Some(p) if lock(&p.rooms).contains(&name) => p.put(Out::Text { json, reliable }),
+        // Being let in: it gets it after the yes (Q-086).
+        Some(_) => hold(&name, &json, reliable, Some(id), None) > 0,
         _ => false,
     }))
 }
@@ -620,7 +658,7 @@ fn broadcast(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let all = lock(&hub().peers);
         ids.iter().filter(|id| Some(**id) != except).filter_map(|id| all.get(id).cloned()).collect()
     };
-    let mut n = 0;
+    let mut n = hold(&name, &json, reliable, None, except);
     for p in peers {
         if p.put(Out::Text { json: json.clone(), reliable }) {
             n += 1;

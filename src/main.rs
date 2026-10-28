@@ -529,7 +529,13 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     };
     if let Loaded::Ready(it) = &loaded {
         // A program with server fns and no routes may be a service: served.
-        if it.routes.is_empty() && it.server_fns.is_empty() && !o.watch {
+        // So is one whose routes are its services' (`service /shop = ...`), or
+        // that only listens, ticks or runs jobs (FEEDBACK12.md, Q-088; branch
+        // feedback12-fixes).
+        let site = &it.site;
+        let serves = !it.routes.is_empty() || !it.server_fns.is_empty() || !it.mounts.is_empty() || !it.remote_mounts.is_empty()
+            || !site.channels.is_empty() || !site.udp.is_empty() || !site.jobs.is_empty() || !site.ticks.is_empty();
+        if !serves && !o.watch {
             return Ok(None);
         }
     }

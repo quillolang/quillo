@@ -63,35 +63,27 @@ fn snapshot(w: map) = {
     o: w.orbs,
 }
 
-// The loop: Quillo has no server-side timer under a second (Q-080), so a job started
-// once a second runs for ever, sleeping to the next 50 ms on the clock.
-fn game_loop() {
-    let next = now()
-    while true {
-        next += TICK_MS
-        let wait = next - now()
-        if wait > 0 { sleep(wait) } else { stats = { ...stats, late: stats.late + 1 } }
-        let t0 = now()
-        gaps = take(push(gaps, t0 - (stats.last ?? t0)), 400)
-        stats = { ...stats, last: t0 }
-        for r in ROOMS {
-            let w = step(worlds[r], TICK_MS / 1000)
-            worlds = set(worlds, r, w)
-            if len(keys(w.players)) > 0 {
-                let s = snapshot(w)
-                let size = len(json.stringify(s))
-                stats = { ...stats, bytes: size, reliable: stats.reliable + (size > 1100 ? 1 : 0) }
-                channel.broadcast(`room-${r}`, s)
-            }
+// The loop: a top-level `every` runs on the server, every 50 ms on the clock
+// (FEEDBACK12.md, Q-080 and Q-083, fixed).
+fn tick() {
+    let t0 = now()
+    let g = push(gaps, t0 - (stats.last ?? t0))
+    gaps = len(g) > 400 ? drop(g, 1) : g
+    stats = { ...stats, last: t0 }
+    for r in ROOMS {
+        let w = step(worlds[r], TICK_MS / 1000)
+        worlds = set(worlds, r, w)
+        if len(keys(w.players)) > 0 {
+            let s = snapshot(w)
+            let size = len(json.stringify(s))
+            stats = { ...stats, bytes: size, reliable: stats.reliable + (size > 1100 ? 1 : 0) }
+            channel.broadcast(`room-${r}`, s)
         }
-        let took = float(now() - t0)
-        stats = { ...stats, ticks: stats.ticks + 1, step_ms: took, worst_ms: max([stats.worst_ms, took]) }
     }
+    let took = float(now() - t0)
+    stats = { ...stats, ticks: stats.ticks + 1, step_ms: took, worst_ms: max([stats.worst_ms, took]) }
 }
-schedule("1s", game_loop)
-// The same loop for the app to start: a service's own jobs do not run when it shares
-// the app's process (FEEDBACK12.md, Q-086), so the app's job calls this instead.
-server fn run_loop() = game_loop()
+every(TICK_MS, tick)
 
 // A round ends each minute: each room's best three go into the leaderboard, and
 // every score starts again.
@@ -143,9 +135,6 @@ fn message(r: str, msg, peer: map) {
             let y = max([0, min([H, t[1]])])
             worlds = set(worlds, r, { ...worlds[r], players: set(worlds[r].players, peer.id, { ...p, target: [x, y] }) })
         }
-        // A page that has joined asks who is here: what `join` broadcast came before
-        // the page could hear it (FEEDBACK12.md).
-        { hello: _ } => channel.send(`room-${r}`, peer, roster_of(r), { reliable: true })
         { chat: str as text } if trim(text) != "" =>
             channel.broadcast(`room-${r}`, { chat: { name: p.name, text: slice(trim(text), 0, 200) } }, { reliable: true })
         _ => null

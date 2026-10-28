@@ -26,6 +26,43 @@ service in the app's process, the game's jobs never ran (Q-083); split apart, it
 cannot be reached (Q-087). And the guide's own app made only of services does not serve
 (Q-088).
 
+## Fixed, on branch feedback12-fixes
+
+Each fix is commented in the code with its issue and the branch. All repros run again
+(`node feedback/run.mjs`): 69 fixed, 2 open (Q-084 and Q-087, below); `cargo test` passes.
+
+| ID | The fix |
+|---|---|
+| Q-080 | `every(ms, f)` at the top of a program is a tick on the server: `f` runs every `ms` milliseconds, on multiples of `ms` counted from 1970, one at a time (a tick still running skips the next), named after its function (`{ name }`, else `every-<line>`; two alike are an error). Each tick has a thread of its own that asks `POST /_quillo/tick/<name>`, which is neither logged nor counted nor recorded in `_quillo_jobs`. Arena's loop is now `every(TICK_MS, tick)`, and its forever job is gone (src/jobs.rs `every_at_top`, `start_ticks`; src/builtins.rs `every`; src/server.rs `run_tick`) |
+| Q-081 | `sleep` waits in slices of 50 ms and ends the request or job with a 503 ("the server is stopping") once the server stops, so a forever job ends with it: the repro's server stops at once, without "a bug in Quillo". A job still running when it is due again is said once a run, not each second (src/builtins.rs `sleep`; src/jobs.rs) |
+| Q-082 | A reload retires the version it replaces (its mounts and services too): a `sleep` in it ends ("the program was loaded again"), so the old loop stops and the new version's job starts at its next time (src/server.rs `retire`; src/interp.rs `retired`) |
+| Q-083 | A service's `schedule` and `every` run with the app's when the service shares its process, as `service~job` (`POST /_quillo/job/game~end_round` in the log), each in the service's own interpreter. Split, the service's process runs them as before. Arena's `start_game` workaround is gone (src/server.rs `start_jobs`, `run_job`) |
+| Q-085 | `quillo check` lets a plain `fn` set a field of a parameter of no declared type, as a page object a component hands it (`paint(el.getContext("2d"))`); a known map or value is still refused, and the server still refuses it at run time (src/check.rs, `Stmt::SetField`) |
+| Q-086 | From the moment a channel's `join` is called for a page to the moment the page hears yes, what is broadcast on the channel, or sent to that page, is held for it (up to 256 messages) and goes to it right after the yes; dropped on a no. Arena's `hello` round trip is gone: the roster `join` broadcasts is the first thing a page hears (src/wt.rs `joining`, `hold`, `joined`) |
+| Q-088 | A program serves when it has routes, server functions, mounted or remote services, channels, UDP listeners, jobs or ticks, not only routes and server functions: the repro's app of two services serves both (src/main.rs) |
+
+Not fixed:
+
+- **Q-084** stays open, documented: the guide's Live data section says a global is one
+  topic, and to keep what changes often in a global of its own. Following a field of a
+  global is a change to how live data records what it reads, left for its own round.
+- **Q-087** stays open: `--split` now warns, at start, of each service whose code uses
+  channels (``quillo: warning: service s (s.qwe) uses channels, and with --split its pages
+  cannot reach them ...``), and the guide's Services section says so. The bridge (pages'
+  messages forwarded to the service's process, its broadcasts back to the app's) is not
+  built.
+
+The user guide has the rest: Ticks (`every` on the server), a forever job and `sleep` at
+stop and reload, a service's jobs, what `join` broadcasts, and a helper setting a page
+object's fields.
+
+A second game, written afterwards on the fixed build, used them as a newcomer would:
+Quillo Snake (`app/snake/main.qwe`), a multiplayer snake that grows by two cells a bite,
+with bots. Its loop is a top-level `every(110, tick)` (9 ticks a second; over 4,000
+ticks, 1 to 3 ms a step and 12 ms at worst), and its `join` sends the page its id and broadcasts the roster, both
+heard by the page joining. Headless Chrome played it with the keyboard: no errors on the
+page.
+
 ## Seen again
 
 None of the known issues; the new ones are below.
@@ -342,3 +379,22 @@ Apple M5, the loop being Arena's forever job (the workaround for Q-080):
 | 100 | 10 | 20.0 | 3 | 7 | 50 | 55 | 55 | 0 | 2618 | 100% | 20.0 | 20.0 |
 | 200 | 10 | 20.0 | 7 | 11 | 50 | 55 | 56 | 0 | 4801 | 100% | 20.0 | 20.0 |
 | 400 | 10 | 20.0 | 12 | 13 | 50 | 55 | 55 | 0 | 9179 | 100% | 20.0 | 20.0 |
+
+## Simulation, after the fixes
+
+The same run on branch feedback12-fixes, the loop being a top-level `every(50, tick)`:
+
+| bots | players | ticks/s | step ms | worst ms | gap p50 | gap p99 | gap max | late | snapshot B | on a stream | updates/s min | updates/s avg |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 10 | 20.0 | 0 | 1 | 50 | 59 | 59 | 0 | 525 | 0% | 20.0 | 20.0 |
+| 20 | 10 | 20.0 | 4 | 5 | 50 | 60 | 63 | 0 | 948 | 0% | 20.0 | 20.0 |
+| 50 | 10 | 20.0 | 2 | 6 | 50 | 59 | 60 | 0 | 1580 | 100% | 20.0 | 20.0 |
+| 100 | 10 | 20.0 | 2 | 6 | 51 | 59 | 60 | 0 | 2621 | 100% | 20.0 | 20.0 |
+| 200 | 10 | 20.0 | 8 | 11 | 50 | 59 | 59 | 0 | 4806 | 100% | 20.0 | 20.0 |
+| 400 | 10 | 19.8 | 10 | 55 | 50 | 58 | 93 | 0 | 9165 | 100% | 19.8 | 19.8 |
+
+The rate holds at 20 ticks a second to 400 bots, and every player still gets each
+update. The gaps spread a little wider than the forever job's (p99 59 ms against 55 ms),
+since each tick is a request over the loopback rather than a `sleep` in one loop; one
+gap of 93 ms at 400 bots skipped one tick (19.8 a second). `late` no longer applies: a
+tick never runs behind, it skips.

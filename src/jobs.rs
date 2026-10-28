@@ -15,6 +15,18 @@
 //! Several servers on one database run each job once per time: the first
 //! to record the time in `_quillo_jobs` runs it, the others skip it.
 //! `quillo run --no-jobs` runs none here.
+//!
+//! `every(ms, f)` at the top of a program is a tick: `f` every `ms`
+//! milliseconds, on the clock, for a game's loop or a simulation's step
+//! (FEEDBACK12.md, Q-080; branch feedback12-fixes). A thread of its own
+//! sleeps to each next time and asks the server to run it, as a job is run
+//! (`POST /_quillo/tick/<name>`), and waits for it: one that takes longer than
+//! its interval skips the times it missed rather than piling up. Ticks are
+//! each process's own (no `_quillo_jobs`), are not logged, and stop with the
+//! program's version: a reload ends them and starts the new version's.
+//!
+//! The jobs and ticks of the services a program runs in its process are
+//! scheduled with its own, as `<service>~<name>` (FEEDBACK12.md, Q-083).
 
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
@@ -39,6 +51,50 @@ pub struct Job {
     pub name: String,
     pub when: When,
     pub f: Value,
+}
+
+/// What `every(ms, f)` at the top of a program set to run (see the top).
+pub struct Tick {
+    pub name: String,
+    pub ms: u64,
+    pub f: Value,
+}
+
+/// `every(ms, f, { name })` at the top of a program, outside any request:
+/// registers a tick (the browser's `every` is compiled for components, and
+/// one met while rendering on the server does nothing).
+pub(crate) fn every_at_top(it: &mut Interp, args: &[Value], line: u32) -> R {
+    let ms = match args.first() {
+        Some(Value::Int(n)) if *n >= 1 => *n as u64,
+        Some(Value::Float(f)) if *f >= 1.0 => *f as u64,
+        _ => return fail(line, "`every` on the server takes at least 1 millisecond: every(50, step)"),
+    };
+    let f = match args.get(1) {
+        Some(f @ (Value::Func(_) | Value::Builtin(..))) => f.clone(),
+        _ => return fail(line, "`every` takes milliseconds and a function: every(100, step)"),
+    };
+    let named = match args.get(2) {
+        Some(Value::Map(o)) => match o.get("name") {
+            Some(Value::Str(n)) => Some(n.to_string()),
+            None | Some(Value::Nil) => None,
+            Some(v) => return fail(line, format!("`every`'s name is a str, got {}", v.type_name())),
+        },
+        None | Some(Value::Nil) => None,
+        Some(v) => return fail(line, format!("`every` expects options as a map, got {}", v.type_name())),
+    };
+    let name = named.unwrap_or_else(|| match &f {
+        Value::Func(c) if name_ok(&c.def.name) => c.def.name.clone(),
+        _ => format!("every-{}", line),
+    });
+    if !name_ok(&name) {
+        return fail(line, format!("`every`: a tick's name is letters, digits, `_`, `-` and `.`, got {:?}", name));
+    }
+    let site = Arc::make_mut(&mut it.site);
+    if site.ticks.iter().any(|t| t.name == name) {
+        return fail(line, format!("`every`: there is already a tick named {:?}; give this one another with {{ name: ... }}", name));
+    }
+    site.ticks.push(Arc::new(Tick { name, ms, f }));
+    Ok(Value::Nil)
 }
 
 /// The secret a job request carries.
@@ -201,6 +257,9 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
         use std::collections::{HashMap, HashSet};
         let mut last: HashMap<String, u64> = HashMap::new();
         let running: Arc<std::sync::Mutex<HashSet<String>>> = Default::default();
+        // Jobs whose skipping was said: once for each run that goes on
+        // (FEEDBACK12.md, Q-081; branch feedback12-fixes).
+        let mut said: HashSet<String> = HashSet::new();
         loop {
             if crate::httpd::stopping() {
                 return;
@@ -215,12 +274,15 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
                 }
                 *prev = due;
                 if !running.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone()) {
-                    eprintln!("quillo: job {} is still running; skipped this time", name);
+                    if said.insert(name.clone()) {
+                        eprintln!("quillo: job {} is still running; skipped until it ends", name);
+                    }
                     continue;
                 }
+                said.remove(&name);
                 let running = running.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = ask(addr, &name, due) {
+                    if let Err(e) = ask(addr, "job", &name, due) {
                         eprintln!("quillo: job {} could not start: {}", name, e);
                     }
                     running.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
@@ -236,6 +298,83 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
     }
 }
 
+/// Runs the program's ticks: `ticks` gives them as they are now (name and
+/// interval; they change when a reload makes a new version), and each has a
+/// thread that sleeps to its next time on the clock and asks the server at
+/// `addr` to run it, waiting for it to end. A tick gone from the list (or whose
+/// interval changed) stops; a new one starts within a tenth of a second.
+pub fn start_ticks(addr: std::net::SocketAddr, ticks: impl Fn() -> Vec<(String, u64)> + Send + Sync + 'static) {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    let addr = loopback(addr);
+    let ticks = Arc::new(ticks);
+    let spawned = std::thread::Builder::new().name("quillo-ticks".into()).spawn(move || {
+        // Each running tick, by name: its interval and whether it is to go on.
+        let mut threads: HashMap<String, (u64, Arc<AtomicBool>)> = HashMap::new();
+        loop {
+            if crate::httpd::stopping() {
+                for (_, (_, on)) in threads.drain() {
+                    on.store(false, Ordering::Relaxed);
+                }
+                return;
+            }
+            let now: Vec<(String, u64)> = ticks();
+            threads.retain(|name, (ms, on)| {
+                let keep = now.iter().any(|(n, m)| n == name && m == ms);
+                if !keep {
+                    on.store(false, Ordering::Relaxed);
+                }
+                keep
+            });
+            for (name, ms) in now {
+                if threads.contains_key(&name) {
+                    continue;
+                }
+                let on = Arc::new(AtomicBool::new(true));
+                threads.insert(name.clone(), (ms, on.clone()));
+                let spawned = std::thread::Builder::new().name(format!("quillo-tick-{}", name)).spawn(move || run_tick(addr, &name, ms, &on));
+                if let Err(e) = spawned {
+                    eprintln!("quillo: cannot start a thread for tick: {}", e);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("quillo: cannot start the ticks: {}", e);
+    }
+}
+
+/// One tick's thread: to each next multiple of `ms` (in milliseconds since
+/// 1970, so it does not drift), then run it, while `on` holds.
+fn run_tick(addr: std::net::SocketAddr, name: &str, ms: u64, on: &std::sync::atomic::AtomicBool) {
+    let epoch_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let mut said = false;
+    while on.load(Ordering::Relaxed) && !crate::httpd::stopping() {
+        let now = epoch_ms();
+        let due = (now / ms + 1) * ms;
+        // In steps, so a tick that stops (a reload, the server stopping) stops soon.
+        loop {
+            let now = epoch_ms();
+            if now >= due || !on.load(Ordering::Relaxed) || crate::httpd::stopping() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis((due - now).min(100)));
+        }
+        if !on.load(Ordering::Relaxed) || crate::httpd::stopping() {
+            return;
+        }
+        match ask(addr, "tick", name, due) {
+            Ok(()) => said = false,
+            Err(e) if !said => {
+                eprintln!("quillo: tick {} could not run: {}", name, e);
+                said = true;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(ms.max(100))),
+        }
+    }
+}
+
 /// Where this process reaches the server listening on `addr`: itself, for
 /// a server listening on every address.
 pub fn loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
@@ -246,13 +385,15 @@ pub fn loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     }
 }
 
-/// Asks the server to run a job, and waits for it to finish.
-fn ask(addr: std::net::SocketAddr, name: &str, due: u64) -> std::io::Result<()> {
+/// Asks the server to run a job (`kind` "job") or a tick ("tick"), and waits
+/// for it to finish.
+fn ask(addr: std::net::SocketAddr, kind: &str, name: &str, due: u64) -> std::io::Result<()> {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
     write!(
         s,
-        "POST /_quillo/job/{}?at={} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /_quillo/{}/{}?at={} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        kind,
         name,
         due,
         token()

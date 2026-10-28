@@ -198,6 +198,10 @@ pub struct Interp {
     /// Loaded as a service (src/service.rs): its server fns are called by
     /// other services, signed, never by browsers (`/_quillo/rpc`).
     pub is_service: bool,
+    /// Set when a reload has replaced this version of the program (shared by
+    /// its forks): a job of it still running ends at its next `sleep`, so the
+    /// new version's starts (FEEDBACK12.md, Q-082; branch feedback12-fixes).
+    pub(crate) retired: Arc<std::sync::atomic::AtomicBool>,
     /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
     /// feedback9-fixes). The app's is in the process's environment.
     pub env_file: Arc<std::collections::HashMap<String, String>>,
@@ -837,6 +841,7 @@ impl Interp {
             mounts: Vec::new(),
             remote_mounts: Vec::new(),
             is_service: false,
+            retired: Default::default(),
             env_file: Default::default(),
             declared_services: Default::default(),
             ready_checks: Default::default(),
@@ -910,6 +915,7 @@ impl Interp {
             mounts: self.mounts.iter().map(|(p, m)| (p.clone(), m.fork())).collect(),
             remote_mounts: self.remote_mounts.clone(),
             is_service: self.is_service,
+            retired: self.retired.clone(),
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
             ready_checks: self.ready_checks.clone(),
