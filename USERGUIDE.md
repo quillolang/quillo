@@ -472,8 +472,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   parameter named `key` (a load-time error); an attribute written twice on one element
   is an error too.
   A row whose item changed is updated where it shows what changed, and moved rows keep
-  their DOM (and focus). `if`, `? :` and `match` in markup make a branch again only
-  when another one is chosen. Nested components keep their own state.
+  their DOM (and focus). `if`, `? :`, `match` and `cond && <markup>` in markup make a
+  branch again only when another one is chosen: an input in one keeps its focus and
+  what was typed while the page updates. Nested components keep their own state.
 - `@event={fn}` handles DOM events (`@click`, `@input`, `@scroll`, `@submit`, ...).
   The function may take the event `e`:
   - `e.value` and `e.checked` of the input, `e.key` of a key press, `e.type`;
@@ -1538,12 +1539,37 @@ service /billing = "billing.qwe"
 - `quillo run app.qwe --split` runs each service the app declares (and those they
   declare) as a process of its own, on a port of its own, its log lines marked with its
   name, all signed with one secret (32 random bytes from the system, unless
-  `QUILLO_SERVICE_SECRET` is set); they stop with it.
+  `QUILLO_SERVICE_SECRET` is set); they stop with it. A service whose process ends
+  while the app runs is started again, the same way, after a second (twice as long each
+  time it ends again soon, at most 30 s), with a line in the log.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`; a decimal stays a decimal, its scale and all), so a
   program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
   call that cannot be made (the service not answering) is an error value: `?` passes
   it on, `??` replaces it.
+- **Live data across services.** A page's `live` loader that gets its data from a service
+  follows only what it reads itself: the service's tables and variables are the
+  service's, and their changes wake no page of the caller. So such a loader `watch`es a
+  topic, and the code that changes the data publishes it: the service itself
+  (`publish("account:7")` in its `server fn`), or the caller after the call. A topic a
+  service publishes while answering a call reaches the caller's pages in one process and
+  split alike: it comes back with the answer, and the caller announces it to its own
+  pages, through every service in between. `quillo check` warns about a loader that calls
+  a service and watches nothing.
+
+  ```quillo
+  // accounts.qwe, the service
+  server fn deposit(id: int, cents: int) {
+      db.exec("update accounts set cents = cents + ? where id = ?", cents, id)
+      publish(`account:${id}`)
+  }
+
+  // the app
+  server fn load_balance(id: int) {
+      watch(`account:${id}`)
+      accounts.balance(id)
+  }
+  ```
 - `quillo check` checks each call against the service's `server fn`s (their names,
   arguments and types; it may fail, so the result may be an error), the browser cannot
   call a service, and a call needs the `http` effect. Services may use one another.

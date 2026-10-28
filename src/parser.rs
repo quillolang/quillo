@@ -1766,7 +1766,7 @@ impl Parser {
                     }
                     (Some('{'), _) => {
                         push_text(&mut children, &mut text);
-                        children.push(HtmlChild::Expr(self.parse_braced_expr()?));
+                        children.push(HtmlChild::Expr(and_as_if(self.parse_braced_expr()?)));
                     }
                     // A line of markup starting with `//` is a comment, not
                     // text for the page (`{"//"}` writes the characters).
@@ -1971,6 +1971,51 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// `cond && <x>` where markup goes is `if cond { <x> }`: the same value
+/// (only `false` and `null` are false, and neither shows), but a branch,
+/// which keeps its elements while `cond` stays true, as `if` and `? :` do.
+/// As an `&&` it was a value made anew each time, so inputs in it lost
+/// their focus and text on every change
+/// (FEEDBACK4.md, Q-041; branch bank-fixes).
+/// Looks into what puts markup where it stands: `for` bodies, branches, a
+/// block's end.
+fn and_as_if(e: Expr) -> Expr {
+    match e {
+        // The condition stays an `&&` (`cond && true` holds when `cond` does),
+        // so `quillo check` still says what it says of `&&` (`count && <x>`
+        // with a number) in the words of `&&`.
+        Expr::Binary(BinOp::And, a, b, line) if is_markup(&b) => Expr::If(
+            Box::new(Expr::Binary(BinOp::And, a, Box::new(Expr::Lit(Lit::Bool(true))), line)),
+            Box::new(and_as_if(*b)),
+            None,
+        ),
+        Expr::For(p, it, body, line) => Expr::For(p, it, Box::new(and_as_if(*body)), line),
+        Expr::If(c, t, f) => Expr::If(c, Box::new(and_as_if(*t)), f.map(|f| Box::new(and_as_if(*f)))),
+        Expr::Match(s, arms, line) => {
+            Expr::Match(s, arms.into_iter().map(|a| Arm { body: and_as_if(a.body), ..a }).collect(), line)
+        }
+        Expr::Block(mut stmts) => {
+            match stmts.pop() {
+                Some(Stmt::Expr(last)) => stmts.push(Stmt::Expr(and_as_if(last))),
+                Some(other) => stmts.push(other),
+                None => {}
+            }
+            Expr::Block(stmts)
+        }
+        e => e,
+    }
+}
+
+/// Whether `e` puts markup on the page: an element, or a choice of them.
+fn is_markup(e: &Expr) -> bool {
+    match e {
+        Expr::Html(..) => true,
+        Expr::Binary(BinOp::And, _, b, _) => is_markup(b),
+        Expr::If(_, t, f) => is_markup(t) || f.as_deref().map_or(false, is_markup),
+        _ => false,
+    }
 }
 
 fn push_text(children: &mut Vec<HtmlChild>, text: &mut String) {

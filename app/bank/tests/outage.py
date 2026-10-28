@@ -2,11 +2,15 @@
 """A desk session submitted while the ledger is down, then again once it is
 back: it carries on from where it stopped, with no second customer.
 
-    python3 app/bank/tests/outage.py http://localhost:8080 <kill-accounts> <start-accounts>
+    python3 app/bank/tests/outage.py http://localhost:8080 <stop-accounts> <start-accounts>
 
-The two commands stop and start the accounts service (run split, with a
-QUILLO_SERVICE_SECRET set, so a restarted service is trusted). Needs
-BANK_DEMO=1."""
+The two commands take the accounts service down and bring it back (run split,
+with a QUILLO_SERVICE_SECRET set, so a restarted service is trusted). Needs
+BANK_DEMO=1. A killed service is started again by --split within a second, and
+the call to it tried again, so the submit would not fail (FEEDBACK4.md, Q-042,
+fixed on bank-fixes): hang it instead, which a restart cannot hide, with
+`pkill -STOP -f 'accounts.qwe --port <port>'` and `pkill -CONT -f ...`. The
+port is in the gateway's log: "service accounts (...) on http://127.0.0.1:<port>"."""
 
 import http.cookiejar, json, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 

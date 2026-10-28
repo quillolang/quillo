@@ -160,25 +160,27 @@ helper) was needed to see the order mattered at all. Repro:
 caller's browser code its functions whichever is loaded first (it looks as if the file is
 marked as loaded once, process-wide).
 
-### Q-044. `quillo check` lets `n / 4` (always a float) through where a builtin takes an int
+### Q-044. `quillo check` lets `n / 4` through where a builtin takes an int: an int only when it divides evenly
 
 | Kind | Detected by | Attempts |
 |---|---|---|
-| loud (at run time) | running a test script | 1 |
+| loud (at run time, for some data) | running a test script | 1 |
 
 ```quillo
 fn groups(s: str) -> list = range(0, (len(s) + 3) / 4)   // ok in quillo check
-print(range(0, 7 / 2))                                    // ok in quillo check; at run time:
+print(groups("abcdefgh"))                                 // [0, 1]... or, for 9 characters:
 // `range` expects an int as argument 2, got float
 ```
 
-`/` of two ints is a float in Quillo (JavaScript's habit, unlike Python's `//` or Rust's
-ints), and `range`, `slice` and the like take ints. The checker knows both and could say
-so; written in a helper that runs only for some pages, this reaches users. Repro:
+`/` is exact in Quillo: `6 / 3` is the int 2, but `7 / 2` is the float 3.5. `range`,
+`slice`, `take` and the like take ints, so a call such as the one above works for some
+lengths and stops for others: it can pass every test and fail in production. The checker
+types `int / int` as "int or float", which is right, and lets it through where an int is
+taken. (A first draft of this report said `int / int` is always a float; it is not.) Repro:
 [feedback/repros/Q-044-int-divided-passed-as-int.qwe](../repros/Q-044-int-divided-passed-as-int.qwe).
 
-**Suggestion:** type `int / int` as a float in the checker and report it where an int is
-taken ("`/` gives a float: `floor(x / 4)`").
+**Suggestion:** warn where a `/` is passed straight to a parameter that takes only an int
+("`/` gives an int only when it divides evenly: `floor(x / 4)`").
 
 ### Q-043. A program with a service logs `POST /_quillo/later -> 200` about once a second, idle
 

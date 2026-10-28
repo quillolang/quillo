@@ -1,5 +1,5 @@
 let balance = 100
-server fn get() -> int = balance
+server fn current() -> int = balance
 server fn spend(cents: int) -> int {
     balance = balance - cents
     balance

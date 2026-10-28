@@ -613,3 +613,91 @@ fn a_version_that_first_calls_services_has_its_calls_made_later_made() {
     let _m = start(&d.join("mailer.qwe"), pm, &[], &[("QUILLO_SERVICE_SECRET", secret)]);
     eventually(15, "the call made later was not made", || (http(pm, "GET", "/sent", &[], "").1 == "bo").then_some(()));
 }
+
+/// A topic a service publishes while answering goes back with the answer,
+/// for the caller to announce to its own pages: split, a service's
+/// `publish` reached no page before (FEEDBACK4.md, Q-038; branch bank-fixes).
+/// Its own tables and variables stay its own.
+#[test]
+fn what_a_service_publishes_goes_back_with_its_answer() {
+    let d = dir("published");
+    std::fs::write(
+        d.join("accounts.qwe"),
+        "let n = 0\nserver fn spend(id: int) -> int {\n    n = n + 1\n    db.exec(\"create table if not exists t (x)\")\n    db.exec(\"insert into t (x) values (?)\", id)\n    db.transaction(() => publish(`account:${id}`))\n    publish(\"accounts\")\n    n\n}\nserver fn quiet() -> int = 1\nserver fn undone(id: int) {\n    db.transaction(() => {\n        publish(`account:${id}`)\n        err(\"rolled back\")\n    })\n}\n",
+    )
+    .unwrap();
+    let secret = "a-test-secret-for-services";
+    let port = free_port();
+    let _accounts = start(&d.join("accounts.qwe"), port, &["--as-service"], &[("QUILLO_SERVICE_SECRET", secret)]);
+    let call = |f: &str, body: &str| http(port, "POST", &format!("/_quillo/service/{}", f), &signed(secret, now_secs(), "accounts", f, &quillo::service::new_id(16), body), body);
+    assert_eq!(call("spend", "[7]"), (200, r#"{"ok":1,"published":["account:7","accounts"]}"#.to_string()));
+    // Nothing published: the answer is as it always was.
+    assert_eq!(call("quiet", "[]"), (200, r#"{"ok":1}"#.to_string()));
+    // Published in a transaction that rolled back: not sent.
+    assert_eq!(call("undone", "[7]"), (200, r#"{"err":"rolled back"}"#.to_string()));
+}
+
+/// A file the app and one of its services both `use` runs in each, whichever
+/// line comes first: with the service first, the app lacked the file's
+/// functions (FEEDBACK4.md, Q-040; branch bank-fixes).
+#[test]
+fn a_file_the_app_and_a_service_both_use_runs_in_each() {
+    let d = dir("shared-use");
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::create_dir_all(d.join("svc")).unwrap();
+    std::fs::write(d.join("lib/text.qwe"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
+    std::fs::write(d.join("svc/greeter.qwe"), "use \"../lib/text.qwe\"\nserver fn hello() -> str = shout(\"from the service\")\n").unwrap();
+    std::fs::write(
+        d.join("app.qwe"),
+        "service greeter = \"svc/greeter.qwe\"\nuse \"lib/text.qwe\"\ncomponent Hi() {\n    state n = 0\n    <button @click={() => { n += 1 }}>{shout(\"page\")}</button>\n}\nroute GET / = [shout(\"app\"), greeter.hello() ?? \"no answer\"]\nroute GET /page = <html><body><Hi/></body></html>\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let _app = start(&d.join("app.qwe"), port, &[], &[]);
+    assert_eq!(http(port, "GET", "/", &[], ""), (200, r#"["APP!","FROM THE SERVICE!"]"#.to_string()));
+    assert!(http(port, "GET", "/page", &[], "").1.contains("PAGE!"));
+}
+
+/// `--split` starts a service again when its process ends while the app
+/// runs (FEEDBACK4.md, Q-042; branch bank-fixes).
+#[test]
+fn split_starts_a_service_again_when_it_ends() {
+    let d = dir("split-again");
+    let port = free_port();
+    let _app = start(&d.join("app.qwe"), port, &["--split"], &[]);
+    eventually(20, "the shop did not answer", || (http(port, "GET", "/shop/buy/ana", &[], "").0 == 200).then_some(()));
+    let billing = d.join("billing.qwe").display().to_string();
+    let pids = String::from_utf8(Command::new("pgrep").args(["-f", &billing]).output().unwrap().stdout).unwrap();
+    assert!(!pids.trim().is_empty(), "billing is not running");
+    for pid in pids.split_whitespace() {
+        let _ = Command::new("kill").args(["-9", pid]).status();
+    }
+    // Back, and holding what a new process holds: no invoices yet.
+    let body = eventually(30, "billing was not started again", || {
+        let (status, body) = http(port, "GET", "/shop/buy/bo", &[], "");
+        (status == 200 && body.starts_with('#')).then_some(body)
+    });
+    assert_eq!(body, "#1 bo none");
+}
+
+/// The scheduler's own call each second (asking that calls made `later` be
+/// sent) is not in the request log (FEEDBACK4.md, Q-043; branch bank-fixes).
+#[test]
+fn the_schedulers_own_calls_are_not_logged() {
+    let d = dir("quiet-log");
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["run", &d.join("shop.qwe").display().to_string(), "--port", &port.to_string()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&child);
+    eventually(20, "the shop did not start", || support::listening(port).then_some(()));
+    assert_eq!(http(port, "GET", "/free", &[], "").0, 200);
+    std::thread::sleep(Duration::from_millis(2500));
+    let _ = child.kill();
+    let mut log = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut log).unwrap();
+    assert!(log.contains("GET /free -> 200"), "{}", log);
+    assert!(!log.contains("/_quillo/later"), "{}", log);
+}
