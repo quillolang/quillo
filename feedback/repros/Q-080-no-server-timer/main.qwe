@@ -1,0 +1,14 @@
+// Q-080 `every(ms, f)` at the top of a program does nothing on the server, without a word, and `schedule` cannot run more often than once a second: a game's loop has no timer
+// mode: serve
+// get: /
+// open-when: "ticks":0
+// fixed-when: /"ticks":[1-9]/
+// From FEEDBACK12.md §Q-080 (found on 6887b0b). `quillo check` passes it.
+
+let ticks = 0
+every(50, () => { ticks += 1 })
+
+route GET / {
+    sleep(1200)
+    { ticks }
+}

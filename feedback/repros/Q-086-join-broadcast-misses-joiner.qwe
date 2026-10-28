@@ -1,0 +1,18 @@
+// Q-086 What `channel.on`'s `join` broadcasts does not reach the page that is joining: a room's roster sent as someone enters never reaches them, without a word
+// mode: browser
+// probe: await new Promise((r) => setTimeout(r, 1500)); return { heard: Number(document.getElementById("h").textContent) }
+// open-when: "heard": 0
+// fixed-when: "heard": 1
+// From FEEDBACK12.md §Q-086 (found on 6887b0b).
+
+channel.on("room", (msg, peer) => null, { join: (peer) => {
+    channel.broadcast("room", { hi: peer.id }, { reliable: true })
+    true
+} })
+
+component P() {
+    state heard = 0
+    let ch = channel.open("room", (m) => { heard += 1 })
+    <p id="h">{heard}</p>
+}
+route GET / = <html><body><P/></body></html>

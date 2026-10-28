@@ -1,0 +1,187 @@
+// The game, as a service of its own: the worlds, the loop that moves them, the
+// rooms' channels, the rounds and the bots. The app (main.qwe) serves the pages and
+// calls this for counts and scores; run with --split, this is a process of its own.
+
+db.open("arena.db")
+db.exec(sql`create table if not exists winners (id integer primary key, room text, name text, score int, at text)`)
+
+let ROOMS = ["north", "south", "east"]
+let W = 1000
+let H = 600
+let TICK_MS = 50
+let SPEED = 320            // world units a second
+let ORBS = 24
+let RADIUS = 22            // how close a player must come to take an orb
+
+// The world, one per room: players by id, and the orbs.
+fn new_world() = { players: {}, orbs: for _ in range(ORBS) => [random_int(30, W - 30), random_int(30, H - 30)], tick: 0 }
+let worlds = reduce(ROOMS, {}, (m, r) => set(m, r, new_world()))
+// How many are in each room, kept apart from the worlds so the lobby's live count
+// is not woken 20 times a second by every move (FEEDBACK12.md, Q-084).
+let counts = reduce(ROOMS, {}, (m, r) => set(m, r, 0))
+// What the loop measures, for /stats.
+let stats = { ticks: 0, step_ms: 0.0, worst_ms: 0.0, late: 0, bytes: 0, reliable: 0 }
+// The time between ticks, the last 400 of them.
+let gaps = []
+
+fn room_of(name: str) = find(ROOMS, (r) => `room-${r}` == name)
+
+fn colour(i: int) = `hsl(${(i * 137) % 360} 75% 60%)`
+
+// One step of a room's world: everyone moves toward where they point, and takes the
+// orbs they touch. Bots point at the nearest orb.
+fn step(w: map, dt: float) {
+    let orbs = w.orbs
+    let players = reduce(keys(w.players), w.players, (ps, id) => {
+        let p = ps[id]
+        let target = p.bot ? nearest(orbs, p.x, p.y) : p.target
+        let dx = target[0] - p.x
+        let dy = target[1] - p.y
+        let d = sqrt(dx * dx + dy * dy)
+        let move = min([d, SPEED * dt])
+        let x = d > 0 ? p.x + dx / d * move : p.x
+        let y = d > 0 ? p.y + dy / d * move : p.y
+        let hit = find_index(orbs, (o) => (o[0] - x) * (o[0] - x) + (o[1] - y) * (o[1] - y) < RADIUS * RADIUS)
+        if hit != null {
+            orbs = slice(orbs, 0, hit) + [[random_int(30, W - 30), random_int(30, H - 30)]] + drop(orbs, hit + 1)
+        }
+        set(ps, id, { ...p, x, y, score: p.score + (hit != null ? 1 : 0) })
+    })
+    { players, orbs, tick: w.tick + 1 }
+}
+
+fn nearest(orbs: list, x: num, y: num) =
+    first(sort_by(orbs, (o) => (o[0] - x) * (o[0] - x) + (o[1] - y) * (o[1] - y))) ?? [x, y]
+
+fn find_index(xs: list, f) = reduce(enumerate(xs), null, (found, pair) => found != null ? found : (f(pair[1]) ? pair[0] : null))
+
+// What a room's pages are sent each tick: positions and scores, as small as JSON
+// allows (a datagram holds about 1,100 bytes; past that it goes on a stream).
+fn snapshot(w: map) = {
+    t: w.tick,
+    p: for id in keys(w.players) => { let p = w.players[id]; [id, round(p.x), round(p.y), p.score] },
+    o: w.orbs,
+}
+
+// The loop: Quillo has no server-side timer under a second (Q-080), so a job started
+// once a second runs for ever, sleeping to the next 50 ms on the clock.
+fn game_loop() {
+    let next = now()
+    while true {
+        next += TICK_MS
+        let wait = next - now()
+        if wait > 0 { sleep(wait) } else { stats = { ...stats, late: stats.late + 1 } }
+        let t0 = now()
+        gaps = take(push(gaps, t0 - (stats.last ?? t0)), 400)
+        stats = { ...stats, last: t0 }
+        for r in ROOMS {
+            let w = step(worlds[r], TICK_MS / 1000)
+            worlds = set(worlds, r, w)
+            if len(keys(w.players)) > 0 {
+                let s = snapshot(w)
+                let size = len(json.stringify(s))
+                stats = { ...stats, bytes: size, reliable: stats.reliable + (size > 1100 ? 1 : 0) }
+                channel.broadcast(`room-${r}`, s)
+            }
+        }
+        let took = float(now() - t0)
+        stats = { ...stats, ticks: stats.ticks + 1, step_ms: took, worst_ms: max([stats.worst_ms, took]) }
+    }
+}
+schedule("1s", game_loop)
+// The same loop for the app to start: a service's own jobs do not run when it shares
+// the app's process (FEEDBACK12.md, Q-086), so the app's job calls this instead.
+server fn run_loop() = game_loop()
+
+// A round ends each minute: each room's best three go into the leaderboard, and
+// every score starts again.
+fn end_round() {
+    for r in ROOMS {
+        let ps = values(worlds[r].players) | filter((p) => p.score > 0) | sort_by((p) => 0 - p.score) | take(3)
+        for p in ps { db.exec("insert into winners (room, name, score, at) values (?, ?, ?, ?)", r, p.name, p.score, date.now()) }
+        if len(ps) > 0 { publish("arena:winners") }
+        if len(ps) > 0 {
+            channel.broadcast(`room-${r}`, { round: ps | map((p) => { name: p.name, score: p.score }) }, { reliable: true })
+        }
+        worlds = set(worlds, r, { ...worlds[r], players: reduce(keys(worlds[r].players), worlds[r].players,
+            (m, id) => set(m, id, { ...m[id], score: 0 })) })
+    }
+}
+schedule("1m", end_round)
+
+// The channels: a page joins its room with a name, sends where it points and what
+// it says, and leaves.
+fn joined(r: str, peer: map) {
+    let name = peer.session.name ?? null
+    if name == null { return false }
+    let p = { name, x: random_int(50, W - 50), y: random_int(50, H - 50), target: [W / 2, H / 2], score: 0, bot: false }
+    worlds = set(worlds, r, { ...worlds[r], players: set(worlds[r].players, peer.id, p) })
+    counts = set(counts, r, len(keys(worlds[r].players)))
+    publish("arena:counts")
+    roster(r)
+    true
+}
+
+fn left(r: str, peer: map) {
+    worlds = set(worlds, r, { ...worlds[r], players: remove(worlds[r].players, peer.id) })
+    counts = set(counts, r, len(keys(worlds[r].players)))
+    publish("arena:counts")
+    roster(r)
+}
+
+// Names and colours change rarely, so they go reliably, apart from the snapshots.
+fn roster_of(r: str) = { roster: for [i, id] in enumerate(keys(worlds[r].players)) =>
+    [id, worlds[r].players[id].name, colour(i)] }
+fn roster(r: str) = channel.broadcast(`room-${r}`, roster_of(r), { reliable: true })
+
+fn message(r: str, msg, peer: map) {
+    let p = worlds[r].players[peer.id]
+    if p == null { return null }
+    match msg {
+        { t: [int | float, int | float] as t } => {
+            let x = max([0, min([W, t[0]])])
+            let y = max([0, min([H, t[1]])])
+            worlds = set(worlds, r, { ...worlds[r], players: set(worlds[r].players, peer.id, { ...p, target: [x, y] }) })
+        }
+        // A page that has joined asks who is here: what `join` broadcast came before
+        // the page could hear it (FEEDBACK12.md).
+        { hello: _ } => channel.send(`room-${r}`, peer, roster_of(r), { reliable: true })
+        { chat: str as text } if trim(text) != "" =>
+            channel.broadcast(`room-${r}`, { chat: { name: p.name, text: slice(trim(text), 0, 200) } }, { reliable: true })
+        _ => null
+    }
+}
+
+for r in ROOMS {
+    channel.on(`room-${r}`, (msg, peer) => message(r, msg, peer),
+        { join: (peer) => joined(r, peer), leave: (peer) => left(r, peer) })
+}
+
+// Bots, to load a room without browsers: from this machine only.
+route POST /bots/:room/:n(int) {
+    if !contains(ROOMS, room) { reply 404 "no such room" }
+    if request.ip != "127.0.0.1" && request.ip != "::1" { reply 403 "bots are added from this machine" }
+    let added = reduce(range(n), worlds[room].players, (ps, i) =>
+        set(ps, `bot${len(keys(ps))}`, { name: `bot ${len(keys(ps))}`, x: random_int(0, W), y: random_int(0, H),
+            target: [0, 0], score: 0, bot: true }))
+    worlds = set(worlds, room, { ...worlds[room], players: added })
+    counts = set(counts, room, len(keys(added)))
+    publish("arena:counts")
+    roster(room)
+    { players: len(keys(added)) }
+}
+
+route GET /stats = { ...stats, gaps, players: reduce(ROOMS, {}, (m, r) => set(m, r, len(keys(worlds[r].players)))) }
+// For a simulation: start the measures again, and empty a room of its bots.
+route POST /stats/reset {
+    if request.ip != "127.0.0.1" && request.ip != "::1" { reply 403 "from this machine" }
+    stats = { ticks: 0, step_ms: 0.0, worst_ms: 0.0, late: 0, bytes: 0, reliable: 0 }
+    gaps = []
+    "ok"
+}
+
+
+server fn room_counts() = counts
+server fn top(room: str) =
+    values(worlds[room]?.players ?? {}) | sort_by((p) => 0 - p.score) | take(10) | map((p) => { name: p.name, score: p.score })
+server fn winners() = db.query("select room, name, score, at from winners order by score desc, id desc limit 10")

@@ -1,0 +1,28 @@
+// Q-084 A global is one topic for live data: a loader that reads one field of a map runs again on every write to the map, 20 times a second under a game's loop, though what it reads never changed
+// mode: browser
+// probe: let a = await (await fetch("/loads")).json(); await new Promise((r) => setTimeout(r, 3000)); let b = await (await fetch("/loads")).json(); let per = (b.loads - a.loads) / 3; return { per_second: Math.round(per), many: per > 3 }
+// open-when: "many": true
+// fixed-when: "many": false
+// From FEEDBACK12.md §Q-084 (found on 6887b0b). A limitation: the workaround keeps what a page shows in a global of its own.
+
+let world = { tick: 0, scores: { ana: 0 } }
+let loads = 0
+fn game_loop() {
+    while true {
+        sleep(50)
+        world = { ...world, tick: world.tick + 1 }
+    }
+}
+schedule("1s", game_loop)
+
+server fn scores() {
+    loads += 1
+    world.scores
+}
+route GET /loads = { loads }
+
+component Board() {
+    state s = live(scores)
+    <p>{json.stringify(s)}</p>
+}
+route GET / = <html><body><Board/></body></html>

@@ -1,0 +1,13 @@
+// Q-081 A job that runs for ever (a game's loop) holds a stopping server for 10 s, then ends as "internal error (a bug in Quillo)"; while it runs, the log says "still running; skipped" every second
+// mode: script
+// script: steps.sh
+// open-when: internal error (a bug in Quillo)
+// open-when: /stopped after (9|10|11)\./
+// fixed-when: /stopped after [0-2]\./
+// From FEEDBACK12.md §Q-081 (found on 6887b0b).
+
+fn game_loop() {
+    while true { sleep(50) }
+}
+schedule("1s", game_loop)
+route GET / = "ok"

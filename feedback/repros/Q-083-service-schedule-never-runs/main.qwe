@@ -1,0 +1,10 @@
+// Q-083 A service's `schedule` never runs while the service shares the app's process (one process, the default): its jobs run only when it is run alone or split
+// mode: serve
+// get: /s/runs
+// open-when: "runs":0
+// fixed-when: /"runs":[1-9]/
+// From FEEDBACK12.md §Q-083 (found on 6887b0b). `quillo check` passes it; s.qwe run alone runs its job.
+
+service /s = "s.qwe"
+
+route GET / = "the app"

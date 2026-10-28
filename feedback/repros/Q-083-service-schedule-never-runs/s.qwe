@@ -1,0 +1,8 @@
+let runs = 0
+fn tick() { runs += 1 }
+schedule("1s", tick)
+
+route GET /runs {
+    sleep(2500)
+    { runs }
+}

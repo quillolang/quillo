@@ -1,0 +1,17 @@
+// Q-087 Split apart (--split), a service's channels are out of the pages' reach: what pages send never gets to its `channel.on`, and what it broadcasts reaches no page; one process works, and nothing says it stops
+// mode: browser
+// flags: --split
+// probe: await new Promise((r) => setTimeout(r, 3500)); let s = await (await fetch("/s/n")).json(); return { page_heard: Number(document.getElementById("t").textContent), service_heard: s.heard }
+// open-when: "page_heard": 0
+// fixed-when: /"page_heard": [1-9][\s\S]*"service_heard": [1-9]/
+// From FEEDBACK12.md §Q-087 (found on 6887b0b). In one process both numbers grow.
+
+service /s = "s.qwe"
+
+component Talk() {
+    state got = 0
+    let ch = channel.open("svc", (m) => { got += 1 })
+    if true { every(100, () => { ch.send({ x: 1 }) }) }
+    <p id="t">{got}</p>
+}
+route GET / = <html><body><Talk/></body></html>

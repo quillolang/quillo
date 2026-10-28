@@ -27,7 +27,8 @@ scoped), [FEEDBACK9.md](reports/FEEDBACK9.md) (no app: whether Quillo keeps its 
 builtins and modules apart from a program's names, on the server and in the browser; how `run` takes its options; `.env` and a service's settings), [FEEDBACK10.md](reports/FEEDBACK10.md) (no app: one service
 scaled to several copies without changing its code, a copy joining while the app runs, and
 retries behind a balancer, health and API description through a gateway), [FEEDBACK11.md](reports/FEEDBACK11.md) (no app:
-Tailwind and CSS tools beside Quillo, and `--watch` with a generated stylesheet), and
+Tailwind and CSS tools beside Quillo, and `--watch` with a generated stylesheet), [FEEDBACK12.md](reports/FEEDBACK12.md) (a real-time
+multiplayer game: a server loop, channels, a game as a service, and a simulation with browsers and bots), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run
@@ -78,11 +79,12 @@ let int = 5
 
 | Line | |
 |---|---|
-| `mode:` | `check` (what `quillo check` says), `run` (what `quillo run` prints), `cli` (what quillo prints for the `args:` line, in the repro's folder), `serve` (responses to `get:` requests, then the server's log), `browser` (the page in headless Chrome: `probe:` result, `remade`, mismatches, console) |
+| `mode:` | `check` (what `quillo check` says), `run` (what `quillo run` prints), `cli` (what quillo prints for the `args:` line, in the repro's folder), `serve` (responses to `get:` requests, then the server's log), `browser` (the page in headless Chrome: `probe:` result, `remade`, mismatches, console), `script` (what a shell script beside it prints, for steps a request cannot take: a signal, a file edited while it runs) |
 | `args: run --watch` | `cli`: quillo's own arguments, for issues of the command line |
 | `get: /path header=value` | `serve`: a request to make; several allowed |
 | `page: /path` | `browser`: the page to open |
 | `probe: return …` | `browser`: JavaScript run in the page once its components are up; returns JSON |
+| `script: steps.sh` | `script`: the script to run in the repro's folder; `$QUILLO` is the build under test |
 | `flags: …` | more options for `quillo run` |
 | `open-when:` | the bug is there if the output contains this (any of them) |
 | `fixed-when:` | fixed if the output contains this (all of them); with no `open-when`, open until then |
@@ -118,5 +120,8 @@ Node 22 or newer, and Chrome (or `QUILLO_CHROME`); nothing to install.
   copy, three listed, and behind limer (round-robin, hashed on `x-quillo-call`, a copy joining
   mid-run): calls a second, which copy answered, and calls that ran twice. `LIMER=` for
   limer's binary; the limer steps are skipped without it.
+- `tools/arena-sim.mjs <url> [players] [bots,...] [seconds]`: loads Quillo Arena (`app/arena`) with
+  real players in headless Chrome and bots, and reports its loop's ticks a second, step time, gaps
+  between ticks, snapshot size and the share sent on a stream, and each player's updates a second.
 - `tools/drive.mjs test.mjs [--mismatches]`: runs a script that default-exports
   `async ({ browser, page, sleep, ALT, CTRL, META, SHIFT }) => result`.

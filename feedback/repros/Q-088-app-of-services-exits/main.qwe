@@ -1,0 +1,8 @@
+// Q-088 A program made only of the services it mounts (the guide's "app.qwe: the app, made of both") does not serve: `quillo run` runs it as a script and exits 0, without a word, though its services have routes
+// mode: script
+// script: steps.sh
+// open-when: exit 0, serving: no
+// fixed-when: serving: yes
+// From FEEDBACK12.md §Q-088 (found on 6887b0b). The guide's own example under Services is this program.
+
+service /shop = "shop.qwe"
