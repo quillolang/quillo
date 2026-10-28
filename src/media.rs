@@ -36,9 +36,11 @@ const MAX_GOP: usize = 600;
 
 pub const VIDEO: u8 = 1;
 pub const AUDIO: u8 = 2;
+/// A stream has ended (`media.close`): no data.
+pub const END: u8 = 0;
 
 pub fn install(m: &mut Map) {
-    let fns: &[(&'static str, BuiltinFn)] = &[("media.rtp", rtp), ("media.streams", streams)];
+    let fns: &[(&'static str, BuiltinFn)] = &[("media.rtp", rtp), ("media.streams", streams), ("media.close", close)];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("media.").into(), Value::Builtin(name, *f));
     }
@@ -453,6 +455,10 @@ enum Codec {
 struct Track {
     stream: Arc<Stream>,
     codec: Codec,
+    /// Set by `media.close`: the socket's thread stops and lets the port go,
+    /// then says so (`released`).
+    closed: bool,
+    released: bool,
 }
 
 fn sockets() -> &'static Mutex<HashMap<u16, Arc<Mutex<Track>>>> {
@@ -483,6 +489,11 @@ fn receive(socket: UdpSocket, track: Arc<Mutex<Track>>) {
     let (mut packets, mut units) = (Vec::new(), Vec::new());
     loop {
         if crate::httpd::stopping() {
+            return;
+        }
+        if lock(&track).closed {
+            drop(socket);
+            lock(&track).released = true;
             return;
         }
         let now = Instant::now();
@@ -573,7 +584,7 @@ fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let s = stream(&name);
     for (port, codec) in tracks {
-        if let Err(e) = listen(&host, port, Track { stream: s.clone(), codec }) {
+        if let Err(e) = listen(&host, port, Track { stream: s.clone(), codec, closed: false, released: false }) {
             return fail(line, format!("`media.rtp`: cannot listen on UDP port {}: {}", port, e));
         }
         let mut ports = lock(&s.ports);
@@ -582,6 +593,37 @@ fn rtp(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     Ok(Value::Nil)
+}
+
+/// `media.close(name)`: the stream stops taking RTP, its ports are let go,
+/// and the pages watching it are told it ended; true if there was one. A
+/// stream made while the program runs (one a room, a call) need not hold its
+/// ports until the program stops (FEEDBACK6.md, Q-061; branch feedback6-fixes).
+fn close(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.to_string(),
+        other => return fail(line, format!("`media.close` takes a stream's name, got {}", other.map_or("nothing".into(), |v| v.repr()))),
+    };
+    let Some(s) = lock(streams_map()).remove(&name) else { return Ok(Value::Bool(false)) };
+    let ports: Vec<u16> = lock(&s.ports).drain(..).collect();
+    let closing: Vec<Arc<Mutex<Track>>> = {
+        let mut all = lock(sockets());
+        ports.iter().filter_map(|p| all.remove(p)).collect()
+    };
+    for t in &closing {
+        lock(t).closed = true;
+    }
+    // Until the ports are free again, for another stream to take at once.
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until && !closing.iter().all(|t| lock(t).released) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let end = Arc::new(Frame::new(&s.name, END, false, 0, &[]));
+    for v in lock(&s.viewers).drain(..) {
+        v.sink.take(&end);
+    }
+    lock(&s.gop).clear();
+    Ok(Value::Bool(true))
 }
 
 /// `media.streams()`: each stream, with its viewers and its tracks' rates.

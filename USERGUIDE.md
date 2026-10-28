@@ -1404,7 +1404,9 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   -f rtp rtp://127.0.0.1:5004 -map 0:a -c:a libopus -f rtp rtp://127.0.0.1:5006
 ```
 
-- `media.rtp(name, { video, audio, host })` is written at the top of a program. Video is
+- `media.rtp(name, { video, audio, host })` makes a stream: at the top of a program, or
+  while it runs (a route, a channel's handler: a stream for each room), once for a name
+  (asked again, it is the same stream). Video is
   H.264 and audio Opus, each on a port of its own (`{ port: 5004, codec: "h264" }` says
   so in full). The packets never reach Quillo code: the server puts them back in order,
   makes frames of them (it reads single NAL units, STAP-A and FU-A), and passes each on
@@ -1413,8 +1415,8 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   script for it (4.5 KB compressed), which decodes with the browser's own decoders
   (WebCodecs) and draws on a canvas. `controls` adds a button for sound, and `muted`
   starts without it (browsers play sound only after a click on the page). Its
-  `data-state` is `connecting`, `waiting`, `playing` or `unsupported` (no WebCodecs),
-  for styling.
+  `data-state` is `connecting`, `waiting`, `playing`, `ended` or `unsupported` (no
+  WebCodecs), for styling.
 - Frames travel on the page's channel connection: over WebTransport, a stream per
   track; else over the WebSocket. The server keeps the video since the last keyframe, so
   a page that starts watching shows a picture at once. A page that falls behind skips
@@ -1424,6 +1426,9 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   seconds (the camera stopped, the connection is down), `data-state` is `waiting`.
 - `media.streams()` gives each stream's viewers and, per track, `frames`, `fps`, `kbps`
   and `lost` packets.
+- `media.close(name)` ends a stream: it stops taking RTP, lets its ports go (for another
+  stream to take), and tells its pages, whose `data-state` turns `ended`. It gives true if
+  there was such a stream.
 - Audio and video are each played as they come, so they are in step within about a
   tenth of a second. The camera's encoder decides the picture: keyframes every second
   or two (`-g 60` at 30 fps) let pages that start watching (or fall behind) catch up

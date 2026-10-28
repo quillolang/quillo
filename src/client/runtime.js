@@ -2976,6 +2976,14 @@ function mediaPlayer(el) {
   };
   const stop = chanWatch(name, (kind, key, ts, data) => {
     try {
+      // `media.close`: the stream has ended (FEEDBACK6.md, Q-061; branch feedback6-fixes).
+      if (kind === 0) {
+        el.dataset.state = "ended";
+        if (st.vd && st.vd.state !== "closed") st.vd.close();
+        st.vd = null;
+        st.last = 0;
+        return;
+      }
       if (kind === 1) video(key, ts, data);
       else if (kind === 2) audio(ts, data);
     } catch (e) {
