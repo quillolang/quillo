@@ -4434,9 +4434,17 @@ function asOwnRoot(w, inst) {
   return r;
 }
 
+// A component made again because the server's HTML was not what it makes:
+// counted, so a page (or a test) can tell, and said in development, with
+// its name and what differed.
+function remade(name) {
+  if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+  if (DEV && wanted) console.warn(`quillo: <${name}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
+}
+
 // A component in its <quillo-island>: made, or taking up the page's.
 function island(def, props, h, c) {
-  const inst = new Inst(def, props, h && h.s, h && h.l);
+  let inst = new Inst(def, props, h && h.s, h && h.l);
   let el;
   if (c.claim) {
     el = c.n;
@@ -4446,8 +4454,26 @@ function island(def, props, h, c) {
     c.n = el.nextSibling;
   } else el = wrapper(def.$name);
   inst.el = el;
-  run(inst, el, c.claim);
-  return c.claim ? el : asOwnRoot(el, inst);
+  if (!c.claim) {
+    run(inst, el, false);
+    return asOwnRoot(el, inst);
+  }
+  // One inside another that cannot be taken up is made again by itself, and
+  // said so, as one at the top is; before, its outer one reported a bare
+  // "quillo: text" (FEEDBACK2.md, Q-014; branch feedback6-fixes). A table's
+  // row is its own root, which only its outer one can make again.
+  try {
+    run(inst, el, true);
+  } catch (e) {
+    if (!(e instanceof Mismatch) || ownRoot(el)) throw e;
+    remade(def.$name);
+    dispose(inst);
+    el.replaceChildren();
+    inst = new Inst(def, props, h && h.s, h && h.l);
+    inst.el = el;
+    run(inst, el, false);
+  }
+  return el;
 }
 
 // The component's code, once; then its markup put in its island.
@@ -4562,13 +4588,14 @@ function resume(el) {
     run(inst, el, true);
     if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
   } catch (e) {
-    if (!(e instanceof Mismatch)) report(e);
-    else if (DEV && wanted) console.warn(`quillo: <${el.dataset.c}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
+    if (e instanceof Mismatch) remade(el.dataset.c);
+    else {
+      report(e);
+      if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+    }
     ok = false;
   }
   if (!ok) {
-    // Counted, so a page (or a test) can tell its HTML was made again.
-    if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
     dispose(inst);
     hydrating = queue();
     if (ownRoot(el)) {
