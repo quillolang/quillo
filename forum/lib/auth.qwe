@@ -1,0 +1,86 @@
+// Accounts: joining, signing in and out, and who may do what. A session
+// cookie carries only a random id; the sessions table says whose it is, so
+// signing out (or "everywhere") ends it on the server too.
+
+let DAY = 86_400_000
+let SESSION_DAYS = 30
+
+type Me = { id: int, name: str, role: str, hue: int, banned_until: int? }
+
+fn user_of_session(sid) with db, time {
+    if sid == null { return null }
+    db.one(sql`select u.id, u.name, u.role, u.hue, u.banned_until from sessions s join users u on u.id = s.user_id
+               where s.id = ? and s.expires > ?`, sid, now())
+}
+
+// Who is signed in, or null.
+fn me() with db, time = user_of_session(session().sid)
+
+// The same, for loaders: without following the sessions table, so someone
+// signing in does not make every open page load again.
+fn viewer() with db, time = unwatched(() => me())
+
+fn is_banned(u) -> bool with time = u != null && u.banned_until != null && u.banned_until > now()
+
+fn is_mod(u) -> bool = u != null && (u.role == "admin" || u.role == "moderator")
+
+fn is_admin(u) -> bool = u != null && u.role == "admin"
+
+// Only paths on this site: "/t/4" but not "//evil.example" or "https://...".
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+// For routes: who is signed in, or off to the sign-in page and back here after.
+fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${back}`)
+
+// For server fns: who is signed in and may act, or an error the page shows.
+fn acting() ! str with db, time {
+    let u = me() ?? err("Sign in first")?
+    if is_banned(u) { return err(`You are suspended: ${left(u.banned_until)}`) }
+    u
+}
+
+fn start_session(user_id: int) with db, time, random {
+    let sid = crypto.token()
+    db.exec("insert into sessions (id, user_id, created, expires) values (?, ?, ?, ?)",
+        sid, user_id, now(), now() + SESSION_DAYS * DAY)
+    set_session({ sid }, { max_age: SESSION_DAYS * 86400 })
+}
+
+// The first person to join runs the place.
+fn register(name: str, email: str, password: str) ! str with db, time, random {
+    let n = trim(name)
+    let e = lower(trim(email))
+    if !valid_name(n) { return err("A name is 3 to 20 letters, digits or _") }
+    if !contains(e, "@") || len(e) > 200 { return err("That email does not look right") }
+    if len(password) < 8 { return err("Use at least 8 characters for the password") }
+    if db.one("select 1 from users where name = ? or email = ?", n, e) != null {
+        return err("That name or email is already taken")
+    }
+    let first = db.one("select count(*) as n from users").n == 0
+    let r = db.exec("insert into users (name, email, password_hash, role, hue, created) values (?, ?, ?, ?, ?, ?)",
+        n, e, crypto.hash_password(password), first ? "admin" : "member", random_int(0, 359), now())?
+    start_session(r.last_id)
+}
+
+fn sign_in(who: str, password: str) ! str with db, time, random {
+    let u = db.one("select id, password_hash from users where name = ? or email = ?", trim(who), lower(trim(who)))
+    // Hash anyway when there is no such user, so the time taken does not say whether there is.
+    let hash = u.password_hash ?? crypto.hash_password("not anyone's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong name or password") }
+    start_session(u.id)
+}
+
+fn sign_out(everywhere: bool) with db, time {
+    let u = me()
+    if u != null {
+        if everywhere {
+            db.exec("delete from sessions where user_id = ?", u.id)
+        } else {
+            db.exec("delete from sessions where id = ?", session().sid)
+        }
+    }
+    end_session()
+}
+
+// Expired sessions, cleared once an hour.
+fn clear_sessions() with db, time = db.exec("delete from sessions where expires < ?", now())

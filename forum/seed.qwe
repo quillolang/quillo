@@ -1,0 +1,120 @@
+// Demo people and threads, so a new forum has something to show. Run with
+// FORUM_DEMO=1; only an empty forum is filled. Every demo account's password
+// is "password", so never turn this on for a forum people really use.
+
+fn seed_user(name: str, role: str, hue: int, bio: str, days_ago: int) with db, time, random =
+    db.exec("insert into users (name, email, password_hash, role, hue, bio, created) values (?, ?, ?, ?, ?, ?, ?)",
+        name, `${name}@example.com`, crypto.hash_password("password"), role, hue, bio, now() - days_ago * DAY).last_id
+
+// A thread and its replies, each [who, minutes after the start, Markdown].
+fn seed_thread(cat: str, who: int, title: str, tags: str, hours_ago: int, posts: list) with db, time {
+    let start = now() - hours_ago * 3600000
+    let cat_id = db.one("select id from categories where slug = ?", cat).id
+    let id = db.exec("insert into threads (category_id, user_id, title, created, last_post_at, last_user_id) values (?, ?, ?, ?, ?, ?)",
+        cat_id, who, title, start, start, who).last_id
+    for tag in parse_tags(tags) => db.exec("insert into tags (thread_id, tag) values (?, ?)", id, tag)
+    let ids = for [author, minutes, body] in posts => {
+        let at = start + minutes * 60000
+        let p = db.exec("insert into posts (thread_id, user_id, body, html, created) values (?, ?, ?, ?, ?)",
+            id, author, body, render(body), at).last_id
+        db.exec("update threads set last_post_at = ?, last_user_id = ? where id = ?", at, author, id)
+        db.exec("insert or ignore into follows (user_id, thread_id, created) values (?, ?, ?)", author, id, at)
+        p
+    }
+    db.exec("update threads set replies = ? where id = ?", len(posts) - 1, id)
+    db.exec("insert into thread_views (thread_id, n) values (?, ?)", id, 12 + len(posts) * 17)
+    { id, posts: ids }
+}
+
+fn seed_votes(post_id: int, voters: list<int>) with db, time {
+    for v in voters => db.exec("insert or ignore into votes (post_id, user_id, created) values (?, ?, ?)", post_id, v, now())
+}
+
+fn seed_reactions(post_id: int, emoji: str, people: list<int>) with db, time {
+    for u in people => db.exec("insert or ignore into reactions (post_id, user_id, emoji, created) values (?, ?, ?, ?)", post_id, u, emoji, now())
+}
+
+fn seed_message(from: int, to: int, minutes_ago: int, body: str) with db, time {
+    let at = now() - minutes_ago * 60000
+    db.exec("insert or ignore into conversations (a_id, b_id, created, last_at) values (?, ?, ?, ?)", min([from, to]), max([from, to]), at, at)
+    let c = conversation_of(from, to)
+    let m = db.exec("insert into messages (conversation_id, user_id, body, html, created) values (?, ?, ?, ?, ?)", c.id, from, body, render(body), at).last_id
+    db.exec("update conversations set last_at = ? where id = ?", at, c.id)
+    mark_messages_read(from, c.id, m)
+}
+
+fn seed_demo() with db, time, random {
+    if db.one("select count(*) as n from users").n > 0 { return null }
+    print("FORUM_DEMO: adding demo people (password: password) and threads")
+    db.transaction(() => {
+        let ada = seed_user("ada", "admin", 265, "Runs the place. Writes compilers for fun.", 120)
+        let lin = seed_user("lin", "moderator", 160, "Databases, mostly. Ask me about indexes.", 90)
+        let sam = seed_user("sam", "member", 20, "Frontend person learning the server side.", 30)
+        let kai = seed_user("kai", "member", 340, "", 12)
+        let rio = seed_user("rio", "member", 200, "I break things so you don't have to.", 3)
+        let bot = seed_user("dealz4u", "member", 90, "", 0)
+
+        let welcome = seed_thread("announcements", ada, "Welcome to the Quillo Forum 👋", "meta, welcome", 240, [
+            [ada, 0, "Hi everyone, and welcome!\n\nA few things this forum does:\n\n- **Live replies**: open a thread in two tabs and reply in one.\n- **Markdown** with highlighted code blocks.\n- **Votes** build reputation; the author of a question can **mark the answer** that solved it.\n- **@mentions** notify people: try @lin.\n- **Search** every post from the top bar (press `/`).\n\nBe kind, and have fun."],
+            [lin, 35, "Glad to be here. I'll keep an eye on the *Help* category."],
+            [sam, 300, "This is great. The typing indicator is a nice touch!"],
+        ])
+        db.exec("update threads set pinned = 1, locked = 1 where id = ?", welcome.id)
+        seed_votes(welcome.posts[0], [lin, sam, kai, rio])
+        seed_reactions(welcome.posts[0], "🎉", [lin, sam, kai, rio])
+        seed_reactions(welcome.posts[0], "❤️", [sam])
+
+        let q = seed_thread("help", sam, "How do I keep a page up to date when the database changes?", "live-data, components", 30, [
+            [sam, 0, "I have a list of orders on a page. When someone adds an order in another tab, the first tab doesn't show it until I reload.\n\nWhat's the idiomatic way to do this?"],
+            [kai, 12, "You could poll with `every(5000, ...)` and call a server fn each time."],
+            [lin, 25, "No need to poll. Make the state `live`: the loader runs again whenever a table it read changes, for everyone.\n\n```quillo\nserver fn load_orders() = db.query(\"select * from orders order by id desc\")\n\ncomponent Orders() {\n    state orders = live(load_orders)\n    <ul>{for o in orders => <li key={o.id}>{o.total}</li>}</ul>\n}\n```\n\nThe server records that `load_orders` read `orders`, and an `insert` into it wakes every page that shows it."],
+            [sam, 40, "@lin that worked on the first try. Thank you!"],
+        ])
+        db.exec("update threads set solution_id = ? where id = ?", q.posts[2], q.id)
+        seed_votes(q.posts[2], [sam, kai, rio, ada])
+        seed_votes(q.posts[0], [lin, kai])
+        seed_reactions(q.posts[2], "👍", [sam, kai, rio])
+        seed_reactions(q.posts[2], "🤔", [kai])
+        seed_reactions(q.posts[3], "🎉", [lin])
+        db.exec("insert into bookmarks (user_id, post_id, created) values (?, ?, ?)", sam, q.posts[2], now() - 3000000)
+
+        let show = seed_thread("show-and-tell", rio, "I built a tiny status page with UDP and channels", "udp, channels, show", 8, [
+            [rio, 0, "Sensors send JSON over UDP, the server broadcasts each reading on a channel, and the page draws a sparkline.\n\n```quillo\nudp.listen(9000, (p) => channel.broadcast(\"readings\", json.parse(p.text)))\n```\n\nThe whole thing is about 80 lines."],
+            [ada, 50, "Love it. How many readings a second does it handle?"],
+            [rio, 70, "About 40k/s on my laptop before the browser became the bottleneck."],
+        ])
+        seed_votes(show.posts[0], [ada, lin, sam])
+        seed_reactions(show.posts[0], "👀", [ada, kai])
+
+        let idea = seed_thread("ideas", kai, "Dark mode for code blocks?", "design", 4, [
+            [kai, 0, "Code blocks look great in light mode, but in dark mode I'd love a darker background."],
+            [sam, 15, "+1. Also: copy buttons on code blocks would be handy."],
+        ])
+        seed_votes(idea.posts[0], [sam])
+
+        let weekly = seed_thread("general", lin, "What are you working on this week?", "weekly", 2, [
+            [lin, 0, "Share what you're building, learning or stuck on. Small things count!"],
+            [ada, 20, "Finishing the checker's `match` exhaustiveness. Slowly."],
+            [rio, 45, "Trying to make SQLite cry with 10 million rows. It's winning."],
+            [bot, 70, "Best deals on watches!!! Visit my site for 90% off, limited time only, click now!!!"],
+        ])
+        seed_reactions(weekly.posts[2], "😂", [ada, lin])
+        for who in [sam, kai] => db.exec("insert into reports (post_id, user_id, reason, note, created) values (?, ?, 'spam', ?, ?)",
+            weekly.posts[3], who, who == sam ? "Same message in three other forums" : "", now() - 1800000)
+
+        let poll = seed_thread("general", ada, "Which database do you use with Quillo?", "databases, poll", 1, [
+            [ada, 0, "Curious what everyone runs in production. Vote below, and say why in a reply!"],
+            [lin, 10, "PostgreSQL at work, SQLite for everything else. WAL mode is plenty for most apps."],
+        ])
+        save_poll(poll.id, { question: "Which database do you use?", options: ["SQLite", "PostgreSQL", "MySQL", "Data in variables"], multiple: true, days: 7 })
+        let options = db.query("select id from poll_options where thread_id = ? order by position", poll.id) | map((o) => o.id)
+        for [who, picks] in [[ada, [0, 1]], [lin, [0, 1]], [sam, [0]], [rio, [0, 3]], [kai, [2]]] =>
+            for i in picks => db.exec("insert into poll_votes (thread_id, option_id, user_id, created) values (?, ?, ?, ?)", poll.id, options[i], who, now())
+
+        seed_message(sam, lin, 50, "Hi @lin, thanks again for the `live` answer! Could I ask you about indexes sometime?")
+        seed_message(lin, sam, 42, "Of course. Send me the query and its `explain query plan` and we'll look at it together.")
+        seed_message(sam, lin, 5, "Here it is:\n\n```sql\nselect * from orders where customer_id = ? order by created desc\n```")
+        db.exec("insert into notifications (user_id, kind, actor_id, thread_id, post_id, created) values (?, 'mention', ?, ?, ?, ?)",
+            lin, sam, q.id, q.posts[3], now() - 3600000)
+    })
+}

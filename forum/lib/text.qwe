@@ -1,0 +1,67 @@
+// Small pure helpers for text: times, counts, names and tags. None of them
+// touch the database, so components use them in the browser too.
+
+let NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
+let TAG_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
+
+// "just now", "5m ago", "3h ago", "2d ago", "6w ago".
+fn ago(t: int) -> str {
+    let s = floor((now() - t) / 1000)
+    if s < 45 { return "just now" }
+    if s < 3600 { return `${s < 90 ? 1 : floor(s / 60)}m ago` }
+    if s < 86400 { return `${floor(s / 3600)}h ago` }
+    if s < 86400 * 14 { return `${floor(s / 86400)}d ago` }
+    `${floor(s / (86400 * 7))}w ago`
+}
+
+// What is left until `t`: "3h left", "2d left", or "until a moderator lifts it".
+fn left(t: int) -> str {
+    // Rounded up: three days less a second is "3d left".
+    let s = (t - now()) / 1000
+    if s > 86400 * 365 { return "until a moderator lifts it" }
+    if s <= 3600 { return `${max([ceil(s / 60), 1])}m left` }
+    if s <= 86400 { return `${ceil(s / 3600)}h left` }
+    `${ceil(s / 86400)}d left`
+}
+
+fn plural(n: int, word: str, words: str = "") -> str = n == 1 ? `1 ${word}` : `${n} ${words != "" ? words : word + "s"}`
+
+// Markdown as plain text, near enough for a one-line summary: no code fences
+// or their language, images as "[image]", links as their text.
+fn plain(md: str) -> str {
+    let fences = re.replace(md, "```[A-Za-z0-9_+-]*", " ")
+    let images = re.replace(fences, "!\\[[^\\]]*\\]\\([^)]*\\)", "[image]")
+    let links = re.replace(images, "\\[([^\\]]*)\\]\\([^)]*\\)", "$1")
+    let bold = re.replace(links, "\\*\\*([^*]+)\\*\\*", "$1")
+    let italic = re.replace(bold, "(^|\\s)\\*([^*\\s][^*]*)\\*", "$1$2")
+    let starts = re.replace(italic, "^(#+|>)[ \\t]*", "", "m")
+    re.replace(replace(starts, "`", ""), "\\s+", " ")
+}
+
+// 1234 is "1.2k".
+fn compact(n: int) -> str = n < 1000 ? str(n) : `${round(n / 100) / 10}k`
+
+fn only_chars(s: str, allowed: str) -> bool = all(split(s, ""), (c) => contains(allowed, c))
+
+fn valid_name(name: str) -> bool = len(name) >= 3 && len(name) <= 20 && only_chars(lower(name), NAME_CHARS)
+
+// "Rust, web dev, rust" is ["rust", "web-dev"]: at most five, each a short slug.
+fn parse_tags(text: str) -> list<str> =
+    split(replace(text, ",", " "), " ")
+        | map((t) => lower(trim(t)))
+        | map((t) => starts_with(t, "#") ? slice(t, 1) : t)
+        | filter((t) => len(t) >= 2 && len(t) <= 24 && only_chars(t, TAG_CHARS))
+        | unique
+        | take(5)
+
+fn tags_of(joined: str) -> list<str> = joined == "" ? [] : split(joined, ",")
+
+// A Markdown quote of a post, for a reply: "> text" lines and who wrote it.
+fn quote_of(name: str, body: str) -> str =
+    `> **@${name}** wrote:\n` + join(split(body, "\n") | map((l) => `> ${l}`), "\n") + "\n\n"
+
+// A post's first words as plain text, for lists and notifications.
+fn excerpt(md: str, n: int = 140) -> str {
+    let p = trim(plain(md))
+    len(p) > n ? slice(p, 0, n) + "…" : p
+}

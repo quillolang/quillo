@@ -1,0 +1,209 @@
+// The desk's own screens (work queue, articles, people, pages), the
+// public site, and signing in.
+
+// What waits for `me`: articles at a step whose role they hold (writers:
+// their own), that they have not already approved.
+fn waiting_for(me, articles: list) -> list = articles | filter((a) =>
+    a.step_role != null && has_role(me, a.step_role) && (a.step_role != "writer" || a.author_id == me.id || has_role(me, "admin"))
+    && !(a.step_role != "writer" && a.author_id == me.id))
+
+view ArticleRow(a, me_id: int) =
+    <li.a-row>
+        <a.a-title href={`/desk/a/${a.id}`}>{a.title}</a>
+        <span.a-meta>
+            <StepPill name={a.step} color={a.step_color}/>
+            {a.needed > 1 && a.step_role != "writer" && <span.muted>{a.approvals} of {a.needed} approved</span>}
+            {a.open_threads > 0 && <span.badge.fb title="Open feedback">💬 {a.open_threads}</span>}
+            {a.round > 1 && <span.muted>round {a.round}</span>}
+            <span.grow/>
+            <Avatar name={a.author} hue={a.author_hue} size="xs"/>
+            <span.muted>{a.author_id == me_id ? "you" : a.author}, {ago(a.updated, now())}</span>
+        </span>
+    </li>
+
+component NewArticle() {
+    state title = ""
+    state problem = null
+    <form.new-article @submit={() => {
+        let r = create_article(title, null)
+        if is_err(r) { problem = r.error } else { navigate(`/desk/a/${r}`) }
+    }}>
+        <input value={title} placeholder="A headline for a new article" maxlength="160" @input={(e) => { title = e.value }}/>
+        <button.btn.primary disabled={len(trim(title)) < 3}>Start writing</button>
+        <Problem text={problem}/>
+    </form>
+}
+
+component DeskHome(me) {
+    state articles = live(load_articles)
+    let all_ = articles ?? []
+    let mine = waiting_for(me, all_)
+    let drafts = all_ | filter((a) => a.author_id == me.id && a.published_at == null)
+    let feedback = drafts | filter((a) => a.open_threads > 0)
+    <div.desk-home>
+        <section.card-box.queue>
+            <h2>Waiting for you <span.muted>{len(mine)}</span></h2>
+            {len(mine) == 0 ? <p.muted>Nothing waits for your roles ({join(me.roles, ", ")}).</p>
+                : <ul.a-list>{for a in mine => <ArticleRow key={a.id} {a} me_id={me.id}/>}</ul>}
+        </section>
+        {has_role(me, "writer") && <section.card-box>
+            <h2>Write</h2>
+            <NewArticle/>
+            {len(feedback) > 0 && <p.warn-note>Feedback to answer on {plural(len(feedback), "article")} of yours.</p>}
+            <h3>Your articles in the works <span.muted>{len(drafts)}</span></h3>
+            <ul.a-list>{for a in drafts => <ArticleRow key={a.id} {a} me_id={me.id}/>}</ul>
+        </section>}
+        <section.card-box>
+            <h2>Recently published</h2>
+            <ul.a-list>{for a in take(all_ | filter((a) => a.published_at != null), 8) => <ArticleRow key={a.id} {a} me_id={me.id}/>}</ul>
+        </section>
+    </div>
+}
+
+component ArticlesBoard(me) {
+    state articles = live(load_articles)
+    state q = ""
+    let all_ = articles ?? []
+    let shown = all_ | filter((a) => q == "" || contains(lower(a.title), lower(q)) || contains(lower(a.author), lower(q)))
+    let steps = unique(all_ | map((a) => a.step))
+    <div>
+        <div.toolbar>
+            <input.search type="search" placeholder="Find an article or author" value={q} @input={(e) => { q = e.value }}/>
+            <span.muted>{plural(len(shown), "article")}</span>
+        </div>
+        <div.lanes>
+            {for s in steps => <section.lane key={s}>
+                <h2>{s} <span.muted>{count(shown, (a) => a.step == s)}</span></h2>
+                <ul.a-list>{for a in shown | filter((a) => a.step == s) => <ArticleRow key={a.id} {a} me_id={me.id}/>}</ul>
+            </section>}
+        </div>
+    </div>
+}
+
+component People() {
+    state people = live(load_people)
+    state problem = null
+    <section.card-box>
+        <h2>People and their roles</h2>
+        <p.muted>Writers write; reviewers and publishers approve and give feedback; designers make flows, objects and pages; admins do all of it.</p>
+        <Problem text={problem}/>
+        <div.people>
+            {for p in people ?? [] => <div.person key={p.id}>
+                <Avatar name={p.name} hue={p.hue} size="sm"/> <b>{p.name}</b> <span.muted>{p.email}</span>
+                <span.grow/>
+                {for r in ROLES => <label key={r} class={`check role-toggle r-${r}`}>
+                    <input type="checkbox" checked={contains(p.roles, r)} @change={() => {
+                        let x = toggle_role(p.id, r)
+                        problem = err_text(x)
+                    }}/> {r}</label>}
+            </div>}
+        </div>
+    </section>
+}
+
+component PagesPage(me) {
+    state pages = live(load_pages)
+    state title = ""
+    state problem = null
+    <section.card-box>
+        <h2>Pages <span.muted>desk pages built from blocks</span></h2>
+        <ul.rows>{for p in pages ?? [] => <li key={p.id}>
+            <a href={`/desk/p/${p.slug}`}><b>{p.title}</b></a>
+            <span.muted>{plural(p.blocks, "block")}{len(p.roles) > 0 && ` · for ${join(p.roles, ", ")}`}</span>
+        </li>}</ul>
+        {has_role(me, "designer") && <form.inline-add @submit={() => {
+            let r = create_page(title)
+            if is_err(r) { problem = r.error } else { title = ""; problem = null }
+        }}>
+            <input placeholder="New page, like Ad desk" value={title} @input={(e) => { title = e.value }}/>
+            <button.btn.primary.small disabled={trim(title) == ""}>Create</button>
+        </form>}
+        <Problem text={problem}/>
+    </section>
+}
+
+component PageScreen(page_id: int) {
+    state data = live(load_page, page_id)
+    state catalog = live(load_catalog)
+    state editing = false
+    state problem = null
+    let d = data
+    <div.page-screen>
+        {is_err(d) ? <p.problem>{d.error}</p> : <div>
+            <header.fd-head>
+                <h1>{d.page.title}</h1>
+                <span.grow/>
+                {d.editable && <label.inline-label><input type="checkbox" checked={editing} @change={(e) => { editing = e.checked }}/> Edit</label>}
+            </header>
+            {d.editable && editing && <div.row.page-roles>
+                <span.muted>Who sees it:</span>
+                {for r in ROLES => <label key={r} class="check"><input type="checkbox" checked={contains(d.page.roles, r)} @change={() => {
+                    problem = err_text(set_page_roles(page_id, toggled(d.page.roles, r)))
+                }}/> {r}</label>}
+                {len(d.page.roles) == 0 && <span.muted>(everyone on the desk)</span>}
+            </div>}
+            <Problem text={problem}/>
+            <BlockList blocks={d.blocks} owner={owner_key("page", page_id)} editable={d.editable && editing}
+                catalog={catalog ?? { lists: [], forms: [] }} types={CONTENT_TYPES + DATA_TYPES}/>
+        </div>}
+    </div>
+}
+
+// ---- the public site ------------------------------------------------------------
+
+// A list on the public site: as it is now, without following changes.
+view StaticList(d) = d != null && <div.data-block.list-block>
+    <header.data-head><b>{d.list.name}</b></header>
+    <div.table-wrap><table.data>
+        <thead><tr><th>State</th>{for c in d.columns => <th key={c.id}>{c.name}</th>}</tr></thead>
+        <tbody>{for r in d.rows => <tr key={r.id}><td>{r.state}</td>{for [i, v] in enumerate(r.cells) => <td key={i}>{v}</td>}</tr>}</tbody>
+    </table></div>
+</div>
+
+view PublicBlock(b) = match b.type {
+    "list" => b.data.list_id == 0 ? null : <StaticList d={list_rows(b.data.list_id)}/>
+    "form" | "transaction" => null
+    _ => <BlockView {b}/>
+}
+
+view FrontPage(me, articles: list) =
+    <Site title="Newsroom" {me}>
+        <h1.front-title>Today's news</h1>
+        {len(articles) == 0 && <p.muted>Nothing is published yet.</p>}
+        <ol.front>{for [i, a] in enumerate(articles) => <li key={a.id} class={i == 0 && "lead-story"}>
+            <a href={`/news/${a.slug}`}><h2>{a.title}</h2></a>
+            <p>{a.lead}</p>
+            <p.muted>By {a.author} · {day_label(day_of_ms(a.published_at))}</p>
+        </li>}</ol>
+    </Site>
+
+view NewsPage(me, a, author: str, blocks: list) =
+    <Site title={a.title} {me}>
+        <article.story>
+            <h1>{a.title}</h1>
+            <p.muted>By {author} · {day_label(day_of_ms(a.published_at))}</p>
+            {for b in blocks => <div key={b.id}><PublicBlock {b}/></div>}
+        </article>
+    </Site>
+
+view AuthPage(mode: str, next: str, form, problem) {
+    let login = mode == "login"
+    <Site title={login ? "Sign in" : "Join"} me={null}>
+        <section.card-box.auth>
+            <h1>{login ? "Staff sign-in" : "Join the newsroom"}</h1>
+            <Problem text={problem}/>
+            <form.stack method="post" action={login ? "/login" : "/register"}>
+                <input type="hidden" name="next" value={next}/>
+                {login
+                    ? <label>Name or email <input name="who" required autofocus value={form.who ?? ""} autocomplete="username"/></label>
+                    : [<label>Name <input name="name" required autofocus value={form.name ?? ""} autocomplete="username"/></label>,
+                       <label>Email <input name="email" type="email" required value={form.email ?? ""}/></label>]}
+                <label>Password <input name="password" type="password" required autocomplete={login ? "current-password" : "new-password"}/></label>
+                <button.btn.primary>{login ? "Sign in" : "Join"}</button>
+            </form>
+            <p.muted>{login ? <span>New? <a href="/register">Join</a> (you start as a writer)</span> : <span>Have an account? <a href="/login">Sign in</a></span>}</p>
+            {env("CMS_DEMO", "") == "1" && <p.muted>Demo: <b>ada</b> (admin), <b>wanda</b> (writer), <b>rex</b> and <b>rita</b> (reviewers),
+                <b>pablo</b> (publisher), <b>dee</b> (designer); password <b>password123</b>.</p>}
+        </section>
+    </Site>
+}

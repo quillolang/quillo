@@ -1,0 +1,14 @@
+// Q-002 A refused prefetch is answered 204, which Chrome takes as the page: links to routes that write do nothing
+// mode: serve
+// get: /count x-quillo-prefetch=1
+// open-when: GET /count -> 204
+// fixed-when: /GET \/count -> (503|409)/
+// From FEEDBACK.md §1 (found on f1695a3).
+
+db.open(":memory:")
+db.exec("create table views (n integer)")
+
+route GET /count {
+    db.exec("insert into views (n) values (1)")
+    "counted"
+}

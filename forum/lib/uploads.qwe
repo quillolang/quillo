@@ -1,0 +1,36 @@
+// Images in posts and messages: pasted, dropped or picked in the editor,
+// checked to be an image, shrunk to at most 1600 pixels wide, and saved
+// under uploads/images/ with a random name. Served from /media/<name>.
+// (A GIF is saved as its first frame.)
+
+let MAX_IMAGE_BYTES = 8_000_000
+let IMAGE_WIDTH = 1600
+let IMAGES_AN_HOUR = 30
+let MEDIA_NAME = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(jpg|png)$"
+
+// The image, saved: { url, width, height }, or why not.
+server fn upload_image(file: map) ! str with db, time, random, fs {
+    let u = acting()?
+    if file.size > MAX_IMAGE_BYTES { return err("Images up to 8 MB") }
+    // Counted from the uploads table: Quillo has no rate limits of its own.
+    let recent = db.one("select count(*) as n from uploads where user_id = ? and created > ?", u.id, now() - 3600000).n
+    if recent >= IMAGES_AN_HOUR { return err("That is a lot of images for one hour; try again later") }
+    let id = uuid()
+    let tmp = save_upload(file, `uploads/incoming/${id}`)?
+    let info = image.info(tmp)
+    if is_err(info) {
+        delete_file(tmp)
+        return err("That is not a JPEG, PNG, WebP or GIF image")
+    }
+    // Transparent images stay PNG; the rest become JPEG, much smaller for photos.
+    let name = `${id}.${info.alpha ? "png" : "jpg"}`
+    let out = image.convert(tmp, `uploads/images/${name}`,
+        { width: IMAGE_WIDTH, format: info.alpha ? "png" : "jpeg", quality: 85 })
+    delete_file(tmp)
+    if is_err(out) { return err("That image could not be read") }
+    db.exec("insert into uploads (user_id, name, width, height, bytes, created) values (?, ?, ?, ?, ?, ?)",
+        u.id, name, out.width, out.height, file.size, now())
+    { url: `/media/${name}`, width: out.width, height: out.height }
+}
+
+fn is_media_name(name: str) -> bool = re.test(name, MEDIA_NAME)

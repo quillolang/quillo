@@ -1,0 +1,9 @@
+// Q-025 db.open with a relative path opens it in the program's folder, and does not say where
+// mode: serve
+// get: /
+// fixed-when: /q025\.db/
+// From FEEDBACK2.md §10 (found on 896e758): PM_DB=pm.db, run from another folder, wrote to the program's own database.
+
+db.open(env("Q025_DB", "q025.db"))
+
+route GET / = "ok"

@@ -1,0 +1,13 @@
+// Q-031 There is no way to comment inside markup: `// note` there is shown on the page
+// mode: run
+// open-when: // a note for whoever
+// fixed-when: <div><p>x</p></div>
+// From FEEDBACK3.md §4 (found on 896e758). `{/* note */}` (as in JSX) and `{// note}` are parse
+// errors; the language has no block comments at all.
+
+view Card() = <div>
+    // a note for whoever edits this
+    <p>x</p>
+</div>
+
+print(str(Card()))

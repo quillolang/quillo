@@ -1,0 +1,3 @@
+fn unused() = 1
+
+fn helper(x) = x.missing.field + 1

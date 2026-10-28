@@ -1,0 +1,100 @@
+// The frame every page uses: the head, the top bar (search, the live
+// message, notification and moderation counts, who is signed in) and the footer. Plus the small views
+// used everywhere: avatars, badges, tags.
+
+view Avatar(name: str, hue: int, size: str = "md") =
+    <span class={`avatar ${size}`} style={`--hue: ${hue}`} aria-hidden="true">{upper(slice(name, 0, 1))}</span>
+
+view Person(name: str, hue: int) =
+    <a.person href={`/u/${name}`}><Avatar {name} {hue} size="sm"/> {name}</a>
+
+view RoleBadge(role: str) = match role {
+    "admin" => <span.role.admin>admin</span>
+    "moderator" => <span.role.mod>mod</span>
+    _ => null
+}
+
+view Tag(tag: str) = <a.tag href={`/tag/${tag}`}>#{tag}</a>
+
+view CategoryPill(slug: str, name: str, color: str) =
+    <a.pill href={`/c/${slug}`} style={`--c: ${color}`}>{name}</a>
+
+// Unread notifications, kept up to date as they arrive.
+component Bell(initial: int) {
+    state unread = live(load_unread)
+    let n = unread ?? initial
+    <a.bell href="/notifications" title="Notifications" class={n > 0 && "has"}>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2Z" fill="currentColor"/></svg>
+        {n > 0 && <span.count>{n > 99 ? "99+" : n}</span>}
+    </a>
+}
+
+// Conversations with unread messages, kept up to date.
+component Envelope(initial: int) {
+    state unread = live(load_unread_messages)
+    let n = unread ?? initial
+    <a.bell href="/messages" title="Messages" class={n > 0 && "has"}>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h15A1.5 1.5 0 0 1 21 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5v-11Zm2 .9V17h14V7.4l-7 5.1-7-5.1ZM6.6 7l5.4 3.9L17.4 7H6.6Z" fill="currentColor"/></svg>
+        {n > 0 && <span.count>{n > 99 ? "99+" : n}</span>}
+    </a>
+}
+
+// For moderators: posts waiting in the report queue.
+component ModLink(initial: int) {
+    state open = live(load_open_reports)
+    let n = open ?? initial
+    <a.bell href="/mod" title="Moderation queue" class={n > 0 && "has warn"}>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm0 2.2 6 2.2V11c0 3.9-2.5 7.4-6 8.9-3.5-1.5-6-5-6-8.9V6.4l6-2.2Z" fill="currentColor"/></svg>
+        {n > 0 && <span.count>{n > 99 ? "99+" : n}</span>}
+    </a>
+}
+
+view TopBar(me, q: str) =
+    <header.top>
+        <div.bar>
+            <a.brand href="/"><span.logo>Q</span><span.name>Quillo Forum</span></a>
+            <form.search action="/search" method="get" role="search">
+                <input name="q" type="search" value={q} placeholder="Search posts…" aria-label="Search posts"/>
+                <kbd>/</kbd>
+            </form>
+            <nav.me>
+                {me != null
+                    ? [
+                        <a.btn.primary href="/new">New thread</a>,
+                        is_mod(me) && <ModLink initial={load_open_reports()}/>,
+                        <Envelope initial={load_unread_messages()}/>,
+                        <Bell initial={load_unread()}/>,
+                        <a.who href={`/u/${me.name}`} title={me.name}><Avatar name={me.name} hue={me.hue}/></a>,
+                        <form.inline method="post" action="/logout"><button.link>Sign out</button></form>,
+                    ]
+                    : [
+                        <a.btn.ghost href="/login">Sign in</a>,
+                        <a.btn.primary href="/register">Join</a>,
+                    ]}
+            </nav>
+        </div>
+    </header>
+
+view Page(title: str, me, children, q: str = "") =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title == "Quillo Forum" ? title : `${title} · Quillo Forum`}</title>
+            <link rel="icon" href="/static/icons/favicon.svg" type="image/svg+xml"/>
+            <link rel="stylesheet" href="/static/css/forum.css"/>
+            <script src="/static/js/forum.js" defer></script>
+        </head>
+        <body data-notices="dialog-center toasts-bottom-right">
+            <TopBar {me} {q}/>
+            {is_banned(me) && <div.suspended>You are suspended ({left(me.banned_until)}): you can read, but not post, vote, react or send messages.</div>}
+            <div.page>{children}</div>
+            <footer.foot>
+                <p>Made with <a href="https://quillolang.org">Quillo</a> · Markdown, @mentions, live replies and full-text search</p>
+            </footer>
+        </body>
+    </html>
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view Empty(children) = <div.empty>{children}</div>

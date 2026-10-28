@@ -1,0 +1,15 @@
+// Q-032 Markup the HTML parser cannot keep as written (a <div> in a <p>) is sent as it is, and the component is made again in the browser
+// mode: browser
+// page: /
+// open-when: "remade": 1
+// fixed-when: cannot go inside a <p>
+// From FEEDBACK3.md §1 (found on 896e758). The same family as Q-011: what the server writes is
+// re-parsed by the browser into another tree, and nothing says so. Fixed by `quillo check`
+// refusing the markup, so the program does not start.
+
+component Byline(name: str) {
+    state n = 0
+    <p>By {name} <div class="presence"><button @click={() => { n += 1 }}>{n}</button></div></p>
+}
+
+route GET / = <html><body><Byline name="wanda"/></body></html>

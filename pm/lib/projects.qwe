@@ -1,0 +1,290 @@
+// Projects and who may do what in them; the board's columns, labels and
+// milestones. Every page of a project follows the topic `project:<id>`,
+// which whatever changes the project publishes (changed_project).
+
+let ROLES = ["owner", "editor", "viewer"]
+let COLUMN_KINDS = ["todo", "doing", "done"]
+let COLORS = ["#4f46e5", "#0891b2", "#059669", "#d97706", "#dc2626", "#db2777", "#7c3aed", "#475569"]
+
+let DEFAULT_COLUMNS = [
+    { name: "Backlog", kind: "todo", wip: null },
+    { name: "To do", kind: "todo", wip: null },
+    { name: "In progress", kind: "doing", wip: 4 },
+    { name: "Review", kind: "doing", wip: 2 },
+    { name: "Done", kind: "done", wip: null },
+]
+
+let DEFAULT_LABELS = [
+    { name: "bug", color: "#dc2626" },
+    { name: "feature", color: "#4f46e5" },
+    { name: "design", color: "#db2777" },
+    { name: "chore", color: "#64748b" },
+]
+
+fn changed_project(project_id: int) = publish(`project:${project_id}`)
+
+fn project_by_key(key: str) with db =
+    db.one("select id, key, name, about, color, archived, created from projects where key = ?", key)
+
+fn role_in(project_id: int, user_id: int) with db =
+    db.one("select role from members where project_id = ? and user_id = ?", project_id, user_id).role
+
+fn can_edit(role) -> bool = role == "owner" || role == "editor"
+
+// For server fns: the person acting and their role in the project, or an
+// error the page shows. `need` is "read", "edit" or "own".
+fn member_of(project_id: int, need: str) ! str with db, time {
+    let u = acting()?
+    let role = unwatched(() => role_in(project_id, u.id)) ?? err("You are not in this project")?
+    if need == "edit" && !can_edit(role) { return err("Viewers cannot change the project") }
+    if need == "own" && role != "owner" { return err("Only the project's owners can do that") }
+    { user: u, role }
+}
+
+fn log_activity(project_id: int, task_id: int?, user_id: int, text: str) with db, time =
+    db.exec("insert into activity (project_id, task_id, user_id, at, text) values (?, ?, ?, ?, ?)",
+        project_id, task_id, user_id, now(), text)
+
+// The projects someone is in, with how far along each is.
+fn my_projects(user_id: int) with db = db.query(sql`
+    select p.id, p.key, p.name, p.about, p.color, m.role,
+           (select count(*) from tasks t where t.project_id = p.id) as tasks,
+           (select count(*) from tasks t join columns c on c.id = t.column_id
+             where t.project_id = p.id and c.kind = 'done') as done,
+           (select count(*) from members x where x.project_id = p.id) as people
+    from projects p join members m on m.project_id = p.id and m.user_id = ?
+    where p.archived = 0
+    order by p.name collate nocase`, user_id)
+
+fn valid_key(key: str) -> bool = re.test(key, "^[A-Z][A-Z0-9]{1,5}$")
+
+type NewProject = { name: str, key: str, about: str = "", color: str = "#4f46e5" }
+
+fn create_project(u, p: NewProject) ! str with db, time {
+    let name = trim(p.name)
+    let key = upper(trim(p.key))
+    if len(name) < 2 || len(name) > 60 { return err("A project's name is 2 to 60 characters") }
+    if !valid_key(key) { return err("A key is 2 to 6 capital letters or digits, starting with a letter: WEB, APP2") }
+    if project_by_key(key) != null { return err(`The key ${key} is taken`) }
+    let color = contains(COLORS, p.color) ? p.color : COLORS[0]
+    db.transaction(() => {
+        let id = db.exec("insert into projects (key, name, about, color, created) values (?, ?, ?, ?, ?)",
+            key, name, trim(p.about), color, now())?.last_id
+        db.exec("insert into members (project_id, user_id, role) values (?, ?, 'owner')", id, u.id)?
+        for [i, c] in enumerate(DEFAULT_COLUMNS) {
+            db.exec("insert into columns (project_id, name, kind, position, wip) values (?, ?, ?, ?, ?)",
+                id, c.name, c.kind, i, c.wip)?
+        }
+        for l in DEFAULT_LABELS {
+            db.exec("insert into labels (project_id, name, color) values (?, ?, ?)", id, l.name, l.color)?
+        }
+        log_activity(id, null, u.id, "created the project")
+        key
+    })
+}
+
+// ---- what a project's pages show -----------------------------------------
+
+fn columns_of(project_id: int) with db =
+    db.query("select id, name, kind, position, wip from columns where project_id = ? order by position, id", project_id)
+
+fn labels_of(project_id: int) with db =
+    db.query("select id, name, color from labels where project_id = ? order by name", project_id)
+
+fn milestones_of(project_id: int) with db =
+    db.query("select id, name, start_day, due_day from milestones where project_id = ? order by due_day, id", project_id)
+
+fn members_of(project_id: int) with db = db.query(sql`
+    select u.id, u.name, u.hue, m.role from members m join users u on u.id = m.user_id
+    where m.project_id = ? order by u.name collate nocase`, project_id)
+
+// The settings page: everything an owner changes.
+server fn load_settings(project_id: int) with db, time {
+    let who = member_of(project_id, "read")?
+    watch(`project:${project_id}`)
+    unwatched(() => ({
+        role: who.role,
+        me: who.user.id,
+        columns: columns_of(project_id),
+        labels: labels_of(project_id),
+        milestones: milestones_of(project_id),
+        members: members_of(project_id),
+        counts: db.query("select column_id, count(*) as n from tasks where project_id = ? group by column_id", project_id),
+    }))
+}
+
+// ---- members -------------------------------------------------------------
+
+server fn add_member(project_id: int, name: str, role: str) ! str with db, time {
+    let who = member_of(project_id, "own")?
+    if !contains(ROLES, role) { return err("No such role") }
+    let u = db.one("select id, name from users where name = ?", trim(name)) ?? err(`Nobody here goes by ${trim(name)}`)?
+    if role_in(project_id, u.id) != null { return err(`${u.name} is already in the project`) }
+    db.exec("insert into members (project_id, user_id, role) values (?, ?, ?)", project_id, u.id, role)?
+    log_activity(project_id, null, who.user.id, `added ${u.name} as ${role}`)
+    changed_project(project_id)
+    true
+}
+
+// A project always keeps an owner: the last one can neither leave nor be
+// made an editor.
+fn owners_left(project_id: int, without: int) with db =
+    db.one("select count(*) as n from members where project_id = ? and role = 'owner' and user_id != ?", project_id, without).n
+
+server fn set_member_role(project_id: int, user_id: int, role: str) ! str with db, time {
+    let who = member_of(project_id, "own")?
+    if !contains(ROLES, role) { return err("No such role") }
+    if role != "owner" && owners_left(project_id, user_id) == 0 { return err("A project needs at least one owner") }
+    let r = db.exec("update members set role = ? where project_id = ? and user_id = ?", role, project_id, user_id)?
+    if r.changes == 0 { return err("They are not in this project") }
+    log_activity(project_id, null, who.user.id, `made someone ${role}`)
+    changed_project(project_id)
+    true
+}
+
+server fn remove_member(project_id: int, user_id: int) ! str with db, time {
+    let who = member_of(project_id, user_id == (me().id ?? 0) ? "read" : "own")?
+    if owners_left(project_id, user_id) == 0 { return err("A project needs at least one owner: make someone else owner first") }
+    db.transaction(() => {
+        db.exec("update tasks set assignee_id = null where project_id = ? and assignee_id = ?", project_id, user_id)?
+        db.exec("delete from members where project_id = ? and user_id = ?", project_id, user_id)?
+    })?
+    log_activity(project_id, null, who.user.id, user_id == who.user.id ? "left the project" : "removed someone")
+    changed_project(project_id)
+    true
+}
+
+// ---- columns -------------------------------------------------------------
+
+fn column_in(project_id: int, column_id: int) with db =
+    db.one("select id, name, kind, wip from columns where id = ? and project_id = ?", column_id, project_id)
+
+type ColumnEdit = { name: str, kind: "todo" | "doing" | "done", wip: int? }
+
+fn check_column(c: ColumnEdit) ! str {
+    if len(trim(c.name)) == 0 || len(c.name) > 30 { return err("A column's name is 1 to 30 characters") }
+    if c.wip != null && (c.wip < 1 || c.wip > 99) { return err("A WIP limit is 1 to 99, or none") }
+    true
+}
+
+server fn add_column(project_id: int, c: ColumnEdit) ! str with db, time {
+    let who = member_of(project_id, "own")?
+    check_column(c)?
+    let pos = db.one("select coalesce(max(position), -1) + 1 as n from columns where project_id = ?", project_id).n
+    db.exec("insert into columns (project_id, name, kind, position, wip) values (?, ?, ?, ?, ?)",
+        project_id, trim(c.name), c.kind, pos, c.wip)?
+    log_activity(project_id, null, who.user.id, `added the column ${trim(c.name)}`)
+    changed_project(project_id)
+    true
+}
+
+// The board needs a column of each kind for the reports to mean anything:
+// at least one todo and one done.
+fn kinds_left(project_id: int, without: int, kind: str) with db =
+    db.one("select count(*) as n from columns where project_id = ? and id != ? and kind = ?", project_id, without, kind).n
+
+server fn edit_column(project_id: int, column_id: int, c: ColumnEdit) ! str with db, time {
+    let who = member_of(project_id, "own")?
+    check_column(c)?
+    let old = column_in(project_id, column_id) ?? err("No such column")?
+    if old.kind != c.kind && old.kind != "doing" && kinds_left(project_id, column_id, old.kind) == 0 {
+        return err(`The board needs at least one ${old.kind} column`)
+    }
+    db.transaction(() => {
+        db.exec("update columns set name = ?, kind = ?, wip = ? where id = ?", trim(c.name), c.kind, c.wip, column_id)?
+        // Cards already in it now count as done (or not) from this moment.
+        if old.kind != c.kind && c.kind == "done" {
+            db.exec("update tasks set done_at = ? where column_id = ?", now(), column_id)?
+        }
+        if old.kind == "done" && c.kind != "done" {
+            db.exec("update tasks set done_at = null where column_id = ?", column_id)?
+        }
+    })?
+    log_activity(project_id, null, who.user.id, `changed the column ${trim(c.name)}`)
+    changed_project(project_id)
+    true
+}
+
+server fn delete_column(project_id: int, column_id: int) ! str with db, time {
+    let who = member_of(project_id, "own")?
+    let old = column_in(project_id, column_id) ?? err("No such column")?
+    if db.one("select count(*) as n from tasks where column_id = ?", column_id).n > 0 {
+        return err("Move its cards out first")
+    }
+    if old.kind != "doing" && kinds_left(project_id, column_id, old.kind) == 0 {
+        return err(`The board needs at least one ${old.kind} column`)
+    }
+    // Its history stays in `moves` (the reports' cumulative flow), so keep
+    // the row if any task ever passed through it.
+    if db.one("select 1 from moves where column_id = ? limit 1", column_id) != null {
+        return err("Cards have passed through this column, and the reports still count them: rename it instead")
+    }
+    db.exec("delete from columns where id = ?", column_id)?
+    log_activity(project_id, null, who.user.id, `deleted the column ${old.name}`)
+    changed_project(project_id)
+    true
+}
+
+// Moves a column one place left (-1) or right (1).
+server fn shift_column(project_id: int, column_id: int, by: int) ! str with db, time {
+    member_of(project_id, "own")?
+    let ids = columns_of(project_id) | map((c) => c.id)
+    let at = index_of(ids, column_id) ?? err("No such column")?
+    let to = at + (by < 0 ? -1 : 1)
+    if to < 0 || to >= len(ids) { return true }
+    let order = for [i, id] in enumerate(ids) => i == at ? ids[to] : i == to ? column_id : id
+    db.transaction(() => {
+        for [i, id] in enumerate(order) { db.exec("update columns set position = ? where id = ?", i, id)? }
+    })?
+    changed_project(project_id)
+    true
+}
+
+// ---- labels and milestones -----------------------------------------------
+
+server fn add_label(project_id: int, name: str, color: str) ! str with db, time {
+    member_of(project_id, "edit")?
+    let n = lower(trim(name))
+    if !re.test(n, "^[a-z0-9][a-z0-9 -]{0,19}$") { return err("A label is 1 to 20 small letters, digits, spaces or -") }
+    if !re.test(color, "^#[0-9a-fA-F]{6}$") { return err("A colour is written #rrggbb") }
+    if db.one("select 1 from labels where project_id = ? and name = ?", project_id, n) != null { return err(`There is already a label ${n}`) }
+    db.exec("insert into labels (project_id, name, color) values (?, ?, ?)", project_id, n, color)?
+    changed_project(project_id)
+    true
+}
+
+server fn delete_label(project_id: int, label_id: int) ! str with db, time {
+    member_of(project_id, "edit")?
+    db.exec("delete from labels where id = ? and project_id = ?", label_id, project_id)?
+    changed_project(project_id)
+    true
+}
+
+type MilestoneEdit = { name: str, start_day: str, due_day: str }
+
+server fn save_milestone(project_id: int, milestone_id: int?, m: MilestoneEdit) ! str with db, time {
+    let who = member_of(project_id, "edit")?
+    let name = trim(m.name)
+    if len(name) == 0 || len(name) > 60 { return err("A milestone's name is 1 to 60 characters") }
+    let a = parse_day(m.start_day)?
+    let b = parse_day(m.due_day)?
+    if b < a { return err("A milestone ends on or after the day it starts") }
+    if b - a > 366 { return err("A milestone is at most a year long") }
+    if milestone_id == null {
+        db.exec("insert into milestones (project_id, name, start_day, due_day) values (?, ?, ?, ?)",
+            project_id, name, day_text(a), day_text(b))?
+        log_activity(project_id, null, who.user.id, `added the milestone ${name}`)
+    } else {
+        db.exec("update milestones set name = ?, start_day = ?, due_day = ? where id = ? and project_id = ?",
+            name, day_text(a), day_text(b), milestone_id, project_id)?
+    }
+    changed_project(project_id)
+    true
+}
+
+server fn delete_milestone(project_id: int, milestone_id: int) ! str with db, time {
+    member_of(project_id, "edit")?
+    db.exec("delete from milestones where id = ? and project_id = ?", milestone_id, project_id)?
+    changed_project(project_id)
+    true
+}

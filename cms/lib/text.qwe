@@ -1,0 +1,61 @@
+// Small pure helpers, on the server and in the browser: times, names, slugs,
+// and the calendar days a date field holds (Quillo has no date module).
+
+let MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let DAY_MS = 86_400_000
+
+fn ago(t: int, now_ms: int) -> str {
+    let s = floor((now_ms - t) / 1000)
+    if s < 45 { return "just now" }
+    if s < 3600 { return `${max([floor(s / 60), 1])}m ago` }
+    if s < 86400 { return `${floor(s / 3600)}h ago` }
+    `${floor(s / 86400)}d ago`
+}
+
+fn plural(n: int, word: str) -> str = n == 1 ? `1 ${word}` : `${n} ${word}s`
+
+// "Hello, World!" is "hello-world".
+fn slugify(text: str) -> str {
+    let s = re.replace(lower(trim(text)), "[^a-z0-9]+", "-")
+    let t = re.replace(s, "^-+|-+$", "")
+    len(t) > 60 ? slice(t, 0, 60) : t
+}
+
+fn pad2(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+fn is_leap(y: int) -> bool = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+
+fn days_in_month(y: int, m: int) -> int =
+    m == 2 ? (is_leap(y) ? 29 : 28) : (m == 4 || m == 6 || m == 9 || m == 11 ? 30 : 31)
+
+// "2026-10-28" back as it is if it is a real day, else an error value.
+fn check_day(text) -> str ! str {
+    let m = re.find(trim(str(text ?? "")), "^(\\d{4})-(\\d{2})-(\\d{2})$") ?? err(`Not a day: ${text}`)?
+    let y = int(m.groups[0])
+    let mo = int(m.groups[1])
+    let d = int(m.groups[2])
+    if mo < 1 || mo > 12 || d < 1 || d > days_in_month(y, mo) { return err(`No such day: ${text}`) }
+    m.text
+}
+
+// "Oct 28, 2026".
+fn day_label(text) -> str {
+    let m = re.find(str(text ?? ""), "^(\\d{4})-(\\d{2})-(\\d{2})$")
+    m == null ? "" : `${MONTHS[int(m.groups[1]) - 1]} ${int(m.groups[2])}, ${m.groups[0]}`
+}
+
+// The UTC day of a moment, as text.
+fn day_of_ms(ms: int) -> str {
+    let n = floor(ms / DAY_MS) + 719468
+    let era = floor(n / 146097)
+    let doe = n - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    `${yoe + era * 400 + (m <= 2 ? 1 : 0)}-${pad2(m)}-${pad2(d)}`
+}
+
+// JSON text from the database as a value, or `fallback` if it is not JSON.
+fn from_json(text, fallback) = text == null ? fallback : json.parse(text) ?? fallback

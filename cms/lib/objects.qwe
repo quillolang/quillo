@@ -1,0 +1,408 @@
+// Objects: tables a designer makes, with fields, a state machine (a flow
+// of kind "object"), forms and lists. Each object's records live in a real
+// table, obj_<id>, with a column f_<field id> per field, made and altered
+// here at run time.
+//
+// A record's state changes in one place only: run_transaction, which a
+// transaction form calls. It runs one of the flow's transitions, for the
+// transition's role, from the state the record is in, and logs it.
+// There is no other way to write `state`: no edit form, no update route.
+//
+// Pages showing an object's records follow `object:<id>`.
+
+let FIELD_TYPES = ["text", "longtext", "number", "money", "date", "choice", "yesno", "user"]
+let FIELD_LABELS = { text: "Text", longtext: "Long text", number: "Number", money: "Money", date: "Date", choice: "Choice", yesno: "Yes / no", user: "Person" }
+
+// money is decimal_text: SQLite keeps the digits as written, Quillo reads decimals.
+fn column_type(type: str) -> str = match type {
+    "number" => "real"
+    "money" => "decimal_text"
+    "yesno" | "user" => "integer"
+    _ => "text"
+}
+
+fn table_of(object_id: int) -> str = sql_name(`obj_${object_id}`)
+
+fn col_of(field_id: int) -> str = `f_${field_id}`
+
+fn object_changed(object_id: int) {
+    publish(`object:${object_id}`)
+    publish("objects")
+}
+
+fn object_row(object_id: int) with db = unwatched(() => db.one("select id, name, flow_id from objects where id = ?", object_id))
+
+fn fields_of(object_id: int) with db =
+    db.query("select id, name, type, required, options, position from fields where object_id = ? order by position, id", object_id)
+        | map((f) => merge(f, { options: from_json(f.options, []) }))
+
+fn forms_of(object_id: int) with db =
+    db.query("select id, name, kind, transition_id, role, fields from forms where object_id = ? order by kind, id", object_id)
+        | map((f) => merge(f, { fields: from_json(f.fields, []) }))
+
+fn lists_of(object_id: int) with db =
+    db.query("select id, name, columns, states, sort_field, sort_desc from lists where object_id = ? order by id", object_id)
+        | map((l) => merge(l, { columns: from_json(l.columns, []), states: from_json(l.states, []) }))
+
+// ---- designing ------------------------------------------------------------------
+
+server fn load_objects() with db, time {
+    acting()?
+    watch("objects")
+    unwatched(() => db.query(sql`
+        select o.id, o.name, f.name as flow, (select count(*) from fields x where x.object_id = o.id) as fields
+        from objects o join flows f on f.id = o.flow_id order by o.name collate nocase`)
+        | map((o) => merge(o, { records: db.one(`select count(*) as n from ${table_of(o.id)}`).n })))
+}
+
+server fn load_object(object_id: int) with db, time {
+    acting()?
+    let o = object_row(object_id) ?? err("No such object")?
+    watch(`object:${object_id}`)
+    watch(`flow:${o.flow_id}`)
+    unwatched(() => ({
+        object: o,
+        fields: fields_of(object_id),
+        forms: forms_of(object_id),
+        lists: lists_of(object_id),
+        steps: steps_of(o.flow_id),
+        transitions: transitions_of(o.flow_id),
+        flows: db.query("select id, name from flows where kind = 'object' order by name"),
+        records: db.one(`select count(*) as n from ${table_of(object_id)}`).n,
+    }))
+}
+
+server fn create_object(name: str, flow_id: int) ! str with db, time {
+    let u = acting(["designer"])?
+    let n = trim(name)
+    if len(n) < 2 || len(n) > 40 { return err("An object's name is 2 to 40 characters") }
+    if db.one("select 1 from objects where name = ?", n) != null { return err(`There is already an object called ${n}`) }
+    if db.one("select 1 from flows where id = ? and kind = 'object'", flow_id) == null { return err("Pick a flow made for objects") }
+    let id = db.transaction(() => {
+        let id = db.exec("insert into objects (name, flow_id, created, created_by) values (?, ?, ?, ?)", n, flow_id, now(), u.id)?.last_id
+        db.exec(`create table ${table_of(id)} (id integer primary key, state integer not null, created integer not null,
+                                              created_by integer not null, updated integer not null)`)?
+        id
+    })?
+    publish("objects")
+    id
+}
+
+type FieldEdit = { name: str, type: str = "text", required: bool = false, options: list<str> = [] }
+
+fn check_field(f: FieldEdit) ! str {
+    let n = trim(f.name)
+    if len(n) == 0 || len(n) > 40 { return err("A field's name is 1 to 40 characters") }
+    if !contains(FIELD_TYPES, f.type) { return err(`No such type: ${f.type}`) }
+    let opts = f.options | map(trim) | filter((o) => o != "") | unique
+    if f.type == "choice" && len(opts) < 2 { return err("A choice needs at least two options") }
+    merge(f, { name: n, options: opts })
+}
+
+server fn add_field(object_id: int, f: FieldEdit) ! str with db, time {
+    acting(["designer"])?
+    object_row(object_id) ?? err("No such object")?
+    let c = check_field(f)?
+    db.transaction(() => {
+        let pos = db.one("select coalesce(max(position), -1) + 1 as n from fields where object_id = ?", object_id).n
+        let id = db.exec("insert into fields (object_id, name, type, required, options, position) values (?, ?, ?, ?, ?, ?)",
+            object_id, c.name, c.type, c.required ? 1 : 0, json.stringify(c.options), pos)?.last_id
+        db.exec(`alter table ${table_of(object_id)} add column ${sql_name(col_of(id))} ${column_type(c.type)}`)?
+    })?
+    object_changed(object_id)
+    true
+}
+
+// A field's name, whether it is required and its options change; its type
+// does not (the records already hold values of it).
+server fn edit_field(field_id: int, f: FieldEdit) ! str with db, time {
+    acting(["designer"])?
+    let old = db.one("select object_id, type from fields where id = ?", field_id) ?? err("That field was deleted")?
+    if f.type != old.type { return err("A field's type cannot change once records may hold it: add a new field instead") }
+    let c = check_field(f)?
+    db.exec("update fields set name = ?, required = ?, options = ? where id = ?", c.name, c.required ? 1 : 0, json.stringify(c.options), field_id)?
+    object_changed(old.object_id)
+    true
+}
+
+server fn delete_field(field_id: int) ! str with db, time {
+    acting(["designer"])?
+    let f = db.one("select object_id from fields where id = ?", field_id) ?? err("That field was already deleted")?
+    db.transaction(() => {
+        for form in forms_of(f.object_id) {
+            db.exec("update forms set fields = ? where id = ?", json.stringify(form.fields | filter((x) => x != field_id)), form.id)?
+        }
+        for l in lists_of(f.object_id) {
+            db.exec("update lists set columns = ?, sort_field = case when sort_field = ? then null else sort_field end where id = ?",
+                json.stringify(l.columns | filter((x) => x != field_id)), field_id, l.id)?
+        }
+        db.exec("delete from fields where id = ?", field_id)?
+        db.exec(`alter table ${table_of(f.object_id)} drop column ${sql_name(col_of(field_id))}`)?
+    })?
+    object_changed(f.object_id)
+    true
+}
+
+type FormEdit = { name: str, kind: "create" | "transaction", transition_id: int?, role: str?, fields: list<int> = [] }
+
+server fn save_form(object_id: int, form_id: int?, f: FormEdit) ! str with db, time {
+    acting(["designer"])?
+    let o = object_row(object_id) ?? err("No such object")?
+    let n = trim(f.name)
+    if len(n) == 0 || len(n) > 40 { return err("A form's name is 1 to 40 characters") }
+    let ids = fields_of(object_id) | map((x) => x.id)
+    if !all(f.fields, (x) => contains(ids, x)) { return err("A field on the form is not this object's") }
+    if f.kind == "transaction" {
+        if f.transition_id == null || db.one("select 1 from transitions where id = ? and flow_id = ?", f.transition_id, o.flow_id) == null {
+            return err("A transaction form runs one of the object's transitions: pick one")
+        }
+    }
+    if f.role != null && !contains(ROLES, f.role) { return err(`No such role: ${f.role}`) }
+    let tid = f.kind == "transaction" ? f.transition_id : null
+    if form_id == null {
+        db.exec("insert into forms (object_id, name, kind, transition_id, role, fields, created) values (?, ?, ?, ?, ?, ?, ?)",
+            object_id, n, f.kind, tid, f.role, json.stringify(f.fields), now())?
+    } else {
+        db.exec("update forms set name = ?, kind = ?, transition_id = ?, role = ?, fields = ? where id = ? and object_id = ?",
+            n, f.kind, tid, f.role, json.stringify(f.fields), form_id, object_id)?
+    }
+    object_changed(object_id)
+    true
+}
+
+server fn delete_form(form_id: int) ! str with db, time {
+    acting(["designer"])?
+    let f = db.one("select object_id from forms where id = ?", form_id) ?? err("That form was already deleted")?
+    db.exec("delete from forms where id = ?", form_id)?
+    object_changed(f.object_id)
+    true
+}
+
+type ListEdit = { name: str, columns: list<int> = [], states: list<int> = [], sort_field: int?, sort_desc: bool = true }
+
+server fn save_list(object_id: int, list_id: int?, l: ListEdit) ! str with db, time {
+    acting(["designer"])?
+    let o = object_row(object_id) ?? err("No such object")?
+    let n = trim(l.name)
+    if len(n) == 0 || len(n) > 40 { return err("A list's name is 1 to 40 characters") }
+    let ids = fields_of(object_id) | map((x) => x.id)
+    if !all(l.columns, (x) => contains(ids, x)) || (l.sort_field != null && !contains(ids, l.sort_field)) {
+        return err("A column is not this object's")
+    }
+    let steps = steps_of(o.flow_id) | map((s) => s.id)
+    if !all(l.states, (x) => contains(steps, x)) { return err("A state is not in the object's flow") }
+    if list_id == null {
+        db.exec("insert into lists (object_id, name, columns, states, sort_field, sort_desc) values (?, ?, ?, ?, ?, ?)",
+            object_id, n, json.stringify(l.columns), json.stringify(l.states), l.sort_field, l.sort_desc ? 1 : 0)?
+    } else {
+        db.exec("update lists set name = ?, columns = ?, states = ?, sort_field = ?, sort_desc = ? where id = ? and object_id = ?",
+            n, json.stringify(l.columns), json.stringify(l.states), l.sort_field, l.sort_desc ? 1 : 0, list_id, object_id)?
+    }
+    object_changed(object_id)
+    true
+}
+
+server fn delete_list(list_id: int) ! str with db, time {
+    acting(["designer"])?
+    let l = db.one("select object_id from lists where id = ?", list_id) ?? err("That list was already deleted")?
+    db.exec("delete from lists where id = ?", list_id)?
+    object_changed(l.object_id)
+    true
+}
+
+// ---- records --------------------------------------------------------------------
+
+// A value from a form, checked and made what its column holds; null for none.
+fn clean_value(f, raw) ! str {
+    let blank = raw == null || (type_of(raw) == "str" && trim(raw) == "")
+    if blank {
+        if f.required == 1 && f.type != "yesno" { return err(`${f.name} is required`) }
+        return f.type == "yesno" ? 0 : null
+    }
+    let s = trim(str(raw))
+    match f.type {
+        "text" => len(s) > 500 ? err(`${f.name}: at most 500 characters`) : s
+        "longtext" => len(s) > MAX_TEXT ? err(`${f.name}: at most ${MAX_TEXT} characters`) : s
+        "number" => float(s) ?? err(`${f.name}: not a number`)
+        "money" => {
+            let d = dec(s) ?? err(`${f.name}: not an amount`)?
+            str(round(d, 2))
+        }
+        "date" => check_day(s) ?? err(`${f.name}: not a day (YYYY-MM-DD)`)
+        "choice" => contains(f.options, s) ? s : err(`${f.name}: not one of the choices`)
+        "yesno" => s == "true" || s == "1" || s == "yes" ? 1 : 0
+        "user" => {
+            let id = int(s) ?? 0
+            db.one("select 1 from users where id = ?", id) == null ? err(`${f.name}: no such person`) : id
+        }
+        _ => err(`${f.name}: unknown type`)
+    }
+}
+
+// The values of the form's fields, as a map of column to value; or the
+// first problem.
+fn values_for(form, fields: list, input: map) ! str {
+    reduce(form.fields, {}, (acc, fid) => {
+        if is_err(acc) { return acc }
+        let f = find(fields, (x) => x.id == fid)
+        if f == null { return acc }
+        let v = clean_value(f, input[str(fid)])
+        is_err(v) ? v : set(acc, col_of(fid), v)
+    })
+}
+
+fn form_row(form_id: int) with db = unwatched(() => {
+    let f = db.one("select id, object_id, name, kind, transition_id, role, fields from forms where id = ?", form_id)
+    f == null ? null : merge(f, { fields: from_json(f.fields, []) })
+})
+
+fn log_record(object_id: int, record_id: int, form_id: int, from_step, to_step: int, user_id: int, data: map) with db, time =
+    db.exec("insert into record_log (object_id, record_id, form_id, from_step, to_step, user_id, at, data) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        object_id, record_id, form_id, from_step, to_step, user_id, now(), json.stringify(data))
+
+// A new record from a create form, at the first step of the object's flow.
+server fn submit_create(form_id: int, input: map) ! str with db, time {
+    let form = form_row(form_id) ?? err("This form was deleted")?
+    if form.kind != "create" { return err("This form does not make records") }
+    let u = acting(form.role == null ? [] : [form.role])?
+    let o = object_row(form.object_id)
+    let values = values_for(form, fields_of(o.id), input)?
+    let start = first_step(o.flow_id)
+    let row = merge(values, { state: start.id, created: now(), created_by: u.id, updated: now() })
+    let cols = keys(row)
+    let id = db.transaction(() => {
+        let id = db.exec(`insert into ${table_of(o.id)} (${sql_name(cols)}) values (${sql_param(cols)})`, row)?.last_id
+        log_record(o.id, id, form.id, null, start.id, u.id, values)?
+        id
+    })?
+    object_changed(o.id)
+    id
+}
+
+// The one way a record's state changes: a transaction form, for the
+// transition's role, from the state the record is in now.
+server fn run_transaction(form_id: int, record_id: int, input: map) ! str with db, time {
+    let form = form_row(form_id) ?? err("This form was deleted")?
+    if form.kind != "transaction" { return err("This form does not run a transaction") }
+    let o = object_row(form.object_id)
+    let t = unwatched(() => db.one("select id, from_step, to_step, name, role from transitions where id = ?", form.transition_id))
+        ?? err("This form's transition was deleted")?
+    let u = acting([t.role])?
+    let rec = db.one(`select id, state from ${table_of(o.id)} where id = ?`, record_id) ?? err(`No record #${record_id}`)?
+    if rec.state != t.from_step { return err(`#${record_id} is not at ${step_row(t.from_step).name} any more`) }
+    let values = values_for(form, fields_of(o.id), input)?
+    let row = merge(values, { state: t.to_step, updated: now(), id: record_id, from: t.from_step })
+    let cols = keys(values) + ["state", "updated"]
+    db.transaction(() => {
+        // `state = :from` again: if someone else moved it since we looked, nothing changes.
+        let r = db.exec(`update ${table_of(o.id)} set (${sql_name(cols)}) = (${sql_param(cols)}) where id = :id and state = :from`, row)?
+        if r.changes == 0 { return err(`#${record_id} was moved by someone else meanwhile`) }
+        log_record(o.id, record_id, form.id, t.from_step, t.to_step, u.id, values)?
+    })?
+    object_changed(o.id)
+    step_row(t.to_step).name
+}
+
+// What a value looks like in a list.
+fn shown_value(f, v, people: map) -> str = v == null ? "" : match f.type {
+    "yesno" => v == 1 ? "Yes" : "No"
+    "money" => str(v)
+    "date" => day_label(v)
+    "user" => people[str(v)] ?? `#${v}`
+    "number" => str(v)
+    _ => str(v)
+}
+
+fn people_names() with db = reduce(db.query("select id, name from users"), {}, (m, p) => set(m, str(p.id), p.name))
+
+// A list's rows: the columns it shows, of the records in its states.
+fn list_rows(list_id: int) with db {
+    let l = db.one("select id, object_id, name, columns, states, sort_field, sort_desc from lists where id = ?", list_id)
+    if l == null { return null }
+    let o = object_row(l.object_id)
+    let fields = fields_of(o.id)
+    let cols = from_json(l.columns, []) | map((id) => find(fields, (f) => f.id == id)) | filter((f) => f != null)
+    let states = from_json(l.states, [])
+    let steps = steps_of(o.flow_id)
+    let sort_col = l.sort_field != null && any(fields, (f) => f.id == l.sort_field) ? sql_name(col_of(l.sort_field)) : "id"
+    let order = l.sort_desc == 1 ? "desc" : "asc"
+    let rows = db.query(`select * from ${table_of(o.id)} where (:any or state in (select value from json_each(:states)))
+                         order by ${sort_col} ${order}, id desc limit 500`, { any: len(states) == 0, states: json.stringify(states) })
+    let people = people_names()
+    {
+        list: { id: l.id, name: l.name },
+        object: o,
+        columns: cols | map((f) => ({ id: f.id, name: f.name, type: f.type })),
+        rows: rows | map((r) => {
+            let s = find(steps, (x) => x.id == r.state)
+            { id: r.id, state: s.name ?? "?", color: s.color ?? "#64748b", updated: r.updated,
+              cells: cols | map((f) => shown_value(f, r[col_of(f.id)], people)) }
+        }),
+    }
+}
+
+server fn load_list(list_id: int) with db, time {
+    acting()?
+    let l = unwatched(() => db.one("select object_id from lists where id = ?", list_id)) ?? err("This list was deleted")?
+    watch(`object:${l.object_id}`)
+    unwatched(() => list_rows(list_id))
+}
+
+// A form, as a block shows it: its fields and, for a transaction, the
+// records it can run on now.
+server fn load_form(form_id: int) with db, time {
+    let u = acting()?
+    let form = form_row(form_id) ?? err("This form was deleted")?
+    watch(`object:${form.object_id}`)
+    unwatched(() => {
+        let o = object_row(form.object_id)
+        let fields = fields_of(o.id)
+        let t = form.transition_id == null ? null : db.one("select id, from_step, to_step, name, role from transitions where id = ?", form.transition_id)
+        let role = t != null ? t.role : form.role
+        let first_text = find(fields, (f) => f.type == "text")
+        {
+            form: { id: form.id, name: form.name, kind: form.kind },
+            object: o,
+            fields: form.fields | map((id) => find(fields, (f) => f.id == id)) | filter((f) => f != null),
+            transition: t == null ? null : merge(t, { from: step_row(t.from_step).name, to: step_row(t.to_step).name }),
+            allowed: role == null || has_role(u, role),
+            role,
+            people: db.query("select id, name from users order by name"),
+            candidates: t == null ? [] : db.query(`select id, ${first_text == null ? "''" : sql_name(col_of(first_text.id))} as label
+                                                   from ${table_of(o.id)} where state = ? order by id desc limit 200`, t.from_step),
+        }
+    })
+}
+
+// A record and everything that happened to it, for the designer.
+server fn load_record(object_id: int, record_id: int) with db, time {
+    acting()?
+    watch(`object:${object_id}`)
+    unwatched(() => {
+        let o = object_row(object_id) ?? err("No such object")?
+        let r = db.one(`select * from ${table_of(object_id)} where id = ?`, record_id) ?? err(`No record #${record_id}`)?
+        let fields = fields_of(object_id)
+        let people = people_names()
+        let steps = steps_of(o.flow_id)
+        let step_name = (id) => (find(steps, (s) => s.id == id) ?? {}).name ?? "–"
+        {
+            id: r.id,
+            state: step_name(r.state),
+            values: fields | map((f) => ({ name: f.name, value: shown_value(f, r[col_of(f.id)], people) })),
+            log: db.query(sql`select l.at, l.from_step, l.to_step, l.data, f.name as form, u.name
+                              from record_log l join users u on u.id = l.user_id left join forms f on f.id = l.form_id
+                              where l.object_id = ? and l.record_id = ? order by l.id`, object_id, record_id)
+                | map((x) => merge(x, { from: x.from_step == null ? "–" : step_name(x.from_step), to: step_name(x.to_step) })),
+        }
+    })
+}
+
+// The lists and forms a data block can show.
+server fn load_catalog() with db, time {
+    acting()?
+    watch("objects")
+    unwatched(() => ({
+        lists: db.query("select l.id, l.name, o.name as object from lists l join objects o on o.id = l.object_id order by o.name, l.name"),
+        forms: db.query("select f.id, f.name, f.kind, o.name as object from forms f join objects o on o.id = f.object_id order by o.name, f.name"),
+    }))
+}

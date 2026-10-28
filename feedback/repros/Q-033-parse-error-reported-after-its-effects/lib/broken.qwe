@@ -1,0 +1,4 @@
+component Room() {
+    state reply = ""
+    <p>{reply}</p>
+}

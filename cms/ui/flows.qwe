@@ -1,0 +1,207 @@
+// The flow designer: a flow's steps as cards (dragged to reorder), the
+// transitions between them, and a diagram drawn from both. Used for
+// article flows and for objects' state machines alike.
+
+let KIND_LABELS = { move: "moves", approve: "approves", reject: "sends back" }
+
+// The flow as boxes in a row, with an arc for each transition: forward ones
+// above, ones that go back below.
+view FlowDiagram(steps: list, transitions: list) {
+    let bw = 132
+    let gap = 48
+    let top = 96
+    let bh = 54
+    let ids = steps | map((s) => s.id)
+    let x = (i) => 16 + i * (bw + gap)
+    let width = max([x(len(steps)) - gap + 16, 300])
+    let height = top + bh + 96
+    // Transitions between the same two steps are spread apart.
+    let arcs = for [k, t] in enumerate(transitions) => {
+        let fi = index_of(ids, t.from_step) ?? 0
+        let ti = index_of(ids, t.to_step) ?? 0
+        let fwd = ti > fi
+        let same = count(take(transitions, k), (o) => o.from_step == t.from_step && o.to_step == t.to_step)
+        let span = abs(ti - fi)
+        let x1 = x(fi) + bw / 2 + (fwd ? 18 : -18)
+        let x2 = x(ti) + bw / 2 + (fwd ? -18 : 18)
+        let y = fwd ? top : top + bh
+        let lift = 26 + span * 14 + same * 18
+        let cy = fwd ? y - lift : y + lift
+        // A forward arc's label sits at its top; one going back is labelled where
+        // it leaves, so labels of arcs from different steps never sit together.
+        { t, d: `M${x1},${y} C${x1},${cy} ${x2},${cy} ${x2},${y}`,
+          lx: fwd ? (x1 + x2) / 2 : x1 - 6, ly: fwd ? cy + lift * 0.25 - 4 : y + lift * 0.5 + 4 + same * 14, anchor: fwd ? "middle" : "end" }
+    }
+    <svg.flow-diagram viewBox={`0 0 ${width} ${height}`} width={width} height={height} role="img"
+         aria-label={`Flow: ${join(steps | map((s) => s.name), " → ")}`}>
+        <defs>
+            {for k in ["move", "approve", "reject"] => <marker key={k} id={`fa-${k}`} viewBox="0 0 8 8" refX="7" refY="4"
+                markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" class={`ah k-${k}`}/></marker>}
+        </defs>
+        {for a in arcs => <g key={a.t.id} class={`arc k-${a.t.kind}`}>
+            <path d={a.d} marker-end={`url(#fa-${a.t.kind})`}/>
+            <text x={a.lx} y={a.ly} text-anchor={a.anchor}>{a.t.name}<tspan class="role-t"> · {a.t.role}</tspan></text>
+        </g>}
+        {for [i, s] in enumerate(steps) => <g key={s.id} class="node">
+            <rect x={x(i)} y={top} width={bw} height={bh} rx="10" style={`--c: ${s.color}`}/>
+            <text x={x(i) + bw / 2} y={top + 22} text-anchor="middle" class="n-name">{s.name}</text>
+            <text x={x(i) + bw / 2} y={top + 40} text-anchor="middle" class="n-role">{s.role ?? "end"}{s.approvals > 1 && ` × ${s.approvals}`}</text>
+        </g>}
+    </svg>
+}
+
+component StepCard(flow_id: int, s, kind: str, used: int, first: bool, on_problem, dragging: bool, on_drag, on_over, on_drop, on_end) {
+    state name = s.name
+    let save = (changes) => {
+        let next = merge({ name, role: s.role, approvals: s.approvals, color: s.color }, changes)
+        on_problem(err_text(save_step(flow_id, s.id, next)))
+    }
+    <li class={`step-card ${dragging ? "dragging" : ""}`} draggable="true" style={`--c: ${s.color}`}
+        @dragstart={on_drag} @dragover={on_over} @drop={on_drop} @dragend={on_end}>
+        <div.sc-top><span.grip aria-hidden="true">⠿</span>{first && <span.badge.start>start</span>}<span.grow/>
+            <span.muted title="Articles or records here now">{used}</span></div>
+        <input.sc-name value={name} aria-label="Step name" maxlength="30"
+            @input={(e) => { name = e.value }} @change={() => save({})}/>
+        <label>Who acts here
+            <select @change={(e) => save({ role: e.value == "" ? null : e.value })}>
+                <option value="" selected={s.role == null}>nobody (the end)</option>
+                {for r in ROLES => <option key={r} value={r} selected={s.role == r}>{r}</option>}
+            </select>
+        </label>
+        {kind == "article" && <label>Approvals needed
+            <input type="number" min="1" max="9" value={s.approvals} @change={(e) => save({ approvals: int(e.value) ?? 1 })}/>
+        </label>}
+        <span.swatches>{for c in STEP_COLORS => <button key={c} type="button" class={`swatch ${s.color == c ? "on" : ""}`}
+            style={`--c: ${c}`} aria-label={`Colour ${c}`} aria-pressed={s.color == c} @click={() => save({ color: c })}/>}</span>
+        <button.link.danger @click={() => {
+            if ask(`Delete the step ${s.name}?`, { ok: "Delete", cancel: "Keep it", tone: "danger" }) { on_problem(err_text(delete_step(flow_id, s.id))) }
+        }}>Delete step</button>
+    </li>
+}
+
+// A transition, edited in place; with t null, a new one.
+component TransitionRow(flow_id: int, t, steps: list, kind: str, on_problem) {
+    state from = t.from_step ?? (steps[0].id ?? 0)
+    state to = t.to_step ?? (steps[1].id ?? 0)
+    state name = t.name ?? ""
+    state role = t.role ?? "writer"
+    state how = t.kind ?? "move"
+    state resolved = (t.needs_resolved ?? 0) == 1
+    let dirty = t == null || from != t.from_step || to != t.to_step || name != t.name || role != t.role || how != t.kind || resolved != (t.needs_resolved == 1)
+    let save = () => {
+        let r = save_transition(flow_id, t.id ?? null, { from_step: from, to_step: to, name, role, kind: how, needs_resolved: resolved })
+        on_problem(err_text(r))
+        if !is_err(r) && t == null { name = "" }
+    }
+    let step_select = (value, label, on) => <select aria-label={label} @change={(e) => on(int(e.value) ?? 0)}>
+        {for s in steps => <option key={s.id} value={s.id} selected={s.id == value}>{s.name}</option>}
+    </select>
+    <div class={`tr-row ${t == null ? "new" : ""}`} role="row">
+        {step_select(from, "From", (v) => { from = v })}
+        <span.arrow>→</span>
+        {step_select(to, "To", (v) => { to = v })}
+        <input value={name} placeholder={t == null ? "New transition" : "Name"} aria-label="Name" maxlength="30" @input={(e) => { name = e.value }}/>
+        <select aria-label="Role" @change={(e) => { role = e.value }}>
+            {for r in ROLES => <option key={r} value={r} selected={role == r}>{r}</option>}
+        </select>
+        {kind == "article"
+            ? <select aria-label="Kind" @change={(e) => { how = e.value }}>
+                {for k in TRANSITION_KINDS => <option key={k} value={k} selected={how == k}>{KIND_LABELS[k]}</option>}
+              </select>
+            : <span/>}
+        {kind == "article"
+            ? <label.check title="Not while feedback is open"><input type="checkbox" checked={resolved} @change={(e) => { resolved = e.checked }}/> resolved</label>
+            : <span/>}
+        <span.row-actions>
+            {dirty && <button.btn.small.primary disabled={trim(name) == ""} @click={save}>{t == null ? "Add" : "Save"}</button>}
+            {t != null && <button.icon-btn aria-label="Delete transition" @click={() => on_problem(err_text(delete_transition(flow_id, t.id)))}>✕</button>}
+        </span>
+    </div>
+}
+
+component FlowDesigner(flow_id: int) {
+    state data = live(load_flow, flow_id)
+    state problem = null
+    state dragging = null
+    state over = null
+    let d = data
+    let set_problem = (p) => { problem = p }
+    let drop_on = (target) => {
+        let id = dragging
+        dragging = null
+        over = null
+        if id == null || id == target { return null }
+        let ids = d.steps | map((s) => s.id) | filter((x) => x != id)
+        let at = index_of(ids, target) ?? len(ids)
+        problem = err_text(order_steps(flow_id, take(ids, at) + [id] + drop(ids, at)))
+    }
+    <div.flow-designer>
+        {is_err(d) ? <p.problem>{d.error}</p> : <div>
+            <header.fd-head>
+                <input.title-input value={d.flow.name} aria-label="Flow name" @change={(e) => { problem = err_text(rename_flow(flow_id, e.value)) }}/>
+                <span.muted>{d.flow.kind == "article" ? "for articles" : "a state machine for objects"}</span>
+            </header>
+            <Problem text={problem}/>
+            <section.card-box>
+                <h2>Diagram</h2>
+                <div.diagram-wrap><FlowDiagram steps={d.steps} transitions={d.transitions}/></div>
+                <ul.legend><li><i.sw.k-move/>moves at once</li><li><i.sw.k-approve/>approves (counts approvals)</li><li><i.sw.k-reject/>sends back</li></ul>
+            </section>
+            <section.card-box>
+                <h2>Steps <span.muted>drag to reorder; the first is where things start</span></h2>
+                <ol.step-cards>
+                    {for [i, s] in enumerate(d.steps) => <StepCard key={`${s.id}-${s.name}`} {flow_id} {s} kind={d.flow.kind}
+                        used={count_at(d.usage, s.id)} first={i == 0} on_problem={set_problem}
+                        dragging={dragging == s.id}
+                        on_drag={(e) => { dragging = s.id; e.dataTransfer.setData("text/plain", s.name); e.dataTransfer.effectAllowed = "move" }}
+                        on_over={(e) => { e.preventDefault(); over = s.id }}
+                        on_drop={(e) => { e.preventDefault(); drop_on(s.id) }}
+                        on_end={() => { dragging = null; over = null }}/>}
+                    <li.step-card.add>
+                        <button.btn.ghost @click={() => { problem = err_text(save_step(flow_id, null, { name: "New step", role: "reviewer", approvals: 1, color: STEP_COLORS[1] })) }}>+ Add step</button>
+                    </li>
+                </ol>
+            </section>
+            <section.card-box>
+                <h2>Transitions <span.muted>who may move things from one step to another</span></h2>
+                <div.tr-table role="table">
+                    <div.tr-row.head role="row"><span>From</span><span/><span>To</span><span>Name</span><span>Role</span>
+                        <span>{d.flow.kind == "article" ? "Kind" : ""}</span><span>{d.flow.kind == "article" ? "Needs" : ""}</span><span/></div>
+                    {for t in d.transitions => <TransitionRow key={`${t.id}-${t.from_step}-${t.to_step}-${t.name}-${t.role}-${t.kind}-${t.needs_resolved}`}
+                        {flow_id} {t} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>}
+                    <TransitionRow key={`new-${len(d.transitions)}-${len(d.steps)}`} {flow_id} t={null} steps={d.steps} kind={d.flow.kind} on_problem={set_problem}/>
+                </div>
+            </section>
+        </div>}
+    </div>
+}
+
+component FlowsPage() {
+    state flows = live(load_flows)
+    state name = ""
+    state kind = "article"
+    state problem = null
+    <div>
+        <section.card-box>
+            <h2>Flows</h2>
+            <ul.rows>{for f in flows ?? [] => <li key={f.id}>
+                <a href={`/desk/flows/${f.id}`}><b>{f.name}</b></a>
+                <span.muted>{f.kind == "article" ? "articles" : "objects"} · {plural(f.steps, "step")}</span>
+                <span.grow/>
+                <span.muted>{f.kind == "article" ? plural(f.articles, "article") : plural(f.objects, "object")}</span>
+            </li>}</ul>
+            <form.inline-add @submit={() => {
+                let r = create_flow(name, kind)
+                if is_err(r) { problem = r.error } else { navigate(`/desk/flows/${r}`) }
+            }}>
+                <input placeholder="New flow" value={name} @input={(e) => { name = e.value }}/>
+                <select @change={(e) => { kind = e.value }}>
+                    <option value="article" selected={kind == "article"}>for articles</option>
+                    <option value="object" selected={kind == "object"}>for objects</option>
+                </select>
+                <button.btn.primary.small disabled={trim(name) == ""}>Create</button>
+            </form>
+            <Problem text={problem}/>
+        </section>
+    </div>
+}

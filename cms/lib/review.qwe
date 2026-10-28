@@ -1,0 +1,131 @@
+// Review: feedback threads on an article's blocks, and who has the article
+// open. Reviewers and publishers open threads on a block and close them;
+// the author answers in them. A thread opened on an older version of its
+// block says the block changed since.
+//
+// Threads follow `threads:<id>` (and the article's own topic, for the
+// blocks' versions); presence follows `presence:<id>`, so heartbeats wake
+// nothing else.
+
+let PRESENT_MS = 30_000
+let MAX_POST = 5000
+
+fn threads_changed(article_id: int) {
+    publish(`threads:${article_id}`)
+    publish(`article:${article_id}`)
+    publish("articles")
+}
+
+fn thread_row(thread_id: int) with db = unwatched(() =>
+    db.one("select t.id, t.article_id, t.block_id, t.status, t.user_id from threads t where t.id = ?", thread_id))
+
+fn reviewer(u) -> bool = has_any(u, ["reviewer", "publisher"])
+
+server fn load_threads(article_id: int) with db, time {
+    acting()?
+    watch(`threads:${article_id}`)
+    watch(`article:${article_id}`)
+    unwatched(() => {
+        let threads = db.query(sql`
+            select t.id, t.block_id, t.status, t.created, t.closed_at, t.block_version,
+                   b.version as block_now, b.id is null as block_gone,
+                   u.name, u.hue, cu.name as closed_by
+            from threads t join users u on u.id = t.user_id
+            left join blocks b on b.id = t.block_id
+            left join users cu on cu.id = t.closed_by
+            where t.article_id = ? order by t.status = 'closed', t.created`, article_id)
+        let posts = db.query(sql`
+            select p.id, p.thread_id, p.body, p.created, u.id as user_id, u.name, u.hue
+            from posts p join threads t on t.id = p.thread_id join users u on u.id = p.user_id
+            where t.article_id = ? order by p.id`, article_id)
+        let by_thread = group_by(posts, (p) => p.thread_id)
+        threads | map((t) => merge(t, {
+            outdated: t.block_now != null && t.block_now > t.block_version,
+            posts: (by_thread[str(t.id)] ?? []) | map((p) => merge(p, { html: str(markdown(p.body)) })),
+        }))
+    })
+}
+
+fn check_post(body: str) ! str {
+    let s = trim(body)
+    if s == "" { return err("Write something first") }
+    if len(s) > MAX_POST { return err(`At most ${MAX_POST} characters`) }
+    s
+}
+
+server fn open_thread(article_id: int, block_id: int, body: str) ! str with db, time {
+    let u = acting()?
+    let a = article_row(article_id) ?? err("This article was deleted")?
+    if !reviewer(u) { return err("Reviewers and publishers give feedback; answer in a thread instead") }
+    if is_final(a.step_id, transitions_of(a.flow_id)) { return err("This article is published") }
+    let text = check_post(body)?
+    let b = block_row(block_id)
+    if b == null || b.owner != owner_key("article", article_id) { return err("That block is not in this article") }
+    let id = db.transaction(() => {
+        let id = db.exec("insert into threads (article_id, block_id, user_id, created, block_version) values (?, ?, ?, ?, ?)",
+            article_id, block_id, u.id, now(), b.version)?.last_id
+        db.exec("insert into posts (thread_id, user_id, body, created) values (?, ?, ?, ?)", id, u.id, text, now())?
+        id
+    })?
+    threads_changed(article_id)
+    id
+}
+
+// The author answers; reviewers and publishers too. Not in a closed thread.
+server fn reply_to(thread_id: int, body: str) ! str with db, time {
+    let u = acting()?
+    let t = thread_row(thread_id) ?? err("That thread was deleted")?
+    let a = article_row(t.article_id)
+    if a.author_id != u.id && !reviewer(u) { return err("Only the author and reviewers talk in feedback") }
+    if t.status != "open" { return err("This thread is closed: a reviewer can reopen it") }
+    let text = check_post(body)?
+    db.exec("insert into posts (thread_id, user_id, body, created) values (?, ?, ?, ?)", thread_id, u.id, text, now())?
+    threads_changed(t.article_id)
+    true
+}
+
+// Closing is the reviewers' (and publishers'): the author answers, the
+// reviewer decides it is settled.
+server fn set_thread(thread_id: int, open: bool) ! str with db, time {
+    let u = acting()?
+    let t = thread_row(thread_id) ?? err("That thread was deleted")?
+    if !reviewer(u) { return err("Only reviewers and publishers close or reopen feedback") }
+    if open {
+        db.exec("update threads set status = 'open', closed_by = null, closed_at = null where id = ?", thread_id)?
+    } else {
+        db.exec("update threads set status = 'closed', closed_by = ?, closed_at = ? where id = ?", u.id, now(), thread_id)?
+    }
+    threads_changed(t.article_id)
+    true
+}
+
+// ---- who is here ----------------------------------------------------------------
+
+// A heartbeat from an open article: who, and on which block. Others hear of
+// it when someone arrives, moves to another block, or has gone quiet.
+server fn here(article_id: int, block_id: int?) with db, time {
+    let u = acting()?
+    let before = unwatched(() => db.one("select block_id from presence where article_id = ? and user_id = ? and seen > ?",
+        article_id, u.id, now() - PRESENT_MS))
+    db.exec(sql`insert into presence (article_id, user_id, block_id, seen) values (?, ?, ?, ?)
+                on conflict (article_id, user_id) do update set block_id = excluded.block_id, seen = excluded.seen`,
+        article_id, u.id, block_id, now())
+    let gone = db.exec("delete from presence where article_id = ? and seen < ?", article_id, now() - PRESENT_MS).changes
+    if before == null || before.block_id != block_id || gone > 0 { publish(`presence:${article_id}`) }
+    true
+}
+
+server fn leave(article_id: int) with db, time {
+    let u = acting()?
+    db.exec("delete from presence where article_id = ? and user_id = ?", article_id, u.id)
+    publish(`presence:${article_id}`)
+    true
+}
+
+server fn load_presence(article_id: int) with db, time {
+    acting()?
+    watch(`presence:${article_id}`)
+    unwatched(() => db.query(sql`
+        select p.user_id, p.block_id, u.name, u.hue from presence p join users u on u.id = p.user_id
+        where p.article_id = ? and p.seen > ? order by u.name`, article_id, now() - PRESENT_MS))
+}

@@ -1,0 +1,205 @@
+// The flows every newsroom starts with, and the demo (CMS_DEMO=1): people
+// in every role, articles at every step with feedback on them, and an ad desk
+// built from an object (Ad bookings) and a page of its blocks.
+
+fn add_flow(name: str, kind: str, steps: list, transitions: list) with db, time {
+    let fid = db.exec("insert into flows (name, kind, created) values (?, ?, ?)", name, kind, now()).last_id
+    let ids = for [i, s] in enumerate(steps) =>
+        db.exec("insert into steps (flow_id, name, position, role, approvals, color) values (?, ?, ?, ?, ?, ?)",
+            fid, s[0], i, s[1], s[2], s[3]).last_id
+    for [i, t] in enumerate(transitions) {
+        db.exec(sql`insert into transitions (flow_id, from_step, to_step, name, role, kind, needs_resolved, position)
+                    values (?, ?, ?, ?, ?, ?, ?, ?)`, fid, ids[t[0]], ids[t[1]], t[2], t[3], t[4], t[5] ? 1 : 0, i)
+    }
+    { id: fid, steps: ids }
+}
+
+fn seed_flows() with db, time {
+    if db.one("select count(*) as n from flows").n > 0 { return null }
+    db.transaction(() => {
+        add_flow("News desk", "article",
+            [["Draft", "writer", 1, "#64748b"], ["Review", "reviewer", 2, "#2a78d6"], ["Approval", "publisher", 1, "#eb6834"], ["Published", null, 1, "#1baf7a"]],
+            [[0, 1, "Submit for review", "writer", "move", false],
+             [1, 2, "Approve", "reviewer", "approve", true],
+             [1, 0, "Send back", "reviewer", "reject", false],
+             [2, 3, "Publish", "publisher", "approve", true],
+             [2, 0, "Send back", "publisher", "reject", false],
+             [3, 0, "Unpublish", "publisher", "reject", false]])
+        add_flow("Booking", "object",
+            [["Requested", "publisher", 1, "#64748b"], ["Approved", "designer", 1, "#2a78d6"], ["Invoiced", "designer", 1, "#eda100"],
+             ["Paid", null, 1, "#1baf7a"], ["Declined", null, 1, "#e34948"]],
+            [[0, 1, "Approve", "publisher", "move", false],
+             [0, 4, "Decline", "publisher", "move", false],
+             [1, 2, "Send invoice", "designer", "move", false],
+             [2, 3, "Record payment", "designer", "move", false]])
+    })
+}
+
+fn seed_demo() with db, time, random {
+    if db.one("select count(*) as n from users").n > 0 { return null }
+    print("CMS_DEMO: making people, articles, feedback and an ad desk")
+    let hash = crypto.hash_password("password123")
+    let people = [
+        ["ada", 210, ROLES], ["wanda", 25, ["writer"]], ["walt", 330, ["writer"]], ["rex", 150, ["reviewer"]],
+        ["rita", 280, ["reviewer"]], ["pablo", 45, ["publisher"]], ["dee", 190, ["designer", "writer"]],
+    ]
+    let t0 = now() - 3 * DAY_MS
+    let ids = for p in people => {
+        let id = db.exec("insert into users (name, email, password_hash, hue, created) values (?, ?, ?, ?, ?)",
+            p[0], `${p[0]}@example.com`, hash, p[1], t0).last_id
+        for r in p[2] { db.exec("insert into user_roles (user_id, role) values (?, ?)", id, r) }
+        id
+    }
+    let [ada, wanda, walt, rex, rita, pablo, dee] = ids
+    db.transaction(() => {
+        seed_articles(wanda, walt, rex, rita, pablo, t0)
+        seed_ads(dee, pablo, wanda, t0)
+    })
+}
+
+fn add_article(title: str, author: int, step: str, at: int) with db {
+    let flow = db.one("select id from flows where name = 'News desk'").id
+    let s = db.one("select id from steps where flow_id = ? and name = ?", flow, step).id
+    let final = step == "Published"
+    db.exec(sql`insert into articles (title, slug, flow_id, step_id, author_id, created, updated, published_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?)`, title, slugify(title), flow, s, author, at, at, final ? at : null).last_id
+}
+
+// Blocks for an article or a page: [type, data] each. Gives their ids.
+fn add_blocks(owner: str, blocks: list, by: int, at: int) with db =
+    for [i, b] in enumerate(blocks) =>
+        db.exec("insert into blocks (owner, position, type, data, updated, updated_by) values (?, ?, ?, ?, ?, ?)",
+            owner, i, b[0], json.stringify(b[1]), at, by).last_id
+
+fn add_thread(article: int, block: int, by: int, posts: list, closed_by, at: int) with db {
+    let t = db.exec("insert into threads (article_id, block_id, user_id, created, status, closed_by, closed_at) values (?, ?, ?, ?, ?, ?, ?)",
+        article, block, by, at, closed_by == null ? "open" : "closed", closed_by, closed_by == null ? null : at + 3_600_000).last_id
+    for [i, p] in enumerate(posts) {
+        db.exec("insert into posts (thread_id, user_id, body, created) values (?, ?, ?, ?)", t, p[0], p[1], at + i * 900_000)
+    }
+}
+
+fn log_demo(article: int, user: int, at: int, text: str) with db =
+    db.exec("insert into article_log (article_id, user_id, at, text) values (?, ?, ?, ?)", article, user, at, text)
+
+fn seed_articles(wanda: int, walt: int, rex: int, rita: int, pablo: int, t0: int) with db {
+    let h = 3_600_000
+    // In review: feedback open on one block, closed on another.
+    let tram = add_article("City council approves the new tram line", wanda, "Review", t0)
+    let tb = add_blocks(owner_key("article", tram), [
+        ["text", { md: "The city council voted **31 to 12** on Tuesday night to build a tram line from the station to the university, ending a debate that has run for six years." }],
+        ["heading", { text: "What it will cost", level: 2 }],
+        ["text", { md: "The line is expected to cost 240 million, of which the national government pays half. Construction starts next spring." }],
+        ["quote", { text: "This is the most important decision this council has taken in a generation.", by: "Mayor Ines Okafor" }],
+        ["callout", { tone: "info", md: "Six stops are planned. A map follows when the route is final." }],
+    ], wanda, t0)
+    add_thread(tram, tb[2], rex, [[rex, "Where does **240 million** come from? Please cite the council's budget document."],
+        [wanda, "It's in the appendix of the motion, page 14. Shall I link it?"]], null, t0 + 20 * h)
+    add_thread(tram, tb[3], rita, [[rita, "Check the mayor's title: is it Mayor or Acting Mayor since August?"],
+        [wanda, "Confirmed with her office: Mayor."]], rita, t0 + 22 * h)
+    add_thread(tram, tb[0], rita, [[rita, "Lead is good. Can we say which councillors voted against?"]], null, t0 + 23 * h)
+    log_demo(tram, wanda, t0, "started it")
+    log_demo(tram, wanda, t0 + 18 * h, "submit for review: now at Review")
+
+    // Approved by both reviewers, waiting for the publisher.
+    let fest = add_article("Harbour festival returns this weekend", walt, "Approval", t0 + 2 * h)
+    add_blocks(owner_key("article", fest), [
+        ["text", { md: "After a two-year break, the harbour festival returns on Saturday with boats, music and food stalls along the quay." }],
+        ["image", { url: "/static/img/harbour.svg", caption: "The quay on festival night, 2023" }],
+        ["text", { md: "- Saturday: sailing parade at noon\n- Sunday: fireworks at 22:00" }],
+    ], walt, t0 + 2 * h)
+    let flow = db.one("select id from flows where name = 'News desk'").id
+    let review = db.one("select id from steps where flow_id = ? and name = 'Review'", flow).id
+    for [u, k] in [[rex, 1], [rita, 2]] {
+        db.exec("insert into approvals (article_id, step_id, round, user_id, at) values (?, ?, 1, ?, ?)", fest, review, u, t0 + (30 + k) * h)
+    }
+    log_demo(fest, rex, t0 + 31 * h, "approved at Review (1 of 2)")
+    log_demo(fest, rita, t0 + 32 * h, "approved at Review (2 of 2)")
+
+    // A draft, sent back once.
+    let bakery = add_article("Local bakery wins the national bread prize", wanda, "Draft", t0 + 5 * h)
+    db.exec("update articles set round = 2 where id = ?", bakery)
+    add_blocks(owner_key("article", bakery), [["text", { md: "Bakkerij Noor on Market Street was named the country's best bakery on Monday." }]], wanda, t0 + 5 * h)
+    log_demo(bakery, pablo, t0 + 40 * h, "sent it back to Draft: Needs a quote from the baker, and the prize's name")
+
+    // Published.
+    let storm = add_article("Storm warning for the coast tonight", walt, "Published", t0 + 10 * h)
+    add_blocks(owner_key("article", storm), [
+        ["callout", { tone: "warn", md: "**Code orange** from 18:00 until 06:00 for the whole coast." }],
+        ["text", { md: "Gusts of up to 110 km/h are expected. The ferry to the islands is cancelled tonight; trains run on a reduced timetable." }],
+        ["quote", { text: "Stay indoors if you can, and keep away from the dunes.", by: "The coastguard" }],
+    ], walt, t0 + 10 * h)
+}
+
+fn seed_ads(dee: int, pablo: int, wanda: int, t0: int) with db, time {
+    let flow = db.one("select id from flows where name = 'Booking'").id
+    let steps = steps_of(flow)
+    let step = (name) => find(steps, (s) => s.name == name).id
+    let tr = (name) => db.one("select id from transitions where flow_id = ? and name = ?", flow, name).id
+    let oid = db.exec("insert into objects (name, flow_id, created, created_by) values ('Ad bookings', ?, ?, ?)", flow, t0, dee).last_id
+    let table = sql_name(`obj_${oid}`)
+    db.exec(`create table ${table} (id integer primary key, state integer not null, created integer not null, created_by integer not null, updated integer not null)`)
+    let field = (name, type, required, options) => {
+        let id = db.exec("insert into fields (object_id, name, type, required, options, position) values (?, ?, ?, ?, ?, (select count(*) from fields where object_id = ?))",
+            oid, name, type, required, json.stringify(options), oid).last_id
+        db.exec(`alter table ${table} add column ${sql_name(`f_${id}`)} ${column_type(type)}`)
+        id
+    }
+    let advertiser = field("Advertiser", "text", 1, [])
+    let size = field("Size", "choice", 1, ["Quarter page", "Half page", "Full page"])
+    let run = field("Runs on", "date", 1, [])
+    let price = field("Price", "money", 0, [])
+    let paid = field("Paid on", "date", 0, [])
+    let notes = field("Notes", "longtext", 0, [])
+    let form = (name, kind, transition, role, fs) =>
+        db.exec("insert into forms (object_id, name, kind, transition_id, role, fields, created) values (?, ?, ?, ?, ?, ?, ?)",
+            oid, name, kind, transition, role, json.stringify(fs), t0).last_id
+    let book = form("Book an ad", "create", null, "writer", [advertiser, size, run, notes])
+    let approve = form("Approve a booking", "transaction", tr("Approve"), null, [notes])
+    let decline = form("Decline a booking", "transaction", tr("Decline"), null, [notes])
+    let invoice = form("Send the invoice", "transaction", tr("Send invoice"), null, [price])
+    let pay = form("Record a payment", "transaction", tr("Record payment"), null, [paid])
+    let all_list = db.exec("insert into lists (object_id, name, columns, states, sort_field, sort_desc) values (?, 'All bookings', ?, '[]', ?, 1)",
+        oid, json.stringify([advertiser, size, run, price]), run).last_id
+    let waiting = db.exec("insert into lists (object_id, name, columns, states, sort_field, sort_desc) values (?, 'Waiting for approval', ?, ?, ?, 0)",
+        oid, json.stringify([advertiser, size, run]), json.stringify([step("Requested")]), run).last_id
+    // Bookings at every state, each with the history that got it there.
+    let bookings = [
+        ["Bakkerij Noor", "Quarter page", "2026-11-02", null, null, "Requested", []],
+        ["Harbour Ferries", "Full page", "2026-11-05", null, null, "Requested", []],
+        ["City Theatre", "Half page", "2026-10-30", null, null, "Approved", [approve]],
+        ["Okafor & Sons", "Full page", "2026-10-21", "1450.00", null, "Invoiced", [approve, invoice]],
+        ["Coast Bikes", "Quarter page", "2026-10-14", "320.00", "2026-10-25", "Paid", [approve, invoice, pay]],
+        ["Casino Royale", "Full page", "2026-11-01", null, null, "Declined", [decline]],
+    ]
+    for [i, b] in enumerate(bookings) {
+        let at = t0 + i * 3_600_000
+        let row = { state: step(b[5]), created: at, created_by: wanda, updated: at }
+        let values = set(set(set(set(set({}, `f_${advertiser}`, b[0]), `f_${size}`, b[1]), `f_${run}`, b[2]), `f_${price}`, b[3]), `f_${paid}`, b[4])
+        let all_values = merge(row, values)
+        let cols = keys(all_values)
+        let rid = db.exec(`insert into ${table} (${sql_name(cols)}) values (${sql_param(cols)})`, all_values).last_id
+        db.exec("insert into record_log (object_id, record_id, form_id, from_step, to_step, user_id, at, data) values (?, ?, ?, null, ?, ?, ?, '{}')",
+            oid, rid, book, step("Requested"), wanda, at)
+        let prev = step("Requested")
+        for [k, f] in enumerate(b[6]) {
+            let to = db.one("select t.to_step from forms f join transitions t on t.id = f.transition_id where f.id = ?", f).to_step
+            db.exec("insert into record_log (object_id, record_id, form_id, from_step, to_step, user_id, at, data) values (?, ?, ?, ?, ?, ?, ?, '{}')",
+                oid, rid, f, prev, to, k == 0 ? pablo : dee, at + (k + 1) * 7_200_000)
+            prev = to
+        }
+    }
+    // The ad desk: a page of the object's blocks.
+    let page = db.exec("insert into pages (title, slug, roles, created) values ('Ad desk', 'ad-desk', '[]', ?)", t0).last_id
+    add_blocks(owner_key("page", page), [
+        ["heading", { text: "Ad desk", level: 2 }],
+        ["text", { md: "Book ads here. A publisher approves or declines each booking; a designer sends the invoice and records the payment. A booking's state changes only through these forms." }],
+        ["form", { form_id: book }],
+        ["list", { list_id: waiting }],
+        ["transaction", { form_id: approve }],
+        ["transaction", { form_id: decline }],
+        ["transaction", { form_id: invoice }],
+        ["transaction", { form_id: pay }],
+        ["list", { list_id: all_list }],
+    ], dee, t0)
+}

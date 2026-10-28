@@ -1,0 +1,155 @@
+// The timeline: each task with days as a bar from its start to its due day,
+// arrows from what it waits for, milestones, weekends and today. A bar is
+// dragged to move it, or by an end to change that day; the days are saved
+// when it is let go. An arrow is red when a task starts before what it waits
+// for is due: the plan cannot hold.
+
+let ROW = 34
+let HEAD = 44
+let ZOOMS = [["Days", 36], ["Weeks", 18], ["Months", 7]]
+
+// A task's span as days: [start, due], from whichever it has.
+fn span_of(t) {
+    let a = day_or_null(t.start_day)
+    let b = day_or_null(t.due_day)
+    if a == null && b == null { return null }
+    [a ?? b, b ?? a]
+}
+
+// Where a span is while being dragged `shift` days in `mode`.
+fn dragged(s: list, mode: str, shift: int) -> list = match mode {
+    "start" => [min([s[0] + shift, s[1]]), s[1]]
+    "end" => [s[0], max([s[1] + shift, s[0]])]
+    _ => [s[0] + shift, s[1] + shift]
+}
+
+component Timeline(project_id: int, today: int) {
+    state board = live(load_board, project_id)
+    state zoom = 18
+    state drag = null
+    state problem = null
+    let b = board
+    let key = b.project.key
+    let editable = can_edit(b.role)
+    let year = year_of(today)
+    let rows = b.tasks
+        | filter((t) => span_of(t) != null)
+        | sort_by((t) => span_of(t)[0] * 10000 + t.num)
+    let unscheduled = b.tasks | filter((t) => span_of(t) == null && t.done_at == null)
+    let ms = b.milestones | map((m) => merge(m, { day: parse_day(m.due_day) ?? today }))
+    let firsts = (rows | map((t) => span_of(t)[0])) + (ms | map((m) => m.day)) + [today - 7]
+    let lasts = (rows | map((t) => span_of(t)[1])) + (ms | map((m) => m.day)) + [today + 21]
+    let from = week_start(min(firsts) - 3)
+    let to = max(lasts) + 7
+    let days = range(from, to + 1)
+    let width = len(days) * zoom
+    let height = HEAD + max([len(rows), 1]) * ROW + 8
+    let x = (d) => (d - from) * zoom
+    let row_of = (id) => index_of(rows | map((t) => t.id), id)
+    let shift = drag == null ? 0 : round(drag.dx / zoom)
+    let span_now = (t) => drag != null && drag.id == t.id ? dragged(span_of(t), drag.mode, shift) : span_of(t)
+    let kind_of = (t) => (find(b.columns, (c) => c.id == t.column_id) ?? {}).kind ?? "todo"
+    let start_drag = (t, mode, e) => {
+        if !editable { return null }
+        e.preventDefault()
+        e.target.setPointerCapture(e.pointerId)
+        drag = { id: t.id, mode, x0: e.clientX, dx: 0 }
+    }
+    let end_drag = () => {
+        if drag == null { return null }
+        let d = drag
+        let s = shift
+        drag = null
+        if s == 0 { return null }
+        let t = find(b.tasks, (x) => x.id == d.id)
+        let next = dragged(span_of(t), d.mode, s)
+        let r = reschedule(d.id, day_text(next[0]), day_text(next[1]))
+        problem = is_err(r) ? r.error : null
+    }
+    <div.timeline>
+        <div.toolbar>
+            <nav.seg aria-label="Zoom">
+                {for [label, z] in ZOOMS => <button key={z} class={zoom == z && "on"} aria-pressed={zoom == z} @click={() => { zoom = z }}>{label}</button>}
+            </nav>
+            <span.grow/>
+            <span.muted>{len(rows)} scheduled · {len(unscheduled)} open without days{editable && " · drag a bar, or its ends"}</span>
+        </div>
+        <Problem text={problem}/>
+        <div.gantt>
+            <ol.gantt-labels style={`padding-top: ${HEAD}px`}>
+                {for t in rows => <li key={t.id} style={`height: ${ROW}px`}>
+                    <a href={`/p/${key}?task=${t.id}`} title={t.title}><span.ref>{key}-{t.num}</span> {t.title}</a>
+                </li>}
+            </ol>
+            <div.gantt-scroll>
+                <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} class={drag != null && "dragging"}
+                     @pointermove={(e) => { if drag != null { drag = merge(drag, { dx: e.clientX - drag.x0 }) } }}
+                     @pointerup={end_drag} @pointercancel={() => { drag = null }}>
+                    <defs>
+                        <marker #arrow viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                            <path d="M0,0 L8,4 L0,8 z" class="arrow-head"/>
+                        </marker>
+                        <marker #arrow-bad viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                            <path d="M0,0 L8,4 L0,8 z" class="arrow-head bad"/>
+                        </marker>
+                    </defs>
+                    {for d in days => (is_weekend(d) && zoom >= 12) && <rect.weekend key={d} x={x(d)} y={HEAD} width={zoom} height={height - HEAD}/>}
+                    {for d in days => civil_from_days(d).d == 1 && <g key={`m${d}`}>
+                        <line.month x1={x(d)} x2={x(d)} y1="0" y2={height}/>
+                        <text.month-label x={x(d) + 4} y="14">{MONTHS[civil_from_days(d).m - 1]} {civil_from_days(d).y}</text>
+                    </g>}
+                    {for d in days => (zoom >= 30 || (zoom >= 12 && weekday(d) == 0) || (zoom < 12 && civil_from_days(d).d == 15)) &&
+                        <text.day-label key={`d${d}`} x={x(d) + 3} y="34">{zoom >= 30 ? `${WEEKDAYS[weekday(d)][0]} ${civil_from_days(d).d}` : short_day(d, year)}</text>}
+                    <line.head-rule x1="0" x2={width} y1={HEAD - 0.5} y2={HEAD - 0.5}/>
+                    {for m in ms => <g key={m.id}>
+                        <line.ms-line x1={x(m.day) + zoom / 2} x2={x(m.day) + zoom / 2} y1={HEAD} y2={height}/>
+                        <path.ms d={`M${x(m.day) + zoom / 2},${HEAD - 14} l6,6 l-6,6 l-6,-6 z`}><title>{m.name}: due {short_day(m.day, year)}</title></path>
+                    </g>}
+                    <line.today x1={x(today) + zoom / 2} x2={x(today) + zoom / 2} y1={HEAD - 6} y2={height}/>
+                    {for dep in b.deps | filter((d) => row_of(d.task_id) != null && row_of(d.blocked_by) != null) => {
+                        let i = row_of(dep.task_id)
+                        let j = row_of(dep.blocked_by)
+                        let t = rows[i]
+                        let w = rows[j]
+                        let a = span_now(w)
+                        let s = span_now(t)
+                        let bad = s[0] <= a[1] && kind_of(w) != "done"
+                        let x1 = x(a[1]) + zoom
+                        let y1 = HEAD + j * ROW + ROW / 2
+                        let x2 = x(s[0])
+                        let y2 = HEAD + i * ROW + ROW / 2
+                        <path key={`${dep.task_id}-${dep.blocked_by}`} class={`dep ${bad ? "bad" : ""}`}
+                              marker-end={bad ? "url(#arrow-bad)" : "url(#arrow)"}
+                              d={`M${x1},${y1} h6 V${y2} H${max([x2 - 2, x1 + 8])}`}/>
+                    }}
+                    {for [i, t] in enumerate(rows) => {
+                        let s = span_now(t)
+                        let kind = kind_of(t)
+                        let late = kind != "done" && s[1] < today
+                        let y = HEAD + i * ROW + 7
+                        let w = (s[1] - s[0] + 1) * zoom
+                        <g key={t.id} class={`bar-g kind-${kind} ${late ? "late" : ""} ${drag != null && drag.id == t.id ? "moving" : ""}`}>
+                            <rect.bar-bg x={x(s[0])} {y} width={w} height={ROW - 14} rx="5"
+                                  @pointerdown={(e) => start_drag(t, "move", e)}>
+                                <title>{key}-{t.num} {t.title}: {short_day(s[0], year)} – {short_day(s[1], year)}</title>
+                            </rect>
+                            {w > 100 && <text.bar-label x={x(s[0]) + 8} y={y + 14}>{t.assignee ?? ""}{t.assignee != null && " · "}{t.points ?? "–"} pts</text>}
+                            {editable && <rect.handle x={x(s[0])} {y} width="8" height={ROW - 14} @pointerdown={(e) => start_drag(t, "start", e)}/>}
+                            {editable && <rect.handle x={x(s[0]) + w - 8} {y} width="8" height={ROW - 14} @pointerdown={(e) => start_drag(t, "end", e)}/>}
+                            {drag != null && drag.id == t.id &&
+                                <text.drag-label x={x(s[0])} y={y - 3}>{short_day(s[0], year)} – {short_day(s[1], year)}</text>}
+                        </g>
+                    }}
+                </svg>
+            </div>
+        </div>
+        <ul.legend>
+            <li><i.sw.kind-todo/>To do</li><li><i.sw.kind-doing/>In progress</li><li><i.sw.kind-done/>Done</li>
+            <li><i.sw.late/>Past due</li><li><i.sw.ms-key/>Milestone</li><li><i.sw.bad-key/>Starts before what it waits for</li>
+        </ul>
+        {len(unscheduled) > 0 && <details.unscheduled>
+            <summary>{len(unscheduled)} open {len(unscheduled) == 1 ? "task has" : "tasks have"} no days yet</summary>
+            <ul>{for t in unscheduled => <li key={t.id}><a href={`/p/${key}?task=${t.id}`}><span.ref>{key}-{t.num}</span> {t.title}</a></li>}</ul>
+        </details>}
+    </div>
+}

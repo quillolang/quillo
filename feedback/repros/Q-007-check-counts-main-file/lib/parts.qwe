@@ -1,0 +1,6 @@
+fn double(x) = x * 2
+
+component Counter() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}

@@ -1,0 +1,132 @@
+// Blocks on screen: as readers see them (BlockView), and as their editor
+// changes them (BlockEdit). <BlockList> lays out an article's or a page's
+// blocks, with a toolbar for each when they may be changed, and an optional
+// gutter beside each one (the article's feedback and who is on it).
+
+view BlockView(b) = match b.type {
+    "heading" => b.data.level == 3 ? <h3.b-heading>{b.data.text}</h3> : <h2.b-heading>{b.data.text}</h2>
+    "text" => b.data.md == "" ? <p.muted.empty-block>Empty text.</p> : <div.md>{raw(b.html)}</div>
+    "quote" => <blockquote.b-quote><p>{raw(b.html)}</p>{b.data.by != "" && <cite>— {b.data.by}</cite>}</blockquote>
+    "image" => b.data.url == ""
+        ? <p.muted.empty-block>No image yet.</p>
+        : <figure.b-image><img src={b.data.url} alt={b.data.caption} loading="lazy"/>{b.data.caption != "" && <figcaption>{b.data.caption}</figcaption>}</figure>
+    "callout" => <aside class={`b-callout ${b.data.tone}`}><div.md>{raw(b.html)}</div></aside>
+    "divider" => <hr.b-divider/>
+    "list" => b.data.list_id == 0 ? <p.muted.empty-block>Pick a list.</p> : <ListBlock key={b.data.list_id} list_id={b.data.list_id}/>
+    "form" => b.data.form_id == 0 ? <p.muted.empty-block>Pick a form.</p> : <FormBlock key={b.data.form_id} form_id={b.data.form_id}/>
+    "transaction" => b.data.form_id == 0 ? <p.muted.empty-block>Pick a transaction form.</p> : <TransactionBlock key={b.data.form_id} form_id={b.data.form_id}/>
+    _ => <p.muted>Unknown block {b.type}</p>
+}
+
+// Rows a text box needs to show `text` without scrolling.
+fn rows_for(text, least: int = 3) -> int = max([least, len(split(str(text ?? ""), "\n")) + 1])
+
+// One block, being edited. Saved when the field loses focus, if it changed;
+// refused if someone saved the block since this one loaded (its version).
+component BlockEdit(b, catalog, on_problem) {
+    state draft = b.data
+    state version = b.version
+    state saved = b.data
+    let save = () => {
+        if draft == saved { return null }
+        let r = save_block(b.id, draft, version)
+        if is_err(r) { on_problem(r.error) } else { version = r; saved = draft; on_problem(null) }
+    }
+    let put = (k, v) => { draft = set(draft, k, v) }
+    <div.b-edit @focusout={save}>
+        {match b.type {
+            "heading" => <div.row>
+                <input.b-heading-input value={draft.text} placeholder="Heading" maxlength="200" @input={(e) => put("text", e.value)}/>
+                <select aria-label="Level" @change={(e) => { put("level", int(e.value) ?? 2); save() }}>
+                    <option value="2" selected={draft.level != 3}>H2</option>
+                    <option value="3" selected={draft.level == 3}>H3</option>
+                </select>
+            </div>
+            "text" => <textarea rows={rows_for(draft.md, 4)} placeholder="Write (Markdown: **bold**, _italic_, [links](https://…), lists)"
+                value={draft.md} @input={(e) => put("md", e.value)}></textarea>
+            "quote" => <div.stack>
+                <textarea rows={rows_for(draft.text, 2)} placeholder="The quote" value={draft.text} @input={(e) => put("text", e.value)}></textarea>
+                <input value={draft.by} placeholder="Who said it" @input={(e) => put("by", e.value)}/>
+            </div>
+            "image" => <div.stack>
+                <input value={draft.url} placeholder="https://… or /static/…" @input={(e) => put("url", e.value)}/>
+                <input value={draft.caption} placeholder="Caption (also what screen readers say)" @input={(e) => put("caption", e.value)}/>
+                {draft.url != "" && <img.thumb src={draft.url} alt=""/>}
+            </div>
+            "callout" => <div.stack>
+                <select aria-label="Tone" @change={(e) => { put("tone", e.value); save() }}>
+                    {for t in ["info", "warn", "good"] => <option key={t} value={t} selected={draft.tone == t}>{t}</option>}
+                </select>
+                <textarea rows={rows_for(draft.md, 2)} placeholder="Callout text" value={draft.md} @input={(e) => put("md", e.value)}></textarea>
+            </div>
+            "divider" => <hr.b-divider/>
+            "list" => <div.stack>
+                <select aria-label="List" @change={(e) => { put("list_id", int(e.value) ?? 0); save() }}>
+                    <option value="0">Pick a list…</option>
+                    {for l in catalog.lists => <option key={l.id} value={l.id} selected={draft.list_id == l.id}>{l.object}: {l.name}</option>}
+                </select>
+                {draft.list_id != 0 && <ListBlock key={draft.list_id} list_id={draft.list_id}/>}
+            </div>
+            "form" | "transaction" => <div.stack>
+                <select aria-label="Form" @change={(e) => { put("form_id", int(e.value) ?? 0); save() }}>
+                    <option value="0">Pick a form…</option>
+                    {for f in catalog.forms | filter((f) => f.kind == (b.type == "form" ? "create" : "transaction")) =>
+                        <option key={f.id} value={f.id} selected={draft.form_id == f.id}>{f.object}: {f.name}</option>}
+                </select>
+                {draft.form_id != 0 && (b.type == "form"
+                    ? <FormBlock key={draft.form_id} form_id={draft.form_id}/>
+                    : <TransactionBlock key={draft.form_id} form_id={draft.form_id}/>)}
+            </div>
+            _ => <p>?</p>
+        }}
+        {draft != saved && <span.unsaved>unsaved</span>}
+    </div>
+}
+
+// The menu that adds a block after `after_id` (null: at the end).
+component AddBlock(owner: str, after_id: int?, types: list, on_problem) {
+    state open = false
+    <div.add-block>
+        <button.add-btn aria-expanded={open} title="Add a block" @click={() => { open = !open }}>+</button>
+        {open && <div.add-menu role="menu">
+            {for t in types => <button key={t} role="menuitem" @click={() => {
+                open = false
+                let r = add_block(owner, after_id, t)
+                on_problem(is_err(r) ? r.error : null)
+            }}>{BLOCK_LABELS[t]}</button>}
+        </div>}
+    </div>
+}
+
+// An article's or a page's blocks. `gutter(b)` adds markup beside a block;
+// `on_focus(id)` hears which block is being worked on.
+component BlockList(blocks: list, owner: str, editable: bool, catalog, types: list, gutter = null, on_focus = null, marked = null) {
+    state problem = null
+    let show_problem = (p) => { problem = p }
+    <div.blocks>
+        <Problem text={problem}/>
+        {editable && len(blocks) == 0 && <AddBlock {owner} after_id={null} {types} on_problem={show_problem}/>}
+        {for b in blocks => <section key={b.id} id={`block-${b.id}`} class={`block t-${b.type} ${marked == b.id ? "marked" : ""}`} tabindex="-1"
+            @focusin={() => { if on_focus != null { on_focus(b.id) } }}>
+            <div.block-main>
+                {editable
+                    ? <BlockEdit key={`${b.id}-${b.type}`} {b} {catalog} on_problem={show_problem}/>
+                    : <BlockView {b}/>}
+                {editable && <div.block-tools>
+                    <span.muted>{BLOCK_LABELS[b.type]}</span>
+                    <button.icon-btn aria-label="Move up" @click={() => show_problem(err_text(move_block(b.id, -1)))}>↑</button>
+                    <button.icon-btn aria-label="Move down" @click={() => show_problem(err_text(move_block(b.id, 1)))}>↓</button>
+                    <button.icon-btn aria-label="Delete block" @click={() => {
+                        if ask(`Delete this ${lower(BLOCK_LABELS[b.type])} block?`, { ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                            show_problem(err_text(delete_block(b.id)))
+                        }
+                    }}>✕</button>
+                    <AddBlock {owner} after_id={b.id} {types} on_problem={show_problem}/>
+                </div>}
+            </div>
+            {gutter != null && gutter(b)}
+        </section>}
+    </div>
+}
+
+fn err_text(r) = is_err(r) ? r.error : null

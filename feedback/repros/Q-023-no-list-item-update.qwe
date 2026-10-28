@@ -1,0 +1,7 @@
+// Q-023 There is no way to change one item of a list: set() takes only maps
+// mode: run
+// open-when: must be map
+// fixed-when: [1, 9, 3]
+// From FEEDBACK2.md §10 (found on 896e758).
+
+print(set([1, 2, 3], 1, 9))

@@ -1,0 +1,364 @@
+// Tasks: the board's cards and everything on them (labels, checklist,
+// comments, what blocks them), moving them, and the history the reports
+// read. Every change publishes `project:<id>`, which the board, the open
+// task, the timeline and the reports follow.
+
+let PRIORITIES = ["None", "Low", "Medium", "High", "Urgent"]
+let MAX_BODY = 20000
+
+fn task_row(task_id: int) with db = unwatched(() =>
+    db.one("select id, project_id, num, title, column_id, assignee_id, start_day, due_day from tasks where id = ?", task_id))
+
+fn task_ref(key: str, num: int) -> str = `${key}-${num}`
+
+fn key_of(project_id: int) with db = unwatched(() => db.one("select key from projects where id = ?", project_id).key)
+
+fn ids_of(joined) -> list<int> =
+    joined == null || joined == "" ? [] : split(str(joined), ",") | map((x) => int(x) ?? 0)
+
+// The board: every card of the project, with what the card shows.
+fn cards_of(project_id: int) with db = db.query(sql`
+    select t.id, t.num, t.title, t.column_id, t.position, t.priority, t.assignee_id, t.points,
+           t.start_day, t.due_day, t.milestone_id, t.created, t.updated, t.done_at,
+           u.name as assignee, u.hue as assignee_hue,
+           (select group_concat(l.label_id) from task_labels l where l.task_id = t.id) as label_ids,
+           (select count(*) from checklist k where k.task_id = t.id) as checks,
+           (select count(*) from checklist k where k.task_id = t.id and k.done = 1) as checked,
+           (select count(*) from comments c where c.task_id = t.id) as comments,
+           (select count(*) from deps d join tasks b on b.id = d.blocked_by join columns bc on bc.id = b.column_id
+             where d.task_id = t.id and bc.kind != 'done') as blockers
+    from tasks t left join users u on u.id = t.assignee_id
+    where t.project_id = ?
+    order by t.position, t.id`, project_id)
+    | map((t) => merge(t, { label_ids: ids_of(t.label_ids) }))
+
+fn deps_of(project_id: int) with db = db.query(sql`
+    select d.task_id, d.blocked_by from deps d join tasks t on t.id = d.task_id where t.project_id = ?`, project_id)
+
+fn board_of(project_id: int, role: str, me_id: int) with db = {
+    project: db.one("select id, key, name, color from projects where id = ?", project_id),
+    role,
+    me: me_id,
+    columns: columns_of(project_id),
+    labels: labels_of(project_id),
+    milestones: milestones_of(project_id),
+    members: members_of(project_id),
+    tasks: cards_of(project_id),
+    deps: deps_of(project_id),
+}
+
+server fn load_board(project_id: int) with db, time {
+    let who = member_of(project_id, "read")?
+    watch(`project:${project_id}`)
+    unwatched(() => board_of(project_id, who.role, who.user.id))
+}
+
+// The cards with one moved to `column_id`, at `index` among the others
+// there: what the board shows at once, before the server says so.
+fn moved(tasks: list, task_id: int, column_id: int, index: int) -> list {
+    let t = find(tasks, (x) => x.id == task_id)
+    if t == null { return tasks }
+    let others = tasks | filter((x) => x.column_id == column_id && x.id != task_id) | sort_by((x) => x.position)
+    let at = min([max([index, 0]), len(others)])
+    let order = take(others, at) + [merge(t, { column_id })] + drop(others, at)
+    let placed = for [i, x] in enumerate(order) => merge(x, { position: i })
+    let ids = placed | map((x) => x.id)
+    filter(tasks, (x) => !contains(ids, x.id)) + placed
+}
+
+fn open_blockers(task_id: int) with db = db.query(sql`
+    select b.num, b.title from deps d join tasks b on b.id = d.blocked_by join columns c on c.id = b.column_id
+    where d.task_id = ? and c.kind != 'done' order by b.num`, task_id)
+
+// Puts a card in a column, at `index` among the cards there. A card cannot
+// be done while what blocks it is not.
+server fn move_task(task_id: int, column_id: int, index: int) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    let who = member_of(t.project_id, "edit")?
+    let col = column_in(t.project_id, column_id) ?? err("That column was deleted")?
+    let key = key_of(t.project_id)
+    if col.kind == "done" && t.column_id != column_id {
+        let open = open_blockers(task_id)
+        if len(open) > 0 {
+            return err(`${task_ref(key, t.num)} is blocked by ${join(open | map((b) => task_ref(key, b.num)), ", ")}: finish those first`)
+        }
+    }
+    let at = now()
+    db.transaction(() => {
+        let ids = db.query("select id from tasks where column_id = ? and id != ? order by position, id", column_id, task_id)
+            | map((r) => r.id)
+        let i = min([max([index, 0]), len(ids)])
+        let order = take(ids, i) + [task_id] + drop(ids, i)
+        for [n, id] in enumerate(order) { db.exec("update tasks set position = ? where id = ?", n, id)? }
+        if t.column_id != column_id {
+            db.exec(sql`update tasks set column_id = :col, updated = :at,
+                          started_at = case when :kind != 'todo' then coalesce(started_at, :at) else started_at end,
+                          done_at = case when :kind = 'done' then :at else null end
+                        where id = :id`, { col: column_id, at, kind: col.kind, id: task_id })?
+            db.exec("insert into moves (project_id, task_id, column_id, at) values (?, ?, ?, ?)", t.project_id, task_id, column_id, at)?
+            log_activity(t.project_id, task_id, who.user.id, `moved ${task_ref(key, t.num)} to ${col.name}`)
+        }
+    })?
+    changed_project(t.project_id)
+    unwatched(() => cards_of(t.project_id))
+}
+
+// A new card at the bottom of a column.
+server fn create_task(project_id: int, column_id: int, title: str) ! str with db, time {
+    let who = member_of(project_id, "edit")?
+    let text = trim(title)
+    if len(text) == 0 { return err("Give the task a title") }
+    if len(text) > 200 { return err("A title is at most 200 characters") }
+    column_in(project_id, column_id) ?? err("That column was deleted")?
+    let at = now()
+    let id = db.transaction(() => {
+        let n = db.one("update projects set next_num = next_num + 1 where id = ? returning next_num - 1 as num", project_id)?.num
+        let pos = db.one("select coalesce(max(position), -1) + 1 as n from tasks where column_id = ?", column_id).n
+        let id = db.exec(sql`insert into tasks (project_id, num, title, column_id, position, created, created_by, updated)
+                             values (?, ?, ?, ?, ?, ?, ?, ?)`, project_id, n, text, column_id, pos, at, who.user.id, at)?.last_id
+        db.exec("insert into moves (project_id, task_id, column_id, at) values (?, ?, ?, ?)", project_id, id, column_id, at)?
+        log_activity(project_id, id, who.user.id, `created ${task_ref(key_of(project_id), n)} ${text}`)
+        id
+    })?
+    changed_project(project_id)
+    id
+}
+
+server fn delete_task(task_id: int) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was already deleted")?
+    let who = member_of(t.project_id, "edit")?
+    db.exec("delete from tasks where id = ?", task_id)?
+    log_activity(t.project_id, null, who.user.id, `deleted ${task_ref(key_of(t.project_id), t.num)} ${t.title}`)
+    changed_project(t.project_id)
+    true
+}
+
+// ---- one task ------------------------------------------------------------
+
+fn linked(sql_text: str, task_id: int) with db = db.query(sql_text, task_id)
+
+server fn load_task(task_id: int) with db, time {
+    let t0 = task_row(task_id) ?? err("This task was deleted")?
+    let who = member_of(t0.project_id, "read")?
+    watch(`project:${t0.project_id}`)
+    unwatched(() => {
+        let t = db.one(sql`
+            select t.*, c.kind, c.name as column_name, cu.name as creator,
+                   (select group_concat(l.label_id) from task_labels l where l.task_id = t.id) as label_ids
+            from tasks t join columns c on c.id = t.column_id join users cu on cu.id = t.created_by
+            where t.id = ?`, task_id) ?? err("This task was deleted")?
+        {
+            task: merge(t, { label_ids: ids_of(t.label_ids), html: str(markdown(t.body)) }),
+            role: who.role,
+            me: who.user.id,
+            checklist: db.query("select id, text, done from checklist where task_id = ? order by position, id", task_id),
+            comments: db.query(sql`select c.id, c.user_id, c.body, c.created, u.name, u.hue
+                                   from comments c join users u on u.id = c.user_id where c.task_id = ? order by c.id`, task_id)
+                | map((c) => merge(c, { html: str(markdown(c.body)) })),
+            blockers: linked(sql`select b.id, b.num, b.title, c.kind = 'done' as done from deps d
+                                 join tasks b on b.id = d.blocked_by join columns c on c.id = b.column_id
+                                 where d.task_id = ? order by b.num`, task_id),
+            blocking: linked(sql`select b.id, b.num, b.title, c.kind = 'done' as done from deps d
+                                 join tasks b on b.id = d.task_id join columns c on c.id = b.column_id
+                                 where d.blocked_by = ? order by b.num`, task_id),
+            history: db.query(sql`select a.at, a.text, u.name from activity a join users u on u.id = a.user_id
+                                  where a.task_id = ? order by a.at desc, a.id desc limit 30`, task_id),
+        }
+    })
+}
+
+// One field of a task, from the open task's form. Each field is saved on
+// its own, so two people changing different fields do not undo each other.
+server fn edit_task(task_id: int, field: str, value) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    let who = member_of(t.project_id, "edit")?
+    let pid = t.project_id
+    let set_col = (col, v) => db.exec(`update tasks set ${sql_name(col)} = ?, updated = ? where id = ?`, v, now(), task_id)
+    let r = match field {
+        "title" => {
+            let s = trim(str(value ?? ""))
+            if len(s) == 0 || len(s) > 200 { return err("A title is 1 to 200 characters") }
+            set_col("title", s)
+        }
+        "body" => {
+            let s = str(value ?? "")
+            if len(s) > MAX_BODY { return err(`A description is at most ${MAX_BODY} characters`) }
+            set_col("body", s)
+        }
+        "priority" => {
+            let p = int(value) ?? -1
+            if p < 0 || p > 4 { return err("No such priority") }
+            set_col("priority", p)
+        }
+        "points" => {
+            let p = value == null || value == "" ? null : int(value) ?? -1
+            if p != null && (p < 0 || p > 100) { return err("Points are 0 to 100, or none") }
+            set_col("points", p)
+        }
+        "assignee_id" => {
+            let a = value == null || value == "" ? null : int(value) ?? 0
+            if a != null && role_in(pid, a) == null { return err("They are not in this project") }
+            set_col("assignee_id", a)
+        }
+        "milestone_id" => {
+            let m = value == null || value == "" ? null : int(value) ?? 0
+            if m != null && db.one("select 1 from milestones where id = ? and project_id = ?", m, pid) == null { return err("No such milestone") }
+            set_col("milestone_id", m)
+        }
+        "start_day" | "due_day" => {
+            let d = value == null || value == "" ? null : parse_day(value)?
+            let other = field == "start_day" ? day_or_null(t.due_day) : day_or_null(t.start_day)
+            if d != null && other != null && (field == "start_day" ? d > other : d < other) {
+                return err("A task is due on or after the day it starts")
+            }
+            set_col(field, d == null ? null : day_text(d))
+        }
+        "column_id" => { return move_task(task_id, int(value) ?? 0, 999_999) }
+        _ => err(`Not a field: ${field}`)
+    }
+    r?
+    log_activity(pid, task_id, who.user.id, `changed ${replace(field, "_id", "")} of ${task_ref(key_of(pid), t.num)}`)
+    changed_project(pid)
+    true
+}
+
+server fn toggle_label(task_id: int, label_id: int) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    member_of(t.project_id, "edit")?
+    if db.one("select 1 from labels where id = ? and project_id = ?", label_id, t.project_id) == null { return err("No such label") }
+    let r = db.exec("delete from task_labels where task_id = ? and label_id = ?", task_id, label_id)?
+    if r.changes == 0 { db.exec("insert into task_labels (task_id, label_id) values (?, ?)", task_id, label_id)? }
+    changed_project(t.project_id)
+    true
+}
+
+// Days set by dragging a bar on the timeline: both at once, so the bar
+// never passes through a start after its due day.
+server fn reschedule(task_id: int, start_day: str, due_day: str) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    let who = member_of(t.project_id, "edit")?
+    let a = parse_day(start_day)?
+    let b = parse_day(due_day)?
+    if b < a { return err("A task is due on or after the day it starts") }
+    db.exec("update tasks set start_day = ?, due_day = ?, updated = ? where id = ?", day_text(a), day_text(b), now(), task_id)?
+    log_activity(t.project_id, task_id, who.user.id, `rescheduled ${task_ref(key_of(t.project_id), t.num)} to ${short_day(a)} – ${short_day(b)}`)
+    changed_project(t.project_id)
+    true
+}
+
+// ---- checklist and comments ----------------------------------------------
+
+server fn add_check(task_id: int, text: str) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    member_of(t.project_id, "edit")?
+    let s = trim(text)
+    if len(s) == 0 || len(s) > 200 { return err("An item is 1 to 200 characters") }
+    let pos = db.one("select coalesce(max(position), -1) + 1 as n from checklist where task_id = ?", task_id).n
+    db.exec("insert into checklist (task_id, text, position) values (?, ?, ?)", task_id, s, pos)?
+    changed_project(t.project_id)
+    true
+}
+
+fn check_task(check_id: int) with db = unwatched(() =>
+    db.one("select k.task_id, t.project_id from checklist k join tasks t on t.id = k.task_id where k.id = ?", check_id))
+
+server fn toggle_check(check_id: int) ! str with db, time {
+    let k = check_task(check_id) ?? err("That item was deleted")?
+    member_of(k.project_id, "edit")?
+    db.exec("update checklist set done = 1 - done where id = ?", check_id)?
+    changed_project(k.project_id)
+    true
+}
+
+server fn delete_check(check_id: int) ! str with db, time {
+    let k = check_task(check_id) ?? err("That item was already deleted")?
+    member_of(k.project_id, "edit")?
+    db.exec("delete from checklist where id = ?", check_id)?
+    changed_project(k.project_id)
+    true
+}
+
+// Viewers may comment: they cannot change the work, but can talk about it.
+server fn add_comment(task_id: int, body: str) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    let who = member_of(t.project_id, "read")?
+    let s = trim(body)
+    if len(s) == 0 { return err("Write something first") }
+    if len(s) > MAX_BODY { return err(`A comment is at most ${MAX_BODY} characters`) }
+    db.exec("insert into comments (task_id, user_id, body, created) values (?, ?, ?, ?)", task_id, who.user.id, s, now())?
+    log_activity(t.project_id, task_id, who.user.id, `commented on ${task_ref(key_of(t.project_id), t.num)}`)
+    changed_project(t.project_id)
+    true
+}
+
+server fn delete_comment(comment_id: int) ! str with db, time {
+    let c = unwatched(() => db.one(sql`select c.user_id, t.project_id from comments c join tasks t on t.id = c.task_id
+                                       where c.id = ?`, comment_id)) ?? err("That comment was already deleted")?
+    let who = member_of(c.project_id, "read")?
+    if c.user_id != who.user.id && who.role != "owner" { return err("Only its writer or an owner can delete a comment") }
+    db.exec("delete from comments where id = ?", comment_id)?
+    changed_project(c.project_id)
+    true
+}
+
+// ---- dependencies --------------------------------------------------------
+
+// "WEB-12", "web-12", "#12" or "12": a task of this project.
+fn find_ref(project_id: int, text: str) with db {
+    let m = re.find(trim(text), "^(?:([A-Za-z][A-Za-z0-9]*)-|#)?(\\d+)$")
+    if m == null { return null }
+    let key = key_of(project_id)
+    if m.groups[0] != null && upper(m.groups[0]) != upper(key) { return null }
+    db.one("select id, num from tasks where project_id = ? and num = ?", project_id, int(m.groups[1]))
+}
+
+// Would `task_id` waiting for `blocker` close a loop: does `blocker` wait,
+// however indirectly, for `task_id`?
+fn would_cycle(task_id: int, blocker: int) with db = db.one(sql`
+    with recursive up(id) as (
+        select blocked_by from deps where task_id = :b
+        union
+        select d.blocked_by from deps d join up on d.task_id = up.id
+    )
+    select 1 as yes from up where id = :a limit 1`, { a: task_id, b: blocker }) != null
+
+server fn add_blocker(task_id: int, ref: str) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    let who = member_of(t.project_id, "edit")?
+    let key = key_of(t.project_id)
+    let b = find_ref(t.project_id, ref) ?? err(`No task ${trim(ref)} in ${key}`)?
+    if b.id == task_id { return err("A task cannot wait for itself") }
+    if would_cycle(task_id, b.id) {
+        return err(`${task_ref(key, b.num)} already waits for ${task_ref(key, t.num)}: that would be a loop`)
+    }
+    db.exec("insert or ignore into deps (task_id, blocked_by) values (?, ?)", task_id, b.id)?
+    log_activity(t.project_id, task_id, who.user.id, `${task_ref(key, t.num)} now waits for ${task_ref(key, b.num)}`)
+    changed_project(t.project_id)
+    true
+}
+
+server fn remove_blocker(task_id: int, blocker_id: int) ! str with db, time {
+    let t = task_row(task_id) ?? err("That task was deleted")?
+    member_of(t.project_id, "edit")?
+    db.exec("delete from deps where task_id = ? and blocked_by = ?", task_id, blocker_id)?
+    changed_project(t.project_id)
+    true
+}
+
+// ---- across projects -----------------------------------------------------
+
+server fn load_activity(project_id: int, limit: int = 50) with db, time {
+    member_of(project_id, "read")?
+    watch(`project:${project_id}`)
+    unwatched(() => db.query(sql`
+        select a.id, a.at, a.text, a.task_id, u.name, u.hue from activity a join users u on u.id = a.user_id
+        where a.project_id = ? order by a.at desc, a.id desc limit ?`, project_id, min([max([limit, 1]), 500])))
+}
+
+// What is on someone's plate in every project: not done, soonest due first.
+fn my_work(user_id: int) with db = db.query(sql`
+    select t.id, t.num, t.title, t.priority, t.due_day, t.points, p.key, p.color, c.name as column_name, c.kind
+    from tasks t join projects p on p.id = t.project_id join columns c on c.id = t.column_id
+    join members m on m.project_id = p.id and m.user_id = t.assignee_id
+    where t.assignee_id = ? and c.kind != 'done' and p.archived = 0
+    order by t.due_day is null, t.due_day, t.priority desc, t.id`, user_id)

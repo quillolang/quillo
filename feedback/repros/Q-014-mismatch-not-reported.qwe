@@ -1,0 +1,26 @@
+// Q-014 When the browser has to make a component again, it says only "quillo: text", or nothing
+// mode: browser
+// page: /
+// flags: --watch
+// open-when: "console.error: quillo: text"
+// open-when: /console\.[a-z]+: quillo: the server wrote/
+// open-when: /"console\.error: quillo: [a-z]+"/
+// fixed-when: /console.*<Inner>/
+// From FEEDBACK2.md §3 (found on 896e758). On fe10f8c, with --watch, a component made again at
+// the top of the page is named ("<Byline> was made again … the server wrote nothing, the browser
+// <div>"); one inside another component is not ("quillo: the server wrote nothing, the browser
+// <div>"). Its mismatch here is text the server and the browser make differently (`js(...)`
+// gives null on the server), since Q-013's numbers now match and Q-032's <div> in a <p> is
+// refused by `quillo check` since e48df25.
+
+component Inner(name: str) {
+    state n = 0
+    <div>{name} <span>{js("Date.now")}</span> <button @click={() => { n += 1 }}>{n}</button></div>
+}
+
+component Outer() {
+    state open = true
+    <section>{open && <Inner name="w"/>}</section>
+}
+
+route GET / = <html><body><Outer/></body></html>

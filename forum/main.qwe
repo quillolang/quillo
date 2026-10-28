@@ -1,0 +1,220 @@
+// Quillo Forum: categories, threads and live replies, with Markdown and
+// highlighted code, images, votes, reactions and reputation, accepted
+// answers, polls, @mentions with suggestions, following, bookmarks, unread
+// tracking and notifications, private messages, tags, full-text search, a
+// moderators' report queue with suspensions, and who is typing.
+//
+//   quillo run forum/main.qwe --watch                  then open http://localhost:8080
+//   FORUM_DEMO=1 quillo run forum/main.qwe --watch     the same, with people and threads to look at
+//   quillo check forum/main.qwe
+//
+//   lib/text.qwe         times, counts, names and tags (on the server and in the browser)
+//   lib/mentions.qwe     @mentions in posts, found with a regular expression (`re`)
+//   lib/auth.qwe         joining, signing in, sessions, roles, suspensions
+//   lib/forum.qwe        threads, posts, votes, reactions, follows, bookmarks, unread,
+//                        notifications, search: queries and server fns
+//   lib/polls.qwe        polls in threads
+//   lib/moderation.qwe   reports, the moderators' queue and log, suspending people
+//   lib/messages.qwe     private messages
+//   lib/uploads.qwe      images: checked, shrunk and saved under uploads/
+//   ui/page.qwe          the frame every page uses, avatars, the live bell and envelope
+//   ui/editor.qwe        <Editor>: the Markdown box, with @name suggestions and images
+//   ui/lists.qwe         <ThreadList>, live, and the rows and tabs around it
+//   ui/thread.qwe        <ThreadView>: posts, votes, reactions, edits, answers, the reply box, typing
+//   ui/poll.qwe          <Poll>, live
+//   ui/messages.qwe      <Inbox> and <Conversation>, live
+//   ui/mod.qwe           <ModQueue>, live, and the moderators' log
+//   ui/pages.qwe         the rest of the pages
+//   seed.qwe             demo people and threads, for FORUM_DEMO=1
+//   migrations/          the tables and the first categories
+//   public/              the stylesheet, a little JavaScript and the icon, under /static/
+
+db.open(env("FORUM_DB", "forum.db"))
+db.migrate("migrations")
+
+use "lib/text.qwe"
+use "lib/mentions.qwe"
+use "lib/auth.qwe"
+use "lib/forum.qwe"
+use "lib/polls.qwe"
+use "lib/moderation.qwe"
+use "lib/messages.qwe"
+use "lib/uploads.qwe"
+use "ui/page.qwe"
+use "ui/editor.qwe"
+use "ui/lists.qwe"
+use "ui/thread.qwe"
+use "ui/poll.qwe"
+use "ui/messages.qwe"
+use "ui/mod.qwe"
+use "ui/pages.qwe"
+use "seed.qwe"
+
+if env("FORUM_DEMO", "") == "1" { seed_demo() }
+
+schedule("1h", clear_sessions)
+
+// Pages tell each other who is typing in which thread. Only people signed in
+// may say so, and the name sent out is theirs, not one the page claims.
+channel.on("typing", (msg, peer) => {
+    let u = me()
+    if u != null && type_of(msg.thread) == "int" {
+        channel.broadcast("typing", { thread: msg.thread, name: u.name }, { except: peer })
+    }
+})
+
+fn sort_of(s) = s == "new" || s == "top" || s == "following" ? s : "latest"
+
+fn side() with db = <Sidebar cats={categories()} tags={popular_tags()} people={top_people()} totals={totals()}/>
+
+// ---- reading -------------------------------------------------------------
+
+route GET / ? { sort: str = "latest", page: int = 1 } =
+    <HomePage me={me()} cats={categories()} side={side()} sort={sort_of(sort)} {page}/>
+
+route GET /c/:slug ? { sort: str = "latest", page: int = 1 } {
+    let u = me()
+    let cat = category(slug) ?? reply 404 <NotFoundPage me={u} what="There is no such category."/>
+    <CategoryPage me={u} {cat} side={side()} sort={sort_of(sort)} {page}/>
+}
+
+route GET /tag/:tag ? { sort: str = "latest", page: int = 1 } =
+    <TagPage me={me()} tag={lower(tag)} side={side()} sort={sort_of(sort)} {page}/>
+
+route GET /t/:id(int) {
+    let u = me()
+    let thread = load_thread(id) ?? reply 404 <NotFoundPage me={u} what="This thread does not exist, or was deleted."/>
+    count_view(id)
+    // Read before the page loads its posts, which marks them seen.
+    let seen_before = u == null ? null : last_read(u.id, id)
+    <ThreadPage me={u} {thread} views={views_of(id)} last_read={seen_before}/>
+}
+
+route GET /u/:name {
+    let u = me()
+    let p = profile(name) ?? reply 404 <NotFoundPage me={u} what="Nobody here goes by that name."/>
+    <ProfilePage me={u} {p} posts={posts_of(p.id)}/>
+}
+
+route GET /search ? { q: str = "", page: int = 1 } =
+    <SearchPage me={me()} q={trim(q)} {page} found={search(trim(q), page)}/>
+
+route GET /bookmarks {
+    let u = signed_in("/bookmarks")
+    <BookmarksPage me={u} items={bookmarks_of(u.id)}/>
+}
+
+route GET /messages {
+    let u = signed_in("/messages")
+    <MessagesPage me={u}/>
+}
+
+route GET /messages/:name {
+    let u = signed_in(`/messages/${name}`)
+    let other = profile(name) ?? reply 404 <NotFoundPage me={u} what="Nobody here goes by that name."/>
+    if other.id == u.id { redirect("/messages") }
+    <ConversationPage me={u} name={other.name}/>
+}
+
+route GET /mod {
+    let u = signed_in("/mod")
+    if !is_mod(u) { reply 403 <NotFoundPage me={u} what="Only moderators see this page."/> }
+    <ModPage me={u} log={mod_log_recent()}/>
+}
+
+route GET /notifications {
+    let u = signed_in("/notifications")
+    let items = notifications_of(u.id)
+    mark_read(u.id)
+    <NotificationsPage me={u} {items}/>
+}
+
+// ---- starting threads ----------------------------------------------------
+
+route GET /new ? { c: str = "" } {
+    let u = signed_in("/new")
+    <NewThreadPage me={u} cats={categories()} form={{ category: c }} problem={null}/>
+}
+
+route POST /new {
+    let u = signed_in("/new")
+    let f = request.form
+    let cat = category(f.category ?? "")
+    let poll = parse_poll(f)
+    if is_err(poll) {
+        reply 422 <NewThreadPage me={u} cats={categories()} form={f} problem={poll.error}/>
+    }
+    let id = create_thread(u, cat.id ?? 0, f.title ?? "", f.body ?? "", f.tags ?? "", poll)
+    if is_err(id) {
+        reply 422 <NewThreadPage me={u} cats={categories()} form={f} problem={id.error}/>
+    }
+    redirect(`/t/${id}`)
+}
+
+// ---- accounts ------------------------------------------------------------
+
+route GET /login ? { next: str = "/" } =
+    <AuthPage me={me()} mode="login" next={safe_next(next)} form={{}} problem={null}/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.who ?? "", f.password ?? "")
+    if is_err(r) {
+        reply 401 <AuthPage me={null} mode="login" next={safe_next(f.next)} form={f} problem={r.error}/>
+    }
+    redirect(safe_next(f.next))
+}
+
+route GET /register ? { next: str = "/" } =
+    <AuthPage me={me()} mode="register" next={safe_next(next)} form={{}} problem={null}/>
+
+route POST /register {
+    let f = request.form
+    let r = register(f.name ?? "", f.email ?? "", f.password ?? "")
+    if is_err(r) {
+        reply 422 <AuthPage me={null} mode="register" next={safe_next(f.next)} form={f} problem={r.error}/>
+    }
+    redirect(safe_next(f.next))
+}
+
+route POST /logout ? { everywhere: str = "" } {
+    sign_out(everywhere == "1")
+    redirect("/")
+}
+
+route POST /settings {
+    let u = signed_in("/")
+    set_bio(u.id, request.form.bio ?? "")
+    redirect(`/u/${u.name}`)
+}
+
+route POST /u/:name/role {
+    let u = signed_in("/")
+    if !is_admin(u) { reply 403 "Admins only" }
+    let role = request.form.role
+    if role != "member" && role != "moderator" && role != "admin" { reply 400 "No such role" }
+    set_role(u, name, role)
+    redirect(`/u/${name}`)
+}
+
+route POST /u/:name/suspend {
+    signed_in("/")
+    let p = profile(name) ?? reply 404 "Nobody here goes by that name"
+    let r = suspend(p.id, int(request.form.days ?? "") ?? 1)
+    if is_err(r) { reply 403 r.error }
+    redirect(`/u/${name}`)
+}
+
+// ---- files and data ------------------------------------------------------
+
+route GET /static/*path = file("public/" + path)
+
+// Uploaded images: random names that never change content, so kept for good.
+route GET /media/:name {
+    if !is_media_name(name) { reply 404 "No such image" }
+    file(`uploads/images/${name}`, { cache: "1y" })
+}
+
+// Threads as JSON, for scripts and feeds.
+route GET /api/threads ? { sort: str = "latest", page: int = 1 } = load_threads(null, null, sort_of(sort), page)
+route GET /api/t/:id(int) = { thread: load_thread(id) ?? reply 404 { error: "no such thread" }, posts: load_posts(id) }

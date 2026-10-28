@@ -1,0 +1,127 @@
+// Data blocks: a list of an object's records, a form that makes one, and a
+// transaction that moves one to its next state. All live: a record made or
+// moved anywhere shows at once wherever its object is shown.
+
+view FieldInput(f, value, people: list, on_change) {
+    let id = `fld-${f.id}`
+    match f.type {
+        "longtext" => <textarea {id} rows="4" value={value ?? ""} @input={(e) => on_change(e.value)}></textarea>
+        "number" => <input {id} type="number" step="any" value={value ?? ""} @input={(e) => on_change(e.value)}/>
+        "money" => <input {id} inputmode="decimal" placeholder="0.00" value={value ?? ""} @input={(e) => on_change(e.value)}/>
+        "date" => <input {id} type="date" value={value ?? ""} @input={(e) => on_change(e.value)}/>
+        "choice" => <select {id} @change={(e) => on_change(e.value)}>
+            <option value="">–</option>
+            {for o in f.options => <option key={o} value={o} selected={value == o}>{o}</option>}
+        </select>
+        "yesno" => <input {id} type="checkbox" checked={value == true} @change={(e) => on_change(e.checked)}/>
+        "user" => <select {id} @change={(e) => on_change(e.value)}>
+            <option value="">–</option>
+            {for p in people => <option key={p.id} value={p.id} selected={str(value ?? "") == str(p.id)}>{p.name}</option>}
+        </select>
+        _ => <input {id} value={value ?? ""} maxlength="500" @input={(e) => on_change(e.value)}/>
+    }
+}
+
+view Fields(fields: list, values: map, people: list, on_change) =
+    <div.form-fields>
+        {for f in fields => <label key={f.id} for={`fld-${f.id}`} class={f.type == "yesno" ? "check" : ""}>
+            <span>{f.name}{f.required == 1 && f.type != "yesno" && <b.req title="Required">*</b>}</span>
+            <FieldInput {f} value={values[str(f.id)]} {people} on_change={(v) => on_change(f.id, v)}/>
+        </label>}
+    </div>
+
+component ListBlock(list_id: int) {
+    state data = live(load_list, list_id)
+    let d = data
+    <div.data-block.list-block>
+        {is_err(d) || d == null
+            ? <p.muted>{is_err(d) ? d.error : "This list was deleted."}</p>
+            : <div>
+                <header.data-head><b>{d.list.name}</b> <span.muted>{d.object.name} · {plural(len(d.rows), "record")}</span></header>
+                {len(d.rows) == 0
+                    ? <p.muted>No records yet.</p>
+                    : <div.table-wrap><table.data>
+                        <thead><tr><th>#</th><th>State</th>{for c in d.columns => <th key={c.id}>{c.name}</th>}</tr></thead>
+                        <tbody>{for r in d.rows => <tr key={r.id}>
+                            <td.num>{r.id}</td>
+                            <td><StepPill name={r.state} color={r.color}/></td>
+                            {for [i, v] in enumerate(r.cells) => <td key={i} class={d.columns[i].type == "money" || d.columns[i].type == "number" ? "num" : ""}>{v}</td>}
+                        </tr>}</tbody>
+                      </table></div>}
+              </div>}
+    </div>
+}
+
+component FormBlock(form_id: int) {
+    state data = live(load_form, form_id)
+    state values = {}
+    state problem = null
+    state sending = false
+    let d = data
+    let submit = () => {
+        if sending { return null }
+        sending = true
+        let r = submit_create(form_id, values)
+        sending = false
+        if is_err(r) { problem = r.error } else {
+            problem = null
+            values = {}
+            notify(`Saved as #${r}`, { tone: "success", seconds: 3 })
+        }
+    }
+    <div.data-block.form-block>
+        {is_err(d) || d == null
+            ? <p.muted>{is_err(d) ? d.error : "This form was deleted."}</p>
+            : <form @submit={submit}>
+                <header.data-head><b>{d.form.name}</b> <span.muted>new {d.object.name} record</span></header>
+                <Fields fields={d.fields} {values} people={d.people} on_change={(id, v) => { values = set(values, str(id), v) }}/>
+                <Problem text={problem}/>
+                {d.allowed
+                    ? <button.btn.primary disabled={sending}>{sending ? "Saving…" : "Save"}</button>
+                    : <p.muted>Only {d.role}s use this form.</p>}
+              </form>}
+    </div>
+}
+
+component TransactionBlock(form_id: int) {
+    state data = live(load_form, form_id)
+    state record = null
+    state values = {}
+    state problem = null
+    let d = data
+    let run = () => {
+        if record == null { problem = "Pick a record first"; return null }
+        let r = run_transaction(form_id, record, values)
+        if is_err(r) { problem = r.error } else {
+            notify(`#${record} is now at ${r}`, { tone: "success", seconds: 3 })
+            problem = null
+            values = {}
+            record = null
+        }
+    }
+    <div.data-block.tx-block>
+        {is_err(d) || d == null
+            ? <p.muted>{is_err(d) ? d.error : "This form was deleted."}</p>
+            : <form @submit={run}>
+                <header.data-head>
+                    <b>{d.form.name}</b>
+                    <span.muted>{d.object.name}: <StepPill name={d.transition.from} color="#64748b"/> → <StepPill name={d.transition.to} color="#1baf7a"/></span>
+                </header>
+                {len(d.candidates) == 0
+                    ? <p.muted>No {d.object.name} record is at {d.transition.from} now.</p>
+                    : <div>
+                        <label.pick>Record
+                            <select @change={(e) => { record = int(e.value) ?? null }}>
+                                <option value="" selected={record == null}>Pick one…</option>
+                                {for c in d.candidates => <option key={c.id} value={c.id} selected={record == c.id}>#{c.id} {c.label ?? ""}</option>}
+                            </select>
+                        </label>
+                        <Fields fields={d.fields} {values} people={d.people} on_change={(id, v) => { values = set(values, str(id), v) }}/>
+                        <Problem text={problem}/>
+                        {d.allowed
+                            ? <button.btn.primary disabled={record == null}>{d.transition.name}</button>
+                            : <p.muted>Only {d.role}s run this.</p>}
+                      </div>}
+              </form>}
+    </div>
+}

@@ -1,0 +1,128 @@
+// A column's row is a component of its own (it keeps what is typed until
+// saved), so the rows are a grid of divs, not a table: a component is
+// wrapped in <quillo-island>, which the HTML parser moves out of a <tbody>.
+//
+// A project's settings: its columns (name, kind, WIP limit, order),
+// labels, milestones and people. Owners change columns and people; editors
+// change labels and milestones.
+
+component ColumnRow(project_id: int, c, cards: int, first: bool, last_one: bool, owner: bool, on_problem) {
+    state name = c.name
+    state kind = c.kind
+    state wip = c.wip == null ? "" : str(c.wip)
+    let dirty = name != c.name || kind != c.kind || wip != (c.wip == null ? "" : str(c.wip))
+    let done = (r) => { on_problem(is_err(r) ? r.error : null) }
+    <div.crow role="row">
+        <span role="cell"><input value={name} maxlength="30" disabled={!owner} aria-label="Name" @input={(e) => { name = e.value }}/></span>
+        <span role="cell"><select disabled={!owner} aria-label="Kind" @change={(e) => { kind = e.value }}>
+            {for k in COLUMN_KINDS => <option key={k} value={k} selected={k == kind}>{k}</option>}
+        </select></span>
+        <span role="cell"><input type="number" min="1" max="99" placeholder="none" value={wip} disabled={!owner} aria-label="WIP limit"
+                   @input={(e) => { wip = e.value }}/></span>
+        <span.num role="cell">{cards}</span>
+        <span.row-actions role="cell">{owner && [
+            dirty && <button.btn.primary.small @click={() => done(edit_column(project_id, c.id, { name, kind, wip: wip == "" ? null : int(wip) ?? 0 }))}>Save</button>,
+            <button.icon-btn.small aria-label="Move left" disabled={first} @click={() => done(shift_column(project_id, c.id, -1))}>←</button>,
+            <button.icon-btn.small aria-label="Move right" disabled={last_one} @click={() => done(shift_column(project_id, c.id, 1))}>→</button>,
+            <button.icon-btn.small aria-label="Delete column" @click={() => {
+                if ask(`Delete the column ${c.name}?`, { ok: "Delete", cancel: "Keep it", tone: "danger" }) { done(delete_column(project_id, c.id)) }
+            }}>✕</button>,
+        ]}</span>
+    </div>
+}
+
+component Settings(project_id: int, today: int) {
+    state data = live(load_settings, project_id)
+    state problem = null
+    state col_name = ""
+    state col_kind = "doing"
+    state label_name = ""
+    state label_color = COLORS[1]
+    state ms_name = ""
+    state ms_start = day_text(today)
+    state ms_due = day_text(today + 13)
+    state person = ""
+    state person_role = "editor"
+    let d = data
+    let owner = d.role == "owner"
+    let editor = can_edit(d.role)
+    let year = year_of(today)
+    let r_ok = (r) => { problem = is_err(r) ? r.error : null; !is_err(r) }
+    let cards = (id) => (find(d.counts, (x) => x.column_id == id) ?? {}).n ?? 0
+    <div.settings>
+        <Problem text={problem}/>
+        <section.card-box>
+            <h2>Columns</h2>
+            <p.muted>A column's kind tells the reports what it means: work not started, under way, or done. A WIP limit marks the column when more cards are in it.</p>
+            <div.ctable role="table" aria-label="Columns">
+                <div.crow.chead role="row"><span role="columnheader">Name</span><span role="columnheader">Kind</span><span role="columnheader">WIP limit</span><span role="columnheader">Cards</span><span/></div>
+                {for [i, c] in enumerate(d.columns) =>
+                    <ColumnRow key={`${c.id}-${c.name}-${c.kind}-${c.wip}`} {project_id} {c} cards={cards(c.id)} first={i == 0}
+                        last_one={i == len(d.columns) - 1} {owner} on_problem={(p) => { problem = p }}/>}
+            </div>
+            {owner && <form.inline-add @submit={() => { if r_ok(add_column(project_id, { name: col_name, kind: col_kind, wip: null })) { col_name = "" } }}>
+                <input placeholder="New column" maxlength="30" bind:value={col_name}/>
+                <select @change={(e) => { col_kind = e.value }}>{for k in COLUMN_KINDS => <option key={k} value={k} selected={k == col_kind}>{k}</option>}</select>
+                <button.btn.ghost.small disabled={trim(col_name) == ""}>Add column</button>
+            </form>}
+        </section>
+
+        <section.card-box>
+            <h2>Milestones</h2>
+            <ul.rows>{for m in d.milestones => <li key={m.id}>
+                <b>{m.name}</b>
+                <span.muted>{short_day(parse_day(m.start_day) ?? today, year)} – {short_day(parse_day(m.due_day) ?? today, year)}</span>
+                <span.grow/>
+                {editor && <button.icon-btn.small aria-label={`Delete ${m.name}`} @click={() => {
+                    if ask(`Delete the milestone ${m.name}? Its tasks stay, without a milestone.`, { ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                        r_ok(delete_milestone(project_id, m.id))
+                    }
+                }}>✕</button>}
+            </li>}</ul>
+            {editor && <form.inline-add @submit={() => {
+                if r_ok(save_milestone(project_id, null, { name: ms_name, start_day: ms_start, due_day: ms_due })) { ms_name = "" }
+            }}>
+                <input placeholder="Milestone" maxlength="60" bind:value={ms_name}/>
+                <input type="date" aria-label="Starts" bind:value={ms_start}/>
+                <input type="date" aria-label="Due" bind:value={ms_due}/>
+                <button.btn.ghost.small disabled={trim(ms_name) == ""}>Add</button>
+            </form>}
+        </section>
+
+        <section.card-box>
+            <h2>Labels</h2>
+            <div.chips>{for l in d.labels => <span key={l.id} class="chip" style={`--c: ${l.color}`}>{l.name}
+                {editor && <button.chip-x aria-label={`Delete ${l.name}`} @click={() => r_ok(delete_label(project_id, l.id))}>✕</button>}</span>}</div>
+            {editor && <form.inline-add @submit={() => { if r_ok(add_label(project_id, label_name, label_color)) { label_name = "" } }}>
+                <input placeholder="New label" maxlength="20" bind:value={label_name}/>
+                <span.swatches>{for c in COLORS => <button key={c} type="button" class={`swatch ${label_color == c ? "on" : ""}`} style={`--c: ${c}`}
+                    aria-label={c} aria-pressed={label_color == c} @click={() => { label_color = c }}/>}</span>
+                <button.btn.ghost.small disabled={trim(label_name) == ""}>Add label</button>
+            </form>}
+        </section>
+
+        <section.card-box>
+            <h2>People</h2>
+            <ul.rows>{for m in d.members => <li key={m.id}>
+                <Avatar name={m.name} hue={m.hue} size="sm"/> <b>{m.name}</b>
+                <span.grow/>
+                {owner
+                    ? <select aria-label={`Role of ${m.name}`} @change={(e) => r_ok(set_member_role(project_id, m.id, e.value))}>
+                        {for r in ROLES => <option key={r} value={r} selected={r == m.role}>{r}</option>}
+                      </select>
+                    : <span.muted>{m.role}</span>}
+                {(owner || m.id == d.me) && <button.btn.ghost.small @click={() => {
+                    let what = m.id == d.me ? "Leave this project?" : `Remove ${m.name} from the project? Their tasks are left with nobody.`
+                    if ask(what, { ok: m.id == d.me ? "Leave" : "Remove", cancel: "Cancel", tone: "danger" }) {
+                        if r_ok(remove_member(project_id, m.id)) && m.id == d.me { js("pm.go", "/") }
+                    }
+                }}>{m.id == d.me ? "Leave" : "Remove"}</button>}
+            </li>}</ul>
+            {owner && <form.inline-add @submit={() => { if r_ok(add_member(project_id, person, person_role)) { person = "" } }}>
+                <input placeholder="Their user name" bind:value={person}/>
+                <select @change={(e) => { person_role = e.value }}>{for r in ROLES => <option key={r} value={r} selected={r == person_role}>{r}</option>}</select>
+                <button.btn.ghost.small disabled={trim(person) == ""}>Add person</button>
+            </form>}
+        </section>
+    </div>
+}

@@ -1,0 +1,25 @@
+// Q-029 SQL built from sql_name(...) is warned about as injection when the name is kept in a variable or made by a helper
+// mode: check
+// open-when: SQL built from values
+// fixed-when: /components\)\s*$/
+// From FEEDBACK3.md §2 (found on 896e758). The guide says SQL made of sql_name "(also kept in a
+// variable)" is not warned about; it is, when sql_name is given a template string, or when a
+// helper returns it. In cms/, all 14 of `quillo check`'s warnings are this.
+
+db.open(":memory:")
+
+// Not warned: the name is a parameter.
+fn rows_of(name: str) {
+    let table = sql_name(name)
+    db.query(`select * from ${table}`)
+}
+
+// Warned: the same, with the name made by a template string.
+fn rows_of_object(id: int) {
+    let table = sql_name(`obj_${id}`)
+    db.query(`select * from ${table}`)
+}
+
+fn table_of(id: int) -> str = sql_name(`obj_${id}`)
+
+fn count_of(id: int) = db.one(`select count(*) as n from ${table_of(id)}`)

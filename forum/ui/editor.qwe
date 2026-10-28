@@ -1,0 +1,123 @@
+// The Markdown box used for replies, edits, new threads and messages. Typing
+// @ and a few letters suggests people (arrow keys and Enter or Tab to pick,
+// Escape to close); images pasted, dropped or picked are uploaded and put in
+// as Markdown where the cursor is.
+//
+// Inside another component it follows `value` and reports changes through
+// `on_change`. Placed straight in a page's form (no `on_change`), it keeps
+// its own text, and `name` sends it with the form.
+
+// "@li" just before the cursor, after a start or a character that is not
+// part of a word, an address or a path (as lib/mentions.qwe reads them).
+let MENTION_TYPING = "(?:^|[^A-Za-z0-9_@/.\\[])@([A-Za-z0-9_]{1,20})$"
+
+component Editor(box_id: str, value: str = "", name: str? = null, rows: int = 6, placeholder: str = "",
+                 thread_id: int? = null, required: bool = false, on_change = null, on_submit = null, on_typing = null) {
+    state own = value
+    state people = []
+    state pick = 0
+    state at = null                 // where the @name being typed is: { start, end }
+    state asked = ""
+    state uploading = 0
+    state problem = null
+    let text = on_change == null ? own : value
+    let put = (v) => { if on_change == null { own = v } else { on_change(v) } }
+    let close = () => { people = []; at = null }
+
+    let suggest = (v, caret) => {
+        let m = re.find(slice(v, 0, caret), MENTION_TYPING)
+        if m == null { close(); return null }
+        let q = m.groups[0]
+        at = { start: m.end - len(q) - 1, end: caret }
+        asked = q
+        let found = find_people(q, thread_id) ?? []
+        // An older answer arriving after a newer question is dropped.
+        if asked == q {
+            people = found
+            pick = 0
+        }
+    }
+
+    let choose = (p) => {
+        let v = slice(text, 0, at.start) + `@${p.name} ` + slice(text, at.end)
+        let caret = at.start + len(p.name) + 2
+        put(v)
+        close()
+        js("forum.caret", box_id, caret)
+    }
+
+    // Text put in where the cursor is, on lines of its own.
+    let insert = (snippet) => {
+        let c = js("forum.caretOf", box_id) ?? len(text)
+        let before = slice(text, 0, c)
+        let pad = before == "" || ends_with(before, "\n\n") ? "" : ends_with(before, "\n") ? "\n" : "\n\n"
+        put(before + pad + snippet + "\n\n" + slice(text, c))
+        js("forum.caret", box_id, len(before) + len(pad) + len(snippet) + 2)
+    }
+
+    let upload = (file) => {
+        if file == null { return null }
+        if !starts_with(file.type ?? "", "image/") { problem = "Only images can be added"; return null }
+        uploading += 1
+        let r = upload_image(file)
+        uploading -= 1
+        if is_err(r) {
+            problem = r.error
+        } else {
+            problem = null
+            insert(`![image](${r.url})`)
+        }
+    }
+
+    <div.editor class={uploading > 0 && "busy"}>
+        <textarea id={box_id} name={name} value={text} rows={rows} placeholder={placeholder} required={required}
+            aria-autocomplete="list" aria-expanded={len(people) > 0}
+            @input={(e) => {
+                put(e.value)
+                if on_typing != null { on_typing() }
+                suggest(e.value, e.target.selectionStart)
+            }}
+            @keydown={(e) => {
+                if len(people) > 0 {
+                    if e.key == "ArrowDown" { e.preventDefault(); pick = (pick + 1) % len(people); return null }
+                    if e.key == "ArrowUp" { e.preventDefault(); pick = (pick + len(people) - 1) % len(people); return null }
+                    if e.key == "Enter" || e.key == "Tab" { e.preventDefault(); choose(people[pick]); return null }
+                    if e.key == "Escape" { e.preventDefault(); close(); return null }
+                }
+                if e.key == "Enter" && (e.ctrlKey || e.metaKey) && on_submit != null { on_submit() }
+            }}
+            @blur={() => { close() }}
+            @paste={(e) => {
+                let f = e.clipboardData.files[0]
+                if f != null { e.preventDefault(); upload(f) }
+            }}
+            @dragover={(e) => { e.preventDefault() }}
+            @drop={(e) => {
+                let f = e.dataTransfer.files[0]
+                if f != null { e.preventDefault(); upload(f) }
+            }}></textarea>
+        {len(people) > 0 && <ul.suggest role="listbox">
+            {for [i, p] in enumerate(people) => <li role="option" aria-selected={i == pick} class={i == pick && "on"}
+                @mousedown={(e) => { e.preventDefault(); choose(p) }}>
+                <Avatar name={p.name} hue={p.hue} size="sm"/> <b>{p.name}</b>
+                {p.here == 1 && <span.muted>in this thread</span>}
+            </li>}
+        </ul>}
+        <div.editor-tools>
+            <label.attach title="Add an image (or paste or drop one)">
+                <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 5h16v14H4zM4 15l4-4 4 4 3-3 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="15.5" cy="9" r="1.5" fill="currentColor"/></svg>
+                Image
+                <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden
+                    @change={(e) => {
+                        let f = e.target.files[0]
+                        // Cleared, so picking the same image again is a change too.
+                        e.target.value = ""
+                        upload(f)
+                    }}/>
+            </label>
+            {uploading > 0 && <span.muted>Uploading…</span>}
+            <span.hint>Markdown · @name · paste or drop images</span>
+        </div>
+        <Problem text={problem}/>
+    </div>
+}

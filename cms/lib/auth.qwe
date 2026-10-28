@@ -1,0 +1,100 @@
+// People, their roles and sessions. Someone may hold several roles; the
+// first person to join is the admin, with every role.
+
+let ROLES = ["admin", "designer", "writer", "reviewer", "publisher"]
+let SESSION_DAYS = 30
+
+fn roles_of(user_id: int) -> list with db =
+    unwatched(() => db.query("select role from user_roles where user_id = ? order by role", user_id)) | map((r) => r.role)
+
+fn user_of_session(sid) with db, time {
+    if sid == null { return null }
+    let u = db.one(sql`select u.id, u.name, u.hue from sessions s join users u on u.id = s.user_id
+                       where s.id = ? and s.expires > ?`, sid, now())
+    u == null ? null : merge(u, { roles: roles_of(u.id) })
+}
+
+// Who is signed in, with their roles; or null. Not followed by loaders: a
+// sign-in somewhere wakes no page.
+fn me() with db, time = unwatched(() => user_of_session(session().sid))
+
+fn has_role(u, role: str) -> bool = u != null && (contains(u.roles, role) || contains(u.roles, "admin"))
+
+fn has_any(u, roles: list) -> bool = any(roles, (r) => has_role(u, r))
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/desk"
+
+fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+// For routes: someone with one of `roles`, or a 403 page.
+fn needs(back: str, roles: list) {
+    let u = signed_in(back)
+    if !has_any(u, roles) { reply 403 <NotAllowed me={u} what={`This needs the ${join(roles, " or ")} role.`}/> }
+    u
+}
+
+// For server fns: who is acting, or an error the page shows.
+fn acting(roles: list = []) ! str with db, time {
+    let u = me() ?? err("Sign in first")?
+    if len(roles) > 0 && !has_any(u, roles) { return err(`This needs the ${join(roles, " or ")} role`) }
+    u
+}
+
+fn start_session(user_id: int) with db, time, random {
+    let sid = crypto.token()
+    db.exec("insert into sessions (id, user_id, created, expires) values (?, ?, ?, ?)",
+        sid, user_id, now(), now() + SESSION_DAYS * DAY_MS)
+    set_session({ sid }, { max_age: SESSION_DAYS * 86400 })
+}
+
+fn register(name: str, email: str, password: str) ! str with db, time, random {
+    let n = trim(name)
+    let e = lower(trim(email))
+    if !re.test(n, "^[A-Za-z0-9_]{3,20}$") { return err("A name is 3 to 20 letters, digits or _") }
+    if !re.test(e, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return err("That email does not look right") }
+    if len(password) < 8 { return err("Use at least 8 characters for the password") }
+    if db.one("select 1 from users where name = ? or email = ?", n, e) != null { return err("That name or email is already taken") }
+    let id = db.transaction(() => {
+        let first = db.one("select count(*) as n from users").n == 0
+        let id = db.exec("insert into users (name, email, password_hash, hue, created) values (?, ?, ?, ?, ?)",
+            n, e, crypto.hash_password(password), random_int(0, 359), now())?.last_id
+        // The first person runs the place; the rest start as writers.
+        for r in first ? ROLES : ["writer"] { db.exec("insert into user_roles (user_id, role) values (?, ?)", id, r)? }
+        id
+    })?
+    start_session(id)
+}
+
+fn sign_in(who: str, password: str) ! str with db, time, random {
+    let u = db.one("select id, password_hash from users where name = ? or email = ?", trim(who), lower(trim(who)))
+    let hash = u.password_hash ?? crypto.hash_password("not anyone's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong name or password") }
+    start_session(u.id)
+}
+
+fn sign_out() with db, time {
+    let sid = session().sid
+    if sid != null { db.exec("delete from sessions where id = ?", sid) }
+    end_session()
+}
+
+// ---- the admin's page --------------------------------------------------------
+
+server fn load_people() with db, time {
+    acting(["admin"])?
+    db.query(sql`select u.id, u.name, u.hue, u.email,
+                        coalesce((select group_concat(role, ',') from user_roles r where r.user_id = u.id), '') as roles
+                 from users u order by u.name collate nocase`)
+        | map((u) => merge(u, { roles: u.roles == "" ? [] : split(u.roles, ",") }))
+}
+
+server fn toggle_role(user_id: int, role: str) ! str with db, time {
+    let u = acting(["admin"])?
+    if !contains(ROLES, role) { return err("No such role") }
+    if user_id == u.id && role == "admin" { return err("You cannot take away your own admin role") }
+    let r = db.exec("delete from user_roles where user_id = ? and role = ?", user_id, role)?
+    if r.changes == 0 { db.exec("insert into user_roles (user_id, role) values (?, ?)", user_id, role)? }
+    true
+}
+
+fn clear_sessions() with db, time = db.exec("delete from sessions where expires < ?", now())

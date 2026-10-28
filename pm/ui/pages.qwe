@@ -1,0 +1,106 @@
+// Pages: home (projects and what is on my plate), signing in, and the frame
+// of a project's pages around their components.
+
+view ProjectCard(p) {
+    let pct = p.tasks == 0 ? 0 : round(p.done / p.tasks * 100)
+    <a.project-card href={`/p/${p.key}`} style={`--c: ${p.color}`}>
+        <div.pc-head><span.key>{p.key}</span><span.muted>{p.role}</span></div>
+        <h3>{p.name}</h3>
+        {p.about != "" && <p.muted>{p.about}</p>}
+        <div.meter><i style={`width: ${pct}%`}/></div>
+        <span.muted>{p.done} of {p.tasks} done · {p.people} {p.people == 1 ? "person" : "people"}</span>
+    </a>
+}
+
+view MyWork(items: list, today: int) =
+    <section.card-box>
+        <h2>On my plate <span.muted>{len(items)} open</span></h2>
+        {len(items) == 0
+            ? <p.muted>Nothing is assigned to you.</p>
+            : <ul.my-work>{for t in items => <li key={t.id}>
+                <a href={`/p/${t.key}?task=${t.id}`}>
+                    <span.ref style={`--c: ${t.color}`}>{t.key}-{t.num}</span>
+                    <PriorityIcon p={t.priority}/>
+                    <span.grow.title>{t.title}</span>
+                    <span.muted>{t.column_name}</span>
+                    {t.due_day != null && <span class={`due ${(parse_day(t.due_day) ?? today) < today ? "late" : ""}`}>{due_label(parse_day(t.due_day) ?? today, today)}</span>}
+                </a>
+            </li>}</ul>}
+    </section>
+
+view NewProjectForm(form, problem) =
+    <section.card-box>
+        <h2>New project</h2>
+        <Problem text={problem}/>
+        <form.stack method="post" action="/projects">
+            <label>Name <input name="name" required maxlength="60" value={form.name ?? ""} placeholder="Website relaunch"/></label>
+            <label>Key <input name="key" required maxlength="6" value={form.key ?? ""} placeholder="WEB" pattern="[A-Za-z][A-Za-z0-9]{1,5}"
+                title="2 to 6 letters or digits, starting with a letter"/>
+                <small.muted>Tasks are named after it: WEB-1, WEB-2…</small></label>
+            <label>About <input name="about" maxlength="200" value={form.about ?? ""}/></label>
+            <fieldset.colors><legend>Colour</legend>
+                {for c in COLORS => <label key={c} class="swatch-pick" style={`--c: ${c}`}>
+                    <input type="radio" name="color" value={c} checked={(form.color ?? COLORS[0]) == c}/><i/></label>}
+            </fieldset>
+            <button.btn.primary>Create project</button>
+        </form>
+    </section>
+
+view HomePage(me, projects: list, work: list, today: int, form, problem) =
+    <Page title="Lanes" {me}>
+        <div.home>
+            <div>
+                <h1>Your projects</h1>
+                {len(projects) == 0
+                    ? <p.muted>You are in no project yet: start one, or ask an owner to add you ({me.name}).</p>
+                    : <div.project-grid>{for p in projects => <ProjectCard key={p.id} {p}/>}</div>}
+                <MyWork items={work} {today}/>
+            </div>
+            <NewProjectForm {form} {problem}/>
+        </div>
+    </Page>
+
+view Landing() =
+    <Page title="Lanes" me={null}>
+        <section.landing>
+            <h1>Projects that move.</h1>
+            <p>Kanban boards that update for everyone at once, a timeline you drag, and reports drawn from what really happened: cumulative flow, burndown, cycle time, and a forecast of when the work is done.</p>
+            <p><a.btn.primary href="/register">Start a project</a> <a.btn.ghost href="/login">Sign in</a></p>
+        </section>
+    </Page>
+
+view AuthPage(mode: str, next: str, form, problem) {
+    let login = mode == "login"
+    <Page title={login ? "Sign in" : "Join"} me={null}>
+        <section.card-box.auth>
+            <h1>{login ? "Sign in" : "Join Lanes"}</h1>
+            <Problem text={problem}/>
+            <form.stack method="post" action={login ? "/login" : "/register"}>
+                <input type="hidden" name="next" value={next}/>
+                {login
+                    ? <label>Name or email <input name="who" required autofocus value={form.who ?? ""} autocomplete="username"/></label>
+                    : [<label>Name <input name="name" required autofocus value={form.name ?? ""} autocomplete="username"/></label>,
+                       <label>Email <input name="email" type="email" required value={form.email ?? ""} autocomplete="email"/></label>]}
+                <label>Password <input name="password" type="password" required minlength={login ? null : "8"}
+                    autocomplete={login ? "current-password" : "new-password"}/></label>
+                <button.btn.primary>{login ? "Sign in" : "Join"}</button>
+            </form>
+            <p.muted>{login
+                ? <span>New here? <a href={`/register?next=${url_encode(next)}`}>Join</a></span>
+                : <span>Have an account? <a href={`/login?next=${url_encode(next)}`}>Sign in</a></span>}</p>
+            {env("PM_DEMO", "") == "1" && <p.muted>Demo: sign in as <b>ada</b>, <b>grace</b>, <b>linus</b> or <b>margaret</b>, password <b>password123</b>.</p>}
+        </section>
+    </Page>
+}
+
+view ProjectPage(me, project, tab: str, children) =
+    <Page title={`${tab} · ${project.name}`} {me} {project} wide={true}>
+        <div.project-head>
+            <h1><i.dot style={`--c: ${project.color}`}/>{project.name} <span.muted.key>{project.key}</span></h1>
+            <ProjectTabs pkey={project.key} on={tab}/>
+        </div>
+        {children}
+    </Page>
+
+view NotFoundPage(me, what: str) =
+    <Page title="Not found" {me}><section.card-box><h1>Not here</h1><p>{what}</p><p><a href="/">Back to your projects</a></p></section></Page>

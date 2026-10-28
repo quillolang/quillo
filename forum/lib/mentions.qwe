@@ -1,0 +1,31 @@
+// @mentions, found with a regular expression (`re`, the same on the server
+// and in pages).
+
+// One pattern, three kinds of match, in the order they are tried: a fenced
+// code block, an inline code span (both matched so they are skipped whole),
+// and @name after the start of the text or a character that is not part of a
+// word, an address, a path or a link (so not mail@x.com, /@x or [@x](...)).
+// A line break is such a character, so a line's start needs no `m` flag;
+// without it `$` is the end of the text, where an unclosed fence ends. The
+// `s` flag lets a fence's `.` cross lines.
+let MENTION = "```.*?(?:```|$)|`[^`\\n]*`|(?:^|[^A-Za-z0-9_@/.\\[])@([A-Za-z0-9_]{3,20})\\b"
+
+// The mentions in a post, outside code: [{ name, start, end }], where
+// start..end is the @name itself.
+fn mentions_in(body: str) =
+    (re.find_all(body, MENTION, "s") ?? [])
+        | filter((m) => m.groups[0] != null)
+        | map((m) => { name: m.groups[0], start: m.end - len(m.groups[0]) - 1, end: m.end })
+
+// The names a post mentions, lowercased.
+fn mentioned(body: str) -> list<str> = mentions_in(body) | map((m) => lower(m.name)) | unique
+
+// Each @name in `names` (people who exist, lowercased) made a link to their profile.
+fn link_mentions(body: str, names: list<str>) -> str {
+    if len(names) == 0 { return body }
+    let done = reduce(mentions_in(body), { at: 0, out: "" }, (acc, m) =>
+        contains(names, lower(m.name))
+            ? { at: m.end, out: acc.out + slice(body, acc.at, m.start) + `[@${m.name}](/u/${m.name})` }
+            : acc)
+    done.out + slice(body, done.at)
+}

@@ -1,0 +1,137 @@
+// Blocks: what articles and pages are made of. Content blocks (heading,
+// text, quote, image, callout, divider) and data blocks (a list of an
+// object's records, a form that makes one, a transaction that moves one).
+//
+// A block belongs to an owner, 'article:<id>' or 'page:<id>'; that is also
+// the topic pages showing the owner follow. Each change raises the block's
+// version: a save made from an older version is refused, and feedback left on
+// an older version says the block changed since.
+
+let CONTENT_TYPES = ["heading", "text", "quote", "image", "callout", "divider"]
+let DATA_TYPES = ["list", "form", "transaction"]
+let BLOCK_LABELS = {
+    heading: "Heading", text: "Text", quote: "Quote", image: "Image", callout: "Callout", divider: "Divider",
+    list: "List of records", form: "Form", transaction: "Transaction",
+}
+let MAX_TEXT = 20000
+
+fn owner_key(kind: str, id: int) -> str = `${kind}:${id}`
+
+fn owner_parts(owner: str) {
+    let m = re.find(owner, "^(article|page):(\\d+)$")
+    m == null ? null : { kind: m.groups[0], id: int(m.groups[1]) }
+}
+
+// The block's data, checked and cleaned for its type: only the fields the
+// type has, of the right kind.
+fn clean_block(type: str, d) ! str {
+    let text = (v, n) => {
+        let s = str(v ?? "")
+        len(s) > n ? err(`At most ${n} characters`) : s
+    }
+    match type {
+        "heading" => ({ text: text(d.text, 200)?, level: d.level == 3 ? 3 : 2 })
+        "text" => ({ md: text(d.md, MAX_TEXT)? })
+        "quote" => ({ text: text(d.text, 2000)?, by: text(d.by, 100)? })
+        "image" => {
+            let url = trim(text(d.url, 500)?)
+            if url != "" && !re.test(url, "^(https://|/)") { return err("An image's address starts with https:// or /") }
+            { url, caption: text(d.caption, 300)? }
+        }
+        "callout" => ({ tone: d.tone == "warn" || d.tone == "good" ? d.tone : "info", md: text(d.md, 2000)? })
+        "divider" => ({})
+        "list" => ({ list_id: int(d.list_id ?? 0) ?? 0 })
+        "form" | "transaction" => ({ form_id: int(d.form_id ?? 0) ?? 0 })
+        _ => err(`No such block: ${type}`)
+    }
+}
+
+// What a block shows, worked out on the server: Markdown made HTML once here,
+// not in each browser.
+fn shown_block(b) {
+    let d = from_json(b.data, {})
+    // Not `let html`: a variable named like a type is not bound (FEEDBACK2.md §2).
+    let rendered = match b.type {
+        "text" => str(markdown(d.md ?? ""))
+        "callout" => str(markdown(d.md ?? ""))
+        "quote" => str(markdown(d.text ?? "", { inline: true }))
+        _ => ""
+    }
+    { id: b.id, type: b.type, data: d, html: rendered, version: b.version, position: b.position }
+}
+
+fn blocks_of(owner: str) with db =
+    db.query("select id, type, data, version, position from blocks where owner = ? order by position, id", owner)
+        | map(shown_block)
+
+// May `u` change the blocks of `owner`? An article, while it is at a step for
+// writers, by its author (or an admin); a page, by designers.
+fn may_edit(u, owner: str) -> bool with db {
+    let o = owner_parts(owner)
+    if u == null || o == null { return false }
+    if o.kind == "page" { return has_role(u, "designer") }
+    let a = article_row(o.id)
+    a != null && article_editable(a, u)
+}
+
+fn block_row(block_id: int) with db = unwatched(() =>
+    db.one("select id, owner, type, data, version, position from blocks where id = ?", block_id))
+
+// A new block after `after_id` (or at the end), empty.
+server fn add_block(owner: str, after_id: int?, type: str) ! str with db, time {
+    let u = acting()?
+    if !may_edit(u, owner) { return err("You cannot change this now") }
+    if owner_parts(owner).kind == "article" && contains(DATA_TYPES, type) && type != "list" {
+        return err("Articles take content and lists; forms and transactions go on pages")
+    }
+    let data = clean_block(type, {})?
+    let id = db.transaction(() => {
+        let ids = db.query("select id from blocks where owner = ? order by position, id", owner) | map((r) => r.id)
+        let at = after_id == null ? len(ids) : (index_of(ids, after_id) ?? len(ids) - 1) + 1
+        let id = db.exec("insert into blocks (owner, position, type, data, updated, updated_by) values (?, ?, ?, ?, ?, ?)",
+            owner, at, type, json.stringify(data), now(), u.id)?.last_id
+        let order = take(ids, at) + [id] + drop(ids, at)
+        for [i, x] in enumerate(order) { db.exec("update blocks set position = ? where id = ?", i, x)? }
+        id
+    })?
+    publish(owner)
+    id
+}
+
+// Saves a block's data, if nobody saved it since `version`. Gives the new version.
+server fn save_block(block_id: int, data: map, version: int) ! str with db, time {
+    let u = acting()?
+    let b = block_row(block_id) ?? err("That block was deleted")?
+    if !may_edit(u, b.owner) { return err("You cannot change this now") }
+    let clean = clean_block(b.type, data)?
+    let r = db.exec("update blocks set data = ?, version = version + 1, updated = ?, updated_by = ? where id = ? and version = ?",
+        json.stringify(clean), now(), u.id, block_id, version)?
+    if r.changes == 0 { return err("Someone changed this block meanwhile: your text is kept below, copy it before reloading") }
+    publish(b.owner)
+    version + 1
+}
+
+server fn move_block(block_id: int, by: int) ! str with db, time {
+    let u = acting()?
+    let b = block_row(block_id) ?? err("That block was deleted")?
+    if !may_edit(u, b.owner) { return err("You cannot change this now") }
+    let ids = db.query("select id from blocks where owner = ? order by position, id", b.owner) | map((r) => r.id)
+    let at = index_of(ids, block_id)
+    let to = at + (by < 0 ? -1 : 1)
+    if to < 0 || to >= len(ids) { return true }
+    let order = for [i, x] in enumerate(ids) => i == at ? ids[to] : i == to ? block_id : x
+    db.transaction(() => {
+        for [i, x] in enumerate(order) { db.exec("update blocks set position = ? where id = ?", i, x)? }
+    })?
+    publish(b.owner)
+    true
+}
+
+server fn delete_block(block_id: int) ! str with db, time {
+    let u = acting()?
+    let b = block_row(block_id) ?? err("That block was already deleted")?
+    if !may_edit(u, b.owner) { return err("You cannot change this now") }
+    db.exec("delete from blocks where id = ?", block_id)?
+    publish(b.owner)
+    true
+}

@@ -1,0 +1,191 @@
+// An article's room: where its author writes and its reviewers and
+// publishers give feedback, live, from as many desks as are open. Each
+// block has a gutter: who is on it now, and its feedback. The panel on the
+// right shows the feedback threads; above, where the article is in its flow
+// and what the viewer may do there.
+
+view StepTrack(steps: list, current_id: int) {
+    let at = index_of(steps | map((s) => s.id), current_id) ?? 0
+    <ol.step-track aria-label="Where the article is">
+        {for [i, s] in enumerate(steps) => <li key={s.id} class={i < at ? "done" : i == at ? "now" : "ahead"} style={`--c: ${s.color}`}
+            aria-current={i == at && "step"}>
+            <span.st-name>{i < at ? "✓ " : ""}{s.name}</span>
+            <span.st-meta>{s.role != null ? <RoleChip role={s.role}/> : <span.muted>end</span>}
+                {s.approvals > 1 && <span.muted> × {s.approvals}</span>}</span>
+            {len(s.approved) > 0 && <span.st-approved title="Approved by">{join(s.approved, ", ")}</span>}
+        </li>}
+    </ol>
+}
+
+// A div: the byline that holds it is a div too, since a <p> cannot hold a
+// <div> (the browser closes the p early, and the page is made again).
+view Presence(people: list, me_id: int) =
+    <div.presence aria-live="polite">
+        {len(people) <= 1
+            ? <span.muted>Only you here</span>
+            : [<span.muted>Here now:</span>, for p in people => p.user_id != me_id && <Avatar key={p.user_id} name={p.name} hue={p.hue} size="sm"/>]}
+    </div>
+
+// One feedback thread, with its own reply box.
+component Thread(t, me, author_id: int, on_problem, on_show) {
+    state answer = ""
+    let reviewer = has_any(me, ["reviewer", "publisher"])
+    let may_reply = t.status == "open" && (me.id == author_id || reviewer)
+    let send = () => {
+        let r = reply_to(t.id, answer)
+        if is_err(r) { on_problem(r.error) } else { answer = ""; on_problem(null) }
+    }
+    <article class={`thread ${t.status}`} id={`thread-${t.id}`}>
+        <header.th-head>
+            <Avatar name={t.name} hue={t.hue} size="sm"/>
+            <b>{t.name}</b>
+            <span.muted>{ago(t.created, now())}</span>
+            <span.grow/>
+            {t.block_gone == 1
+                ? <span.badge.gone title="The block was deleted">block deleted</span>
+                : <button.link @click={() => on_show(t.block_id)}>show block</button>}
+        </header>
+        {t.outdated && t.status == "open" && <p.badge.changed>The block changed since this was written</p>}
+        <ol.posts>{for p in t.posts => <li key={p.id} class={p.user_id == author_id && "by-author"}>
+            {p.id != t.posts[0].id && <span.p-who><b>{p.name}</b>{p.user_id == author_id && " (author)"} <span.muted>{ago(p.created, now())}</span></span>}
+            <div.md>{raw(p.html)}</div>
+        </li>}</ol>
+        {t.status == "closed" && <p.muted.closed-note>✓ Closed by {t.closed_by ?? "someone"}, {ago(t.closed_at ?? 0, now())}</p>}
+        {may_reply && <form.reply @submit={send}>
+            <textarea rows="2" placeholder={me.id == author_id ? "Answer the reviewer" : "Reply"} value={answer}
+                @input={(e) => { answer = e.value }}
+                @keydown={(e) => { if e.key == "Enter" && (e.metaKey || e.ctrlKey) { e.preventDefault(); send() } }}></textarea>
+            <div.actions>
+                <button.btn.small.ghost disabled={trim(answer) == ""}>Reply</button>
+                {reviewer && <button.btn.small.good type="button" @click={() => on_problem(err_text(set_thread(t.id, false)))}>✓ Close</button>}
+            </div>
+        </form>}
+        {t.status == "closed" && reviewer && <button.link @click={() => on_problem(err_text(set_thread(t.id, true)))}>Reopen</button>}
+    </article>
+}
+
+component ArticleRoom(article_id: int) {
+    state data = live(load_article, article_id)
+    state threads = live(load_threads, article_id)
+    state people = live(load_presence, article_id)
+    state catalog = live(load_catalog)
+    state focus = null
+    state panel_block = null
+    state draft = ""
+    state note = ""
+    state rejecting = null
+    state show_closed = false
+    state problem = null
+    // Who is here: a heartbeat every 10 seconds, and at once when the block changes.
+    if true { every(10_000, () => { here(article_id, focus) }) }
+    let d = data
+    let a = d.article
+    let ts = threads ?? []
+    let open_on = (bid) => count(ts, (t) => t.block_id == bid && t.status == "open")
+    let shown = ts | filter((t) => (panel_block == null || t.block_id == panel_block) && (show_closed || t.status == "open"))
+    let on_block = (bid) => {
+        if focus != bid { focus = bid; here(article_id, bid) }
+    }
+    let show = (bid) => {
+        panel_block = bid
+        js("cms.reveal", `block-${bid}`)
+    }
+    let gutter = (b) => <aside.gutter>
+        <span.on-block>{for p in people ?? [] => p.block_id == b.id && p.user_id != d.me.id && <Avatar key={p.user_id} name={p.name} hue={p.hue} size="xs"/>}</span>
+        <button class={`fb-btn ${open_on(b.id) > 0 ? "has" : ""} ${panel_block == b.id ? "on" : ""}`}
+            title={open_on(b.id) > 0 ? `${open_on(b.id)} open` : d.may_comment ? "Give feedback on this block" : "Feedback"}
+            aria-label={`Feedback on this block: ${open_on(b.id)} open`}
+            @click={() => { panel_block = panel_block == b.id ? null : b.id; focus = b.id; here(article_id, b.id) }}>
+            💬 {open_on(b.id) > 0 ? open_on(b.id) : ""}
+        </button>
+    </aside>
+    let act_on = (x) => {
+        if x.kind == "reject" && rejecting != x.id { rejecting = x.id; note = ""; return null }
+        let r = act(article_id, x.id, note)
+        if is_err(r) { problem = r.error } else {
+            problem = null
+            rejecting = null
+            notify(x.kind == "approve" && r == d.step.name ? "Approved: waiting for others" : `Now at ${r}`, { tone: "success", seconds: 3 })
+        }
+    }
+    <div.room @mount={(el) => {
+        here(article_id, null)
+        () => leave(article_id)
+    }}>
+        {is_err(d)
+            ? <p.problem>{d.error}</p>
+            : <div.room-grid>
+                <div.room-main>
+                    <header.room-head>
+                        {d.editable
+                            ? <input.title-input value={a.title} aria-label="Headline" maxlength="160"
+                                @change={(e) => { problem = err_text(retitle(article_id, e.value)) }}/>
+                            : <h1.title-text>{a.title}</h1>}
+                        <div.byline>
+                            <Avatar name={d.author.name} hue={d.author.hue} size="sm"/> by <b>{d.author.name}</b>{" · "}
+                            <StepPill name={d.step.name} color={d.step.color}/>
+                            {a.round > 1 && <span.muted> · round {a.round}</span>}
+                            {a.published_at != null && <a href={`/news/${a.slug}`}> · read it on the site ↗</a>}
+                            <span.grow/>
+                            <Presence people={people ?? []} me_id={d.me.id}/>
+                        </div>
+                        <StepTrack steps={d.steps} current_id={a.step_id}/>
+                        <div.actions-bar>
+                            {len(d.actions) == 0 && <span.muted>Nothing to do here: this is where the flow ends.</span>}
+                            {for x in d.actions => <div key={x.id} class={`action k-${x.kind}`}>
+                                <button class={`btn ${x.kind == "reject" ? "ghost danger-text" : "primary"}`} disabled={!x.allowed}
+                                    title={x.why ?? ""} @click={() => act_on(x)}>{x.name}</button>
+                                {x.kind == "approve" && <span.muted.progress>{len(x.approvals)} of {x.needed}
+                                    {for p in x.approvals => <Avatar key={p.id} name={p.name} hue={p.hue} size="xs"/>}</span>}
+                                {!x.allowed && x.why != null && <span.muted.why>{x.why}</span>}
+                            </div>}
+                        </div>
+                        {rejecting != null && <form.reject-box @submit={() => act_on(find(d.actions, (x) => x.id == rejecting))}>
+                            <label>Why does it go back? The author sees this.
+                                <textarea rows="2" value={note} @input={(e) => { note = e.value }} autofocus></textarea></label>
+                            <div.actions>
+                                <button.btn.danger.small disabled={trim(note) == ""}>Send back</button>
+                                <button.btn.ghost.small type="button" @click={() => { rejecting = null }}>Cancel</button>
+                            </div>
+                        </form>}
+                        <Problem text={problem}/>
+                    </header>
+                    <BlockList blocks={d.blocks} owner={owner_key("article", article_id)} editable={d.editable}
+                        catalog={catalog ?? { lists: [], forms: [] }} types={CONTENT_TYPES + ["list"]}
+                        {gutter} on_focus={on_block} marked={panel_block}/>
+                    {d.editable && <footer.room-foot>
+                        <button.btn.ghost.danger-text @click={() => {
+                            if ask("Delete this article? Its blocks and feedback go with it.", { title: "Delete", ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                                let r = delete_article(article_id)
+                                if is_err(r) { problem = r.error } else { navigate("/desk") }
+                            }
+                        }}>Delete article</button>
+                    </footer>}
+                </div>
+                <aside.panel aria-label="Feedback">
+                    <header.panel-head>
+                        <h2>Feedback</h2>
+                        <span.muted>{count(ts, (t) => t.status == "open")} open</span>
+                        <span.grow/>
+                        <label.inline-label><input type="checkbox" checked={show_closed} @change={(e) => { show_closed = e.checked }}/> closed too</label>
+                    </header>
+                    {panel_block != null && <p.panel-filter>On one block · <button.link @click={() => { panel_block = null }}>show all</button></p>}
+                    {d.may_comment && panel_block != null && <form.new-thread @submit={() => {
+                        let r = open_thread(article_id, panel_block, draft)
+                        if is_err(r) { problem = r.error } else { draft = ""; problem = null }
+                    }}>
+                        <textarea rows="3" placeholder="What should change in this block?" value={draft} @input={(e) => { draft = e.value }}></textarea>
+                        <button.btn.primary.small disabled={trim(draft) == ""}>Give feedback</button>
+                    </form>}
+                    {d.may_comment && panel_block == null && <p.muted.hint>Pick a block's 💬 to give feedback on it.</p>}
+                    {len(shown) == 0 && <p.muted>{panel_block != null ? "No feedback on this block." : "No open feedback."}</p>}
+                    {for t in shown => <Thread key={t.id} {t} me={d.me} author_id={a.author_id}
+                        on_problem={(p) => { problem = p }} on_show={show}/>}
+                    <details.history>
+                        <summary>History</summary>
+                        <ol>{for h in d.log => <li key={`${h.at}-${h.text}`}><b>{h.name}</b> {h.text} <span.muted>{ago(h.at, now())}</span></li>}</ol>
+                    </details>
+                </aside>
+              </div>}
+    </div>
+}

@@ -1,0 +1,214 @@
+// The object designer: an object's fields, the forms that make and move
+// its records, the lists that show them, its state machine, and its
+// records with the history of each.
+
+component FieldRow(f, on_problem) {
+    state name = f.name
+    state required = f.required == 1
+    state options = join(f.options, ", ")
+    let dirty = name != f.name || required != (f.required == 1) || options != join(f.options, ", ")
+    <div.f-row role="row">
+        <input value={name} aria-label="Field name" maxlength="40" @input={(e) => { name = e.value }}/>
+        <span.muted>{FIELD_LABELS[f.type]}</span>
+        <label.check><input type="checkbox" checked={required} @change={(e) => { required = e.checked }}/> required</label>
+        {f.type == "choice"
+            ? <input value={options} aria-label="Choices, comma-separated" @input={(e) => { options = e.value }}/>
+            : <span/>}
+        <span.row-actions>
+            {dirty && <button.btn.small.primary @click={() => on_problem(err_text(edit_field(f.id,
+                { name, type: f.type, required, options: split(options, ",") })))}>Save</button>}
+            <button.icon-btn aria-label={`Delete ${f.name}`} @click={() => {
+                if ask(`Delete the field ${f.name}? Its values in every record go too.`, { ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                    on_problem(err_text(delete_field(f.id)))
+                }
+            }}>✕</button>
+        </span>
+    </div>
+}
+
+component NewField(object_id: int, on_problem) {
+    state name = ""
+    state type = "text"
+    state required = false
+    state options = ""
+    <form.f-row.new @submit={() => {
+        let r = add_field(object_id, { name, type, required, options: split(options, ",") })
+        on_problem(err_text(r))
+        if !is_err(r) { name = ""; options = "" }
+    }}>
+        <input value={name} placeholder="New field" aria-label="New field's name" maxlength="40" @input={(e) => { name = e.value }}/>
+        <select aria-label="Type" @change={(e) => { type = e.value }}>
+            {for t in FIELD_TYPES => <option key={t} value={t} selected={type == t}>{FIELD_LABELS[t]}</option>}
+        </select>
+        <label.check><input type="checkbox" checked={required} @change={(e) => { required = e.checked }}/> required</label>
+        {type == "choice" ? <input value={options} placeholder="One, Two, Three" @input={(e) => { options = e.value }}/> : <span/>}
+        <span.row-actions><button.btn.small.primary disabled={trim(name) == ""}>Add field</button></span>
+    </form>
+}
+
+view Checks(items: list, chosen: list, on_toggle) =
+    <span.checks>{for it in items => <label key={it.id} class="check">
+        <input type="checkbox" checked={contains(chosen, it.id)} @change={() => on_toggle(it.id)}/> {it.name}</label>}</span>
+
+fn toggled(xs: list, x) -> list = contains(xs, x) ? filter(xs, (y) => y != x) : xs + [x]
+
+// A form, edited in place; with f null, a new one.
+component FormCard(object_id: int, f, fields: list, steps: list, transitions: list, on_problem) {
+    state name = f.name ?? ""
+    state kind = f.kind ?? "create"
+    state transition = f.transition_id
+    state role = f.role ?? "writer"
+    state chosen = f.fields ?? []
+    let step_name = (id) => (find(steps, (s) => s.id == id) ?? {}).name ?? "?"
+    <div class={`card-box sub ${f == null ? "new" : ""}`}>
+        <div.row>
+            <input value={name} placeholder={f == null ? "New form" : "Form name"} maxlength="40" @input={(e) => { name = e.value }}/>
+            <select aria-label="Kind" @change={(e) => { kind = e.value }}>
+                <option value="create" selected={kind == "create"}>makes a record</option>
+                <option value="transaction" selected={kind == "transaction"}>runs a transaction</option>
+            </select>
+            {kind == "create"
+                ? <select aria-label="Who may use it" @change={(e) => { role = e.value }}>
+                    {for r in ROLES => <option key={r} value={r} selected={role == r}>for {r}s</option>}
+                  </select>
+                : <select aria-label="Transition" @change={(e) => { transition = int(e.value) ?? null }}>
+                    <option value="" selected={transition == null}>Which transition?</option>
+                    {for t in transitions => <option key={t.id} value={t.id} selected={transition == t.id}>
+                        {t.name}: {step_name(t.from_step)} → {step_name(t.to_step)} (for {t.role}s)</option>}
+                  </select>}
+        </div>
+        <div.row><span.muted>Asks for</span><Checks items={fields} {chosen} on_toggle={(id) => { chosen = toggled(chosen, id) }}/></div>
+        <div.actions>
+            <button.btn.small.primary disabled={trim(name) == ""} @click={() => {
+                let r = save_form(object_id, f.id ?? null, { name, kind, transition_id: kind == "transaction" ? transition : null,
+                    role: kind == "create" ? role : null, fields: chosen })
+                on_problem(err_text(r))
+                if !is_err(r) && f == null { name = ""; chosen = [] }
+            }}>{f == null ? "Add form" : "Save"}</button>
+            {f != null && <button.link.danger @click={() => on_problem(err_text(delete_form(f.id)))}>Delete</button>}
+        </div>
+    </div>
+}
+
+component ListCard(object_id: int, l, fields: list, steps: list, on_problem) {
+    state name = l.name ?? ""
+    state columns = l.columns ?? []
+    state states = l.states ?? []
+    state sort_field = l.sort_field
+    state desc = (l.sort_desc ?? 1) == 1
+    <div class={`card-box sub ${l == null ? "new" : ""}`}>
+        <div.row>
+            <input value={name} placeholder={l == null ? "New list" : "List name"} maxlength="40" @input={(e) => { name = e.value }}/>
+            <select aria-label="Sort by" @change={(e) => { sort_field = int(e.value) ?? null }}>
+                <option value="" selected={sort_field == null}>newest first</option>
+                {for f in fields => <option key={f.id} value={f.id} selected={sort_field == f.id}>by {f.name}</option>}
+            </select>
+            <label.check><input type="checkbox" checked={desc} @change={(e) => { desc = e.checked }}/> descending</label>
+        </div>
+        <div.row><span.muted>Columns</span><Checks items={fields} chosen={columns} on_toggle={(id) => { columns = toggled(columns, id) }}/></div>
+        <div.row><span.muted>Only at</span><Checks items={steps} chosen={states} on_toggle={(id) => { states = toggled(states, id) }}/>
+            {len(states) == 0 && <span.muted>(every state)</span>}</div>
+        <div.actions>
+            <button.btn.small.primary disabled={trim(name) == ""} @click={() => {
+                let r = save_list(object_id, l.id ?? null, { name, columns, states, sort_field, sort_desc: desc })
+                on_problem(err_text(r))
+                if !is_err(r) && l == null { name = "" }
+            }}>{l == null ? "Add list" : "Save"}</button>
+            {l != null && <button.link.danger @click={() => on_problem(err_text(delete_list(l.id)))}>Delete</button>}
+        </div>
+        {l != null && <ListBlock key={`${l.id}`} list_id={l.id}/>}
+    </div>
+}
+
+component RecordView(object_id: int, record_id: int, on_close) {
+    state r = live(load_record, object_id, record_id)
+    <aside.record-view>
+        {is_err(r) ? <p.problem>{r.error}</p> : <div>
+            <header.panel-head><h3>#{r.id} <span.muted>at {r.state}</span></h3><span.grow/>
+                <button.icon-btn aria-label="Close" @click={on_close}>✕</button></header>
+            <dl.values>{for v in r.values => [<dt key={`t${v.name}`}>{v.name}</dt>, <dd key={`d${v.name}`}>{v.value == "" ? "–" : v.value}</dd>]}</dl>
+            <h4>History</h4>
+            <ol.history>{for h in r.log => <li key={h.at}>
+                <b>{h.name}</b> {h.form ?? "?"}: {h.from} → {h.to} <span.muted>{ago(h.at, now())}</span>
+            </li>}</ol>
+        </div>}
+    </aside>
+}
+
+component ObjectDesigner(object_id: int) {
+    state data = live(load_object, object_id)
+    state problem = null
+    state record = null
+    state record_text = ""
+    let d = data
+    let set_problem = (p) => { problem = p }
+    <div.object-designer>
+        {is_err(d) ? <p.problem>{d.error}</p> : <div>
+            <header.fd-head>
+                <h1>{d.object.name}</h1>
+                <span.muted>{plural(d.records, "record")} · table <code>obj_{d.object.id}</code> ·
+                    states from <a href={`/desk/flows/${d.object.flow_id}`}>its flow</a></span>
+            </header>
+            <Problem text={problem}/>
+            <section.card-box>
+                <h2>State machine <span.muted>a record's state changes only through a transaction form</span></h2>
+                <div.diagram-wrap><FlowDiagram steps={d.steps} transitions={d.transitions}/></div>
+            </section>
+            <section.card-box>
+                <h2>Fields</h2>
+                <div.f-table role="table">
+                    {for f in d.fields => <FieldRow key={`${f.id}-${f.name}-${f.required}-${join(f.options, ",")}`} {f} on_problem={set_problem}/>}
+                    <NewField {object_id} on_problem={set_problem}/>
+                </div>
+            </section>
+            <section.card-box>
+                <h2>Forms <span.muted>put them on a page as blocks</span></h2>
+                {for f in d.forms => <FormCard key={`${f.id}-${f.name}-${f.kind}-${f.transition_id}-${f.role}-${join(f.fields | map(str), ",")}`}
+                    {object_id} {f} fields={d.fields} steps={d.steps} transitions={d.transitions} on_problem={set_problem}/>}
+                <FormCard key={`new-${len(d.forms)}`} {object_id} f={null} fields={d.fields} steps={d.steps} transitions={d.transitions} on_problem={set_problem}/>
+            </section>
+            <section.card-box>
+                <h2>Lists</h2>
+                {for l in d.lists => <ListCard key={`${l.id}-${l.name}-${join(l.columns | map(str), ",")}-${join(l.states | map(str), ",")}-${l.sort_field}-${l.sort_desc}`}
+                    {object_id} {l} fields={d.fields} steps={d.steps} on_problem={set_problem}/>}
+                <ListCard key={`new-${len(d.lists)}`} {object_id} l={null} fields={d.fields} steps={d.steps} on_problem={set_problem}/>
+            </section>
+            <section.card-box>
+                <h2>A record's history</h2>
+                <form.inline-add @submit={() => { record = int(trim(record_text)) ?? null }}>
+                    <input placeholder="Record number" inputmode="numeric" value={record_text} @input={(e) => { record_text = e.value }}/>
+                    <button.btn.ghost.small>Show</button>
+                </form>
+                {record != null && <RecordView key={record} {object_id} record_id={record} on_close={() => { record = null }}/>}
+            </section>
+        </div>}
+    </div>
+}
+
+component ObjectsPage() {
+    state objects = live(load_objects)
+    state flows = live(load_flows)
+    state name = ""
+    state flow = null
+    state problem = null
+    let object_flows = (flows ?? []) | filter((f) => f.kind == "object")
+    <section.card-box>
+        <h2>Objects <span.muted>tables you design: fields, forms, lists and a state machine</span></h2>
+        <ul.rows>{for o in objects ?? [] => <li key={o.id}>
+            <a href={`/desk/objects/${o.id}`}><b>{o.name}</b></a>
+            <span.muted>{plural(o.fields, "field")} · {o.flow}</span><span.grow/><span.muted>{plural(o.records, "record")}</span>
+        </li>}</ul>
+        <form.inline-add @submit={() => {
+            let r = create_object(name, flow ?? (object_flows[0].id ?? 0))
+            if is_err(r) { problem = r.error } else { navigate(`/desk/objects/${r}`) }
+        }}>
+            <input placeholder="New object, like Ad bookings" value={name} @input={(e) => { name = e.value }}/>
+            <select aria-label="Its state machine" @change={(e) => { flow = int(e.value) ?? null }}>
+                {for f in object_flows => <option key={f.id} value={f.id} selected={flow == f.id}>{f.name}</option>}
+            </select>
+            <button.btn.primary.small disabled={trim(name) == "" || len(object_flows) == 0}>Create</button>
+        </form>
+        {len(object_flows) == 0 && <p.muted>Make a flow for objects first, under Flows.</p>}
+        <Problem text={problem}/>
+    </section>
+}

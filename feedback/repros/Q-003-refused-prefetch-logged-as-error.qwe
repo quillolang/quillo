@@ -1,0 +1,14 @@
+// Q-003 Each refused prefetch is logged as an error, though it is expected
+// mode: serve
+// get: /count x-quillo-prefetch=1
+// open-when: /error.*prefetch/
+// fixed-when: /GET \/count -> (503|409)/
+// From FEEDBACK.md §1 (found on f1695a3).
+
+db.open(":memory:")
+db.exec("create table views (n integer)")
+
+route GET /count {
+    db.exec("insert into views (n) values (1)")
+    "counted"
+}

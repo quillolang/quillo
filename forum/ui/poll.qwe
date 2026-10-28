@@ -1,0 +1,64 @@
+// A thread's poll, live: everyone sees the results move as people vote.
+// Results show once you have voted, or when the poll has closed.
+
+view PollBar(o, total: int, chosen: bool) {
+    let pct = total == 0 ? 0 : round(o.votes * 100 / total)
+    <li.poll-result class={chosen && "mine"}>
+        <div.poll-fill style={`width: ${pct}%`}></div>
+        <span.poll-text>{chosen && "✓ "}{o.text}</span>
+        <span.poll-n>{pct}% · {o.votes}</span>
+    </li>
+}
+
+component Poll(thread_id: int, me, owner_id: int) {
+    state poll = live(load_poll, thread_id)
+    state chosen = []
+    state changing = false
+    state problem = null
+    // Shares of the voters, so with several choices allowed they can add up past 100%.
+    let total = poll == null ? 0 : poll.voters
+    let results = poll != null && (poll.closed || me == null || (poll.voted && !changing))
+    let can_close = poll != null && !poll.closed && me != null && (me.id == owner_id || is_mod(me))
+    let toggle = (id) => {
+        if poll.multiple {
+            chosen = contains(chosen, id) ? chosen | filter((x) => x != id) : chosen + [id]
+        } else {
+            chosen = [id]
+        }
+    }
+    let show = (r) => {
+        if is_err(r) { problem = r.error } else { problem = null; poll = r; changing = false }
+    }
+
+    {poll != null && <section.poll>
+        <h3>📊 {poll.question}</h3>
+        {results
+            ? <ol.poll-results>{for o in poll.options => <PollBar key={o.id} {o} total={total} chosen={o.mine == 1}/>}</ol>
+            : <form.poll-choices @submit={() => show(vote_poll(thread_id, chosen))}>
+                {for o in poll.options => <label.poll-choice key={o.id}>
+                    <input type={poll.multiple ? "checkbox" : "radio"} name="poll" checked={contains(chosen, o.id)}
+                        @change={() => toggle(o.id)}/>
+                    {o.text}
+                </label>}
+                <div.actions>
+                    <button.btn.primary disabled={len(chosen) == 0}>Vote</button>
+                    {changing && <button.btn.ghost type="button" @click={() => { changing = false }}>Cancel</button>}
+                </div>
+            </form>}
+        <Problem text={problem}/>
+        <footer.poll-foot>
+            <span>{plural(poll.voters, "voter")}{poll.multiple && " · several choices allowed"}</span>
+            <span>{poll.closed ? "Closed" : poll.closes_at != null ? left(poll.closes_at) : "Open"}</span>
+            {me == null && !poll.closed && <a href={`/login?next=/t/${thread_id}`}>Sign in to vote</a>}
+            {results && poll.voted && !poll.closed && <button.link @click={() => {
+                chosen = poll.options | filter((o) => o.mine == 1) | map((o) => o.id)
+                changing = true
+            }}>Change vote</button>}
+            {can_close && <button.link @click={() => {
+                if ask("Close the poll now? Nobody can vote after.", { title: "Close poll", ok: "Close it", cancel: "Keep it open" }) {
+                    show(close_poll(thread_id))
+                }
+            }}>Close poll</button>}
+        </footer>
+    </section>}
+}

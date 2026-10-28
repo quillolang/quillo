@@ -1,0 +1,181 @@
+// One task, open beside the board: every field saves on its own as it
+// changes, and the panel follows changes others make while it is open.
+
+// `board` is the board's own live data, for the columns, people, labels
+// and milestones the fields choose from.
+component TaskPanel(task_id: int, today: int, board, on_close) {
+    state data = live(load_task, task_id)
+    state editing_body = false
+    state body = ""
+    state preview = ""
+    state tab = "write"
+    state check_text = ""
+    state blocker_text = ""
+    state comment = ""
+    state problem = null
+    let t = data.task
+    let b = board
+    let editable = can_edit(data.role)
+    let key = b.project.key ?? ""
+    let save = (field, value) => {
+        let r = edit_task(task_id, field, value)
+        problem = is_err(r) ? r.error : null
+    }
+    let ok = (r) => { problem = is_err(r) ? r.error : null; !is_err(r) }
+    // Esc closes the panel wherever the focus is, but not while the
+    // description is being written (Esc there leaves the editor).
+    <aside.panel role="dialog" aria-label={t != null ? `${key}-${t.num} ${t.title}` : "Task"}
+        @mount={(el) => {
+            let on_key = (e) => { if e.key == "Escape" && !editing_body && !ask_open() { on_close() } }
+            el.ownerDocument.addEventListener("keydown", on_key)
+            () => el.ownerDocument.removeEventListener("keydown", on_key)
+        }}>
+        {is_err(data) || t == null
+            ? <div.panel-body>
+                <header.panel-head><span.grow/><button.icon-btn aria-label="Close" @click={on_close}>✕</button></header>
+                <p.muted>{is_err(data) ? data.error : "Loading…"}</p>
+              </div>
+            : <div.panel-body>
+                <header.panel-head>
+                    <span.ref>{key}-{t.num}</span>
+                    <span.muted>by {t.creator}, {ago(t.created, now())}</span>
+                    <span.grow/>
+                    <button.icon-btn aria-label="Close" title="Close (Esc)" @click={on_close}>✕</button>
+                </header>
+                {editable
+                    ? <input.title-input value={t.title} aria-label="Title" maxlength="200"
+                        @change={(e) => save("title", e.value)}
+                        @keydown={(e) => { if e.key == "Enter" { e.target.blur() } }}/>
+                    : <h2.title-text>{t.title}</h2>}
+                <Problem text={problem}/>
+
+                <div.fields>
+                    <label>Status
+                        <select disabled={!editable} @change={(e) => save("column_id", int(e.value))}>
+                            {for c in b.columns ?? [] => <option key={c.id} value={c.id} selected={c.id == t.column_id}>{c.name}</option>}
+                        </select>
+                    </label>
+                    <label>Assignee
+                        <select disabled={!editable} @change={(e) => save("assignee_id", e.value)}>
+                            <option value="" selected={t.assignee_id == null}>Nobody</option>
+                            {for m in b.members ?? [] => <option key={m.id} value={m.id} selected={m.id == t.assignee_id}>{m.name}</option>}
+                        </select>
+                    </label>
+                    <label>Priority
+                        <select disabled={!editable} @change={(e) => save("priority", int(e.value))}>
+                            {for [p, name] in enumerate(PRIORITIES) => <option key={p} value={p} selected={p == t.priority}>{name}</option>}
+                        </select>
+                    </label>
+                    <label>Points
+                        <input type="number" min="0" max="100" value={t.points ?? ""} disabled={!editable}
+                            @change={(e) => save("points", e.value)}/>
+                    </label>
+                    <label>Starts
+                        <input type="date" value={t.start_day ?? ""} disabled={!editable} @change={(e) => save("start_day", e.value)}/>
+                    </label>
+                    <label>Due
+                        <input type="date" value={t.due_day ?? ""} disabled={!editable} @change={(e) => save("due_day", e.value)}/>
+                    </label>
+                    <label.wide>Milestone
+                        <select disabled={!editable} @change={(e) => save("milestone_id", e.value)}>
+                            <option value="" selected={t.milestone_id == null}>None</option>
+                            {for m in b.milestones ?? [] => <option key={m.id} value={m.id} selected={m.id == t.milestone_id}>{m.name} (due {short_day(parse_day(m.due_day) ?? today)})</option>}
+                        </select>
+                    </label>
+                </div>
+                {t.due_day != null && t.kind != "done" && (parse_day(t.due_day) ?? today) < today &&
+                    <p.late-note>⚠ {due_label(parse_day(t.due_day) ?? today, today)}</p>}
+
+                <h3>Labels</h3>
+                <div.chips.pick>
+                    {for l in b.labels ?? [] => <button key={l.id} type="button" class={`chip ${contains(t.label_ids, l.id) ? "on" : "off"}`}
+                        style={`--c: ${l.color}`} disabled={!editable} aria-pressed={contains(t.label_ids, l.id)}
+                        @click={() => ok(toggle_label(task_id, l.id))}>{l.name}</button>}
+                </div>
+
+                <h3>Description
+                    {editable && !editing_body && <button.link @click={() => { body = t.body; tab = "write"; editing_body = true }}>Edit</button>}
+                </h3>
+                {editing_body
+                    ? <form.body-edit @submit={() => { if ok(edit_task(task_id, "body", body)) { editing_body = false } }}>
+                        <nav.mini-tabs>
+                            <button type="button" class={tab == "write" && "on"} @click={() => { tab = "write" }}>Write</button>
+                            <button type="button" class={tab == "preview" && "on"} @click={() => { preview = str(markdown(body)); tab = "preview" }}>Preview</button>
+                        </nav>
+                        {tab == "write"
+                            ? <textarea rows="8" bind:value={body} placeholder="Markdown: **bold**, lists, `code`, - [ ] tasks"
+                                @keydown={(e) => { if e.key == "Escape" { editing_body = false } }}></textarea>
+                            : <div.md.preview>{raw(preview)}</div>}
+                        <div.actions>
+                            <button.btn.primary.small>Save</button>
+                            <button.btn.ghost.small type="button" @click={() => { editing_body = false }}>Cancel</button>
+                        </div>
+                      </form>
+                    : t.body == "" ? <p.muted>No description.</p> : <div.md>{raw(t.html)}</div>}
+
+                <h3>Checklist {len(data.checklist) > 0 && <span.muted>{count(data.checklist, (k) => k.done == 1)}/{len(data.checklist)}</span>}</h3>
+                {len(data.checklist) > 0 && <div.meter><i style={`width: ${round(count(data.checklist, (k) => k.done == 1) / len(data.checklist) * 100)}%`}/></div>}
+                <ul.checklist>
+                    {for k in data.checklist => <li key={k.id} class={k.done == 1 && "done"}>
+                        <label><input type="checkbox" checked={k.done == 1} disabled={!editable} @change={() => ok(toggle_check(k.id))}/> {k.text}</label>
+                        {editable && <button.icon-btn.small aria-label={`Remove ${k.text}`} @click={() => ok(delete_check(k.id))}>✕</button>}
+                    </li>}
+                </ul>
+                {editable && <form.inline-add @submit={() => { if ok(add_check(task_id, check_text)) { check_text = "" } }}>
+                    <input placeholder="Add an item" maxlength="200" bind:value={check_text}/>
+                    <button.btn.ghost.small disabled={trim(check_text) == ""}>Add</button>
+                </form>}
+
+                <h3>Waits for</h3>
+                {len(data.blockers) == 0 && <p.muted>Nothing.</p>}
+                <ul.links>
+                    {for x in data.blockers => <li key={x.id} class={x.done == 1 && "done"}>
+                        <span>{x.done == 1 ? "✓" : "⛔"}</span> <b>{key}-{x.num}</b> {x.title}
+                        {editable && <button.icon-btn.small aria-label="Remove" @click={() => ok(remove_blocker(task_id, x.id))}>✕</button>}
+                    </li>}
+                </ul>
+                {editable && <form.inline-add @submit={() => { if ok(add_blocker(task_id, blocker_text)) { blocker_text = "" } }}>
+                    <input placeholder={`${key}-12`} aria-label="Task this one waits for" bind:value={blocker_text}/>
+                    <button.btn.ghost.small disabled={trim(blocker_text) == ""}>Add</button>
+                </form>}
+                {len(data.blocking) > 0 && <div>
+                    <h3>Holds up</h3>
+                    <ul.links>{for x in data.blocking => <li key={x.id}><b>{key}-{x.num}</b> {x.title}</li>}</ul>
+                </div>}
+
+                <h3>Comments</h3>
+                <ul.comments>
+                    {for c in data.comments => <li key={c.id}>
+                        <Avatar name={c.name} hue={c.hue} size="sm"/>
+                        <div>
+                            <div.c-head><b>{c.name}</b> <span.muted>{ago(c.created, now())}</span>
+                                {(c.user_id == data.me || data.role == "owner") &&
+                                    <button.link.danger @click={() => {
+                                        if ask("Delete this comment?", { ok: "Delete", cancel: "Keep it", tone: "danger" }) { ok(delete_comment(c.id)) }
+                                    }}>Delete</button>}
+                            </div>
+                            <div.md>{raw(c.html)}</div>
+                        </div>
+                    </li>}
+                </ul>
+                <form.comment-box @submit={() => { if ok(add_comment(task_id, comment)) { comment = "" } }}>
+                    <textarea rows="3" placeholder="Write a comment (Markdown)" bind:value={comment}
+                        @keydown={(e) => { if e.key == "Enter" && (e.metaKey || e.ctrlKey) { if ok(add_comment(task_id, comment)) { comment = "" } } }}></textarea>
+                    <button.btn.primary.small disabled={trim(comment) == ""}>Comment</button>
+                </form>
+
+                <h3>History</h3>
+                <ul.history>{for h in data.history => <li key={`${h.at}-${h.text}`}><b>{h.name}</b> {h.text} <span.muted>{ago(h.at, now())}</span></li>}</ul>
+
+                {editable && <footer.panel-foot>
+                    <button.btn.danger.small @click={() => {
+                        if ask(`Delete ${key}-${t.num}? Its comments and history go with it.`, { title: "Delete task", ok: "Delete", cancel: "Keep it", tone: "danger" }) {
+                            if ok(delete_task(task_id)) { on_close() }
+                        }
+                    }}>Delete task</button>
+                </footer>}
+              </div>}
+    </aside>
+}
+
+fn ask_open() = js("pm.dialogOpen") == true
