@@ -11,7 +11,7 @@
 //   CMS_DEMO=1 quillo run app/cms/main.qwe --watch      with people, articles in review, and an ad desk
 //   quillo check app/cms/main.qwe
 //
-//   lib/text.qwe       times, slugs, calendar days (Quillo has no date module)
+//   lib/text.qwe       times, slugs, calendar days
 //   lib/auth.qwe       people, roles, sessions
 //   lib/flows.qwe      flows: steps, transitions, the designer's server fns
 //   lib/blocks.qwe     blocks: types, checking, editing with versions

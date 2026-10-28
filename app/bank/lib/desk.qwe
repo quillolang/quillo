@@ -64,11 +64,8 @@ fn shown_of(kind: str, section: str, data: map, accounts: list) -> list {
     })
 }
 
-// "2026-10-28": today's date, for the age check (Quillo has no date module).
-fn today_text() -> str with time {
-    let c = civil(now())
-    `${c.year}-${two(c.month)}-${two(c.day)}`
-}
+// "2026-10-28": today's date in UTC, for the age check.
+fn today_text() -> str with time = date.today("UTC")
 
 // What is wrong with a section's values before the client is asked, or null.
 fn section_problem(kind: str, section: str, data: map, accounts: list) -> str? with time {
@@ -77,9 +74,9 @@ fn section_problem(kind: str, section: str, data: map, accounts: list) -> str? w
         "personal" => {
             if v("first_name") == "" || v("last_name") == "" { return "First and last name, please" }
             let b = v("birth_date")
-            if !re.test(b, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return "Date of birth as YYYY-MM-DD" }
+            if !re.test(b, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") || !date.valid(b) { return "Date of birth as YYYY-MM-DD" }
             let t = today_text()
-            let adult = `${int(slice(t, 0, 4)) - 18}${slice(t, 4)}`
+            let adult = date.add_years(t, -18)
             if b > t { return "A date of birth in the future" }
             if b > adult { return "Account holders are 18 or older" }
             if v("email") != "" && !re.test(v("email"), "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return "That email does not look right" }

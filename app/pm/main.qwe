@@ -9,7 +9,7 @@
 //   PM_DEMO=1 quillo run app/pm/main.qwe --watch      the same, with people, projects and six weeks of history
 //   quillo check app/pm/main.qwe
 //
-//   lib/dates.qwe       calendar days, counted by hand (Quillo has no date module)
+//   lib/dates.qwe       calendar days, on the date module
 //   lib/auth.qwe        joining, signing in, sessions, the viewer's time zone
 //   lib/projects.qwe    projects, members and roles, columns, labels, milestones
 //   lib/tasks.qwe       tasks: the live board, moves, fields, checklist, comments, dependencies
