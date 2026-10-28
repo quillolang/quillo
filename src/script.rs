@@ -148,6 +148,10 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
             define(&root, name, v);
         }
     }
+    // Dates, without the clock: a script gives the same answer each time.
+    let mut date = Map::new();
+    crate::dates::install_pure(&mut date);
+    define(&root, "date", Value::map(date));
     let env = Scope::child(&root);
     if let Some(m) = vars {
         for (k, v) in m.iter() {

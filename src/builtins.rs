@@ -163,6 +163,9 @@ pub fn install(env: &Env) {
     let mut vec = Map::new();
     crate::numeric::install_vec(&mut vec);
     define(env, "vec", Value::map(vec));
+    let mut date = Map::new();
+    crate::dates::install(&mut date);
+    define(env, "date", Value::map(date));
 }
 
 /// Every builtin name, as programs see it (`db.query`, `len`, ...).

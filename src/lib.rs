@@ -7,6 +7,7 @@ pub mod check;
 pub mod client;
 pub mod cluster;
 pub mod crypto;
+pub mod dates;
 pub mod db;
 pub mod txn;
 pub mod decimal;

@@ -1521,7 +1521,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http")
+                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);

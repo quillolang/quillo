@@ -687,6 +687,27 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("channel.broadcast", "str, any, map | null=", "int"),
     ("channel.peers", "str", "list"),
     ("channel.open", "str, fn, map | null=", "map"),
+    // src/dates.rs (FEEDBACK2.md, Q-027; branch feedback6-fixes)
+    ("date.today", "str | null=", "str"),
+    ("date.now", "str | null=", "str"),
+    ("date.parse", "str, str | null=", "str | error(str)"),
+    ("date.valid", "any", "bool"),
+    ("date.of", "int, int, int", "str"),
+    ("date.parts", "str", "map"),
+    ("date.weekday", "str", "int"),
+    ("date.is_leap_year", "int | str", "bool"),
+    ("date.days_in_month", "int | str, int=", "int"),
+    ("date.add_days", "str, int", "str"),
+    ("date.add_months", "str, int", "str"),
+    ("date.add_years", "str, int", "str"),
+    ("date.days_between", "str, str", "int"),
+    ("date.months_between", "str, str", "int"),
+    ("date.start_of_month", "str", "str"),
+    ("date.end_of_month", "str", "str"),
+    ("date.to_zone", "str, str | null=", "str"),
+    ("date.date_in", "str, str | null=", "str"),
+    ("date.at", "str, str | null=, str | null=", "str"),
+    ("date.format", "str, str | map", "str"),
     ("media.rtp", "str, map", "null"),
     ("media.close", "str", "bool"),
     ("media.on", "str, map | null=", "null"),
@@ -825,9 +846,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "money", "re"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "money", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =

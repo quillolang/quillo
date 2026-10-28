@@ -2034,6 +2034,66 @@ Making a list one item at a time is the interpreter's work, though: `map(range(n
 `vec` instead (`vec.div(vec.mod(vec.mul(vec.arange(n), k), m), 1000.0)`), the same list
 takes a fifteenth of the comprehension's time.
 
+### Dates and times
+
+There is no date type: a date is its ISO 8601 text, `"2026-10-27"`, and a date-time is
+RFC 3339 text with its offset, `"2026-10-27T14:30:00Z"` or `"2026-10-27T15:30:00+01:00"`.
+Text like that sorts and compares in time order (date-times when they have the same
+offset: keep them in UTC), and goes through JSON, databases, forms (`<input type="date">`)
+and the browser as it is. The `date` module works on it, on the server and in the browser
+alike, with the same answers:
+
+```quillo
+date.today()                          // "2026-10-27", in UTC; date.today("Europe/Paris")
+date.now()                            // "2026-10-27T14:30:00Z", to the second
+date.add_months("2026-01-31", 1)      // "2026-02-28": the end of the month, not March
+date.to_zone("2026-10-27T14:30:00Z", "Europe/Paris")       // "2026-10-27T15:30:00+01:00"
+date.at("2026-10-27", "17:00", "America/New_York")         // "2026-10-27T17:00:00-04:00"
+date.days_between("2026-11-05", "2026-11-14")              // 9: the nights of a stay
+date.format("2026-10-27", { locale: "de-DE", style: "long" })  // "27. Oktober 2026"
+date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or an error value
+```
+
+- **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time),
+  `date.parts(d)` (`{ year, month, day, weekday }`, weekday 1 for Monday to 7 for Sunday;
+  a date-time adds `hour minute second offset`), `date.weekday(d)`, `date.is_leap_year(year
+  or d)`, `date.days_in_month(d)` or `(year, month)`.
+- **Arithmetic:** `date.add_days(d, n)`, `date.add_months(d, n)` and `date.add_years(d, n)`
+  (a day past the month's end is its last day: `2024-02-29` plus a year is `2025-02-28`),
+  `date.days_between(a, b)` (`b - a`, in days), `date.months_between(a, b)` (whole months:
+  `2026-01-31` to `2026-02-28` is one), `date.start_of_month(d)`, `date.end_of_month(d)`.
+  These take dates; `date.date_in(t, tz)` gives a date-time's date.
+- **Time zones:** `date.to_zone(t, tz)` is the same instant at the zone's offset then
+  (daylight saving included); `date.date_in(t, tz)` its calendar date there;
+  `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go
+  forward is moved forward by the gap, 02:30 becoming 03:30; a time that happens twice
+  when they go back is the first). A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
+  an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
+  reads the system's time zone database, or a copy built into `quillo` where there is none
+  (Windows, small containers); the browser asks its own (`Intl`).
+- **Text:** `date.format(d, pattern)` with `YYYY YY`, `MM M` (month number, padded or
+  not), `MMMM MMM` (its name), `DD D`, `dddd ddd` (the weekday's name), `HH H` and `hh h`
+  (24 or 12 hours), `mm ss A` (AM/PM) and `Z` (the offset); anything else, and text in
+  `[brackets]`, is kept as it is. A date-time shows its time as written: `date.to_zone` it
+  first to show another zone's. `date.format(d, { locale, style })` gives a locale's
+  `"short"`, `"medium"` (the default), `"long"` or `"full"` date, and `{ locale, pattern }`
+  the pattern with that language's names. The locales are English (US, and the British
+  style for `en-GB`, `en-AU`, `en-IE`, `en-NZ`, `en-IN`, `en-ZA`), German, French, Spanish,
+  Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
+  forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
+  `date.parse(s, pattern)` reads by a pattern (English names; `YY` is 2000 to 2099; with a
+  time and no `Z`, UTC). Either gives an error value when the text is not a date.
+
+A malformed date (`"2026-02-30"`, `"27/10/2026"`, a number) is an error in every function
+but `date.parse` and `date.valid`. Years are 1 to 9999. `date.today` and `date.now` read
+the clock, so they are the `time` effect, and scripts run with `run_script` have the rest
+of `date` but not them. A program's own variable called `date` hides the module, as with
+the others.
+
+Business days, holidays and the day counts of interest are a program's own: a calendar
+is a list of holidays and the arithmetic above.
+
 ### Database
 
 `db` talks to SQLite (built in), PostgreSQL or MySQL/MariaDB, with the same functions.

@@ -50,6 +50,9 @@ rustls-native-certs = "0.8"
 bytes = "1"
 # float_roundtrip: a float in JSON is read as the nearest one, not a step off.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# Time zones for `date` (src/dates.rs): the system's database, and a bundled
+# copy where there is none (Windows, small containers).
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 # Numeric functions compiled to machine code (src/jit.rs).
 cranelift-codegen = { version = "=0.134.4", optional = true }
 cranelift-frontend = { version = "=0.134.4", optional = true }
