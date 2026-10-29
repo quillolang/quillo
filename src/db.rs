@@ -1109,6 +1109,8 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    // Timed for /_quillo/health/queries (branch query-stats).
+    let started = std::time::Instant::now();
     let res = match &*b {
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -1143,6 +1145,7 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             pooled_run(it, &b, move |c| c.exec(&sql, &params))
         }
     };
+    crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
     // An update that changed no row (`set seen = 1 where seen = 0`, once all
     // are seen) is not announced: a loader marking what it shows as read
     // would otherwise wake itself for ever (FEEDBACK13.md, Q-090; branch
@@ -1434,6 +1437,8 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
         return Err(crate::interp::PREFETCH_REFUSED.into());
     }
     let b = backend_on(it, on)?;
+    // Timed for /_quillo/health/queries (branch query-stats).
+    let started = std::time::Instant::now();
     // A read, to a replica: if it fails there, the primary answers (and the
     // replica is left out for ten seconds).
     if let Some((reps, i)) = reader(it, &b, &sql) {
@@ -1441,6 +1446,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
         let (q, p) = (sql.clone(), params.clone());
         match pooled_run(it, &r, move |c| c.query(&q, &p, limit)) {
             Ok(rows) => {
+                crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, true);
                 announce(it, &sql, on);
                 return Ok(rows);
             }
@@ -1468,6 +1474,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
             pooled_run(it, &b, move |c| c.query(&sql, &params, limit))
         }
     };
+    crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
     if res.is_ok() {
         announce(it, &sql, on);
     }

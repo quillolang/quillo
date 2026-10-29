@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Query stats at `/_quillo/health/queries`:** the minimum, maximum and average time
+  of the last 100 database queries, overall for anyone and per statement with the health
+  token (`QUILLO_HEALTH_TOKEN`). Off until switched on: `--watch`, `--query-stats`,
+  `QUILLO_QUERY_STATS=1`, or `POST /_quillo/health/queries?on=1` with the token while
+  the server runs.
+
 ### Fixes
 
 - **`--watch` loads a program with a large file quickly again.** A file's text went

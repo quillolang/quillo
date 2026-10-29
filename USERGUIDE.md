@@ -51,6 +51,7 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
+| `--query-stats` | time database queries for `GET /_quillo/health/queries`: the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
 | `--scale NAME=N` | with `--split`: run service NAME as N copies (1 to 64), called in turn (see [Services](#services)) |
 | `--join URL` | with `--as-service` and a `--port`: join the app at URL as one more copy of this service while it runs |
 | `--describe` | answer `GET /_quillo/describe` with the program's API, as `quillo docs` writes it |
@@ -83,6 +84,8 @@ Everything Quillo reads from the environment:
 |---|---|
 | `PORT` | the port, when `--port` is not given |
 | `QUILLO_SECRET` | signs sessions (see [Cookies and sessions](#cookies-and-sessions)); without it, a key made at start |
+| `QUILLO_QUERY_STATS` | `1`: query stats on from the start, as `--query-stats` |
+| `QUILLO_HEALTH_TOKEN` | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
 | `QUILLO_DB` | the database when the program does not call `db.open`; without it, SQLite in memory, gone at restart |
 | `QUILLO_SYSTEM_DB` | where Quillo's own tables go with a database per tenant (see [Quillo's own tables](#quillos-own-tables)) |
 | `QUILLO_SERVICE_SECRET`, `QUILLO_SERVICE_<NAME>` | signs calls between services; where service NAME runs (see [Services](#services)) |
@@ -3909,6 +3912,28 @@ whether what the program needs is there: `{ "ready": true, "checks": { "database
 database (`select 1`), each service it declares (see [Services](#services)) and the
 program's own checks, `ready("ledger", () => ...)` at the top level, a function that
 gives true. For an orchestrator's readiness probe. Neither request is logged or counted.
+
+`GET /_quillo/health/queries` says how long database queries take: the minimum,
+maximum and average of the last 100, with how many ran and failed in all:
+
+```
+{ "enabled": true, "window": 100,
+  "queries": { "count": 100, "min_ms": 0.21, "max_ms": 48.7, "avg_ms": 3.4, "total": 5120, "errors": 2 },
+  "statements": [ { "sql": "select * from orders where customer = ?", "count": 100, "min_ms": 1.9, "max_ms": 48.7, "avg_ms": 12.3, "total": 840, "errors": 0 }, ... ] }
+```
+
+- **Off until switched on**, so a server pays nothing for it: on under `--watch`, with
+  `--query-stats` or `QUILLO_QUERY_STATS=1`, or while it runs with `POST
+  /_quillo/health/queries?on=1` (`?on=0` switches it off; either way what was counted is
+  forgotten). Off, the address answers `{ "enabled": false }`.
+- **`statements`**, each statement's figures, slowest on average first (at most 100 of
+  them, its SQL as written with its `?`s, spaces squeezed), are shown only to a request
+  with `Authorization: Bearer` and `QUILLO_HEALTH_TOKEN`, which switching on and off
+  needs too: they show the program's SQL, and a server behind a proxy sees every
+  visitor coming from this machine. Under `--watch`, requests from this machine may.
+- `db.exec`, `db.query` and `db.one` are counted, a replica's answers too, failed ones
+  as errors; Quillo's own tables (`_quillo_jobs` and the like) are not. The last 500
+  statements are kept; past that, the one used longest ago makes room.
 
 A second Ctrl-C, or a second `SIGTERM`, exits at once with status 130. Stopping also
 stops the commands run with `--with`, and a stream's `send` fails once the server is
