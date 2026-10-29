@@ -416,3 +416,44 @@ fn classes_in_markup_lead_to_their_rules() {
     let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
     assert!(["card", "tag", "chip", "chip-x"].iter().all(|l| labels.contains(l)) && !labels.contains(&"len"), "{:?}", labels);
 }
+
+/// Private names: hover and the outline say `private`, ranges cover the
+/// name as written, and another file's private view is not offered after
+/// `<` (branch public-private-editor).
+#[test]
+fn private_names_are_shown_as_private_and_kept_to_their_file() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-private-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let lib = "private fn page_of(n: int) = n\nprivate view Post(p: map) = <b>{p.title}</b>\npublic fn first() = page_of(1)\n";
+    std::fs::write(dir.join("lib/forum.qwe"), lib).unwrap();
+    let main = "use \"lib/forum.qwe\"\nroute GET / = <main></main>\n";
+    std::fs::write(dir.join("main.qwe"), main).unwrap();
+    let lib_uri = format!("file://{}/lib/forum.qwe", dir.display());
+    let main_uri = format!("file://{}/main.qwe", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lib_uri, "languageId": "quillo", "version": 1, "text": lib } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": main_uri, "languageId": "quillo", "version": 1, "text": main } }));
+
+    let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": lib_uri }, "position": { "line": 2, "character": 22 } }), &mut notes);
+    assert!(h["contents"]["value"].as_str().unwrap().contains("private fn page_of(n: int)"), "{}", h);
+    let syms = c.request("textDocument/documentSymbol", json!({ "textDocument": { "uri": lib_uri } }), &mut notes);
+    assert_eq!(syms[0]["name"], json!("page_of"));
+    assert!(syms[0]["detail"].as_str().unwrap().starts_with("private fn page_of"), "{}", syms);
+    assert_eq!(syms[0]["selectionRange"]["start"], json!({ "line": 0, "character": 11 }));
+    let def = c.request("textDocument/definition", json!({ "textDocument": { "uri": lib_uri }, "position": { "line": 2, "character": 22 } }), &mut notes);
+    assert_eq!(def["range"]["start"], json!({ "line": 0, "character": 11 }), "{}", def);
+
+    let typing = main.replace("<main>", "<main><");
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": main_uri, "version": 2 }, "contentChanges": [{ "text": typing }] }));
+    let items = c.request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": main_uri }, "position": { "line": 1, "character": 21 }, "context": { "triggerKind": 2, "triggerCharacter": "<" } }),
+        &mut notes,
+    );
+    let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
+    assert!(labels.contains(&"div") && !labels.contains(&"Post"), "{:?}", labels);
+}
