@@ -1588,6 +1588,53 @@ The statuses the server answers by itself:
 | 501 | a `transfer-encoding` other than `chunked` |
 | 503 | the server stopping or its program failed to load; a prefetch refused; too many files being sent or pages waiting (with `retry-after: 5`) |
 
+### Route groups
+
+Routes that share a start of their path, middleware or a request pattern are written once
+for all of them, in a `routes` group, as Laravel's `Route::prefix()->middleware()->group()`:
+
+```quillo
+fn signed_in(r) = session().user != null ? r : reply 303 redirect(`/login?next=${url_encode(r.path)}`)
+fn admins(r) = is_admin(session().user) ? r : respond(403, "admins only")
+
+routes /admin | signed_in | admins {
+    route GET / = <AdminHome/>                      // GET /admin
+    route GET /users = list_users()                 // GET /admin/users
+    route POST /users/:id(int)/ban { ban(id) }
+
+    routes /teams/:team(int) {                      // groups nest: /admin/teams/7/members
+        route GET /members = members(team)
+    }
+}
+
+routes /api { headers: { host: "api.example.com" } } {    // Laravel's domain()
+    route GET /me = me()
+}
+
+routes / | signed_in {                              // no prefix: middleware only
+    route GET /settings = <Settings/>
+}
+```
+
+- **The path** goes before each route's own, parameters and types included
+  (`:team(int)`), which the routes' bodies and patterns can use; a group's `/` alone
+  adds nothing.
+- **Middleware** (each after a `|`, as in a pipeline) is called with `request` before the
+  route's body, outer groups' first, in the order written. A `reply` in it answers the
+  request in the route's place, as does a response it gives back (`redirect(...)`,
+  `respond(...)`); anything else it gives lets the route go on, so the middleware of a
+  pipeline (`auth.required`, which gives the request back) works as it is. What it gives
+  does not reach the route: a route that needs the user reads it again (`session()`,
+  `me()`). `quillo check` checks each call as it checks any other, at the line the
+  middleware is written on.
+- **A request pattern** after the middleware is matched as well as each route's own
+  (both must match), and binds the same way: a request it does not match goes on to the
+  next route, as with a route's own pattern.
+- A group holds only `route`s and `routes` groups, is written at the top level of a file,
+  and keeps its routes in the order written, among the file's others. Outside that,
+  `routes` is a name like any other (`routes / 2` divides). Routes from groups are
+  routes: `quillo docs` lists them by their whole path.
+
 ### Uploads
 
 A form with `enctype="multipart/form-data"` sends files. Its text fields are in
@@ -1818,7 +1865,8 @@ route GET /users/:id(int) {
 The questions that come up once an app is past its first pages, answered from the
 server's code:
 
-- **A hook before every route, or a global error handler:** there is none. Middleware
+- **A hook before every route, or a global error handler:** there is none (a `routes`
+  group at `/` gives middleware to the routes inside it; see [Route groups](#route-groups)). Middleware
   is a pipeline stage that `reply`s (above), written into each route that needs it. A
   runtime error is always the plain `internal error` 500; a 404 page of your own is a
   last `route ANY /*rest`.
@@ -4253,7 +4301,7 @@ does not do it today; the way around it follows.
 | Can I... | |
 |---|---|
 | serve HTTPS or HTTP/2 from Quillo itself? | No: HTTP/1.1 on plain TCP; a proxy in front (limer, Caddy, nginx) does TLS. See [What a route cannot do](#what-a-route-cannot-do) |
-| write middleware? | Yes, as a pipeline stage that `reply`s; there is no global hook, and no custom 500 page. See [What a route returns](#what-a-route-returns) |
+| write middleware? | Yes, as a pipeline stage that `reply`s, or for many routes at once in a `routes` group (prefix, middleware, request pattern, nested; see [Route groups](#route-groups)); there is no global hook, and no custom 500 page |
 | answer CORS preflights? | Not by itself: declare `route OPTIONS` and set the headers with `respond` |
 | open WebSockets of my own? | No: `live`, `events` with `listen`, and channels are the ways to push. See [Channels](#channels) |
 | receive or send binary data? | Only as files: `file()`, uploads, `image.*`. There is no bytes value; bodies are text |

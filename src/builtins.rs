@@ -120,6 +120,7 @@ pub fn install(env: &Env) {
         ("url", url),
         ("navigate", navigate),
         ("waiting", waiting),
+        ("__answer", answer_with),
         ("publish", publish),
         ("watch", watch),
         ("unwatched", unwatched),
@@ -1733,6 +1734,17 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     s_arg(&args, 0, "navigate", line)?;
     Ok(Value::Nil)
+}
+
+/// What a `routes` group's middleware gave, before a route's body: a response
+/// (`redirect(...)`, `respond(...)`) answers the request in the route's place,
+/// as a `reply` in the middleware does; anything else lets the route go on
+/// (branch route-groups).
+fn answer_with(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    match args.into_iter().next() {
+        Some(Value::Response(r)) => Err(Ctrl::Reply(r)),
+        _ => Ok(Value::Nil),
+    }
 }
 
 /// `waiting(state)`: in a component, whether a live state waits for the

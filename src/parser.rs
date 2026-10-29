@@ -62,6 +62,12 @@ pub struct Parser {
     /// The elements still open where the text ended, if it ended inside
     /// markup: what an editor closes at the cursor (see `open_tags_at_end`).
     unclosed_at_end: Option<Vec<OpenTag>>,
+    /// The statement being parsed is one of the file's own, at its top
+    /// level: where a `routes` group may be (branch route-groups).
+    top: bool,
+    /// The routes of a group after its first, which the program takes after
+    /// the statement that gave them (branch route-groups).
+    more: Vec<Stmt>,
 }
 
 /// An element whose end tag has not been read yet.
@@ -175,7 +181,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new() }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -316,7 +322,10 @@ impl Parser {
             if self.at(&Tok::Eof)? {
                 return Ok(out);
             }
+            self.top = true;
             out.push(self.parse_stmt()?);
+            // A `routes` group's other routes, in order (branch route-groups).
+            out.append(&mut self.more);
             self.end_stmt()?;
         }
     }
@@ -338,6 +347,8 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // Only the outermost statement is at the top level (route-groups).
+        let top = std::mem::take(&mut self.top);
         let line = self.line()?;
         if let Tok::Ident(k) = self.peek()? {
             match k.as_str() {
@@ -388,6 +399,26 @@ impl Parser {
                 "route" => {
                     self.next()?;
                     return Ok(Stmt::Route(Arc::new(self.parse_route(line)?)));
+                }
+                // `routes /admin | auth.required { route GET /users = ... }`: a
+                // group, whose prefix, middleware and request pattern each of
+                // its routes takes; otherwise `routes` is a name (branch route-groups).
+                "routes" => {
+                    let saved = self.save();
+                    self.next()?;
+                    self.lx.skip_spaces();
+                    if self.peeked.is_none() && self.group_ahead() {
+                        if !top {
+                            return Err(QuilloError::new("a `routes` group is written at the top level of a file, as `route` is", line));
+                        }
+                        let mut routes = self.parse_group(line, &[], &[], &[])?.into_iter();
+                        let Some(first) = routes.next() else {
+                            return Err(QuilloError::new("this `routes` group has no routes in it", line));
+                        };
+                        self.more.extend(routes.map(|r| Stmt::Route(Arc::new(r))));
+                        return Ok(Stmt::Route(Arc::new(first)));
+                    }
+                    self.restore(saved);
                 }
                 "component" => {
                     self.next()?;
@@ -876,10 +907,16 @@ impl Parser {
                 line,
             ));
         }
-        // The path is read character by character: `/users/:id(int)/*rest`.
+        let path = self.parse_path("after the method")?;
+        self.parse_route_rest(method, path, line)
+    }
+
+    /// A route's or a group's path, read character by character:
+    /// `/users/:id(int)/*rest`.
+    fn parse_path(&mut self, after: &str) -> PResult<Vec<Seg>> {
         self.lx.skip_spaces();
         if self.lx.peek_char() != Some('/') {
-            return Err(QuilloError::new("expected a path starting with `/` after the method", self.lx.line));
+            return Err(QuilloError::new(format!("expected a path starting with `/` {}", after), self.lx.line));
         }
         let mut path = Vec::new();
         while self.lx.peek_char() == Some('/') {
@@ -926,7 +963,10 @@ impl Parser {
             }
         }
         self.lx.last = Some(Tok::RParen);
+        Ok(path)
+    }
 
+    fn parse_route_rest(&mut self, method: String, path: Vec<Seg>, line: u32) -> PResult<RouteDef> {
         let query = if self.eat(&Tok::Question)? {
             if !self.at(&Tok::LBrace)? {
                 return self.err_at("expected `{` with query parameters after `?`");
@@ -962,7 +1002,95 @@ impl Parser {
         let uses_request = body_pat.is_some()
             || names_request(&body)
             || query.as_ref().map_or(false, pattern_names_request);
-        Ok(RouteDef { method, path, query, body_pat, body, line, file: self.file.clone(), uses_request })
+        Ok(RouteDef { method, path, query, body_pat, guards: Vec::new(), body, line, file: self.file.clone(), uses_request })
+    }
+
+    /// Whether what follows `routes` is a group's path: `/` and a path
+    /// (`/admin`, `/:team`), or `/` alone before `|` or `{` (a group at the
+    /// root). `routes / 2` is a division (branch route-groups).
+    fn group_ahead(&self) -> bool {
+        if self.lx.peek_char() != Some('/') {
+            return false;
+        }
+        match self.lx.peek_char_at(1) {
+            Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '-' | '.' | '*') => true,
+            _ => {
+                let mut n = 1;
+                while matches!(self.lx.peek_char_at(n), Some(' ' | '\t')) {
+                    n += 1;
+                }
+                matches!(self.lx.peek_char_at(n), Some('|' | '{'))
+            }
+        }
+    }
+
+    /// `routes /prefix | middleware ... { request pattern } { routes }`, the
+    /// prefix and the rest added to those of the groups around it: its routes,
+    /// each with the prefix before its path, the middleware called before its
+    /// body (`__answer(m(request))`: a `reply` in it, or a response it gives,
+    /// answers instead), and the pattern matched with its own (branch
+    /// route-groups).
+    fn parse_group(&mut self, line: u32, prefix: &[Seg], before: &[(Expr, u32)], guards: &[Pattern]) -> PResult<Vec<RouteDef>> {
+        let mut path = prefix.to_vec();
+        path.extend(self.parse_path("after `routes`")?);
+        let mut before = before.to_vec();
+        while self.eat(&Tok::Bar)? {
+            // Its call is told of at the line it is written on.
+            let at = self.line()?;
+            before.push((self.parse_or()?, at));
+        }
+        let mut guards = guards.to_vec();
+        if self.at(&Tok::LBrace)? {
+            let saved = self.save();
+            match self.parse_pattern() {
+                Ok(p) if self.at(&Tok::LBrace)? => guards.push(p),
+                _ => self.restore(saved),
+            }
+        }
+        if !self.eat(&Tok::LBrace)? {
+            return self.err_at("expected `{` and the group's routes");
+        }
+        let mut out = Vec::new();
+        loop {
+            self.skip_seps()?;
+            if self.eat(&Tok::RBrace)? {
+                break;
+            }
+            let at = self.line()?;
+            match self.peek()? {
+                Tok::Ident(k) if k == "route" => {
+                    self.next()?;
+                    let mut r = self.parse_route(at)?;
+                    let mut full = path.clone();
+                    full.append(&mut r.path);
+                    r.path = full;
+                    let mut gs = guards.clone();
+                    gs.append(&mut r.guards);
+                    r.guards = gs;
+                    if !before.is_empty() {
+                        let mut stmts: Vec<Stmt> = before
+                            .iter()
+                            .map(|(m, ml)| {
+                                let called = Expr::Call(Box::new(m.clone()), vec![Expr::Ident("request".into(), *ml)], *ml);
+                                Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__answer".into(), *ml)), vec![called], *ml))
+                            })
+                            .collect();
+                        stmts.push(Stmt::Expr(std::mem::replace(&mut r.body, Expr::Lit(Lit::Nil))));
+                        r.body = Expr::Block(stmts);
+                    }
+                    r.uses_request = r.uses_request || !before.is_empty() || !r.guards.is_empty();
+                    out.push(r);
+                }
+                Tok::Ident(k) if k == "routes" => {
+                    self.next()?;
+                    out.extend(self.parse_group(at, &path, &before, &guards)?);
+                }
+                other => return self.err_at(format!("a `routes` group holds `route` and `routes`, found {}", other.describe())),
+            }
+            self.end_stmt()?;
+        }
+        let _ = line;
+        Ok(out)
     }
 
     /// Runs `f` with `name => ...` arrows allowed again (inside brackets).

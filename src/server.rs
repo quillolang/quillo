@@ -447,7 +447,10 @@ impl Interp {
             }
 
             let mut binds = Vec::new();
-            let checks = [(r.query.as_ref(), &query_v, Mode::Lenient), (r.body_pat.as_ref(), &reqv, Mode::Request)];
+            // The `routes` groups' patterns too, outermost first (branch route-groups).
+            let checks = std::iter::once((r.query.as_ref(), &query_v, Mode::Lenient))
+                .chain(r.guards.iter().map(|g| (Some(g), &reqv, Mode::Request)))
+                .chain(std::iter::once((r.body_pat.as_ref(), &reqv, Mode::Request)));
             let mut matched = true;
             for (pat, val, mode) in checks {
                 let Some(pat) = pat else { continue };
