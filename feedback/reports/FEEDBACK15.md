@@ -132,6 +132,34 @@ involved. Worth a look at how the first connection after `listening` is handled.
 The site also changed on its side: the reference pages' blocks are parsed when a page
 is asked for, not all 315 at load, which took 0.1 s of the program's top level.
 
+### Q-099. The watcher looks at every file twenty times a second and sees a change up to 50 ms late
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| perf | the reload timings of Q-098: 25 ms of the average were the poll | 1 |
+
+After Q-098 the watcher polled the modification time of every program file every 50 ms:
+hundreds of `stat` calls a second for nothing while idle, and a change seen 25 ms late on
+average. macOS and Linux tell of changes as they happen.
+
+Measured on the site, save to `reloaded`, wall clock:
+
+| | Poll every 50 ms | OS events |
+|---|---|---|
+| In-place write, six in a row | 167 to 215 ms | 118 to 128 ms |
+| A save renamed over the file (VS Code's way), three in a row | the same | 125 to 127 ms |
+| The server idle | a stat per file every 50 ms | nothing |
+
+**Fix, on branch file-events:** `events` in src/server.rs: on macOS a kqueue with
+`EVFILT_VNODE` on each watched file; on Linux inotify on each file's folder, since a
+watch on the file itself is lost when a save renames a new file over it. The watcher
+waits on it, a second at most, then compares modification times as before, so a
+filesystem that reports nothing (a network mount) is still looked at every second. The
+watches are made again after each reload and after a served file changed, which is what
+makes a rename-over save followed by another save work. Where the system refuses (a
+missing file, too many open files) or elsewhere (Windows), the 50 ms poll stays, and the
+log says so once. No repro: timings.
+
 ## Where the AI struggled
 
 | What I wrote first | Why | What happened | Cost |

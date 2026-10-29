@@ -16,6 +16,10 @@
   up (a component that cannot run in the browser is then reported in the log right
   after the load); and the watcher looks every 50 ms. The documentation site reloads in 0.15 s, from 0.5 s
   (Q-098).
+- **The watcher is told of changes by the system** on macOS (kqueue) and Linux (inotify)
+  instead of looking every 50 ms, so a save, in place or renamed over the file, reloads
+  within a few milliseconds of it and an idle server does nothing; the poll stays as the
+  fallback and elsewhere (Q-099).
 - **`bind:value` with `@input`** (and `bind:checked` with `@change`) on one input: both
   run, the binding first, so the handler reads the state as typed. Before, the one
   written second took the other's place (FEEDBACK14, Q-094).
