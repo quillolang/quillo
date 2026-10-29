@@ -88,7 +88,8 @@ async function main() {
       if (!s.sourceMapURL || !s.sourceMapURL.startsWith("data:")) continue;
       const map = JSON.parse(Buffer.from(s.sourceMapURL.split(",")[1], "base64").toString());
       if (map.sources[0] !== source) continue;
-      out.sourcesContent = typeof map.sourcesContent[0] === "string";
+      // The file's text is in the first script's map only (Q-097).
+      out.sourcesContent = out.sourcesContent || typeof map.sourcesContent[0] === "string";
       decode(map.mappings).forEach((segs, line) => {
         for (const [col, src] of segs) if (src + 1 === want) places.push({ url: s.url, line, col, map });
       });

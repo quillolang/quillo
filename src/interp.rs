@@ -130,8 +130,15 @@ pub struct Interp {
     pub locale: Option<Arc<str>>,
     /// Every statement the program has loaded, for the browser compiler.
     pub program: Arc<Vec<Arc<Vec<Stmt>>>>,
-    /// The browser bundle (`/_quillo/quillo.js`), built after loading.
+    /// The browser bundle (`/_quillo/quillo.js`), built after loading; in
+    /// development, made when first asked for (see `client_js`).
     pub client_js: Arc<String>,
+    client_lazy: Arc<std::sync::OnceLock<Arc<String>>>,
+    /// Whether the program names `db.atomic` (then transactions it left
+    /// prepared are looked after: see `db::recover`). Noted as the files are
+    /// read: it was found by printing the whole program as text and searching
+    /// that, 17 ms of every reload (FEEDBACK15.md, Q-098; branch dev-maps-once).
+    pub uses_atomic: bool,
     /// The request being handled, visible as `request` inside `server fn`s.
     pub current_request: Option<Value>,
     /// The request being handled, when its map has not been made yet (see
@@ -260,6 +267,34 @@ pub const PREFETCH_REFUSED: &str = "not while the page is prefetched";
 
 /// A source file's absolute path, as the parser records it on what it
 /// parses (see `FnDef::file`).
+/// Programs parsed, by file, with a hash of the text each was parsed from: a
+/// reload under --watch parses only the files that changed, not a 4 MB kit
+/// file again (FEEDBACK15.md, Q-098; branch dev-maps-once). One parse is kept
+/// per file: a file's new text replaces its old parse.
+static PARSED: Mutex<Vec<(Arc<str>, u64, Arc<Vec<Stmt>>)>> = Mutex::new(Vec::new());
+
+fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str) -> Result<Arc<Vec<Stmt>>, QuilloError> {
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        h.finish()
+    };
+    if let Some(abs) = &abs {
+        let kept = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, stmts)) = kept.iter().find(|(p, h, _)| p == abs && *h == hash) {
+            return Ok(stmts.clone());
+        }
+    }
+    let stmts = Arc::new(Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?);
+    if let Some(abs) = abs {
+        let mut kept = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+        kept.retain(|(p, _, _)| *p != abs);
+        kept.push((abs, hash, stmts.clone()));
+    }
+    Ok(stmts)
+}
+
 fn source_path(file: &Path) -> Option<Arc<str>> {
     let p = std::fs::canonicalize(file).ok()?;
     Some(Arc::from(p.display().to_string()))
@@ -825,6 +860,8 @@ impl Interp {
             locale: None,
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
+            client_lazy: Default::default(),
+            uses_atomic: false,
             bundles: Default::default(),
             styles: Default::default(),
             current_request: None,
@@ -901,6 +938,8 @@ impl Interp {
             locale: None,
             program: self.program.clone(),
             client_js: self.client_js.clone(),
+            client_lazy: self.client_lazy.clone(),
+            uses_atomic: self.uses_atomic,
             bundles: self.bundles.clone(),
             styles: self.styles.clone(),
             current_request: None,
@@ -1261,7 +1300,8 @@ impl Interp {
     /// Parses and runs a program's top level, registering its routes.
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
         let abs = source_path(Path::new(file));
-        let stmts = Arc::new(Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?);
+        self.uses_atomic |= src.contains(".atomic");
+        let stmts = parse_cached(src, abs.clone(), file)?;
         Arc::make_mut(&mut self.program).push(stmts.clone());
         let env = self.globals.clone();
         let mut last = Value::Nil;
@@ -1295,13 +1335,41 @@ impl Interp {
 
     /// Compiles the program's components (and what they use) for the browser.
     pub fn build_client(&mut self) -> Result<(), QuilloError> {
-        self.client_js = Arc::new(crate::client::bundle(self)?);
-        let runtime = crate::client::runtime_file(self)?.map(Arc::new);
+        // In development the whole program's bundle is made when first asked
+        // for: each page compiles its own components, and a reload is a
+        // third quicker without it (FEEDBACK15.md, Q-098; branch dev-maps-once).
+        let runtime = if crate::client::DEV.load(std::sync::atomic::Ordering::Relaxed) {
+            self.client_js = Arc::new(String::new());
+            self.client_lazy = Default::default();
+            None
+        } else {
+            let (js, runtime) = crate::client::bundle_and_runtime(self)?;
+            self.client_js = Arc::new(js);
+            runtime.map(Arc::new)
+        };
         let mut bundles = crate::client::Bundles::default();
         bundles.runtime = runtime;
         self.bundles = Arc::new(std::sync::Mutex::new(bundles));
         self.styles = Arc::new(std::sync::Mutex::new(crate::styles::Styles::collect(self)?));
         Ok(())
+    }
+
+    /// The whole program's bundle: `/_quillo/quillo.js`, and a page's bundle
+    /// no longer kept. In development it is made here, the first time; a
+    /// component that cannot run in the browser then says so in the
+    /// browser's console instead of at load.
+    pub fn client_js(&self) -> Arc<String> {
+        if !self.client_js.is_empty() {
+            return self.client_js.clone();
+        }
+        self.client_lazy
+            .get_or_init(|| {
+                Arc::new(crate::client::bundle(self).unwrap_or_else(|e| {
+                    eprintln!("quillo: {}", e);
+                    format!("console.error({});\n", serde_json::json!(e.to_string()))
+                }))
+            })
+            .clone()
     }
 
     /// The bundle for a page with these components: its address's hash,
@@ -1467,7 +1535,8 @@ impl Interp {
                     .map_err(|e| QuilloError::new(format!("cannot read {}: {}", full.display(), e), *line))?;
                 let fname = full.display().to_string();
                 let abs = source_path(&full);
-                let stmts = Arc::new(Parser::new(&src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(&fname))?);
+                self.uses_atomic |= src.contains(".atomic");
+                let stmts = parse_cached(&src, abs.clone(), &fname)?;
                 Arc::make_mut(&mut self.program).push(stmts.clone());
                 let g = self.globals.clone();
                 let debugging = crate::debug::on();

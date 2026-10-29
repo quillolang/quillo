@@ -1213,7 +1213,7 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
 /// Whether a program uses `db.atomic` (then transactions it left prepared
 /// are looked after: see `recover`).
 pub fn uses_atomic(it: &Interp) -> bool {
-    format!("{:?}", it.program).contains("\"atomic\"")
+    it.uses_atomic
 }
 
 /// `db.system(target)`: where Quillo keeps its own tables, when the

@@ -749,7 +749,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   stream ends.
 - Component code, and the functions, views and constants it uses, is compiled to
   JavaScript. Code that cannot run in a browser is an error when the program loads
-  (and in `quillo check`, for what the component calls directly): `request`, `db`, `env`
+  (under `--watch`, in the log right after the load, and in the browser's console of
+  a page that needs the component; and in `quillo check`, for what the component calls
+  directly): `request`, `db`, `env`
   (but for variables named `PUBLIC_...`), files, `reply`, or a global the server changes
   (pass it as a prop instead). `http.*` runs in the browser, from event handlers (see
   [What the browser can reach](#what-the-browser-can-reach)). Any name is fine in
@@ -3852,11 +3854,15 @@ threads, the system's elsewhere.
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. `--reload` reloads it the same way without
 `--watch`'s development aids (errors on pages, refreshing them), for production
-programs that change their own files, such as a plugin editor. Both look, four times a
-second, at the modification time of the main file and of every file the program loaded
+programs that change their own files, such as a plugin editor. Both look, twenty times
+a second, at the modification time of the main file and of every file the program loaded
 (`use`d, mounted, a service's; under `--watch`, files served with `file()` too): no
 folder is watched, so a new file is noticed once something loads it. A version that
 fails to load or check does not replace the one that works; the errors are printed.
+A reload parses only the files that changed (the others' parses are kept) and, under
+`--watch`, compiles the program for the browser on a thread of its own once the new
+version answers, so a save shows in open pages in about a fifth of a second for a
+program of a few hundred components, plus the time to parse the file that changed.
 
 What a reload keeps, and what it starts afresh:
 

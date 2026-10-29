@@ -45,11 +45,24 @@ const CLIENT_BUILTINS: &[&str] = &[
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
-    let c = compiled(it, None)?;
-    if c.0.dev {
-        return Ok(dev::bundle(it, &c.0, c.1));
+    let (c, boots) = compiled(it, None)?;
+    Ok(bundle_from(it, &c, boots))
+}
+
+/// The whole program's bundle and its runtime file from one compile. Made
+/// apart, each compiled the program again: two thirds of a program's load
+/// (FEEDBACK15.md, Q-098; branch dev-maps-once).
+pub fn bundle_and_runtime(it: &Interp) -> Result<(String, Option<RuntimeFile>), QuilloError> {
+    let (c, boots) = compiled(it, None)?;
+    let js = bundle_from(it, &c, boots);
+    Ok((js, (!c.dev).then(|| runtime_from(it, &c, boots))))
+}
+
+fn bundle_from(it: &Interp, c: &Compiler, boots: bool) -> String {
+    if c.dev {
+        return dev::bundle(it, c, boots);
     }
-    Ok(assemble("(function () {", &program_text(it, &c.0, c.1, true), "})();"))
+    assemble("(function () {", &program_text(it, c, boots, true), "})();")
 }
 
 /// The program compiled for the browser, from `roots` (all its components
@@ -197,10 +210,11 @@ pub struct RuntimeFile {
 /// the runtime as it is written).
 pub fn runtime_file(it: &Interp) -> Result<Option<RuntimeFile>, QuilloError> {
     let (c, boots) = compiled(it, None)?;
-    if c.dev {
-        return Ok(None);
-    }
-    let program = program_text(it, &c, boots, false);
+    Ok((!c.dev).then(|| runtime_from(it, &c, boots)))
+}
+
+fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
+    let program = program_text(it, c, boots, false);
     let rt = runtime_units();
     let keep = shake(rt, &program);
     let wanted: HashSet<String> = names_in(&program).into_iter().collect();
@@ -224,7 +238,7 @@ pub fn runtime_file(it: &Interp) -> Result<Option<RuntimeFile>, QuilloError> {
     let _ = writeln!(js, "window.__quillo_rt = {{ {} }};", exported.join(", "));
     js.push_str("})();\n");
     let hash = hash_text(&js);
-    Ok(Some(RuntimeFile { hash, js: Arc::new(js), keep, exported: exported.into_iter().collect() }))
+    RuntimeFile { hash, js: Arc::new(js), keep, exported: exported.into_iter().collect() }
 }
 
 impl RuntimeFile {
@@ -457,14 +471,22 @@ mod dev {
         let mut order = vec!["quillo.js".to_string()];
         files.insert("quillo.js".into(), RUNTIME.to_string());
         let mut sources: HashMap<Arc<str>, Option<String>> = HashMap::new();
+        // A file's text goes into the map of the first piece made from it only;
+        // the other pieces name the file and carry no copy. With it in every
+        // piece, a program using a 4 MB file of 1,600 definitions (a component
+        // kit) took 7 s to load under --watch, nearly all of it writing and
+        // base64-encoding that file hundreds of times over (FEEDBACK15.md,
+        // Q-097; branch dev-maps-once).
+        let mut embedded: HashSet<Arc<str>> = HashSet::new();
         for p in pieces {
             if p.code.trim().is_empty() {
                 continue;
             }
             let text = match &p.source {
                 Some(src) => {
-                    let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok()).clone();
-                    with_map(&p.code, src, content.as_deref())
+                    let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok());
+                    let once = if embedded.insert(src.clone()) { content.as_deref() } else { None };
+                    with_map(&p.code, src, once)
                 }
                 None => format!("\"use strict\";\n{}", unmarked(&p.code)),
             };

@@ -593,7 +593,7 @@ impl Interp {
         if let Some(hash) = rest.strip_prefix("b/").and_then(|r| r.strip_suffix(".js")) {
             let (js, cache) = match self.bundle_by_hash(hash) {
                 Some(js) => (js, "public, max-age=31536000, immutable"),
-                None => (self.client_js.clone(), "no-cache"),
+                None => (self.client_js(), "no-cache"),
             };
             return HttpResponse {
                 status: 200,
@@ -625,7 +625,7 @@ impl Interp {
             let etag = format!("\"{:016x}\"", {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                self.client_js.hash(&mut h);
+                self.client_js().hash(&mut h);
                 h.finish()
             });
             let fresh = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.contains(&etag));
@@ -636,7 +636,7 @@ impl Interp {
                     ("cache-control".into(), "no-cache".into()),
                     ("etag".into(), etag),
                 ],
-                body: if fresh { Vec::new() } else { self.client_js.as_bytes().to_vec() },
+                body: if fresh { Vec::new() } else { self.client_js().as_bytes().to_vec() },
             };
         }
         // Whether what the program needs is there (FEEDBACK10.md, Q-076;
@@ -1342,7 +1342,11 @@ impl App {
     /// `loaded` must have been loaded with `shared`; the caller holds the lock.
     pub fn new(loaded: Loaded, shared: Arc<Shared>, main_file: &Path, base_dir: &Path, watch: bool) -> Self {
         App {
-            slot: Mutex::new((1, Arc::new(loaded))),
+            slot: Mutex::new((1, {
+                let loaded = Arc::new(loaded);
+                warm_client(&loaded);
+                loaded
+            })),
             changed: Condvar::new(),
             shared,
             main_file: main_file.to_path_buf(),
@@ -1435,7 +1439,9 @@ impl App {
                 if let Loaded::Ready(old) = &*slot.1 {
                     retire(old);
                 }
-                *slot = (slot.0 + 1, Arc::new(Loaded::Ready(it)));
+                let loaded = Arc::new(Loaded::Ready(it));
+                warm_client(&loaded);
+                *slot = (slot.0 + 1, loaded);
             }
             Err(e) => {
                 eprintln!("quillo: {}", e);
@@ -1487,12 +1493,15 @@ fn watch(app: Arc<App>) {
     let mut seen = mtimes(&files);
     crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
+    // Every 50 ms: a stat of each file, cheap for the hundreds a program
+    // has, and a change is seen within that instead of within 250 ms
+    // (FEEDBACK15.md, Q-098; branch dev-maps-once).
     loop {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(50));
         let now = mtimes(&files);
         if now != seen {
             // Editors often write in several steps; let them finish.
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(30));
             app.reload();
             files = app.watched_files();
             seen = mtimes(&files);
@@ -1989,6 +1998,25 @@ fn is_job_request(req: &HttpRequest) -> bool {
 /// Calls made later (`billing.later.invoice(...)`) delivered, and
 /// transactions over several databases recovered, for a program that may
 /// have them (started once; see `service::start_deliveries`).
+/// In development the whole program's bundle is made on a thread of its own
+/// once the program is up, so that a reload does not wait for it and a
+/// component that cannot run in the browser is still reported in the log
+/// right after (FEEDBACK15.md, Q-098; branch dev-maps-once).
+fn warm_client(loaded: &Arc<Loaded>) {
+    if !crate::client::DEV.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let loaded = loaded.clone();
+    std::thread::Builder::new()
+        .name("quillo-client".into())
+        .spawn(move || {
+            if let Loaded::Ready(it) = &*loaded {
+                it.client_js();
+            }
+        })
+        .ok();
+}
+
 fn start_background(it: &Interp, addr: std::net::SocketAddr) {
     if crate::service::uses_services(it) || crate::db::uses_atomic(it) {
         crate::service::start_deliveries(addr);
