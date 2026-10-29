@@ -1877,11 +1877,11 @@ route GET /users/:id(int) {
 The questions that come up once an app is past its first pages, answered from the
 server's code:
 
-- **A hook before every route, or a global error handler:** there is none (a `routes`
-  group at `/` gives middleware to the routes inside it; see [Route groups](#route-groups)). Middleware
-  is a pipeline stage that `reply`s (above), written into each route that needs it. A
-  runtime error is always the plain `internal error` 500; a 404 page of your own is a
-  last `route ANY /*rest`.
+- **A hook before every route, or a global error handler:** the hook is a `routes /`
+  group with middleware around the routes that need it (see [Route groups](#route-groups));
+  for one route, a pipeline stage that `reply`s (above). There is no global error
+  handler: a runtime error is always the plain `internal error` 500, and a 404 page of
+  your own is a last `route ANY /*rest`.
 - **`request` in a helper:** `request` is read only in a route or a `server fn`; a
   function they call gets it as an argument. `session()`, `cookie(name)`, `tenant()`
   and `locale()` work in any function the request runs.
