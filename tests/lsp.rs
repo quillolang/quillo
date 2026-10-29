@@ -457,3 +457,70 @@ fn private_names_are_shown_as_private_and_kept_to_their_file() {
     let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
     assert!(labels.contains(&"div") && !labels.contains(&"Post"), "{:?}", labels);
 }
+
+/// A class: hover shows its rules, references reach its rules and the
+/// markup that writes it (from either side), rename changes both, and a
+/// class with no rule is told: a warning when a rule is near it, else a
+/// hint (branch class-tools).
+#[test]
+fn classes_are_hovered_found_renamed_and_told_when_unstyled() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-class-tools-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("public/css")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let css = ".chip { color: red; }\n.box .chip { margin: 0; }\n";
+    std::fs::write(dir.join("public/css/site.css"), css).unwrap();
+    let main = dir.join("main.qwe");
+    let text = "route GET / = <div.box><span.chip>a</span><b class=\"chip\">b</b><i.chiip>c</i><i.marker>d</i></div>\n";
+    std::fs::write(&main, text).unwrap();
+    let uri = format!("file://{}", main.display());
+    let css_uri = format!("file://{}/public/css/site.css", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    let init = c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    assert_eq!(init["capabilities"]["referencesProvider"], json!(true));
+    assert_eq!(init["capabilities"]["experimental"]["cssClasses"], json!(true));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let d = loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            break m["params"]["diagnostics"].clone();
+        }
+    };
+    let told: Vec<(String, u64)> = d.as_array().unwrap().iter().map(|d| (d["message"].as_str().unwrap().to_string(), d["severity"].as_u64().unwrap())).collect();
+    assert!(told.contains(&("no style sheet has a rule for `.chiip` (did you mean `chip`?)".to_string(), 2)), "{:?}", told);
+    assert!(told.contains(&("no style sheet has a rule for `.marker`".to_string(), 4)), "{:?}", told);
+
+    let at = |line: u32, character: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+    let h = c.request("textDocument/hover", at(0, 31), &mut notes);
+    let v = h["contents"]["value"].as_str().unwrap();
+    assert!(v.contains("`.chip`: 2 rules") && v.contains("site.css:2") && v.contains(".box .chip { margin: 0; }"), "{}", v);
+
+    let mut p = at(0, 31);
+    p["context"] = json!({ "includeDeclaration": true });
+    let refs = c.request("textDocument/references", p, &mut notes);
+    let found: Vec<(bool, u64, u64)> = refs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["uri"] == json!(css_uri), r["range"]["start"]["line"].as_u64().unwrap(), r["range"]["start"]["character"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(found, vec![(true, 0, 1), (true, 1, 6), (false, 0, 29), (false, 0, 52)], "{}", refs);
+
+    // From the style sheet, opened in the editor.
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": css_uri, "languageId": "css", "version": 1, "text": css } }));
+    let refs = c.request(
+        "textDocument/references",
+        json!({ "textDocument": { "uri": css_uri }, "position": { "line": 1, "character": 8 }, "context": { "includeDeclaration": false } }),
+        &mut notes,
+    );
+    assert_eq!(refs.as_array().unwrap().len(), 2, "{}", refs);
+
+    let mut p = at(0, 31);
+    p["newName"] = json!("tag");
+    let edit = c.request("textDocument/rename", p, &mut notes);
+    assert_eq!(edit["changes"][&css_uri].as_array().unwrap().len(), 2, "{}", edit);
+    assert_eq!(edit["changes"][&uri].as_array().unwrap().len(), 2, "{}", edit);
+    assert_eq!(edit["changes"][&uri][1], json!({ "range": { "start": { "line": 0, "character": 52 }, "end": { "line": 0, "character": 56 } }, "newText": "tag" }));
+    assert_eq!(c.request("textDocument/prepareRename", at(0, 3), &mut notes), Value::Null);
+}

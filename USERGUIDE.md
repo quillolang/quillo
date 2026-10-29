@@ -121,12 +121,19 @@ end tags added as you type a start tag's `>` or `</`, and a debugger: see [Debug
 An element left open is reported at its start tag (`` `<li>` is never closed: add `</li>` before
 `</ul>` on line 5 ``), with a quick fix that adds the end tag there. A class in markup
 (`<span.chip>`, `class="chip"`) goes to its rules with Go to Definition, in `css(...)`, a
-component's `style` or the CSS files under `public/`, and those classes are offered after
-`<span.` and in `class="`. It runs the `quillo` it finds (its `quillo.path`
+component's `style` or the CSS files under `public/`, and hover shows them; those classes
+are offered after `<span.` and in `class="`. Find All References lists a class's rules and
+the markup that writes it, from either side, and Rename renames it in both (a class put
+together, `card-${size}`, is left as it is). A class no sheet has a rule for is marked: a
+warning when a rule's class is close to it (`` no style sheet has a rule for `.chiip` (did
+you mean `chip`?) ``, which `quillo check` says too), else a faint hint, as markup often
+carries classes for its own sake. Neither is told when the program has no sheets of its
+own or links one from another site. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,
-go to definition (of names, and of classes to their CSS rules), document symbols,
+go to definition (of names, and of classes to their CSS rules), references and rename
+of classes (also from the CSS files under `public/`, when the client sends them), document symbols,
 completion after `.`, `<`, `</` and `@` (and of classes after `<tag.` and in `class="`), diagnostics on
 open, change and save, quick fixes as code actions, and `quillo/closeTag`: at a position
 just after a start tag's `>` or after `</`, the text to insert there, or null; `initializationOptions: { "strictNull": true }` for the extra
