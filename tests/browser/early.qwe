@@ -1,0 +1,16 @@
+// Mouse and pointer events made before the page's code came: each is done
+// again once it runs, as it was made (branch early-events).
+
+component Pad() {
+    state got = []
+    let note = (what: str) => { got = got | push(what) }
+    <section>
+        <button #plain @click={(e) => note(`click ${e.clientX} ${e.shiftKey} ${e.detail}`)} @dblclick={() => note("dblclick")}>plain</button>
+        <button #menu @contextmenu={(e) => { e.preventDefault(); note("contextmenu") }} @auxclick={(e) => note(`auxclick ${e.button}`)}>menu</button>
+        <div #grip @pointerdown={(e) => { e.target.setPointerCapture(e.pointerId); note(`pointerdown ${e.pointerType}`) }} @mousedown={() => note("mousedown")} @pointerup={() => note("pointerup")}>grip</div>
+        <input #box type="checkbox" @change={(e) => note(`change ${e.target.checked}`)}/>
+        <p #got>{join(got, "; ")}</p>
+    </section>
+}
+
+route GET / = <html><body><main><Pad/></main></body></html>

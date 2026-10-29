@@ -329,6 +329,30 @@ fn islands_load_their_code_when_it_is_needed() {
     assert_eq!(r, serde_json::json!({ "clockRuns": true, "errors": [] }));
 }
 
+/// Mouse and pointer events made in a component before the page's code came
+/// are kept, in order, and done again once it runs as they were made: where,
+/// with which buttons and keys, and how many clicks. A click waits (a
+/// checkbox is ticked then); a touch press whose finger is gone may still
+/// capture its pointer (branch early-events).
+#[test]
+fn mouse_events_before_the_code_comes_are_done_again_as_made() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("early.qwe"), free_port(), Some(&dir.join("early.js")));
+    let want = serde_json::json!({
+        "before": false,
+        "kept": 9,
+        "boxWaits": false,
+        "heard": "pointerdown touch; mousedown; pointerup; click 31 true 1; click 31 false 2; dblclick; contextmenu; auxclick 1; change true",
+        "box": true,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// `ask` waits for an answer in a dialog on the page (a dangerous question
 /// starting on "Cancel", Escape saying no); `notify` shows a note that goes.
 #[test]

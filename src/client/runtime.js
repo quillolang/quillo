@@ -5423,19 +5423,16 @@ function boot() {
     if (i) resume(i);
   }
   // What was done before the bundle came (the loader in server.rs kept it):
-  // the same elements are on the page, so it is done again on them.
+  // the same elements are on the page, so it is done again on them, each
+  // mouse and pointer event as it was made, where and with the buttons and
+  // keys it had (branch early-events).
   const held = window.__quillo_q || [];
+  const redo = window.__quillo_redo;
   window.__quillo_booted = true;
-  for (const e of held.splice(0)) {
-    const i = outerIsland(e.target);
+  for (const r of held.splice(0)) {
+    const i = outerIsland(r.el);
     if (i) resume(i);
-    if (!e.target.isConnected) continue;
-    if (e.type === "submit") {
-      const form = e.target.closest("form") || e.target;
-      if (form.requestSubmit) form.requestSubmit(); else form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-    } else {
-      e.target.click();
-    }
+    if (redo) redo(r);
   }
 }
 

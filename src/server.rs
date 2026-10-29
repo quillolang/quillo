@@ -2360,7 +2360,9 @@ pub const WORKER_STACK: usize = 16 << 20;
 /// (hovers, touches or focuses it), or the page is idle and has one that
 /// runs by itself (`data-e`, `data-l`) or is the page (`<body>` holds it).
 /// A click or a form sent before the bundle runs waits for it, and is done
-/// then (see `boot` in runtime.js).
+/// then (see `boot` in runtime.js); presses, releases, double, right and
+/// middle clicks are kept beside them and made again as they were made
+/// (branch early-events).
 /// `/_quillo/ready`: 200 or 503, and each thing the program needs.
 fn ready_response(it: &mut Interp) -> HttpResponse {
     let (ok, detail) = crate::ready::report(it);
@@ -2373,12 +2375,28 @@ fn island_loader(srcs: &[String]) -> String {
     let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
     format!(
         concat!(
-            "(()=>{{const d=document,q=window.__quillo_q=[];let go=0;",
+            "(()=>{{const d=document,w=window,q=w.__quillo_q=[];let go=0;",
             // In order: the runtime file first, when there is one.
-            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");t.src=s;t.async=false;t.onerror=()=>{{window.__quillo_booted=1}};d.head.appendChild(t)}}}};",
+            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");t.src=s;t.async=false;t.onerror=fail;d.head.appendChild(t)}}}};",
             "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island,[data-qi]\");",
-            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{window.__quillo_at=e.target;load()}}}},{{capture:true,passive:true}});",
-            "for(const v of[\"click\",\"submit\"])d.addEventListener(v,(e)=>{{if(!window.__quillo_booted&&isl(e)){{e.preventDefault();e.stopPropagation();q.push(e);load()}}}},true);",
+            // What a mouse or pointer event said, to make it again: where, with
+            // which buttons and keys, how many clicks (branch early-events).
+            "const K=\"clientX clientY screenX screenY button buttons detail ctrlKey shiftKey altKey metaKey pointerId pointerType isPrimary width height pressure\".split(\" \");",
+            // An event kept, done again on its element: a form sent, else the
+            // same event made anew (a click on a link or a checkbox does what
+            // it does).
+            // A finger lifted before then is no longer a pointer: capturing it
+            // (as a drag's `@pointerdown` does) is let go, not an error.
+            "const redo=w.__quillo_redo=(r)=>{{const el=r.el;if(!el.isConnected)return;if(r.t===\"submit\"){{const f=el.closest(\"form\")||el;f.requestSubmit?f.requestSubmit():f.dispatchEvent(new Event(\"submit\",{{bubbles:true,cancelable:true}}));return}}",
+            "const P=Element.prototype,sc=P.setPointerCapture;if(r.p)P.setPointerCapture=function(id){{try{{sc.call(this,id)}}catch(_){{}}}};",
+            "try{{el.dispatchEvent(new(r.p?PointerEvent:MouseEvent)(r.t,Object.assign({{bubbles:true,cancelable:true,composed:true,view:w}},r.i)))}}finally{{P.setPointerCapture=sc}}}};",
+            // No bundle: the clicks and forms kept are done as the page alone does them.
+            "const fail=()=>{{w.__quillo_booted=1;for(const r of q.splice(0))if(r.t===\"click\"||r.t===\"submit\")redo(r)}};",
+            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{w.__quillo_at=e.target;load()}}}},{{capture:true,passive:true}});",
+            // Kept until the bundle runs, in order: what the page alone would do
+            // for a click or a form waits too; a press, a double click or a menu
+            // goes on as the browser does it.
+            "for(const v of[\"pointerdown\",\"mousedown\",\"pointerup\",\"mouseup\",\"click\",\"auxclick\",\"dblclick\",\"contextmenu\",\"submit\"])d.addEventListener(v,(e)=>{{if(w.__quillo_booted||!isl(e))return;const i={{}};for(const k of K)if(k in e)i[k]=e[k];q.push({{t:v,el:e.target,i,p:typeof PointerEvent!==\"undefined\"&&e instanceof PointerEvent}});if(v===\"click\"||v===\"submit\"){{e.preventDefault();e.stopPropagation()}}load()}},true);",
             "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
             "d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
         ),

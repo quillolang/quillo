@@ -791,7 +791,12 @@ route GET / = <html><body><Counter start={5}/></body></html>
   which loads a file per component and function (see [Debugging](#in-the-browser)).
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
   when someone reaches for a component (points at, touches or focuses it, or presses a
-  key in it). What they typed and clicked before it came is kept and done then. A
+  key in it). What they typed before it came is kept, and each click, double click,
+  right or middle click, press and release is done again then as it was made: on the
+  same element, at the same point, with the same buttons, keys and click count (a
+  `@pointerdown` may still capture a pointer whose finger was lifted meanwhile). A
+  click waits for the code, so a checkbox ticks and a link is followed then; should the
+  code fail to load, they are done as the page alone does them. A
   component that runs by itself (`every`, `live`, `listen`, `js`, `js_new`, `@mount` in
   its code or markup, or in a component nested inside it) or that is the page (in
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
