@@ -1,0 +1,28 @@
+// Browser libraries by name: `use Gauge from lib.js` declares what the script
+// defines, and the page loads it only where a component uses it. Driven by
+// libs.js (tests/browser.rs).
+
+use Gauge, lib from libs-lib.js
+use gauge from "/libs-lib.js"
+
+component Widget() {
+    state value = 1
+    state gauge_ = null
+    state doubled = 0
+    state wrong = ""
+    <div>
+        <div class="gauge" @mount={(el) => {
+            gauge_ = Gauge.new(el, value)
+            () => lib.gone(el.className)
+        }}></div>
+        <button id="inc" @click={() => { value += 1; gauge_.set(value); doubled = lib.double(value) }}>+</button>
+        <button id="near" @click={() => { wrong = gauge.new(null) }}>near</button>
+        <button id="cls" @click={() => { wrong = Gauge(null) }}>cls</button>
+        <span class="doubled">{doubled}</span>
+        <span class="version">{lib.version}</span>
+        <span class="wrong">{wrong}</span>
+    </div>
+}
+
+route GET /libs-lib.js = file("libs-lib.js")
+route GET / = <html><body><Widget/></body></html>

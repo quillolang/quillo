@@ -426,7 +426,9 @@ pub enum Stmt {
     Route(Arc<RouteDef>),
     /// `use "lib.qwe"` (and `use * from "..."`): every public name. With names,
     /// `use cache_get as redis_get, cache_set from "redis.qwer"`: those only, each
-    /// under the name after `as` (a `.qwer` file's, in 0.6; branch imports).
+    /// under the name after `as` (a `.qwer` file's, in 0.6; branch imports). From a
+    /// script, `use Chart from "https://.../chart.umd.min.js"`: the names it gives the
+    /// page, for the browser (see `is_script`; branch js-libraries).
     Use(String, Option<Vec<(String, String)>>, u32),
     Return(Option<Expr>),
     /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
@@ -460,6 +462,14 @@ impl TypeDef {
     pub fn is_record(&self) -> bool {
         self.ty.fields.is_some() && self.ty.names == ["map"]
     }
+}
+
+/// Whether a `use` names a browser library rather than a Quillo or Rust file: a
+/// `.js` file or an address (`https://...`, `//...`). It is loaded by the pages
+/// whose components use it, and the names it takes are what it defines on the
+/// page (branch js-libraries).
+pub fn is_script(path: &str) -> bool {
+    path.ends_with(".js") || path.starts_with("https://") || path.starts_with("http://") || path.starts_with("//")
 }
 
 /// Whether a name is one of the program's own types (a record, or another

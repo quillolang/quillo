@@ -1031,7 +1031,7 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
         for s in prog {
             match s {
-                crate::ast::Stmt::Use(p, _, _) => todo.push(dir.join(p)),
+                crate::ast::Stmt::Use(p, _, _) if !crate::ast::is_script(&p) => todo.push(dir.join(p)),
                 crate::ast::Stmt::Mount(_, p, _) => todo.push(dir.join(p)),
                 _ => {}
             }

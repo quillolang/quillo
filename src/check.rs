@@ -1342,6 +1342,9 @@ struct Checker {
     effect_cache: HashMap<usize, u8>,
     /// Functions of `.qwer` files the program uses, with their files.
     natives: Vec<(Arc<str>, crate::native::Export)>,
+    /// Names browser libraries give (`use Chart from "...js"`): each with its
+    /// script, and the file and line of its `use` (branch js-libraries).
+    js_libs: Vec<(String, String, Arc<str>, u32)>,
     /// Each `state` (by its file, line and name): the types it takes (its
     /// first value's, and what is assigned to it), and the references to it,
     /// whose hover text says so once the program is checked.
@@ -1442,6 +1445,7 @@ impl Checker {
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
             natives: Vec::new(),
+            js_libs: Vec::new(),
             state_types: HashMap::new(),
             live_ok: false,
             services: HashMap::new(),
@@ -1568,6 +1572,13 @@ impl Checker {
                     }));
                 }
                 order.push(Item { stmt: s.clone(), file: file.clone() });
+                continue;
+            }
+            if let (Stmt::Use(path, Some(names), line), true) = (s, crate::ast::is_script(match s { Stmt::Use(p, ..) => p, _ => "" })) {
+                for (global, name) in names {
+                    let src = if global == name { path.clone() } else { format!("{} ({})", path, global) };
+                    self.js_libs.push((name.clone(), src, file.clone(), *line));
+                }
                 continue;
             }
             if let Stmt::Use(path, names, line) = s {
@@ -1707,6 +1718,11 @@ impl Checker {
             }
             self.out.symbols.push(Symbol { name: e.name.clone(), kind: SymbolKind::Function, file: file.to_string(), line: e.line, detail });
             self.globals.insert(e.name.clone(), Var { t: T::of(FN), sig: Some(Arc::new(sig)), file, line: e.line, kind: Kind::Global, used: true, ready: true });
+        }
+        for (name, src, file, line) in std::mem::take(&mut self.js_libs) {
+            let detail = format!("{}  (JavaScript, in the browser: {})", name, src);
+            self.out.symbols.push(Symbol { name: name.clone(), kind: SymbolKind::Variable, file: file.to_string(), line, detail });
+            self.globals.insert(name, Var { t: T::of(ANY), sig: None, file, line, kind: Kind::Global, used: true, ready: true });
         }
         // Everything top-level is known up front; it becomes usable from
         // top-level code once the program has run its definition.

@@ -356,7 +356,8 @@ impl Parser {
         }
         let mut p = String::new();
         while let Some(c) = self.lx.peek_char() {
-            if is_path_char(c) || c == '/' || c == '\\' {
+            // `:`, `@` and `+` for an address: `https://cdn.example/chart@4/chart.js` (branch js-libraries).
+            if is_path_char(c) || c == '/' || c == '\\' || (matches!(c, ':' | '@' | '+') && !p.is_empty()) {
                 p.push(if c == '\\' { '/' } else { c });
                 self.lx.bump();
             } else {
@@ -367,7 +368,7 @@ impl Parser {
             return Err(QuilloError::new("`use` expects a file: use lib/auth.qwe", line));
         }
         self.lx.last = Some(Tok::RParen);
-        if !p.ends_with(".qwe") && !p.ends_with(".qwer") {
+        if !p.ends_with(".qwe") && !p.ends_with(".qwer") && !crate::ast::is_script(&p) {
             p.push_str(if names { ".qwer" } else { ".qwe" });
         }
         Ok(p)
@@ -699,6 +700,17 @@ impl Parser {
                             self.use_path(false, line)?
                         }
                     };
+                    // A script's names are what it defines on the page (branch js-libraries).
+                    if crate::ast::is_script(&path) {
+                        let Some(list) = &names else {
+                            return Err(QuilloError::new(format!(
+                                "a script gives the page names of its own: name what it defines, as in use Chart from \"{}\"", path), line));
+                        };
+                        if let Some((n, _)) = list.iter().find(|(n, _)| n.starts_with("__")) {
+                            return Err(QuilloError::new(format!("`{}`: a name from a script cannot start with `__`", n), line));
+                        }
+                        return Ok(Stmt::Use(path, names, line));
+                    }
                     if names.is_some() && !path.ends_with(".qwer") {
                         return Err(QuilloError::new(format!(
                             "names are taken from a `.qwer` file; a `.qwe` file gives all its public names: write `use {}`, and mark what it keeps to itself `private`",

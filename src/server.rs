@@ -363,7 +363,8 @@ impl Interp {
                 // branch feedback7-fixes).
                 let srcs = match self.bundle_for_page(&names) {
                     Some(page) => {
-                        let mut s = Vec::new();
+                        // The libraries its components use first (branch js-libraries).
+                        let mut s = page.libs.clone();
                         if let Some((rt, _)) = self.runtime_file().filter(|_| page.split) {
                             s.push(format!("{}/_quillo/r/{}.js", self.base, rt));
                         }
@@ -373,7 +374,9 @@ impl Interp {
                     }
                     None => {
                         bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
-                        vec![format!("{}/_quillo/quillo.js", self.base)]
+                        let mut s = crate::client::all_libs(self);
+                        s.push(format!("{}/_quillo/quillo.js", self.base));
+                        s
                     }
                 };
                 tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));

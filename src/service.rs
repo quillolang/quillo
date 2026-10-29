@@ -423,6 +423,10 @@ fn statements(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Stmt>) -> 
     let dir = path.parent().unwrap_or(Path::new("."));
     for s in stmts {
         if let Stmt::Use(file, _, _) = &s {
+            if crate::ast::is_script(file) {
+                out.push(s);
+                continue;
+            }
             statements(&dir.join(file), seen, out)?;
         }
         out.push(s);

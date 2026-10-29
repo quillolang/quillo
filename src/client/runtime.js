@@ -1557,12 +1557,24 @@ function jsPath(path, f) {
   let owner = globalThis, v = globalThis;
   for (const p of path.split(".")) {
     foreignName(p);
-    if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page`)];
+    if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page${jsNear(v, p)}`)];
     owner = v;
     v = v[p];
   }
   return [owner, v, null];
 }
+// A name written in another case than the script's (`chart` for `Chart`):
+// the one it has, to say (branch js-libraries).
+function jsNear(v, p) {
+  if (v === null || v === undefined) return "";
+  const want = p.toLowerCase();
+  try {
+    for (const k of Object.keys(v)) if (k.toLowerCase() === want) return ` (did you mean ${k}?)`;
+  } catch (_) {}
+  return "";
+}
+// A class, which only `new` makes one of: `Chart.new(...)`, `js_new(...)`.
+const isClass = (v) => { try { return /^class[\s{]/.test(Function.prototype.toString.call(v)); } catch (_) { return false; } };
 B.js = meta((path, ...args) => {
   const [owner, v, missing] = jsPath(path, "js");
   if (missing) return missing;
@@ -1570,8 +1582,16 @@ B.js = meta((path, ...args) => {
     if (args.length) fail(`\`js\`: ${path} is not a function`);
     return v === undefined ? null : v;
   }
+  if (isClass(v)) fail(`${path} is a class: make one with ${path}.new(...) (or js_new("${path}", ...))`);
   return fromPage(Reflect.apply(v, owner, guardCall(`\`js\`: ${path}`, v, args)));
 }, "js", null);
+// `Chart`, `Chart.defaults`: what a library's name (`use Chart from "...js"`)
+// holds on the page, its functions not called (branch js-libraries).
+B.js_value = (path) => {
+  const [, v, missing] = jsPath(path, "js");
+  if (missing) return missing;
+  return fromPage(v);
+};
 B.js_new = meta((path, ...args) => {
   const [, v, missing] = jsPath(path, "js_new");
   if (missing) return missing;

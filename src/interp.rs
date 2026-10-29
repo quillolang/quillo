@@ -237,6 +237,9 @@ pub struct Interp {
     pub(crate) streams_direct: bool,
     /// The program's own types (`type User = { ... }`: src/record.rs).
     pub(crate) types: Arc<crate::record::Types>,
+    /// Browser libraries, by the name the program calls each: `use Chart from
+    /// "https://.../chart.umd.min.js"` (branch js-libraries).
+    pub(crate) js_libs: Arc<std::collections::BTreeMap<String, crate::client::JsLib>>,
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
@@ -902,6 +905,7 @@ impl Interp {
             ready_checks: Default::default(),
             style_with: None,
             types: Arc::new(Default::default()),
+            js_libs: Arc::new(Default::default()),
             stream_out: None,
             pending_stream: None,
             streams_direct: false,
@@ -983,6 +987,7 @@ impl Interp {
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
             types: self.types.clone(),
+            js_libs: self.js_libs.clone(),
             stream_out: None,
             pending_stream: None,
             streams_direct: false,
@@ -1525,6 +1530,17 @@ impl Interp {
             }
             Stmt::Route(r) => {
                 Arc::make_mut(&mut self.routes).push(r.clone());
+                Ok(Value::Nil)
+            }
+            // A browser library: its names, for components' code; on the server
+            // they give null, as `js(...)` does (branch js-libraries).
+            Stmt::Use(path, Some(names), _) if crate::ast::is_script(path) => {
+                for (global, name) in names {
+                    let libs = Arc::make_mut(&mut self.js_libs);
+                    let order = libs.get(name).map_or(libs.len(), |l| l.order);
+                    libs.insert(name.clone(), crate::client::JsLib { global: global.clone(), src: path.clone(), order });
+                    define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
+                }
                 Ok(Value::Nil)
             }
             Stmt::Use(path, names, line) => {
@@ -2136,6 +2152,11 @@ impl Interp {
         // `analytics.query(...)` on a connection from `db.connect`: which one.
         let mut db_on = None;
         let f = if let Expr::Field(obj, name, _) = callee {
+            // `Chart.new(...)`, `L.control.zoom(...)`: the browser's, null here
+            // (branch js-libraries).
+            if !self.js_libs.is_empty() && lib_root(obj, env) {
+                return Ok(Value::Nil);
+            }
             let recv = self.eval(obj, env)?;
             // `json.stringify(...)` where a variable named `json` hides the
             // module (FEEDBACK9.md, Q-069; branch feedback9-fixes).
@@ -2189,6 +2210,8 @@ impl Interp {
     fn get_field(&mut self, v: Value, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
         match &v {
             Value::Nil => return Ok(Value::Nil),
+            // `lib.version`: the browser's, null here (branch js-libraries).
+            Value::Builtin("__jslib", _) => return Ok(Value::Nil),
             Value::Map(m) => {
                 // A record's few fields are found faster in order than hashed.
                 let found = if m.len() <= 8 { m.iter().find(|(k, _)| k.as_str() == name).map(|(_, x)| x) } else { m.get(name) };
@@ -3530,4 +3553,14 @@ fn changed_fields(old: &Value, new: &Value) -> Vec<String> {
 fn defer_call(e: &Expr, env: &Env) -> bool {
     matches!(e, Expr::Call(f, args, _) if args.len() == 1
         && matches!(&**f, Expr::Ident(n, _) if n == "defer" && matches!(lookup(env, "defer"), Some(Value::Builtin("defer", _)))))
+}
+
+/// Whether `Chart`, `L.control` or the like starts at a browser library's name
+/// (branch js-libraries).
+fn lib_root(e: &Expr, env: &Env) -> bool {
+    match e {
+        Expr::Ident(n, _) => matches!(lookup(env, n), Some(Value::Builtin("__jslib", _))),
+        Expr::Field(o, _, _) => lib_root(o, env),
+        _ => false,
+    }
 }
