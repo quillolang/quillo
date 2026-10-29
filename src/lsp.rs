@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "component", "server", "route", "use", "mount", "return", "if", "else", "match", "for", "while", "in",
-    "true", "false", "null", "reply", "as", "with", "state", "type", "service",
+    "true", "false", "null", "reply", "as", "with", "state", "type", "service", "private", "public",
 ];
 const TYPES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
@@ -612,7 +612,7 @@ impl Server {
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```\n{}\n\n*Exported to the programs that `use` this file.*", sig, doc) } });
         }
         if let Some((_, r)) = self.reference_at(params) {
-            return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", r.detail) } });
+            return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail)) } });
         }
         let (uri, line, col) = Self::position(params);
         if let Some((w, _)) = self.docs.get(&uri).and_then(|d| word_at(&d.text, line, col)) {
@@ -637,7 +637,7 @@ impl Server {
         };
         let l = line.saturating_sub(1) as usize;
         let src = text.lines().nth(l).unwrap_or("");
-        let (a, b) = find_word(src, &r.name).unwrap_or((0, 0));
+        let (a, b) = find_word(src, crate::privacy::private_name(&r.name).unwrap_or(&r.name)).unwrap_or((0, 0));
         json!({
             "uri": path_to_uri(&file),
             "range": {
@@ -819,8 +819,11 @@ impl Server {
         }
         let mut items = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let file = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or("")).display().to_string();
         for s in &doc.analysis.symbols {
-            if matches!(s.kind, SymbolKind::View | SymbolKind::Component) && seen.insert(s.name.clone()) {
+            // Another file's private views are not this file's (branch public-private-editor).
+            let theirs = crate::privacy::private_name(&s.name).is_some() && s.file != file;
+            if matches!(s.kind, SymbolKind::View | SymbolKind::Component) && !theirs && seen.insert(s.name.clone()) {
                 items.push(json!({ "label": s.name, "kind": 7, "detail": s.detail, "sortText": format!("0{}", s.name) }));
             }
         }
@@ -908,10 +911,10 @@ impl Server {
             .map(|s| {
                 let l = s.line.saturating_sub(1) as usize;
                 let src = lines.get(l).copied().unwrap_or("");
-                let (a, b) = find_word(src, &s.name).unwrap_or((0, src.chars().count()));
+                let (a, b) = find_word(src, crate::privacy::private_name(&s.name).unwrap_or(&s.name)).unwrap_or((0, src.chars().count()));
                 let full = json!({ "start": { "line": l, "character": 0 }, "end": { "line": l, "character": utf16_col(src, src.chars().count()) } });
                 let sel = json!({ "start": { "line": l, "character": utf16_col(src, a) }, "end": { "line": l, "character": utf16_col(src, b) } });
-                json!({ "name": s.name, "detail": s.detail, "kind": symbol_kind(s.kind), "range": full, "selectionRange": sel })
+                json!({ "name": s.name, "detail": private_detail(&s.name, &s.detail), "kind": symbol_kind(s.kind), "range": full, "selectionRange": sel })
             })
             .collect();
         json!(out)
@@ -921,6 +924,15 @@ impl Server {
 impl Default for Server {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A private name's signature says so: `private fn page_of(...)` (branch
+/// public-private-editor).
+fn private_detail(name: &str, detail: &str) -> String {
+    match crate::privacy::private_name(name) {
+        Some(_) if !detail.starts_with("param ") => format!("private {}", detail),
+        _ => detail.to_string(),
     }
 }
 
@@ -936,6 +948,8 @@ fn keyword_doc(w: &str) -> Option<String> {
         "use" => "`use \"lib.qwe\"` runs another file once, into the global scope.",
         "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",
         "state" => "`state count = 0` in a component: state, set on the first render and kept between renders (`~count = 0` is the short form). Assigning to `count` re-renders the component.",
+        "private" => "`private fn helper() = ...` (also `view`, `component`, a top-level `let`)\n\nA name for this file only: other files cannot use it, and each file may have its own `helper`. Not for a `server fn` or a `type`.",
+        "public" => "`public fn name() = ...`\n\nThe default, said out loud: every file of the program may use the name.",
         "type" => "`type User = { name: str, role: \"admin\" | \"member\" = \"member\" }`\n\nA record (or another name for a type). `User({ ... })` makes one, or gives an error value; in annotations and patterns it is checked field by field.",
         "service" => "`service billing = \"billing.qwe\"` (or `service /shop = \"shop.qwe\"`): a part of the app that runs here or as a server of its own; its `server fn`s are called as `billing.invoice(...)`.",
         _ => return None,
