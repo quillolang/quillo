@@ -243,13 +243,21 @@ impl Interp {
                 let mut inner = req.clone();
                 inner.url = if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() };
                 sub.streams_direct = self.streams_direct;
-                let resp = sub.handle(&inner);
+                let mut resp = sub.handle(&inner);
                 self.pending_stream = sub.pending_stream.take();
+                // A mounted program's deferred parts are its own to render: whole
+                // here (branch defer).
+                if let Some(page) = self.pending_stream.as_mut().and_then(|p| p.page.take()) {
+                    self.pending_stream = None;
+                    resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::stream::MARK));
+                    resp.body = crate::defer::whole(sub, page);
+                }
                 return resp;
             }
         }
         self.rendered_island = false;
         self.island_names.clear();
+        self.deferred.clear();
         self.tenant = None;
         self.tenant_named = false;
         self.upload_body = None;
@@ -266,6 +274,15 @@ impl Interp {
         let prefetch = is_prefetch(req).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.prefetching = prefetch.clone();
         let mut resp = self.handle_inner(req);
+        // A prefetch's deferred parts: worked out now, as part of the prefetch, which
+        // may change nothing (branch defer).
+        if prefetch.is_some() && !self.deferred.is_empty() {
+            let jobs = std::mem::take(&mut self.deferred);
+            if resp.header("content-type").is_some_and(|c| c.starts_with("text/html")) && resp.status == 200 {
+                let page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
+                resp.body = crate::defer::whole(self, page);
+            }
+        }
         self.prefetching = None;
         // A streamed answer: its function, for the server to run after the
         // head; or, with no server to, run now into the body.
@@ -382,6 +399,21 @@ impl Interp {
                     (None, None) => 0,
                 };
                 resp.body.splice(at..at, link.into_bytes());
+            }
+        }
+        // Waiting components (src/defer.rs; branch defer): the page now, each of them
+        // after it in the same answer; whole when there is no server to stream it.
+        if !self.deferred.is_empty() {
+            let jobs = std::mem::take(&mut self.deferred);
+            if html && req.method != "HEAD" && resp.status == 200 {
+                let page = crate::defer::split(std::mem::take(&mut resp.body), jobs);
+                if self.streams_direct {
+                    resp.headers.push((crate::stream::MARK.into(), "1".into()));
+                    resp.headers.push(("x-accel-buffering".into(), "no".into()));
+                    self.pending_stream = Some(crate::stream::Pending { f: Value::Nil, events: false, page: Some(page) });
+                } else {
+                    resp.body = crate::defer::whole(self, page);
+                }
             }
         }
         resp
@@ -1977,7 +2009,12 @@ impl Worker {
             resp.headers.remove(i);
             let pending = self.local.as_mut().and_then(|it| it.pending_stream.take());
             match (sink, pending, self.local.as_mut()) {
-                (Some(sink), Some(p), Some(it)) => {
+                (Some(sink), Some(mut p), Some(it)) => {
+                    // A deferred page keeps the development script (branch defer).
+                    if let (true, Some(page)) = (app.watch, p.page.as_mut()) {
+                        let script = dev_script(self.generation);
+                        page.tail.splice(0..0, script.into_bytes());
+                    }
                     resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
                     let mut head = Vec::new();
                     crate::httpd::write_stream_head(&mut head, &resp);

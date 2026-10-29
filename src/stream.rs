@@ -57,6 +57,9 @@ unsafe impl Sync for SinkPtr {}
 pub(crate) struct Pending {
     pub f: Value,
     pub events: bool,
+    /// A page whose waiting components follow it, instead of a function
+    /// (src/defer.rs; branch defer).
+    pub page: Option<crate::defer::Page>,
 }
 
 thread_local! {
@@ -66,7 +69,7 @@ thread_local! {
 }
 
 pub(crate) fn made(f: Value, events: bool) {
-    MADE.with(|m| *m.borrow_mut() = Some(Pending { f, events }));
+    MADE.with(|m| *m.borrow_mut() = Some(Pending { f, events, page: None }));
 }
 
 pub(crate) fn take_made() -> Option<Pending> {
@@ -219,7 +222,43 @@ pub(crate) enum Ended {
 
 /// Runs a stream's function with `send`, writing to `sink` (in chunks, for
 /// a connection), and ends the answer.
-pub(crate) fn run(it: &mut Interp, p: Pending, sink: &mut dyn Sink, chunked: bool) -> Ended {
+/// One piece of an answer, framed as a chunk when the answer is chunked; false when the
+/// client is gone.
+fn piece(sink: &mut dyn Sink, data: &[u8], chunked: bool) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    if !chunked {
+        return sink.write(data);
+    }
+    let mut f = format!("{:x}\r\n", data.len()).into_bytes();
+    f.extend_from_slice(data);
+    f.extend_from_slice(b"\r\n");
+    sink.write(&f) && !crate::httpd::stopping()
+}
+
+/// A page with waiting components: the page, then each component's part as it is
+/// rendered, then the end of the page (src/defer.rs; branch defer).
+fn run_page(it: &mut Interp, page: crate::defer::Page, sink: &mut dyn Sink, chunked: bool) -> Ended {
+    if !piece(sink, &page.first, chunked) {
+        return Ended::Gone;
+    }
+    for d in &page.jobs {
+        let part = crate::defer::resolve(it, d);
+        if !piece(sink, part.as_bytes(), chunked) {
+            return Ended::Gone;
+        }
+    }
+    if !piece(sink, &page.tail, chunked) || (chunked && !sink.write(b"0\r\n\r\n")) {
+        return Ended::Gone;
+    }
+    Ended::Done
+}
+
+pub(crate) fn run(it: &mut Interp, mut p: Pending, sink: &mut dyn Sink, chunked: bool) -> Ended {
+    if let Some(page) = p.page.take() {
+        return run_page(it, page, sink, chunked);
+    }
     // SAFETY (lifetime): `stream_out` is cleared below, before `sink` goes.
     let sink: *mut (dyn Sink + '_) = sink;
     let sink: *mut dyn Sink = unsafe { std::mem::transmute(sink) };

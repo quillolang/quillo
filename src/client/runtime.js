@@ -1620,6 +1620,9 @@ B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
 // `waiting(state)` is compiled to W.waiting(signal); given any other way, it
 // knows of no load (FEEDBACK13.md, Q-091; branch feedback13-fixes).
 B.waiting = meta(() => false, "waiting", null);
+// `defer(x)` is `x` in the browser: a state that calls the server is null until it
+// answers (src/defer.rs; branch defer).
+B.defer = meta((v) => v, "defer", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
@@ -5297,7 +5300,9 @@ function outerIsland(node) {
 // An island taken up: its component (and those inside it) resumed from
 // the state the server wrote, on the HTML it wrote.
 function resume(el) {
-  if (el.__q) return;
+  // Still waiting for its deferred state, which the server sends after the page
+  // and swaps in (src/defer.rs; branch defer): taken up once it has come.
+  if (el.__q || (el.hasAttribute && el.hasAttribute("data-qd"))) return;
   el.__q = true;
   const def = C[el.dataset.c];
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
@@ -5379,6 +5384,8 @@ function wake(e) {
 }
 
 function boot() {
+  // A deferred island swapped in after the runtime came: taken up if it runs by itself.
+  window.__quillo_resume = (el) => { if (el && !el.__q) resume(el); };
   // Someone reaching for an island takes it up (before their event is
   // handled: it reaches the component).
   for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);

@@ -864,3 +864,51 @@ fn cookie_reads_the_requests_cookie_anywhere() {
     assert_eq!(String::from_utf8_lossy(&r.body), "Asia/Manila");
     assert_eq!(String::from_utf8_lossy(&get(&mut it, "/tz").body), "UTC");
 }
+
+/// `state x = defer(load())`: the page first with the state null and the island
+/// waiting; then the component again, its other states as they were and the deferred
+/// one worked out, as a template the page swaps in. Whole here, with no server to
+/// stream it (branch defer).
+#[test]
+fn deferred_state_follows_the_page() {
+    let mut it = app(r#"
+let calls = { fast: 0, slow: 0 }
+server fn fast() { calls = { ...calls, fast: calls.fast + 1 }; "fast" }
+server fn slow() { calls = { ...calls, slow: calls.slow + 1 }; ["a", "b"] }
+
+component Inner() {
+    state x = defer(slow())
+    <i id="inner">{x == null ? "none" : len(x)}</i>
+}
+
+component Page() {
+    state f = fast()
+    state s = defer(slow())
+    <div>
+        <b>{f}</b>
+        {s == null ? <p id="wait">waiting</p> : <ul>{for v in s => <li>{v}</li>}</ul>}
+        <Inner/>
+    </div>
+}
+route GET / = <html><body><Page/><footer>end</footer></body></html>
+route GET /calls = calls
+"#);
+    let r = get(&mut it, "/");
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    // The page: waiting, the placeholder shown, the swap defined, the end of the page last.
+    let island = body.find("data-qd=\"0\"").expect("the island waits");
+    assert!(body[island..].contains("id=\"wait\""), "{}", body);
+    assert!(body.contains("window.__quillo_swap"), "{}", body);
+    // A component inside another does not defer: worked out in place.
+    assert!(body.contains("<i id=\"inner\">2</i>"), "{}", body);
+    // Its part: the component again, with the list.
+    let part = body.find("<template data-qt=\"0\">").expect("the part");
+    assert!(part > island);
+    assert!(body[part..].contains("<li>a</li><li>b</li>") && body[part..].contains("__quillo_swap(\"0\")"), "{}", body);
+    assert!(!body[part..].contains("data-qd"), "the part does not wait: {}", body);
+    assert!(body.trim_end().ends_with("</html>") && body.rfind("<footer>end</footer>").unwrap() < part, "{}", body);
+    // The page's own fast state ran once. The slow one: once deferred, and inside
+    // twice, as a component inside a deferring one renders again with it.
+    let calls = String::from_utf8_lossy(&get(&mut it, "/calls").body).to_string();
+    assert_eq!(calls, r#"{"fast":1,"slow":3}"#);
+}
