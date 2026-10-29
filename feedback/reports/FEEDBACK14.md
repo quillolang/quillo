@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | App | [coop/](../../app/coop), "Quillo Coop": a credit cooperative of members who apply, are approved by a clerk and get a member number, savings and share capital; fixed deposits of 3 to 24 months; a loan designer in which the manager sets a product's terms and sees a sample schedule as they type, and which the board approves by vote; loan applications with co-makers, the clerk's review, the board's votes and the release into savings; salary deductions from employers, as a monthly batch the employer downloads and remits by CSV or by an API with its own key; web stores paid from savings or by salary installments; raffles drawn from a seed published before sales; events with tickets and check-in; a help desk; and a daily job that pays out matured deposits and posts savings interest. 3,289 lines of Quillo in 22 files, a migration, a stylesheet and six tests |
-| Quillo | 0.6.0 (991e96c), the newest commit; all three findings open there |
+| Quillo | 0.6.0 (991e96c), the newest commit then; all three findings open there, and on 7eb9ce6; fixed on branch feedback14-fixes |
 | Model | Claude Opus 5.5 |
 | Tested with | `quillo check`; four browser tests in headless Chrome: a loan's whole way from the application through co-maker, clerk, three directors and release (17 of 17), a member's pages (28 of 28), an employer's batch and remittance (19 of 19), the loan designer and the board's vote on a product (13 of 13); [tests/hostile.py](../../app/coop/tests/hostile.py), 73 direct calls to `server fn`s and routes as the wrong person, with bad data, and two clerks at once (73 of 73); [tests/jobs.py](../../app/coop/tests/jobs.py), the daily job (7 of 7); `tools/mismatches.mjs` on all 39 pages as each of the five roles (nothing made again, no errors) |
 
@@ -27,6 +27,31 @@ failed far away with "list has no field `member_id`" (Q-095). An `@input` beside
 amount typed with too many digits crashed the `server fn` with a 500 instead of giving an
 error value (Q-096). None of the three needed Quillo to change; each has a workaround in the
 app, commented with its ID.
+
+## Fixed, on branch feedback14-fixes
+
+Made on main as of 7eb9ce6, with the coop's two commits on top. Each fix is commented in the
+code with its issue and the branch. All repros run again (`node feedback/run.mjs`): 79
+fixed, none open; without the four changed files, on the same commit, Q-094, Q-095 and
+Q-096 are open. `cargo test --release` runs 506 tests in 39 suites: on a machine with a
+load average of 8 to 11, five tests that wait on requests failed once (two in services,
+one in idempotency, two in serve, each a different one from run to run) and their suites
+passed when run again (21 of 21, 8 of 8, and 26 of 26 twice). Quillo Coop's tests pass with
+its three workarounds gone, and its 39 pages as each role are taken up as sent:
+the loan (17 of 17), the member (28 of 28), payroll (19 of 19), the designer (13 of 13),
+the hostile calls (73 of 73) and the daily job (7 of 7).
+
+| ID | The fix |
+|---|---|
+| Q-094 | An element's handlers are joined after its attributes: `bind:value` with `@input` (or `bind:checked` with `@change`) is one handler that sets the state, then calls the one written, which reads it; in either order. The guide says so, with `<input bind:value={amount} @input={refresh}/>`. The coop's deposit form is written that way again (src/client.rs `tpl_el`; tests/browser.rs `a_binding_and_a_handler_on_one_input_both_run`) |
+| Q-095 | After `=>`, a `for` body in braces (a block or a map) ends at its `}`, as a body without the arrow always did, so a pipe after it takes the list; a body without braces is as before. The guide says so under Control flow; the coop's `deductions_for` has no parentheses (src/parser.rs `parse_for`; tests/lang.rs `control_flow`) |
+| Q-096 | `money.of` gives an error value for text with an exponent ("1e3") and for an amount whose minor units do not fit an int ("99999999999999999999.00 PHP is too large an amount"), on the server and in the browser, so `money.to_minor` of money it made cannot fail; a sum past an int is still a runtime error, as an int's is. The coop's `centavos` lost its pattern (src/money.rs `of`, `minor_of`; src/client/runtime.js `B.money.of`; tests/money.rs) |
+
+Also on the branch, outside Quillo's core: `feedback/run.mjs --update` split INDEX rows on
+every `|`, an escaped `\|` in an issue's text too, and so wrote the status into the wrong
+cell; it splits on unescaped ones now, and Q-051's row (shifted by it since FEEDBACK5) is
+put back. The coop's `.vote` got a rule, which the newer `quillo check` on 7eb9ce6 asked
+for ("no style sheet has a rule for `.vote`").
 
 ## Seen again
 

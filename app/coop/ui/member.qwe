@@ -50,9 +50,7 @@ component NewDepositForm(rates) {
     <form.mini @submit={open}>
         <h3>Open a fixed deposit</h3>
         <div.row>
-            // Not bind:value with @input: the handler would take the binding's
-            // place, silently (FEEDBACK14.md, Q-094). The handler sets it.
-            <input placeholder="Amount" inputmode="decimal" value={amount} @input={(e) => { amount = e.target.value; refresh() }} aria-label="Amount to deposit"/>
+            <input placeholder="Amount" inputmode="decimal" bind:value={amount} @input={refresh} aria-label="Amount to deposit"/>
             <select aria-label="Term" @change={(e) => { months = int(e.target.value) ?? 12; refresh() }}>
                 {for [m, bp] in rates => <option value={m} selected={int(m) == months}>{m} months, {pct(bp)}</option>}
             </select>

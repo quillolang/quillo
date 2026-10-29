@@ -3576,6 +3576,10 @@ impl<'a> Compiler<'a> {
             hole(&mut holes, vals, 1, "", if r { format!("() => {}", v) } else { v });
         }
         let mut written = Vec::new();
+        // Handlers (`@input`) and bindings' own (`bind:value`), joined after
+        // the attributes when they listen to the same event.
+        let mut ons: Vec<(String, String)> = Vec::new();
+        let mut binds: Vec<(&str, String)> = Vec::new();
         for (name, v) in &el.attrs {
             if matches!(v, AttrVal::Spread(_)) || name == "key" || name == "class" {
                 continue;
@@ -3600,7 +3604,7 @@ impl<'a> Compiler<'a> {
                     }
                     _ => "true".to_string(),
                 };
-                hole(&mut holes, vals, 2, event_name(ev), f);
+                ons.push((event_name(ev).to_string(), f));
                 continue;
             }
             if let Some(prop) = name.strip_prefix("bind:") {
@@ -3620,7 +3624,7 @@ impl<'a> Compiler<'a> {
                 };
                 self.reactive = saved;
                 hole(&mut holes, vals, 0, prop, get);
-                hole(&mut holes, vals, 2, event, format!("(e) => {{ {}; }}", set));
+                binds.push((event, set));
                 continue;
             }
             // value, checked and selected are the element's live state,
@@ -3643,6 +3647,24 @@ impl<'a> Compiler<'a> {
                 }
                 _ => hole(&mut holes, vals, 0, name, "true".into()),
             }
+        }
+        // An element listens once to an event, so `bind:value` with `@input`
+        // (or `bind:checked` with `@change`) is one handler: the binding sets
+        // the state, then the handler runs and reads it. Before, the second
+        // took the first one's place (FEEDBACK14.md, Q-094; branch
+        // feedback14-fixes).
+        for (ev, f) in ons {
+            let f = match binds.iter().position(|(b, _)| *b == ev) {
+                Some(i) => {
+                    let (_, set) = binds.remove(i);
+                    format!("(e) => {{ {}; const $h = {}; if (typeof $h === \"function\") return $h.length > 0 ? $h(e) : $h(); }}", set, f)
+                }
+                None => f,
+            };
+            hole(&mut holes, vals, 2, &ev, f);
+        }
+        for (ev, set) in binds {
+            hole(&mut holes, vals, 2, ev, format!("(e) => {{ {}; }}", set));
         }
         if !spread_js.is_empty() {
             let v = format!("W.spread([{}], [{}])", spread_js.join(", "), written.join(", "));

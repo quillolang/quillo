@@ -58,6 +58,12 @@ fn amounts_have_the_currency_s_minor_units() {
         "[12.35m, 12.34m, 12.34m, 1234m]");
     same("[money.of(\"abc\", \"USD\"), money.of(1, \"ZZZ\")]", "[err(\"not an amount: \\\"abc\\\"\"), err(\"unknown currency \\\"ZZZ\\\"\")]");
     same("money.of(1.5, \"USD\")", "ERROR: `money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
+    // Text with an exponent is not an amount, and money whose minor units do
+    // not fit an int is an error value, not a runtime error in `to_minor`
+    // (FEEDBACK14.md, Q-096; branch feedback14-fixes).
+    same("[money.of(\"1e3\", \"PHP\"), money.of(\"99999999999999999999\", \"PHP\"), money.of(\"92233720368547758.08\", \"USD\")]",
+        "[err(\"not an amount: \\\"1e3\\\"\"), err(\"99999999999999999999.00 PHP is too large an amount\"), err(\"92233720368547758.08 USD is too large an amount\")]");
+    same("money.to_minor(money.of(\"92233720368547758.07\", \"USD\"))", "9223372036854775807");
     same("[money.from_minor(1250, \"USD\"), money.from_minor(-5, \"KWD\").amount, money.to_minor(money.of(12.5m, \"USD\")), money.to_minor(money.of(1235, \"JPY\"))]",
         "[{ amount: 12.50m, currency: \"USD\" }, -0.005m, 1250, 1235]");
     same("[money.zero(\"EUR\"), money.is_zero(money.zero(\"JPY\")), money.is_zero(money.of(1, \"JPY\"))]",

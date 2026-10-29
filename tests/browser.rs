@@ -295,6 +295,21 @@ fn spread_attributes_from_data_stay_attributes() {
     assert_eq!(r, want);
 }
 
+/// `bind:value` with `@input`, and `bind:checked` with `@change`, on one
+/// input in either order: the binding sets the state and the handler then
+/// runs with it (FEEDBACK14.md, Q-094; branch feedback14-fixes).
+#[test]
+fn a_binding_and_a_handler_on_one_input_both_run() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("binds.qwe"), free_port(), Some(&dir.join("binds.js")));
+    let want = serde_json::json!({ "text": "20000|asked about 20000|Ana|Ana|on|yes", "cleared": "", "errors": [] });
+    assert_eq!(r, want);
+}
+
 /// A page loads its components' code when it is needed: not before someone
 /// reaches for one (what they typed and clicked meanwhile is kept), and at
 /// once for one that runs by itself. It resumes on the server's HTML: the

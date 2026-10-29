@@ -1,0 +1,21 @@
+// `bind:value` with `@input` and `bind:checked` with `@change`, in either
+// order: the state follows the input, then the handler runs and reads it
+// (FEEDBACK14.md, Q-094; branch feedback14-fixes).
+
+component Binds() {
+    state amount = ""
+    state seen = ""
+    state name = ""
+    state heard = ""
+    state ok = false
+    state said = ""
+    <div>
+        <input #amount bind:value={amount} @input={() => { seen = `asked about ${amount}` }}/>
+        <input #name @input={(e) => { heard = e.target.value }} bind:value={name}/>
+        <input #ok type="checkbox" bind:checked={ok} @change={() => { said = ok ? "yes" : "no" }}/>
+        <button #go @click={() => { amount = "" }}>clear</button>
+        <p #out>{amount}|{seen}|{name}|{heard}|{ok ? "on" : "off"}|{said}</p>
+    </div>
+}
+
+route GET / = <html><body><Binds/></body></html>

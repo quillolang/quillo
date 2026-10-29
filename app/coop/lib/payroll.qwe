@@ -18,9 +18,7 @@ let KIND_ORDER = { loan: 0, store: 1, savings: 2 }
 fn deductions_for(employer_id: int, period: str) with db {
     let end = period_end(period)
     let members = db.query("select * from members where employer_id = ? and status = 'active' order by employee_no", employer_id)
-    // In parentheses: `for ... => { ... } | flatten()` flattens each member's
-    // block, not the list (FEEDBACK14.md, Q-095).
-    (for m in members => {
+    for m in members => {
         let loans = db.query(sql`select l.id, coalesce(sum(i.principal + i.interest - i.paid), 0) as due from loans l
                                  join installments i on i.loan_id = l.id
                                  where l.member_id = ? and l.status = 'released' and l.repay = 'salary' and i.due <= ? and i.paid < i.principal + i.interest
@@ -31,7 +29,7 @@ fn deductions_for(employer_id: int, period: str) with db {
             | map((o) => { member_id: m.id, kind: "store", ref_id: o.id, amount: min([o.total - o.paid, int(ceil(dec(o.total) / o.installments))]) })
         let savings = m.monthly_savings > 0 ? [{ member_id: m.id, kind: "savings", ref_id: null, amount: m.monthly_savings }] : []
         loans + orders + savings
-    }) | flatten()
+    } | flatten()
 }
 
 // Makes (or makes again, while it is open) an employer's batch for a month.

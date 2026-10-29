@@ -84,6 +84,7 @@ tr.line-short td, tr.line-missing td { background: #fff4e0; }
 .steps li.past { color: var(--accent); }
 .steps li.now { background: var(--accent); color: #fff; }
 .steps li.off { background: var(--danger); }
+.vote { margin-top: .8rem; }
 .votes { list-style: none; padding: 0; margin: .3rem 0; }
 .votes li.approve::before { content: "✓ "; color: var(--accent); }
 .votes li.reject::before { content: "✗ "; color: var(--danger); }

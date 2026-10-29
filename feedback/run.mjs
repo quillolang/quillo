@@ -199,7 +199,8 @@ if (update) {
   const updated = lines.map((l) => {
     const id = l.match(/^\| (Q-\d+) /)?.[1];
     if (!id || !byId.has(id)) return l;
-    const cells = l.split("|");
+    // A `\\|` in a cell's text is a pipe, not a cell's end.
+    const cells = l.split(/(?<!\\)\|/);
     cells[col] = ` ${byId.get(id)} (${commit}) `;
     return cells.join("|");
   });

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **`bind:value` with `@input`** (and `bind:checked` with `@change`) on one input: both
+  run, the binding first, so the handler reads the state as typed. Before, the one
+  written second took the other's place (FEEDBACK14, Q-094).
+- **A `for` body in braces ends at its `}`** after `=>` too: `for x in xs => { ... } |
+  flatten()` flattens the list, not each round's block (Q-095).
+- **`money.of`** refuses text with an exponent (`"1e3"`) and an amount whose minor units
+  do not fit an int, as error values: `money.to_minor` of what it gives no longer fails
+  at run time (Q-096).
+
 ## 0.6.0 (2026-10-29)
 
 ### Language
