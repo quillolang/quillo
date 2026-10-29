@@ -1454,7 +1454,8 @@ impl Checker {
         if self.quiet > 0 {
             return;
         }
-        let msg = msg.into();
+        // A private name as it was written (src/privacy.rs; branch public-private).
+        let msg = crate::privacy::demangle(&msg.into());
         if !self.reported.insert((file.clone(), line, msg.clone())) {
             return;
         }
@@ -1919,7 +1920,22 @@ impl Checker {
                     self.error("`request` only exists in routes and `server fn`s; pass what you need as an argument");
                 } else if !self.unparsed_names.contains(name) {
                     let removed = crate::error::removed_note(name);
-                    self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
+                    // Another file's `private` name (branch public-private).
+                    let cwd = std::env::current_dir().ok();
+                    let mut private_in: Vec<String> = self.globals.iter()
+                        .filter(|(k, _)| crate::privacy::private_name(k) == Some(name))
+                        .map(|(_, v)| {
+                            let p = std::path::Path::new(&*v.file);
+                            cwd.as_ref().and_then(|d| p.strip_prefix(d).ok()).unwrap_or(p).display().to_string().trim_start_matches("./").to_string()
+                        })
+                        .collect();
+                    private_in.sort();
+                    if !private_in.is_empty() {
+                        self.error(format!("`{}` is private to {}: only {} sees it (make it `public` there, or call something public)", name,
+                            private_in.join(" and "), if private_in.len() == 1 { "that file" } else { "each of those files" }));
+                    } else {
+                        self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
+                    }
                 }
                 (T::ANY, None)
             }

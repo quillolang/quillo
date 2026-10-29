@@ -262,8 +262,8 @@ Most expressions read as they would in JavaScript. The differences:
 - There are no classes, interfaces, enums (a `"a" | "b"` type, checked when the program
   runs, is the nearest), generics (beyond `list<T>` and map shapes), decorators,
   exceptions, or modules with their own names: `use` puts a file's names in the one
-  namespace of the program; `mount` and `service` are the boundaries (see [Files of a
-  program](#files-of-a-program)).
+  namespace of the program, but those it marks `private` (see [Files of a
+  program](#files-of-a-program)); `mount` and `service` are the boundaries.
 - Regular expressions are strings given to `re.*` (`re.find_all(text, "@(\\w+)")`), not
   `/.../` literals, and take only the syntax both sides read alike (see the standard
   library).
@@ -2871,6 +2871,28 @@ level off: `flatten(flatten(xs))` for two.
   "../shared/auth.qwe"`); there are no globs, and a `.qwer` file is `use`d the same way
   (see [Rust](#rust)).
 - A file `use`d twice, or by several files, runs once.
+- **`private` and `public`.** `private` before a `fn`, `view`, `component` or top-level
+  `let` keeps the name to its file: the file uses it as any name, other files do not
+  see it, and two files may each have a private `helper` without clashing. `public`
+  says the default, for a file that wants to say what it offers:
+
+  ```quillo
+  // lib/forum.qwe
+  private let PAGE = 20
+  private fn page_of(posts: list, n: int) = posts | drop((n - 1) * PAGE) | take(PAGE)
+  private view Post(p: map) = <article><h2>{p.title}</h2></article>
+
+  public fn latest(n: int = 1) = page_of(db.query("select * from posts order by id desc"), n)
+  public view Feed(n: int = 1) = <div>{for p in latest(n) => <Post p={p}/>}</div>
+  ```
+
+  Another file calling `page_of` is told: "`page_of` is private to lib/forum.qwe". Only
+  at a file's top level, and not for a `server fn` (an address on the server anyone can
+  call; keep the work in a private `fn` it calls) or a `type`. A view's or component's
+  parameter cannot share a private name of its file, as props are passed by name.
+  Elsewhere `private` and `public` are ordinary names (`{ private: true }`). A private
+  function given to `schedule` or `every` keeps its job to itself, under a name of its
+  own (`tick__pv` and eight hex digits in the log).
 - An editor finds the program a file belongs to by looking, in the file's folder and up
   to three above it (stopping at a folder with `.git` or `Cargo.toml`), for the first
   `.qwe` file by name that `use`s it, directly or through others. Keep a program's files
@@ -4295,7 +4317,7 @@ does not do it today; the way around it follows.
 | mutate a list or map in place? | No: `push`, `set`, `+` give new ones, cheaply when nothing else holds the old one. See [Standard library](#standard-library) |
 | throw and catch exceptions? | No: failures are error values, `?` passes them on, `??` replaces them. A runtime error ends the request with a 500. See [Errors](#errors) |
 | write `async`/`await`, threads or locks? | No need: waits suspend the request and the server goes on; `parallel` overlaps waits. Long computing holds its instance: put it in Rust or run more instances. See [Concurrency](#concurrency-and-reloading) |
-| use namespaces or modules? | One namespace per program: `use` adds a file's names to it, and a name is defined once. `mount` and `service` are the boundaries. See [Files of a program](#files-of-a-program) |
+| use namespaces or modules? | One namespace per program: `use` adds a file's names to it, and a name is defined once, but `private fn` (and `view`, `component`, `let`) keeps a name to its file. `mount` and `service` are the boundaries. See [Files of a program](#files-of-a-program) |
 | recurse deeply? | Up to 10,000 calls; there is no tail-call optimisation |
 | rely on integer overflow wrapping, or bitwise operators? | No: overflow is an error, and there are no `& \| ^ << >>` or `**` (use `pow`, `math.*`) |
 | have the checker prove a `match` covers every case? | Not yet: a value no arm takes fails when it comes |
