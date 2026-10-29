@@ -25,6 +25,10 @@ usage:
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
                                     into .quillo/native/ next to them, so it
                                     runs where Rust is not installed
+  quillo install <plugin>...        download Rust plugins (.qwer) from
+                                    quillolang.org/plugins into this folder,
+                                    their version and hash checked; --example,
+                                    --update, --list (`quillo install --help`)
   quillo repl                       interactive prompt
   quillo lsp                        language server for editors (stdio)
   quillo dap                        debugger for editors (the Debug Adapter
@@ -253,6 +257,8 @@ fn real_main(args: Vec<String>) -> i32 {
                     1
                 }
         }),
+        // Plugins from quillolang.org's catalog, into the program's folder.
+        Some("install") => quillo::install::main(&args[2..]),
         Some("repl") | None => repl(),
         Some("lsp") => quillo::lsp::Server::new().run(),
         Some("version" | "--version" | "-V") => {
