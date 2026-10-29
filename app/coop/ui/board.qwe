@@ -1,0 +1,73 @@
+// The board of directors: loans and loan products before it, live, with each
+// director's vote.
+
+component VoteBox(kind: str, id: int, mine) {
+    state comment = mine.comment ?? ""
+    state problem = null
+    state busy = false
+    let vote = (v: str) => {
+        busy = true
+        let r = kind == "loan" ? vote_loan(id, v, comment) : vote_product(id, v, comment)
+        busy = false
+        problem = is_err(r) ? r.error : null
+    }
+    <div.vote>
+        {mine != null && <p.muted>You voted to {mine.vote}{mine.comment != "" && `: ${mine.comment}`}. You may change it until the board decides.</p>}
+        <div.row>
+            <input placeholder="Comment (needed to reject)" bind:value={comment} aria-label="Comment"/>
+            <button.primary disabled={busy} @click={() => vote("approve")}>Approve</button>
+            <button.danger disabled={busy} @click={() => vote("reject")}>Reject</button>
+        </div>
+        <Problem text={problem}/>
+    </div>
+}
+
+view Tally(votes, approvals: int, directors: int) {
+    let yes = len(votes | filter((v) => v.vote == "approve"))
+    let no = len(votes | filter((v) => v.vote == "reject"))
+    <div.tally>
+        <span.yes>{yes} approve</span> <span.no>{no} reject</span>
+        <span.muted>· {approvals} of {directors} approvals needed</span>
+        <ul.votes>{for v in votes => <li key={v.director_id} class={v.vote}><b>{v.name}</b>{v.comment != "" && `: ${v.comment}`}</li>}</ul>
+    </div>
+}
+
+component BoardAgenda(only: str = "") {
+    state a = live(load_board)
+    {a == null ? <p>For directors only.</p> : <div>
+        {only != "products" && <section.card>
+            <h1>Loans before the board <span.count>{len(a.loans)}</span></h1>
+            {len(a.loans) == 0 && <p.muted>Nothing to decide.</p>}
+            {for l in a.loans => <article.agenda key={l.id}>
+                <h2><a href={`/board/loans/${l.number}`}>{l.number}</a> · {l.member_name} ({l.member_number}) · {l.product}</h2>
+                <p><b>{peso(l.amount)}</b> over {plural(l.term, "month")} at {pct(l.rate_bp)}: {peso(l.monthly)} a month. “{l.purpose}”</p>
+                <p.muted>Savings {peso(l.savings)} · share capital {peso(l.share)} · already owes {peso(l.owing)}{l.review_note != "" && ` · office: ${l.review_note}`}</p>
+                <Tally votes={l.votes} approvals={l.approvals} directors={a.directors}/>
+                <VoteBox kind="loan" id={l.id} mine={l.mine}/>
+            </article>}
+        </section>}
+        {only != "loans" && <section.card>
+            <h1>Loan products put to the board <span.count>{len(a.products)}</span></h1>
+            {len(a.products) == 0 && <p.muted>None.</p>}
+            {for p in a.products => <article.agenda key={p.id}>
+                <h2>{p.name} ({p.code})</h2>
+                <p>{p.description}</p>
+                <ProductFacts p={p}/>
+                <Tally votes={p.votes} approvals={p.approvals} directors={a.directors}/>
+                <VoteBox kind="product" id={p.id} mine={p.mine}/>
+            </article>}
+        </section>}
+    </div>}
+}
+
+view ProductFacts(p) =
+    <dl.facts>
+        <dt>Amounts</dt><dd>{peso(p.min_amount)} to {peso(p.max_amount)}</dd>
+        <dt>Terms</dt><dd>{p.min_term} to {p.max_term} months</dd>
+        <dt>Interest</dt><dd>{pct(p.rate_bp)} a year, {p.method == "flat" ? "flat" : "diminishing balance"}</dd>
+        <dt>At release</dt><dd>{pct(p.fee_bp)} service fee, {pct(p.insurance_bp)} insurance</dd>
+        <dt>Limits</dt><dd>{p.capital_multiple > 0 ? `${p.capital_multiple}× share capital and savings` : "none"}; {p.min_months} months of membership; {plural(p.max_active, "open loan")} at once</dd>
+        <dt>Co-makers</dt><dd>{p.comakers}</dd>
+        <dt>Repayment</dt><dd>{p.salary_only == 1 ? "salary deductions only" : "salary deductions or the counter"}</dd>
+        <dt>Board approvals</dt><dd>{p.approvals}</dd>
+    </dl>

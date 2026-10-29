@@ -1,0 +1,131 @@
+// Savings and share capital: cash at the counter (a clerk), transfers by the
+// member, and the month's interest on savings, posted by the daily job.
+
+type Cash = { member: str, account: "savings" | "share", direction: "in" | "out", amount: str, memo: str = "" }
+
+server fn counter_cash(c: Cash) ! str with db, time, random {
+    let clerk = acting_as(["clerk"])?
+    let m = member_by_number(c.member) ?? err(`No member ${c.member}`)?
+    if m.status != "active" { return err(`${m.number} is not an active member`) }
+    let amount = centavos(c.amount)?
+    if c.account == "share" && c.direction == "out" { return err("Share capital is paid back only when a member leaves the coop") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let a = account_of(m.id, c.account) ?? err("That account is not open")?
+        let signed = c.direction == "in" ? amount : -amount
+        let memo = trim(c.memo) != "" ? trim(c.memo) : (c.direction == "in" ? "Cash deposit" : "Cash withdrawal")
+        let after = post(a.id, signed, c.direction == "in" ? "deposit" : "withdrawal", memo, new_journal(), clerk.id)?
+        audit(clerk.id, `cash ${c.direction}`, `${m.number} ${c.account} ${peso(amount)}`)
+        after
+    })
+}
+
+// A member moving savings into share capital.
+server fn savings_to_share(amount: str) ! str with db, time, random {
+    let me = acting_member()?
+    let c = centavos(amount)?
+    db.transaction({ isolation: "serializable" }, () => {
+        let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+        let sc = account_of(me.member.id, "share") ?? err("No share capital account")?
+        let j = new_journal()
+        post(sv.id, -c, "transfer", "To share capital", j, me.user.id)?
+        post(sc.id, c, "transfer", "From savings", j, me.user.id)?
+        true
+    })
+}
+
+// The interest on every savings account for a month ("2026-10"): on the
+// balance at the end of it, at the savings rate, once.
+fn post_savings_interest(period: str) -> int with db, time, random {
+    let key = `interest:${period}`
+    if db.one("select 1 from settings where key = ?", key) != null { return 0 }
+    let rate = setting_int("savings_rate_bp", 200)
+    db.transaction({ isolation: "serializable" }, () => {
+        db.exec("insert into settings (key, value) values (?, ?)", key, str(now()))
+        let posted = for a in db.query("select id, balance from accounts where kind = 'savings' and status = 'open' and balance > 0") => {
+            let interest = int(round(dec(a.balance) * dec(rate) / 120000, 0, "half_up"))
+            if interest > 0 { post(a.id, interest, "interest", `Interest for ${period} at ${pct(rate)} a year`, new_journal(), null) }
+            interest
+        }
+        len(posted | filter((x) => x > 0))
+    })
+}
+
+// Fixed deposits: a sum kept for a term at a rate set by the term, paid into
+// savings with its interest when it matures. Taken out early, it earns none.
+
+fn deposit_rates() with db =
+    json.parse(setting("fd_rates", "{\"3\": 300, \"6\": 400, \"12\": 550, \"24\": 650}")) ?? { "3": 300, "6": 400, "12": 550, "24": 650 }
+
+fn deposit_interest(principal: int, rate_bp: int, months: int) -> int =
+    int(round(dec(principal) * dec(rate_bp) * months / 120000, 0, "half_up"))
+
+server fn deposit_offer(amount: str, months: int) with db {
+    let rates = deposit_rates()
+    let rate = get(rates, str(months))
+    let c = centavos(amount)
+    if rate == null || is_err(c) { return null }
+    { rate_bp: rate, interest: deposit_interest(c, rate, months), months }
+}
+
+type NewDeposit = { amount: str, months: int }
+
+server fn open_deposit(d: NewDeposit) ! str with db, time, random {
+    let me = acting_member()?
+    let c = centavos(d.amount)?
+    let least = setting_int("min_deposit", 1000000)
+    if c < least { return err(`A fixed deposit is at least ${peso(least)}`) }
+    let rate = get(deposit_rates(), str(d.months)) ?? err("Terms are 3, 6, 12 or 24 months")?
+    db.transaction({ isolation: "serializable" }, () => {
+        let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+        let starts = today()
+        let id = db.one(sql`insert into accounts (member_id, kind, number, opened, term_months, rate_bp, starts, matures, principal)
+                            values (?, 'deposit', ?, ?, ?, ?, ?, ?, ?) returning id`,
+            me.member.id, `FD-${new_journal()}`, now(), d.months, rate, starts, date.add_months(starts, d.months), c).id
+        db.exec("update accounts set number = ? where id = ?", `FD-${pad(id, 5)}`, id)
+        let j = new_journal()
+        post(sv.id, -c, "transfer", `Into fixed deposit FD-${pad(id, 5)}`, j, me.user.id)?
+        post(id, c, "transfer", "From savings", j, me.user.id)?
+        id
+    })
+}
+
+// Pays a deposit out into savings: with its interest when `matured`.
+fn close_deposit(id: int, matured: bool, by) ! str with db, time, random {
+    let d = db.one("select * from accounts where id = ? and kind = 'deposit' and status = 'open'", id) ?? err("That deposit is not open")?
+    let sv = account_of(d.member_id, "savings") ?? err("No savings account")?
+    let j = new_journal()
+    if matured {
+        let interest = deposit_interest(d.principal, d.rate_bp, d.term_months)
+        post(d.id, interest, "interest", `${d.term_months} months at ${pct(d.rate_bp)} a year`, j, by)?
+    }
+    let total = db.one("select balance from accounts where id = ?", d.id).balance
+    post(d.id, -total, matured ? "maturity" : "withdrawal", "To savings", j, by)?
+    post(sv.id, total, matured ? "maturity" : "transfer", `${d.number} ${matured ? "matured" : "taken out early, without interest"}`, j, by)?
+    db.exec("update accounts set status = ? where id = ?", matured ? "matured" : "closed", d.id)
+    total
+}
+
+server fn break_deposit(id: int) ! str with db, time, random {
+    let me = acting_member()?
+    let d = db.one("select member_id from accounts where id = ?", id)
+    if d == null || d.member_id != me.member.id { return err("Not your deposit") }
+    db.transaction({ isolation: "serializable" }, () => close_deposit(id, false, me.user.id))
+}
+
+// The deposits that reached their day.
+fn mature_deposits() -> int with db, time, random {
+    let due = db.query("select id from accounts where kind = 'deposit' and status = 'open' and matures <= ?", today())
+    for d in due {
+        db.transaction({ isolation: "serializable" }, () => close_deposit(d.id, true, null))
+    }
+    len(due)
+}
+
+// Once a day: deposits that matured, and on the first of a month last
+// month's savings interest.
+fn daily() with db, time, random {
+    let t = today()
+    let matured = mature_deposits()
+    let interest = slice(t, 8) == "01" ? post_savings_interest(slice(date.add_months(t, -1), 0, 7)) : 0
+    if matured > 0 || interest > 0 { print(`coop: ${matured} deposits matured, interest on ${interest} savings accounts`) }
+}

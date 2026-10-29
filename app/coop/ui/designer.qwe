@@ -1,0 +1,163 @@
+// The manager's pages: the loan designer (a product's terms, checked and
+// previewed in the browser as they are typed), the rates, and employers.
+
+component ProductsList() {
+    state rows = live(load_products)
+    <section.card>
+        <h1>Loan products <a.button.primary href="/products/new">Design a product</a></h1>
+        <table.data>
+            <thead><tr><th>Code</th><th>Name</th><th>Interest</th><th>Amounts</th><th>Board</th><th>Status</th></tr></thead>
+            <tbody>{for p in rows => <tr key={p.id}>
+                <td><a href={`/products/${p.code}`}>{p.code}</a></td><td>{p.name}</td>
+                <td>{pct(p.rate_bp)} {p.method}</td><td>{peso(p.min_amount)} – {peso(p.max_amount)}</td>
+                <td>{p.status == "proposed" ? `${p.yes} for, ${p.no} against, ${p.approvals} needed` : ""}</td>
+                <td><Status s={p.status}/></td>
+            </tr>}</tbody>
+        </table>
+    </section>
+}
+
+fn form_of(p) = p == null
+    ? { code: "", name: "", description: "", min_amount: "5000", max_amount: "100000", min_term: 3, max_term: 24, rate: "12",
+        method: "diminishing", fee: "1.5", insurance: "0.5", capital_multiple: 3, min_months: 6, comakers: 1, max_active: 1,
+        salary_only: false, approvals: 3 }
+    : { code: p.code, name: p.name, description: p.description, min_amount: amount_text(p.min_amount), max_amount: amount_text(p.max_amount),
+        min_term: p.min_term, max_term: p.max_term, rate: bp_text(p.rate_bp), method: p.method, fee: bp_text(p.fee_bp),
+        insurance: bp_text(p.insurance_bp), capital_multiple: p.capital_multiple, min_months: p.min_months, comakers: p.comakers,
+        max_active: p.max_active, salary_only: p.salary_only == 1, approvals: p.approvals }
+
+// 1250 basis points as "12.5", for the form.
+fn bp_text(bp: int) -> str = str(dec(bp) / 100)
+
+component Designer(id: int?, start, status: str, first_due: str) {
+    state f = start
+    state sample = start.max_amount
+    state months = start.min_term
+    state problem = null
+    state done = null
+    state busy = false
+    let set_f = (k: str, v) => { f = set(f, k, v) }
+    let checked = check_product(f)
+    let p = is_err(checked) ? null : checked
+    let cents = centavos(sample)
+    let rows = p == null || is_err(cents) ? [] : schedule_of(cents, months, p.rate_bp, p.method, first_due)
+    let ch = p == null || is_err(cents) ? null : charges(cents, p.fee_bp, p.insurance_bp)
+    let editable = status == "draft" || id == null
+    let save = () => {
+        busy = true
+        let r = save_product(id, f)
+        busy = false
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Saved as a draft."; if id == null { navigate(`/products/${upper(trim(f.code))}`) } }
+    }
+    let propose = () => {
+        let r = propose_product(id)
+        if is_err(r) { problem = r.error } else { problem = null; done = "Put to the board."; navigate(`/products/${upper(trim(f.code))}`) }
+    }
+    let retire = () => {
+        let r = retire_product(id)
+        if is_err(r) { problem = r.error } else { done = "Retired."; navigate("/products") }
+    }
+    <div.designer>
+        <section.card>
+            <h1>{id == null ? "A new loan product" : f.name} {id != null && <Status s={status}/>}</h1>
+            {!editable && <p.muted>Only a draft can be changed; this product is {status}.</p>}
+            <fieldset disabled={!editable}>
+                <div.cols2>
+                    <label>Code <input value={f.code} @input={(e) => set_f("code", e.target.value)} placeholder="SAL-12"/></label>
+                    <label>Name <input value={f.name} @input={(e) => set_f("name", e.target.value)}/></label>
+                    <label.span2>Description <input value={f.description} @input={(e) => set_f("description", e.target.value)}/></label>
+                    <label>Smallest amount (₱) <input inputmode="decimal" value={f.min_amount} @input={(e) => set_f("min_amount", e.target.value)}/></label>
+                    <label>Largest amount (₱) <input inputmode="decimal" value={f.max_amount} @input={(e) => set_f("max_amount", e.target.value)}/></label>
+                    <label>Shortest term (months) <input type="number" value={f.min_term} @input={(e) => set_f("min_term", int(e.target.value) ?? 0)}/></label>
+                    <label>Longest term (months) <input type="number" value={f.max_term} @input={(e) => set_f("max_term", int(e.target.value) ?? 0)}/></label>
+                    <label>Interest a year (%) <input inputmode="decimal" value={f.rate} @input={(e) => set_f("rate", e.target.value)}/></label>
+                    <label>Method
+                        <select @change={(e) => set_f("method", e.target.value)}>
+                            <option value="diminishing" selected={f.method == "diminishing"}>Diminishing balance</option>
+                            <option value="flat" selected={f.method == "flat"}>Flat (add-on)</option>
+                        </select>
+                    </label>
+                    <label>Service fee (% at release) <input inputmode="decimal" value={f.fee} @input={(e) => set_f("fee", e.target.value)}/></label>
+                    <label>Insurance (% at release) <input inputmode="decimal" value={f.insurance} @input={(e) => set_f("insurance", e.target.value)}/></label>
+                    <label>Most: times share capital and savings (0: no limit) <input type="number" value={f.capital_multiple} @input={(e) => set_f("capital_multiple", int(e.target.value) ?? 0)}/></label>
+                    <label>Months of membership needed <input type="number" value={f.min_months} @input={(e) => set_f("min_months", int(e.target.value) ?? 0)}/></label>
+                    <label>Co-makers <input type="number" value={f.comakers} @input={(e) => set_f("comakers", int(e.target.value) ?? 0)}/></label>
+                    <label>Open loans of it at once <input type="number" value={f.max_active} @input={(e) => set_f("max_active", int(e.target.value) ?? 1)}/></label>
+                    <label>Board approvals needed <input type="number" value={f.approvals} @input={(e) => set_f("approvals", int(e.target.value) ?? 1)}/></label>
+                    <label.check><input type="checkbox" checked={f.salary_only} @change={(e) => set_f("salary_only", e.target.checked)}/> Paid through salary deductions only</label>
+                </div>
+            </fieldset>
+            {is_err(checked) ? <Problem text={checked.error}/> : <p.done>The terms hold together.</p>}
+            <Problem text={problem}/><Done text={done}/>
+            <div.row>
+                {editable && <button.primary disabled={busy || is_err(checked)} @click={save}>Save the draft</button>}
+                {id != null && status == "draft" && <button.ghost disabled={busy} @click={propose}>Put it to the board</button>}
+                {id != null && status == "active" && <button.danger disabled={busy} @click={retire}>Retire it</button>}
+            </div>
+        </section>
+        <section.card>
+            <h2>A sample loan</h2>
+            <div.row>
+                <label>Amount (₱) <input inputmode="decimal" bind:value={sample}/></label>
+                <label>Months <input type="number" value={months} @input={(e) => { months = int(e.target.value) ?? months }}/></label>
+            </div>
+            {len(rows) == 0
+                ? <p.muted>The sample shows once the terms hold together.</p>
+                : <div>
+                    <p.big>{peso(rows[0].payment)} <small>a month</small></p>
+                    <p>Interest in all {peso(total_interest(rows))}; {peso(ch.fee + ch.insurance)} taken at release, so {peso(ch.net)} reaches savings.</p>
+                    <Schedule rows={rows}/>
+                </div>}
+        </section>
+    </div>
+}
+
+view SettingsPage(me, s, problem, done) =
+    <Page title="Rates" me={me} here="/settings">
+        <form.card.narrow method="post" action="/settings">
+            <h1>Rates and limits</h1>
+            <label>Savings interest a year (%) <input name="savings_rate" inputmode="decimal" value={bp_text(s.savings_rate_bp)}/></label>
+            <label>The least to keep in savings (₱) <input name="min_savings" inputmode="decimal" value={amount_text(s.min_savings)}/></label>
+            <label>The least share capital to join (₱) <input name="min_share" inputmode="decimal" value={amount_text(s.min_share)}/></label>
+            <label>The smallest fixed deposit (₱) <input name="min_deposit" inputmode="decimal" value={amount_text(s.min_deposit)}/></label>
+            <fieldset><legend>Fixed deposits a year (%)</legend>
+                <div.cols2>{for [m, bp] in s.fd_rates => <label key={m}>{m} months <input name={`fd_${m}`} inputmode="decimal" value={bp_text(bp)}/></label>}</div>
+            </fieldset>
+            <Problem text={problem}/><Done text={done}/>
+            <button.primary>Save</button>
+        </form>
+    </Page>
+
+component NewKey(employer_id: int) {
+    state key = null
+    state problem = null
+    let make = () => {
+        if !ask("Make a new API key? The old one stops working at once.", { title: "New API key", ok: "Make it" }) { return null }
+        let r = new_api_key(employer_id)
+        if is_err(r) { problem = r.error } else { key = r }
+    }
+    <div>
+        {key != null ? <p.done>The new key, shown once: <code>{key}</code></p> : <button.small @click={make}>New API key</button>}
+        <Problem text={problem}/>
+    </div>
+}
+
+view EmployersPage(me, rows, problem) =
+    <Page title="Employers" me={me} here="/employers">
+        <section.card>
+            <h1>Employers</h1>
+            <table.data>
+                <thead><tr><th>Code</th><th>Name</th><th>Contact</th><th>Members</th><th>API</th></tr></thead>
+                <tbody>{for e in rows => <tr key={e.id}><td>{e.code}</td><td>{e.name}</td><td>{e.contact}</td><td>{e.members}</td>
+                    <td>{e.api_key_hash != null ? "has a key" : "no key"} <NewKey employer_id={e.id}/></td></tr>}</tbody>
+            </table>
+        </section>
+        <form.card.narrow method="post" action="/employers">
+            <h2>Add an employer</h2>
+            <label>Code <input name="code" placeholder="ACME" required/></label>
+            <label>Name <input name="name" required/></label>
+            <label>Payroll contact <input name="contact"/></label>
+            <Problem text={problem}/>
+            <button.primary>Add</button>
+        </form>
+    </Page>

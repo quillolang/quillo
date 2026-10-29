@@ -1,0 +1,140 @@
+// Membership: someone applies on the website, a clerk approves them (a
+// member number, a sign-in, a savings and a share capital account), and the
+// member keeps their details and their monthly salary savings.
+
+type Application = {
+    first_name: str,
+    last_name: str,
+    birth_date: date,
+    address: str,
+    phone: str,
+    email: str,
+    employer_code: str = "",
+    employee_no: str = "",
+    pledge: str,
+    monthly_savings: str = "0",
+}
+
+fn age_on(birth: str, day: str) -> int {
+    let years = int(slice(day, 0, 4)) - int(slice(birth, 0, 4))
+    slice(day, 5) < slice(birth, 5) ? years - 1 : years
+}
+
+fn full_name(m) -> str = `${m.first_name} ${m.last_name}`
+
+// The checks an application must pass; the values to keep.
+fn check_application(a: Application) ! str with db, time {
+    let first = trim(a.first_name)
+    let last = trim(a.last_name)
+    if first == "" || last == "" { return err("First and last name, please") }
+    if len(first) > 60 || len(last) > 60 { return err("Names up to 60 characters") }
+    if age_on(a.birth_date, today()) < 18 { return err("Members are 18 or older") }
+    if a.birth_date < "1900-01-01" { return err("That birth date is too far back") }
+    if !re.test(trim(a.email), "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return err("That email does not look right") }
+    let phone = re.replace(a.phone, "[\\s-]", "")
+    if !re.test(phone, "^\\+?[0-9]{10,13}$") { return err("A mobile number of 10 to 13 digits") }
+    if trim(a.address) == "" { return err("Your address, please") }
+    let pledge = centavos(a.pledge) ?? err("Share capital to pledge: an amount in pesos")?
+    let least = setting_int("min_share", 100000)
+    if pledge < least { return err(`The least share capital is ${peso(least)}`) }
+    let monthly = trim(a.monthly_savings) == "" || trim(a.monthly_savings) == "0" ? 0 : (centavos(a.monthly_savings) ?? err("Monthly savings: an amount in pesos")?)
+    let code = trim(a.employer_code)
+    let emp_no = trim(a.employee_no)
+    let employer = code == "" ? null : (db.one("select id from employers where code = ?", code) ?? err(`No employer with the code ${code}`)?)
+    if employer != null && emp_no == "" { return err("Your employee number at that company, please") }
+    if employer == null && monthly > 0 { return err("Monthly savings come from a salary: give your employer's code") }
+    if employer != null && db.one("select 1 from members where employer_id = ? and employee_no = ? and status in ('applied', 'active')", employer.id, emp_no) != null {
+        return err("That employee number is already a member's, or has applied")
+    }
+    if db.one("select 1 from members where lower(email) = lower(?) and status in ('applied', 'active')", trim(a.email)) != null {
+        return err("That email is already a member's, or has applied")
+    }
+    { first_name: first, last_name: last, birth_date: a.birth_date, address: trim(a.address), phone, email: trim(a.email),
+      employer_id: employer.id, employee_no: employer == null ? null : emp_no, pledge, monthly_savings: monthly }
+}
+
+fn apply_membership(a: Application) -> int ! str with db, time {
+    let v = check_application(a)?
+    let id = db.one(sql`insert into members (first_name, last_name, birth_date, address, phone, email, employer_id, employee_no,
+                        pledge, monthly_savings, status, applied_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied', ?) returning id`,
+        v.first_name, v.last_name, v.birth_date, v.address, v.phone, v.email, v.employer_id, v.employee_no, v.pledge, v.monthly_savings, now()).id
+    publish(OFFICE)
+    id
+}
+
+fn next_member_number() -> str with db {
+    let n = db.one("select count(*) as n from members where number is not null").n + 1
+    `M-${pad(n, 4)}`
+}
+
+// A password to give a new member once; they change it when they sign in.
+fn temp_password() -> str with random {
+    let letters = "abcdefghjkmnpqrstuvwxyz23456789"
+    join(for i in range(10) => { let k = random_int(0, len(letters) - 1); slice(letters, k, k + 1) }, "")
+}
+
+server fn approve_member(id: int) ! str with db, time, random {
+    let clerk = acting_as(["clerk", "manager"])?
+    db.transaction({ isolation: "serializable" }, () => {
+        let m = db.one("select * from members where id = ? and status = 'applied'", id) ?? err("That application is not waiting")?
+        let number = next_member_number()
+        let password = temp_password()
+        db.exec("update members set number = ?, status = 'active', decided_at = ?, decided_by = ? where id = ?", number, now(), clerk.id, id)
+        db.exec("insert into users (username, name, role, password_hash, member_id, must_change, created) values (?, ?, 'member', ?, ?, 1, ?)",
+            number, full_name(m), crypto.hash_password(password), id, now())
+        open_account(id, "savings", `SV-${slice(number, 2)}`)
+        open_account(id, "share", `SC-${slice(number, 2)}`)
+        audit(clerk.id, "approve member", number)
+        publish(OFFICE)
+        { number, password }
+    })
+}
+
+server fn reject_member(id: int, reason: str) ! str with db, time {
+    let clerk = acting_as(["clerk", "manager"])?
+    if trim(reason) == "" { return err("Say why, for the applicant") }
+    let r = db.exec("update members set status = 'rejected', decided_at = ?, decided_by = ?, note = ? where id = ? and status = 'applied'", now(), clerk.id, trim(reason), id)
+    if r.changes == 0 { return err("That application is not waiting") }
+    audit(clerk.id, "reject member", str(id))
+    publish(OFFICE)
+    true
+}
+
+server fn load_applications() with db, time {
+    let u = viewer()
+    if u == null || !contains(STAFF, u.role) { return [] }
+    watch(OFFICE)
+    unwatched(() => db.query(sql`select m.*, e.name as employer from members m left join employers e on e.id = m.employer_id
+                                 where m.status = 'applied' order by m.applied_at`))
+}
+
+fn member_by_number(number: str) with db = db.one("select * from members where number = ? collate nocase", trim(number))
+
+fn search_members(q: str) with db {
+    let like = `%${trim(q)}%`
+    db.query(sql`select m.*, e.name as employer from members m left join employers e on e.id = m.employer_id
+                 where m.number is not null and (m.number like ? or m.first_name || ' ' || m.last_name like ? or m.email like ?)
+                 order by m.number limit 50`, like, like, like)
+}
+
+// The member's months as an approved member.
+fn months_member(m) -> int with time {
+    if m.decided_at == null { return 0 }
+    floor((now() - m.decided_at) / (30 * DAY_MS))
+}
+
+type Profile = { address: str, phone: str, email: str, monthly_savings: str = "0" }
+
+server fn save_profile(p: Profile) ! str with db, time {
+    let me = acting_member()?
+    let m = me.member
+    let phone = re.replace(p.phone, "[\\s-]", "")
+    if !re.test(phone, "^\\+?[0-9]{10,13}$") { return err("A mobile number of 10 to 13 digits") }
+    if !re.test(trim(p.email), "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return err("That email does not look right") }
+    if trim(p.address) == "" { return err("Your address, please") }
+    let monthly = trim(p.monthly_savings) == "" || trim(p.monthly_savings) == "0" ? 0 : (centavos(p.monthly_savings) ?? err("Monthly savings: an amount in pesos")?)
+    if m.employer_id == null && monthly > 0 { return err("Monthly savings come from a salary, and you have no employer on file") }
+    db.exec("update members set address = ?, phone = ?, email = ?, monthly_savings = ? where id = ?", trim(p.address), phone, trim(p.email), monthly, m.id)
+    publish(member_topic(m.id))
+    true
+}

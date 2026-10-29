@@ -1,0 +1,403 @@
+// Quillo Coop: a credit cooperative. Members save (savings, share capital,
+// fixed deposits), borrow under loan products the manager designs and the
+// board of directors approves, apply for loans that co-makers vouch for, a
+// clerk reviews and the board votes on, repay through salary deductions their
+// employers remit each month, shop in the coop's stores, buy raffle tickets,
+// book events, and ask the office through the help desk.
+//
+//   COOP_DEMO=1 quillo run app/coop/main.qwe --watch    then open http://127.0.0.1:8080
+//   quillo check app/coop/main.qwe
+//
+// Demo sign-ins (password coop1234): members M-0001 to M-0008, the clerk
+// clara, the manager mario, the directors dir.cruz, dir.lim, dir.garcia,
+// dir.tan and dir.ramos, and the payroll staff acme.hr and ltel.hr.
+//
+// COOP_DB picks the database file; PUBLIC_COOP_TZ the coop's time zone.
+//
+//   lib/amounts.qwe      pesos as shown and typed (server and browser)
+//   lib/auth.qwe         signing in, sessions, roles, the audit log
+//   lib/ledger.qwe       accounts and every posting
+//   lib/members.qwe      applying, approval, member details
+//   lib/savings.qwe      cash at the counter, share capital, interest, fixed deposits
+//   lib/products.qwe     the loan designer, the board's votes, schedules (server and browser)
+//   lib/loans.qwe        applications, co-makers, review, the board, release, payments
+//   lib/payroll.qwe      salary deduction batches, remittances (file and API)
+//   lib/store.qwe        the web stores and orders
+//   lib/raffles.qwe      raffles, events and the help desk
+//   lib/dashboards.qwe   what the dashboards show, live
+//   lib/seed.qwe         the demo coop, for COOP_DEMO=1
+//   ui/*.qwe             the pages
+//
+// Tests (need COOP_DEMO=1, freshly seeded; BASE=http://127.0.0.1:8080):
+//
+//   node feedback/tools/drive.mjs app/coop/tests/loan.mjs        a loan from application to the board to release, on five screens
+//   node feedback/tools/drive.mjs app/coop/tests/member.mjs      joining, approval, savings, a deposit, the store, a raffle, an event
+//   node feedback/tools/drive.mjs app/coop/tests/payroll.mjs     a month's deductions, remitted by file and through the API
+//   node feedback/tools/drive.mjs app/coop/tests/designer.mjs    a product designed, put to the board and approved
+//   python3 app/coop/tests/hostile.py $BASE                      every server fn called by the wrong role
+
+db.open(env("COOP_DB", "coop.db"))
+db.migrate("migrations")
+
+use lib/amounts
+use lib/auth
+use lib/ledger
+use lib/members
+use lib/savings
+use lib/products
+use lib/loans
+use lib/payroll
+use lib/store
+use lib/raffles
+use lib/dashboards
+use lib/seed
+use ui/page
+use ui/public
+use ui/loan
+use ui/member
+use ui/office
+use ui/payroll
+use ui/board
+use ui/designer
+use ui/store
+
+seed()
+schedule("1h", clear_sessions)
+// Every day at 00:30 in Manila: matured deposits; on the 1st, the month's savings interest.
+schedule("30 16 * * *", daily)
+
+route GET /static/*path = file("public/" + path)
+
+// ---- public -------------------------------------------------------------------------
+
+route GET / {
+    let stats = {
+        members: db.one("select count(*) as n from members where status = 'active'").n,
+        savings_rate: setting_int("savings_rate_bp", 200),
+        products: active_products(),
+        events: db.query("select * from events where status = 'open' order by starts limit 3"),
+    }
+    <Home me={me()} {stats}/>
+}
+
+route GET /join = <JoinPage me={me()} form={{}} problem={null} employers={employers()}/>
+
+route POST /join { form: Application as a } {
+    let r = apply_membership(a)
+    if is_err(r) { reply 422 <JoinPage me={me()} form={request.form} problem={r.error} employers={employers()}/> }
+    <Applied me={me()}/>
+}
+
+route POST /join = <JoinPage me={me()} form={request.form} problem="Check the birth date and each field" employers={employers()}/>
+
+route GET /login ? { next: str = "/" } = <LoginPage next={safe_next(next)} problem={null}/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.username ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <LoginPage next={safe_next(f.next)} problem={r.error}/> }
+    let u = db.one("select role, must_change from users where id = ?", r)
+    if u.must_change == 1 { return redirect("/me/password") }
+    redirect(f.next != null && f.next != "/" ? safe_next(f.next) : home_of(u.role))
+}
+
+route POST /logout {
+    sign_out()
+    redirect("/login")
+}
+
+view PasswordPage(me, problem) =
+    <Page title="Your password" me={me}>
+        <form.card.narrow method="post" action="/me/password">
+            <h1>{me.must_change == 1 ? "Choose your own password" : "Change your password"}</h1>
+            <label>Current password <input name="old" type="password" autocomplete="current-password" required/></label>
+            <label>New password (8 or more characters) <input name="new" type="password" autocomplete="new-password" required/></label>
+            <Problem text={problem}/>
+            <button.primary>Save</button>
+        </form>
+    </Page>
+
+route GET /me/password = <PasswordPage me={signed_in("/me/password")} problem={null}/>
+
+route POST /me/password {
+    let u = signed_in("/me/password")
+    let r = change_password(u, request.form.old ?? "", request.form.new ?? "")
+    if is_err(r) { reply 422 <PasswordPage me={u} problem={r.error}/> }
+    redirect(home_of(u.role))
+}
+
+// ---- members ------------------------------------------------------------------------
+
+fn first_due() -> str with time = date.add_months(today(), 1)
+
+route GET /me {
+    let u = signed_in_as("/me", ["member"])
+    <Page title="My coop" me={u} here="/me"><MyCoop rates={deposit_rates()}/></Page>
+}
+
+route GET /me/accounts/:number {
+    let u = signed_in_as("/me", ["member"])
+    let a = db.one("select * from accounts where number = ? and member_id = ?", number, u.member_id) ?? reply 404 <NotFound me={u} what="No such account of yours"/>
+    <Statement me={u} {a} entries={entries_of(a.id, 100)}/>
+}
+
+route GET /me/loans {
+    let u = signed_in_as("/me/loans", ["member"])
+    let loans = db.query("select l.*, p.name as product from loans l join products p on p.id = l.product_id where l.member_id = ? order by l.id desc", u.member_id)
+    <MyLoans me={u} {loans}/>
+}
+
+route GET /me/loans/new {
+    let u = signed_in_as("/me/loans/new", ["member"])
+    <Page title="Apply for a loan" me={u} here="/me/loans"><LoanApplication products={active_products()} first_due={first_due()}/></Page>
+}
+
+route GET /me/loans/:number {
+    let u = signed_in_as("/me/loans", ["member"])
+    <Page title={number} me={u} here="/me/loans"><LoanView {number} role="member"/></Page>
+}
+
+route GET /me/help {
+    let u = signed_in_as("/me/help", ["member"])
+    let tickets = db.query("select * from tickets where member_id = ? order by updated desc", u.member_id)
+    <Page title="Help desk" me={u} here="/me/help">
+        <section.card>
+            <h1>Help desk</h1>
+            {len(tickets) == 0 ? <p.muted>You have asked nothing yet.</p> : <ul.plain>
+                {for t in tickets => <li key={t.id}><a href={`/me/help/${t.id}`}>{t.subject}</a> <Status s={t.status}/> <When ms={t.updated}/></li>}
+            </ul>}
+        </section>
+        <NewTicket/>
+    </Page>
+}
+
+route GET /me/help/:id(int) {
+    let u = signed_in_as("/me/help", ["member"])
+    <Page title="Help desk" me={u} here="/me/help"><TicketThread {id} role="member"/></Page>
+}
+
+route GET /me/profile {
+    let u = signed_in_as("/me/profile", ["member"])
+    let m = db.one("select * from members where id = ?", u.member_id)
+    <Page title="Profile" me={u} here="/me">
+        <ProfileForm {m}/>
+        <p><a href="/me/password">Change your password</a></p>
+    </Page>
+}
+
+route GET /store {
+    let u = signed_in("/store")
+    <StoresPage me={u} rows={stores()}/>
+}
+
+route GET /store/:slug {
+    let u = signed_in("/store")
+    let m = u.role == "member" ? db.one("select employer_id from members where id = ?", u.member_id) : null
+    <Page title="Store" me={u} here="/store"><Shop {slug} member={u.role == "member"} can_salary={m.employer_id != null}/></Page>
+}
+
+route GET /raffles {
+    let u = signed_in("/raffles")
+    let staff = u.role == "clerk" || u.role == "manager"
+    <Page title="Raffles" me={u} here="/raffles">
+        <h1>Raffles</h1>
+        <Raffles member={u.role == "member"} {staff}/>
+        {staff && <RaffleForm/>}
+    </Page>
+}
+
+route GET /events {
+    let u = signed_in("/events")
+    <Page title="Events" me={u} here="/events"><h1>Events</h1><Events member={u.role == "member"}/></Page>
+}
+
+// ---- the office ---------------------------------------------------------------------
+
+route GET /office = <OfficeHome me={signed_in_as("/office", ["clerk"])}/>
+
+route GET /office/members ? { q: str = "" } {
+    let u = signed_in_as("/office/members", ["clerk", "manager"])
+    <MembersPage me={u} {q} rows={search_members(q)}/>
+}
+
+route GET /office/members/:number {
+    let u = signed_in_as("/office/members", ["clerk", "manager"])
+    let m = member_by_number(number) ?? reply 404 <NotFound me={u} what={`No member ${number}`}/>
+    let loans = db.query("select l.*, p.name as product from loans l join products p on p.id = l.product_id where l.member_id = ? order by l.id desc", m.id)
+    <MemberDetail me={u} {m} accounts={accounts_of(m.id)} {loans}/>
+}
+
+route GET /office/loans/:number {
+    let u = signed_in_as("/office", ["clerk", "manager"])
+    <Page title={number} me={u} here="/office"><LoanView {number} role={u.role}/></Page>
+}
+
+route GET /office/help/:id(int) {
+    let u = signed_in_as("/office", ["clerk"])
+    <Page title="Help desk" me={u} here="/office"><TicketThread {id} role="clerk"/></Page>
+}
+
+route GET /office/payroll {
+    let u = signed_in_as("/office/payroll", ["clerk", "manager"])
+    <Page title="Payroll" me={u} here="/office/payroll">
+        <MakeBatch employers={employers()} period={period_of(today())}/>
+        <Batches base="/office/payroll"/>
+    </Page>
+}
+
+route GET /office/payroll/:id(int) {
+    let u = signed_in_as("/office/payroll", ["clerk", "manager"])
+    <Page title="Batch" me={u} here="/office/payroll"><BatchView {id} csv_href={`/office/payroll/${id}/csv`}/></Page>
+}
+
+fn csv_answer(id: int) with db {
+    let b = db.one("select b.period, e.code from batches b join employers e on e.id = b.employer_id where b.id = ?", id) ?? reply 404 "No such batch"
+    respond(200, batch_csv(id), { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="${b.code}-${b.period}.csv"` })
+}
+
+route GET /office/payroll/:id(int)/csv {
+    signed_in_as("/office/payroll", ["clerk", "manager"])
+    csv_answer(id)
+}
+
+route GET /office/events {
+    let u = signed_in_as("/office/events", ["clerk", "manager"])
+    let rows = db.query("select * from events order by starts desc")
+    <Page title="Events" me={u} here="/office/events">
+        <section.card>
+            <h1>Events</h1>
+            <ul.plain>{for e in rows => <li key={e.id}><a href={`/office/events/${e.slug}`}>{e.title}</a> · {event_when(e.starts)} <Status s={e.status}/></li>}</ul>
+        </section>
+        <EventForm/>
+    </Page>
+}
+
+route GET /office/events/:slug {
+    let u = signed_in_as("/office/events", ["clerk"])
+    let e = db.one("select * from events where slug = ?", slug) ?? reply 404 <NotFound me={u} what="No such event"/>
+    <Page title={e.title} me={u} here="/office/events"><CheckIn event_id={e.id} title={e.title}/></Page>
+}
+
+// ---- the board ----------------------------------------------------------------------
+
+route GET /board = <Page title="Board" me={signed_in_as("/board", ["bod"])} here="/board"><BoardAgenda only="loans"/></Page>
+
+route GET /board/products = <Page title="Board" me={signed_in_as("/board", ["bod"])} here="/board/products"><BoardAgenda only="products"/></Page>
+
+route GET /board/loans/:number {
+    let u = signed_in_as("/board", ["bod"])
+    <Page title={number} me={u} here="/board"><LoanView {number} role="bod"/></Page>
+}
+
+// ---- the manager --------------------------------------------------------------------
+
+route GET /products = <Page title="Loan designer" me={signed_in_as("/products", ["manager"])} here="/products"><ProductsList/></Page>
+
+route GET /products/new {
+    let u = signed_in_as("/products", ["manager"])
+    <Page title="Design a product" me={u} here="/products"><Designer id={null} start={form_of(null)} status="draft" first_due={first_due()}/></Page>
+}
+
+route GET /products/:code {
+    let u = signed_in_as("/products", ["manager"])
+    let p = db.one("select * from products where code = ?", code) ?? reply 404 <NotFound me={u} what={`No product ${code}`}/>
+    <Page title={p.name} me={u} here="/products">
+        <Designer id={p.id} start={form_of(p)} status={p.status} first_due={first_due()}/>
+        {p.status != "draft" && <section.card><h2>The board</h2><Tally votes={product_votes(p.id)} approvals={p.approvals} directors={directors()}/></section>}
+    </Page>
+}
+
+fn settings_now() with db = {
+    savings_rate_bp: setting_int("savings_rate_bp", 200),
+    min_savings: setting_int("min_savings", 50000),
+    min_share: setting_int("min_share", 100000),
+    min_deposit: setting_int("min_deposit", 1000000),
+    fd_rates: deposit_rates(),
+}
+
+route GET /settings = <SettingsPage me={signed_in_as("/settings", ["manager"])} s={settings_now()} problem={null} done={null}/>
+
+fn save_settings(f) ! str with db, time {
+    let rate = bp_of(f.savings_rate, "Savings interest")?
+    let min_savings = centavos(f.min_savings) ?? err("The least to keep in savings: pesos")?
+    let min_share = centavos(f.min_share) ?? err("The least share capital: pesos")?
+    let min_deposit = centavos(f.min_deposit) ?? err("The smallest fixed deposit: pesos")?
+    let rates = for [m, _] in deposit_rates() => [m, bp_of(get(f, `fd_${m}`), `${m}-month deposits`)?]
+    let pairs = [["savings_rate_bp", str(rate)], ["min_savings", str(min_savings)], ["min_share", str(min_share)], ["min_deposit", str(min_deposit)],
+                 ["fd_rates", json.stringify(reduce(rates, {}, (acc, r) => set(acc, r[0], r[1])))]]
+    for [k, v] in pairs {
+        db.exec("insert into settings (key, value) values (?, ?) on conflict (key) do update set value = excluded.value", k, v)
+    }
+    true
+}
+
+route POST /settings {
+    let u = signed_in_as("/settings", ["manager"])
+    let r = save_settings(request.form)
+    if is_err(r) { reply 422 <SettingsPage me={u} s={settings_now()} problem={r.error} done={null}/> }
+    audit(u.id, "settings", "")
+    <SettingsPage me={u} s={settings_now()} problem={null} done="Saved."/>
+}
+
+fn employers_page(u, problem) with db =
+    <EmployersPage me={u} rows={db.query("select e.*, (select count(*) from members m where m.employer_id = e.id and m.status = 'active') as members from employers e order by e.name")} {problem}/>
+
+route GET /employers = employers_page(signed_in_as("/employers", ["manager"]), null)
+
+route POST /employers {
+    let u = signed_in_as("/employers", ["manager"])
+    let code = upper(trim(request.form.code ?? ""))
+    let name = trim(request.form.name ?? "")
+    if !re.test(code, "^[A-Z0-9]{2,10}$") || name == "" { reply 422 employers_page(u, "A code of 2 to 10 letters or digits, and a name") }
+    if db.one("select 1 from employers where code = ?", code) != null { reply 422 employers_page(u, `There is an employer ${code} already`) }
+    db.exec("insert into employers (code, name, contact) values (?, ?, ?)", code, name, trim(request.form.contact ?? ""))
+    audit(u.id, "add employer", code)
+    redirect("/employers")
+}
+
+// ---- employers ----------------------------------------------------------------------
+
+route GET /payroll {
+    let u = signed_in_as("/payroll", ["employer"])
+    let e = db.one("select * from employers where id = ?", u.employer_id)
+    <Page title="Deductions" me={u} here="/payroll">
+        <h1>{e.name}: salary deductions</h1>
+        <Batches base="/payroll"/>
+        <ApiHelp code={e.code}/>
+    </Page>
+}
+
+route GET /payroll/:id(int) {
+    let u = signed_in_as("/payroll", ["employer"])
+    <Page title="Batch" me={u} here="/payroll"><BatchView {id} csv_href={`/payroll/${id}/csv`}/></Page>
+}
+
+route GET /payroll/:id(int)/csv {
+    let u = signed_in_as("/payroll", ["employer"])
+    let b = db.one("select employer_id from batches where id = ?", id)
+    if b == null || b.employer_id != u.employer_id { reply 404 "No such batch" }
+    csv_answer(id)
+}
+
+// The payroll system's remittance: the month and each employee's amount.
+type ApiRemittance = { period: str, lines: list<{ employee_no: str, amount: str }> }
+
+route POST /api/remittances { json: ApiRemittance as body } {
+    let e = employer_of_key(request.headers.authorization) ?? reply 401 { error: "An API key in the Authorization header: Bearer coop_..." }
+    if !valid_period(body.period) { reply 422 { error: "period: a month, like 2026-11" } }
+    idempotent({ isolation: "serializable", user: e.code }, () => {
+        let b = db.one("select * from batches where employer_id = ? and period = ?", e.id, body.period)
+        if b == null { return respond(404, { error: `No batch for ${body.period}` }) }
+        let lines = for [i, l] in enumerate(body.lines) => {
+            let a = centavos(l.amount)
+            if is_err(a) { return respond(422, { error: `lines[${i}]: ${a.error}` }) }
+            { employee_no: trim(l.employee_no), amount: a }
+        }
+        let r = remit(b.id, lines, "api", null)
+        if is_err(r) { return respond(409, { error: r.error }) }
+        audit(null, "remit api", `${e.code} ${body.period} ${peso(r.posted)}`)
+        respond(201, { batch: b.id, posted: amount_text(r.posted), unknown: r.unknown })
+    })
+}
+
+route POST /api/remittances = respond(422, { error: "A JSON body: { period: \"2026-11\", lines: [{ employee_no, amount }] }" })

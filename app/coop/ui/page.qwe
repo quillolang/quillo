@@ -1,0 +1,67 @@
+// The frame every page uses, the sign-in page, and small pieces shown
+// everywhere.
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view Done(text) = text != null && text != "" && <p.done role="status">{text}</p>
+
+view Status(s: str) = <span class={`status st-${s}`}>{s}</span>
+
+view Money(c: int) = <span.amount>{peso(c)}</span>
+
+view When(ms) = ms == null ? <span.muted>–</span> : <time>{date.format(date.from_ms(ms), "D MMM YYYY")}</time>
+
+let NAV = {
+    member: [["/me", "My coop"], ["/me/loans", "Loans"], ["/store", "Stores"], ["/raffles", "Raffles"], ["/events", "Events"], ["/me/help", "Help"]],
+    clerk: [["/office", "Office"], ["/office/members", "Members"], ["/office/payroll", "Payroll"], ["/office/events", "Events"], ["/raffles", "Raffles"]],
+    bod: [["/board", "Board"], ["/board/products", "Products"]],
+    manager: [["/products", "Loan designer"], ["/office/payroll", "Payroll"], ["/employers", "Employers"], ["/settings", "Rates"]],
+    employer: [["/payroll", "Deductions"]],
+}
+
+view TopBar(me, here: str) =
+    <header.top>
+        <a.brand href="/"><span.logo>◆</span> Quillo Coop</a>
+        {me != null && <nav.links>
+            {for [href, label] in (get(NAV, me.role) ?? []) =>
+                <a href={href} class={here == href || (href != "/me" && href != "/office" && starts_with(here, href)) ? "here" : ""}>{label}</a>}
+        </nav>}
+        <span.grow/>
+        {me != null && <span.who>{me.name} · {me.role == "bod" ? "director" : me.role}</span>}
+        {me != null && <form.inline method="post" action="/logout"><button.link>Sign out</button></form>}
+        {me == null && <a.button.ghost href="/login">Sign in</a>}
+    </header>
+
+view Page(title: str, me, here: str = "", children) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title} · Quillo Coop</title>
+            <link rel="stylesheet" href="/static/coop.css"/>
+        </head>
+        <body data-notices="dialog-center toasts-bottom-right">
+            <TopBar {me} {here}/>
+            <main.page>{children}</main>
+            <footer.foot>Quillo Coop · a credit cooperative · amounts in Philippine pesos</footer>
+        </body>
+    </html>
+
+view LoginPage(next: str, problem) =
+    <Page title="Sign in" me={null}>
+        <form.card.narrow method="post" action="/login">
+            <h1>Sign in</h1>
+            <input type="hidden" name="next" value={next}/>
+            <label>Username or member number <input name="username" autocomplete="username" required/></label>
+            <label>Password <input name="password" type="password" autocomplete="current-password" required/></label>
+            <Problem text={problem}/>
+            <button.primary>Sign in</button>
+            <p.hint>Demo: members M-0001 to M-0008, clerk <b>clara</b>, manager <b>mario</b>, directors <b>dir.cruz</b>, <b>dir.lim</b>,
+                <b>dir.garcia</b>, <b>dir.tan</b>, <b>dir.ramos</b>, payroll <b>acme.hr</b> and <b>ltel.hr</b>. The password is coop1234.</p>
+        </form>
+    </Page>
+
+view NotFound(me, what: str) =
+    <Page title="Not found" me={me}>
+        <section.card.narrow><h1>Not found</h1><p>{what}</p><p><a href="/">Back home</a></p></section>
+    </Page>

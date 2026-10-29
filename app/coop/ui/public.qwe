@@ -1,0 +1,64 @@
+// The public pages: the coop's front page, and applying for membership.
+
+view Home(me, stats) =
+    <Page title="Home" me={me}>
+        <section.hero>
+            <h1>Save together. Borrow fairly.</h1>
+            <p>Quillo Coop is owned by its {stats.members} members: savings that earn {pct(stats.savings_rate)} a year, fixed deposits,
+               loans decided by a board you elect, stores at members' prices, and deductions straight from your salary.</p>
+            <p.actions>
+                <a.button.primary href="/join">Become a member</a>
+                {me == null ? <a.button.ghost href="/login">Sign in</a> : <a.button.ghost href={home_of(me.role)}>Go to your page</a>}
+            </p>
+        </section>
+        <section.grid3>
+            <article.card><h2>Savings and deposits</h2><p>A savings account from day one, share capital that makes you an owner, and fixed deposits
+                from 3 to 24 months.</p></article>
+            <article.card><h2>Loans</h2><p>{join(stats.products | map((p) => p.name), ", ")}: apply online, have co-makers vouch for you, and follow the
+                board's decision as it is made.</p></article>
+            <article.card><h2>Through your payroll</h2><p>Members at partner employers save and repay through salary deductions, every month,
+                with nothing to queue for.</p></article>
+        </section>
+        {len(stats.events) > 0 && <section.card>
+            <h2>Coming up</h2>
+            <ul.plain>{for e in stats.events => <li key={e.id}><b>{e.title}</b> · {event_when(e.starts)} · {e.venue}</li>}</ul>
+        </section>}
+    </Page>
+
+fn event_when(starts: str) -> str = date.format(slice(starts, 0, 10), "ddd D MMM YYYY") + " at " + slice(starts, 11, 16)
+
+view JoinPage(me, form, problem, employers) =
+    <Page title="Become a member" me={me}>
+        <form.card.wide method="post" action="/join">
+            <h1>Become a member</h1>
+            <p.lead>Fill this in and the office will contact you. Membership needs share capital of at least {peso(setting_int("min_share", 100000))}.</p>
+            <div.cols2>
+                <label>First name <input name="first_name" value={form.first_name ?? ""} required/></label>
+                <label>Last name <input name="last_name" value={form.last_name ?? ""} required/></label>
+                <label>Birth date <input name="birth_date" type="date" value={form.birth_date ?? ""} required/></label>
+                <label>Mobile number <input name="phone" inputmode="tel" value={form.phone ?? ""} required/></label>
+                <label.span2>Address <input name="address" value={form.address ?? ""} required/></label>
+                <label.span2>Email <input name="email" type="email" value={form.email ?? ""} required/></label>
+                <label>Employer (if it deducts from your salary)
+                    <select name="employer_code">
+                        <option value="">None</option>
+                        {for e in employers => <option value={e.code} selected={form.employer_code == e.code}>{e.name}</option>}
+                    </select>
+                </label>
+                <label>Employee number <input name="employee_no" value={form.employee_no ?? ""}/></label>
+                <label>Share capital you pledge (₱) <input name="pledge" inputmode="decimal" value={form.pledge ?? ""} required/></label>
+                <label>Monthly savings from your salary (₱) <input name="monthly_savings" inputmode="decimal" value={form.monthly_savings ?? "0"}/></label>
+            </div>
+            <Problem text={problem}/>
+            <button.primary>Apply</button>
+        </form>
+    </Page>
+
+view Applied(me) =
+    <Page title="Application received" me={me}>
+        <section.card.narrow>
+            <h1>Thank you</h1>
+            <p>Your application is with the office. They will check it and call you; once approved you get a member number and a password to sign in.</p>
+            <p><a href="/">Back to the front page</a></p>
+        </section>
+    </Page>

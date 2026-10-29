@@ -1,0 +1,215 @@
+// Raffles, events and the help desk.
+//
+// A raffle's winner comes from a seed made when it opens, whose SHA-256 is
+// shown from then on: at the draw the seed is shown too, and the winning
+// ticket is the hash of the seed and the number of tickets sold, so anyone can
+// check that nobody chose it after seeing the tickets.
+
+type NewRaffle = { name: str, prize: str, ticket_price: str, max_tickets: int, per_member: int = 10, closes: date }
+
+server fn create_raffle(r: NewRaffle) ! str with db, time, random {
+    let u = acting_as(["clerk", "manager"])?
+    if trim(r.name) == "" || trim(r.prize) == "" { return err("A name and a prize") }
+    let price = centavos(r.ticket_price)?
+    if r.max_tickets < 2 || r.max_tickets > 100000 { return err("From 2 to 100,000 tickets") }
+    if r.per_member < 1 || r.per_member > r.max_tickets { return err("Tickets a member may buy: 1 up to all of them") }
+    if r.closes <= today() { return err("It closes after today") }
+    let seed = crypto.token()
+    let id = db.one(sql`insert into raffles (name, prize, ticket_price, max_tickets, per_member, closes, seed_hash, seed)
+                        values (?, ?, ?, ?, ?, ?, ?, ?) returning id`, trim(r.name), trim(r.prize), price, r.max_tickets, r.per_member, r.closes, crypto.sha256(seed), seed).id
+    audit(u.id, "create raffle", trim(r.name))
+    publish("raffles")
+    id
+}
+
+server fn buy_tickets(raffle_id: int, count: int) ! str with db, time, random {
+    let me = acting_member()?
+    if count < 1 || count > 100 { return err("From 1 to 100 tickets at a time") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let r = db.one("select * from raffles where id = ? and status = 'open'", raffle_id) ?? err("That raffle is not selling tickets")?
+        if r.closes < today() { return err("Ticket sales have closed") }
+        let sold = db.one("select count(*) as n from raffle_tickets where raffle_id = ?", raffle_id).n
+        let mine = db.one("select count(*) as n from raffle_tickets where raffle_id = ? and member_id = ?", raffle_id, me.member.id).n
+        if mine + count > r.per_member { return err(`At most ${r.per_member} tickets each; you have ${mine}`) }
+        if sold + count > r.max_tickets { return err(`Only ${r.max_tickets - sold} tickets left`) }
+        let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+        post(sv.id, -r.ticket_price * count, "raffle", `${plural(count, "ticket")} for ${r.name}`, new_journal(), me.user.id)?
+        let numbers = for i in range(count) => {
+            db.exec("insert into raffle_tickets (raffle_id, n, member_id, at) values (?, ?, ?, ?)", raffle_id, sold + i + 1, me.member.id, now())
+            sold + i + 1
+        }
+        publish("raffles")
+        numbers
+    })
+}
+
+// The first 12 hex digits of a hash, as a number.
+fn hex_value(h: str) -> int {
+    let digits = "0123456789abcdef"
+    let v = 0
+    for c in slice(h, 0, 12) { v = v * 16 + index_of(digits, c) }
+    v
+}
+
+fn winning_ticket(seed: str, sold: int) -> int = hex_value(crypto.sha256(`${seed}:${sold}`)) % sold + 1
+
+server fn draw_raffle(raffle_id: int) ! str with db, time {
+    let u = acting_as(["clerk", "manager"])?
+    db.transaction({ isolation: "serializable" }, () => {
+        let r = db.one("select * from raffles where id = ? and status != 'drawn'", raffle_id) ?? err("That raffle is drawn already")?
+        if r.closes >= today() { return err(`Ticket sales close on ${r.closes}; draw it after`) }
+        let sold = db.one("select count(*) as n from raffle_tickets where raffle_id = ?", raffle_id).n
+        if sold == 0 { return err("No tickets were sold") }
+        let n = winning_ticket(r.seed, sold)
+        db.exec("update raffles set status = 'drawn', winner_ticket = ?, drawn_at = ?, drawn_by = ? where id = ?", n, now(), u.id, raffle_id)
+        audit(u.id, "draw raffle", `${r.name}: ticket ${n}`)
+        publish("raffles")
+        n
+    })
+}
+
+// Raffles as a member sees them: the seed only once drawn.
+server fn load_raffles() with db, time {
+    let u = viewer()
+    watch("raffles")
+    unwatched(() => db.query(sql`select r.id, r.name, r.prize, r.ticket_price, r.max_tickets, r.per_member, r.closes, r.status, r.seed_hash,
+                                 case when r.status = 'drawn' then r.seed end as seed, r.winner_ticket, r.drawn_at,
+                                 (select count(*) from raffle_tickets t where t.raffle_id = r.id) as sold,
+                                 (select group_concat(t.n) from raffle_tickets t where t.raffle_id = r.id and t.member_id = ?) as mine,
+                                 (select m.number from raffle_tickets t join members m on m.id = t.member_id where t.raffle_id = r.id and t.n = r.winner_ticket) as winner
+                                 from raffles r order by r.status = 'drawn', r.closes`, u.member_id ?? 0))
+}
+
+// Events: members book a place (paid from savings when it has a price), and
+// the clerk at the door checks in each code.
+
+type NewEvent = { title: str, description: str = "", starts: str, venue: str, capacity: int, price: str = "0" }
+
+fn slug_of(text: str) -> str {
+    let s = re.replace(lower(trim(text)), "[^a-z0-9]+", "-")
+    let t = re.replace(s, "^-+|-+$", "")
+    len(t) > 50 ? slice(t, 0, 50) : t
+}
+
+server fn create_event(e: NewEvent) ! str with db, time {
+    let u = acting_as(["clerk", "manager"])?
+    if trim(e.title) == "" || trim(e.venue) == "" { return err("A title and a venue") }
+    if !re.test(e.starts, "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$") || !date.valid(slice(e.starts, 0, 10)) { return err("When it starts: a day and a time") }
+    if slice(e.starts, 0, 10) < today() { return err("It starts today or later") }
+    if e.capacity < 1 || e.capacity > 10000 { return err("Room for 1 to 10,000") }
+    let price = trim(e.price) == "" || trim(e.price) == "0" ? 0 : centavos(e.price)?
+    let slug = `${slug_of(e.title)}-${slice(e.starts, 0, 10)}`
+    if db.one("select 1 from events where slug = ?", slug) != null { return err("There is an event of that name on that day") }
+    db.exec("insert into events (slug, title, description, starts, venue, capacity, price) values (?, ?, ?, ?, ?, ?, ?)",
+        slug, trim(e.title), trim(e.description), e.starts, trim(e.venue), e.capacity, price)
+    audit(u.id, "create event", slug)
+    publish("events")
+    slug
+}
+
+fn ticket_code() -> str with random {
+    let letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    join(for i in range(6) => { let k = random_int(0, len(letters) - 1); slice(letters, k, k + 1) }, "")
+}
+
+server fn book_event(event_id: int) ! str with db, time, random {
+    let me = acting_member()?
+    db.transaction({ isolation: "serializable" }, () => {
+        let e = db.one("select * from events where id = ? and status = 'open'", event_id) ?? err("That event is not taking bookings")?
+        if slice(e.starts, 0, 10) < today() { return err("That event is over") }
+        if db.one("select 1 from event_tickets where event_id = ? and member_id = ? and status != 'cancelled'", event_id, me.member.id) != null { return err("You have a place already") }
+        let booked = db.one("select count(*) as n from event_tickets where event_id = ? and status != 'cancelled'", event_id).n
+        if booked >= e.capacity { return err("It is full") }
+        if e.price > 0 {
+            let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+            post(sv.id, -e.price, "event", e.title, new_journal(), me.user.id)?
+        }
+        let code = ticket_code()
+        db.exec("delete from event_tickets where event_id = ? and member_id = ? and status = 'cancelled'", event_id, me.member.id)
+        db.exec("insert into event_tickets (event_id, member_id, code, at) values (?, ?, ?, ?)", event_id, me.member.id, code, now())
+        publish(`event:${event_id}`)
+        publish("events")
+        code
+    })
+}
+
+server fn check_in(event_id: int, code: str) ! str with db, time {
+    let clerk = acting_as(["clerk"])?
+    let t = db.one(sql`select t.*, m.number, m.first_name || ' ' || m.last_name as name from event_tickets t join members m on m.id = t.member_id
+                       where t.event_id = ? and t.code = ?`, event_id, upper(trim(code))) ?? err(`No ticket ${upper(trim(code))} for this event`)?
+    if t.status == "checked_in" { return err(`${t.name} came in already`) }
+    if t.status == "cancelled" { return err("That ticket was cancelled") }
+    db.exec("update event_tickets set status = 'checked_in', checked_at = ?, checked_by = ? where id = ?", now(), clerk.id, t.id)
+    publish(`event:${event_id}`)
+    `${t.name} (${t.number})`
+}
+
+server fn load_events() with db, time {
+    let u = viewer()
+    watch("events")
+    unwatched(() => db.query(sql`select e.*, (select count(*) from event_tickets t where t.event_id = e.id and t.status != 'cancelled') as booked,
+                                 (select code from event_tickets t where t.event_id = e.id and t.member_id = ? and t.status != 'cancelled') as my_code
+                                 from events e where e.status = 'open' order by e.starts`, u.member_id ?? 0))
+}
+
+server fn load_attendance(event_id: int) with db, time {
+    let u = viewer()
+    if u == null || !contains(STAFF, u.role) { return null }
+    watch(`event:${event_id}`)
+    unwatched(() => ({
+        booked: db.one("select count(*) as n from event_tickets where event_id = ? and status != 'cancelled'", event_id).n,
+        arrived: db.query(sql`select t.code, t.checked_at, m.number, m.first_name || ' ' || m.last_name as name from event_tickets t
+                              join members m on m.id = t.member_id where t.event_id = ? and t.status = 'checked_in' order by t.checked_at desc`, event_id),
+    }))
+}
+
+// The help desk.
+
+server fn open_ticket(subject: str, body: str) ! str with db, time {
+    let me = acting_member()?
+    if len(trim(subject)) < 3 || len(trim(body)) < 3 { return err("A subject and a message, please") }
+    if len(body) > 5000 { return err("Keep it under 5,000 characters") }
+    let id = db.one("insert into tickets (member_id, subject, at, updated) values (?, ?, ?, ?) returning id", me.member.id, trim(subject), now(), now()).id
+    db.exec("insert into ticket_messages (ticket_id, user_id, body, at) values (?, ?, ?, ?)", id, me.user.id, trim(body), now())
+    publish(OFFICE)
+    publish(`ticket:${id}`)
+    id
+}
+
+server fn reply_ticket(id: int, body: str) ! str with db, time {
+    let u = acting()?
+    let t = db.one("select * from tickets where id = ?", id) ?? err("No such ticket")?
+    if u.role == "member" && u.member_id != t.member_id { return err("Not your ticket") }
+    if u.role != "member" && u.role != "clerk" { return err("Not allowed for your role") }
+    if t.status == "closed" { return err("That ticket is closed") }
+    if len(trim(body)) < 1 || len(body) > 5000 { return err("A message of up to 5,000 characters") }
+    db.exec("insert into ticket_messages (ticket_id, user_id, body, at) values (?, ?, ?, ?)", id, u.id, trim(body), now())
+    db.exec("update tickets set status = ?, updated = ? where id = ?", u.role == "clerk" ? "answered" : "open", now(), id)
+    publish(OFFICE)
+    publish(`ticket:${id}`)
+    publish(member_topic(t.member_id))
+    true
+}
+
+server fn close_ticket(id: int) ! str with db, time {
+    let u = acting()?
+    let t = db.one("select * from tickets where id = ?", id) ?? err("No such ticket")?
+    if u.role == "member" && u.member_id != t.member_id { return err("Not your ticket") }
+    db.exec("update tickets set status = 'closed', updated = ? where id = ?", now(), id)
+    publish(OFFICE)
+    publish(`ticket:${id}`)
+    true
+}
+
+server fn load_ticket(id: int) with db, time {
+    let u = viewer()
+    let t = unwatched(() => db.one("select t.*, m.number from tickets t join members m on m.id = t.member_id where t.id = ?", id))
+    if u == null || t == null { return null }
+    if u.role == "member" && u.member_id != t.member_id { return null }
+    if u.role != "member" && u.role != "clerk" { return null }
+    watch(`ticket:${id}`)
+    unwatched(() => ({
+        ticket: db.one("select * from tickets where id = ?", id),
+        messages: db.query("select tm.*, us.name, us.role from ticket_messages tm join users us on us.id = tm.user_id where tm.ticket_id = ? order by tm.id", id),
+    }))
+}

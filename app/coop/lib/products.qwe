@@ -1,0 +1,178 @@
+// Loan products, made in the loan designer by the manager and put to the
+// board: a product is offered once enough directors approve it.
+//
+// The schedule of a loan is worked out here, the same in the browser (the
+// designer's and the application's previews) and on the server (what is
+// kept when a loan is released).
+
+type ProductForm = {
+    code: str,
+    name: str,
+    description: str = "",
+    min_amount: str,
+    max_amount: str,
+    min_term: int,
+    max_term: int,
+    rate: str,                         // a year, in percent: "12", "10.5"
+    method: "diminishing" | "flat",
+    fee: str = "0",                    // percent of the principal, at release
+    insurance: str = "0",
+    capital_multiple: int = 0,
+    min_months: int = 0,
+    comakers: int = 0,
+    max_active: int = 1,
+    salary_only: bool = false,
+    approvals: int = 2,
+}
+
+// "12.5" percent as basis points (1250), or an error.
+fn bp_of(text, what: str) -> int ! str {
+    let d = dec(trim(str(text ?? ""))) ?? err(`${what}: a percent, like 12 or 10.5`)?
+    if d < 0 || d > 100 { return err(`${what}: between 0 and 100 percent`) }
+    let bp = d * 100
+    if bp != round(bp, 0) { return err(`${what}: at most two decimals`) }
+    int(bp)
+}
+
+// One month's rate, exact.
+fn monthly_rate(rate_bp: int) -> dec = dec(rate_bp) / 120000
+
+// The installments of a loan of `amount` centavos over `term` months: each
+// with its due day, principal, interest and payment. Diminishing balance pays
+// interest on what is still owed, in equal payments; flat (add-on) interest
+// is worked out on the whole amount for the whole term and spread evenly.
+fn schedule_of(amount: int, term: int, rate_bp: int, method: str, first_due: str) -> list {
+    if amount <= 0 || term <= 0 { return [] }
+    let r = monthly_rate(rate_bp)
+    if method == "flat" {
+        let interest = int(round(dec(amount) * dec(rate_bp) * term / 120000, 0, "half_up"))
+        let p_each = floor(amount / term)
+        let i_each = floor(interest / term)
+        return for n in range(1, term + 1) => {
+            let principal = n == term ? amount - p_each * (term - 1) : p_each
+            let int_part = n == term ? interest - i_each * (term - 1) : i_each
+            { n, due: date.add_months(first_due, n - 1), principal, interest: int_part, payment: principal + int_part }
+        }
+    }
+    let payment = if rate_bp == 0 {
+        int(ceil(dec(amount) / term))
+    } else {
+        let f = reduce(range(term), 1m, (acc, _) => acc * (1m + r))
+        int(round(dec(amount) * r * f / (f - 1m), 0, "half_up"))
+    }
+    let rows = []
+    let balance = amount
+    for n in range(1, term + 1) {
+        let interest = int(round(dec(balance) * r, 0, "half_up"))
+        let principal = n == term ? balance : min([payment - interest, balance])
+        balance = balance - principal
+        rows = rows | push({ n, due: date.add_months(first_due, n - 1), principal, interest, payment: principal + interest })
+    }
+    rows
+}
+
+fn total_interest(rows: list) -> int = rows | map((r) => r.interest) | sum()
+
+// What is taken at release, and what the member receives.
+fn charges(amount: int, fee_bp: int, insurance_bp: int) {
+    let fee = int(round(dec(amount) * dec(fee_bp) / 10000, 0, "half_up"))
+    let insurance = int(round(dec(amount) * dec(insurance_bp) / 10000, 0, "half_up"))
+    { fee, insurance, net: amount - fee - insurance }
+}
+
+// The checks a product must pass; the row to keep.
+fn check_product(p: ProductForm) ! str {
+    let code = upper(trim(p.code))
+    if !re.test(code, "^[A-Z][A-Z0-9-]{1,15}$") { return err("A code of 2 to 16 letters, digits or dashes, like SAL-12") }
+    if trim(p.name) == "" { return err("A name for the product") }
+    let min_amount = centavos(p.min_amount) ?? err("Smallest amount: pesos")?
+    let max_amount = centavos(p.max_amount) ?? err("Largest amount: pesos")?
+    if max_amount < min_amount { return err("The largest amount is below the smallest") }
+    if p.min_term < 1 || p.max_term > 120 || p.max_term < p.min_term { return err("Terms from 1 to 120 months, the longest not below the shortest") }
+    let rate = bp_of(p.rate, "Interest")?
+    let fee = bp_of(p.fee, "Service fee")?
+    let insurance = bp_of(p.insurance, "Insurance")?
+    if fee + insurance >= 10000 { return err("The fees would take the whole loan") }
+    if p.capital_multiple < 0 || p.capital_multiple > 20 { return err("A multiple of share capital and savings from 0 (none) to 20") }
+    if p.comakers < 0 || p.comakers > 3 { return err("From 0 to 3 co-makers") }
+    if p.max_active < 1 || p.max_active > 5 { return err("From 1 to 5 loans of it at once") }
+    if p.approvals < 1 || p.approvals > 9 { return err("From 1 to 9 board approvals") }
+    if p.min_months < 0 || p.min_months > 120 { return err("Months of membership: 0 to 120") }
+    { code, name: trim(p.name), description: trim(p.description), min_amount, max_amount, min_term: p.min_term, max_term: p.max_term,
+      rate_bp: rate, method: p.method, fee_bp: fee, insurance_bp: insurance, capital_multiple: p.capital_multiple,
+      min_months: p.min_months, comakers: p.comakers, max_active: p.max_active, salary_only: p.salary_only ? 1 : 0, approvals: p.approvals }
+}
+
+// Saves a draft: a new product, or one not yet put to the board.
+server fn save_product(id: int?, p: ProductForm) ! str with db, time {
+    let u = acting_as(["manager"])?
+    let v = check_product(p)?
+    if id == null {
+        if db.one("select 1 from products where code = ?", v.code) != null { return err(`There is a product ${v.code} already`) }
+        let row = db.one(sql`insert into products (code, name, description, min_amount, max_amount, min_term, max_term, rate_bp, method, fee_bp,
+                             insurance_bp, capital_multiple, min_months, comakers, max_active, salary_only, approvals, designed_by)
+                             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id`,
+            v.code, v.name, v.description, v.min_amount, v.max_amount, v.min_term, v.max_term, v.rate_bp, v.method, v.fee_bp,
+            v.insurance_bp, v.capital_multiple, v.min_months, v.comakers, v.max_active, v.salary_only, v.approvals, u.id)
+        audit(u.id, "design product", v.code)
+        return row.id
+    }
+    let cur = db.one("select status, code from products where id = ?", id) ?? err("No such product")?
+    if cur.status != "draft" { return err("Only a draft can be changed: this one is " + cur.status) }
+    if v.code != cur.code && db.one("select 1 from products where code = ? and id != ?", v.code, id) != null { return err(`There is a product ${v.code} already`) }
+    db.exec(sql`update products set code = ?, name = ?, description = ?, min_amount = ?, max_amount = ?, min_term = ?, max_term = ?, rate_bp = ?,
+                method = ?, fee_bp = ?, insurance_bp = ?, capital_multiple = ?, min_months = ?, comakers = ?, max_active = ?, salary_only = ?,
+                approvals = ? where id = ?`,
+        v.code, v.name, v.description, v.min_amount, v.max_amount, v.min_term, v.max_term, v.rate_bp, v.method, v.fee_bp, v.insurance_bp,
+        v.capital_multiple, v.min_months, v.comakers, v.max_active, v.salary_only, v.approvals, id)
+    id
+}
+
+server fn propose_product(id: int) ! str with db, time {
+    let u = acting_as(["manager"])?
+    let r = db.exec("update products set status = 'proposed', proposed_at = ? where id = ? and status = 'draft'", now(), id)
+    if r.changes == 0 { return err("Only a draft is put to the board") }
+    db.exec("delete from product_votes where product_id = ?", id)
+    audit(u.id, "propose product", str(id))
+    publish(BOARD)
+    true
+}
+
+server fn retire_product(id: int) ! str with db, time {
+    let u = acting_as(["manager"])?
+    let r = db.exec("update products set status = 'retired' where id = ? and status = 'active'", id)
+    if r.changes == 0 { return err("Only an offered product is retired") }
+    audit(u.id, "retire product", str(id))
+    publish(BOARD)
+    true
+}
+
+fn directors() -> int with db = db.one("select count(*) as n from users where role = 'bod'").n
+
+// A director's vote on a product put to the board. Enough approvals offer it;
+// enough rejections that it can no longer get them send it back as a draft.
+server fn vote_product(id: int, vote: "approve" | "reject", comment: str = "") ! str with db, time {
+    let u = acting_as(["bod"])?
+    if vote == "reject" && trim(comment) == "" { return err("Say why, for the manager") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let p = db.one("select * from products where id = ? and status = 'proposed'", id) ?? err("That product is not before the board")?
+        db.exec("insert into product_votes (product_id, director_id, vote, comment, at) values (?, ?, ?, ?, ?) on conflict (product_id, director_id) do update set vote = excluded.vote, comment = excluded.comment, at = excluded.at",
+            id, u.id, vote, trim(comment), now())
+        let t = db.one("select sum(vote = 'approve') as yes, sum(vote = 'reject') as no from product_votes where product_id = ?", id)
+        let outcome = if t.yes >= p.approvals {
+            db.exec("update products set status = 'active', decided_at = ? where id = ?", now(), id)
+            "active"
+        } else if directors() - t.no < p.approvals {
+            db.exec("update products set status = 'draft', decided_at = ? where id = ?", now(), id)
+            "draft"
+        } else {
+            "proposed"
+        }
+        audit(u.id, `vote product ${vote}`, p.code)
+        publish(BOARD)
+        outcome
+    })
+}
+
+fn product_votes(id: int) with db =
+    db.query("select v.*, u.name from product_votes v join users u on u.id = v.director_id where v.product_id = ? order by v.at", id)
