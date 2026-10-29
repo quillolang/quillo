@@ -1,0 +1,14 @@
+// Q-092 A file that does not parse makes `quillo check` warn about every class it writes ("`.grid` is styled here, but nothing in the program writes it"): 17 such warnings beside the one parse error in Quillo Shifts
+// mode: check
+// open-when: `.grid` is styled here
+// fixed-when: keyword
+// From FEEDBACK13.md §Q-092 (found on add81dc).
+
+use "grid.qwe"
+
+let SHEET = css`
+  .grid { border-collapse: collapse }
+  .grid td.short { color: red }
+`
+
+route GET / = <html><head><style>{SHEET}</style></head><body><Grid mode="week"/></body></html>

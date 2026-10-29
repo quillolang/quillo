@@ -1,0 +1,48 @@
+// Signing in with an employee number, sessions kept in the database, and who
+// may see what: operators their own roster, supervisors their lines,
+// managers everything.
+
+let SESSION_DAYS = 14
+let DAY_MS = 86400000
+
+fn user_of_session(sid) with db, time {
+    if sid == null { return null }
+    db.one(sql`select u.id, u.emp_no, u.name, u.role, u.hue from sessions s join users u on u.id = s.user_id
+               where s.id = ? and s.expires > ?`, sid, now())
+}
+
+fn me() with db, time = user_of_session(session().sid)
+
+// For loaders: who is asking, without following the sessions table (every
+// sign-in would wake every page otherwise).
+fn viewer() with db, time = unwatched(() => me())
+
+fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+fn home_of(role: str) -> str = match role { "manager" => "/manpower", "supervisor" => "/team", _ => "/me" }
+
+fn sign_in(emp_no: str, password: str) ! str with db, time, random {
+    let u = db.one("select id, password_hash from users where emp_no = ?", trim(emp_no))
+    let hash = u.password_hash ?? crypto.hash_password("nobody's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong employee number or password") }
+    let sid = crypto.token()
+    db.exec("insert into sessions (id, user_id, expires) values (?, ?, ?)", sid, u.id, now() + SESSION_DAYS * DAY_MS)
+    set_session({ sid }, { max_age: SESSION_DAYS * 86400 })
+    u.id
+}
+
+fn sign_out() with db {
+    let sid = session().sid
+    if sid != null { db.exec("delete from sessions where id = ?", sid) }
+    end_session()
+}
+
+fn clear_sessions() with db, time = db.exec("delete from sessions where expires < ?", now())
+
+// For server fns: the caller, or the error a page shows.
+fn acting() ! str with db, time = me() ?? err("Sign in first")
+
+fn may_see_line(u, line_id: int) -> bool with db =
+    u.role == "manager" || (u.role == "supervisor" && db.one("select 1 from supervises where user_id = ? and line_id = ?", u.id, line_id) != null)

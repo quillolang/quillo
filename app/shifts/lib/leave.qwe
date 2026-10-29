@@ -1,0 +1,162 @@
+// Leave: an operator asks, the supervisor of their line approves or rejects
+// it, and an approval may not take a shift below the line's minimum unless
+// the supervisor says why. Rest days inside a leave are not leave.
+
+type LeaveRequest = {
+    kind: "annual" | "sick" | "unpaid",
+    start_day: str,
+    end_day: str,
+    note: str = "",
+}
+
+let MAX_LEAVE_DAYS = 31
+let SICK_BACK_DAYS = 7
+
+fn factory_today() -> str with time = date.today(FACTORY_TZ)
+
+fn year_of(day: str) -> str = slice(day, 0, 4)
+
+// Annual leave taken or asked for in a year, in shifts, worked out again from
+// the crews the operator is in now (a move to another crew changes which
+// days were working days).
+fn annual_used(user_id: int, year: str, spans: list) -> int with db =
+    db.query(sql`select start_day, end_day from leaves where user_id = ? and kind = 'annual'
+                 and status in ('pending', 'approved') and start_day <= ? and end_day >= ?`,
+        user_id, `${year}-12-31`, `${year}-01-01`)
+        | map((l) => working_days(spans, l.start_day, l.end_day) | filter((d) => year_of(d) == year) | len)
+        | sum()
+
+fn balance(user_id: int) with db, time {
+    let u = db.one("select annual_days from users where id = ?", user_id)
+    let spans = spans_of(user_id)
+    let year = year_of(factory_today())
+    let used = annual_used(user_id, year, spans)
+    { year, allowed: u.annual_days, used, left: u.annual_days - used }
+}
+
+// The checks a request must pass before it is saved; the shifts it costs.
+fn check_request(u, r: LeaveRequest) -> int ! str with db, time {
+    if !is_day(r.start_day) || !is_day(r.end_day) { return err("Pick the first and last day") }
+    if r.end_day < r.start_day { return err("The last day comes before the first") }
+    if date.days_between(r.start_day, r.end_day) + 1 > MAX_LEAVE_DAYS { return err(`At most ${MAX_LEAVE_DAYS} days in one request`) }
+    if len(r.note) > 500 { return err("Keep the note under 500 characters") }
+    let today = factory_today()
+    if r.kind == "sick" {
+        if r.start_day < date.add_days(today, -SICK_BACK_DAYS) { return err(`Sick leave goes back at most ${SICK_BACK_DAYS} days`) }
+        if r.start_day > date.add_days(today, 1) { return err("Sick leave starts today or before") }
+    } else if r.start_day <= today {
+        return err("Ask for annual and unpaid leave from tomorrow on")
+    }
+    let spans = spans_of(u.id)
+    let days = working_days(spans, r.start_day, r.end_day)
+    if len(days) == 0 { return err("Those are all rest days: there is nothing to take off") }
+    let clash = db.one(sql`select start_day, end_day, status from leaves where user_id = ? and status in ('pending', 'approved')
+                           and start_day <= ? and end_day >= ? limit 1`, u.id, r.end_day, r.start_day)
+    if clash != null { return err(`You already have leave ${clash.status == "pending" ? "asked for" : "approved"} from ${clash.start_day} to ${clash.end_day}`) }
+    if r.kind == "annual" {
+        let allowed = db.one("select annual_days from users where id = ?", u.id).annual_days
+        for year in unique(days | map(year_of)) {
+            let more = days | filter((d) => year_of(d) == year) | len
+            let used = annual_used(u.id, year, spans)
+            if used + more > allowed {
+                return err(`That is ${more} shifts of ${year}'s annual leave, and ${allowed - used} are left`)
+            }
+        }
+    }
+    len(days)
+}
+
+server fn apply_leave(r: LeaveRequest) ! str with db, time {
+    let u = acting()?
+    if u.role != "operator" { return err("Only operators ask for leave here") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let shifts = check_request(u, r)?
+        let row = db.one(sql`insert into leaves (user_id, kind, start_day, end_day, shifts, note, created)
+                             values (?, ?, ?, ?, ?, ?, ?) returning id`,
+            u.id, r.kind, r.start_day, r.end_day, shifts, trim(r.note), now())?
+        publish(leave_topic(u.id))
+        row.id
+    })
+}
+
+server fn cancel_leave(id: int) ! str with db, time {
+    let u = acting()?
+    let l = db.one("select * from leaves where id = ? and user_id = ?", id, u.id) ?? return err("No such request")
+    if l.status == "approved" && l.start_day <= factory_today() { return err("That leave has started: ask your supervisor") }
+    if l.status != "pending" && l.status != "approved" { return err(`It is ${l.status} already`) }
+    db.exec("update leaves set status = 'cancelled', decided_at = ? where id = ?", now(), id)
+    publish(leave_topic(u.id))
+    true
+}
+
+// What approving a request would leave each of its shifts with.
+fn impact(l) with db {
+    let spans = spans_of(l.user_id)
+    working_days(spans, l.start_day, l.end_day) | map((day) => {
+        let s = span_on(spans, day)
+        let line = db.one("select code, min_day, min_night from lines where id = ?", s.line_id)
+        let shift = shift_of(day, s.offset)
+        let have = turning_up(s.crew_id, day, l.id) - 1
+        let min = shift == "D" ? line.min_day : line.min_night
+        { day, shift, line: line.code, crew: s.letter, have, min, short: have < min }
+    })
+}
+
+server fn decide_leave(id: int, approve: bool, reason: str, force: bool = false) ! str with db, time {
+    let u = acting()?
+    if u.role == "operator" { return err("Only supervisors and managers decide leave") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let l = db.one("select * from leaves where id = ?", id) ?? return err("No such request")
+        if l.user_id == u.id { return err("Someone else decides your own leave") }
+        let s = span_on(spans_of(l.user_id), l.start_day)
+        if s == null || !may_see_line(u, s.line_id) { return err("That operator is not on one of your lines") }
+        if l.status != "pending" { return err(`It was ${l.status} already`) }
+        if approve {
+            let short = impact(l) | filter((x) => x.short)
+            if len(short) > 0 && !(force && trim(reason) != "") {
+                return err(`It leaves ${join(short | map((x) => `${x.day} ${x.shift} (${x.have} of ${x.min})`), ", ")} short: give a reason to approve anyway`)
+            }
+        } else if trim(reason) == "" {
+            return err("Say why it is rejected")
+        }
+        db.exec("update leaves set status = ?, decided_by = ?, decided_at = ?, reason = ? where id = ?",
+            approve ? "approved" : "rejected", u.id, now(), trim(reason), id)?
+        publish(leave_topic(l.user_id))
+        true
+    })
+}
+
+// ---- for pages ----------------------------------------------------------
+
+// An operator's own leave follows a topic of theirs, which every write to
+// their leave publishes: a request anywhere else wakes no other operator's page.
+fn leave_topic(user_id: int) -> str = `leave:${user_id}`
+
+server fn my_leaves() with db, time {
+    let u = viewer() ?? return []
+    watch(leave_topic(u.id))
+    unwatched(() => db.query(sql`select l.id, l.kind, l.start_day, l.end_day, l.shifts, l.note, l.status, l.reason, d.name as decided_by
+                 from leaves l left join users d on d.id = l.decided_by
+                 where l.user_id = ? order by l.start_day desc limit 50`, u.id))
+}
+
+server fn my_balance() with db, time {
+    let u = viewer() ?? return null
+    watch(leave_topic(u.id))
+    unwatched(() => balance(u.id))
+}
+
+// The requests a supervisor (or a manager) has to decide, with what each
+// would do to its shifts.
+server fn pending_for_me() with db, time {
+    let u = viewer() ?? return []
+    if u.role == "operator" { return [] }
+    let ids = lines_of(u) | map((l) => l.id)
+    db.query(sql`select l.*, u.name, u.emp_no from leaves l join users u on u.id = l.user_id
+                 where l.status = 'pending' order by l.start_day, l.created`)
+        | filter((l) => {
+            let s = span_on(spans_of(l.user_id), l.start_day)
+            s != null && contains(ids, s.line_id)
+        })
+        | map((l) => merge(l, { impact: impact(l) }))
+}

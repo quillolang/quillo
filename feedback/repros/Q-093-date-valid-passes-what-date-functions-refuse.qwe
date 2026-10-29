@@ -1,0 +1,9 @@
+// Q-093 `date.valid` passes a date-time that the date functions then refuse with a runtime error (a 500, not an error value), and a record cannot say a field is a date: text from a page checked with `date.valid` still ends a request
+// mode: serve
+// get: /next?d=2026-11-20
+// get: /next?d=2026-11-20T08:00:00Z
+// open-when: 500
+// fixed-when: T08:00:00Z -> 400
+// From FEEDBACK13.md §Q-093 (found on add81dc).
+
+route GET /next ? { d: str } = date.valid(d) ? date.add_days(d, 1) : respond(400, "not a date")

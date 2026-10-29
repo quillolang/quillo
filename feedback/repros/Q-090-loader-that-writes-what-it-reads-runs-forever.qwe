@@ -1,0 +1,27 @@
+// Q-090 A live loader that writes a table it reads (the guide's own advice: mark messages read in the loader) wakes itself and runs again for ever, thousands of times a second, though its update changes no row after the first: the page looks right and nothing says so
+// mode: browser
+// probe: await quillo.server.send("hello"); await new Promise((r) => setTimeout(r, 1500)); let a = (await (await fetch("/runs")).json()).n; await new Promise((r) => setTimeout(r, 2000)); let b = (await (await fetch("/runs")).json()).n; return { per_second: Math.round((b - a) / 2), forever: b - a > 10 }
+// open-when: "forever": true
+// fixed-when: "forever": false
+// From FEEDBACK13.md §Q-090 (found on add81dc). Also a loader that assigns a global it reads.
+
+db.open(":memory:")
+db.exec("create table messages (id integer primary key, text text, seen int not null default 0)")
+db.exec("create table runs (n int)")
+db.exec("insert into runs values (0)")
+
+server fn inbox() {
+    unwatched(() => db.exec("update runs set n = n + 1"))
+    db.exec("update messages set seen = 1 where seen = 0")      // changes 0 rows from the second run on
+    db.query("select id, text from messages")
+}
+
+server fn send(text: str) = db.exec("insert into messages (text) values (?)", text)
+
+component Inbox() {
+    state msgs = live(inbox)
+    <ul>{for m in msgs => <li key={m.id}>{m.text}</li>}</ul>
+}
+
+route GET / = <html><body><Inbox/></body></html>
+route GET /runs = db.one("select n from runs")

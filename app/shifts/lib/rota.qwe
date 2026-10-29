@@ -1,0 +1,57 @@
+// The rotation: which crew works which shift on which day, and how long a
+// shift lasts. Plain functions on dates, used on the server and in components
+// alike (the operator's calendar and the leave form work them out in the
+// browser, with the same answers).
+
+// Six days: two day shifts, two nights, two days off. Crew A starts at 0,
+// B at 2 and C at 4, so each day has one crew on days and one on nights.
+let PATTERN = ["D", "D", "N", "N", "R", "R"]
+let EPOCH = "2026-01-05"                  // day 0 of the rotation, a Monday
+let SHIFT_NAMES = { D: "Day", N: "Night", R: "Rest" }
+let FACTORY_TZ = env("PUBLIC_FACTORY_TZ", "Europe/Berlin")
+
+// The remainder that is never negative: Quillo's `%` keeps the sign of the
+// left side, as JavaScript's does, and days before EPOCH count down from 0.
+fn mod(n: int, m: int) -> int = ((n % m) + m) % m
+
+fn cycle_day(day: str, offset: int) -> int = mod(date.days_between(EPOCH, day) - offset, 6)
+
+// "D", "N" or "R": what a crew with this offset does on a day.
+fn shift_of(day: str, offset: int) -> str = PATTERN[cycle_day(day, offset)]
+
+fn days_from(start: str, n: int) -> list<str> = for i in 0..n => date.add_days(start, i)
+
+fn days_span(a: str, b: str) -> list<str> = b < a ? [] : days_from(a, date.days_between(a, b) + 1)
+
+// A day of the form YYYY-MM-DD that is a real date. `date.valid` also takes a
+// date-time, and the other date functions fail (not an error value) on
+// anything else, so text from a form is checked here first.
+fn is_day(s) -> bool = type_of(s) == "str" && re.test(s, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(s)
+
+// Which crew offset someone has on a day, from their memberships
+// ({ offset, from_day, to_day }), or null when they are in no crew then.
+fn offset_on(spans: list, day: str) {
+    let m = spans | find((m) => m.from_day <= day && (m.to_day == null || m.to_day >= day))
+    m == null ? null : m.offset
+}
+
+// The days from start to end that someone works: what a leave over them costs.
+fn working_days(spans: list, start: str, end: str) -> list<str> =
+    days_span(start, end) | filter((d) => {
+        let o = offset_on(spans, d)
+        o != null && shift_of(d, o) != "R"
+    })
+
+// A shift's start and end in the factory's zone, and its hours: a night
+// when the clocks change is 11 or 13 hours long.
+fn shift_span(day: str, s: str, tz: str = FACTORY_TZ) {
+    let from = s == "D" ? "07:00" : "19:00"
+    let to = s == "D" ? "19:00" : "07:00"
+    let start = date.at(day, from, tz)
+    let end = date.at(s == "N" ? date.add_days(day, 1) : day, to, tz)
+    { start, end, hours: (date.ms(end) - date.ms(start)) / 3600000 }
+}
+
+fn day_label(day: str) -> str = date.format(day, "ddd D MMM")
+
+fn month_of(day: str) -> str = slice(day, 0, 7)

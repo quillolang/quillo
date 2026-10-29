@@ -1,0 +1,12 @@
+// Q-089 Served over plain HTTP at an address other than localhost (a factory's kiosks at http://10.0.0.5:8080), signing in never sticks: without --watch the session cookie is `__Host-...; Secure`, which browsers take only over HTTPS or from localhost, and nothing says so
+// mode: script
+// script: steps.sh
+// open-when: dropped silently
+// fixed-when: told
+// From FEEDBACK13.md §Q-089 (found on add81dc).
+
+route POST /login {
+    set_session({ user: 1 })
+    redirect("/me")
+}
+route GET /me = session().user == null ? redirect("/login") : "signed in"

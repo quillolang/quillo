@@ -1,0 +1,49 @@
+// A supervisor's page: the requests waiting on their lines, each with the
+// shifts it would take and how many the crew would have left, and the next
+// week of their lines.
+
+component Decision(item) {
+    state reason = ""
+    state force = false
+    state problem = null
+    state busy = false
+    let short = item.impact | filter((x) => x.short)
+    let act = (approve: bool) => {
+        busy = true
+        let r = decide_leave(item.id, approve, reason, force)
+        busy = false
+        problem = is_err(r) ? r.error : null
+    }
+    <li.request data-id={item.id}>
+        <div.head>
+            <b>{item.name}</b> <small>{item.emp_no}</small>
+            <span.kind>{item.kind}</span>
+            <span>{item.start_day == item.end_day ? day_label(item.start_day) : `${day_label(item.start_day)} – ${day_label(item.end_day)}`}</span>
+            <span>{item.shifts} {item.shifts == 1 ? "shift" : "shifts"}</span>
+        </div>
+        {item.note != "" && <p.note>{item.note}</p>}
+        <ul.impact>
+            {for x in item.impact =>
+                <li key={x.day} class={x.short ? "short" : ""}>
+                    {day_label(x.day)} <ShiftTag s={x.shift}/> {x.line}{x.crew}: {x.have} of {x.min}
+                </li>}
+        </ul>
+        <div.row>
+            <input placeholder={len(short) > 0 ? "Why approve it anyway, or why not" : "Reason (needed to reject)"} bind:value={reason} aria-label="Reason"/>
+            {len(short) > 0 && <label.check><input type="checkbox" bind:checked={force}/> approve below the minimum</label>}
+            <button.primary disabled={busy} @click={() => act(true)}>Approve</button>
+            <button.ghost disabled={busy} @click={() => act(false)}>Reject</button>
+        </div>
+        <Problem text={problem}/>
+    </li>
+}
+
+component Pending() {
+    state items = live(pending_for_me)
+    <section.card>
+        <h2>Waiting for a decision <span.count>{len(items)}</span></h2>
+        {len(items) == 0
+            ? <p.empty>Nothing to decide.</p>
+            : <ul.requests>{for i in items => <Decision key={i.id} item={i}/>}</ul>}
+    </section>
+}

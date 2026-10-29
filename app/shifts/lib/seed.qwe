@@ -1,0 +1,74 @@
+// A factory to try it on, made when the database is empty: 24 lines in four
+// areas, three crews each of 4 to 10 operators (about 500 people), eight
+// supervisors with three lines each, a manager, leave already asked for and
+// decided around today, and a few operators moving crews in two weeks.
+//
+// Everyone's password is "shift123": M01 is the manager, S01 to S08 the
+// supervisors, E0001 on the operators.
+
+let AREAS = ["Press", "Weld", "Paint", "Assembly"]
+let FIRST = ["Aiko", "Ben", "Chen", "Dara", "Emil", "Farah", "Goran", "Hana", "Ivan", "Jia", "Kofi", "Lena",
+             "Malik", "Nora", "Omar", "Priya", "Quinn", "Rosa", "Sami", "Tariq", "Uma", "Viktor", "Wei", "Yara", "Zane"]
+let LAST = ["Abe", "Bauer", "Costa", "Dubois", "Eze", "Fischer", "Garcia", "Haddad", "Ito", "Jensen", "Kim",
+            "Lopez", "Meyer", "Nowak", "Okafor", "Park", "Rossi", "Silva", "Tan", "Weber"]
+
+fn seed() with db, time, random {
+    if db.one("select count(*) as n from users").n > 0 { return null }
+    let hash = crypto.hash_password("shift123")
+    let today = factory_today()
+    let since = date.add_days(EPOCH, -30)
+    db.transaction(() => {
+        db.exec("insert into users (emp_no, name, role, password_hash, hue) values ('M01', 'Marta Lindqvist', 'manager', ?, 20)", hash)
+        for s in 1..9 {
+            let no = `S0${s}`
+            db.exec("insert into users (emp_no, name, role, password_hash, hue) values (?, ?, 'supervisor', ?, ?)",
+                no, `${FIRST[s * 3 % 25]} ${LAST[s * 7 % 20]}`, hash, s * 40 % 360)
+        }
+        let emp = 0
+        for i in 1..25 {
+            let code = i < 10 ? `L0${i}` : `L${i}`
+            let area = AREAS[floor((i - 1) / 6)]
+            // The minimum is one less than the smallest crew (at least 3), so
+            // one leave fits and two in that crew on one shift may not.
+            let sizes = for k in 0..3 => 4 + (i * 3 + k * 5) % 7
+            let min_day = max([3, min(sizes) - 1])
+            let line = db.one("insert into lines (code, name, area, min_day, min_night) values (?, ?, ?, ?, ?) returning id",
+                code, `${area} ${code}`, area, min_day, max([3, min_day - 1]))
+            let sup = db.one("select id from users where emp_no = ?", `S0${floor((i - 1) / 3) + 1}`)
+            db.exec("insert into supervises (user_id, line_id) values (?, ?)", sup.id, line.id)
+            for [k, letter] in enumerate(["A", "B", "C"]) {
+                let crew = db.one("insert into crews (line_id, letter, offset) values (?, ?, ?) returning id", line.id, letter, k * 2)
+                let size = sizes[k]
+                for _j in 0..size {
+                    emp += 1
+                    let no = `E${slice(str(10000 + emp), 1, 5)}`
+                    let name = `${FIRST[emp % 25]} ${LAST[(emp * 7) % 20]}`
+                    let u = db.one("insert into users (emp_no, name, role, password_hash, hue) values (?, ?, 'operator', ?, ?) returning id",
+                        no, name, hash, emp * 37 % 360)
+                    db.exec("insert into members (user_id, crew_id, from_day) values (?, ?, ?)", u.id, crew.id, since)
+                }
+            }
+        }
+        // Leave around today: some decided, some waiting.
+        let ops = db.query("select id from users where role = 'operator' order by id")
+        for [n, o] in enumerate(ops) {
+            if n % 9 == 0 {
+                let start = date.add_days(today, 2 + n % 20)
+                let end = date.add_days(start, n % 5)
+                let status = n % 2 == 0 ? "approved" : "pending"
+                let days = working_days(spans_of(o.id), start, end)
+                if len(days) > 0 {
+                    db.exec(sql`insert into leaves (user_id, kind, start_day, end_day, shifts, status, created)
+                                values (?, 'annual', ?, ?, ?, ?, ?)`, o.id, start, end, len(days), status, now())
+                }
+            }
+        }
+        // Three operators move to crew B of their line in two weeks.
+        let move_on = date.add_days(today, 14)
+        for o in db.query("select m.id, m.user_id, c.line_id from members m join crews c on c.id = m.crew_id where c.letter = 'A' order by m.id limit 3") {
+            let b = db.one("select id from crews where line_id = ? and letter = 'B'", o.line_id)
+            db.exec("update members set to_day = ? where id = ?", date.add_days(move_on, -1), o.id)
+            db.exec("insert into members (user_id, crew_id, from_day) values (?, ?, ?)", o.user_id, b.id, move_on)
+        }
+    })
+}

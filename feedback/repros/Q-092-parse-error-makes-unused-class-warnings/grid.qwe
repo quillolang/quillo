@@ -1,0 +1,4 @@
+// `view` is a keyword: this file does not parse, so its classes are not seen.
+fn range_of(view: str) = view
+
+view Grid(mode: str) = <table.grid><tr><td.short>{range_of(mode)}</td></tr></table>

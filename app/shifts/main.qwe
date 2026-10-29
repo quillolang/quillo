@@ -1,0 +1,103 @@
+// Quillo Shifts: two-shift scheduling for a factory of 24 lines. Each line
+// has three crews of 4 to 10 operators that rotate through two day shifts,
+// two nights and two days off; operators ask for leave, their line's
+// supervisor approves it (not below the line's minimum without a reason),
+// and the manager sees the manpower of every line for the next week or month,
+// live.
+//
+//   quillo run app/shifts/main.qwe --watch          then open http://127.0.0.1:8080
+//   quillo check app/shifts/main.qwe
+//
+// The database is made and filled with a factory the first time (lib/seed.qwe).
+// SHIFTS_DB picks the file; PUBLIC_FACTORY_TZ the factory's time zone.
+//
+//   lib/rota.qwe        the rotation and shift times (server and browser)
+//   lib/auth.qwe        signing in, sessions, who may see which line
+//   lib/roster.qwe      crews over time, and the manpower grid
+//   lib/leave.qwe       asking for leave, deciding it, balances
+//   lib/seed.qwe        the demo factory
+//   ui/page.qwe         the frame, and signing in
+//   ui/operator.qwe     <OperatorHome>: calendar, leave form, requests
+//   ui/team.qwe         <Pending>: the supervisor's decisions
+//   ui/manpower.qwe     <Manpower>: the grid
+
+db.open(env("SHIFTS_DB", "shifts.db"))
+db.migrate("migrations")
+
+use "lib/rota.qwe"
+use "lib/auth.qwe"
+use "lib/roster.qwe"
+use "lib/leave.qwe"
+use "lib/seed.qwe"
+use "ui/page.qwe"
+use "ui/operator.qwe"
+use "ui/team.qwe"
+use "ui/manpower.qwe"
+
+seed()
+schedule("1h", clear_sessions)
+
+route GET / {
+    let u = me() ?? reply 303 redirect("/login")
+    redirect(home_of(u.role))
+}
+
+route GET /login ? { next: str = "/" } = <LoginPage next={safe_next(next)} problem={null}/>
+
+route POST /login {
+    let f = request.form
+    let r = sign_in(f.emp_no ?? "", f.password ?? "")
+    if is_err(r) { reply 401 <LoginPage next={safe_next(f.next)} problem={r.error}/> }
+    let u = db.one("select role from users where id = ?", r)
+    redirect(f.next != null && f.next != "/" ? safe_next(f.next) : home_of(u.role))
+}
+
+route POST /logout {
+    sign_out()
+    redirect("/login")
+}
+
+route GET /me {
+    let u = signed_in("/me")
+    if u.role != "operator" { return redirect(home_of(u.role)) }
+    <Page title="My roster" me={u}>
+        <OperatorHome spans={spans_of(u.id)} today={factory_today()}/>
+    </Page>
+}
+
+route GET /team {
+    let u = signed_in("/team")
+    if u.role == "operator" { reply 403 <Page title="Not yours" me={u}><p>Only supervisors and managers decide leave.</p></Page> }
+    <Page title="Leave to decide" me={u}>
+        <p.lead>Your lines: {join(lines_of(u) | map((l) => l.code), ", ")}</p>
+        <Pending/>
+    </Page>
+}
+
+route GET /manpower {
+    let u = signed_in("/manpower")
+    if u.role == "operator" { reply 403 <Page title="Not yours" me={u}><p>Only supervisors and managers see manpower.</p></Page> }
+    <Page title="Manpower" me={u}>
+        <Manpower today={factory_today()}/>
+    </Page>
+}
+
+// The grid as CSV, one row per line, day and shift.
+route GET /manpower.csv ? { from: str, to: str } {
+    let _u = signed_in("/manpower")
+    let g = load_manpower(from, to)
+    if is_err(g) { reply 400 g.error }
+    stream((send) => {
+        send("line,day,shift,crew,members,on_leave,asked,turning_up,minimum,short\n")
+        for l in g.lines {
+            for c in l.cells {
+                for s in ["D", "N"] {
+                    let x = c[s]
+                    send(`${l.code},${c.day},${s},${x.crew},${x.members},${x.off},${x.pending},${x.have},${x.min},${x.short}\n`)
+                }
+            }
+        }
+    }, { type: "text/csv; charset=utf-8", headers: { "content-disposition": `attachment; filename="manpower-${from}-${to}.csv"` } })
+}
+
+route GET /static/*path = file("public/" + path)

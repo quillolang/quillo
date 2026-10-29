@@ -1,0 +1,65 @@
+// Who is in which crew on a day, and how many of a crew turn up: its members
+// that day less those on approved leave. The manpower grid works this out for
+// every line, day and shift at once, from four queries.
+
+// Someone's crews over time, with each crew's offset and line.
+fn spans_of(user_id: int) with db =
+    db.query(sql`select m.from_day, m.to_day, c.offset, c.letter, c.id as crew_id, l.id as line_id, l.code as line_code
+                 from members m join crews c on c.id = m.crew_id join lines l on l.id = c.line_id
+                 where m.user_id = ? order by m.from_day`, user_id)
+
+fn span_on(spans: list, day: str) = spans | find((m) => m.from_day <= day && (m.to_day == null || m.to_day >= day))
+
+fn lines_of(u) with db =
+    u.role == "manager"
+        ? db.query("select * from lines order by code")
+        : db.query("select l.* from lines l join supervises s on s.line_id = l.id where s.user_id = ? order by l.code", u.id)
+
+fn active_on(m, day: str) -> bool = m.from_day <= day && (m.to_day == null || m.to_day >= day)
+
+fn covers(l, day: str) -> bool = l.start_day <= day && l.end_day >= day
+
+// The grid: for each line, each day from `from` to `to`, and each shift, the
+// crew on it, how many it has, how many are off on approved leave, how many
+// more have asked, and the line's minimum. `line_ids` null means every line.
+fn manpower(from: str, to: str, line_ids) with db {
+    let lines = db.query("select * from lines order by code")
+        | filter((l) => line_ids == null || contains(line_ids, l.id))
+    let crews = db.query("select * from crews order by line_id, letter")
+    let members = db.query("select user_id, crew_id, from_day, to_day from members where from_day <= ? and (to_day is null or to_day >= ?)", to, from)
+    let leaves = db.query(sql`select id, user_id, start_day, end_day, status from leaves
+                              where status in ('approved', 'pending') and start_day <= ? and end_day >= ?`, to, from)
+    let by_crew = group_by(members, (m) => m.crew_id)
+    let by_user = group_by(leaves, (l) => l.user_id)
+    let days = days_span(from, to)
+    let crews_of = group_by(crews, (c) => c.line_id)
+    let cell = (line, crew, day: str, min: int) => {
+        let here = (by_crew[crew.id] ?? []) | filter((m) => active_on(m, day))
+        let off = here | filter((m) => (by_user[m.user_id] ?? []) | any((l) => l.status == "approved" && covers(l, day)))
+        let asked = here | filter((m) => (by_user[m.user_id] ?? []) | any((l) => l.status == "pending" && covers(l, day)))
+        let have = len(here) - len(off)
+        { crew: crew.letter, members: len(here), off: len(off), pending: len(asked), have, min, short: have < min }
+    }
+    let rows = for line in lines {
+        let cs = crews_of[line.id] ?? []
+        let cells = for day in days {
+            let on = (s) => cs | find((c) => shift_of(day, c.offset) == s)
+            let d = on("D")
+            let n = on("N")
+            { day, D: cell(line, d, day, line.min_day), N: cell(line, n, day, line.min_night) }
+        }
+        { id: line.id, code: line.code, name: line.name, area: line.area, cells }
+    }
+    { from, to, days, lines: rows }
+}
+
+// How many of a crew turn up on a day, not counting one leave (the one being
+// decided).
+fn turning_up(crew_id: int, day: str, except_leave: int) -> int with db {
+    let r = db.one(sql`select count(*) as n from members m
+                       where m.crew_id = ? and m.from_day <= ? and (m.to_day is null or m.to_day >= ?)
+                         and not exists (select 1 from leaves l where l.user_id = m.user_id and l.status = 'approved'
+                                         and l.start_day <= ? and l.end_day >= ? and l.id != ?)`,
+        crew_id, day, day, day, day, except_leave)
+    r.n
+}

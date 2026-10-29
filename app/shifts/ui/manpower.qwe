@@ -1,0 +1,79 @@
+// Manpower: for every line (a supervisor: theirs), each day and each shift,
+// how many operators turn up against the line's minimum, with leave approved
+// and asked for. A week or a month; it follows every decision live.
+
+server fn load_manpower(from: str, to: str) with db, time {
+    let u = viewer() ?? return err("Sign in first")
+    if u.role == "operator" { return err("Managers and supervisors only") }
+    if !is_day(from) || !is_day(to) || to < from { return err("Pick a range of days") }
+    if date.days_between(from, to) > 62 { return err("At most two months at once") }
+    let ids = u.role == "manager" ? null : lines_of(u) | map((l) => l.id)
+    manpower(from, to, ids)
+}
+
+fn next_monday(today: str) -> str = date.add_days(today, 8 - date.weekday(today))
+
+fn range_of(mode: str, start: str) {
+    match mode {
+        "month" => [start, date.end_of_month(start)]
+        _ => [start, date.add_days(start, 6)]
+    }
+}
+
+view Cell(c, s: str) =
+    <td class={`c s-${s} ${c.short ? "short" : ""} ${c.pending > 0 ? "asked" : ""}`}
+        title={`${SHIFT_NAMES[s]}, crew ${c.crew}: ${c.members} in the crew, ${c.off} on leave, ${c.pending} asked; minimum ${c.min}`}>
+        {c.have}{c.pending > 0 && <sup>{c.pending}</sup>}
+    </td>
+
+component Manpower(today: str) {
+    state mode = "week"
+    state start = next_monday(today)
+    let range = range_of(mode, start)
+    state grid = live(load_manpower, range[0], range[1])
+    let short = is_err(grid) ? [] : grid.lines | map((l) => {
+        let n = l.cells | map((c) => (c.D.short ? 1 : 0) + (c.N.short ? 1 : 0)) | sum()
+        { code: l.code, n }
+    }) | filter((x) => x.n > 0)
+    let shifts_short = short | map((x) => x.n) | sum()
+    <section.card.wide>
+        <div.bar>
+            <div.seg role="group" aria-label="Range">
+                <button class={mode == "week" && start == next_monday(today) ? "on" : ""} @click={() => { mode = "week"; start = next_monday(today) }}>Next week</button>
+                <button class={mode == "month" && start == date.start_of_month(date.add_months(today, 1)) ? "on" : ""}
+                        @click={() => { mode = "month"; start = date.start_of_month(date.add_months(today, 1)) }}>Next month</button>
+                <button class={mode == "month" && start == date.start_of_month(today) ? "on" : ""}
+                        @click={() => { mode = "month"; start = date.start_of_month(today) }}>This month</button>
+            </div>
+            <button.ghost aria-label="Earlier" @click={() => { start = mode == "month" ? date.add_months(start, -1) : date.add_days(start, -7) }}>‹</button>
+            <h2>{day_label(range[0])} – {day_label(range[1])}</h2>
+            <button.ghost aria-label="Later" @click={() => { start = mode == "month" ? date.add_months(start, 1) : date.add_days(start, 7) }}>›</button>
+            <span.grow/>
+            <a.btn.ghost href={`/manpower.csv?from=${range[0]}&to=${range[1]}`}>CSV</a>
+        </div>
+        {is_err(grid)
+            ? <Problem text={grid.error}/>
+            : <div>
+                <p.summary>{shifts_short == 0 ? "Every shift has its minimum." : `${shifts_short} shifts below the minimum, on ${len(short)} lines: ${join(short | map((x) => `${x.code} (${x.n})`), ", ")}`}</p>
+                <div.scroll>
+                    <table.grid>
+                        <thead>
+                            <tr>
+                                <th rowspan="2">Line</th>
+                                {for d in grid.days => <th key={d} colspan="2" class={date.weekday(d) >= 6 ? "we" : ""}>{date.format(d, "ddd D")}</th>}
+                            </tr>
+                            <tr>{for d in grid.days => <th key={d} colspan="2" class="dn"><span>D</span><span>N</span></th>}</tr>
+                        </thead>
+                        <tbody>
+                            {for l in grid.lines =>
+                                <tr key={l.id} data-line={l.code}>
+                                    <th title={l.name}>{l.code}</th>
+                                    {for c in l.cells => [<Cell c={c.D} s="D"/>, <Cell c={c.N} s="N"/>]}
+                                </tr>}
+                        </tbody>
+                    </table>
+                </div>
+                <p.hint>Operators turning up per shift; a small number is leave asked for and not yet decided. Red: below the line's minimum.</p>
+              </div>}
+    </section>
+}

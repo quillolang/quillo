@@ -1,0 +1,22 @@
+// Q-091 When a live loader's arguments change, its state keeps the old answer until the new one comes, and nothing tells the component it is waiting: a manager's grid titled December shows November
+// mode: browser
+// probe: let seen = []; let look = () => seen.push(document.getElementById("out").textContent); document.querySelector("button").click(); for (let i = 0; i < 30; i++) { await new Promise((r) => requestAnimationFrame(r)); look(); } return { seen: [...new Set(seen)], stale_shown: seen.includes("month 12, data for 11") }
+// open-when: "stale_shown": true
+// fixed-when: "stale_shown": false
+// From FEEDBACK13.md §Q-091 (found on add81dc). A limitation: the workaround echoes the arguments in the answer and compares.
+
+server fn load_month(m: int) {
+    sleep(300)                                  // a month of 24 lines takes a moment
+    { month: m, rows: [] }
+}
+
+component Grid() {
+    state month = 11
+    state data = live(load_month, month)
+    <div>
+        <button @click={() => { month = month + 1 }}>Later</button>
+        <p id="out">month {month}, data for {data.month}</p>
+    </div>
+}
+
+route GET / = <html><body><Grid/></body></html>
