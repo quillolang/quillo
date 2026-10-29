@@ -1,6 +1,6 @@
 [package]
 name = "quillo"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # The oldest Rust the locked dependencies build with (Cranelift's); scripts/doctor.sh checks it.
 rust-version = "1.94"

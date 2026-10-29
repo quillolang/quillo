@@ -94,7 +94,7 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
         match s {
             Stmt::Route(r) => parts.routes.push((prefix.to_string(), r)),
             Stmt::Fn(d) if d.server => parts.fns.push((prefix.to_string(), d)),
-            Stmt::Use(p, _) => collect_file(&base.join(&p), base, prefix, parts, seen, depth + 1)?,
+            Stmt::Use(p, _, _) => collect_file(&base.join(&p), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
             Stmt::Service(_, Some(p), file, _, _) => {
                 let full = base.join(&file);

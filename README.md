@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/version-0.5.0-informational.svg" alt="Version 0.5.0">
+  <img src="https://img.shields.io/badge/version-0.6.0-informational.svg" alt="Version 0.6.0">
   <img src="https://img.shields.io/badge/written_in-Rust-orange.svg" alt="Written in Rust">
 </p>
 

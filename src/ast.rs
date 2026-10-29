@@ -424,7 +424,10 @@ pub enum Stmt {
     Expr(Expr),
     Fn(Arc<FnDef>),
     Route(Arc<RouteDef>),
-    Use(String, u32),
+    /// `use "lib.qwe"` (and `use * from "..."`): every public name. With names,
+    /// `use cache_get as redis_get, cache_set from "redis.qwer"`: those only, each
+    /// under the name after `as` (a `.qwer` file's, in 0.6; branch imports).
+    Use(String, Option<Vec<(String, String)>>, u32),
     Return(Option<Expr>),
     /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
     State(String, Expr, u32),

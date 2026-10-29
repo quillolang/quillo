@@ -1447,16 +1447,18 @@ impl Interp {
                 Arc::make_mut(&mut self.routes).push(r.clone());
                 Ok(Value::Nil)
             }
-            Stmt::Use(path, line) => {
+            Stmt::Use(path, names, line) => {
                 let full = self.base_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                if !Arc::make_mut(&mut self.loaded).insert(key) {
+                // A `.qwer` file's names are defined for each `use` that takes some
+                // (its library is built and opened once); anything else runs once.
+                if !Arc::make_mut(&mut self.loaded).insert(key) && (names.is_none() || !path.ends_with(".qwer")) {
                     return Ok(Value::Nil);
                 }
                 // Rust: built, loaded, and its functions defined (see `native`).
                 if path.ends_with(".qwer") {
                     let fname = full.display().to_string();
-                    return match crate::native::use_file(self, &full, *line) {
+                    return match crate::native::use_file(self, &full, names.as_deref(), *line) {
                         Err(Ctrl::Error(e)) => Err(Ctrl::Error(e.in_file(&fname))),
                         other => other.map(|_| Value::Nil),
                     };

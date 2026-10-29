@@ -1544,10 +1544,11 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
             }
-            if let Stmt::Use(path, line) = s {
+            if let Stmt::Use(path, names, line) = s {
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                if !seen.insert(key) {
+                // A `.qwer` file's names are taken by each `use` that names some (branch imports).
+                if !seen.insert(key) && (names.is_none() || !path.ends_with(".qwer")) {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
@@ -1560,8 +1561,32 @@ impl Checker {
                             for (l, msg) in parsed.problems {
                                 self.diag_at(fname.clone(), l, Severity::Warning, msg);
                             }
-                            for e in parsed.exports {
-                                self.natives.push((fname.clone(), e));
+                            let short = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
+                            if let Some(names) = names {
+                                for (n, _) in names {
+                                    if !parsed.exports.iter().any(|e| e.name == *n) {
+                                        self.diag_at(file.clone(), *line, Severity::Error, crate::native::missing_export(&short, n, &parsed.exports));
+                                    }
+                                }
+                            }
+                            for e in parsed.exports.iter() {
+                                let taken: Vec<String> = match names {
+                                    Some(names) => names.iter().filter(|(n, _)| *n == e.name).map(|(_, a)| a.clone()).collect(),
+                                    None => vec![e.name.clone()],
+                                };
+                                for alias in taken {
+                                    // One name from two plugins: the last `use`d wins, so say so,
+                                    // and how to keep both (branch imports).
+                                    if let Some((other, _)) = self.natives.iter().find(|(f, x)| *f != fname && x.name == alias) {
+                                        let other = std::path::Path::new(&**other).file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
+                                        self.diag_at(file.clone(), *line, Severity::Warning, format!(
+                                            "`{}` comes from {} and {}: this one replaces the other; take one under another name: use {} as {}_{} from {}",
+                                            alias, other, short, alias, short.trim_end_matches(".qwer"), alias, path));
+                                    }
+                                    if !self.natives.iter().any(|(f, x)| *f == fname && x.name == alias) {
+                                        self.natives.push((fname.clone(), crate::native::Export { name: alias, ..e.clone() }));
+                                    }
+                                }
                             }
                         }
                         Err(e) => self.diag_at(file.clone(), *line, Severity::Error, format!("cannot read {}: {}", full.display(), e)),
@@ -2285,7 +2310,7 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Use(_, line) => {
+            Stmt::Use(_, _, line) => {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`use` must be at the top level");
