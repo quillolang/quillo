@@ -9,6 +9,13 @@
   one's only, and the others name the file. A program using a 4 MB component kit
   of 1,600 definitions loaded in 7 s under `--watch` and in 0.5 s now, with a
   fifth of the memory (FEEDBACK15, Q-097).
+- **A reload under `--watch` is quicker:** the program is compiled for the browser
+  once, not twice; files that did not change are not parsed again; whether the program
+  uses `db.atomic` is noted as it loads instead of searched for in a printout of it;
+  in development the whole program's bundle is made on a thread once the program is
+  up (a component that cannot run in the browser is then reported in the log right
+  after the load); and the watcher looks every 50 ms. The documentation site reloads in 0.15 s, from 0.5 s
+  (Q-098).
 - **`bind:value` with `@input`** (and `bind:checked` with `@change`) on one input: both
   run, the binding first, so the handler reads the state as typed. Before, the one
   written second took the other's place (FEEDBACK14, Q-094).
