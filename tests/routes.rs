@@ -138,6 +138,63 @@ route GET /me = request | auth.required | (r) => { ip: r.ip }
     assert_eq!((r.status, r.text().as_str()), (200, r#"{"ip":"10.0.0.1"}"#));
 }
 
+/// `routes /prefix | middleware { pattern } { ... }`: each route takes the
+/// group's prefix, its middleware (a `reply` or a response from one answers in
+/// the route's place) and its request pattern; groups nest (branch route-groups).
+#[test]
+fn route_groups_take_prefix_middleware_and_pattern() {
+    let mut it = app(
+        r#"
+let seen = []
+fn note(r) { seen = seen | push(r.path) }
+fn signed(r) = r.headers.authorization == "Bearer ok" ? r : reply 401 "sign in first"
+fn admins(r) = r.headers["x-role"] == "admin" ? null : redirect("/login")
+route GET / = "home"
+routes /admin | note | signed | admins {
+    route GET / = "admin home"
+    route GET /users = ["ana"]
+    routes /teams/:team(int) | note {
+        route GET /members = { team }
+    }
+}
+routes /api { headers: { host: "api.example.com" } } {
+    route GET /me = "the api"
+}
+route GET /api/me = "not the api's host"
+route GET /seen = seen
+let routes = 10
+fn half() { routes / 2 }
+route GET /half = half()
+"#,
+    );
+    let with = |it: &mut Interp, url: &str, hs: &[(&str, &str)]| {
+        let mut headers: Vec<(String, String)> = vec![("Host".into(), "localhost".into())];
+        headers.extend(hs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        it.handle(&HttpRequest { method: "GET".into(), url: url.into(), headers, body: vec![], remote: "127.0.0.1".into() })
+    };
+    assert_eq!(get(&mut it, "/").text(), "home");
+    assert_eq!(get(&mut it, "/admin/users").status, 401);
+    assert_eq!(with(&mut it, "/admin/users", &[("Authorization", "Bearer ok")]).status, 303);
+    let ok = [("Authorization", "Bearer ok"), ("X-Role", "admin")];
+    assert_eq!(with(&mut it, "/admin/users", &ok).text(), r#"["ana"]"#);
+    assert_eq!(with(&mut it, "/admin", &ok).text(), "admin home");
+    assert_eq!(with(&mut it, "/admin/teams/3/members", &ok).text(), r#"{"team":3}"#);
+    assert_eq!(with(&mut it, "/admin/teams/x/members", &ok).status, 404);
+    assert_eq!(get(&mut it, "/seen").text(), r#"["/admin/users","/admin/users","/admin/users","/admin","/admin/teams/3/members","/admin/teams/3/members"]"#);
+    assert_eq!(with(&mut it, "/api/me", &[]).text(), "not the api's host");
+    let api = it.handle(&HttpRequest { method: "GET".into(), url: "/api/me".into(), headers: vec![("Host".into(), "api.example.com".into())], body: vec![], remote: "127.0.0.1".into() });
+    assert_eq!(api.text(), "the api");
+    assert_eq!(get(&mut it, "/half").text(), "5");
+}
+
+#[test]
+fn route_groups_are_checked() {
+    let msg = |src: &str| Interp::new(env!("CARGO_MANIFEST_DIR")).load_source(src, "test.qwe").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(msg("fn f() {\n    routes /x {\n        route GET /a = 1\n    }\n}\n").contains("top level"));
+    assert!(msg("routes /x {\n}\n").contains("no routes"));
+    assert!(msg("routes /x {\n    let a = 1\n}\n").contains("holds `route` and `routes`"));
+}
+
 #[test]
 fn not_found_with_coalesce() {
     let mut it = app(

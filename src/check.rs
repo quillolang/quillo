@@ -645,6 +645,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("sql", "str", "str"),
     ("navigate", "str", "null"),
     ("waiting", "any", "bool"),
+    // What a `routes` group's middleware gave: a response answers (branch route-groups).
+    ("__answer", "any", "null"),
     ("publish", "any...", "null"),
     ("watch", "any...", "null"),
     ("unwatched", "fn", "any"),
@@ -2110,6 +2112,10 @@ impl Checker {
         let mut binds = Vec::new();
         if let Some(q) = &r.query {
             self.bind_pattern(q, T::of(MAP), &mut binds);
+        }
+        // A `routes` group's pattern binds as the route's own does (branch route-groups).
+        for g in &r.guards {
+            self.bind_pattern(g, T::of(MAP), &mut binds);
         }
         if let Some(b) = &r.body_pat {
             self.bind_pattern(b, T::of(MAP), &mut binds);

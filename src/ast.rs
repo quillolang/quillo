@@ -235,6 +235,9 @@ pub struct RouteDef {
     pub path: Vec<Seg>,
     pub query: Option<Pattern>,
     pub body_pat: Option<Pattern>,
+    /// The request patterns of the `routes` groups around it, outermost
+    /// first: each must match as `body_pat` does (branch route-groups).
+    pub guards: Vec<Pattern>,
     pub body: Expr,
     pub line: u32,
     /// The file it was written in, as for `FnDef::file`.
