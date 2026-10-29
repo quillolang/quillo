@@ -1113,6 +1113,10 @@ pub struct Analysis {
     /// know (file, line): perhaps it is for a newer one. Errors that name
     /// the rule broken (a keyword as a name, say) are not here.
     pub syntax_errors: Vec<(String, u32)>,
+    /// The classes the program's style sheets have rules for (name, file,
+    /// line): where an editor goes from `<span.chip>`, and what it offers
+    /// after `<span.` (branch class-links).
+    pub classes: Vec<(String, String, u32)>,
 }
 
 impl Analysis {
@@ -1227,6 +1231,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             }
             let mut order = Vec::new();
             c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
+            c.out.classes = class_rules(&order, base_dir);
             if opts.css {
                 for (file, line, msg) in unused_classes(&order, base_dir, &c.unparsed_texts) {
                     c.diag_at(file, line, Severity::Warning, msg);
@@ -4109,6 +4114,61 @@ fn called_names(e: &Expr, out: &mut Vec<String>) {
 /// public scripts, no start of a template (`card-${size}` writes any
 /// `card-...`), not set by Quillo, nor by a script a sheet names
 /// (`/* set elsewhere: leaflet- */`). Each with where it is styled.
+/// A style sheet's text as written: a string, or a template with its
+/// `${...}` as a space.
+fn sheet_text(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Lit(Lit::Str(s)) => Some(s.to_string()),
+        Expr::Template(parts) => Some(parts.iter().map(|p| if let TPart::Lit(t) = p { t.as_str() } else { " " }).collect()),
+        _ => None,
+    }
+}
+
+/// Every class a rule is written for, and where: in `css(...)`, in a
+/// component's or view's `style`, and in the CSS files under public/
+/// (branch class-links).
+fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
+    let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| {
+            if let Expr::Call(f, args, line) = e {
+                if matches!(&**f, Expr::Ident(n, _) if n == "css" || n == "__style") {
+                    if let Some(text) = args.first().and_then(sheet_text) {
+                        sheets.push((it.file.clone(), *line, text));
+                    }
+                }
+            }
+        });
+    }
+    fn css_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth < 8 {
+                css_files(&p, out, depth + 1);
+            } else if p.extension().is_some_and(|x| x == "css") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    css_files(&base.join("public"), &mut files, 0);
+    files.sort();
+    for p in files {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            sheets.push((Arc::from(p.display().to_string()), 1, text));
+        }
+    }
+    let mut out = Vec::new();
+    for (file, line, text) in &sheets {
+        for (class, k) in crate::styles::classes_in(text) {
+            out.push((class, file.to_string(), line + k));
+        }
+    }
+    out.dedup();
+    out
+}
+
 fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<str>, u32, String)> {
     let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
     let mut sheet_args: HashSet<*const Expr> = HashSet::new();
@@ -4122,12 +4182,7 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
     for it in order {
         walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| match e {
             Expr::Call(f, args, line) if matches!(&**f, Expr::Ident(n, _) if n == "css") && args.len() == 1 => {
-                let text = match &args[0] {
-                    Expr::Lit(Lit::Str(s)) => Some(s.to_string()),
-                    Expr::Template(parts) => Some(parts.iter().map(|p| if let TPart::Lit(t) = p { t.as_str() } else { " " }).collect()),
-                    _ => None,
-                };
-                if let Some(text) = text {
+                if let Some(text) = sheet_text(&args[0]) {
                     sheet_args.insert(&args[0] as *const Expr);
                     sheets.push((it.file.clone(), *line, text));
                 }

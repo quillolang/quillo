@@ -250,6 +250,57 @@ fn word_at(text: &str, line: usize, col16: usize) -> Option<(String, usize)> {
     (a < b).then(|| (chars[a..b].iter().collect(), a))
 }
 
+fn is_class_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Text before a class name that makes it one: `.` in a tag (`<span.chip`,
+/// `<a.btn.primary`), or an open `class="...` (or `class={...` with a
+/// string open in it).
+fn before_class(pre: &[char]) -> bool {
+    if pre.last() == Some(&'.') {
+        let mut i = pre.len() - 1;
+        while i > 0 && (is_class_char(pre[i - 1]) || pre[i - 1] == '.' || pre[i - 1] == '#') {
+            i -= 1;
+        }
+        return i > 0 && pre[i - 1] == '<' && pre[i].is_alphabetic();
+    }
+    let pre: String = pre.iter().collect();
+    let Some(at) = pre.rfind("class=") else { return false };
+    let rest = &pre[at + "class=".len()..];
+    if let Some(r) = rest.strip_prefix('"') {
+        return !r.contains('"');
+    }
+    rest.starts_with('{') && (rest.matches('"').count() % 2 == 1 || rest.matches('`').count() % 2 == 1)
+}
+
+/// The class name at a position (UTF-16 column) and its first column, in
+/// characters, when it is in a place that names a class.
+fn class_at(src: &str, col16: usize) -> Option<(String, usize)> {
+    let chars: Vec<char> = src.chars().collect();
+    let col = char_col(src, col16).min(chars.len());
+    let mut a = col;
+    while a > 0 && is_class_char(chars[a - 1]) {
+        a -= 1;
+    }
+    let mut b = col;
+    while b < chars.len() && is_class_char(chars[b]) {
+        b += 1;
+    }
+    (a < b && before_class(&chars[..a])).then(|| (chars[a..b].iter().collect(), a))
+}
+
+/// Where `.class` is on a line of CSS, as character columns of the name.
+fn find_class(line: &str, class: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let w: Vec<char> = class.chars().collect();
+    (0..chars.len()).find_map(|i| {
+        let end = i + 1 + w.len();
+        (chars[i] == '.' && end <= chars.len() && chars[i + 1..end] == w[..] && chars.get(end).map_or(true, |c| !is_class_char(*c)))
+            .then(|| (i + 1, end))
+    })
+}
+
 fn symbol_kind(k: SymbolKind) -> u32 {
     match k {
         SymbolKind::Function | SymbolKind::ServerFn => 12,
@@ -429,6 +480,7 @@ impl Server {
             if let Some(old) = self.docs.remove(&uri) {
                 analysis.symbols = old.analysis.symbols;
                 analysis.references = old.analysis.references;
+                analysis.classes = old.analysis.classes;
             }
         }
         self.docs.insert(uri, Doc { text, analysis });
@@ -569,6 +621,9 @@ impl Server {
     }
 
     fn definition(&self, params: &J) -> J {
+        if let Some(found) = self.class_definition(params) {
+            return found;
+        }
         let Some((_, r)) = self.reference_at(params) else { return J::Null };
         let Some((file, line)) = r.def else { return J::Null };
         let (uri, _, _) = Self::position(params);
@@ -589,6 +644,35 @@ impl Server {
         })
     }
 
+    /// A class in markup (`<span.chip>`, `class="chip"`): the rules the
+    /// program's style sheets have for it (branch class-links).
+    fn class_definition(&self, params: &J) -> Option<J> {
+        let (uri, line, col) = Self::position(params);
+        let doc = self.docs.get(&uri)?;
+        let (class, _) = class_at(doc.text.lines().nth(line)?, col)?;
+        let mut texts: HashMap<String, String> = HashMap::new();
+        let here = uri_to_path(&uri).display().to_string();
+        let found: Vec<J> = doc
+            .analysis
+            .classes
+            .iter()
+            .filter(|(name, _, _)| *name == class)
+            .map(|(_, file, l)| {
+                let text = texts.entry(file.clone()).or_insert_with(|| {
+                    if *file == here { doc.text.clone() } else { std::fs::read_to_string(file).unwrap_or_default() }
+                });
+                let l = l.saturating_sub(1) as usize;
+                let src = text.lines().nth(l).unwrap_or("");
+                let (a, b) = find_class(src, &class).unwrap_or((0, 0));
+                json!({
+                    "uri": path_to_uri(file),
+                    "range": { "start": { "line": l, "character": utf16_col(src, a) }, "end": { "line": l, "character": utf16_col(src, b) } }
+                })
+            })
+            .collect();
+        (!found.is_empty()).then(|| json!(found))
+    }
+
     fn completion(&self, params: &J) -> J {
         let (uri, line, col) = Self::position(params);
         // Rust: Quillo's names would only be in the way.
@@ -596,6 +680,9 @@ impl Server {
             return json!([]);
         }
         let Some(doc) = self.docs.get(&uri) else { return json!([]) };
+        if let Some(items) = Self::class_completion(doc, line, col) {
+            return items;
+        }
         if let Some(items) = Self::markup_completion(doc, params, line, col) {
             return items;
         }
@@ -662,6 +749,33 @@ impl Server {
             }
         }
         json!(items)
+    }
+
+    /// After `<span.` or in `class="...`: the classes the program's style
+    /// sheets have rules for (branch class-links).
+    fn class_completion(doc: &Doc, line: usize, col: usize) -> Option<J> {
+        let src = doc.text.lines().nth(line)?;
+        let chars: Vec<char> = src.chars().collect();
+        let col = char_col(src, col).min(chars.len());
+        let mut a = col;
+        while a > 0 && is_class_char(chars[a - 1]) {
+            a -= 1;
+        }
+        if !before_class(&chars[..a]) {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let items: Vec<J> = doc
+            .analysis
+            .classes
+            .iter()
+            .filter(|(name, _, _)| seen.insert(name.clone()))
+            .map(|(name, file, l)| {
+                let short = Path::new(file).file_name().map_or(file.clone(), |f| f.to_string_lossy().into_owned());
+                json!({ "label": name, "kind": 7, "detail": format!("{}:{}", short, l) })
+            })
+            .collect();
+        Some(json!(items))
     }
 
     /// After `</`: the end tag of the element open there. After a `<` that
