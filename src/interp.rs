@@ -206,6 +206,9 @@ pub struct Interp {
     /// what it wrote and also read does not wake it again (FEEDBACK13.md,
     /// Q-090; branch feedback13-fixes).
     pub(crate) own_seqs: Vec<u64>,
+    /// Running a scheduled job or a tick, not a request: its `sleep` ends at a
+    /// stop or a reload (FEEDBACK12.md, Q-081 and Q-082; branch feedback12-sleep).
+    pub(crate) in_job: bool,
     /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
     /// feedback9-fixes). The app's is in the process's environment.
     pub env_file: Arc<std::collections::HashMap<String, String>>,
@@ -847,6 +850,7 @@ impl Interp {
             is_service: false,
             retired: Default::default(),
             own_seqs: Vec::new(),
+            in_job: false,
             env_file: Default::default(),
             declared_services: Default::default(),
             ready_checks: Default::default(),
@@ -922,6 +926,7 @@ impl Interp {
             is_service: self.is_service,
             retired: self.retired.clone(),
             own_seqs: Vec::new(),
+            in_job: self.in_job,
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
             ready_checks: self.ready_checks.clone(),

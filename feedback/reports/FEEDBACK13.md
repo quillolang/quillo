@@ -54,7 +54,9 @@ instead of `done`, and `tests/services.rs`
 `a_request_running_when_the_program_reloads_finishes_on_its_version` gets `the program was
 loaded again`: feedback12-fixes' `sleep` that ends at stop and reload (Q-081, Q-082) ends
 requests in progress too, which the guide (Stopping and health; Concurrency and reloading)
-says finish.
+says finish. Fixed afterwards on branch feedback12-sleep: `sleep` ends early only in a
+scheduled job or a tick (`Interp::in_job`, set by `run_job` and `run_tick`), so a request
+waits it out, and both tests pass; Q-081's and Q-082's repros stay fixed.
 
 ## Seen again
 

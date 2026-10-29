@@ -2629,7 +2629,7 @@ What each does at its edges, where the answer is not what another language would
 | `pow(2, 10)` | an int while it fits, else a float |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
-| `sleep(ms)` | no maximum; other requests run meanwhile; ends the request or job (status 503) when the server stops or the program is loaded again |
+| `sleep(ms)` | no maximum; other requests run meanwhile; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
 | `random_int(lo, hi)` | both ends included |
 | `uuid()` | a version 4 UUID |
 | `read_file(path)` | text: bytes that are not UTF-8 are replaced; a missing file is an error value |
@@ -3801,7 +3801,8 @@ schedule("@daily", () => db.exec("delete from tokens where expires < ?", now()))
   most 64, and no two alike. Nobody outside the server can start one.
 - A job that runs for ever (a loop with `sleep` in it) is told to end when the server
   stops, and when `--watch` loads the program again: its `sleep` ends the job, so a
-  new version never runs beside the old one. A job still running when it is due again
+  new version never runs beside the old one (a tick's too; a request's `sleep` is waited
+  out, since requests in progress are answered). A job still running when it is due again
   is said once in the log, not each time.
 - A service's jobs run with the app's when the service shares its process
   (`POST /_quillo/job/game~end_round` in the log), and in the service's own process
