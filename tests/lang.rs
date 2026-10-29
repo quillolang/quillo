@@ -298,6 +298,11 @@ fn parse_errors_have_lines() {
     assert!(e.contains("<input>:2:") && e.contains("`<div>` is never closed: add `</div>` before the `}` on line 4"), "{}", e);
     let e = ev_err("view V() =\n  <main>\n    <p>x</p>\n\nroute GET / = <V/>\n");
     assert!(e.contains("<input>:2:") && e.contains("`<main>` is never closed: add `</main>` before `route` on line 5"), "{}", e);
+    // A `use` with no quotes starts a declaration too (branch use-editor).
+    for u in ["use lib/auth", "use a, b as c from x.qwer", "use * from lib", "use lib"] {
+        let e = ev_err(&format!("view V() =\n  <div>x\n{}\n", u));
+        assert!(e.contains("<input>:2:") && e.contains("add `</div>` before `use` on line 3"), "{}: {}", u, e);
+    }
     let e = ev_err("fn f(x: number) = x");
     assert!(e.contains("unknown type `number`"), "{}", e);
 }

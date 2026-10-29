@@ -524,3 +524,56 @@ fn classes_are_hovered_found_renamed_and_told_when_unstyled() {
     assert_eq!(edit["changes"][&uri][1], json!({ "range": { "start": { "line": 0, "character": 52 }, "end": { "line": 0, "character": 56 } }, "newText": "tag" }));
     assert_eq!(c.request("textDocument/prepareRename", at(0, 3), &mut notes), Value::Null);
 }
+
+/// `use` lines: a file reached by a path without quotes is checked as part
+/// of its program; the path and the names taken from a `.qwer` file are
+/// hovered and followed (a name under another, `as`, too); paths complete
+/// to the program's files and names to the file's functions (branch
+/// use-editor).
+#[test]
+fn use_lines_are_hovered_followed_and_completed() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-use-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::create_dir_all(dir.join("plugins")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let main = "use lib/auth\nuse brightness as bright, shout from plugins/img.qwer\nfn site() = \"Q\"\nlet a = bright(\"#fff\")\n";
+    std::fs::write(dir.join("main.qwe"), main).unwrap();
+    let lib = "fn greet(n) = site() + n\n";
+    std::fs::write(dir.join("lib/auth.qwe"), lib).unwrap();
+    let rust = "/// How bright a colour is.\npub fn brightness(hex: String) -> f64 {\n    0.5\n}\n\npub fn shout(s: String) -> String {\n    s\n}\n";
+    std::fs::write(dir.join("plugins/img.qwer"), rust).unwrap();
+    let main_uri = format!("file://{}/main.qwe", dir.display());
+    let lib_uri = format!("file://{}/lib/auth.qwe", dir.display());
+    let rust_uri = format!("file://{}/plugins/img.qwer", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": main_uri, "languageId": "quillo", "version": 1, "text": main } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lib_uri, "languageId": "quillo", "version": 1, "text": lib } }));
+    let at = |uri: &str, line: u32, character: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+
+    let h = c.request("textDocument/hover", at(&lib_uri, 0, 15), &mut notes);
+    assert!(h["contents"]["value"].as_str().unwrap().contains("fn site()"), "{}", h);
+    let h = c.request("textDocument/hover", at(&main_uri, 1, 21), &mut notes);
+    let text = h["contents"]["value"].as_str().unwrap();
+    assert!(text.contains("bright(str) -> float") && text.contains("How bright") && text.contains("called `bright` here"), "{}", h);
+
+    let d = c.request("textDocument/definition", at(&main_uri, 0, 6), &mut notes);
+    assert_eq!((d["uri"].as_str().unwrap(), &d["range"]["start"]), (lib_uri.as_str(), &json!({ "line": 0, "character": 0 })), "{}", d);
+    let expected = json!({ "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 17 } });
+    for (line, character) in [(1, 8), (1, 21), (3, 9)] {
+        let d = c.request("textDocument/definition", at(&main_uri, line, character), &mut notes);
+        assert_eq!((d["uri"].as_str().unwrap(), &d["range"]), (rust_uri.as_str(), &expected), "{}:{} {}", line, character, d);
+    }
+
+    let labels = |c: &mut Client, notes: &mut Vec<Value>, text: &str, version: u32, character: u32| -> Vec<String> {
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": main_uri, "version": version }, "contentChanges": [{ "text": text }] }));
+        let items = c.request("textDocument/completion", at(&main_uri, 0, character), notes);
+        items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(labels(&mut c, &mut notes, "use \n", 2, 4), ["lib/auth.qwe", "plugins/img.qwer"]);
+    assert_eq!(labels(&mut c, &mut notes, "use shout from pl\n", 3, 17), ["plugins/img.qwer"]);
+    assert_eq!(labels(&mut c, &mut notes, "use  from plugins/img.qwer\n", 4, 4), ["brightness", "shout"]);
+    assert_eq!(labels(&mut c, &mut notes, "use shout,  from plugins/img\n", 5, 11), ["brightness"]);
+}

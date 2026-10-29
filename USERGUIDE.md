@@ -128,7 +128,10 @@ together, `card-${size}`, is left as it is). A class no sheet has a rule for is 
 warning when a rule's class is close to it (`` no style sheet has a rule for `.chiip` (did
 you mean `chip`?) ``, which `quillo check` says too), else a faint hint, as markup often
 carries classes for its own sake. Neither is told when the program has no sheets of its
-own or links one from another site. It runs the `quillo` it finds (its `quillo.path`
+own or links one from another site. On a `use` line, the path goes to its file and
+completes to the program's files, and the names taken from a `.qwer` file go to their
+Rust functions, show their signatures (under the name after `as`) and complete to the
+file's functions. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,

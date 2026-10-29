@@ -128,7 +128,8 @@ fn starts_declaration(line: &[char]) -> bool {
         "fn" => name(second) && line.contains('('),
         "server" => second == "fn",
         "let" => name(second) && line.contains('='),
-        "use" => second.starts_with('"'),
+        // `use "lib.qwe"`, `use lib/auth`, `use * from ...`, `use a, b from x.qwer` (branch use-editor).
+        "use" => second.starts_with('"') || second == "*" || second.contains(['/', '\\', '.']) || line.contains(" from ") || words.next().is_none(),
         "service" => name(second),
         _ => false,
     }

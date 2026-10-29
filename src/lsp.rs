@@ -126,9 +126,9 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
         }
         let Ok(src) = std::fs::read_to_string(&f) else { continue };
         for line in src.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("use ") else { continue };
-            let Some(path) = rest.trim().strip_prefix('"').and_then(|r| r.split('"').next()) else { continue };
-            let Ok(full) = base.join(path).canonicalize() else { continue };
+            // A `.qwer` file uses no other.
+            let Some(u) = use_line(line).filter(|u| !u.path.ends_with(".qwer")) else { continue };
+            let Ok(full) = base.join(&u.path).canonicalize() else { continue };
             if full == target {
                 return true;
             }
@@ -136,6 +136,104 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
         }
     }
     false
+}
+
+/// A `use` line as written: the names it takes (each with the name it has
+/// here, after `as`, and its column), the file it names, as the parser
+/// reads it, and that file's columns on the line, in characters (branch
+/// use-editor).
+#[derive(Debug, Default)]
+struct UseLine {
+    names: Vec<(String, String, usize)>,
+    path: String,
+    at: (usize, usize),
+}
+
+fn use_line(src: &str) -> Option<UseLine> {
+    let chars: Vec<char> = src.chars().collect();
+    let skip = |mut i: usize| {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word_end = |mut i: usize| {
+        while i < chars.len() && is_word(chars[i]) {
+            i += 1;
+        }
+        i
+    };
+    let word = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+    let mut i = skip(0);
+    if word_end(i) != i + 3 || word(i, i + 3) != "use" {
+        return None;
+    }
+    i = skip(i + 3);
+    let mut u = UseLine::default();
+    if chars.get(i) == Some(&'*') {
+        i = skip(i + 1);
+        let e = word_end(i);
+        if word(i, e) != "from" {
+            return None;
+        }
+        i = skip(e);
+    } else if chars.get(i) != Some(&'"') {
+        // Names, then `from`: told apart as the parser does, by the words before it.
+        let rest: String = chars[i..].iter().collect();
+        let words: Vec<&str> = rest.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        let ident = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && w.chars().all(is_word);
+        if words.iter().position(|w| *w == "from").is_some_and(|at| at > 0 && words[..at].iter().all(|w| ident(w))) {
+            loop {
+                let e = word_end(i);
+                let name = word(i, e);
+                if name == "from" {
+                    i = skip(e);
+                    break;
+                }
+                let (col, mut j) = (i, skip(e));
+                let mut alias = name.clone();
+                if word(j, word_end(j)) == "as" {
+                    let a = skip(word_end(j));
+                    j = word_end(a);
+                    alias = word(a, j);
+                    j = skip(j);
+                }
+                u.names.push((name, alias, col));
+                if chars.get(j) == Some(&',') {
+                    j = skip(j + 1);
+                }
+                if j == i {
+                    return None;
+                }
+                i = j;
+            }
+        }
+    }
+    if chars.get(i) == Some(&'"') {
+        let end = chars[i + 1..].iter().position(|c| *c == '"').map_or(chars.len(), |p| i + 1 + p);
+        u.path = word(i + 1, end);
+        u.at = (i + 1, end);
+        return Some(u);
+    }
+    let mut e = i;
+    while e < chars.len() && (chars[e].is_alphanumeric() || "-._~%/\\".contains(chars[e])) {
+        e += 1;
+    }
+    if e == i {
+        return None;
+    }
+    u.path = word(i, e).replace('\\', "/");
+    if !u.path.ends_with(".qwe") && !u.path.ends_with(".qwer") {
+        u.path.push_str(if u.names.is_empty() { ".qwe" } else { ".qwer" });
+    }
+    u.at = (i, e);
+    Some(u)
+}
+
+/// The folder a file's `use` paths are read from: its program's main
+/// file's (branch use-editor).
+fn use_base(file: &Path) -> PathBuf {
+    program_entry(file).unwrap_or_else(|| file.to_path_buf()).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn uri_to_path(uri: &str) -> PathBuf {
@@ -634,6 +732,9 @@ impl Server {
             let (sig, doc) = r.detail.split_once("\n\n").unwrap_or((&r.detail, ""));
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```\n{}\n\n*Exported to the programs that `use` this file.*", sig, doc) } });
         }
+        if let Some(h) = self.use_hover(params) {
+            return h;
+        }
         if let Some(h) = self.class_hover(params) {
             return h;
         }
@@ -649,7 +750,151 @@ impl Server {
         J::Null
     }
 
+    /// What the cursor is on in a `use` line: the file it names (no name),
+    /// or a name it takes and the name it has here (branch use-editor).
+    fn use_here(&self, params: &J) -> Option<(UseLine, PathBuf, Option<(String, String)>)> {
+        let (uri, line, col) = Self::position(params);
+        if !uri.ends_with(".qwe") {
+            return None;
+        }
+        let doc = self.docs.get(&uri)?;
+        let src = doc.text.lines().nth(line)?;
+        let u = use_line(src)?;
+        let full = use_base(&uri_to_path(&uri)).join(&u.path);
+        let at = char_col(src, col);
+        if at >= u.at.0 && at <= u.at.1 {
+            return Some((u, full, None));
+        }
+        let (w, _) = word_at(&doc.text, line, col)?;
+        let taken = u.names.iter().find(|(n, a, _)| *n == w || *a == w).map(|(n, a, _)| (n.clone(), a.clone()))?;
+        Some((u, full, Some(taken)))
+    }
+
+    /// A `.qwer` file's exported functions, as open in the editor or saved.
+    fn exports_of(&self, full: &Path) -> Vec<crate::native::Export> {
+        crate::native::parse(&self.text_of(&full.display().to_string())).exports
+    }
+
+    /// On a `use` line: the functions a `.qwer` file gives (those the line
+    /// takes), or one of them with the name it has here; a `.qwe` file's
+    /// path (branch use-editor).
+    fn use_hover(&self, params: &J) -> Option<J> {
+        let (u, full, taken) = self.use_here(params)?;
+        let short = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
+        let text = if !full.exists() {
+            format!("`{}`: no such file", u.path)
+        } else if let Some((name, alias)) = taken {
+            let e = self.exports_of(&full).into_iter().find(|e| e.name == name)?;
+            let called = if alias != name { format!(", called `{}` here", alias) } else { String::new() };
+            let doc = if e.doc.is_empty() { String::new() } else { format!("{}\n\n", e.doc) };
+            format!("```quillo\n{}\n```\n{}*From {}{}.*", check::native_signature(&crate::native::Export { name: alias, ..e }), doc, short, called)
+        } else if u.path.ends_with(".qwer") {
+            let sigs: Vec<String> = self
+                .exports_of(&full)
+                .iter()
+                .filter(|e| u.names.is_empty() || u.names.iter().any(|(n, _, _)| *n == e.name))
+                .map(|e| match u.names.iter().find(|(n, a, _)| *n == e.name && a != n) {
+                    Some((_, a, _)) => check::native_signature(&crate::native::Export { name: a.clone(), ..e.clone() }),
+                    None => check::native_signature(e),
+                })
+                .collect();
+            format!("`{}`: Rust, {}\n```quillo\n{}\n```", u.path, if u.names.is_empty() { "every function it exports" } else { "the functions taken" }, sigs.join("\n"))
+        } else {
+            format!("`{}`: run once, its public names this file's to use", u.path)
+        };
+        Some(json!({ "contents": { "kind": "markdown", "value": text } }))
+    }
+
+    /// On a `use` line: the file it names, or where a `.qwer` file defines
+    /// a name the line takes (branch use-editor).
+    fn use_definition(&self, params: &J) -> Option<J> {
+        let (_, full, taken) = self.use_here(params)?;
+        if !full.exists() {
+            return None;
+        }
+        let file = full.display().to_string();
+        let Some((name, _)) = taken else { return Some(self.location(&file, 0, 0, 0)) };
+        let e = self.exports_of(&full).into_iter().find(|e| e.name == name)?;
+        let l = e.line.saturating_sub(1) as usize;
+        let text = self.text_of(&file);
+        let (a, b) = find_word(text.lines().nth(l).unwrap_or(""), &name).unwrap_or((0, 0));
+        Some(self.location(&file, l, a, b))
+    }
+
+    /// On a `use` line: the program's files where a path goes, and a
+    /// `.qwer` file's functions where names go (branch use-editor).
+    fn use_completion(&self, doc: &Doc, uri: &str, line: usize, col16: usize) -> Option<J> {
+        let src = doc.text.lines().nth(line)?;
+        let chars: Vec<char> = src.chars().collect();
+        let col = char_col(src, col16).min(chars.len());
+        let before: String = chars[..col].iter().collect();
+        let words: Vec<&str> = before.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        if words.first() != Some(&"use") || !before.trim_start()[3..].starts_with(char::is_whitespace) {
+            return None;
+        }
+        let mut a = col;
+        while a > 0 && (chars[a - 1].is_alphanumeric() || "-._~%/\\".contains(chars[a - 1])) {
+            a -= 1;
+        }
+        let typed = a < col;
+        // The word before the one being typed.
+        let prev = words.get(words.len() - 1 - typed as usize).copied().unwrap_or("");
+        let quoted = a > 0 && chars[a - 1] == '"';
+        let from_at = words.iter().position(|w| *w == "from");
+        let names = from_at.is_some_and(|f| f > 1 && words[1] != "*");
+        if prev == "*" {
+            return Some(json!([{ "label": "from", "kind": 14 }]));
+        }
+        if prev == "as" {
+            return Some(json!([]));
+        }
+        let path_here = quoted || prev == "from" || (prev == "use" && !src[before.len()..].contains(" from "));
+        if !path_here {
+            // A name: the functions of the file after `from`, not yet taken.
+            // With no name yet, the line is not a `use` of names: its file is read alone.
+            let from = &src[src.find(" from ")?..];
+            let qwer = |u: &UseLine| u.path.ends_with(".qwer");
+            let u = use_line(src).filter(qwer).or_else(|| use_line(&format!("use x{}", from)).filter(qwer))?;
+            let full = use_base(&uri_to_path(uri)).join(&u.path);
+            let items: Vec<J> = self
+                .exports_of(&full)
+                .iter()
+                .filter(|e| !u.names.iter().any(|(n, _, c)| *n == e.name && *c != a))
+                .map(|e| json!({ "label": e.name, "kind": 3, "detail": check::native_signature(e), "documentation": e.doc }))
+                .collect();
+            return Some(json!(items));
+        }
+        let base = use_base(&uri_to_path(uri));
+        let here = uri_to_path(uri).canonicalize().ok();
+        let mut files = Vec::new();
+        let mut todo = vec![(base.clone(), 0)];
+        while let Some((dir, depth)) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if depth < 4 && !name.starts_with('.') && name != "target" && name != "node_modules" {
+                        todo.push((p, depth + 1));
+                    }
+                } else if (name.ends_with(".qwer") || !names && name.ends_with(".qwe")) && p.canonicalize().ok() != here && files.len() < 500 {
+                    files.push(p.strip_prefix(&base).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        files.sort();
+        let range = json!({ "start": { "line": line, "character": utf16_col(src, a) }, "end": { "line": line, "character": col16 } });
+        let items: Vec<J> = files
+            .iter()
+            .map(|f| json!({ "label": f, "kind": 17, "filterText": f, "textEdit": { "range": range, "newText": f } }))
+            .collect();
+        Some(json!(items))
+    }
+
     fn definition(&self, params: &J) -> J {
+        if let Some(found) = self.use_definition(params) {
+            return found;
+        }
         if let Some(found) = self.class_definition(params) {
             return found;
         }
@@ -663,7 +908,13 @@ impl Server {
         };
         let l = line.saturating_sub(1) as usize;
         let src = text.lines().nth(l).unwrap_or("");
-        let (a, b) = find_word(src, crate::privacy::private_name(&r.name).unwrap_or(&r.name)).unwrap_or((0, 0));
+        // A `.qwer` function taken under another name (`use brightness as bright`)
+        // is found by its own (branch use-editor).
+        let own = || {
+            let at = src.find("fn ")? + 3;
+            find_word(src, &src[at..].chars().take_while(|c| is_word(*c)).collect::<String>())
+        };
+        let (a, b) = find_word(src, crate::privacy::private_name(&r.name).unwrap_or(&r.name)).or_else(own).unwrap_or((0, 0));
         json!({
             "uri": path_to_uri(&file),
             "range": {
@@ -916,6 +1167,9 @@ impl Server {
             return json!([]);
         }
         let Some(doc) = self.docs.get(&uri) else { return json!([]) };
+        if let Some(items) = self.use_completion(doc, &uri, line, col) {
+            return items;
+        }
         if let Some(items) = Self::class_completion(doc, line, col) {
             return items;
         }
@@ -1178,7 +1432,7 @@ fn keyword_doc(w: &str) -> Option<String> {
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
         "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
         "match" => "`match value { pattern [if guard] => result ... }`",
-        "use" => "`use \"lib.qwe\"` runs another file once, into the global scope.",
+        "use" => "`use lib/auth.qwe` (or `use lib/auth`, or `use \"lib/auth.qwe\"`) runs another file once: its public names are this file's to use.\n\n`use cache_get as redis_get, cache_set from redis.qwer` takes only those functions of a Rust file, each under the name after `as`; `use * from redis.qwer` takes them all.",
         "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",
         "state" => "`state count = 0` in a component: state, set on the first render and kept between renders (`~count = 0` is the short form). Assigning to `count` re-renders the component.",
         "private" => "`private fn helper() = ...` (also `view`, `component`, a top-level `let`)\n\nA name for this file only: other files cannot use it, and each file may have its own `helper`. Not for a `server fn` or a `type`.",
