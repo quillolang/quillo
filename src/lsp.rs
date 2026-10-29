@@ -220,7 +220,7 @@ fn diag_range(text: &str, line: u32, msg: &str) -> J {
     let src = text.lines().nth(l).unwrap_or("");
     let mut span = None;
     for part in msg.split('`').skip(1).step_by(2) {
-        let word = part.trim_start_matches('~').trim_start_matches('<').trim_end_matches('>');
+        let word = part.trim_start_matches('~').trim_start_matches('<').trim_start_matches('.').trim_end_matches('>');
         if let Some(s) = find_word(src, word) {
             span = Some(s);
             break;
@@ -314,7 +314,7 @@ fn symbol_kind(k: SymbolKind) -> u32 {
 
 impl Server {
     pub fn new() -> Self {
-        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options::default(), rust: Default::default() }
+        Server { docs: HashMap::new(), out: io::stdout(), opts: check::Options { classes: true, ..Default::default() }, rust: Default::default() }
     }
 
     fn send(&mut self, msg: J) {
@@ -352,7 +352,12 @@ impl Server {
                             "definitionProvider": true,
                             "documentSymbolProvider": true,
                             "completionProvider": { "triggerCharacters": [".", "<", "@", "/"] },
-                            "codeActionProvider": { "codeActionKinds": ["quickfix"] }
+                            "codeActionProvider": { "codeActionKinds": ["quickfix"] },
+                            "referencesProvider": true,
+                            "renameProvider": { "prepareProvider": true },
+                            // CSS files are welcome: their classes (an
+                            // older server would read them as Quillo).
+                            "experimental": { "cssClasses": true }
                         },
                         "serverInfo": { "name": "quillo", "version": env!("CARGO_PKG_VERSION") }
                     });
@@ -411,6 +416,18 @@ impl Server {
                     let r = self.code_actions(params);
                     self.reply(id.unwrap_or(J::Null), r);
                 }
+                "textDocument/references" => {
+                    let r = self.class_references(params);
+                    self.reply(id.unwrap_or(J::Null), r);
+                }
+                "textDocument/prepareRename" => {
+                    let r = self.prepare_rename(params);
+                    self.reply(id.unwrap_or(J::Null), r);
+                }
+                "textDocument/rename" => match self.rename(params) {
+                    Ok(r) => self.reply(id.unwrap_or(J::Null), r),
+                    Err(message) => self.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": message } })),
+                },
                 "quillo/closeTag" => {
                     let r = self.close_tag(params);
                     self.reply(id.unwrap_or(J::Null), r);
@@ -431,6 +448,11 @@ impl Server {
     fn update(&mut self, uri: String, text: String) {
         if uri.ends_with(".qwer") {
             return self.update_rust(uri, text);
+        }
+        // An app's style sheet: kept for its classes' rules, as typed.
+        if uri.ends_with(".css") {
+            self.docs.insert(uri, Doc { text, analysis: Analysis::default() });
+            return;
         }
         let path = uri_to_path(&uri);
         let file = path.display().to_string();
@@ -468,7 +490,7 @@ impl Server {
             }
             by_file.entry(duri).or_default().push(json!({
                 "range": range,
-                "severity": if d.severity == Severity::Error { 1 } else { 2 },
+                "severity": match d.severity { Severity::Error => 1, Severity::Warning => 2, Severity::Hint => 4 },
                 "source": "quillo",
                 "message": message,
             }));
@@ -483,6 +505,7 @@ impl Server {
                 analysis.symbols = old.analysis.symbols;
                 analysis.references = old.analysis.references;
                 analysis.classes = old.analysis.classes;
+                analysis.files = old.analysis.files;
             }
         }
         self.docs.insert(uri, Doc { text, analysis });
@@ -611,6 +634,9 @@ impl Server {
             let (sig, doc) = r.detail.split_once("\n\n").unwrap_or((&r.detail, ""));
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```\n{}\n\n*Exported to the programs that `use` this file.*", sig, doc) } });
         }
+        if let Some(h) = self.class_hover(params) {
+            return h;
+        }
         if let Some((_, r)) = self.reference_at(params) {
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", r.detail) } });
         }
@@ -651,35 +677,242 @@ impl Server {
     /// program's style sheets have for it (branch class-links).
     fn class_definition(&self, params: &J) -> Option<J> {
         let (uri, line, col) = Self::position(params);
+        if !uri.ends_with(".qwe") {
+            return None;
+        }
         let doc = self.docs.get(&uri)?;
         let (class, _) = class_at(doc.text.lines().nth(line)?, col)?;
-        let mut texts: HashMap<String, String> = HashMap::new();
-        let here = uri_to_path(&uri).display().to_string();
-        let found: Vec<J> = doc
-            .analysis
-            .classes
-            .iter()
-            .filter(|(name, _, _)| *name == class)
-            .map(|(_, file, l)| {
-                let text = texts.entry(file.clone()).or_insert_with(|| {
-                    if *file == here { doc.text.clone() } else { std::fs::read_to_string(file).unwrap_or_default() }
-                });
-                let l = l.saturating_sub(1) as usize;
-                let src = text.lines().nth(l).unwrap_or("");
-                let (a, b) = find_class(src, &class).unwrap_or((0, 0));
-                json!({
-                    "uri": path_to_uri(file),
-                    "range": { "start": { "line": l, "character": utf16_col(src, a) }, "end": { "line": l, "character": utf16_col(src, b) } }
-                })
-            })
-            .collect();
+        let found: Vec<J> = self.rule_spans(&doc.analysis, &class).into_iter().map(|(f, l, a, b)| self.location(&f, l, a, b)).collect();
         (!found.is_empty()).then(|| json!(found))
+    }
+
+    /// The text of a file: as open in the editor, else as saved.
+    fn text_of(&self, file: &str) -> String {
+        match self.docs.iter().find(|(u, _)| uri_to_path(u).display().to_string() == file) {
+            Some((_, d)) => d.text.clone(),
+            None => std::fs::read_to_string(file).unwrap_or_default(),
+        }
+    }
+
+    /// A location from character columns on a line (from 0).
+    fn location(&self, file: &str, line: usize, a: usize, b: usize) -> J {
+        let text = self.text_of(file);
+        let src = text.lines().nth(line).unwrap_or("");
+        json!({ "uri": path_to_uri(file), "range": {
+            "start": { "line": line, "character": utf16_col(src, a) },
+            "end": { "line": line, "character": utf16_col(src, b) }
+        } })
+    }
+
+    /// The class at a position, in markup or in a rule (in a `.css` file
+    /// or in a sheet in a `.qwe` file), and the characters it spans.
+    fn class_here(&self, params: &J) -> Option<(String, usize, usize)> {
+        let (uri, line, col) = Self::position(params);
+        let doc = self.docs.get(&uri)?;
+        let src = doc.text.lines().nth(line)?;
+        let chars: Vec<char> = src.chars().collect();
+        let col = char_col(src, col).min(chars.len());
+        let (mut a, mut b) = (col, col);
+        while a > 0 && is_class_char(chars[a - 1]) {
+            a -= 1;
+        }
+        while b < chars.len() && is_class_char(chars[b]) {
+            b += 1;
+        }
+        if a == b {
+            return None;
+        }
+        let class: String = chars[a..b].iter().collect();
+        let dot = a > 0 && chars[a - 1] == '.';
+        let here = uri_to_path(&uri).display().to_string();
+        let found = if uri.ends_with(".css") {
+            dot
+        } else if uri.ends_with(".qwe") {
+            before_class(&chars[..a])
+                || (dot && doc.analysis.classes.iter().any(|(n, f, l)| *n == class && *f == here && *l as usize == line + 1))
+        } else {
+            false
+        };
+        found.then_some((class, a, b))
+    }
+
+    /// The program a document is part of: a `.qwe` file's own; for a CSS
+    /// file, that of an open `.qwe` file whose sheets include it, else the
+    /// `main.qwe` in the folder above its `public/`.
+    fn with_program<R>(&self, uri: &str, f: impl FnOnce(&Analysis) -> R) -> Option<R> {
+        if !uri.ends_with(".css") {
+            return self.docs.get(uri).map(|d| f(&d.analysis));
+        }
+        let path = uri_to_path(uri);
+        let file = path.display().to_string();
+        if let Some(d) = self.docs.values().find(|d| d.analysis.classes.iter().any(|(_, f, _)| *f == file)) {
+            return Some(f(&d.analysis));
+        }
+        let base = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == "public"))?.parent()?;
+        let main = base.join("main.qwe");
+        if !main.exists() {
+            return None;
+        }
+        let open: HashMap<PathBuf, String> = self.docs.iter().map(|(u, d)| (uri_to_path(u), d.text.clone())).collect();
+        Some(f(&check::check_file_opts(&main, open, self.opts)))
+    }
+
+    /// Every `.class` in the rules for it: file, line (from 0) and the
+    /// name's characters. A CSS file is read as it is now, open or saved.
+    fn rule_spans(&self, a: &Analysis, class: &str) -> Vec<(String, usize, usize, usize)> {
+        let mut lines: Vec<(String, usize)> = Vec::new();
+        let mut sheets: Vec<&String> = Vec::new();
+        for (name, file, line) in &a.classes {
+            if file.ends_with(".css") {
+                if !sheets.contains(&file) {
+                    sheets.push(file);
+                }
+            } else if name == class {
+                lines.push((file.clone(), line.saturating_sub(1) as usize));
+            }
+        }
+        for file in sheets {
+            for (name, k) in crate::styles::classes_in(&self.text_of(file)) {
+                if name == class {
+                    lines.push((file.clone(), k as usize));
+                }
+            }
+        }
+        lines.dedup();
+        let mut out = Vec::new();
+        let mut texts: HashMap<String, String> = HashMap::new();
+        for (file, l) in lines {
+            let text = texts.entry(file.clone()).or_insert_with(|| self.text_of(&file));
+            let src = text.lines().nth(l).unwrap_or("");
+            let mut from = 0;
+            let chars: Vec<char> = src.chars().collect();
+            while let Some((x, y)) = find_class(&chars[from..].iter().collect::<String>(), class) {
+                if !out.contains(&(file.clone(), l, from + x, from + y)) {
+                    out.push((file.clone(), l, from + x, from + y));
+                }
+                from += y;
+            }
+        }
+        out
+    }
+
+    /// Where the program's markup writes `class`, as written.
+    fn use_spans(&self, a: &Analysis, class: &str) -> Vec<(String, usize, usize, usize)> {
+        let mut out = Vec::new();
+        for file in &a.files {
+            for (l, src) in self.text_of(file).lines().enumerate() {
+                let chars: Vec<char> = src.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if !is_class_char(chars[i]) || (i > 0 && is_class_char(chars[i - 1])) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i;
+                    while j < chars.len() && is_class_char(chars[j]) {
+                        j += 1;
+                    }
+                    if chars[i..j].iter().copied().eq(class.chars()) && before_class(&chars[..i]) {
+                        out.push((file.clone(), l, i, j));
+                    }
+                    i = j;
+                }
+            }
+        }
+        out
+    }
+
+    /// A class: its rules, as CSS (branch class-tools).
+    fn class_hover(&self, params: &J) -> Option<J> {
+        let (uri, line, _) = Self::position(params);
+        let (class, a, b) = self.class_here(params)?;
+        let rules = self.with_program(&uri, |p| self.rule_spans(p, &class))?;
+        let mut shown: Vec<(String, usize)> = rules.iter().map(|(f, l, _, _)| (f.clone(), *l)).collect();
+        shown.dedup();
+        let mut value = if shown.is_empty() {
+            format!("`.{}`: no style sheet of the program has a rule for it", class)
+        } else {
+            format!("`.{}`: {} rule{}", class, shown.len(), if shown.len() == 1 { "" } else { "s" })
+        };
+        for (file, l) in shown.iter().take(5) {
+            let text = self.text_of(file);
+            // The rule, to the `}` that ends it.
+            let mut rule = Vec::new();
+            let mut depth = 0i32;
+            for src in text.lines().skip(*l).take(12) {
+                rule.push(src);
+                depth += src.matches('{').count() as i32 - src.matches('}').count() as i32;
+                if depth <= 0 && src.contains('}') {
+                    break;
+                }
+            }
+            let short = Path::new(file).file_name().map_or(file.clone(), |f| f.to_string_lossy().into_owned());
+            value.push_str(&format!("\n\n{}:{}\n```css\n{}\n```", short, l + 1, rule.join("\n")));
+        }
+        if shown.len() > 5 {
+            value.push_str(&format!("\n\n… and {} more", shown.len() - 5));
+        }
+        let src = self.docs.get(&uri)?.text.lines().nth(line).unwrap_or("").to_string();
+        Some(json!({
+            "contents": { "kind": "markdown", "value": value },
+            "range": { "start": { "line": line, "character": utf16_col(&src, a) }, "end": { "line": line, "character": utf16_col(&src, b) } }
+        }))
+    }
+
+    /// A class's rules (when asked for) and everywhere markup writes it
+    /// (branch class-tools).
+    fn class_references(&self, params: &J) -> J {
+        let (uri, _, _) = Self::position(params);
+        let Some((class, _, _)) = self.class_here(params) else { return json!([]) };
+        let rules = params["context"]["includeDeclaration"].as_bool().unwrap_or(true);
+        let spans = self.with_program(&uri, |p| {
+            let mut all = if rules { self.rule_spans(p, &class) } else { Vec::new() };
+            all.extend(self.use_spans(p, &class));
+            all
+        });
+        json!(spans.unwrap_or_default().into_iter().map(|(f, l, a, b)| self.location(&f, l, a, b)).collect::<Vec<_>>())
+    }
+
+    fn prepare_rename(&self, params: &J) -> J {
+        let (uri, line, _) = Self::position(params);
+        let Some((class, a, b)) = self.class_here(params) else { return J::Null };
+        let src = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)).unwrap_or("").to_string();
+        json!({
+            "range": { "start": { "line": line, "character": utf16_col(&src, a) }, "end": { "line": line, "character": utf16_col(&src, b) } },
+            "placeholder": class
+        })
+    }
+
+    /// A class renamed in its rules and in the markup that writes it as
+    /// written; one put together (`card-${size}`) is left as it is (branch
+    /// class-tools).
+    fn rename(&self, params: &J) -> Result<J, String> {
+        let (uri, _, _) = Self::position(params);
+        let Some((class, _, _)) = self.class_here(params) else { return Err("only a class can be renamed here".into()) };
+        let name = params["newName"].as_str().unwrap_or("").trim().trim_start_matches('.');
+        if !name.chars().all(is_class_char) || !name.trim_start_matches('-').starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            return Err(format!("`{}` is not a class name", name));
+        }
+        let spans = self
+            .with_program(&uri, |p| {
+                let mut all = self.rule_spans(p, &class);
+                all.extend(self.use_spans(p, &class));
+                all
+            })
+            .unwrap_or_default();
+        let mut changes: serde_json::Map<String, J> = serde_json::Map::new();
+        for (f, l, a, b) in spans {
+            let mut loc = self.location(&f, l, a, b);
+            let edits = changes.entry(loc["uri"].as_str().unwrap_or("").to_string()).or_insert_with(|| json!([]));
+            edits.as_array_mut().unwrap().push(json!({ "range": loc["range"].take(), "newText": name }));
+        }
+        Ok(json!({ "changes": changes }))
     }
 
     fn completion(&self, params: &J) -> J {
         let (uri, line, col) = Self::position(params);
-        // Rust: Quillo's names would only be in the way.
-        if uri.ends_with(".qwer") {
+        // Rust or CSS: Quillo's names would only be in the way.
+        if !uri.ends_with(".qwe") {
             return json!([]);
         }
         let Some(doc) = self.docs.get(&uri) else { return json!([]) };
@@ -838,7 +1071,7 @@ impl Server {
     fn close_tag(&self, params: &J) -> J {
         let (uri, line, col) = Self::position(params);
         let Some(doc) = self.docs.get(&uri) else { return J::Null };
-        if uri.ends_with(".qwer") {
+        if !uri.ends_with(".qwe") {
             return J::Null;
         }
         let at = byte_offset(&doc.text, line, col);
@@ -866,7 +1099,7 @@ impl Server {
     fn code_actions(&self, params: &J) -> J {
         let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
         let Some(doc) = self.docs.get(uri) else { return json!([]) };
-        if uri.ends_with(".qwer") {
+        if !uri.ends_with(".qwe") {
             return json!([]);
         }
         let Err(e) = crate::parser::Parser::new(&doc.text).parse_program() else { return json!([]) };

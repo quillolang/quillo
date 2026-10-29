@@ -1053,6 +1053,9 @@ pub fn def_text(d: &FnDef) -> String {
 pub enum Severity {
     Error,
     Warning,
+    /// Shown by an editor, faintly; not by `quillo check` (branch
+    /// class-tools).
+    Hint,
 }
 
 #[derive(Clone, Debug)]
@@ -1065,7 +1068,11 @@ pub struct Diagnostic {
 
 impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let sev = if self.severity == Severity::Error { "error" } else { "warning" };
+        let sev = match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Hint => "hint",
+        };
         if self.line > 0 {
             write!(f, "{}:{}: {}: {}", self.file, self.line, sev, self.message)
         } else {
@@ -1119,6 +1126,9 @@ pub struct Analysis {
     /// line): where an editor goes from `<span.chip>`, and what it offers
     /// after `<span.` (branch class-links).
     pub classes: Vec<(String, String, u32)>,
+    /// The program's `.qwe` files, where an editor looks for the classes
+    /// markup writes (branch class-tools).
+    pub files: Vec<String>,
 }
 
 impl Analysis {
@@ -1146,6 +1156,9 @@ pub struct Options {
     /// Also warn of classes the program styles and never writes (`quillo
     /// check`; FEEDBACK8.md, Q-065; branch feedback8-fixes).
     pub css: bool,
+    /// Warn of classes markup writes that no style sheet has a rule for
+    /// (`quillo check`, and `quillo lsp`; branch class-tools).
+    pub classes: bool,
 }
 
 /// How many programs deep `mount` and `service` may lead, and files deep
@@ -1234,9 +1247,21 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             let mut order = Vec::new();
             c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
             c.out.classes = class_rules(&order, base_dir);
+            for it in &order {
+                if !c.out.files.iter().any(|f| **f == *it.file) {
+                    c.out.files.push(it.file.to_string());
+                }
+            }
             if opts.css {
                 for (file, line, msg) in unused_classes(&order, base_dir, &c.unparsed_texts) {
                     c.diag_at(file, line, Severity::Warning, msg);
+                }
+            }
+            if opts.css || opts.classes {
+                for (file, line, sev, msg) in unstyled_classes(&order, base_dir, &c.out.classes) {
+                    if sev == Severity::Warning || opts.classes {
+                        c.diag_at(file, line, sev, msg);
+                    }
                 }
             }
             c.run(order);
@@ -1471,7 +1496,7 @@ impl Checker {
     }
 
     fn options(&self) -> Options {
-        Options { strict_null: self.strict_null, confined: self.confined, css: false }
+        Options { strict_null: self.strict_null, confined: self.confined, css: false, classes: false }
     }
 
     /// The file a `use`, `mount` or `service` names; when confined, none
@@ -4189,6 +4214,164 @@ fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
     }
     out.dedup();
     out
+}
+
+/// The classes markup writes as they are written (`<span.chip>`,
+/// `class="a b"`, the strings in `class={...}`), with the file and the
+/// line of their element. A class put together (`card-${size}`) is not.
+fn class_uses(order: &[Item]) -> Vec<(String, Arc<str>, u32)> {
+    // The strings that are the value: not those given to a function on
+    // the way (`replace(state, " ", "-")`).
+    fn words(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Lit(Lit::Str(s)) => out.extend(s.split_whitespace().map(str::to_string)),
+            Expr::If(_, a, b) => {
+                words(a, out);
+                if let Some(b) = b {
+                    words(b, out)
+                }
+            }
+            Expr::Match(_, arms, _) => arms.iter().for_each(|a| words(&a.body, out)),
+            Expr::Binary(BinOp::And, _, b, _) => words(b, out),
+            Expr::Binary(BinOp::Or, a, b, _) | Expr::Coalesce(a, b) => {
+                words(a, out);
+                words(b, out)
+            }
+            Expr::List(xs) => xs.iter().for_each(|x| words(x, out)),
+            Expr::Template(parts) => {
+                for (k, p) in parts.iter().enumerate() {
+                    let TPart::Lit(t) = p else { continue };
+                    let ws: Vec<&str> = t.split(char::is_whitespace).collect();
+                    for (i, w) in ws.iter().enumerate() {
+                        let glued = (i == 0 && k > 0) || (i + 1 == ws.len() && k + 1 < parts.len());
+                        if !w.is_empty() && !glued {
+                            out.push(w.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn el_uses(el: &HtmlEl, file: &Arc<str>, out: &mut Vec<(String, Arc<str>, u32)>) {
+        let mut found = Vec::new();
+        for c in &el.classes {
+            if let Expr::Lit(Lit::Str(s)) = c {
+                found.push(s.to_string());
+            }
+        }
+        for (name, v) in &el.attrs {
+            if let (AttrVal::Expr(e), "class") = (v, name.as_str()) {
+                words(e, &mut found);
+            }
+        }
+        out.extend(found.into_iter().map(|c| (c, file.clone(), el.line)));
+        // Elements written inside `{...}` are reached as expressions.
+        for c in &el.children {
+            if let HtmlChild::El(child) = c {
+                el_uses(child, file, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| {
+            if let Expr::Html(el, _) = e {
+                el_uses(el, &it.file, &mut out);
+            }
+        });
+    }
+    out
+}
+
+/// Classes markup writes that no style sheet of the program has a rule for:
+/// a misspelt class, or a rule since removed (branch class-tools). Not
+/// told when the program has no sheets of its own or links one from
+/// elsewhere, for a class Quillo writes, or for one its scripts use.
+fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]) -> Vec<(Arc<str>, u32, Severity, String)> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let uses = class_uses(order);
+    let mut linked = false;
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| {
+            if let Expr::Html(el, _) = e {
+                walk_html_els(el, &mut |el| {
+                    if el.tag == "link" {
+                        for (n, v) in &el.attrs {
+                            if let (AttrVal::Expr(Expr::Lit(Lit::Str(h))), "href") = (v, n.as_str()) {
+                                linked |= h.starts_with("http") || h.starts_with("//");
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    if linked {
+        return Vec::new();
+    }
+    // What the app's scripts and sheets say of classes they set themselves.
+    let mut scripts = String::new();
+    let mut elsewhere = Vec::new();
+    fn files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth < 8 {
+                files(&p, out, depth + 1);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut public = Vec::new();
+    files(&base.join("public"), &mut public, 0);
+    for p in public {
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        match ext {
+            "js" | "mjs" => scripts.push_str(&text),
+            "css" => elsewhere.extend(crate::styles::set_elsewhere(&text)),
+            _ => {}
+        }
+    }
+    let script_words: HashSet<&str> = scripts.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).collect();
+    let styled: HashSet<&str> = rules.iter().map(|(n, _, _)| n.as_str()).collect();
+    let mut out = Vec::new();
+    let mut said = HashSet::new();
+    for (class, file, line) in uses {
+        if styled.contains(class.as_str())
+            || crate::styles::set_by_quillo(&class)
+            || elsewhere.iter().any(|p| class.starts_with(p.as_str()))
+            || script_words.contains(class.as_str())
+            || !class.trim_start_matches('-').starts_with(|c: char| c.is_alphabetic() || c == '_')
+            || !said.insert((class.clone(), file.clone(), line))
+        {
+            continue;
+        }
+        // A near miss is likely a typo; a class with no rule and none like
+        // it, a name the markup carries for its own sake (`.dashboard`).
+        let most = (class.chars().count() / 4).clamp(1, 2);
+        let near = styled.iter().filter(|n| edit_distance(n, &class) <= most).min_by_key(|n| (edit_distance(n, &class), **n));
+        match near {
+            Some(n) => out.push((file, line, Severity::Warning, format!("no style sheet has a rule for `.{}` (did you mean `{}`?)", class, n))),
+            None => out.push((file, line, Severity::Hint, format!("no style sheet has a rule for `.{}`", class))),
+        }
+    }
+    out
+}
+
+/// Each element of `el`, itself first, as far as its children go (not
+/// those inside `{...}`).
+fn walk_html_els(el: &HtmlEl, f: &mut dyn FnMut(&HtmlEl)) {
+    f(el);
+    for c in &el.children {
+        if let HtmlChild::El(child) = c {
+            walk_html_els(child, f);
+        }
+    }
 }
 
 fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<str>, u32, String)> {
