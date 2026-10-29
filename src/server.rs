@@ -1909,6 +1909,25 @@ impl Worker {
             r.headers = vec![("content-type".into(), "text/plain; version=0.0.4".into())];
             return Answer::Respond(r);
         }
+        // How long queries take (src/querystats.rs; branch query-stats): the figures
+        // for anyone while on; each statement, and switching on or off, with the
+        // health token (under --watch, from this machine too).
+        if path == "/_quillo/health/queries" {
+            let auth = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
+            let local = app.watch && (req.remote == "127.0.0.1" || req.remote == "::1");
+            let trusted = crate::querystats::has_token(auth) || local;
+            if req.method == "POST" {
+                if !trusted {
+                    return Answer::Respond(plain(403, "send the health token (QUILLO_HEALTH_TOKEN) as Authorization: Bearer ...\n"));
+                }
+                let q = req.url.split_once('?').map_or("", |(_, q)| q);
+                let on = !q.split('&').any(|kv| kv == "on=0" || kv == "on=false" || kv == "off");
+                crate::querystats::set(on);
+            }
+            let mut r = plain(200, &serde_json::to_string_pretty(&crate::querystats::report(trusted)).unwrap_or_default());
+            r.headers = vec![("content-type".into(), "application/json".into()), ("cache-control".into(), "no-store".into())];
+            return Answer::Respond(r);
+        }
         // For a load balancer: whether to send requests here.
         if path == "/_quillo/health" {
             let ready = matches!(&*app.current().1, Loaded::Ready(_)) && !crate::httpd::stopping();

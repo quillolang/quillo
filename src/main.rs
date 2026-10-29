@@ -96,6 +96,10 @@ options for `run`:
                  rid) or off
   --metrics      answer GET /_quillo/metrics: request counts and times, open
                  connections and uptime, in Prometheus's text format
+  --query-stats  time database queries for GET /_quillo/health/queries: min,
+                 max and average of the last 100, overall and per statement
+                 (on under --watch; also QUILLO_QUERY_STATS=1, or switched on
+                 while running with the health token)
   --register URL join limer's `discover` pool through its admin API (such as
                  http://127.0.0.1:2019), and share live updates with the other
                  servers there; limer's admin secret must be in
@@ -139,7 +143,7 @@ const VALUE_OPTIONS: &[&str] = &[
 /// Options of `run`, `app`, `build` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--plain-http", "--metrics", "--strict-null", "--describe",
+    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -451,6 +455,11 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 i += 1;
                 continue;
             }
+            ("--query-stats", _) => {
+                quillo::querystats::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
             ("--metrics", _) => {
                 quillo::metrics::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 quillo::metrics::start();
@@ -508,6 +517,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
         eprintln!("quillo: --tls-cert and --tls-key go together");
         return Err(2);
+    }
+    // Query stats: on in development, else when asked (branch query-stats).
+    if o.watch || std::env::var("QUILLO_QUERY_STATS").is_ok_and(|v| v == "1" || v == "true") {
+        quillo::querystats::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(o)
 }
