@@ -1683,6 +1683,12 @@ fn js(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
+/// A name from a browser library (`use Chart from "...js"`), called while the
+/// server renders: null, as `js(...)` gives (branch js-libraries).
+pub fn js_lib(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Nil)
+}
+
 /// `parallel(f, g, ...)` or `parallel([f, g, ...])`: calls the functions at
 /// once; their results, in order.
 fn parallel(it: &mut Interp, args: Vec<Value>, line: u32) -> R {

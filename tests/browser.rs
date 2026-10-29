@@ -379,6 +379,31 @@ fn components_call_the_pages_javascript() {
     assert_eq!(r, want);
 }
 
+/// Libraries by name (`use Gauge from libs-lib.js`; branch js-libraries): the
+/// script loaded before the bundle, `Gauge.new`, `lib.double`, `lib.version`,
+/// and what a wrong one says.
+#[test]
+fn components_use_libraries_by_name() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("libs.qwe"), free_port(), Some(&dir.join("libs.js")));
+    // One script for both names, before the runtime and the bundle. Calling the
+    // class without `.new` stops the handler, saying how to make one.
+    let near = "err(\"js_new: gauge is not defined on this page (did you mean Gauge?)\")";
+    let want = serde_json::json!({
+        "loaded": ["libs-lib.js", "_quillo", "_quillo"],
+        "mounted": ["gauge 1", 1, "1.2.3"],
+        "called": ["gauge 2", "4"],
+        "near": near,
+        "cls": near,
+        "errors": ["Gauge is a class: make one with Gauge.new(...) (or js_new(\"Gauge\", ...))"]
+    });
+    assert_eq!(r, want);
+}
+
 /// The ways around the checks on the page's functions, tried in a real
 /// page: none runs its text, and ordinary calls still work.
 #[test]

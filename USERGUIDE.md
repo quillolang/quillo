@@ -913,16 +913,65 @@ component Dashboard() {
 
 ### JavaScript libraries
 
-A component can hand an element to a library the page loads (a chart, a map, an editor)
-and call into it:
+A component can hand an element to a library (a chart, a map, an editor) and call into
+it. Name the library with `use`, then call it as JavaScript does:
+
+```quillo
+use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+use L from /assets/leaflet.js
+use confetti from "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"
+
+component Sales(points: list) {
+    state chart = null
+    <canvas @mount={(el) => {
+        chart = Chart.new(el, { type: "line", data: points })    // new Chart(el, ...)
+        () => chart.destroy()                   // when the canvas leaves the page
+    }}></canvas>
+    <button @click={() => confetti({ particleCount: 120 })}>Celebrate</button>
+}
+
+component Where() {
+    <div class="map" @mount={(el) => { L.map(el).setView([14.6, 121.0], 12) }}></div>
+}
+
+route GET / = <html><body><Sales points={load_points()}/></body></html>
+```
+
+- `use Name from <script>`: a path ending in `.js`, or an address, is a browser library.
+  `Name` is what the script defines on the page (`Chart`, `L`, `confetti`, `dayjs`):
+  the name the library's own documentation uses, in its case. Several from one script:
+  `use L, LeafletDraw from /assets/leaflet.js`; another name for one:
+  `use Chart as ChartJS from ...`. Quotes are optional, as for every `use`; put an
+  address in them, so editors do not read its `//` as a comment.
+- `Name.new(args)` makes an object of a class (`new Chart(el, config)`); `Name(args)`
+  calls a function (`confetti()`); `Name.fn(args)` calls one of its functions
+  (`L.map(el)`, `dayjs.extend(...)`); `Name.field` reads a value (`Chart.version`).
+  What they give is the library's object, whose methods and fields are used as below
+  (`chart.update()`, `map.setView(...)`).
+- The page loads the script only where a component that uses the library is on it (or
+  one it can come to show), once, in the order the program names its libraries, before
+  the components' own code. A page without such a component loads nothing more. No
+  `<script>` tag is written; one you write still works, as below.
+- A path (`/assets/leaflet.js`, `assets/leaflet.js`) is from the program's own address,
+  under its base path; serve it as any other file (`public/`, or a route with `file()`).
+  An address (`https://...`, `//...`) is loaded as written: pin its version.
+- The names are known to `quillo check` and the editor. They are the browser's: on the
+  server, while a component renders, `Chart.version` and `Chart.new(...)` give null, as
+  `js(...)` does, so call them in `@mount` and event handlers.
+- Mistakes say what to do: `Chart(el)` for a class stops with "Chart is a class: make
+  one with Chart.new(...)"; a name in the wrong case gives an error value,
+  `js_new: chart is not defined on this page (did you mean Chart?)`; so does a script
+  that did not load.
+- `use` takes a library that sets a global (a "UMD" or "browser" build: `.umd.js`,
+  `.min.js`, `.browser.js`), not an ES module (`import`/`export`) or an npm package.
+
+Without `use`, a page's own `<script>` tags work too, and `js` and `js_new` reach what
+they define by name:
 
 ```quillo
 component Sales(points: list) {
     state chart = null
-    <canvas @mount={(el) => {
-        chart = js_new("Chart", el, { type: "line", data: points })
-        () => chart.destroy()                   // when the canvas leaves the page
-    }}></canvas>
+    <canvas @mount={(el) => { chart = js_new("Chart", el, { type: "line", data: points }) }}></canvas>
 }
 
 route GET / = <html><head><script src="/assets/chart.js"></script></head>
@@ -938,8 +987,9 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   works, and `off` finds what `on` was given.
 - `js("path.to.fn", args...)` calls a function of the page's scripts, found by its dotted
   name from the page's globals (`js("L.map", el)`, `js("analytics.track", "signup")`),
-  and gives its result; `js_new("Chart", ...)` makes an object of a class. The name is
-  written in the code: one from data could reach anything on the page, so a variable is
+  and gives its result; `js_new("Chart", ...)` makes an object of a class. A library's
+  name from `use` is the same call written as JavaScript reads, with the same checks.
+  The name is written in the code: one from data could reach anything on the page, so a variable is
   an error when the program loads, as are `eval`, `Function` and the like.
 - Objects from the page (elements, a library's objects) have their properties and
   methods as fields: `el.value`, `chart.update()`; and their fields can be set:
@@ -970,8 +1020,8 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 - A name the page does not have (a library's `<script>` left out) gives an error value,
   `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
-- There are no npm packages, `import`s or TypeScript: a library is a `<script>` the page
-  loads, and component code reaches it by name. `js("fetch", url)` works, but `http.*`
+- There are no npm packages, `import`s or TypeScript: a library is a script the page
+  loads (named with `use`, or a `<script>` tag), and component code reaches it by name. `js("fetch", url)` works, but `http.*`
   is the way.
 
 ### Single-page apps
@@ -2924,6 +2974,9 @@ level off: `flatten(flatten(xs))` for two.
   `.qwe` file (`use lib/auth`), or a `.qwer` one when the `use` takes names. `use *
   from lib/auth.qwe` says the same as `use lib/auth.qwe`: every public name.
 - A file `use`d twice, or by several files, runs once.
+- A `.js` file or an address is a browser library, for components:
+  `use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"`
+  (see [JavaScript libraries](#javascript-libraries)).
 - **`private` and `public`.** `private` before a `fn`, `view`, `component` or top-level
   `let` keeps the name to its file: the file uses it as any name, other files do not
   see it, and two files may each have a private `helper` without clashing. `public`

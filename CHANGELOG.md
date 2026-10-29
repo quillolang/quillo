@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Browser libraries by name.** `use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"`
+  (or a path, `use L from /assets/leaflet.js`) names what a script defines on the page,
+  and component code calls it as JavaScript reads: `Chart.new(el, config)`, `L.map(el)`,
+  `confetti()`, `Chart.version`. The page loads the script only where a component using
+  it is, before the components' code; no `<script>` tag to write. The names are known to
+  the checker and the editor; on the server they give null. Calling a class without
+  `.new` says how, and a name in the wrong case says which one the page has (`did you
+  mean Chart?`), for `js(...)` too. `js` and `js_new` stay, for a page's own scripts.
 - **`defer`: slow parts of a page streamed after it.** `state reviews =
   defer(load_reviews(id))` in a component placed in the page: the page is sent at once
   with the state null (its placeholder shown), and the component follows in the same

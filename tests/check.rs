@@ -717,3 +717,20 @@ fn use_takes_names_from_plugins() {
     assert!(both.iter().any(|m| m.starts_with("2 `cache_get` comes from kv.qwer and mem.qwer") && m.contains("use cache_get as mem_cache_get from lib/mem.qwer")), "{:#?}", both);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// `use Chart from "...js"`: the names a browser library gives are known, a
+/// script without names is an error, and so is a name it is not given
+/// (branch js-libraries).
+#[test]
+fn browser_libraries_by_name() {
+    clean(r#"use Chart from https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js
+use L, confetti from "/assets/vendor.js"
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, { type: "line" }); L.map(el).setView([1, 2], 3); confetti() }}></canvas>
+}
+route GET / = <Sales/>"#);
+    one(r#"use "/assets/chart.js""#, "a script gives the page names of its own: name what it defines");
+    one(r#"use * from "/assets/chart.js""#, "a script gives the page names of its own");
+    one("use Chart from /assets/chart.js\nprint(chart)", "unknown name `chart`");
+}

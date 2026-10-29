@@ -912,3 +912,38 @@ route GET /calls = calls
     let calls = String::from_utf8_lossy(&get(&mut it, "/calls").body).to_string();
     assert_eq!(calls, r#"{"fast":1,"slow":3}"#);
 }
+
+/// A page loads a browser library's script, before its bundle, only when a
+/// component on it uses the library (branch js-libraries).
+#[test]
+fn a_page_loads_the_libraries_its_components_use() {
+    let mut it = app(r#"
+use Chart from "https://cdn.example/chart.umd.js"
+use L from assets/leaflet.js
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, {}) }}></canvas>
+}
+component Map() {
+    <div @mount={(el) => { L.map(el) }}></div>
+}
+component Plain() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+route GET /sales = <html><body><Sales/></body></html>
+route GET /both = <html><body><Map/><Sales/></body></html>
+route GET /plain = <html><body><Plain/></body></html>
+"#);
+    let page = |it: &mut _, p: &str| String::from_utf8_lossy(&get(it, p).body).to_string();
+    let sales = page(&mut it, "/sales");
+    let chart = sales.find("\"https://cdn.example/chart.umd.js\"").expect("the script");
+    assert!(chart < sales.find("/_quillo/").expect("the bundle"), "{}", sales);
+    assert!(!sales.contains("leaflet.js"), "{}", sales);
+    // In the order the program names them, a path from the program's own address.
+    let both = page(&mut it, "/both");
+    let (c, l) = (both.find("chart.umd.js").expect("chart"), both.find("\"/assets/leaflet.js\"").expect("leaflet"));
+    assert!(c < l, "{}", both);
+    let plain = page(&mut it, "/plain");
+    assert!(!plain.contains("chart.umd.js") && !plain.contains("leaflet.js"), "{}", plain);
+}

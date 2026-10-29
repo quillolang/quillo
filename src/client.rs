@@ -117,6 +117,56 @@ fn styles_of(it: &Interp, c: &Compiler) -> Vec<String> {
     out
 }
 
+/// A browser library a program uses: `use Chart from "...js"` (branch
+/// js-libraries). `global` is what the script defines on the page, `src` where
+/// it is, `order` its place among the program's (a script after the one it
+/// builds on).
+#[derive(Clone, Debug)]
+pub struct JsLib {
+    pub global: String,
+    pub src: String,
+    pub order: usize,
+}
+
+/// The scripts of the libraries a compile's code uses, in the order the program
+/// names them: a page loads them before its bundle (branch js-libraries).
+fn libs_of(it: &Interp, c: &Compiler) -> Vec<String> {
+    let mut libs: Vec<&JsLib> = c.globals.keys().filter_map(|k| it.js_libs.get(k)).collect();
+    libs.sort_by_key(|l| l.order);
+    let mut out: Vec<String> = Vec::new();
+    for l in libs {
+        let src = script_src(it, &l.src);
+        if !out.contains(&src) {
+            out.push(src);
+        }
+    }
+    out
+}
+
+/// Every library's script, for the whole program's bundle.
+pub fn all_libs(it: &Interp) -> Vec<String> {
+    let mut libs: Vec<&JsLib> = it.js_libs.values().collect();
+    libs.sort_by_key(|l| l.order);
+    let mut out: Vec<String> = Vec::new();
+    for l in libs {
+        let src = script_src(it, &l.src);
+        if !out.contains(&src) {
+            out.push(src);
+        }
+    }
+    out
+}
+
+/// A script's address as the page loads it: an address as written, a path from
+/// the program's own (`/assets/leaflet.js`, under its base).
+fn script_src(it: &Interp, src: &str) -> String {
+    if src.starts_with("https://") || src.starts_with("http://") || src.starts_with("//") {
+        src.to_string()
+    } else {
+        format!("{}/{}", it.base, src.trim_start_matches("./").trim_start_matches('/'))
+    }
+}
+
 /// The compiled program as one script: `BASE` (when `with_base`), the
 /// markup blocks, the definitions, the `server fn` stubs, and the boot.
 fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> String {
@@ -165,15 +215,16 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
     }
     let (c, boots) = c;
     let styles = styles_of(it, &c);
+    let libs = libs_of(it, &c);
     if c.dev {
-        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles });
+        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs });
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok(PageBundle { js, set, split: true, styles });
+            return Ok(PageBundle { js, set, split: true, styles, libs });
         }
     }
-    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles })
+    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs })
 }
 
 pub struct PageBundle {
@@ -184,6 +235,8 @@ pub struct PageBundle {
     pub split: bool,
     /// The styles of the components and views it holds.
     pub styles: Vec<String>,
+    /// The scripts of the libraries its code uses, loaded before it.
+    pub libs: Vec<String>,
 }
 
 /// A page's bundle as the page names it.
@@ -193,6 +246,7 @@ pub struct PageRef {
     /// It takes the runtime from the runtime file.
     pub split: bool,
     pub styles: Vec<String>,
+    pub libs: Vec<String>,
 }
 
 /// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
@@ -344,7 +398,7 @@ impl Bundles {
             m.used = self.tick;
             return m.page.clone();
         }
-        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles };
+        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs };
         self.by_set.insert(set, Made { page: page.clone(), js: Arc::new(b.js), used: self.tick });
         crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while self.by_set.len() > KEPT {
@@ -1793,6 +1847,12 @@ impl<'a> Compiler<'a> {
             return self.err(format!("unknown name `{}`{}", name, crate::error::removed_note(name)));
         };
         let js = format!("G[{}]", js_str(name));
+        // A library's name: what its script defined on the page (branch js-libraries).
+        if let (Value::Builtin("__jslib", _), Some(lib)) = (&v, self.it.js_libs.get(name)) {
+            let r = (format!("B.js_value({})", js_str(&lib.global)), false);
+            self.globals.insert(name.to_string(), r.clone());
+            return Ok(r);
+        }
         match &v {
             Value::Builtin(b, _) => {
                 if CLIENT_BUILTINS.contains(b) {
@@ -2716,6 +2776,11 @@ impl<'a> Compiler<'a> {
             }
             Expr::Field(obj, name, line) => {
                 self.line = *line;
+                // `Chart.defaults`: read from the library (branch js-libraries).
+                if let Some(path) = self.lib_path(e)? {
+                    self.js_name("js", Some(&Expr::Lit(Lit::Str(path.as_str().into()))))?;
+                    return Ok(format!("B.js_value({})", js_str(&path)));
+                }
                 let o = self.expr(obj)?;
                 let mut fb = self.fallback(name);
                 // `x.js` is no call of `js` with the name x holds.
@@ -2959,6 +3024,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
+        if let Some(path) = self.lib_path(callee)? {
+            return self.lib_call(&path, args, pre);
+        }
         let mut argv: Vec<String> = pre.into_iter().collect();
         if let Expr::Field(obj, name, _) = callee {
             let saved = std::mem::replace(&mut self.keep_promise, matches!(name.as_str(), "then" | "catch" | "finally"));
@@ -3040,6 +3108,47 @@ impl<'a> Compiler<'a> {
             return self.finish_call(&name, true, format!("W.settle({})", call));
         }
         self.finish_call(&name, is_async, call)
+    }
+
+    /// `Chart`, `L.map`, `Chart.new`: a name a browser library gives, and the
+    /// fields after it, as the dotted path on the page; none for anything else
+    /// (branch js-libraries).
+    fn lib_path(&mut self, e: &Expr) -> Result<Option<String>, QuilloError> {
+        match e {
+            Expr::Ident(n, _) => {
+                if !self.it.js_libs.contains_key(n) {
+                    return Ok(None);
+                }
+                Ok(match self.resolve(n)? {
+                    Resolved::Global(js, _) if js.starts_with("B.js_value(") => self.it.js_libs.get(n).map(|l| l.global.clone()),
+                    _ => None,
+                })
+            }
+            Expr::Field(obj, name, _) => Ok(self.lib_path(obj)?.map(|p| format!("{}.{}", p, name))),
+            _ => Ok(None),
+        }
+    }
+
+    /// `Chart.new(el, config)` is `js_new("Chart", el, config)`, and `L.map(el)`
+    /// is `js("L.map", el)`: the same checks, written as JavaScript reads
+    /// (branch js-libraries).
+    fn lib_call(&mut self, path: &str, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
+        let (f, path) = match path.strip_suffix(".new") {
+            Some(p) => ("js_new", p),
+            None => ("js", path),
+        };
+        self.js_name(f, Some(&Expr::Lit(Lit::Str(path.into()))))?;
+        let mut argv = vec![js_str(path)];
+        argv.extend(pre);
+        for a in args {
+            argv.push(self.expr(a)?);
+        }
+        let call = format!("B.{}({})", f, argv.join(", "));
+        // Its Promise is waited for where code can wait, as `js(...)`'s is.
+        if !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
+            return self.finish_call(path, true, format!("W.settle({})", call));
+        }
+        self.finish_call(path, false, call)
     }
 
     /// `http.get(...)` and the rest, which the browser makes once the page
