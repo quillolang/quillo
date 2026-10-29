@@ -20,6 +20,7 @@ pub mod highlight;
 pub mod httpd;
 pub mod i18n;
 pub mod idempotency;
+pub mod install;
 pub mod imaging;
 pub mod island;
 pub mod jobs;

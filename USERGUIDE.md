@@ -4192,6 +4192,29 @@ How it runs:
 
 See [rust.qwe](https://github.com/quillolang/examples/blob/main/rust.qwe) and [rust.qwer](https://github.com/quillolang/examples/blob/main/rust.qwer).
 
+### Plugins from the catalog
+
+[quillolang.org/plugins](https://quillolang.org/plugins/) has `.qwer` files ready to use,
+each with a version, an example, and a test run before it is published. `quillo install`
+puts them beside the program:
+
+```
+quillo install csv qr jwt          # csv.qwer, qr.qwer and jwt.qwer, into this folder
+quillo install csv --example       # and csv.qwe, its example program
+quillo install --update            # the plugins here that the catalog has newer
+quillo install --list pdf          # what the catalog has, matching "pdf"
+```
+
+- It reads the catalog (`https://quillolang.org/plugins/index.json`; `--registry` or
+  `QUILLO_REGISTRY` for another), downloads each file, and writes it only when its
+  SHA-256 and the `//! version:` line of its header match the catalog's. A plugin
+  that fails leaves the others going, and the exit status is 1.
+- A file already there is left alone when it is the same, replaced when the catalog's
+  version is newer, and kept when it is newer or the same version changed by hand:
+  `--force` replaces it. `--dir DIR` installs elsewhere. `name@1.2.0` asks for that
+  version, and fails when the catalog has another (it keeps only the newest).
+- Then `use "csv.qwer"`: the first run builds it with cargo, as any `.qwer` file.
+
 ### Other stores
 
 `db` is for SQL databases. For another kind (Redis, MongoDB, a graph database), use its
