@@ -1,15 +1,16 @@
 // The office: the clerks' queues (live), members and the counter.
 
-component ApplicationItem(a) {
+// An approved applicant leaves the live list at once, so what the clerk must
+// read out (the first password) is kept by the list, not by its row.
+component ApplicationItem(a, on_approved) {
     state reason = ""
     state problem = null
-    state given = null
     state busy = false
     let approve = () => {
         busy = true
         let r = approve_member(a.id)
         busy = false
-        if is_err(r) { problem = r.error } else { problem = null; given = r }
+        if is_err(r) { problem = r.error } else { problem = null; on_approved({ ...r, name: `${a.first_name} ${a.last_name}` }) }
     }
     let reject = () => {
         let r = reject_member(a.id, reason)
@@ -20,22 +21,23 @@ component ApplicationItem(a) {
         <p>{a.email} · {a.phone} · born {a.birth_date} · {a.address}</p>
         <p>{a.employer != null ? `${a.employer}, employee ${a.employee_no}` : "No employer"} · pledges {peso(a.pledge)}
            {a.monthly_savings > 0 && `, saves ${peso(a.monthly_savings)} a month`}</p>
-        {given != null
-            ? <p.done>Approved as <b>{given.number}</b>. Their first password: <code>{given.password}</code> (shown once; they change it when they sign in).</p>
-            : <div.row>
-                <button.primary disabled={busy} @click={approve}>Approve</button>
-                <input placeholder="Reason, to reject" bind:value={reason} aria-label="Reason"/>
-                <button.ghost disabled={busy} @click={reject}>Reject</button>
-            </div>}
+        <div.row>
+            <button.primary disabled={busy} @click={approve}>Approve</button>
+            <input placeholder="Reason, to reject" bind:value={reason} aria-label="Reason"/>
+            <button.ghost disabled={busy} @click={reject}>Reject</button>
+        </div>
         <Problem text={problem}/>
     </li>
 }
 
 component Applications() {
     state items = live(load_applications)
+    state given = []
     <section.card>
         <h2>Membership applications <span.count>{len(items)}</span></h2>
-        {len(items) == 0 ? <p.muted>None waiting.</p> : <ul.plain>{for a in items => <ApplicationItem key={a.id} a={a}/>}</ul>}
+        {len(given) > 0 && <ul.plain.given>{for g in given => <li key={g.number}><p.done>{g.name} is member <b>{g.number}</b>. Their first password:
+            <code>{g.password}</code> (shown once; they choose their own when they sign in).</p></li>}</ul>}
+        {len(items) == 0 ? <p.muted>None waiting.</p> : <ul.plain>{for a in items => <ApplicationItem key={a.id} a={a} on_approved={(g) => { given = given | push(g) }}/>}</ul>}
     </section>
 }
 

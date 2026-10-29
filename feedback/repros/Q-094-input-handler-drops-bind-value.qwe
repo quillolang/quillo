@@ -1,0 +1,20 @@
+// Q-094 `bind:value` and `@input` on one input: the handler takes the binding's place, silently; the state never follows the input, and `quillo check` says nothing
+// mode: browser
+// probe: const i = document.getElementById("amount"); i.focus(); await new Promise((r) => setTimeout(r, 400)); i.value = "20000"; i.dispatchEvent(new Event("input", { bubbles: true })); await new Promise((r) => setTimeout(r, 300)); return { state: document.getElementById("state").textContent, seen: document.getElementById("seen").textContent };
+// open-when: "state": ""
+// fixed-when: "state": "20000"
+// From FEEDBACK14.md §Q-094 (found on 991e96c). The guide says the handler "takes the binding's
+// place"; written as one writes it in Svelte (`bind:value` plus `on:input`) or Vue (`v-model` plus
+// `@input`), where both run, the amount typed is lost and the form sends "".
+
+component Deposit() {
+    state amount = ""
+    state seen = "nothing"
+    <div>
+        <input #amount bind:value={amount} @input={() => { seen = `asked about ${amount}` }}/>
+        <p #state>{amount}</p>
+        <p #seen>{seen}</p>
+    </div>
+}
+
+route GET / = <html><body><Deposit/></body></html>

@@ -112,8 +112,24 @@ component Designer(id: int?, start, status: str, first_due: str) {
     </div>
 }
 
+component RunDaily() {
+    state result = null
+    state problem = null
+    let go = () => {
+        let r = run_daily()
+        if is_err(r) { problem = r.error } else { problem = null; result = `${plural(r.matured, "deposit")} paid out; interest posted on ${plural(r.interest, "savings account")}.` }
+    }
+    <section.card.narrow>
+        <h2>The daily job</h2>
+        <p.muted>Every day at 00:30 the coop pays out the fixed deposits that matured, and on the 1st it posts last month's savings interest, once.</p>
+        <button.ghost @click={go}>Run it now</button>
+        <Problem text={problem}/><Done text={result}/>
+    </section>
+}
+
 view SettingsPage(me, s, problem, done) =
     <Page title="Rates" me={me} here="/settings">
+        <RunDaily/>
         <form.card.narrow method="post" action="/settings">
             <h1>Rates and limits</h1>
             <label>Savings interest a year (%) <input name="savings_rate" inputmode="decimal" value={bp_text(s.savings_rate_bp)}/></label>

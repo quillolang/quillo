@@ -121,6 +121,17 @@ fn mature_deposits() -> int with db, time, random {
     len(due)
 }
 
+// The manager's button for what the daily job does (to show it, or after the
+// server was down at 00:30): deposits due, and last month's interest if not
+// yet posted.
+server fn run_daily() ! str with db, time, random {
+    let u = acting_as(["manager"])?
+    let matured = mature_deposits()
+    let interest = post_savings_interest(slice(date.add_months(today(), -1), 0, 7))
+    audit(u.id, "run daily", `${matured} deposits, interest on ${interest}`)
+    { matured, interest }
+}
+
 // Once a day: deposits that matured, and on the first of a month last
 // month's savings interest.
 fn daily() with db, time, random {

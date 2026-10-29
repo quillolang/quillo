@@ -1,0 +1,11 @@
+// Q-096 `money.to_minor` of an amount past an int's range is a runtime error (a 500 in a route), not an error value; `money.of` takes it, and reads "1e3" as 1,000
+// mode: run
+// open-when: integer overflow
+// fixed-when: err(
+// From FEEDBACK14.md §Q-096 (found on 991e96c). An amount typed into a form, made money with
+// `money.of(text, "PHP")` (an error value for bad text, which the code tests for) and then
+// centavos with `money.to_minor`, crashes the server fn instead.
+
+let m = money.of("99999999999999999999", "PHP")
+print(type_of(m))
+print(money.to_minor(m))

@@ -29,7 +29,8 @@ scaled to several copies without changing its code, a copy joining while the app
 retries behind a balancer, health and API description through a gateway), [FEEDBACK11.md](reports/FEEDBACK11.md) (no app:
 Tailwind and CSS tools beside Quillo, and `--watch` with a generated stylesheet), [FEEDBACK12.md](reports/FEEDBACK12.md) (a real-time
 multiplayer game: a server loop, channels, a game as a service, and a simulation with browsers and bots), [FEEDBACK13.md](reports/FEEDBACK13.md) (two-shift scheduling for a
-factory of 24 lines: rotating crews, leave and its approval, and live manpower for a week or a month), and
+factory of 24 lines: rotating crews, leave and its approval, and live manpower for a week or a month), [FEEDBACK14.md](reports/FEEDBACK14.md) (a credit
+cooperative: members, savings, fixed deposits, a loan designer, loans approved by the board, salary deductions from employers by file or API, stores, raffles and events), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

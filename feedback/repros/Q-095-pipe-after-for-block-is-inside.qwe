@@ -1,0 +1,14 @@
+// Q-095 `for x in xs => { ... } | flatten()` pipes each round's block, not the list: a list of lists comes out, and `quillo check` says nothing
+// mode: run
+// open-when: [[1, 10], [2, 20]]
+// fixed-when: /warning|\[1, 10, 2, 20\]/
+// From FEEDBACK14.md §Q-095 (found on 991e96c). In JavaScript `xs.map((n) => { ... }).flat()`
+// flattens the list; here the `|` after the block's `}` belongs to the body. Quillo Coop's
+// salary deduction batch was a list of lists, and failed later, elsewhere, with
+// "list has no field `member_id`".
+
+let pairs = for n in [1, 2] => {
+    let tens = n * 10
+    [n, tens]
+} | flatten()
+print(pairs)

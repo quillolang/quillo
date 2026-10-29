@@ -11,10 +11,14 @@ fn peso(c: int) -> str = money.format(money.from_minor(c, CURRENCY), LOCALE)
 fn signed(c: int) -> str = c < 0 ? "−" + peso(-c) : "+" + peso(c)
 
 // What someone typed, as centavos: "1,500", "₱ 1,500.50", "250.5". Thousands
-// separators are taken out first: `dec` does not read them.
+// separators are taken out first: `dec` does not read them. Only digits and a
+// point: `money.of` reads "1e3" as 1,000, and an amount past an int's range
+// makes `money.to_minor` fail with a runtime error, not an error value
+// (FEEDBACK14.md, Q-096).
 fn centavos(text) -> int ! str {
     let t = replace(replace(replace(trim(str(text ?? "")), ",", ""), "₱", ""), " ", "")
     if t == "" { return err("Enter an amount") }
+    if !re.test(t, "^-?[0-9]{1,12}(\\.[0-9]{1,2})?$") { return err(`Not an amount in pesos: ${text}`) }
     let m = money.of(t, CURRENCY)
     if type_of(m) == "error" { return err(`Not an amount in pesos: ${text}`) }
     let c = money.to_minor(m)

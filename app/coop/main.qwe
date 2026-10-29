@@ -34,7 +34,8 @@
 //   node feedback/tools/drive.mjs app/coop/tests/member.mjs      joining, approval, savings, a deposit, the store, a raffle, an event
 //   node feedback/tools/drive.mjs app/coop/tests/payroll.mjs     a month's deductions, remitted by file and through the API
 //   node feedback/tools/drive.mjs app/coop/tests/designer.mjs    a product designed, put to the board and approved
-//   python3 app/coop/tests/hostile.py $BASE                      every server fn called by the wrong role
+//   python3 app/coop/tests/hostile.py $BASE <coop.db>            every server fn called by the wrong role, with bad data, at once
+//   python3 app/coop/tests/jobs.py $BASE <coop.db>               the daily job: a matured deposit and the month's interest, once
 
 db.open(env("COOP_DB", "coop.db"))
 db.migrate("migrations")
