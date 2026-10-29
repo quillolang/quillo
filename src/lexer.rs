@@ -143,6 +143,11 @@ impl Lexer {
         self.chars.get(self.pos).copied()
     }
 
+    /// The text being read, for messages that point back into it.
+    pub fn text(&self) -> &[char] {
+        &self.chars
+    }
+
     pub fn peek_char_at(&self, n: usize) -> Option<char> {
         self.chars.get(self.pos + n).copied()
     }
