@@ -3865,8 +3865,9 @@ file is noticed once something loads it. A version that fails to load or check d
 replace the one that works; the errors are printed.
 A reload parses only the files that changed (the others' parses are kept) and, under
 `--watch`, compiles the program for the browser on a thread of its own once the new
-version answers, so a save shows in open pages in about a fifth of a second for a
-program of a few hundred components, plus the time to parse the file that changed.
+version answers, so a save shows in open pages about 120 ms later for a program of a
+few hundred components (the site quillolang.org, measured), plus the time to parse the
+file that changed.
 
 What a reload keeps, and what it starts afresh:
 
