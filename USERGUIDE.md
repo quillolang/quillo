@@ -3854,15 +3854,20 @@ threads, the system's elsewhere.
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. `--reload` reloads it the same way without
 `--watch`'s development aids (errors on pages, refreshing them), for production
-programs that change their own files, such as a plugin editor. Both look, twenty times
-a second, at the modification time of the main file and of every file the program loaded
-(`use`d, mounted, a service's; under `--watch`, files served with `file()` too): no
-folder is watched, so a new file is noticed once something loads it. A version that
-fails to load or check does not replace the one that works; the errors are printed.
+programs that change their own files, such as a plugin editor. Both watch the main file
+and every file the program loaded (`use`d, mounted, a service's; under `--watch`, files
+served with `file()` too): on macOS and Linux the system tells of a change as it happens
+(kqueue, inotify), and a save, in place or as an editor does it, a new file renamed over
+the old, is seen within a few milliseconds; elsewhere, or when the system cannot watch a
+file (too many open, a network mount that tells nothing), the files' modification times
+are looked at every 50 ms, and said so once in the log. No folder is watched, so a new
+file is noticed once something loads it. A version that fails to load or check does not
+replace the one that works; the errors are printed.
 A reload parses only the files that changed (the others' parses are kept) and, under
 `--watch`, compiles the program for the browser on a thread of its own once the new
-version answers, so a save shows in open pages in about a fifth of a second for a
-program of a few hundred components, plus the time to parse the file that changed.
+version answers, so a save shows in open pages about 120 ms later for a program of a
+few hundred components (the site quillolang.org, measured), plus the time to parse the
+file that changed.
 
 What a reload keeps, and what it starts afresh:
 

@@ -1488,16 +1488,178 @@ fn mtimes(files: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
 /// such as Tailwind's): a stylesheet is swapped in the open pages, and
 /// anything else refreshes them (FEEDBACK11.md, Q-078; branch
 /// feedback11-fixes).
+/// Where the system tells of changes to files, the watcher waits for them
+/// instead of looking every 50 ms: kqueue on macOS, inotify on Linux.
+/// Elsewhere, and when the system refuses (a file missing, too many open),
+/// it looks every 50 ms as before. Under events it still looks once a
+/// second, for a filesystem that tells nothing (a network mount)
+/// (FEEDBACK15.md, Q-099; branch file-events).
+mod events {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    pub struct Events {
+        kq: i32,
+        fds: Vec<i32>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Events {
+        /// Watches `files`, or none when one cannot be watched.
+        pub fn open(files: &[PathBuf]) -> Result<Events, String> {
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let mut ev = Events { kq, fds: Vec::with_capacity(files.len()) };
+            for f in files {
+                let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+                let fd = unsafe { libc::open(c.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    return Err(format!("{}: {}", f.display(), std::io::Error::last_os_error()));
+                }
+                ev.fds.push(fd);
+                let k = libc::kevent {
+                    ident: fd as libc::uintptr_t,
+                    filter: libc::EVFILT_VNODE,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_ATTRIB,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                if unsafe { libc::kevent(kq, &k, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+                    return Err(format!("{}: {}", f.display(), std::io::Error::last_os_error()));
+                }
+            }
+            Ok(ev)
+        }
+
+        /// Waits up to `timeout` for a change to one of the files.
+        pub fn wait(&self, timeout: Duration) {
+            let ts = libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as libc::c_long };
+            let mut out: [libc::kevent; 32] = unsafe { std::mem::zeroed() };
+            unsafe { libc::kevent(self.kq, std::ptr::null(), 0, out.as_mut_ptr(), out.len() as libc::c_int, &ts) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Events {
+        fn drop(&mut self) {
+            for fd in &self.fds {
+                unsafe { libc::close(*fd) };
+            }
+            unsafe { libc::close(self.kq) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub struct Events {
+        fd: i32,
+        /// What is watched: each file's folder, and the file's name in it (an
+        /// editor's save is often a new file renamed over the old one, which
+        /// a watch on the file itself would lose).
+        names: std::collections::HashSet<(i32, Vec<u8>)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Events {
+        pub fn open(files: &[PathBuf]) -> Result<Events, String> {
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let mut ev = Events { fd, names: Default::default() };
+            let mut dirs: std::collections::HashMap<PathBuf, i32> = Default::default();
+            for f in files {
+                let dir = f.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+                let wd = match dirs.get(&dir) {
+                    Some(wd) => *wd,
+                    None => {
+                        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+                        let mask = libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+                        let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) };
+                        if wd < 0 {
+                            return Err(format!("{}: {}", dir.display(), std::io::Error::last_os_error()));
+                        }
+                        dirs.insert(dir, wd);
+                        wd
+                    }
+                };
+                if let Some(name) = f.file_name() {
+                    ev.names.insert((wd, name.as_encoded_bytes().to_vec()));
+                }
+            }
+            Ok(ev)
+        }
+
+        /// Waits up to `timeout` for a change to one of the files (a change
+        /// to another file in one of their folders wakes it too, and is then
+        /// found to have changed nothing).
+        pub fn wait(&self, timeout: Duration) {
+            let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let n = unsafe { libc::poll(&mut p, 1, timeout.as_millis() as libc::c_int) };
+            if n <= 0 {
+                return;
+            }
+            // Drain what came, so the next wait is for what comes after.
+            let mut buf = [0u8; 8192];
+            loop {
+                let got = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if got <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Events {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.fd) };
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub struct Events;
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    impl Events {
+        pub fn open(_files: &[PathBuf]) -> Result<Events, String> {
+            Err("not on this system".into())
+        }
+        pub fn wait(&self, _timeout: Duration) {}
+    }
+}
+
 fn watch(app: Arc<App>) {
     let mut files = app.watched_files();
     let mut seen = mtimes(&files);
     crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
-    // Every 50 ms: a stat of each file, cheap for the hundreds a program
-    // has, and a change is seen within that instead of within 250 ms
-    // (FEEDBACK15.md, Q-098; branch dev-maps-once).
+    // Told of changes by the system where it can be (see `events`); else a
+    // stat of each file every 50 ms, cheap for the hundreds a program has
+    // (FEEDBACK15.md, Q-098 and Q-099; branches dev-maps-once, file-events).
+    let mut said = false;
+    let open = |files: &[PathBuf], served: &std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>, said: &mut bool| {
+        let all: Vec<PathBuf> = files.iter().cloned().chain(served.keys().cloned()).collect();
+        match events::Events::open(&all) {
+            Ok(ev) => Some(ev),
+            Err(why) => {
+                if !*said && cfg!(any(target_os = "macos", target_os = "linux")) {
+                    eprintln!("quillo: looking for changed files every 50 ms (the system cannot tell of them: {})", why);
+                    *said = true;
+                }
+                None
+            }
+        }
+    };
+    let mut events = open(&files, &served, &mut said);
     loop {
-        std::thread::sleep(Duration::from_millis(50));
+        match &events {
+            Some(ev) => ev.wait(Duration::from_secs(1)),
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
         let now = mtimes(&files);
         if now != seen {
             // Editors often write in several steps; let them finish.
@@ -1505,12 +1667,16 @@ fn watch(app: Arc<App>) {
             app.reload();
             files = app.watched_files();
             seen = mtimes(&files);
+            // A save that renamed a new file over the old one left the
+            // old one watched: watch the files as they are now.
+            events = open(&files, &served, &mut said);
             continue;
         }
         if !app.watch {
             continue;
         }
         let (mut css, mut other) = (Vec::new(), Vec::new());
+        let mut grew = false;
         for (file, path) in crate::statics::served_files() {
             if files.contains(&file) {
                 continue;
@@ -1524,8 +1690,12 @@ fn watch(app: Arc<App>) {
                         other.push(path);
                     }
                 }
+                None => grew = true,
                 _ => {}
             }
+        }
+        if events.is_some() && (grew || !css.is_empty() || !other.is_empty()) {
+            events = open(&files, &served, &mut said);
         }
         if !other.is_empty() {
             app.refresh_pages(other);
