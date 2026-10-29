@@ -337,7 +337,9 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let amount = match args.first() {
         Some(Value::Dec(d)) => *d,
         Some(Value::Int(n)) => Dec::from_i64(*n),
-        Some(Value::Str(s)) => match Dec::parse(s.trim()) {
+        // Text is an amount as people write one: "1e3" is not 1,000
+        // (FEEDBACK14.md, Q-096; branch feedback14-fixes).
+        Some(Value::Str(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
             Some(d) => d,
             None => return Ok(Value::err(Value::str(format!("not an amount: {:?}", &**s)))),
         },
@@ -357,6 +359,12 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => to_units(amount, units, mode(&args, 2, "money.of", line)?, line)?,
     };
+    // Money whose minor units do not fit an int is an error value here,
+    // where a form's amount is checked, not a runtime error later in
+    // `money.to_minor` (FEEDBACK14.md, Q-096; branch feedback14-fixes).
+    if minor_of(rounded, units).is_none() {
+        return Ok(Value::err(Value::str(format!("{} {} is too large an amount", rounded, code))));
+    }
     Ok(Money { amount: rounded, code, units }.value())
 }
 
@@ -378,10 +386,15 @@ fn from_minor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn to_minor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let m = money(&args, 0, "money.to_minor", line)?;
     let d = to_units(m.amount, m.units, Rounding::HalfEven, line)?;
-    match i64::try_from(d.mantissa()) {
-        Ok(n) if d.scale() == m.units => Ok(Value::Int(n)),
-        _ => fail(line, "integer overflow"),
+    match minor_of(d, m.units) {
+        Some(n) => Ok(Value::Int(n)),
+        None => fail(line, "integer overflow"),
     }
+}
+
+/// An amount with `units` decimals as an int of minor units, if it fits.
+fn minor_of(d: Dec, units: u32) -> Option<i64> {
+    i64::try_from(d.mantissa()).ok().filter(|_| d.scale() == units)
 }
 
 fn add(_: &mut Interp, args: Vec<Value>, line: u32) -> R {

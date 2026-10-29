@@ -1,0 +1,38 @@
+// Amounts as the coop shows and reads them: pesos, kept as whole centavos.
+// Pure: the same on the server and in the browser.
+
+let CURRENCY = "PHP"
+let LOCALE = "fil-PH"
+
+// "₱1,234.50"
+fn peso(c: int) -> str = money.format(money.from_minor(c, CURRENCY), LOCALE)
+
+// The same with a sign, for statements: "+₱500.00", "−₱120.00".
+fn signed(c: int) -> str = c < 0 ? "−" + peso(-c) : "+" + peso(c)
+
+// What someone typed, as centavos: "1,500", "₱ 1,500.50", "250.5". Thousands
+// separators are taken out first: `dec` does not read them. `money.of` refuses
+// the rest (more than two decimals, "1e3", an amount too large for an int).
+fn centavos(text) -> int ! str {
+    let t = replace(replace(replace(trim(str(text ?? "")), ",", ""), "₱", ""), " ", "")
+    if t == "" { return err("Enter an amount") }
+    let m = money.of(t, CURRENCY)
+    if type_of(m) == "error" { return err(`Not an amount in pesos: ${text}`) }
+    let c = money.to_minor(m)
+    if c <= 0 { return err("The amount must be more than zero") }
+    c
+}
+
+// A rate in basis points a year, as people read it: "12%", "1.75%".
+fn pct(bp: int) -> str {
+    let whole = floor(bp / 100)
+    let rest = bp % 100
+    rest == 0 ? `${whole}%` : `${whole}.${rest < 10 ? "0" : ""}${rest % 10 == 0 ? floor(rest / 10) : rest}%`
+}
+
+fn plural(n: int, word: str) -> str = n == 1 ? `1 ${word}` : `${n} ${word}s`
+
+fn pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) >= width ? s : repeat("0", width - len(s)) + s
+}

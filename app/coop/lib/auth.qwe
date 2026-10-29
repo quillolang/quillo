@@ -1,0 +1,87 @@
+// Signing in, sessions kept in the database, roles, and the audit log.
+//
+// Roles: member (their own pages), clerk (the office), bod (the board of
+// directors), manager (products, rates, employers) and employer (a company's
+// payroll staff, who see their own employees' deductions).
+
+let SESSION_DAYS = 14
+let DAY_MS = 86400000
+let STAFF = ["clerk", "bod", "manager"]
+
+fn user_of_session(sid) with db, time {
+    if sid == null { return null }
+    db.one(sql`select u.id, u.username, u.name, u.role, u.member_id, u.employer_id, u.must_change
+               from sessions s join users u on u.id = s.user_id where s.id = ? and s.expires > ?`, sid, now())
+}
+
+fn me() with db, time = user_of_session(session().sid)
+
+// For loaders: who is asking, without following the sessions table.
+fn viewer() with db, time = unwatched(() => me())
+
+fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
+
+// A page for some roles only: the user, or a 403 page.
+fn signed_in_as(back: str, roles: list) {
+    let u = signed_in(back)
+    if !contains(roles, u.role) { reply 403 respond(403, "This page is not for your role") }
+    u
+}
+
+fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+
+fn home_of(role: str) -> str = match role {
+    "member" => "/me"
+    "clerk" => "/office"
+    "bod" => "/board"
+    "manager" => "/products"
+    "employer" => "/payroll"
+    _ => "/"
+}
+
+fn sign_in(username: str, password: str) ! str with db, time, random {
+    let u = db.one("select id, password_hash from users where username = ?", trim(username))
+    let hash = u.password_hash ?? crypto.hash_password("nobody's password")
+    if !crypto.verify_password(password, hash) || u == null { return err("Wrong username or password") }
+    let sid = crypto.token()
+    db.exec("insert into sessions (id, user_id, expires) values (?, ?, ?)", sid, u.id, now() + SESSION_DAYS * DAY_MS)
+    set_session({ sid }, { max_age: SESSION_DAYS * 86400 })
+    audit(u.id, "sign in", "")
+    u.id
+}
+
+fn sign_out() with db {
+    let sid = session().sid
+    if sid != null { db.exec("delete from sessions where id = ?", sid) }
+    end_session()
+}
+
+fn clear_sessions() with db, time = db.exec("delete from sessions where expires < ?", now())
+
+// For server fns: the caller, or the error a page shows.
+fn acting() ! str with db, time = me() ?? err("Sign in first")
+
+fn acting_as(roles: list) ! str with db, time {
+    let u = acting()?
+    if !contains(roles, u.role) { return err("Not allowed for your role") }
+    u
+}
+
+// A member's own record, for a member signed in.
+fn acting_member() ! str with db, time {
+    let u = acting_as(["member"])?
+    let m = db.one("select * from members where id = ? and status = 'active'", u.member_id)
+    if m == null { return err("Your membership is not active") }
+    { user: u, member: m }
+}
+
+fn audit(user_id, action: str, detail: str) with db, time =
+    db.exec("insert into audit (user_id, action, detail, at) values (?, ?, ?, ?)", user_id, action, detail, now())
+
+fn change_password(u, old: str, new: str) ! str with db, random {
+    if len(new) < 8 { return err("At least 8 characters") }
+    let row = db.one("select password_hash from users where id = ?", u.id)
+    if !crypto.verify_password(old, row.password_hash) { return err("The current password is not right") }
+    db.exec("update users set password_hash = ?, must_change = 0 where id = ?", crypto.hash_password(new), u.id)
+    true
+}

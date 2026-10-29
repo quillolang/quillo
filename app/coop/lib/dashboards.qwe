@@ -1,0 +1,70 @@
+// What the dashboards show, live: a member's coop, the office's queues and
+// the board's agenda.
+
+server fn load_my_coop() with db, time {
+    let u = viewer()
+    if u == null || u.role != "member" { return null }
+    watch(member_topic(u.member_id))
+    unwatched(() => {
+        let m = db.one("select m.*, e.name as employer from members m left join employers e on e.id = m.employer_id where m.id = ?", u.member_id)
+        let accounts = accounts_of(m.id)
+        let loans = db.query(sql`select l.*, p.name as product from loans l join products p on p.id = l.product_id
+                                 where l.member_id = ? and l.status not in ('cancelled') order by l.id desc`, m.id)
+        let next_due = db.one(sql`select i.due, i.principal + i.interest - i.paid as amount, l.number from installments i join loans l on l.id = i.loan_id
+                                  where l.member_id = ? and l.status = 'released' and i.paid < i.principal + i.interest order by i.due limit 1`, m.id)
+        let asked = db.query(sql`select l.id, l.number, l.amount, l.term, l.purpose, bm.number as borrower_number, bm.first_name || ' ' || bm.last_name as borrower
+                                 from comakers c join loans l on l.id = c.loan_id join members bm on bm.id = l.member_id
+                                 where c.member_id = ? and c.status = 'asked' and l.status = 'submitted'`, m.id)
+        { member: m, accounts, loans, next_due, asked, orders: orders_of(m.id),
+          tickets: db.query("select * from tickets where member_id = ? order by updated desc limit 10", m.id) }
+    })
+}
+
+server fn load_office_loans() with db, time {
+    let u = viewer()
+    if u == null || !contains(STAFF, u.role) { return [] }
+    watch(OFFICE)
+    unwatched(() => db.query(sql`select l.*, p.name as product, m.number as member_number, m.first_name || ' ' || m.last_name as member_name,
+                                 (select count(*) from comakers c where c.loan_id = l.id and c.status = 'agreed') as agreed,
+                                 (select count(*) from comakers c where c.loan_id = l.id) as asked
+                                 from loans l join products p on p.id = l.product_id join members m on m.id = l.member_id
+                                 where l.status in ('submitted', 'board', 'approved') order by l.applied_at`))
+}
+
+server fn load_help_queue() with db, time {
+    let u = viewer()
+    if u == null || u.role != "clerk" { return [] }
+    watch(OFFICE)
+    unwatched(() => db.query(sql`select t.*, m.number, m.first_name || ' ' || m.last_name as name from tickets t join members m on m.id = t.member_id
+                                 where t.status = 'open' order by t.updated`))
+}
+
+// The board's agenda: loans and products before it, each with the votes so
+// far and the director's own.
+server fn load_board() with db, time {
+    let u = viewer()
+    if u == null || u.role != "bod" { return null }
+    watch(BOARD)
+    unwatched(() => {
+        let loans = db.query(sql`select l.*, p.name as product, p.approvals, m.number as member_number, m.first_name || ' ' || m.last_name as member_name,
+                                 (select coalesce(sum(balance), 0) from accounts a where a.member_id = l.member_id and a.kind = 'savings' and a.status = 'open') as savings,
+                                 (select coalesce(sum(balance), 0) from accounts a where a.member_id = l.member_id and a.kind = 'share' and a.status = 'open') as share,
+                                 (select coalesce(sum(balance), 0) from accounts a where a.member_id = l.member_id and a.kind = 'loan' and a.status = 'open') as owing
+                                 from loans l join products p on p.id = l.product_id join members m on m.id = l.member_id
+                                 where l.status = 'board' order by l.forwarded_at`)
+            | map((l) => { ...l, votes: loan_votes(l.id), mine: db.one("select vote, comment from loan_votes where loan_id = ? and director_id = ?", l.id, u.id) })
+        let products = db.query("select * from products where status = 'proposed' order by proposed_at")
+            | map((p) => { ...p, votes: product_votes(p.id), mine: db.one("select vote, comment from product_votes where product_id = ? and director_id = ?", p.id, u.id) })
+        { loans, products, directors: directors() }
+    })
+}
+
+server fn load_products() with db, time {
+    let u = viewer()
+    if u == null || !contains(STAFF, u.role) { return [] }
+    watch(BOARD)
+    unwatched(() => db.query(sql`select p.*, (select count(*) from product_votes v where v.product_id = p.id and v.vote = 'approve') as yes,
+                                 (select count(*) from product_votes v where v.product_id = p.id and v.vote = 'reject') as no,
+                                 (select count(*) from loans l where l.product_id = p.id and l.status = 'released') as open_loans
+                                 from products p order by case p.status when 'proposed' then 0 when 'draft' then 1 when 'active' then 2 else 3 end, p.name`))
+}

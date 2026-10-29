@@ -433,7 +433,9 @@ code like those with `for` (see [Compiled numbers](#compiled-numbers)).
 
 Everything is an expression: `if` without `else` is `null` when the condition fails,
 `while` is `null`, `for` is the list of its body's values (with a block body too:
-`for i in 0..3 { i * i }` is `[0, 1, 4]`), and `match` is its arm's. `for` runs over a
+`for i in 0..3 { i * i }` is `[0, 1, 4]`), and `match` is its arm's. A body in braces
+ends at its `}`, after `=>` too, so what follows takes the list: `for n in ns => { ...
+} | flatten()` flattens the list of every round's values. `for` runs over a
 list, a map (as `[key, value]` pairs), a string (character by character), a range (not
 made into a list first) or `null` (no rounds); anything else is an error. A `match`
 that no arm takes is a runtime error, and so is a `let` pattern that does not match.
@@ -722,9 +724,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
 - `bind:value={x}` and `bind:checked={x}` keep an input and a variable in step; there is
   no other `bind:`. `x` is the component's state or a local, not a global or a map's
   field (give each input its own state, and make the map with a `let`). `bind:value`
-  listens to `input` and `bind:checked` to `change`, and an `@input` written on the same
-  input takes the binding's place: work out what follows the input with a `let`
-  instead. An input with `value={x}` (or `checked`, `selected`) is held to `x`: after
+  listens to `input` and `bind:checked` to `change`; an `@input` (or `@change`) on the
+  same input runs after the binding, with the state already set: `<input
+  bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`) is held to `x`: after
   each handler it is set back to the state, so typing the state does not take is
   undone. A bare `<input>` keeps what is typed, read through `e.value` or `e.form`.
 - Assigning state updates the page a moment later (once the handler's synchronous code
@@ -3012,9 +3014,11 @@ money.format(price, "de-DE")                    // "19,99 $"
 ```
 
 - `money.of(amount, currency, mode)` takes a decimal, an int or numeric text (a float
-  is a runtime error, as is a currency that is not text: `dec(x)` it first). An amount
-  with more decimals than the currency has, bad text and an unknown currency give error
-  values, as `int("x")` does; with a
+  is a runtime error, as is a currency that is not text: `dec(x)` it first). Text is an
+  amount as people write one: digits, a sign and a point, not `"1e3"`. An amount
+  with more decimals than the currency has, bad text, an amount whose minor units do
+  not fit an int (so that `money.to_minor` always can) and an unknown currency give
+  error values, as `int("x")` does; with a
   rounding mode (those of `round`), the amount is rounded instead. Codes are ISO 4217's
   active ones (`money.minor_units("JPY")` is 0); codes without minor units, such as XAU,
   are not money.

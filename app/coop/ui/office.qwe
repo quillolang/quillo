@@ -1,0 +1,169 @@
+// The office: the clerks' queues (live), members and the counter.
+
+// An approved applicant leaves the live list at once, so what the clerk must
+// read out (the first password) is kept by the list, not by its row.
+component ApplicationItem(a, on_approved) {
+    state reason = ""
+    state problem = null
+    state busy = false
+    let approve = () => {
+        busy = true
+        let r = approve_member(a.id)
+        busy = false
+        if is_err(r) { problem = r.error } else { problem = null; on_approved({ ...r, name: `${a.first_name} ${a.last_name}` }) }
+    }
+    let reject = () => {
+        let r = reject_member(a.id, reason)
+        problem = is_err(r) ? r.error : null
+    }
+    <li.application>
+        <div.head><b>{a.first_name} {a.last_name}</b> <span.muted>applied <When ms={a.applied_at}/></span></div>
+        <p>{a.email} · {a.phone} · born {a.birth_date} · {a.address}</p>
+        <p>{a.employer != null ? `${a.employer}, employee ${a.employee_no}` : "No employer"} · pledges {peso(a.pledge)}
+           {a.monthly_savings > 0 && `, saves ${peso(a.monthly_savings)} a month`}</p>
+        <div.row>
+            <button.primary disabled={busy} @click={approve}>Approve</button>
+            <input placeholder="Reason, to reject" bind:value={reason} aria-label="Reason"/>
+            <button.ghost disabled={busy} @click={reject}>Reject</button>
+        </div>
+        <Problem text={problem}/>
+    </li>
+}
+
+component Applications() {
+    state items = live(load_applications)
+    state given = []
+    <section.card>
+        <h2>Membership applications <span.count>{len(items)}</span></h2>
+        {len(given) > 0 && <ul.plain.given>{for g in given => <li key={g.number}><p.done>{g.name} is member <b>{g.number}</b>. Their first password:
+            <code>{g.password}</code> (shown once; they choose their own when they sign in).</p></li>}</ul>}
+        {len(items) == 0 ? <p.muted>None waiting.</p> : <ul.plain>{for a in items => <ApplicationItem key={a.id} a={a} on_approved={(g) => { given = given | push(g) }}/>}</ul>}
+    </section>
+}
+
+component LoanQueue() {
+    state loans = live(load_office_loans)
+    let group = (s) => loans | filter((l) => l.status == s)
+    <section.card>
+        <h2>Loans</h2>
+        {for [s, title] in [["submitted", "To review"], ["approved", "Approved: to release"], ["board", "Before the board"]] => <div key={s}>
+            <h3>{title} <span.count>{len(group(s))}</span></h3>
+            {len(group(s)) == 0 ? <p.muted>None.</p> : <table.data>
+                <tbody>{for l in group(s) => <tr key={l.id}>
+                    <td><a href={`/office/loans/${l.number}`}>{l.number}</a></td><td>{l.member_name} ({l.member_number})</td>
+                    <td>{l.product}</td><td.num>{peso(l.amount)}</td>
+                    <td>{l.asked > 0 && `${l.agreed} of ${l.asked} co-makers agreed`}</td>
+                </tr>}</tbody>
+            </table>}
+        </div>}
+    </section>
+}
+
+component OrdersQueue() {
+    state orders = live(load_open_orders)
+    state problem = null
+    let mark = (id: int, s: str) => {
+        let r = mark_order(id, s)
+        problem = is_err(r) ? r.error : null
+    }
+    <section.card>
+        <h2>Store orders <span.count>{len(orders)}</span></h2>
+        {len(orders) == 0 ? <p.muted>None open.</p> : <table.data>
+            <tbody>{for o in orders => <tr key={o.id}>
+                <td>{o.number}</td><td>{o.member_name}</td><td>{o.store}</td><td.num>{peso(o.total)}</td><td>{o.pay}</td><td><Status s={o.status}/></td>
+                <td>{o.status == "placed"
+                    ? <button.small @click={() => mark(o.id, "ready")}>Ready</button>
+                    : <button.small @click={() => mark(o.id, "collected")}>{o.pay == "pickup" ? `Collected, paid ${peso(o.total)}` : "Collected"}</button>}</td>
+            </tr>}</tbody>
+        </table>}
+        <Problem text={problem}/>
+    </section>
+}
+
+component HelpQueue() {
+    state tickets = live(load_help_queue)
+    <section.card>
+        <h2>Help desk <span.count>{len(tickets)}</span></h2>
+        {len(tickets) == 0 ? <p.muted>Nothing to answer.</p> : <ul.plain>
+            {for t in tickets => <li key={t.id}><a href={`/office/help/${t.id}`}>{t.subject}</a> · {t.name} ({t.number}) · <When ms={t.updated}/></li>}
+        </ul>}
+    </section>
+}
+
+view OfficeHome(me) =
+    <Page title="Office" me={me} here="/office">
+        <div.grid2>
+            <div><Applications/><HelpQueue/></div>
+            <div><LoanQueue/><OrdersQueue/></div>
+        </div>
+    </Page>
+
+view MembersPage(me, q: str, rows) =
+    <Page title="Members" me={me} here="/office/members">
+        <section.card>
+            <h1>Members</h1>
+            <form.row method="get" action="/office/members">
+                <input name="q" value={q} placeholder="Number, name or email" aria-label="Search"/>
+                <button.primary>Search</button>
+            </form>
+            <table.data>
+                <thead><tr><th>Number</th><th>Name</th><th>Employer</th><th>Status</th></tr></thead>
+                <tbody>{for m in rows => <tr key={m.id}><td><a href={`/office/members/${m.number}`}>{m.number}</a></td><td>{m.first_name} {m.last_name}</td><td>{m.employer ?? "–"}</td><td><Status s={m.status}/></td></tr>}</tbody>
+            </table>
+        </section>
+    </Page>
+
+component CounterCash(number: str) {
+    state account = "savings"
+    state direction = "in"
+    state amount = ""
+    state memo = ""
+    state problem = null
+    state done = null
+    state busy = false
+    let go = () => {
+        busy = true
+        let r = counter_cash({ member: number, account, direction, amount, memo })
+        busy = false
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = `Done: the balance is now ${peso(r)}.`; amount = "" }
+    }
+    <form.card @submit={go}>
+        <h2>At the counter</h2>
+        <div.row>
+            <select aria-label="Account" @change={(e) => { account = e.target.value }}>
+                <option value="savings" selected={account == "savings"}>Savings</option>
+                <option value="share" selected={account == "share"}>Share capital</option>
+            </select>
+            <select aria-label="Direction" @change={(e) => { direction = e.target.value }}>
+                <option value="in" selected={direction == "in"}>Cash in</option>
+                <option value="out" selected={direction == "out"}>Cash out</option>
+            </select>
+            <input placeholder="Amount" inputmode="decimal" bind:value={amount} aria-label="Amount"/>
+            <input placeholder="Note" bind:value={memo} aria-label="Note"/>
+            <button.primary disabled={busy}>Post</button>
+        </div>
+        <Problem text={problem}/><Done text={done}/>
+    </form>
+}
+
+view MemberDetail(me, m, accounts, loans) =
+    <Page title={m.number} me={me} here="/office/members">
+        <section.card>
+            <h1>{m.first_name} {m.last_name} <small>{m.number}</small> <Status s={m.status}/></h1>
+            <p>{m.email} · {m.phone} · {m.address}</p>
+            <p>{m.employer_id == null ? "No employer" : `Employee ${m.employee_no}`} · saves {peso(m.monthly_savings)} a month from salary · member since <When ms={m.decided_at}/></p>
+        </section>
+        {m.status == "active" && <CounterCash number={m.number}/>}
+        <section.card>
+            <h2>Accounts</h2>
+            <table.data>
+                <tbody>{for a in accounts => <tr key={a.id}><td>{a.number}</td><td>{a.kind}</td><td><Status s={a.status}/></td><td.num>{peso(a.balance)}</td></tr>}</tbody>
+            </table>
+        </section>
+        <section.card>
+            <h2>Loans</h2>
+            <table.data>
+                <tbody>{for l in loans => <tr key={l.id}><td><a href={`/office/loans/${l.number}`}>{l.number}</a></td><td>{l.product}</td><td.num>{peso(l.amount)}</td><td><Status s={l.status}/></td></tr>}</tbody>
+            </table>
+        </section>
+    </Page>

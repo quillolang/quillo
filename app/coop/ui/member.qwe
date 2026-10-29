@@ -1,0 +1,278 @@
+// A member's pages: their coop at a glance (live), statements, loans and the
+// application form, the help desk and their profile.
+
+component CoMakerAsk(item) {
+    state problem = null
+    state busy = false
+    let answer = (agree: bool) => {
+        busy = true
+        let r = answer_comaker(item.id, agree)
+        busy = false
+        problem = is_err(r) ? r.error : null
+    }
+    <li.ask>
+        <p><b>{item.borrower}</b> ({item.borrower_number}) asks you to co-make loan {item.number}: {peso(item.amount)} over {plural(item.term, "month")}, for “{item.purpose}”.</p>
+        <p.muted>A co-maker pays if the borrower does not.</p>
+        <div.row>
+            <button.primary disabled={busy} @click={() => answer(true)}>I vouch for them</button>
+            <button.ghost disabled={busy} @click={() => answer(false)}>Decline</button>
+        </div>
+        <Problem text={problem}/>
+    </li>
+}
+
+component ToShare() {
+    state amount = ""
+    state problem = null
+    state done = null
+    let send = () => {
+        let r = savings_to_share(amount)
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Moved to share capital."; amount = "" }
+    }
+    <form.mini @submit={send}>
+        <h3>Add to share capital</h3>
+        <div.row><input placeholder="Amount" inputmode="decimal" bind:value={amount} aria-label="Amount to move"/><button.ghost>Move from savings</button></div>
+        <Problem text={problem}/><Done text={done}/>
+    </form>
+}
+
+component NewDepositForm(rates) {
+    state amount = ""
+    state months = 12
+    state offer = null
+    state problem = null
+    state done = null
+    let refresh = () => { offer = deposit_offer(amount, months) }
+    let open = () => {
+        let r = open_deposit({ amount, months })
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Fixed deposit opened."; amount = "" }
+    }
+    <form.mini @submit={open}>
+        <h3>Open a fixed deposit</h3>
+        <div.row>
+            <input placeholder="Amount" inputmode="decimal" bind:value={amount} @input={refresh} aria-label="Amount to deposit"/>
+            <select aria-label="Term" @change={(e) => { months = int(e.target.value) ?? 12; refresh() }}>
+                {for [m, bp] in rates => <option value={m} selected={int(m) == months}>{m} months, {pct(bp)}</option>}
+            </select>
+            <button.ghost>Open</button>
+        </div>
+        {offer != null && <p.muted>At {pct(offer.rate_bp)} a year: {peso(offer.interest)} interest after {offer.months} months.</p>}
+        <Problem text={problem}/><Done text={done}/>
+    </form>
+}
+
+component MyCoop(rates) {
+    state c = live(load_my_coop)
+    {c == null
+        ? <p>Sign in as a member to see this page.</p>
+        : <div.dash>
+            <section.hello>
+                <h1>Hello, {c.member.first_name}</h1>
+                <p.muted>Member {c.member.number} since <When ms={c.member.decided_at}/>{c.member.employer != null && ` · ${c.member.employer}, ${c.member.employee_no}`}</p>
+            </section>
+            {len(c.asked) > 0 && <section.card.attention>
+                <h2>Co-maker requests</h2>
+                <ul.plain>{for a in c.asked => <CoMakerAsk key={a.id} item={a}/>}</ul>
+            </section>}
+            <section.tiles>
+                {for a in c.accounts | filter((a) => a.status == "open") =>
+                    <a.tile key={a.id} href={`/me/accounts/${a.number}`} class={`k-${a.kind}`}>
+                        <span.label>{a.kind == "share" ? "Share capital" : (a.kind == "deposit" ? `Fixed deposit, ${a.term_months} mo` : (a.kind == "loan" ? "Loan owed" : "Savings"))}</span>
+                        <b>{peso(a.balance)}</b>
+                        <small>{a.number}{a.kind == "deposit" && ` · matures ${a.matures}`}</small>
+                    </a>}
+            </section>
+            {c.next_due != null && <section.card>
+                <h2>Next installment</h2>
+                <p><b>{peso(c.next_due.amount)}</b> on {c.next_due.due}, loan <a href={`/me/loans/${c.next_due.number}`}>{c.next_due.number}</a></p>
+            </section>}
+            <section.grid2>
+                <div.card><ToShare/></div>
+                <div.card><NewDepositForm {rates}/></div>
+            </section>
+            <section.card>
+                <h2>Loans <a.small href="/me/loans/new">Apply for a loan</a></h2>
+                {len(c.loans) == 0 ? <p.muted>No loans.</p> : <table.data>
+                    <thead><tr><th>Loan</th><th>Product</th><th.num>Amount</th><th>Status</th></tr></thead>
+                    <tbody>{for l in c.loans => <tr key={l.id}><td><a href={`/me/loans/${l.number}`}>{l.number}</a></td><td>{l.product}</td><td.num>{peso(l.amount)}</td><td><Status s={l.status}/></td></tr>}</tbody>
+                </table>}
+            </section>
+            {len(c.orders) > 0 && <section.card>
+                <h2>Orders</h2>
+                <table.data>
+                    <thead><tr><th>Order</th><th>Store</th><th.num>Total</th><th>Paid by</th><th>Status</th></tr></thead>
+                    <tbody>{for o in c.orders => <tr key={o.id}><td>{o.number}</td><td>{o.store}</td><td.num>{peso(o.total)}</td><td>{o.pay}{o.installments > 1 && ` ×${o.installments}`}</td><td><Status s={o.status}/></td></tr>}</tbody>
+                </table>
+            </section>}
+        </div>}
+}
+
+view Statement(me, a, entries) =
+    <Page title={a.number} me={me} here="/me">
+        <section.card>
+            <h1>{a.number} <small>{a.kind}</small></h1>
+            <p.big>{peso(a.balance)}</p>
+            {a.kind == "deposit" && <p.muted>{peso(a.principal)} for {a.term_months} months at {pct(a.rate_bp)} a year, from {a.starts} to {a.matures}.</p>}
+            {a.kind == "deposit" && a.status == "open" && <BreakDeposit id={a.id}/>}
+            <table.data>
+                <thead><tr><th>When</th><th>What</th><th.num>Amount</th><th.num>Balance</th></tr></thead>
+                <tbody>{for e in entries => <tr key={e.id}><td><When ms={e.at}/></td><td>{e.memo}</td><td.num>{signed(a.kind == "loan" ? -e.amount : e.amount)}</td><td.num>{peso(e.balance)}</td></tr>}</tbody>
+            </table>
+        </section>
+    </Page>
+
+component BreakDeposit(id: int) {
+    state problem = null
+    state done = null
+    let go = () => {
+        if !ask("Take the deposit out now? It earns no interest when taken out early.", { title: "Withdraw early", ok: "Withdraw", tone: "danger" }) { return null }
+        let r = break_deposit(id)
+        if is_err(r) { problem = r.error } else { done = `${peso(r)} is back in your savings.` }
+    }
+    <div.row><button.danger @click={go}>Withdraw early</button><Problem text={problem}/><Done text={done}/></div>
+}
+
+// Applying for a loan: the schedule is worked out in the browser as the
+// member types, with the same function the server keeps it with; the server
+// checks what it alone knows (limits, co-makers) before it is sent.
+component LoanApplication(products, first_due: str) {
+    state code = len(products) > 0 ? products[0].code : ""
+    state amount = ""
+    state term = len(products) > 0 ? products[0].min_term : 1
+    state purpose = ""
+    state repay = len(products) > 0 && products[0].salary_only == 1 ? "salary" : "counter"
+    state comakers = ["", "", ""]
+    state problem = null
+    state checked = null
+    state busy = false
+    let p = find(products, (x) => x.code == code)
+    let cents = centavos(amount)
+    let rows = p == null || is_err(cents) ? [] : schedule_of(cents, term, p.rate_bp, p.method, first_due)
+    let ch = p == null || is_err(cents) ? null : charges(cents, p.fee_bp, p.insurance_bp)
+    let form = () => ({ product: code, amount, term, purpose, repay, comakers: take(comakers, p.comakers ?? 0) })
+    let check = () => {
+        let r = loan_preview(form())
+        checked = r.problem == null ? "The office would take this application." : null
+        problem = r.problem
+    }
+    let submit = () => {
+        busy = true
+        let r = apply_loan(form())
+        busy = false
+        if is_err(r) { problem = r.error } else { navigate(`/me/loans/${r}`) }
+    }
+    <div.apply>
+        <section.card>
+            <h1>Apply for a loan</h1>
+            <label>Product
+                <select @change={(e) => { code = e.target.value; let q = find(products, (x) => x.code == e.target.value); term = q.min_term ?? 1; repay = q.salary_only == 1 ? "salary" : repay }}>
+                    {for x in products => <option value={x.code} selected={x.code == code}>{x.name} · {pct(x.rate_bp)}</option>}
+                </select>
+            </label>
+            {p != null && <p.muted>{p.description} {peso(p.min_amount)} to {peso(p.max_amount)}, {p.min_term} to {p.max_term} months.
+                {p.comakers > 0 && ` Needs ${plural(p.comakers, "co-maker")}.`}{p.capital_multiple > 0 && ` Up to ${p.capital_multiple}× your share capital and savings.`}</p>}
+            <div.cols2>
+                <label>Amount (₱) <input inputmode="decimal" bind:value={amount}/></label>
+                <label>Months <input type="number" min={p.min_term ?? 1} max={p.max_term ?? 60} value={term} @input={(e) => { term = int(e.target.value) ?? term }}/></label>
+                <label.span2>What it is for <input bind:value={purpose} maxlength="300"/></label>
+                <label>Paid through
+                    <select @change={(e) => { repay = e.target.value }}>
+                        <option value="salary" selected={repay == "salary"}>salary deductions</option>
+                        {(p == null || p.salary_only == 0) && <option value="counter" selected={repay == "counter"}>the counter or savings</option>}
+                    </select>
+                </label>
+                {for i in range(p.comakers ?? 0) =>
+                    <label key={i}>Co-maker {i + 1}: member number
+                        <input value={comakers[i]} @input={(e) => { comakers = set(comakers, i, e.target.value) }} placeholder="M-0000"/>
+                    </label>}
+            </div>
+        </section>
+        <section.card>
+            <h2>What it costs</h2>
+            {len(rows) == 0
+                ? <p.muted>Enter an amount to see the schedule.</p>
+                : <div>
+                    <p.big>{peso(rows[0].payment)} <small>a month for {plural(term, "month")}</small></p>
+                    <p>Interest in all {peso(total_interest(rows))}; at release {peso(ch.fee)} service fee and {peso(ch.insurance)} insurance are taken, so {peso(ch.net)} reaches your savings.</p>
+                    <details><summary>The schedule</summary><Schedule rows={rows}/></details>
+                </div>}
+            <Problem text={problem}/><Done text={checked}/>
+            <div.row>
+                <button.ghost disabled={busy} @click={check}>Check it</button>
+                <button.primary disabled={busy || len(rows) == 0} @click={submit}>Apply</button>
+            </div>
+        </section>
+    </div>
+}
+
+view MyLoans(me, loans) =
+    <Page title="Loans" me={me} here="/me/loans">
+        <section.card>
+            <h1>Your loans <a.button.primary href="/me/loans/new">Apply for a loan</a></h1>
+            {len(loans) == 0 ? <p.muted>No loans yet.</p> : <table.data>
+                <thead><tr><th>Loan</th><th>Product</th><th.num>Amount</th><th>Applied</th><th>Status</th></tr></thead>
+                <tbody>{for l in loans => <tr key={l.id}><td><a href={`/me/loans/${l.number}`}>{l.number}</a></td><td>{l.product}</td><td.num>{peso(l.amount)}</td><td><When ms={l.applied_at}/></td><td><Status s={l.status}/></td></tr>}</tbody>
+            </table>}
+        </section>
+    </Page>
+
+component NewTicket() {
+    state subject = ""
+    state body = ""
+    state problem = null
+    let send = () => {
+        let r = open_ticket(subject, body)
+        if is_err(r) { problem = r.error } else { navigate(`/me/help/${r}`) }
+    }
+    <form.card @submit={send}>
+        <h2>Ask the office</h2>
+        <label>Subject <input bind:value={subject} maxlength="120"/></label>
+        <label>Message <textarea rows="4" bind:value={body}></textarea></label>
+        <Problem text={problem}/>
+        <button.primary>Send</button>
+    </form>
+}
+
+component TicketThread(id: int, role: str) {
+    state t = live(load_ticket, id)
+    state body = ""
+    state problem = null
+    let send = () => {
+        let r = reply_ticket(id, body)
+        if is_err(r) { problem = r.error } else { problem = null; body = "" }
+    }
+    {t == null ? <p>No such ticket.</p> : <section.card>
+        <h1>{t.ticket.subject} <Status s={t.ticket.status}/></h1>
+        <ol.thread>{for m in t.messages => <li key={m.id} class={m.role == "member" ? "them" : "us"}><b>{m.name}</b> <When ms={m.at}/><p>{m.body}</p></li>}</ol>
+        {t.ticket.status != "closed" && <form @submit={send}>
+            <textarea rows="3" bind:value={body} aria-label="Reply"></textarea>
+            <Problem text={problem}/>
+            <div.row>
+                <button.primary>Reply</button>
+                <button.ghost type="button" @click={() => { let r = close_ticket(id); problem = is_err(r) ? r.error : null }}>Close the ticket</button>
+            </div>
+        </form>}
+    </section>}
+}
+
+component ProfileForm(m) {
+    state address = m.address
+    state phone = m.phone
+    state email = m.email
+    state monthly = m.monthly_savings == 0 ? "0" : str(money.from_minor(m.monthly_savings, CURRENCY).amount)
+    state problem = null
+    state done = null
+    let save = () => {
+        let r = save_profile({ address, phone, email, monthly_savings: monthly })
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Saved." }
+    }
+    <form.card @submit={save}>
+        <h2>Your details</h2>
+        <label>Address <input bind:value={address}/></label>
+        <label>Mobile number <input bind:value={phone}/></label>
+        <label>Email <input type="email" bind:value={email}/></label>
+        <label>Monthly savings from your salary (₱) <input inputmode="decimal" bind:value={monthly}/></label>
+        <Problem text={problem}/><Done text={done}/>
+        <button.primary>Save</button>
+    </form>
+}

@@ -1895,7 +1895,15 @@ impl Parser {
         self.no_bare_arrow -= 1;
         let iter = iter?;
         let body = if self.eat(&Tok::FatArrow)? {
-            self.parse_expr()?
+            // A body in braces ends at its `}`, as without the arrow, so
+            // what follows applies to the list: `for x in xs => { ... } |
+            // flatten()` flattens the list, not each round's block
+            // (FEEDBACK14.md, Q-095; branch feedback14-fixes).
+            if self.at(&Tok::LBrace)? {
+                self.parse_primary()?
+            } else {
+                self.parse_expr()?
+            }
         } else if self.at(&Tok::LBrace)? {
             self.parse_block()?
         } else {

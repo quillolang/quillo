@@ -2008,15 +2008,18 @@ B.money = {
     let d;
     if (amount instanceof Dec) d = amount;
     else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
-    else if (typeof amount === "string") { d = decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
+    // Text as people write an amount, and money whose cents fit an int, as
+    // on the server (FEEDBACK14.md, Q-096; branch feedback14-fixes).
+    else if (typeof amount === "string") { d = /[eE]/.test(amount) ? null : decParse(amount.trim(), false); if (d === null) return new Err(`not an amount: ${JSON.stringify(amount)}`); }
     else if (typeof amount === "number") fail("`money.of` takes a dec, an int or text, not a float: convert it with dec(x)");
     else fail(`\`money.of\` expects an amount (a dec, int or str) as argument 1, got ${moneyShort(amount)}`);
+    let r;
     if (isNil(mode)) {
-      const exact = decRound(d, c.units, "down");
-      if (decCmp(exact, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
-      return moneyOf(exact, c.code);
-    }
-    return moneyOf(decRound(d, c.units, moneyMode(mode, "money.of")), c.code);
+      r = decRound(d, c.units, "down");
+      if (decCmp(r, d) !== 0) return new Err(`${decText(d)} has more decimals than ${c.code} has (${c.units}); give a rounding mode to round it`);
+    } else r = decRound(d, c.units, moneyMode(mode, "money.of"));
+    if (r.s !== c.units || r.m < I64_MIN || r.m > I64_MAX) return new Err(`${decText(r)} ${c.code} is too large an amount`);
+    return moneyOf(r, c.code);
   },
   from_minor: (n, currency) => {
     const c = moneyCurrency(currency, "money.from_minor", 2);

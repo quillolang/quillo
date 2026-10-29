@@ -1,0 +1,281 @@
+// Loans, from application to the last payment:
+//
+//   submitted   the member applied; co-makers are asked to vouch
+//   returned    the clerk sent it back to fix (the member may apply again)
+//   board       the clerk checked it and put it to the board
+//   approved    enough directors approved it; the clerk releases it
+//   rejected    the clerk or the board said no
+//   released    the money is in the member's savings; installments are due
+//   paid        the last installment is paid
+//   cancelled   the member withdrew it before the board decided
+
+type LoanForm = {
+    product: str,                      // its code
+    amount: str,
+    term: int,
+    purpose: str,
+    repay: "salary" | "counter",
+    comakers: list<str> = [],          // member numbers
+}
+
+fn loan_topic(id) -> str = `loan:${id}`
+
+fn active_products() with db = db.query("select * from products where status = 'active' order by name")
+
+// What a member could borrow under a product: their share capital and
+// savings, times the product's multiple (none when the multiple is 0).
+fn loanable(member_id: int, p) -> int? with db {
+    if p.capital_multiple == 0 { return null }
+    let own = db.one("select coalesce(sum(balance), 0) as c from accounts where member_id = ? and kind in ('share', 'savings') and status = 'open'", member_id).c
+    own * p.capital_multiple
+}
+
+// What stands in the way of a loan; the loan's terms when nothing does.
+fn check_loan(m, f: LoanForm) ! str with db, time {
+    let p = db.one("select * from products where code = ? and status = 'active'", trim(f.product)) ?? err("That loan product is not offered")?
+    let amount = centavos(f.amount)?
+    if amount < p.min_amount || amount > p.max_amount { return err(`${p.name}: from ${peso(p.min_amount)} to ${peso(p.max_amount)}`) }
+    if f.term < p.min_term || f.term > p.max_term { return err(`${p.name}: from ${plural(p.min_term, "month")} to ${plural(p.max_term, "month")}`) }
+    let purpose = trim(f.purpose)
+    if len(purpose) < 5 || len(purpose) > 300 { return err("Say what the loan is for, in 5 to 300 characters") }
+    let months = months_member(m)
+    if months < p.min_months { return err(`${p.name} needs ${plural(p.min_months, "month")} of membership; you have ${months}`) }
+    let most = loanable(m.id, p)
+    if most != null && amount > most { return err(`You can borrow up to ${peso(most)} under ${p.name}: ${p.capital_multiple} times your share capital and savings`) }
+    let open = db.one("select count(*) as n from loans where member_id = ? and product_id = ? and status in ('submitted', 'board', 'approved', 'released')", m.id, p.id).n
+    if open >= p.max_active { return err(`You have ${plural(open, "open loan")} of ${p.name} already; ${p.max_active} at most`) }
+    if p.salary_only == 1 && f.repay != "salary" { return err(`${p.name} is paid through salary deductions`) }
+    if f.repay == "salary" && m.employer_id == null { return err("Salary deductions need an employer on file: ask the office") }
+    let numbers = f.comakers | map((n) => upper(trim(n))) | filter((n) => n != "") | unique()
+    if len(numbers) != p.comakers { return err(p.comakers == 0 ? `${p.name} needs no co-makers` : `${p.name} needs ${plural(p.comakers, "co-maker")}: other members who vouch for you`) }
+    let comakers = for n in numbers => {
+        let c = member_by_number(n) ?? err(`No member ${n}`)?
+        if c.id == m.id { return err("You cannot be your own co-maker") }
+        if c.status != "active" { return err(`${n} is not an active member`) }
+        c
+    }
+    let first_due = date.add_months(today(), 1)
+    let rows = schedule_of(amount, f.term, p.rate_bp, p.method, first_due)
+    let ch = charges(amount, p.fee_bp, p.insurance_bp)
+    { product: p, amount, term: f.term, purpose, repay: f.repay, comakers, rows, charges: ch }
+}
+
+fn next_loan_number() -> str with db = `L-${pad(db.one("select count(*) as n from loans").n + 1, 5)}`
+
+server fn apply_loan(f: LoanForm) ! str with db, time {
+    let me = acting_member()?
+    db.transaction({ isolation: "serializable" }, () => {
+        let v = check_loan(me.member, f)?
+        let number = next_loan_number()
+        let id = db.one(sql`insert into loans (number, member_id, product_id, amount, term, rate_bp, method, fee, insurance, monthly, purpose, repay, status, applied_at)
+                            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ?) returning id`,
+            number, me.member.id, v.product.id, v.amount, v.term, v.product.rate_bp, v.product.method, v.charges.fee, v.charges.insurance,
+            v.rows[0].payment, v.purpose, v.repay, now()).id
+        for c in v.comakers {
+            db.exec("insert into comakers (loan_id, member_id) values (?, ?)", id, c.id)
+            publish(member_topic(c.id))
+        }
+        audit(me.user.id, "apply loan", number)
+        publish(OFFICE)
+        publish(member_topic(me.member.id))
+        number
+    })
+}
+
+// A preview for the application form: the terms, or why not.
+server fn loan_preview(f: LoanForm) with db, time {
+    let me = acting_member()
+    if is_err(me) { return { problem: me.error } }
+    let v = check_loan(me.member, f)
+    if is_err(v) { return { problem: v.error } }
+    { problem: null, monthly: v.rows[0].payment, interest: total_interest(v.rows), fee: v.charges.fee, insurance: v.charges.insurance, net: v.charges.net, rows: v.rows }
+}
+
+server fn answer_comaker(loan_id: int, agree: bool) ! str with db, time {
+    let me = acting_member()?
+    let l = db.one("select * from loans where id = ? and status = 'submitted'", loan_id) ?? err("That loan is no longer waiting for co-makers")?
+    let r = db.exec("update comakers set status = ?, at = ? where loan_id = ? and member_id = ? and status = 'asked'", agree ? "agreed" : "declined", now(), loan_id, me.member.id)
+    if r.changes == 0 { return err("You were not asked, or have answered") }
+    audit(me.user.id, agree ? "agree comaker" : "decline comaker", l.number)
+    publish(member_topic(me.member.id))
+    publish(member_topic(l.member_id))
+    publish(OFFICE)
+    publish(loan_topic(loan_id))
+    true
+}
+
+server fn cancel_loan(loan_id: int) ! str with db, time {
+    let me = acting_member()?
+    let r = db.exec("update loans set status = 'cancelled', decided_at = ? where id = ? and member_id = ? and status in ('submitted', 'board')", now(), loan_id, me.member.id)
+    if r.changes == 0 { return err("Only a loan not yet decided can be withdrawn") }
+    publish(OFFICE)
+    publish(BOARD)
+    publish(member_topic(me.member.id))
+    publish(loan_topic(loan_id))
+    true
+}
+
+// The clerk: put it to the board, send it back to fix, or reject it.
+server fn review_loan(loan_id: int, action: "forward" | "return" | "reject", note: str = "") ! str with db, time {
+    let clerk = acting_as(["clerk"])?
+    let note = trim(note)
+    if action != "forward" && note == "" { return err("Say why, for the member") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let l = db.one("select * from loans where id = ? and status = 'submitted'", loan_id) ?? err("That loan is not waiting for review")?
+        if action == "forward" {
+            let waiting = db.one("select count(*) as n from comakers where loan_id = ? and status != 'agreed'", loan_id).n
+            if waiting > 0 { return err(`${plural(waiting, "co-maker")} has not agreed yet`) }
+        }
+        let status = match action { "forward" => "board", "return" => "returned", _ => "rejected" }
+        db.exec("update loans set status = ?, reviewed_by = ?, review_note = ?, forwarded_at = ?, decided_at = ? where id = ?",
+            status, clerk.id, note, action == "forward" ? now() : null, action == "forward" ? null : now(), loan_id)
+        audit(clerk.id, `review loan ${action}`, l.number)
+        publish(OFFICE)
+        publish(BOARD)
+        publish(member_topic(l.member_id))
+        publish(loan_topic(loan_id))
+        status
+    })
+}
+
+// A director's vote. The product's number of approvals approves the loan;
+// enough rejections that it can no longer get them reject it.
+server fn vote_loan(loan_id: int, vote: "approve" | "reject", comment: str = "") ! str with db, time {
+    let u = acting_as(["bod"])?
+    if vote == "reject" && trim(comment) == "" { return err("Say why, for the record") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let l = db.one("select l.*, p.approvals from loans l join products p on p.id = l.product_id where l.id = ? and l.status = 'board'", loan_id)
+            ?? err("That loan is not before the board")?
+        db.exec("insert into loan_votes (loan_id, director_id, vote, comment, at) values (?, ?, ?, ?, ?) on conflict (loan_id, director_id) do update set vote = excluded.vote, comment = excluded.comment, at = excluded.at",
+            loan_id, u.id, vote, trim(comment), now())
+        let t = db.one("select coalesce(sum(vote = 'approve'), 0) as yes, coalesce(sum(vote = 'reject'), 0) as no from loan_votes where loan_id = ?", loan_id)
+        let status = if t.yes >= l.approvals { "approved" } else if directors() - t.no < l.approvals { "rejected" } else { "board" }
+        if status != "board" {
+            db.exec("update loans set status = ?, decided_at = ? where id = ?", status, now(), loan_id)
+        }
+        audit(u.id, `vote loan ${vote}`, l.number)
+        publish(BOARD)
+        publish(OFFICE)
+        publish(member_topic(l.member_id))
+        publish(loan_topic(loan_id))
+        status
+    })
+}
+
+// The clerk releases an approved loan: the loan account owes the amount, the
+// member's savings get it less the fees, and its installments are kept.
+server fn release_loan(loan_id: int) ! str with db, time, random {
+    let clerk = acting_as(["clerk"])?
+    db.transaction({ isolation: "serializable" }, () => {
+        let l = db.one("select * from loans where id = ? and status = 'approved'", loan_id) ?? err("That loan is not approved, or is released already")?
+        let sv = account_of(l.member_id, "savings") ?? err("The member has no savings account")?
+        let first_due = date.add_months(today(), 1)
+        let rows = schedule_of(l.amount, l.term, l.rate_bp, l.method, first_due)
+        let acct = open_account(l.member_id, "loan", `LN-${slice(l.number, 2)}`)
+        db.exec("update accounts set loan_id = ? where id = ?", l.id, acct)
+        let j = new_journal()
+        post(acct, l.amount, "release", `${l.number} released`, j, clerk.id)?
+        post(sv.id, l.amount - l.fee - l.insurance, "release",
+            `${l.number}: ${peso(l.amount)} less fees ${peso(l.fee)} and insurance ${peso(l.insurance)}`, j, clerk.id)?
+        for r in rows {
+            db.exec("insert into installments (loan_id, n, due, principal, interest) values (?, ?, ?, ?, ?)", l.id, r.n, r.due, r.principal, r.interest)
+        }
+        db.exec("update loans set status = 'released', released_at = ?, released_by = ?, first_due = ?, monthly = ? where id = ?",
+            now(), clerk.id, first_due, rows[0].payment, l.id)
+        audit(clerk.id, "release loan", l.number)
+        publish(OFFICE)
+        publish(loan_topic(l.id))
+        acct
+    })
+}
+
+// What is still owed on a loan's installments, oldest first.
+fn unpaid(loan_id: int) with db =
+    db.query("select n, due, principal, interest, paid, principal + interest - paid as left from installments where loan_id = ? and paid < principal + interest order by n", loan_id)
+
+fn owed(loan_id: int) -> int with db = db.one("select coalesce(sum(principal + interest - paid), 0) as c from installments where loan_id = ?", loan_id).c
+
+// Pays `amount` toward a loan, oldest installment first and within it
+// interest before principal; the loan account goes down by the principal.
+// What was not needed (the loan paid off) is given back.
+fn pay_loan(loan_id: int, amount: int, memo: str, journal: str, by) -> int ! str with db, time {
+    let l = db.one("select * from loans where id = ? and status = 'released'", loan_id) ?? err("That loan is not being repaid")?
+    let acct = db.one("select id from accounts where loan_id = ? and kind = 'loan'", loan_id) ?? err("The loan has no account")?
+    let left = amount
+    let principal_paid = 0
+    // (No `break`: an installment once the money is used up is passed over.)
+    for i in unpaid(loan_id) {
+        if left > 0 {
+            let interest_left = max([i.interest - i.paid, 0])
+            let take = min([left, i.left])
+            let to_principal = max([take - interest_left, 0])
+            db.exec("update installments set paid = paid + ? where loan_id = ? and n = ?", take, loan_id, i.n)
+            principal_paid = principal_paid + to_principal
+            left = left - take
+        }
+    }
+    if principal_paid > 0 { post(acct.id, -principal_paid, "payment", memo, journal, by)? }
+    if owed(loan_id) == 0 {
+        db.exec("update loans set status = 'paid', decided_at = ? where id = ?", now(), loan_id)
+        db.exec("update accounts set status = 'closed' where id = ?", acct.id)
+    }
+    publish(loan_topic(loan_id))
+    publish(member_topic(l.member_id))
+    left
+}
+
+// The clerk takes a cash payment at the counter.
+server fn counter_payment(loan_id: int, amount: str) ! str with db, time, random {
+    let clerk = acting_as(["clerk"])?
+    let c = centavos(amount)?
+    db.transaction({ isolation: "serializable" }, () => {
+        let o = owed(loan_id)
+        if c > o { return err(`Only ${peso(o)} is owed`) }
+        pay_loan(loan_id, c, "Paid at the counter", new_journal(), clerk.id)?
+        audit(clerk.id, "loan payment", `${loan_id} ${peso(c)}`)
+        true
+    })
+}
+
+// The member pays from savings.
+server fn pay_from_savings(loan_id: int, amount: str) ! str with db, time, random {
+    let me = acting_member()?
+    let c = centavos(amount)?
+    db.transaction({ isolation: "serializable" }, () => {
+        let l = db.one("select member_id from loans where id = ?", loan_id)
+        if l == null || l.member_id != me.member.id { return err("Not your loan") }
+        let o = owed(loan_id)
+        if c > o { return err(`Only ${peso(o)} is owed`) }
+        let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+        let j = new_journal()
+        post(sv.id, -c, "payment", "Loan payment", j, me.user.id)?
+        pay_loan(loan_id, c, "Paid from savings", j, me.user.id)?
+        true
+    })
+}
+
+fn loan_by_number(number: str) with db =
+    db.one(sql`select l.*, p.code as product_code, p.name as product_name, p.approvals, m.number as member_number,
+               m.first_name || ' ' || m.last_name as member_name from loans l join products p on p.id = l.product_id
+               join members m on m.id = l.member_id where l.number = ? collate nocase`, trim(number))
+
+fn loan_votes(loan_id: int) with db =
+    db.query("select v.*, u.name from loan_votes v join users u on u.id = v.director_id where v.loan_id = ? order by v.at", loan_id)
+
+fn loan_comakers(loan_id: int) with db =
+    db.query("select c.*, m.number, m.first_name || ' ' || m.last_name as name from comakers c join members m on m.id = c.member_id where c.loan_id = ?", loan_id)
+
+// Live: a loan as its page shows it, to whoever may see it.
+server fn load_loan(number: str) with db, time {
+    let u = viewer()
+    let l = unwatched(() => loan_by_number(number))
+    if u == null || l == null { return null }
+    if u.role == "member" && u.member_id != l.member_id && unwatched(() => db.one("select 1 from comakers where loan_id = ? and member_id = ?", l.id, u.member_id)) == null { return null }
+    if u.role == "employer" { return null }
+    watch(loan_topic(l.id))
+    unwatched(() => {
+        let fresh = loan_by_number(number)
+        { loan: fresh, votes: loan_votes(fresh.id), comakers: loan_comakers(fresh.id), directors: directors(),
+          installments: db.query("select * from installments where loan_id = ? order by n", fresh.id), owed: owed(fresh.id) }
+    })
+}

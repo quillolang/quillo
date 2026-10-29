@@ -1,0 +1,226 @@
+// Salary deductions. Each month the office makes a batch for each employer:
+// what to take from each employed member's salary (loan installments due that
+// month, store orders paid in installments, the member's monthly savings).
+// The employer's payroll staff see it, download it as CSV, and remit: by
+// uploading a CSV of employee numbers and amounts, or through the API. Each
+// member's remittance pays their lines in order (loans, store, savings);
+// what is short is marked, and anything more goes to their savings.
+
+fn period_of(day: str) -> str = slice(day, 0, 7)
+
+fn period_end(period: str) -> str = date.end_of_month(period + "-01")
+
+fn valid_period(p) -> bool = type_of(p) == "str" && re.test(p, "^20[0-9]{2}-(0[1-9]|1[0-2])$")
+
+let KIND_ORDER = { loan: 0, store: 1, savings: 2 }
+
+// What a batch for an employer and month would hold.
+fn deductions_for(employer_id: int, period: str) with db {
+    let end = period_end(period)
+    let members = db.query("select * from members where employer_id = ? and status = 'active' order by employee_no", employer_id)
+    for m in members => {
+        let loans = db.query(sql`select l.id, coalesce(sum(i.principal + i.interest - i.paid), 0) as due from loans l
+                                 join installments i on i.loan_id = l.id
+                                 where l.member_id = ? and l.status = 'released' and l.repay = 'salary' and i.due <= ? and i.paid < i.principal + i.interest
+                                 group by l.id`, m.id, end)
+            | filter((l) => l.due > 0)
+            | map((l) => { member_id: m.id, kind: "loan", ref_id: l.id, amount: l.due })
+        let orders = db.query("select id, total, paid, installments from orders where member_id = ? and pay = 'salary' and status != 'cancelled' and paid < total", m.id)
+            | map((o) => { member_id: m.id, kind: "store", ref_id: o.id, amount: min([o.total - o.paid, int(ceil(dec(o.total) / o.installments))]) })
+        let savings = m.monthly_savings > 0 ? [{ member_id: m.id, kind: "savings", ref_id: null, amount: m.monthly_savings }] : []
+        loans + orders + savings
+    } | flatten()
+}
+
+// Makes (or makes again, while it is open) an employer's batch for a month.
+server fn make_batch(employer_id: int, period: str) ! str with db, time {
+    let clerk = acting_as(["clerk", "manager"])?
+    if !valid_period(period) { return err("A month, like 2026-11") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let e = db.one("select * from employers where id = ?", employer_id) ?? err("No such employer")?
+        let b = db.one("select * from batches where employer_id = ? and period = ?", employer_id, period)
+        if b != null && b.status == "posted" { return err(`${e.name}'s batch for ${period} is posted already`) }
+        let id = b != null ? b.id : db.one("insert into batches (employer_id, period, created) values (?, ?, ?) returning id", employer_id, period, now()).id
+        db.exec("delete from batch_lines where batch_id = ?", id)
+        let lines = deductions_for(employer_id, period)
+        for l in lines {
+            db.exec("insert into batch_lines (batch_id, member_id, kind, ref_id, amount) values (?, ?, ?, ?, ?)", id, l.member_id, l.kind, l.ref_id, l.amount)
+        }
+        audit(clerk.id, "make batch", `${e.code} ${period}`)
+        publish(OFFICE)
+        publish(batch_topic(id))
+        { id, lines: len(lines), total: lines | map((l) => l.amount) | sum() }
+    })
+}
+
+fn batch_topic(id) -> str = `batch:${id}`
+
+fn batch_lines(batch_id: int) with db =
+    db.query(sql`select bl.*, m.number, m.employee_no, m.first_name || ' ' || m.last_name as name,
+                 l.number as loan_number, o.number as order_number from batch_lines bl join members m on m.id = bl.member_id
+                 left join loans l on bl.kind = 'loan' and l.id = bl.ref_id left join orders o on bl.kind = 'store' and o.id = bl.ref_id
+                 where bl.batch_id = ? order by m.employee_no, bl.id`, batch_id)
+
+fn csv_field(v) -> str {
+    let s = str(v ?? "")
+    contains(s, ",") || contains(s, "\"") || contains(s, "\n") ? "\"" + replace(s, "\"", "\"\"") + "\"" : s
+}
+
+fn amount_text(c: int) -> str = str(money.from_minor(c, CURRENCY).amount)
+
+// The batch as the employer's payroll takes it: one line per deduction.
+fn batch_csv(batch_id: int) -> str with db {
+    let rows = batch_lines(batch_id) | map((l) => join([l.employee_no, l.name, l.kind, l.loan_number ?? l.order_number ?? "", amount_text(l.amount)] | map(csv_field), ","))
+    join(["employee_no,name,kind,reference,amount"] + rows, "\n") + "\n"
+}
+
+// CSV text as rows of fields: commas, quotes ("" for one), CRLF or LF.
+fn csv_rows(text: str) -> list {
+    let rows = []
+    let row = []
+    let field = ""
+    let quoted = false
+    let was_quote = false
+    for c in replace(text, "\r\n", "\n") {
+        if quoted {
+            if c == "\"" { quoted = false; was_quote = true } else { field = field + c }
+        } else if c == "\"" {
+            if was_quote { field = field + "\"" }
+            quoted = true
+            was_quote = false
+        } else if c == "," {
+            row = row | push(field); field = ""; was_quote = false
+        } else if c == "\n" {
+            row = row | push(field); field = ""; was_quote = false
+            if row != [""] { rows = rows | push(row) }
+            row = []
+        } else {
+            field = field + c
+            was_quote = false
+        }
+    }
+    if field != "" || len(row) > 0 { rows = rows | push(row | push(field)) }
+    rows
+}
+
+// A remittance file: `employee_no,amount` (more columns, in any order, as
+// long as those two are named in the first line). The lines, or why not.
+fn read_remittance(text: str) ! str {
+    let rows = csv_rows(text)
+    if len(rows) < 2 { return err("The file has no lines after its header") }
+    let head = rows[0] | map((h) => lower(trim(h)))
+    let emp = index_of(head, "employee_no") ?? err("The first line names no employee_no column")?
+    let amt = index_of(head, "amount") ?? err("The first line names no amount column")?
+    for [i, r] in enumerate(drop(rows, 1)) => {
+        let e = trim(r[emp] ?? "")
+        let a = centavos(r[amt] ?? "")
+        if e == "" { return err(`Line ${i + 2}: no employee number`) }
+        if is_err(a) { return err(`Line ${i + 2}: ${a.error}`) }
+        { employee_no: e, amount: a }
+    }
+}
+
+// Posts a remittance to an open batch. Each member's remitted total pays
+// their lines in order; what is left goes to their savings. Lines for
+// employee numbers not in the batch are not posted and are listed back.
+fn remit(batch_id: int, lines: list, source: str, by) ! str with db, time, random {
+    let b = db.one("select * from batches where id = ?", batch_id) ?? err("No such batch")?
+    if b.status == "posted" { return err("This batch is posted already") }
+    let all = batch_lines(batch_id)
+    let by_emp = group_by(lines, (l) => l.employee_no)
+    let unknown = keys(by_emp) | filter((e) => find(all, (l) => l.employee_no == e) == null)
+    let j = new_journal()
+    let members = unique(all | map((l) => l.member_id))
+    for mid in members {
+        let mine = all | filter((l) => l.member_id == mid) | sort_by((l) => KIND_ORDER[l.kind])
+        let emp_no = mine[0].employee_no
+        let left = (get(by_emp, emp_no) ?? []) | map((l) => l.amount) | sum()
+        for l in mine {
+            let take = min([left, l.amount])
+            left = left - take
+            let status = take == l.amount ? "paid" : (take > 0 ? "short" : "missing")
+            db.exec("update batch_lines set remitted = ?, status = ? where id = ?", take, status, l.id)
+            if take > 0 {
+                if l.kind == "loan" {
+                    let back = pay_loan(l.ref_id, take, `Salary deduction ${b.period}`, j, by)?
+                    left = left + back
+                } else if l.kind == "store" {
+                    db.exec("update orders set paid = paid + ? where id = ?", take, l.ref_id)
+                } else {
+                    let sv = account_of(mid, "savings") ?? err(`${l.number} has no savings account`)?
+                    post(sv.id, take, "deduction", `Salary savings ${b.period}`, j, by)?
+                }
+            }
+        }
+        if left > 0 {
+            let sv = account_of(mid, "savings") ?? err("No savings account")?
+            post(sv.id, left, "deduction", `Remitted beyond the deductions, ${b.period}`, j, by)?
+        }
+    }
+    let total = lines | filter((l) => !contains(unknown, l.employee_no)) | map((l) => l.amount) | sum()
+    db.exec("insert into remittances (batch_id, source, lines, total, by_user, at) values (?, ?, ?, ?, ?, ?)", batch_id, source, len(lines), total, by, now())
+    db.exec("update batches set status = 'posted', posted_at = ? where id = ?", now(), batch_id)
+    publish(OFFICE)
+    publish(batch_topic(batch_id))
+    { posted: total, unknown }
+}
+
+// The employer's staff upload their remittance file.
+server fn upload_remittance(batch_id: int, file: map) ! str with db, time, random {
+    let u = acting_as(["employer", "clerk"])?
+    let b = db.one("select * from batches where id = ?", batch_id) ?? err("No such batch")?
+    if u.role == "employer" && u.employer_id != b.employer_id { return err("Not your company's batch") }
+    if file.size > 1_000_000 { return err("A remittance file up to 1 MB") }
+    let text = read_upload(file)?
+    let lines = read_remittance(text)?
+    db.transaction({ isolation: "serializable" }, () => {
+        let r = remit(batch_id, lines, `upload: ${file.filename}`, u.id)?
+        audit(u.id, "remit", `${b.period} ${peso(r.posted)}`)
+        r
+    })
+}
+
+// The API's caller: the employer whose key it is.
+fn employer_of_key(header) with db {
+    let key = trim(replace(str(header ?? ""), "Bearer ", ""))
+    if key == "" { return null }
+    db.one("select * from employers where api_key_hash = ?", crypto.sha256(key))
+}
+
+server fn new_api_key(employer_id: int) ! str with db, time, random {
+    let u = acting_as(["manager"])?
+    let key = "coop_" + crypto.token()
+    let r = db.exec("update employers set api_key_hash = ? where id = ?", crypto.sha256(key), employer_id)
+    if r.changes == 0 { return err("No such employer") }
+    audit(u.id, "new api key", str(employer_id))
+    key
+}
+
+server fn load_batches() with db, time {
+    let u = viewer()
+    if u == null { return [] }
+    watch(OFFICE)
+    unwatched(() => {
+        let rows = db.query(sql`select b.*, e.name as employer, e.code, (select count(*) from batch_lines where batch_id = b.id) as lines,
+                                (select coalesce(sum(amount), 0) from batch_lines where batch_id = b.id) as total,
+                                (select coalesce(sum(remitted), 0) from batch_lines where batch_id = b.id) as remitted
+                                from batches b join employers e on e.id = b.employer_id order by b.period desc, e.name`)
+        u.role == "employer" ? rows | filter((b) => b.employer_id == u.employer_id) : (contains(STAFF, u.role) ? rows : [])
+    })
+}
+
+server fn load_batch(id: int) with db, time {
+    let u = viewer()
+    let b = unwatched(() => db.one("select b.*, e.name as employer, e.code from batches b join employers e on e.id = b.employer_id where b.id = ?", id))
+    if u == null || b == null { return null }
+    if u.role == "employer" && u.employer_id != b.employer_id { return null }
+    if u.role == "member" { return null }
+    watch(batch_topic(id))
+    unwatched(() => ({
+        batch: db.one("select b.*, e.name as employer, e.code from batches b join employers e on e.id = b.employer_id where b.id = ?", id),
+        lines: batch_lines(id),
+        remittances: db.query("select * from remittances where batch_id = ? order by id", id),
+    }))
+}
+
+fn employers() with db = db.query("select * from employers order by name")

@@ -1,0 +1,93 @@
+// A loan's page, live, for the member, the clerk and the board: what it is,
+// where it stands, its co-makers and votes, its schedule, and what the viewer
+// may do with it.
+
+let STEPS = ["submitted", "board", "approved", "released", "paid"]
+
+view Steps(status: str) =
+    <ol.steps>
+        {for s in STEPS => <li key={s} class={status == s ? "now" : (index_of(STEPS, s) < (index_of(STEPS, status) ?? -1) ? "past" : "")}>{s}</li>}
+        {contains(["rejected", "returned", "cancelled"], status) && <li.now.off>{status}</li>}
+    </ol>
+
+view Schedule(rows: list) =
+    <table.data>
+        <thead><tr><th>#</th><th>Due</th><th.num>Principal</th><th.num>Interest</th><th.num>Payment</th><th.num>Paid</th></tr></thead>
+        <tbody>
+            {for r in rows => <tr key={r.n} class={(r.paid ?? 0) >= r.principal + r.interest ? "settled" : ""}>
+                <td>{r.n}</td><td>{r.due}</td><td.num>{peso(r.principal)}</td><td.num>{peso(r.interest)}</td>
+                <td.num>{peso(r.principal + r.interest)}</td><td.num>{r.paid == null ? "" : peso(r.paid)}</td>
+            </tr>}
+        </tbody>
+    </table>
+
+component LoanView(number: str, role: str) {
+    state data = live(load_loan, number)
+    state note = ""
+    state amount = ""
+    state problem = null
+    state done = null
+    state busy = false
+    let act = (f) => {
+        busy = true
+        let r = f()
+        busy = false
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Done." }
+    }
+    {data == null
+        ? <section.card><p>No such loan, or not yours to see.</p></section>
+        : <div.loan>
+            <section.card>
+                <h1>{data.loan.number} · {data.loan.product_name} <Status s={data.loan.status}/></h1>
+                <Steps status={data.loan.status}/>
+                <dl.facts>
+                    <dt>Member</dt><dd>{data.loan.member_name} ({data.loan.member_number})</dd>
+                    <dt>Amount</dt><dd>{peso(data.loan.amount)} over {plural(data.loan.term, "month")}</dd>
+                    <dt>Interest</dt><dd>{pct(data.loan.rate_bp)} a year, {data.loan.method == "flat" ? "flat (add-on)" : "on the diminishing balance"}</dd>
+                    <dt>Installment</dt><dd>{peso(data.loan.monthly)} a month</dd>
+                    <dt>Fees at release</dt><dd>{peso(data.loan.fee)} service, {peso(data.loan.insurance)} insurance</dd>
+                    <dt>Paid through</dt><dd>{data.loan.repay == "salary" ? "salary deductions" : "the counter or savings"}</dd>
+                    <dt>Purpose</dt><dd>{data.loan.purpose}</dd>
+                    {data.loan.review_note != "" && [<dt>Office's note</dt>, <dd>{data.loan.review_note}</dd>]}
+                    {data.loan.status == "released" && [<dt>Still owed</dt>, <dd><b>{peso(data.owed)}</b></dd>]}
+                </dl>
+            </section>
+            {len(data.comakers) > 0 && <section.card>
+                <h2>Co-makers</h2>
+                <ul.plain>{for c in data.comakers => <li key={c.member_id}>{c.name} ({c.number}) <Status s={c.status}/></li>}</ul>
+            </section>}
+            {(data.loan.status == "board" || len(data.votes) > 0) && <section.card>
+                <h2>The board <small>{len(data.votes | filter((v) => v.vote == "approve"))} of {data.loan.approvals} approvals needed, {data.directors} directors</small></h2>
+                <ul.votes>{for v in data.votes => <li key={v.director_id} class={v.vote}><b>{v.name}</b> {v.vote == "approve" ? "approves" : "rejects"}{v.comment != "" && `: ${v.comment}`}</li>}</ul>
+                {len(data.votes) == 0 && <p.muted>No votes yet.</p>}
+            </section>}
+            <section.card.actions-card>
+                {role == "member" && contains(["submitted", "board"], data.loan.status) &&
+                    <button.ghost disabled={busy} @click={() => act(() => cancel_loan(data.loan.id))}>Withdraw the application</button>}
+                {role == "member" && data.loan.status == "released" && <div.row>
+                    <input placeholder="Amount" inputmode="decimal" bind:value={amount} aria-label="Amount to pay from savings"/>
+                    <button.primary disabled={busy} @click={() => act(() => pay_from_savings(data.loan.id, amount))}>Pay from savings</button>
+                </div>}
+                {role == "clerk" && data.loan.status == "submitted" && <div.row>
+                    <input placeholder="Note for the member (needed to return or reject)" bind:value={note} aria-label="Note"/>
+                    <button.primary disabled={busy} @click={() => act(() => review_loan(data.loan.id, "forward", note))}>Forward to the board</button>
+                    <button.ghost disabled={busy} @click={() => act(() => review_loan(data.loan.id, "return", note))}>Return to fix</button>
+                    <button.danger disabled={busy} @click={() => act(() => review_loan(data.loan.id, "reject", note))}>Reject</button>
+                </div>}
+                {role == "clerk" && data.loan.status == "approved" &&
+                    <button.primary disabled={busy} @click={() => act(() => release_loan(data.loan.id))}>Release {peso(data.loan.amount - data.loan.fee - data.loan.insurance)} to savings</button>}
+                {role == "clerk" && data.loan.status == "released" && <div.row>
+                    <input placeholder="Amount" inputmode="decimal" bind:value={amount} aria-label="Amount paid at the counter"/>
+                    <button.primary disabled={busy} @click={() => act(() => counter_payment(data.loan.id, amount))}>Take payment</button>
+                </div>}
+                {role == "bod" && data.loan.status == "board" && <div.row>
+                    <input placeholder="Comment (needed to reject)" bind:value={note} aria-label="Comment"/>
+                    <button.primary disabled={busy} @click={() => act(() => vote_loan(data.loan.id, "approve", note))}>Approve</button>
+                    <button.danger disabled={busy} @click={() => act(() => vote_loan(data.loan.id, "reject", note))}>Reject</button>
+                </div>}
+                <Problem text={problem}/>
+                <Done text={done}/>
+            </section>
+            {len(data.installments) > 0 && <section.card><h2>Schedule</h2><Schedule rows={data.installments}/></section>}
+        </div>}
+}

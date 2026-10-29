@@ -1,0 +1,89 @@
+// Salary deductions, for the office and for the employers' payroll staff:
+// the batches, one batch's lines (live), its CSV, and remitting it.
+
+component MakeBatch(employers, period: str) {
+    state employer = len(employers) > 0 ? employers[0].id : 0
+    state month = period
+    state problem = null
+    state done = null
+    let make = () => {
+        let r = make_batch(employer, month)
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = `${plural(r.lines, "line")}, ${peso(r.total)} in all.` }
+    }
+    <form.card @submit={make}>
+        <h2>Make a month's batch</h2>
+        <div.row>
+            <select aria-label="Employer" @change={(e) => { employer = int(e.target.value) ?? employer }}>
+                {for e in employers => <option value={e.id} selected={e.id == employer}>{e.name}</option>}
+            </select>
+            <input type="month" bind:value={month} aria-label="Month"/>
+            <button.primary>Make it</button>
+        </div>
+        <p.muted>Made again, an open batch takes what is due now. A posted one stays as it was.</p>
+        <Problem text={problem}/><Done text={done}/>
+    </form>
+}
+
+component Batches(base: str) {
+    state rows = live(load_batches)
+    <section.card>
+        <h2>Batches</h2>
+        {len(rows) == 0 ? <p.muted>No batches yet.</p> : <table.data>
+            <thead><tr><th>Month</th><th>Employer</th><th.num>Lines</th><th.num>To deduct</th><th.num>Remitted</th><th>Status</th></tr></thead>
+            <tbody>{for b in rows => <tr key={b.id}>
+                <td><a href={`${base}/${b.id}`}>{b.period}</a></td><td>{b.employer}</td><td.num>{b.lines}</td>
+                <td.num>{peso(b.total)}</td><td.num>{peso(b.remitted)}</td><td><Status s={b.status}/></td>
+            </tr>}</tbody>
+        </table>}
+    </section>
+}
+
+component RemitUpload(batch_id: int) {
+    state problem = null
+    state result = null
+    state busy = false
+    let send = (file) => {
+        if file == null { return null }
+        busy = true
+        let r = upload_remittance(batch_id, file)
+        busy = false
+        if is_err(r) { problem = r.error; result = null } else { problem = null; result = r }
+    }
+    <div.upload>
+        <label>Remittance file (CSV with employee_no and amount columns)
+            <input type="file" accept=".csv,text/csv" disabled={busy} @change={(e) => send(e.target.files[0])}/>
+        </label>
+        <Problem text={problem}/>
+        {result != null && <p.done>Posted {peso(result.posted)}.{len(result.unknown) > 0 && ` Not in this batch, and not posted: ${join(result.unknown, ", ")}.`}</p>}
+    </div>
+}
+
+component BatchView(id: int, csv_href: str) {
+    state b = live(load_batch, id)
+    {b == null ? <section.card><p>No such batch.</p></section> : <section.card>
+        <h1>{b.batch.employer} · {b.batch.period} <Status s={b.batch.status}/></h1>
+        <p><a.button.ghost href={csv_href} download>Download the CSV</a></p>
+        {b.batch.status == "open" && <RemitUpload batch_id={id}/>}
+        <table.data>
+            <thead><tr><th>Employee</th><th>Member</th><th>For</th><th.num>To deduct</th><th.num>Remitted</th><th>Status</th></tr></thead>
+            <tbody>{for l in b.lines => <tr key={l.id} class={`line-${l.status}`}>
+                <td>{l.employee_no}</td><td>{l.name} ({l.number})</td>
+                <td>{l.kind == "loan" ? `loan ${l.loan_number}` : (l.kind == "store" ? `order ${l.order_number}` : "savings")}</td>
+                <td.num>{peso(l.amount)}</td><td.num>{peso(l.remitted)}</td><td><Status s={l.status}/></td>
+            </tr>}</tbody>
+            <tfoot><tr><th colspan="3">Total</th><th.num>{peso(b.lines | map((l) => l.amount) | sum())}</th><th.num>{peso(b.lines | map((l) => l.remitted) | sum())}</th><th/></tr></tfoot>
+        </table>
+        {len(b.remittances) > 0 && <p.muted>{for r in b.remittances => <span key={r.id}>Remitted by {r.source}: {plural(r.lines, "line")}, {peso(r.total)}, <When ms={r.at}/>. </span>}</p>}
+    </section>}
+}
+
+view ApiHelp(code: str) =
+    <section.card>
+        <h2>Remitting through the API</h2>
+        <p>Instead of a file, the payroll system can send the month's remittance, with the key the coop's manager gave you:</p>
+        <pre>{`curl https://coop.example/api/remittances \\
+  -H "Authorization: Bearer coop_..." \\
+  -H "Idempotency-Key: $(uuidgen)" \\
+  --json '{"period": "2026-11", "lines": [{"employee_no": "A-1001", "amount": "7330.93"}]}'`}</pre>
+        <p.muted>Sent again with the same Idempotency-Key (after a timeout, say), it is posted once. Your code is {code}.</p>
+    </section>

@@ -1,0 +1,53 @@
+// Accounts and postings. Every movement of money goes through `post`, inside
+// the caller's transaction: the balance changes in one statement, an entry
+// records it, and the member's pages are told.
+
+let COOP_TZ = env("PUBLIC_COOP_TZ", "Asia/Manila")
+
+fn today() -> str with time = date.today(COOP_TZ)
+
+// What a member's pages follow, and what the office's queues follow.
+fn member_topic(member_id) -> str = `member:${member_id}`
+let OFFICE = "office"
+let BOARD = "board"
+
+fn setting(key: str, fallback: str) -> str with db = db.one("select value from settings where key = ?", key).value ?? fallback
+
+fn setting_int(key: str, fallback: int) -> int with db = int(setting(key, str(fallback))) ?? fallback
+
+fn account_of(member_id: int, kind: str) with db =
+    db.one("select * from accounts where member_id = ? and kind = ? and status = 'open' order by id limit 1", member_id, kind)
+
+fn new_journal() -> str with random = slice(replace(uuid(), "-", ""), 0, 16)
+
+// Opens an account for a member; its number says what it is.
+fn open_account(member_id: int, kind: str, number: str) -> int with db, time =
+    db.one("insert into accounts (member_id, kind, number, opened) values (?, ?, ?, ?) returning id", member_id, kind, number, now()).id
+
+let KIND_NAMES = { savings: "savings", share: "share capital", deposit: "the fixed deposit", loan: "the loan" }
+
+// Adds `amount` (signed) to an account. Savings, share capital and deposits
+// cannot go below zero; savings not below the minimum balance unless
+// `to_zero` (closing it). The balance after.
+fn post(account_id: int, amount: int, kind: str, memo: str, journal: str, by, to_zero: bool = false) -> int ! str with db, time {
+    let row = db.one("update accounts set balance = balance + ? where id = ? and status = 'open' returning member_id, kind, balance", amount, account_id)
+    if row == null { return err("That account is closed or does not exist") }
+    let least = row.kind == "savings" && amount < 0 && !to_zero ? setting_int("min_savings", 50000) : 0
+    if row.kind != "loan" && row.balance < least {
+        let had = row.balance - amount
+        return err(least > 0
+            ? `That would leave ${peso(row.balance)} in savings; the least to keep is ${peso(least)} (${peso(had)} there now)`
+            : `Not enough in ${KIND_NAMES[row.kind]}: ${peso(had)} there now`)
+    }
+    db.exec("insert into entries (account_id, journal, amount, balance, kind, memo, by_user, at) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        account_id, journal, amount, row.balance, kind, memo, by, now())
+    publish(member_topic(row.member_id))
+    row.balance
+}
+
+// A member's accounts, newest first within each kind.
+fn accounts_of(member_id: int) with db =
+    db.query("select * from accounts where member_id = ? order by case kind when 'savings' then 0 when 'share' then 1 when 'deposit' then 2 else 3 end, id desc", member_id)
+
+fn entries_of(account_id: int, limit: int = 50) with db =
+    db.query("select * from entries where account_id = ? order by id desc limit ?", account_id, limit)

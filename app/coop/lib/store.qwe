@@ -1,0 +1,106 @@
+// The coop's web stores: members order at members' prices and pay from
+// savings, through salary deductions (in up to 6 installments), or at pickup.
+// The office marks orders ready and collected.
+
+type OrderLine = { item: int, qty: int }
+type NewOrder = { store: str, lines: list<OrderLine>, pay: "savings" | "salary" | "pickup", installments: int = 1 }
+
+fn stores() with db = db.query("select * from stores order by name")
+
+fn store_items(store_id: int) with db = db.query("select * from items where store_id = ? and active = 1 order by name", store_id)
+
+fn next_order_number() -> str with db = `O-${pad(db.one("select count(*) as n from orders").n + 1, 5)}`
+
+// Places an order. Prices are the store's, not the page's: the page sends
+// only the items and how many.
+server fn place_order(o: NewOrder) ! str with db, time, random {
+    let me = acting_member()?
+    let lines = o.lines | filter((l) => l.qty > 0)
+    if len(lines) == 0 { return err("The cart is empty") }
+    if len(lines) > 50 { return err("At most 50 different items in one order") }
+    if o.pay == "salary" && me.member.employer_id == null { return err("Salary deductions need an employer on file") }
+    if o.installments < 1 || o.installments > 6 || (o.pay != "salary" && o.installments != 1) { return err("Installments are for salary deductions, 1 to 6") }
+    db.transaction({ isolation: "serializable" }, () => {
+        let s = db.one("select * from stores where slug = ?", o.store) ?? err("No such store")?
+        let priced = for l in lines => {
+            if l.qty > 99 { return err("At most 99 of one item") }
+            let it = db.one("select * from items where id = ? and store_id = ? and active = 1", l.item, s.id) ?? err("An item is no longer sold")?
+            let r = db.exec("update items set stock = stock - ? where id = ? and stock >= ?", l.qty, it.id, l.qty)
+            if r.changes == 0 { return err(`Only ${it.stock} of ${it.name} left`) }
+            { item: it, qty: l.qty, price: it.member_price }
+        }
+        let total = priced | map((p) => p.price * p.qty) | sum()
+        let number = next_order_number()
+        let id = db.one("insert into orders (number, member_id, store_id, total, pay, installments, at) values (?, ?, ?, ?, ?, ?, ?) returning id",
+            number, me.member.id, s.id, total, o.pay, o.installments, now()).id
+        for p in priced {
+            db.exec("insert into order_lines (order_id, item_id, qty, price) values (?, ?, ?, ?) on conflict (order_id, item_id) do update set qty = qty + excluded.qty", id, p.item.id, p.qty, p.price)
+        }
+        if o.pay == "savings" {
+            let sv = account_of(me.member.id, "savings") ?? err("No savings account")?
+            post(sv.id, -total, "store", `${number} at ${s.name}`, new_journal(), me.user.id)?
+            db.exec("update orders set paid = total where id = ?", id)
+        }
+        audit(me.user.id, "order", `${number} ${peso(total)}`)
+        publish(OFFICE)
+        publish(`store:${s.id}`)
+        publish(member_topic(me.member.id))
+        number
+    })
+}
+
+server fn cancel_order(id: int) ! str with db, time, random {
+    let u = acting()?
+    db.transaction({ isolation: "serializable" }, () => {
+        let o = db.one("select * from orders where id = ? and status = 'placed'", id) ?? err("Only an order not yet ready can be cancelled")?
+        if u.role == "member" && u.member_id != o.member_id { return err("Not your order") }
+        if u.role != "member" && u.role != "clerk" { return err("Not allowed for your role") }
+        for l in db.query("select item_id, qty from order_lines where order_id = ?", id) {
+            db.exec("update items set stock = stock + ? where id = ?", l.qty, l.item_id)
+        }
+        // What was paid comes back to savings.
+        if o.paid > 0 {
+            let sv = account_of(o.member_id, "savings") ?? err("No savings account")?
+            post(sv.id, o.paid, "store", `${o.number} cancelled`, new_journal(), u.id)?
+        }
+        db.exec("update orders set status = 'cancelled', paid = 0 where id = ?", id)
+        publish(OFFICE)
+        publish(`store:${o.store_id}`)
+        publish(member_topic(o.member_id))
+        true
+    })
+}
+
+server fn mark_order(id: int, status: "ready" | "collected") ! str with db, time {
+    let clerk = acting_as(["clerk"])?
+    let from = status == "ready" ? "placed" : "ready"
+    let o = db.one("select * from orders where id = ?", id) ?? err("No such order")?
+    if status == "collected" && o.pay == "pickup" && o.paid < o.total {
+        db.exec("update orders set paid = total where id = ?", id)
+    }
+    let r = db.exec("update orders set status = ? where id = ? and status = ?", status, id, from)
+    if r.changes == 0 { return err(`Only a ${from} order can be marked ${status}`) }
+    audit(clerk.id, `order ${status}`, o.number)
+    publish(OFFICE)
+    publish(member_topic(o.member_id))
+    true
+}
+
+server fn load_store(slug: str) with db {
+    let s = unwatched(() => db.one("select * from stores where slug = ?", slug))
+    if s == null { return null }
+    watch(`store:${s.id}`)
+    unwatched(() => ({ store: s, items: store_items(s.id) }))
+}
+
+fn orders_of(member_id: int) with db =
+    db.query("select o.*, s.name as store from orders o join stores s on s.id = o.store_id where o.member_id = ? order by o.id desc limit 30", member_id)
+
+server fn load_open_orders() with db, time {
+    let u = viewer()
+    if u == null || u.role != "clerk" { return [] }
+    watch(OFFICE)
+    unwatched(() => db.query(sql`select o.*, s.name as store, m.number as member_number, m.first_name || ' ' || m.last_name as member_name
+                                 from orders o join stores s on s.id = o.store_id join members m on m.id = o.member_id
+                                 where o.status in ('placed', 'ready') order by o.id`))
+}

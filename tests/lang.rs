@@ -199,6 +199,11 @@ fn control_flow() {
     assert_eq!(ev("if 1 > 2 { \"a\" } else if 2 > 1 { \"b\" } else { \"c\" }"), "\"b\"");
     assert_eq!(ev("let x = if false { 1 }\nx"), "null");
     assert_eq!(ev("for x in [1, 2, 3] => x * x"), "[1, 4, 9]");
+    // A body in braces ends at its `}`: what follows takes the list
+    // (FEEDBACK14.md, Q-095; branch feedback14-fixes).
+    assert_eq!(ev("for n in [1, 2] => {\n let tens = n * 10\n [n, tens]\n} | flatten()"), "[1, 10, 2, 20]");
+    assert_eq!(ev("for n in [1, 2] => { k: n } | map((m) => m.k * 2)"), "[2, 4]");
+    assert_eq!(ev("for xs in [[1], [2, 3]] => xs | len()"), "[1, 2]");
     assert_eq!(ev("for [k, v] in { a: 1, b: 2 } => `${k}=${v}`"), "[\"a=1\", \"b=2\"]");
     assert_eq!(ev("fn f(x) { if x > 0 { return \"pos\" }\n \"other\" }\n[f(1), f(0)]"), "[\"pos\", \"other\"]");
 }

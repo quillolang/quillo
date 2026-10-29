@@ -1,0 +1,132 @@
+// The demo coop, made the first time with COOP_DEMO=1: staff, two employers,
+// members with savings and share capital, loan products (two offered, one
+// before the board), loans at each stage, two stores, a raffle and events.
+// Every password is coop1234.
+
+let DEMO_PASSWORD = "coop1234"
+
+fn demo_user(username: str, name: str, role: str, member_id, employer_id) with db, time, random =
+    db.one("insert into users (username, name, role, password_hash, member_id, employer_id, created) values (?, ?, ?, ?, ?, ?, ?) returning id",
+        username, name, role, crypto.hash_password(DEMO_PASSWORD), member_id, employer_id, now()).id
+
+// A member approved `months` ago, with savings and share capital.
+fn demo_member(first: str, last: str, employer_id, emp_no, months: int, savings: int, share: int, monthly: int) with db, time, random {
+    let number = next_member_number()
+    let joined = now() - months * 30 * DAY_MS
+    let id = db.one(sql`insert into members (number, first_name, last_name, birth_date, address, phone, email, employer_id, employee_no,
+                        monthly_savings, pledge, status, applied_at, decided_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?) returning id`,
+        number, first, last, "1988-04-12", "12 Rizal St., Quezon City", "09171234567", `${lower(first)}.${lower(last)}@example.ph`,
+        employer_id, emp_no, monthly, share, joined - DAY_MS, joined).id
+    let sv = open_account(id, "savings", `SV-${slice(number, 2)}`)
+    let sc = open_account(id, "share", `SC-${slice(number, 2)}`)
+    post(sv, savings, "deposit", "Opening deposit", new_journal(), null)
+    post(sc, share, "deposit", "Share capital", new_journal(), null)
+    demo_user(number, `${first} ${last}`, "member", id, null)
+    id
+}
+
+fn seed() with db, time, random, env {
+    if env("COOP_DEMO", "") != "1" || db.one("select 1 from users limit 1") != null { return null }
+    db.transaction(() => {
+        for [k, v] in { min_savings: "50000", min_share: "100000", min_deposit: "1000000", savings_rate_bp: "200",
+                        fd_rates: "{\"3\": 300, \"6\": 400, \"12\": 550, \"24\": 650}" } {
+            db.exec("insert into settings (key, value) values (?, ?)", k, v)
+        }
+        let acme = db.one("insert into employers (code, name, contact) values ('ACME', 'Acme Manufacturing Corp.', 'payroll@acme.example.ph') returning id").id
+        let ltel = db.one("insert into employers (code, name, contact) values ('LTEL', 'Luzon Telecom Inc.', 'hr@ltel.example.ph') returning id").id
+        demo_user("clara", "Clara Reyes", "clerk", null, null)
+        demo_user("mario", "Mario Santos", "manager", null, null)
+        let directors = for [u, n] in [["dir.cruz", "Elena Cruz"], ["dir.lim", "Victor Lim"], ["dir.garcia", "Rosa Garcia"], ["dir.tan", "Benjamin Tan"], ["dir.ramos", "Luz Ramos"]] =>
+            demo_user(u, n, "bod", null, null)
+        demo_user("acme.hr", "Acme Payroll", "employer", null, acme)
+        demo_user("ltel.hr", "Luzon Telecom HR", "employer", null, ltel)
+
+        let ana = demo_member("Ana", "Dizon", acme, "A-1001", 26, 4500000, 2500000, 200000)
+        let ben = demo_member("Ben", "Ocampo", acme, "A-1002", 18, 1800000, 1000000, 100000)
+        let carla = demo_member("Carla", "Mendoza", ltel, "T-2001", 40, 9500000, 5000000, 300000)
+        demo_member("Dan", "Villanueva", ltel, "T-2002", 8, 600000, 300000, 50000)
+        let ella = demo_member("Ella", "Torres", null, null, 30, 2200000, 1500000, 0)
+        demo_member("Fred", "Aquino", acme, "A-1003", 14, 1200000, 800000, 100000)
+        demo_member("Gina", "Bautista", null, null, 3, 300000, 200000, 0)
+        let hugo = demo_member("Hugo", "Navarro", ltel, "T-2003", 22, 3100000, 2000000, 150000)
+
+        let mario = db.one("select id from users where username = 'mario'").id
+        let product = (code, name, desc, min_a, max_a, min_t, max_t, rate, method, fee, ins, mult, min_m, comk, salary, approvals, status) =>
+            db.one(sql`insert into products (code, name, description, min_amount, max_amount, min_term, max_term, rate_bp, method, fee_bp, insurance_bp,
+                       capital_multiple, min_months, comakers, max_active, salary_only, approvals, status, designed_by, proposed_at, decided_at)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?) returning id`,
+                code, name, desc, min_a, max_a, min_t, max_t, rate, method, fee, ins, mult, min_m, comk, salary, approvals, status, mario,
+                status == "draft" ? null : now(), status == "active" ? now() : null).id
+        let sal = product("SAL", "Salary loan", "For members with a salary from a partner employer, paid through payroll.", 500000, 20000000, 3, 24, 1200, "diminishing", 150, 50, 3, 6, 1, 1, 3, "active")
+        let emr = product("EMR", "Emergency loan", "Quick cash for emergencies, with no co-maker.", 100000, 3000000, 1, 12, 1000, "flat", 100, 0, 0, 3, 0, 0, 2, "active")
+        product("PROV", "Providential loan", "Tuition, appliances and home repairs.", 1000000, 10000000, 6, 36, 1100, "diminishing", 200, 75, 2, 12, 1, 0, 3, "proposed")
+
+        // A loan before the board, with one vote.
+        let l1 = db.one(sql`insert into loans (number, member_id, product_id, amount, term, rate_bp, method, fee, insurance, monthly, purpose, repay, status, applied_at, forwarded_at, reviewed_by)
+                            values ('L-00001', ?, ?, 10000000, 12, 1200, 'diminishing', 150000, 50000, 888488, 'House repairs after the typhoon', 'salary', 'board', ?, ?, 1) returning id`,
+            carla, sal, now() - 3 * DAY_MS, now() - DAY_MS).id
+        db.exec("insert into comakers (loan_id, member_id, status, at) values (?, ?, 'agreed', ?)", l1, hugo, now() - 2 * DAY_MS)
+        db.exec("insert into loan_votes (loan_id, director_id, vote, comment, at) values (?, ?, 'approve', 'Good savings record', ?)", l1, directors[0], now() - 3600000)
+        // One waiting for its co-maker.
+        let l2 = db.one(sql`insert into loans (number, member_id, product_id, amount, term, rate_bp, method, fee, insurance, monthly, purpose, repay, status, applied_at)
+                            values ('L-00002', ?, ?, 3000000, 6, 1200, 'diminishing', 45000, 15000, 517645, 'Motorcycle for work', 'salary', 'submitted', ?) returning id`,
+            ben, sal, now() - DAY_MS).id
+        db.exec("insert into comakers (loan_id, member_id) values (?, ?)", l2, ana)
+        // A released emergency loan, paid through the counter.
+        let l3 = db.one(sql`insert into loans (number, member_id, product_id, amount, term, rate_bp, method, fee, insurance, monthly, purpose, repay, status, applied_at, decided_at)
+                            values ('L-00003', ?, ?, 1200000, 6, 1000, 'flat', 12000, 0, 210000, 'Hospital bill', 'counter', 'approved', ?, ?) returning id`,
+            ella, emr, now() - 10 * DAY_MS, now() - 8 * DAY_MS).id
+        let acct = open_account(ella, "loan", "LN-00003")
+        db.exec("update accounts set loan_id = ? where id = ?", l3, acct)
+        let j = new_journal()
+        post(acct, 1200000, "release", "L-00003 released", j, null)
+        post(account_of(ella, "savings").id, 1188000, "release", "L-00003: ₱12,000.00 less fees ₱120.00", j, null)
+        let first = date.add_months(today(), 1)
+        for r in schedule_of(1200000, 6, 1000, "flat", first) {
+            db.exec("insert into installments (loan_id, n, due, principal, interest) values (?, ?, ?, ?, ?)", l3, r.n, r.due, r.principal, r.interest)
+        }
+        db.exec("update loans set status = 'released', released_at = ?, first_due = ? where id = ?", now() - 7 * DAY_MS, first, l3)
+        // A released salary loan for Ana, its first installment due this month.
+        let l4 = db.one(sql`insert into loans (number, member_id, product_id, amount, term, rate_bp, method, fee, insurance, monthly, purpose, repay, status, applied_at, decided_at)
+                            values ('L-00004', ?, ?, 6000000, 12, 1200, 'diminishing', 90000, 30000, 533093, 'Small sari-sari store', 'salary', 'approved', ?, ?) returning id`,
+            ana, sal, now() - 40 * DAY_MS, now() - 35 * DAY_MS).id
+        let acct4 = open_account(ana, "loan", "LN-00004")
+        db.exec("update accounts set loan_id = ? where id = ?", l4, acct4)
+        let j4 = new_journal()
+        post(acct4, 6000000, "release", "L-00004 released", j4, null)
+        post(account_of(ana, "savings").id, 5880000, "release", "L-00004: ₱60,000.00 less fees and insurance", j4, null)
+        let first4 = today()
+        for r in schedule_of(6000000, 12, 1200, "diminishing", first4) {
+            db.exec("insert into installments (loan_id, n, due, principal, interest) values (?, ?, ?, ?, ?)", l4, r.n, r.due, r.principal, r.interest)
+        }
+        db.exec("update loans set status = 'released', released_at = ?, first_due = ?, monthly = ? where id = ?", now() - 30 * DAY_MS, first4, 533093, l4)
+
+        // Stores.
+        let mart = db.one("insert into stores (slug, name, description) values ('mart', 'Coop Mart', 'Groceries and household goods at members'' prices.') returning id").id
+        let agri = db.one("insert into stores (slug, name, description) values ('agri', 'Agri Supply', 'Seeds, fertiliser and tools for members who farm.') returning id").id
+        for [store, sku, name, price, member_price, stock] in [
+            [mart, "RICE-25", "Rice, 25 kg sack", 145000, 132000, 40], [mart, "OIL-1L", "Cooking oil, 1 L", 12500, 11000, 120],
+            [mart, "SUGAR-1", "Brown sugar, 1 kg", 8500, 7800, 80], [mart, "SOAP-6", "Laundry soap, 6 bars", 9900, 8900, 60],
+            [mart, "NOODLE-24", "Instant noodles, box of 24", 28800, 26400, 30], [mart, "COFFEE", "3-in-1 coffee, 30 sachets", 21000, 19500, 50],
+            [agri, "SEED-RICE", "Certified rice seeds, 20 kg", 180000, 165000, 25], [agri, "UREA-50", "Urea fertiliser, 50 kg", 210000, 195000, 15],
+            [agri, "SPRAYER", "Knapsack sprayer, 16 L", 260000, 239000, 8], [agri, "BOLO", "Farm bolo", 45000, 41000, 20]] {
+            db.exec("insert into items (store_id, sku, name, price, member_price, stock) values (?, ?, ?, ?, ?, ?)", store, sku, name, price, member_price, stock)
+        }
+
+        // A raffle and events.
+        let seed_text = crypto.token()
+        db.exec("insert into raffles (name, prize, ticket_price, max_tickets, per_member, closes, seed_hash, seed) values (?, ?, ?, ?, ?, ?, ?, ?)",
+            "Anniversary raffle", "A motorcycle (125 cc)", 5000, 500, 20, date.add_days(today(), 14), crypto.sha256(seed_text), seed_text)
+        db.exec("insert into events (slug, title, description, starts, venue, capacity, price) values (?, ?, ?, ?, ?, ?, ?)",
+            "general-assembly-" + date.add_days(today(), 21), "General assembly", "The yearly meeting of all members: the financial report, and electing three directors.",
+            date.add_days(today(), 21) + "T09:00", "Barangay Hall, Quezon City", 300, 0)
+        db.exec("insert into events (slug, title, description, starts, venue, capacity, price) values (?, ?, ?, ?, ?, ?, ?)",
+            "financial-literacy-" + date.add_days(today(), 9), "Financial literacy seminar", "Budgeting, saving and borrowing well. Snacks included.",
+            date.add_days(today(), 9) + "T14:00", "Coop office, 2nd floor", 40, 15000)
+
+        // An application waiting for the office.
+        db.exec(sql`insert into members (first_name, last_name, birth_date, address, phone, email, employer_id, employee_no, pledge, monthly_savings, status, applied_at)
+                    values ('Iris', 'Castillo', '1995-09-30', '7 Mabini St., Pasig', '09181112222', 'iris.castillo@example.ph', ?, 'A-1004', 200000, 100000, 'applied', ?)`, acme, now() - 2 * 3600000)
+        true
+    })
+}

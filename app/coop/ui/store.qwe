@@ -1,0 +1,199 @@
+// The web stores, raffles and events.
+
+view StoresPage(me, rows) =
+    <Page title="Stores" me={me} here="/store">
+        <section.card>
+            <h1>The coop's stores</h1>
+            <div.grid2>{for s in rows => <a.tile.store key={s.id} href={`/store/${s.slug}`}><b>{s.name}</b><span>{s.description}</span></a>}</div>
+        </section>
+    </Page>
+
+component Shop(slug: str, member: bool, can_salary: bool) {
+    state s = live(load_store, slug)
+    state cart = {}
+    state pay = "savings"
+    state installments = 1
+    state problem = null
+    state placed = null
+    state busy = false
+    let qty = (id) => get(cart, str(id)) ?? 0
+    let add = (id, n) => { cart = set(cart, str(id), max([qty(id) + n, 0])) }
+    let lines = s == null ? [] : s.items | filter((it) => qty(it.id) > 0) | map((it) => ({ item: it.id, qty: qty(it.id), price: it.member_price, name: it.name }))
+    let total = lines | map((l) => l.price * l.qty) | sum()
+    let order = () => {
+        busy = true
+        let r = place_order({ store: slug, lines: lines | map((l) => ({ item: l.item, qty: l.qty })), pay, installments })
+        busy = false
+        if is_err(r) { problem = r.error; placed = null } else { problem = null; placed = r; cart = {} }
+    }
+    {s == null ? <p>No such store.</p> : <div.shop>
+        <section.card>
+            <h1>{s.store.name}</h1>
+            <p.muted>{s.store.description}</p>
+            <ul.items>{for it in s.items => <li key={it.id}>
+                <div><b>{it.name}</b><small>{it.sku} · {it.stock > 0 ? `${it.stock} in stock` : "out of stock"}</small></div>
+                <div.price><s>{peso(it.price)}</s> <b>{peso(it.member_price)}</b></div>
+                {member && <div.qty>
+                    <button.small disabled={qty(it.id) == 0} @click={() => add(it.id, -1)} aria-label={`One less ${it.name}`}>−</button>
+                    <span>{qty(it.id)}</span>
+                    <button.small disabled={qty(it.id) >= it.stock} @click={() => add(it.id, 1)} aria-label={`One more ${it.name}`}>+</button>
+                </div>}
+            </li>}</ul>
+        </section>
+        {member && <section.card.cart>
+            <h2>Your cart</h2>
+            {len(lines) == 0 ? <p.muted>Empty.</p> : <ul.plain>{for l in lines => <li key={l.item}>{l.qty} × {l.name} · {peso(l.price * l.qty)}</li>}</ul>}
+            <p.big>{peso(total)}</p>
+            <label>Pay
+                <select @change={(e) => { pay = e.target.value; installments = 1 }}>
+                    <option value="savings" selected={pay == "savings"}>from my savings, now</option>
+                    {can_salary && <option value="salary" selected={pay == "salary"}>through salary deductions</option>}
+                    <option value="pickup" selected={pay == "pickup"}>at pickup</option>
+                </select>
+            </label>
+            {pay == "salary" && <label>Installments
+                <select @change={(e) => { installments = int(e.target.value) ?? 1 }}>
+                    {for n in range(1, 7) => <option value={n} selected={n == installments}>{n} {n == 1 ? "month" : "months"}{n > 1 && `, ${peso(int(ceil(dec(total) / n)))} each`}</option>}
+                </select>
+            </label>}
+            <Problem text={problem}/>
+            {placed != null && <p.done>Order {placed} placed. The office tells you when it is ready.</p>}
+            <button.primary disabled={busy || len(lines) == 0} @click={order}>Order</button>
+        </section>}
+    </div>}
+}
+
+component RaffleBox(r, member: bool, staff: bool) {
+    state count = 1
+    state problem = null
+    state done = null
+    let buy = () => {
+        let res = buy_tickets(r.id, count)
+        if is_err(res) { problem = res.error; done = null } else { problem = null; done = `Your ticket${len(res) > 1 ? "s" : ""}: ${join(res | map(str), ", ")}.` }
+    }
+    let draw = () => {
+        let res = draw_raffle(r.id)
+        problem = is_err(res) ? res.error : null
+    }
+    <article.card.raffle>
+        <h2>{r.name} <Status s={r.status}/></h2>
+        <p>Prize: <b>{r.prize}</b>. Tickets {peso(r.ticket_price)}, {r.sold} of {r.max_tickets} sold, up to {r.per_member} each. Sales close on {r.closes}.</p>
+        {r.mine != null && <p>Your tickets: {r.mine}</p>}
+        {r.status == "drawn"
+            ? <p.done>Ticket <b>{r.winner_ticket}</b> won{r.winner != null && `: member ${r.winner}`}. The seed was <code>{r.seed}</code>; its SHA-256 is the one shown since it opened.</p>
+            : <p.muted>The draw's seed has the SHA-256 <code>{r.seed_hash}</code>: the winner will be SHA-256 of the seed, a colon and the number of tickets sold, its first 12 hex digits, modulo the tickets sold, plus one.</p>}
+        {member && r.status == "open" && <div.row>
+            <input type="number" min="1" max={r.per_member} value={count} @input={(e) => { count = int(e.target.value) ?? 1 }} aria-label="Tickets"/>
+            <button.primary @click={buy}>Buy, {peso(r.ticket_price * count)} from savings</button>
+        </div>}
+        {staff && r.status != "drawn" && <button.ghost @click={draw}>Draw the winner</button>}
+        <Problem text={problem}/><Done text={done}/>
+    </article>
+}
+
+component Raffles(member: bool, staff: bool) {
+    state rows = live(load_raffles)
+    <div>{len(rows) == 0 ? <p.muted>No raffles.</p> : for r in rows => <RaffleBox key={r.id} {r} {member} {staff}/>}</div>
+}
+
+component RaffleForm() {
+    state name = ""
+    state prize = ""
+    state price = "50"
+    state max = 500
+    state each = 10
+    state closes = ""
+    state problem = null
+    state done = null
+    let go = () => {
+        let r = create_raffle({ name, prize, ticket_price: price, max_tickets: max, per_member: each, closes })
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Raffle opened." }
+    }
+    <form.card @submit={go}>
+        <h2>Open a raffle</h2>
+        <div.cols2>
+            <label>Name <input bind:value={name}/></label>
+            <label>Prize <input bind:value={prize}/></label>
+            <label>Ticket price (₱) <input inputmode="decimal" bind:value={price}/></label>
+            <label>Tickets in all <input type="number" value={max} @input={(e) => { max = int(e.target.value) ?? max }}/></label>
+            <label>Most per member <input type="number" value={each} @input={(e) => { each = int(e.target.value) ?? each }}/></label>
+            <label>Sales close on <input type="date" bind:value={closes}/></label>
+        </div>
+        <Problem text={problem}/><Done text={done}/>
+        <button.primary>Open it</button>
+    </form>
+}
+
+component EventCard(e, member: bool) {
+    state problem = null
+    state code = e.my_code
+    let book = () => {
+        let r = book_event(e.id)
+        if is_err(r) { problem = r.error } else { problem = null; code = r }
+    }
+    <article.card.event>
+        <h2>{e.title}</h2>
+        <p><b>{event_when(e.starts)}</b> · {e.venue}</p>
+        <p>{e.description}</p>
+        <p.muted>{e.booked} of {e.capacity} places taken · {e.price == 0 ? "free" : peso(e.price)}</p>
+        {code != null
+            ? <p.done>Your ticket code: <b.code>{code}</b>. Show it at the door.</p>
+            : member && <button.primary disabled={e.booked >= e.capacity} @click={book}>{e.booked >= e.capacity ? "Full" : (e.price == 0 ? "Book a place" : `Book, ${peso(e.price)} from savings`)}</button>}
+        <Problem text={problem}/>
+    </article>
+}
+
+component Events(member: bool) {
+    state rows = live(load_events)
+    <div>{len(rows) == 0 ? <p.muted>No events coming up.</p> : for e in rows => <EventCard key={e.id} {e} {member}/>}</div>
+}
+
+component EventForm() {
+    state title = ""
+    state description = ""
+    state starts = ""
+    state venue = ""
+    state capacity = 50
+    state price = "0"
+    state problem = null
+    state done = null
+    let go = () => {
+        let r = create_event({ title, description, starts, venue, capacity, price })
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = "Event added."; navigate(`/office/events/${r}`) }
+    }
+    <form.card @submit={go}>
+        <h2>Add an event</h2>
+        <div.cols2>
+            <label>Title <input bind:value={title}/></label>
+            <label>Starts <input type="datetime-local" bind:value={starts}/></label>
+            <label>Venue <input bind:value={venue}/></label>
+            <label>Places <input type="number" value={capacity} @input={(e) => { capacity = int(e.target.value) ?? capacity }}/></label>
+            <label>Price (₱, 0 for free) <input inputmode="decimal" bind:value={price}/></label>
+            <label.span2>Description <input bind:value={description}/></label>
+        </div>
+        <Problem text={problem}/><Done text={done}/>
+        <button.primary>Add it</button>
+    </form>
+}
+
+component CheckIn(event_id: int, title: str) {
+    state a = live(load_attendance, event_id)
+    state code = ""
+    state problem = null
+    state done = null
+    let go = () => {
+        let r = check_in(event_id, code)
+        if is_err(r) { problem = r.error; done = null } else { problem = null; done = `Welcome, ${r}`; code = "" }
+    }
+    <div>
+        <form.card @submit={go}>
+            <h1>{title}: the door</h1>
+            <div.row><input bind:value={code} placeholder="Ticket code" aria-label="Ticket code" autocomplete="off"/><button.primary>Check in</button></div>
+            <Problem text={problem}/><Done text={done}/>
+        </form>
+        {a != null && <section.card>
+            <h2>{len(a.arrived)} of {a.booked} arrived</h2>
+            <ul.plain>{for x in a.arrived => <li key={x.code}>{x.name} ({x.number}) · {x.code}</li>}</ul>
+        </section>}
+    </div>
+}
