@@ -321,6 +321,57 @@ impl Parser {
         Err(QuilloError::new(msg, line))
     }
 
+    /// Whether the rest of the line is names (and `as`), then `from`: read as text, so a
+    /// path (`lib\\auth`) is never taken for code (branch imports).
+    fn names_then_from(&self) -> bool {
+        let mut line = String::new();
+        let mut i = 0;
+        while let Some(c) = self.lx.peek_char_at(i) {
+            if c == '\n' || c == ';' {
+                break;
+            }
+            line.push(c);
+            i += 1;
+        }
+        let words: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        let Some(at) = words.iter().position(|w| *w == "from") else { return false };
+        let ident = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && w.chars().all(|c| c.is_alphanumeric() || c == '_');
+        at > 0 && words[..at].iter().all(|w| ident(w))
+    }
+
+    /// The file a `use` names: a string, or a path written as it is (`lib/auth.qwe`,
+    /// `../shared/auth`, `lib\\auth`, a backslash read as `/`). Without an extension it
+    /// is a `.qwe` file, or a `.qwer` one when the `use` takes names (branch imports).
+    fn use_path(&mut self, names: bool, line: u32) -> PResult<String> {
+        let quoted = self.peeked.is_some() || {
+            self.lx.skip_spaces();
+            self.lx.peek_char() == Some('"')
+        };
+        if quoted {
+            if let Tok::Str(parts) = self.next()?.tok {
+                return lit_string(parts).ok_or_else(|| QuilloError::new("`use` takes a plain path, not a template", line));
+            }
+            return Err(QuilloError::new("`use` expects a file: use lib/auth.qwe", line));
+        }
+        let mut p = String::new();
+        while let Some(c) = self.lx.peek_char() {
+            if is_path_char(c) || c == '/' || c == '\\' {
+                p.push(if c == '\\' { '/' } else { c });
+                self.lx.bump();
+            } else {
+                break;
+            }
+        }
+        if p.is_empty() || p.ends_with('/') {
+            return Err(QuilloError::new("`use` expects a file: use lib/auth.qwe", line));
+        }
+        self.lx.last = Some(Tok::RParen);
+        if !p.ends_with(".qwe") && !p.ends_with(".qwer") {
+            p.push_str(if names { ".qwer" } else { ".qwe" });
+        }
+        Ok(p)
+    }
+
     // ---- statements ----------------------------------------------------
 
     pub fn parse_program(&mut self) -> PResult<Vec<Stmt>> {
@@ -596,13 +647,63 @@ impl Parser {
                 }
                 "use" => {
                     self.next()?;
-                    let t = self.next()?;
-                    if let Tok::Str(parts) = t.tok {
-                        if let Some(path) = lit_string(parts) {
-                            return Ok(Stmt::Use(path, line));
+                    // `use lib/auth.qwe`, `use * from lib/auth`, `use a, b as c from redis.qwer`:
+                    // names taken from a `.qwer` file, and paths with or without quotes
+                    // (branch imports).
+                    let mut names: Option<Vec<(String, String)>> = None;
+                    // Told apart by the next character, so a path is read as written.
+                    let next = if self.peeked.is_none() {
+                        self.lx.skip_spaces();
+                        self.lx.peek_char()
+                    } else {
+                        None
+                    };
+                    let path = if next == Some('"') || self.peeked.is_some() {
+                        self.use_path(false, line)?
+                    } else if next == Some('*') {
+                        self.lx.bump();
+                        if !self.eat_kw("from")? {
+                            return Err(QuilloError::new("`use *` takes every name from a file: use * from lib/auth.qwe", line));
                         }
+                        self.use_path(false, line)?
+                    } else if !self.names_then_from() {
+                        self.use_path(false, line)?
+                    } else {
+                        // A list of names, then `from`.
+                        let saved = self.save();
+                        let mut list: Vec<(String, String)> = Vec::new();
+                        let mut is_list = false;
+                        while let Tok::Ident(name) = self.peek()? {
+                            if name == "from" && !list.is_empty() {
+                                break;
+                            }
+                            self.next()?;
+                            let alias = if self.eat_kw("as")? { self.expect_ident("the name to call it after `as`")? } else { name.clone() };
+                            if list.iter().any(|(_, a)| *a == alias) {
+                                return Err(QuilloError::new(format!("`{}` is taken twice in this `use`", alias), line));
+                            }
+                            list.push((name, alias));
+                            if self.eat(&Tok::Comma)? {
+                                continue;
+                            }
+                            is_list = self.at_kw("from")?;
+                            break;
+                        }
+                        if is_list {
+                            self.next()?;
+                            names = Some(list);
+                            self.use_path(true, line)?
+                        } else {
+                            self.restore(saved);
+                            self.use_path(false, line)?
+                        }
+                    };
+                    if names.is_some() && !path.ends_with(".qwer") {
+                        return Err(QuilloError::new(format!(
+                            "names are taken from a `.qwer` file; a `.qwe` file gives all its public names: write `use {}`, and mark what it keeps to itself `private`",
+                            path), line));
                     }
-                    return Err(QuilloError::new("`use` expects a file path string, e.g. use \"lib.qwe\"", line));
+                    return Ok(Stmt::Use(path, names, line));
                 }
                 "return" => {
                     self.next()?;

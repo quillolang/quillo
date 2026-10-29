@@ -2870,6 +2870,10 @@ level off: `flatten(flatten(xs))` for two.
   `lib/b.qwe` writes `use "lib/c.qwe"`. A path outside the folder works (`use
   "../shared/auth.qwe"`); there are no globs, and a `.qwer` file is `use`d the same way
   (see [Rust](#rust)).
+- A path may be written without quotes: `use lib/auth.qwe`, `use ../shared/auth.qwe`,
+  and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is a
+  `.qwe` file (`use lib/auth`), or a `.qwer` one when the `use` takes names. `use *
+  from lib/auth.qwe` says the same as `use lib/auth.qwe`: every public name.
 - A file `use`d twice, or by several files, runs once.
 - **`private` and `public`.** `private` before a `fn`, `view`, `component` or top-level
   `let` keeps the name to its file: the file uses it as any name, other files do not
@@ -3754,7 +3758,7 @@ warnings counted) and exits 0. `--strict-null` (below) is its one option.
 
 After a syntax error that a newer Quillo might accept (an unknown character or escape,
 an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language
-server say which quillo they are (`note: this is quillo 0.5.0 (f1695a3, 2026-10-27),
+server say which quillo they are (`note: this is quillo 0.6.0 (f1695a3, 2026-10-29),
 built 2026-10-27 at ...`): code written for a newer Quillo fails to parse in an older
 one, such as an old build left on the `PATH`. `quillo --version` names the commit too: `QUILLO_COMMIT` when
 the build sets it (as for a source archive, which has no git), else the checkout's.
@@ -4165,7 +4169,14 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
   `[patch]`, no `build.rs` of the file's own; a crate's own build scripts do run).
   `serde_json` is always there. C libraries come through `-sys` crates.
-- Two `.qwer` files exporting one name are not reported: the last `use`d wins.
+- **Taking names.** `use cache_get, cache_set from redis.qwer` takes only those
+  functions; `as` gives one another name, `use cache_get as redis_get from redis.qwer`,
+  and it is not there under its own. A name the file does not export is an error that
+  names the nearest it does. `use * from redis.qwer`, or `use redis.qwer`, takes them
+  all. (A `.qwe` file gives every public name: what it keeps to itself it marks
+  `private`, see [Files of a program](#files-of-a-program).)
+- Two `.qwer` files exporting one name: the last `use`d replaces the other, with a
+  warning that says how to take one under another name.
 - `quillo check` reads the functions' types from the Rust, without building anything:
   calls are checked, and editors show them on hover. The language server also runs
   `cargo check` on each save of a `.qwer` file, and shows Rust's errors in the editor.
@@ -4235,7 +4246,8 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
   version is newer, and kept when it is newer or the same version changed by hand:
   `--force` replaces it. `--dir DIR` installs elsewhere. `name@1.2.0` asks for that
   version, and fails when the catalog has another (it keeps only the newest).
-- Then `use "csv.qwer"`: the first run builds it with cargo, as any `.qwer` file.
+- Then `use csv.qwer`, or only what you need, `use csv_parse, csv_write from csv`: the
+  first run builds it with cargo, as any `.qwer` file.
 
 ### Other stores
 

@@ -422,7 +422,7 @@ fn statements(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Stmt>) -> 
     let stmts = Parser::new(&src).parse_program().map_err(|e| format!("{}: {}", path.display(), e))?;
     let dir = path.parent().unwrap_or(Path::new("."));
     for s in stmts {
-        if let Stmt::Use(file, _) = &s {
+        if let Stmt::Use(file, _, _) = &s {
             statements(&dir.join(file), seen, out)?;
         }
         out.push(s);

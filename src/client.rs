@@ -2487,7 +2487,7 @@ impl<'a> Compiler<'a> {
                     self.line = r.line;
                     return self.err("routes cannot be declared in browser code");
                 }
-                Stmt::Use(_, line) => {
+                Stmt::Use(_, _, line) => {
                     self.line = *line;
                     return self.err("`use` must be at the top level");
                 }

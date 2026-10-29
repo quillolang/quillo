@@ -687,3 +687,33 @@ fn private_names_stay_in_their_file() {
     // Still a plain name elsewhere.
     clean("let private = { public: 1 }\nprint(private.public)");
 }
+
+/// `use` with names, `as` and `*`, and paths with or without quotes (branch imports).
+#[test]
+fn use_takes_names_from_plugins() {
+    let d = std::env::temp_dir().join(format!("quillo-imports-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::write(d.join("lib/greet.qwe"), "fn hello(n: str) = `hi ${n}`\n").unwrap();
+    std::fs::write(d.join("lib/kv.qwer"), "pub fn cache_get(key: &str) -> Option<String> { let _ = key; None }\npub fn cache_set(key: &str, v: &str) -> bool { let _ = (key, v); true }\n").unwrap();
+    std::fs::write(d.join("lib/mem.qwer"), "pub fn cache_get(key: &str) -> Option<String> { let _ = key; None }\n").unwrap();
+    let check = |main: &str| -> Vec<String> {
+        std::fs::write(d.join("main.qwe"), main).unwrap();
+        quillo::check::check_file(&d.join("main.qwe")).diagnostics.iter().map(|x| format!("{} {}", x.line, x.message)).collect()
+    };
+    // Every way to write it.
+    let ok = check("use lib/greet.qwe\nuse lib\\greet\nuse * from \"lib/greet.qwe\"\nuse cache_get as kv_get, cache_set from lib/kv.qwer\nuse cache_get as mem_get from lib/mem\nprint(hello(\"a\"), kv_get(\"k\"), cache_set(\"k\", \"v\"), mem_get(\"k\"))\n");
+    assert!(ok.is_empty(), "{:#?}", ok);
+    // A name taken under another is not there under its own.
+    let renamed = check("use cache_get as kv_get from lib/kv\nprint(cache_get(\"k\"))\n");
+    assert!(renamed.iter().any(|m| m.contains("unknown name `cache_get`")), "{:#?}", renamed);
+    // A function the plugin does not have, with the nearest it has.
+    let typo = check("use cache_gett from lib/kv\n");
+    assert!(typo.iter().any(|m| m.contains("kv.qwer has no function `cache_gett` (did you mean `cache_get`?)")), "{:#?}", typo);
+    // Names come from a `.qwer` file.
+    let qwe = check("use hello from lib/greet.qwe\n");
+    assert!(qwe.iter().any(|m| m.contains("names are taken from a `.qwer` file")), "{:#?}", qwe);
+    // One name from two plugins: a warning, with the way out.
+    let both = check("use lib/kv.qwer\nuse lib/mem.qwer\n");
+    assert!(both.iter().any(|m| m.starts_with("2 `cache_get` comes from kv.qwer and mem.qwer") && m.contains("use cache_get as mem_cache_get from lib/mem.qwer")), "{:#?}", both);
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -906,7 +906,7 @@ fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
 }
 
 /// `use "x.qwer"`: builds and loads it, and defines its functions.
-pub fn use_file(it: &mut Interp, qwer: &Path, line: u32) -> Result<(), Ctrl> {
+pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>, line: u32) -> Result<(), Ctrl> {
     let path = qwer.to_path_buf();
     // A build takes seconds: other requests go on meanwhile (on a reload,
     // with the version that runs now).
@@ -914,16 +914,60 @@ pub fn use_file(it: &mut Interp, qwer: &Path, line: u32) -> Result<(), Ctrl> {
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    // `use a, b as c from "x.qwer"`: each must be one of its functions (branch imports).
+    if let Some(only) = only {
+        for (name, _) in only {
+            if !parsed.exports.iter().any(|e| e.name == *name) {
+                return Err(Ctrl::Error(crate::error::QuilloError::new(missing_export(&file, name, &parsed.exports), line)));
+            }
+        }
+    }
     for (i, e) in parsed.exports.iter().enumerate() {
+        let names: Vec<&str> = match only {
+            Some(only) => only.iter().filter(|(n, _)| *n == e.name).map(|(_, a)| a.as_str()).collect(),
+            None => vec![e.name.as_str()],
+        };
+        if names.is_empty() {
+            continue;
+        }
         // The builtin's name says which function it is: one per library, so
         // a version loaded later has names of its own.
         let key: &'static str = Box::leak(format!("native:{}:{}", lib_path.display(), e.name).into_boxed_str());
         functions().lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| {
             Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone() })
         });
-        define(&it.globals, &e.name, Value::Builtin(key, call_placeholder));
+        for n in names {
+            define(&it.globals, n, Value::Builtin(key, call_placeholder));
+        }
     }
     Ok(())
+}
+
+/// What a `use` is told when it takes a name the file does not have: the nearest of
+/// those it has.
+pub fn missing_export(file: &str, name: &str, exports: &[Export]) -> String {
+    let mut have: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+    have.sort();
+    let near = have.iter().min_by_key(|h| edit_distance(name, h)).filter(|h| edit_distance(name, h) <= 2);
+    match near {
+        Some(n) => format!("{} has no function `{}` (did you mean `{}`?)", file, name, n),
+        None => format!("{} has no function `{}`; it has {}", file, name, have.iter().map(|h| format!("`{}`", h)).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut prev = row[0];
+        row[0] = i;
+        for j in 1..=b.len() {
+            let cur = row[j];
+            row[j] = (row[j] + 1).min(row[j - 1] + 1).min(prev + if a[i - 1] == b[j - 1] { 0 } else { 1 });
+            prev = cur;
+        }
+    }
+    row[b.len()]
 }
 
 /// Never called: `Interp::call` sends a `native:` builtin to `call`.
@@ -987,7 +1031,7 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
         for s in prog {
             match s {
-                crate::ast::Stmt::Use(p, _) => todo.push(dir.join(p)),
+                crate::ast::Stmt::Use(p, _, _) => todo.push(dir.join(p)),
                 crate::ast::Stmt::Mount(_, p, _) => todo.push(dir.join(p)),
                 _ => {}
             }
