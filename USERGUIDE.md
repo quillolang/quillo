@@ -43,6 +43,7 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--no-view-cache` | render views every time (see [Cached views](#cached-views)) |
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
+| `--plain-http` | the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
 | `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Concurrency](#concurrency-and-reloading)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 | `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
@@ -593,7 +594,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   its services' and the scripts under `public/`. A template's start counts for every class
   that begins with it (`` `card-${size}` `` writes any `card-...`), and so do the classes
   Quillo sets (below). For classes a library's script sets, name their starts in a comment
-  in the sheet: `/* set elsewhere: leaflet- */`.
+  in the sheet: `/* set elsewhere: leaflet- */`. A file that does not parse counts as
+  writing every class its text holds, so its one error is not followed by a warning for
+  each of them.
 - `<script>{x}</script>` writes `x` as JSON, a JavaScript value (`<` written `\u003c`,
   so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
@@ -1004,7 +1007,11 @@ component Notes(initial: list) {
   follows nothing: live data is a component's.
 - Its arguments are followed too: `live(load, id)` runs `load` again with the new `id`
   when the prop or state it came from changes, and an answer still on its way for the
-  old one is dropped. They are sent as JSON, so they must be data.
+  old one is dropped. They are sent as JSON, so they must be data. Until the new answer
+  comes, the state keeps the old one: `waiting(grid)` is true meanwhile (and while a
+  page the browser made waits for its first), so a grid titled December can say that it
+  still shows November: `<table class={waiting(grid) ? "stale" : ""}>`. On the server it
+  is false, since the server renders with the answer.
 - What a loader *reads* is recorded: the tables in its queries (`from notes`,
   `join users`, in subqueries too; a schema's prefix is dropped, so `a.notes` and
   `b.notes` are one table) and the global variables it uses (`todos`; a global holding
@@ -1059,7 +1066,11 @@ component Notes(initial: list) {
   viewer (marking posts or messages read) is done in the loader: a component's code
   cannot call a `server fn` when state changes, but the loader is that call. A page
   whose loader writes is not prefetched (see [Prefetching](#prefetching)); it is made
-  when the link is followed.
+  when the link is followed. What a loader writes does not wake that loader again on its
+  page, since its answer has it already (pages showing it elsewhere are woken), and a
+  statement that changed no row (`update messages set seen = 1 where seen = 0`, once
+  everything is seen) is not announced at all: a loader that marks what it shows as
+  read runs once for each change, not for ever.
 - The server renders the first value; the page keeps one WebSocket open
   (`/_quillo/live`, served by its own thread), down which the server streams each
   change to its topics (the names, with a sequence number; a ping every 20 s when
@@ -1705,7 +1716,12 @@ route POST /logout { end_session(); redirect("/") }
   `--base`, the default `Path` is the prefix.
   `Secure` is left out with `--watch` and in desktop apps, which are served
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
-  such as limer in front). `request.cookies` has what the browser sent, and
+  such as limer in front). A browser drops a `Secure` cookie that comes over plain HTTP
+  from anywhere but `localhost`, so a site reached as `http://10.0.0.5:8080` cannot keep
+  anyone signed in: the server says so once, the first time it sends such a cookie to a
+  request that came straight from another machine (not through a proxy here, and without
+  `x-forwarded-proto: https`). On a network you trust, `--plain-http` leaves `Secure` out,
+  as `--watch` does. `request.cookies` has what the browser sent, and
   `cookie(name)` one of them (or null), in any function the request runs, as
   `session()` is: a helper that reads the visitor's time zone from a cookie need not be
   handed `request` by every caller. Outside a request (a job, a script), `session()` is
@@ -2585,7 +2601,7 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
   `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `allow_cross_site`,
   `tenant`, `tenant_from`, `with_tenant`, and in components `url`, `navigate`, `every`,
-  `ask`, `notify`, `js`, `js_new`, `live`, `publish`, `watch`, `unwatched`: each is
+  `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
 
 What each does at its edges, where the answer is not what another language would give:
@@ -3017,7 +3033,10 @@ date.format("2026-10-27", { locale: "de-DE", style: "long" })  // "27. Oktober 2
 date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or an error value
 ```
 
-- **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time),
+- **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time;
+  `date.valid(s, "date")` only a date and `date.valid(s, "date-time")` only a date-time:
+  check text from a page with the first before the functions below, which take only
+  dates and fail on a date-time with a runtime error, not an error value),
   `date.parts(d)` (`{ year, month, day, weekday }`, weekday 1 for Monday to 7 for Sunday;
   a date-time adds `hour minute second offset`), `date.weekday(d)`, `date.is_leap_year(year
   or d)`, `date.days_in_month(d)` or `(year, month)`.

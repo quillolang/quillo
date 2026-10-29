@@ -73,6 +73,7 @@ table.list td, table.list th { text-align: left; padding: 5px 4px; border-bottom
 .seg button.on { background: var(--ink); color: #fff; }
 .summary { margin: 0 0 8px; }
 .scroll { overflow-x: auto; }
+.scroll.stale { opacity: .45; transition: opacity .15s; }
 table.grid { border-collapse: collapse; font-size: 12px; }
 table.grid th, table.grid td { border: 1px solid var(--line); padding: 2px 4px; text-align: center; white-space: nowrap; }
 table.grid tbody th { text-align: left; position: sticky; left: 0; background: var(--card); }

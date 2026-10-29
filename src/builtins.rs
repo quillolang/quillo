@@ -119,6 +119,7 @@ pub fn install(env: &Env) {
         ("sql_param", sql_param),
         ("url", url),
         ("navigate", navigate),
+        ("waiting", waiting),
         ("publish", publish),
         ("watch", watch),
         ("unwatched", unwatched),
@@ -1728,6 +1729,13 @@ fn url(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     s_arg(&args, 0, "navigate", line)?;
     Ok(Value::Nil)
+}
+
+/// `waiting(state)`: in a component, whether a live state waits for the
+/// answer to new arguments. The server renders with the answer, so here it
+/// is never waiting (FEEDBACK13.md, Q-091; branch feedback13-fixes).
+fn waiting(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Bool(false))
 }
 
 /// A name a program puts in SQL (a table's, a column's): letters, digits

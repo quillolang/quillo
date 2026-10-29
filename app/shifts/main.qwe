@@ -9,7 +9,9 @@
 //   quillo check app/shifts/main.qwe
 //
 // The database is made and filled with a factory the first time (lib/seed.qwe).
-// SHIFTS_DB picks the file; PUBLIC_FACTORY_TZ the factory's time zone.
+// SHIFTS_DB picks the file; PUBLIC_FACTORY_TZ the factory's time zone. Reached
+// over plain HTTP on the factory's network (kiosks at http://10.0.0.5:8080),
+// run it with --plain-http, or sessions do not stick.
 //
 //   lib/rota.qwe        the rotation and shift times (server and browser)
 //   lib/auth.qwe        signing in, sessions, who may see which line

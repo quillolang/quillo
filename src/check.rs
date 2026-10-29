@@ -642,6 +642,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("style_with", "str", "null"),
     ("sql", "str", "str"),
     ("navigate", "str", "null"),
+    ("waiting", "any", "bool"),
     ("publish", "any...", "null"),
     ("watch", "any...", "null"),
     ("unwatched", "fn", "any"),
@@ -694,7 +695,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("date.today", "str | null=", "str"),
     ("date.now", "str | null=", "str"),
     ("date.parse", "str, str | null=", "str | error(str)"),
-    ("date.valid", "any", "bool"),
+    ("date.valid", "any, str | null=", "bool"),
     ("date.of", "int, int, int", "str"),
     ("date.parts", "str", "map"),
     ("date.weekday", "str", "int"),
@@ -1225,7 +1226,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             let mut order = Vec::new();
             c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
             if opts.css {
-                for (file, line, msg) in unused_classes(&order, base_dir) {
+                for (file, line, msg) in unused_classes(&order, base_dir, &c.unparsed_texts) {
                     c.diag_at(file, line, Severity::Warning, msg);
                 }
             }
@@ -1338,6 +1339,10 @@ struct Checker {
     /// The names those files seem to define (read from their text): not
     /// reported as unknown, since the file that defines them is broken.
     unparsed_names: HashSet<String>,
+    /// Those files' text: the classes it holds are not reported as written
+    /// by nothing, since the file that writes them is broken (FEEDBACK13.md,
+    /// Q-092; branch feedback13-fixes).
+    unparsed_texts: Vec<String>,
     /// The program's functions that give only SQL-safe text (each result
     /// `sql_name(...)`, say): calling one is as safe as `sql_name` itself.
     sql_name_fns: HashSet<String>,
@@ -1417,6 +1422,7 @@ impl Checker {
             reported: HashSet::new(),
             parse_errors: HashSet::new(),
             unparsed_names: HashSet::new(),
+            unparsed_texts: Vec::new(),
             sql_name_fns: HashSet::new(),
             sql_vars: Vec::new(),
             next_sql: SqlVar::Other,
@@ -1569,6 +1575,7 @@ impl Checker {
                             }
                             self.parse_errors.insert((fname.clone(), e.line));
                             self.unparsed_names.extend(names_in_text(&src));
+                            self.unparsed_texts.push(src.clone());
                             self.diag_at(fname, e.line, Severity::Error, e.msg)
                         }
                     },
@@ -4100,7 +4107,7 @@ fn called_names(e: &Expr, out: &mut Vec<String>) {
 /// public scripts, no start of a template (`card-${size}` writes any
 /// `card-...`), not set by Quillo, nor by a script a sheet names
 /// (`/* set elsewhere: leaflet- */`). Each with where it is styled.
-fn unused_classes(order: &[Item], base: &Path) -> Vec<(Arc<str>, u32, String)> {
+fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<str>, u32, String)> {
     let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
     let mut sheet_args: HashSet<*const Expr> = HashSet::new();
     let mut written: HashSet<String> = HashSet::new();
@@ -4154,6 +4161,11 @@ fn unused_classes(order: &[Item], base: &Path) -> Vec<(Arc<str>, u32, String)> {
             }
             _ => {}
         });
+    }
+    // A file that does not parse may write any class its text holds
+    // (FEEDBACK13.md, Q-092; branch feedback13-fixes).
+    for src in unparsed {
+        words(src, &mut written);
     }
     // What the app's services send it is theirs to say: their text counts.
     for it in order {

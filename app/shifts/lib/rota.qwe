@@ -23,10 +23,9 @@ fn days_from(start: str, n: int) -> list<str> = for i in 0..n => date.add_days(s
 
 fn days_span(a: str, b: str) -> list<str> = b < a ? [] : days_from(a, date.days_between(a, b) + 1)
 
-// A day of the form YYYY-MM-DD that is a real date. `date.valid` also takes a
-// date-time, and the other date functions fail (not an error value) on
-// anything else, so text from a form is checked here first.
-fn is_day(s) -> bool = type_of(s) == "str" && re.test(s, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(s)
+// A day (YYYY-MM-DD) that is a real date, not a date-time: the other date
+// functions fail on anything else, so text from a form is checked first.
+fn is_day(s) -> bool = date.valid(s, "date")
 
 // Which crew offset someone has on a day, from their memberships
 // ({ offset, from_day, to_day }), or null when they are in no crew then.

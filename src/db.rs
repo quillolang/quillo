@@ -740,6 +740,11 @@ pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option
 /// A connection's tables are topics of their own (`db@<label>:orders`), so
 /// that one `orders` changing does not refresh pages showing another.
 pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
+    announce_as(it, sql, on, true)
+}
+
+/// As `announce`, the writes left out when the statement changed nothing.
+fn announce_as(it: &mut Interp, sql: &str, on: Option<usize>, wrote: bool) {
     let t = crate::sqlinfo::tables_of(sql);
     let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(l, _)| l.clone())) {
         Some(label) => format!("db@{}:", label),
@@ -750,9 +755,19 @@ pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
             it.watch(format!("{}{}", prefix, r));
         }
     }
-    if !t.writes.is_empty() {
+    if wrote && !t.writes.is_empty() {
         it.publish(t.writes.iter().map(|w| format!("{}{}", prefix, w)).collect());
     }
+}
+
+/// One `insert`, `update` or `delete` (a `with` before it too, and `replace`):
+/// when it changed no row, nothing changed that a page could show. A schema
+/// statement changes no row and still counts (FEEDBACK13.md, Q-090; branch
+/// feedback13-fixes).
+fn rows_statement(sql: &str) -> bool {
+    let s = sql.trim().trim_end_matches(';');
+    let first = s.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_ascii_lowercase();
+    matches!(first.as_str(), "insert" | "update" | "delete" | "replace" | "with") && !s.contains(';')
 }
 
 /// Starts a transaction level; returns where its announcements begin.
@@ -771,7 +786,11 @@ fn tx_end(it: &mut Interp, mark: usize, committed: bool) {
     it.tx_depth -= 1;
     if it.tx_depth == 0 {
         let topics = std::mem::take(&mut it.pending);
-        it.shared.publish(&topics);
+        let seq = it.shared.publish(&topics);
+        // A live loader's own write (FEEDBACK13.md, Q-090; branch feedback13-fixes).
+        if it.reads.is_some() && seq > 0 {
+            it.own_seqs.push(seq);
+        }
         // What a service sends back with its answer: only what committed
         // (FEEDBACK4.md, Q-038; branch bank-fixes).
         let raw = std::mem::take(&mut it.pending_raw);
@@ -1124,8 +1143,14 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             pooled_run(it, &b, move |c| c.exec(&sql, &params))
         }
     };
-    if res.is_ok() {
-        announce(it, &sql, on);
+    // An update that changed no row (`set seen = 1 where seen = 0`, once all
+    // are seen) is not announced: a loader marking what it shows as read
+    // would otherwise wake itself for ever (FEEDBACK13.md, Q-090; branch
+    // feedback13-fixes).
+    match &res {
+        Ok(Value::Map(m)) if matches!(m.get("changes"), Some(Value::Int(0))) && rows_statement(&sql) => announce_as(it, &sql, on, false),
+        Ok(_) => announce(it, &sql, on),
+        Err(_) => {}
     }
     Ok(res.unwrap_or_else(db_err))
 }

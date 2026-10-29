@@ -2,7 +2,8 @@
 // mode: script
 // script: steps.sh
 // open-when: dropped silently
-// fixed-when: told
+// fixed-when: told: quillo: warning
+// fixed-when: --plain-http: set-cookie: quillo_session
 // From FEEDBACK13.md §Q-089 (found on add81dc).
 
 route POST /login {

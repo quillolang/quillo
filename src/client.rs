@@ -40,6 +40,8 @@ const CLIENT_BUILTINS: &[&str] = &[
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
     "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    // FEEDBACK13.md, Q-091; branch feedback13-fixes.
+    "waiting",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {
@@ -2962,6 +2964,21 @@ impl<'a> Compiler<'a> {
                     None => "null".into(),
                 },
             });
+        }
+        // `waiting(grid)`: whether the live state `grid` waits for the answer
+        // to new arguments (or its first, in the browser): read from its
+        // signal, and followed (FEEDBACK13.md, Q-091; branch feedback13-fixes).
+        if let (Expr::Ident(n, _), [Expr::Ident(var, _)]) = (callee, args) {
+            if n == "waiting" && argv.is_empty() && matches!(self.resolve(n)?, Resolved::Global(js, _) if js == "B.waiting") {
+                if let Resolved::State(js) = self.resolve(var)? {
+                    self.reactive = true;
+                    if let Some(log) = &mut self.read_log {
+                        log.push("*".into());
+                    }
+                    return Ok(format!("W.waiting({})", js));
+                }
+                return self.err(format!("`waiting` takes a component's live state by its name (`state {} = live(...)`)", var));
+            }
         }
         let (f, is_async) = self.callee_value(callee)?;
         // The component's own functions, the program's and url() may read

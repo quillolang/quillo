@@ -6,8 +6,7 @@
 //
 //   BASE=http://127.0.0.1:8080 node feedback/tools/drive.mjs app/shifts/tests/leave.mjs
 //
-// Needs a freshly seeded database (lib/seed.qwe), and TODAY, the factory's
-// date, when it is not the machine's.
+// Needs a freshly seeded database (lib/seed.qwe).
 
 export default async ({ browser, sleep }) => {
   const base = process.env.BASE;
@@ -21,7 +20,8 @@ export default async ({ browser, sleep }) => {
   const addDays = (s, n) => { const d = new Date(s + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return day(d); };
   const between = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
   const shift = (d, offset) => "DDNNRR"[(((between("2026-01-05", d) - offset) % 6) + 6) % 6];
-  const today = process.env.TODAY || day(new Date());
+  // The factory's date, not this machine's (PUBLIC_FACTORY_TZ, Europe/Berlin by default).
+  const today = process.env.TODAY || new Intl.DateTimeFormat("en-CA", { timeZone: process.env.PUBLIC_FACTORY_TZ || "Europe/Berlin" }).format(new Date());
   const weekday = (new Date(today + "T00:00:00Z").getUTCDay() + 6) % 7 + 1;
   const monday = addDays(today, 8 - weekday);
   const sunday = addDays(monday, 6);

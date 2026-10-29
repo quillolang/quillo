@@ -26,6 +26,36 @@ cannot keep anyone signed in once it runs without `--watch`, with no word from t
 (Q-089). A live grid whose month was changed shows the old month under the new title until
 the answer comes (Q-091).
 
+## Fixed, on branch feedback13-fixes
+
+Each fix is commented in the code with its issue and the branch. All repros run again
+(`node feedback/run.mjs`): 74 fixed, 2 open (Q-084 and Q-087, left open by
+feedback12-fixes). The suites near the changes pass (check, client, browser, lang, routes,
+security, cluster, sessions, databases, services, tenants, streams, viewcache,
+idempotency, isolation, records) but for two tests that fail the same way on 7989489,
+before these fixes (below). Quillo Shifts' browser test passes, 18 of 18, with its
+workarounds gone.
+
+| ID | The fix |
+|---|---|
+| Q-089 | The first time a `Secure` cookie goes to a request that came straight from another machine over plain HTTP (its peer and its `Host` not this machine's, no `x-forwarded-proto: https`), the server says once that browsers drop it, and what to do. `--plain-http` leaves `Secure` (and the `__Host-` name) out, for a network the site trusts: the repro's sign-in from the LAN address is told about, and kept with the option (src/session.rs `warn_if_dropped`, `PLAIN_HTTP_ASKED`; src/main.rs; src/server.rs) |
+| Q-090 | A live loader's own writes do not wake it on its page: `Shared::publish` gives the sequence number each change was given, a loader's run keeps those it made, and when every change since the run began is its own, its answer says it has seen them; the page does not ask that loader again for a change its answer already covers, and one asked while its answer is on the way waits for it. Other pages showing the same tables are woken as before. An `insert`, `update` or `delete` that changed no row is not announced. The repro's loader runs once per message, not 4,000 times a second (src/shared.rs; src/interp.rs `own_seqs`; src/server.rs; src/db.rs `rows_statement`; src/client/runtime.js `liveChanged`, `liveRefresh`) |
+| Q-091 | `waiting(state)`: in a component, true while a live state waits for the answer to new arguments (or, on a page the browser made, its first); false on the server, which renders with the answer. Quillo Shifts' grid is dimmed (`aria-busy`) while December's answer is on its way (src/client.rs; src/client/runtime.js `W.waiting`; src/builtins.rs; src/check.rs) |
+| Q-092 | A file that does not parse counts as writing every class its text holds, as its names already count as defined: the repro's error comes alone (src/check.rs `unparsed_texts`) |
+| Q-093 | `date.valid(s, "date")` takes only a date, `date.valid(s, "date-time")` only a date-time, the same on the server and in the browser. Quillo Shifts' `is_day` is now that call, not a pattern of its own (src/dates.rs `valid`; src/client/runtime.js; src/check.rs) |
+
+Not done: a `date` type for records, patterns and `server fn` parameters (`start_day:
+date`), the rest of Q-093's suggestion. Records still say `str` and check with
+`date.valid(s, "date")`.
+
+Seen while testing, not from these fixes: on 7989489 itself,
+`tests/serve.rs` `stopping_finishes_requests_in_progress` gets `503 the server is stopping`
+instead of `done`, and `tests/services.rs`
+`a_request_running_when_the_program_reloads_finishes_on_its_version` gets `the program was
+loaded again`: feedback12-fixes' `sleep` that ends at stop and reload (Q-081, Q-082) ends
+requests in progress too, which the guide (Stopping and health; Concurrency and reloading)
+says finish.
+
 ## Seen again
 
 None of the known issues. The nearest is the family of Q-084 (a write wakes every loader that

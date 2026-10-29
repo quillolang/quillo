@@ -55,7 +55,7 @@ component Manpower(today: str) {
             ? <Problem text={grid.error}/>
             : <div>
                 <p.summary>{shifts_short == 0 ? "Every shift has its minimum." : `${shifts_short} shifts below the minimum, on ${len(short)} lines: ${join(short | map((x) => `${x.code} (${x.n})`), ", ")}`}</p>
-                <div.scroll>
+                <div class={waiting(grid) ? "scroll stale" : "scroll"} aria-busy={waiting(grid) ? "true" : "false"}>
                     <table.grid>
                         <thead>
                             <tr>

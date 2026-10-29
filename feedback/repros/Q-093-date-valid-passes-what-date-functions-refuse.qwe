@@ -3,7 +3,8 @@
 // get: /next?d=2026-11-20
 // get: /next?d=2026-11-20T08:00:00Z
 // open-when: 500
+// open-when: /`date.valid`.*(argument|expects)/
 // fixed-when: T08:00:00Z -> 400
-// From FEEDBACK13.md §Q-093 (found on add81dc).
+// From FEEDBACK13.md §Q-093 (found on add81dc). Fixed by `date.valid(s, "date")`, which takes only a date.
 
-route GET /next ? { d: str } = date.valid(d) ? date.add_days(d, 1) : respond(400, "not a date")
+route GET /next ? { d: str } = date.valid(d, "date") ? date.add_days(d, 1) : respond(400, "not a date")
