@@ -4,6 +4,11 @@
 
 ### Fixes
 
+- **`--watch` loads a program with a large file quickly again.** A file's text went
+  into the source map of every function compiled from it; it goes into the first
+  one's only, and the others name the file. A program using a 4 MB component kit
+  of 1,600 definitions loaded in 7 s under `--watch` and in 0.5 s now, with a
+  fifth of the memory (FEEDBACK15, Q-097).
 - **`bind:value` with `@input`** (and `bind:checked` with `@change`) on one input: both
   run, the binding first, so the handler reads the state as typed. Before, the one
   written second took the other's place (FEEDBACK14, Q-094).

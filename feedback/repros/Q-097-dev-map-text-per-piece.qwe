@@ -1,0 +1,24 @@
+// Q-097 Under --watch, every function compiled from a file carries the whole file's text in its source map
+// mode: browser
+// page: /
+// flags: --watch
+// probe: document.querySelector("button").dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); for (let i = 0; i < 60 && !window.__quillo_booted; i++) await new Promise((r) => setTimeout(r, 50)); const srcs = [...document.scripts].map((s) => s.src).filter((s) => s.includes("/_quillo/src/")); let maps = 0, withText = 0; for (const s of srcs) { const t = await (await fetch(s)).text(); const m = t.match(/sourceMappingURL=data:[^,]*,([A-Za-z0-9+\/=]+)/); if (!m) continue; const map = JSON.parse(atob(m[1])); if (!map.sources[0].endsWith(".qwe")) continue; maps++; if (typeof map.sourcesContent[0] === "string") withText++ } return { maps, withText }
+// open-when: /"withText": [2-9]/
+// fixed-when: /"maps": [2-9]/
+// fixed-when: "withText": 1
+// Found on the documentation site (no app): a 4 MB component kit file of 1,600
+// definitions made every --watch reload take 7 s, nearly all of it writing and
+// base64-encoding that file once per function compiled from it.
+
+fn double(n: int) = n * 2
+fn label(n: int) = `count ${n}`
+
+component Counter() {
+    state count = 0
+    <div>
+        <p>{label(count)}</p>
+        <button @click={() => { count = double(count) + 1 }}>Go</button>
+    </div>
+}
+
+route GET / = <html><body><Counter/></body></html>

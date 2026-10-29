@@ -457,14 +457,22 @@ mod dev {
         let mut order = vec!["quillo.js".to_string()];
         files.insert("quillo.js".into(), RUNTIME.to_string());
         let mut sources: HashMap<Arc<str>, Option<String>> = HashMap::new();
+        // A file's text goes into the map of the first piece made from it only;
+        // the other pieces name the file and carry no copy. With it in every
+        // piece, a program using a 4 MB file of 1,600 definitions (a component
+        // kit) took 7 s to load under --watch, nearly all of it writing and
+        // base64-encoding that file hundreds of times over (FEEDBACK15.md,
+        // Q-097; branch dev-maps-once).
+        let mut embedded: HashSet<Arc<str>> = HashSet::new();
         for p in pieces {
             if p.code.trim().is_empty() {
                 continue;
             }
             let text = match &p.source {
                 Some(src) => {
-                    let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok()).clone();
-                    with_map(&p.code, src, content.as_deref())
+                    let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok());
+                    let once = if embedded.insert(src.clone()) { content.as_deref() } else { None };
+                    with_map(&p.code, src, once)
                 }
                 None => format!("\"use strict\";\n{}", unmarked(&p.code)),
             };
