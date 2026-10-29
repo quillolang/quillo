@@ -116,13 +116,16 @@ for a cookie, and requests without one (other programs, pages of other sites)
 get 403. Links to other sites open in the system's browser.
 
 Editor support: [quillolang/editors](https://github.com/quillolang/editors) has a VS Code extension (highlighting,
-diagnostics as you type, hover, go to definition, completion, outline, snippets, and a
-debugger: see [Debugging](#debugging)). It runs the `quillo` it finds (its `quillo.path`
+diagnostics as you type, quick fixes, hover, go to definition, completion, outline, snippets,
+end tags added as you type a start tag's `>` or `</`, and a debugger: see [Debugging](#debugging)).
+An element left open is reported at its start tag (`` `<li>` is never closed: add `</li>` before
+`</ul>` on line 5 ``), with a quick fix that adds the end tag there. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,
-go to definition, document symbols, completion after `.`, `<` and `@`, diagnostics on
-open, change and save; `initializationOptions: { "strictNull": true }` for the extra
+go to definition, document symbols, completion after `.`, `<`, `</` and `@`, diagnostics on
+open, change and save, quick fixes as code actions, and `quillo/closeTag`: at a position
+just after a start tag's `>` or after `</`, the text to insert there, or null; `initializationOptions: { "strictNull": true }` for the extra
 warnings) and `quillo dap` directly.
 
 Examples, in [quillolang/examples](https://github.com/quillolang/examples) (cloned as `../quillo-examples` in the commands here): [hello.qwe](https://github.com/quillolang/examples/blob/main/hello.qwe) (routes), [orders.qwe](https://github.com/quillolang/examples/blob/main/orders.qwe)

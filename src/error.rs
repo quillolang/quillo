@@ -6,11 +6,30 @@ pub struct QuilloError {
     pub msg: String,
     pub line: u32,
     pub file: Option<String>,
+    /// A change to the text that would mend it, offered by `quillo lsp`
+    /// as a quick fix (branch editor-end-tags).
+    pub fix: Option<Box<Fix>>,
+}
+
+/// Replace `len` characters at `line` (from 1) and `col` (in characters,
+/// from 0) with `text`.
+#[derive(Debug, Clone)]
+pub struct Fix {
+    pub title: String,
+    pub line: u32,
+    pub col: u32,
+    pub len: u32,
+    pub text: String,
 }
 
 impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
-        QuilloError { msg: msg.into(), line, file: None }
+        QuilloError { msg: msg.into(), line, file: None, fix: None }
+    }
+
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fix = Some(Box::new(fix));
+        self
     }
 
     pub fn in_file(mut self, file: &str) -> Self {

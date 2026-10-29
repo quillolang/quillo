@@ -18,6 +18,16 @@ const KEYWORDS: &[&str] = &[
 ];
 const TYPES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response", "null"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"];
+/// HTML's elements, offered after `<` with the program's views and components.
+const HTML_TAGS: &[&str] = &[
+    "a", "abbr", "article", "aside", "audio", "b", "blockquote", "body", "br", "button", "canvas", "caption", "code", "col",
+    "colgroup", "datalist", "dd", "details", "dialog", "div", "dl", "dt", "em", "fieldset", "figcaption", "figure", "footer",
+    "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "i", "iframe", "img", "input", "kbd", "label",
+    "legend", "li", "link", "main", "mark", "meta", "meter", "nav", "noscript", "ol", "optgroup", "option", "output", "p",
+    "picture", "pre", "progress", "q", "s", "script", "section", "select", "slot", "small", "source", "span", "strong", "style",
+    "sub", "summary", "sup", "svg", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title",
+    "tr", "track", "u", "ul", "video",
+];
 
 struct Doc {
     text: String,
@@ -149,6 +159,25 @@ fn utf16_col(line: &str, chars: usize) -> usize {
     line.chars().take(chars).map(char::len_utf16).sum()
 }
 
+/// Where a position (line, UTF-16 column) is in `text`, as a byte index.
+fn byte_offset(text: &str, line: usize, col16: usize) -> usize {
+    let mut at = 0;
+    for (i, l) in text.split_inclusive('\n').enumerate() {
+        if i == line {
+            let mut n = 0;
+            for (b, c) in l.char_indices() {
+                if n >= col16 || c == '\n' {
+                    return at + b;
+                }
+                n += c.len_utf16();
+            }
+            return at + l.len();
+        }
+        at += l.len();
+    }
+    text.len()
+}
+
 /// Character index for a UTF-16 column.
 fn char_col(line: &str, utf16: usize) -> usize {
     let mut n = 0;
@@ -269,7 +298,8 @@ impl Server {
                             "hoverProvider": true,
                             "definitionProvider": true,
                             "documentSymbolProvider": true,
-                            "completionProvider": { "triggerCharacters": [".", "<", "@"] }
+                            "completionProvider": { "triggerCharacters": [".", "<", "@", "/"] },
+                            "codeActionProvider": { "codeActionKinds": ["quickfix"] }
                         },
                         "serverInfo": { "name": "quillo", "version": env!("CARGO_PKG_VERSION") }
                     });
@@ -322,6 +352,14 @@ impl Server {
                 }
                 "textDocument/completion" => {
                     let r = self.completion(params);
+                    self.reply(id.unwrap_or(J::Null), r);
+                }
+                "textDocument/codeAction" => {
+                    let r = self.code_actions(params);
+                    self.reply(id.unwrap_or(J::Null), r);
+                }
+                "quillo/closeTag" => {
+                    let r = self.close_tag(params);
                     self.reply(id.unwrap_or(J::Null), r);
                 }
                 "textDocument/documentSymbol" => {
@@ -558,6 +596,9 @@ impl Server {
             return json!([]);
         }
         let Some(doc) = self.docs.get(&uri) else { return json!([]) };
+        if let Some(items) = Self::markup_completion(doc, params, line, col) {
+            return items;
+        }
         let src = doc.text.lines().nth(line).unwrap_or("");
         let before: String = src.chars().take(char_col(src, col)).collect();
         let mut items = Vec::new();
@@ -621,6 +662,116 @@ impl Server {
             }
         }
         json!(items)
+    }
+
+    /// After `</`: the end tag of the element open there. After a `<` that
+    /// starts markup: the program's views and components, and HTML's
+    /// elements (branch editor-end-tags).
+    fn markup_completion(doc: &Doc, params: &J, line: usize, col: usize) -> Option<J> {
+        let at = byte_offset(&doc.text, line, col);
+        let head = &doc.text[..at];
+        let partial = head.len() - head.trim_end_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_').len();
+        let head = &head[..head.len() - partial];
+        let typed = doc.text[at - partial..at].encode_utf16().count();
+        let range = json!({ "start": { "line": line, "character": col - typed }, "end": { "line": line, "character": col } });
+        if let Some(rest) = head.strip_suffix("</") {
+            let Some(open) = crate::parser::open_tags_at_end(rest) else { return Some(json!([])) };
+            let o = open.last()?;
+            let text = if doc.text[at..].starts_with('>') { o.tag.clone() } else { format!("{}>", o.tag) };
+            return Some(json!([{
+                "label": format!("</{}>", o.tag),
+                "kind": 10,
+                "detail": format!("ends <{}> from line {}", o.tag, o.line),
+                "filterText": o.tag,
+                "preselect": true,
+                "textEdit": { "range": range, "newText": text },
+            }]));
+        }
+        // `/` is division or a comment anywhere else.
+        if params["context"]["triggerCharacter"].as_str() == Some("/") {
+            return Some(json!([]));
+        }
+        let rest = head.strip_suffix('<')?;
+        // `a < b`, `xs[i] <`: a comparison.
+        if rest.trim_end().ends_with(|c: char| is_word(c) || c == ')' || c == ']' || c == '<') {
+            return None;
+        }
+        let mut items = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for s in &doc.analysis.symbols {
+            if matches!(s.kind, SymbolKind::View | SymbolKind::Component) && seen.insert(s.name.clone()) {
+                items.push(json!({ "label": s.name, "kind": 7, "detail": s.detail, "sortText": format!("0{}", s.name) }));
+            }
+        }
+        for t in HTML_TAGS {
+            items.push(json!({ "label": t, "kind": 10, "detail": "HTML element", "sortText": format!("1{}", t) }));
+        }
+        Some(json!(items))
+    }
+
+    /// `quillo/closeTag`, asked by the editor as `>` or `</` is typed: what
+    /// to put at the cursor. After the `>` of a start tag whose element has
+    /// no end tag yet, that end tag after the cursor (a snippet,
+    /// `$0</li>`); after `</`, the name of the element open there and `>`;
+    /// else null (branch editor-end-tags).
+    fn close_tag(&self, params: &J) -> J {
+        let (uri, line, col) = Self::position(params);
+        let Some(doc) = self.docs.get(&uri) else { return J::Null };
+        if uri.ends_with(".qwer") {
+            return J::Null;
+        }
+        let at = byte_offset(&doc.text, line, col);
+        let (head, after) = doc.text.split_at(at);
+        if let Some(rest) = head.strip_suffix("</") {
+            let Some(o) = crate::parser::open_tags_at_end(rest).and_then(|mut o| o.pop()) else { return J::Null };
+            return json!(if after.starts_with('>') { o.tag } else { format!("{}>", o.tag) });
+        }
+        if !head.ends_with('>') {
+            return J::Null;
+        }
+        // A `>` typed again in a start tag that has its end tag already.
+        if crate::parser::Parser::new(&doc.text).parse_program().is_ok() {
+            return J::Null;
+        }
+        let Some(o) = crate::parser::open_tags_at_end(head).and_then(|mut o| o.pop()) else { return J::Null };
+        if o.end != head.chars().count() || after.trim_start().starts_with(&format!("</{}>", o.tag)) {
+            return J::Null;
+        }
+        json!(format!("$0</{}>", o.tag))
+    }
+
+    /// Quick fixes: the change a syntax error comes with, such as the end
+    /// tag an element is missing (branch editor-end-tags).
+    fn code_actions(&self, params: &J) -> J {
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+        let Some(doc) = self.docs.get(uri) else { return json!([]) };
+        if uri.ends_with(".qwer") {
+            return json!([]);
+        }
+        let Err(e) = crate::parser::Parser::new(&doc.text).parse_program() else { return json!([]) };
+        let Some(fix) = e.fix else { return json!([]) };
+        let l = e.line.saturating_sub(1) as u64;
+        let (first, last) = (params["range"]["start"]["line"].as_u64().unwrap_or(0), params["range"]["end"]["line"].as_u64().unwrap_or(0));
+        let diags: Vec<J> = params["context"]["diagnostics"]
+            .as_array()
+            .map(|d| d.iter().filter(|d| d["source"] == "quillo" && d["range"]["start"]["line"].as_u64() == Some(l)).cloned().collect())
+            .unwrap_or_default();
+        if diags.is_empty() && !(first..=last).contains(&l) {
+            return json!([]);
+        }
+        let fl = fix.line.saturating_sub(1) as usize;
+        let src = doc.text.lines().nth(fl).unwrap_or("");
+        let range = json!({
+            "start": { "line": fl, "character": utf16_col(src, fix.col as usize) },
+            "end": { "line": fl, "character": utf16_col(src, (fix.col + fix.len) as usize) }
+        });
+        json!([{
+            "title": fix.title,
+            "kind": "quickfix",
+            "isPreferred": true,
+            "diagnostics": diags,
+            "edit": { "changes": { uri: [{ "range": range, "newText": fix.text }] } },
+        }])
     }
 
     fn document_symbols(&self, params: &J) -> J {

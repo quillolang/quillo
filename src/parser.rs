@@ -3,7 +3,7 @@
 //! unary `-`, then postfix calls, fields, indexing and `?`.
 
 use crate::ast::*;
-use crate::error::QuilloError;
+use crate::error::{Fix, QuilloError};
 use crate::lexer::{Lexer, StrPart, Tok, Token};
 use std::sync::Arc;
 
@@ -56,6 +56,72 @@ pub struct Parser {
     styling: Option<Styling>,
     /// The `fn` about to be parsed is a view (`view`, or a capital name).
     view_next: bool,
+    /// The elements whose children are being parsed, innermost last: what a
+    /// missing end tag is told against (branch editor-end-tags).
+    open: Vec<OpenTag>,
+    /// The elements still open where the text ended, if it ended inside
+    /// markup: what an editor closes at the cursor (see `open_tags_at_end`).
+    unclosed_at_end: Option<Vec<OpenTag>>,
+}
+
+/// An element whose end tag has not been read yet.
+#[derive(Debug, Clone)]
+pub struct OpenTag {
+    pub tag: String,
+    /// The line of its `<`.
+    pub line: u32,
+    /// Just after its start tag's `>`, as a character index, and that line.
+    pub end: usize,
+    pub end_line: u32,
+    /// The indentation of the line it starts on.
+    pub indent: String,
+}
+
+/// The elements open at the end of `src` (an editor's text up to its
+/// cursor), outermost first; None when the text does not end in markup.
+/// The parser's own reading, so that markup in `{...}` and text such as
+/// `a < b` are told apart as they are when the file runs (branch
+/// editor-end-tags).
+pub fn open_tags_at_end(src: &str) -> Option<Vec<OpenTag>> {
+    let mut p = Parser::new(src);
+    match p.parse_program() {
+        Ok(_) => None,
+        Err(_) => p.unclosed_at_end.filter(|o| !o.is_empty()),
+    }
+}
+
+/// The column of `pos` on its line, in characters.
+fn col_at(text: &[char], pos: usize) -> u32 {
+    text[..pos].iter().rev().take_while(|c| **c != '\n').count() as u32
+}
+
+/// Only spaces come before `pos` on its line.
+fn starts_line(text: &[char], pos: usize) -> bool {
+    text[..pos].iter().rev().take_while(|c| **c != '\n').all(|c| *c == ' ' || *c == '\t')
+}
+
+/// A line that starts a new declaration at its first column (`route GET
+/// /x`, `fn f(`, `view Page`...): markup left open runs into it. Written to
+/// its shape, as markup may start a line with a plain word.
+fn starts_declaration(line: &[char]) -> bool {
+    if line.first().map_or(true, |c| c.is_whitespace()) {
+        return false;
+    }
+    let line: String = line.iter().take(80).collect();
+    let mut words = line.split_whitespace();
+    let (Some(first), Some(second)) = (words.next(), words.next()) else { return false };
+    let name = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+    let upper = |w: &str| w.chars().next().is_some_and(char::is_uppercase);
+    match first {
+        "route" => second.chars().all(|c| c.is_ascii_uppercase()),
+        "view" | "component" | "type" => upper(second),
+        "fn" => name(second) && line.contains('('),
+        "server" => second == "fn",
+        "let" => name(second) && line.contains('='),
+        "use" => second.starts_with('"'),
+        "service" => name(second),
+        _ => false,
+    }
 }
 
 /// A component's or view's own CSS (FEEDBACK8.md, Q-067; branch
@@ -109,7 +175,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -1706,6 +1772,8 @@ impl Parser {
     }
 
     fn parse_html_el(&mut self, line: u32) -> PResult<HtmlEl> {
+        // Where its `<` is (just read).
+        let start = self.lx.pos.saturating_sub(1);
         let tag = self.read_html_name();
         let mut id = None;
         let mut classes = Vec::new();
@@ -1823,63 +1891,18 @@ impl Parser {
         }
         let mut children = Vec::new();
         if !self_closing {
-            let mut text = String::new();
-            loop {
-                match (self.lx.peek_char(), self.lx.peek_char_at(1)) {
-                    (Some('<'), Some('/')) => {
-                        push_text(&mut children, &mut text);
-                        self.lx.bump();
-                        self.lx.bump();
-                        let close = self.read_html_name();
-                        if close != tag {
-                            return self.html_err(format!(
-                                "expected </{}> (opened on line {}), found </{}>",
-                                tag, line, close
-                            ));
-                        }
-                        self.lx.skip_inline_ws();
-                        if self.lx.peek_char() != Some('>') {
-                            return self.html_err(format!("expected `>` to close </{}", tag));
-                        }
-                        self.lx.bump();
-                        break;
-                    }
-                    (Some('<'), Some(c)) if c.is_alphabetic() => {
-                        push_text(&mut children, &mut text);
-                        let l = self.lx.line;
-                        self.lx.bump();
-                        children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
-                    }
-                    // `{/* a note */}`: a comment, as in JSX.
-                    (Some('{'), _) if self.braced_comment_len() > 0 => {
-                        for _ in 0..self.braced_comment_len() {
-                            self.lx.bump();
-                        }
-                    }
-                    (Some('{'), _) => {
-                        push_text(&mut children, &mut text);
-                        children.push(HtmlChild::Expr(and_as_if(self.parse_braced_expr()?)));
-                    }
-                    // A line of markup starting with `//` is a comment, not
-                    // text for the page (`{"//"}` writes the characters).
-                    (Some('/'), Some('/')) if text.contains('\n') && text.rsplit('\n').next().map_or(false, |l| l.trim().is_empty()) => {
-                        while !matches!(self.lx.peek_char(), Some('\n') | None) {
-                            self.lx.bump();
-                        }
-                    }
-                    (Some('}'), _) => {
-                        return self.html_err(format!("unexpected `}}` inside <{}> (write {{\"}}\"}} for the character)", tag))
-                    }
-                    (None, _) => {
-                        return self.html_err(format!("unexpected end of input: unclosed <{}> from line {}", tag, line))
-                    }
-                    (Some(c), _) => {
-                        // Text, as in JSX.
-                        text.push(c);
-                        self.lx.bump();
-                    }
-                }
-            }
+            let text = self.lx.text();
+            let opened = OpenTag {
+                tag: tag.clone(),
+                line,
+                end: self.lx.pos,
+                end_line: self.lx.line,
+                indent: text[start - col_at(text, start) as usize..].iter().take_while(|c| **c == ' ' || **c == '\t').collect(),
+            };
+            self.open.push(opened);
+            let r = self.parse_html_children(&tag, line);
+            self.open.pop();
+            children = r?;
         }
         // `<textarea>{text}</textarea>` follows `text` in the browser (see
         // `textareaFollows` in the runtime); with `value={...}` as well, one
@@ -1901,6 +1924,137 @@ impl Parser {
         }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
         Ok(HtmlEl { tag, id, classes, attrs, children, line, facts })
+    }
+
+    /// What is between an element's tags, up to its end tag. A missing end
+    /// tag is told at the element that lacks it, with where it should go
+    /// as the fix (branch editor-end-tags): before an end tag that closes
+    /// an element around it, before the `}` that ends the code around it,
+    /// or before the declaration that the file goes on with.
+    fn parse_html_children(&mut self, tag: &str, line: u32) -> PResult<Vec<HtmlChild>> {
+        let mut children = Vec::new();
+        let mut text = String::new();
+        loop {
+            match (self.lx.peek_char(), self.lx.peek_char_at(1)) {
+                (Some('<'), Some('/')) => {
+                    push_text(&mut children, &mut text);
+                    let (at, at_line) = (self.lx.pos, self.lx.line);
+                    self.lx.bump();
+                    self.lx.bump();
+                    let close = self.read_html_name();
+                    if close != tag {
+                        let around = self.open.iter().rev().skip(1).any(|o| o.tag == close);
+                        if around {
+                            return Err(self.never_closed(format!("before `</{}>` on line {}", close, at_line), at, at_line));
+                        }
+                        let col = col_at(self.lx.text(), at) + 2;
+                        return Err(QuilloError::new(
+                            format!("`</{}>` does not close `<{}>` from line {}: expected `</{}>`", close, tag, line, tag),
+                            at_line,
+                        )
+                        .with_fix(Fix { title: format!("Change to </{}>", tag), line: at_line, col, len: close.chars().count() as u32, text: tag.to_string() }));
+                    }
+                    self.lx.skip_inline_ws();
+                    if self.lx.peek_char() != Some('>') {
+                        return self.html_err(format!("expected `>` to close </{}", tag));
+                    }
+                    self.lx.bump();
+                    return Ok(children);
+                }
+                (Some('<'), Some(c)) if c.is_alphabetic() => {
+                    push_text(&mut children, &mut text);
+                    let l = self.lx.line;
+                    self.lx.bump();
+                    children.push(HtmlChild::El(self.nested(|p| p.parse_html_el(l))?));
+                }
+                // `{/* a note */}`: a comment, as in JSX.
+                (Some('{'), _) if self.braced_comment_len() > 0 => {
+                    for _ in 0..self.braced_comment_len() {
+                        self.lx.bump();
+                    }
+                }
+                (Some('{'), _) => {
+                    push_text(&mut children, &mut text);
+                    children.push(HtmlChild::Expr(and_as_if(self.parse_braced_expr()?)));
+                }
+                // A line of markup starting with `//` is a comment, not
+                // text for the page (`{"//"}` writes the characters).
+                (Some('/'), Some('/')) if text.contains('\n') && text.rsplit('\n').next().map_or(false, |l| l.trim().is_empty()) => {
+                    while !matches!(self.lx.peek_char(), Some('\n') | None) {
+                        self.lx.bump();
+                    }
+                }
+                (Some('}'), _) => {
+                    let (at, at_line) = (self.lx.pos, self.lx.line);
+                    // `<p>a } b</p>`: the end tag follows, so the `}` is
+                    // meant as text.
+                    let rest: String = self.lx.text()[at..].iter().take_while(|c| **c != '\n').collect();
+                    if rest.contains(&format!("</{}>", tag)) {
+                        return self.html_err(format!("unexpected `}}` inside <{}> (write {{\"}}\"}} for the character)", tag));
+                    }
+                    let mut e = self.never_closed(format!("before the `}}` on line {}", at_line), at, at_line);
+                    e.msg.push_str(" (write {\"}\"} for the character)");
+                    return Err(e);
+                }
+                (None, _) => {
+                    self.unclosed_at_end = Some(self.open.clone());
+                    // The file goes on with a declaration of its own: the
+                    // end tag goes after the last line of markup before it.
+                    let chars = self.lx.text();
+                    let from = self.open.last().map_or(self.lx.pos, |o| o.end);
+                    let mut l = self.open.last().map_or(line, |o| o.end_line);
+                    let mut next = None;
+                    for i in from..chars.len() {
+                        if chars[i] == '\n' {
+                            l += 1;
+                            let rest = &chars[i + 1..];
+                            let eol = rest.iter().position(|c| *c == '\n').unwrap_or(rest.len());
+                            if starts_declaration(&rest[..eol]) {
+                                next = Some((i + 1, l));
+                                break;
+                            }
+                        }
+                    }
+                    return Err(match next {
+                        Some((at, at_line)) => {
+                            let word: String = chars[at..].iter().take_while(|c| c.is_alphabetic()).collect();
+                            // Back over the blank lines before it.
+                            let mut at = at;
+                            let mut at_line = at_line;
+                            while at > from && chars[at - 1] == '\n' && chars[..at - 1].iter().rev().take_while(|c| **c != '\n').all(|c| c.is_whitespace()) {
+                                at -= chars[..at - 1].iter().rev().take_while(|c| **c != '\n').count() + 1;
+                                at_line -= 1;
+                            }
+                            self.never_closed(format!("before `{}` on line {}", word, l), at, at_line)
+                        }
+                        None => {
+                            let (at, at_line) = (chars.len(), self.lx.line);
+                            self.never_closed("at the end of the file".to_string(), at, at_line)
+                        }
+                    });
+                }
+                (Some(c), _) => {
+                    // Text, as in JSX.
+                    text.push(c);
+                    self.lx.bump();
+                }
+            }
+        }
+    }
+
+    /// The innermost open element has no end tag; it goes at `at`, on its
+    /// own line when `at` starts one.
+    fn never_closed(&self, place: String, at: usize, at_line: u32) -> QuilloError {
+        let o = self.open.last().expect("an element is open");
+        let chars = self.lx.text();
+        let fix = if starts_line(chars, at) {
+            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: 0, len: 0, text: format!("{}</{}>\n", o.indent, o.tag) }
+        } else if at == chars.len() {
+            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("\n{}</{}>", o.indent, o.tag) }
+        } else {
+            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("</{}>", o.tag) }
+        };
+        QuilloError::new(format!("`<{}>` is never closed: add `</{}>` {}", o.tag, o.tag, place), o.line).with_fix(fix)
     }
 
     /// How many characters `{/* ... */}` takes, starting at its `{`, or 0

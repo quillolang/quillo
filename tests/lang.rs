@@ -289,7 +289,15 @@ fn parse_errors_have_lines() {
     let e = ev_err("let a = 1\nlet b = (2 +\n");
     assert!(e.contains("end of input"), "{}", e);
     let e = ev_err("let a = 1\n<div>x</span>");
-    assert!(e.contains("<input>:2:") && e.contains("expected </div>"), "{}", e);
+    assert!(e.contains("<input>:2:") && e.contains("expected `</div>`"), "{}", e);
+    // A missing end tag is told at the element that lacks it (branch
+    // editor-end-tags).
+    let e = ev_err("let a = 1\nlet b = <ul>\n  <li>one\n</ul>");
+    assert!(e.contains("<input>:3:") && e.contains("`<li>` is never closed: add `</li>` before `</ul>` on line 4"), "{}", e);
+    let e = ev_err("fn f() {\n  <div>\n    <p>x</p>\n}");
+    assert!(e.contains("<input>:2:") && e.contains("`<div>` is never closed: add `</div>` before the `}` on line 4"), "{}", e);
+    let e = ev_err("view V() =\n  <main>\n    <p>x</p>\n\nroute GET / = <V/>\n");
+    assert!(e.contains("<input>:2:") && e.contains("`<main>` is never closed: add `</main>` before `route` on line 5"), "{}", e);
     let e = ev_err("fn f(x: number) = x");
     assert!(e.contains("unknown type `number`"), "{}", e);
 }

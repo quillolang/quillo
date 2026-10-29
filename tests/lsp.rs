@@ -316,3 +316,63 @@ fn a_syntax_error_says_which_quillo_read_it() {
     assert!(!d[0]["message"].as_str().unwrap().contains("this is quillo"), "{}", d);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A missing end tag: told at the element, with a quick fix that adds it;
+/// `</` is completed with the element open there, and `quillo/closeTag`
+/// gives the end tag once a start tag's `>` is typed (branch
+/// editor-end-tags).
+#[test]
+fn a_missing_end_tag_is_told_completed_and_fixed() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-tags-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let uri = format!("file://{}/app.qwe", dir.display());
+    let text = "component List() {\n    <ul>\n        <li>one\n    </ul>\n}\n";
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    let init = c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    assert!(init["capabilities"]["codeActionProvider"].is_object(), "{}", init);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let d = loop {
+        let m = c.recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == json!(uri) {
+            break m["params"]["diagnostics"].clone();
+        }
+    };
+    assert_eq!(d[0]["message"], json!("`<li>` is never closed: add `</li>` before `</ul>` on line 4"), "{}", d);
+    assert_eq!(d[0]["range"], json!({ "start": { "line": 2, "character": 9 }, "end": { "line": 2, "character": 11 } }));
+
+    let acts = c.request(
+        "textDocument/codeAction",
+        json!({ "textDocument": { "uri": uri }, "range": d[0]["range"], "context": { "diagnostics": d } }),
+        &mut notes,
+    );
+    assert_eq!(acts[0]["title"], json!("Add </li>"), "{}", acts);
+    assert_eq!(
+        acts[0]["edit"]["changes"][&uri][0],
+        json!({ "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 0 } }, "newText": "        </li>\n" })
+    );
+
+    let typing = "component List() {\n    <ul>\n        <li>one</\n}\n";
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": typing }] }));
+    let items = c.request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 17 }, "context": { "triggerKind": 2, "triggerCharacter": "/" } }),
+        &mut notes,
+    );
+    assert_eq!(items.as_array().unwrap().len(), 1, "{}", items);
+    assert_eq!(items[0]["textEdit"]["newText"], json!("li>"));
+    let close = c.request("quillo/closeTag", json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 17 } }), &mut notes);
+    assert_eq!(close, json!("li>"));
+
+    let typing = "component List() {\n    <ul>\n        <li>\n    </ul>\n}\n";
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": typing }] }));
+    let close = c.request("quillo/closeTag", json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 12 } }), &mut notes);
+    assert_eq!(close, json!("$0</li>"));
+    // Not after `/>`, a void element, or a comparison.
+    for (src, col) in [("fn f() = <p><br/>\n", 17), ("fn f() = <p><br>\n", 16), ("fn f(a, b) = a > b\n", 16)] {
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 4 }, "contentChanges": [{ "text": src }] }));
+        let close = c.request("quillo/closeTag", json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": col } }), &mut notes);
+        assert_eq!(close, Value::Null, "{}", src);
+    }
+}
