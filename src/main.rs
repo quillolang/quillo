@@ -720,7 +720,11 @@ fn run(file: &str, flags: &[String]) -> i32 {
             eprintln!("quillo: --split does not go with --instances or --register");
             return 2;
         }
-        match quillo::service::split(path, o.watch, o.static_check, &o.scale) {
+        // Where the app listens, for its services' channels (FEEDBACK12.md,
+        // Q-087; branch open-fixes).
+        let reach = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host.as_str() };
+        let app_url = if reach.contains(':') { format!("http://[{}]:{}", reach, port) } else { format!("http://{}:{}", reach, port) };
+        match quillo::service::split(path, o.watch, o.static_check, &o.scale, &app_url) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("quillo: {}", e);

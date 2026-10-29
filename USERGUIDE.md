@@ -299,7 +299,7 @@ view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</sect
 ```
 
 Type annotations are checked when the function is called and when it returns, and
-`quillo check` checks them before the program runs: `int float dec num str bool list map
+`quillo check` checks them before the program runs: `int float dec num str date bool list map
 html fn response any` (`num` is `int | float`, not `dec`). Unions are written `int | str`; add `?` or `| null` to also allow null
 (`str?`, `int | null`). `list<int>` says what a list holds, and `{ title: str, tags:
 list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
@@ -370,6 +370,13 @@ match v {
   refused. A record may name itself (`type Node = { value: int, kids: list<Node> = [] }`).
   `type`, like `service` and `mount`, is written at the top level. A field that is
   there but `null` counts as missing: its default fills it, or it is reported.
+- `date` is text that is a calendar date (`YYYY-MM-DD`, a real day): `type Leave = {
+  start: date, end: date }` refuses `"2026-02-30"` and a date-time, in a record, an
+  annotation (`fn next(d: date)`), a pattern (`match x { date => ... }`, a query's `?
+  { from: date }`) and a `server fn`'s arguments from a page, so the `date` module's
+  functions, which fail on anything else, are safe on what got through. It is a `str` to
+  `quillo check` and to JSON (OpenAPI's `format: date`); as a variable's name, `date`
+  still hides the module.
 - Strings in a type (`"admin" | "member"`) are checked when the program runs; `quillo
   check` takes them as `str`.
 
@@ -422,7 +429,7 @@ The same patterns work in `match`, `let`, `for`, and route declarations:
 |---|---|
 | `_`, `name` | anything (`name` binds it) |
 | `42`, `"order"`, `true`, `null` | that literal |
-| `int`, `str`, `list`, ... | any value of that type (`dec` also takes an int, numeric text or a JSON number, made a decimal) |
+| `int`, `str`, `list`, ... | any value of that type (`dec` also takes an int, numeric text or a JSON number, made a decimal; `date` takes text that is a date, `"2026-11-20"`, not a date-time) |
 | `"order" \| "refund"` | either alternative |
 | `int as n` | binds what matched |
 | `[first, second, ..rest]` | lists |
@@ -1041,10 +1048,13 @@ component Notes(initial: list) {
   `unwatched(() => me())` calls it without following what it reads. Keep what changes
   often but is not shown (view counts, last-seen times) in a table of its own, so
   writing it wakes no page.
-- A global is one topic, however much of it a loader reads: a loader that shows one
-  field of a map runs again on every write to the map, 20 times a second when a game's
-  loop writes it. Keep what changes that often in a global of its own, apart from what
-  pages show (a room's player count apart from the world it counts).
+- A field of a global map, read as `world.scores`, is a topic of its own
+  (`var:world.scores`): a loader that shows it runs again when that field changes, not on
+  every write to the map, even 20 times a second from a game's loop. Assigning the map
+  announces each top-level field whose value changed (what `{ ...world, tick: t }` keeps
+  is unchanged), and the map itself, for what reads it whole (`world`, `keys(world)`,
+  `world.len`, a field it lacks). Deeper fields are not followed apart: `world.scores.ana`
+  follows `scores`.
 - A write to a table wakes every loader that read the table, whatever rows it read:
   a reply in one thread runs `load_posts` again on every open thread page. To follow
   one thread only, read the table `unwatched` and watch a topic of its own, which the
@@ -1518,7 +1528,8 @@ route METHOD /path { ... block ... }
   request reaches only a route declared `OPTIONS` (or `ANY`); nothing answers CORS
   preflights by itself, and no `access-control-*` header is written for you.
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
-  `float`, `dec`, `num`, `str`). `*rest` (or `*name`) takes the rest of the path; `*`
+  `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
+  `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
   alone names it `rest`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
@@ -1687,6 +1698,21 @@ route POST /logout { end_session(); redirect("/") }
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
+  `max_age` is seconds or a duration (`"12h"`, as for cookies below).
+- A session ends when its time is up, however often the visitor comes back: `session()`
+  reads the cookie and never sends it again. For a session that lasts while it is used,
+  call `set_session` again on the requests that count as use. Once a day is enough, and
+  keeps the cookie from being sent with every answer:
+
+```quillo
+fn touch() {
+    let s = session()
+    let day = 24 * 60 * 60 * 1000                      // now() is milliseconds
+    if s.user != null && now() - (s.at ?? 0) > day {
+        set_session({ ...s, at: now() }, { max_age: "30d" })
+    }
+}
+```
 - A session is a cookie signed with HMAC-SHA256: the browser can read it but not
   change it, so keep secrets out of it. Cookies hold about 4 KB; keep an id in
   the session and the rest in the database. The signature covers its expiry, its tenant
@@ -2392,10 +2418,14 @@ service /billing = "billing.qwe"
   copies (up to 64), called in turn; they share its database, so give it one that
   several processes can open (SQLite on one machine, PostgreSQL across machines). Copies
   share only that: each has its own global variables, as `--instances` do. A service's
-  channels do not cross: pages connect to the app's process, so under `--split` what
-  they send never gets to the service's `channel.on`, and what it broadcasts reaches no
-  page. `--split` warns of a service that uses channels; keep a game's or a chat's
-  channels in the app, or run it in one process.
+  channels work apart too: pages connect to the app's process, which asks the services
+  which channels their `channel.on` took, hands what pages send on one to its service
+  (in order, a batch at a time, with the page's session), and passes on what the
+  service broadcasts, sends or asks of `channel.peers` to its pages; all of it signed
+  with `QUILLO_SERVICE_SECRET`, and none of it logged. Each crossing is a call on this
+  machine (well under a millisecond): a game service ticking 20 times a second reaches
+  its players 20 times a second. With `--scale`, channels go to the service's first copy
+  only, so one copy holds a game's world.
 - Either way, what crosses is data, as JSON: arguments and results are copied (a
   function arrives as `null`; a decimal stays a decimal, its scale and all), so a
   program behaves the same whichever way it runs. Optional arguments left out are not sent, so the service's own defaults apply. A
@@ -3036,7 +3066,8 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
 - **Making and reading:** `date.of(y, m, d)`, `date.valid(s)` (a date or a date-time;
   `date.valid(s, "date")` only a date and `date.valid(s, "date-time")` only a date-time:
   check text from a page with the first before the functions below, which take only
-  dates and fail on a date-time with a runtime error, not an error value),
+  dates and fail on a date-time with a runtime error, not an error value; or give the
+  field or parameter the type `date`, see [Records](#records)),
   `date.parts(d)` (`{ year, month, day, weekday }`, weekday 1 for Monday to 7 for Sunday;
   a date-time adds `hour minute second offset`), `date.weekday(d)`, `date.is_leap_year(year
   or d)`, `date.days_in_month(d)` or `(year, month)`.

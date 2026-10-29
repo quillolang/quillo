@@ -412,6 +412,17 @@ function typeName(v) {
   return "map";
 }
 
+// "2026-11-20", a real day of years 1 to 9999, as the server's `date` type
+// takes: apart from the date module, which a page that only checks a type
+// does not carry (FEEDBACK13.md, Q-093; branch open-fixes).
+function isDay(s) {
+  const m = typeof s === "string" && /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const feb = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0) ? 29 : 28;
+  return y >= 1 && mo >= 1 && mo <= 12 && d >= 1 && d <= [31, feb, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+}
+
 function typeIs(t, v) {
   switch (t) {
     case "any": return true;
@@ -421,6 +432,8 @@ function typeIs(t, v) {
     case "num": return typeof v === "number" || typeof v === "bigint";
     case "dec": return v instanceof Dec;
     case "str": return typeof v === "string";
+    // Text that is a date (FEEDBACK13.md, Q-093; branch open-fixes).
+    case "date": return isDay(v);
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
     case "map": return isMap(v) || isEvent(v);
@@ -941,6 +954,7 @@ function coerce(t, s) {
   if (t === "int") return /^[+-]?\d+$/.test(s) ? parseInt(s, 10) : null;
   if (t === "float" || t === "num") return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
   if (t === "dec") return decParse(s, false);
+  if (t === "date") return isDay(s) ? s : null;
   return null;
 }
 

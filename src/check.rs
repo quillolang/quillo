@@ -428,6 +428,8 @@ fn name_bits(n: &str) -> u16 {
     match n {
         "any" => ANY,
         "num" => NUM,
+        // A date is text (FEEDBACK13.md, Q-093; branch open-fixes).
+        "date" => STR,
         "nil" | "null" => NIL,
         other => BASE.iter().find(|(_, x)| *x == other).map_or(ANY, |(b, _)| *b),
     }

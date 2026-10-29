@@ -284,6 +284,8 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
         "dec" => matches!(v, Value::Dec(_)),
         "num" => matches!(v, Value::Int(_) | Value::Float(_)),
         "str" => matches!(v, Value::Str(_)),
+        // Text that is a date, not a date-time (FEEDBACK13.md, Q-093; branch open-fixes).
+        "date" => matches!(v, Value::Str(s) if crate::dates::parse_date(s).is_some()),
         "bool" => matches!(v, Value::Bool(_)),
         "list" => matches!(v, Value::List(_)),
         "map" => matches!(v, Value::Map(_)),
@@ -337,6 +339,7 @@ pub fn coerce(t: &str, s: &str) -> Option<Value> {
         "float" => s.parse::<f64>().ok().map(Value::Float),
         "num" => s.parse::<i64>().ok().map(Value::Int).or_else(|| s.parse::<f64>().ok().map(Value::Float)),
         "dec" => Dec::parse(s).map(Value::Dec),
+        "date" => crate::dates::parse_date(s).map(|_| Value::str(s)),
         "bool" => match s {
             "true" | "on" | "1" | "yes" => Some(Value::Bool(true)),
             "false" | "off" | "0" | "no" => Some(Value::Bool(false)),
@@ -1037,7 +1040,7 @@ impl Interp {
     #[cold]
     fn note_global_read(&mut self, env: &Env, name: &str) {
         if let Some((v, true)) = lookup_global(env, name) {
-            let module = matches!(&v, Value::Map(m) if !m.is_empty() && m.values().all(|x| matches!(x, Value::Builtin(..))));
+            let module = matches!(&v, Value::Map(m) if is_module_map(m));
             if !module && !matches!(v, Value::Func(_) | Value::Builtin(..)) {
                 self.watch(format!("var:{}", name));
             }
@@ -1404,6 +1407,13 @@ impl Interp {
                     }
                 };
                 let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
+                // Which fields of a global map changed, for what follows
+                // one field (FEEDBACK12.md, Q-084; branch open-fixes).
+                let followed = self.shared.field_reads.lock().unwrap_or_else(|e| e.into_inner()).contains(name.as_str());
+                let fields = match lookup_global(env, name) {
+                    Some((old, true)) if followed => changed_fields(&old, &v),
+                    _ => Vec::new(),
+                };
                 match assign_global(env, name, v) {
                     None => fail(
                         *line,
@@ -1411,7 +1421,9 @@ impl Interp {
                     ),
                     Some(global) => {
                         if global {
-                            self.publish(vec![format!("var:{}", name)]);
+                            let mut topics = vec![format!("var:{}", name)];
+                            topics.extend(fields.into_iter().map(|k| format!("var:{}.{}", name, k)));
+                            self.publish(topics);
                             // Cached renders do not record the functions
                             // they called, so a new one starts afresh.
                             if function {
@@ -1611,6 +1623,27 @@ impl Interp {
                     });
                     if let Some(Some(x)) = found {
                         return Ok(x);
+                    }
+                }
+                // A field of a global map, read by a live loader or a cached
+                // view: what it follows is that field (`var:world.scores`),
+                // not every write to the map (FEEDBACK12.md, Q-084; branch
+                // open-fixes). A name the map lacks may be a method
+                // (`world.len`), which reads all of it.
+                if let Expr::Ident(var, _) = &**obj {
+                    if self.reads.is_some() || !self.tracks.is_empty() {
+                        if let Some((Value::Map(m), true)) = lookup_global(env, var) {
+                            if m.contains_key(name.as_str()) && !is_module_map(&m) {
+                                {
+                                    let mut f = self.shared.field_reads.lock().unwrap_or_else(|e| e.into_inner());
+                                    if !f.contains(var.as_str()) {
+                                        f.insert(var.to_string());
+                                    }
+                                }
+                                self.watch(format!("var:{}.{}", var, name));
+                                return self.get_field(Value::Map(m), name, env, *line);
+                            }
+                        }
                     }
                 }
                 let v = self.eval(obj, env)?;
@@ -3303,4 +3336,46 @@ impl Interp {
         out.push_str("</quillo-island>");
         Ok(())
     }
+}
+
+/// A module (`date`, `json`): a map of builtins, which no write changes.
+fn is_module_map(m: &Map) -> bool {
+    !m.is_empty() && m.values().all(|x| matches!(x, Value::Builtin(..)))
+}
+
+/// The top-level keys whose values differ between a global's old value and
+/// its new one, when either is a map: what a loader that read one field of it
+/// follows. Values the new map shares with the old (`{ ...world, tick: n }`
+/// keeps `scores` as it was) are the same at once; others are compared when
+/// small, and taken as changed when large (FEEDBACK12.md, Q-084; branch
+/// open-fixes).
+fn changed_fields(old: &Value, new: &Value) -> Vec<String> {
+    fn same(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Map(x), Value::Map(y)) => Arc::ptr_eq(x, y) || (x.len() <= 32 && crate::value::equal(a, b)),
+            (Value::List(x), Value::List(y)) => Arc::ptr_eq(x, y) || (x.len() <= 32 && crate::value::equal(a, b)),
+            (Value::Str(x), Value::Str(y)) => Arc::ptr_eq(x, y) || x == y,
+            (Value::Func(x), Value::Func(y)) => Arc::ptr_eq(x, y),
+            _ => crate::value::equal(a, b),
+        }
+    }
+    let empty = Map::new();
+    let (o, n) = match (old, new) {
+        (Value::Map(o), Value::Map(n)) => (&**o, &**n),
+        (Value::Map(o), _) => (&**o, &empty),
+        (_, Value::Map(n)) => (&empty, &**n),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (k, v) in n {
+        if o.get(k).map_or(true, |w| !same(w, v)) {
+            out.push(k.to_string());
+        }
+    }
+    for k in o.keys() {
+        if !n.contains_key(k) {
+            out.push(k.to_string());
+        }
+    }
+    out
 }

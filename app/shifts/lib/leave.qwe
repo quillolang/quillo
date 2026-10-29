@@ -4,8 +4,8 @@
 
 type LeaveRequest = {
     kind: "annual" | "sick" | "unpaid",
-    start_day: str,
-    end_day: str,
+    start_day: date,
+    end_day: date,
     note: str = "",
 }
 
@@ -36,7 +36,6 @@ fn balance(user_id: int) with db, time {
 
 // The checks a request must pass before it is saved; the shifts it costs.
 fn check_request(u, r: LeaveRequest) -> int ! str with db, time {
-    if !is_day(r.start_day) || !is_day(r.end_day) { return err("Pick the first and last day") }
     if r.end_day < r.start_day { return err("The last day comes before the first") }
     if date.days_between(r.start_day, r.end_day) + 1 > MAX_LEAVE_DAYS { return err(`At most ${MAX_LEAVE_DAYS} days in one request`) }
     if len(r.note) > 500 { return err("Keep the note under 500 characters") }
