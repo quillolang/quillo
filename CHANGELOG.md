@@ -4,6 +4,13 @@
 
 ### Added
 
+- **`defer`: slow parts of a page streamed after it.** `state reviews =
+  defer(load_reviews(id))` in a component placed in the page: the page is sent at once
+  with the state null (its placeholder shown), and the component follows in the same
+  answer once the data comes, its other states kept, swapped in by a line of script
+  before the browser takes it up. Search engines read the whole page. Inside another
+  component, in the browser, for a prefetch or without a server to stream to, `defer(x)`
+  is `x` and the page is whole.
 - **Query stats at `/_quillo/health/queries`:** the minimum, maximum and average time
   of the last 100 database queries, overall for anyone and per statement with the health
   token (`QUILLO_HEALTH_TOKEN`). Off until switched on: `--watch`, `--query-stats`,

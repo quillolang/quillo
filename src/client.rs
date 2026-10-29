@@ -42,6 +42,8 @@ const CLIENT_BUILTINS: &[&str] = &[
     "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
     // FEEDBACK13.md, Q-091; branch feedback13-fixes.
     "waiting",
+    // In the browser, `defer(x)` is `x` (src/defer.rs; branch defer).
+    "defer",
 ];
 
 pub fn bundle(it: &Interp) -> Result<String, QuilloError> {

@@ -1235,9 +1235,41 @@ page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect
 retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
 either: set a state of your own around the call.
 
-There is no way to load a `state` after the page shows: a `state` initializer runs while
-the server renders. For slow data (another site's API), render a placeholder and call
-the `server fn` from `@mount`.
+**Slow data: `defer`.** A `state` initializer runs while the server renders, so the
+page waits for its slowest one. `defer` lets a slow one follow the page instead:
+
+```quillo
+component Product(id: int) {
+    state product = load_product(id)                  // in the first bytes
+    state reviews = defer(load_reviews(id))           // streamed when it is ready
+    <div>
+        <h1>{product.name}</h1>
+        {reviews == null ? <p>Loading reviews…</p> : <ReviewList reviews={reviews}/>}
+    </div>
+}
+```
+
+- The page is sent at once with `reviews` null: what the component shows for null is
+  there (a skeleton, "Loading…"). The rest of the answer comes when `load_reviews`
+  does: the component rendered again, its other states as they were (`load_product`
+  is not called twice) and `reviews` worked out, which a line of script swaps in. The
+  answer is one response, so search engines read the whole page, reviews included.
+- The browser takes the component up once its part has come, not before: until then
+  it is HTML (links work, nothing else does). Its part comes as soon as it is ready,
+  and before the page counts as loaded.
+- Only a component placed in the page defers. Inside another component, and in the
+  browser (a page made there after `navigate`), `defer(x)` is `x`: there a state that
+  calls the server is null until it answers anyway. Components inside a deferring one
+  render again with it, their initializers too.
+- Several deferred components follow in the order they are on the page, each as soon
+  as the ones before it are sent. A deferred part cannot set cookies or the session
+  (the answer's head is gone): do that in the route or a server fn.
+- Without a connection to stream to (a test calling `handle`), for a prefetch, or for
+  a mounted program, the parts are worked out first and the page is sent whole. A
+  runtime error in one is logged, and its placeholder stays.
+
+For data a page should not wait for at all (another site's API that may take seconds),
+render a placeholder and call the `server fn` from `@mount`.
 
 There is no `async` or `await` to write: on the server a call simply waits (and other
 requests run meanwhile); in the browser the compiler awaits it, and every function that
@@ -4390,6 +4422,7 @@ does not do it today; the way around it follows.
 
 | Can I... | |
 |---|---|
+| send the page before its slow parts, as React's Suspense streams them? | Yes: `state x = defer(load())` streams that component when its data comes, in the same answer. See [Server functions](#server-functions) |
 | render on the server and have it interactive in the browser? | Yes, that is what a `component` is: rendered on the server, resumed in the browser without being drawn again. See [Components](#components) |
 | render a component only in the browser, or mount one from a script? | No: components start from the server's HTML, or inside another component |
 | use npm packages, TypeScript, a bundler? | No: component code is Quillo, compiled to JavaScript by `quillo`; a library is a `<script>` reached with `js(...)`. See [JavaScript libraries](#javascript-libraries) |

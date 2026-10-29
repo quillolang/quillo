@@ -243,6 +243,12 @@ pub struct Interp {
     /// The components this request's page was rendered with: the browser
     /// loads a bundle of those (and what they use) alone.
     pub island_names: Vec<String>,
+    /// The page's waiting components, rendered again after it (src/defer.rs;
+    /// branch defer), the deferred states of the island rendering now, and the
+    /// states a second render takes as they were.
+    pub(crate) deferred: Vec<crate::defer::Deferred>,
+    island_defers: Vec<String>,
+    state_preset: Option<Map>,
     /// Bundles for sets of components, by their names: (hash, script).
     /// Shared by every handle on the program, made again when it loads.
     pub bundles: Arc<std::sync::Mutex<crate::client::Bundles>>,
@@ -901,6 +907,9 @@ impl Interp {
             streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
+            deferred: Vec::new(),
+            island_defers: Vec::new(),
+            state_preset: None,
             spare: String::new(),
             view_cache: crate::viewcache::enabled().then(Default::default),
             tracks: Vec::new(),
@@ -979,6 +988,9 @@ impl Interp {
             streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
+            deferred: Vec::new(),
+            island_defers: Vec::new(),
+            state_preset: None,
             spare: String::new(),
             view_cache: self.view_cache.clone(),
             tracks: Vec::new(),
@@ -1618,7 +1630,18 @@ impl Interp {
             }
             Stmt::State(name, e, _) => {
                 self.last_live = None;
-                let v = self.eval(e, env)?;
+                // A component placed in the page (the only island rendering) defers
+                // `defer(...)`: null now, worked out after the page. Its second
+                // render takes the other states as they were (src/defer.rs; branch defer).
+                let top = self.islands.len() == 1;
+                let v = match self.state_preset.as_ref().filter(|_| top).and_then(|m| m.get(name.as_str()).cloned()) {
+                    Some(v) => v,
+                    None if top && self.state_preset.is_none() && defer_call(e, env) => {
+                        self.island_defers.push(name.clone());
+                        Value::Nil
+                    }
+                    None => self.eval(e, env)?,
+                };
                 let live = self.last_live.take();
                 if let Some((state, subs)) = self.islands.last_mut() {
                     state.insert(name.into(), v.clone());
@@ -3343,11 +3366,14 @@ impl Interp {
         }
         self.mark_impure();
         self.islands.push((Map::new(), Map::new()));
+        // A component placed in the page may defer: what renders it again (branch defer).
+        let again = (!nested).then(|| args.clone());
         let mut body = String::new();
         let was = std::mem::replace(&mut self.in_component, true);
         let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut body));
         self.in_component = was;
         let (state, live) = self.islands.pop().unwrap_or_default();
+        let defers = if nested { Vec::new() } else { std::mem::take(&mut self.island_defers) };
         r?;
         let props = if nested { Map::new() } else { props };
         for (what, m) in [("prop", &props), ("state", &state)] {
@@ -3368,6 +3394,28 @@ impl Interp {
                 }
             }
         }
+        // Waiting: registered, and marked for the browser to leave alone until it comes.
+        let mut extra = String::new();
+        if !defers.is_empty() {
+            let id = self.deferred.len();
+            let mut kept = state.clone();
+            for n in &defers {
+                kept.shift_remove(n.as_str());
+            }
+            self.deferred.push(crate::defer::Deferred {
+                id, c: c.clone(), args: again.unwrap_or_default(), tag: el.tag.clone(), props: props.clone(), state: kept, live: live.clone(), line,
+            });
+            extra = format!(" data-qd=\"{}\"", id);
+        }
+        let eager = crate::island::runs_by_itself(&c.def.body);
+        self.island_wrap(&el.tag, props, state, live, eager, &extra, &body, out);
+        Ok(())
+    }
+
+    /// A component's island: its HTML in a `<quillo-island>` carrying its props and
+    /// state (or, inside a table or a select, its own root element carrying them).
+    #[allow(clippy::too_many_arguments)]
+    fn island_wrap(&self, tag: &str, props: Map, state: Map, live: Map, eager: bool, extra: &str, body: &str, out: &mut String) {
         let live_attrs = if live.is_empty() {
             String::new()
         } else {
@@ -3381,31 +3429,58 @@ impl Interp {
         // A component that runs by itself (timers, live data, `@mount`, the
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
-        let eager = if crate::island::runs_by_itself(&c.def.body) { " data-e" } else { "" };
         let data = format!(
-            " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}",
-            escape(&el.tag),
+            " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}{}",
+            escape(tag),
             escape(&island_json(&Value::map(props)).to_string()),
             escape(&island_json(&Value::map(state)).to_string()),
             live_attrs,
-            eager
+            if eager { " data-e" } else { "" },
+            extra
         );
         // Inside a table or a select the browser's parser moves any other
         // element out, island and all: there the component's own root
         // element is its island.
-        if let Some(at) = crate::island::own_root(&body) {
+        if let Some(at) = crate::island::own_root(body) {
             out.push_str(&body[..at]);
             out.push_str(" data-qi");
             out.push_str(&data);
             out.push_str(&body[at..]);
-            return Ok(());
+            return;
         }
         out.push_str("<quillo-island style=\"display:contents\"");
         out.push_str(&data);
         out.push('>');
-        out.push_str(&body);
+        out.push_str(body);
         out.push_str("</quillo-island>");
-        Ok(())
+    }
+
+    /// A waiting component rendered again (src/defer.rs; branch defer): the states it
+    /// had as they were, its deferred ones worked out now.
+    pub(crate) fn render_deferred(&mut self, d: &crate::defer::Deferred) -> Result<String, Ctrl> {
+        self.state_preset = Some(d.state.clone());
+        self.islands.push((Map::new(), Map::new()));
+        let mut body = String::new();
+        let was = std::mem::replace(&mut self.in_component, true);
+        let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
+        self.in_component = was;
+        let (state, mut live) = self.islands.pop().unwrap_or_default();
+        self.state_preset = None;
+        r?;
+        // What it followed the first time, it follows still.
+        for (k, v) in d.live.iter() {
+            if !live.contains_key(k) {
+                live.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, x) in state.iter() {
+            if let Some(bad) = not_sendable(x) {
+                return fail(d.line, format!("state `{}` of <{}> is {}, which cannot be sent to the browser", k, d.tag, bad));
+            }
+        }
+        let mut out = String::new();
+        self.island_wrap(&d.tag, d.props.clone(), state, live, crate::island::runs_by_itself(&d.c.def.body), "", &body, &mut out);
+        Ok(out)
     }
 }
 
@@ -3449,4 +3524,10 @@ fn changed_fields(old: &Value, new: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// `defer(x)`, the builtin (not a function of the program's own of that name).
+fn defer_call(e: &Expr, env: &Env) -> bool {
+    matches!(e, Expr::Call(f, args, _) if args.len() == 1
+        && matches!(&**f, Expr::Ident(n, _) if n == "defer" && matches!(lookup(env, "defer"), Some(Value::Builtin("defer", _)))))
 }

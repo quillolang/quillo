@@ -84,6 +84,7 @@ pub fn install(env: &Env) {
         ("random", random),
         ("random_int", random_int),
         ("uuid", uuid),
+        ("defer", defer),
         ("abs", abs),
         ("round", round),
         ("floor", floor),
@@ -1226,6 +1227,12 @@ fn random_int(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `uuid()`: a random (version 4) UUID string. The bytes come from the
 /// operating system, so a uuid can serve as a session id or token, which
 /// `random()` and `random_int()` cannot.
+/// `defer(x)`: `x`. As a component's `state` initializer, the server sends the page
+/// first and the component after it (src/defer.rs; branch defer).
+fn defer(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    Ok(args.into_iter().next().unwrap_or(Value::Nil))
+}
+
 fn uuid(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
     let mut b = [0u8; 16];
     if getrandom::getrandom(&mut b).is_err() {

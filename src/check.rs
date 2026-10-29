@@ -593,6 +593,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("random", "", "float"),
     ("random_int", "int, int", "int"),
     ("uuid", "", "str"),
+    ("defer", "any", "any"),
     ("abs", "num | dec", "num | dec"),
     ("round", "num | dec, int=, str=", "num | dec"),
     ("floor", "num | dec", "num | dec"),
