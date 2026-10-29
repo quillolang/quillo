@@ -521,3 +521,19 @@ fn textarea_children_are_its_value() {
 <textarea>Item {n}</textarea>"#), "<textarea>Item 2</textarea>");
     assert!(ev_err(r#"<textarea value={"a"}>{"b"}</textarea>"#).contains("not both"));
 }
+
+/// Private names run as written: each file's own, locals of the same name included
+/// (branch public-private).
+#[test]
+fn private_names_run_in_their_file() {
+    let d = std::env::temp_dir().join(format!("quillo-private-run-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::write(d.join("lib/a.qwe"), "private let PREFIX = \"a\"\nprivate fn helper(x: str) = `${PREFIX}:${x}`\nfn from_a(x: str) = helper(x)\nfn shadow(helper: str) = helper\n").unwrap();
+    std::fs::write(d.join("lib/b.qwe"), "private fn helper(x: str) = `b:${x}`\nfn from_b(x: str) = helper(x)\n").unwrap();
+    std::fs::write(d.join("main.qwe"), "use \"lib/a.qwe\"\nuse \"lib/b.qwe\"\nlet out = [from_a(\"x\"), from_b(\"y\"), shadow(\"mine\")]\n").unwrap();
+    let mut it = quillo::interp::Interp::new(&d);
+    it.load_file(&d.join("main.qwe")).unwrap();
+    let out = it.load_source("out", "probe.qwe").unwrap();
+    assert_eq!(out.repr(), "[\"a:x\", \"b:y\", \"mine\"]");
+    let _ = std::fs::remove_dir_all(&d);
+}

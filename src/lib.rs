@@ -42,6 +42,7 @@ pub mod lsp;
 pub mod parser;
 pub mod script;
 pub mod pg;
+pub mod privacy;
 pub mod server;
 pub mod numeric;
 pub mod re;

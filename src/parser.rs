@@ -68,6 +68,10 @@ pub struct Parser {
     /// The routes of a group after its first, which the program takes after
     /// the statement that gave them (branch route-groups).
     more: Vec<Stmt>,
+    /// The file's `private` names, renamed once it is parsed (src/privacy.rs;
+    /// branch public-private), and what their new names end in.
+    privates: std::collections::HashSet<String>,
+    privacy_tag: String,
 }
 
 /// An element whose end tag has not been read yet.
@@ -181,11 +185,15 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new() }
+        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
+                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src) }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
     pub fn in_file(mut self, file: Option<Arc<str>>) -> Self {
+        if let Some(f) = &file {
+            self.privacy_tag = crate::privacy::tag(Some(f), "");
+        }
         self.file = file;
         self
     }
@@ -320,6 +328,10 @@ impl Parser {
         loop {
             self.skip_seps()?;
             if self.at(&Tok::Eof)? {
+                // `private` names: renamed in the whole file (src/privacy.rs).
+                if !self.privates.is_empty() {
+                    crate::privacy::rename(&mut out, &self.privates, &self.privacy_tag)?;
+                }
                 return Ok(out);
             }
             self.top = true;
@@ -352,6 +364,46 @@ impl Parser {
         let line = self.line()?;
         if let Tok::Ident(k) = self.peek()? {
             match k.as_str() {
+                // `private fn helper()`, `public view Card`: who sees the name. Only
+                // before a definition at a file's top level; otherwise a name
+                // (branch public-private).
+                "private" | "public" => {
+                    let private = k == "private";
+                    let saved = self.save();
+                    self.next()?;
+                    let what = match self.peek()? {
+                        Tok::Ident(w) if self.line()? == line && ["fn", "view", "component", "let", "server", "type"].contains(&w.as_str()) => Some(w),
+                        _ => None,
+                    };
+                    if let Some(what) = what {
+                        if !top {
+                            return Err(QuilloError::new(format!("`{}` is written at the top level of a file, before what it names", k), line));
+                        }
+                        if private && what == "server" {
+                            return Err(QuilloError::new("a `server fn` cannot be private: it is an address on the server that anyone can call; keep the work in a private `fn` it calls", line));
+                        }
+                        if private && what == "type" {
+                            return Err(QuilloError::new("`private type` is not there yet: a type's name is the program's", line));
+                        }
+                        self.top = true;
+                        let stmt = self.parse_stmt()?;
+                        if private {
+                            match &stmt {
+                                Stmt::Fn(def) => {
+                                    self.privates.insert(def.name.clone());
+                                }
+                                Stmt::Let(pat, _, _) => {
+                                    let mut names = Vec::new();
+                                    pattern_binds(pat, &mut names);
+                                    self.privates.extend(names);
+                                }
+                                _ => {}
+                            }
+                        }
+                        return Ok(stmt);
+                    }
+                    self.restore(saved);
+                }
                 // `style css`...`` (or a name): the CSS of the component or
                 // view this is the body of. Otherwise `style` is a name.
                 "style" => {
@@ -2443,5 +2495,25 @@ fn pattern_names_request(p: &Pattern) -> bool {
         Pattern::List(items, _) | Pattern::Alt(items) => items.iter().any(pattern_names_request),
         Pattern::As(q, _) => pattern_names_request(q),
         _ => false,
+    }
+}
+
+/// The names a `let` pattern binds.
+fn pattern_binds(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::Bind(n) => out.push(n.clone()),
+        Pattern::As(inner, n) => {
+            pattern_binds(inner, out);
+            out.push(n.clone());
+        }
+        Pattern::Alt(ps) => ps.iter().for_each(|p| pattern_binds(p, out)),
+        Pattern::List(ps, rest) => {
+            ps.iter().for_each(|p| pattern_binds(p, out));
+            if let Some(Some(n)) = rest {
+                out.push(n.clone());
+            }
+        }
+        Pattern::Record(fs) => fs.iter().for_each(|f| pattern_binds(&f.pat, out)),
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => {}
     }
 }

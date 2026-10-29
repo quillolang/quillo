@@ -24,7 +24,8 @@ pub struct Fix {
 
 impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
-        QuilloError { msg: msg.into(), line, file: None, fix: None }
+        // A private name as it was written (src/privacy.rs; branch public-private).
+        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None }
     }
 
     pub fn with_fix(mut self, fix: Fix) -> Self {

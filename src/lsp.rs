@@ -55,7 +55,8 @@ struct RustDiags {
 
 /// Sends a message from any thread (stdout's lock keeps messages whole).
 fn send_any(msg: &J) {
-    let body = msg.to_string();
+    // Private names as they were written (src/privacy.rs; branch public-private).
+    let body = crate::privacy::demangle(&msg.to_string());
     let mut out = io::stdout().lock();
     let _ = write!(out, "Content-Length: {}\r\n\r\n{}", body.len(), body);
     let _ = out.flush();
@@ -317,7 +318,8 @@ impl Server {
     }
 
     fn send(&mut self, msg: J) {
-        let body = msg.to_string();
+        // Private names as they were written (src/privacy.rs; branch public-private).
+        let body = crate::privacy::demangle(&msg.to_string());
         let mut out = self.out.lock();
         let _ = write!(out, "Content-Length: {}\r\n\r\n{}", body.len(), body);
         let _ = out.flush();
@@ -586,10 +588,11 @@ impl Server {
             .analysis
             .references
             .iter()
-            .find(|r| r.name == word && here(r.line) && r.file == file)
+            // A private name is found by what was written (branch public-private).
+            .find(|r| (r.name == word || crate::privacy::private_name(&r.name) == Some(word.as_str())) && here(r.line) && r.file == file)
             .cloned()
             .or_else(|| {
-                doc.analysis.symbols.iter().find(|s| s.name == word && here(s.line) && s.file == file).map(|s| check::Reference {
+                doc.analysis.symbols.iter().find(|s| (s.name == word || crate::privacy::private_name(&s.name) == Some(word.as_str())) && here(s.line) && s.file == file).map(|s| check::Reference {
                     file: s.file.clone(),
                     line: s.line,
                     name: s.name.clone(),
@@ -711,6 +714,10 @@ impl Server {
             }
         }
         for s in &doc.analysis.symbols {
+            // Another file's private names are not this file's to use (branch public-private).
+            if crate::privacy::private_name(&s.name).is_some() && s.file != file {
+                continue;
+            }
             if s.kind != SymbolKind::Route && seen.insert(s.name.clone()) {
                 let kind = match s.kind {
                     SymbolKind::Variable => 6,

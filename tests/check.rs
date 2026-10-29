@@ -656,3 +656,34 @@ fn a_live_loader_that_only_calls_a_service_is_warned_about() {
     assert!(warnings(app("server fn load() -> int with http, db = (ledger.current() ?? 0) + db.one(\"select 1 as n\").n")).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// `private fn`, `private let`, `private view`: a name only its file sees, so two
+/// files may each have one; `public` says the default; other files are told the name
+/// is private (branch public-private).
+#[test]
+fn private_names_stay_in_their_file() {
+    let d = std::env::temp_dir().join(format!("quillo-private-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::write(d.join("lib/x.qwe"), "private fn helper() = 1\nprivate let shared = 10\npublic fn from_x() = helper() + shared\nprivate view Tag(text: str) = <b>{text}</b>\nview ShowX() = <Tag text=\"x\"/>\n").unwrap();
+    std::fs::write(d.join("lib/y.qwe"), "private fn helper() = 2\nprivate let shared = 20\nfn from_y() = helper() + shared\n").unwrap();
+    let check = |main: &str| -> Vec<String> {
+        std::fs::write(d.join("main.qwe"), main).unwrap();
+        quillo::check::check_file(&d.join("main.qwe")).diagnostics.iter()
+            .map(|x| format!("{}:{} {}", x.file.rsplit('/').next().unwrap(), x.line, x.message)).collect()
+    };
+    // Two private `helper`s and `shared`s: not "defined twice".
+    let ok = check("use \"lib/x.qwe\"\nuse \"lib/y.qwe\"\nprint(from_x() + from_y())\nroute GET / = <ShowX/>\n");
+    assert!(ok.iter().all(|m| !m.contains("defined twice")), "{:#?}", ok);
+    assert!(ok.is_empty(), "{:#?}", ok);
+    // Another file's private name: said so, by both files; no mangled name in sight.
+    let bad = check("use \"lib/x.qwe\"\nuse \"lib/y.qwe\"\nprint(helper())\nroute GET / = <Tag text=\"t\"/>\n");
+    assert!(bad.iter().any(|m| m.contains("`helper` is private to") && m.contains("x.qwe and") && m.contains("y.qwe")), "{:#?}", bad);
+    assert!(bad.iter().all(|m| !m.contains("__pv")), "{:#?}", bad);
+    let _ = std::fs::remove_dir_all(&d);
+    // Where `private` cannot go, and what it cannot be.
+    one("private server fn s() = 1", "a `server fn` cannot be private");
+    one("fn f() {\n    private fn g() = 1\n    g()\n}", "`private` is written at the top level of a file");
+    one("private fn title() = \"t\"\nview Card(title: str) = <b>{title}</b>", "a prop of `Card` too");
+    // Still a plain name elsewhere.
+    clean("let private = { public: 1 }\nprint(private.public)");
+}
