@@ -240,6 +240,13 @@ impl Joining {
     }
 }
 
+/// The first address of service `name`: where its channels are, so that one
+/// copy (under `--scale`) holds a channel's pages and state (FEEDBACK12.md,
+/// Q-087; branch open-fixes).
+pub fn first_url_of(shared: &crate::shared::Shared, name: &str) -> Option<String> {
+    urls_of(shared, name).first().cloned()
+}
+
 /// One address of service `name`, for passing its routes on: the next that
 /// is not left alone (see `pick`).
 pub fn url_of(shared: &crate::shared::Shared, name: &str) -> Option<String> {
@@ -657,6 +664,67 @@ pub fn signature(secret: &str, t: u64, to: &str, f: &str, tenant: &str, call: &s
     let mut msg = format!("quillo-service-2\n{}\n{}\n{}\n{}\n{}\n", t, to, f, tenant, call).into_bytes();
     msg.extend_from_slice(body);
     crate::crypto::hex(&crate::crypto::hmac_sha256(secret.as_bytes(), &msg))
+}
+
+// ---- channels across processes (FEEDBACK12.md, Q-087; branch open-fixes) ----
+
+/// Under `--split`, where the app listens, for its services' processes: what
+/// they broadcast on a channel goes to the app's pages through it.
+static APP_URL: OnceLock<String> = OnceLock::new();
+
+/// A signed POST between the app and a service's process, for channels:
+/// `to` the service (or "" for the app), `f` what it is for. The answer's body.
+pub fn signed_post(base: &str, path: &str, to: &str, f: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    let secret = secret().ok_or("QUILLO_SERVICE_SECRET is not set")?;
+    let t = now_secs();
+    let nonce = new_id(16);
+    let sig = signature(&secret, t, to, f, "", &nonce, body);
+    let r = agent()
+        .post(&format!("{}{}", base.trim_end_matches('/'), path))
+        .timeout(Duration::from_secs(10))
+        .set("content-type", "application/json")
+        .set("x-quillo-service", &format!("t={},sig={}", t, sig))
+        .set("x-quillo-call", &nonce)
+        .set("x-quillo-to", to)
+        .send_bytes(body);
+    match r {
+        Ok(resp) => {
+            let mut out = Vec::new();
+            resp.into_reader().read_to_end(&mut out).map_err(|e| e.to_string())?;
+            Ok(out)
+        }
+        Err(ureq::Error::Status(code, resp)) => Err(format!("{} {}", code, resp.into_string().unwrap_or_default().trim())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether `req` was signed by `signed_post` for `f`, lately, with the shared
+/// secret; and, when `named`, for this process's `--service-name` (what the
+/// app sends a service), else for the app ("", what a service sends it).
+pub fn signed_for(req: &HttpRequest, f: &str, named: bool) -> Result<(), HttpResponse> {
+    let Some(secret) = secret() else {
+        return Err(refused(403, "channels between processes need QUILLO_SERVICE_SECRET, on both sides"));
+    };
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let sig = header("x-quillo-service").unwrap_or("");
+    let t = sig.split(',').find_map(|p| p.strip_prefix("t=")).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let given = sig.split(',').find_map(|p| p.strip_prefix("sig=")).unwrap_or("");
+    let to = header("x-quillo-to").unwrap_or("");
+    let c = header("x-quillo-call").unwrap_or("");
+    let expected = signature(&secret, t, to, f, "", c, &req.body);
+    if req.method != "POST" || now_secs().abs_diff(t) > WINDOW || !crate::crypto::same(expected.as_bytes(), given.as_bytes()) {
+        return Err(refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)"));
+    }
+    if (named && SERVED_AS.get().is_some_and(|me| *me != to)) || (!named && !to.is_empty()) {
+        return Err(refused(401, "this is for another process"));
+    }
+    Ok(())
+}
+
+/// In a service's process started by `--split`: where its app listens.
+pub fn app_url() -> Option<&'static str> {
+    static U: OnceLock<Option<String>> = OnceLock::new();
+    U.get_or_init(|| std::env::var("QUILLO_APP_URL").ok().filter(|u| !u.is_empty())).as_deref()
 }
 
 /// How one try went.
@@ -1304,7 +1372,13 @@ fn free_port() -> std::io::Result<u16> {
 
 /// Starts a service's process, its log lines marked with its name.
 fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process::Child, String> {
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    // Where the app listens, for the service's channels (FEEDBACK12.md, Q-087;
+    // branch open-fixes).
+    if let Some(u) = APP_URL.get() {
+        command.env("QUILLO_APP_URL", u);
+    }
+    let mut child = command
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1373,8 +1447,9 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
 /// `--scale risk=3`, a service runs as that many copies, each on a port of
 /// its own, taking calls in turn and sharing its database (FEEDBACK10.md,
 /// Q-075; branch feedback10-fixes).
-pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usize)]) -> Result<Split, String> {
+pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
     let services = declared(path)?;
+    let _ = APP_URL.set(app_url.to_string());
     if let Some((name, _)) = scale.iter().find(|(n, _)| !services.iter().any(|(s, _, _)| s == n)) {
         let names: Vec<&str> = services.iter().map(|(s, _, _)| s.as_str()).collect();
         return Err(format!("--scale {}: no service `{}` (the app declares {})", name, name, if names.is_empty() { "none".to_string() } else { names.join(", ") }));
@@ -1394,26 +1469,11 @@ pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usi
         }
         std::env::set_var(env_name(name), urls.join(","));
     }
-    // A service's channels are out of its pages' reach when it runs apart: the
-    // pages connect to the app's process, and its `channel.on` and broadcasts are
-    // in another. Said, until the processes are bridged (FEEDBACK12.md, Q-087;
-    // branch feedback12-fixes).
-    for (name, _, file) in &services {
-        let src = std::fs::read_to_string(file).unwrap_or_default();
-        let on = src.lines().any(|l| {
-            let code = l.split("//").next().unwrap_or("");
-            code.contains("channel.on(") || code.contains("channel.broadcast(") || code.contains("channel.send(")
-        });
-        if on {
-            eprintln!(
-                "quillo: warning: service {} ({}) uses channels, and with --split its pages cannot reach them: \
-                 what pages send does not get to its `channel.on`, and what it broadcasts reaches no page. \
-                 Run without --split, or keep the channels in the app (FEEDBACK12.md, Q-087)",
-                name,
-                file.display()
-            );
-        }
-    }
+    // A service's channels, when it runs apart: the pages connect to the app's
+    // process, which asks the services which channels are theirs and hands
+    // them what pages send there; what a service broadcasts comes back through
+    // the app (`QUILLO_APP_URL`) (FEEDBACK12.md, Q-087; branch open-fixes).
+    crate::wt::set_split(services.iter().map(|(name, _, _)| name.clone()).collect());
     let ports: Vec<u16> = copies.iter().map(|c| c.3).collect();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut running = Vec::new();

@@ -143,6 +143,10 @@ pub struct Shared {
     /// Live loaders' runs shared between pages, and the values pages have,
     /// for patches (FEEDBACK2.md, Q-028; branch feedback6-fixes).
     pub live_cache: Mutex<crate::livecache::LiveCache>,
+    /// Globals one of whose fields something follows (`world.scores`): only
+    /// their writes are compared field by field (FEEDBACK12.md, Q-084; branch
+    /// open-fixes).
+    pub field_reads: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Shared {
@@ -156,6 +160,7 @@ impl Shared {
             peers: Mutex::new(Vec::new()),
             service_urls: Mutex::new(std::collections::HashMap::new()),
             live_cache: Mutex::new(Default::default()),
+            field_reads: Mutex::new(Default::default()),
         }
     }
 

@@ -85,7 +85,7 @@ route GET /manpower {
 }
 
 // The grid as CSV, one row per line, day and shift.
-route GET /manpower.csv ? { from: str, to: str } {
+route GET /manpower.csv ? { from: date, to: date } {
     let _u = signed_in("/manpower")
     let g = load_manpower(from, to)
     if is_err(g) { reply 400 g.error }

@@ -44,9 +44,11 @@ workarounds gone.
 | Q-092 | A file that does not parse counts as writing every class its text holds, as its names already count as defined: the repro's error comes alone (src/check.rs `unparsed_texts`) |
 | Q-093 | `date.valid(s, "date")` takes only a date, `date.valid(s, "date-time")` only a date-time, the same on the server and in the browser. Quillo Shifts' `is_day` is now that call, not a pattern of its own (src/dates.rs `valid`; src/client/runtime.js; src/check.rs) |
 
-Not done: a `date` type for records, patterns and `server fn` parameters (`start_day:
-date`), the rest of Q-093's suggestion. Records still say `str` and check with
-`date.valid(s, "date")`.
+The rest of Q-093's suggestion came after, on branch open-fixes: a `date` type, text that
+is a calendar date, for records, annotations, patterns, query patterns and path parameters
+(`/day/:d(date)`), the same on the server and in the browser, a `str` to `quillo check`
+and `format: date` in OpenAPI. Quillo Shifts' `LeaveRequest` says `start_day: date`, and
+its manpower range `from: date, to: date`.
 
 Seen while testing, not from these fixes: on 7989489 itself,
 `tests/serve.rs` `stopping_finishes_requests_in_progress` gets `503 the server is stopping`

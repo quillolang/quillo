@@ -2,10 +2,10 @@
 // how many operators turn up against the line's minimum, with leave approved
 // and asked for. A week or a month; it follows every decision live.
 
-server fn load_manpower(from: str, to: str) with db, time {
+server fn load_manpower(from: date, to: date) with db, time {
     let u = viewer() ?? return err("Sign in first")
     if u.role == "operator" { return err("Managers and supervisors only") }
-    if !is_day(from) || !is_day(to) || to < from { return err("Pick a range of days") }
+    if to < from { return err("Pick a range of days") }
     if date.days_between(from, to) > 62 { return err("At most two months at once") }
     let ids = u.role == "manager" ? null : lines_of(u) | map((l) => l.id)
     manpower(from, to, ids)

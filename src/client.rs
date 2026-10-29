@@ -1972,6 +1972,7 @@ impl<'a> Compiler<'a> {
                         "int" => Some(format!("Number.isInteger({})", js)),
                         "float" | "num" => Some(format!("typeof {} === \"number\"", js)),
                         "str" => Some(format!("typeof {} === \"string\"", js)),
+                        "date" => Some(format!("B.date.valid({}, \"date\")", js)),
                         "bool" => Some(format!("typeof {} === \"boolean\"", js)),
                         "list" => Some(format!("Array.isArray({})", js)),
                         _ => None,

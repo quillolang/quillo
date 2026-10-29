@@ -435,10 +435,134 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
     }
 }
 
+// ---- a service's channels under --split (FEEDBACK12.md, Q-087; branch open-fixes) ----
+
+/// In the app under `--split`: the services in processes of their own.
+static SPLIT: OnceLock<Vec<String>> = OnceLock::new();
+
+pub fn set_split(names: Vec<String>) {
+    let _ = SPLIT.set(names);
+}
+
+/// What the services said their channels are (names, or starts ending `*`),
+/// and when they were asked: asked again, at most every two seconds, when a
+/// channel is no one's (a service started again, or reloaded).
+fn remote_channels() -> &'static Mutex<(Vec<(String, String)>, Option<std::time::Instant>)> {
+    static R: OnceLock<Mutex<(Vec<(String, String)>, Option<std::time::Instant>)>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn remote_for(it: &mut Interp, name: &str) -> Option<String> {
+    let services = SPLIT.get().filter(|s| !s.is_empty())?;
+    let matches = |n: &str| n == name || n.strip_suffix('*').is_some_and(|p| name.starts_with(p));
+    {
+        let r = lock(remote_channels());
+        if let Some((_, s)) = r.0.iter().find(|(n, _)| matches(n)) {
+            return Some(s.clone());
+        }
+        if r.1.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return None;
+        }
+    }
+    let asks: Vec<(String, Option<String>)> = services.iter().map(|s| (s.clone(), crate::service::first_url_of(&it.shared, s))).collect();
+    let found = it.unlocked(move || {
+        let mut all = Vec::new();
+        for (s, url) in asks {
+            let Some(u) = url else { continue };
+            if let Ok(b) = crate::service::signed_post(&u, "/_quillo/service-channels", &s, "_channels", b"[]") {
+                for n in serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default() {
+                    all.push((n, s.clone()));
+                }
+            }
+        }
+        all
+    });
+    let mut r = lock(remote_channels());
+    *r = (found, Some(std::time::Instant::now()));
+    r.0.iter().find(|(n, _)| matches(n)).map(|(_, s)| s.clone())
+}
+
+/// `POST /_quillo/service-channels`, in a service: the channels its
+/// `channel.on` took, for the app to hand it what pages send there.
+pub fn names_here(it: &Interp) -> crate::server::HttpResponse {
+    let names: Vec<&str> = it.site.channels.iter().map(|h| h.name.as_str()).collect();
+    crate::server::HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body: serde_json::to_vec(&names).unwrap_or_default() }
+}
+
+/// The app hands a batch for a service's channel to the service's process,
+/// and gives back its verdicts. Pages joining are held for (as `join` here
+/// would), so that what the service broadcasts from its `join` reaches them.
+fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::server::HttpResponse {
+    let text = String::from_utf8_lossy(body);
+    let mut joins = 0;
+    for line in text.lines() {
+        let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if e["k"] == "j" {
+            joins += 1;
+            if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
+                lock(joining()).insert((name.to_string(), id), Vec::new());
+            }
+        }
+    }
+    let url = crate::service::first_url_of(&it.shared, service);
+    let (to, ch, sent) = (service.to_string(), name.to_string(), body.to_vec());
+    let answer = it.unlocked(move || match url {
+        Some(u) => crate::service::signed_post(&u, &format!("/_quillo/service-channel/{}", ch), &to, &format!("_channel:{}", ch), &sent),
+        None => Err(format!("service {} has no address", to)),
+    });
+    let body = match answer {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("quillo: channel {}: service {} did not take what pages sent: {}", name, service, e);
+            serde_json::to_vec(&vec![false; joins]).unwrap_or_default()
+        }
+    };
+    crate::server::HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body }
+}
+
+/// In a service's process started by `--split`: what it sends on a channel
+/// goes to the app's pages, through the app. `None` when this process's pages
+/// are its own.
+fn relay(it: &mut Interp, op: serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+    let app = crate::service::app_url()?;
+    let body = op.to_string().into_bytes();
+    let out = it.unlocked(move || crate::service::signed_post(app, "/_quillo/channel-relay", "", "_channel-relay", &body));
+    Some(out.and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())))
+}
+
+/// `POST /_quillo/channel-relay`, in the app: a service's `channel.broadcast`,
+/// `send` or `peers`, done with the app's pages.
+pub fn relay_here(body: &[u8]) -> crate::server::HttpResponse {
+    let Ok(op) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return crate::server::HttpResponse { status: 400, headers: Vec::new(), body: b"not JSON\n".to_vec() };
+    };
+    let ch = op["ch"].as_str().unwrap_or("");
+    let json = op["json"].as_str().unwrap_or("");
+    let reliable = op["reliable"].as_bool().unwrap_or(false);
+    let peer = |k: &str| op[k].as_str().and_then(|p| u64::from_str_radix(p, 16).ok());
+    let out = if !name_ok(ch) || json.len() > MAX_MESSAGE {
+        serde_json::Value::Null
+    } else {
+        match op["op"].as_str().unwrap_or("") {
+            "b" => serde_json::json!(broadcast_here(ch, json, reliable, peer("except"))),
+            "s" => serde_json::json!(peer("to").is_some_and(|id| send_here(ch, id, json, reliable))),
+            "p" => serde_json::json!(peers_here(ch)),
+            _ => serde_json::Value::Null,
+        }
+    };
+    crate::server::HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body: out.to_string().into_bytes() }
+}
+
 /// `POST /_quillo/channel/<name>`: a batch of what pages did, each given to
 /// the channel's functions in turn. The answer is the joins' verdicts.
 pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpResponse {
     let handler = find(it, name);
+    // A service's channel, the service in a process of its own (Q-087).
+    if handler.is_none() {
+        if let Some(service) = remote_for(it, name) {
+            return forward(it, &service, name, body);
+        }
+    }
     let mut verdicts: Vec<bool> = Vec::new();
     let text = String::from_utf8_lossy(body);
     for line in text.lines() {
@@ -636,43 +760,71 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (reliable, _) = reliable_opt(args.get(3), "channel.send", line)?;
     let json = message(&name, &v);
     too_big(&json, "channel.send", line)?;
+    // From a service apart, through the app's pages (Q-087).
+    let op = serde_json::json!({ "op": "s", "ch": name, "json": json, "reliable": reliable, "to": format!("{:x}", id) });
+    if let Some(r) = relay(it, op) {
+        return Ok(Value::Bool(r.map_or(false, |v| v.as_bool().unwrap_or(false))));
+    }
+    Ok(Value::Bool(send_here(&name, id, &json, reliable)))
+}
+
+fn send_here(name: &str, id: u64, json: &str, reliable: bool) -> bool {
     let p = lock(&hub().peers).get(&id).cloned();
-    Ok(Value::Bool(match p {
-        Some(p) if lock(&p.rooms).contains(&name) => p.put(Out::Text { json, reliable }),
+    match p {
+        Some(p) if lock(&p.rooms).contains(name) => p.put(Out::Text { json: json.to_string(), reliable }),
         // Being let in: it gets it after the yes (Q-086).
-        Some(_) => hold(&name, &json, reliable, Some(id), None) > 0,
+        Some(_) => hold(name, json, reliable, Some(id), None) > 0,
         _ => false,
-    }))
+    }
 }
 
 /// `channel.broadcast(name, value, { except, reliable })`: to every page in
 /// the channel; how many it went to.
-fn broadcast(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn broadcast(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "channel.broadcast", line)?;
     let v = args.get(1).cloned().unwrap_or(Value::Nil);
     let (reliable, except) = reliable_opt(args.get(2), "channel.broadcast", line)?;
     let json = message(&name, &v);
     too_big(&json, "channel.broadcast", line)?;
-    let ids: Vec<u64> = lock(&hub().rooms).get(&name).map(|m| m.iter().copied().collect()).unwrap_or_default();
+    // From a service apart, to the app's pages (Q-087).
+    let op = serde_json::json!({ "op": "b", "ch": name, "json": json, "reliable": reliable, "except": except.map(|e| format!("{:x}", e)) });
+    if let Some(r) = relay(it, op) {
+        return Ok(Value::Int(r.map_or(0, |v| v.as_i64().unwrap_or(0))));
+    }
+    Ok(Value::Int(broadcast_here(&name, &json, reliable, except)))
+}
+
+fn broadcast_here(name: &str, json: &str, reliable: bool, except: Option<u64>) -> i64 {
+    let json = json.to_string();
+    let ids: Vec<u64> = lock(&hub().rooms).get(name).map(|m| m.iter().copied().collect()).unwrap_or_default();
     let peers: Vec<Arc<Peer>> = {
         let all = lock(&hub().peers);
         ids.iter().filter(|id| Some(**id) != except).filter_map(|id| all.get(id).cloned()).collect()
     };
-    let mut n = hold(&name, &json, reliable, None, except);
+    let mut n = hold(name, &json, reliable, None, except);
     for p in peers {
         if p.put(Out::Text { json: json.clone(), reliable }) {
             n += 1;
         }
     }
-    Ok(Value::Int(n))
+    n
 }
 
 /// `channel.peers(name)`: the ids of the pages in it.
-fn peers(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn peers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "channel.peers", line)?;
-    let mut ids: Vec<u64> = lock(&hub().rooms).get(&name).map(|m| m.iter().copied().collect()).unwrap_or_default();
+    // A service apart asks the app, whose pages they are (Q-087).
+    if let Some(r) = relay(it, serde_json::json!({ "op": "p", "ch": name })) {
+        let ids = r.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+        return Ok(Value::list(ids.iter().filter_map(|v| v.as_str()).map(Value::str).collect()));
+    }
+    Ok(Value::list(peers_here(&name).into_iter().map(Value::str).collect()))
+}
+
+fn peers_here(name: &str) -> Vec<String> {
+    let mut ids: Vec<u64> = lock(&hub().rooms).get(name).map(|m| m.iter().copied().collect()).unwrap_or_default();
     ids.sort();
-    Ok(Value::list(ids.into_iter().map(|id| Value::str(format!("{:012x}", id))).collect()))
+    ids.into_iter().map(|id| format!("{:012x}", id)).collect()
 }
 
 /// `channel.open(name, f)` is the browser's (src/client/runtime.js); while a

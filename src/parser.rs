@@ -21,7 +21,8 @@ fn key_not_a_param(def: &FnDef) -> PResult<()> {
     Ok(())
 }
 
-pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "bool", "list", "map", "html", "fn", "any", "response"];
+// `date`: text that is a calendar date, YYYY-MM-DD (FEEDBACK13.md, Q-093; branch open-fixes).
+pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 const KEYWORDS: &[&str] = &[
@@ -827,9 +828,9 @@ impl Parser {
                     let ty = if self.lx.peek_char() == Some('(') {
                         self.lx.bump();
                         let t = self.read_word();
-                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "dec" | "num" | "str") {
+                        if self.lx.bump() != Some(')') || !matches!(t.as_str(), "int" | "float" | "dec" | "num" | "str" | "date") {
                             return Err(QuilloError::new(
-                                "path parameter types are written :name(int), :name(float), :name(dec), :name(num) or :name(str)",
+                                "path parameter types are written :name(int), :name(float), :name(dec), :name(num), :name(str) or :name(date)",
                                 self.lx.line,
                             ));
                         }

@@ -699,6 +699,27 @@ impl Interp {
             }
             return crate::service::deliver(self);
         }
+        // A service's channels under --split: the app hands it what pages sent
+        // on them, and it sends to the pages through the app (FEEDBACK12.md,
+        // Q-087; branch open-fixes).
+        if let Some(name) = rest.strip_prefix("service-channel/") {
+            if let Err(r) = crate::service::signed_for(req, &format!("_channel:{}", name), true) {
+                return r;
+            }
+            return crate::wt::answer(self, name, &req.body);
+        }
+        if rest == "service-channels" {
+            if let Err(r) = crate::service::signed_for(req, "_channels", true) {
+                return r;
+            }
+            return crate::wt::names_here(self);
+        }
+        if rest == "channel-relay" {
+            if let Err(r) = crate::service::signed_for(req, "_channel-relay", false) {
+                return r;
+            }
+            return crate::wt::relay_here(&req.body);
+        }
         if let Some(name) = rest.strip_prefix("service/") {
             return crate::service::answer(self, name, req);
         }
@@ -1786,7 +1807,10 @@ impl Worker {
         // logged (FEEDBACK12.md, Q-080; branch feedback12-fixes).
         let delivery = req.url.starts_with("/_quillo/udp/") || req.url.starts_with("/_quillo/channel/")
             || (req.url == "/_quillo/later" && resp.status == 200)
-            || (req.url.starts_with("/_quillo/tick/") && resp.status == 200);
+            || (req.url.starts_with("/_quillo/tick/") && resp.status == 200)
+            // Channels between the app and a service apart, as channel
+            // messages are (FEEDBACK12.md, Q-087; branch open-fixes); a refusal is logged.
+            || ((req.url.starts_with("/_quillo/service-channel") || req.url == "/_quillo/channel-relay") && resp.status == 200);
         if !delivery {
             crate::metrics::answered(resp.status, took);
         }

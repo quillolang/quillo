@@ -280,6 +280,7 @@ fn name_schema(n: &str) -> J {
         "float" | "num" => json!({ "type": "number" }),
         "dec" => json!({ "type": "string", "format": "decimal" }),
         "str" => json!({ "type": "string" }),
+        "date" => json!({ "type": "string", "format": "date" }),
         "bool" => json!({ "type": "boolean" }),
         "list" => json!({ "type": "array" }),
         "map" => json!({ "type": "object" }),
