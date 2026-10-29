@@ -119,11 +119,15 @@ Editor support: [quillolang/editors](https://github.com/quillolang/editors) has 
 diagnostics as you type, quick fixes, hover, go to definition, completion, outline, snippets,
 end tags added as you type a start tag's `>` or `</`, and a debugger: see [Debugging](#debugging)).
 An element left open is reported at its start tag (`` `<li>` is never closed: add `</li>` before
-`</ul>` on line 5 ``), with a quick fix that adds the end tag there. It runs the `quillo` it finds (its `quillo.path`
+`</ul>` on line 5 ``), with a quick fix that adds the end tag there. A class in markup
+(`<span.chip>`, `class="chip"`) goes to its rules with Go to Definition, in `css(...)`, a
+component's `style` or the CSS files under `public/`, and those classes are offered after
+`<span.` and in `class="`. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,
-go to definition, document symbols, completion after `.`, `<`, `</` and `@`, diagnostics on
+go to definition (of names, and of classes to their CSS rules), document symbols,
+completion after `.`, `<`, `</` and `@` (and of classes after `<tag.` and in `class="`), diagnostics on
 open, change and save, quick fixes as code actions, and `quillo/closeTag`: at a position
 just after a start tag's `>` or after `</`, the text to insert there, or null; `initializationOptions: { "strictNull": true }` for the extra
 warnings) and `quillo dap` directly.

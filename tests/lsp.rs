@@ -376,3 +376,43 @@ fn a_missing_end_tag_is_told_completed_and_fixed() {
         assert_eq!(close, Value::Null, "{}", src);
     }
 }
+
+/// A class in markup leads to its rules: in the CSS files under public/, in
+/// `css(...)`, and in a component's `style`; after `<span.` the classes are
+/// offered (branch class-links).
+#[test]
+fn classes_in_markup_lead_to_their_rules() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-classes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("public/css")).unwrap();
+    std::fs::write(dir.join("public/css/site.css"), "body { margin: 0; }\n.chip { color: red; }\n.chip-x { color: blue; }\n").unwrap();
+    let uri = format!("file://{}/app.qwe", dir.display());
+    let text = "let sheet = css(\"\n.card { padding: 4px; }\n\")\ncomponent Tag() {\n    style \".tag { color: green; }\"\n    <b.tag>x</b>\n}\nroute GET / = <div.card><span.chip class=\"card\">a</span></div>\n";
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let def = |c: &mut Client, notes: &mut Vec<Value>, line: u32, character: u32| {
+        c.request("textDocument/definition", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }), notes)
+    };
+    // `.chip` in `<span.chip`: the rule in site.css, not `.chip-x`.
+    let d = def(&mut c, &mut notes, 7, 33);
+    assert_eq!(d.as_array().map(|a| a.len()), Some(1), "{}", d);
+    assert!(d[0]["uri"].as_str().unwrap().ends_with("/public/css/site.css"), "{}", d);
+    assert_eq!(d[0]["range"], json!({ "start": { "line": 1, "character": 1 }, "end": { "line": 1, "character": 5 } }));
+    // `card` in `class="card"` and in `<div.card`: the rule in `css(...)`.
+    for col in [44, 21] {
+        let d = def(&mut c, &mut notes, 7, col);
+        assert_eq!(d[0]["uri"], json!(uri), "{}", d);
+        assert_eq!(d[0]["range"]["start"], json!({ "line": 1, "character": 1 }), "{}", d);
+    }
+    // `.tag`: the component's own `style`.
+    let d = def(&mut c, &mut notes, 5, 8);
+    assert_eq!(d[0]["range"]["start"], json!({ "line": 4, "character": 12 }), "{}", d);
+
+    let typing = text.replace("<span.chip", "<span.");
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": typing }] }));
+    let items = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": 7, "character": 30 } }), &mut notes);
+    let labels: Vec<&str> = items.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
+    assert!(["card", "tag", "chip", "chip-x"].iter().all(|l| labels.contains(l)) && !labels.contains(&"len"), "{:?}", labels);
+}
