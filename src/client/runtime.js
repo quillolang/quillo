@@ -1603,6 +1603,9 @@ B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 B.navigate = meta((to) => navigate(S(to, "navigate")), "navigate", null);
+// `waiting(state)` is compiled to W.waiting(signal); given any other way, it
+// knows of no load (FEEDBACK13.md, Q-091; branch feedback13-fixes).
+B.waiting = meta(() => false, "waiting", null);
 B.json = {
   parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
@@ -2943,7 +2946,12 @@ B.date = {
     const r = dtRead(Array.from(s.trim()), Array.from(pattern));
     return r === null ? new Err(`${dtGot(s)} is not a date in the form ${dtGot(pattern)}`) : r;
   },
-  valid: (s) => dtDate(s) !== null || dtStamp(s) !== null,
+  // "date" or "date-time" as the second argument takes only that (FEEDBACK13.md,
+  // Q-093; branch feedback13-fixes).
+  valid: (s, kind) => {
+    if (!isNil(kind) && kind !== "date" && kind !== "date-time") fail(`\`date.valid\` takes "date" or "date-time" as argument 2, got ${dtGot(kind)}`);
+    return (kind !== "date-time" && dtDate(s) !== null) || (kind !== "date" && dtStamp(s) !== null);
+  },
   of: (y, m, d) => {
     dtInt(y, "date.of", 1); dtInt(m, "date.of", 2); dtInt(d, "date.of", 3);
     const z = dtYmd(y, m, d);
@@ -3818,28 +3826,47 @@ function liveSocket(url, signal) {
   });
 }
 
+// A loader whose answer already has the change (its own write: it marked
+// what it shows as read) is not asked again; one asked while its answer is on
+// the way waits for it, and asks again only if the answer is older than the
+// change (FEEDBACK13.md, Q-090; branch feedback13-fixes).
 function liveChanged(j) {
   Live.seq = j.seq;
   Live.server = j.server || "";
   const changed = new Set(j.changed || []);
-  if (changed.size) for (const s of [...Live.subs]) if (s.topics.some((t) => changed.has(t))) liveRefresh(s);
+  if (!changed.size) return;
+  for (const s of [...Live.subs]) {
+    if (!s.topics.some((t) => changed.has(t))) continue;
+    if (s.seen >= j.seq && s.seenOn === Live.server) continue;
+    if (s.loading) { s.wanted = Math.max(s.wanted || 0, j.seq); continue; }
+    liveRefresh(s);
+  }
 }
 
-async function liveRefresh(sub) {
+async function liveRefresh(sub, newArgs) {
   // Only the latest load counts: an older one may answer last.
   const n = (sub.loads = (sub.loads || 0) + 1);
+  sub.loading = true;
+  sub.wanted = 0;
+  if (newArgs) waitSig(sub.sig).set(true);
   try {
     const { value, topics, seq, server, failed, h } = await rpcRaw(sub.fname, sub.args, sub);
     if (n !== sub.loads) return;
+    sub.loading = false;
+    if (sub.sig.$wait) sub.sig.$wait.set(false);
     // Keep showing the last good data; the next change tries again.
     if (failed) { report(value.error); return; }
     liveSeen(seq, server);
+    sub.seen = seq;
+    sub.seenOn = server;
+    if (sub.wanted > seq) queueMicrotask(() => liveRefresh(sub));
     sub.topics = topics;
     sub.h = value instanceof Err ? "" : h;
     sub.base = value;
     sub.sig.set(value);
     liveRestart();
   } catch (e) {
+    if (n === sub.loads) { sub.loading = false; if (sub.sig.$wait) sub.sig.$wait.set(false); }
     report(e);
   }
 }
@@ -5455,6 +5482,11 @@ W.component = (name, params, render) => {
 };
 // A function's form for `<Name .../>`: its code once, with props as getters.
 W.view = (f, view) => { f.$view = view; return f; };
+// Whether a live state waits for the answer to its new arguments (or to its
+// first, when the server did not render it): its old value is still shown
+// meanwhile (FEEDBACK13.md, Q-091; branch feedback13-fixes).
+const waitSig = (sig) => sig.$wait || (sig.$wait = new Sig(false));
+W.waiting = (sig) => waitSig(sig).v;
 // `state name = live(fname, ...args)`: state that follows the server. When
 // its arguments change (`live(load, id)` after `id` changed), it loads again.
 W.live = (inst, name, fname, args) => {
@@ -5476,12 +5508,12 @@ function liveSig(inst, name, fname, args) {
       if (first) {
         first = false;
         sub.args = a;
-        if (had) liveRestart(); else liveRefresh(sub);
+        if (had) liveRestart(); else liveRefresh(sub, true);
         return;
       }
       if (eq(sub.args, a)) return;
       sub.args = a;
-      liveRefresh(sub);
+      liveRefresh(sub, true);
     });
   });
   return sig;

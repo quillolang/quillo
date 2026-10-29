@@ -77,6 +77,9 @@ options for `run`:
   --no-jobs      run none of the program's `schedule`d jobs on this server
   --no-prefetch  pages do not prefetch the links pointed at (see Prefetching
                  in the user guide)
+  --plain-http   the site is served over plain HTTP on purpose, on a network
+                 you trust: cookies are not Secure (browsers drop Secure ones
+                 there, so signing in would not stick)
   --max-body N   largest request body to accept, in bytes (default 10 MiB)
   --wt-port N    the UDP port pages connect to for channels over WebTransport
                  (default: the HTTP port's number)
@@ -132,7 +135,7 @@ const VALUE_OPTIONS: &[&str] = &[
 /// Options of `run`, `app`, `build` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--metrics", "--strict-null", "--describe",
+    "--no-jobs", "--plain-http", "--metrics", "--strict-null", "--describe",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -418,6 +421,12 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--no-prefetch", _) => {
                 quillo::server::PREFETCH.store(false, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            // FEEDBACK13.md, Q-089; branch feedback13-fixes.
+            ("--plain-http", _) => {
+                quillo::session::PLAIN_HTTP_ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 continue;
             }

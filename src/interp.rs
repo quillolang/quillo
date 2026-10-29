@@ -202,6 +202,10 @@ pub struct Interp {
     /// its forks): a job of it still running ends at its next `sleep`, so the
     /// new version's starts (FEEDBACK12.md, Q-082; branch feedback12-fixes).
     pub(crate) retired: Arc<std::sync::atomic::AtomicBool>,
+    /// The sequence numbers the running live loader's own writes were given:
+    /// what it wrote and also read does not wake it again (FEEDBACK13.md,
+    /// Q-090; branch feedback13-fixes).
+    pub(crate) own_seqs: Vec<u64>,
     /// A service's own `.env`, beside its file (FEEDBACK9.md, Q-071; branch
     /// feedback9-fixes). The app's is in the process's environment.
     pub env_file: Arc<std::collections::HashMap<String, String>>,
@@ -842,6 +846,7 @@ impl Interp {
             remote_mounts: Vec::new(),
             is_service: false,
             retired: Default::default(),
+            own_seqs: Vec::new(),
             env_file: Default::default(),
             declared_services: Default::default(),
             ready_checks: Default::default(),
@@ -916,6 +921,7 @@ impl Interp {
             remote_mounts: self.remote_mounts.clone(),
             is_service: self.is_service,
             retired: self.retired.clone(),
+            own_seqs: Vec::new(),
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
             ready_checks: self.ready_checks.clone(),
@@ -950,7 +956,10 @@ impl Interp {
             self.pending.extend(topics);
             self.pending_raw.extend(raw);
         } else {
-            self.shared.publish(&topics);
+            let seq = self.shared.publish(&topics);
+            if self.reads.is_some() {
+                self.own_seqs.push(seq);
+            }
             self.note_published(raw);
         }
     }

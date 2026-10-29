@@ -336,8 +336,18 @@ fn day_value(z: Option<i64>, f: &str, line: u32) -> R {
 
 // ---- dates -------------------------------------------------------------
 
-fn valid(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(s)) if parse_date(s).is_some() || parse_stamp(s).is_some())))
+// `date.valid(s, "date")` takes only a date, and `"date-time"` only a
+// date-time: text a page sends, checked with `date.valid(s)` alone, may be a
+// date-time that `date.add_days` and the rest refuse with a runtime error
+// (FEEDBACK13.md, Q-093; branch feedback13-fixes).
+fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (date, stamp) = match args.get(1) {
+        None | Some(Value::Nil) => (true, true),
+        Some(Value::Str(k)) if &**k == "date" => (true, false),
+        Some(Value::Str(k)) if &**k == "date-time" => (false, true),
+        Some(other) => return fail(line, format!("`date.valid` takes \"date\" or \"date-time\" as argument 2, got {}", got(Some(other)))),
+    };
+    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(s)) if (date && parse_date(s).is_some()) || (stamp && parse_stamp(s).is_some()))))
 }
 
 fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {

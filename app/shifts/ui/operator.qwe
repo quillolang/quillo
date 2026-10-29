@@ -1,0 +1,118 @@
+// An operator's page: their month of shifts (worked out in the browser from
+// their crews), a form to ask for leave that counts the shifts it would take
+// as the days are picked, and their requests, which follow the supervisor's
+// decisions live.
+
+let KINDS = [["annual", "Annual"], ["sick", "Sick"], ["unpaid", "Unpaid"]]
+
+view StatusChip(status: str) = <span class={`chip st-${status}`}>{status}</span>
+
+component Calendar(spans: list, leaves: list, today: str) {
+    state month = month_of(today)
+    let first = `${month}-01`
+    let lead = date.weekday(first) - 1
+    let days = days_span(first, date.end_of_month(first))
+    let on_leave = (d) => leaves | find((l) => (l.status == "approved" || l.status == "pending") && l.start_day <= d && l.end_day >= d)
+    <section.card>
+        <div.bar>
+            <button.ghost aria-label="Previous month" @click={() => { month = month_of(date.add_months(first, -1)) }}>‹</button>
+            <h2>{date.format(first, "MMMM YYYY")}</h2>
+            <button.ghost aria-label="Next month" @click={() => { month = month_of(date.add_months(first, 1)) }}>›</button>
+        </div>
+        <div.cal>
+            {for w in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] => <b key={w}>{w}</b>}
+            {for i in 0..lead => <i key={`pad${i}`}/>}
+            {for d in days {
+                let o = offset_on(spans, d)
+                let s = o == null ? "-" : shift_of(d, o)
+                let l = on_leave(d)
+                let span = s == "D" || s == "N" ? shift_span(d, s) : null
+                <div key={d} class={`day s-${s} ${d == today ? "today" : ""} ${l != null && s != "R" ? `leave ${l.status}` : ""}`}
+                     data-day={d} title={span == null ? SHIFT_NAMES[s] ?? "No crew" : `${SHIFT_NAMES[s]} ${span.hours} h`}>
+                    <span.n>{date.parts(d).day}</span>
+                    <span.s>{s}</span>
+                    {span != null && span.hours != 12 && <span.h>{span.hours} h</span>}
+                    {l != null && s != "R" && <span.l>{l.status == "approved" ? "leave" : "asked"}</span>}
+                </div>
+            }}
+        </div>
+        <p.hint>D day 07:00–19:00 · N night 19:00–07:00 (it belongs to the day it starts) · R rest</p>
+    </section>
+}
+
+component ApplyLeave(spans: list, today: str) {
+    state kind = "annual"
+    state start = date.add_days(today, 1)
+    state end = date.add_days(today, 1)
+    state note = ""
+    state problem = null
+    state sent = null
+    let counted = is_day(start) && is_day(end) && end >= start ? len(working_days(spans, start, end)) : 0
+    <form.card @submit={(e) => {
+        e.preventDefault()
+        problem = null
+        let r = apply_leave({ kind, start_day: start, end_day: end, note })
+        if is_err(r) { problem = r.error } else { sent = r; note = "" }
+    }}>
+        <h2>Ask for leave</h2>
+        <div.row>
+            <label>Kind
+                <select name="kind" bind:value={kind}>
+                    {for [v, label] in KINDS => <option key={v} value={v}>{label}</option>}
+                </select>
+            </label>
+            <label>From <input type="date" name="start" bind:value={start}/></label>
+            <label>To <input type="date" name="end" bind:value={end} min={start}/></label>
+        </div>
+        <label>Note <textarea name="note" bind:value={note} rows="2" maxlength="500"></textarea></label>
+        <p.count>{counted == 0 ? "No working shifts in those days" : `${counted} working ${counted == 1 ? "shift" : "shifts"}`}</p>
+        <Problem text={problem}/>
+        {sent != null && problem == null && <p.ok role="status">Sent: request #{sent} waits for your supervisor.</p>}
+        <button.primary disabled={counted == 0}>Ask</button>
+    </form>
+}
+
+component MyLeaves() {
+    state leaves = live(my_leaves)
+    state bal = live(my_balance)
+    state problem = null
+    <section.card>
+        <h2>My requests</h2>
+        {bal != null && <p.balance>Annual leave {bal.year}: {bal.used} of {bal.allowed} shifts used or asked for, {bal.left} left</p>}
+        <Problem text={problem}/>
+        {len(leaves) == 0
+            ? <p.empty>No requests yet.</p>
+            : <table.list>
+                <thead><tr><th>Days</th><th>Kind</th><th>Shifts</th><th>Status</th><th/></tr></thead>
+                <tbody>
+                    {for l in leaves =>
+                        <tr key={l.id} data-id={l.id}>
+                            <td>{l.start_day == l.end_day ? day_label(l.start_day) : `${day_label(l.start_day)} – ${day_label(l.end_day)}`}</td>
+                            <td>{l.kind}</td>
+                            <td>{l.shifts}</td>
+                            <td><StatusChip status={l.status}/>{l.reason != "" && <small> {l.reason}</small>}</td>
+                            <td>{(l.status == "pending" || l.status == "approved") &&
+                                <button.link @click={() => {
+                                    if ask("Cancel this request?", { ok: "Cancel it", cancel: "Keep it", tone: "danger" }) {
+                                        let r = cancel_leave(l.id)
+                                        problem = is_err(r) ? r.error : null
+                                    }
+                                }}>Cancel</button>}</td>
+                        </tr>}
+                </tbody>
+              </table>}
+    </section>
+}
+
+component OperatorHome(spans: list, today: str) {
+    state leaves = live(my_leaves)
+    <div.cols>
+        <div>
+            <Calendar {spans} {leaves} {today}/>
+        </div>
+        <div>
+            <ApplyLeave {spans} {today}/>
+            <MyLeaves/>
+        </div>
+    </div>
+}

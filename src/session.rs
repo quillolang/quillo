@@ -38,6 +38,14 @@ pub const HOST_COOKIE: &str = "__Host-quillo_session";
 /// Served over plain HTTP on purpose (`--watch`, desktop apps): cookies
 /// are not `Secure`.
 pub static PLAIN_HTTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--plain-http`: the site is served over plain HTTP on purpose, on a
+/// network it trusts (a factory's kiosks at http://10.0.0.5:8080), so its
+/// cookies are not `Secure`, which browsers would drop there (FEEDBACK13.md,
+/// Q-089; branch feedback13-fixes).
+pub static PLAIN_HTTP_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the warning that browsers drop a `Secure` cookie sent over plain
+/// HTTP has been given (once a process).
+static WARNED_PLAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Browsers keep cookies up to about 4096 bytes, name and attributes included.
 const MAX_COOKIE: usize = 3900;
 const DEFAULT_AGE: u64 = 30 * 86400;
@@ -191,10 +199,38 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
     let secure = same_site == "None" || opt("secure").map_or(!plain, |v| v.truthy());
     if secure {
         s.push_str("; Secure");
+        warn_if_dropped(it);
     }
     s.push_str("; SameSite=");
     s.push_str(&same_site);
     Ok(s)
+}
+
+/// A `Secure` cookie on a request that came straight from another machine
+/// over plain HTTP (no proxy here, no `x-forwarded-proto: https`, a host that
+/// is not this machine's) is dropped by the browser: signing in there never
+/// sticks, and nothing else would say so. Said once (FEEDBACK13.md, Q-089;
+/// branch feedback13-fixes).
+fn warn_if_dropped(it: &mut Interp) {
+    if WARNED_PLAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(Value::Map(req)) = it.request_value() else { return };
+    let ip = req.get("ip").map(|v| v.display()).unwrap_or_default();
+    let host = header(it, "host").unwrap_or_default();
+    let proto = header(it, "x-forwarded-proto").unwrap_or_default();
+    let name = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(h, _)| h);
+    let local = |h: &str| h == "localhost" || h.ends_with(".localhost") || h.starts_with("127.") || h == "::1" || h == "[::1]";
+    if ip.is_empty() || local(&ip) || local(name) || proto.eq_ignore_ascii_case("https") {
+        return;
+    }
+    if !WARNED_PLAIN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "quillo: warning: a Secure cookie was sent to http://{} over plain HTTP, which browsers drop: sessions will not stick there. \
+             Serve the site over HTTPS (a proxy with TLS in front, sending x-forwarded-proto: https), or run with --plain-http on a network you trust",
+            host
+        );
+    }
 }
 
 /// Queues the cookie for the response, replacing one queued under its name.

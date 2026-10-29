@@ -1,0 +1,45 @@
+// The frame every page uses.
+
+view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
+
+view ShiftTag(s: str) = <span class={`tag s-${s}`} title={SHIFT_NAMES[s]}>{s}</span>
+
+view TopBar(me) =
+    <header.top>
+        <a.brand href="/"><span.logo>◐</span> Quillo Shifts</a>
+        {me != null && <nav.links>
+            {me.role == "operator" && <a href="/me">My roster</a>}
+            {me.role != "operator" && <a href="/team">Leave to decide</a>}
+            {me.role != "operator" && <a href="/manpower">Manpower</a>}
+        </nav>}
+        <span.grow/>
+        {me != null && <span.who>{me.name} · {me.emp_no} · {me.role}</span>}
+        {me != null && <form.inline method="post" action="/logout"><button.link>Sign out</button></form>}
+    </header>
+
+view Page(title: str, me, children) =
+    <html lang="en">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>{title} · Quillo Shifts</title>
+            <link rel="stylesheet" href="/static/shifts.css"/>
+        </head>
+        <body data-notices="dialog-center toasts-bottom-right">
+            <TopBar {me}/>
+            <main.page>{children}</main>
+        </body>
+    </html>
+
+view LoginPage(next: str, problem) =
+    <Page title="Sign in" me={null}>
+        <form.card.narrow method="post" action="/login">
+            <h1>Sign in</h1>
+            <input type="hidden" name="next" value={next}/>
+            <label>Employee number <input name="emp_no" autocomplete="username" required/></label>
+            <label>Password <input name="password" type="password" autocomplete="current-password" required/></label>
+            <Problem text={problem}/>
+            <button.primary>Sign in</button>
+            <p.hint>Try M01 (manager), S01 (supervisor of L01 to L03) or E0001 (an operator); the password is shift123.</p>
+        </form>
+    </Page>

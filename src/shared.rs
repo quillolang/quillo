@@ -167,16 +167,19 @@ impl Shared {
     /// Marks topics as changed and wakes the pages waiting on them; and when
     /// running with other servers, tells them too. Data kept in variables
     /// (`var:` topics) belongs to this server alone, so it stays here.
-    pub fn publish(&self, topics: &[String]) {
-        self.publish_here(topics);
+    /// Gives the sequence number the change was given (0 for no topics), so
+    /// that a live loader can tell its own writes from others' (FEEDBACK13.md,
+    /// Q-090; branch feedback13-fixes).
+    pub fn publish(&self, topics: &[String]) -> u64 {
+        let made = self.publish_here(topics);
         let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
         let outbox = self.outbox.lock().unwrap_or_else(|e| e.into_inner());
         if peers.is_empty() && outbox.is_none() {
-            return;
+            return made;
         }
         let shared: Vec<String> = topics.iter().filter(|t| !t.contains("var:")).cloned().collect();
         if shared.is_empty() {
-            return;
+            return made;
         }
         for p in peers.iter().filter_map(|p| p.upgrade()) {
             p.publish_here(&shared);
@@ -184,6 +187,7 @@ impl Shared {
         if let Some(tx) = &*outbox {
             let _ = tx.send(shared);
         }
+        made
     }
 
     /// Makes instances of one program tell each other about changes to
@@ -196,9 +200,9 @@ impl Shared {
     }
 
     /// Marks topics as changed here only: for changes another server made.
-    pub fn publish_here(&self, topics: &[String]) {
+    pub fn publish_here(&self, topics: &[String]) -> u64 {
         if topics.is_empty() {
-            return;
+            return 0;
         }
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         live.seq += 1;
@@ -208,6 +212,7 @@ impl Shared {
         }
         drop(live);
         self.live_changed.notify_all();
+        seq
     }
 
     /// Notes that pages (or cached views) here depend on `topics`, so that

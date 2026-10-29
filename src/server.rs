@@ -826,9 +826,17 @@ impl Interp {
                 let seq = self.shared.live_seq();
                 self.reads = Some(Default::default());
                 self.read_request = false;
+                self.own_seqs.clear();
                 let cookies = self.set_cookies.len();
                 let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
                 let mut topics: Vec<String> = self.reads.take().unwrap_or_default().into_iter().collect();
+                // Every change since the run began its own (it marked what it
+                // shows as read, say): the answer has them already, so the
+                // page is told it has seen them, and the loader does not wake
+                // itself for ever (FEEDBACK13.md, Q-090; branch feedback13-fixes).
+                let own = std::mem::take(&mut self.own_seqs);
+                let end = self.shared.live_seq();
+                let seen = if end > seq && (seq + 1..=end).all(|s| own.contains(&s)) { end } else { seq };
                 topics.sort();
                 self.shared.track(&topics);
                 self.current_request = None;
@@ -851,7 +859,7 @@ impl Interp {
                         cache.share(k, self.read_request.then_some(viewer), seq, topics.clone(), answer.clone());
                     }
                 }
-                (answer, topics, seq)
+                (answer, topics, seen)
             }
         };
         let mut patch = None;
@@ -1846,7 +1854,9 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
         eprintln!("quillo: watching for changes");
     }
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
-    crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some(), std::sync::atomic::Ordering::Relaxed);
+    // `--plain-http` too (FEEDBACK13.md, Q-089; branch feedback13-fixes).
+    let asked = crate::session::PLAIN_HTTP_ASKED.load(std::sync::atomic::Ordering::Relaxed);
+    crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some() || asked, std::sync::atomic::Ordering::Relaxed);
     app.shared.gil.release();
     if app.watch || app.reload {
         let app = app.clone();
