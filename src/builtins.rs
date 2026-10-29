@@ -762,17 +762,21 @@ fn sleep(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // of holding the server for the whole drain and ending as an internal error,
     // or going on with an old version's code (FEEDBACK12.md, Q-081 and Q-082;
     // branch feedback12-fixes).
+    // Only in a job or a tick: a request in progress is answered at a stop, and
+    // finishes on its version at a reload, as the guide says (FEEDBACK12.md,
+    // Q-081 and Q-082; branch feedback12-sleep).
     let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     let retired = it.retired.clone();
+    let in_job = it.in_job;
     let ended = it.unlocked(move || loop {
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return None;
         }
-        if crate::httpd::stopping() {
+        if in_job && crate::httpd::stopping() {
             return Some("the server is stopping");
         }
-        if retired.load(std::sync::atomic::Ordering::Relaxed) {
+        if in_job && retired.load(std::sync::atomic::Ordering::Relaxed) {
             return Some("the program was loaded again");
         }
         std::thread::sleep(left.min(std::time::Duration::from_millis(50)));

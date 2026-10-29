@@ -517,7 +517,12 @@ impl Interp {
         if !crate::db::claim_job(self, name, at) {
             return plain(200, "run by another server\n");
         }
-        match finish(self.call(&job.f, Vec::new(), 0)) {
+        // Its `sleep` ends at a stop or a reload (FEEDBACK12.md, Q-081 and Q-082;
+        // branch feedback12-sleep).
+        self.in_job = true;
+        let ran = self.call(&job.f, Vec::new(), 0);
+        self.in_job = false;
+        match finish(ran) {
             r if r.status >= 500 => r,
             _ => plain(200, "ok\n"),
         }
@@ -540,7 +545,11 @@ impl Interp {
         let Some(tick) = self.site.ticks.iter().find(|t| t.name == name).cloned() else {
             return plain(404, "no such tick\n");
         };
-        match finish(self.call(&tick.f, Vec::new(), 0)) {
+        // As a job's (FEEDBACK12.md, Q-081 and Q-082; branch feedback12-sleep).
+        self.in_job = true;
+        let ran = self.call(&tick.f, Vec::new(), 0);
+        self.in_job = false;
+        match finish(ran) {
             r if r.status >= 500 => r,
             _ => plain(200, "ok\n"),
         }
