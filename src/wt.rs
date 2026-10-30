@@ -37,7 +37,10 @@ use crate::value::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+// Only the WebTransport server keeps its certificate's hash behind one (built without it on phones; branch mobile).
+#[cfg(feature = "realtime")]
+use std::sync::RwLock;
 use std::time::Duration;
 
 type R = Result<Value, Ctrl>;
