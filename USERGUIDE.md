@@ -796,7 +796,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   same element, at the same point, with the same buttons, keys and click count (a
   `@pointerdown` may still capture a pointer whose finger was lifted meanwhile). A
   click waits for the code, so a checkbox ticks and a link is followed then; should the
-  code fail to load, they are done as the page alone does them. A
+  code fail to load, they are done as the page alone does them. (The idea comes from
+  Flickr, Google's JSAction, Angular's preboot and event replay, Qwik and React: see
+  Acknowledgements in the [README](README.md#acknowledgements).) A
   component that runs by itself (`every`, `live`, `listen`, `js`, `js_new`, `@mount` in
   its code or markup, or in a component nested inside it) or that is the page (in
   `<body>` itself, an app) loads as soon as the page is idle. `/_quillo/quillo.js` has
