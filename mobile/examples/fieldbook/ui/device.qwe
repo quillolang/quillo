@@ -1,5 +1,5 @@
-// /device: what platform() says (the server's side, read at start), and what the app's
-// native side says now (the battery), with the minute job's last run.
+// /device: what platform() says (the server's side, read at start), and a live part that
+// updates each second: the program's clock, the battery, the screen, the minute job.
 
 fn show(v) = v == null ? "—" : type_of(v) == "map" ? join(keys(v) | map((k) => `${k}: ${v[k]}`), ", ") : str(v)
 
@@ -9,12 +9,43 @@ view DevicePage(p: map, beat) =
         <p.muted>What <code>platform()</code> says, in a program running {p.runtime == "mobile" ? "inside this app" : `as ${p.runtime}`}.</p>
         <table>{for k in keys(p) => <tr><th>{k}</th><td>{show(p[k])}</td></tr>}</table>
         <h2>Now</h2>
-        <Live/>
-        <p.muted>The job that runs every minute last ran {beat == null ? "never" : `${ago(beat.at)} (${beat.n} times)`}.</p>
+        <Live first_beat={beat}/>
     </section>
 
-// The battery: null while the server renders, then read in the app once the page is up.
-component Live() {
+// What the program on the phone says, asked once a second: its clock and the minute job.
+server fn pulse() with db, time = {
+    time: date.format(date.from_ms(now(), platform().time_zone), "HH:mm:ss"),
+    beat: last_beat(),
+}
+
+// The live part: once a second the page asks the app for the battery and the screen, and
+// the program for its clock, and times that trip. `every` is the page's clock.
+component Live(first_beat) {
     state battery = js("quilloNative.battery")
-    <p>{battery == null ? "Battery: asking the app…" : is_err(battery) ? `Battery: ${battery.error}` : `Battery: ${battery.level == null ? "level not said" : `${round(battery.level * 100)}%`}, ${battery.state}${battery.low_power ? ", low power mode" : ""}`}</p>
+    state bright = null
+    state clock = "—"
+    state beat = first_beat
+    state trip = null
+    state ticks = 0
+    let refresh = () => {
+        battery = js("quilloNative.battery")
+        bright = js("quilloNative.brightness")
+        let t0 = js("performance.now")
+        let p = pulse()
+        trip = round(js("performance.now") - t0, 1)
+        if !is_err(p) {
+            clock = p.time
+            beat = p.beat
+        }
+        ticks += 1
+    }
+    every(1000, refresh)
+    <table.live>
+        <tr><th>clock</th><td>{clock}</td></tr>
+        <tr><th>battery</th><td>{battery == null ? "asking the app…" : is_err(battery) ? battery.error : `${battery.level == null ? "level not said" : `${round(battery.level * 100)}%`}, ${battery.state}${battery.low_power ? ", low power mode" : ""}`}</td></tr>
+        <tr><th>brightness</th><td>{bright == null || is_err(bright) ? "—" : `${round(bright * 100)}%`}</td></tr>
+        <tr><th>round trip</th><td>{trip == null ? "—" : `${trip} ms, page to program and back`}</td></tr>
+        <tr><th>minute job</th><td>{beat == null ? "never" : `${ago(beat.at)} (${beat.n} times)`}</td></tr>
+        <tr><th>updates</th><td>{ticks}</td></tr>
+    </table>
 }
