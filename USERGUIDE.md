@@ -167,7 +167,10 @@ A program runs inside an iOS or Android app: the runtime is linked into it and s
 program on 127.0.0.1 to the app's own web view, as `quillo app` does on a desktop, so it works
 offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
 --run` builds the app around a program folder for the iOS simulator and opens it there, and
-`mobile/android/build.sh app --run` a debug APK for an Android emulator or phone;
+`mobile/android/build.sh app --run` a debug APK for an Android emulator or phone. The
+app's name, id, version, build number and icon come from an `app.toml` beside main.qwe;
+`--device` and `--archive` (iOS) and `--release` (Android, a signed APK and App Bundle)
+make builds for the stores;
 `mobile/README.md` says how, and what a phone build leaves out (compiled numbers,
 WebTransport, `.qwer` plugins built at run time, anything that starts a process). The
 app puts `window.quilloNative` on the program's pages for what a web view cannot reach:

@@ -2,7 +2,7 @@
 // simulator: the title, the place from the app, a photo (drawn here, since the
 // simulator has no camera to pick from), two seconds of the microphone, then save.
 // mobile/ios/build.sh mobile/examples/fieldbook, then:
-//   xcrun simctl launch booted org.quillolang.app --eval "location.href='/new'" \
+//   xcrun simctl launch booted org.quillolang.fieldbook --eval "location.href='/new'" \
 //     --eval "$(cat mobile/examples/fieldbook/automation/capture.js)"
 (async () => {
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));

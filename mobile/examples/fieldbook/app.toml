@@ -1,0 +1,5 @@
+# The app around this program, for mobile/ios/build.sh and mobile/android/build.sh.
+name = "Fieldbook"
+id = "org.quillolang.fieldbook"   # never changed once the app is published
+version = "1.0.0"
+build = 1

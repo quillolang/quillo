@@ -1,0 +1,8 @@
+// Q-107 Reading a member a module does not have gives null, and `quillo check` says nothing
+// mode: check
+// open-when: ok (
+// fixed-when: no `title`
+// From FEEDBACK18.md §Q-107 (found on e6227d1).
+
+print(json.title)
+print(db.nothing)
