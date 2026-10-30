@@ -3056,6 +3056,22 @@ impl Checker {
                 }
             }
         }
+        // `js(name, ...)`: the name is written in the code, as loading the
+        // program requires (FEEDBACK18.md, Q-100; branch feedback18-fixes).
+        if let (Expr::Ident(n, _), None) = (callee, &pre) {
+            if (n == "js" || n == "js_new") && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
+                match args.first() {
+                    Some(Expr::Lit(Lit::Str(path))) => {
+                        let ok = !path.is_empty() && path.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$'));
+                        if !ok {
+                            self.error(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", n, path));
+                        }
+                    }
+                    Some(_) => self.error(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", n, n)),
+                    None => {}
+                }
+            }
+        }
         // `audit(...)`: the module `audit` is a function too.
         if let Expr::Ident(n, _) = callee {
             if n == "audit" && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
@@ -3920,6 +3936,18 @@ impl Checker {
         if sig.builtin {
             if let Some(t) = self.builtin_ret(&sig.name, &args, arg_exprs) {
                 return t;
+            }
+        }
+        // A `server fn` called from a component's handler is a request: when
+        // it fails (no connection, an argument refused) the call gives an
+        // error value, so `is_err(r) ? r.error : ...` is right. A state's
+        // initializer runs on the server and calls it directly
+        // (FEEDBACK18.md, Q-104; branch feedback18-fixes).
+        if sig.server && self.in_component().is_some() {
+            let f = self.fns.last();
+            if f.map_or(false, |f| f.nested && !f.state_init) {
+                let r = self.fn_ret(&sig);
+                return if r.bits & ERR != 0 { r } else { r.union(T::error(STR)) };
             }
         }
         self.fn_ret(&sig)

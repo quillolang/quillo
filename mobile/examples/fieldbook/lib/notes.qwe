@@ -13,11 +13,7 @@ server fn load_notes() -> list with db =
 
 server fn load_note(id: int) with db = note_of(id) ?? err("no such note")
 
-// The numbers take an int too: a reading from the page that happens to be whole (an
-// accuracy of 5 m, a heading of 90°) arrives as one (FEEDBACK18.md, Q-103).
-type Reading = float | int | null
-
-server fn create_note(title: str, body: str, lat: Reading, lon: Reading, accuracy: Reading, place_from: str?, heading: Reading) -> int ! str with db, time {
+server fn create_note(title: str, body: str, lat: float?, lon: float?, accuracy: float?, place_from: str?, heading: float?) -> int ! str with db, time {
     let t = trim(title)
     if t == "" { return err("A note needs a title") }
     if len(t) > 120 { return err("Keep the title under 120 characters") }

@@ -37,6 +37,21 @@
 
 ### Fixes
 
+- **A state read from the page** (`state wide = js("window.innerWidth") > 800`) was null for
+  good on a page the server rendered: the initializer now runs again in the browser once
+  the component is on the page (FEEDBACK18.md, Q-105).
+- **A component's `let` functions wait for `js(...)`** as its handlers do, when its markup
+  does not call them: `let locate = () => { let p = js("quilloNative.location") ... }` with
+  `@click={locate}` gets the place, not a Promise (Q-102).
+- **A whole number is a float where data is made into a type**: a `server fn`'s arguments
+  from the browser, `Type(json)`, a record's fields and a `list<float>`. JavaScript and
+  JSON have one kind of number, so 5.0 came as 5 and a `float` parameter answered 400
+  (Q-103).
+- **`quillo check`**: `r.error` after `is_err(r)` on a `server fn` called from a handler,
+  which fails as a request can, is no longer refused (Q-104); `js(name, ...)` with the
+  name in a variable is refused, as loading the program refuses it (Q-100).
+- **A load error in a component compiled for the browser** names the component's own file,
+  not main.qwe with another file's line (Q-101).
 - **Clicks before a page's code comes** are done as they were made. A component's code
   loads when someone reaches for it; a click, a double click, a right or middle click,
   a press (`@pointerdown`, `@mousedown`) and its release made meanwhile were reduced to

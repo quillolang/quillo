@@ -13,9 +13,8 @@ view DevicePage(p: map, beat) =
         <p.muted>The job that runs every minute last ran {beat == null ? "never" : `${ago(beat.at)} (${beat.n} times)`}.</p>
     </section>
 
-// The battery is read in @mount: a state's initializer runs on the server, where
-// js() gives null (FEEDBACK18.md, Q-105).
+// The battery: null while the server renders, then read in the app once the page is up.
 component Live() {
-    state battery = null
-    <p @mount={() => { battery = js("quilloNative.battery") }}>{battery == null ? "Battery: asking the app…" : is_err(battery) ? `Battery: ${battery.error}` : `Battery: ${battery.level == null ? "level not said" : `${round(battery.level * 100)}%`}, ${battery.state}${battery.low_power ? ", low power mode" : ""}`}</p>
+    state battery = js("quilloNative.battery")
+    <p>{battery == null ? "Battery: asking the app…" : is_err(battery) ? `Battery: ${battery.error}` : `Battery: ${battery.level == null ? "level not said" : `${round(battery.level * 100)}%`}, ${battery.state}${battery.low_power ? ", low power mode" : ""}`}</p>
 }

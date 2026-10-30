@@ -202,3 +202,33 @@ fn the_browser_makes_and_checks_records_the_same() {
         assert_eq!(s, b, "{}", e);
     }
 }
+
+/// A whole number is made into a float where data is made into a type: JSON,
+/// and a browser's JavaScript, have one kind of number, so a reading of 5.0
+/// arrives as 5. A union that takes an int keeps it (FEEDBACK18.md, Q-103;
+/// branch feedback18-fixes).
+#[test]
+fn whole_numbers_are_floats_where_data_is_made() {
+    let src = r#"
+type Spot = { lat: float, acc: float?, path: list<float> = [] }
+type Either = { n: float | int }
+fn __a() = Spot(json.parse("{\"lat\": 1, \"acc\": 5, \"path\": [1, 2.5]}"))
+fn __b() = Either(json.parse("{\"n\": 5}")).n
+fn __c() = type_of(Spot(json.parse("{\"lat\": 1}")).lat)
+server fn half(x: float) = x / 2
+server fn far(at: Spot) = at.lat + 0.5
+"#;
+    let mut it = Interp::new(".");
+    it.load_source(src, "app.qwe").unwrap();
+    let call = |it: &mut Interp, f: &str| it.call(&quillo::value::lookup(&it.globals, f).unwrap(), vec![], 0).ok().unwrap().repr();
+    assert_eq!(call(&mut it, "__a"), "{ lat: 1.0, acc: 5.0, path: [1.0, 2.5] }");
+    assert_eq!(call(&mut it, "__b"), "5");
+    assert_eq!(call(&mut it, "__c"), "\"float\"");
+    let r = post(&mut it, "/_quillo/rpc/half", "application/json", "[5]");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("2.5"), "{}", String::from_utf8_lossy(&r.body));
+    let r = post(&mut it, "/_quillo/rpc/far", "application/json", r#"[{"lat": 1}]"#);
+    assert!(String::from_utf8_lossy(&r.body).contains("1.5"), "{}", String::from_utf8_lossy(&r.body));
+    // Text is still not a float.
+    assert_eq!(post(&mut it, "/_quillo/rpc/half", "application/json", r#"["5"]"#).status, 400);
+}

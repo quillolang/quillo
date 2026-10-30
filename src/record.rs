@@ -166,6 +166,13 @@ fn has_record(types: &Types, ty: &Ty, depth: usize) -> bool {
             || ty.elem.as_deref().map_or(false, |e| has_record(types, e, depth + 1)))
 }
 
+/// Whether a type has a `float` in it, which a whole number is made into.
+fn has_float(types: &Types, ty: &Ty, depth: usize) -> bool {
+    depth < 8
+        && (ty.names.iter().any(|n| n == "float" || types.get(n).map_or(false, |td| !td.is_record() && has_float(types, &td.ty, depth + 1)))
+            || ty.elem.as_deref().map_or(false, |e| has_float(types, e, depth + 1)))
+}
+
 /// `v` made into a value of type `ty`: records made from maps (defaults
 /// put in, other fields left out), lists of them item by item, the rest
 /// checked as it is. `lenient`: text converts to the scalar asked for, as
@@ -199,7 +206,7 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
         return make_record(it, &td, m, lenient, depth);
     }
     match (n, v) {
-        ("list", Value::List(items)) if ty.elem.as_deref().map_or(false, |e| has_record(&it.types, e, 0)) => {
+        ("list", Value::List(items)) if ty.elem.as_deref().map_or(false, |e| has_record(&it.types, e, 0) || has_float(&it.types, e, 0)) => {
             let e = ty.elem.as_deref().unwrap();
             let mut out = Vec::with_capacity(items.len());
             for (i, x) in items.iter().enumerate() {
@@ -210,6 +217,11 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
             }
             Ok(Ok(Value::list(out)))
         }
+        // A float takes a whole number: JSON, and a browser's JavaScript, have
+        // one kind of number, so 5.0 arrives as 5. Only data made into a type
+        // is widened; a call within the program still wants a float
+        // (FEEDBACK18.md, Q-103; branch feedback18-fixes).
+        ("float", Value::Int(i)) if !ty.names.iter().any(|n| n == "int") => Ok(Ok(Value::Float(*i as f64))),
         // A decimal field takes an int, numeric text or a JSON number.
         ("dec", _) => Ok(crate::interp::as_dec(v).map(Value::Dec).ok_or_else(Why::default)),
         (t, Value::Str(s)) if lenient && !type_name_matches(t, v) => match crate::interp::coerce(t, s) {

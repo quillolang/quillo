@@ -1,6 +1,3 @@
-// Handlers that wait for js() are written where they are used, not as `let` functions,
-// which would not wait (FEEDBACK18.md, Q-102).
-//
 // <Capture>: a new note, with what the phone can add to it: the place (the web view's
 // geolocation, or the app's own through window.quilloNative), the compass heading, a
 // photo (the camera or the library: the input's own picker) and a voice memo

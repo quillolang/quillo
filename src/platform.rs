@@ -154,17 +154,25 @@ fn read_system() -> serde_json::Map<String, serde_json::Value> {
 /// launcher said laid over it. Read once: it does not change while the program runs.
 pub fn info() -> Value {
     INFO.get_or_init(|| {
-        let mut m = read_system();
-        if let Some(serde_json::Value::Object(given)) = LAUNCHER.get() {
-            for (k, v) in given {
-                if !v.is_null() {
-                    m.insert(k.clone(), v.clone());
-                }
-            }
-        }
+        let m = read_system();
+        let m = match LAUNCHER.get() {
+            Some(serde_json::Value::Object(given)) => overlay(m, given),
+            _ => m,
+        };
         Value::from_json(&serde_json::Value::Object(m))
     })
     .clone()
+}
+
+/// What the system said, with what the launcher gave laid over it; a null
+/// from the launcher does not hide what the system said.
+fn overlay(mut m: serde_json::Map<String, serde_json::Value>, given: &serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+    for (k, v) in given {
+        if !v.is_null() {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    m
 }
 
 pub fn platform(_: &mut crate::interp::Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
@@ -181,11 +189,15 @@ mod tests {
         assert!(m["quillo"].as_str().unwrap().starts_with(env!("CARGO_PKG_VERSION")));
         #[cfg(target_os = "macos")]
         assert!(m["os_version"].as_str().is_some_and(|v| v.contains('.')), "{:?}", m["os_version"]);
-        super::set_launcher(r#"{ "model": "iPhone17,3", "screen": { "width": 402, "height": 874, "scale": 3 }, "os_version": null }"#);
-        let v = super::info();
-        let crate::value::Value::Map(map) = &v else { panic!("a map") };
-        assert_eq!(map.get("model").map(|v| v.display()), Some("iPhone17,3".to_string()));
+        // Tested apart from `info`, whose launcher facts are set once per
+        // process, as another test (mobile.rs) sets them too (branch
+        // feedback18-fixes).
+        let given: serde_json::Value = serde_json::from_str(r#"{ "model": "iPhone17,3", "screen": { "width": 402, "height": 874, "scale": 3 }, "os_version": null }"#).unwrap();
+        let o = super::overlay(m.clone(), given.as_object().unwrap());
+        assert_eq!(o["model"], "iPhone17,3");
+        assert_eq!(o["screen"]["scale"], 3);
         // A null from the launcher does not hide what the system said.
-        assert_eq!(map.get("os_version").map(|v| v.display()).is_some(), m["os_version"].is_string());
+        assert_eq!(o["os_version"], m["os_version"]);
+        assert!(matches!(super::info(), crate::value::Value::Map(_)));
     }
 }

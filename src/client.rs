@@ -1165,6 +1165,14 @@ struct Compiler<'a> {
     /// Compiling what `.then`, `.catch` or `.finally` is called on: a Promise
     /// is wanted there, not what it gives.
     keep_promise: bool,
+    /// `let` functions that wait for what `js(...)` gives, as a handler
+    /// does: a component's own (unless its markup calls them, which cannot
+    /// wait) and those written inside a handler (FEEDBACK18.md, Q-102;
+    /// branch feedback18-fixes).
+    waiting: HashSet<*const FnDef>,
+    /// For each component being compiled, the names its code calls where it
+    /// cannot wait: in markup, outside any function.
+    sync_calls: Vec<HashSet<String>>,
     assigned: HashSet<String>,
     /// Globals read from the server's environment, files or database.
     private: HashSet<String>,
@@ -1200,6 +1208,9 @@ struct Compiler<'a> {
     line: u32,
     /// The component or function being compiled, for error messages.
     what: String,
+    /// The file it is written in, so an error names that file and not the
+    /// program's main one (FEEDBACK18.md, Q-101; branch feedback18-fixes).
+    file: Option<std::sync::Arc<str>>,
     /// The program's own types whose shapes are in the bundle (`W.type`).
     types: HashSet<String>,
     /// Whether statements are marked with the line they come from (see `DEV`).
@@ -1289,6 +1300,50 @@ fn expr_assigned(e: &Expr, out: &mut HashSet<String>) {
         }
         Expr::Html(el, _) => html_assigned(el, out),
     }
+}
+
+/// The names a component's code calls where it cannot wait (outside any
+/// function: its markup, its state's initializers), and what the `let`
+/// functions among them call in turn (FEEDBACK18.md, Q-102; branch
+/// feedback18-fixes).
+fn sync_called(body: &Expr) -> HashSet<String> {
+    fn calls(e: &Expr, out: &mut HashSet<String>) {
+        each_expr_in(e, &mut |x| match x {
+            Expr::Call(c, _, _) => {
+                if let Expr::Ident(n, _) = &**c {
+                    out.insert(n.clone());
+                }
+            }
+            Expr::Pipe(_, b, _) => {
+                if let Expr::Ident(n, _) = &**b {
+                    out.insert(n.clone());
+                }
+            }
+            _ => {}
+        }, false);
+    }
+    let mut lets: HashMap<&str, &FnDef> = HashMap::new();
+    if let Expr::Block(ss) = body {
+        for st in ss {
+            if let Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) = st {
+                lets.insert(n.as_str(), &**d);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    calls(body, &mut out);
+    let mut done: HashSet<String> = HashSet::new();
+    loop {
+        let todo: Vec<String> = out.iter().filter(|n| lets.contains_key(n.as_str()) && !done.contains(*n)).cloned().collect();
+        if todo.is_empty() {
+            break;
+        }
+        for n in todo {
+            calls(&lets[n.as_str()].body, &mut out);
+            done.insert(n);
+        }
+    }
+    out
 }
 
 /// Calls `f` on `e` and every expression inside it.
@@ -1650,10 +1705,13 @@ impl<'a> Compiler<'a> {
             globals: HashMap::new(),
             handler: None,
             keep_promise: false,
+            waiting: HashSet::new(),
+            sync_calls: Vec::new(),
             ctxs: Vec::new(),
             counter: 0,
             line: 0,
             what: String::new(),
+            file: None,
             types: HashSet::new(),
             dev: DEV.load(std::sync::atomic::Ordering::Relaxed),
         }
@@ -1743,7 +1801,11 @@ impl<'a> Compiler<'a> {
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, QuilloError> {
         let msg = msg.into();
         let where_ = if self.what.is_empty() { String::new() } else { format!("{} (compiled for the browser): ", self.what) };
-        Err(QuilloError::new(format!("{}{}", where_, msg), self.line))
+        let e = QuilloError::new(format!("{}{}", where_, msg), self.line);
+        Err(match &self.file {
+            Some(f) => e.in_file(&crate::error::shown_path(f)),
+            None => e,
+        })
     }
 
     fn fresh(&mut self, name: &str) -> String {
@@ -1909,11 +1971,16 @@ impl<'a> Compiler<'a> {
                         if def.component { format!("<{}>", def.name) } else { format!("`{}`", def.name) },
                     );
                     let saved_line = self.line;
+                    let saved_file = self.file.clone();
+        if def.file.is_some() {
+            self.file = def.file.clone();
+        }
                     self.line = def.line.max(line);
                     let res = if def.component { self.component(&def) } else { self.function(&def) };
                     self.ctxs = saved_ctxs;
                     self.what = saved_what;
                     self.line = saved_line;
+                    self.file = saved_file;
                     let (code, is_async) = res?;
                     if is_async && !assume_async {
                         self.defs.truncate(defs_before);
@@ -2101,7 +2168,7 @@ impl<'a> Compiler<'a> {
         let saved_line = self.line;
         self.line = def.line;
         self.new_ctx(None, is_async);
-        if self.handler == Some(def as *const FnDef) {
+        if self.handler == Some(def as *const FnDef) || self.waiting.contains(&(def as *const FnDef)) {
             self.ctx().waits_js = true;
         }
         let mut pre = String::new();
@@ -2171,7 +2238,9 @@ impl<'a> Compiler<'a> {
         self.new_ctx(Some(def.name.clone()), false);
         self.ctx().view = view;
         let saved = (std::mem::take(&mut self.mutable), std::mem::replace(&mut self.reactive, false));
+        self.sync_calls.push(sync_called(&def.body));
         let res = self.setup_inner(def);
+        self.sync_calls.pop();
         let ctx = self.ctxs.pop().unwrap();
         self.mutable = saved.0;
         self.reactive = saved.1;
@@ -2406,6 +2475,14 @@ impl<'a> Compiler<'a> {
                 }
                 Stmt::Let(p, e, line) => {
                     self.line = *line;
+                    if let (Pattern::Bind(n), Expr::Lambda(d)) = (p, e) {
+                        let not_sync = self.sync_calls.last().map_or(false, |s| !s.contains(n));
+                        let c = self.ctx();
+                        let own = c.component.is_some() && !c.view && not_sync;
+                        if own || c.waits_js {
+                            self.waiting.insert(&**d as *const FnDef);
+                        }
+                    }
                     let func = if let (Pattern::Bind(_), Expr::Lambda(d)) = (p, e) { Some(self.lambda_is_async(d)?) } else { None };
                     let v = self.expr(e)?;
                     if let Pattern::Bind(n) = p {
@@ -2546,14 +2623,19 @@ impl<'a> Compiler<'a> {
                     }
                     self.ctxs[0].scopes = outer;
                     self.reactive = saved_reactive;
+                    // An initializer that reads the page runs again in the
+                    // browser when the component is resumed (FEEDBACK18.md,
+                    // Q-105; branch feedback18-fixes).
+                    let page = ["B.js(", "B.js_new(", "B.js_value("].iter().any(|f| init.contains(f));
                     let _ = writeln!(
                         body,
-                        "const {} = $i.sig({}, {}() => {{ {}return {}; }});",
+                        "const {} = $i.sig({}, {}() => {{ {}return {}; }}{});",
                         sig,
                         js_str(name),
                         if init_ctx.is_async { "async " } else { "" },
                         Self::temps_decl(init_ctx.temps),
-                        init
+                        init,
+                        if page { ", true" } else { "" }
                     );
                     self.declare_as(name, Local::State(sig));
                     if last {
@@ -3622,11 +3704,16 @@ impl<'a> Compiler<'a> {
         let saved_ctxs = std::mem::take(&mut self.ctxs);
         let saved_what = std::mem::replace(&mut self.what, format!("<{}>", def.name));
         let saved_line = self.line;
+        let saved_file = self.file.clone();
+        if def.file.is_some() {
+            self.file = def.file.clone();
+        }
         self.line = def.line;
         let res = self.setup(&def, true);
         self.ctxs = saved_ctxs;
         self.what = saved_what;
         self.line = saved_line;
+        self.file = saved_file;
         let code = res?;
         self.view_defs.push(format!("W.view({}, {});", js, code));
         Ok(())

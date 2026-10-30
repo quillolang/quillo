@@ -1030,14 +1030,21 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   out of what `js` calls, as you would in JavaScript.
 - A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
   waited for where code can wait, as a `server fn` call is: in an event handler, in
-  `@mount`, and in a `state` initializer: `let cam = js("navigator.mediaDevices.getUserMedia",
-  { video: true })` is the stream, or an error value if it was refused. Elsewhere (a
-  function `map` calls, a statement that runs again), and with `.then`, `.catch` or
-  `.finally` after it, it stays a Promise: `js("load").then((x) => { data = x })`.
-  `type_of` calls one `promise`.
+  `@mount`, in a `state` initializer, and in the component's `let` functions that its
+  markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
+  js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
+  error value if it was refused. Elsewhere (a function `map` calls, a function the
+  markup calls, a statement that runs again), and with `.then`, `.catch` or `.finally`
+  after it, it stays a Promise: `js("load").then((x) => { data = x })`. `type_of` calls
+  one `promise`.
+- A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
+  gives null while the server renders the component, and runs again in the browser
+  once the component is on the page, which sets the state from what it gives.
 - A name the page does not have (a library's `<script>` left out) gives an error value,
   `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
+- `js` names what it calls in the code (`js("Chart", ...)`, not `js(name, ...)`), which
+  `quillo check` says as loading the program does.
 - There are no npm packages, `import`s or TypeScript: a library is a script the page
   loads (named with `use`, or a `<script>` tag), and component code reaches it by name. `js("fetch", url)` works, but `http.*`
   is the way.
