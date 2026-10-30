@@ -1,0 +1,20 @@
+// The frame every page uses: the head, and a tab bar at the foot, as phone apps have.
+
+view Page(title: str, here: str, children) =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+            <title>{title}</title>
+            <link rel="stylesheet" href="/static/style.css"/>
+        </head>
+        <body>
+            <main>{children}</main>
+            <nav.tabs>
+                <a href="/" class={here == "/" && "on"}>Notes</a>
+                <a href="/new" class={here == "/new" && "on"}>New</a>
+                <a href="/probe" class={here == "/probe" && "on"}>Probe</a>
+                <a href="/device" class={here == "/device" && "on"}>Device</a>
+            </nav>
+        </body>
+    </html>

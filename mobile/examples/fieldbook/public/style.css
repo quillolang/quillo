@@ -1,0 +1,49 @@
+:root { --bg: #f4f3ef; --card: #fff; --ink: #18181b; --muted: #6b6b73; --line: #e6e4de; --accent: #1f7a5a; --warn: #b45309; --bad: #b91c1c; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.45 -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--ink); padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
+main { padding: 16px; }
+h1 { font-size: 28px; margin: 4px 0 6px; }
+h2 { font-size: 18px; margin: 22px 0 8px; }
+a { color: var(--accent); }
+.muted, small { color: var(--muted); }
+.top { margin-bottom: 10px; }
+.empty { color: var(--muted); padding: 24px 0; }
+.notes { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.notes a { display: flex; gap: 12px; align-items: center; padding: 10px; background: var(--card); border-radius: 14px; text-decoration: none; color: var(--ink); border: 1px solid var(--line); }
+.notes img, .nothumb { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; flex: none; }
+.nothumb { display: grid; place-items: center; background: #dcefe6; color: var(--accent); font-weight: 700; font-size: 22px; }
+.what { display: grid; min-width: 0; }
+.what b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.done .what b { text-decoration: line-through; color: var(--muted); }
+form { display: grid; gap: 12px; }
+input, textarea, select { width: 100%; font: inherit; padding: 11px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+fieldset { border: 1px solid var(--line); border-radius: 14px; background: var(--card); padding: 10px 14px 14px; margin: 0; }
+legend { font-weight: 600; padding: 0 4px; }
+fieldset p { margin: 4px 0 10px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+button { font: inherit; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+button.primary { background: var(--accent); color: #fff; border: 0; font-weight: 600; padding: 13px; width: 100%; }
+button.stop, button.danger { color: var(--bad); }
+.note { color: var(--warn); font-size: 14px; margin: 8px 0 0; }
+.problem { color: var(--bad); }
+.photo { width: 100%; border-radius: 14px; margin: 8px 0; }
+audio { width: 100%; margin: 6px 0; }
+dl { display: grid; grid-template-columns: 90px 1fr; gap: 6px 10px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 14px; overflow: hidden; border: 1px solid var(--line); font-size: 14px; }
+td, th { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; width: 34%; }
+td small { display: block; font-size: 12px; }
+td.st { font-weight: 600; width: 64px; }
+tr.yes td.st { color: var(--accent); } tr.no td.st { color: var(--muted); } tr.refused td.st, tr.asks td.st { color: var(--warn); } tr.error td.st { color: var(--bad); }
+td.dt { overflow-wrap: anywhere; font-size: 13px; }
+/* On a phone the detail goes under the name, not in a third column. */
+.probe tr { display: grid; grid-template-columns: 1fr auto; border-bottom: 1px solid var(--line); }
+.probe td { border-bottom: 0; }
+.probe td.dt { grid-column: 1 / -1; padding-top: 0; color: var(--muted); }
+.summary { font-weight: 600; margin: 12px 0 8px; }
+.tabs { position: fixed; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(4, 1fr); background: rgba(255,255,255,.94); border-top: 1px solid var(--line); padding: 8px 0 calc(8px + env(safe-area-inset-bottom)); backdrop-filter: blur(12px); }
+.tabs a { text-align: center; text-decoration: none; color: var(--muted); font-size: 13px; font-weight: 600; padding: 6px 0; }
+.tabs a.on { color: var(--accent); }

@@ -1,0 +1,32 @@
+// Fieldbook: notes from the field, on the phone. A photo (the camera or the library),
+// the place (the web view's geolocation, or the app's own), the compass heading, a
+// voice memo, the weather where it was taken; shared, copied or read aloud; a live
+// list; a job every minute; and two pages that say what the phone can do: /probe (each
+// hardware API, tried) and /device (platform(), the battery, the native bridge).
+//
+//   mobile/ios/build.sh mobile/examples/fieldbook --run      in the iOS simulator
+//   quillo run mobile/examples/fieldbook/main.qwe --watch    in a browser, for comparison
+
+db.open("fieldbook.db")
+db.migrate("migrations")
+
+use "lib/notes.qwe"
+use "ui/page.qwe"
+use "ui/notes.qwe"
+use "ui/capture.qwe"
+use "ui/note.qwe"
+use "ui/probe.qwe"
+use "ui/device.qwe"
+
+route GET / = <Page title="Fieldbook" here="/"><NoteList initial={load_notes()}/></Page>
+route GET /new = <Page title="New note" here="/new"><Capture/></Page>
+route GET /n/:id(int) {
+    let n = note_of(id) ?? reply 404 <Page title="Not found" here="/"><p.empty>No such note.</p></Page>
+    <Page title={n.title} here="/"><NoteView initial={n}/></Page>
+}
+route GET /probe = <Page title="What this phone can do" here="/probe"><Probe/></Page>
+route GET /device = <Page title="This device" here="/device"><DevicePage p={platform()} beat={last_beat()}/></Page>
+route GET /export.csv = respond(200, notes_csv(), { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=\"fieldbook.csv\"" })
+
+route GET /media/*path = file("media/" + path, { cache: "1d" })
+route GET /static/*path = file("public/" + path)

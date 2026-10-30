@@ -1,0 +1,31 @@
+// <NoteList>: every note, following the database live (a note saved from another page,
+// or ticked, shows at once).
+
+fn ago(ms: int) {
+    let s = (now() - ms) / 1000
+    s < 60 ? "just now" : s < 3600 ? `${floor(s / 60)} min ago` : s < 86400 ? `${floor(s / 3600)} h ago` : `${floor(s / 86400)} d ago`
+}
+
+fn place_text(lat, lon) = lat == null ? "no place" : `${round(lat, 4)}, ${round(lon, 4)}`
+
+component NoteList(initial: list) {
+    state notes = live(load_notes)
+    let open = notes | count((n) => n.done == 0)
+    <section>
+        <header.top>
+            <h1>Fieldbook</h1>
+            <p.muted>{len(notes)} {len(notes) == 1 ? "note" : "notes"} · {open} open · <a href="/export.csv">CSV</a></p>
+        </header>
+        {len(notes) == 0 && <p.empty>No notes yet. <a href="/new">Take the first one.</a></p>}
+        <ul.notes>{for n in notes =>
+            <li key={n.id} class={n.done == 1 && "done"}>
+                <a href={`/n/${n.id}`}>
+                    {n.thumb != null ? <img src={`/${n.thumb}`} alt=""/> : <span.nothumb>{upper(slice(n.title, 0, 1))}</span>}
+                    <span.what>
+                        <b>{n.title}</b>
+                        <small>{place_text(n.lat, n.lon)} · {ago(n.created)}{n.audio != null ? " · memo" : ""}</small>
+                    </span>
+                </a>
+            </li>}</ul>
+    </section>
+}

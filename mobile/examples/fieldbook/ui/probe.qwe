@@ -1,0 +1,124 @@
+// <Probe>: each thing a phone can do, tried from the page, with what it answered.
+// "yes" it works here, "no" it is not there, "refused" it is there but said no, "asks"
+// it needs a tap of the person's own first. Run with the button (some only answer a
+// tap), or on its own when the page opens with ?run.
+
+fn row(name: str, how: str, status: str, detail) = { name, how, status, detail: detail == null ? "" : str(detail) }
+
+// The rows kept, for reading later (and for the report this app was written for).
+server fn keep_probe(rows: list) with db, time = db.exec("insert into probes (at, rows) values (?, ?)", now(), json.stringify(rows)).last_id
+// The last run, shown when the page opens: [] when there is none.
+server fn last_probe() with db {
+    let r = db.query("select rows from probes order by id desc limit 1")
+    len(r) == 0 ? [] : json.parse(r[0].rows)
+}
+server fn amend_probe(id: int, rows: list) with db = db.exec("update probes set rows = ? where id = ?", json.stringify(rows), id).changes
+
+server fn internet_check() with http {
+    let r = http.get("https://api.open-meteo.com/v1/forecast?latitude=1.29&longitude=103.85&current=temperature_2m", {}, { timeout: 8 })
+    is_err(r) ? r : { status: r.status, temperature: r.json.current.temperature_2m }
+}
+
+component Probe() {
+    state rows = last_probe()
+    state running = false
+    state motion_events = 0
+    let put = (r) => { rows = push(rows, r) }
+    // A name the page lacks is an error value from js(), not null (FEEDBACK5.md, Q-054).
+    let has = (v) => !is_err(v) && v != null
+    let tried = (name, how, r, ok) => put(is_err(r)
+        ? row(name, how, contains(r.error, "not defined") ? "no" : contains(r.error, "NotAllowed") || contains(r.error, "denied") || contains(r.error, "refused") || contains(r.error, "turned off") ? "refused" : "error", r.error)
+        : row(name, how, "yes", ok(r)))
+    let summary = () => {
+        let n = (s) => rows | count((r) => r.status == s)
+        `${n("yes")} work, ${n("asks")} ask for a tap, ${n("refused")} refused, ${n("no")} not here, ${n("error")} errors`
+    }
+    // The run is written in the button's own handler: a `let` function would not wait
+    // for what js() gives (FEEDBACK18.md, Q-102). ?run presses the button.
+    <section.probe @mount={(el) => { if js("location.search") == "?run" { el.querySelector("button").click() } }}>
+        <h1>What this phone can do</h1>
+        <p.muted>Each tried from this page, in the app's web view.</p>
+        <button.primary disabled={running} @click={() => {
+            running = true
+            rows = []
+            // Place
+            let native_place = js("quilloNative.location")
+            tried("Location", "the app (CoreLocation)", native_place, (p) => `${round(p.lat, 4)}, ${round(p.lon, 4)} ±${round(p.accuracy)} m`)
+            js("navigator.geolocation.getCurrentPosition",
+                (pos) => put(row("Location", "the web view (navigator.geolocation)", "yes", `${round(pos.coords.latitude, 4)}, ${round(pos.coords.longitude, 4)} ±${round(pos.coords.accuracy)} m`)),
+                (e) => put(row("Location", "the web view (navigator.geolocation)", e.code == 1 ? "refused" : "error", `${e.message} (code ${e.code})`)),
+                { timeout: 8000 })
+            // Camera and microphone
+            let cam = js("navigator.mediaDevices.getUserMedia", { video: true })
+            tried("Camera", "getUserMedia video", cam, (s) => { let t = first(s.getVideoTracks()); t.stop(); t.label })
+            let mic = js("navigator.mediaDevices.getUserMedia", { audio: true })
+            tried("Microphone", "getUserMedia audio", mic, (s) => { let t = first(s.getAudioTracks()); t.stop(); t.label })
+            let mp4 = js("MediaRecorder.isTypeSupported", "audio/mp4")
+            tried("Recording", "MediaRecorder, audio/mp4", mp4, (y) => y ? "audio/mp4 recorded" : "not audio/mp4")
+            let devices = js("navigator.mediaDevices.enumerateDevices")
+            tried("Media devices", "enumerateDevices", devices, (ds) => join(ds | map((d) => d.kind), ", "))
+            // Motion
+            let ori = js("DeviceOrientationEvent.requestPermission")
+            put(is_err(ori) ? row("Orientation", "DeviceOrientationEvent.requestPermission", contains(ori.error, "not defined") ? "no" : "asks", ori.error) : row("Orientation", "DeviceOrientationEvent.requestPermission", ori == "granted" ? "yes" : "refused", ori))
+            let mot = js("DeviceMotionEvent.requestPermission")
+            put(is_err(mot) ? row("Motion", "DeviceMotionEvent.requestPermission", contains(mot.error, "not defined") ? "no" : "asks", mot.error) : row("Motion", "DeviceMotionEvent.requestPermission", mot == "granted" ? "yes" : "refused", mot))
+            motion_events = 0
+            js("window.addEventListener", "devicemotion", (e) => { motion_events = motion_events + 1 })
+            js("quilloNative.wait", 1500)
+            put(row("Motion events", "devicemotion, 1.5 s", motion_events > 0 ? "yes" : "no", `${motion_events} events`))
+            // Touch feedback
+            tried("Vibration", "navigator.vibrate", js("navigator.vibrate", 0), (v) => v)
+            tried("Haptics", "the app (UIFeedbackGenerator)", js("quilloNative.haptic", "success"), (k) => k)
+            // Power
+            tried("Battery", "navigator.getBattery", js("navigator.getBattery"), (b) => `${round(b.level * 100)}%`)
+            tried("Battery", "the app (UIDevice)", js("quilloNative.battery"), (b) => `${b.level == null ? "level not said" : `${round(b.level * 100)}%`}, ${b.state}${b.low_power ? ", low power" : ""}`)
+            tried("Screen stays on", "navigator.wakeLock.request", js("navigator.wakeLock.request", "screen"), (l) => { l.release(); "held, then released" })
+            tried("Screen stays on", "the app (idle timer)", js("quilloNative.keepAwake", false), (v) => "set")
+            tried("Brightness", "the app (UIScreen)", js("quilloNative.brightness"), (b) => `${round(b * 100)}%`)
+            // Network
+            let online = js("navigator.onLine")
+            put(row("Online", "navigator.onLine", online == true ? "yes" : "no", online))
+            put(row("Connection type", "navigator.connection", has(js("navigator.connection")) ? "yes" : "no", has(js("navigator.connection")) ? js("navigator.connection.effectiveType") : null))
+            tried("The internet", "the program's server (http.get, TLS)", internet_check(), (r) => `${r.status}, ${r.temperature} °C in Singapore`)
+            // Sharing and text
+            tried("Clipboard", "navigator.clipboard.writeText", js("navigator.clipboard.writeText", "Fieldbook"), (v) => "written")
+            tried("Clipboard", "navigator.clipboard.readText", js("navigator.clipboard.readText"), (v) => `read “${v}”`)
+            tried("Share sheet", "navigator.share", js("navigator.canShare", { text: "x" }), (v) => v ? "can share text" : "cannot share text")
+            let voices = js("speechSynthesis.getVoices")
+            tried("Speech", "speechSynthesis", voices, (vs) => `${len(vs)} voices`)
+            let recog = js("webkitSpeechRecognition.name")
+            put(row("Dictation", "webkitSpeechRecognition", has(recog) ? "yes" : "no", null))
+            // Notifications
+            put(row("Notifications", "the web's Notification", has(js("Notification.permission")) ? "yes" : "no", has(js("Notification.permission")) ? js("Notification.permission") : null))
+            // Storage
+            js("localStorage.setItem", "fieldbook", "1")
+            put(row("Local storage", "localStorage", js("localStorage.getItem", "fieldbook") == "1" ? "yes" : "no", null))
+            tried("Storage", "navigator.storage.estimate", js("navigator.storage.estimate"), (e) => `${round(e.quota / 1073741824, 1)} GB quota`)
+            put(row("IndexedDB", "indexedDB", has(js("indexedDB")) ? "yes" : "no", null))
+            // The screen
+            put(row("Orientation", "screen.orientation", has(js("screen.orientation")) ? "yes" : "no", js("screen.orientation.type")))
+            put(row("Full screen", "document.fullscreenEnabled", js("document.fullscreenEnabled") == true ? "yes" : "no", null))
+            // Radios and ports
+            // Each name written out: js() takes no name from a variable.
+            put(row("Bluetooth", "navigator.bluetooth", has(js("navigator.bluetooth")) ? "yes" : "no", null))
+            put(row("NFC", "NDEFReader", is_err(js("NDEFReader.name")) ? "no" : "yes", null))
+            put(row("USB", "navigator.usb", has(js("navigator.usb")) ? "yes" : "no", null))
+            put(row("Serial", "navigator.serial", has(js("navigator.serial")) ? "yes" : "no", null))
+            put(row("HID", "navigator.hid", has(js("navigator.hid")) ? "yes" : "no", null))
+            tried("Native bridge", "window.quilloNative", js("quilloNative.info"), (i) => join(i.calls, ", "))
+            // Kept before the last step: the first time, notifications ask the person,
+            // and the step waits for the answer for as long as it takes.
+            let kept = keep_probe(rows)
+            tried("Notifications", "the app (a local one in 2 s)", js("quilloNative.notify", "Fieldbook", "The probe ran.", 2), (id) => "scheduled")
+            amend_probe(kept, rows)
+            running = false
+        }}>{running ? "Trying…" : "Try everything"}</button>
+        {len(rows) > 0 && <p.summary>{summary()}</p>}
+        <table>{for r in rows =>
+            <tr class={r.status}>
+                <td><b>{r.name}</b><small>{r.how}</small></td>
+                <td.st>{r.status}</td>
+                <td.dt>{r.detail}</td>
+            </tr>}</table>
+    </section>
+}

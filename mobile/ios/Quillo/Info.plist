@@ -16,6 +16,14 @@
     <key>UIApplicationSceneManifest</key>
     <dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
     <key>QuilloMain</key><string>main.qwe</string>
+    <!-- Why the app asks, shown in each system prompt. A program that does not use one
+         never asks for it. -->
+    <key>NSCameraUsageDescription</key><string>For photos and video the program takes.</string>
+    <key>NSMicrophoneUsageDescription</key><string>For voice notes and calls the program records.</string>
+    <key>NSLocationWhenInUseUsageDescription</key><string>For the places the program records.</string>
+    <key>NSPhotoLibraryUsageDescription</key><string>For pictures you choose to add.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key><string>For pictures the program saves for you.</string>
+    <key>NSMotionUsageDescription</key><string>For the compass and the device's motion.</string>
     <!-- The program is served to this app on 127.0.0.1 over plain HTTP. -->
     <key>NSAppTransportSecurity</key>
     <dict><key>NSAllowsLocalNetworking</key><true/></dict>

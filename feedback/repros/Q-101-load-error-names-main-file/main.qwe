@@ -1,0 +1,9 @@
+// Q-101 A load error from compiling a component for the browser names main.qwe and a line of another file (ui/probe.qwe:9 is said as main.qwe:9)
+// mode: cli
+// args: run main.qwe --port 4398
+// open-when: /main\.qwe:9/
+// fixed-when: /probe\.qwe:9/
+// From FEEDBACK18.md §Q-101 (found on fc8bfb9).
+use "ui/probe.qwe"
+
+route GET / = <html><body><Probe/></body></html>

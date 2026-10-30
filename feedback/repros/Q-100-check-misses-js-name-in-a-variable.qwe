@@ -1,0 +1,16 @@
+// Q-100 `quillo check` passes `js(name, ...)` with the name in a variable, which loading the program refuses (`js` needs the name written out): the program does not start
+// mode: check
+// open-when: ok (
+// fixed-when: needs the name
+// From FEEDBACK18.md §Q-100 (found on fc8bfb9). `quillo run` of this file:
+// "`js` needs the name of what it calls written out, like js("Chart", ...)".
+
+component Probe() {
+    state said = "-"
+    <button @click={() => {
+        let name = "Math.max"
+        said = str(js(name, 1, 2))
+    }}>{said}</button>
+}
+
+route GET / = <html><body><Probe/></body></html>

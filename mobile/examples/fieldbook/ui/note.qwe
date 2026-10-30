@@ -1,0 +1,61 @@
+// <NoteView>: one note, with its photo, memo, place and weather, and what the phone can
+// do with it: share it (the web's share sheet, or the app's), copy it, read it aloud,
+// tick it off (with a haptic tap), delete it (after a confirm).
+
+component NoteView(initial: map) {
+    state n = initial
+    state weather = null
+    state weather_note = "Asking open-meteo…"
+    state note = null
+    state tz = platform_tz()
+    let text = () => `${n.title}${n.body != "" ? "\n" + n.body : ""}${n.lat != null ? `\nat ${round(n.lat, 5)}, ${round(n.lon, 5)}` : ""}`
+    let load_weather = () => {
+        let w = weather_for(n.id)
+        if is_err(w) { weather_note = w.error } else { weather = w; weather_note = null }
+    }
+    <article.entry @mount={load_weather}>
+        <h1>{n.title}</h1>
+        {n.body != "" && <p>{n.body}</p>}
+        {n.photo != null && <img.photo src={`/${n.photo}`} alt={n.title}/>}
+        {n.audio != null && <audio controls src={`/${n.audio}`}></audio>}
+        <dl>
+            <dt>Place</dt><dd>{n.lat == null ? "none" : <a href={`https://www.openstreetmap.org/?mlat=${n.lat}&mlon=${n.lon}#map=17/${n.lat}/${n.lon}`}>{round(n.lat, 5)}, {round(n.lon, 5)}</a>}{n.place_from != null ? ` (${n.place_from})` : ""}</dd>
+            {n.heading != null && [<dt>Heading</dt>, <dd>{n.heading}°</dd>]}
+            <dt>Weather</dt><dd>{weather != null ? `${weather.temperature} °C, ${weather_words(weather.code)}, wind ${weather.wind} km/h` : weather_note}</dd>
+            <dt>Taken</dt><dd>{date.format(date.from_ms(n.created, tz), "D MMM YYYY, HH:mm")}</dd>
+        </dl>
+        <div.actions>
+            <button type="button" @click={() => {
+                let r = js("navigator.share", { title: n.title, text: text() })
+                note = is_err(r) ? `The web's share sheet: ${r.error}` : "Shared."
+            }}>Share (web)</button>
+            <button type="button" @click={() => {
+                let r = js("quilloNative.share", text())
+                note = is_err(r) ? `The app's share sheet: ${r.error}` : r.shared ? `Shared to ${r.to}.` : "Not shared."
+            }}>Share (app)</button>
+            <button type="button" @click={() => {
+                let r = js("navigator.clipboard.writeText", text())
+                note = is_err(r) ? `Copying: ${r.error}` : "Copied."
+            }}>Copy</button>
+            <button type="button" @click={() => {
+                let u = js_new("SpeechSynthesisUtterance", text())
+                js("speechSynthesis.speak", u)
+                note = "Reading aloud."
+            }}>Read aloud</button>
+            <button type="button" @click={() => {
+                let d = set_done(n.id, n.done == 0)
+                n = merge(n, { done: d ? 1 : 0 })
+                js("quilloNative.haptic", d ? "success" : "light")
+            }}>{n.done == 1 ? "Reopen" : "Done"}</button>
+            <button type="button" class="danger" @click={() => {
+                if js("confirm", `Delete “${n.title}”?`) == true {
+                    delete_note(n.id)
+                    navigate("/")
+                }
+            }}>Delete</button>
+        </div>
+        {note != null && <p.note>{note}</p>}
+    </article>
+}
+
+server fn platform_tz() = platform().time_zone ?? "UTC"

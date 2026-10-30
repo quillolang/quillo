@@ -14,6 +14,9 @@ root=$(cd "$here/../.." && pwd)
 prog=$(cd "${1:-$root/app}" && pwd)
 run=""; [ "$2" = "--run" ] && run=1
 target=aarch64-apple-ios-sim
+# The oldest iOS the app runs on, for Swift, Rust and the C the runtime builds (SQLite,
+# ring): without it the C is built for the SDK's own version and may not run on older ones.
+export IPHONEOS_DEPLOYMENT_TARGET=17.0
 
 echo "== the runtime, for $target"
 (cd "$root/mobile/quillo-mobile" && cargo build --release --target $target)
@@ -36,7 +39,7 @@ echo "== the app"
 sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
 xcrun -sdk iphonesimulator swiftc -O -parse-as-library -target arm64-apple-ios17.0-simulator -sdk "$sdk" \
     -import-objc-header "$here/Quillo/quillo.h" "$here"/Quillo/*.swift "$lib" \
-    -framework WebKit -framework UIKit -framework Security -framework SystemConfiguration -framework CoreFoundation -lc++ \
+    -framework WebKit -framework UIKit -framework CoreLocation -framework UserNotifications -framework Security -framework SystemConfiguration -framework CoreFoundation -lc++ \
     -o "$out/Quillo"
 cp "$here/Quillo/Info.plist" "$out/Info.plist"
 codesign --force --sign - "$out" >/dev/null
