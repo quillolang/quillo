@@ -13,6 +13,10 @@
   location, haptics, battery, notifications, screen and share sheet; built and run in the
   iOS simulator by `mobile/ios/build.sh` and on an Android emulator or phone by
   `mobile/android/build.sh`. See mobile/README.md; HarmonyOS NEXT is planned there.
+  Each program names its app in an `app.toml` (name, id, version, build, icon); the iOS
+  script builds for devices and makes an .ipa (signed when given a certificate and
+  profile, with the privacy manifest and icon App Store Connect wants), and the Android
+  script makes a signed APK and App Bundle targeting Android 16, as Google Play requires.
 
 ### Added
 

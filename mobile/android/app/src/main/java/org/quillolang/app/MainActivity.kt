@@ -12,6 +12,7 @@ import android.util.Base64
 import androidx.core.content.FileProvider
 import android.util.Log
 import android.view.WindowInsets
+import android.window.OnBackInvokedDispatcher
 import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import android.webkit.ConsoleMessage
@@ -77,7 +78,10 @@ class MainActivity : Activity() {
             }
         }
         bridge = Bridge(this, web)
-        intent?.extras?.let { x ->
+        // Launch scripts are for tests, in debug builds only: the activity is open to other
+        // apps, which could otherwise start it with a script of their own.
+        val debuggable = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (debuggable) intent?.extras?.let { x ->
             // A script may come as "base64:...", which adb's shell passes untouched.
             val script = { v: String -> if (v.startsWith("base64:")) String(Base64.decode(v.removePrefix("base64:"), Base64.DEFAULT)) else v }
             x.getString("eval")?.let { pendingEvals.add(script(it)) }
@@ -162,6 +166,14 @@ class MainActivity : Activity() {
         }
         origin = Uri.parse(said).let { "${it.scheme}://${it.host}:${it.port}" }
         bridge.attach(origin)
+        // Back goes back in the program's pages first. From Android 13 the system asks
+        // for a callback (predictive back, the only way from Android 16); before, the
+        // key comes to onBackPressed.
+        if (Build.VERSION.SDK_INT >= 33) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) {
+                if (web.canGoBack()) web.goBack() else finish()
+            }
+        }
         if (state == null) web.loadUrl(said)
     }
 

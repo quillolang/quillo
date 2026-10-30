@@ -39,7 +39,44 @@ its own pages, having asked the person once (Info.plist says why). iOS suspends 
 and the program's server with it, when it leaves the screen: a `schedule` job waits until
 it is back.
 
-## iOS, in the simulator
+## The app's name, id, version and icon: app.toml
+
+Each program says what its app is called in an `app.toml` beside its main.qwe, which both
+build scripts read (app-config.sh):
+
+```toml
+name = "Fieldbook"                  # under the icon, 30 characters at most
+id = "org.quillolang.fieldbook"     # the bundle id (iOS) and application id (Android); never changed once published
+version = "1.0.0"                   # what people see in the store
+build = 1                           # a whole number, higher for each upload to a store
+icon = "icon.png"                   # 1024 x 1024 PNG without transparency; Quillo's when left out
+```
+
+A bad value stops the build with what is wrong. Without an `app.toml`, the app is
+"Quillo" (`org.quillolang.app`) with Quillo's icon. The icon becomes an asset catalog
+(iOS, compiled by `actool`) and launcher icons at every density plus an adaptive icon
+(Android).
+
+## iOS
+
+```sh
+mobile/ios/build.sh app --run                 # the simulator
+mobile/ios/build.sh app --device              # iPhones and iPads (arm64), build/iphoneos/Quillo.app
+mobile/ios/build.sh app --archive             # ... and build/<Name>-<version>-<build>.ipa for App Store Connect
+mobile/ios/build.sh app --device --run        # ... installed on a connected iPhone (signed only)
+```
+
+A device build is what App Store Connect expects: arm64, iOS 17 or later, built with the
+installed SDK, the icon, the privacy manifest (`Quillo/PrivacyInfo.xcprivacy`: no tracking,
+no data collected by the app itself, file times and disk space read inside its container)
+and the build keys Xcode writes (`DTSDKName`, `DTXcode`, ...). It is signed when
+`QUILLO_IOS_IDENTITY` (the certificate, as `security find-identity -v -p codesigning` names
+it) and `QUILLO_IOS_PROFILE` (the provisioning profile for the app's id) are set; the
+entitlements come from the profile, which must be for the app's id. Without them the
+build and the .ipa are unsigned, ready to sign once an Apple Developer account is active.
+A signed .ipa goes up with Apple's Transporter app or `xcrun altool --upload-app`.
+
+### In the simulator
 
 ```sh
 mobile/ios/build.sh app --run                 # app/main.qwe, the to-do list
@@ -86,15 +123,32 @@ HTTP is allowed (res/xml/network_security_config.xml).
   accepted, the camera, whose photo reaches the page through a FileProvider.
 - **Edge to edge**: Android 15 draws apps under the system bars; the page is kept clear of
   them and of the keyboard.
+- **Back**: back goes back in the program's pages, then leaves the app; on Android 13 and
+  later through the system's back callback (predictive back, the only way from Android 16).
 - **Tests**: `--es eval "<js>"` (then `eval2`, `eval3`, ...) runs scripts in the pages as
   they load, as `--eval` does on iOS; a long one goes as `"base64:$(base64 < x.js)"`.
+  Debug builds only: the activity is open to other apps, which must not run scripts in it.
   An emulator can be tapped (`adb shell input tap`), so the system's prompts can be
   answered in a test, which the iOS simulator cannot do.
 
-It needs the Android SDK (platform 35, build-tools, the NDK), a JDK 17, `cargo-ndk` and
+Releases:
+
+```sh
+mobile/android/build.sh app --release         # build/outputs/<Name>-<version>-<build>.apk (signed) and .aab for Google Play
+```
+
+A release targets Android 16 (API 36), as Google Play requires, and runs from Android 8
+(API 26); its native library is aligned for 16 KB pages, as Play also requires. It is
+signed with the upload key in `QUILLO_ANDROID_KEYSTORE` (with `QUILLO_ANDROID_KEY_ALIAS`
+and `QUILLO_ANDROID_STORE_PASSWORD`); without them, a key is made once for the app's id in
+`~/.quillo/android/<id>-upload.jks`, its password beside it, and used from then on. Keep
+that key backed up: Google Play knows the app by it (with Play App Signing, a lost upload
+key can be reset through Play's support).
+
+It needs the Android SDK (platform 36, build-tools, the NDK), a JDK 17, `cargo-ndk` and
 the Rust targets `aarch64-linux-android` and `x86_64-linux-android`; Gradle comes from
 the wrapper. On a Mac: `brew install --cask android-commandlinetools`, then
-`sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"`
+`sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"`
 (and `"emulator" "system-images;android-35;google_apis;arm64-v8a"` for an emulator). Tried
 on the Android 15 emulator: Fieldbook's probe, notes with the place, a photo from the
 camera and a voice memo, the share sheet, the location prompt refused and allowed.
@@ -123,8 +177,9 @@ battery or memory; the program starts again from its database when the app is op
 
 ## Not done yet
 
-- A device build (signing, an Xcode project or `xcodebuild` archive) and the App Store.
-- Android: a release build, signed, and the Play Store; tried on a real phone.
+- iOS: signing and an upload, waiting on an Apple Developer account; tried on a real iPhone.
+- Android: an upload to Google Play; tried on real phones.
+- Only the permissions a program uses (both apps ask for camera, microphone and location).
 - HarmonyOS NEXT: see harmony/PLAN.md.
 - Linking `.qwer` plugins into the app.
 
