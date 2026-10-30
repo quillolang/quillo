@@ -1,0 +1,8 @@
+// Q-125 `quillo check ok.qwe bad.qwe` looks only at the first, and `--strict-nul` is taken without a word: both say ok
+// mode: cli
+// args: check main.qwe bad.qwe
+// open-when: main.qwe: ok
+// fixed-when: /bad\.qwe.*error|cannot|unknown/
+// From FEEDBACK16.md §Q-125 (found on b28e689).
+
+print(1)

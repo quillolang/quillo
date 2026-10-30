@@ -1,0 +1,7 @@
+// Q-146 `(-9223372036854775807 - 1) % -1` is an overflow error, where the answer is 0
+// mode: run
+// open-when: integer overflow
+// fixed-when: 0
+// From FEEDBACK16.md §Q-146 (found on b28e689).
+
+print((-9223372036854775807 - 1) % -1)

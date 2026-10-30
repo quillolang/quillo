@@ -1,0 +1,19 @@
+// Q-119 A constant map with a `__proto__` key and plain values goes to the browser as a JSON literal, which sets the prototype: the key is lost
+// mode: browser
+// page: /
+// probe: document.querySelector("#go").click(); await new Promise((r) => setTimeout(r, 200)); return document.querySelector("#v").textContent
+// open-when: "probe": "null"
+// fixed-when: "probe": "1"
+// From FEEDBACK16.md §Q-119 (found on b28e689).
+
+let m = { "__proto__": 1 }
+
+component Page() {
+    state v = "wait"
+    <div>
+        <button #go @click={() => { v = `${m["__proto__"]}` }}>go</button>
+        <p #v>{v}</p>
+    </div>
+}
+
+route GET / = <html><body><Page/></body></html>

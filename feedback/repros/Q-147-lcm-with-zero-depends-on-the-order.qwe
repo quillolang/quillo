@@ -1,0 +1,7 @@
+// Q-147 `math.lcm(MIN, 0)` overflows, while `math.lcm(0, MIN)` is 0
+// mode: run
+// open-when: integer overflow
+// fixed-when: 0
+// From FEEDBACK16.md §Q-147 (found on b28e689).
+
+print(math.lcm(-9223372036854775807 - 1, 0))

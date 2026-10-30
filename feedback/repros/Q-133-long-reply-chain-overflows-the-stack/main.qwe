@@ -1,0 +1,8 @@
+// Q-133 A long chain of `reply` escapes the parser's nesting limit: `quillo check` crashes on the stack, where deep nesting of anything else is refused
+// mode: script
+// script: steps.sh
+// open-when: /signal|overflow|Abort|exit 13[0-9]/
+// fixed-when: nests too deeply
+// From FEEDBACK16.md §Q-133 (found on b28e689).
+
+print(1)

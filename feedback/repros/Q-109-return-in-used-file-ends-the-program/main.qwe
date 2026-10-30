@@ -1,0 +1,8 @@
+// Q-109 A `return` at the top level of a used file also ends the program that used it, without a word
+// mode: run
+// fixed-when: after the use
+// From FEEDBACK16.md §Q-109 (found on b28e689).
+
+use early.qwe
+
+print("after the use")

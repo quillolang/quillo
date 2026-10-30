@@ -1,0 +1,17 @@
+// Q-120 A float literal too large for a float (`1e999`) is inf on the server and null in the browser
+// mode: browser
+// page: /
+// probe: document.querySelector("#go").click(); await new Promise((r) => setTimeout(r, 200)); return document.querySelector("#v").textContent
+// open-when: "probe": "null"
+// fixed-when: "probe": "inf"
+// From FEEDBACK16.md §Q-120 (found on b28e689).
+
+component Page() {
+    state v = "wait"
+    <div>
+        <button #go @click={() => { v = `${1e999}` }}>go</button>
+        <p #v>{v}</p>
+    </div>
+}
+
+route GET / = <html><body><Page/></body></html>

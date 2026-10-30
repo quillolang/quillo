@@ -1,0 +1,8 @@
+// Q-139 `quillo app.qwe --log=off` is refused, though the usage says it is the same as `quillo run`
+// mode: cli
+// args: Q-139-a-file-alone-takes-fewer-options-than-run.qwe --log=off
+// open-when: unknown option
+// fixed-when: ran
+// From FEEDBACK16.md §Q-139 (found on b28e689).
+
+print("ran")

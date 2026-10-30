@@ -1,0 +1,8 @@
+// Q-140 An option left without its value is called unknown, then offered as its own correction: unknown option `--port` (did you mean `--port`?)
+// mode: cli
+// args: run Q-140-an-option-without-its-value-is-unknown.qwe --port
+// open-when: did you mean `--port`
+// fixed-when: needs a value
+// From FEEDBACK16.md §Q-140 (found on b28e689).
+
+print(1)

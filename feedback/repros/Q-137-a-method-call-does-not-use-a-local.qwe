@@ -1,0 +1,11 @@
+// Q-137 A local function called as a method (`1.adder()`) is still warned about as unused
+// mode: check
+// open-when: adder
+// fixed-when: ok (
+// From FEEDBACK16.md §Q-137 (found on b28e689).
+
+fn f() {
+    let adder = (x) => x + 10
+    1.adder()
+}
+print(f())

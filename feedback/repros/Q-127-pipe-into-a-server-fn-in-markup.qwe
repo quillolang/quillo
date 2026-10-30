@@ -1,0 +1,13 @@
+// Q-127 Under `--no-check`, `{1 | save}` in markup, with a server fn, gets past the browser compiler, which refuses `{save(1)}`: the page renders, and the browser would get a Promise
+// mode: serve
+// flags: --no-check
+// get: /
+// open-when: <p>1</p>
+// fixed-when: waits on the server
+// From FEEDBACK16.md §Q-127 (found on b28e689). `quillo check` and a plain `quillo run` refuse it.
+
+server fn save(x) = x
+
+component C() = <p>{1 | save}</p>
+
+route GET / = <html><body><C/></body></html>

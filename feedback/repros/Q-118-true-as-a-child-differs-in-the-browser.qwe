@@ -1,0 +1,19 @@
+// Q-118 `{true}` as a child is the text true on the server and nothing in the browser, so a boolean disappears once the browser renders it
+// mode: browser
+// page: /
+// probe: document.querySelector("#show").click(); await new Promise((r) => setTimeout(r, 200)); return document.querySelector("#flag").textContent
+// open-when: "probe": ""
+// fixed-when: "probe": "true"
+// From FEEDBACK16.md §Q-118 (found on b28e689).
+
+view Flag(on) = <span #flag>{on}</span>
+
+component Page() {
+    state shown = false
+    <div>
+        <button #show @click={() => { shown = true }}>show</button>
+        {shown && <Flag on={true}/>}
+    </div>
+}
+
+route GET / = <html><body><Page/></body></html>

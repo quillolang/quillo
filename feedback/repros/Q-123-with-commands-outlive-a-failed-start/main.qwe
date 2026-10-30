@@ -1,0 +1,8 @@
+// Q-123 `--with` commands outlive a program that fails to load or ends with nothing to serve: `run` returns without stopping them, though the guide says they stop with it
+// mode: script
+// script: steps.sh
+// open-when: still running
+// fixed-when: stopped
+// From FEEDBACK16.md §Q-123 (found on b28e689).
+
+let = 

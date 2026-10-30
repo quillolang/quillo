@@ -1,0 +1,7 @@
+// Q-116 In the last two days of 9999 a named zone's offset is taken as 0, so `date.to_zone` writes the time as UTC
+// mode: run
+// open-when: 9999-12-31T12:00:00Z
+// fixed-when: 9999-12-31T07:00:00-05:00
+// From FEEDBACK16.md §Q-116 (found on b28e689).
+
+print(date.to_zone("9999-12-31T12:00:00Z", "America/New_York"))

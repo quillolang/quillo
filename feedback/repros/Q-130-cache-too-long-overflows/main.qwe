@@ -1,0 +1,8 @@
+// Q-130 `file("a.txt", { cache: "999999999999y" })` is not refused: the duration overflows
+// mode: run
+// open-when: loaded
+// fixed-when: `file`'s cache
+// From FEEDBACK16.md §Q-130 (found on b28e689).
+
+let f = file("a.txt", { cache: "999999999999y" })
+print("loaded")

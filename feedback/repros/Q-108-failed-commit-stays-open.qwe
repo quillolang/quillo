@@ -1,0 +1,13 @@
+// Q-108 A plain `db.transaction` whose commit fails (a deferred foreign key) stays open: the error comes back, but its rows are still seen, and later statements run in it
+// mode: run
+// open-when: rows after the failed commit: 1
+// fixed-when: rows after the failed commit: 0
+// From FEEDBACK16.md §Q-108 (found on b28e689).
+
+db.open(":memory:")
+db.exec("create table p (id integer primary key)")
+db.exec("create table k (p int references p (id) deferrable initially deferred)")
+
+let r = db.transaction(() => db.exec("insert into k values (9)"))
+print(r)
+print(`rows after the failed commit: ${len(db.query("select * from k"))}`)

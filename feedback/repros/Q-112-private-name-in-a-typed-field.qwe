@@ -1,0 +1,10 @@
+// Q-112 `private let q` beside `route GET /q ? { q: str } = q`: the field binds the key `q`, but the body reads the private variable, not what the request sent
+// mode: serve
+// get: /q?q=sent
+// open-when: the variable
+// fixed-when: sent
+// From FEEDBACK16.md §Q-112 (found on b28e689).
+
+private let q = "the variable"
+
+route GET /q ? { q: str } = q

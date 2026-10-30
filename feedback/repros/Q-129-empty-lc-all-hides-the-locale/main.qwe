@@ -1,0 +1,8 @@
+// Q-129 `platform().locale` is null under `LC_ALL=""` with LANG set, though an empty LC_ALL counts as unset everywhere else
+// mode: script
+// script: steps.sh
+// open-when: locale: null
+// fixed-when: locale: en-US
+// From FEEDBACK16.md §Q-129 (found on b28e689).
+
+print(`locale: ${platform().locale}`)

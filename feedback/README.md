@@ -30,7 +30,7 @@ retries behind a balancer, health and API description through a gateway), [FEEDB
 Tailwind and CSS tools beside Quillo, and `--watch` with a generated stylesheet), [FEEDBACK12.md](reports/FEEDBACK12.md) (a real-time
 multiplayer game: a server loop, channels, a game as a service, and a simulation with browsers and bots), [FEEDBACK13.md](reports/FEEDBACK13.md) (two-shift scheduling for a
 factory of 24 lines: rotating crews, leave and its approval, and live manpower for a week or a month), [FEEDBACK14.md](reports/FEEDBACK14.md) (a credit
-cooperative: members, savings, fixed deposits, a loan designer, loans approved by the board, salary deductions from employers by file or API, stores, raffles and events), [FEEDBACK15.md](reports/FEEDBACK15.md) (no app: the documentation site under `--watch`, and what its source maps cost), [FEEDBACK18.md](reports/FEEDBACK18.md) (a phone app on iOS: field notes with the place, a photo, a voice memo and the weather, and a probe of 35 things a phone can do from the app's web view), and
+cooperative: members, savings, fixed deposits, a loan designer, loans approved by the board, salary deductions from employers by file or API, stores, raffles and events), [FEEDBACK15.md](reports/FEEDBACK15.md) (no app: the documentation site under `--watch`, and what its source maps cost), [FEEDBACK16.md](reports/FEEDBACK16.md) (no app: what tests found on the way to 99% coverage of the Rust), [FEEDBACK18.md](reports/FEEDBACK18.md) (a phone app on iOS: field notes with the place, a photo, a voice memo and the weather, and a probe of 35 things a phone can do from the app's web view), and
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

@@ -1,0 +1,11 @@
+// Q-138 A bare `return` that breaks the return type is reported on the line before it
+// mode: check
+// open-when: :9:
+// fixed-when: :10:
+// From FEEDBACK16.md §Q-138 (found on b28e689).
+
+fn f() -> int {
+    let x = 1
+    print(x)
+    return
+}

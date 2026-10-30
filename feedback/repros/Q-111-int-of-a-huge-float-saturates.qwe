@@ -1,0 +1,7 @@
+// Q-111 `int(1.0e30)` is silently 9223372036854775807, where a dec that large is an error value
+// mode: run
+// open-when: 9223372036854775807
+// fixed-when: /rror/
+// From FEEDBACK16.md §Q-111 (found on b28e689).
+
+print(int(1.0e30))
