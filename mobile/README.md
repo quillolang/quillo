@@ -76,6 +76,28 @@ entitlements come from the profile, which must be for the app's id. Without them
 build and the .ipa are unsigned, ready to sign once an Apple Developer account is active.
 A signed .ipa goes up with Apple's Transporter app or `xcrun altool --upload-app`.
 
+### On your own iPhone, with a free Apple ID
+
+No paid account is needed to run on your own phone; the app stops launching after 7 days,
+until it is installed again.
+
+1. Turn on Developer Mode on the phone (Settings, Privacy & Security), and connect it.
+2. Make a small Xcode project with the app's id, sign in under Signing & Capabilities (Team:
+   your Personal Team), and run it on the phone once. Xcode makes the certificate and a
+   profile for that id and phone, in `~/Library/Developer/Xcode/UserData/Provisioning Profiles`.
+3. Build with them:
+
+```sh
+QUILLO_IOS_IDENTITY="Apple Development: Your Name (ABCDE12345)" \
+QUILLO_IOS_PROFILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/<uuid>.mobileprovision" \
+mobile/ios/build.sh app --device --run
+```
+
+4. The phone must be unlocked. The first launch needs your developer profile trusted, once:
+   Settings, General, VPN & Device Management.
+
+`QUILLO_IOS_DEVICE` names the phone when several are connected (`xcrun devicectl list devices`).
+
 ### In the simulator
 
 ```sh
