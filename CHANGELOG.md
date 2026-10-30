@@ -27,6 +27,14 @@
 
 ### Fixes
 
+- **Clicks before a page's code comes** are done as they were made. A component's code
+  loads when someone reaches for it; a click, a double click, a right or middle click,
+  a press (`@pointerdown`, `@mousedown`) and its release made meanwhile were reduced to
+  a bare click (no position, no Shift, no click count) or lost. Each is now kept in
+  order and made again once the code runs, with its position, buttons, keys, click
+  count and pointer type; a canvas gets the point clicked. If the code never comes, a
+  kept click or form is done as plain HTML (a link is followed, a form sent).
+
 - **`--watch` loads a program with a large file quickly again.** A file's text went
   into the source map of every function compiled from it; it goes into the first
   one's only, and the others name the file. A program using a 4 MB component kit
