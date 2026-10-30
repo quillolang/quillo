@@ -734,3 +734,49 @@ route GET / = <Sales/>"#);
     one(r#"use * from "/assets/chart.js""#, "a script gives the page names of its own");
     one("use Chart from /assets/chart.js\nprint(chart)", "unknown name `chart`");
 }
+
+/// `js(name, ...)` with the name in a variable: refused by the checker as by
+/// loading the program (FEEDBACK18.md, Q-100; branch feedback18-fixes).
+#[test]
+fn js_names_what_it_calls_in_the_code() {
+    one(r#"component P() {
+    state s = "-"
+    <button @click={() => {
+        let name = "Math.max"
+        s = str(js(name, 1, 2))
+    }}>{s}</button>
+}
+route GET / = <P/>"#, "`js` needs the name of what it calls written out");
+    one(r#"component P() {
+    <button @mount={(el) => { js_new("not a name", el) }}>x</button>
+}
+route GET / = <P/>"#, "is not a dotted name");
+    clean(r#"component P() {
+    state s = "-"
+    <button @click={() => { s = str(js("Math.max", 1, 2)) }}>{s}</button>
+}
+route GET / = <P/>"#);
+}
+
+/// A `server fn` called from a component's handler can fail as a request
+/// does, so its result may be an error value: `r.error` after `is_err(r)` is
+/// right (FEEDBACK18.md, Q-104; branch feedback18-fixes).
+#[test]
+fn a_server_call_from_a_handler_may_be_an_error() {
+    clean(r#"server fn half(x: float) = x / 2
+component Halves() {
+    state said = "-"
+    <button @click={() => {
+        let r = half(5.0)
+        said = is_err(r) ? r.error : str(r)
+    }}>{said}</button>
+}
+route GET / = <Halves/>"#);
+    // A state's initializer runs on the server, calling it directly.
+    one(r#"server fn half(x: float) = x / 2
+component Halves() {
+    state h = half(5.0)
+    <p>{h.error}</p>
+}
+route GET / = <Halves/>"#, "no field `error`");
+}

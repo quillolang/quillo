@@ -1756,6 +1756,8 @@ struct Part {
 enum Kind {
     Sqlite,
     Pg,
+    // Not made in a build without MySQL (the phone's; branch mobile).
+    #[cfg_attr(not(feature = "mysql"), allow(dead_code))]
     My,
 }
 

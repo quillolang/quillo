@@ -1,0 +1,146 @@
+// <Capture>: a new note, with what the phone can add to it: the place (the web view's
+// geolocation, or the app's own through window.quilloNative), the compass heading, a
+// photo (the camera or the library: the input's own picker) and a voice memo
+// (getUserMedia and MediaRecorder).
+
+component Capture() {
+    state title = ""
+    state body = ""
+    state place = null
+    state place_note = null
+    state heading = null
+    state compass_note = null
+    state photo = null
+    state photo_note = null
+    state recorder = null
+    state chunks = []
+    state memo = null
+    state memo_note = null
+    state recording = false
+    state saving = false
+    state problem = null
+
+    let locate_web = () => {
+        place_note = "Asking the web view…"
+        js("navigator.geolocation.getCurrentPosition",
+            (pos) => {
+                place = { lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, from: "web" }
+                place_note = null
+            },
+            (e) => { place_note = `The web view said: ${e.message} (code ${e.code})` },
+            { enableHighAccuracy: true, timeout: 10000 })
+    }
+    let stop = () => {
+        recorder.stop()
+        recording = false
+    }
+    let save = () => {
+        saving = true
+        problem = null
+        let id = create_note(title, body, place.lat, place.lon, place.accuracy, place.from, heading)
+        if is_err(id) {
+            problem = id.error
+            saving = false
+        } else {
+            if photo != null {
+                let r = add_photo(id, photo)
+                if is_err(r) { problem = `The photo was not kept: ${r.error}` }
+            }
+            if memo != null {
+                let r = add_audio(id, memo)
+                if is_err(r) { problem = `The memo was not kept: ${r.error}` }
+            }
+            js("quilloNative.haptic", "success")
+            if problem == null { navigate(`/n/${id}`) } else { saving = false }
+        }
+    }
+
+    <section.capture>
+        <h1>New note</h1>
+        <form @submit={save}>
+            <input bind:value={title} placeholder="What is it?" maxlength="120" required/>
+            <textarea bind:value={body} rows="3" placeholder="Notes"></textarea>
+
+            <fieldset>
+                <legend>Place</legend>
+                <p>{place == null ? "Not yet" : `${round(place.lat, 5)}, ${round(place.lon, 5)} (±${round(place.accuracy)} m, ${place.from == "web" ? "the web view" : "the app"})`}</p>
+                <div.row>
+                    <button type="button" @click={locate_web}>Locate (web)</button>
+                    <button type="button" @click={() => {
+                        place_note = "Asking the app…"
+                        let r = js("quilloNative.location")
+                        if is_err(r) {
+                            place_note = `The app said: ${r.error}`
+                        } else {
+                            place = { lat: r.lat, lon: r.lon, accuracy: r.accuracy, from: "native" }
+                            place_note = null
+                        }
+                    }}>Locate (app)</button>
+                </div>
+                {place_note != null && <p.note>{place_note}</p>}
+            </fieldset>
+
+            <fieldset>
+                <legend>Heading</legend>
+                <p>{heading == null ? "Not yet" : `${heading}° from north`}</p>
+                <button type="button" @click={() => {
+                    // iOS asks first, and only from a tap; elsewhere there is nothing to ask.
+                    let ok = js("DeviceOrientationEvent.requestPermission")
+                    if is_err(ok) && !contains(ok.error, "not defined") {
+                        compass_note = ok.error
+                    } else if ok == "denied" {
+                        compass_note = "Motion and orientation were refused"
+                    } else {
+                        compass_note = "Waiting for the compass…"
+                        js("window.addEventListener", "deviceorientation", (e) => {
+                            let h = e.webkitCompassHeading ?? e.alpha
+                            if h != null {
+                                heading = round(h)
+                                compass_note = null
+                            }
+                        })
+                    }
+                }}>Use the compass</button>
+                {compass_note != null && <p.note>{compass_note}</p>}
+            </fieldset>
+
+            <fieldset>
+                <legend>Photo</legend>
+                <input type="file" accept="image/*" capture="environment" @change={(e) => {
+                    photo = e.target.files[0]
+                    photo_note = photo == null ? null : `${photo.name}, ${round(photo.size / 1024)} KB`
+                }}/>
+                {photo_note != null && <p.note>{photo_note}</p>}
+            </fieldset>
+
+            <fieldset>
+                <legend>Voice memo</legend>
+                {recording
+                    ? <button type="button" class="stop" @click={stop}>Stop</button>
+                    : <button type="button" @click={() => {
+                        let stream = js("navigator.mediaDevices.getUserMedia", { audio: true })
+                        if is_err(stream) {
+                            memo_note = `No microphone: ${stream.error}`
+                        } else {
+                            let rec = js_new("MediaRecorder", stream)
+                            chunks = []
+                            rec.addEventListener("dataavailable", (e) => { chunks = push(chunks, e.data) })
+                            rec.addEventListener("stop", () => {
+                                memo = js_new("Blob", chunks, { type: rec.mimeType })
+                                memo_note = `${round(memo.size / 1024, 1)} KB of ${rec.mimeType}`
+                                for t in stream.getTracks() { t.stop() }
+                            })
+                            rec.start()
+                            recorder = rec
+                            recording = true
+                            memo_note = "Recording…"
+                        }
+                    }}>Record</button>}
+                {memo_note != null && <p.note>{memo_note}</p>}
+            </fieldset>
+
+            {problem != null && <p.problem>{problem}</p>}
+            <button.primary disabled={saving}>{saving ? "Saving…" : "Save the note"}</button>
+        </form>
+    </section>
+}

@@ -1,0 +1,11 @@
+// The line `quillo run` should name: ui/probe.qwe, line 9.
+
+
+
+component Probe() {
+    state said = "-"
+    <button @click={() => {
+        let name = "Math.max"
+        said = str(js(name, 1, 2))
+    }}>{said}</button>
+}

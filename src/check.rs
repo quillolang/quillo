@@ -581,6 +581,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("escape", "any", "str"),
     ("url_encode", "any", "str"),
     ("env", "str, any=", "any"),
+    ("platform", "", "map"),
     ("now", "", "int"),
     ("sleep", "num", "null"),
     ("file", "str, map | null=", "response"),
@@ -866,7 +867,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -3055,6 +3056,22 @@ impl Checker {
                 }
             }
         }
+        // `js(name, ...)`: the name is written in the code, as loading the
+        // program requires (FEEDBACK18.md, Q-100; branch feedback18-fixes).
+        if let (Expr::Ident(n, _), None) = (callee, &pre) {
+            if (n == "js" || n == "js_new") && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
+                match args.first() {
+                    Some(Expr::Lit(Lit::Str(path))) => {
+                        let ok = !path.is_empty() && path.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$'));
+                        if !ok {
+                            self.error(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", n, path));
+                        }
+                    }
+                    Some(_) => self.error(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", n, n)),
+                    None => {}
+                }
+            }
+        }
         // `audit(...)`: the module `audit` is a function too.
         if let Expr::Ident(n, _) = callee {
             if n == "audit" && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
@@ -3919,6 +3936,18 @@ impl Checker {
         if sig.builtin {
             if let Some(t) = self.builtin_ret(&sig.name, &args, arg_exprs) {
                 return t;
+            }
+        }
+        // A `server fn` called from a component's handler is a request: when
+        // it fails (no connection, an argument refused) the call gives an
+        // error value, so `is_err(r) ? r.error : ...` is right. A state's
+        // initializer runs on the server and calls it directly
+        // (FEEDBACK18.md, Q-104; branch feedback18-fixes).
+        if sig.server && self.in_component().is_some() {
+            let f = self.fns.last();
+            if f.map_or(false, |f| f.nested && !f.state_init) {
+                let r = self.fn_ret(&sig);
+                return if r.bits & ERR != 0 { r } else { r.union(T::error(STR)) };
             }
         }
         self.fn_ret(&sig)

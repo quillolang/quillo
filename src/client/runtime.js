@@ -5149,10 +5149,18 @@ class Inst extends Scope {
 
   // `state name = init`: what the server rendered with, or init's value.
   // Asked again (a body made again whole), the same state.
-  sig(name, init) {
+  // `page`: the initializer reads the page (`js(...)`), which it could not
+  // do while the server rendered the component: resumed, the state starts
+  // as the server had it and is set from the initializer run here, once the
+  // component is in place (FEEDBACK18.md, Q-105; branch feedback18-fixes).
+  sig(name, init, page) {
     const had = this.sigs || (this.sigs = {});
     if (had[name]) return had[name];
-    if (hasOwn(this.s0, name)) return (had[name] = new Sig(this.s0[name]));
+    if (hasOwn(this.s0, name)) {
+      const s = (had[name] = new Sig(this.s0[name]));
+      if (page) Promise.resolve().then(init).then((x) => s.set(x), report);
+      return s;
+    }
     const v = init();
     if (v instanceof Promise) {
       const s = new Sig(null);

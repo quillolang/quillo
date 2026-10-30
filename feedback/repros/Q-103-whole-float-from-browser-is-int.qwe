@@ -1,0 +1,27 @@
+// Q-103 A float from the browser that happens to be whole reaches a `server fn` as an int, and a `float` parameter refuses it
+// mode: browser
+// page: /
+// probe: for (let i = 0; i < 40 && !window.__quillo_booted; i++) { document.querySelector("button").dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); await new Promise((r) => setTimeout(r, 50)); } document.querySelector("button").click(); await new Promise((r) => setTimeout(r, 600)); return { half: document.querySelector("#half").textContent, whole: document.querySelector("#whole").textContent }
+// open-when: /must be float/
+// fixed-when: "whole": "2.5"
+
+// A phone's GPS accuracy is often a whole number of metres (5), a heading 90, a
+// price 12: in JavaScript a number has no int or float kind, so the call sends 5.
+server fn half(x: float) = x / 2
+
+component Halves() {
+    state a = "-"
+    state b = "-"
+    <div>
+        <button @click={() => {
+            let r1 = half(2.5)
+            a = str(r1)
+            let r2 = half(5.0)
+            b = str(r2)
+        }}>halve</button>
+        <p id="half">{a}</p>
+        <p id="whole">{b}</p>
+    </div>
+}
+
+route GET / = <html><body><Halves/></body></html>

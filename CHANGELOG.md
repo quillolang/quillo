@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Additions
+
+- **`platform()`**: where the program runs, as a map: the operating system and its version,
+  the device and its hardware model, simulator or not, the processor, how the program runs
+  (a phone app, `quillo app`, a server), and in a phone app its screen, memory, locale and
+  the app's version. Server-side, as `env` is.
+- **Phone apps, in progress** (branch `mobile`): a program inside an iOS app, served to the
+  app's web view by the runtime linked into it; built and run in the iOS simulator by
+  `mobile/ios/build.sh`. See mobile/README.md.
+
 ### Added
 
 - **Browser libraries by name.** `use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"`
@@ -27,6 +37,21 @@
 
 ### Fixes
 
+- **A state read from the page** (`state wide = js("window.innerWidth") > 800`) was null for
+  good on a page the server rendered: the initializer now runs again in the browser once
+  the component is on the page (FEEDBACK18.md, Q-105).
+- **A component's `let` functions wait for `js(...)`** as its handlers do, when its markup
+  does not call them: `let locate = () => { let p = js("quilloNative.location") ... }` with
+  `@click={locate}` gets the place, not a Promise (Q-102).
+- **A whole number is a float where data is made into a type**: a `server fn`'s arguments
+  from the browser, `Type(json)`, a record's fields and a `list<float>`. JavaScript and
+  JSON have one kind of number, so 5.0 came as 5 and a `float` parameter answered 400
+  (Q-103).
+- **`quillo check`**: `r.error` after `is_err(r)` on a `server fn` called from a handler,
+  which fails as a request can, is no longer refused (Q-104); `js(name, ...)` with the
+  name in a variable is refused, as loading the program refuses it (Q-100).
+- **A load error in a component compiled for the browser** names the component's own file,
+  not main.qwe with another file's line (Q-101).
 - **Clicks before a page's code comes** are done as they were made. A component's code
   loads when someone reaches for it; a click, a double click, a right or middle click,
   a press (`@pointerdown`, `@mousedown`) and its release made meanwhile were reduced to

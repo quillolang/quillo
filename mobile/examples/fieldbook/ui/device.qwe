@@ -1,0 +1,20 @@
+// /device: what platform() says (the server's side, read at start), and what the app's
+// native side says now (the battery), with the minute job's last run.
+
+fn show(v) = v == null ? "—" : type_of(v) == "map" ? join(keys(v) | map((k) => `${k}: ${v[k]}`), ", ") : str(v)
+
+view DevicePage(p: map, beat) =
+    <section.device>
+        <h1>This device</h1>
+        <p.muted>What <code>platform()</code> says, in a program running {p.runtime == "mobile" ? "inside this app" : `as ${p.runtime}`}.</p>
+        <table>{for k in keys(p) => <tr><th>{k}</th><td>{show(p[k])}</td></tr>}</table>
+        <h2>Now</h2>
+        <Live/>
+        <p.muted>The job that runs every minute last ran {beat == null ? "never" : `${ago(beat.at)} (${beat.n} times)`}.</p>
+    </section>
+
+// The battery: null while the server renders, then read in the app once the page is up.
+component Live() {
+    state battery = js("quilloNative.battery")
+    <p>{battery == null ? "Battery: asking the app…" : is_err(battery) ? `Battery: ${battery.error}` : `Battery: ${battery.level == null ? "level not said" : `${round(battery.level * 100)}%`}, ${battery.state}${battery.low_power ? ", low power mode" : ""}`}</p>
+}

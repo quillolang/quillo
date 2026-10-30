@@ -161,6 +161,17 @@ A whole application: [crm](https://github.com/quillolang/apps/tree/main/crm) in 
 and news outlets, with a shop, campaigns, a flow designer, and plugins whose rules run in
 the browser and on the server.
 
+### Phone apps (in progress)
+
+On branch `mobile`, a program runs inside an iOS app: the runtime is linked into it and
+serves the program on 127.0.0.1 to the app's own web view, as `quillo app` does on a
+desktop, so it works offline and keeps its SQLite database in the app's container.
+`mobile/ios/build.sh app --run` builds the app around a program folder for the iOS
+simulator and opens it there; `mobile/README.md` says how, and what a phone build leaves
+out (compiled numbers, WebTransport, `.qwer` plugins built at run time, anything that
+starts a process). A device build and Android are not done yet. `platform()` (see
+[Standard library](#standard-library)) tells a program it is in a phone app, and on what.
+
 ## Language tour
 
 ### Values
@@ -1019,14 +1030,21 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   out of what `js` calls, as you would in JavaScript.
 - A Promise a page's function gives (`navigator.mediaDevices.getUserMedia`, `fetch`) is
   waited for where code can wait, as a `server fn` call is: in an event handler, in
-  `@mount`, and in a `state` initializer: `let cam = js("navigator.mediaDevices.getUserMedia",
-  { video: true })` is the stream, or an error value if it was refused. Elsewhere (a
-  function `map` calls, a statement that runs again), and with `.then`, `.catch` or
-  `.finally` after it, it stays a Promise: `js("load").then((x) => { data = x })`.
-  `type_of` calls one `promise`.
+  `@mount`, in a `state` initializer, and in the component's `let` functions that its
+  markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
+  js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
+  error value if it was refused. Elsewhere (a function `map` calls, a function the
+  markup calls, a statement that runs again), and with `.then`, `.catch` or `.finally`
+  after it, it stays a Promise: `js("load").then((x) => { data = x })`. `type_of` calls
+  one `promise`.
+- A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
+  gives null while the server renders the component, and runs again in the browser
+  once the component is on the page, which sets the state from what it gives.
 - A name the page does not have (a library's `<script>` left out) gives an error value,
   `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
+- `js` names what it calls in the code (`js("Chart", ...)`, not `js(name, ...)`), which
+  `quillo check` says as loading the program does.
 - There are no npm packages, `import`s or TypeScript: a library is a script the page
   loads (named with `use`, or a `<script>` tag), and component code reaches it by name. `js("fetch", url)` works, but `http.*`
   is the way.
@@ -2791,9 +2809,18 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
   Python, Rust, shell, SQL, CSS, HTML and XML, JSON; anything else as escaped text),
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
   `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `allow_cross_site`,
-  `tenant`, `tenant_from`, `with_tenant`, and in components `url`, `navigate`, `every`,
+  `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
+- **Where the program runs:** `platform()` gives a map: `os` (`"ios"`, `"android"`,
+  `"macos"`, `"linux"`, `"windows"`), `os_name` and `os_version` (`"iOS"`, `"27.0"`), `kernel`,
+  `device` (`"phone"`, `"tablet"`, `"desktop"` in `quillo app`, `"server"`), `model` (the
+  hardware's identifier: `"iPhone19,2"`, `"Mac17,2"`), `arch`, `cpus`, `simulator`, `runtime`
+  (`"mobile"`, `"app"` or `"server"`), `locale`, `time_zone`, `quillo` (this build's version), and in a
+  phone app also `model_family` (`"iPhone"`), `memory` (bytes), `screen` (`{ width, height, scale }`, in
+  points) and `app` (`{ id, name, version, build }`). What a system does not tell is `null`. It is read
+  once: the screen and locale are as they were when the program started. It runs on the server, as
+  `env` does: in a component, call it from a `server fn`.
 
 What each does at its edges, where the answer is not what another language would give:
 

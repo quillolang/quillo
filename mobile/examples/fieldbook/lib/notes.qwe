@@ -1,0 +1,89 @@
+// Notes on the phone's own server: the record, the queries, and the server functions
+// the components call. Everything is in fieldbook.db in the app's container.
+
+type Note = {
+    id: int, title: str, body: str, lat: float?, lon: float?, accuracy: float?, place_from: str?,
+    heading: float?, photo: str?, thumb: str?, audio: str?, weather: str?, done: int, created: int,
+}
+
+fn note_of(id: int) with db = db.one("select * from notes where id = ?", id)
+
+server fn load_notes() -> list with db =
+    db.query("select id, title, body, lat, lon, thumb, audio, done, created from notes order by done, created desc")
+
+server fn load_note(id: int) with db = note_of(id) ?? err("no such note")
+
+server fn create_note(title: str, body: str, lat: float?, lon: float?, accuracy: float?, place_from: str?, heading: float?) -> int ! str with db, time {
+    let t = trim(title)
+    if t == "" { return err("A note needs a title") }
+    if len(t) > 120 { return err("Keep the title under 120 characters") }
+    db.exec("insert into notes (title, body, lat, lon, accuracy, place_from, heading, created) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        t, trim(body), lat, lon, accuracy, place_from, heading, now())?.last_id
+}
+
+// A photo from the camera or the library: kept as sent, with a 480-pixel thumbnail
+// made on the phone.
+server fn add_photo(id: int, file: map) ! str with db, fs, random {
+    if note_of(id) == null { return err("no such note") }
+    if file.size > 25_000_000 { return err("Photos up to 25 MB") }
+    let ext = file.type == "image/png" ? "png" : file.type == "image/heic" ? "heic" : "jpg"
+    let name = `${id}-${uuid()}`
+    let photo = save_upload(file, `media/photos/${name}.${ext}`)?
+    // image.convert gives the size of what it wrote ({ width, height }), not its path.
+    let thumb = `media/thumbs/${name}.jpg`
+    let made = image.convert(photo, thumb, { width: 480, format: "jpeg", quality: 75 })
+    db.exec("update notes set photo = ?, thumb = ? where id = ?", photo, is_err(made) ? null : thumb, id)
+    { photo, thumb: is_err(made) ? null : thumb, thumb_error: is_err(made) ? made.error : null }
+}
+
+// A voice memo recorded in the page (MediaRecorder): audio/mp4 on iOS, webm elsewhere.
+server fn add_audio(id: int, file: map) ! str with db, fs, random {
+    if note_of(id) == null { return err("no such note") }
+    if file.size > 25_000_000 { return err("Memos up to 25 MB") }
+    let ext = contains(file.type ?? "", "mp4") ? "m4a" : contains(file.type ?? "", "webm") ? "webm" : "audio"
+    let path = save_upload(file, `media/audio/${id}-${uuid()}.${ext}`)?
+    db.exec("update notes set audio = ? where id = ?", path, id)
+    { audio: path, type: file.type, size: file.size }
+}
+
+server fn set_done(id: int, done: bool) with db {
+    db.exec("update notes set done = ? where id = ?", done ? 1 : 0, id)
+    done
+}
+
+server fn delete_note(id: int) with db, fs {
+    let n = note_of(id) ?? return false
+    for p in [n.photo, n.thumb, n.audio] { if p != null { delete_file(p) } }
+    db.exec("delete from notes where id = ?", id)
+    true
+}
+
+// The weather where the note was taken, from open-meteo (no key), fetched once and
+// kept with the note: the phone's own server reaching the internet over TLS.
+server fn weather_for(id: int) ! str with db, http {
+    let n = note_of(id) ?? return err("no such note")
+    if n.weather != null { return json.parse(n.weather) }
+    if n.lat == null || n.lon == null { return err("This note has no place") }
+    let r = http.get(`https://api.open-meteo.com/v1/forecast?latitude=${n.lat}&longitude=${n.lon}&current=temperature_2m,wind_speed_10m,weather_code`, {}, { timeout: 8 })?
+    if !r.ok { return err(`The weather service answered ${r.status}`) }
+    let w = { temperature: r.json.current.temperature_2m, wind: r.json.current.wind_speed_10m, code: r.json.current.weather_code, at: r.json.current.time }
+    db.exec("update notes set weather = ? where id = ?", json.stringify(w), id)
+    w
+}
+
+fn weather_words(code: int) =
+    code == 0 ? "clear" : code <= 3 ? "partly cloudy" : code <= 48 ? "fog" : code <= 67 ? "rain" : code <= 77 ? "snow" : code <= 82 ? "showers" : "storms"
+
+// A job every minute while the app is open: whether scheduled work runs on a phone.
+fn beat() with db, time {
+    db.exec("insert into beats (name, at, n) values ('minute', ?, 1) on conflict (name) do update set at = excluded.at, n = n + 1", now())
+}
+schedule("1m", beat)
+
+fn last_beat() with db = db.one("select at, n from beats where name = 'minute'")
+
+fn csv_cell(v) = v == null ? "" : `"${replace(str(v), "\"", "\"\"")}"`
+fn notes_csv() with db {
+    let rows = db.query("select id, title, body, lat, lon, heading, done, created from notes order by created")
+    "id,title,body,lat,lon,heading,done,created\n" + join(rows | map((r) => join([r.id, r.title, r.body, r.lat, r.lon, r.heading, r.done, date.from_ms(r.created, "UTC")] | map(csv_cell), ",")), "\n") + "\n"
+}

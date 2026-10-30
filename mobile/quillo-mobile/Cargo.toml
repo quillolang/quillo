@@ -1,0 +1,32 @@
+# The Quillo runtime as a library a phone app links: iOS takes the static
+# library, Android the shared one. See ../README.md.
+[package]
+name = "quillo-mobile"
+version = "0.6.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# No JIT (iOS forbids writable code), no WebTransport (pages use the WebSocket),
+# no MySQL: the phone keeps its data in SQLite.
+quillo = { path = "../..", default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+# Its own workspace, so the main one's build is not touched.
+[workspace]

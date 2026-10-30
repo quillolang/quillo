@@ -1,0 +1,18 @@
+// Q-104 A `server fn` called from a component gives an error value when the call fails (no connection, an argument refused), but `quillo check` types the result as the declared return, so `r.error` after `is_err(r)` is refused
+// mode: check
+// open-when: float has no field `error`
+// fixed-when: ok (
+// From FEEDBACK18.md §Q-104 (found on fc8bfb9). Q-103 is one way such a call fails:
+// the 400 comes back as an error value, and only `str(r)` can show why.
+
+server fn half(x: float) = x / 2
+
+component Halves() {
+    state said = "-"
+    <button @click={() => {
+        let r = half(5.0)
+        said = is_err(r) ? r.error : str(r)
+    }}>{said}</button>
+}
+
+route GET / = <html><body><Halves/></body></html>

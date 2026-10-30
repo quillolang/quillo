@@ -1,0 +1,21 @@
+// Q-105 A component's `state x = js(...)` is always null on the page: the server renders the component, where js() gives null, and the browser resumes with that; the js reference's own example (a theme from localStorage) never sees "dark", and `quillo check` says nothing
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 600)); return [...document.querySelectorAll("p")].map((p) => p.textContent)
+// open-when: "width: "
+// fixed-when: /"width: \d+/
+// From FEEDBACK18.md §Q-105 (found on fc8bfb9). In the phone app the battery read
+// this way was always null; moved into @mount it is read.
+
+component Reads() {
+    state width = js("window.innerWidth")
+    state dark = js("localStorage.getItem", "theme") == "dark"
+    state later = "-"
+    <div @mount={() => { later = `${js("window.innerWidth")}` }}>
+        <p>width: {width}</p>
+        <p>dark: {dark}</p>
+        <p>in @mount: {later}</p>
+    </div>
+}
+
+route GET / = <html><body><Reads/></body></html>
