@@ -28,3 +28,11 @@ android {
     // The program's files are served as they are: keep them uncompressed and whole.
     androidResources { noCompress += listOf("qwe", "db") }
 }
+
+dependencies {
+    // WebViewCompat: the native bridge for the program's own origin only, and a
+    // script put on its pages before theirs.
+    implementation("androidx.webkit:webkit:1.12.1")
+    // FileProvider: the camera writes a photo where the page can be given it.
+    implementation("androidx.core:core:1.13.1")
+}

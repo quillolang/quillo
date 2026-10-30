@@ -38,7 +38,7 @@ component Probe() {
         rows = []
         // Place
         let native_place = js("quilloNative.location")
-        tried("Location", "the app (CoreLocation)", native_place, (p) => `${round(p.lat, 4)}, ${round(p.lon, 4)} ±${round(p.accuracy)} m`)
+        tried("Location", "the app (location services)", native_place, (p) => `${round(p.lat, 4)}, ${round(p.lon, 4)} ±${round(p.accuracy)} m`)
         js("navigator.geolocation.getCurrentPosition",
             (pos) => put(row("Location", "the web view (navigator.geolocation)", "yes", `${round(pos.coords.latitude, 4)}, ${round(pos.coords.longitude, 4)} ±${round(pos.coords.accuracy)} m`)),
             (e) => put(row("Location", "the web view (navigator.geolocation)", e.code == 1 ? "refused" : "error", `${e.message} (code ${e.code})`)),
@@ -63,13 +63,13 @@ component Probe() {
         put(row("Motion events", "devicemotion, 1.5 s", motion_events > 0 ? "yes" : "no", `${motion_events} events`))
         // Touch feedback
         tried("Vibration", "navigator.vibrate", js("navigator.vibrate", 0), (v) => v)
-        tried("Haptics", "the app (UIFeedbackGenerator)", js("quilloNative.haptic", "success"), (k) => k)
+        tried("Haptics", "the app (haptics)", js("quilloNative.haptic", "success"), (k) => k)
         // Power
         tried("Battery", "navigator.getBattery", js("navigator.getBattery"), (b) => `${round(b.level * 100)}%`)
-        tried("Battery", "the app (UIDevice)", js("quilloNative.battery"), (b) => `${b.level == null ? "level not said" : `${round(b.level * 100)}%`}, ${b.state}${b.low_power ? ", low power" : ""}`)
+        tried("Battery", "the app (battery)", js("quilloNative.battery"), (b) => `${b.level == null ? "level not said" : `${round(b.level * 100)}%`}, ${b.state}${b.low_power ? ", low power" : ""}`)
         tried("Screen stays on", "navigator.wakeLock.request", js("navigator.wakeLock.request", "screen"), (l) => { l.release(); "held, then released" })
-        tried("Screen stays on", "the app (idle timer)", js("quilloNative.keepAwake", false), (v) => "set")
-        tried("Brightness", "the app (UIScreen)", js("quilloNative.brightness"), (b) => `${round(b * 100)}%`)
+        tried("Screen stays on", "the app (screen kept on)", js("quilloNative.keepAwake", false), (v) => "set")
+        tried("Brightness", "the app (screen)", js("quilloNative.brightness"), (b) => `${round(b * 100)}%`)
         // Network
         let online = js("navigator.onLine")
         put(row("Online", "navigator.onLine", online == true ? "yes" : "no", online))

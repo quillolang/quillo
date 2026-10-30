@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Where the camera writes a photo for <input type="file" capture>. -->
+<paths>
+    <cache-path name="captures" path="captures/" />
+</paths>
