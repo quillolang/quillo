@@ -735,6 +735,48 @@ route GET / = <Sales/>"#);
     one("use Chart from /assets/chart.js\nprint(chart)", "unknown name `chart`");
 }
 
+/// `use Chart with preload from ...`: `preload` or `preconnect`, for a browser library,
+/// and `preconnect` only for one at an address (branch library-hints).
+#[test]
+fn browser_library_hints() {
+    clean(r#"use Chart with preload from "https://cdn.example/chart.js"
+use L as Map, Draw with preconnect from https://cdn.example/leaflet.js
+use Local with preload from /assets/local.js
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, {}); Map.map(el); Draw.go(); Local.go() }}></canvas>
+}
+route GET / = <Sales/>"#);
+    one(r#"use Chart with prefetch from "https://cdn.example/chart.js""#, "takes `module`, `preload` or `preconnect`, not `prefetch`");
+    one(r#"use Chart with from "https://cdn.example/chart.js""#, "takes `module`, `preload` or `preconnect`, not `from`");
+    one(r#"use Chart with preload, preconnect from "https://cdn.example/chart.js""#, "not both");
+    one("use Local with preconnect from /assets/local.js", "`with preconnect` is for a script at another address");
+    one("use cache_get with preload from redis.qwer", "are for a browser library");
+}
+
+/// ES modules: their exports by name, `default as`, `* as`, a `.mjs` file told by its
+/// name, and what each says when it is wrong (branch library-hints).
+#[test]
+fn browser_modules() {
+    clean(r#"use Chart, registerables with module from "https://cdn.example/chart.js"
+use Chart as ChartJS with module, preload from "https://cdn.example/chart.js"
+use default as dayjs with module, preconnect from "https://cdn.example/dayjs.js"
+use * as THREE with module from "https://cdn.example/three.js"
+use * as Own from /assets/own.mjs
+use late from "/assets/late.mjs?v=2"
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, {}); ChartJS.register(registerables); dayjs(); THREE.Scene.new(); Own.go(); late() }}></canvas>
+}
+route GET / = <Sales/>"#);
+    one(r#"use * as THREE from "https://cdn.example/three.js""#, "`use * as THREE` takes a whole ES module: write `use * as THREE with module from");
+    one("use * as Auth from lib/auth.qwe", "takes a whole ES module, not `lib/auth.qwe`");
+    one(r#"use default with module from "https://cdn.example/dayjs.js""#, "default export needs a name of yours");
+    one("use cache_get with module from redis.qwer", "are for a browser library");
+    one("use Local with module, preconnect from /assets/local.js", "`with preconnect` is for a script at another address");
+    one("use Chart with module from /assets/chart.js\nprint(chart)", "unknown name `chart`");
+}
+
 /// `js(name, ...)` with the name in a variable: refused by the checker as by
 /// loading the program (FEEDBACK18.md, Q-100; branch feedback18-fixes).
 #[test]

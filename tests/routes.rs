@@ -913,6 +913,95 @@ route GET /calls = calls
     assert_eq!(calls, r#"{"fast":1,"slow":3}"#);
 }
 
+/// `use Chart with preload from ...` and `with preconnect` put a `<link>` in the head
+/// of the pages that can load the library, and no others (branch library-hints).
+#[test]
+fn a_page_gets_ready_for_the_libraries_named_with_a_hint() {
+    let mut it = app(r#"
+use Chart with preload from "https://cdn.example/chart.umd.js?v=1&x=2"
+use L as Map, Draw with preconnect from https://tiles.example:8443/leaflet.js
+use Other with preconnect from "//tiles.example:8443/other.js"
+use Local with preload from assets/local.js
+use Quiet from "https://quiet.example/quiet.js"
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, {}) }}></canvas>
+}
+component Where() {
+    <div @mount={(el) => { Map.map(el); Draw.go(); Other.go() }}></div>
+}
+component Own() {
+    <div @mount={(el) => { Local.go(el) }}></div>
+}
+component Still() {
+    <div @mount={(el) => { Quiet.go(el) }}></div>
+}
+route GET /sales = <html><head><title>s</title></head><body><Sales/></body></html>
+route GET /where = <html><head><title>w</title></head><body><Where/></body></html>
+route GET /own = <html><head><title>o</title></head><body><Own/></body></html>
+route GET /still = <html><head><title>q</title></head><body><Still/></body></html>
+route GET /plain = <html><head><title>p</title></head><body><p>no library</p></body></html>
+"#);
+    let page = |it: &mut _, p: &str| String::from_utf8_lossy(&get(it, p).body).to_string();
+    let head = |page: &str| page[..page.find("</head>").expect("a head")].to_string();
+    // The script's address, escaped; no `crossorigin`, which the loader's `<script>`
+    // does not have: the browser would fetch it twice.
+    let sales = page(&mut it, "/sales");
+    assert!(head(&sales).contains(r#"<link rel="preload" as="script" href="https://cdn.example/chart.umd.js?v=1&amp;x=2">"#), "{}", sales);
+    assert!(!sales.contains("rel=\"preconnect\""), "{}", sales);
+    // Its host, once for all the libraries from there.
+    let place = page(&mut it, "/where");
+    assert!(head(&place).contains(r#"<link rel="preconnect" href="https://tiles.example:8443">"#), "{}", place);
+    assert!(head(&place).contains(r#"<link rel="preconnect" href="//tiles.example:8443">"#), "{}", place);
+    assert!(!place.contains("rel=\"preload\""), "{}", place);
+    assert_eq!(place.matches(r#"href="https://tiles.example:8443""#).count(), 1, "{}", place);
+    let own = page(&mut it, "/own");
+    assert!(head(&own).contains(r#"<link rel="preload" as="script" href="/assets/local.js">"#), "{}", own);
+    // No hint, or no library on the page: as before.
+    for p in ["/still", "/plain"] {
+        let got = page(&mut it, p);
+        assert!(!got.contains("rel=\"preload\"") && !got.contains("rel=\"preconnect\""), "{}", got);
+    }
+}
+
+/// An ES module is no `<script>`: its bundle imports it, a preload is a
+/// `modulepreload`, and a connection is made for CORS (branch library-hints).
+#[test]
+fn a_page_imports_the_modules_its_components_use() {
+    let mut it = app(r#"
+use Chart with module, preload from "https://cdn.example/chart.js"
+use default as dayjs with module, preconnect from "https://day.example/dayjs.js"
+use Own from assets/own.mjs
+use Gauge from "https://cdn.example/gauge.umd.js"
+component Sales() {
+    state chart = null
+    <canvas @mount={(el) => { chart = Chart.new(el, {}); dayjs(); Gauge.go(); Own.go() }}></canvas>
+}
+component Plain() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+route GET /sales = <html><head><title>s</title></head><body><Sales/></body></html>
+route GET /plain = <html><head><title>p</title></head><body><Plain/></body></html>
+"#);
+    let page = |it: &mut _, p: &str| String::from_utf8_lossy(&get(it, p).body).to_string();
+    let sales = page(&mut it, "/sales");
+    let head = &sales[..sales.find("</head>").expect("a head")];
+    assert!(head.contains(r#"<link rel="modulepreload" href="https://cdn.example/chart.js">"#), "{}", sales);
+    assert!(head.contains(r#"<link rel="preconnect" href="https://day.example" crossorigin>"#), "{}", sales);
+    // The plain script is loaded by the page, the modules are not.
+    let body = &sales[head.len()..];
+    assert!(body.contains("gauge.umd.js") && !body.contains("chart.js") && !body.contains("own.mjs"), "{}", sales);
+    let at = sales.find("/_quillo/b/").expect("the bundle");
+    let end = at + sales[at..].find('"').expect("its end");
+    let bundle = String::from_utf8_lossy(&get(&mut it, &sales[at..end]).body).to_string();
+    assert!(bundle.contains(r#"["Chart", "Chart", "https://cdn.example/chart.js"]"#), "{}", bundle);
+    assert!(bundle.contains(r#"["dayjs", "default", "https://day.example/dayjs.js"]"#), "{}", bundle);
+    assert!(bundle.contains(r#"["Own", "Own", "/assets/own.mjs"]"#), "{}", bundle);
+    let plain = page(&mut it, "/plain");
+    assert!(!plain.contains("modulepreload") && !plain.contains("crossorigin"), "{}", plain);
+}
+
 /// A page loads a browser library's script, before its bundle, only when a
 /// component on it uses the library (branch js-libraries).
 #[test]

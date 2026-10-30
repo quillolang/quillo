@@ -120,18 +120,22 @@ fn styles_of(it: &Interp, c: &Compiler) -> Vec<String> {
 /// A browser library a program uses: `use Chart from "...js"` (branch
 /// js-libraries). `global` is what the script defines on the page, `src` where
 /// it is, `order` its place among the program's (a script after the one it
-/// builds on).
+/// builds on), `hint` what a page does ahead of it, `export` what it takes from an
+/// ES module (a name, `default` or `*`), which then goes by `global` in the runtime
+/// and not on the page (branch library-hints).
 #[derive(Clone, Debug)]
 pub struct JsLib {
     pub global: String,
     pub src: String,
     pub order: usize,
+    pub hint: Option<LibHint>,
+    pub export: Option<String>,
 }
 
 /// The scripts of the libraries a compile's code uses, in the order the program
 /// names them: a page loads them before its bundle (branch js-libraries).
 fn libs_of(it: &Interp, c: &Compiler) -> Vec<String> {
-    let mut libs: Vec<&JsLib> = c.globals.keys().filter_map(|k| it.js_libs.get(k)).collect();
+    let mut libs: Vec<&JsLib> = c.globals.keys().filter_map(|k| it.js_libs.get(k)).filter(|l| l.export.is_none()).collect();
     libs.sort_by_key(|l| l.order);
     let mut out: Vec<String> = Vec::new();
     for l in libs {
@@ -145,7 +149,7 @@ fn libs_of(it: &Interp, c: &Compiler) -> Vec<String> {
 
 /// Every library's script, for the whole program's bundle.
 pub fn all_libs(it: &Interp) -> Vec<String> {
-    let mut libs: Vec<&JsLib> = it.js_libs.values().collect();
+    let mut libs: Vec<&JsLib> = it.js_libs.values().filter(|l| l.export.is_none()).collect();
     libs.sort_by_key(|l| l.order);
     let mut out: Vec<String> = Vec::new();
     for l in libs {
@@ -157,14 +161,62 @@ pub fn all_libs(it: &Interp) -> Vec<String> {
     out
 }
 
+/// The `<link>`s for a page's `<head>`, for those of these libraries named `with
+/// preload` or `with preconnect`. No `crossorigin` for a script: the page's loader
+/// makes a plain `<script>`, and a preload that differs from it is fetched twice. A
+/// module is fetched with CORS: `modulepreload` is, and a connection needs saying so
+/// (branch library-hints).
+fn hint_links<'a>(it: &Interp, libs: impl Iterator<Item = &'a JsLib>) -> String {
+    let mut libs: Vec<&JsLib> = libs.collect();
+    libs.sort_by_key(|l| l.order);
+    let mut out = String::new();
+    for l in libs {
+        let module = l.export.is_some();
+        let link = match (l.hint, crate::ast::script_origin(&l.src)) {
+            (Some(LibHint::Preload), _) if module => format!("<link rel=\"modulepreload\" href=\"{}\">", crate::interp::escape(&script_src(it, &l.src))),
+            (Some(LibHint::Preload), _) => format!("<link rel=\"preload\" as=\"script\" href=\"{}\">", crate::interp::escape(&script_src(it, &l.src))),
+            (Some(LibHint::Preconnect), Some(origin)) => {
+                format!("<link rel=\"preconnect\" href=\"{}\"{}>", crate::interp::escape(origin), if module { " crossorigin" } else { "" })
+            }
+            _ => continue,
+        };
+        if !out.contains(&link) {
+            out.push_str(&link);
+        }
+    }
+    out
+}
+
+/// Every library's `<link>`s, for the whole program's bundle.
+pub fn all_hints(it: &Interp) -> String {
+    hint_links(it, it.js_libs.values())
+}
+
 /// A script's address as the page loads it: an address as written, a path from
 /// the program's own (`/assets/leaflet.js`, under its base).
 fn script_src(it: &Interp, src: &str) -> String {
-    if src.starts_with("https://") || src.starts_with("http://") || src.starts_with("//") {
+    if crate::ast::is_address(src) {
         src.to_string()
     } else {
         format!("{}/{}", it.base, src.trim_start_matches("./").trim_start_matches('/'))
     }
+}
+
+/// What starts a page: `boot`, once the modules its code uses are in, so that a
+/// component never runs ahead of one (branch library-hints).
+fn boot_line(it: &Interp, c: &Compiler) -> String {
+    let start = "if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();";
+    let mut mods: Vec<(&String, &JsLib)> = c.globals.keys().filter_map(|k| it.js_libs.get_key_value(k)).collect();
+    mods.retain(|(_, l)| l.export.is_some());
+    mods.sort_by_key(|(_, l)| l.order);
+    if mods.is_empty() {
+        return format!("{}\n", start);
+    }
+    let list: Vec<String> = mods
+        .iter()
+        .map(|(name, l)| format!("[{}, {}, {}]", js_str(name), js_str(l.export.as_deref().unwrap_or_default()), js_str(&script_src(it, &l.src))))
+        .collect();
+    format!("W.imports([{}]).then(() => {{ {} }});\n", list.join(", "), start)
 }
 
 /// The compiled program as one script: `BASE` (when `with_base`), the
@@ -191,9 +243,7 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
     if boots {
-        program.push_str(
-            "if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n",
-        );
+        program.push_str(&boot_line(it, c));
     }
     program
 }
@@ -216,15 +266,16 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
     let (c, boots) = c;
     let styles = styles_of(it, &c);
     let libs = libs_of(it, &c);
+    let hints = hint_links(it, c.globals.keys().filter_map(|k| it.js_libs.get(k)));
     if c.dev {
-        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs });
+        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints });
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok(PageBundle { js, set, split: true, styles, libs });
+            return Ok(PageBundle { js, set, split: true, styles, libs, hints });
         }
     }
-    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs })
+    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints })
 }
 
 pub struct PageBundle {
@@ -237,6 +288,8 @@ pub struct PageBundle {
     pub styles: Vec<String>,
     /// The scripts of the libraries its code uses, loaded before it.
     pub libs: Vec<String>,
+    /// The `<link>`s of those named `with preload` or `with preconnect`.
+    pub hints: String,
 }
 
 /// A page's bundle as the page names it.
@@ -247,6 +300,7 @@ pub struct PageRef {
     pub split: bool,
     pub styles: Vec<String>,
     pub libs: Vec<String>,
+    pub hints: String,
 }
 
 /// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
@@ -398,7 +452,7 @@ impl Bundles {
             m.used = self.tick;
             return m.page.clone();
         }
-        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs };
+        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs, hints: b.hints };
         self.by_set.insert(set, Made { page: page.clone(), js: Arc::new(b.js), used: self.tick });
         crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while self.by_set.len() > KEPT {
@@ -519,7 +573,7 @@ mod dev {
             boot.push_str("window.quillo = { server, components: C, rpc };\n");
         }
         if boots {
-            boot.push_str("if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot();\n");
+            boot.push_str(&super::boot_line(it, c));
         }
         pieces.push(Piece { path: "boot.js".into(), code: boot, source: None });
 
@@ -2653,7 +2707,7 @@ impl<'a> Compiler<'a> {
                     self.line = r.line;
                     return self.err("routes cannot be declared in browser code");
                 }
-                Stmt::Use(_, _, line) => {
+                Stmt::Use(_, _, line, _) => {
                     self.line = *line;
                     return self.err("`use` must be at the top level");
                 }

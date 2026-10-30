@@ -980,7 +980,27 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   `<script>` tag is written; one you write still works, as below.
 - A path (`/assets/leaflet.js`, `assets/leaflet.js`) is from the program's own address,
   under its base path; serve it as any other file (`public/`, or a route with `file()`).
-  An address (`https://...`, `//...`) is loaded as written: pin its version.
+  An address (`https://...`, `http://...`, `//...`, in any case) is loaded as written:
+  pin its version. Either may carry a query or a fragment (`/assets/app.js?v=2`). Any
+  other kind of address (`ftp:`, `file:`, `data:`) is refused, and so is one with a user
+  name or password in it: browsers do not load those, and the page would show it.
+- A page loads a library late: when the browser is idle, or at the first touch of a
+  component that only answers clicks. To get ready for it sooner, say how between the
+  names and `from`, for all the names of that `use`:
+
+  ```quillo
+  use Chart with preload from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+  use L with preconnect from "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  ```
+
+  `with preload` has the page's `<head>` fetch the script (`<link rel="preload"
+  as="script">`), which suits a library the page uses as soon as it opens, such as a
+  chart in its `@mount`. `with preconnect` only opens the connection to the script's
+  host (`<link rel="preconnect">`), which costs little and suits one a click may need;
+  it takes an address, since a path is on the page's own connection. Take one or the
+  other: a preload opens the connection itself. Each goes only in
+  pages that can load the library, as the script does. A preload is fetched whether or
+  not the library ends up used, so keep it for one or two scripts a page needs at once.
 - The names are known to `quillo check` and the editor. They are the browser's: on the
   server, while a component renders, `Chart.version` and `Chart.new(...)` give null, as
   `js(...)` does, so call them in `@mount` and event handlers.
@@ -988,8 +1008,46 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   one with Chart.new(...)"; a name in the wrong case gives an error value,
   `js_new: chart is not defined on this page (did you mean Chart?)`; so does a script
   that did not load.
-- `use` takes a library that sets a global (a "UMD" or "browser" build: `.umd.js`,
-  `.min.js`, `.browser.js`), not an ES module (`import`/`export`) or an npm package.
+- Without `with module`, `use` takes a library that sets a global (a "UMD" or "browser"
+  build: `.umd.js`, `.min.js`, `.browser.js`). An ES module is below; an npm package
+  needs a CDN that serves it as one.
+
+An ES module (`import`/`export`) gives names by exporting them, and `with module` takes
+them. Nothing goes on `window`: what the module exports is kept in Quillo's runtime, where
+the page's scripts cannot reach or replace it, and is called as any library is:
+
+```quillo
+use Chart, registerables with module from "https://esm.sh/chart.js@4.4.1"
+use Chart as ChartJS with module, preload from "https://esm.sh/chart.js@4.4.1"
+use default as dayjs with module from "https://esm.sh/dayjs@1.11.13"
+use * as THREE with module from "https://esm.sh/three@0.170.0"
+use helper from /assets/helper.mjs
+
+component Scene() {
+    <canvas @mount={(el) => {
+        let scene = THREE.Scene.new()
+        scene.name = dayjs().format("YYYY")
+    }}></canvas>
+}
+```
+
+- Each name is an export, and `as` gives it another name. `default as Name` takes the
+  default export, and `* as Name` the whole module (`THREE.Scene.new()`,
+  `Name.default(...)`).
+- A file ending in `.mjs` is a module without saying so. A `.js` file or an address may be
+  either, so `with module` says which.
+- With `preload`, the page has `<link rel="modulepreload">`, and with `preconnect` a
+  connection made for CORS. A module at another address needs its server to send
+  `access-control-allow-origin`, as the public CDNs do, and its own imports must be
+  addresses too: a CDN such as esm.sh or jsDelivr's `/+esm` rewrites an npm package's.
+- A page's components start once its modules are in, so a slow module holds them back,
+  and what is done on the page meanwhile is done when they start.
+- `quillo check` cannot read a module at an address, so a wrong name is known in the
+  browser: an error value where it is used, `gone: /x.js has no export \`gone\``, or
+  `/x.js did not load: ...`, and the rest of the page runs. Calling a class without `.new`
+  and the rest say what they do for any library.
+- `js("Chart")` finds the module's `Chart` too, ahead of a `Chart` on the page. Anything
+  else `js` and `js_new` find from the page's globals.
 
 Without `use`, a page's own `<script>` tags work too, and `js` and `js_new` reach what
 they define by name:
@@ -3018,7 +3076,11 @@ level off: `flatten(flatten(xs))` for two.
 - A file `use`d twice, or by several files, runs once.
 - A `.js` file or an address is a browser library, for components:
   `use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"`
-  (see [JavaScript libraries](#javascript-libraries)).
+  (see [JavaScript libraries](#javascript-libraries)). `use Chart with preload from ...`
+  fetches it from the page's `<head>`, `with preconnect` only connects to its host.
+  `use Chart with module from ...` takes an export of an ES module, kept in the runtime
+  and not on `window`; `use default as Name` and `use * as Name` take the default export
+  and the whole module. A `.mjs` file is a module without saying so.
 - **`private` and `public`.** `private` before a `fn`, `view`, `component` or top-level
   `let` keeps the name to its file: the file uses it as any name, other files do not
   see it, and two files may each have a private `helper` without clashing. `public`

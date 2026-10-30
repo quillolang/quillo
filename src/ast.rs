@@ -428,8 +428,10 @@ pub enum Stmt {
     /// `use cache_get as redis_get, cache_set from "redis.qwer"`: those only, each
     /// under the name after `as` (a `.qwer` file's, in 0.6; branch imports). From a
     /// script, `use Chart from "https://.../chart.umd.min.js"`: the names it gives the
-    /// page, for the browser (see `is_script`; branch js-libraries).
-    Use(String, Option<Vec<(String, String)>>, u32),
+    /// page, for the browser (see `is_script`; branch js-libraries). `use Chart with
+    /// module, preload from ...` says how the page takes it (see `LibOptions`; branch
+    /// library-hints); a module's `use * as THREE` is the name `"*"`.
+    Use(String, Option<Vec<(String, String)>>, u32, LibOptions),
     Return(Option<Expr>),
     /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
     State(String, Expr, u32),
@@ -469,7 +471,70 @@ impl TypeDef {
 /// whose components use it, and the names it takes are what it defines on the
 /// page (branch js-libraries).
 pub fn is_script(path: &str) -> bool {
-    path.ends_with(".js") || path.starts_with("https://") || path.starts_with("http://") || path.starts_with("//")
+    // Before a `?v=2` as well, in any case (branch library-hints).
+    let file = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
+    file.ends_with(".js") || file.ends_with(".mjs") || is_address(path)
+}
+
+/// What a page does ahead of a browser library it can load (branch library-hints):
+/// `with preload` fetches its script from the `<head>`, `with preconnect` only opens
+/// the connection to its host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LibHint {
+    Preload,
+    Preconnect,
+}
+
+/// What `with` says of a browser library (branch library-hints): `module` for an ES
+/// module, whose exports are kept in the runtime rather than on the page, and a hint.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LibOptions {
+    pub module: bool,
+    pub hint: Option<LibHint>,
+}
+
+/// Whether a script says by its name that it is an ES module (branch library-hints).
+pub fn is_module_file(path: &str) -> bool {
+    path.split(['?', '#']).next().is_some_and(|p| p.to_ascii_lowercase().ends_with(".mjs"))
+}
+
+/// Whether a path is an address on the web. A scheme is the same in any case:
+/// `HTTP://...` is no path on this site (branch library-hints).
+pub fn is_address(path: &str) -> bool {
+    let start = path.get(..8).unwrap_or(path).to_ascii_lowercase();
+    start.starts_with("https://") || start.starts_with("http://") || path.starts_with("//")
+}
+
+/// Why a `use` cannot name this: nothing at all, a kind of address a page cannot
+/// load a script from, or one with a password in it, which browsers refuse and the
+/// page would show to everyone (branch library-hints).
+pub fn bad_use_path(path: &str) -> Option<String> {
+    if path.trim().is_empty() {
+        return Some("`use` expects a file: use lib/auth.qwe".into());
+    }
+    let scheme = path.split_once(':').map(|(s, _)| s).filter(|s| {
+        // One letter is a Windows drive.
+        s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    });
+    if let Some(s) = scheme.filter(|_| !is_address(path)) {
+        return Some(format!("`use` takes a file, or a script at https://, http:// or //, not a `{}:` address", s));
+    }
+    if script_origin(path).is_some_and(|o| o.contains('@')) {
+        return Some(format!("`{}` has a user name in it, which browsers refuse to load and everyone could read: put the script where no password is needed", path));
+    }
+    None
+}
+
+/// Where a script at an address is served from (`https://cdn.example`,
+/// `//cdn.example`), which `with preconnect` connects to; a path on the program's
+/// own address has none (branch library-hints).
+pub fn script_origin(path: &str) -> Option<&str> {
+    if !is_address(path) {
+        return None;
+    }
+    let host = path.find("//")? + 2;
+    let end = path[host..].find(['/', '?', '#']).map_or(path.len(), |e| host + e);
+    Some(&path[..end])
 }
 
 /// Whether a name is one of the program's own types (a record, or another

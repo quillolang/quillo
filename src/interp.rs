@@ -1534,16 +1534,19 @@ impl Interp {
             }
             // A browser library: its names, for components' code; on the server
             // they give null, as `js(...)` does (branch js-libraries).
-            Stmt::Use(path, Some(names), _) if crate::ast::is_script(path) => {
+            Stmt::Use(path, Some(names), _, options) if crate::ast::is_script(path) => {
                 for (global, name) in names {
                     let libs = Arc::make_mut(&mut self.js_libs);
                     let order = libs.get(name).map_or(libs.len(), |l| l.order);
-                    libs.insert(name.clone(), crate::client::JsLib { global: global.clone(), src: path.clone(), order });
+                    // A module's exports go by the program's name for them, in the
+                    // runtime (branch library-hints).
+                    let (page_name, export) = if options.module { (name.clone(), Some(global.clone())) } else { (global.clone(), None) };
+                    libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.clone(), order, hint: options.hint, export });
                     define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
                 }
                 Ok(Value::Nil)
             }
-            Stmt::Use(path, names, line) => {
+            Stmt::Use(path, names, line, _) => {
                 let full = self.base_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are defined for each `use` that takes some

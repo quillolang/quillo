@@ -24,11 +24,13 @@ view TopBar(me, project) =
               </nav>
             : <nav.me><a.btn.ghost href="/login">Sign in</a><a.btn.primary href="/register">Join</a></nav>}
     </header>
+    
 
 view ProjectTabs(pkey: str, on: str) =
     <nav.tabs aria-label="Project">
         {for [path, label] in [["", "Board"], ["/timeline", "Timeline"], ["/reports", "Reports"], ["/activity", "Activity"], ["/settings", "Settings"]] =>
             <a key={label} href={`/p/${pkey}${path}`} class={on == label && "on"} aria-current={on == label && "page"}>{label}</a>}
+    
     </nav>
 
 view Page(title: str, me, children, project = null, wide: bool = false) =

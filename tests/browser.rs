@@ -428,6 +428,32 @@ fn components_use_libraries_by_name() {
     assert_eq!(r, want);
 }
 
+/// ES modules by name (`use add with module from ...`; branch library-hints): what
+/// they export is in the runtime and not on the page, a page waits for them, even a
+/// slow one, and one that fails says so where its name is used.
+#[test]
+fn components_use_modules_by_name() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("modules.qwe"), free_port(), Some(&dir.join("modules.js")));
+    let want = serde_json::json!({
+        "early": false,
+        "made": "3 4 8 hello ann 2.0.0 5 hello bo 10 2.0.0 late",
+        "clicks": "1",
+        "page": [],
+        "add": "the page's",
+        "scripts": ["_quillo", "_quillo"],
+        "links": ["/modules-lib.js"],
+        "nothing": "err(\"nothing: /modules-lib.js has no export `nothing`\")",
+        "gone": "err(\"gone: /modules-missing.js did not load",
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 /// The ways around the checks on the page's functions, tried in a real
 /// page: none runs its text, and ordinary calls still work.
 #[test]

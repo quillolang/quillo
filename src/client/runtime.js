@@ -1547,6 +1547,10 @@ B.index_of = meta((c, x) => {
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
 }, "index_of", null);
 B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.length * n > 1e8) fail("`repeat` count is negative or too large"); return s.repeat(n); }, "repeat", null);
+// What the program's ES modules give, by the program's name for it, or the error
+// value saying why not: here, where the page's scripts cannot reach them or
+// replace them (branch library-hints).
+const MODS = new Map();
 // `js("Chart.register", ...)`: a function of the page's scripts, found from
 // the page's globals by its dotted path; `js_new` for a class.
 // A name the page does not have is an error value, which code can check and
@@ -1555,7 +1559,14 @@ B.repeat = meta((s, n) => { S(s, "repeat"); I(n, "repeat", 2); if (n < 0 || s.le
 function jsPath(path, f) {
   S(path, f);
   let owner = globalThis, v = globalThis;
-  for (const p of path.split(".")) {
+  const parts = path.split(".");
+  // A name a module gave the program is that, whatever the page has by the name.
+  if (MODS.has(parts[0])) {
+    v = MODS.get(parts.shift());
+    if (v instanceof Err) return [null, null, v];
+    owner = undefined;
+  }
+  for (const p of parts) {
     foreignName(p);
     if (v === null || v === undefined || !(p in Object(v))) return [null, null, new Err(`${f}: ${path} is not defined on this page${jsNear(v, p)}`)];
     owner = v;
@@ -5458,6 +5469,14 @@ W.settle = async (v) => {
 };
 W.Dec = Dec;
 W.Ret = Ret;
+// The program's modules, `[name, export, address]` each, all in before the page
+// starts. One that fails is said when its name is used, as for a script that did
+// not load, and the rest of the page runs. A script with no exports at all is not
+// a module, and says so (branch library-hints).
+W.imports = (mods) => Promise.all(mods.map(([name, exp, url]) => import(url).then(
+  (m) => { MODS.set(name, exp === "*" ? m : exp in m ? m[exp] : new Err(Object.keys(m).length ? `${name}: ${url} has no export \`${exp}\`` : `${name}: ${url} exports nothing: a plain script, so leave out \`with module\``)); },
+  (e) => { MODS.set(name, new Err(`${name}: ${url} did not load: ${e && e.message || e}`)); },
+)));
 W.fail = fail;
 W.truthy = truthy;
 W.eq = eq;

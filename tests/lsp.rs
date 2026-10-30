@@ -576,4 +576,14 @@ fn use_lines_are_hovered_followed_and_completed() {
     assert_eq!(labels(&mut c, &mut notes, "use shout from pl\n", 3, 17), ["plugins/img.qwer"]);
     assert_eq!(labels(&mut c, &mut notes, "use  from plugins/img.qwer\n", 4, 4), ["brightness", "shout"]);
     assert_eq!(labels(&mut c, &mut notes, "use shout,  from plugins/img\n", 5, 11), ["brightness"]);
+    // What a page does ahead of a browser library (branch library-hints).
+    let with = ["module", "preload", "preconnect"];
+    assert_eq!(labels(&mut c, &mut notes, "use Chart with \n", 6, 15), with);
+    assert_eq!(labels(&mut c, &mut notes, "use Chart with pre\n", 7, 18), with);
+    assert_eq!(labels(&mut c, &mut notes, "use Chart with preload \n", 8, 23), ["from"]);
+    assert_eq!(labels(&mut c, &mut notes, "use Chart with module, \n", 8, 23), with);
+    assert_eq!(labels(&mut c, &mut notes, "use * as THREE with module \n", 8, 27), ["from"]);
+    assert_eq!(labels(&mut c, &mut notes, "use *\n", 8, 5), ["as", "from"]);
+    assert_eq!(labels(&mut c, &mut notes, "use Chart with preload from pl\n", 9, 30), ["plugins/img.qwer"]);
+    assert_eq!(labels(&mut c, &mut notes, "use  with module, preload from plugins/img.qwer\n", 10, 4), ["brightness", "shout"]);
 }

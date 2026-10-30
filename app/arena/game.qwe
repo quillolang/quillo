@@ -149,6 +149,8 @@ for r in ROOMS {
 // Bots, to load a room without browsers: from this machine only.
 route POST /bots/:room/:n(int) {
     if !contains(ROOMS, room) { reply 404 "no such room" }
+
+    
     if request.ip != "127.0.0.1" && request.ip != "::1" { reply 403 "bots are added from this machine" }
     let added = reduce(range(n), worlds[room].players, (ps, i) =>
         set(ps, `bot${len(keys(ps))}`, { name: `bot ${len(keys(ps))}`, x: random_int(0, W), y: random_int(0, H),

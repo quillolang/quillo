@@ -1,0 +1,31 @@
+// ES modules by name: `use add with module from lib.js` keeps what the module
+// exports in the runtime, not on the page. Driven by modules.js (tests/browser.rs).
+
+use add, Thing, version with module from /modules-lib.js
+use add as plus with module from /modules-lib.js
+use default as hello with module, preload from /modules-lib.js
+use * as NS with module from /modules-lib.js
+use late from /modules-slow.mjs
+use nothing with module from /modules-lib.js
+use gone with module from /modules-missing.js
+
+component Widget() {
+    state made = "waiting"
+    state clicks = 0
+    state wrong = ""
+    <div>
+        <div class="made" @mount={(el) => {
+            let t = Thing.new(4)
+            let m = NS
+            made = [add(1, 2), plus(2, 2), t.twice(), hello("ann"), version, NS.add(2, 3), NS.default("bo"), NS.Thing.new(5).twice(), m.version, late()].join(" ")
+        }}>{made}</div>
+        <button id="clicks" @click={() => { clicks += 1 }}>{clicks}</button>
+        <button id="nothing" @click={() => { wrong = str(nothing(1)) }}>nothing</button>
+        <button id="gone" @click={() => { wrong = str(gone(1)) }}>gone</button>
+        <span class="wrong">{wrong}</span>
+    </div>
+}
+
+route GET /modules-lib.js = file("modules-lib.js")
+route GET /modules-slow.mjs = file("modules-slow.mjs")
+route GET / = <html><head><title>m</title><script>{raw(`window.add = () => "the page's"`)}</script></head><body><Widget/></body></html>

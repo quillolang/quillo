@@ -346,6 +346,7 @@ impl Interp {
         // The styles of what the page's bundle can show, or all of them for
         // the whole program's bundle.
         let mut bundle_styles: Vec<String> = Vec::new();
+        let mut hints = String::new();
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             let mut tags = String::new();
@@ -370,10 +371,12 @@ impl Interp {
                         }
                         s.push(format!("{}/_quillo/b/{}.js", self.base, page.hash));
                         bundle_styles = page.styles;
+                        hints = page.hints;
                         s
                     }
                     None => {
                         bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
+                        hints = crate::client::all_hints(self);
                         let mut s = crate::client::all_libs(self);
                         s.push(format!("{}/_quillo/quillo.js", self.base));
                         s
@@ -393,8 +396,13 @@ impl Interp {
         if html && req.method != "HEAD" {
             let mut ids = crate::styles::ids_in(&resp.body);
             ids.extend(bundle_styles);
+            // The libraries named `with preload` or `with preconnect`, before the
+            // sheet (branch library-hints).
+            let mut link = hints;
             if let Some(hash) = self.sheet_for_page(&ids) {
-                let link = format!("<link rel=\"stylesheet\" href=\"{}/_quillo/s/{}.css\">", self.base, hash);
+                link.push_str(&format!("<link rel=\"stylesheet\" href=\"{}/_quillo/s/{}.css\">", self.base, hash));
+            }
+            if !link.is_empty() {
                 let find = |needle: &[u8]| resp.body.windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle));
                 let at = match (find(b"</head>"), find(b"<body")) {
                     (Some(h), _) => h,

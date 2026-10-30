@@ -1575,14 +1575,14 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
             }
-            if let (Stmt::Use(path, Some(names), line), true) = (s, crate::ast::is_script(match s { Stmt::Use(p, ..) => p, _ => "" })) {
+            if let (Stmt::Use(path, Some(names), line, _), true) = (s, crate::ast::is_script(match s { Stmt::Use(p, ..) => p, _ => "" })) {
                 for (global, name) in names {
                     let src = if global == name { path.clone() } else { format!("{} ({})", path, global) };
                     self.js_libs.push((name.clone(), src, file.clone(), *line));
                 }
                 continue;
             }
-            if let Stmt::Use(path, names, line) = s {
+            if let Stmt::Use(path, names, line, _) = s {
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are taken by each `use` that names some (branch imports).
@@ -2353,7 +2353,7 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Use(_, _, line) => {
+            Stmt::Use(_, _, line, _) => {
                 self.line = *line;
                 if !self.scopes.is_empty() {
                     self.error("`use` must be at the top level");

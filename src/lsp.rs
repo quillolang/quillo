@@ -170,8 +170,22 @@ fn use_line(src: &str) -> Option<UseLine> {
     }
     i = skip(i + 3);
     let mut u = UseLine::default();
+    // `with module, preload`, before `from` (branch library-hints).
+    let skip_with = |mut j: usize| {
+        if word(j, word_end(j)) == "with" {
+            while j < chars.len() && word(j, word_end(j)) != "from" {
+                j = skip(if chars[j] == ',' { j + 1 } else { word_end(j).max(j + 1) });
+            }
+        }
+        j
+    };
     if chars.get(i) == Some(&'*') {
         i = skip(i + 1);
+        // `use * as THREE with module from ...`.
+        if word(i, word_end(i)) == "as" {
+            i = skip(word_end(skip(word_end(i))));
+            i = skip_with(i);
+        }
         let e = word_end(i);
         if word(i, e) != "from" {
             return None;
@@ -198,6 +212,7 @@ fn use_line(src: &str) -> Option<UseLine> {
                     alias = word(a, j);
                     j = skip(j);
                 }
+                j = skip_with(j);
                 u.names.push((name, alias, col));
                 if chars.get(j) == Some(&',') {
                     j = skip(j + 1);
@@ -843,10 +858,21 @@ impl Server {
         let from_at = words.iter().position(|w| *w == "from");
         let names = from_at.is_some_and(|f| f > 1 && words[1] != "*");
         if prev == "*" {
-            return Some(json!([{ "label": "from", "kind": 14 }]));
+            return Some(json!([{ "label": "as", "kind": 14 }, { "label": "from", "kind": 14 }]));
         }
         if prev == "as" {
             return Some(json!([]));
+        }
+        // What `with` takes for a browser library, then `from` (branch library-hints).
+        if words.contains(&"with") && from_at.is_none() {
+            let head: String = chars[..a].iter().collect();
+            let head = head.trim_end();
+            if head.ends_with("with") || head.ends_with(',') {
+                return Some(json!([{ "label": "module", "kind": 14 }, { "label": "preload", "kind": 14 }, { "label": "preconnect", "kind": 14 }]));
+            }
+            if matches!(prev, "module" | "preload" | "preconnect") {
+                return Some(json!([{ "label": "from", "kind": 14 }]));
+            }
         }
         let path_here = quoted || prev == "from" || (prev == "use" && !src[before.len()..].contains(" from "));
         if !path_here {
@@ -1430,7 +1456,7 @@ fn keyword_doc(w: &str) -> Option<String> {
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
-        "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
+        "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.\n\n`use Chart with module, preload from \"...\"`\n\nHow a page takes a browser library: `module` for an ES module, kept in the runtime and not on `window`; `preload` fetches it ahead; `preconnect` only connects to its host.",
         "match" => "`match value { pattern [if guard] => result ... }`",
         "use" => "`use lib/auth.qwe` (or `use lib/auth`, or `use \"lib/auth.qwe\"`) runs another file once: its public names are this file's to use.\n\n`use cache_get as redis_get, cache_set from redis.qwer` takes only those functions of a Rust file, each under the name after `as`; `use * from redis.qwer` takes them all.",
         "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",

@@ -4,6 +4,17 @@
 
 ### Additions
 
+- **ES modules by name.** `use Chart, registerables with module from "..."` takes a
+  module's exports, `use default as dayjs with module from "..."` its default export,
+  and `use * as THREE with module from "..."` all of it. They are called as any library
+  is (`Chart.new(el, config)`, `THREE.Scene.new()`), and nothing goes on `window`: the
+  exports are kept in Quillo's runtime. A page's components start once its modules are
+  in, and a `.mjs` file is a module without saying so. A wrong name or a module that does
+  not load is an error value where it is used.
+- **`use Chart with preload from ...` and `with preconnect`.** A browser library can say
+  how a page gets ready for it: `with preload` fetches the script from the page's
+  `<head>`, `with preconnect` only opens the connection to its host. Only pages that can
+  load the library carry the `<link>`, so nothing is written by hand.
 - **`platform()`**: where the program runs, as a map: the operating system and its version,
   the device and its hardware model, simulator or not, the processor, how the program runs
   (a phone app, `quillo app`, a server), and in a phone app its screen, memory, locale and

@@ -121,7 +121,7 @@ fn rearm(st: &State) {
 /// declarations (functions, routes, types) are not stops.
 pub fn stmt_line(s: &Stmt) -> Option<u32> {
     let l = match s {
-        Stmt::Let(_, _, l) | Stmt::Assign(_, _, _, l) | Stmt::SetField(_, _, _, _, l) | Stmt::State(_, _, l) | Stmt::Use(_, _, l) => *l,
+        Stmt::Let(_, _, l) | Stmt::Assign(_, _, _, l) | Stmt::SetField(_, _, _, _, l) | Stmt::State(_, _, l) | Stmt::Use(_, _, l, _) => *l,
         Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_line(e),
         Stmt::Return(None) | Stmt::Fn(_) | Stmt::Route(_) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) => 0,
     };
