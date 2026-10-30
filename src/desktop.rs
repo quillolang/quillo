@@ -51,6 +51,7 @@ pub fn main(file: &str, flags: &[String]) -> i32 {
         return 2;
     }
     crate::warn_of_secrets();
+    quillo::platform::set_runtime("app");
     let token = match quillo::server::launch_token() {
         Ok(t) => t,
         Err(e) => {

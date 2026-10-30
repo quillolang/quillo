@@ -63,6 +63,8 @@ pub fn install(env: &Env) {
         ("escape", escape_fn),
         ("url_encode", url_encode),
         ("env", env_var),
+        // Where the program runs: the system, the device, how it runs (branch mobile).
+        ("platform", crate::platform::platform),
         ("now", now),
         ("sleep", sleep),
         ("file", file),

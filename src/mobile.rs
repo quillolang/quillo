@@ -90,8 +90,11 @@ fn keep_secret(data: &Path) -> Result<(), String> {
 
 /// Copies the program from `bundle` into `<data>/app`, loads `main` (a file of
 /// it, "main.qwe" when empty) and serves it on a thread of its own; returns
-/// once it listens. Called once per process.
-pub fn start(bundle: &Path, data: &Path, main: &str) -> Result<Started, String> {
+/// once it listens. `device` is what the launcher knows of the device, as JSON,
+/// for `platform()` ("" when nothing). Called once per process.
+pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Started, String> {
+    crate::platform::set_runtime("mobile");
+    crate::platform::set_launcher(device);
     let app_dir = data.join("app");
     std::fs::create_dir_all(&app_dir).map_err(|e| format!("{}: {}", app_dir.display(), e))?;
     sync(bundle, &app_dir)?;
@@ -165,7 +168,7 @@ mod tests {
         let (from, to) = (root.join("bundle"), root.join("data"));
         std::fs::create_dir_all(&from).unwrap();
         std::fs::write(from.join("main.qwe"), "db.open(\"app.db\")\ndb.exec(\"create table if not exists t (n int)\")\nroute GET / = \"hello from the phone\"\n").unwrap();
-        let s = start(&from, &to, "").unwrap();
+        let s = start(&from, &to, "", r#"{ "model": "Test1,1" }"#).unwrap();
         let get = |path: &str| {
             let mut c = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
             write!(c, "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path).unwrap();

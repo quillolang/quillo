@@ -1,0 +1,37 @@
+// About this device: what platform() says, as a page. Built into the phone app by
+//   mobile/ios/build.sh mobile/examples/about --run
+// and runs as it is on a server or with `quillo app`, where it describes that machine.
+
+fn row(label: str, value) = value == null ? null : <tr><th>{label}</th><td>{str(value)}</td></tr>
+
+route GET / {
+    let p = platform()
+    let screen = p.screen == null ? null : `${p.screen.width} × ${p.screen.height} points, ${p.screen.scale}x`
+    let memory = p.memory == null ? null : `${round(p.memory / 1073741824, 1)} GB`
+    <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>About this device</title>
+            <style>{"body{font:16px -apple-system,system-ui,sans-serif;margin:0;padding:24px 20px;background:#f6f6f8;color:#111}h1{font-size:28px;margin:8px 0 4px}p{color:#666;margin:0 0 18px}table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden}th,td{text-align:left;padding:11px 14px;border-bottom:1px solid #eee;font-size:15px}th{color:#666;font-weight:500;width:40%}td{font-family:ui-monospace,monospace;font-size:14px}"}</style>
+        </head>
+        <body>
+            <h1>About this device</h1>
+            <p>What <code>platform()</code> says, from a Quillo program running {p.runtime == "mobile" ? "inside this app" : p.runtime == "app" ? "in a desktop window" : "as a server"}.</p>
+            <table>
+                {row("System", `${p.os_name} ${p.os_version ?? ""}`)}
+                {row("Device", p.device)}
+                {row("Model", p.model)}
+                {row("Kind", p.model_family)}
+                {row("Simulator", p.simulator)}
+                {row("Processor", `${p.arch}, ${p.cpus} cores`)}
+                {row("Memory", memory)}
+                {row("Screen", screen)}
+                {row("Locale", p.locale)}
+                {row("Time zone", p.time_zone)}
+                {row("App", p.app == null ? null : `${p.app.name} ${p.app.version} (${p.app.build}), ${p.app.id}`)}
+                {row("Runs as", p.runtime)}
+                {row("Quillo", p.quillo)}
+            </table>
+        </body>
+    </html>
+}

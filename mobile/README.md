@@ -46,3 +46,15 @@ suspended with it, and answers again when the app comes back.
 - A device build (signing, an Xcode project or `xcodebuild` archive) and the App Store.
 - Android: `android/` is written but not built here (no SDK on this machine).
 - Linking `.qwer` plugins into the app.
+
+## Where the program runs: `platform()`
+
+A program can ask: `platform()` gives the system, its version, the device, the hardware
+model, simulator or not, the processor, the screen, the locale and time zone, the app's
+version, and whether it runs in a phone app, `quillo app` or as a server. The iOS launcher
+hands over what only it knows (`Program.device` in ios/Quillo/App.swift) when it starts the
+program; the runtime reads the rest. `examples/about/` is a page that shows it all:
+
+```sh
+mobile/ios/build.sh mobile/examples/about --run
+```

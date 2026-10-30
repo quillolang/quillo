@@ -7,8 +7,7 @@ import WebKit
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        Program.startOnce()
-        return true
+        true
     }
 
     func application(_ application: UIApplication, configurationForConnecting session: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
@@ -23,6 +22,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
         guard let scene = scene as? UIWindowScene else { return }
+        Program.startOnce(screen: scene.screen)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = ProgramViewController()
         window.makeKeyAndVisible()
@@ -43,7 +43,47 @@ enum Started {
 enum Program {
     nonisolated(unsafe) static var result: Started = .failed("not started")
 
-    static func startOnce() {
+    /// What only the app knows of the device, for the program's `platform()`.
+    static func device(screen: UIScreen) -> String {
+        let d = UIDevice.current
+        var sys = utsname()
+        uname(&sys)
+        let machine = withUnsafeBytes(of: &sys.machine) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        #if targetEnvironment(simulator)
+        let simulator = true
+        let model = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] ?? machine
+        #else
+        let simulator = false
+        let model = machine
+        #endif
+        let info = Bundle.main.infoDictionary ?? [:]
+        let size = screen.bounds.size
+        let facts: [String: Any] = [
+            "os": "ios",
+            "os_name": d.systemName,
+            "os_version": d.systemVersion,
+            "device": d.userInterfaceIdiom == .pad ? "tablet" : "phone",
+            "model": model,
+            "model_family": d.model,
+            "simulator": simulator,
+            "memory": ProcessInfo.processInfo.physicalMemory,
+            "cpus": ProcessInfo.processInfo.activeProcessorCount,
+            "locale": Locale.preferredLanguages.first ?? Locale.current.identifier,
+            "time_zone": TimeZone.current.identifier,
+            "screen": ["width": Int(size.width), "height": Int(size.height), "scale": Double(screen.scale)],
+            "app": [
+                "id": info["CFBundleIdentifier"] as? String ?? "",
+                "name": info["CFBundleDisplayName"] as? String ?? info["CFBundleName"] as? String ?? "",
+                "version": info["CFBundleShortVersionString"] as? String ?? "",
+                "build": info["CFBundleVersion"] as? String ?? "",
+            ],
+        ]
+        let json = try? JSONSerialization.data(withJSONObject: facts)
+        return json.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    static func startOnce(screen: UIScreen) {
+        if case .url = result { return }
         let fm = FileManager.default
         let bundle = Bundle.main.resourceURL!.appendingPathComponent("program").path
         let data = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("quillo")
@@ -51,7 +91,7 @@ enum Program {
         let main = (Bundle.main.object(forInfoDictionaryKey: "QuilloMain") as? String) ?? "main.qwe"
         var out = [CChar](repeating: 0, count: 4096)
         let started = Date()
-        let code = quillo_start(bundle, data.path, main, &out, out.count)
+        let code = quillo_start(bundle, data.path, main, device(screen: screen), &out, out.count)
         let said = out.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         if code == 0, let url = URL(string: said) {

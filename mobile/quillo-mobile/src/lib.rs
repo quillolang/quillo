@@ -14,14 +14,15 @@ fn text(p: *const c_char) -> String {
 
 /// Copies the program bundled at `bundle` into `<data>/app`, starts it, and
 /// writes the URL the web view opens into `out` (at most `len` bytes, with a
-/// NUL). Returns 0; on failure, 1 with the reason in `out`.
+/// NUL). `device` is a JSON object of what the app knows of the device, for
+/// `platform()`. Returns 0; on failure, 1 with the reason in `out`.
 ///
 /// # Safety
-/// `bundle`, `data` and `main` are NUL-terminated strings or null; `out`
-/// points to `len` writable bytes.
+/// `bundle`, `data`, `main` and `device` are NUL-terminated strings or null;
+/// `out` points to `len` writable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn quillo_start(bundle: *const c_char, data: *const c_char, main: *const c_char, out: *mut c_char, len: usize) -> i32 {
-    let (code, said) = match quillo::mobile::start(Path::new(&text(bundle)), Path::new(&text(data)), &text(main)) {
+pub unsafe extern "C" fn quillo_start(bundle: *const c_char, data: *const c_char, main: *const c_char, device: *const c_char, out: *mut c_char, len: usize) -> i32 {
+    let (code, said) = match quillo::mobile::start(Path::new(&text(bundle)), Path::new(&text(data)), &text(main), &text(device)) {
         Ok(s) => (0, s.url),
         Err(e) => (1, e),
     };
@@ -34,8 +35,8 @@ pub unsafe extern "C" fn quillo_start(bundle: *const c_char, data: *const c_char
     code
 }
 
-/// `org.quillolang.app.Quillo.start(bundle, data, main)`: the URL to open, or
-/// "error: ..." (Android).
+/// `org.quillolang.app.Quillo.start(bundle, data, main, device)`: the URL to open,
+/// or "error: ..." (Android).
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_org_quillolang_app_Quillo_start<'l>(
@@ -44,10 +45,11 @@ pub extern "system" fn Java_org_quillolang_app_Quillo_start<'l>(
     bundle: jni::objects::JString<'l>,
     data: jni::objects::JString<'l>,
     main: jni::objects::JString<'l>,
+    device: jni::objects::JString<'l>,
 ) -> jni::sys::jstring {
     let get = |env: &mut jni::JNIEnv<'l>, s: &jni::objects::JString<'l>| -> String { env.get_string(s).map(|s| s.into()).unwrap_or_default() };
-    let (b, d, m) = (get(&mut env, &bundle), get(&mut env, &data), get(&mut env, &main));
-    let said = match quillo::mobile::start(Path::new(&b), Path::new(&d), &m) {
+    let (b, d, m, dev) = (get(&mut env, &bundle), get(&mut env, &data), get(&mut env, &main), get(&mut env, &device));
+    let said = match quillo::mobile::start(Path::new(&b), Path::new(&d), &m, &dev) {
         Ok(s) => s.url,
         Err(e) => format!("error: {}", e),
     };

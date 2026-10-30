@@ -581,6 +581,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("escape", "any", "str"),
     ("url_encode", "any", "str"),
     ("env", "str, any=", "any"),
+    ("platform", "", "map"),
     ("now", "", "int"),
     ("sleep", "num", "null"),
     ("file", "str, map | null=", "response"),
@@ -866,7 +867,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload"];
+      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

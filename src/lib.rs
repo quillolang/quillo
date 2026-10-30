@@ -37,6 +37,7 @@ pub mod livecache;
 pub mod metrics;
 pub mod migrate;
 pub mod mobile;
+pub mod platform;
 pub mod money;
 #[cfg(feature = "mysql")]
 pub mod my;
