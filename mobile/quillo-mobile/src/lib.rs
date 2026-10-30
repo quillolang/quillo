@@ -41,7 +41,7 @@ pub unsafe extern "C" fn quillo_start(bundle: *const c_char, data: *const c_char
 #[no_mangle]
 pub extern "system" fn Java_org_quillolang_app_Quillo_start<'l>(
     mut env: jni::JNIEnv<'l>,
-    _class: jni::objects::JClass<'l>,
+    _this: jni::objects::JObject<'l>,
     bundle: jni::objects::JString<'l>,
     data: jni::objects::JString<'l>,
     main: jni::objects::JString<'l>,

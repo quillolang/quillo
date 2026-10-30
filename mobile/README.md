@@ -8,7 +8,8 @@ database in the app's container, and is written exactly as it is for a server.
 |---|---|
 | `quillo-mobile/` | the runtime as a library: `quillo_start(bundle, data, main, out, len)` for iOS (C), `Quillo.start` for Android (JNI) |
 | `ios/` | the iOS app: one screen, a WKWebView on the program; `build.sh` makes Quillo.app for the simulator |
-| `android/` | the Android app: the same, with a WebView (needs the Android SDK and NDK to build) |
+| `android/` | the Android app: the same, with a WebView; `build.sh` makes a debug APK (needs the Android SDK and NDK) |
+| `examples/about/` | a page showing what `platform()` says |
 | `../src/mobile.rs` | what `start` does: copies the bundled program into the app's container, keeps a session key there, and serves the program to the web view only |
 
 ## iOS, in the simulator
@@ -31,6 +32,22 @@ on 127.0.0.1 at a port the system picks and answers only the web view (a token i
 first URL, then a cookie); other apps get 403. When iOS suspends the app, the server is
 suspended with it, and answers again when the app comes back.
 
+## Android
+
+```sh
+mobile/android/build.sh app --run      # a debug APK around app/, installed with adb
+```
+
+The same design: `MainActivity` unpacks the program from the APK's assets into the app's
+files (assets are not files), gathers the device's facts (`Build`, the display, memory,
+locale), starts the runtime through JNI (`Quillo.start`, `Java_org_quillolang_app_Quillo_start`
+in quillo-mobile) and shows a WebView on the URL it gives; links to other sites open in the
+browser, and the back button goes back in the program's pages first. 127.0.0.1 is the only
+place cleartext HTTP is allowed (res/xml/network_security_config.xml). It needs the Android
+SDK and NDK, Gradle, `cargo-ndk` and the Rust targets `aarch64-linux-android` and
+`x86_64-linux-android`. Status: written, the JNI layer type-checked for
+`aarch64-linux-android`; the Kotlin and Gradle side has not been built yet.
+
 ## What a phone build leaves out
 
 - Compiled numbers: iOS forbids writable code, so there is no JIT (built without the `jit`
@@ -44,7 +61,7 @@ suspended with it, and answers again when the app comes back.
 ## Not done yet
 
 - A device build (signing, an Xcode project or `xcodebuild` archive) and the App Store.
-- Android: `android/` is written but not built here (no SDK on this machine).
+- Android: built and run on an emulator (`android/` is written, not yet built: no SDK on the branch's machine).
 - Linking `.qwer` plugins into the app.
 
 ## Where the program runs: `platform()`
