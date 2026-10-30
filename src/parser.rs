@@ -113,7 +113,7 @@ fn starts_line(text: &[char], pos: usize) -> bool {
 /// A line that starts a new declaration at its first column (`route GET
 /// /x`, `fn f(`, `view Page`...): markup left open runs into it. Written to
 /// its shape, as markup may start a line with a plain word.
-fn starts_declaration(line: &[char]) -> bool {
+pub(crate) fn starts_declaration(line: &[char]) -> bool {
     if line.first().map_or(true, |c| c.is_whitespace()) {
         return false;
     }

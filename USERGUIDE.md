@@ -134,7 +134,10 @@ carries classes for its own sake. Neither is told when the program has no sheets
 own or links one from another site. On a `use` line, the path goes to its file and
 completes to the program's files, and the names taken from a `.qwer` file go to their
 Rust functions, show their signatures (under the name after `as`) and complete to the
-file's functions. It runs the `quillo` it finds (its `quillo.path`
+file's functions. Inside a call, as `(` and `,` are typed and with Ctrl+Space, it shows the
+parameters, the current one marked, and a line about the function: a builtin's own, a `.qwer`
+function's `///` comment, or the `//` comment above your function. Completion offers the
+variables in scope at the cursor first. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,

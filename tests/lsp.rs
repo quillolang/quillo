@@ -577,3 +577,144 @@ fn use_lines_are_hovered_followed_and_completed() {
     assert_eq!(labels(&mut c, &mut notes, "use  from plugins/img.qwer\n", 4, 4), ["brightness", "shout"]);
     assert_eq!(labels(&mut c, &mut notes, "use shout,  from plugins/img\n", 5, 11), ["brightness"]);
 }
+
+/// Inside a call the server gives the signature, the argument reached and a
+/// line about it; outside one, nothing. `¦` is the cursor (branch
+/// signature-help).
+#[test]
+fn a_call_shows_its_parameters_and_says_what_it_does() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-signature-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let defs = "// Says hello\n// to someone.\nfn greet(who: str, loud: bool = false) = who\n\nprivate fn twice(n: int) = n * 2\n\n";
+    std::fs::write(dir.join("main.qwe"), defs).unwrap();
+    let uri = format!("file://{}/main.qwe", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": defs } }));
+    let mut version = 1;
+    let mut help = |sample: &str| -> Value {
+        let text = format!("{}{}", defs, sample);
+        let at = text.find('¦').unwrap();
+        let (line, column) = (text[..at].matches('\n').count(), text[..at].rsplit('\n').next().unwrap().encode_utf16().count());
+        version += 1;
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text.replace('¦', "") }] }));
+        c.request("textDocument/signatureHelp", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": column } }), &mut notes)
+    };
+    let sig = |h: &Value| h["signatures"][0]["label"].as_str().unwrap_or("").to_string();
+
+    let h = help("let a = contains(¦)\n");
+    assert!(sig(&h).starts_with("contains(x: str | list | map | null, y: any) -> bool"), "{}", h);
+    assert_eq!(h["activeParameter"], json!(0), "{}", h);
+    assert!(h["signatures"][0]["documentation"]["value"].as_str().unwrap().len() > 10, "{}", h);
+    let label = sig(&h);
+    let span = h["signatures"][0]["parameters"][1]["label"].as_array().unwrap();
+    assert_eq!(&label[span[0].as_u64().unwrap() as usize..span[1].as_u64().unwrap() as usize], "y: any");
+
+    assert_eq!(help("let a = contains(\"a,b\", ¦)\n")["activeParameter"], json!(1));
+    assert_eq!(help("let a = contains(\"a,¦b\", 1)\n")["activeParameter"], json!(0));
+    assert_eq!(help("let a = contains([1, 2¦], 1)\n")["activeParameter"], json!(0));
+    assert_eq!(help("let a = contains(\n    \"text\",\n    ¦\n)\n")["activeParameter"], json!(1));
+    // A pipe gives the first argument.
+    let h = help("let a = [1] | contains(¦)\n");
+    assert!(sig(&h).starts_with("contains("), "{}", h);
+    assert_eq!(h["activeParameter"], json!(1), "{}", h);
+    // The innermost call, wherever it is.
+    assert!(sig(&help("let a = contains(len(¦))\n")).starts_with("len("));
+    assert!(sig(&help("let a = `${len(¦)}`\n")).starts_with("len("));
+    assert!(sig(&help("let a = <p>don't {len(¦)}</p>\n")).starts_with("len("));
+    assert!(sig(&help("let a = db.exec(¦)\n")).starts_with("db.exec("));
+    assert!(sig(&help("let a = len(`te¦xt`)\n")).starts_with("len("));
+
+    let h = help("let a = greet(\"x\", ¦)\n");
+    assert!(sig(&h).starts_with("fn greet(who: str, loud: bool = …)"), "{}", h);
+    assert_eq!(h["activeParameter"], json!(1), "{}", h);
+    assert_eq!(h["signatures"][0]["documentation"]["value"], json!("Says hello to someone."), "{}", h);
+    assert!(sig(&help("let a = twice(¦)\n")).contains("twice(n: int)"));
+
+    // Not in a call.
+    for sample in [
+        "let a = 1¦\n",
+        "let a = len(\"x\")¦\n",
+        "fn other(¦) = 1\n",
+        "if (¦true) { }\n",
+        "let a = (¦1)\n",
+        "let a = map([1], (x) => {\n    ¦\n})\n",
+        "let a = <p>a (b¦</p>\n",
+        "let a = nothing_here(¦)\n",
+    ] {
+        assert_eq!(help(sample), Value::Null, "{}", sample);
+    }
+}
+
+/// Each builtin has its line, and a name for each of its parameters (branch
+/// signature-help).
+#[test]
+fn every_builtin_says_what_it_does() {
+    use quillo::builtin_docs::DOCS;
+    let sigs = quillo::check::builtin_signatures();
+    for (name, sig) in sigs.iter().filter(|(n, _)| !n.starts_with("__")) {
+        let d = DOCS.iter().find(|d| d.0 == name).unwrap_or_else(|| panic!("{} has no entry in builtin_docs.rs", name));
+        let inner = &sig[sig.find('(').unwrap() + 1..];
+        let (mut depth, mut types) = (0, if inner.starts_with(')') { 0 } else { 1 });
+        for ch in inner.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' => depth -= 1,
+                ',' if depth == 0 => types += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(d.1.split(", ").filter(|n| !n.is_empty()).count(), types, "the parameters of {}: {}", name, sig);
+        assert!(!d.2.is_empty() && d.2.len() <= 140, "the line for {}", name);
+    }
+    for d in DOCS {
+        assert!(sigs.iter().any(|(n, _)| n == d.0), "{} in builtin_docs.rs is no builtin", d.0);
+        assert_eq!(DOCS.iter().filter(|o| o.0 == d.0).count(), 1, "{} twice in builtin_docs.rs", d.0);
+    }
+}
+
+/// Completion offers what is in scope at the cursor, nearest first: not
+/// another function's locals, nor a `let` before its line, and a line just
+/// typed in a block still sees the block's names (branch signature-help).
+#[test]
+fn completion_offers_the_variables_in_scope() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let src = "fn other(far) {\n    let elsewhere = far\n    elsewhere\n}\n\nfn f(first, second) {\n    let early = first\n    if early {\n        let inner = second\n        inner\n    }\n    let late = early\n    for item in [late] {\n        item\n    }\n    late\n}\n\nroute GET /rooms/:room {\n    let found = room\n    found\n}\n";
+    std::fs::write(dir.join("main.qwe"), src).unwrap();
+    let uri = format!("file://{}/main.qwe", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": src } }));
+    let mut version = 1;
+    let mut names = |text: &str, line: u32| -> Vec<String> {
+        version += 1;
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }));
+        let items = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": 8 } }), &mut notes);
+        let mut local: Vec<(String, String)> = items.as_array().unwrap().iter().filter(|i| i["sortText"].is_string()).map(|i| (i["sortText"].as_str().unwrap().to_string(), i["label"].as_str().unwrap().to_string())).collect();
+        local.sort();
+        local.into_iter().map(|l| l.1).collect()
+    };
+    assert_eq!(names(src, 9), ["inner", "early", "first", "second"]);
+    assert_eq!(names(src, 13), ["item", "late", "early", "first", "second"]);
+    assert_eq!(names(src, 15), ["late", "early", "first", "second"]);
+    assert_eq!(names(src, 20), ["found", "request", "room"]);
+    assert_eq!(names(src, 2), ["elsewhere", "far"]);
+    assert!(names(src, 4).is_empty());
+
+    // A line typed at the end of a block, and one that does not parse yet.
+    let typed = src.replace("    late\n}", "    late\n    \n}");
+    assert_eq!(names(&typed, 16), ["late", "early", "first", "second"]);
+    let typed = src.replace("    late\n}", "    late\n    let x = \n}");
+    assert_eq!(names(&typed, 16), ["late", "early", "first", "second"]);
+    // Past the block's end, nothing of it.
+    let typed = src.replace("    late\n}\n", "    late\n}\n\n");
+    assert!(names(&typed, 18).is_empty());
+}
