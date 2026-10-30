@@ -8,9 +8,11 @@
   the device and its hardware model, simulator or not, the processor, how the program runs
   (a phone app, `quillo app`, a server), and in a phone app its screen, memory, locale and
   the app's version. Server-side, as `env` is.
-- **Phone apps, in progress** (branch `mobile`): a program inside an iOS app, served to the
-  app's web view by the runtime linked into it; built and run in the iOS simulator by
-  `mobile/ios/build.sh`. See mobile/README.md.
+- **Phone apps, in preview**: a program inside an iOS or Android app, served to the app's
+  web view by the runtime linked into it, with `window.quilloNative` for the phone's
+  location, haptics, battery, notifications, screen and share sheet; built and run in the
+  iOS simulator by `mobile/ios/build.sh` and on an Android emulator or phone by
+  `mobile/android/build.sh`. See mobile/README.md; HarmonyOS NEXT is planned there.
 
 ### Added
 

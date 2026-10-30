@@ -163,16 +163,17 @@ the browser and on the server.
 
 ### Phone apps (preview)
 
-A program runs inside an iOS app: the runtime is linked into it and serves the program
-on 127.0.0.1 to the app's own web view, as `quillo app` does on a desktop, so it works
+A program runs inside an iOS or Android app: the runtime is linked into it and serves the
+program on 127.0.0.1 to the app's own web view, as `quillo app` does on a desktop, so it works
 offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
---run` builds the app around a program folder for the iOS simulator and opens it there;
+--run` builds the app around a program folder for the iOS simulator and opens it there, and
+`mobile/android/build.sh app --run` a debug APK for an Android emulator or phone;
 `mobile/README.md` says how, and what a phone build leaves out (compiled numbers,
 WebTransport, `.qwer` plugins built at run time, anything that starts a process). The
 app puts `window.quilloNative` on the program's pages for what a web view cannot reach:
 `js("quilloNative.location")`, `.haptic`, `.battery`, `.notify`, `.keepAwake`,
-`.brightness`, `.share`, `.openSettings`, `.wait`. A signed device build and Android
-are not done yet. `platform()` (see [Standard library](#standard-library)) tells a program
+`.brightness`, `.share`, `.openSettings`, `.wait`. Signed builds for the stores are not done
+yet, and HarmonyOS NEXT is planned (`mobile/harmony/PLAN.md`). `platform()` (see [Standard library](#standard-library)) tells a program
 it is in a phone app, and on what. `mobile/examples/fieldbook` tries the phone's hardware
 from a program.
 
@@ -4603,7 +4604,8 @@ does not do it today; the way around it follows.
 - a formatter
 - splitting a page's bundle by route, and components loaded lazily
 - discovering services through limer's pool, and `--join` for copies behind NAT
-- phone apps on devices: a signed iOS build and the App Store, Android built and run,
+- phone apps in the stores: a signed iOS build and the App Store, a signed Android release
+  and the Play Store, HarmonyOS NEXT,
   `.qwer` plugins linked into the app, and work while the app is in the background
 
 ## Layout
