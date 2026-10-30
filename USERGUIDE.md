@@ -161,16 +161,20 @@ A whole application: [crm](https://github.com/quillolang/apps/tree/main/crm) in 
 and news outlets, with a shop, campaigns, a flow designer, and plugins whose rules run in
 the browser and on the server.
 
-### Phone apps (in progress)
+### Phone apps (preview)
 
-On branch `mobile`, a program runs inside an iOS app: the runtime is linked into it and
-serves the program on 127.0.0.1 to the app's own web view, as `quillo app` does on a
-desktop, so it works offline and keeps its SQLite database in the app's container.
-`mobile/ios/build.sh app --run` builds the app around a program folder for the iOS
-simulator and opens it there; `mobile/README.md` says how, and what a phone build leaves
-out (compiled numbers, WebTransport, `.qwer` plugins built at run time, anything that
-starts a process). A device build and Android are not done yet. `platform()` (see
-[Standard library](#standard-library)) tells a program it is in a phone app, and on what.
+A program runs inside an iOS app: the runtime is linked into it and serves the program
+on 127.0.0.1 to the app's own web view, as `quillo app` does on a desktop, so it works
+offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
+--run` builds the app around a program folder for the iOS simulator and opens it there;
+`mobile/README.md` says how, and what a phone build leaves out (compiled numbers,
+WebTransport, `.qwer` plugins built at run time, anything that starts a process). The
+app puts `window.quilloNative` on the program's pages for what a web view cannot reach:
+`js("quilloNative.location")`, `.haptic`, `.battery`, `.notify`, `.keepAwake`,
+`.brightness`, `.share`, `.openSettings`, `.wait`. A signed device build and Android
+are not done yet. `platform()` (see [Standard library](#standard-library)) tells a program
+it is in a phone app, and on what. `mobile/examples/fieldbook` tries the phone's hardware
+from a program.
 
 ## Language tour
 
@@ -4599,6 +4603,8 @@ does not do it today; the way around it follows.
 - a formatter
 - splitting a page's bundle by route, and components loaded lazily
 - discovering services through limer's pool, and `--join` for copies behind NAT
+- phone apps on devices: a signed iOS build and the App Store, Android built and run,
+  `.qwer` plugins linked into the app, and work while the app is in the background
 
 ## Layout
 
@@ -4672,6 +4678,8 @@ src/alloc.rs       the memory allocator: mimalloc on event loops and waiting thr
                    the system's elsewhere
 src/stack.rs       room on the stack for deep recursion
 src/desktop.rs     quillo app: the program in a native window (the app feature)
+src/mobile.rs      a program inside a phone app: copied into the app, served to its web view
+src/platform.rs    platform(): where the program runs
 
 The browser and editors
 src/client.rs      compiles components to JavaScript

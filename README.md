@@ -172,7 +172,8 @@ component Gauge() {
 Links prefetched as you point at them (and never doing anything by it), sessions,
 uploads, images, translations, streaming, scheduled jobs, metrics, a JavaScript bridge
 for browser libraries, multi-tenant hosting, graceful reloads that let requests in
-progress finish, and desktop apps in a native window (`quillo app`).
+progress finish, desktop apps in a native window (`quillo app`), and, in preview, the
+same program inside an iOS app, served on the phone to the app's own web view (`mobile/`).
 
 ## Performance
 
