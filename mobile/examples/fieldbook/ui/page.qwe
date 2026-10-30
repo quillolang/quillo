@@ -9,6 +9,7 @@ view Page(title: str, here: str, children) =
             <link rel="stylesheet" href="/static/style.css"/>
         </head>
         <body>
+            <p.brand>Quillo Test App</p>
             <main>{children}</main>
             <nav.tabs>
                 <a href="/" class={here == "/" && "on"}>Notes</a>

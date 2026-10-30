@@ -134,7 +134,10 @@ carries classes for its own sake. Neither is told when the program has no sheets
 own or links one from another site. On a `use` line, the path goes to its file and
 completes to the program's files, and the names taken from a `.qwer` file go to their
 Rust functions, show their signatures (under the name after `as`) and complete to the
-file's functions. It runs the `quillo` it finds (its `quillo.path`
+file's functions. Inside a call, as `(` and `,` are typed and with Ctrl+Space, it shows the
+parameters, the current one marked, and a line about the function: a builtin's own, a `.qwer`
+function's `///` comment, or the `//` comment above your function. Completion offers the
+variables in scope at the cursor first. It runs the `quillo` it finds (its `quillo.path`
 setting, the workspace's `target/release`, then the `PATH`), so stale errors on code the
 build accepts come from an old binary: `quillo --version` names the commit, and
 `scripts/doctor.sh` points out an old one. Other editors can run `quillo lsp` (hover,
@@ -175,8 +178,8 @@ make builds for the stores;
 WebTransport, `.qwer` plugins built at run time, anything that starts a process). The
 app puts `window.quilloNative` on the program's pages for what a web view cannot reach:
 `js("quilloNative.location")`, `.haptic`, `.battery`, `.notify`, `.keepAwake`,
-`.brightness`, `.share`, `.openSettings`, `.wait`. Signed builds for the stores are not done
-yet, and HarmonyOS NEXT is planned (`mobile/harmony/PLAN.md`). `platform()` (see [Standard library](#standard-library)) tells a program
+`.brightness`, `.share`, `.openSettings`, `.wait`. It has run on a real iPhone. Uploads to the stores are not
+done yet, and HarmonyOS NEXT is planned (`mobile/harmony/PLAN.md`). `platform()` (see [Standard library](#standard-library)) tells a program
 it is in a phone app, and on what. `mobile/examples/fieldbook` tries the phone's hardware
 from a program.
 
@@ -4669,8 +4672,7 @@ does not do it today; the way around it follows.
 - a formatter
 - splitting a page's bundle by route, and components loaded lazily
 - discovering services through limer's pool, and `--join` for copies behind NAT
-- phone apps in the stores: a signed iOS build and the App Store, a signed Android release
-  and the Play Store, HarmonyOS NEXT,
+- phone apps in the stores: uploads to the App Store and Google Play, HarmonyOS NEXT,
   `.qwer` plugins linked into the app, and work while the app is in the background
 
 ## Layout

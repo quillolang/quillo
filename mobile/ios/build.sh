@@ -150,7 +150,8 @@ fi
 [ -z "$run" ] && exit 0
 if [ -n "$device" ]; then
     [ -n "$signed" ] || { echo "a phone runs only a signed app: set QUILLO_IOS_IDENTITY and QUILLO_IOS_PROFILE" >&2; exit 1; }
-    phone=$(xcrun devicectl list devices 2>/dev/null | awk '/connected/ && /iPhone|iPad/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F-]{36}$/) { print $i; exit } }')
+    # A real device's id: 8 and 16 hex digits, or 40; a simulator's has dashes throughout.
+    phone=${QUILLO_IOS_DEVICE:-$(xcrun devicectl list devices 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}$/ || $i ~ /^[0-9a-f]{40}$/) { print $i; exit } }')}
     [ -n "$phone" ] || { echo "no iPhone connected (xcrun devicectl list devices)" >&2; exit 1; }
     echo "== on the phone $phone"
     xcrun devicectl device install app --device "$phone" "$out"

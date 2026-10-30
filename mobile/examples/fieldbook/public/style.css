@@ -3,6 +3,7 @@
 body { margin: 0; font: 16px/1.45 -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--ink); padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
 main { padding: 16px; }
 h1 { font-size: 28px; margin: 4px 0 6px; }
+.brand { position: sticky; top: 0; z-index: 5; margin: 0; padding: 6px 0; text-align: center; color: var(--accent); font-weight: 600; font-size: 13px; background: var(--bg); border-bottom: 1px solid var(--line); }
 h2 { font-size: 18px; margin: 22px 0 8px; }
 a { color: var(--accent); }
 .muted, small { color: var(--muted); }

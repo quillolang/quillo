@@ -465,6 +465,7 @@ impl Server {
                             "definitionProvider": true,
                             "documentSymbolProvider": true,
                             "completionProvider": { "triggerCharacters": [".", "<", "@", "/"] },
+                            "signatureHelpProvider": { "triggerCharacters": ["(", ","], "retriggerCharacters": [")"] },
                             "codeActionProvider": { "codeActionKinds": ["quickfix"] },
                             "referencesProvider": true,
                             "renameProvider": { "prepareProvider": true },
@@ -523,6 +524,10 @@ impl Server {
                 }
                 "textDocument/completion" => {
                     let r = self.completion(params);
+                    self.reply(id.unwrap_or(J::Null), r);
+                }
+                "textDocument/signatureHelp" => {
+                    let r = self.signature_help(params);
                     self.reply(id.unwrap_or(J::Null), r);
                 }
                 "textDocument/codeAction" => {
@@ -618,6 +623,7 @@ impl Server {
                 analysis.symbols = old.analysis.symbols;
                 analysis.references = old.analysis.references;
                 analysis.classes = old.analysis.classes;
+                analysis.locals = old.analysis.locals;
                 analysis.files = old.analysis.files;
             }
         }
@@ -754,7 +760,11 @@ impl Server {
             return h;
         }
         if let Some((_, r)) = self.reference_at(params) {
-            return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail)) } });
+            let mut text = format!("```quillo\n{}\n```", private_detail(&r.name, &r.detail));
+            if let (None, Some(d)) = (&r.def, builtin_doc(&r.name)) {
+                text = format!("{}\n{}", text, d.2);
+            }
+            return json!({ "contents": { "kind": "markdown", "value": text } });
         }
         let (uri, line, col) = Self::position(params);
         if let Some((w, _)) = self.docs.get(&uri).and_then(|d| word_at(&d.text, line, col)) {
@@ -915,6 +925,71 @@ impl Server {
             .map(|f| json!({ "label": f, "kind": 17, "filterText": f, "textEdit": { "range": range, "newText": f } }))
             .collect();
         Some(json!(items))
+    }
+
+    /// What a name called here is: its signature, its parameters' names where
+    /// the signature has none, and a line about it: a builtin's from
+    /// `builtin_docs`, a function's from the comment above it (branch
+    /// signature-help).
+    fn callee(&self, doc: &Doc, uri: &str, name: &str) -> Option<(String, Vec<String>, String)> {
+        let file = uri_to_path(uri).display().to_string();
+        let mine = doc.analysis.symbols.iter().filter(|s| {
+            let private = crate::privacy::private_name(&s.name);
+            matches!(s.kind, SymbolKind::Function | SymbolKind::ServerFn | SymbolKind::View | SymbolKind::Component)
+                && (s.name == name || private == Some(name))
+                && (private.is_none() || s.file == file)
+        });
+        if let Some(s) = mine.min_by_key(|s| s.file != file) {
+            let text = self.text_of(&s.file);
+            let (sig, about) = s.detail.split_once("\n\n").unwrap_or((&s.detail, ""));
+            if !s.file.ends_with(".qwer") {
+                return Some((sig.to_string(), Vec::new(), comment_above(&text, s.line)));
+            }
+            let export = crate::native::parse(&text).exports.into_iter().find(|e| e.line == s.line);
+            let names = export.map(|e| e.params.into_iter().map(|(n, _)| n).collect()).unwrap_or_default();
+            return Some((sig.to_string(), names, about.to_string()));
+        }
+        let (_, sig) = check::builtin_signatures().into_iter().find(|(n, _)| n == name)?;
+        let d = builtin_doc(name);
+        let names = d.map_or(Vec::new(), |d| d.1.split(", ").filter(|n| !n.is_empty()).map(String::from).collect());
+        Some((sig, names, d.map_or(String::new(), |d| d.2.to_string())))
+    }
+
+    /// In a call: its signature with the argument the cursor is at, and a
+    /// line about it (branch signature-help).
+    fn signature_help(&self, params: &J) -> J {
+        let (uri, line, col) = Self::position(params);
+        if !uri.ends_with(".qwe") {
+            return J::Null;
+        }
+        let Some(doc) = self.docs.get(&uri) else { return J::Null };
+        let at = byte_offset(&doc.text, line, col);
+        let Some((name, arg)) = call_at(&doc.text[..at]) else { return J::Null };
+        let Some((sig, names, about)) = self.callee(doc, &uri, &name) else { return J::Null };
+        let Some((head, types, tail)) = split_signature(&sig) else { return J::Null };
+        let mut label = format!("{}(", head);
+        let mut parameters = Vec::new();
+        for (i, p) in types.iter().enumerate() {
+            if i > 0 {
+                label.push_str(", ");
+            }
+            let a = label.encode_utf16().count();
+            match (names.get(i), p.strip_prefix("...")) {
+                (Some(n), Some(t)) => label.push_str(&format!("...{}: {}", n, t)),
+                (Some(n), None) => label.push_str(&format!("{}: {}", n, p)),
+                _ => label.push_str(p),
+            }
+            parameters.push(json!({ "label": [a, label.encode_utf16().count()] }));
+        }
+        label.push(')');
+        label.push_str(tail);
+        // Every argument past a `...` parameter is that parameter's.
+        let active = if types.last().is_some_and(|p| p.starts_with("...")) { arg.min(types.len() - 1) } else { arg };
+        let mut one = json!({ "label": label, "parameters": parameters, "activeParameter": active });
+        if !about.is_empty() {
+            one["documentation"] = json!({ "kind": "markdown", "value": about });
+        }
+        json!({ "signatures": [one], "activeSignature": 0, "activeParameter": active })
     }
 
     fn definition(&self, params: &J) -> J {
@@ -1211,7 +1286,7 @@ impl Server {
             let module: String = prefix.chars().rev().take_while(|c| is_word(*c)).collect::<Vec<_>>().into_iter().rev().collect();
             for (name, sig) in check::builtin_signatures() {
                 if let Some(f) = name.strip_prefix(&format!("{}.", module)) {
-                    items.push(json!({ "label": f, "kind": 3, "detail": sig }));
+                    items.push(json!({ "label": f, "kind": 3, "detail": sig, "documentation": builtin_doc(&name).map(|d| d.2) }));
                 }
             }
             if !items.is_empty() {
@@ -1220,10 +1295,15 @@ impl Server {
         }
         let file = uri_to_path(&uri).display().to_string();
         let mut seen = std::collections::HashSet::new();
-        // Names used or defined near the cursor (locals, parameters, state).
-        for r in &doc.analysis.references {
-            if r.file == file && r.def.as_ref().map_or(false, |(f, _)| *f == file) && seen.insert(r.name.clone()) {
-                items.push(json!({ "label": r.name, "kind": 6, "detail": r.detail }));
+        // What is in scope here (parameters, `let`s, state), nearest first and
+        // above other names; a `let` hides an outer one of its name (branch
+        // signature-help).
+        let (_, depths) = read_open(&doc.text);
+        let mut here: Vec<&check::Local> = doc.analysis.locals.iter().filter(|l| l.file == file && in_scope(l, line, &depths)).collect();
+        here.sort_by(|a, b| b.line.cmp(&a.line).then_with(|| a.name.cmp(&b.name)));
+        for l in here {
+            if seen.insert(l.name.clone()) {
+                items.push(json!({ "label": l.name, "kind": 6, "detail": l.detail, "sortText": format!("0{:04}", items.len()) }));
             }
         }
         for s in &doc.analysis.symbols {
@@ -1242,7 +1322,7 @@ impl Server {
         }
         for (name, sig) in check::builtin_signatures() {
             if !name.contains('.') && seen.insert(name.clone()) {
-                items.push(json!({ "label": name, "kind": 3, "detail": sig }));
+                items.push(json!({ "label": name, "kind": 3, "detail": sig, "documentation": builtin_doc(&name).map(|d| d.2) }));
             }
         }
         for m in check::MODULES {
@@ -1447,6 +1527,194 @@ fn private_detail(name: &str, detail: &str) -> String {
         Some(_) if !detail.starts_with("param ") => format!("private {}", detail),
         _ => detail.to_string(),
     }
+}
+
+fn builtin_doc(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    crate::builtin_docs::DOCS.iter().find(|d| d.0 == name)
+}
+
+/// What is open at a point in a file.
+enum Open {
+    /// `name(` (no name for a group, or a definition's parameters), and the
+    /// argument reached.
+    Call(Option<String>, usize),
+    Bracket,
+    Brace,
+    Template,
+    Interpolation,
+}
+
+/// What is open at the end of the text, and how much is, at the start and
+/// the end of each line. Read forward, as a string is only known from its
+/// start; a declaration at the start of a line begins again, so text in
+/// markup that leaves a `(` open stays there (branch signature-help).
+fn read_open(text: &str) -> (Vec<Open>, Vec<(usize, usize)>) {
+    let c: Vec<char> = text.chars().collect();
+    let mut open: Vec<Open> = Vec::new();
+    let mut depths = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '\n' {
+            depths.push((start, open.len()));
+            let next = &c[i + 1..];
+            let end = next.iter().position(|x| *x == '\n').unwrap_or(next.len());
+            if !matches!(open.last(), Some(Open::Template)) && crate::parser::starts_declaration(&next[..end]) {
+                open.clear();
+            }
+            start = open.len();
+            i += 1;
+            continue;
+        }
+        if matches!(open.last(), Some(Open::Template)) {
+            match c[i] {
+                '\\' if c.get(i + 1) != Some(&'\n') => i += 1,
+                '`' => drop(open.pop()),
+                '$' if c.get(i + 1) == Some(&'{') => {
+                    open.push(Open::Interpolation);
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c[i] {
+            // An apostrophe in a word (`don't`, in markup) starts no string.
+            q @ ('"' | '\'') if q == '"' || i == 0 || !is_word(c[i - 1]) => {
+                i += 1;
+                while i < c.len() && c[i] != q && c[i] != '\n' {
+                    i += if c[i] == '\\' && c.get(i + 1) != Some(&'\n') { 2 } else { 1 };
+                }
+                if c.get(i) == Some(&'\n') {
+                    continue;
+                }
+            }
+            '/' if c.get(i + 1) == Some(&'/') => {
+                while i + 1 < c.len() && c[i + 1] != '\n' {
+                    i += 1;
+                }
+            }
+            '`' => open.push(Open::Template),
+            '[' => open.push(Open::Bracket),
+            '{' => open.push(Open::Brace),
+            '(' => {
+                let mut a = i;
+                while a > 0 && (is_word(c[a - 1]) || c[a - 1] == '.') {
+                    a -= 1;
+                }
+                let mut b = a;
+                while b > 0 && c[b - 1].is_whitespace() {
+                    b -= 1;
+                }
+                let piped = b > 0 && c[b - 1] == '|' && (b < 2 || c[b - 2] != '|');
+                let mut w = b;
+                while w > 0 && is_word(c[w - 1]) {
+                    w -= 1;
+                }
+                let before: String = c[w..b].iter().collect();
+                let name: String = c[a..i].iter().collect();
+                let call = !name.is_empty() && !KEYWORDS.contains(&name.as_str()) && !matches!(before.as_str(), "fn" | "view" | "component");
+                open.push(Open::Call(call.then_some(name), piped as usize));
+            }
+            ')' if matches!(open.last(), Some(Open::Call(..))) => drop(open.pop()),
+            ']' if matches!(open.last(), Some(Open::Bracket)) => drop(open.pop()),
+            '}' if matches!(open.last(), Some(Open::Brace | Open::Interpolation)) => drop(open.pop()),
+            ',' => {
+                if let Some(Open::Call(_, n)) = open.last_mut() {
+                    *n += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depths.push((start, open.len()));
+    (open, depths)
+}
+
+/// Whether a local can be used on `at` (a line, from 0): within its scope's
+/// code, or on a line typed after it while its block is still open, which
+/// the last check may not have seen.
+fn in_scope(l: &check::Local, at: usize, depths: &[(usize, usize)]) -> bool {
+    let (line, end) = (l.line.saturating_sub(1) as usize, l.end.saturating_sub(1) as usize);
+    if at < line || (at == line && l.statement) {
+        return false;
+    }
+    if at <= end {
+        return true;
+    }
+    let Some(&(start, stop)) = depths.get(line) else { return false };
+    let block = if l.statement {
+        start
+    } else if stop > start {
+        // `fn f(a) {`, `(x) => {`: the block it opens on its line.
+        start + 1
+    } else {
+        return false;
+    };
+    depths.get(end..at).is_some_and(|lines| lines.iter().all(|d| d.1 >= block))
+}
+
+/// The call the text ends inside: its name and the argument reached, from 0
+/// (`xs | map(f` is at the second: the pipe gave the first).
+fn call_at(text: &str) -> Option<(String, usize)> {
+    let (open, _) = read_open(text);
+    for o in open.iter().rev() {
+        match o {
+            Open::Call(Some(name), arg) => return Some((name.clone(), *arg)),
+            Open::Call(None, _) | Open::Bracket | Open::Template => {}
+            // A body or a map is its own place.
+            Open::Brace | Open::Interpolation => return None,
+        }
+    }
+    None
+}
+
+/// `head(a, b) tail` taken apart, at its first parentheses, its parameters
+/// split at the commas between them.
+fn split_signature(sig: &str) -> Option<(&str, Vec<String>, &str)> {
+    let start = sig.find('(')?;
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let (mut depth, mut quote) = (0, None);
+    for (i, ch) in sig[start + 1..].char_indices() {
+        match (quote, ch) {
+            (Some(q), _) if q == ch => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => quote = Some(ch),
+            (None, '(' | '[' | '{' | '<') => depth += 1,
+            (None, ')') if depth == 0 => {
+                if !part.trim().is_empty() {
+                    parts.push(part.trim().to_string());
+                }
+                return Some((&sig[..start], parts, &sig[start + 1 + i + 1..]));
+            }
+            (None, ')' | ']' | '}' | '>') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                parts.push(part.trim().to_string());
+                part.clear();
+                continue;
+            }
+            _ => {}
+        }
+        part.push(ch);
+    }
+    None
+}
+
+/// The `//` comment right above the definition on `line` (from 1), as one line.
+fn comment_above(text: &str, line: u32) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut above = Vec::new();
+    for l in lines[..(line as usize).saturating_sub(1).min(lines.len())].iter().rev() {
+        match l.trim().strip_prefix("//") {
+            Some(c) => above.push(c.trim_start_matches('/').trim()),
+            None => break,
+        }
+    }
+    above.reverse();
+    above.join(" ")
 }
 
 fn keyword_doc(w: &str) -> Option<String> {

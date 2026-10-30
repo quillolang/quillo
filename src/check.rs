@@ -1115,6 +1115,20 @@ pub struct Reference {
     pub detail: String,
 }
 
+/// A parameter, a `let`, a state or a bound name, and the lines it can be
+/// used on: from `line` to `end`, the last its scope has code on.
+#[derive(Debug, Clone)]
+pub struct Local {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub end: u32,
+    pub detail: String,
+    /// Written as a statement of its block (`let`, `state`), so it lasts as
+    /// long as that block; else its scope starts on `line`.
+    pub statement: bool,
+}
+
 #[derive(Default, Debug)]
 pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
@@ -1128,6 +1142,9 @@ pub struct Analysis {
     /// line): where an editor goes from `<span.chip>`, and what it offers
     /// after `<span.` (branch class-links).
     pub classes: Vec<(String, String, u32)>,
+    /// Names that live in a part of a file, for completion (branch
+    /// signature-help).
+    pub locals: Vec<Local>,
     /// The program's `.qwe` files, where an editor looks for the classes
     /// markup writes (branch class-tools).
     pub files: Vec<String>,
@@ -1289,6 +1306,24 @@ enum Kind {
     State,
     Fn,
     Bound,
+}
+
+fn var_detail(name: &str, v: &Var) -> String {
+    match &v.sig {
+        Some(s) => s.text(),
+        None => {
+            let kw = match v.kind {
+                Kind::State => "state ",
+                Kind::Param => "param ",
+                _ => "let ",
+            };
+            if MODULES.contains(&name) && v.kind == Kind::Global && &*v.file == "<builtin>" {
+                format!("module {}", name)
+            } else {
+                format!("{}{}: {}", kw, name, t_text(v.t))
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1887,6 +1922,12 @@ impl Checker {
         }
         if let Some(scope) = self.scopes.pop() {
             for (name, v) in scope {
+                if self.quiet == 0 {
+                    let detail = var_detail(&name, &v);
+                    let (file, line, end) = (v.file.to_string(), v.line, self.line.max(v.line));
+                    let statement = matches!(v.kind, Kind::Let | Kind::State);
+                    self.out.locals.push(Local { name: name.clone(), file, line, end, detail, statement });
+                }
                 if v.kind == Kind::Let && !v.used && !name.starts_with('_') && self.quiet == 0 {
                     self.diag_at(v.file.clone(), v.line, Severity::Warning, format!("unused variable `{}` (name it `_{}` if that is intended)", name, name));
                 }
@@ -1917,21 +1958,7 @@ impl Checker {
             return;
         }
         let def = if &*v.file == "<builtin>" { None } else { Some((v.file.to_string(), v.line)) };
-        let detail = match &v.sig {
-            Some(s) => s.text(),
-            None => {
-                let kw = match v.kind {
-                    Kind::State => "state ",
-                    Kind::Param => "param ",
-                    _ => "let ",
-                };
-                if MODULES.contains(&name) && v.kind == Kind::Global && def.is_none() {
-                    format!("module {}", name)
-                } else {
-                    format!("{}{}: {}", kw, name, t_text(v.t))
-                }
-            }
-        };
+        let detail = var_detail(name, v);
         if v.kind == Kind::State {
             let at = self.out.references.len();
             if let Some(e) = self.state_types.get_mut(&(v.file.clone(), v.line, name.to_string())) {

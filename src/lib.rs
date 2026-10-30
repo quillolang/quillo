@@ -3,6 +3,7 @@
 pub mod alloc;
 pub mod ast;
 pub mod builtins;
+pub mod builtin_docs;
 pub mod check;
 pub mod client;
 pub mod cluster;
