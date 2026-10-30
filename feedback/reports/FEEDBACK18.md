@@ -5,7 +5,7 @@
 | App | [mobile/examples/fieldbook/](../../mobile/examples/fieldbook): field notes on a phone. A note has a title, the place (from the app or from the web view), the compass heading, a photo with a thumbnail made on the phone, a voice memo, and the weather at that place from a web API. It also has a probe page that tries 35 things a phone can do and keeps the answers, a page of what `platform()` says, a job every minute, and a CSV export. 638 lines in 11 files. |
 | Quillo | 0.6.0 (fc8bfb9, 2026-10-30), branch `mobile` |
 | Model | Claude (Fable 5.1) |
-| Tested with | `quillo check`; the iOS app from `mobile/ios/build.sh` on the iOS 27 simulator (iPhone, `iPhone19,2`), driven by `--eval` scripts and `simctl` (location, privacy grants, screenshots), its database read with `sqlite3` from the app's container; the repros under `feedback/run.mjs` (headless Chrome) |
+| Tested with | `quillo check`; the iOS app from `mobile/ios/build.sh` on the iOS 27 simulator (iPhone, `iPhone19,2`), driven by `--eval` scripts and `simctl` (location, privacy grants, screenshots), its database read with `sqlite3` from the app's container; **a real iPhone 17 Pro Max on iOS 26.7.1**, signed with a free Apple ID and used by hand, its database copied off with `devicectl`; the Android app on the Android 15 emulator; the repros under `feedback/run.mjs` (headless Chrome) |
 
 What worked well: the program is an ordinary Quillo program, and nearly all of it ran on the
 phone unchanged. Uploads from a component (a photo and a voice memo, as files given to a
@@ -179,7 +179,83 @@ Repro: [Q-101-load-error-names-main-file/](../repros/Q-101-load-error-names-main
 
 **Suggestion:** name the component's own file, as run-time errors do since Q-016.
 
-## The phone's hardware, tried
+### Q-107. Reading a member a module does not have gives null, and `quillo check` says nothing
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | a 500 from a sample route, then a two-line program | 1 |
+
+`json.title` and `db.nothing` read as `null`, at run time and in the checker. It came up
+writing `route POST /notes { json: { title: str, body: str } } = create_note(json.title,
+json.body)`: an inline shape binds `title` and `body`, not `json`, so `json` is still the
+module, and the route failed later with "argument `t` of `create_note` must be str, got
+null". A call of a missing function is caught; reading one is not.
+
+```quillo
+print(json.title)   // null; check: ok
+print(db.nothing)   // null; check: ok
+```
+
+Repro: [Q-107-missing-module-member-is-null.qwe](../repros/Q-107-missing-module-member-is-null.qwe).
+
+**Suggestion:** a checker error, "`json` has no `title`", and for this route's case a hint
+that the shape binds its fields.
+
+### Q-106. Quillo does not build for Windows on ARM
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| limitation | building in a Windows 11 ARM64 virtual machine | 1 |
+
+`corosensei`, which `src/httpd.rs` and `src/stack.rs` use for coroutines, stops with
+"Unsupported target" on `aarch64-pc-windows-msvc`. CI builds Windows only for x64, so this
+never showed. The x64 build ran on Windows 11 ARM under emulation: `quillo.exe` starts, and
+`quillo app` opens its native window, serves the page (200 for the page and its script) and
+takes the page's title. In the screenshots taken inside the VM the page area stayed white.
+Whether that is the VM's display, emulation, WebView2 or the screenshot is not yet known, so
+the desktop window on Windows is not proven.
+
+**Suggestion:** Windows fibers behind the same interface where `corosensei` has no port, and
+an ARM64 Windows job in CI.
+
+## A real iPhone
+
+The simulator's results below stand, but a simulator has no sensors, mock cameras and no
+person to tap. So Fieldbook was then built for a device and run by hand on an iPhone 17 Pro
+Max (iOS 26.7.1), signed with a free Apple ID's Personal Team. Nothing in the program
+changed, and no Quillo core change was needed.
+
+The probe, run with a real tap: **37 checks, 26 work, 0 need a tap, 1 refused, 10 not there,
+0 errors.** Two notes were saved by hand. The first had the place from the app (±5.7 m), a
+compass heading and a 3-second voice memo. The second had a place, a 2.3 MB photo from the
+camera, a 26 KB thumbnail made on the phone by `image.convert`, and a memo. Both fetched
+their weather, and the minute job ran.
+
+| What | iOS simulator | Real iPhone |
+|---|---|---|
+| Location, the app | a position set by `simctl`, ±5 m | real, ±6 m |
+| Location, the web view | a second prompt that could not be answered | real, ±6 m, once allowed |
+| Compass heading | none | real |
+| Camera | "Mock video device 1" | "Front Ultra Wide Camera" and the phone's others |
+| Microphone | "Mock audio device 1" | "iPhone Microphone" |
+| Recording | audio/mp4 | audio/mp4, played back |
+| Orientation, motion permission | "requires a user gesture" | granted |
+| Motion events, 1.5 s | 0 | 88 |
+| Battery, the app | level not said, unknown | 80%, charging |
+| `navigator.wakeLock` | "Permission was denied" | held, then released |
+| Clipboard write | refused | written |
+| Clipboard read | refused | refused |
+| Notifications, the app | the prompt could not be answered | scheduled |
+
+Three things the simulator said were limits of the simulator, not of iOS: the wake lock,
+writing to the clipboard, and everything behind a tap. What is missing from WKWebView is the
+same on both: Vibration, Battery, Network Information, full screen, Bluetooth, NFC, USB,
+Serial and HID. `speechSynthesis` is there, with 0 voices listed on both.
+
+Three things are not yet tried on the phone by anyone: a notification seen arriving, the
+app left for hours, and force-quitting and reopening.
+
+## The phone's hardware, tried in the simulator
 
 Each row is what the probe page found, in the app's web view (WKWebView) on the iOS 27
 simulator, with location, camera, microphone, photos and motion granted by `simctl privacy`.
@@ -241,6 +317,9 @@ What `platform()` said on the phone: os `ios`, os_name `iOS`, os_version `27.0`,
 | A three-column table of probe results | as on a desktop | on a phone the detail column was one letter wide; rows became a grid | 1 screenshot |
 | Saving the probe's rows after the last step | the end of the run | the last step (notifications) waits for a tap that never came, so nothing was saved; rows are now kept first | 2 runs |
 | Effects, a `server fn` in markup, `state_events` | my slips | each caught by `quillo check` | 3 checks |
+| `json.title` after an inline `{ json: { ... } }` shape | as with `{ json: Order }`, which binds `json` | null at run time, nothing from the checker (Q-107) | 1 run |
+| A simulator's `wakeLock` and clipboard refusals, written up as iOS's | they were what the probe found | a real phone does both; the guide and this report said otherwise until corrected | 1 phone |
+| Running `./gradlew` by hand after build.sh | quicker | no app.toml read, so the APK took the default id and I tested the old install | 3 runs |
 
 ## Limitations
 
@@ -257,6 +336,8 @@ What `platform()` said on the phone: os `ios`, os_name `iOS`, os_version `27.0`,
   "Allow"; the prompt stays over the app until the simulator is rebooted.
 - **The web view's geolocation asks again**, under the name "127.0.0.1", though the app holds
   the location permission. Programs in the app should use `quilloNative.location`.
+- **A free Apple ID's signing lasts 7 days**, and a device build needs a small Xcode project
+  once, to make the certificate and profile (mobile/README.md).
 - **Web APIs WebKit does not have** (Bluetooth, NFC, USB, Serial, HID, Vibration, Battery,
   Network Information) need native calls in the app's bridge to be reached at all.
 - **No work in the background.** iOS suspends the app, and the program's server with it, soon
