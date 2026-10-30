@@ -37,7 +37,7 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
         checks.insert(name, detail);
     };
     // The database, when the program opened one.
-    if it.db.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+    if it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
         let ok = crate::parser::Parser::new("db.query(\"select 1\")")
             .parse_expr()
             .ok()
@@ -62,7 +62,7 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
             put(format!("service {}", name), ok, J::Object(detail));
             continue;
         }
-        let local = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(&name).map(|(_, s)| s.fork());
+        let local = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&name).map(|(_, s)| s.fork());
         let joined = crate::service::joined_urls(&name);
         match local {
             Some(mut svc) if depth < DEPTH => {
@@ -98,14 +98,14 @@ pub fn service(it: &mut Interp, name: &str, url: &str) -> (bool, J) {
 fn remote_ready(url: &str) -> bool {
     static SEEN: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    if let Some((at, ok)) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(url) {
+    if let Some((at, ok)) = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(url) {
         if at.elapsed() < KEPT {
             return *ok;
         }
     }
     let agent = ureq::AgentBuilder::new().timeout(WAIT).redirects(0).build();
     let ok = matches!(agent.get(&format!("{}/_quillo/ready", url)).call(), Ok(r) if r.status() == 200);
-    seen.lock().unwrap_or_else(|e| e.into_inner()).insert(url.to_string(), (Instant::now(), ok));
+    seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(url.to_string(), (Instant::now(), ok));
     ok
 }
 

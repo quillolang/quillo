@@ -290,14 +290,14 @@ fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str) -> Result<Arc<Vec<
         h.finish()
     };
     if let Some(abs) = &abs {
-        let kept = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = PARSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((_, _, stmts)) = kept.iter().find(|(p, h, _)| p == abs && *h == hash) {
             return Ok(stmts.clone());
         }
     }
     let stmts = Arc::new(Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?);
     if let Some(abs) = abs {
-        let mut kept = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = PARSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         kept.retain(|(p, _, _)| *p != abs);
         kept.push((abs, hash, stmts.clone()));
     }
@@ -1077,7 +1077,7 @@ impl Interp {
     pub fn view_cache_stats(&self) -> (u64, u64) {
         match &self.view_cache {
             Some(c) => {
-                let c = c.lock().unwrap_or_else(|e| e.into_inner());
+                let c = c.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 (c.hits, c.misses)
             }
             None => (0, 0),
@@ -1182,7 +1182,7 @@ impl Interp {
         }
         let in_tx = self.tx_depth > 0
             || self.sqlite_tx > 0
-            || !self.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+            || !self.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
         if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() {
             let mut out = Vec::with_capacity(fs.len());
             for f in &fs {
@@ -1398,29 +1398,29 @@ impl Interp {
         sorted.dedup();
         let key = sorted.join(",");
         let runtime = {
-            let mut b = self.bundles.lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(hash) = b.hash_for_roots(&key) {
                 return Some(hash);
             }
             b.runtime.clone()
         };
         let made = crate::client::bundle_for(self, &sorted, runtime.as_deref()).ok()?;
-        Some(self.bundles.lock().unwrap_or_else(|e| e.into_inner()).keep(key, made))
+        Some(self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(key, made))
     }
 
     pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {
-        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).by_hash(hash)
+        self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_hash(hash)
     }
 
     /// The sheet of the styles a page shows (FEEDBACK8.md, Q-068; branch
     /// feedback8-fixes): its hash, or none when none of them has a style.
     pub fn sheet_for_page(&self, ids: &[String]) -> Option<String> {
-        self.styles.lock().unwrap_or_else(|e| e.into_inner()).sheet_for(ids)
+        self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sheet_for(ids)
     }
 
     /// A page's sheet by its hash, or, for one no longer kept, every style.
     pub fn sheet_by_hash(&self, hash: &str) -> (Arc<String>, bool) {
-        let s = self.styles.lock().unwrap_or_else(|e| e.into_inner());
+        let s = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match s.by_hash(hash) {
             Some(css) => (css, true),
             None => (Arc::new(s.all()), false),
@@ -1430,7 +1430,7 @@ impl Interp {
     /// The runtime file pages' bundles share, when there is one: its hash
     /// and its code.
     pub fn runtime_file(&self) -> Option<(String, Arc<String>)> {
-        self.bundles.lock().unwrap_or_else(|e| e.into_inner()).runtime.as_ref().map(|r| (r.hash.clone(), r.js.clone()))
+        self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).runtime.as_ref().map(|r| (r.hash.clone(), r.js.clone()))
     }
 
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
@@ -1494,7 +1494,7 @@ impl Interp {
                 let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
                 // Which fields of a global map changed, for what follows
                 // one field (FEEDBACK12.md, Q-084; branch open-fixes).
-                let followed = self.shared.field_reads.lock().unwrap_or_else(|e| e.into_inner()).contains(name.as_str());
+                let followed = self.shared.field_reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name.as_str());
                 let fields = match lookup_global(env, name) {
                     Some((old, true)) if followed => changed_fields(&old, &v),
                     _ => Vec::new(),
@@ -1513,7 +1513,7 @@ impl Interp {
                             // they called, so a new one starts afresh.
                             if function {
                                 if let Some(c) = &self.view_cache {
-                                    c.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                    c.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
                                 }
                             }
                         }
@@ -1748,7 +1748,7 @@ impl Interp {
                         if let Some((Value::Map(m), true)) = lookup_global(env, var) {
                             if m.contains_key(name.as_str()) && !is_module_map(&m) {
                                 {
-                                    let mut f = self.shared.field_reads.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut f = self.shared.field_reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if !f.contains(var.as_str()) {
                                         f.insert(var.to_string());
                                     }
@@ -2578,7 +2578,7 @@ impl Interp {
     ) -> Result<(), Ctrl> {
         use crate::viewcache::Found;
         let locale = if self.site.i18n.is_some() { self.locale() } else { None };
-        let found = cache.lock().unwrap_or_else(|e| e.into_inner()).lookup(&c.def, &args, &self.shared, locale.as_ref());
+        let found = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lookup(&c.def, &args, &self.shared, locale.as_ref());
         match found {
             Found::Hit(entry) => {
                 out.push_str(&entry.html);
@@ -2608,7 +2608,7 @@ impl Interp {
                 if !track.impure {
                     self.shared.track(&track.deps);
                 }
-                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if track.impure {
                     cache.forbid(&c.def);
                 } else {

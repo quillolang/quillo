@@ -273,7 +273,7 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
                     continue;
                 }
                 *prev = due;
-                if !running.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone()) {
+                if !running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.clone()) {
                     if said.insert(name.clone()) {
                         eprintln!("quillo: job {} is still running; skipped until it ends", name);
                     }
@@ -285,7 +285,7 @@ pub fn start(addr: std::net::SocketAddr, jobs: impl Fn() -> Vec<(String, When)> 
                     if let Err(e) = ask(addr, "job", &name, due) {
                         eprintln!("quillo: job {} could not start: {}", name, e);
                     }
-                    running.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
+                    running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&name);
                 });
             }
             // Wake just after the next second starts.

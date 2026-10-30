@@ -108,7 +108,7 @@ fn dbg() -> &'static Debugger {
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    dbg().state.lock().unwrap_or_else(|e| e.into_inner())
+    dbg().state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn rearm(st: &State) {
@@ -426,7 +426,7 @@ fn stop(it: &mut Interp, reason: &str, error: Option<String>, hit: Vec<u64>) {
     }
     event("stopped", body);
     let mut here = Stopped { nodes: Vec::new(), error };
-    let rx = dbg().cmds.lock().unwrap_or_else(|e| e.into_inner());
+    let rx = dbg().cmds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Ask(command, args, reply) => {
@@ -824,7 +824,7 @@ fn place(lines: &[u32], items: &[u32], line: u32) -> Option<u32> {
 fn send(msg: Json) {
     let Some(d) = D.get() else { return };
     let text = msg.to_string();
-    let mut out = d.out.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = d.out.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = write!(out, "Content-Length: {}\r\n\r\n{}", text.len(), text);
     let _ = out.flush();
 }
@@ -888,7 +888,7 @@ fn ask(command: &str, args: &Json) -> Result<Json, String> {
         return Err("the program is running".into());
     }
     let (tx, rx) = channel();
-    let _ = dbg().send_cmd.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::Ask(command.into(), args.clone(), tx));
+    let _ = dbg().send_cmd.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(Cmd::Ask(command.into(), args.clone(), tx));
     rx.recv().unwrap_or_else(|_| Err("the program ended".into()))
 }
 
@@ -899,7 +899,7 @@ fn resume(step: Step) {
     rearm(&st);
     drop(st);
     if was {
-        let _ = dbg().send_cmd.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::Resume);
+        let _ = dbg().send_cmd.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(Cmd::Resume);
     }
 }
 

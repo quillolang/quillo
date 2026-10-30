@@ -215,16 +215,16 @@ fn in_turn<T>(f: impl FnOnce() -> T) -> T {
     use std::sync::{Condvar, Mutex};
     static RUNNING: Mutex<usize> = Mutex::new(0);
     static FREED: Condvar = Condvar::new();
-    let mut n = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = RUNNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     while *n >= cores() {
-        n = FREED.wait(n).unwrap_or_else(|e| e.into_inner());
+        n = FREED.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     *n += 1;
     drop(n);
     struct Done;
     impl Drop for Done {
         fn drop(&mut self) {
-            *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            *RUNNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
             FREED.notify_one();
         }
     }

@@ -110,7 +110,7 @@ impl Pool {
 
     /// An idle connection or a new one, or None when all `max` are taken.
     pub fn try_checkout(&self) -> Result<Option<Conn>, String> {
-        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = g.0.pop() {
             return Ok(Some(c));
         }
@@ -120,7 +120,7 @@ impl Pool {
         g.1 += 1;
         drop(g);
         self.connect().map(Some).inspect_err(|_| {
-            self.idle.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+            self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1 -= 1;
             self.freed.notify_one();
         })
     }
@@ -139,7 +139,7 @@ impl Pool {
             }
             // In slices: one given back between the try and the wait is not
             // missed for long.
-            let g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = self.freed.wait_timeout(g, std::time::Duration::from_millis(50));
         }
     }
@@ -182,7 +182,7 @@ impl Pool {
         if c.aside {
             return;
         }
-        let mut g = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if c.client.is_closed() {
             g.1 -= 1;
         } else {
@@ -694,7 +694,7 @@ impl Lanes {
         let order = (0..usual).map(|k| (first + k) % usual).chain(usual..self.slots.len());
         let mut pick = first;
         for i in order {
-            let l = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let l = self.slots[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             match l {
                 Some(l) if l.client.is_closed() => {
                     pick = i;
@@ -708,7 +708,7 @@ impl Lanes {
                 }
             }
         }
-        if let Some(l) = self.slots[pick].lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(l) = self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
             if !l.client.is_closed() {
                 return Ok(l);
             }
@@ -718,16 +718,16 @@ impl Lanes {
             let _ = conn.await;
         });
         let l = Arc::new(Lane { client, stmts: Mutex::new(HashMap::new()), waiting: AtomicUsize::new(0), moved: AtomicU64::new(0) });
-        *self.slots[pick].lock().unwrap_or_else(|e| e.into_inner()) = Some(l.clone());
+        *self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.clone());
         Ok(l)
     }
 
     async fn prepare(lane: &Lane, sql: &str) -> Result<tokio_postgres::Statement, String> {
-        if let Some(s) = lane.stmts.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+        if let Some(s) = lane.stmts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sql) {
             return Ok(s.clone());
         }
         let s = lane.client.prepare(sql).await.map_err(|e| describe(&e))?;
-        let mut g = lane.stmts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lane.stmts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if g.len() >= 256 {
             g.clear();
         }
@@ -903,7 +903,7 @@ fn translate(sql: &str, params: &[Value]) -> Result<(String, Vec<Value>), String
 /// own. Depends on the SQL alone, so it is worked out once per statement.
 fn positional(sql: &str) -> String {
     static SEEN: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-    if let Some(done) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(sql)) {
+    if let Some(done) = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(sql)) {
         return done.clone();
     }
     let out = if has_numbered(sql) {
@@ -920,7 +920,7 @@ fn positional(sql: &str) -> String {
             *i += 1;
         })
     };
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let m = g.get_or_insert_with(HashMap::new);
     // Statements are usually written in the program, so few; if they are
     // built from values instead, the cache starts over now and then.

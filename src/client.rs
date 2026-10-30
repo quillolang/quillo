@@ -496,7 +496,7 @@ mod dev {
 
     /// A file of a development bundle (`/_quillo/src/<hash>/<path>`).
     pub fn file(hash: &str, path: &str) -> Option<String> {
-        FILES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(hash)?.get(path).cloned()
+        FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.get(hash)?.get(path).cloned()
     }
 
     /// A file being made: its path and code (with line marks), and where
@@ -613,7 +613,7 @@ mod dev {
             format!("{:016x}", h.finish())
         };
         {
-            let mut all = FILES.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let all = all.get_or_insert_with(HashMap::new);
             // Bundles from long-gone versions of the program.
             if all.len() > 256 {

@@ -202,7 +202,7 @@ pub fn announced(shared: &Shared, key: &str, body: &[u8]) -> u16 {
         return 403;
     }
     {
-        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if seen.contains_key(sig) {
             return 403;
         }

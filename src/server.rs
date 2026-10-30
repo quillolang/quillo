@@ -375,7 +375,7 @@ impl Interp {
                         s
                     }
                     None => {
-                        bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
+                        bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                         hints = crate::client::all_hints(self);
                         let mut s = crate::client::all_libs(self);
                         s.push(format!("{}/_quillo/quillo.js", self.base));
@@ -384,7 +384,7 @@ impl Interp {
                 };
                 tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));
             } else {
-                bundle_styles = self.styles.lock().unwrap_or_else(|e| e.into_inner()).ids();
+                bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
             resp.body.splice(at..at, tags.into_bytes());
@@ -550,7 +550,7 @@ impl Interp {
         // A job of a service this process runs, `<service>~<name>`, runs in the
         // service (FEEDBACK12.md, Q-083; branch feedback12-fixes).
         if let Some((service, job)) = name.split_once('~') {
-            let found = self.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(service).map(|(_, s)| s.fork());
+            let found = self.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(service).map(|(_, s)| s.fork());
             return match found {
                 Some(mut sub) => sub.run_job(job, req, qs),
                 None => plain(404, "no such service\n"),
@@ -582,7 +582,7 @@ impl Interp {
             return plain(404, "not found\n");
         }
         if let Some((service, tick)) = name.split_once('~') {
-            let found = self.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(service).map(|(_, s)| s.fork());
+            let found = self.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(service).map(|(_, s)| s.fork());
             return match found {
                 Some(mut sub) => sub.run_tick(tick, req),
                 None => plain(404, "no such service\n"),
@@ -890,7 +890,7 @@ impl Interp {
             crate::livecache::hash(&text)
         };
         let found = key.as_ref().and_then(|k| {
-            let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.shared(k, viewer, |t, seq| self.shared.unchanged_since(t, seq))
         });
         let (answer, topics, seq) = match found {
@@ -931,7 +931,7 @@ impl Interp {
                 // Not shared: a run that wrote, or set a cookie.
                 if let Some(k) = key {
                     if self.set_cookies.len() == cookies && self.shared.live_seq() == seq {
-                        let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         cache.share(k, self.read_request.then_some(viewer), seq, topics.clone(), answer.clone());
                     }
                 }
@@ -940,7 +940,7 @@ impl Interp {
         };
         let mut patch = None;
         if !answer.err {
-            let mut cache = self.shared.live_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.keep(answer.h, answer.value.clone(), answer.text.len());
             patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value)).map(|p| p.to_string()).filter(|p| p.len() < answer.text.len());
         }
@@ -1002,7 +1002,7 @@ impl Waiter {
     fn take(ip: &str) -> Option<Waiter> {
         use std::sync::atomic::Ordering::SeqCst;
         let who = crate::statics::client_of(ip);
-        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let m = g.get_or_insert_with(Default::default);
         let mine = m.get(&who).copied().unwrap_or(0);
         if mine >= MAX_WAITERS_PER_CLIENT {
@@ -1020,7 +1020,7 @@ impl Waiter {
 impl Drop for Waiter {
     fn drop(&mut self) {
         WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(n) = g.as_mut().and_then(|m| m.get_mut(&self.0)) {
             *n -= 1;
             if *n == 0 {
@@ -1410,24 +1410,24 @@ impl App {
     /// The pages swap these stylesheets, as they are.
     fn css_changed(&self, paths: Vec<String>) {
         eprintln!("quillo: {} changed: swapped in open pages", paths.join(", "));
-        let mut c = self.css.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.css.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *c = (c.0 + 1, paths);
         drop(c);
         // Wakes the pages' connections (they wait on `changed`).
-        let _g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.changed.notify_all();
     }
 
     /// The pages refresh, the program as it is: a file it served changed.
     fn refresh_pages(&self, paths: Vec<String>) {
         eprintln!("quillo: {} changed: refreshing open pages", paths.join(", "));
-        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = (slot.0 + 1, slot.1.clone());
         self.changed.notify_all();
     }
 
     fn css_seq(&self) -> (u64, Vec<String>) {
-        self.css.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.css.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// What the program's interpreters share.
@@ -1440,7 +1440,7 @@ impl App {
     }
 
     fn current(&self) -> (u64, Arc<Loaded>) {
-        let g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (g.0, g.1.clone())
     }
 
@@ -1467,13 +1467,13 @@ impl App {
             Err(crate::error::QuilloError::new(problems, 0))
         };
         self.shared.gil.release();
-        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match res {
             Ok(_) => {
                 eprintln!("quillo: reloaded {} ({} routes)", self.main_file.display(), it.routes.len());
                 // A version that is the first to use services or `db.atomic`
                 // needs what delivers and recovers in the background.
-                let addr = *self.addr.lock().unwrap_or_else(|e| e.into_inner());
+                let addr = *self.addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(addr) = addr {
                     start_background(&it, addr);
                 }
@@ -1502,11 +1502,11 @@ impl App {
     /// stylesheet changed after `css_seen`:
     /// the version, and the stylesheets' paths when they changed.
     fn wait_for_change_or_css(&self, seen: u64, css_seen: u64, timeout: Duration) -> (u64, Option<(u64, Vec<String>)>) {
-        let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (slot, _) = self
             .changed
             .wait_timeout_while(slot, timeout, |s| s.0 == seen && self.css.lock().map_or(true, |c| c.0 == css_seen))
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let v = slot.0;
         drop(slot);
         let css = self.css_seq();
@@ -2128,7 +2128,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.len();
         eprintln!("quillo: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, shown);
-        if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             eprintln!("quillo: database {}", db);
         }
     }
@@ -2220,7 +2220,7 @@ fn retire(it: &Interp) {
         }
     }
     mark(it);
-    for (_, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for (_, (_, s)) in it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
         mark(s);
     }
 }
@@ -2271,7 +2271,7 @@ fn start_udp(app: &Arc<App>, addr: std::net::SocketAddr) {
 
 /// Starts the job scheduler for the program `app` runs (see `jobs`).
 fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
-    *app.addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
+    *app.addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(addr);
     if let Loaded::Ready(it) = &*app.current().1 {
         start_background(it, addr);
     }
@@ -2285,7 +2285,7 @@ fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
     crate::jobs::start(addr, move || match &*jobs_of.current().1 {
         Loaded::Ready(it) => {
             let mut all: Vec<_> = it.site.jobs.iter().map(|j| (j.name.clone(), j.when.clone())).collect();
-            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
                 all.extend(s.site.jobs.iter().map(|j| (format!("{}~{}", service, j.name), j.when.clone())));
             }
             all
@@ -2296,7 +2296,7 @@ fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
     crate::jobs::start_ticks(addr, move || match &*ticks_of.current().1 {
         Loaded::Ready(it) => {
             let mut all: Vec<_> = it.site.ticks.iter().map(|t| (t.name.clone(), t.ms)).collect();
-            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            for (service, (_, s)) in it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
                 all.extend(s.site.ticks.iter().map(|t| (format!("{}~{}", service, t.name), t.ms)));
             }
             all

@@ -140,7 +140,7 @@ fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (St
         h.finish()
     };
     let run = |input: &str| -> Result<String, String> {
-        if let Some(out) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key(input)) {
+        if let Some(out) = MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).get(&key(input)) {
             return Ok(out.clone());
         }
         use std::io::Write;
@@ -163,7 +163,7 @@ fn made_with(cmd: &str, dir: &std::path::Path, styles: &mut BTreeMap<String, (St
             return Err(err.lines().filter(|l| !l.trim().is_empty()).take(6).collect::<Vec<_>>().join("\n"));
         }
         let made = String::from_utf8_lossy(&out.stdout).into_owned();
-        MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key(input), made.clone());
+        MADE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(key(input), made.clone());
         Ok(made)
     };
     if styles.is_empty() {

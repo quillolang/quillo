@@ -510,7 +510,7 @@ impl Server {
                 "textDocument/didClose" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
                     self.docs.remove(&uri);
-                    self.rust.lock().unwrap_or_else(|e| e.into_inner()).remove(&uri);
+                    self.rust.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&uri);
                     self.send(json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": { "uri": uri, "diagnostics": [] } }));
                 }
                 "textDocument/hover" => {
@@ -647,7 +647,7 @@ impl Server {
             })
             .collect();
         {
-            let mut all = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = self.rust.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let d = all.entry(uri.clone()).or_default();
             d.quillo = quillo;
             publish_rust(&uri, d);
@@ -659,7 +659,7 @@ impl Server {
     /// its own (`cargo check` takes a moment); one at a time per file.
     fn check_rust(&mut self, uri: String) {
         {
-            let mut all = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = self.rust.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let d = all.entry(uri.clone()).or_default();
             if d.running {
                 d.again = true;
@@ -692,7 +692,7 @@ impl Server {
                     .collect(),
                 Err(e) => vec![json!({ "range": diag_range(&text, 1, ""), "severity": 3, "source": "quillo", "message": e })],
             };
-            let mut all = rust.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = rust.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(d) = all.get_mut(&uri) else { return };
             d.cargo = cargo;
             publish_rust(&uri, d);

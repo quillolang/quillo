@@ -490,7 +490,7 @@ fn cleanup(it: &mut Interp, tenant: Option<&str>) {
     let now = now_ms();
     let k = format!("{}\0{}", it.base, tenant.unwrap_or(""));
     {
-        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let last = g.get_or_insert_with(Default::default);
         if last.get(&k).map_or(false, |t| now - t < 60_000) {
             return;

@@ -802,7 +802,7 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     }
     // One build at a time in this process (instances load the same files).
     static BUILDING: Mutex<()> = Mutex::new(());
-    let _one = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if lib.is_file() {
         return Ok((lib, parsed));
     }
@@ -884,7 +884,7 @@ fn libraries() -> &'static Mutex<HashMap<PathBuf, Arc<Lib>>> {
 }
 
 fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
-    let mut libs = libraries().lock().unwrap_or_else(|e| e.into_inner());
+    let mut libs = libraries().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(l) = libs.get(path) {
         return Ok(l.clone());
     }
@@ -933,7 +933,7 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         // The builtin's name says which function it is: one per library, so
         // a version loaded later has names of its own.
         let key: &'static str = Box::leak(format!("native:{}:{}", lib_path.display(), e.name).into_boxed_str());
-        functions().lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| {
+        functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_insert_with(|| {
             Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone() })
         });
         for n in names {
@@ -977,7 +977,7 @@ fn call_placeholder(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
 
 /// A call of a `.qwer` function, off the event loop.
 pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
-    let Some(f) = functions().lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned() else {
+    let Some(f) = functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned() else {
         return fail(line, "a Rust function was called without its library");
     };
     let input = serde_json::to_vec(&serde_json::Value::Array(args.iter().map(|a| a.to_json()).collect())).unwrap_or_default();

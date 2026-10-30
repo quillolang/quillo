@@ -540,7 +540,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     }
     let mut interp = Interp::new(base);
     let shared = interp.shared.clone();
-    shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).extend(o.service_urls.iter().cloned());
+    shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
     let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| e.to_string())) {
@@ -613,13 +613,13 @@ mod with {
                 }
             });
         }
-        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(child);
+        RUNNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(child);
         Ok(())
     }
 
     /// Stops each command and what it started.
     pub fn stop_all() {
-        let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = RUNNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for child in running.iter_mut() {
             #[cfg(unix)]
             unsafe {

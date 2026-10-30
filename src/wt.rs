@@ -93,7 +93,7 @@ pub fn name_ok(n: &str) -> bool {
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // ---- the hub ---------------------------------------------------------------
@@ -382,7 +382,7 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
                 if crate::httpd::stopping() {
                     return;
                 }
-                q = i.arrived.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
+                q = i.arrived.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
             let (mut n, mut bytes) = (0, 0);
             while n < q.len() && n < 1024 && (n == 0 || bytes + q[n].value.len() <= 1 << 20) {
@@ -924,7 +924,7 @@ mod quic {
                 None
             }
         });
-        r.as_ref().map(|r| (r.port, r.hash.read().unwrap_or_else(|e| e.into_inner()).clone()))
+        r.as_ref().map(|r| (r.port, r.hash.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()))
     }
 
     fn hex_hash(id: &Identity) -> Option<String> {
@@ -991,7 +991,7 @@ mod quic {
                     let hash = hex_hash(&id);
                     if server.reload_config(config(addr, id), false).is_ok() {
                         if let Some(Some(r)) = RUNNING.get() {
-                            *r.hash.write().unwrap_or_else(|e| e.into_inner()) = hash;
+                            *r.hash.write().unwrap_or_else(std::sync::PoisonError::into_inner) = hash;
                         }
                     }
                 }

@@ -66,7 +66,7 @@ pub fn stopping() -> bool {
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Work a paused request hands to the pool.
@@ -352,7 +352,7 @@ impl Pool {
                 self.idle.fetch_sub(1, SeqCst);
                 return j;
             }
-            q = self.ready.wait(q).unwrap_or_else(|e| e.into_inner());
+            q = self.ready.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 

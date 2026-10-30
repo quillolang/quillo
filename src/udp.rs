@@ -82,7 +82,7 @@ fn sockets() -> &'static Mutex<HashMap<u16, Arc<Bound>>> {
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {
@@ -258,7 +258,7 @@ fn deliver_loop(addr: SocketAddr, port: u16, b: Arc<Bound>) {
                 if b.closed.load(Relaxed) {
                     return;
                 }
-                q = b.arrived.wait_timeout(q, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
+                q = b.arrived.wait_timeout(q, Duration::from_millis(250)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
             }
             let (mut n, mut bytes) = (0, 0);
             while n < q.len() && n < BATCH_PACKETS && (n == 0 || bytes + q[n].data.len() <= BATCH_BYTES) {

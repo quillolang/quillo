@@ -29,7 +29,7 @@ fn from_file() -> &'static Mutex<HashSet<String>> {
 
 /// Whether `name` came from a `.env` file rather than the environment.
 fn set_by_file(name: &str) -> bool {
-    from_file().lock().unwrap_or_else(|e| e.into_inner()).contains(name)
+    from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name)
 }
 
 /// Reads `path` into the process's environment, leaving the variables the
@@ -41,7 +41,7 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
         Err(_) if !required => return Ok(()),
         Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
     };
-    let mut keys = from_file().lock().unwrap_or_else(|e| e.into_inner());
+    let mut keys = from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for (k, v) in parse(&text) {
         if std::env::var_os(&k).is_some() && !keys.contains(&k) {
             continue;

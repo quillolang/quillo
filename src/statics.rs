@@ -26,7 +26,7 @@ struct Lru<K> {
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Under `--watch`, the files the program has served with `file()`, and the
@@ -41,7 +41,7 @@ pub fn served(file: &Path, path: &str) {
     if !WATCH_SERVED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut s = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = SERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let m = s.get_or_insert_with(HashMap::new);
     if m.len() < 10_000 {
         m.insert(file.to_path_buf(), path.to_string());
@@ -50,7 +50,7 @@ pub fn served(file: &Path, path: &str) {
 
 /// The files served so far, with the path each was asked for at.
 pub fn served_files() -> Vec<(PathBuf, String)> {
-    SERVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Vec::new(), |m| m.iter().map(|(f, p)| (f.clone(), p.clone())).collect())
+    SERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map_or(Vec::new(), |m| m.iter().map(|(f, p)| (f.clone(), p.clone())).collect())
 }
 
 static FILES: Mutex<Option<Lru<(PathBuf, u64, u128)>>> = Mutex::new(None);

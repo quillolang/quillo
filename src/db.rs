@@ -79,7 +79,7 @@ pub(crate) fn program_db_is_mysql(it: &Interp) -> bool {
         Some(DbSlot::One(b)) => b.is_mysql(),
         Some(DbSlot::PerTenant(t)) => match &t.target {
             Target::Text(s) => is_mysql_url(s),
-            Target::Fn(_) => t.open.lock().unwrap_or_else(|e| e.into_inner()).values().next().map_or(false, |b| b.is_mysql()),
+            Target::Fn(_) => t.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().next().map_or(false, |b| b.is_mysql()),
         },
         Some(DbSlot::Shards(_)) => false,
         None => std::env::var("QUILLO_DB").map_or(false, |t| is_mysql_url(&t)),
@@ -219,7 +219,7 @@ fn replica_sets() -> &'static Mutex<Vec<(std::sync::Weak<Backend>, Arc<Replicas>
 }
 
 fn replicas_of(b: &Arc<Backend>) -> Option<Arc<Replicas>> {
-    let mut sets = replica_sets().lock().unwrap_or_else(|e| e.into_inner());
+    let mut sets = replica_sets().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     sets.retain(|(w, _)| w.strong_count() > 0);
     sets.iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(b))).map(|(_, r)| r.clone())
 }
@@ -241,13 +241,13 @@ fn reader(it: &Interp, b: &Arc<Backend>, sql: &str) -> Option<(Arc<Replicas>, us
     if it.wrote_req == Some(crate::httpd::request_number()) || !only_reads(sql) {
         return None;
     }
-    if it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b)) {
+    if it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b)) {
         return None;
     }
     let n = reps.list.len();
     let start = reps.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let now = std::time::Instant::now();
-    let down = reps.down.lock().unwrap_or_else(|e| e.into_inner());
+    let down = reps.down.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let i = (0..n).map(|k| (start + k) % n).find(|i| down[*i].map_or(true, |t| now >= t))?;
     drop(down);
     Some((reps, i))
@@ -417,7 +417,7 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool) -> Result<Backend,
 /// The database a call is on: a connection's (`db.connect`), or the program's.
 pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
     let Some(i) = on else { return backend(it) };
-    let slot = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone());
+    let slot = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(_, s)| s.clone());
     match slot {
         Some(DbSlot::One(b)) => Ok(b),
         Some(DbSlot::PerTenant(t)) => tenant_backend(it, &t),
@@ -429,15 +429,15 @@ pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backe
 /// The slot a call is on, if it has been opened.
 fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
     match on {
-        None => it.db.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-        Some(i) => it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(_, s)| s.clone()),
+        None => it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+        Some(i) => it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(_, s)| s.clone()),
     }
 }
 
 /// The program's database (the tenant's, for one per tenant), opening the
 /// default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
-    let slot = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     match slot {
         Some(DbSlot::One(b)) => return Ok(b),
         Some(DbSlot::PerTenant(t)) => return tenant_backend(it, &t),
@@ -447,11 +447,11 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
     if target.contains("{tenant}") {
         let t = Arc::new(TenantDbs::new(Target::Text(target)));
-        *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(DbSlot::PerTenant(t.clone()));
+        *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DbSlot::PerTenant(t.clone()));
         return tenant_backend(it, &t);
     }
     let b = Arc::new(open_backend(it, &target)?);
-    let mut slot = it.db.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match slot.get_or_insert(DbSlot::One(b)) {
         DbSlot::One(b) => Ok(b.clone()),
         _ => unreachable!("set just above"),
@@ -464,7 +464,7 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         return Err("the database is one per tenant ({tenant} in its target), and this code runs for none: see tenant_from and with_tenant".into());
     };
     {
-        let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open = dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(i) = open.get_index_of(&*name) {
             // The most recently used go last.
             let last = open.len() - 1;
@@ -486,8 +486,8 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         }
     }
     let b = Arc::new(open_backend_as(it, &target, make).map_err(|e| format!("tenant {}: {}", name, e))?);
-    let is_default = matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
-    let dir = dbs.migrations.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
+    let is_default = matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
+    let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
     if let Some(dir) = dir {
         let mb = b.clone();
         let applied = it.unlocked(move || crate::migrate::run(&mb, &dir)).map_err(|e| format!("tenant {}: {}", name, e))?;
@@ -495,7 +495,7 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
             eprintln!("quillo: applied migration {} for tenant {}", m, name);
         }
     }
-    let mut open = dbs.open.lock().unwrap_or_else(|e| e.into_inner());
+    let mut open = dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Each open server tenant keeps connections (a few each).
     let most = if is_server_url(&target) { OPEN_PG_TENANTS } else { OPEN_TENANTS };
     while open.len() >= most {
@@ -581,14 +581,14 @@ pub(crate) fn pooled_run<T: Send>(
     f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send,
 ) -> Result<T, String> {
     let pool = &**b;
-    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)).and_then(|tx| tx.conn.take());
+    let pinned = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)).and_then(|tx| tx.conn.take());
     match pinned {
         Some(mut c) => {
             let (c, r) = it.unlocked(move || {
                 let r = f(&mut c);
                 (c, r)
             });
-            if let Some(tx) = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)) {
+            if let Some(tx) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)) {
                 tx.conn = Some(c);
             }
             r
@@ -605,7 +605,7 @@ pub(crate) fn pooled_run<T: Send>(
 /// In the server, outside a transaction, queries use the connections all
 /// requests share (pipelined; see `pg::Lanes`). `None`: use `pg_run`.
 fn shared_lanes(it: &Interp, b: &Arc<Backend>, pool: &pg::Pool) -> Option<Arc<pg::Lanes>> {
-    let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, b));
+    let pinned = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, b));
     (!pinned && crate::httpd::in_task()).then(|| pool.lanes())
 }
 
@@ -746,7 +746,7 @@ pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
 /// As `announce`, the writes left out when the statement changed nothing.
 fn announce_as(it: &mut Interp, sql: &str, on: Option<usize>, wrote: bool) {
     let t = crate::sqlinfo::tables_of(sql);
-    let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).get(i).map(|(l, _)| l.clone())) {
+    let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(l, _)| l.clone())) {
         Some(label) => format!("db@{}:", label),
         None => "db:".to_string(),
     };
@@ -827,7 +827,7 @@ fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !crate::site::tenant_name_ok(&name) {
         return Ok(Value::Bool(false));
     }
-    if dbs.open.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&*name) {
+    if dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&*name) {
         return Ok(Value::Bool(true));
     }
     let target = match tenant_target_or_none(it, &dbs, &name) {
@@ -973,7 +973,7 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
         if !list.is_empty() {
             let n = list.len();
             let reps = Arc::new(Replicas { list, next: Default::default(), down: Mutex::new(vec![None; n]) });
-            replica_sets().lock().unwrap_or_else(|e| e.into_inner()).push((Arc::downgrade(&b), reps));
+            replica_sets().lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((Arc::downgrade(&b), reps));
         }
         return Ok(Ok(DbSlot::One(b)));
     }
@@ -996,12 +996,12 @@ pub static OPENED: Mutex<Option<String>> = Mutex::new(None);
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match slot_for(it, &args, "db.open", line)? {
         Ok(slot) => {
-            *it.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(slot);
+            *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
             if let Some(Value::Str(t)) = args.first() {
                 if !is_server_url(t) && &**t != ":memory:" && !t.contains("{tenant}") {
                     let full = if Path::new(&**t).is_absolute() { Path::new(&**t).to_path_buf() } else { it.base_dir.join(&**t) };
                     let full = std::fs::canonicalize(&full).unwrap_or(full);
-                    *OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some(full.display().to_string());
+                    *OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(full.display().to_string());
                 }
             }
             Ok(Value::Nil)
@@ -1017,10 +1017,10 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let label = match args.first() {
         // A label for its live updates' topics, the same on every server (and no secret in it).
         Some(Value::Str(t)) => crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(t.as_bytes()))[..12].to_string(),
-        _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).len()),
+        _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()),
     };
     if matches!(args.first(), Some(Value::Str(_))) {
-        if let Some(i) = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter().position(|(l, _)| *l == label) {
+        if let Some(i) = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| *l == label) {
             return Ok(connection(i));
         }
     }
@@ -1028,7 +1028,7 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(s) => s,
         Err(e) => return Ok(db_err(e)),
     };
-    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     conns.push((label, slot));
     Ok(connection(conns.len() - 1))
 }
@@ -1077,7 +1077,7 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     // One database per tenant: each is migrated when first opened.
     if let Some(DbSlot::PerTenant(t)) = slot_on(it, on) {
-        *t.migrations.lock().unwrap_or_else(|e| e.into_inner()) = Some(full.clone());
+        *t.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(full.clone());
         if it.tenant().is_none() {
             return Ok(Value::list(Vec::new()));
         }
@@ -1113,7 +1113,7 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let started = std::time::Instant::now();
     let res = match &*b {
         Backend::Sqlite(m) => {
-            let c = m.lock().unwrap_or_else(|e| e.into_inner());
+            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (|| {
                 if params.is_empty() {
                     c.execute_batch(&sql).map_err(|e| e.to_string())?;
@@ -1179,10 +1179,10 @@ pub(crate) fn system_on(it: &mut Interp, make: bool) -> Option<Option<usize>> {
 /// system database too (made with `make`): for what must outlive a restart,
 /// such as calls made later.
 pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option<Option<usize>> {
-    if let Some(i) = it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter().position(|(l, _)| l == SYSTEM) {
+    if let Some(i) = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| l == SYSTEM) {
         return Some(Some(i));
     }
-    let slot = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     match slot {
         Some(DbSlot::One(_)) => return Some(None),
         Some(_) => {}
@@ -1197,7 +1197,7 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
                 }
             } else {
                 let _ = backend(it);
-                if matches!(&*it.db.lock().unwrap_or_else(|e| e.into_inner()), Some(DbSlot::One(_))) {
+                if matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::One(_))) {
                     return Some(None);
                 }
             }
@@ -1208,7 +1208,7 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
         return None;
     }
     let b = open_backend(it, &target).map_err(|e| eprintln!("quillo: the system database {}: {}", target, e)).ok()?;
-    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
     Some(Some(conns.len() - 1))
 }
@@ -1232,7 +1232,7 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
-    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     conns.retain(|(l, _)| l != SYSTEM);
     conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
     Ok(Value::Nil)
@@ -1452,7 +1452,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
             }
             Err(e) => {
                 eprintln!("quillo: a read replica failed ({}); reading from the primary", e);
-                reps.down.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                reps.down.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
             }
         }
     }
@@ -1460,7 +1460,7 @@ fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, l
         it.wrote_req = Some(crate::httpd::request_number());
     }
     let res = match &*b {
-        Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(|e| e.into_inner()), &sql, &params, limit),
+        Backend::Sqlite(m) => rows(&m.lock().unwrap_or_else(std::sync::PoisonError::into_inner), &sql, &params, limit),
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
             None => {
@@ -1533,13 +1533,13 @@ pub(crate) fn attempt(
     let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
     match &*b {
         Backend::Sqlite(m) => {
-            let outermost = m.lock().unwrap_or_else(|e| e.into_inner()).is_autocommit();
+            let outermost = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_autocommit();
             if !outermost && opts.isolation.is_some() {
                 return (nested_isolation(), false);
             }
             // With options, the outermost takes the write lock at once.
             let immediate = outermost && opts.given;
-            let run = |sql: &str| m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(sql);
+            let run = |sql: &str| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch(sql);
             let busy = |e: &rusqlite::Error| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
             if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
                 return (Ok(db_err(&e)), immediate && busy(&e));
@@ -1572,7 +1572,7 @@ pub(crate) fn attempt(
             let pool = &*b;
             // Keep one connection for this request until the outermost
             // transaction ends.
-            let pinned = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
+            let pinned = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, &b));
             if pinned && opts.isolation.is_some() {
                 return (nested_isolation(), false);
             }
@@ -1582,10 +1582,10 @@ pub(crate) fn attempt(
                     Err(e) => return (Ok(db_err(e)), false),
                 };
                 c.watch_conflicts(true);
-                it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
+                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
             }
             let depth = {
-                let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let tx = g.iter_mut().find(|t| Arc::ptr_eq(&t.backend, &b)).expect("pinned");
                 tx.depth += 1;
                 tx.depth
@@ -1598,7 +1598,7 @@ pub(crate) fn attempt(
                 Err(e) => Ok(db_err(e)),
             };
             let conflicted = |it: &Interp| {
-                let g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 g.iter().find(|t| Arc::ptr_eq(&t.backend, &b)).and_then(|t| t.conn.as_ref()).map_or(false, |c| c.conflicted())
             };
             // A statement failed because of another transaction: this one
@@ -1616,7 +1616,7 @@ pub(crate) fn attempt(
             let lost = lost || (depth == 1 && conflicted(it));
             tx_end(it, mark, commit && ended.is_ok());
             let done = {
-                let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let i = g.iter().position(|t| Arc::ptr_eq(&t.backend, &b)).expect("pinned");
                 g[i].depth -= 1;
                 if g[i].depth == 0 {
@@ -1669,7 +1669,7 @@ fn shards(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     let n = list.len();
-    let mut conns = it.db_conns.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let label = format!("shards{}", conns.len());
     conns.push((label, DbSlot::Shards(Arc::new(list))));
     let mut m = Map::new();
@@ -1774,7 +1774,7 @@ fn now_ms() -> i64 {
 fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> Result<Vec<Value>, String> {
     match &**b {
         Backend::Sqlite(m) => {
-            let c = m.lock().unwrap_or_else(|e| e.into_inner());
+            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if sql.trim_start().to_ascii_lowercase().starts_with("select") {
                 rows(&c, &sql, &params, None)
             } else {
@@ -1887,7 +1887,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if parts.iter().filter(|p| p.kind == Kind::Sqlite).count() > 1 {
         return fail(line, "`db.atomic`: one SQLite database at most (it commits last; SQLite cannot prepare a transaction)");
     }
-    if parts.iter().any(|p| it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| Arc::ptr_eq(&t.backend, &p.b))) || it.sqlite_tx > 0 {
+    if parts.iter().any(|p| it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|t| Arc::ptr_eq(&t.backend, &p.b))) || it.sqlite_tx > 0 {
         return fail(line, "`db.atomic` cannot begin inside a transaction already open on one of its databases");
     }
     let sys = match system_backend(it) {
@@ -1907,13 +1907,13 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     for (k, p) in parts.iter().enumerate() {
         let r = match p.kind {
             Kind::Sqlite => match &*p.b {
-                Backend::Sqlite(m) => m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
+                Backend::Sqlite(m) => m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
                 _ => unreachable!(),
             },
             _ => {
                 match checkout_for_tx(it, &p.b) {
                     Ok(c) => {
-                        it.pg_tx.lock().unwrap_or_else(|e| e.into_inner()).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
+                        it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
                         let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
                         pooled_run(it, &p.b, move |c| c.batch(&begin))
                     }
@@ -1950,7 +1950,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // The connections go back.
     for p in &parts {
         let taken = {
-            let mut g = it.pg_tx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.iter().position(|t| Arc::ptr_eq(&t.backend, &p.b)).map(|i| g.remove(i))
         };
         if let Some(TxConn { conn: Some(c), .. }) = taken {
@@ -1992,7 +1992,7 @@ fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &s
     // 3. SQLite, last: then the decision stands.
     for p in parts.iter() {
         if let (Kind::Sqlite, Backend::Sqlite(m)) = (p.kind, &*p.b) {
-            if let Err(e) = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("release quillo_tx") {
+            if let Err(e) = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("release quillo_tx") {
                 if !sys_is_part {
                     let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
                 }
@@ -2025,7 +2025,7 @@ fn abort_parts(it: &mut Interp, parts: &mut [Part], begun: &[usize]) {
         }
         match (p.kind, &*p.b) {
             (Kind::Sqlite, Backend::Sqlite(m)) => {
-                let _ = m.lock().unwrap_or_else(|e| e.into_inner()).execute_batch("rollback to quillo_tx; release quillo_tx");
+                let _ = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("rollback to quillo_tx; release quillo_tx");
             }
             (Kind::Pg, _) => {
                 let sql = if p.prepared { format!("rollback prepared '{}'", p.gid) } else { "rollback".to_string() };
@@ -2056,10 +2056,10 @@ pub fn recover(it: &mut Interp) {
     let Some(on) = system_on(it, false) else { return };
     let Ok(sys) = backend_on(it, on) else { return };
     let mut servers: Vec<Arc<Backend>> = Vec::new();
-    if let Some(DbSlot::One(b)) = it.db.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    if let Some(DbSlot::One(b)) = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
         servers.push(b);
     }
-    for (_, s) in it.db_conns.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for (_, s) in it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
         if let DbSlot::One(b) = s {
             if !servers.iter().any(|x| Arc::ptr_eq(x, b)) {
                 servers.push(b.clone());

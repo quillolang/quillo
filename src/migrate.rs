@@ -40,7 +40,7 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
     let todo = files(dir)?;
     match db {
         Backend::Sqlite(m) => {
-            let c = m.lock().unwrap_or_else(|e| e.into_inner());
+            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             c.execute_batch(TABLE).map_err(|e| e.to_string())?;
             let mut applied = Vec::new();
             for (name, text) in &todo {

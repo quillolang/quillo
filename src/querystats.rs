@@ -66,7 +66,7 @@ pub fn record(sql: &str, ms: f64, ok: bool) {
         return;
     }
     let key = statement(sql);
-    let mut s = stats().lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = stats().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     push(&mut s.last, ms);
     s.total += 1;
     if !ok {
@@ -107,7 +107,7 @@ pub fn report(detail: bool) -> serde_json::Value {
         return serde_json::json!({ "enabled": false,
             "how": "off: run with --query-stats or QUILLO_QUERY_STATS=1, or POST /_quillo/health/queries?on=1 with the health token" });
     }
-    let s = stats().lock().unwrap_or_else(|e| e.into_inner());
+    let s = stats().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut queries = figures(&s.last);
     queries["total"] = s.total.into();
     queries["errors"] = s.errors.into();
@@ -132,7 +132,7 @@ pub fn report(detail: bool) -> serde_json::Value {
 /// On or off; what was there is forgotten either way.
 pub fn set(on: bool) {
     ENABLED.store(on, Relaxed);
-    *stats().lock().unwrap_or_else(|e| e.into_inner()) = Stats::default();
+    *stats().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Stats::default();
 }
 
 /// Whether a request carries the health token (`QUILLO_HEALTH_TOKEN`), compared in

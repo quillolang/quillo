@@ -90,11 +90,11 @@ impl Baton {
             }
         }
         self.spinning.fetch_sub(1, SeqCst);
-        let mut g = self.m.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sleeping.fetch_add(1, SeqCst);
         // Given back between the count and the check: taken here.
         while !self.try_take() {
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            g = self.cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         self.sleeping.fetch_sub(1, SeqCst);
     }
@@ -102,7 +102,7 @@ impl Baton {
     pub fn give(&self) {
         self.taken.store(false, SeqCst);
         if self.sleeping.load(SeqCst) > 0 {
-            let _g = self.m.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = self.m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.cv.notify_one();
         }
     }
@@ -166,7 +166,7 @@ impl Shared {
 
     /// From now on, changes are also sent here, for the other servers.
     pub fn set_outbox(&self, tx: std::sync::mpsc::Sender<Vec<String>>) {
-        *self.outbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        *self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     }
 
     /// Marks topics as changed and wakes the pages waiting on them; and when
@@ -177,8 +177,8 @@ impl Shared {
     /// Q-090; branch feedback13-fixes).
     pub fn publish(&self, topics: &[String]) -> u64 {
         let made = self.publish_here(topics);
-        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-        let outbox = self.outbox.lock().unwrap_or_else(|e| e.into_inner());
+        let peers = self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outbox = self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if peers.is_empty() && outbox.is_none() {
             return made;
         }
@@ -200,7 +200,7 @@ impl Shared {
     pub fn link(all: &[std::sync::Arc<Shared>]) {
         for s in all {
             let others = all.iter().filter(|o| !std::sync::Arc::ptr_eq(o, s)).map(std::sync::Arc::downgrade).collect();
-            *s.peers.lock().unwrap_or_else(|e| e.into_inner()) = others;
+            *s.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = others;
         }
     }
 
@@ -209,7 +209,7 @@ impl Shared {
         if topics.is_empty() {
             return 0;
         }
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         live.seq += 1;
         let seq = live.seq;
         for t in topics {
@@ -226,7 +226,7 @@ impl Shared {
         if topics.is_empty() {
             return;
         }
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for t in topics {
             if !live.versions.contains_key(t) {
                 // Version 0 is older than any a page has seen: no change yet.
@@ -240,7 +240,7 @@ impl Shared {
     /// Nothing here waits on a topic it has never heard of, and a message
     /// cannot make this server remember topics without end.
     pub fn publish_known(&self, topics: &[String]) {
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let known: Vec<&String> = topics.iter().filter(|t| live.versions.contains_key(*t)).collect();
         if known.is_empty() {
             return;
@@ -261,12 +261,12 @@ impl Shared {
         if topics.is_empty() {
             return true;
         }
-        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         topics.iter().all(|t| live.versions.get(t).map_or(true, |v| *v <= seq))
     }
 
     pub fn live_seq(&self) -> u64 {
-        self.live.lock().unwrap_or_else(|e| e.into_inner()).seq
+        self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seq
     }
 
     /// The current sequence number and which of `topics` changed after
@@ -284,7 +284,7 @@ impl Shared {
         let changed = |live: &Live| -> Vec<String> {
             topics.iter().filter(|t| live.versions.get(*t).map_or(false, |v| *v > since)).cloned().collect()
         };
-        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if since > 0 && server.map_or(false, |s| s != self.id) {
             return (live.seq, topics.to_vec());
         }
@@ -294,7 +294,7 @@ impl Shared {
         let (live, _) = self
             .live_changed
             .wait_timeout_while(live, timeout, |l| changed(l).is_empty())
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (live.seq, changed(&live))
     }
 }

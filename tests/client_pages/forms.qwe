@@ -1,0 +1,117 @@
+// Component forms the compiler has its own paths for: bodies made again whole,
+// values taken apart, and props, attributes and rows of the rarer kinds. Each
+// is shown by a click, so the browser makes it, not the server.
+
+component Boot() = <button #boot @click={() => { print("awake") }}>boot</button>
+
+// A body that can return early is made again whole when what it read changes.
+component Early() {
+    state n = 0
+    if n > 1 { return <p #early>early {n}</p> }
+    <button #late @click={() => { n += 1 }}>late {n}</button>
+}
+
+component Tried() {
+    state text = "41"
+    let n = int(text)?
+    <button #tried @click={() => { text = "x" }}>{n + 1}</button>
+}
+
+// It changes its own variable as it runs.
+component Counted() {
+    state k = 1
+    let n = k
+    n = n + 1
+    <button #counted @click={() => { k += 1 }}>{n}</button>
+}
+
+// A value of state taken apart follows the state.
+component Parts() {
+    state a = 1
+    let [x, y] = [a, 2]
+    <button #parts @click={() => { a += 1 }}>{x}-{y}</button>
+}
+
+component PartsLast() {
+    state a = 1
+    let [x] = [a]
+}
+
+view Flag(on) = <span #flag>{on}</span>
+
+component Attrs() {
+    state shown = false
+    <div>
+        <button #showattrs @click={() => { shown = true }}>show</button>
+        {shown && <div>
+            <Flag on/>
+            <input #bare checked/>
+            <span #noclass class="">x</span>
+            { { <b #inblock>single</b> } }
+        </div>}
+    </div>
+}
+
+component Guarded() {
+    state n = 1
+    <button #guarded @click={() => { n += 1 }}>
+        {match n {
+            k if k > 1 => <b>many {k}</b>
+            _ => <i>one</i>
+        }}
+    </button>
+}
+
+fn shout(s: str) = upper(s)
+
+component Rows() {
+    state rows = [{ id: 1, tags: ["a"] }]
+    state mark = "m"
+    <ul #rows>
+        <button #addrow @click={() => { rows = rows + [{ id: 2, tags: ["b", "c"] }] }}>add</button>
+        {for r in rows => <li key={r.id} class={r.id > 1 ? "two" : "one"} title={len([<ul>{for t in r.tags => <b key={t} class={t + mark} title={t + mark}>x</b>}</ul>])} lang={shout(mark)}>
+            {waiting(mark)}{shout(mark)}
+            {for t in r.tags => <span key={t} class={mark} title={t + mark}>{t}{mark}</span>}
+            {r.id > 1 && <em class={r.id > 1 ? "big" : "small"} title={shout(mark)}>{shout(mark)}{waiting(mark)}</em>}
+        </li>}
+    </ul>
+}
+
+component Calls(p) {
+    state shown = false
+    let fs = [(x) => x + 1]
+    let adder = (x) => x + 10
+    <div>
+        <button #showcalls @click={() => { shown = true }}>show</button>
+        {shown && <div>
+            <p #fieldfn>{"a".shout()}</p>
+            <p #propfn>{"b".p()}</p>
+            <p #localfn>{1.adder()}</p>
+            <p #itemfn>{fs[0](1)}</p>
+        </div>}
+        <i>{adder(0)}</i>
+    </div>
+}
+
+component Outer() = <Calls p={(s) => s + "?"}/>
+
+component LetCalls() {
+    state shown = false
+    let inner = () => 5
+    let outer = () => inner() + 1
+    <button #letcalls @click={() => { shown = true }}>{shown ? outer() : "no"}</button>
+}
+
+route GET / = <html><body>
+    <Boot/>
+    <Early/>
+    <Tried/>
+    <Counted/>
+    <Parts/>
+    <PartsLast/>
+    <Attrs/>
+    <Guarded/>
+    <Rows/>
+    <Outer/>
+    <LetCalls/>
+</body></html>

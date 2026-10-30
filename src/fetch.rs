@@ -204,7 +204,7 @@ fn resolve_public(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
 /// which has no limit on the whole answer, only on a silence in it).
 fn agent(o: Opts, stream: bool) -> ureq::Agent {
     static AGENTS: OnceLock<Mutex<HashMap<(u32, bool, bool), ureq::Agent>>> = OnceLock::new();
-    let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut agents = AGENTS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     agents
         .entry((o.redirects, o.public_only, stream))
         .or_insert_with(|| {
@@ -286,7 +286,7 @@ const CACHE_BYTES: usize = 64 << 20;
 
 fn cache() -> std::sync::MutexGuard<'static, (HashMap<String, Cached>, usize)> {
     static CACHE: OnceLock<Mutex<(HashMap<String, Cached>, usize)>> = OnceLock::new();
-    CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    CACHE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn cache_key(o: Opts, method: &str, url: &str, headers: &[(String, String)]) -> String {

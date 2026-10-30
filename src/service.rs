@@ -86,7 +86,7 @@ pub fn urls_of(shared: &crate::shared::Shared, name: &str) -> Vec<String> {
 
 /// The addresses service `name` was given (`--service-url`, `QUILLO_SERVICE_...`).
 pub fn configured_urls(shared: &crate::shared::Shared, name: &str) -> Vec<String> {
-    let given = match shared.service_urls.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+    let given = match shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name) {
         Some(u) => u.clone(),
         None => std::env::var(env_name(name)).unwrap_or_default(),
     };
@@ -109,7 +109,7 @@ fn joined() -> &'static Mutex<HashMap<String, HashMap<String, Instant>>> {
 
 /// The copies of service `name` that joined and are still heard from.
 pub fn joined_urls(name: &str) -> Vec<String> {
-    let mut j = joined().lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = joined().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(copies) = j.get_mut(name) else { return Vec::new() };
     copies.retain(|_, at| at.elapsed() < JOINED_FOR);
     let mut urls: Vec<String> = copies.keys().cloned().collect();
@@ -144,7 +144,7 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
         return refused(401, "not signed with this server's QUILLO_SERVICE_SECRET (or too old)");
     }
     {
-        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if seen.contains_key(nonce) {
             return refused(409, "this join was sent before");
         }
@@ -160,7 +160,7 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
         std::net::IpAddr::V6(v6) => format!("http://[{}]:{}", v6, port),
         v4 => format!("http://{}:{}", v4, port),
     };
-    let mut j = joined().lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = joined().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let copies = j.entry(service.clone()).or_default();
     if body["leave"].as_bool() == Some(true) {
         if copies.remove(&url).is_some() {
@@ -282,7 +282,7 @@ fn opts_table() -> &'static Mutex<HashMap<String, Opts>> {
 
 /// How service `name` is called.
 pub fn opts(name: &str) -> Opts {
-    opts_table().lock().unwrap_or_else(|e| e.into_inner()).get(name).copied().unwrap_or_default()
+    opts_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).copied().unwrap_or_default()
 }
 
 /// A duration given as milliseconds (`1500`) or text (`"1.5s"`, `"500ms"`, `"2m"`).
@@ -336,7 +336,7 @@ fn set_opts(name: &str, given: &Value, line: u32) -> Result<(), Ctrl> {
             }
         }
     }
-    opts_table().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), o);
+    opts_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string(), o);
     Ok(())
 }
 
@@ -358,7 +358,7 @@ fn health() -> &'static Mutex<HashMap<String, Health>> {
 
 /// Whether to call `url` now (taking its one try, when its time has come).
 fn usable(url: &str, o: &Opts) -> bool {
-    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = health().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(st) = h.get_mut(url) else { return true };
     match st.until {
         None => true,
@@ -371,7 +371,7 @@ fn usable(url: &str, o: &Opts) -> bool {
 }
 
 fn went_well(url: &str) {
-    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = health().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if h.get(url).map_or(false, |st| st.fails > 0 || st.until.is_some()) {
         if h.get(url).map_or(false, |st| st.until.is_some()) {
             eprintln!("quillo: {} answers again", url);
@@ -381,7 +381,7 @@ fn went_well(url: &str) {
 }
 
 fn went_wrong(url: &str, o: &Opts) {
-    let mut h = health().lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = health().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let st = h.entry(url.to_string()).or_default();
     st.fails += 1;
     if st.fails >= o.failures {
@@ -403,7 +403,7 @@ fn pick(urls: &[String], tried: &[String], o: &Opts) -> Option<String> {
     }
     let start = NEXT.fetch_add(1, Ordering::Relaxed);
     let order: Vec<&String> = (0..urls.len()).map(|i| &urls[(start + i) % urls.len()]).collect();
-    let healthy = |u: &&String| health().lock().unwrap_or_else(|e| e.into_inner()).get(u.as_str()).map_or(true, |st| st.until.map_or(true, |t| Instant::now() >= t));
+    let healthy = |u: &&String| health().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(u.as_str()).map_or(true, |st| st.until.map_or(true, |t| Instant::now() >= t));
     let fresh = order.iter().copied().find(|u| !tried.contains(u) && healthy(u));
     let any = || order.iter().copied().find(|u| healthy(u));
     let u = fresh.or_else(any)?;
@@ -607,7 +607,7 @@ fn from_wire(j: &serde_json::Value) -> Value {
 }
 
 fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, line: u32) -> Outcome {
-    let found = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(_, s)| s.fork());
+    let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
         return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
     };
@@ -785,7 +785,7 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
         let sig = signature(&secret, t, name, f, &tenant, &call, &body);
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string());
-        let mine = contracts().lock().unwrap_or_else(|e| e.into_inner()).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
+        let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let got = it.unlocked(move || -> Try {
             let mut rq = agent()
                 .post(&endpoint)
@@ -944,7 +944,7 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     // delivered twice, or was replayed by someone who saw it): answered as
     // it was, not run again.
     {
-        let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match seen.get(c) {
             Some((_, Some(r))) => return r.clone(),
             Some((_, None)) => return refused(503, "this call is still running"),
@@ -966,11 +966,11 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     match shared {
         Some(crate::db::Claim::Done(status, body)) => {
             let r = HttpResponse { status, headers: vec![("content-type".into(), "application/json".into())], body: body.into_bytes() };
-            seen().lock().unwrap_or_else(|e| e.into_inner()).insert(c.to_string(), (Instant::now(), Some(r.clone())));
+            seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c.to_string(), (Instant::now(), Some(r.clone())));
             return r;
         }
         Some(crate::db::Claim::Running) => {
-            seen().lock().unwrap_or_else(|e| e.into_inner()).remove(c);
+            seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(c);
             return refused(503, "this call is still running");
         }
         Some(crate::db::Claim::Mine) | None => {}
@@ -979,7 +979,7 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
     if shared.is_some() {
         crate::db::call_done(it, c, r.status, &String::from_utf8_lossy(&r.body));
     }
-    let mut seen = seen().lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A call that did not run (a busy server) may be sent again.
     if r.status >= 502 {
         seen.remove(c);
@@ -1125,7 +1125,7 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
     let full = it.base_dir.join(file);
     let defs = offered(&full).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     {
-        let mut c = contracts().lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for d in &defs {
             c.insert((name.to_string(), d.name.clone()), crate::describe::contract(d));
         }
@@ -1138,13 +1138,13 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
         }
     } else {
         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-        let existing = it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(p, s)| (p.clone(), s.fork()));
+        let existing = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(p, s)| (p.clone(), s.fork()));
         let svc = match existing {
             Some((p, s)) if p == key => Some(s),
             Some((p, _)) => return fail(line, format!("service `{}` is {} elsewhere in this app, and {} here", name, p.display(), key.display())),
-            None if it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).contains(name) => None,
+            None if it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name) => None,
             None => {
-                it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+                it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string());
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| it.base_dir.to_path_buf());
                 // Its own settings, beside its file (FEEDBACK9.md, Q-071).
                 let own = crate::dotenv::read(&dir.join(".env"));
@@ -1153,9 +1153,9 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
                 sub.is_service = true;
                 sub.env_file = std::sync::Arc::new(own);
                 let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
-                it.services.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
                 loaded?;
-                it.services.loaded.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (key, sub.fork()));
+                it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string(), (key, sub.fork()));
                 Some(sub)
             }
         };
@@ -1223,7 +1223,7 @@ pub fn later(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !crate::db::later_put(it, &call) {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| eprintln!("quillo: calls made later are kept in memory (no database could keep them): a restart loses those not made yet"));
-        waiting().lock().unwrap_or_else(|e| e.into_inner()).push(call);
+        waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(call);
     }
     Ok(Value::str(id))
 }
@@ -1240,7 +1240,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
     // Every half minute: transactions over several databases left part way.
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let due = {
-        let mut l = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let due = l.map_or(true, |t| t.elapsed() >= Duration::from_secs(30));
         if due {
             *l = Some(Instant::now());
@@ -1252,7 +1252,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
     }
     let now = now_ms();
     let due: Vec<Later> = {
-        let mut w = waiting().lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (due, rest): (Vec<Later>, Vec<Later>) = std::mem::take(&mut *w).into_iter().partition(|c| c.at <= now);
         *w = rest;
         due
@@ -1262,7 +1262,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
             c.tries += 1;
             c.at = now_ms() + backoff(c.tries);
             eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(c.tries) / 1000);
-            waiting().lock().unwrap_or_else(|e| e.into_inner()).push(c);
+            waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(c);
         }
     }
     // Kept in the database: each taken by one server (others may share it).
@@ -1363,7 +1363,7 @@ struct Running {
 impl Drop for Split {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        for r in self.services.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+        for r in self.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut() {
             let _ = r.child.kill();
             let _ = r.child.wait();
         }
@@ -1413,7 +1413,7 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
             return;
         }
         let now = Instant::now();
-        for r in services.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+        for r in services.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut() {
             match r.again_at {
                 None => {
                     if let Ok(Some(status)) = r.child.try_wait() {

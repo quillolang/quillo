@@ -202,13 +202,13 @@ fn in_turn<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     // (running, waiting)
     static AT_ONCE: Mutex<(usize, usize)> = Mutex::new((0, 0));
     static FREED: Condvar = Condvar::new();
-    let mut n = AT_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = AT_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if n.0 >= most_converting() && n.1 >= MOST_WAITING {
         return Err("too many images are being converted at once; try again shortly".into());
     }
     n.1 += 1;
     while n.0 >= most_converting() {
-        n = FREED.wait(n).unwrap_or_else(|e| e.into_inner());
+        n = FREED.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     n.1 -= 1;
     n.0 += 1;
@@ -216,7 +216,7 @@ fn in_turn<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     struct Done;
     impl Drop for Done {
         fn drop(&mut self) {
-            AT_ONCE.lock().unwrap_or_else(|e| e.into_inner()).0 -= 1;
+            AT_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 -= 1;
             FREED.notify_one();
         }
     }
