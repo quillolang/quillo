@@ -2362,7 +2362,10 @@ pub const WORKER_STACK: usize = 16 << 20;
 /// A click or a form sent before the bundle runs waits for it, and is done
 /// then (see `boot` in runtime.js); presses, releases, double, right and
 /// middle clicks are kept beside them and made again as they were made
-/// (branch early-events).
+/// (branch early-events). The idea is others': Flickr's actionQueue, Google's
+/// JSAction (and Angular's event replay on it), Angular Universal's preboot,
+/// Qwik's Qwikloader and React's selective hydration (README.md,
+/// Acknowledgements; branch acknowledgements).
 /// `/_quillo/ready`: 200 or 503, and each thing the program needs.
 fn ready_response(it: &mut Interp) -> HttpResponse {
     let (ok, detail) = crate::ready::report(it);

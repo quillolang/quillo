@@ -63,6 +63,7 @@ calls the server: no API to write, no `fetch`, no `async`/`await`.
 - [Documentation](#documentation)
 - [Community](#community)
 - [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## Features
@@ -299,6 +300,30 @@ requests are welcome. Before sending a change:
 cargo test
 for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 ```
+
+## Acknowledgements
+
+Quillo stands on ideas others worked out first.
+
+**Events made before a page's code comes.** A page's components load their code only
+when someone reaches for one, and what is clicked, pressed or sent meanwhile is kept
+and done again once the code runs. Others did this before us:
+
+- **Flickr's `actionQueue`**, which kept the clicks made before a page's scripts had
+  loaded, and replayed them once they had.
+- **Google's [JSAction](https://github.com/google/jsaction)**, a small event contract
+  on the page that queues events and hands them to their handlers once these have
+  loaded; Angular's event replay
+  ([`withEventReplay`](https://angular.dev/api/platform-browser/withEventReplay)) is
+  built on it.
+- **Angular Universal's [preboot](https://github.com/angular/preboot)**, which recorded
+  what people did on a server-rendered page and played it back in the client app once
+  that had started.
+- **Qwik's [Qwikloader](https://qwik.dev/docs/advanced/qwikloader/)**, an inline
+  script that listens for every event the page uses and loads only the handler that
+  is needed.
+- **React 18's selective hydration**, which hydrates the part of a page that was
+  clicked first and replays the event to it.
 
 ## License
 
