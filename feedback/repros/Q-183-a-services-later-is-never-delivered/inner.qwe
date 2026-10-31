@@ -1,0 +1,6 @@
+let seen = []
+server fn hit(x: str) {
+    seen = [...seen, x]
+    "ok"
+}
+server fn hits() = seen

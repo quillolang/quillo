@@ -1,0 +1,13 @@
+// Q-188 A step cannot see its own call, and `.later` gives nothing back
+// mode: serve
+// get: /step
+// get: /status
+// open-when: /Unknown|no field|undefined|not defined|unknown/
+// fixed-when: call
+// fixed-when: state
+// From FEEDBACK23.md §Q-188 (found on da6c1a3).
+
+db.open("front.db")
+service work = "work.qwe"
+route GET /step = json.stringify(work.step())
+route GET /status = json.stringify(later.status(work.later.step()))

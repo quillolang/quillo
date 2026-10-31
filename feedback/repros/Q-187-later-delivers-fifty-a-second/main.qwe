@@ -1,0 +1,16 @@
+// Q-187 `.later` delivers at most 50 calls a second per server
+// mode: script
+// script: steps.sh
+// open-when: /left after two seconds: [1-9]/
+// fixed-when: left after two seconds: 0
+// From FEEDBACK23.md §Q-187 (found on da6c1a3).
+
+db.open("front.db")
+service work = "work.qwe"
+route GET /many = db.transaction(() => {
+    for i in range(0, 300) {
+        work.later.hit(i)
+    }
+    "kept"
+})
+route GET /left = `left after two seconds: ${300 - work.count()}`

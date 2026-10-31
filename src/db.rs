@@ -1348,22 +1348,110 @@ pub(crate) fn claim_job(it: &mut Interp, name: &str, at: u64) -> bool {
     }
 }
 
-// ---- calls made later (src/service.rs), kept with Quillo's own tables ----
+// ---- calls made later (src/service.rs), kept with the work they go with ----
+
+/// How long a finished call's answer can be asked for (`later.status`).
+const LATER_ANSWER_MS: i64 = 86_400_000;
+/// How long after its last call a tenant is still looked at: a call in a
+/// transaction shows only when that commits.
+const LATER_TENANT_MS: i64 = 3_600_000;
+/// `at` of a call given up on: never due. It keeps its row, `tries` < 0.
+const LATER_NEVER: i64 = 9_000_000_000_000_000;
 
 fn later_table(it: &mut Interp, on: Option<usize>) -> bool {
-    let sql = if kind_on(it, on) {
+    let mysql = kind_on(it, on);
+    let sql = if mysql {
         "create table if not exists _quillo_later (id varchar(64) primary key, service varchar(255) not null, fn varchar(255) not null, \
          args text not null, tenant varchar(255) not null, rid varchar(64) not null, at bigint not null, tries bigint not null, error text)"
     } else {
         "create table if not exists _quillo_later (id text primary key, service text not null, fn text not null, \
          args text not null, tenant text not null, rid text not null, at bigint not null, tries bigint not null, error text)"
     };
+    // MySQL and MariaDB commit an open transaction before `create table`, even
+    // one that makes nothing, and the rollback then has nothing to undo
+    // (FEEDBACK23.md, Q-182; branch feedback23-fixes): ask, and make it apart.
+    if mysql {
+        let made = "select 1 as n from information_schema.tables where table_schema = database() and table_name = '_quillo_later'";
+        if matches!(query_on(it, on, vec![Value::str(made)]), Ok(Value::List(l)) if !l.is_empty()) {
+            return true;
+        }
+        let Ok(b) = backend_on(it, on) else { return false };
+        return apart(it, &b, sql.into(), Vec::new()).is_ok();
+    }
     matches!(exec_on(it, on, vec![Value::str(sql)]), Ok(Value::Map(_)))
+}
+
+/// A statement on one of Quillo's tables, made the first time it is missing.
+/// Not for a program's transaction: PostgreSQL gives up on one at the error.
+fn on_own_table(it: &mut Interp, on: Option<usize>, table: &str, make: &str, args: Vec<Value>) -> bool {
+    for first in [true, false] {
+        match exec_on(it, on, args.clone()) {
+            Ok(Value::Map(_)) => return true,
+            Ok(Value::Err(e, _, _)) if first && e.display().contains(table) => {
+                if !matches!(exec_on(it, on, vec![Value::str(make)]), Ok(Value::Map(_))) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn tenant_dbs(it: &Interp) -> bool {
+    matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::PerTenant(_)))
+}
+
+/// Where a call made later is kept: the database the work is in, so that it
+/// commits or rolls back with it, on any database and beside `db.system`
+/// (FEEDBACK23.md, Q-185; branch feedback23-fixes). With neither, the system
+/// database.
+fn later_home(it: &mut Interp) -> Option<Option<usize>> {
+    let system = system_on_for(it, true, true);
+    let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    match slot {
+        Some(DbSlot::One(_)) => Some(None),
+        Some(DbSlot::PerTenant(_)) if it.tenant().is_some() => Some(None),
+        _ => system,
+    }
+}
+
+/// Where a program's calls are looked for, tenants' databases aside.
+pub(crate) fn later_homes(it: &mut Interp) -> Vec<Option<usize>> {
+    let mut homes: Vec<Option<usize>> = system_on(it, false).into_iter().collect();
+    let one = matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::One(_)));
+    if one && !homes.contains(&None) {
+        homes.push(None);
+    }
+    homes
+}
+
+/// Notes in the system database that a tenant has calls: its database is not
+/// otherwise looked at. It goes in ahead of the call, and outside any
+/// transaction, so a call rolled back leaves a note that comes to nothing.
+fn later_tenant_noted(it: &mut Interp, tenant: &str) -> bool {
+    let Some(on) = system_on_for(it, true, true) else { return false };
+    let mysql = kind_on(it, on);
+    let make = if mysql {
+        "create table if not exists _quillo_later_tenants (tenant varchar(255) primary key, made bigint not null, at bigint not null)"
+    } else {
+        "create table if not exists _quillo_later_tenants (tenant text primary key, made bigint not null, at bigint not null)"
+    };
+    let sql = if mysql {
+        "insert into _quillo_later_tenants (tenant, made, at) values (?, ?, ?) on duplicate key update made = values(made), at = values(at)"
+    } else {
+        "insert into _quillo_later_tenants (tenant, made, at) values (?, ?, ?) on conflict (tenant) do update set made = excluded.made, at = excluded.at"
+    };
+    let now = now_ms();
+    on_own_table(it, on, "_quillo_later_tenants", make, vec![Value::str(sql), Value::str(tenant), Value::Int(now), Value::Int(now)])
 }
 
 /// Keeps a call made later; false when there is no database to keep it in.
 pub(crate) fn later_put(it: &mut Interp, c: &crate::service::Later) -> bool {
-    let Some(on) = system_on_for(it, true, true) else { return false };
+    let Some(on) = later_home(it) else { return false };
+    if on.is_none() && tenant_dbs(it) && !later_tenant_noted(it, &c.tenant) {
+        return false;
+    }
     if !later_table(it, on) {
         return false;
     }
@@ -1382,9 +1470,8 @@ pub(crate) fn later_put(it: &mut Interp, c: &crate::service::Later) -> bool {
     matches!(exec_on(it, on, args), Ok(Value::Map(_)))
 }
 
-/// Calls made later that are due.
-pub(crate) fn later_due(it: &mut Interp, now: i64, limit: usize) -> Vec<crate::service::Later> {
-    let Some(on) = system_on(it, false) else { return Vec::new() };
+/// Calls made later that are due, on connection `on`.
+pub(crate) fn later_due(it: &mut Interp, on: Option<usize>, now: i64, limit: usize) -> Vec<crate::service::Later> {
     let sql = format!("select id, service, fn, args, tenant, rid, at, tries from _quillo_later where at <= ? order by at limit {}", limit);
     let Ok(Value::List(rows)) = query_on(it, on, vec![Value::str(sql), Value::Int(now)]) else { return Vec::new() };
     let text = |r: &Map, k: &str| match r.get(k) {
@@ -1414,8 +1501,7 @@ pub(crate) fn later_due(it: &mut Interp, now: i64, limit: usize) -> Vec<crate::s
 
 /// Takes a due call for this server (others may share the database): only
 /// if it is still due at `was`; it is put off to `until` meanwhile.
-pub(crate) fn later_take(it: &mut Interp, id: &str, was: i64, until: i64) -> bool {
-    let Some(on) = system_on(it, false) else { return false };
+pub(crate) fn later_take(it: &mut Interp, on: Option<usize>, id: &str, was: i64, until: i64) -> bool {
     let sql = "update _quillo_later set at = ? where id = ? and at = ?";
     match exec_on(it, on, vec![Value::str(sql), Value::Int(until), Value::str(id), Value::Int(was)]) {
         Ok(Value::Map(m)) => !matches!(m.get("changes"), Some(Value::Int(0))),
@@ -1423,17 +1509,120 @@ pub(crate) fn later_take(it: &mut Interp, id: &str, was: i64, until: i64) -> boo
     }
 }
 
-pub(crate) fn later_done(it: &mut Interp, id: &str) {
-    if let Some(on) = system_on(it, false) {
-        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_later where id = ?"), Value::str(id)]);
+/// A call that got through: its row goes, and its answer is kept for a day
+/// (FEEDBACK23.md, Q-188; branch feedback23-fixes), in a table of its own so
+/// that `_quillo_later` stays as small as what is waiting.
+pub(crate) fn later_done(it: &mut Interp, on: Option<usize>, id: &str, answer: &str) {
+    let make = if kind_on(it, on) {
+        "create table if not exists _quillo_later_done (id varchar(64) primary key, at bigint not null, answer longtext not null)"
+    } else {
+        "create table if not exists _quillo_later_done (id text primary key, at bigint not null, answer text not null)"
+    };
+    let now = now_ms();
+    let sql = "insert into _quillo_later_done (id, at, answer) values (?, ?, ?)";
+    on_own_table(it, on, "_quillo_later_done", make, vec![Value::str(sql), Value::str(id), Value::Int(now), Value::str(answer)]);
+    if fastrand::u8(..) == 0 {
+        let _ = exec_on(it, on, vec![Value::str("delete from _quillo_later_done where at < ?"), Value::Int(now - LATER_ANSWER_MS)]);
+    }
+    let _ = exec_on(it, on, vec![Value::str("delete from _quillo_later where id = ?"), Value::str(id)]);
+}
+
+pub(crate) fn later_again(it: &mut Interp, on: Option<usize>, id: &str, at: i64, tries: i64, why: &str) {
+    let sql = "update _quillo_later set at = ?, tries = ?, error = ? where id = ?";
+    let _ = exec_on(it, on, vec![Value::str(sql), Value::Int(at), Value::Int(tries), Value::str(why), Value::str(id)]);
+}
+
+/// A call given up on: its row stays, with why (FEEDBACK23.md, Q-184; branch
+/// feedback23-fixes), so that a person can look, and send it again by setting
+/// `at` and `tries` to 0.
+pub(crate) fn later_failed(it: &mut Interp, on: Option<usize>, id: &str, why: &str) {
+    later_again(it, on, id, LATER_NEVER, -1, why);
+}
+
+/// Tenants that may have calls due, and when each was last given one.
+pub(crate) fn later_tenants(it: &mut Interp, now: i64, limit: usize) -> Vec<(String, i64)> {
+    if !tenant_dbs(it) {
+        return Vec::new();
+    }
+    let Some(on) = system_on(it, false) else { return Vec::new() };
+    let sql = format!("select tenant, made from _quillo_later_tenants where at <= ? order by at limit {}", limit);
+    let Ok(Value::List(rows)) = query_on(it, on, vec![Value::str(sql), Value::Int(now)]) else { return Vec::new() };
+    rows.iter()
+        .filter_map(|r| match r {
+            Value::Map(r) => match (r.get("tenant"), r.get("made")) {
+                (Some(Value::Str(t)), Some(Value::Int(m))) => Some((t.to_string(), *m)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// When the calls waiting on `on` are next due: None if there are none, an
+/// error if the database cannot say.
+pub(crate) fn later_next(it: &mut Interp, on: Option<usize>) -> Result<Option<i64>, ()> {
+    let sql = "select min(at) as at from _quillo_later where tries >= 0";
+    match query_on(it, on, vec![Value::str(sql)]) {
+        Ok(Value::List(rows)) => Ok(match rows.first() {
+            Some(Value::Map(r)) => match r.get("at") {
+                Some(Value::Int(at)) => Some(*at),
+                _ => None,
+            },
+            _ => None,
+        }),
+        // Made in a transaction that rolled back.
+        Ok(Value::Err(e, _, _)) if e.display().contains("_quillo_later") => Ok(None),
+        _ => Err(()),
     }
 }
 
-pub(crate) fn later_again(it: &mut Interp, id: &str, at: i64, tries: i64, why: &str) {
-    if let Some(on) = system_on(it, false) {
-        let sql = "update _quillo_later set at = ?, tries = ?, error = ? where id = ?";
-        let _ = exec_on(it, on, vec![Value::str(sql), Value::Int(at), Value::Int(tries), Value::str(why), Value::str(id)]);
+/// After looking at a tenant: when to look again. With nothing waiting, soon
+/// after a call was made, as it may be in a transaction not yet committed,
+/// then less often, and after a while not at all.
+pub(crate) fn later_tenant_seen(it: &mut Interp, tenant: &str, made: i64, next: Result<Option<i64>, ()>) {
+    let Some(on) = system_on(it, false) else { return };
+    let now = now_ms();
+    let at = match next {
+        Ok(Some(at)) => at,
+        Ok(None) if now - made >= LATER_TENANT_MS => {
+            let sql = "delete from _quillo_later_tenants where tenant = ? and made = ?";
+            let _ = exec_on(it, on, vec![Value::str(sql), Value::str(tenant), Value::Int(made)]);
+            return;
+        }
+        Ok(None) => now + (now - made).clamp(1000, 60_000),
+        Err(()) => now + 60_000,
+    };
+    let sql = "update _quillo_later_tenants set at = ? where tenant = ? and made = ?";
+    let _ = exec_on(it, on, vec![Value::str(sql), Value::Int(at), Value::str(tenant), Value::Int(made)]);
+}
+
+/// What became of call `id`: its tries and why it has not got through, or its
+/// answer. Read apart, as a table not made yet must not end a transaction,
+/// so a call made in a transaction shows once that has committed.
+pub(crate) fn later_status(it: &mut Interp, id: &str) -> Option<(i64, Option<String>, Option<String>)> {
+    let mut homes = later_homes(it);
+    if tenant_dbs(it) && it.tenant().is_some() {
+        homes.insert(0, None);
     }
+    for on in homes {
+        let Ok(b) = backend_on(it, on) else { continue };
+        let waiting = apart(it, &b, "select tries, error from _quillo_later where id = ?".into(), vec![Value::str(id)]);
+        if let Ok(Some(Value::Map(r))) = waiting.map(|mut rows| rows.pop()) {
+            let tries = if let Some(Value::Int(n)) = r.get("tries") { *n } else { 0 };
+            let error = match r.get("error") {
+                Some(Value::Str(e)) => Some(e.to_string()),
+                _ => None,
+            };
+            return Some((tries, error, None));
+        }
+        let done = apart(it, &b, "select answer from _quillo_later_done where id = ?".into(), vec![Value::str(id)]);
+        if let Ok(Some(Value::Map(r))) = done.map(|mut rows| rows.pop()) {
+            if let Some(Value::Str(a)) = r.get("answer") {
+                return Some((0, None, Some(a.to_string())));
+            }
+        }
+    }
+    None
 }
 
 // ---- calls a service answered, shared by its copies (src/service.rs) ----------------------
@@ -1474,11 +1663,21 @@ pub(crate) fn call_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: 
     if matches!(exec_on(it, on, vec![Value::str(sql), Value::str(id), Value::Int(now_ms)]), Ok(Value::Map(_))) {
         return Some(Claim::Mine);
     }
-    let rows = query_on(it, on, vec![Value::str("select status, answer from _quillo_calls where id = ?"), Value::str(id)]);
+    let rows = query_on(it, on, vec![Value::str("select status, answer, at from _quillo_calls where id = ?"), Value::str(id)]);
     match rows {
         Ok(Value::List(rows)) => match rows.first() {
-            Some(Value::Map(r)) => match (r.get("status"), r.get("answer")) {
-                (Some(Value::Int(s)), Some(Value::Str(a))) if *s > 0 => Some(Claim::Done(*s as u16, a.to_string())),
+            Some(Value::Map(r)) => match (r.get("status"), r.get("answer"), r.get("at")) {
+                (Some(Value::Int(s)), Some(Value::Str(a)), _) if *s > 0 => Some(Claim::Done(*s as u16, a.to_string())),
+                // A copy that died running it left this, and it would be
+                // refused for ever. Older than a signature can be, it is free
+                // (FEEDBACK23.md, Q-186; branch feedback23-fixes).
+                (_, _, Some(Value::Int(at))) if *at < forget_before => {
+                    let sql = "update _quillo_calls set at = ? where id = ? and status = 0 and at = ?";
+                    match exec_on(it, on, vec![Value::str(sql), Value::Int(now_ms), Value::str(id), Value::Int(*at)]) {
+                        Ok(Value::Map(m)) if !matches!(m.get("changes"), Some(Value::Int(0))) => Some(Claim::Mine),
+                        _ => Some(Claim::Running),
+                    }
+                }
                 _ => Some(Claim::Running),
             },
             // Gone between the two (forgotten): this copy runs it.
@@ -1488,11 +1687,11 @@ pub(crate) fn call_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: 
     }
 }
 
-/// The answer to a call this copy claimed; one that did not run (a busy
-/// server) is let go, to be sent again.
+/// The answer to a call this copy claimed; one that did not finish is let
+/// go, to be sent again (FEEDBACK23.md, Q-184; branch feedback23-fixes).
 pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
     let Some(on) = system_on(it, false) else { return };
-    if status >= 502 {
+    if status != 200 {
         let _ = exec_on(it, on, vec![Value::str("delete from _quillo_calls where id = ?"), Value::str(id)]);
     } else {
         let sql = "update _quillo_calls set status = ?, answer = ? where id = ?";

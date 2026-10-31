@@ -1,0 +1,4 @@
+db.open("svc.db")
+service inner = "inner.qwe"
+server fn go() = inner.later.hit("x")
+server fn seen() = inner.hits()

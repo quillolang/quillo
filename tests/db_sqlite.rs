@@ -694,7 +694,8 @@ fn a_call_sent_again_to_another_copy_is_answered_as_it_was() {
     let c = rusqlite::Connection::open(d.join("ledger.db")).unwrap();
     assert_eq!(entries(&c), 1);
     // One still running on another copy: asked again later, not run here.
-    c.execute_batch("insert into _quillo_calls values ('call2', 1, 0, '')").unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    c.execute("insert into _quillo_calls values ('call2', ?, 0, '')", [now]).unwrap();
     let r = call(a.port, "call2", "[1]");
     assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.contains("still running"), "{}", r.body);

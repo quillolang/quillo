@@ -159,6 +159,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("db.open", "target, options", "Opens the program's database: a SQLite path or a server URL. A failure is an error value, not a stop."),
     ("db.connect", "target, options", "Opens another database and gives its `exec`, `query`, `one` and the like; one `target`, one connection."),
     ("db.system", "target", "Keeps Quillo's own tables (jobs, calls made later, `db.atomic`'s decisions) in this database."),
+    ("later.status", "id", "What became of a call made later: `{ state, tries, error }` while waiting or failed, `{ state: \"done\", result }`, or null."),
     ("db.shards", "targets", "Databases split by a key: `.on(key)` is a shard's connection, `.all(sql)` asks every shard."),
     ("db.atomic", "dbs, f", "Runs `f` as one transaction over the databases listed: all of it commits, or none."),
     ("db.exec", "sql, params", "Runs SQL, with `?` or `:name` values; `{ changes, last_id }`, or an error value."),

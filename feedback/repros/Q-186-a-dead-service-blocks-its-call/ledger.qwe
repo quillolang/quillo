@@ -1,0 +1,8 @@
+db.open("ledger.db")
+db.exec("create table if not exists entries (who text)")
+
+server fn post(who: str) -> str {
+    db.exec("insert into entries (who) values (?)", who)
+    sleep(4000)
+    "posted"
+}

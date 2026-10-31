@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Calls made later, and sagas
+
+- **`.later` goes with its transaction on every database.** On MySQL and MariaDB one call
+  inside `db.transaction` used to end the transaction, so its rollback undid nothing. With a
+  database per tenant or beside `db.system`, a call rolled back used to be delivered: it is
+  now kept in the database the work is in.
+- **A service's own `.later` is delivered in one process**, as it is under `--split`, and its
+  `db.atomic` work is finished there too.
+- **Only a finished call is finished.** A 401, 404, 409 or 500 no longer deletes a call: it
+  is tried for about a day, then kept and marked, with `quillo_later_total` counting them. A
+  400 is marked at once. A service remembers only answers of 200.
+- **`later.status(id)`** says what became of a call: waiting, done with its result, or failed.
+- **A long queue drains:** after a full go of 50 calls the next comes at once.
+- **A service that dies during a call no longer blocks it for good:** after eleven minutes the
+  call runs again. The guide now says what was always so: across a crash a call runs at
+  least once.
+- **`request.call`** is a call's own id in a service, the same for each try, and `idempotent`
+  uses it as its key there, so a step is safe across a crash in one word.
+- The guide has a section on [sagas](USERGUIDE.md#sagas).
+
 ### Prefetching
 
 - **A page kept for a click no longer outlives a logout.** Only Quillo's own background

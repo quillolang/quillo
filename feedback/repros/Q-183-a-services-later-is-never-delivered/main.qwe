@@ -1,0 +1,11 @@
+// Q-183 In one process, a `.later` made by a service is kept and never delivered
+// mode: script
+// script: steps.sh
+// open-when: delivered: []
+// fixed-when: delivered: ["x"]
+// From FEEDBACK23.md §Q-183 (found on da6c1a3).
+
+db.open("main.db")
+service svc = "svc.qwe"
+route GET /go = svc.go()
+route GET /seen = `delivered: ${json.stringify(svc.seen())}`

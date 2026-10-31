@@ -1,0 +1,20 @@
+// Q-182 On MySQL and MariaDB, `.later` inside `db.transaction` ends the transaction, and the rollback undoes nothing
+// mode: script
+// script: steps.sh
+// open-when: rows left: 2
+// fixed-when: rows left: 0
+// From FEEDBACK23.md §Q-182 (found on da6c1a3).
+
+db.open(env("REPRO_DB")) | unwrap
+db.exec("create table if not exists orders (id bigint primary key)")
+service mailer = "mailer.qwe"
+
+route GET /go {
+    db.transaction(() => {
+        db.exec("insert into orders (id) values (?)", 1)
+        mailer.later.send("x")
+        db.exec("insert into orders (id) values (?)", 2)
+        err("no")
+    })
+    `rows left: ${len(db.query("select id from orders"))}`
+}

@@ -537,13 +537,15 @@ enum Outcome {
     Ran(Value),
     /// It did not run, or may not have (no answer in time): why.
     Missed(String),
+    /// The service answered, with no value: a status, and why.
+    Refused(u16, String),
 }
 
 impl Outcome {
     fn value(self) -> Value {
         match self {
             Outcome::Ran(v) => v,
-            Outcome::Missed(why) => Value::err(Value::str(why)),
+            Outcome::Missed(why) | Outcome::Refused(_, why) => Value::err(Value::str(why)),
         }
     }
 }
@@ -559,10 +561,11 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
         // Q-074; branch feedback10-fixes); here again if none answers.
         static TURN: AtomicUsize = AtomicUsize::new(0);
         if joined.is_empty() || TURN.fetch_add(1, Ordering::Relaxed) % (joined.len() + 1) == 0 {
-            return local(it, name, f, args, tenant, rid, line);
+            return local(it, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)), line);
         }
-        return match remote(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), call.unwrap_or_else(|| new_id(16))) {
-            Outcome::Missed(_) => local(it, name, f, args, tenant, rid, line),
+        let id = call.unwrap_or_else(|| new_id(16));
+        return match remote(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), id.clone()) {
+            Outcome::Missed(_) => local(it, name, f, args, tenant, rid, id, line),
             ran => ran,
         };
     }
@@ -606,23 +609,55 @@ fn from_wire(j: &serde_json::Value) -> Value {
     crate::interp::from_island_json(j)
 }
 
-fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, line: u32) -> Outcome {
+/// `request` in a function a service answers with: the id of the request it
+/// came from, as far as it goes with the call, and the call's own, the same
+/// for each try (FEEDBACK23.md, Q-188; branch feedback23-fixes).
+fn step_request(rid: Option<&str>, call: &str) -> Value {
+    let mut m = Map::new();
+    if let Some(id) = rid {
+        m.insert("id".into(), Value::str(id));
+    }
+    m.insert("call".into(), Value::str(call));
+    Value::map(m)
+}
+
+/// A function's value as a service's answer says it.
+pub(crate) fn wire_answer(v: &Value) -> serde_json::Value {
+    match v {
+        // Whether the program wrote it goes along, for the caller's visitors.
+        Value::Err(e, own, _) => serde_json::json!({ "err": to_wire(e), "own": own }),
+        v => serde_json::json!({ "ok": to_wire(v) }),
+    }
+}
+
+/// The value in such an answer.
+pub(crate) fn from_answer(j: &serde_json::Value) -> Value {
+    match j.get("err") {
+        Some(e) if j["own"] == serde_json::json!(true) => Value::own_err(from_wire(e)),
+        Some(e) => Value::err(from_wire(e)),
+        None => from_wire(&j["ok"]),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, line: u32) -> Outcome {
     let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
         return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
     };
     let Some(Value::Func(c)) = lookup(&svc.globals, f).filter(|_| svc.server_fns.iter().any(|n| n == f)) else {
-        return Outcome::Ran(Value::err(Value::str(format!("service {}: no server fn `{}`", name, f))));
+        return Outcome::Refused(404, format!("service {}: no server fn `{}`", name, f));
     };
     let args: Vec<Value> = args.iter().map(crossed).collect();
     let args = match crate::server::take_args(&mut svc, &c.def, args) {
         Ok(a) => a,
-        Err(msg) => return Outcome::Ran(Value::err(Value::str(format!("service {}: {}", name, msg)))),
+        Err(msg) => return Outcome::Refused(400, format!("service {}: {}", name, msg)),
     };
     svc.tenant = Some(tenant.clone());
     svc.tenant_named = tenant.is_some();
+    svc.current_request = Some(step_request(rid.as_deref(), &call));
     svc.request_id = rid;
-    let err = |msg: String| Outcome::Ran(Value::err(Value::str(msg)));
+    let err = |msg: String| Outcome::Refused(500, msg);
     match svc.call_closure(&c, args.into_iter().map(Some).collect(), line) {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => err(format!("service {}: `{}` answered with a page, not a value", name, f)),
@@ -842,15 +877,11 @@ fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value
                         it.publish(topics);
                     }
                 }
-                return Outcome::Ran(match status {
-                    200 => match answer {
-                        Some(j) if j.get("ok").is_some() => from_wire(&j["ok"]),
-                        Some(j) if j["own"] == serde_json::json!(true) => Value::own_err(from_wire(&j["err"])),
-                        Some(j) if j.get("err").is_some() => Value::err(from_wire(&j["err"])),
-                        _ => Value::err(Value::str(format!("service {}: an answer that is not one", name))),
-                    },
-                    _ => Value::err(Value::str(format!("service {}: {} {}", name, status, reason(&text)))),
-                });
+                return match (status, answer) {
+                    (200, Some(j)) if j.get("ok").is_some() || j.get("err").is_some() => Outcome::Ran(from_answer(&j)),
+                    (200, _) => Outcome::Refused(200, format!("service {}: an answer that is not one", name)),
+                    _ => Outcome::Refused(status, format!("service {}: {} {}", name, status, reason(&text))),
+                };
             }
             Try::NotSent(e) => {
                 went_wrong(&url, &o);
@@ -983,8 +1014,10 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         crate::db::call_done(it, c, r.status, &String::from_utf8_lossy(&r.body));
     }
     let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A call that did not run (a busy server) may be sent again.
-    if r.status >= 502 {
+    // A call that did not finish may be sent again: only an answer of 200
+    // ends one, so a 409 before a deploy is not the answer after it
+    // (FEEDBACK23.md, Q-184; branch feedback23-fixes).
+    if r.status != 200 {
         seen.remove(c);
     } else {
         seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
@@ -1025,19 +1058,15 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     it.tenant = Some(if tenant.is_empty() { None } else { Some(Arc::from(tenant)) });
     it.tenant_named = !tenant.is_empty();
     // Called by another service: `request` is the request it came from, as
-    // far as it goes with the call (its id).
-    if let Some(id) = &it.request_id {
-        let mut m = Map::new();
-        m.insert("id".into(), Value::str(&**id));
-        it.current_request = Some(Value::map(m));
-    }
+    // far as it goes with the call (its id), and the call's own id.
+    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    it.current_request = Some(step_request(it.request_id.as_deref(), header("x-quillo-call").unwrap_or("")));
     // The topics this call publishes go back with the answer, so the
     // caller's pages that watch them follow, as they do in one process
     // (FEEDBACK4.md, Q-038; branch bank-fixes).
     it.published = Some(Vec::new());
     // How long the caller waits for it: what this call's own calls to
     // services may wait in turn (FEEDBACK6.md, Q-056; branch feedback6-fixes).
-    let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
     it.deadline = header("x-quillo-deadline").and_then(|ms| ms.parse::<u64>().ok()).map(|ms| Instant::now() + Duration::from_millis(ms.min(3_600_000)));
     let result = it.call_closure(&c, args.into_iter().map(Some).collect(), 0);
     it.deadline = None;
@@ -1052,9 +1081,7 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
     match result {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
-            // Whether the program wrote it goes along, for the caller's visitors.
-            Value::Err(e, own, _) => json(200, with_published(serde_json::json!({ "err": to_wire(&e), "own": own }))),
-            v => json(200, with_published(serde_json::json!({ "ok": to_wire(&v) }))),
+            v => json(200, with_published(wire_answer(&v))),
         },
         Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
         Err(Ctrl::Error(e)) => {
@@ -1238,12 +1265,19 @@ fn backoff(tries: i64) -> i64 {
     (1000i64 << tries.clamp(0, 9)).min(300_000)
 }
 
+/// How many due calls one go takes, on each database.
+const BATCH: usize = 50;
+/// How many tries a call the service keeps answering with an error gets,
+/// with `backoff`: about a day. A service that does not answer at all is
+/// waited for, however long.
+const ANSWERED_TRIES: i64 = 290;
+
 /// Makes the calls that are due (asked by the server's scheduler, each
 /// second): those that get through are done with; the others wait longer.
 pub fn deliver(it: &mut Interp) -> HttpResponse {
     // Every half minute: transactions over several databases left part way.
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let due = {
+    let recovering = {
         let mut l = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let due = l.map_or(true, |t| t.elapsed() >= Duration::from_secs(30));
         if due {
@@ -1251,7 +1285,7 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
         }
         due
     };
-    if due {
+    if recovering {
         crate::db::recover(it);
     }
     let now = now_ms();
@@ -1262,32 +1296,110 @@ pub fn deliver(it: &mut Interp) -> HttpResponse {
         due
     };
     for mut c in due {
-        if let Err(why) = make_later(it, &c) {
-            c.tries += 1;
-            c.at = now_ms() + backoff(c.tries);
-            eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(c.tries) / 1000);
-            waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(c);
+        match make_later(it, &c) {
+            Tried::Through(_) => crate::metrics::later(0),
+            Tried::Again(why) => {
+                c.tries += 1;
+                c.at = now_ms() + backoff(c.tries);
+                said_again(&c, c.tries, &why);
+                waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(c);
+            }
+            Tried::Never(why) => said_never(&c, &why),
         }
     }
-    // Kept in the database: each taken by one server (others may share it).
-    for c in crate::db::later_due(it, now, 50) {
-        if !crate::db::later_take(it, &c.id, c.at, now_ms() + 60_000) {
+    let mut more = deliver_kept(it);
+    // The services this process runs keep their calls where their work is,
+    // and only this thread is there to make them (FEEDBACK23.md, Q-183; branch
+    // feedback23-fixes), and to finish their `db.atomic` work.
+    let here: Vec<Interp> = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().map(|(_, s)| s.fork()).collect();
+    for mut s in here {
+        if recovering {
+            crate::db::recover(&mut s);
+        }
+        if !s.declared_services.is_empty() {
+            more |= deliver_kept(&mut s);
+        }
+    }
+    // A full go: the next comes at once, not in a second (FEEDBACK23.md,
+    // Q-187; branch feedback23-fixes). Each is a request of its own, so what
+    // visitors ask for goes between them.
+    HttpResponse { status: 200, headers: Vec::new(), body: if more { b"more\n".to_vec() } else { b"ok\n".to_vec() } }
+}
+
+/// Makes a program's calls that are due, kept in its databases and its
+/// tenants'; true if there may be more at once.
+fn deliver_kept(it: &mut Interp) -> bool {
+    let mut more = false;
+    for on in crate::db::later_homes(it) {
+        more |= deliver_from(it, on);
+    }
+    let tenants = crate::db::later_tenants(it, now_ms(), BATCH);
+    more |= tenants.len() == BATCH;
+    for (tenant, made) in tenants {
+        let was = (it.tenant.take(), it.tenant_named);
+        it.tenant = Some(Some(Arc::from(tenant.as_str())));
+        it.tenant_named = true;
+        more |= deliver_from(it, None);
+        let next = crate::db::later_next(it, None);
+        (it.tenant, it.tenant_named) = was;
+        crate::db::later_tenant_seen(it, &tenant, made, next);
+    }
+    more
+}
+
+/// One go at the calls due on connection `on`, each taken by one server
+/// (others may share the database); true if it took all it could.
+fn deliver_from(it: &mut Interp, on: Option<usize>) -> bool {
+    let due = crate::db::later_due(it, on, now_ms(), BATCH);
+    let full = due.len() == BATCH;
+    for c in due {
+        if !crate::db::later_take(it, on, &c.id, c.at, now_ms() + 60_000) {
             continue;
         }
         match make_later(it, &c) {
-            Ok(()) => crate::db::later_done(it, &c.id),
-            Err(why) => {
+            Tried::Through(answer) => {
+                crate::metrics::later(0);
+                crate::db::later_done(it, on, &c.id, &answer);
+            }
+            Tried::Again(why) => {
                 let tries = c.tries + 1;
-                eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(tries) / 1000);
-                crate::db::later_again(it, &c.id, now_ms() + backoff(tries), tries, &why);
+                said_again(&c, tries, &why);
+                crate::db::later_again(it, on, &c.id, now_ms() + backoff(tries), tries, &why);
+            }
+            Tried::Never(why) => {
+                said_never(&c, &why);
+                crate::db::later_failed(it, on, &c.id, &why);
             }
         }
     }
-    HttpResponse { status: 200, headers: Vec::new(), body: b"ok\n".to_vec() }
+    full
 }
 
-/// One call made later: Ok when it got through (whatever the function gave).
-fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
+fn said_again(c: &Later, tries: i64, why: &str) {
+    crate::metrics::later(1);
+    eprintln!("quillo: {}.{} (made later, {}) not made yet: {}; again in {}s", c.service, c.f, c.id, why, backoff(tries) / 1000);
+}
+
+fn said_never(c: &Later, why: &str) {
+    crate::metrics::later(2);
+    eprintln!("quillo: {}.{} (made later, {}) failed after {} tries: {}; not tried again", c.service, c.f, c.id, c.tries + 1, why);
+}
+
+/// How a try of a call made later went.
+enum Tried {
+    /// It got through: the answer, as a service's answer says it.
+    Through(String),
+    /// Not yet: why.
+    Again(String),
+    /// It cannot, or has failed too long: why.
+    Never(String),
+}
+
+/// One call made later. Only a value, or an error value the function gave,
+/// finishes one: a service that answers with an error of its own may be
+/// mid-deploy, and a call deleted then is lost (FEEDBACK23.md, Q-184; branch
+/// feedback23-fixes). Arguments it refuses (400) will not do any better.
+fn make_later(it: &mut Interp, c: &Later) -> Tried {
     let args = match serde_json::from_str::<serde_json::Value>(&c.args) {
         Ok(serde_json::Value::Array(a)) => a.iter().map(from_wire).collect(),
         _ => Vec::new(),
@@ -1295,13 +1407,51 @@ fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
     let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
     let rid = (!c.rid.is_empty()).then(|| Arc::from(c.rid.as_str()));
     match make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0) {
-        Outcome::Ran(Value::Err(e, _, _)) => {
-            eprintln!("quillo: {}.{} (made later, {}) gave an error: {}", c.service, c.f, c.id, short(&e));
-            Ok(())
+        Outcome::Ran(v) => {
+            if let Value::Err(e, _, _) = &v {
+                eprintln!("quillo: {}.{} (made later, {}) gave an error: {}", c.service, c.f, c.id, short(e));
+            }
+            Tried::Through(wire_answer(&v).to_string())
         }
-        Outcome::Ran(_) => Ok(()),
-        Outcome::Missed(why) => Err(why),
+        Outcome::Refused(400, why) => Tried::Never(why),
+        Outcome::Refused(_, why) if c.tries + 1 >= ANSWERED_TRIES => Tried::Never(why),
+        Outcome::Refused(_, why) | Outcome::Missed(why) => Tried::Again(why),
     }
+}
+
+/// `later.status(id)`: what became of a call made later (FEEDBACK23.md, Q-188;
+/// branch feedback23-fixes), or null if nothing is known of it.
+fn later_status(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Some(Value::Str(id)) = args.first() else {
+        return fail(line, "`later.status` expects the id a `.later` call gave");
+    };
+    let state = |state: &str, fields: Vec<(&str, Value)>| {
+        let mut m = Map::new();
+        m.insert("state".into(), Value::str(state));
+        for (k, v) in fields {
+            m.insert(k.into(), v);
+        }
+        Value::map(m)
+    };
+    // Why a call has not got through names addresses, so it is an error
+    // value, which no visitor sees.
+    let error = |e: Option<String>| e.map_or(Value::Nil, |e| Value::err(Value::str(e)));
+    if let Some(c) = waiting().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|c| c.id == **id) {
+        return Ok(state("waiting", vec![("tries", Value::Int(c.tries)), ("error", Value::Nil)]));
+    }
+    Ok(match crate::db::later_status(it, id) {
+        None => Value::Nil,
+        Some((_, _, Some(answer))) => {
+            let j = serde_json::from_str::<serde_json::Value>(&answer).unwrap_or_default();
+            state("done", vec![("result", from_answer(&j))])
+        }
+        Some((tries, e, None)) if tries < 0 => state("failed", vec![("error", error(e))]),
+        Some((tries, e, None)) => state("waiting", vec![("tries", Value::Int(tries)), ("error", error(e))]),
+    })
+}
+
+pub fn install_later(m: &mut Map) {
+    m.insert("status".into(), Value::Builtin("later.status", later_status));
 }
 
 /// Whether a program declares services (then its calls made later are
@@ -1322,12 +1472,15 @@ pub fn start_deliveries(addr: std::net::SocketAddr) {
         ip if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port())),
         _ => addr,
     };
+    let mut more = false;
     let _ = std::thread::Builder::new().name("quillo-later".into()).spawn(move || loop {
         if crate::httpd::stopping() {
             return;
         }
-        std::thread::sleep(Duration::from_secs(1));
-        let asked = (|| -> std::io::Result<()> {
+        if !more {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let asked = (|| -> std::io::Result<bool> {
             use std::io::Write;
             let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
             write!(
@@ -1337,9 +1490,9 @@ pub fn start_deliveries(addr: std::net::SocketAddr) {
             )?;
             let mut out = Vec::new();
             s.read_to_end(&mut out)?;
-            Ok(())
+            Ok(out.ends_with(b"more\n"))
         })();
-        let _ = asked;
+        more = matches!(asked, Ok(true));
     });
 }
 

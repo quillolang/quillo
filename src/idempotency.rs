@@ -61,6 +61,12 @@
 //! Without the header, `f` simply runs (in its transaction), unless
 //! `{ required: true }`, which answers 400. Outside a request (a script,
 //! a job), there is no key: `f` runs.
+//!
+//! In a function a service answers with, the key is the call's own id, which
+//! is the same for each try, so the value is kept in place of an answer
+//! (FEEDBACK23.md, Q-188; branch feedback23-fixes). What would refuse a
+//! request is a runtime error there: the call did not finish, and is sent
+//! again.
 
 use crate::interp::{fail, Ctrl, Interp};
 use crate::server::HttpResponse;
@@ -154,8 +160,14 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let path = text("path");
     // A server fn called from a page answers as server fns do (see `server`).
     let rpc = path.strip_prefix("/_quillo/rpc/").map(str::to_string);
+    let call = text("call");
+    let step = !call.is_empty();
+    let no = |status: u16, msg: &str| if step { fail(line, msg.to_string()) } else { refuse(status, msg) };
+    let give = |a: HttpResponse, replayed: bool| if step { Ok(step_value(&a)) } else { answer(a, replayed) };
     let key = match header("idempotency-key") {
         Some(k) => k,
+        // By its line too: a function may have two.
+        None if step => format!("{}:{}", call, line),
         None if opts.required => return refuse(400, "this request needs an Idempotency-Key header"),
         None => return run_plain(it),
     };
@@ -164,6 +176,7 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let user = match &opts.user {
         Some(u) => u.clone(),
+        None if step => Value::Nil,
         None => session_user(it, line)?,
     };
     let tenant = it.tenant();
@@ -171,15 +184,15 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let print = fingerprint(it, &req, &header("content-type").unwrap_or_default());
     let token = match claim(it, &id, &path, &print, opts.keep_ms, opts.transaction) {
         Ok(Claim::Mine(t)) => t,
-        Ok(Claim::Answer(a)) => return answer(a, true),
-        Ok(Claim::Refused(status, msg)) => return refuse(status, &msg),
-        Err(e) => return refuse(503, &format!("could not record the Idempotency-Key: {}", e)),
+        Ok(Claim::Answer(a)) => return give(a, true),
+        Ok(Claim::Refused(status, msg)) => return no(status, &msg),
+        Err(e) => return no(503, &format!("could not record the Idempotency-Key: {}", e)),
     };
     cleanup(it, tenant.as_deref());
 
     if !opts.transaction {
         let r = it.call(&f, Vec::new(), line);
-        let a = match render(rpc.as_deref(), r) {
+        let a = match if step { render_step(r) } else { render(rpc.as_deref(), r) } {
             Ok(a) => a,
             Err(e) => {
                 release(it, &id, &token);
@@ -191,7 +204,7 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(false) => eprintln!("quillo: an idempotent request's claim was gone when its answer was kept"),
             Err(e) => eprintln!("quillo: could not keep an idempotent request's answer: {}", e),
         }
-        return answer(a, false);
+        return give(a, false);
     }
 
     // The work and its answer, in one transaction.
@@ -205,7 +218,7 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(v) if !matches!(v, Value::Err(..)) => v,
             other => return other,
         };
-        let a = render(rpc.as_deref(), Ok(v.clone()))?;
+        let a = if step { render_step(Ok(v.clone()))? } else { render(rpc.as_deref(), Ok(v.clone()))? };
         match store(it, &id, &token, &a) {
             Ok(true) => {
                 kept = Some(a);
@@ -220,20 +233,20 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     });
     match kept {
-        Some(a) if ok(&r) => answer(a, false),
+        Some(a) if ok(&r) => give(a, false),
         _ => {
             // Nothing was committed: give the claim up, so the request may
             // run again.
             release(it, &id, &token);
             if lost {
                 return match claim(it, &id, &path, &print, opts.keep_ms, true) {
-                    Ok(Claim::Answer(a)) => answer(a, true),
+                    Ok(Claim::Answer(a)) => give(a, true),
                     Ok(Claim::Mine(t)) => {
                         release(it, &id, &t);
-                        refuse(409, "a request with this Idempotency-Key was running at the same time; try again")
+                        no(409, "a request with this Idempotency-Key was running at the same time; try again")
                     }
-                    Ok(Claim::Refused(status, msg)) => refuse(status, &msg),
-                    Err(e) => refuse(503, &format!("could not read the Idempotency-Key: {}", e)),
+                    Ok(Claim::Refused(status, msg)) => no(status, &msg),
+                    Err(e) => no(503, &format!("could not read the Idempotency-Key: {}", e)),
                 };
             }
             r
@@ -323,6 +336,24 @@ fn render(rpc: Option<&str>, r: R) -> Result<HttpResponse, Ctrl> {
             json(500, serde_json::json!({ "error": format!("internal error in `{}`", name) }))
         }
     })
+}
+
+/// What a service's function gave, kept as its value and not as a page.
+fn render_step(r: R) -> Result<HttpResponse, Ctrl> {
+    let v = match r {
+        Ok(v) | Err(Ctrl::Return(v)) => v,
+        Err(e) => return Err(e),
+    };
+    if matches!(v, Value::Response(_)) {
+        return fail(0, "a service's function gives a value, not a page");
+    }
+    let body = crate::service::wire_answer(&v).to_string().into_bytes();
+    Ok(HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body })
+}
+
+/// The value kept by `render_step`.
+fn step_value(a: &HttpResponse) -> Value {
+    crate::service::from_answer(&serde_json::from_slice(&a.body).unwrap_or_default())
 }
 
 /// Ends the request with an answer (kept, or given again).

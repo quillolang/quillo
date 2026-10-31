@@ -1,0 +1,21 @@
+// Q-185 With a database per tenant, a call made in a transaction that rolls back is still delivered
+// mode: script
+// script: steps.sh
+// open-when: sent: ["bob"]
+// fixed-when: sent: []
+// From FEEDBACK23.md §Q-185 (found on da6c1a3).
+
+db.open("data/{tenant}.db")
+service mailer = "mailer.qwe"
+
+route GET /rollback/:who = with_tenant("acme", () => {
+    db.exec("create table if not exists orders (id integer primary key, who text)")
+    db.transaction(() => {
+        db.exec("insert into orders (who) values (?)", who)
+        mailer.later.send(who)
+        err("change of mind")
+    })
+    "tried"
+})
+
+route GET /sent = `sent: ${json.stringify(mailer.sent())}`

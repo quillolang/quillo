@@ -1,0 +1,11 @@
+// Q-186 A service that dies during a call blocks that call, then runs it twice
+// mode: script
+// script: steps.sh
+// open-when: calls waiting: 1
+// fixed-when: calls waiting: 0
+// From FEEDBACK23.md §Q-186 (found on da6c1a3). The row is aged by hand, as the report's was.
+
+db.open("front.db")
+service ledger = "ledger.qwe"
+route GET /post/:who = ledger.later.post(who)
+route GET /waiting = `calls waiting: ${len(db.query("select id from _quillo_later"))}`

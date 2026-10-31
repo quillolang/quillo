@@ -1,0 +1,11 @@
+// Q-184 A `.later` call is deleted on any answer, so a bad deploy loses it with one log line
+// mode: script
+// script: steps.sh
+// open-when: calls kept: 0
+// fixed-when: calls kept: 1
+// From FEEDBACK23.md §Q-184 (found on da6c1a3).
+
+db.open("front.db")
+service mailer = "mailer.qwe"
+route GET /send/:who = mailer.later.send(who)
+route GET /kept = `calls kept: ${len(db.query("select id from _quillo_later"))}`

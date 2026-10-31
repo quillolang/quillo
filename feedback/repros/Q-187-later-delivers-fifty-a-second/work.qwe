@@ -1,0 +1,6 @@
+let n = 0
+server fn hit(i: int) {
+    n = n + 1
+    n
+}
+server fn count() = n

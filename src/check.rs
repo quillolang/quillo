@@ -659,6 +659,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.open", "str | fn, map=", "null | error(str)"),
     ("db.connect", "str | fn, map=", "map | error(str)"),
     ("db.system", "str", "null | error(str)"),
+    ("later.status", "str", "map | null"),
     ("db.shards", "list", "map | error(str)"),
     ("db.atomic", "list, fn", "any"),
     ("db.exec", "str, any...", "map | error(str)"),
@@ -868,7 +869,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 /// Modules the browser has too (src/client/runtime.js).
 const BROWSER_MODULES: &[&str] = &["json", "math", "bit", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "bit", "stats", "vec", "date", "money", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "later", "math", "bit", "stats", "vec", "date", "money", "re"];
 
 /// What the modules hold that is not a function.
 const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "math.nan"];
@@ -878,7 +879,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;

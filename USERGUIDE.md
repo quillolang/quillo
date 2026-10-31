@@ -568,7 +568,7 @@ The effects, and the builtins behind each:
 
 | Effect | Builtins |
 |---|---|
-| `db` | every `db.*` but `db.error_kind`; `idempotent` |
+| `db` | every `db.*` but `db.error_kind`; `idempotent`, `later.status` |
 | `http` | `http.*`, and calls to services |
 | `fs` | `file`, `read_file`, `write_file`, `delete_file`, `check_program`, `image.info`, `image.convert` |
 | `env` | `env` |
@@ -2202,6 +2202,11 @@ curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bo
   values, shared by everyone who knows one.
 - Without the header, `f` simply runs; `{ required: true }` answers 400 instead.
   Outside a request (a script, a job), `f` runs.
+- In a function a service answers with, the key is the call's own id, which is the same
+  for each try, so a step is one word: `server fn charge(ref: str, cents: int) =
+  idempotent(() => ...)`. Its value is kept and given again, and what would refuse a
+  request is a runtime error there, so the call is sent again. It holds across a crash,
+  which a service's memory of its calls does not (see [Services](#services)).
 - `idempotent` answers the request with what `f` gives, as the route or server fn would
   have: it ends the request, so make it the last thing. What comes before it (an
   `auth.required`, a pattern, a 400 for a bad form) runs every time and is not kept,
@@ -2785,7 +2790,7 @@ service /billing = "billing.qwe"
   `db.atomic` spans databases of one program, not calls. A chain of calls commits step
   by step, so give each step a reference the caller makes up and keep what was done,
   so that a request sent again goes on from where it stopped rather than doing it
-  twice.
+  twice. To undo the steps before one that fails, see [Sagas](#sagas).
 - A service's `server fn`s are for other services: pages cannot call them. A service
   does not answer `/_quillo/rpc/...` (in one process, under its prefix; split, `--split`
   starts it with `--as-service`), only signed calls at `/_quillo/service/...`, whose
@@ -2834,9 +2839,16 @@ When a service runs elsewhere, its calls are made to hold up:
   jitter). A call sent but not answered in time is tried again at the same address, with
   the same call id: the service remembers the calls it answered (for eleven minutes, up
   to 100,000 of them in memory, and in `_quillo_calls` when it has a database) and gives
-  the same answer, so the function runs once however often the call is sent. A call
-  still running there is waited for (the service says `503 this call is still running`,
-  and the caller asks again). An answer of 502 to 504 is not remembered.
+  the same answer, so while the service stays up the function runs once however often
+  the call is sent. A call still running there is waited for (the service says `503 this
+  call is still running`, and the caller asks again). Only an answer of 200 is
+  remembered, so a service that refused a call may take it after the next deploy.
+- **Across a crash, at least once.** A service stopped in the middle of a function cannot
+  say how far it got. The call is refused as still running for eleven minutes, as long as
+  a signature lasts, and then runs again, though its first run may have committed. So a
+  function that must not do its work twice keeps its own record: a reference the caller
+  makes up as a key, or [`idempotent`](#idempotent-requests), which commits a record with
+  the work.
 - **Left alone when failing.** An address that fails several calls in a row is not
   called for a while (its circuit is open), then tried with one call; the others take its
   calls meanwhile. Each time it fails again it is left alone twice as long, up to
@@ -2867,7 +2879,8 @@ When a service runs elsewhere, its calls are made to hold up:
   service passes it on, so a request is followed across services. With `--log json`,
   each call to a service is a line of its own: the service, the function, the address,
   the status, how long it took, the tries and the id (a chain that failed altogether
-  logs status 0).
+  logs status 0). In a function a service answers with, `request.call` is the call's own
+  id, the same for each try of it, and for a call made later the id `.later` gave.
 - **On the wire**, for a balancer's rules, a log, or a service written in another
   language: a call is `POST <service>/_quillo/service/<fn>` with the arguments as a
   JSON array, and the headers `x-quillo-service: t=<unix seconds>,sig=<hex>`,
@@ -2887,14 +2900,155 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Made later.** `billing.later.invoice(name, 1200)` does not wait: the call is kept, its
   id is the result, and it is made in the background, tried every second, then a little
   later each time (up to five minutes), until it gets through. Since the service
-  remembers call ids, it runs once. The calls are kept with Quillo's own tables
-  (`_quillo_later`: see [Quillo's own tables](#quillos-own-tables)), so they outlive a
-  restart, and servers sharing that database make each once; a program with no database
-  keeps them in `quillo-system.db` next to it. They are delivered by the thread that
-  also finishes `db.atomic`'s work, every second, which `--no-jobs` does not stop.
-  Checked as the call itself is (`quillo check`).
+  remembers call ids, it runs once while it stays up. Checked as the call itself is
+  (`quillo check`).
+  - **It goes with the transaction.** The call is kept in the database the work is in,
+    the program's or the tenant's (`_quillo_later`: see [Quillo's own
+    tables](#quillos-own-tables)), so inside `db.transaction` it commits or rolls back
+    with the work, on every database. It outlives a restart, and servers sharing that
+    database make each once; a program with no database keeps its calls in
+    `quillo-system.db` next to it.
+  - **What finishes it.** A value, or an error value the function gave, finishes a call;
+    its answer is kept for a day. Any other answer does not: a 401, 404 or 409 from a
+    deploy gone wrong, or a 500, is tried again for about a day, and a service that does
+    not answer at all is waited for however long it takes. A 400, arguments the service
+    refuses, cannot work and is given up on at once. A call given up on stays in
+    `_quillo_later` with `tries` -1 and why in `error`, is counted by `--metrics`, and goes
+    again with `update _quillo_later set at = 0, tries = 0 where tries < 0`.
+  - **Asking after one.** `later.status(id)` gives `{ state: "waiting", tries, error }`,
+    `{ state: "done", result }`, `{ state: "failed", error }`, or `null` if nothing is
+    known of it: a call done over a day ago, kept in memory and done, or made in a
+    transaction not committed yet. `result` is what the function gave, an error value
+    if it said no. `error` is an error value, as it can name addresses, so a visitor
+    is not shown it.
+  - **Who delivers them.** The thread that also finishes `db.atomic`'s work, for each
+    program in the process: the app and the services it runs, however the program runs.
+    `--no-jobs` does not stop it. It takes 50 calls a go from each database, each second,
+    and the next go at once after a full one. A call that has to wait does not hold up
+    the next, so order is not kept.
 
 See [services](https://github.com/quillolang/examples/tree/main/services): a shop that bills through a billing service.
+
+#### Sagas
+
+A saga is a business operation spread over services that share no transaction. Each
+service commits its own part, and if a later part cannot happen, the earlier parts are
+undone by compensating steps you write: an order reserves stock, charges a card and books
+a parcel, and if the parcel cannot be booked, the charge is refunded and the stock
+released.
+
+Quillo has no `saga` word. One is a table, a job that moves each row a step at a time, and
+ordinary calls, and it needs nothing else. The state is written before anything else
+happens, so a server that stops goes on from there:
+
+```quillo
+db.open("orders.db")
+db.exec("create table if not exists sagas (id text primary key, cents int not null, state text not null, step int not null, tries int not null, next_at bigint not null, why text)")
+
+service inventory = "inventory.qwe" { timeout: "1s", retries: 1 }
+service payments = "payments.qwe" { timeout: "1s", retries: 1 }
+
+let steps = 2
+
+fn forward(s) = match s.step {
+    0 => inventory.reserve(s.id)
+    _ => payments.charge(s.id, s.cents)
+}
+
+fn undo(s) = match s.step {
+    0 => inventory.release(s.id)
+    _ => payments.refund(s.id)
+}
+
+fn move(s, state, step, why) =
+    db.exec("update sagas set state = ?, step = ?, tries = 0, next_at = 0, why = ? where id = ? and state = ? and step = ?", state, step, why, s.id, s.state, s.step)
+
+fn try_again(s, why) =
+    db.exec("update sagas set tries = ?, next_at = ?, why = ? where id = ?", s.tries + 1, now() + min([1000 * pow(2, s.tries + 1), 60000]), why, s.id)
+
+fn advance(s) {
+    if s.state == "running" {
+        let r = forward(s)
+        if is_err(r) {
+            // No answer: it may have run. Try again, then undo this step too.
+            if s.tries + 1 >= 3 {
+                move(s, "undoing", s.step, str(r))
+            } else {
+                try_again(s, str(r))
+            }
+        } else if !r.ok {
+            move(s, "undoing", s.step - 1, r.why)
+        } else if s.step + 1 == steps {
+            move(s, "done", s.step, null)
+        } else {
+            move(s, "running", s.step + 1, null)
+        }
+    } else if s.step < 0 {
+        move(s, "undone", s.step, s.why)
+    } else {
+        let r = undo(s)
+        if is_err(r) {
+            // An undo is never given up on: it waits for the service.
+            try_again(s, str(r))
+        } else {
+            move(s, "undoing", s.step - 1, s.why)
+        }
+    }
+}
+
+fn advance_all() {
+    for s in db.query("select * from sagas where state in ('running', 'undoing') and next_at <= ? order by id limit 100", now()) {
+        advance(s)
+    }
+}
+
+schedule("1s", advance_all)
+```
+
+And a step, the same in every service:
+
+```quillo
+server fn charge(ref: str, cents: int) -> map {
+    db.transaction(() => {
+        let was = db.one("select state from charges where ref = ?", ref)
+        if was != null {
+            return { ok: was.state == "charged", why: was.state }
+        }
+        if cents > 100000 {
+            return { ok: false, why: "declined" }
+        }
+        db.exec("insert into charges (ref, cents, state) values (?, ?, 'charged')", ref, cents)
+        { ok: true }
+    })
+}
+
+server fn refund(ref: str) -> map {
+    db.exec("insert into charges (ref, cents, state) values (?, 0, 'refunded') on conflict (ref) do update set state = 'refunded'", ref)
+    { ok: true }
+}
+```
+
+Five rules carry it, and leaving out any one breaks it:
+
+1. **The reference is the key.** The caller makes it up, and a step keyed on it changes
+   nothing the second time. A job's tries are new calls with new ids, so `request.call`
+   and `idempotent` do not do this job here, though they do for one call sent again.
+2. **A "no" is an answer, not an error.** A step gives `{ ok: false, why }`. An error value
+   means no answer came and the step may have run, which is a different decision.
+3. **An undo works on what never happened, and leaves a mark.** A refund with no charge
+   writes `refunded`, so a charge that arrives late is refused. A call that times out
+   keeps running at the service, so this order really happens.
+4. **A step with no answer is undone too.** It may have run, and rule 3 makes that safe.
+5. **An undo never gives up.** It waits for the service. If it can never work, a person has
+   to look, so a saga long in `undoing` is what to alert on.
+
+Put the step that cannot be undone last. And sagas do not isolate each other: between
+steps, other requests see the stock reserved and the charge taken, so a state such as
+`held` must mean something to them.
+
+`.later` can carry a step too, committing the move with the call: `later.status(id)` tells
+how it ended, and a `server fn` with `idempotent` is safe across a crash. A job as above
+stays the simpler choice when the next move depends on the answer.
 
 ## Standard library
 
@@ -3916,23 +4070,27 @@ db.atomic([db, ledger], () => {
 
 ### Quillo's own tables
 
-Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on), calls
-made later (`_quillo_later`) and the decisions of `db.atomic` (`_quillo_atomic`) are
-kept in the program's database. When there is a database per tenant they cannot be,
-and go to the system database instead: `db.system(target)` (a database every server of
-the program shares, for several servers), `$QUILLO_SYSTEM_DB`, or else a SQLite file
-`quillo-system.db` next to the program. `db.system` also keeps them apart from the
-program's own tables when there is one database. A program with no database at all
-keeps its calls made later in that file too, so they outlive a restart (its jobs need
-no record: one server runs them).
+Scheduled jobs (`_quillo_jobs`: each run once, whichever server it is due on) and the
+decisions of `db.atomic` (`_quillo_atomic`) are kept in the program's database. When
+there is a database per tenant they cannot be, and go to the system database instead:
+`db.system(target)` (a database every server of the program shares, for several servers),
+`$QUILLO_SYSTEM_DB`, or else a SQLite file `quillo-system.db` next to the program.
+`db.system` also keeps them apart from the program's own tables when there is one
+database.
 
-The answers of [idempotent requests](#idempotent-requests) (`_quillo_idempotency`) are
-the exception: they are kept in the program's database, the tenant's when there is one
-per tenant, so they commit in the same transaction as the work they answer for. So are
-the migrations applied (`_quillo_migrations`). The calls a service answered
-(`_quillo_calls`) go with the jobs. `quillo-system.db` is made only when something must
-be kept in it (calls made later, `db.atomic`'s decisions); `$QUILLO_SYSTEM_DB` may be a
-URL.
+What must commit with the work is kept with the work, in the program's database, or the
+tenant's when there is one per tenant, whatever `db.system` says: the answers of
+[idempotent requests](#idempotent-requests) (`_quillo_idempotency`) and calls made later
+(`_quillo_later`, with the answers of those finished in `_quillo_later_done`). A call made
+with no database to go with goes to the system database, so that it outlives a restart;
+a program with no database at all has `quillo-system.db` for that (its jobs need no
+record: one server runs them). With a database per tenant, the system database notes
+which tenants have calls (`_quillo_later_tenants`), as nothing else says where to look.
+
+The migrations applied (`_quillo_migrations`) are in the program's database. The calls a
+service answered (`_quillo_calls`) go with the jobs. `quillo-system.db` is made only when
+something must be kept in it (calls made later, `db.atomic`'s decisions);
+`$QUILLO_SYSTEM_DB` may be a URL.
 
 ### Many tenants
 
@@ -4455,6 +4613,7 @@ With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
 | `quillo_request_duration_seconds` | a histogram (1 ms, 2.5, 5, 10, 25, 50, 100, 250 ms, 1 s, 5 s) |
 | `quillo_requests_in_progress`, `quillo_connections` | now |
 | `quillo_prefetches_total{result}` | pages asked for ahead of a click: `answered`, `refused`, `used` |
+| `quillo_later_total{result}` | tries of calls made later: `delivered`, `again`, `failed` (given up on) |
 | `quillo_uptime_seconds` | since the server started |
 | `quillo_bundles` | sets of components whose bundle is kept (see [Components](#components)) |
 | `quillo_udp_received_total`, `quillo_udp_dropped_total` | packets (see [UDP](#udp)) |

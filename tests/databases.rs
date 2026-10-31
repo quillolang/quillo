@@ -238,10 +238,13 @@ fn quillos_own_tables_go_to_the_system_database_with_one_per_tenant() {
     std::env::set_var("QUILLO_SERVICE_MAILER", "http://127.0.0.1:9");
     let id = eval(&mut it, "send()");
     std::env::remove_var("QUILLO_SERVICE_MAILER");
-    // Kept, not in a tenant's database, but next to the program.
-    let sys = rusqlite::Connection::open(d.join("quillo-system.db")).unwrap();
-    let kept: String = sys.query_row("select id from _quillo_later", [], |r| r.get(0)).unwrap();
+    // Kept in the tenant's database, to go with its work; next to the program, a note of who has some.
+    let tenant = rusqlite::Connection::open(d.join("data/acme.db")).unwrap();
+    let kept: String = tenant.query_row("select id from _quillo_later", [], |r| r.get(0)).unwrap();
     assert_eq!(format!("\"{}\"", kept), id);
+    let sys = rusqlite::Connection::open(d.join("quillo-system.db")).unwrap();
+    let noted: String = sys.query_row("select tenant from _quillo_later_tenants", [], |r| r.get(0)).unwrap();
+    assert_eq!(noted, "acme");
     // Or where `db.system` says.
     let d2 = dir("system2");
     std::fs::write(d2.join("mailer.qwe"), "server fn send(to: str) = to\n").unwrap();

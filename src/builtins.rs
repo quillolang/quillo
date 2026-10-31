@@ -161,6 +161,9 @@ pub fn install(env: &Env) {
     let mut image = Map::new();
     crate::imaging::install(&mut image);
     define(env, "image", Value::map(image));
+    let mut later = Map::new();
+    crate::service::install_later(&mut later);
+    define(env, "later", Value::map(later));
     let mut money = Map::new();
     crate::money::install(&mut money);
     define(env, "money", Value::map(money));

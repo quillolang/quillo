@@ -49,6 +49,14 @@ pub fn prefetch_used() {
     PREFETCHES[2].fetch_add(1, Relaxed);
 }
 
+/// What became of tries of calls made later: delivered, to be tried again,
+/// and given up on (FEEDBACK23.md, Q-184; branch feedback23-fixes).
+static LATER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub fn later(result: usize) {
+    LATER[result].fetch_add(1, Relaxed);
+}
+
 /// A request was answered with `status` after `secs`.
 pub fn answered(status: u16, secs: f64) {
     if !ENABLED.load(Relaxed) {
@@ -82,6 +90,10 @@ pub fn render() -> String {
     s.push_str("# HELP quillo_prefetches_total Pages asked for ahead of a click: answered, refused, and used by a click.\n# TYPE quillo_prefetches_total counter\n");
     for (name, n) in ["answered", "refused", "used"].iter().zip(&PREFETCHES) {
         let _ = writeln!(s, "quillo_prefetches_total{{result=\"{}\"}} {}", name, n.load(Relaxed));
+    }
+    s.push_str("# HELP quillo_later_total Tries of calls made later: delivered, to be tried again, and given up on.\n# TYPE quillo_later_total counter\n");
+    for (name, n) in ["delivered", "again", "failed"].iter().zip(&LATER) {
+        let _ = writeln!(s, "quillo_later_total{{result=\"{}\"}} {}", name, n.load(Relaxed));
     }
     s.push_str("# HELP quillo_requests_in_progress Requests being answered.\n# TYPE quillo_requests_in_progress gauge\n");
     let _ = writeln!(s, "quillo_requests_in_progress {}", IN_PROGRESS.load(Relaxed));

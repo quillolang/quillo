@@ -134,7 +134,7 @@ pub fn builtin_effect(name: &str) -> u8 {
     if name == "db.error_kind" {
         return 0;
     }
-    let e = if name.starts_with("db.") || name == "idempotent" {
+    let e = if name.starts_with("db.") || name == "idempotent" || name == "later.status" {
         "db"
     } else if name.starts_with("http.") || name == "__service" || name == "__service_later" {
         "http"

@@ -1,0 +1,6 @@
+let seen = []
+server fn send(who: str) {
+    seen = [...seen, who]
+    who
+}
+server fn sent() = seen
