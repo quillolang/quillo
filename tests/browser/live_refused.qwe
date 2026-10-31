@@ -1,0 +1,23 @@
+// A page the server has no place for waits as it is told, and says so, once. Its socket and
+// its asking are stood in for, so that a refusal needs no thousand pages. Driven by
+// live_refused.js (FEEDBACK24.md, Q-189; branch feedback24-fixes).
+
+db.exec("create table if not exists n (id integer primary key)")
+
+server fn load() = len(db.query("select id from n"))
+
+component Shown() {
+    state n = live(load)
+    <p id="n">{n}</p>
+}
+
+route GET / = <html><head><script>{raw("
+    window.__asked = [];
+    window.WebSocket = undefined;
+    const real = window.fetch;
+    window.fetch = (u, o) => {
+      if (!String(u).includes('/_quillo/live')) return real(u, o);
+      window.__asked.push(Date.now());
+      return Promise.resolve(new Response('no place', { status: 503, headers: { 'retry-after': '1' } }));
+    };
+")}</script></head><body><Shown/></body></html>

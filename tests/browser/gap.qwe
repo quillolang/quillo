@@ -1,0 +1,17 @@
+// `live({ every })`: a burst of changes is a refresh a gap, not one a change. Driven by
+// gap.js (FEEDBACK24.md, Q-190; branch feedback24-fixes).
+
+db.exec("create table if not exists n (id integer primary key)")
+
+server fn seen() = len(db.query("select id from n"))
+server fn add() = db.exec("insert into n (id) values (null)")
+
+component Gap() {
+    state slow = live({ every: "800ms" }, seen)
+    <div>
+        <p id="slow">{slow}</p>
+        <button id="add" @click={() => { add() }}>Add</button>
+    </div>
+}
+
+route GET / = <html><body><Gap/></body></html>

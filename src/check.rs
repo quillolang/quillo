@@ -634,7 +634,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("read_upload", "map", "str | error(str)"),
     ("js", "str, any...", "any"),
     ("js_new", "str, any...", "any"),
-    ("live", "fn, any...", "any"),
+    ("live", "any, any...", "any"),
     ("parallel", "any...", "list"),
     ("every", "num, fn, map | null=", "null"),
     ("stream", "fn, map | null=", "response"),
@@ -2670,7 +2670,8 @@ impl Checker {
                 }
                 // `live(load, ...)` holds what `load` gives.
                 if let (true, Expr::Call(_, args, _)) = (is_live, e) {
-                    if let Some(Expr::Ident(f, _)) = args.first() {
+                    let loader = if matches!(args.first(), Some(Expr::Map(_))) { args.get(1) } else { args.first() };
+                    if let Some(Expr::Ident(f, _)) = loader {
                         let ret = self.scopes.iter().rev().find_map(|s| s.get(f).cloned()).or_else(|| self.globals.get(f).cloned()).and_then(|v| v.sig).and_then(|s| s.ret);
                         if let Some(r) = ret {
                             t = r;
@@ -4139,7 +4140,11 @@ impl Checker {
             }
         }
         if sig.builtin && sig.name == "live" {
-            match arg_exprs.first() {
+            if let Some(Err(e)) = arg_exprs.first().filter(|o| matches!(o, Expr::Map(_))).map(crate::builtins::live_every) {
+                self.error(e);
+            }
+            let loader = if matches!(arg_exprs.first(), Some(Expr::Map(_))) { arg_exprs.get(1) } else { arg_exprs.first() };
+            match loader {
                 Some(Expr::Ident(f, _)) => {
                     let is_server = self.globals.get(f).and_then(|v| v.sig.clone()).map_or(true, |s| s.server || s.def.is_none() && !s.builtin);
                     if !is_server {

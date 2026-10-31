@@ -60,6 +60,32 @@ impl Socket {
         self.frame(0x9, &[])
     }
 
+    /// Whether the page has gone, for a thread that only writes: what the
+    /// page sent is read here, pongs to drop, or a close. A write would learn of
+    /// it up to two pings later, and a place would stay taken till then
+    /// (FEEDBACK24.md, Q-194; branch feedback24-fixes).
+    pub fn gone(&mut self) -> bool {
+        if self.0.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 512];
+        let mut gone = false;
+        for _ in 0..16 {
+            match self.0.read(&mut buf) {
+                Ok(0) => gone = true,
+                Ok(n) => gone = closes(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => gone = true,
+            }
+            if gone {
+                break;
+            }
+        }
+        let _ = self.0.set_nonblocking(false);
+        gone
+    }
+
     pub fn close(mut self) {
         self.frame(0x8, &[]);
     }
@@ -80,6 +106,22 @@ impl Socket {
         f.extend_from_slice(payload);
         self.0.write_all(&f).and_then(|_| self.0.flush()).is_ok()
     }
+}
+
+/// Whether short frames from a page hold a close (a waiting page sends only
+/// those and pongs, each a few bytes).
+fn closes(mut wire: &[u8]) -> bool {
+    while wire.len() >= 2 {
+        if wire[0] & 0x0f == 0x8 {
+            return true;
+        }
+        let len = (wire[1] & 0x7f) as usize;
+        if len >= 126 {
+            return false;
+        }
+        wire = wire.get(6 + len..).unwrap_or(&[]);
+    }
+    false
 }
 
 /// A message from the page.

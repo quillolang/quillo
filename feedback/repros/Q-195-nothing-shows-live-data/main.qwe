@@ -1,0 +1,9 @@
+// Q-195 Two things an operator needs at 1000 pages are missing: enough file descriptors, and any sign of live
+// mode: script
+// script: steps.sh
+// open-when: page 300 refused
+// fixed-when: page 300 opened
+// From FEEDBACK24.md §Q-195 (found on 57370bc, measured on 5f7f76c). A soft limit of 256, as a
+// low system's, and pages past it.
+
+route GET / = "up"

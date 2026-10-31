@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// A lock that is not tied to a guard's lifetime, so a builtin can release
@@ -137,20 +137,70 @@ impl Baton {
 pub struct Live {
     pub seq: u64,
     versions: HashMap<String, u64>,
+    /// A topic forgotten changed no later than this (see `forget`).
+    floor: u64,
+    /// The pages waiting, by the topics they follow: pages of one kind follow
+    /// the same ones, so a change takes one call to wake them all, and none to
+    /// wake those following something else (FEEDBACK24.md, Q-192; branch
+    /// feedback24-fixes).
+    groups: HashMap<String, (Arc<Group>, usize)>,
+    by_topic: HashMap<String, Vec<Arc<Group>>>,
+}
+
+/// Pages waiting on the same topics.
+pub struct Group {
+    key: String,
+    topics: Vec<String>,
+    changed: Condvar,
+}
+
+/// Most topics remembered before those no page follows are forgotten: a topic
+/// for each user or thread is the pattern the guide gives.
+const MOST_TOPICS: usize = 1 << 16;
+
+impl Live {
+    fn changed_after(&self, topic: &str, since: u64) -> bool {
+        self.versions.get(topic).map_or(self.floor > since, |v| *v > since)
+    }
+
+    /// The groups following `topics`, to wake once the lock is let go.
+    fn following(&self, topics: &[&String]) -> Vec<Arc<Group>> {
+        let mut woken: Vec<Arc<Group>> = Vec::new();
+        for t in topics {
+            for g in self.by_topic.get(*t).into_iter().flatten() {
+                if !woken.iter().any(|w| Arc::ptr_eq(w, g)) {
+                    woken.push(g.clone());
+                }
+            }
+        }
+        let pages: usize = woken.iter().map(|g| self.groups.get(&g.key).map_or(0, |(_, n)| *n)).sum();
+        crate::metrics::live_woke(pages as u64);
+        woken
+    }
+
+    /// With many topics, drops those no page follows, which counts them all as
+    /// changed at `floor`: a page that asks gets one needless refresh.
+    fn forget(&mut self) {
+        if self.versions.len() <= MOST_TOPICS {
+            return;
+        }
+        let (by_topic, seq) = (&self.by_topic, self.seq);
+        self.versions.retain(|t, _| by_topic.contains_key(t));
+        self.floor = seq;
+    }
 }
 
 impl Default for Live {
     /// The count starts at 1: a page that saw 1 knows the state at 1, while
     /// 0 means "I know nothing yet" (asking returns the current count).
     fn default() -> Self {
-        Live { seq: 1, versions: HashMap::new() }
+        Live { seq: 1, versions: HashMap::new(), floor: 0, groups: HashMap::new(), by_topic: HashMap::new() }
     }
 }
 
 pub struct Shared {
     pub gil: Gil,
     pub live: Mutex<Live>,
-    live_changed: Condvar,
     /// This server, among several serving the same app: sequence numbers
     /// are its own, so pages are told whose they are. New at each start.
     pub id: String,
@@ -174,7 +224,6 @@ impl Shared {
         Shared {
             gil: Gil::new_held(),
             live: Mutex::new(Live::default()),
-            live_changed: Condvar::new(),
             id: format!("{:08x}", fastrand::u32(..)),
             outbox: Mutex::new(None),
             peers: Mutex::new(Vec::new()),
@@ -235,8 +284,12 @@ impl Shared {
         for t in topics {
             live.versions.insert(t.clone(), seq);
         }
+        live.forget();
+        let woken = live.following(&topics.iter().collect::<Vec<_>>());
         drop(live);
-        self.live_changed.notify_all();
+        for g in woken {
+            g.changed.notify_all();
+        }
         seq
     }
 
@@ -250,7 +303,8 @@ impl Shared {
         for t in topics {
             if !live.versions.contains_key(t) {
                 // Version 0 is older than any a page has seen: no change yet.
-                live.versions.insert(t.clone(), 0);
+                let floor = live.floor;
+                live.versions.insert(t.clone(), floor);
             }
         }
     }
@@ -267,13 +321,16 @@ impl Shared {
         }
         live.seq += 1;
         let seq = live.seq;
-        for t in known {
-            if let Some(v) = live.versions.get_mut(t) {
+        for t in &known {
+            if let Some(v) = live.versions.get_mut(*t) {
                 *v = seq;
             }
         }
+        let woken = live.following(&known);
         drop(live);
-        self.live_changed.notify_all();
+        for g in woken {
+            g.changed.notify_all();
+        }
     }
 
     /// Whether none of `topics` changed after `seq`.
@@ -282,7 +339,7 @@ impl Shared {
             return true;
         }
         let live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        topics.iter().all(|t| live.versions.get(t).map_or(true, |v| *v <= seq))
+        topics.iter().all(|t| !live.changed_after(t, seq))
     }
 
     pub fn live_seq(&self) -> u64 {
@@ -290,20 +347,8 @@ impl Shared {
     }
 
     /// The current sequence number and which of `topics` changed after
-    /// `since`, waiting up to `timeout` for one to change. `server` is the
-    /// server `since` came from (`None`: this one); a number from another
-    /// server (or from before a restart) says nothing about this one, so all
-    /// the topics count as changed.
-    pub fn wait_live(
-        &self,
-        since: u64,
-        server: Option<&str>,
-        topics: &[String],
-        timeout: std::time::Duration,
-    ) -> (u64, Vec<String>) {
-        let changed = |live: &Live| -> Vec<String> {
-            topics.iter().filter(|t| live.versions.get(*t).map_or(false, |v| *v > since)).cloned().collect()
-        };
+    /// `since`, as `Follower::wait` says it, without waiting.
+    pub fn live_now(&self, since: u64, server: Option<&str>, topics: &[String]) -> (u64, Vec<String>) {
         let live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if since > 0 && server.map_or(false, |s| s != self.id) {
             return (live.seq, topics.to_vec());
@@ -311,11 +356,73 @@ impl Shared {
         if since == 0 || since > live.seq {
             return (live.seq, Vec::new());
         }
-        let (live, _) = self
-            .live_changed
-            .wait_timeout_while(live, timeout, |l| changed(l).is_empty())
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = topics.iter().filter(|t| live.changed_after(t, since)).cloned().collect();
+        (live.seq, changed)
+    }
+
+    /// A page that will wait for changes to `topics`, for as long as this lives.
+    pub fn follow(self: &Arc<Self>, topics: Vec<String>) -> Follower {
+        let key = topics.join("\n");
+        let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = &mut *live;
+        if let Some((g, n)) = live.groups.get_mut(&key) {
+            *n += 1;
+            return Follower { shared: self.clone(), group: g.clone() };
+        }
+        let group = Arc::new(Group { key: key.clone(), topics, changed: Condvar::new() });
+        for t in &group.topics {
+            live.by_topic.entry(t.clone()).or_default().push(group.clone());
+        }
+        live.groups.insert(key, (group.clone(), 1));
+        Follower { shared: self.clone(), group }
+    }
+}
+
+/// A place among the pages waiting for changes.
+pub struct Follower {
+    shared: Arc<Shared>,
+    group: Arc<Group>,
+}
+
+impl Follower {
+    /// `Shared::live_now`, waiting up to `timeout` for a topic to change. `server`
+    /// is the server `since` came from (`None`: this one); a number from another
+    /// server (or from before a restart) says nothing about this one, so all the
+    /// topics count as changed.
+    pub fn wait(&self, since: u64, server: Option<&str>, timeout: std::time::Duration) -> (u64, Vec<String>) {
+        let g = &self.group;
+        let changed = |live: &Live| -> Vec<String> { g.topics.iter().filter(|t| live.changed_after(t, since)).cloned().collect() };
+        let live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if since > 0 && server.map_or(false, |s| s != self.shared.id) {
+            return (live.seq, g.topics.clone());
+        }
+        if since == 0 || since > live.seq {
+            return (live.seq, Vec::new());
+        }
+        let (live, _) = g.changed.wait_timeout_while(live, timeout, |l| changed(l).is_empty()).unwrap_or_else(std::sync::PoisonError::into_inner);
         (live.seq, changed(&live))
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        let mut live = self.shared.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = &mut *live;
+        let g = &self.group;
+        let Some((_, n)) = live.groups.get_mut(&g.key) else { return };
+        *n -= 1;
+        if *n > 0 {
+            return;
+        }
+        live.groups.remove(&g.key);
+        for t in &g.topics {
+            if let Some(gs) = live.by_topic.get_mut(t) {
+                gs.retain(|x| !Arc::ptr_eq(x, g));
+                if gs.is_empty() {
+                    live.by_topic.remove(t);
+                }
+            }
+        }
     }
 }
 

@@ -1431,6 +1431,62 @@ fn ip_of(a: &SocketAddr) -> String {
     a.ip().to_string()
 }
 
+/// `--trust-proxy`: the addresses whose `X-Forwarded-For` is believed. Without it the
+/// client is the connection's peer, as anyone can send that header (FEEDBACK24.md,
+/// Q-189; branch feedback24-fixes).
+static TRUSTED: std::sync::OnceLock<Vec<(std::net::IpAddr, u32)>> = std::sync::OnceLock::new();
+
+/// Takes `10.0.0.0/8,127.0.0.1`; false if a part of it is neither.
+pub fn trust_proxies(list: &str) -> bool {
+    let mut nets = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (ip, bits) = part.split_once('/').map_or((part, None), |(i, b)| (i, Some(b)));
+        let Ok(ip) = ip.parse::<std::net::IpAddr>() else { return false };
+        let most = if ip.is_ipv4() { 32 } else { 128 };
+        let bits = match bits {
+            None => most,
+            Some(b) => match b.parse::<u32>() {
+                Ok(b) if b <= most => b,
+                _ => return false,
+            },
+        };
+        nets.push((ip, bits));
+    }
+    !nets.is_empty() && TRUSTED.set(nets).is_ok()
+}
+
+fn trusted(ip: std::net::IpAddr, nets: &[(std::net::IpAddr, u32)]) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(a) => a.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    nets.iter().any(|(net, bits)| match (ip, net) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n)) => u32::from(a).checked_shr(32 - bits).unwrap_or(0) == u32::from(*n).checked_shr(32 - bits).unwrap_or(0),
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(n)) => u128::from(a).checked_shr(128 - bits).unwrap_or(0) == u128::from(*n).checked_shr(128 - bits).unwrap_or(0),
+        _ => false,
+    })
+}
+
+/// Who sent a request: the nearest address in `X-Forwarded-For` that is not one of
+/// the proxies, as those to its left are whatever the client wrote.
+fn client_of(peer: &str, headers: &[(String, String)]) -> String {
+    let Some(nets) = TRUSTED.get() else { return peer.to_string() };
+    if !peer.parse().is_ok_and(|ip| trusted(ip, nets)) {
+        return peer.to_string();
+    }
+    let mut client = peer.to_string();
+    for (_, v) in headers.iter().rev().filter(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for")) {
+        for hop in v.rsplit(',').map(str::trim) {
+            let Ok(ip) = hop.parse::<std::net::IpAddr>() else { return client };
+            client = ip.to_string();
+            if !trusted(ip, nets) {
+                return client;
+            }
+        }
+    }
+    client
+}
+
 #[cfg(unix)]
 fn into_std(s: TcpStream) -> Option<std::net::TcpStream> {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -1537,13 +1593,14 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
         }
         (buf[head..head + n].to_vec(), head + n)
     };
+    let remote = client_of(peer, &hs);
     Parsed::Done {
         req: HttpRequest {
             method: r.method.unwrap_or("GET").to_ascii_uppercase(),
             url: r.path.unwrap_or("/").to_string(),
             headers: hs,
             body,
-            remote: peer.to_string(),
+            remote,
         },
         len,
         keep_alive,

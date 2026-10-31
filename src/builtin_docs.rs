@@ -131,7 +131,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("js_new", "name, args", "Makes an object of a class of the page's scripts, by `name`; null on the server."),
     ("defer", "x", "`x`; as the `state` initializer of a component placed in a page, the page goes first and `x` follows."),
     // Live data
-    ("live", "load, args", "State that follows the server: runs the `server fn` `load`, and again when what it read changes."),
+    ("live", "load, args", "State that follows the server: runs the `server fn` `load`, and again when what it read changes; `{ every: \"2s\" }` before it sets a gap."),
     ("waiting", "state", "Whether a `live` state waits for the answer to new arguments; false on the server."),
     ("publish", "topics", "Wakes the pages whose `live` data watches these topics."),
     ("watch", "topics", "Inside a `live` loader, runs it again when these topics are published."),

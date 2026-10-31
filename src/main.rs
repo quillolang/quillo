@@ -47,6 +47,8 @@ options for `run`:
   --host H       address to listen on (default 127.0.0.1)
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
+  --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
+  --live-per-client N  pages one client may have waiting for live data (default 256)
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
   --workers N    requests that can wait (for a database, the network) at
@@ -138,7 +140,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with",
 ];
 
@@ -542,6 +544,19 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 Some(ms) => quillo::httpd::limit_compute(ms),
                 None => {
                     eprintln!("quillo: --max-compute needs a length of time: 500ms, 2s or 1m");
+                    return Err(2);
+                }
+            },
+            ("--trust-proxy", Some(v)) => {
+                if !quillo::httpd::trust_proxies(v) {
+                    eprintln!("quillo: --trust-proxy needs addresses or networks, as 127.0.0.1 or 10.0.0.0/8,192.168.0.0/16");
+                    return Err(2);
+                }
+            }
+            ("--live-per-client", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => quillo::server::LIVE_PER_CLIENT.store(n, std::sync::atomic::Ordering::Relaxed),
+                _ => {
+                    eprintln!("quillo: --live-per-client needs a positive number");
                     return Err(2);
                 }
             },

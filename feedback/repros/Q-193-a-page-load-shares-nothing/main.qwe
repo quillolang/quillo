@@ -1,0 +1,18 @@
+// Q-193 Large values: a page load shares nothing, patches run out, and each full answer is gzipped per page
+// mode: script
+// script: steps.sh
+// open-when: loader runs: 6
+// fixed-when: loader runs: 1
+// From FEEDBACK24.md §Q-193 (found on 57370bc, measured on 5f7f76c).
+
+server fn load() {
+    print("ran")
+    [1, 2, 3]
+}
+
+component Shown() {
+    state n = live(load)
+    <p>{len(n)}</p>
+}
+
+route GET / = <html><body><Shown/></body></html>

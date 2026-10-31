@@ -57,6 +57,50 @@ pub fn later(result: usize) {
     LATER[result].fetch_add(1, Relaxed);
 }
 
+/// Live data, which nothing showed from outside (FEEDBACK24.md, Q-195; branch
+/// feedback24-fixes): pages waiting, those refused a place, pages woken by a
+/// change, runs of loaders (made, shared) and answers (same, patch, whole).
+pub static LIVE_PAGES: AtomicI64 = AtomicI64::new(0);
+pub static LIVE_REFUSED: AtomicU64 = AtomicU64::new(0);
+static LIVE_WAKES: AtomicU64 = AtomicU64::new(0);
+static LIVE_RUNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static LIVE_ANSWERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub fn live_woke(pages: u64) {
+    LIVE_WAKES.fetch_add(pages, Relaxed);
+}
+
+pub fn live_run(shared: bool) {
+    LIVE_RUNS[shared as usize].fetch_add(1, Relaxed);
+}
+
+/// 0: the same; 1: a patch; 2: the whole value.
+pub fn live_answer(kind: usize) {
+    LIVE_ANSWERS[kind].fetch_add(1, Relaxed);
+}
+
+/// Counts a page as waiting while it lives.
+pub struct LivePage;
+
+impl LivePage {
+    pub fn new() -> LivePage {
+        LIVE_PAGES.fetch_add(1, Relaxed);
+        LivePage
+    }
+}
+
+impl Default for LivePage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LivePage {
+    fn drop(&mut self) {
+        LIVE_PAGES.fetch_sub(1, Relaxed);
+    }
+}
+
 /// A request was answered with `status` after `secs`.
 pub fn answered(status: u16, secs: f64) {
     if !ENABLED.load(Relaxed) {
@@ -90,6 +134,20 @@ pub fn render() -> String {
     s.push_str("# HELP quillo_prefetches_total Pages asked for ahead of a click: answered, refused, and used by a click.\n# TYPE quillo_prefetches_total counter\n");
     for (name, n) in ["answered", "refused", "used"].iter().zip(&PREFETCHES) {
         let _ = writeln!(s, "quillo_prefetches_total{{result=\"{}\"}} {}", name, n.load(Relaxed));
+    }
+    s.push_str("# HELP quillo_live_pages Pages waiting for live data.\n# TYPE quillo_live_pages gauge\n");
+    let _ = writeln!(s, "quillo_live_pages {}", LIVE_PAGES.load(Relaxed));
+    s.push_str("# HELP quillo_live_refused_total Pages refused a place to wait for live data.\n# TYPE quillo_live_refused_total counter\n");
+    let _ = writeln!(s, "quillo_live_refused_total {}", LIVE_REFUSED.load(Relaxed));
+    s.push_str("# HELP quillo_live_wakes_total Pages woken by a change to what they follow.\n# TYPE quillo_live_wakes_total counter\n");
+    let _ = writeln!(s, "quillo_live_wakes_total {}", LIVE_WAKES.load(Relaxed));
+    s.push_str("# HELP quillo_live_runs_total Live loaders asked for: run, or given a run another page made.\n# TYPE quillo_live_runs_total counter\n");
+    for (name, n) in ["ran", "shared"].iter().zip(&LIVE_RUNS) {
+        let _ = writeln!(s, "quillo_live_runs_total{{outcome=\"{}\"}} {}", name, n.load(Relaxed));
+    }
+    s.push_str("# HELP quillo_live_answers_total Answers to live loaders: nothing new, a patch, or the whole value.\n# TYPE quillo_live_answers_total counter\n");
+    for (name, n) in ["same", "patch", "whole"].iter().zip(&LIVE_ANSWERS) {
+        let _ = writeln!(s, "quillo_live_answers_total{{kind=\"{}\"}} {}", name, n.load(Relaxed));
     }
     s.push_str("# HELP quillo_later_total Tries of calls made later: delivered, to be tried again, and given up on.\n# TYPE quillo_later_total counter\n");
     for (name, n) in ["delivered", "again", "failed"].iter().zip(&LATER) {

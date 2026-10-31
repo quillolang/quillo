@@ -337,10 +337,15 @@ impl Interp {
             // outlive the session it was made for (FEEDBACK22.md, Q-176; branch
             // feedback22-fixes).
             let own = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-prefetch"));
-            if own && resp.status == 200 && resp.header("cache-control").is_none() {
+            if own && resp.status == 200 && resp.header("cache-control").is_none() && !crate::idempotency::holds_form_key(&resp.body) {
                 resp.headers.push(("cache-control".into(), "private, max-age=30".into()));
                 resp.headers.push(("vary".into(), "Cookie".into()));
             }
+        }
+        // A page with a key in a form is for this visitor, this once.
+        if resp.header("cache-control").is_some_and(|c| c.contains("public") || c.contains("max-age")) && crate::idempotency::holds_form_key(&resp.body) {
+            resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
+            resp.headers.push(("cache-control".into(), "no-store".into()));
         }
         // What this changed may be in a page kept for a click: Chrome lets those go on
         // this. Not on every request: a server fn that reads is a POST as well, and a `GET`
@@ -723,7 +728,7 @@ impl Interp {
             // Without waiting; the server's worker threads answer `live`
             // requests themselves and wait for a change first.
             let (since, server, topics) = live_query(qs);
-            let (seq, changed) = self.shared.wait_live(since, server.as_deref(), &topics, std::time::Duration::ZERO);
+            let (seq, changed) = self.shared.live_now(since, server.as_deref(), &topics);
             return json_response(200, serde_json::json!({ "seq": seq, "server": self.shared.id, "changed": changed }));
         }
         if let Some(name) = rest.strip_prefix("job/") {
@@ -901,25 +906,19 @@ impl Interp {
         }
         let had = hdr("x-quillo-had").and_then(crate::livecache::parse_hash);
         let key = boundary.is_none().then(|| (name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
-        let viewer = {
-            // The address without its port, which each connection has its own of.
-            let mut text = req.remote.parse::<std::net::SocketAddr>().map_or_else(|_| req.remote.clone(), |a| a.ip().to_string());
-            for n in ["cookie", "authorization", "accept-language", "user-agent"] {
-                text.push('\n');
-                text.push_str(hdr(n).unwrap_or(""));
-            }
-            crate::livecache::hash(&text)
+        let viewer = viewer_of(&req.remote, |n| hdr(n).map(str::to_string));
+        let (found, mut flying) = match &key {
+            Some(k) => self.live_turn(k, viewer),
+            None => (None, None),
         };
-        let found = key.as_ref().and_then(|k| {
-            let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.shared(k, viewer, |t, seq| self.shared.unchanged_since(t, seq))
-        });
         let (answer, topics, seq) = match found {
             Some(f) => {
+                crate::metrics::live_run(true);
                 self.current_request = None;
                 f
             }
             None => {
+                crate::metrics::live_run(false);
                 let seq = self.shared.live_seq();
                 self.reads = Some(Default::default());
                 self.read_request = false;
@@ -949,9 +948,14 @@ impl Interp {
                         return rpc_error(500, &format!("internal error in `{}`", name));
                     }
                 });
-                // Not shared: a run that wrote, or set a cookie.
+                if let Some(f) = &mut flying {
+                    f.personal = self.read_request;
+                }
+                // Not shared: a run that wrote, or set a cookie, or read what
+                // changed as it ran. What others wrote elsewhere has nothing
+                // to do with it (FEEDBACK24.md, Q-191; branch feedback24-fixes).
                 if let Some(k) = key {
-                    if self.set_cookies.len() == cookies && self.shared.live_seq() == seq {
+                    if self.set_cookies.len() == cookies && own.is_empty() && self.shared.unchanged_since(&topics, seq) {
                         let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         cache.share(k, self.read_request.then_some(viewer), seq, topics.clone(), answer.clone());
                     }
@@ -962,12 +966,20 @@ impl Interp {
         let mut patch = None;
         if !answer.err {
             let mut cache = self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.keep(answer.h, answer.value.clone(), answer.text.len());
-            patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value)).map(|p| p.to_string()).filter(|p| p.len() < answer.text.len());
+            cache.keep(answer.h, &answer.text);
+            patch = had.and_then(|from| cache.patch(from, answer.h, &answer.value)).filter(|p| p.len() < answer.text.len());
         }
+        // Past what a page should be sent, whoever wrote the loader should hear of it.
+        if answer.text.len() > LIVE_LARGE {
+            static SAID: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+            if SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(Default::default).insert(name.to_string()) {
+                eprintln!("quillo: `{}` gives {} MB to each live page: a loader should give what the page shows, not the table", name, answer.text.len() >> 20);
+            }
+        }
+        crate::metrics::live_answer(if had == Some(answer.h) { 0 } else if patch.is_some() { 1 } else { 2 });
         let (field, value) = match &patch {
-            Some(p) => ("patch", p.as_str()),
-            None => (if answer.err { "err" } else { "ok" }, answer.text.as_str()),
+            Some(p) => ("patch", &**p),
+            None => (if answer.err { "err" } else { "ok" }, &*answer.text),
         };
         let mut resp = json_response(200, serde_json::Value::Null);
         resp.body = format!(
@@ -980,7 +992,97 @@ impl Interp {
             serde_json::json!(self.shared.id)
         )
         .into_bytes();
+        // A whole answer many pages share is gzipped once.
+        if patch.is_none() && resp.body.len() >= LIVE_GZ_KEPT {
+            let mut kept = answer.gz.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*kept {
+                Some((s, gz)) if *s == seq && accepts_gzip(req) => {
+                    resp.body = gz.to_vec();
+                    resp.headers.push(("content-encoding".into(), "gzip".into()));
+                    resp.headers.push(("vary".into(), "accept-encoding".into()));
+                }
+                _ => {
+                    compress(req, &mut resp);
+                    if resp.header("content-encoding").is_some() {
+                        *kept = Some((seq, Arc::new(resp.body.clone())));
+                    }
+                }
+            }
+        }
         resp
+    }
+
+    /// What a page load shares a run by: the same as a refresh's, where it can
+    /// tell who is asking.
+    pub(crate) fn live_key(&mut self, name: &str, args: &[Value]) -> Option<(crate::livecache::RunKey, u64)> {
+        let read = self.read_request;
+        let req = self.request_value();
+        self.read_request = read;
+        let Some(Value::Map(req)) = req else { return None };
+        let Some(Value::Map(headers)) = req.get("headers") else { return None };
+        let hdr = |n: &str| headers.get(n).map(|v| v.display());
+        let ip = req.get("ip").map_or(String::new(), |v| v.display());
+        let viewer = viewer_of(&ip, hdr);
+        let json = serde_json::Value::Array(args.iter().map(crate::interp::island_json).collect()).to_string().into_bytes();
+        Some(((name.to_string(), json, hdr("host").unwrap_or_default()), viewer))
+    }
+
+    /// A call of a live loader: a run it may have, or else it runs, its turn taken
+    /// (the landing, for those that wait for it). One run at a time of a call.
+    pub(crate) fn live_turn(&mut self, key: &crate::livecache::RunKey, viewer: u64) -> (Option<crate::livecache::Shared>, Option<Landing>) {
+        let shared = self.shared.clone();
+        let find = || {
+            let mut cache = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.shared(key, viewer, |t, seq| shared.unchanged_since(t, seq))
+        };
+        if let Some(f) = find() {
+            return (Some(f), None);
+        }
+        for _ in 0..3 {
+            let begun = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).begin(key);
+            match begun {
+                crate::livecache::Begun::Run => return (None, Some(Landing { shared: shared.clone(), key: key.clone(), personal: false })),
+                crate::livecache::Begun::Alone => break,
+                crate::livecache::Begun::Wait(f) => {
+                    if crate::httpd::wait_elsewhere(move || f.wait(crate::livecache::SHARED_FOR)).is_err() {
+                        break;
+                    }
+                    if let Some(f) = find() {
+                        return (Some(f), None);
+                    }
+                }
+            }
+        }
+        (None, None)
+    }
+}
+
+/// Who asks, for a run that read the request: the address, without the port each
+/// connection has its own of, and what identifies them.
+fn viewer_of(remote: &str, hdr: impl Fn(&str) -> Option<String>) -> u64 {
+    let mut text = remote.parse::<std::net::SocketAddr>().map_or_else(|_| remote.to_string(), |a| a.ip().to_string());
+    for n in ["cookie", "authorization", "accept-language", "user-agent"] {
+        text.push('\n');
+        text.push_str(&hdr(n).unwrap_or_default());
+    }
+    crate::livecache::hash(&text)
+}
+
+/// A loader's answer past this is said in the log, once for each.
+const LIVE_LARGE: usize = 4 << 20;
+/// Whole answers from this size keep their gzipped copy.
+const LIVE_GZ_KEPT: usize = 16 << 10;
+
+/// The end of a run others may be waiting for, however it ends.
+pub(crate) struct Landing {
+    shared: Arc<Shared>,
+    key: crate::livecache::RunKey,
+    pub personal: bool,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).land(&self.key, self.personal);
     }
 }
 
@@ -1012,6 +1114,9 @@ const WAITER_STACK: usize = 256 << 10;
 /// one cannot take them all and leave the others' pages without updates.
 pub const MAX_WAITERS_PER_CLIENT: usize = 256;
 
+/// `--live-per-client`: that limit, where one address really is many visitors.
+pub static LIVE_PER_CLIENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_WAITERS_PER_CLIENT);
+
 static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// The places taken, by client.
 static WAITING: Mutex<Option<std::collections::HashMap<String, usize>>> = Mutex::new(None);
@@ -1026,7 +1131,14 @@ impl Waiter {
         let mut g = WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let m = g.get_or_insert_with(Default::default);
         let mine = m.get(&who).copied().unwrap_or(0);
-        if mine >= MAX_WAITERS_PER_CLIENT {
+        if mine >= LIVE_PER_CLIENT.load(SeqCst) {
+            // Behind a proxy every visitor is one address, and pages past the
+            // limit show old data with no sign of it (FEEDBACK24.md, Q-189;
+            // branch feedback24-fixes).
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!("quillo: {} holds {} pages waiting for changes, and more are refused: behind a proxy, name it with --trust-proxy; for one address with many visitors, raise --live-per-client", who, mine);
+            });
             return None;
         }
         if WAITERS.fetch_add(1, SeqCst) >= MAX_WAITERS {
@@ -1098,6 +1210,7 @@ fn send_file(resp: HttpResponse, what: (std::path::PathBuf, u64, u64), head: boo
 /// `ip` holds its share of them.
 fn waiter(name: &'static str, ip: &str, f: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Answer {
     let Some(place) = Waiter::take(ip) else {
+        crate::metrics::LIVE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resp = plain(503, "too many pages are waiting for changes; try again later\n");
         resp.headers.push(("retry-after".into(), "5".into()));
         return Answer::Respond(resp);
@@ -1126,6 +1239,12 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
     serde_json::json!({ "seq": seq, "server": shared.id, "changed": changed }).to_string()
 }
 
+/// How often a waiting page's socket is looked at, how often it is pinged, and
+/// how long after a change the next may go.
+const LIVE_LOOK: Duration = Duration::from_secs(5);
+const LIVE_PING: Duration = Duration::from_secs(20);
+const LIVE_GATHER: Duration = Duration::from_millis(100);
+
 /// Answers `/_quillo/live` on a thread of its own, so open pages do not hold
 /// on to the server's threads. Over a WebSocket, each change to the topics
 /// is sent as `{seq, server, changed}` for as long as the page stays; as a
@@ -1133,27 +1252,49 @@ fn live_json(shared: &Shared, seq: u64, changed: &[String]) -> String {
 fn serve_live(shared: Arc<Shared>, req: HttpRequest) -> Answer {
     let (mut since, server, topics) = live_query(req.url.split_once('?').map_or("", |(_, q)| q));
     waiter("quillo-live", &req.remote.clone(), move |stream| {
+        let _page = crate::metrics::LivePage::new();
+        let following = shared.follow(topics);
         if crate::ws::is_upgrade(&req) {
             let Some(mut socket) = crate::ws::Socket::accept(&req, stream) else { return };
             let mut server = server;
+            let mut quiet = Duration::ZERO;
+            let mut next = Instant::now();
             loop {
-                let (seq, changed) = shared.wait_live(since, server.as_deref(), &topics, Duration::from_secs(20));
+                let (mut seq, mut changed) = following.wait(since, server.as_deref(), LIVE_LOOK);
                 // A page that did not know the sequence number, or knew one
                 // from another server or from before a restart, is told the
                 // current one.
-                let alive = if !changed.is_empty() || since == 0 || since > seq || server.is_some() {
-                    socket.send(&live_json(&shared, seq, &changed))
+                if changed.is_empty() && since != 0 && since <= seq && server.is_none() {
+                    quiet += LIVE_LOOK;
+                    if socket.gone() {
+                        return;
+                    }
+                    if quiet >= LIVE_PING {
+                        if !socket.ping() {
+                            return;
+                        }
+                        quiet = Duration::ZERO;
+                    }
                 } else {
-                    socket.ping()
-                };
-                if !alive {
-                    return;
+                    // The first change goes at once; what follows it closely is
+                    // gathered into one frame, so a burst of writes is one
+                    // refresh (FEEDBACK24.md, Q-190; branch feedback24-fixes).
+                    let early = next.saturating_duration_since(Instant::now());
+                    if !early.is_zero() {
+                        std::thread::sleep(early);
+                        (seq, changed) = following.wait(since, server.as_deref(), Duration::ZERO);
+                    }
+                    if !socket.send(&live_json(&shared, seq, &changed)) {
+                        return;
+                    }
+                    next = Instant::now() + LIVE_GATHER + Duration::from_millis(fastrand::u64(..50));
+                    quiet = Duration::ZERO;
                 }
                 since = seq;
                 server = None;
             }
         }
-        let (seq, changed) = shared.wait_live(since, server.as_deref(), &topics, Duration::from_secs(25));
+        let (seq, changed) = following.wait(since, server.as_deref(), Duration::from_secs(25));
         let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed)).unwrap_or_default());
         resp.headers.push(("cache-control".into(), "no-store".into()));
         send_on(stream, resp);
@@ -1943,6 +2084,10 @@ fn run_program(it: &mut Interp, req: &HttpRequest) -> Option<HttpResponse> {
 }
 
 /// Gzips text responses of 1 KiB or more for clients that accept it.
+fn accepts_gzip(req: &HttpRequest) -> bool {
+    req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v.split(',').any(|e| e.trim().starts_with("gzip")))
+}
+
 fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     use std::io::Write;
     // A part of a file stays as it is: its byte range is of the file.
@@ -1951,11 +2096,7 @@ fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     }
     let ctype = resp.header("content-type").unwrap_or("");
     let text = ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("javascript") || ctype.contains("svg");
-    let accepts = req
-        .headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v.split(',').any(|e| e.trim().starts_with("gzip")));
-    if !text || !accepts {
+    if !text || !accepts_gzip(req) {
         return;
     }
     // A file's gzipped copy is kept (by its ETag) rather than made again.
@@ -2215,6 +2356,34 @@ pub(crate) fn plain_response(status: u16, msg: &str) -> HttpResponse {
 /// Serves the app. `workers` is how many requests may wait (for the
 /// database, the network) at once; each waiting one has a thread. The
 /// calling thread must hold the interpreter lock; it gives it up here.
+/// Takes all the file descriptors the system allows: each page holds two, a
+/// socket for live data and a connection, and past the soft limit, often 1024,
+/// new visitors hang while those here carry on (FEEDBACK24.md, Q-195; branch
+/// feedback24-fixes). A limit still too low for the pages allowed is said.
+#[cfg(unix)]
+fn take_descriptors() {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `r` is a live rlimit for the call to write and read.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return;
+    }
+    // macOS refuses more than OPEN_MAX whatever the hard limit says.
+    let most = if cfg!(target_os = "macos") { r.rlim_max.min(10_240) } else { r.rlim_max };
+    if r.rlim_cur < most {
+        let raised = libc::rlimit { rlim_cur: most, rlim_max: r.rlim_max };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            r.rlim_cur = most;
+        }
+    }
+    if (r.rlim_cur as usize) < 2 * MAX_WAITERS {
+        eprintln!("quillo: {} file descriptors allowed, about {} pages with live data: raise `ulimit -n` for more", r.rlim_cur, r.rlim_cur / 2);
+    }
+}
+
+#[cfg(not(unix))]
+fn take_descriptors() {}
+
 pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     serve_with(app, addr, workers, |_| {})
 }
@@ -2222,6 +2391,7 @@ pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
 /// `serve`, calling `listening` with the address once it is bound (with
 /// port 0, the port the system chose).
 pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(std::net::SocketAddr)) -> Result<(), String> {
+    take_descriptors();
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
     let bound = listener.local_addr().ok();
     let shown = bound.map_or_else(|| addr.to_string(), |a| a.to_string());
@@ -2266,6 +2436,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
 /// from the same socket. The calling thread must hold the instances'
 /// interpreter locks; it gives them up here.
 pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), String> {
+    take_descriptors();
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
     let shown = listener.local_addr().map_or_else(|_| addr.to_string(), |a| a.to_string());
     let apps: Vec<Arc<App>> = apps.into_iter().map(Arc::new).collect();

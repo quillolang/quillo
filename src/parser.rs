@@ -2433,6 +2433,15 @@ impl Parser {
                 line,
             ));
         }
+        // `<form idempotent>`: no script is there to send a header, so a key goes
+        // with the form, made as it is rendered (FEEDBACK24.md, Q-196; branch
+        // feedback24-fixes).
+        if tag == "form" {
+            if let Some(i) = attrs.iter().position(|(n, a)| n == "idempotent" && matches!(a, AttrVal::Bool)) {
+                attrs.remove(i);
+                children.insert(0, HtmlChild::El(form_key_field(line)));
+            }
+        }
         // An element of a component or view with a style of its own.
         if let Some(s) = &mut self.styling {
             s.els += 1;
@@ -2859,4 +2868,13 @@ fn pattern_binds(p: &Pattern, out: &mut Vec<String>) {
         Pattern::Record(fs) => fs.iter().for_each(|f| pattern_binds(&f.pat, out)),
         Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => {}
     }
+}
+
+/// The hidden field `<form idempotent>` carries: see `idempotency::FORM_FIELD`.
+fn form_key_field(line: u32) -> HtmlEl {
+    let text = |s: &str| AttrVal::Expr(Expr::Lit(Lit::Str(s.into())));
+    let key = Expr::Call(Box::new(Expr::Ident("uuid".into(), line)), Vec::new(), line);
+    let attrs = vec![("type".to_string(), text("hidden")), ("name".to_string(), text(crate::idempotency::FORM_FIELD)), ("value".to_string(), AttrVal::Expr(key))];
+    let facts = ElFacts::of("input", &None, &[], &attrs, &[], true);
+    HtmlEl { tag: "input".into(), id: None, classes: Vec::new(), attrs, children: Vec::new(), line, dollars: Vec::new(), facts }
 }

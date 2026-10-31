@@ -1,0 +1,24 @@
+// Q-191 A run is not shared if anything was written anywhere while it ran, and identical runs start together
+// mode: script
+// script: steps.sh
+// open-when: /loader runs: ([3-9]|1[0-9])/
+// fixed-when: loader runs: 2
+// From FEEDBACK24.md §Q-191 (found on 57370bc, measured on 5f7f76c).
+
+db.open("live.db")
+db.exec("create table if not exists rows (id integer primary key, title text)")
+db.exec("create table if not exists other (id integer primary key)")
+db.exec("insert or ignore into rows (id, title) values (1, 'one'), (2, 'two')")
+
+server fn rows() {
+    print("ran")
+    db.query("select * from rows order by id")
+}
+server fn slow() {
+    print("ran")
+    sleep(300)
+    db.query("select * from rows order by id")
+}
+
+route GET /write = db.exec("update rows set title = ? where id = 1", str(random_int(0, 1000000)))
+route GET /other = db.exec("insert into other (id) values (null)")

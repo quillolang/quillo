@@ -1,0 +1,22 @@
+// Q-196 A form sent twice runs twice, and making it safe is left to the developer
+// mode: browser
+// page: /
+// probe: document.getElementById("send").click(); document.getElementById("send").click(); await new Promise((r) => setTimeout(r, 900)); return { calls: performance.getEntriesByType("resource").filter((e) => e.name.endsWith("/rpc/pay")).length };
+// open-when: "calls": 2
+// fixed-when: "calls": 1
+// From FEEDBACK24.md §Q-196 (found on 5f7f76c).
+
+db.exec("create table if not exists paid (who text)")
+
+server fn pay() = idempotent(() => {
+    sleep(300)
+    db.exec("insert into paid (who) values ('x')")
+    "paid"
+})
+
+component Pay() {
+    state said = null
+    <form @submit={() => { said = pay() }}><button id="send">Pay</button> <span>{said}</span></form>
+}
+
+route GET / = <html><body><Pay/></body></html>

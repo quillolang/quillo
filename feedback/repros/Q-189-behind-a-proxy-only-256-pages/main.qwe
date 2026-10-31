@@ -1,0 +1,8 @@
+// Q-189 Behind a proxy, only 256 pages get live updates, and the rest go stale with no sign
+// mode: script
+// script: steps.sh
+// open-when: client: []
+// fixed-when: client: [203.0.113.9]
+// From FEEDBACK24.md §Q-189 (found on 57370bc, measured on 5f7f76c: 256 opened, 44 refused).
+
+route GET /ip = request.ip

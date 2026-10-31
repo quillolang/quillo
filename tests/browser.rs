@@ -689,6 +689,59 @@ fn a_link_in_a_component_pointed_at_starts_with_its_state() {
     }));
 }
 
+/// Two clicks on a function marked `idempotent` are one call (FEEDBACK24.md, Q-196; branch
+/// feedback24-fixes).
+#[test]
+fn two_clicks_on_an_idempotent_call_are_one() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("once.qwe"), free_port(), Some(&dir.join("once.js")));
+    assert_eq!(r, serde_json::json!({
+        "errors": [],
+        "form": [1, "1"],
+        "said": "form",
+        "click": [2, "2"],
+        "again": [3, "3"],
+        "helper": [1, "4"],
+        "plain": [2, "6"],
+    }));
+}
+
+/// A page refused a place waits as it is told and says so (FEEDBACK24.md, Q-189; branch
+/// feedback24-fixes).
+#[test]
+fn a_page_refused_live_data_waits_and_says_so() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("live_refused.qwe"), free_port(), Some(&dir.join("live_refused.js")));
+    assert_eq!(r, serde_json::json!({
+        "errors": [],
+        "told_once": 1,
+        "asked_at_most_five_times": true,
+        "waits_as_told": true,
+        "all_different": true,
+    }));
+}
+
+/// `live({ every })` holds a loader to a gap, and still ends with the last change
+/// (FEEDBACK24.md, Q-190; branch feedback24-fixes).
+#[test]
+fn a_loader_with_a_gap_refreshes_no_oftener() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("gap.qwe"), free_port(), Some(&dir.join("gap.js")));
+    assert_eq!(r, serde_json::json!({ "errors": [], "refreshes_few": true, "ended_with_the_last": "10" }));
+}
+
 /// A prerender runs nothing until it is shown, and then runs as any page (FEEDBACK22.md,
 /// Q-178; branch feedback22-fixes).
 #[test]

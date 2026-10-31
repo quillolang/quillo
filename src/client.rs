@@ -240,7 +240,7 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
     if !it.server_fns.is_empty() {
         program.push_str("const server = {};\n");
         for name in it.server_fns.iter() {
-            let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&c.def));
+            let idem = matches!(lookup(&it.globals, name), Some(Value::Func(c)) if crate::idempotency::used_by(&it.globals, &c.def));
             let _ = writeln!(program, "server[{}] = W.server({}{});", js_str(name), js_str(name), if idem { ", true" } else { "" });
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
@@ -2034,7 +2034,7 @@ impl<'a> Compiler<'a> {
             Value::Func(f) if f.def.server => {
                 let r = (js.clone(), true);
                 self.globals.insert(name.to_string(), r.clone());
-                let idem = if crate::idempotency::used_by(&f.def) { ", true" } else { "" };
+                let idem = if crate::idempotency::used_by(&self.it.globals, &f.def) { ", true" } else { "" };
                 self.defs.push(format!("{} = W.server({}{});", js, js_str(name), idem));
                 Ok(r)
             }
@@ -2679,12 +2679,13 @@ impl<'a> Compiler<'a> {
                     }
                     let sig = self.fresh(name);
                     // `state x = live(load, ...args)`: a subscription.
-                    if let Some((fname, args)) = self.live_call(e)? {
+                    if let Some((fname, args, every)) = self.live_call(e)? {
                         let mut argv = Vec::new();
                         for a in args {
                             argv.push(self.reactive_expr(a)?.0);
                         }
-                        let _ = writeln!(body, "const {} = W.live($i, {}, {}, () => [{}]);", sig, js_str(name), js_str(&fname), argv.join(", "));
+                        let gap = if every > 0 { format!(", {}", every) } else { String::new() };
+                        let _ = writeln!(body, "const {} = W.live($i, {}, {}, () => [{}]{});", sig, js_str(name), js_str(&fname), argv.join(", "), gap);
                         self.declare_as(name, Local::State(sig));
                         if last {
                             body.push_str("return null;\n");
@@ -2764,7 +2765,7 @@ impl<'a> Compiler<'a> {
 
     /// `live(server_fn, ...args)`, if `e` is such a call: the function's
     /// name and the arguments.
-    fn live_call<'e>(&mut self, e: &'e Expr) -> Result<Option<(String, &'e [Expr])>, QuilloError> {
+    fn live_call<'e>(&mut self, e: &'e Expr) -> Result<Option<(String, &'e [Expr], u64)>, QuilloError> {
         let Expr::Call(callee, args, line) = e else { return Ok(None) };
         let Expr::Ident(n, _) = &**callee else { return Ok(None) };
         if n != "live" || self.ctxs.iter().any(|c| c.scopes.iter().any(|s| s.contains_key("live"))) {
@@ -2774,6 +2775,13 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         }
         self.line = *line;
+        let (every, args) = match args.first() {
+            Some(o @ Expr::Map(_)) => match crate::builtins::live_every(o) {
+                Ok(ms) => (ms, &args[1..]),
+                Err(e) => return self.err(e),
+            },
+            _ => (0, &args[..]),
+        };
         let fname = match args.first() {
             Some(Expr::Ident(f, _)) => match lookup(&self.it.globals, f) {
                 Some(Value::Func(c)) if c.def.server => f.clone(),
@@ -2781,7 +2789,7 @@ impl<'a> Compiler<'a> {
             },
             _ => return self.err("`live` needs a server fn by name: state items = live(load_items, ...)"),
         };
-        Ok(Some((fname, &args[1..])))
+        Ok(Some((fname, &args[1..], every)))
     }
 
     /// Whether a function waits on the server (it calls a `server fn`, or a

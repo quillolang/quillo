@@ -228,7 +228,7 @@ fn a_run_is_shared_with_the_pages_it_may_be_shown_to() {
     assert!(c.shared(&key("a"), 8, |_, _| true).is_none());
     assert!(c.shared(&key("a"), 7, |_, _| false).is_none());
     let (got, topics, seq) = c.shared(&key("a"), 7, |t, s| t == ["t".to_string()] && s == 5).unwrap();
-    assert_eq!((got.text.as_str(), topics, seq), ("[1]", vec!["t".to_string()], 5));
+    assert_eq!((&*got.text, topics, seq), ("[1]", vec!["t".to_string()], 5));
     assert!(!got.err);
     // A run for all viewers.
     c.share(key("b"), None, 1, Vec::new(), answer.clone());
@@ -248,37 +248,39 @@ fn a_run_is_shared_with_the_pages_it_may_be_shown_to() {
 #[test]
 fn values_are_kept_for_patches_until_their_room_is_needed() {
     let mut c = LiveCache::default();
-    let v = |n: i32| Arc::new(json!({ "n": n, "pad": 0 }));
+    let v = |n: i32| -> Arc<str> { json!({ "n": n, "pad": 0 }).to_string().into() };
+    let big = |n: i32| -> Arc<str> { format!("{{\"n\":{},\"pad\":\"{}\"}}", n, " ".repeat(8 << 20)).into() };
     let new = json!({ "n": 1000, "pad": 0 });
     // Not known: no patch, and the whole value goes.
     assert!(c.patch(1, 2, &new).is_none());
-    assert_eq!(*c.patch(5, 5, &new).unwrap(), json!({ "$=": 1 }));
-    c.keep(1, v(1), 10);
+    assert_eq!(&*c.patch(5, 5, &new).unwrap(), "{\"$=\":1}");
+    c.keep(1, &v(1));
     let p = c.patch(1, 2, &new).unwrap();
-    assert_eq!(*p, json!({ "$m": { "n": { "$v": 1000 } } }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&p).unwrap(), json!({ "$m": { "n": { "$v": 1000 } } }));
     // Once for all the pages that had it.
     assert!(Arc::ptr_eq(&p, &c.patch(1, 2, &new).unwrap()));
     // Keeping it again costs nothing.
-    c.keep(1, v(1), 10);
+    c.keep(1, &v(1));
     // Too large to keep.
-    c.keep(2, v(2), 17 << 20);
+    let large: Arc<str> = " ".repeat(17 << 20).into();
+    c.keep(2, &large);
     assert!(c.patch(2, 3, &new).is_none());
-    // Past the room there is, the one unused longest goes, with its patches.
-    for h in 10..14 {
-        c.keep(h, v(h as i32), 16 << 20);
+    // Past the room there is, values go. What many pages use is the last to.
+    for _ in 0..50 {
+        c.keep(1, &v(1));
     }
-    assert!(c.patch(10, 3, &new).is_some());
-    c.keep(20, v(20), 16 << 20);
-    c.keep(21, v(21), 16 << 20);
-    assert!(c.patch(1, 3, &new).is_none());
-    assert!(c.patch(11, 3, &new).is_none());
-    assert!(c.patch(13, 3, &new).is_some());
+    for h in 10..24 {
+        c.keep(h, &big(h as i32));
+    }
+    let left = (10..24).filter(|h| c.patch(*h, 3, &new).is_some()).count();
+    assert!((1..=8).contains(&left), "{} left", left);
+    assert!(c.patch(1, 3, &new).is_some());
     // Patches are forgotten together, past their limit.
-    let first = c.patch(13, 3, &new).unwrap();
+    let first = c.patch(1, 3, &new).unwrap();
     for to in 100..400 {
-        c.patch(13, to, &new);
+        c.patch(1, to, &new);
     }
-    assert!(!Arc::ptr_eq(&first, &c.patch(13, 3, &new).unwrap()));
+    assert!(!Arc::ptr_eq(&first, &c.patch(1, 3, &new).unwrap()));
     assert_eq!(quillo::livecache::parse_hash(&quillo::livecache::hash_text(255)), Some(255));
     assert_eq!(quillo::livecache::parse_hash("not hex"), None);
 }

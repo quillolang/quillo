@@ -1639,9 +1639,37 @@ fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 // ---- live updates ------------------------------------------------------
 
+/// `{ every: "1s" }` before `live`'s loader, as milliseconds: the least time
+/// between a page's refreshes (FEEDBACK24.md, Q-190; branch feedback24-fixes).
+pub fn live_every(e: &crate::ast::Expr) -> Result<u64, String> {
+    use crate::ast::{Expr, Lit};
+    let wrong = || "`live`'s options are { every: \"1s\" } here, as written: the least time between refreshes, as 500, \"500ms\", \"2s\" or \"1m\"".to_string();
+    let Expr::Map(fields) = e else { return Err(wrong()) };
+    let [(k, v)] = fields.as_slice() else { return Err(wrong()) };
+    if k != "every" {
+        return Err(wrong());
+    }
+    match v {
+        Expr::Lit(Lit::Int(n)) if *n > 0 => Ok(*n as u64),
+        Expr::Lit(Lit::Str(s)) => {
+            let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let n: u64 = s[..at].parse().map_err(|_| wrong())?;
+            match &s[at..] {
+                "ms" if n > 0 => Ok(n),
+                "s" if n > 0 => Ok(n * 1000),
+                "m" if n > 0 => Ok(n * 60_000),
+                _ => Err(wrong()),
+            }
+        }
+        _ => Err(wrong()),
+    }
+}
+
 /// `state items = live(load_items, ...args)` in a component: calls the server fn
 /// now, and the browser calls it again whenever something it read changes.
 fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // `live({ every: "1s" }, load, ...)`: for the page, which makes the refreshes.
+    let args = if matches!(args.first(), Some(Value::Map(_))) { args[1..].to_vec() } else { args };
     let f = match args.first() {
         Some(Value::Func(c)) if c.def.server => Value::Func(c.clone()),
         Some(other) => {
@@ -1652,13 +1680,51 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Value::Func(c) = &f else { unreachable!() };
     let name = c.def.name.clone();
     let rest: Vec<Value> = args[1..].to_vec();
-    let outer = it.reads.replace(std::collections::HashSet::new());
-    let r = it.call(&f, rest.clone(), line);
-    let topics = std::mem::replace(&mut it.reads, outer).unwrap_or_default();
-    if let Some(o) = &mut it.reads {
-        o.extend(topics.iter().cloned());
-    }
-    let mut topics: Vec<String> = topics.into_iter().collect();
+    // A page load shares a run as a refresh does: a thousand arrivals are not a
+    // thousand runs (FEEDBACK24.md, Q-193; branch feedback24-fixes).
+    let key = it.live_key(&name, &rest);
+    let (found, landing) = match &key {
+        Some((k, viewer)) => it.live_turn(k, *viewer),
+        None => (None, None),
+    };
+    let (r, mut topics, kept) = match found {
+        Some((a, topics, _)) => {
+            crate::metrics::live_run(true);
+            if let Some(o) = &mut it.reads {
+                o.extend(topics.iter().cloned());
+            }
+            (Ok(crate::interp::from_island_json(&a.value)), topics, Some(a))
+        }
+        None => {
+            crate::metrics::live_run(false);
+            let seq = it.shared.live_seq();
+            let (cookies, own, read) = (it.set_cookies.len(), it.own_seqs.len(), it.read_request);
+            it.read_request = false;
+            let outer = it.reads.replace(std::collections::HashSet::new());
+            let r = it.call(&f, rest.clone(), line);
+            let topics = std::mem::replace(&mut it.reads, outer).unwrap_or_default();
+            if let Some(o) = &mut it.reads {
+                o.extend(topics.iter().cloned());
+            }
+            let mut topics: Vec<String> = topics.into_iter().collect();
+            topics.sort();
+            let personal = it.read_request;
+            it.read_request |= read;
+            let answer = r.as_ref().ok().filter(|v| !matches!(v, Value::Err(..) | Value::Response(_)) && crate::server::hidden(v).is_none()).map(|v| {
+                Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false)))
+            });
+            if let (Some((k, viewer)), Some(a)) = (key, &answer) {
+                if it.set_cookies.len() == cookies && it.own_seqs.len() == own && it.shared.unchanged_since(&topics, seq) {
+                    let mut cache = it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cache.share(k, personal.then_some(viewer), seq, topics.clone(), a.clone());
+                }
+            }
+            if let Some(mut l) = landing {
+                l.personal = personal;
+            }
+            (r, topics, answer)
+        }
+    };
     topics.sort();
     it.shared.track(&topics);
     let mut info = Map::new();
@@ -1669,8 +1735,8 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
     if let Ok(v) = &r {
         if !matches!(v, Value::Err(..)) {
-            let a = crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false));
-            it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(a.h, a.value.clone(), a.text.len());
+            let a = kept.unwrap_or_else(|| Arc::new(crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false))));
+            it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(a.h, &a.text);
             info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));
         }
     }

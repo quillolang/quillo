@@ -3744,6 +3744,29 @@ function mediaPlayer(el) {
 // once, and gives the first answer to the tries after it.
 const RETRIED = [409, 502, 503, 504];
 
+// The key belongs to what is sent, not to the click (FEEDBACK24.md, Q-196; branch
+// feedback24-fixes). While a call runs, the same call shares its answer and sends
+// nothing, so two clicks are one payment. One that got no answer keeps its key, so
+// that sending it again is safe; any answer ends it, and the next is a new call.
+const Sent = new Map();
+
+function rpcOnce(name, args) {
+  if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) return rpcRaw(name, args, false, idemKey());
+  const id = name + "\0" + JSON.stringify(args.map((a) => toJSON(a, true)));
+  let call = Sent.get(id);
+  if (call && call.running) return call.running;
+  if (!call) {
+    if (Sent.size >= 64) Sent.delete(Sent.keys().next().value);
+    Sent.set(id, (call = { key: idemKey() }));
+  }
+  call.running = rpcRaw(name, args, false, call.key).then((r) => {
+    call.running = null;
+    if (!r.unanswered) Sent.delete(id);
+    return r;
+  });
+  return call.running;
+}
+
 function idemKey() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
   const b = new Uint8Array(16);
@@ -3762,7 +3785,7 @@ async function rpcRaw(name, args, live, idem) {
   const had = live && live.h, base = live && live.base;
   if (live) headers["x-quillo-live"] = "1";
   if (had) headers["x-quillo-had"] = had;
-  if (idem) headers["idempotency-key"] = idemKey();
+  if (idem) headers["idempotency-key"] = idem;
   // Files (from an <input type=file>) go as parts of a multipart body, the
   // other arguments as JSON beside them.
   let payload;
@@ -3787,7 +3810,7 @@ async function rpcRaw(name, args, live, idem) {
       });
     } catch (e) {
       r = null;
-      if (--tries <= 0) return failed(`server fn \`${name}\` could not be reached: ${e.message}`);
+      if (--tries <= 0) return { ...failed(`server fn \`${name}\` could not be reached: ${e.message}`), unanswered: true };
     }
     if (r && !(idem && RETRIED.includes(r.status) && --tries > 0)) break;
     // 0.25 s, 0.5 s, 1 s, give or take a quarter.
@@ -3795,7 +3818,7 @@ async function rpcRaw(name, args, live, idem) {
   }
   let body = null;
   try { body = await r.json(); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
-  if (!r.ok) return failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`);
+  if (!r.ok) return { ...failed(`server fn \`${name}\` failed (${r.status})${body && body.error ? ": " + body.error : ""}`), unanswered: RETRIED.includes(r.status) };
   let value = null;
   if (body && hasOwn(body, "patch")) {
     if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);
@@ -3827,7 +3850,7 @@ function livePatched(old, p) {
 }
 
 async function rpc(name, args, idem) {
-  return (await rpcRaw(name, args, false, idem)).value;
+  return (await (idem ? rpcOnce(name, args) : rpcRaw(name, args, false))).value;
 }
 
 // ---- live updates --------------------------------------------------------
@@ -3877,18 +3900,36 @@ function liveRestart() {
 }
 
 async function liveLoop() {
+  // Tries in a row that came to nothing, and whether the page was told.
+  let fails = 0;
   for (;;) {
     const topics = liveTopics();
     Live.key = topics.join(",");
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
     const url = BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&t=" + encodeURIComponent(Live.key);
+    // What a refusal asks for: a server that is full says when to try again.
+    let after = 0;
     try {
-      if (!(await liveSocket(url, ctrl.signal)) && !ctrl.signal.aborted)
-        liveChanged(await (await fetch(url, { signal: ctrl.signal, cache: "no-store" })).json());
+      if (await liveSocket(url, ctrl.signal)) fails = 0;
+      else if (!ctrl.signal.aborted) {
+        const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+        if (r.ok) { liveChanged(await r.json()); fails = 0; continue; }
+        after = (Number(r.headers.get("retry-after")) || 0) * 1000;
+        fails++;
+      }
     } catch (e) {
-      if (!ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 1000));
+      fails++;
     }
+    if (ctrl.signal.aborted) continue;
+    // A page that stays behind has to be seen (FEEDBACK24.md, Q-189), once. A
+    // refusal is plain at once; a failed try may be a moment's.
+    if (fails === (after ? 1 : 3)) report("live updates are not reaching this page: the server is not taking them");
+    // All at once after a restart is what a restart must not be: each page waits
+    // a second or so, spread out, and longer each time it fails
+    // (FEEDBACK24.md, Q-194; branch feedback24-fixes).
+    const wait = Math.max(after, Math.min(1000 * 2 ** fails, 30000));
+    await new Promise((r) => setTimeout(r, wait * (0.5 + Math.random())));
   }
 }
 
@@ -3915,6 +3956,8 @@ function liveSocket(url, signal) {
 // the way waits for it, and asks again only if the answer is older than the
 // change (FEEDBACK13.md, Q-090; branch feedback13-fixes).
 function liveChanged(j) {
+  // A new server, after a restart: every page asks at once otherwise.
+  const late = Live.server && j.server && Live.server !== j.server ? Math.random() * 1000 : 0;
   Live.seq = j.seq;
   Live.server = j.server || "";
   const changed = new Set(j.changed || []);
@@ -3923,7 +3966,19 @@ function liveChanged(j) {
     if (!s.topics.some((t) => changed.has(t))) continue;
     if (s.seen >= j.seq && s.seenOn === Live.server) continue;
     if (s.loading) { s.wanted = Math.max(s.wanted || 0, j.seq); continue; }
-    liveRefresh(s);
+    // `live({ every: "1s" }, ...)`: what comes sooner waits for the gap, and
+    // whatever more comes meanwhile is the same refresh (FEEDBACK24.md, Q-190;
+    // branch feedback24-fixes).
+    const gap = s.every ? s.last + s.every - Date.now() : 0;
+    if (late || gap > 0) {
+      if (s.held) continue;
+      s.held = setTimeout(() => {
+        s.held = null;
+        if (s.inst.dead) return;
+        if (s.loading) s.wanted = Live.seq;
+        else liveRefresh(s);
+      }, Math.max(late, gap));
+    } else liveRefresh(s);
   }
 }
 
@@ -3931,6 +3986,7 @@ async function liveRefresh(sub, newArgs) {
   // Only the latest load counts: an older one may answer last.
   const n = (sub.loads = (sub.loads || 0) + 1);
   sub.loading = true;
+  sub.last = Date.now();
   sub.wanted = 0;
   if (newArgs) waitSig(sub.sig).set(true);
   try {
@@ -5681,16 +5737,16 @@ const waitSig = (sig) => sig.$wait || (sig.$wait = new Sig(false));
 W.waiting = (sig) => waitSig(sig).v;
 // `state name = live(fname, ...args)`: state that follows the server. When
 // its arguments change (`live(load, id)` after `id` changed), it loads again.
-W.live = (inst, name, fname, args) => {
+W.live = (inst, name, fname, args, every) => {
   const had0 = inst.sigs || (inst.sigs = {});
   if (had0[name]) return had0[name];
-  return (had0[name] = within(inst, () => liveSig(inst, name, fname, args)));
+  return (had0[name] = within(inst, () => liveSig(inst, name, fname, args, every)));
 };
-function liveSig(inst, name, fname, args) {
+function liveSig(inst, name, fname, args, every) {
   const info = inst.liveInfo && inst.liveInfo[name];
   const had = hasOwn(inst.s0, name);
   const sig = new Sig(had ? inst.s0[name] : null);
-  const sub = { inst, sig, name, fname, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined };
+  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined };
   Live.subs.add(sub);
   onCleanup(() => { Live.subs.delete(sub); liveRestart(); });
   let first = true;

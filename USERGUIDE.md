@@ -33,6 +33,8 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
 | `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
 | `--max-compute 2s` | end a request that computes this long without letting go, as a 500 (see Concurrency) |
+| `--trust-proxy 10.0.0.0/8` | believe `X-Forwarded-For` from these addresses (see [Live data](#live-data)) |
+| `--live-per-client N` | pages one client may have waiting for live data (default 256) |
 | `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency); not with `--watch`, `--register` or `--split` |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
@@ -1255,9 +1257,9 @@ component Notes(initial: list) {
   subscribes to it.
 - What a loader reads includes what the functions it calls read: a `me()` that looks up
   the `sessions` table makes every loader calling it run again when anyone signs in.
-  `unwatched(() => me())` calls it without following what it reads. Keep what changes
-  often but is not shown (view counts, last-seen times) in a table of its own, so
-  writing it wakes no page.
+  `unwatched(() => me())` calls it without following what it reads, though what it read
+  still makes the run the viewer's own. Keep what changes often but is not shown (view
+  counts, last-seen times) in a table of its own, so writing it wakes no page.
 - A field of a global map, read as `world.scores`, is a topic of its own
   (`var:world.scores`): a loader that shows it runs again when that field changes, not on
   every write to the map, even 20 times a second from a game's loop. Assigning the map
@@ -1301,30 +1303,51 @@ component Notes(initial: list) {
   waiting would hold them, and server calls would queue behind them. Where a
   WebSocket cannot open, the page asks the same URL as a plain request instead,
   answered at the first change or after 25 s, and asked again at once. A connection
-  that drops is opened again at once; when the server cannot be reached at all, the
-  page waits a second between tries. A tab in the background keeps its connection and
-  runs its loaders as a visible one does. A page on another site cannot open it (403).
+  that drops is opened again after a second or so, spread out, and after a restart pages
+  ask for their data over a second, so that they do not all come at once; when the
+  server cannot be reached, the page waits longer each time, up to half a minute. A tab
+  in the background keeps its connection and runs its loaders as a visible one does. A
+  page on another site cannot open it (403).
 - A server keeps at most 4096 such connections open (live data, `--watch` reloads,
   channels over a WebSocket), and at most 256 for one client: an IPv4 address, or an
-  IPv6 /64 network. Past that, a page is answered `503` and tries again later. Channels
-  over WebTransport are not counted. Behind a proxy that does
-  not pass the client's own connection through, every visitor is the proxy's address,
-  so put the proxy's own per-client limits in front (Quillo does not read
-  `X-Forwarded-For`, which a client can write).
+  IPv6 /64 network. Channels over WebTransport are not counted. Past that, a page is
+  answered `503`, keeps what it shows, says so once in the console, and asks again when
+  told. The server says so once in its log, and `quillo_live_refused_total` counts them.
+- **Behind a proxy, name it.** Every visitor is then the proxy's address, so without
+  this only 256 pages get updates. `--trust-proxy 127.0.0.1` (addresses or networks,
+  comma-separated) believes `X-Forwarded-For` on connections from those: the client is
+  the nearest address in it that is not one of them, for this limit, for `request.ip` and
+  everywhere else. From any other address the header is ignored, as a client can write
+  it. When one address really is many visitors, as an office is, `--live-per-client 1000`
+  raises the limit.
 - Only changes made through Quillo are seen: a row changed by another program
   (`psql`, a script) does not wake pages.
-- One change wakes every page showing it, and they all ask at once. A loader's run
-  is shared by the pages that ask, within two seconds, for the same function with the
-  same arguments (and the same `Host`) while nothing it read has changed: fifty open
-  boards run `load_board` once. A run that read the request (`session()`, cookies,
-  headers, the locale) is shared only by the same viewer's pages (their tabs), wherever
-  in the run it read it; a viewer is told by address, cookies, `Authorization`,
-  `Accept-Language` and `User-Agent` together. A run that wrote, set a cookie, took a
-  file, or answered with `respond` is not shared.
+- One change wakes the pages showing it, and no others, and they all ask at once. The
+  first change goes to a page at once; what comes within a tenth of a second or so after
+  it goes as one, so a burst of writes is a few refreshes, not one each.
+  `live({ every: "2s" }, load)` asks for a gap of its own between a page's refreshes,
+  as `500`, `"500ms"`, `"2s"` or `"1m"`, written here as it is.
+- A loader's run is shared by the pages that ask, within two seconds, for the same
+  function with the same arguments (and the same `Host`) while nothing it read has
+  changed: fifty open boards run `load_board` once, and that goes for a page's first
+  load too. Calls that come while a run is under way wait for it. A run that read the
+  request (`session()`, cookies, headers, the locale) is shared only by the same viewer's
+  pages (their tabs), wherever in the run it read it; a viewer is told by address,
+  cookies, `Authorization`, `Accept-Language` and `User-Agent` together. A run that
+  wrote, set a cookie, took a file, or answered with `respond` is not shared.
+- **What a thousand pages cost** depends on whether the loader is shared. A loader for
+  everyone runs once a change however many pages show it. One that reads the viewer runs
+  once for each page, on every change to what it read, so with many pages and a busy
+  table give each viewer a topic of their own: `watch("user:7")` and an `unwatched` query,
+  published by whoever writes. What is in the table does not matter, what the loader
+  returns does: each run makes that value's JSON, so return what the page shows (`limit`,
+  or `live(load_page, page)`), not the table. A loader giving over 4 MB is said in the
+  log. `quillo_live_runs_total` tells runs made from runs shared.
 - A page is sent what changed in the value, not the whole value again: the server keeps
-  the values pages have (up to 64 MB, no value over 16 MB, the least recently used
-  dropped first), and answers a page with a patch to its own when the patch is the
-  shorter. Lists of rows are matched by their `id` (a number or text; the first of two
+  the values pages have (up to 64 MB with the patches, no value over 16 MB; past that,
+  those few pages share go first), and answers a page with a patch to its own when the
+  patch is the shorter. A patch does not go inside text, so one letter changed in a long
+  field sends the field. Lists of rows are matched by their `id` (a number or text; the first of two
   alike counts), rows without one by place, then by content, and what is inside a row
   is patched the same way, so a card moved or renamed on a board of 3,000 costs that
   card. A map whose keys changed order, and a decimal, go whole. The patch applies to
@@ -1495,8 +1518,13 @@ src="/_quillo/quillo.js"></script>` first. A component cannot be mounted from a 
 components start from the server's HTML, or inside another component.
 
 A call that must not happen twice (a payment, a transfer) is wrapped in
-[`idempotent`](#idempotent-requests): the page then sends a key with each call, and
-sends the call again when its answer does not come back, and the server runs it once.
+[`idempotent`](#idempotent-requests), in the `server fn` or a function it calls: the page
+then sends a key with each call, and sends the call again when its answer does not come
+back, and the server runs it once. Two clicks are one call: while a call runs, the same
+call with the same arguments shares its answer and sends nothing, and a call that got no
+answer keeps its key, so sending it again is safe. Any answer ends it, so the next
+payment, even of the same amount, is a new one. A call with other arguments is another
+call.
 
 #### What the browser can reach
 
@@ -2142,9 +2170,9 @@ server's code:
   matters in a table of your own: wrong PINs per account, uploads per hour. What is
   limited by itself: 256 large files being sent at once (8 per client), 4096 pages
   waiting for live data (256 per client), answered 503 with `retry-after: 5`.
-- **The visitor behind a proxy:** `request.ip` is the TCP peer. `X-Forwarded-For` is
-  never read; when the proxy is the only way in, read it yourself from
-  `request.headers`. An `x-request-id` a proxy sends is kept and echoed.
+- **The visitor behind a proxy:** `request.ip` is the TCP peer, unless `--trust-proxy`
+  names it (see [Live data](#live-data)): `X-Forwarded-For` is read from no one else. An
+  `x-request-id` a proxy sends is kept and echoed.
 - **Matching the host or a subdomain in the route line:** no; match the `host` header
   in a request pattern, or use `tenant_from` (see [Many tenants](#many-tenants)).
 - **Logs anywhere but stderr:** the request log and errors go to stderr, text or JSON
@@ -2202,6 +2230,12 @@ curl localhost:8080/payments -H "Idempotency-Key: $(uuidgen)" --json '{"to": "bo
   values, shared by everyone who knows one.
 - Without the header, `f` simply runs; `{ required: true }` answers 400 instead.
   Outside a request (a script, a job), `f` runs.
+- **A plain form** cannot send a header, so `<form method="post" idempotent>` carries a key
+  of its own, made as the page is rendered, in a hidden field (`_idempotency_key`) that
+  `idempotent` reads where there is no header, `{ required: true }` included. The browser
+  shows the answer to the last of two clicks, so that one waits for the first and gets
+  its answer, not a 409, and the form edited and sent again is another request, not a
+  422. A page with such a key is never kept by a cache.
 - In a function a service answers with, the key is the call's own id, which is the same
   for each try, so a step is one word: `server fn charge(ref: str, cents: int) =
   idempotent(() => ...)`. Its value is kept and given again, and what would refuse a
@@ -4345,6 +4379,11 @@ later, one for `--watch`, and one for each channel and `--with` command. Memory 
 limited by anything configurable: the allocator is mimalloc on the loops and the waiting
 threads, the system's elsewhere.
 
+Each page with live data is a thread with 256 KiB of stack reserved, of which it touches
+little, and two file descriptors, a socket and a connection. Quillo takes all the
+descriptors the system allows when it starts, and says so in the log if that is too few
+for 4096 pages; `ulimit -n`, or `LimitNOFILE=` under systemd, raises what is allowed.
+
 With `--watch`, a change to the program or a `use`d file reloads it (starting its
 state afresh) and refreshes open pages. `--reload` reloads it the same way without
 `--watch`'s development aids (errors on pages, refreshing them), for production
@@ -4614,6 +4653,10 @@ With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
 | `quillo_requests_in_progress`, `quillo_connections` | now |
 | `quillo_prefetches_total{result}` | pages asked for ahead of a click: `answered`, `refused`, `used` |
 | `quillo_later_total{result}` | tries of calls made later: `delivered`, `again`, `failed` (given up on) |
+| `quillo_live_pages`, `quillo_live_refused_total` | pages waiting for live data, and those refused a place |
+| `quillo_live_wakes_total` | pages woken by a change to what they follow |
+| `quillo_live_runs_total{outcome}` | loaders asked for: `ran`, or `shared` a run another page made |
+| `quillo_live_answers_total{kind}` | answers: `same`, a `patch`, or the `whole` value |
 | `quillo_uptime_seconds` | since the server started |
 | `quillo_bundles` | sets of components whose bundle is kept (see [Components](#components)) |
 | `quillo_udp_received_total`, `quillo_udp_dropped_total` | packets (see [UDP](#udp)) |
@@ -4909,7 +4952,7 @@ does not do it today; the way around it follows.
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
 | limit how often a client calls? | Not built in: count in a table of your own. See [What a route cannot do](#what-a-route-cannot-do) |
 | put a time limit on a route? | No: only sockets time out |
-| see the visitor's address behind a proxy? | Read `x-forwarded-for` from `request.headers` yourself; Quillo never trusts it |
+| see the visitor's address behind a proxy? | Name it with `--trust-proxy`, and `request.ip` is the visitor's. Otherwise read `x-forwarded-for` from `request.headers` yourself; Quillo never trusts it |
 | run several programs on one port? | Yes, in one process: `mount` or `service /prefix`. See [Mounting programs](#mounting-programs) |
 | serve a site as static files? | Yes, when its components call nothing on the server: fetch every page and the bundles it loads, and upload them |
 | make requests run once when retried? | Yes: `idempotent`. See [Idempotent requests](#idempotent-requests) |

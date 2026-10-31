@@ -62,6 +62,12 @@
 //! `{ required: true }`, which answers 400. Outside a request (a script,
 //! a job), there is no key: `f` runs.
 //!
+//! A plain form cannot send a header: `<form method="post" idempotent>` carries
+//! a key in a hidden field instead (FEEDBACK24.md, Q-196; branch
+//! feedback24-fixes). The browser shows the answer to the last of two clicks,
+//! so that one waits for the first's answer rather than getting 409, and a
+//! form edited and sent again is another request, not a 422.
+//!
 //! In a function a service answers with, the key is the call's own id, which
 //! is the same for each try, so the value is kept in place of an answer
 //! (FEEDBACK23.md, Q-188; branch feedback23-fixes). What would refuse a
@@ -87,6 +93,10 @@ const LEASE_MS: i64 = 60_000;
 const KEEP_S: u64 = 86_400;
 /// Keys are at most this long (Stripe's limit).
 const MAX_KEY: usize = 255;
+/// The field of a `<form idempotent>` its key comes in.
+pub const FORM_FIELD: &str = "_idempotency_key";
+/// How long a form sent again waits for the first to finish.
+const FORM_WAIT_MS: i64 = 30_000;
 
 struct Options {
     tx: crate::txn::Options,
@@ -164,12 +174,21 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let step = !call.is_empty();
     let no = |status: u16, msg: &str| if step { fail(line, msg.to_string()) } else { refuse(status, msg) };
     let give = |a: HttpResponse, replayed: bool| if step { Ok(step_value(&a)) } else { answer(a, replayed) };
-    let key = match header("idempotency-key") {
-        Some(k) => k,
+    let form_key = match req.get("form") {
+        Some(Value::Map(f)) => f.get(FORM_FIELD).map(|v| v.display()),
+        _ => None,
+    };
+    let mut by_form = false;
+    let key = match (header("idempotency-key"), form_key) {
+        (Some(k), _) => k,
         // By its line too: a function may have two.
-        None if step => format!("{}:{}", call, line),
-        None if opts.required => return refuse(400, "this request needs an Idempotency-Key header"),
-        None => return run_plain(it),
+        (None, _) if step => format!("{}:{}", call, line),
+        (None, Some(k)) => {
+            by_form = true;
+            k
+        }
+        (None, None) if opts.required => return refuse(400, "this request needs an Idempotency-Key header"),
+        (None, None) => return run_plain(it),
     };
     if key.is_empty() || key.len() > MAX_KEY || !key.bytes().all(|b| (0x21..0x7f).contains(&b)) {
         return refuse(400, &format!("an Idempotency-Key is 1 to {} visible ASCII characters", MAX_KEY));
@@ -180,9 +199,16 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None => session_user(it, line)?,
     };
     let tenant = it.tenant();
-    let id = sha256_hex(&[tenant.as_deref().unwrap_or("").as_bytes(), it.base.as_bytes(), crate::interp::island_json(&user).to_string().as_bytes(), key.as_bytes()]);
     let print = fingerprint(it, &req, &header("content-type").unwrap_or_default());
-    let token = match claim(it, &id, &path, &print, opts.keep_ms, opts.transaction) {
+    let form_print = if by_form { print.as_str() } else { "" };
+    let id = sha256_hex(&[tenant.as_deref().unwrap_or("").as_bytes(), it.base.as_bytes(), crate::interp::island_json(&user).to_string().as_bytes(), key.as_bytes(), form_print.as_bytes()]);
+    let mut claimed = claim(it, &id, &path, &print, opts.keep_ms, opts.transaction);
+    let until = now_ms() + FORM_WAIT_MS;
+    while by_form && matches!(claimed, Ok(Claim::Refused(409, _))) && now_ms() < until {
+        it.unlocked(|| std::thread::sleep(std::time::Duration::from_millis(50)));
+        claimed = claim(it, &id, &path, &print, opts.keep_ms, opts.transaction);
+    }
+    let token = match claimed {
         Ok(Claim::Mine(t)) => t,
         Ok(Claim::Answer(a)) => return give(a, true),
         Ok(Claim::Refused(status, msg)) => return no(status, &msg),
@@ -531,9 +557,30 @@ fn cleanup(it: &mut Interp, tenant: Option<&str>) {
     let _ = sql(it, false, "delete from _quillo_idempotency where expires_at < ?", vec![Value::Int(now)]);
 }
 
-/// Whether a server fn uses `idempotent`: then the page sends a key with
-/// each call, and sends it again with the call if the answer does not come
-/// (see `rpcRaw` in the browser runtime).
-pub fn used_by(def: &crate::ast::FnDef) -> bool {
-    format!("{:?}", def.body).contains("\"idempotent\"")
+/// Whether a server fn uses `idempotent`, or a function it calls does
+/// (FEEDBACK24.md, Q-196; branch feedback24-fixes): then the page sends a key
+/// with each call, and sends it again with the call if the answer does not come
+/// (see `rpcOnce` in the browser runtime).
+pub fn used_by(globals: &Env, def: &crate::ast::FnDef) -> bool {
+    reaches(globals, def, &mut std::collections::HashSet::new())
+}
+
+fn reaches(globals: &Env, def: &crate::ast::FnDef, seen: &mut std::collections::HashSet<String>) -> bool {
+    let body = format!("{:?}", def.body);
+    if body.contains("\"idempotent\"") {
+        return true;
+    }
+    body.split("Ident(\"").skip(1).filter_map(|rest| rest.split_once('"')).any(|(name, _)| {
+        if !seen.insert(name.to_string()) {
+            return false;
+        }
+        matches!(lookup(globals, name), Some(Value::Func(c)) if reaches(globals, &c.def, seen))
+    })
+}
+
+/// Whether an answer holds such a key: the page cannot be kept for anyone,
+/// the same visitor later included, or two payments would be one.
+pub fn holds_form_key(body: &[u8]) -> bool {
+    let name = FORM_FIELD.as_bytes();
+    body.windows(name.len()).any(|w| w == name)
 }

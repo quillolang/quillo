@@ -1,0 +1,38 @@
+// Two clicks on a function marked `idempotent` are one call, and a payment after it is
+// another. Driven by once.js (FEEDBACK24.md, Q-196; branch feedback24-fixes).
+
+db.exec("create table if not exists paid (who text)")
+
+fn charge(who: str) = idempotent(() => {
+    sleep(300)
+    db.exec("insert into paid (who) values (?)", who)
+    who
+})
+
+server fn pay(who: str) = idempotent(() => {
+    sleep(300)
+    db.exec("insert into paid (who) values (?)", who)
+    who
+})
+server fn pay_by_helper(who: str) = charge(who)
+server fn paid() = len(db.query("select who from paid"))
+server fn plain(who: str) {
+    db.exec("insert into paid (who) values (?)", who)
+    who
+}
+
+component Pay() {
+    state said = null
+    state n = 0
+    <div>
+        <form id="form" @submit={() => { said = pay("form") }}><button id="send">Pay</button></form>
+        <button id="click" @click={() => { said = pay("click") }}>Pay</button>
+        <button id="helper" @click={() => { said = pay_by_helper("helper") }}>Pay</button>
+        <button id="plain" @click={() => { plain("plain") }}>Not marked</button>
+        <button id="count" @click={() => { n = paid() }}>Count</button>
+        <p id="said">{said}</p>
+        <p id="n">{n}</p>
+    </div>
+}
+
+route GET / = <html><body><Pay/></body></html>

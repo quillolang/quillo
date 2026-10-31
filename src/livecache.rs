@@ -30,24 +30,66 @@
 //! Tagged values (`{"$dec": "1.50"}` and the like) are replaced whole.
 
 use serde_json::{json, Map, Value as J};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long a run is shared: the pages told of one change ask within it.
 pub const SHARED_FOR: Duration = Duration::from_secs(2);
 
-/// Values kept to make patches against, in bytes of JSON.
+/// Values kept to make patches against, and patches, in bytes of JSON.
 const KEPT_BYTES: usize = 64 << 20;
+/// How many values are looked at to choose the one to let go.
+const CANDIDATES: usize = 4;
 
 #[derive(Default)]
 pub struct LiveCache {
     runs: HashMap<RunKey, Vec<Run>>,
     values: HashMap<u64, Kept>,
     bytes: usize,
-    tick: u64,
-    patches: HashMap<(u64, u64), Arc<J>>,
+    patches: HashMap<(u64, u64), Arc<str>>,
+    patch_bytes: usize,
+    swept: Option<Instant>,
+    /// Runs under way, and the runs known to read the request, which cannot be
+    /// given to another viewer, so that nothing waits for them.
+    flights: HashMap<RunKey, Arc<Flight>>,
+    personal: HashSet<RunKey>,
+}
+
+/// A run under way. On a database that lets go of the lock while it works, the
+/// next page's call would find no answer and start the same query, up to a
+/// server's worth of them: those wait for this one and take its answer
+/// (FEEDBACK24.md, Q-191; branch feedback24-fixes).
+#[derive(Default)]
+pub struct Flight {
+    done: Mutex<bool>,
+    ended: Condvar,
+}
+
+impl Flight {
+    pub fn wait(&self, longest: Duration) {
+        let done = self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = self.ended.wait_timeout_while(done, longest, |d| !*d);
+    }
+
+    fn end(&self) {
+        *self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.ended.notify_all();
+    }
+}
+
+/// A run a page may have: the answer, its topics and its sequence number.
+pub type Shared = (Arc<Answer>, Vec<String>, u64);
+
+/// What a call with no answer to share does.
+pub enum Begun {
+    /// It runs the loader.
+    Run,
+    /// It waits for the run under way.
+    Wait(Arc<Flight>),
+    /// It runs, beside the others: each viewer's run is its own.
+    Alone,
 }
 
 /// The function, its arguments as the page sent them, and the host (each
@@ -66,37 +108,71 @@ struct Run {
 /// What a loader gave: its value as JSON, the text of it, and its hash.
 pub struct Answer {
     pub value: Arc<J>,
-    pub text: String,
+    pub text: Arc<str>,
     pub h: u64,
     /// An error value: sent as `err`, and never patched.
     pub err: bool,
+    /// The answer as it goes out gzipped, and the `seq` in it: a thousand pages
+    /// sharing a run are not a thousand gzips (FEEDBACK24.md, Q-193; branch
+    /// feedback24-fixes).
+    pub gz: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
 }
 
 impl Answer {
     pub fn new(value: J, err: bool) -> Self {
-        let text = value.to_string();
-        Answer { h: hash(&text), value: Arc::new(value), text, err }
+        let text: Arc<str> = value.to_string().into();
+        Answer { h: hash(&text), value: Arc::new(value), text, err, gz: Mutex::new(None) }
     }
 }
 
+/// As text, not parsed: what the budget counts is then what is held, several
+/// times less than a parsed value (FEEDBACK24.md, Q-193; branch feedback24-fixes).
 struct Kept {
-    value: Arc<J>,
-    size: usize,
-    used: u64,
+    text: Arc<str>,
+    uses: u64,
 }
 
 impl LiveCache {
     /// A run another page made that this one may have: the answer, its
     /// topics and the sequence number it was made at.
-    pub fn shared(&mut self, key: &RunKey, viewer: u64, unchanged: impl Fn(&[String], u64) -> bool) -> Option<(Arc<Answer>, Vec<String>, u64)> {
+    pub fn shared(&mut self, key: &RunKey, viewer: u64, unchanged: impl Fn(&[String], u64) -> bool) -> Option<Shared> {
         let runs = self.runs.get_mut(key)?;
         runs.retain(|r| r.at.elapsed() < SHARED_FOR);
         let r = runs.iter().rev().find(|r| r.viewer.map_or(true, |v| v == viewer) && unchanged(&r.topics, r.seq))?;
         Some((r.answer.clone(), r.topics.clone(), r.seq))
     }
 
+    /// A call with no answer to share, for `key`.
+    pub fn begin(&mut self, key: &RunKey) -> Begun {
+        if self.personal.contains(key) {
+            return Begun::Alone;
+        }
+        if let Some(f) = self.flights.get(key) {
+            return Begun::Wait(f.clone());
+        }
+        self.flights.insert(key.clone(), Default::default());
+        Begun::Run
+    }
+
+    /// The run `begin` said to make has ended, whatever became of it; `personal`
+    /// if it read the request.
+    pub fn land(&mut self, key: &RunKey, personal: bool) {
+        if let Some(f) = self.flights.remove(key) {
+            f.end();
+        }
+        if personal {
+            if self.personal.len() >= 4096 {
+                self.personal.clear();
+            }
+            self.personal.insert(key.clone());
+        } else {
+            self.personal.remove(key);
+        }
+    }
+
     pub fn share(&mut self, key: RunKey, viewer: Option<u64>, seq: u64, topics: Vec<String>, answer: Arc<Answer>) {
-        if self.runs.len() > 256 {
+        if self.runs.len() > 256 && self.swept.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
+            self.swept = Some(Instant::now());
             self.runs.retain(|_, rs| {
                 rs.retain(|r| r.at.elapsed() < SHARED_FOR);
                 !rs.is_empty()
@@ -108,40 +184,56 @@ impl LiveCache {
     }
 
     /// Keeps a value a page now has, by its hash, for patches against it.
-    pub fn keep(&mut self, h: u64, value: Arc<J>, size: usize) {
-        self.tick += 1;
+    pub fn keep(&mut self, h: u64, text: &Arc<str>) {
         if let Some(k) = self.values.get_mut(&h) {
-            k.used = self.tick;
+            k.uses += 1;
             return;
         }
-        if size > KEPT_BYTES / 4 {
+        if text.len() > KEPT_BYTES / 4 {
             return;
         }
-        self.bytes += size;
-        self.values.insert(h, Kept { value, size, used: self.tick });
-        while self.bytes > KEPT_BYTES {
-            let Some((&old, _)) = self.values.iter().min_by_key(|(_, k)| k.used) else { break };
-            if let Some(k) = self.values.remove(&old) {
-                self.bytes -= k.size;
+        self.bytes += text.len();
+        self.values.insert(h, Kept { text: text.clone(), uses: 1 });
+        while self.bytes + self.patch_bytes > KEPT_BYTES {
+            if self.patch_bytes > 0 {
+                self.patches.clear();
+                self.patch_bytes = 0;
+                continue;
             }
-            self.patches.retain(|(a, b), _| *a != old && *b != old);
+            let Some(old) = self.least_used(h) else { break };
+            if let Some(k) = self.values.remove(&old) {
+                self.bytes -= k.text.len();
+            }
         }
     }
 
-    /// The patch from the value hashed `from` to `to` (which is `new`), when
-    /// `from` is still known; made once for all the pages that had it.
-    pub fn patch(&mut self, from: u64, to: u64, new: &J) -> Option<Arc<J>> {
+    /// The value to let go. Pages refresh in turn, so the oldest is the next to
+    /// be asked for: dropping it, past the budget, would leave no patches at all
+    /// where some random ones cost a part. Of a few, the one least used goes, as
+    /// a value many pages have is worth more than one for a single viewer.
+    fn least_used(&self, not: u64) -> Option<u64> {
+        let from = fastrand::usize(..self.values.len().min(1024));
+        self.values.iter().skip(from).chain(self.values.iter()).filter(|(h, _)| **h != not).take(CANDIDATES).min_by_key(|(_, k)| k.uses).map(|(h, _)| *h)
+    }
+
+    /// The patch from the value hashed `from` to `to` (which is `new`), as text,
+    /// when `from` is still known; made once for all the pages that had it.
+    pub fn patch(&mut self, from: u64, to: u64, new: &J) -> Option<Arc<str>> {
         if from == to {
-            return Some(Arc::new(json!({ "$=": 1 })));
+            return Some(Arc::from("{\"$=\":1}"));
         }
         if let Some(p) = self.patches.get(&(from, to)) {
             return Some(p.clone());
         }
-        let old = self.values.get(&from)?.value.clone();
-        let p = Arc::new(diff(&old, new));
+        let kept = self.values.get_mut(&from)?;
+        kept.uses += 1;
+        let old: J = serde_json::from_str(&kept.text).ok()?;
+        let p: Arc<str> = diff(&old, new).to_string().into();
         if self.patches.len() > 256 {
             self.patches.clear();
+            self.patch_bytes = 0;
         }
+        self.patch_bytes += p.len();
         self.patches.insert((from, to), p.clone());
         Some(p)
     }
@@ -352,6 +444,52 @@ mod tests {
         round(json!([1, 2, 3, 4]), json!([4, 1, 2, 3, 5]));
         round(json!([{ "x": 1 }, { "x": 2 }]), json!([{ "x": 2 }, { "x": 3 }]));
         round(json!(null), json!([1]));
+    }
+
+    /// Pages refreshing in turn, more of them than there is room for: taking the
+    /// oldest would leave none (FEEDBACK24.md, Q-193; branch feedback24-fixes).
+    #[test]
+    fn a_full_store_still_has_most_of_what_fits() {
+        let text = |i: u64| -> Arc<str> { format!("[{}{}]", i, " ".repeat(1 << 20)).into() };
+        let mut c = LiveCache::default();
+        let (mut found, mut asked) = (0, 0);
+        for round in 0..6 {
+            for i in 0..100u64 {
+                asked += (round > 2) as u32;
+                found += (round > 2 && c.values.contains_key(&i)) as u32;
+                c.keep(i, &text(i));
+            }
+        }
+        assert!(c.bytes <= KEPT_BYTES);
+        assert!(found * 100 / asked >= 35, "{} of {}", found, asked);
+    }
+
+    #[test]
+    fn a_value_many_pages_have_is_the_last_to_go() {
+        let text = |i: u64| -> Arc<str> { format!("[{}{}]", i, " ".repeat(1 << 20)).into() };
+        let mut c = LiveCache::default();
+        for _ in 0..50 {
+            c.keep(1_000_000, &text(1_000_000));
+        }
+        for i in 0..300 {
+            c.keep(i, &text(i));
+        }
+        assert!(c.values.contains_key(&1_000_000));
+    }
+
+    #[test]
+    fn patches_are_counted_and_let_go_first() {
+        let mut c = LiveCache::default();
+        let a: Arc<str> = "[1]".into();
+        c.keep(1, &a);
+        let p = c.patch(1, 2, &json!([1, 2])).unwrap();
+        assert_eq!(c.patch_bytes, p.len());
+        assert_eq!(c.patch(1, 1, &json!([1])).unwrap().as_ref(), "{\"$=\":1}");
+        let big: Arc<str> = " ".repeat(KEPT_BYTES / 4).into();
+        for i in 10..15 {
+            c.keep(i, &big);
+        }
+        assert_eq!(c.patch_bytes, 0);
     }
 
     #[test]

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Live data at a thousand pages
+
+Measured with real sockets, 250 pages on the build before and on this one, and 1,000 and
+3,000 on this one; on one machine, so these show what changed, not what a server can hold.
+
+- **Behind a proxy, every page gets updates.** `--trust-proxy` names the proxy, and only
+  then is `X-Forwarded-For` believed, for `request.ip` and each client's limit of 256.
+  `--live-per-client` changes that limit. A page refused says so, the log says so, and it
+  waits as it is told, spread out, instead of asking twice a second for ever.
+- **A loader waits for a run under way.** On PostgreSQL, 200 pages after 10 writes ran a
+  50 ms query 736 times and took 14 s to catch up; now 11 times and 1.8 s. A write
+  elsewhere no longer costs a run its sharing.
+- **A burst of changes is a few refreshes:** 4,238 calls where there were 10,000, for 40
+  writes at 20 a second to 250 pages, and the first change still goes at once.
+  `live({ every: "2s" }, load)` sets a gap of its own.
+- **A change wakes only the pages following it:** with pages waiting and 200 unrelated
+  writes a second, the server's CPU fell from 2.81 s to 0.14 s.
+- **A page load shares a run**, as a refresh does, and a whole answer many pages share is
+  gzipped once. Values are kept as text, so the 64 MB is 64 MB, patches count towards
+  it, and a store past its size keeps most of what fits rather than none.
+- **A page that left gives its place back** in about 5 seconds, not up to 40.
+- **`--metrics` shows live data:** `quillo_live_pages`, `_refused_total`, `_wakes_total`,
+  `_runs_total` and `_answers_total`. Quillo takes all the file descriptors it may at the
+  start, and says so if that is too few.
+
+### Forms sent twice
+
+- **Two clicks are one call** on a function marked `idempotent`, however deep it uses it,
+  for `@submit` and `@click` alike, with no code of your own.
+- **`<form method="post" idempotent>`** does the same with no script: the second click gets
+  the first's answer, on SQLite, PostgreSQL and MariaDB, and `{ required: true }` works
+  from a form.
+
 ### Calls made later, and sagas
 
 - **`.later` goes with its transaction on every database.** On MySQL and MariaDB one call
