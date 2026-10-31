@@ -105,6 +105,8 @@ pub enum Out {
     /// A frame of a stream it watches (see `media`), over a WebSocket.
     Media(Arc<crate::media::Frame>),
     Ping,
+    /// The answer to a ping from the other end, over a WebSocket.
+    Pong(Vec<u8>),
     Close,
 }
 
@@ -1088,7 +1090,7 @@ mod quic {
                             }
                         }
                     }
-                    Some(Out::Ping | Out::Media(_)) => {}
+                    Some(Out::Ping | Out::Pong(_) | Out::Media(_)) => {}
                     Some(Out::Close) | None => break,
                 },
                 _ = &mut reader => break,
@@ -1139,6 +1141,10 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
                 match reader.next() {
                     Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
                     Ok(crate::ws::Message::Binary(b)) => frame_from_page(&peer, b),
+                    // RFC 6455 5.5.2 (FEEDBACK16.md, Q-132; branch feedback20-fixes).
+                    Ok(crate::ws::Message::Ping(data)) => {
+                        peer.put(Out::Pong(data));
+                    }
                     Ok(crate::ws::Message::Close) | Err(_) => break,
                     Ok(_) => {}
                 }
@@ -1163,6 +1169,7 @@ pub fn over_websocket(mut socket: crate::ws::Socket, ticket: Ticket) {
             Out::Text { json, .. } => socket.send(&json),
             Out::Media(f) => socket.send_binary(&f.wire),
             Out::Ping => socket.ping(),
+            Out::Pong(data) => socket.pong(&data),
             Out::Close => break,
         };
         if !alive {

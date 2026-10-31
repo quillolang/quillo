@@ -386,28 +386,44 @@ fn a_service_url_sends_its_calls_to_that_server() {
     assert_eq!(far.get("/runs").body, "1", "the call ran there, not here");
 }
 
-#[test]
-#[ignore = "finding: `--with` commands outlive a program that fails to load, ends with nothing to serve, or cannot listen: `run` returns without with::stop_all"]
-fn commands_beside_a_program_stop_when_it_fails_to_start() {
-    let dir = folder("with-failed", &[("bad.qwe", "route GET / = nope\n")]);
+/// Runs app.qwe, which takes a second before it fails so that a command beside
+/// it has written its pid, and finds that command gone. Gives the exit code and
+/// what the program said.
+fn beside(dir: &std::path::Path, extra: &[&str]) -> (Option<i32>, String) {
     let o = Command::new(env!("CARGO_BIN_EXE_quillo"))
-        .args(["run", "bad.qwe", "--with", "echo $$ > side.pid; exec sleep 30"])
-        .current_dir(&dir)
-        .env("HOME", &dir)
+        .args(["run", "app.qwe", "--with", "echo $$ > side.pid; exec sleep 30"])
+        .args(extra)
+        .current_dir(dir)
+        .env("HOME", dir)
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(1));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        let text = std::fs::read_to_string(dir.join("side.pid")).unwrap_or_default();
-        if !text.trim().is_empty() {
-            break text.trim().to_string();
-        }
-        assert!(Instant::now() < deadline, "the command did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(!alive(&pid), "the command stops with the program");
+    let pid = std::fs::read_to_string(dir.join("side.pid")).expect("the command did not start");
+    assert!(!alive(pid.trim()), "the command stops with the program");
+    (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+}
+
+#[test]
+fn commands_beside_a_program_stop_when_it_fails_to_start() {
+    // Past the check, where it fails on its own.
+    let dir = folder("with-failed", &[("app.qwe", "sleep(1000)\nlet x = 1 / 0\n")]);
+    assert_eq!(beside(&dir, &["--no-check"]).0, Some(1));
+}
+
+#[test]
+fn commands_beside_a_program_with_nothing_to_serve_stop_with_it() {
+    let dir = folder("with-nothing", &[("app.qwe", "sleep(1000)\nprint(\"done\")\n")]);
+    assert_eq!(beside(&dir, &[]).0, Some(0));
+}
+
+#[test]
+fn commands_beside_a_program_that_cannot_listen_stop_with_it() {
+    let dir = folder("with-taken", &[("app.qwe", "sleep(1000)\nroute GET / = \"hi\"\n")]);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let (code, said) = beside(&dir, &["--port", &port]);
+    assert_eq!(code, Some(1), "{}", said);
+    assert!(said.contains("cannot listen"), "{}", said);
 }
 
 const CHANNEL: &str = "channel.on(\"room\", (m, peer) => { })\nroute GET / = \"hi\"\n";

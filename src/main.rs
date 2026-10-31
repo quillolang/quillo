@@ -17,10 +17,10 @@ usage:
   quillo run <file.qwe> [options]   run a program; serve it if it has routes
   quillo app <file.qwe> [options]   run a program in a native window (needs a
                                     build with `--features app`)
-  quillo check <file.qwe>           check a program without running it
+  quillo check <file.qwe>           check a program without running it, and
+               [--strict-null]      warn where a value may be null and null
+                                    does not work
   quillo fix <file.qwe>             write the `import`s a program's files need
-               [--strict-null]      and warn where a value may be null and
-                                    null does not work
   quillo docs <file.qwe>            the program's API as OpenAPI 3: its routes,
                                     and its server fns' contracts
   quillo build <file.qwe>           build the Rust (.qwer files) a program uses,
@@ -134,15 +134,15 @@ fn main() {
     std::process::exit(child.join().unwrap_or(1));
 }
 
-/// Options of `run`, `app` and `build` that take a value: the word after one
-/// is its value, not the program.
+/// Options of `run` and `app` that take a value: the word after one is its
+/// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--max-compute", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with",
 ];
 
-/// Options of `run`, `app`, `build` and `check` that take no value.
+/// Options of `run`, `app` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
     "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe",
@@ -154,11 +154,15 @@ fn meant(option: &str) -> String {
     if option == "-p" {
         return " (the port is `--port`)".to_string();
     }
-    let near = VALUE_OPTIONS
-        .iter()
-        .chain(FLAG_OPTIONS)
+    nearest(option, VALUE_OPTIONS.iter().chain(FLAG_OPTIONS))
+}
+
+fn nearest<'a>(option: &str, known: impl Iterator<Item = &'a &'a str>) -> String {
+    // Never itself: `--strict-null` under `run` is no misspelling (FEEDBACK16.md, Q-140; branch
+    // feedback20-fixes).
+    let near = known
         .map(|o| (quillo::check::edit_distance(option, o), *o))
-        .filter(|(d, o)| *d <= 2.max(o.len() / 4))
+        .filter(|(d, o)| *d <= 2.max(o.len() / 4) && *o != option)
         .min();
     near.map_or_else(String::new, |(_, o)| format!(" (did you mean `{}`?)", o))
 }
@@ -227,18 +231,43 @@ fn with_program(args: &[String], f: impl FnOnce(&str, &[String]) -> i32) -> i32 
     }
 }
 
+/// `with_program` for a command that takes one program and the options in
+/// `known`. What it does not know is refused, as `run` refuses it: a misspelt
+/// `--strict-null` would turn a check off, and a second program would go
+/// unseen under `ok` (FEEDBACK16.md, Q-125; branch feedback20-fixes).
+fn with_one_program(args: &[String], known: &[&str], f: impl FnOnce(&str, &[String]) -> i32) -> i32 {
+    if args[2..].iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", USAGE);
+        return 0;
+    }
+    with_program(&args[2..], |program, flags| {
+        for a in flags {
+            if known.contains(&a.as_str()) {
+                continue;
+            }
+            if a.starts_with('-') {
+                eprintln!("quillo: unknown option `{}` for `{}`{}", a, args[1], nearest(a, known.iter()));
+            } else {
+                eprintln!("quillo: unknown argument `{}`: `{}` takes one program", a, args[1]);
+            }
+            return 2;
+        }
+        f(program, flags)
+    })
+}
+
 fn real_main(args: Vec<String>) -> i32 {
     match args.get(1).map(String::as_str) {
         Some("run") => with_program(&args[2..], run),
         // A debug adapter for editors, on stdin and stdout (src/debug.rs).
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
-        Some("check") => {
-            let strict_null = args.iter().any(|a| a == "--strict-null");
-            with_program(&args[2..], |f, _| check(f, quillo::check::Options { strict_null, css: true, ..Default::default() }))
-        }
+        Some("check") => with_one_program(&args, &["--strict-null"], |f, flags| {
+            let strict_null = flags.iter().any(|a| a == "--strict-null");
+            check(f, quillo::check::Options { strict_null, css: true, ..Default::default() })
+        }),
         // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
         // branch feedback10-fixes).
-        Some("docs") => with_program(&args[2..], |f, _| match quillo::describe::of_source(Path::new(f)) {
+        Some("docs") => with_one_program(&args, &[], |f, _| match quillo::describe::of_source(Path::new(f)) {
             Ok(doc) => {
                 println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
                 0
@@ -248,7 +277,7 @@ fn real_main(args: Vec<String>) -> i32 {
                 1
             }
         }),
-        Some("build") => with_program(&args[2..], |f, _| match quillo::native::build_all(Path::new(f)) {
+        Some("build") => with_one_program(&args, &[], |f, _| match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
                         println!("built {}", l.display());
@@ -264,7 +293,7 @@ fn real_main(args: Vec<String>) -> i32 {
                 }
         }),
         // The `use`s a program's files need (src/modules.rs; branch feedback19-fixes).
-        Some("fix") => with_program(&args[2..], |f, _| match quillo::modules::fix(Path::new(f)) {
+        Some("fix") => with_one_program(&args, &[], |f, _| match quillo::modules::fix(Path::new(f)) {
             Ok(said) => {
                 for s in &said {
                     println!("{}", s);
@@ -291,7 +320,9 @@ fn real_main(args: Vec<String>) -> i32 {
             println!("{}", USAGE);
             0
         }
-        Some(f) if f.ends_with(".qwe") => run(f, &args[2..]),
+        // The same reading as `run`: `--log=off` is `--log off` here too
+        // (FEEDBACK16.md, Q-139; branch feedback20-fixes).
+        Some(f) if f.ends_with(".qwe") => with_program(&args[1..], run),
         Some(_) => usage(),
     }
 }
@@ -532,6 +563,19 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 println!("{}", USAGE);
                 return Err(0);
             }
+            // Known, and with nothing after it (FEEDBACK16.md, Q-140; branch feedback20-fixes).
+            (other, None) if VALUE_OPTIONS.contains(&other) => {
+                eprintln!("quillo: `{}` needs a value", other);
+                return Err(2);
+            }
+            ("--with", Some(_)) => {
+                eprintln!("quillo: --with needs a command to run");
+                return Err(2);
+            }
+            ("--open", Some(_)) => {
+                eprintln!("quillo: --open is for `quillo app`, which opens a window on that page");
+                return Err(2);
+            }
             (other, _) => {
                 eprintln!("quillo: unknown option `{}`{}", other, meant(other.split('=').next().unwrap_or(other)));
                 return Err(2);
@@ -568,7 +612,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
-    let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| e.to_string())) {
+    let loaded = match checked.and_then(|()| interp.load_file(path).map_err(|e| format!("{:#}", e))) {
         Ok(_) => Loaded::Ready(interp),
         Err(e) => {
             if !e.is_empty() {
@@ -737,11 +781,9 @@ fn warn_of_secrets() {
     }
 }
 
-fn run(file: &str, flags: &[String]) -> i32 {
-    let o = match run_options(flags) {
-        Ok(o) => o,
-        Err(code) => return code,
-    };
+/// What `run` and `app` do before the program: `app` used to skip it
+/// (FEEDBACK16.md, Q-124; branch feedback20-fixes).
+fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
     // The program's `.env`, before anything reads the environment
     // (FEEDBACK9.md, Q-071; branch feedback9-fixes).
     let env_file = match &o.env_file {
@@ -750,7 +792,7 @@ fn run(file: &str, flags: &[String]) -> i32 {
     };
     if let Err(e) = quillo::dotenv::load_into_process(&env_file.0, env_file.1) {
         eprintln!("quillo: {}", e);
-        return 2;
+        return Err(2);
     }
     // What runs beside the program (FEEDBACK11.md, Q-079; branch
     // feedback11-fixes): started in its folder, stopped with it.
@@ -758,11 +800,30 @@ fn run(file: &str, flags: &[String]) -> i32 {
     for cmd in &o.with {
         if let Err(e) = with::start(cmd, dir) {
             eprintln!("quillo: --with {:?}: {}", cmd, e);
-            with::stop_all();
-            return 1;
+            return Err(1);
         }
     }
     warn_of_secrets();
+    Ok(())
+}
+
+/// Runs the program. Whichever way it ends, a program that fails to load, has
+/// nothing to serve or cannot listen included, what runs beside it stops
+/// with it (FEEDBACK16.md, Q-123; branch feedback20-fixes).
+fn run(file: &str, flags: &[String]) -> i32 {
+    let code = run_program(file, flags);
+    with::stop_all();
+    code
+}
+
+fn run_program(file: &str, flags: &[String]) -> i32 {
+    let o = match run_options(flags) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if let Err(code) = before_the_program(file, &o) {
+        return code;
+    }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
     let path = Path::new(file);

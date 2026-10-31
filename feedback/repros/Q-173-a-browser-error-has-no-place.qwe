@@ -1,6 +1,7 @@
 // Q-173 A runtime error in the browser prints its message alone: no file, no line, no call chain, under --watch too, where the source maps exist. The server says `file:line`
 // mode: browser
 // page: /
+// flags: --watch
 // probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { clicked: true }
 // open-when: quillo: division by zero
 // fixed-when: /\.qwe:\d+/

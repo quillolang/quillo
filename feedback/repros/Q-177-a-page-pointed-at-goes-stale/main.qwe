@@ -1,0 +1,33 @@
+// Q-177 A page pointed at and then changed is shown as it was when pointed at: Chrome keeps the prefetch for minutes, and nothing tells it the page changed
+// mode: script
+// script: steps.sh
+// open-when: "shows":"0"
+// open-when: "shows":"ada"
+// fixed-when: "shows":"1"
+// fixed-when: "shows":"nobody"
+// From FEEDBACK22.md §Q-177 (found on 401b416).
+
+let n = 0
+let REPORT = "addEventListener('load', () => { const e = performance.getEntriesByType('navigation')[0]; document.body.setAttribute('data-result', JSON.stringify({ shows: document.getElementById('v').textContent, delivery: e.deliveryType })) })"
+
+route GET / = <html><body><a id="count" href="/count">count</a> <a id="me" href="/me">me</a></body></html>
+
+route GET /count {
+    <html><body><p id="v">{n}</p><script>{raw(REPORT)}</script></body></html>
+}
+route POST /bump {
+    n = n + 1
+    "ok"
+}
+route GET /me {
+    let u = session().user ?? "nobody"
+    <html><body><p id="v">{u}</p><script>{raw(REPORT)}</script></body></html>
+}
+route POST /login {
+    set_session({ user: "ada" })
+    "ok"
+}
+route POST /logout {
+    end_session()
+    "ok"
+}

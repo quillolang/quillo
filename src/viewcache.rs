@@ -152,7 +152,7 @@ fn same(a: &Value, b: &Value) -> bool {
         (Value::Map(x), Value::Map(y)) => Arc::ptr_eq(x, y),
         (Value::Func(x), Value::Func(y)) => Arc::ptr_eq(x, y),
         (Value::Builtin(x, _), Value::Builtin(y, _)) => x == y,
-        (Value::Err(x, _), Value::Err(y, _)) => Arc::ptr_eq(x, y),
+        (Value::Err(x, _, _), Value::Err(y, _, _)) => Arc::ptr_eq(x, y),
         (Value::Response(x), Value::Response(y)) => Arc::ptr_eq(x, y),
         _ => false,
     }

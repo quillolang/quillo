@@ -126,7 +126,9 @@ fn read_system() -> serde_json::Map<String, serde_json::Value> {
         _ => "server",
     };
     let time_zone = jiff::tz::TimeZone::system().iana_name().map(str::to_string);
-    let locale = std::env::var("LC_ALL").or_else(|_| std::env::var("LANG")).ok().map(|l| l.split('.').next().unwrap_or("").replace('_', "-")).filter(|l| !l.is_empty() && l != "C" && l != "POSIX");
+    // An empty one counts as unset, as for every program that reads them
+    // (FEEDBACK16.md, Q-129; branch feedback20-fixes).
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty())).map(|l| l.split('.').next().unwrap_or("").replace('_', "-")).filter(|l| !l.is_empty() && l != "C" && l != "POSIX");
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     match json!({
         "os": os,

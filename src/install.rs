@@ -304,11 +304,13 @@ pub fn main(args: &[String]) -> i32 {
             .collect();
         shown.sort_by(|a, b| a.group.cmp(&b.group).then(a.name.cmp(&b.name)));
         let width = shown.iter().map(|e| e.name.len()).max().unwrap_or(4);
-        let mut group = "";
+        // None at the start, not "", or those with no group get no heading
+        // (FEEDBACK16.md, Q-131; branch feedback20-fixes).
+        let mut group = None;
         for e in &shown {
-            if e.group != group {
-                group = &e.group;
-                println!("\n{}", if group.is_empty() { "Other" } else { group });
+            if group != Some(&e.group) {
+                group = Some(&e.group);
+                println!("\n{}", if e.group.is_empty() { "Other" } else { &e.group });
             }
             println!("  {:width$}  {:8}  {}", e.name, e.version, e.summary, width = width);
         }

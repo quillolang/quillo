@@ -57,15 +57,17 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--join URL` | with `--as-service` and a `--port`: join the app at URL as one more copy of this service while it runs |
 | `--describe` | answer `GET /_quillo/describe` with the program's API, as `quillo docs` writes it |
 | `--env-file F` | the settings file to read (a path from the folder `quillo` runs in; it must exist), instead of the `.env` beside the program (which need not) |
-| `--with CMD` | run a command beside the program (through `sh -c`, in its folder), its lines marked with its name, stopped with it (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
+| `--with CMD` | run a command beside the program (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
 
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
 files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
 [Files of a program](#files-of-a-program)), `quillo repl`, `quillo lsp`, `quillo dap`,
-`quillo version` (or `--version`, `-V`). `quillo check` exits 1 when there is an error (warnings do not
+`quillo version` (or `--version`, `-V`). `quillo <file.qwe>` is `quillo run <file.qwe>`, options
+and all. `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
+they do not have (`check` has `--strict-null`). `quillo check` exits 1 when there is an error (warnings do not
 fail it), `quillo run` 1 when the program does not load or the port cannot be taken, and
-either 2 for a usage mistake (an unknown option, no program, `--register` without its
+either 2 for a usage mistake (an unknown option, an option without its value, no program, `--register` without its
 secret, options that do not go together). A stopped server exits 0 (see [Stopping and
 health](#stopping-and-health)).
 
@@ -113,7 +115,9 @@ cargo build --release --features app      # Linux also needs libwebkit2gtk-4.1-d
 ```
 
 The release downloads are built without it. It takes the options of `run` except
-`--host`, `--register` and `--service`, and `--open PATH`, the page the window opens on
+`--host`, `--register` and `--service`, reads the `.env` beside the program (or
+`--env-file`) as `run` does, keeps `--with` commands going until the window closes, and
+takes `--open PATH`, the page the window opens on
 (`--open /admin`; `/` by default). The program is served on 127.0.0.1, at a port the
 system picks (or `--port`), to the window alone:
 the window's first request carries a token made for this launch and trades it
@@ -169,7 +173,8 @@ program on 127.0.0.1 to the app's own web view, as `quillo app` does on a deskto
 offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
 --run` builds the app around a program folder for the iOS simulator and opens it there, and
 `mobile/android/build.sh app --run` a debug APK for an Android emulator or phone. The
-app's name, id, version, build number and icon come from an `app.toml` beside main.qwe;
+app's name, id, version, build number, icon and first file (`main = "mobile.qwe"`, by
+default main.qwe) come from an `app.toml` in the program's folder;
 `--device` and `--archive` (iOS) and `--release` (Android, a signed APK and App Bundle)
 make builds for the stores;
 `mobile/README.md` says how, and what a phone build leaves out (compiled numbers,
@@ -528,6 +533,26 @@ reports it, and a `?` that would pass on the wrong kind of error, before the pro
 Mistakes in the code itself (calling a non-function, adding a map to an int, a
 failed type check, recursion more than 10,000 calls deep) are runtime errors. In a
 route they become a 500 response, and the server logs them.
+
+A runtime error says where it happened and how it got there, in the terminal, the log and,
+under `--watch`, on the page. A visitor sees only `internal error`:
+
+```
+quillo: price.qwe:2: division by zero
+  in share, called at main.qwe:4
+  in split_bill, called at main.qwe:7
+```
+
+A deep recursion keeps its first and last five calls. Under `--log json` the calls are a
+`calls` field beside `error`. The chain is built as the error leaves each call, so calls
+that succeed pay nothing, and a function in machine code gives the same chain, as what
+fails there runs again in the interpreter. An error value is not a failure yet and has no chain, but
+the log says where one was made when it ends a request: `main.qwe:8: db: no such column:
+nope`. A program does not see that place: two errors with the same contents are equal
+wherever they were made.
+
+In a page under `--watch`, the browser's console says the same, from the error's stack:
+the `.qwe` file and line, and the calls. In production it says the message alone.
 
 ### Effects
 
@@ -2915,7 +2940,7 @@ See [services](https://github.com/quillolang/examples/tree/main/services): a sho
   `"macos"`, `"linux"`, `"windows"`), `os_name` and `os_version` (`"iOS"`, `"27.0"`), `kernel`,
   `device` (`"phone"`, `"tablet"`, `"desktop"` in `quillo app`, `"server"`), `model` (the
   hardware's identifier: `"iPhone19,2"`, `"Mac17,2"`), `arch`, `cpus`, `simulator`, `runtime`
-  (`"mobile"`, `"app"` or `"server"`), `locale`, `time_zone`, `quillo` (this build's version), and in a
+  (`"mobile"`, `"app"` or `"server"`), `locale` (the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that is set and not empty; null for `C` and `POSIX`), `time_zone`, `quillo` (this build's version), and in a
   phone app also `model_family` (`"iPhone"`), `memory` (bytes), `screen` (`{ width, height, scale }`, in
   points) and `app` (`{ id, name, version, build }`). What a system does not tell is `null`. It is read
   once: the screen and locale are as they were when the program started. It runs on the server, as

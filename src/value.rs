@@ -152,8 +152,57 @@ pub enum Value {
     /// An error value: `err(x)`, a failed `int("x")`, ... The flag says the program wrote it,
     /// to be read: what a builtin makes can say what no visitor should see, so it has to be
     /// marked, as the text cannot tell them apart (FEEDBACK21.md, Q-171; branch
-    /// feedback20-fixes).
-    Err(Arc<Value>, bool),
+    /// feedback20-fixes). The place is where it was made (FEEDBACK21.md, Q-174).
+    Err(Arc<Value>, bool, Place),
+}
+
+/// Where an error value was made, for the log: a file and a line in four bytes, which fit
+/// beside its flag, so that no other value grows for it. Files go by a number, from the table
+/// below; a program of more than `FILE_BITS` worth loses the file, and past `LINE_BITS` the
+/// line (FEEDBACK21.md, Q-174; branch feedback20-fixes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Place(u32);
+
+const LINE_BITS: u32 = 20;
+const FILE_BITS: u32 = 32 - LINE_BITS;
+static PLACE_FILES: std::sync::Mutex<Vec<Arc<str>>> = std::sync::Mutex::new(Vec::new());
+
+impl Place {
+    pub const NONE: Place = Place(0);
+
+    pub fn new(file: Option<&Arc<str>>, line: u32) -> Place {
+        let line = if line < 1 << LINE_BITS { line } else { 0 };
+        let file = file.map_or(0, |f| {
+            let mut all = PLACE_FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at = all.iter().position(|x| x == f).unwrap_or_else(|| {
+                all.push(f.clone());
+                all.len() - 1
+            });
+            if at + 1 < 1 << FILE_BITS { at as u32 + 1 } else { 0 }
+        });
+        Place(file << LINE_BITS | line)
+    }
+
+    /// `text`, after where it was made.
+    pub fn before(self, text: &str) -> String {
+        match self.to_string().as_str() {
+            "" => text.to_string(),
+            at => format!("{}: {}", at, text),
+        }
+    }
+}
+
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let (file, line) = ((self.0 >> LINE_BITS) as usize, self.0 & ((1 << LINE_BITS) - 1));
+        let name = file.checked_sub(1).and_then(|i| PLACE_FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).cloned());
+        match (name, line) {
+            (Some(n), 0) => write!(f, "{}", crate::error::shown_path(&n)),
+            (Some(n), l) => write!(f, "{}:{}", crate::error::shown_path(&n), l),
+            (None, 0) => Ok(()),
+            (None, l) => write!(f, "line {}", l),
+        }
+    }
 }
 
 pub struct Closure {
@@ -194,12 +243,12 @@ impl Value {
     }
 
     pub fn err(v: Value) -> Value {
-        Value::Err(Arc::new(v), false)
+        Value::Err(Arc::new(v), false, Place::NONE)
     }
 
     /// An error the program means a visitor to read.
     pub fn own_err(v: Value) -> Value {
-        Value::Err(Arc::new(v), true)
+        Value::Err(Arc::new(v), true, Place::NONE)
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -286,7 +335,7 @@ impl Value {
                 }
                 out.push_str(" }");
             }
-            Value::Err(e, _) => {
+            Value::Err(e, _, _) => {
                 out.push_str("err(");
                 e.repr_into(out);
                 out.push(')');
@@ -327,7 +376,7 @@ impl Value {
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
             Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json())).collect()),
-            Value::Err(e, _) => serde_json::json!({ "error": e.to_json() }),
+            Value::Err(e, _, _) => serde_json::json!({ "error": e.to_json() }),
             Value::Response(r) => serde_json::json!({ "status": r.status }),
             Value::Func(_) | Value::Builtin(..) => J::String(self.repr()),
         }
@@ -368,7 +417,7 @@ impl Value {
                 }
                 out.push(b'}');
             }
-            Value::Err(e, _) => {
+            Value::Err(e, _, _) => {
                 out.extend_from_slice(b"{\"error\":");
                 e.json_into(out);
                 out.push(b'}');
@@ -495,7 +544,7 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (Html(x), Html(y)) => x == y,
         (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
         (Map(x), Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| equal(v, w))),
-        (Err(x, _), Err(y, _)) => equal(x, y),
+        (Err(x, ..), Err(y, ..)) => equal(x, y),
         (Func(x), Func(y)) => Arc::ptr_eq(x, y),
         (Builtin(x, _), Builtin(y, _)) => x == y,
         _ => false,

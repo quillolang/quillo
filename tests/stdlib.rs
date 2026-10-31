@@ -306,7 +306,6 @@ route GET /kind = file("a.txt", { cache: true })
 /// `n * per` overflows: a panic where overflow is checked, and a meaningless
 /// max-age where it wraps.
 #[test]
-#[ignore = "finding: a cache duration too long for a u64 overflows instead of being refused"]
 fn a_cache_too_long_to_count_is_refused() {
     let d = folder("file-overflow");
     std::fs::write(d.join("a.txt"), "hello").unwrap();
@@ -587,12 +586,12 @@ fn under_watch_a_change_to_a_served_file_refreshes_the_pages() {
     wait_for("the server did not start", || support::listening(port));
     wait_for("the file was not served", || support::send(port, "GET", "/note", &[], "").body == "first");
     // Changed again and again: the first look at a file only notes its time.
-    // Asked for each time too: the watcher starts on a thread of its own, and
-    // a file served before it has does not count as served.
+    // Asked for no more: a file served as the server starts counts as served,
+    // however long the watcher takes to start (FEEDBACK16.md, Q-149; branch
+    // feedback20-fixes).
     let mut n = 0;
     wait_for("the change was not noticed", || {
         n += 1;
-        support::send(port, "GET", "/note", &[], "");
         std::fs::write(d.join("note.txt"), format!("change {}", n)).unwrap();
         std::thread::sleep(Duration::from_millis(150));
         std::fs::read_to_string(&log).unwrap().contains("/note changed: refreshing open pages")

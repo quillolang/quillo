@@ -31,6 +31,11 @@ impl Gil {
     pub fn waiting(&self) -> usize {
         self.0.waiting()
     }
+
+    /// Gives a waiting thread its turn, then takes the lock back.
+    pub fn hand_over(&self) {
+        self.0.hand_over();
+    }
 }
 
 /// Something one thread holds at a time (the interpreter lock, the lead of
@@ -50,6 +55,8 @@ pub struct Baton {
 const SPIN: Duration = Duration::from_micros(100);
 /// How many threads may try at once.
 const SPINNERS: usize = 2;
+/// How long a thread handing over waits for a waiter to wake and take it.
+const HAND_OVER: Duration = Duration::from_millis(10);
 
 impl Baton {
     pub const fn new(taken: bool) -> Self {
@@ -110,6 +117,19 @@ impl Baton {
     /// Threads waiting for it, trying or asleep.
     pub fn waiting(&self) -> usize {
         self.spinning.load(SeqCst) + self.sleeping.load(SeqCst)
+    }
+
+    /// Gives it up to whoever waits and takes it back after them. A plain
+    /// `give` then `take` is over before a sleeping thread has woken, so that
+    /// thread could wait for as long as this one stays busy
+    /// (FEEDBACK16.md, Q-135; branch feedback20-fixes).
+    pub fn hand_over(&self) {
+        self.give();
+        let start = Instant::now();
+        while !self.taken.load(SeqCst) && self.waiting() > 0 && start.elapsed() < HAND_OVER {
+            std::thread::yield_now();
+        }
+        self.take();
     }
 }
 

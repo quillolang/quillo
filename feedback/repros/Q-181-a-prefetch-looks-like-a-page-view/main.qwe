@@ -1,0 +1,8 @@
+// Q-181 A prefetch looks like a page view in the log, and nothing says how many were used: no hit rate, no waste, and anything counting the log counts pages nobody saw
+// mode: script
+// script: steps.sh
+// open-when: log lines naming a prefetch: 0
+// fixed-when: log lines naming a prefetch: 1
+// From FEEDBACK22.md §Q-181 (found on 401b416).
+
+route GET / = <html><body>home</body></html>

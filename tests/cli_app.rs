@@ -105,13 +105,22 @@ mod with_windows {
     }
 
     #[test]
-    #[ignore = "finding: `quillo app` reads no `.env` and takes no notice of --env-file or --with, which `run` has and the guide says `app` takes"]
     fn the_env_file_beside_the_program_is_read_as_for_run() {
         let d = folder("dotenv", &[("app.qwe", "print(env(\"GREETING\"))\n"), (".env", "GREETING=hello\n")]);
         let (_, out, _) = no_window(&d, &["app.qwe"], &[]);
         assert_eq!(out, "hello\n");
         let (code, _, err) = no_window(&d, &["app.qwe", "--env-file", "nope.env"], &[]);
         assert_eq!(code, 2, "{}", err);
+    }
+
+    #[test]
+    fn a_command_beside_the_program_runs_in_its_folder_and_stops_with_it() {
+        let d = folder("with", &[("app.qwe", "sleep(1000)\nlet x = 1 / 0\n")]);
+        let (code, _, err) = no_window(&d, &["app.qwe", "--no-check", "--with", "echo $$ > side.pid; exec sleep 30"], &[]);
+        assert_eq!(code, 1, "{}", err);
+        let pid = std::fs::read_to_string(d.join("side.pid")).expect("the command did not start");
+        let alive = std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().unwrap().success();
+        assert!(!alive, "the command stops with the program");
     }
 
     #[test]

@@ -1,0 +1,10 @@
+// A failure in a helper of a helper (FEEDBACK21.md, Q-173): where it says it happened.
+fn inner(a, b) = a / b
+fn share(a) = inner(a, 0)
+
+component Pay() {
+    state n = 7
+    <button id="go" @click={() => { n = share(n) }}>pay {n}</button>
+}
+
+route GET / = <html><body><Pay/></body></html>

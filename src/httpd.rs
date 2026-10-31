@@ -129,7 +129,12 @@ pub fn error_line(text: &str) {
     let key = own_request();
     let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
     if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
-        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "error", "request": what, "error": text }));
+        // The calls it came through, as a field and not in the text (FEEDBACK21.md, Q-174; branch
+        // feedback20-fixes).
+        let mut lines = text.lines();
+        let error = lines.next().unwrap_or("");
+        let calls: Vec<&str> = lines.map(str::trim).collect();
+        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "error", "request": what, "error": error, "calls": calls }));
     } else if let Some(what) = what {
         eprintln!("quillo: error: {}: {}", what, text);
     } else {
@@ -712,8 +717,7 @@ impl Loop {
             }
             // A reload, or threads `parallel` started, are waiting to run.
             if gil.waiting() > 0 {
-                gil.release();
-                gil.acquire();
+                gil.hand_over();
             }
             flush_log();
             let later = crate::value::deferred_drops();

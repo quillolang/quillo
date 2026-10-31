@@ -111,7 +111,9 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
         .name("quillo-mobile".into())
         .stack_size(crate::server::WORKER_STACK)
         .spawn(move || {
-            let base = app_dir.clone();
+            // Beside the file, as `quillo run` has it: `main` may be in a subfolder
+            // (FEEDBACK20.md, Q-169; branch feedback20-fixes).
+            let base = path.parent().map_or_else(|| app_dir.clone(), Path::to_path_buf);
             let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             crate::service::serve_as(&stem);
             let mut interp = Interp::new(&base);

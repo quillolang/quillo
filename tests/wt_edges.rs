@@ -264,8 +264,9 @@ fn frames_and_messages_go_over_a_websocket_both_ways() {
     assert_eq!(b.read(), Frame::Text("[\"j\",\"chat\",true]".into()));
     a.text("[\"m\",\"chat\",\"hello\"]");
     assert_eq!(b.read(), Frame::Text("[\"m\",\"chat\",\"hello\"]".into()));
-    // A ping from the page changes nothing.
+    // A ping from the page gets its pong (FEEDBACK16.md, Q-132), and changes nothing else.
     a.send(9, b"are you there");
+    assert_eq!(a.read(), Frame::Pong);
     a.text("[\"m\",\"chat\",\"still here\"]");
     assert_eq!(b.read(), Frame::Text("[\"m\",\"chat\",\"still here\"]".into()));
 
@@ -287,7 +288,6 @@ fn frames_and_messages_go_over_a_websocket_both_ways() {
 }
 
 #[test]
-#[ignore = "finding: a ping sent on a page's channel WebSocket gets no pong (over_websocket drops it), which RFC 6455 5.5.2 requires"]
 fn a_ping_on_a_channels_websocket_is_answered() {
     let d = dir("ws-pong");
     std::fs::write(d.join("main.qwe"), CHANNELS).unwrap();
@@ -295,6 +295,9 @@ fn a_ping_on_a_channels_websocket_is_answered() {
     let mut a = Ws::open(&r);
     a.send(9, b"are you there");
     assert_eq!(a.read(), Frame::Pong);
+    // Still in use: the answer did not end it.
+    a.text("[\"j\",\"chat\"]");
+    assert_eq!(a.read(), Frame::Text("[\"j\",\"chat\",true]".into()));
 }
 
 #[test]

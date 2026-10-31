@@ -169,6 +169,13 @@ pub fn expr_line(e: &Expr) -> u32 {
 #[cold]
 #[inline(never)]
 pub(crate) fn stmt(it: &mut Interp, s: &Stmt, env: &Env) -> Result<Value, Ctrl> {
+    around(it, s, env, |it| it.run_stmt(s, env))
+}
+
+/// `run` as statement `s` of the program: a stop before it, and its line among
+/// those in progress. A block in markup writes its last statement to the page
+/// instead of running it (FEEDBACK16.md, Q-148; branch feedback20-fixes).
+pub(crate) fn around<T>(it: &mut Interp, s: &Stmt, env: &Env, run: impl FnOnce(&mut Interp) -> Result<T, Ctrl>) -> Result<T, Ctrl> {
     let line = stmt_line(s);
     let frame = it.trace.frames.len().checked_sub(1);
     if let Some(line) = line {
@@ -177,7 +184,7 @@ pub(crate) fn stmt(it: &mut Interp, s: &Stmt, env: &Env) -> Result<Value, Ctrl> 
             f.running.push(line);
         }
     }
-    let r = it.run_stmt(s, env);
+    let r = run(it);
     if line.is_some() {
         if let Some(f) = frame.and_then(|i| it.trace.frames.get_mut(i)) {
             f.running.pop();
@@ -570,7 +577,7 @@ fn children(v: &Value, start: Option<u64>, count: Option<u64>) -> Vec<(String, V
             xs.iter().enumerate().skip(start).take(count).map(|(i, x)| (i.to_string(), x.clone())).collect()
         }
         Value::Map(m) => m.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-        Value::Err(x, _) => vec![("error".into(), (**x).clone())],
+        Value::Err(x, _, _) => vec![("error".into(), (**x).clone())],
         Value::Response(r) => {
             let mut out = vec![("status".to_string(), Value::Int(r.status as i64))];
             let headers = r.headers.iter().map(|(k, v)| Value::list(vec![Value::str(k), Value::str(v)])).collect();
@@ -665,7 +672,7 @@ fn write_preview(v: &Value, budget: usize, out: &mut String, top: bool) {
             let left = budget.saturating_sub(out.len()).max(20);
             push_cut(out, &format!("{:?}", &**h), left);
         }
-        Value::Err(x, _) => {
+        Value::Err(x, _, _) => {
             out.push_str("err(");
             write_preview(x, budget, out, false);
             out.push(')');

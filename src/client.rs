@@ -509,7 +509,9 @@ mod dev {
 
     pub fn bundle(it: &Interp, c: &Compiler, boots: bool) -> String {
         let mut pieces: Vec<Piece> = Vec::new();
-        let mut prelude = String::from("DEV = true;\n");
+        // Room in a stack for the calls an error came through (FEEDBACK21.md, Q-173; branch
+        // feedback20-fixes).
+        let mut prelude = String::from("DEV = true;\nError.stackTraceLimit = 64;\n");
         if !it.base.is_empty() {
             let _ = writeln!(prelude, "BASE = {};", js_str(&it.base));
         }
@@ -596,7 +598,7 @@ mod dev {
                 Some(src) => {
                     let content = sources.entry(src.clone()).or_insert_with(|| std::fs::read_to_string(&**src).ok());
                     let once = if embedded.insert(src.clone()) { content.as_deref() } else { None };
-                    with_map(&p.code, src, once)
+                    with_map(&p.path, &p.code, src, once)
                 }
                 None => format!("\"use strict\";\n{}", unmarked(&p.code)),
             };
@@ -670,8 +672,12 @@ mod dev {
 
     /// `code` without its line marks, and a source map (inline) from each
     /// mark's place to the line of `source` it names.
-    fn with_map(code: &str, source: &str, content: Option<&str>) -> String {
-        let (mut out, map) = mapped(code, source, content);
+    fn with_map(path: &str, code: &str, source: &str, content: Option<&str>) -> String {
+        let (mut out, mut map) = mapped(code, source, content);
+        // The marks again, for the page itself to read an error's stack by: `report` in the
+        // runtime (FEEDBACK21.md, Q-173; branch feedback20-fixes).
+        let places = map.as_object_mut().and_then(|m| m.remove("x_places")).unwrap_or_default();
+        let _ = writeln!(out, "PLACES[{}] = [{}, {}];", js_str(path), js_str(&crate::error::shown_path(source)), places);
         let _ = write!(out, "//# sourceMappingURL=data:application/json;charset=utf-8;base64,{}\n", crate::ws::base64(map.to_string().as_bytes()));
         out
     }
@@ -740,12 +746,20 @@ mod dev {
             }
         }
         let url = format!("file://{}", url_path(source));
+        // By the file's line, from 1, as a stack says it.
+        let places: serde_json::Map<String, serde_json::Value> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, segs)| !segs.is_empty())
+            .map(|(i, segs)| ((i + 1).to_string(), serde_json::json!(segs.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>())))
+            .collect();
         let map = serde_json::json!({
             "version": 3,
             "sources": [url],
             "sourcesContent": [content],
             "names": names,
             "mappings": mappings,
+            "x_places": places,
         });
         (out, map)
     }

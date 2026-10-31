@@ -627,12 +627,12 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => err(format!("service {}: `{}` answered with a page, not a value", name, f)),
             // Whether the program wrote it goes along, as it does over the wire.
-            Value::Err(e, true) => Outcome::Ran(Value::own_err(crossed(&e))),
+            Value::Err(e, true, _) => Outcome::Ran(Value::own_err(crossed(&e))),
             v => Outcome::Ran(crossed(&v)),
         },
         Err(Ctrl::Reply(_)) => err(format!("service {}: `{}` replied with a page, not a value", name, f)),
         Err(Ctrl::Error(e)) => {
-            eprintln!("quillo: service {}: error in `{}`: {}", name, f, e);
+            eprintln!("quillo: service {}: error in `{}`: {:#}", name, f, e);
             err(format!("service {}: internal error in `{}`", name, f))
         }
     }
@@ -1053,12 +1053,12 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest) -> HttpRe
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused(500, &format!("`{}` answered with a page, not a value", f)),
             // Whether the program wrote it goes along, for the caller's visitors.
-            Value::Err(e, own) => json(200, with_published(serde_json::json!({ "err": to_wire(&e), "own": own }))),
+            Value::Err(e, own, _) => json(200, with_published(serde_json::json!({ "err": to_wire(&e), "own": own }))),
             v => json(200, with_published(serde_json::json!({ "ok": to_wire(&v) }))),
         },
         Err(Ctrl::Reply(_)) => refused(500, &format!("`{}` replied with a page, not a value", f)),
         Err(Ctrl::Error(e)) => {
-            eprintln!("quillo: error in server fn `{}` (called by a service): {}", f, e);
+            eprintln!("quillo: error in server fn `{}` (called by a service): {:#}", f, e);
             refused(500, &format!("internal error in `{}`", f))
         }
     }
@@ -1295,7 +1295,7 @@ fn make_later(it: &mut Interp, c: &Later) -> Result<(), String> {
     let tenant = (!c.tenant.is_empty()).then(|| Arc::from(c.tenant.as_str()));
     let rid = (!c.rid.is_empty()).then(|| Arc::from(c.rid.as_str()));
     match make(it, &c.service, &c.f, args, tenant, rid, Some(c.id.clone()), 0) {
-        Outcome::Ran(Value::Err(e, _)) => {
+        Outcome::Ran(Value::Err(e, _, _)) => {
             eprintln!("quillo: {}.{} (made later, {}) gave an error: {}", c.service, c.f, c.id, short(&e));
             Ok(())
         }

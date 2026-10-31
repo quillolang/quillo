@@ -712,7 +712,7 @@ fn is_err(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 
 fn unwrap(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
-        Value::Err(e, _) => fail(line, format!("unwrap of an error: {}", e.display())),
+        Value::Err(e, _, _) => fail(line, format!("unwrap of an error: {}", e.display())),
         v => Ok(v),
     }
 }
@@ -967,7 +967,8 @@ pub(crate) fn duration_seconds(v: &Value) -> Option<u64> {
                 "y" => 365 * 86400,
                 _ => return None,
             };
-            Some(n * per)
+            // Too long to count is a bad duration (FEEDBACK16.md, Q-130; branch feedback20-fixes).
+            n.checked_mul(per)
         }
         _ => None,
     }

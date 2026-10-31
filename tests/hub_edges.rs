@@ -199,7 +199,7 @@ fn text(rx: &mut Receiver<Out>) -> String {
     match next(rx) {
         Out::Text { json, .. } => json,
         Out::Media(_) => panic!("a frame came"),
-        Out::Ping => panic!("a ping came"),
+        Out::Ping | Out::Pong(_) => panic!("a ping came"),
         Out::Close => panic!("it was closed"),
     }
 }

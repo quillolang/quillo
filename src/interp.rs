@@ -52,7 +52,7 @@ const CHANGES: &[&str] = &[
 /// unless it knows already.
 pub(crate) fn in_file<T>(r: Result<T, Ctrl>, file: &Option<Arc<str>>) -> Result<T, Ctrl> {
     match (r, file) {
-        (Err(Ctrl::Error(e)), Some(f)) if e.file.is_none() => Err(Ctrl::Error(e.in_file(&crate::error::shown_path(f)))),
+        (Err(Ctrl::Error(e)), Some(f)) if e.wants_file() => Err(Ctrl::Error(e.in_file(&crate::error::shown_path(f)))),
         (r, _) => r,
     }
 }
@@ -636,7 +636,7 @@ pub fn script_json(j: &serde_json::Value) -> String {
 /// into an error value, its decimal and a BigInt.
 pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
-        Value::Err(e, _) => serde_json::json!({ "$quillo_err": island_json(e) }),
+        Value::Err(e, _, _) => serde_json::json!({ "$quillo_err": island_json(e) }),
         Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
         Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
@@ -676,7 +676,7 @@ pub fn not_sendable(v: &Value) -> Option<&'static str> {
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
         Value::Html(_) => Some("html"),
         Value::Response(_) => Some("a response"),
-        Value::Err(e, _) => not_sendable(e),
+        Value::Err(e, _, _) => not_sendable(e),
     }
 }
 
@@ -2289,7 +2289,7 @@ impl Interp {
                 }
                 _ => {}
             },
-            Value::Err(e, _) if name == "error" => return Ok((**e).clone()),
+            Value::Err(e, _, _) if name == "error" => return Ok((**e).clone()),
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
@@ -2334,7 +2334,12 @@ impl Interp {
                 if self.fuel != u64::MAX {
                     return self.script_builtin(name, *func, args, line);
                 }
-                func(self, args, line)
+                match func(self, args, line) {
+                    // All an error value is made by: `err` and the builtins that fail
+                    // (FEEDBACK21.md, Q-174; branch feedback20-fixes).
+                    Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
+                    r => r,
+                }
             }
             Value::Func(c) => {
                 let c = c.clone();
@@ -2393,7 +2398,7 @@ impl Interp {
             self.allowed = a;
         }
         let r = r?;
-        if let (Some(ety), Value::Err(payload, _)) = (&def.err, &r) {
+        if let (Some(ety), Value::Err(payload, _, _)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
                 return in_file(fail(
                     def.line,
@@ -2461,9 +2466,14 @@ impl Interp {
             crate::debug::leave(self);
         }
         self.depth -= 1;
+        let r = match in_file(r, &def.file) {
+            // On the way out: a call that succeeds pays nothing (FEEDBACK21.md, Q-174; branch
+            // feedback20-fixes).
+            Err(Ctrl::Error(e)) => Err(Ctrl::Error(e.called(&def.name, caller.as_ref(), line))),
+            r => r,
+        };
         self.cur_file = caller;
         self.caller_file = outer_caller;
-        let r = in_file(r, &def.file);
         if was_component {
             self.in_component = true;
         }
@@ -2767,10 +2777,13 @@ impl Interp {
                 fail(*line, format!("no `match` arm matches {}", short(&v)))
             }
             Expr::Block(stmts) => match stmts.split_last() {
-                Some((Stmt::Expr(last), rest)) => {
+                Some((end @ Stmt::Expr(last), rest)) => {
                     let scope = Scope::child(env);
                     for s in rest {
                         self.exec_stmt(s, &scope)?;
+                    }
+                    if crate::debug::on() {
+                        return crate::debug::around(self, end, &scope, |it| it.render_expr_into(last, &scope, out));
                     }
                     self.render_expr_into(last, &scope, out)
                 }

@@ -50,7 +50,13 @@ id = "org.quillolang.fieldbook"     # the bundle id (iOS) and application id (An
 version = "1.0.0"                   # what people see in the store
 build = 1                           # a whole number, higher for each upload to a store
 icon = "icon.png"                   # 1024 x 1024 PNG without transparency; Quillo's when left out
+main = "mobile.qwe"                 # the file the app starts from, in the program's folder; main.qwe when left out
 ```
+
+`main` is for a program with a file for each platform: `web.qwe` and `desktop.qwe` for
+`quillo run` and `quillo app`, `mobile.qwe` for the phone, over the same code. The whole
+folder is bundled, so `main = "apps/phone.qwe"` may say `use ../lib/api.qwe`, as long as
+`apps/` has no main.qwe of its own, which would make it a program apart.
 
 A bad value stops the build with what is wrong. Without an `app.toml`, the app is
 "Quillo" (`org.quillolang.app`) with Quillo's icon. The icon becomes an asset catalog

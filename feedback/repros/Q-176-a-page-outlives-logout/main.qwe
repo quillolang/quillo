@@ -1,0 +1,26 @@
+// Q-176 A page prefetched while signed in is shown after logging out, for 30 seconds: `max-age=30` on a prefetch answer puts it in the browser's HTTP cache, with no `Vary: Cookie`
+// mode: script
+// script: steps.sh
+// open-when: "shows":"ada"
+// fixed-when: "shows":"nobody"
+// From FEEDBACK22.md §Q-176 (found on 401b416).
+
+let REPORT = "addEventListener('load', () => { const e = performance.getEntriesByType('navigation')[0]; document.body.setAttribute('data-result', JSON.stringify({ shows: document.getElementById('v').textContent, delivery: e.deliveryType })) })"
+
+route GET / = <html><body><a id="me" href="/me">me</a> <form id="out" method="post" action="/logout"></form></body></html>
+
+route GET /me {
+    let u = session().user ?? "nobody"
+    <html><body><p id="v">{u}</p><script>{raw(REPORT)}</script></body></html>
+}
+route POST /login {
+    set_session({ user: "ada" })
+    "ok"
+}
+route POST /logout {
+    end_session()
+    redirect("/after")
+}
+route GET /after {
+    <html><body><a id="next" href="/me">me</a><script>{raw("addEventListener('load', () => setTimeout(() => document.getElementById('next').click(), 200))")}</script></body></html>
+}

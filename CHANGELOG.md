@@ -38,6 +38,51 @@
   and the process exits with status 0.
 - `quillo check` warns on a `while` that cannot end.
 
+### Errors that say how they got there
+
+- **A runtime error names the calls it came through**, in the terminal, the log and on the
+  page under `--watch`: `in share, called at main.qwe:4`, a line each, and the first and
+  last five of a deep recursion. It costs nothing until something fails. A visitor still
+  sees `internal error`, and `--log json` has them as `calls`.
+- **An error value knows where it was made:** the log line of a request it ended starts
+  with the file and line, so a failed `db.*` no longer logs its SQL and nothing else.
+  Programs see no difference.
+- **In the browser, under `--watch`, a runtime error prints the `.qwe` file and line and
+  its calls**, as the server does, with the stack behind it through the source maps. In
+  production the console keeps the message alone, and bundles do not grow.
+
+### Commands and start-up
+
+- **`quillo check`, `docs`, `build` and `fix` refuse what they do not know**: a misspelt
+  `--strict-null` no longer turns a check off without a word, and a second program is
+  refused, not skipped under `ok`.
+- **`quillo app` reads `.env` and `--env-file` and runs `--with`**, as `run` does.
+- **`--with` commands stop however the program ends**, also when it does not load, has
+  nothing to serve or cannot listen.
+- **`quillo app.qwe --log=off`** works: a file alone is read as `quillo run` reads it.
+- `--port` with nothing after it says it needs a value, not that it is unknown, and an
+  option is no longer offered as its own correction. `--with ""` and `--open` under `run`
+  say what is wrong.
+- `quillo install --list` prints its `Other` heading.
+- **Phone apps can start from any file:** `main = "mobile.qwe"` in `app.toml`, which the
+  build refuses when it is not a `.qwe` file in the program's folder.
+
+### Servers and files
+
+- **A reload gets its turn on a busy server:** the event loop hands the interpreter lock to
+  whoever waits, where it gave it back and took it again before the waiter woke, which held
+  a `--reload` off for 15 s and more.
+- **A ping on a channel's WebSocket gets a pong**, as RFC 6455 requires, which matters to
+  clients and proxies other than browsers.
+- **`image.convert` reports a full disk:** the last write was not checked, so a small image
+  came out cut off and the program was told it worked. A failed rename no longer leaves a
+  temporary file beside the destination.
+- **A breakpoint inside a block in markup stops there:** `{for x in xs { print(x) }}` was
+  marked as set and ran past it.
+- Under `--watch`, a file served before the watcher has looked round is watched too.
+- A `file()` cache duration too long to count is refused. `platform().locale` skips an empty
+  `LC_ALL`, and reads `LC_MESSAGES` before `LANG`.
+
 ### Checks and corrections
 
 - **`quillo check` refuses what a module does not have.** `json.title` and `db.nothing` read

@@ -5347,8 +5347,35 @@ function takeHydration(name) {
   return q && q.length ? q.shift() : null;
 }
 
+// What each file of the program's brings in development: its compiled lines'
+// marks, so that an error can say where it happened (see `placed`).
+const PLACES = {}; // dev
+// An error as the server's log has it: the file and line it happened on, and the
+// calls it came through, read from its stack. The console's link to the stack goes
+// through the source maps as well, for those who click (FEEDBACK21.md, Q-173; branch
+// feedback20-fixes).
+const placed = (e) => { // dev
+  const calls = []; // dev
+  for (const l of String(e.stack).split("\n")) { // dev
+    const m = l.match(/\/_quillo\/src\/\w+\/(.+?):(\d+):(\d+)\)?$/); // dev
+    const f = m && PLACES[m[1]]; // dev
+    if (!f) continue; // dev
+    let n = +m[2]; // dev
+    while (n > 0 && !f[1][n]) n--; // dev
+    if (!n) continue; // dev
+    const marks = f[1][n]; // dev
+    const mark = (n === +m[2] && marks.filter((x) => x[0] < +m[3]).pop()) || marks[marks.length - 1]; // dev
+    calls.push([decodeURIComponent(m[1].split("/").pop().slice(0, -3)), `${f[0]}:${mark[1]}`]); // dev
+  } // dev
+  if (!calls.length) return e.message; // dev
+  const chain = calls.slice(0, -1).map((c, i) => `\n  in ${c[0]}, called at ${calls[i + 1][1]}`); // dev
+  return `${calls[0][1]}: ${e.message}${chain.join("")}`; // dev
+}; // dev
+
 function report(e) {
-  console.error("quillo:", e instanceof Error ? e.message : e);
+  const said = ["quillo:", e instanceof Error ? e.message : e];
+  if (DEV && e instanceof Error) said.splice(1, 1, placed(e), e); // dev
+  console.error(...said);
   if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
 }
 

@@ -1,0 +1,19 @@
+// Q-179 Prefetches wait in the same line as visitors: a page of 0.3 ms takes 900 ms behind 40 prefetches, and nothing drops them when the server is busy
+// mode: script
+// script: steps.sh
+// open-when: a visitor waited behind prefetches
+// fixed-when: a visitor went first
+// From FEEDBACK22.md §Q-179 (found on 401b416).
+
+fn work(seed) {
+    let t = 0
+    for i in range(0, 120000) {
+        t = t + len(str(i + seed))
+    }
+    t
+}
+route GET /heavy {
+    let t = work(int(request.query.n) ?? 0)
+    <html><body>{t}</body></html>
+}
+route GET /quick = <html><body>quick</body></html>

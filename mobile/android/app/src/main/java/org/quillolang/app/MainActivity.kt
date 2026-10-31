@@ -232,7 +232,8 @@ object Program {
         unpack(activity, "program", bundle)
         val data = File(activity.filesDir, "quillo").apply { mkdirs() }
         val started = System.currentTimeMillis()
-        val result = Quillo.start(bundle.path, data.path, "main.qwe", device(activity))
+        // `main` in app.toml (FEEDBACK20.md, Q-169; branch feedback20-fixes).
+        val result = Quillo.start(bundle.path, data.path, activity.getString(R.string.quillo_main), device(activity))
         Log.i("quillo", "${if (result.startsWith("error: ")) "did not start: $result" else "started"} in ${System.currentTimeMillis() - started} ms: data in ${data.path}")
         said = result
         return result

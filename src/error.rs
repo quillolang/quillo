@@ -1,15 +1,38 @@
 use std::fmt;
+use std::sync::Arc;
 
 /// A parse or runtime error, with the line it happened on when known.
 #[derive(Debug, Clone)]
 pub struct QuilloError {
     pub msg: String,
     pub line: u32,
-    pub file: Option<String>,
+    /// Not a String: an error goes back through every call as a `Result`, and its size is
+    /// what the deepest code has to fit on the stack, so `calls` takes these eight bytes.
+    pub file: Option<Box<str>>,
     /// A change to the text that would mend it, offered by `quillo lsp`
     /// as a quick fix (branch editor-end-tags).
     pub fix: Option<Box<Fix>>,
+    /// The calls it has come out of so far (FEEDBACK21.md, Q-174; branch feedback20-fixes).
+    calls: Option<Box<Calls>>,
 }
+
+/// The calls an error came out of, innermost first, kept as it passes up them
+/// so that a call that succeeds pays nothing. Those of a deep recursion: the
+/// first and the last `KEPT`.
+#[derive(Debug, Clone, Default)]
+struct Calls {
+    kept: Vec<Call>,
+    left_out: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Call {
+    name: String,
+    file: Option<Arc<str>>,
+    line: u32,
+}
+
+const KEPT: usize = 5;
 
 /// Replace `len` characters at `line` (from 1) and `col` (in characters,
 /// from 0) with `text`.
@@ -25,7 +48,7 @@ pub struct Fix {
 impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
         // A private name as it was written (src/privacy.rs; branch public-private).
-        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None }
+        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None, calls: None }
     }
 
     pub fn with_fix(mut self, fix: Fix) -> Self {
@@ -35,21 +58,68 @@ impl QuilloError {
 
     pub fn in_file(mut self, file: &str) -> Self {
         if self.file.is_none() {
-            self.file = Some(file.to_string());
+            self.file = Some(file.into());
         }
+        // Calls made at a file's top level, which is no function's.
+        if let Some(c) = &mut self.calls {
+            for call in c.kept.iter_mut().filter(|c| c.file.is_none()) {
+                call.file = Some(Arc::from(file));
+            }
+        }
+        self
+    }
+
+    /// Whether `in_file` has anything to tell it.
+    pub fn wants_file(&self) -> bool {
+        self.file.is_none() || self.calls.as_ref().is_some_and(|c| c.kept.iter().any(|c| c.file.is_none()))
+    }
+
+    /// The error leaves function `name`, which was called at `line` of `file`.
+    #[cold]
+    pub fn called(mut self, name: &str, file: Option<&Arc<str>>, line: u32) -> Self {
+        let c = self.calls.get_or_insert_with(Default::default);
+        if c.kept.len() == 2 * KEPT {
+            c.kept.remove(KEPT);
+            c.left_out += 1;
+        }
+        c.kept.push(Call { name: crate::privacy::demangle(name), file: file.cloned(), line });
         self
     }
 }
 
+impl fmt::Display for Call {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let name = if self.name == "<fn>" { "a function" } else { &self.name };
+        match (&self.file, self.line) {
+            (Some(file), l) if l > 0 => write!(f, "in {}, called at {}:{}", name, shown_path(file), l),
+            (Some(file), _) => write!(f, "in {}, called in {}", name, shown_path(file)),
+            (None, l) if l > 0 => write!(f, "in {}, called at line {}", name, l),
+            _ => write!(f, "in {}", name),
+        }
+    }
+}
+
+/// `{}` is the one line the error has always been: what a visitor under
+/// `--watch`, a test or another message goes on. `{:#}` adds the calls it came
+/// through, a line each: for the log, and the page under `--watch`.
 impl fmt::Display for QuilloError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let msg = &self.msg;
         match (&self.file, self.line) {
-            (Some(file), l) if l > 0 => write!(f, "{}:{}: {}", file, l, msg),
-            (Some(file), _) => write!(f, "{}: {}", file, msg),
-            (None, l) if l > 0 => write!(f, "line {}: {}", l, msg),
-            _ => write!(f, "{}", msg),
+            (Some(file), l) if l > 0 => write!(f, "{}:{}: {}", file, l, msg)?,
+            (Some(file), _) => write!(f, "{}: {}", file, msg)?,
+            (None, l) if l > 0 => write!(f, "line {}: {}", l, msg)?,
+            _ => write!(f, "{}", msg)?,
         }
+        if let (true, Some(calls)) = (f.alternate(), &self.calls) {
+            for (i, c) in calls.kept.iter().enumerate() {
+                if i == KEPT && calls.left_out > 0 {
+                    write!(f, "\n  ... {} more call{}", calls.left_out, if calls.left_out == 1 { "" } else { "s" })?;
+                }
+                write!(f, "\n  {}", c)?;
+            }
+        }
+        Ok(())
     }
 }
 

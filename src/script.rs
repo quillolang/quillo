@@ -57,7 +57,7 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
                     todo.push((x, depth + 1));
                 }
             }
-            Value::Err(x, _) => todo.push((x, depth + 1)),
+            Value::Err(x, _, _) => todo.push((x, depth + 1)),
             _ => n += 8,
         }
         if n > SCRIPT_BYTES {

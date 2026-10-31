@@ -17,6 +17,7 @@
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 type R = Result<Value, Ctrl>;
@@ -169,7 +170,7 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
     let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
     let out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let mut w = std::io::BufWriter::new(out);
-    let written = match job.format {
+    let encoded = match job.format {
         ImageFormat::Jpeg => {
             let rgb = img.to_rgb8();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, job.quality).encode_image(&rgb).map_err(|e| e.to_string())
@@ -177,12 +178,19 @@ fn make(src: &Path, dest: &Path, job: Job) -> Result<(u32, u32), String> {
         ImageFormat::WebP => img.to_rgba8().write_with_encoder(image::codecs::webp::WebPEncoder::new_lossless(&mut w)).map_err(|e| e.to_string()),
         _ => img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut w)).map_err(|e| e.to_string()),
     };
+    // The last bytes wait in `w`: on a full disk only this flush says so, and a drop would swallow
+    // it (FEEDBACK16.md, Q-144; branch feedback20-fixes).
+    let written = encoded.and_then(|()| w.flush().map_err(|e| e.to_string()));
     drop(w);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        // (FEEDBACK16.md, Q-145; branch feedback20-fixes)
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     Ok((img.width(), img.height()))
 }
 

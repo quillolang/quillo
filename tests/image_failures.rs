@@ -85,7 +85,6 @@ fn a_finished_image_that_can_not_take_the_place_of_a_folder_says_so() {
 }
 
 #[test]
-#[ignore = "finding: image.convert leaves its temporary file behind when the rename fails"]
 fn a_finished_image_that_has_nowhere_to_go_leaves_nothing_behind() {
     let d = folder("tmp-left");
     std::fs::create_dir_all(d.join("out.png/inside")).unwrap();
@@ -132,14 +131,22 @@ fn a_png_that_can_not_be_written_says_why() {
 }
 
 #[test]
-#[ignore = "finding: image.convert never checks its last flush: on a full disk a small image gives a success and a cut-off file"]
 fn an_image_cut_off_by_a_full_disk_is_not_a_success() {
     let d = folder("file-limit");
-    std::fs::write(d.join("app.qwe"), "print(image.convert(\"small.png\", \"out.jpeg\", { format: \"jpeg\" }))\n").unwrap();
-    // Files past 512 bytes refused, as on a full disk (a coverage file wouldn't fit either).
+    // Past a block of the limit below, and short of the 8 KB a writer holds, so that only the last
+    // flush can tell: `ulimit -f` counts 512 bytes under dash and 1024 under macOS's sh.
+    image::RgbImage::from_fn(48, 48, |x, y| image::Rgb([(x * x + y * 7) as u8, (y * y + x * 13) as u8, (x * y) as u8])).save(d.join("mid.png")).unwrap();
+    std::fs::write(d.join("app.qwe"), "print(image.convert(\"mid.png\", \"out.jpeg\", { format: \"jpeg\" }))\n").unwrap();
+    let whole = run(&d, r#"image.convert("mid.png", "whole.jpeg", { format: "jpeg" })"#);
+    assert!(whole.contains("width: 48"), "{}", whole);
+    let size = std::fs::metadata(d.join("whole.jpeg")).unwrap().len();
+    assert!((1100..8000).contains(&size), "{} bytes", size);
+    // Files past a block refused, as on a full disk (a coverage file wouldn't fit either).
     let script = format!("trap '' XFSZ; ulimit -f 1; exec '{}' run app.qwe", env!("CARGO_BIN_EXE_quillo"));
     let out = Command::new("sh").args(["-c", &script]).current_dir(&d).env_remove("LLVM_PROFILE_FILE").stdin(Stdio::null()).output().unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(said.contains("image: "), "{}\n{}", said, String::from_utf8_lossy(&out.stderr));
     assert!(!d.join("out.jpeg").exists(), "{} bytes", std::fs::metadata(d.join("out.jpeg")).unwrap().len());
+    let left: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.contains("tmp")).collect();
+    assert!(left.is_empty(), "{:?}", left);
 }

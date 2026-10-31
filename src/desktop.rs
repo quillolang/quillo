@@ -24,6 +24,12 @@ enum UserEvent {
 }
 
 pub fn main(file: &str, flags: &[String]) -> i32 {
+    let code = window(file, flags);
+    crate::with::stop_all();
+    code
+}
+
+fn window(file: &str, flags: &[String]) -> i32 {
     // `--open /admin`: the page the window opens on (the program's own path).
     let mut open = "/".to_string();
     let mut rest = Vec::new();
@@ -50,7 +56,18 @@ pub fn main(file: &str, flags: &[String]) -> i32 {
         eprintln!("quillo: `app` serves its own window only; --host, --register and --service are for `run`");
         return 2;
     }
-    crate::warn_of_secrets();
+    if let Err(code) = crate::before_the_program(file, &o) {
+        return code;
+    }
+    // Commands beside the program are in process groups of their own, so a
+    // signal reaches them only from here (FEEDBACK16.md, Q-124; branch
+    // feedback20-fixes).
+    if !o.with.is_empty() {
+        let _ = ctrlc::set_handler(|| {
+            crate::with::stop_all();
+            std::process::exit(130);
+        });
+    }
     quillo::platform::set_runtime("app");
     let token = match quillo::server::launch_token() {
         Ok(t) => t,
@@ -172,6 +189,8 @@ fn open_window(name: &str, origin: &str, start: &str, token: &str, devtools: boo
                 let _ = webview.load_url(&url);
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
+            // `run` does not return: the last thing before it ends.
+            Event::LoopDestroyed => crate::with::stop_all(),
             _ => {}
         }
     })

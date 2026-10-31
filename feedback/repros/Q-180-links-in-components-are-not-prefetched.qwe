@@ -1,0 +1,24 @@
+// Q-180 Links in components are not prefetched, and neither is their data: a single-page app's state is null until the answer comes, however long the link was pointed at
+// mode: browser
+// page: /
+// probe: const before = performance.getEntriesByType("resource").length; document.getElementById("go").dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); document.getElementById("go").dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await new Promise((r) => setTimeout(r, 400)); return { asked: performance.getEntriesByType("resource").length - before + document.querySelectorAll("script[type=speculationrules]").length }
+// open-when: "asked": 0
+// fixed-when: /"asked": [1-9]/
+// From FEEDBACK22.md §Q-180 (found on 401b416).
+
+server fn load_items() {
+    sleep(300)
+    ["a", "b"]
+}
+component Items() {
+    state items = load_items()
+    <p id="items">{items == null ? "nothing yet" : len(items)}</p>
+}
+component App() {
+    let path = url().path
+    <div>
+        <a id="go" href="/items">items</a>
+        {path == "/items" ? <Items/> : <p>home</p>}
+    </div>
+}
+route GET /*rest = <html><body><App/></body></html>

@@ -1162,6 +1162,26 @@ fn bits_and_filled_work_in_a_page_as_on_the_server() {
     assert_eq!(r, want);
 }
 
+/// Under `--watch` the console says what the server's log would, and for a visitor it stays
+/// the message alone (FEEDBACK21.md, Q-173; branch feedback20-fixes).
+#[test]
+fn an_error_in_a_page_names_its_place_in_development_only() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let (app, script) = (dir.join("placed.qwe"), dir.join("placed.js"));
+    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &["--watch"]);
+    let said = r["said"][0].as_str().unwrap_or_else(|| panic!("{}", r));
+    assert!(said.contains("placed.qwe:2: division by zero\n  in inner, called at "), "{}", said);
+    assert!(said.contains("placed.qwe:3\n  in share, called at "), "{}", said);
+    assert!(said.contains("placed.qwe:7"), "{}", said);
+    assert!(said.ends_with("<the error>"), "{}", said);
+    let r = run_page_args(&chrome, &app, free_port(), "/", Some(&script), &[]);
+    assert_eq!(r["said"], serde_json::json!(["quillo: division by zero"]));
+}
+
 #[test]
 fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {

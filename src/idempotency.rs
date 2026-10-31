@@ -314,12 +314,12 @@ fn render(rpc: Option<&str>, r: R) -> Result<HttpResponse, Ctrl> {
     Ok(match r {
         Ok(v) | Err(Ctrl::Return(v)) => match crate::server::for_visitor(v) {
             v @ Value::Response(_) => crate::server::finish(Ok(v)),
-            Value::Err(e, _) => json(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
+            Value::Err(e, _, _) => json(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
             v => json(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
         },
         Err(Ctrl::Reply(x)) => crate::server::finish(Err(Ctrl::Reply(x))),
         Err(Ctrl::Error(e)) => {
-            eprintln!("quillo: error in server fn `{}`: {}", name, e);
+            eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
             json(500, serde_json::json!({ "error": format!("internal error in `{}`", name) }))
         }
     })
@@ -376,7 +376,7 @@ fn sql(it: &mut Interp, query: bool, sql: &str, params: Vec<Value>) -> Result<Va
     for first in [true, false] {
         let r = if query { crate::db::query_on(it, None, args.clone()) } else { crate::db::exec_on(it, None, args.clone()) };
         match r {
-            Ok(Value::Err(e, _)) => {
+            Ok(Value::Err(e, _, _)) => {
                 let msg = e.display();
                 if first && msg.contains(TABLE) {
                     make_table(it);

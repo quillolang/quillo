@@ -1,0 +1,31 @@
+// Q-178 A prerender nobody follows runs the page's components, and their `server fn`s write: the guard covers the page's GET only
+// mode: script
+// script: steps.sh
+// open-when: "mounted":1
+// fixed-when: "ran":1
+// fixed-when: "mounted":0
+// From FEEDBACK22.md §Q-178 (found on 401b416).
+
+let mounted = 0
+let ran = 0
+
+server fn touch() {
+    mounted = mounted + 1
+    mounted
+}
+component Mounts() {
+    state done = 0
+    <div @mount={(el) => { done = touch() }}>mounted {done}</div>
+}
+// `ran` is the control: the page's own script, to show the prerender happened.
+route POST /ran {
+    ran = ran + 1
+    "ok"
+}
+route GET /target = <html><body><Mounts/><script>{raw("fetch('/ran', { method: 'POST' })")}</script></body></html>
+route GET /counts {
+    let m = { ran: ran, mounted: mounted }
+    m
+}
+let RULE = "const s = document.createElement('script'); s.type = 'speculationrules'; s.textContent = JSON.stringify({ prerender: [{ source: 'list', urls: ['/target'] }] }); document.head.appendChild(s)"
+route GET / = <html><body><p>stay here</p><script>{raw(RULE)}</script></body></html>

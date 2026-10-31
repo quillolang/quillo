@@ -71,7 +71,7 @@ xcrun -sdk $sdkname swiftc -O -parse-as-library -target $swift_target -sdk "$sdk
     -o "$out/Quillo"
 [ -n "$device" ] && xcrun strip -x "$out/Quillo"
 
-# Info.plist: the template, with the app's own name, id and version.
+# Info.plist: the template, with the app's own name, id, version and first file.
 plist="$out/Info.plist"
 cp "$here/Quillo/Info.plist" "$plist"
 plutil -replace CFBundleIdentifier -string "$APP_ID" "$plist"
@@ -80,6 +80,7 @@ plutil -replace CFBundleDisplayName -string "$APP_NAME" "$plist"
 plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "$plist"
 plutil -replace CFBundleVersion -string "$APP_BUILD" "$plist"
 plutil -replace CFBundleSupportedPlatforms -json "[\"$platform\"]" "$plist"
+plutil -replace QuilloMain -string "$APP_MAIN" "$plist"
 cp "$here/Quillo/PrivacyInfo.xcprivacy" "$out/"
 
 # The icon: an asset catalog of one 1024-point image, compiled by actool, which also

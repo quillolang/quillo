@@ -183,10 +183,22 @@ fn a_breakpoint_inside_markup_with_classes_lands_on_its_line() {
     drop(dap);
 }
 
-/// It is verified above, so an editor shows it as set; the block's statements
-/// run (the `print` prints) without stopping there.
 #[test]
-#[ignore = "finding: a breakpoint on a statement in a `{for ...}` or `{if ...}` block inside markup is verified but never stops"]
+fn a_breakpoint_in_an_if_in_markup_stops_on_the_taken_side_only() {
+    let src = "fn card(on) {\n    <div>\n        {if on {\n            print(1)\n        } else {\n            print(2)\n        }}\n    </div>\n}\nroute GET / = card(true)\n";
+    let d = program("if-in-markup", src);
+    let port = support::free_port();
+    let (mut dap, set) = Dap::launch(&d, port, &[4, 6]);
+    assert_eq!((&set[1]["verified"], &set[1]["line"]), (&json!(true), &json!(6)), "{:?}", set);
+    let page = get(port, "/");
+    assert_eq!(dap.stopped()["reason"], "breakpoint");
+    let stack = dap.call("stackTrace", json!({ "threadId": 1 }));
+    assert_eq!(stack["stackFrames"][0]["line"], 4, "{}", stack);
+    dap.call("continue", json!({ "threadId": 1 }));
+    assert!(page.join().unwrap().contains("<div>"));
+}
+
+#[test]
 fn a_breakpoint_inside_a_block_in_markup_stops_there() {
     let d = program("in-markup", MARKUP);
     let port = support::free_port();

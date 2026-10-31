@@ -25,6 +25,8 @@ android {
         versionCode = env("QUILLO_APP_BUILD", "1").toInt()
         versionName = env("QUILLO_APP_VERSION", "0.1.0")
         resValue("string", "app_name", env("QUILLO_APP_NAME", "Quillo"))
+        // The file the program starts from (FEEDBACK20.md, Q-169; branch feedback20-fixes).
+        resValue("string", "quillo_main", env("QUILLO_APP_MAIN", "main.qwe"))
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     signingConfigs {

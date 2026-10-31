@@ -329,7 +329,7 @@ fn db_err(e: impl std::fmt::Display) -> Value {
 /// words itself (FEEDBACK5.md, Q-053; branch stays-fixes).
 fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
     let kind = match args.first() {
-        Some(Value::Err(e, _)) => match &**e {
+        Some(Value::Err(e, _, _)) => match &**e {
             Value::Str(s) => s.strip_prefix("db: ").and_then(kind_of),
             _ => None,
         },
@@ -600,7 +600,7 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
     match r {
         Ok(Value::Str(s)) | Err(Ctrl::Return(Value::Str(s))) => Ok(Some(s.to_string())),
         Ok(Value::Nil) | Err(Ctrl::Return(Value::Nil)) => Ok(None),
-        Ok(Value::Err(e, _)) => Err(format!("tenant {}: {}", name, e.display())),
+        Ok(Value::Err(e, _, _)) => Err(format!("tenant {}: {}", name, e.display())),
         Ok(other) => Err(format!("tenant {}: the function for tenants' databases gave {}, not a path or a URL", name, other.type_name())),
         Err(Ctrl::Error(e)) => Err(format!("tenant {}: {}", name, e.msg)),
         Err(_) => Err(format!("tenant {}: the function for tenants' databases did not give a path or a URL", name)),

@@ -262,7 +262,6 @@ fn plugins_with_no_group_appear_with_the_rest() {
 }
 
 #[test]
-#[ignore = "finding: `quillo install --list` never prints its `Other` heading: the group starts as \"\", so plugins with no group get no heading"]
 fn plugins_with_no_group_are_listed_under_other() {
     let file = plugin("1.0.0");
     let mut loose = entry("loose", "1.0.0", &file);

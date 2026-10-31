@@ -552,7 +552,6 @@ fn a_reload_waiting_behind_a_busy_server_comes_when_it_quietens() {
 }
 
 #[test]
-#[ignore = "finding: under sustained computing a reload is held off, 15 s and more in some runs: the event loop gives the interpreter lock back and takes it again at once, before the waiting thread wakes"]
 fn a_reload_gets_its_turn_on_a_busy_server() {
     let (srv, f) = reloading("busy");
     let busy = Busy::on(srv.port);

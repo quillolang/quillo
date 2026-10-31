@@ -871,12 +871,12 @@ impl Interp {
             return match res {
                 Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                     Value::Response(r) => render_response(&r),
-                    Value::Err(e, _) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
+                    Value::Err(e, _, _) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
                     v => json_response(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
                 },
                 Err(Ctrl::Reply(r)) => render_response(&r),
                 Err(Ctrl::Error(e)) => {
-                    eprintln!("quillo: error in server fn `{}`: {}", name, e);
+                    eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
                     rpc_error(500, &format!("internal error in `{}`", name))
                 }
             };
@@ -922,12 +922,12 @@ impl Interp {
                 let answer = Arc::new(match res {
                     Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                         Value::Response(r) => return render_response(&r),
-                        Value::Err(e, _) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
+                        Value::Err(e, _, _) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
                         v => crate::livecache::Answer::new(crate::interp::island_json(&v), false),
                     },
                     Err(Ctrl::Reply(r)) => return render_response(&r),
                     Err(Ctrl::Error(e)) => {
-                        eprintln!("quillo: error in server fn `{}`: {}", name, e);
+                        eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
                         return rpc_error(500, &format!("internal error in `{}`", name));
                     }
                 });
@@ -1236,7 +1236,7 @@ fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
 /// Whether a value has an error in it that a visitor is not to read, at any depth.
 fn holds_hidden_error(v: &Value) -> bool {
     match v {
-        Value::Err(e, own) => !own || holds_hidden_error(e),
+        Value::Err(e, own, _) => !own || holds_hidden_error(e),
         Value::List(l) => l.iter().any(holds_hidden_error),
         Value::Map(m) => m.iter().any(|(_, x)| holds_hidden_error(x)),
         _ => false,
@@ -1245,15 +1245,15 @@ fn holds_hidden_error(v: &Value) -> bool {
 
 fn without_hidden_errors(v: &Value) -> Value {
     match v {
-        Value::Err(e, false) => {
+        Value::Err(e, false, at) => {
             let text = e.display();
             // Anyone can try a subdomain: that is not worth a line each.
             if !text.starts_with("db: there is no tenant") {
-                crate::httpd::error_line(&text);
+                crate::httpd::error_line(&at.before(&text));
             }
             Value::err(Value::str("internal error"))
         }
-        Value::Err(e, true) => Value::own_err(without_hidden_errors(e)),
+        Value::Err(e, true, _) => Value::own_err(without_hidden_errors(e)),
         Value::List(l) => Value::list(l.iter().map(without_hidden_errors).collect()),
         Value::Map(m) => Value::map(m.iter().map(|(k, x)| (k.clone(), without_hidden_errors(x))).collect()),
         other => other.clone(),
@@ -1285,12 +1285,12 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Err(Ctrl::Error(e)) => {
             // A prefetch stopped before it changed something is expected.
             if !e.msg.contains(crate::interp::PREFETCH_REFUSED) {
-                crate::httpd::error_line(&e.to_string());
+                crate::httpd::error_line(&format!("{:#}", e));
             }
             // The message names files and lines of the program; it is for
             // its author (`--watch`), not for whoever sent the request.
             if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
-                plain(500, &format!("internal error: {}\n", e))
+                plain(500, &format!("internal error: {:#}\n", e))
             } else {
                 plain(500, "internal error\n")
             }
@@ -1346,8 +1346,8 @@ fn value_response(v: Value) -> HttpResponse {
         other => {
             // So that no 500 is without a reason in the log (FEEDBACK21.md, Q-171; branch
             // feedback20-fixes).
-            if let Value::Err(e, true) = &other {
-                crate::httpd::error_line(&e.display());
+            if let Value::Err(e, true, at) = &other {
+                crate::httpd::error_line(&at.before(&e.display()));
             }
             let status = match &other {
                 Value::Nil => 204,
@@ -1730,7 +1730,6 @@ mod events {
 fn watch(app: Arc<App>) {
     let mut files = app.watched_files();
     let mut seen = mtimes(&files);
-    crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
     // Told of changes by the system where it can be (see `events`); else a
     // stat of each file every 50 ms, cheap for the hundreds a program has
@@ -2195,6 +2194,9 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some() || asked, std::sync::atomic::Ordering::Relaxed);
     app.shared.gil.release();
     if app.watch || app.reload {
+        // Before the first request, not on the watcher's thread: it reads every file first, and a
+        // file served meanwhile would never be watched (FEEDBACK16.md, Q-149; branch feedback20-fixes).
+        crate::statics::WATCH_SERVED.store(app.watch, std::sync::atomic::Ordering::Relaxed);
         let app = app.clone();
         std::thread::Builder::new()
             .name("quillo-watch".into())

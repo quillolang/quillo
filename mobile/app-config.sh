@@ -6,8 +6,9 @@
 #   version = "1.0.0"                   # what people see in the store
 #   build = 1                           # a whole number, higher for each upload to a store
 #   icon = "icon.png"                   # 1024 x 1024 PNG, no transparency (default: Quillo's)
+#   main = "mobile.qwe"                 # the file the app starts from (default: main.qwe)
 #
-# Sets APP_NAME, APP_ID, APP_VERSION, APP_BUILD, APP_ICON (a path) and APP_CONFIG
+# Sets APP_NAME, APP_ID, APP_VERSION, APP_BUILD, APP_ICON (a path), APP_MAIN and APP_CONFIG
 # (the file, or empty when there is none and the defaults are used).
 
 app_value() {
@@ -21,11 +22,14 @@ APP_CONFIG=""
 if [ -n "$APP_CONFIG" ]; then
     APP_NAME=$(app_value name); APP_ID=$(app_value id); APP_VERSION=$(app_value version)
     APP_BUILD=$(app_value build); APP_ICON=$(app_value icon)
+    # One codebase, a file for each platform (FEEDBACK20.md, Q-169; branch feedback20-fixes).
+    APP_MAIN=$(app_value main)
 fi
 APP_NAME=${APP_NAME:-Quillo}
 APP_ID=${APP_ID:-org.quillolang.app}
 APP_VERSION=${APP_VERSION:-0.1.0}
 APP_BUILD=${APP_BUILD:-1}
+APP_MAIN=${APP_MAIN:-main.qwe}
 if [ -n "$APP_ICON" ]; then
     case "$APP_ICON" in /*) ;; *) APP_ICON="$prog/$APP_ICON";; esac
 else
@@ -39,4 +43,7 @@ echo "$APP_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || app_fail "version \"
 echo "$APP_BUILD" | grep -Eq '^[1-9][0-9]{0,8}$' || app_fail "build \"$APP_BUILD\" is not a whole number from 1"
 [ -n "$APP_NAME" ] && [ "${#APP_NAME}" -le 30 ] || app_fail "name must be 1 to 30 characters"
 [ -f "$APP_ICON" ] || app_fail "icon $APP_ICON: no such file"
-export APP_NAME APP_ID APP_VERSION APP_BUILD APP_ICON APP_CONFIG
+echo "$APP_MAIN" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_./-]*\.qwe$' && ! echo "$APP_MAIN" | grep -q '\.\.' ||
+    app_fail "main \"$APP_MAIN\" is not a .qwe file in the program's folder, like mobile.qwe or apps/phone.qwe"
+[ -f "$prog/$APP_MAIN" ] || app_fail "main $APP_MAIN: no such file in $prog"
+export APP_NAME APP_ID APP_VERSION APP_BUILD APP_ICON APP_MAIN APP_CONFIG

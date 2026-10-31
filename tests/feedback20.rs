@@ -120,7 +120,9 @@ fn the_log_has_what_the_visitor_does_not() {
     assert_eq!(send(port, "GET", "/value", &[], "").body, r#"{"error":"internal error"}"#);
     drop(g);
     let text = std::fs::read_to_string(&log).unwrap();
-    assert!(text.contains("quillo: error: GET /value (rid ") && text.contains("): db: no such column: nope"), "{}", text);
+    assert!(text.contains("quillo: error: GET /value (rid ") && text.contains(": db: no such column: nope"), "{}", text);
+    // Where it was made, ahead of it (FEEDBACK21.md, Q-174).
+    assert!(text.contains("main.qwe:"), "{}", text);
 }
 
 #[test]

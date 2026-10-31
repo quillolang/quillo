@@ -165,7 +165,6 @@ fn an_option_without_its_value_is_refused() {
 }
 
 #[test]
-#[ignore = "finding: an option left without its value is called unknown, then offered as its own correction: unknown option `--port` (did you mean `--port`?)"]
 fn an_option_without_its_value_is_not_called_unknown() {
     let dir = folder("novalue-said", &[("app.qwe", PRINTS)]);
     let (_, text) = refused(&dir, &["run", "app.qwe", "--port"]);
@@ -174,7 +173,6 @@ fn an_option_without_its_value_is_not_called_unknown() {
 }
 
 #[test]
-#[ignore = "finding: `quillo <file.qwe>` skips the handling `quillo run` has, so `--log=off` is refused though the usage says it is the same as run"]
 fn a_qwe_file_alone_takes_options_as_run_does() {
     let dir = folder("alone-options", &[("app.qwe", PRINTS)]);
     let o = quillo(&dir, &["app.qwe", "--log=off"]);
@@ -183,7 +181,6 @@ fn a_qwe_file_alone_takes_options_as_run_does() {
 }
 
 #[test]
-#[ignore = "finding: `quillo check`, `docs` and `build` drop what they do not know: a misspelt --strict-null, or a second program, whose errors then go unseen under `ok`"]
 fn check_refuses_what_it_does_not_know() {
     let dir = folder("check-unknown", &[("ok.qwe", PRINTS), ("bad.qwe", "fn f() = nope\n")]);
     assert_eq!(quillo(&dir, &["check", "ok.qwe", "--strict-nul"]).status.code(), Some(2));
@@ -501,9 +498,8 @@ fn platform_says_how_the_program_runs_here() {
 }
 
 #[test]
-#[ignore = "finding: platform().locale is null under LC_ALL=\"\" with LANG set: an empty LC_ALL counts as unset everywhere else"]
 fn an_empty_lc_all_leaves_the_locale_to_lang() {
     let dir = folder("locale", &[("app.qwe", "print(platform().locale)\n")]);
-    let o = command(&dir, &["run", "app.qwe"]).env("LC_ALL", "").env("LANG", "en_US.UTF-8").stdin(Stdio::null()).output().unwrap();
+    let o = command(&dir, &["run", "app.qwe"]).env("LC_ALL", "").env_remove("LC_MESSAGES").env("LANG", "en_US.UTF-8").stdin(Stdio::null()).output().unwrap();
     assert_eq!(out(&o), "en-US\n");
 }

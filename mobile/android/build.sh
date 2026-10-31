@@ -44,7 +44,7 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 adb="$ANDROID_HOME/platform-tools/adb"
 echo "== $APP_NAME ($APP_ID) $APP_VERSION ($APP_BUILD)${APP_CONFIG:+, from app.toml}"
 [ -z "$APP_CONFIG" ] && echo "   no app.toml in $prog: Quillo's name, id and icon are used"
-export QUILLO_APP_NAME="$APP_NAME" QUILLO_APP_ID="$APP_ID" QUILLO_APP_VERSION="$APP_VERSION" QUILLO_APP_BUILD="$APP_BUILD"
+export QUILLO_APP_NAME="$APP_NAME" QUILLO_APP_ID="$APP_ID" QUILLO_APP_VERSION="$APP_VERSION" QUILLO_APP_BUILD="$APP_BUILD" QUILLO_APP_MAIN="$APP_MAIN"
 
 echo "== the runtime, for Android"
 (cd "$root/mobile/quillo-mobile" && cargo ndk -t arm64-v8a -t x86_64 -o "$here/app/src/main/jniLibs" build --release)
