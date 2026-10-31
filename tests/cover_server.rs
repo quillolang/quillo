@@ -2,7 +2,9 @@
 //! the wrong moment, a server out of file descriptors, a debugger's requests that cross
 //! what the program is doing, and a program that fails after its answer has started.
 
-#![cfg(unix)]
+// Descriptors running out, resets and what follows them are the system's own: these were
+// worked out on macOS, where coverage is measured.
+#![cfg(target_os = "macos")]
 
 mod support;
 

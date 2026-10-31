@@ -471,7 +471,7 @@ route GET /s = stream((send) => {
 
 // ---- a large file and a slow reader ---------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn connect_with_small_window(port: u16) -> TcpStream {
     use std::os::fd::FromRawFd;
     // SAFETY: plain socket calls, on a socket made here and owned by the stream.
@@ -491,8 +491,9 @@ fn connect_with_small_window(port: u16) -> TcpStream {
 }
 
 /// A reader slower than the slowest allowed is let go after the grace period.
-/// (This test takes as long as that, and more: 45 seconds.)
-#[cfg(unix)]
+/// (This test takes as long as that, and more: 45 seconds.) On macOS: Linux's larger send
+/// buffers keep what was sent above that rate for far longer.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_reader_that_barely_reads_a_large_file_is_let_go() {
     let (d, f) = app("slow-reader", "route GET /big = file(\"big.bin\")\n");
