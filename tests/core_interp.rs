@@ -225,7 +225,6 @@ fn used_files_run_once_and_tell_their_own_errors() {
 
 /// `return` at the top of a used file leaves that file, as at the top of a program.
 #[test]
-#[ignore = "finding: `return` at the top level of a used file also ends the program that used it, silently"]
 fn a_return_in_a_used_file_ends_only_that_file() {
     let d = support::temp_dir("core-use-return");
     std::fs::write(d.join("early.qwe"), "let a = 1\nreturn\nlet c = 2\n").unwrap();

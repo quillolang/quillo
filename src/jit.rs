@@ -215,7 +215,7 @@ fn shape_ok(def: &FnDef) -> bool {
     }
     fn stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::Let(Pattern::Bind(_), e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e)) => expr(e),
+            Stmt::Let(Pattern::Bind(_), e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr(e),
             _ => false,
         }
     }
@@ -377,7 +377,7 @@ impl<'a> Plan<'a> {
                         return None;
                     }
                 }
-                Stmt::Return(Some(e)) => {
+                Stmt::Return(Some(e), _) => {
                     let t = self.value(e, sc, ret)?;
                     if ret.map_or(false, |r| r != t) {
                         return None;
@@ -932,7 +932,7 @@ impl Gen<'_, '_> {
                     };
                     self.b.def_var(var, v);
                 }
-                Stmt::Return(Some(e)) => {
+                Stmt::Return(Some(e), _) => {
                     let v = self.value(e, ret)?;
                     self.leave(v);
                 }

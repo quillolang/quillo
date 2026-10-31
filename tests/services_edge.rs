@@ -404,7 +404,7 @@ fn a_signed_call_is_refused_for_what_is_wrong_with_it() {
     assert_eq!(call(w, "page", signed(t, "work", "page", &id(5), "", "[]"), "[]"), (500, "{\"error\":\"`page` answered with a page, not a value\"}".to_string()));
     assert_eq!(call(w, "replies", signed(t, "work", "replies", &id(6), "", "[]"), "[]"), (500, "{\"error\":\"`replies` replied with a page, not a value\"}".to_string()));
     assert_eq!(call(w, "broken", signed(t, "work", "broken", &id(7), "", "[]"), "[]"), (500, "{\"error\":\"internal error in `broken`\"}".to_string()));
-    assert_eq!(call(w, "fails", signed(t, "work", "fails", &id(8), "", "[]"), "[]"), (200, "{\"err\":\"it did not go well\"}".to_string()));
+    assert_eq!(call(w, "fails", signed(t, "work", "fails", &id(8), "", "[]"), "[]"), (200, "{\"err\":\"it did not go well\",\"own\":true}".to_string()));
     // In a tenant, and sent again: answered as it was.
     let h = signed(t, "work", "add", &id(9), "acme", "[1,2]");
     assert_eq!(call(w, "add", h.clone(), "[1,2]"), (200, "{\"ok\":3}".to_string()));

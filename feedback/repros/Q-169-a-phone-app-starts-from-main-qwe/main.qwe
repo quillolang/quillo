@@ -1,0 +1,8 @@
+// Q-169 A phone app can only start from main.qwe: app.toml has no key for it, Android passes the name as a literal and iOS keeps it in an Info.plist no build changes
+// mode: script
+// script: steps.sh
+// open-when: app.toml can name the entry: no
+// fixed-when: app.toml can name the entry: yes
+// From FEEDBACK20.md §Q-169 (found on 9e8c2fb).
+
+route GET / = "a program"

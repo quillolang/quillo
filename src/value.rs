@@ -149,8 +149,11 @@ pub enum Value {
     /// Already-rendered, safe HTML.
     Html(Arc<str>),
     Response(Arc<Response>),
-    /// An error value: `err(x)`, a failed `int("x")`, ...
-    Err(Arc<Value>),
+    /// An error value: `err(x)`, a failed `int("x")`, ... The flag says the program wrote it,
+    /// to be read: what a builtin makes can say what no visitor should see, so it has to be
+    /// marked, as the text cannot tell them apart (FEEDBACK21.md, Q-171; branch
+    /// feedback20-fixes).
+    Err(Arc<Value>, bool),
 }
 
 pub struct Closure {
@@ -191,7 +194,12 @@ impl Value {
     }
 
     pub fn err(v: Value) -> Value {
-        Value::Err(Arc::new(v))
+        Value::Err(Arc::new(v), false)
+    }
+
+    /// An error the program means a visitor to read.
+    pub fn own_err(v: Value) -> Value {
+        Value::Err(Arc::new(v), true)
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -207,12 +215,12 @@ impl Value {
             Value::Func(_) | Value::Builtin(..) => "fn",
             Value::Html(_) => "html",
             Value::Response(_) => "response",
-            Value::Err(_) => "error",
+            Value::Err(..) => "error",
         }
     }
 
     pub fn truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false) | Value::Err(_))
+        !matches!(self, Value::Nil | Value::Bool(false) | Value::Err(..))
     }
 
     pub fn as_f64(&self) -> Option<f64> {
@@ -278,7 +286,7 @@ impl Value {
                 }
                 out.push_str(" }");
             }
-            Value::Err(e) => {
+            Value::Err(e, _) => {
                 out.push_str("err(");
                 e.repr_into(out);
                 out.push(')');
@@ -302,7 +310,7 @@ impl Value {
             Value::Builtin(n, _) => write!(out, "<builtin {}>", n),
             Value::Html(h) => write!(out, "{}", h),
             Value::Response(r) => write!(out, "<response {}>", r.status),
-            Value::List(_) | Value::Map(_) | Value::Err(_) => Ok(self.repr_into(out)),
+            Value::List(_) | Value::Map(_) | Value::Err(..) => Ok(self.repr_into(out)),
         };
     }
 
@@ -319,7 +327,7 @@ impl Value {
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json()).collect()),
             Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json())).collect()),
-            Value::Err(e) => serde_json::json!({ "error": e.to_json() }),
+            Value::Err(e, _) => serde_json::json!({ "error": e.to_json() }),
             Value::Response(r) => serde_json::json!({ "status": r.status }),
             Value::Func(_) | Value::Builtin(..) => J::String(self.repr()),
         }
@@ -360,7 +368,7 @@ impl Value {
                 }
                 out.push(b'}');
             }
-            Value::Err(e) => {
+            Value::Err(e, _) => {
                 out.extend_from_slice(b"{\"error\":");
                 e.json_into(out);
                 out.push(b'}');
@@ -422,13 +430,15 @@ pub fn js_numbers<R>(on: bool, f: impl FnOnce() -> R) -> R {
 }
 
 /// A number as JavaScript's `String(x)` writes it: `8` for 8.0, an
-/// exponent from 1e21 up and below 1e-6 (`1e+21`, `1.5e-7`).
+/// exponent from 1e21 up and below 1e-6 (`1e+21`, `1.5e-7`). An infinity is
+/// `inf`, as everywhere else on both sides (FEEDBACK16.md, Q-120; branch
+/// feedback20-fixes).
 pub fn js_number(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        return if f > 0.0 { "inf" } else { "-inf" }.into();
     }
     if f == 0.0 {
         return "0".into();
@@ -485,7 +495,7 @@ pub fn equal(a: &Value, b: &Value) -> bool {
         (Html(x), Html(y)) => x == y,
         (List(x), List(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equal(p, q)),
         (Map(x), Map(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| equal(v, w))),
-        (Err(x), Err(y)) => equal(x, y),
+        (Err(x, _), Err(y, _)) => equal(x, y),
         (Func(x), Func(y)) => Arc::ptr_eq(x, y),
         (Builtin(x, _), Builtin(y, _)) => x == y,
         _ => false,

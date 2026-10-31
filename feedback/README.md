@@ -33,6 +33,7 @@ factory of 24 lines: rotating crews, leave and its approval, and live manpower f
 cooperative: members, savings, fixed deposits, a loan designer, loans approved by the board, salary deductions from employers by file or API, stores, raffles and events), [FEEDBACK15.md](reports/FEEDBACK15.md) (no app: the documentation site under `--watch`, and what its source maps cost), [FEEDBACK16.md](reports/FEEDBACK16.md) (no app: what tests found on the way to 99% coverage of the Rust), [FEEDBACK18.md](reports/FEEDBACK18.md) (a phone app on iOS: field notes with the place, a photo, a voice memo and the weather, and a probe of 35 things a phone can do from the app's web view), and
 [FEEDBACK19.md](reports/FEEDBACK19.md) (no app: a reader's critique of the language, checked claim by claim),
 [FEEDBACK20.md](reports/FEEDBACK20.md) (no app: how well Quillo suits a SaaS, under hostile hosts and tenant limits, and web, desktop and phone from one program),
+[FEEDBACK21.md](reports/FEEDBACK21.md) (no app: how Quillo prints an error, what it gives the log and the visitor, in a script, a route, a service and the browser),
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

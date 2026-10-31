@@ -43,7 +43,7 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
             .ok()
             .map(|e| {
                 let g = it.globals.clone();
-                matches!(it.eval(&e, &g), Ok(v) if !matches!(v, Value::Err(_)))
+                matches!(it.eval(&e, &g), Ok(v) if !matches!(v, Value::Err(..)))
             })
             .unwrap_or(false);
         put("database".into(), ok, json!(if ok { "ready" } else { "down" }));

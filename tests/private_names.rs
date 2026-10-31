@@ -169,7 +169,6 @@ route GET /d ? { q = name } = q
 }
 
 #[test]
-#[ignore = "finding: `{ q: str }` binds the key `q`, while the body's `q` is renamed to the private name and reads the global instead of what matched"]
 fn a_typed_field_binds_its_key_though_a_private_name_has_that_name() {
     let mut it = app("private let q = \"the variable\"\nroute GET /q ? { q: str } = q\n");
     assert_eq!(body(&mut it, "/q?q=hi"), "hi");

@@ -150,7 +150,7 @@ route GET /items = db.query("select n from items") | map((r) => r.n)
     assert_eq!(String::from_utf8_lossy(&request(&mut it, "GET", "/items", &[("X-Tenant", "acme")], "").body), r#"["acme"]"#);
     assert_eq!(String::from_utf8_lossy(&request(&mut it, "GET", "/items", &[("X-Tenant", "zeta")], "").body), r#"["zeta"]"#);
     // A tenant the function knows nothing of has no database.
-    assert_eq!(request(&mut it, "GET", "/items", &[("X-Tenant", "ghost")], "").status, 500);
+    assert_eq!(request(&mut it, "GET", "/items", &[("X-Tenant", "ghost")], "").status, 404);
     assert!(eval(&mut it, r#"with_tenant("ghost", () => db.query("select 1"))"#).contains("gave null, not a path or a URL"));
     assert_eq!(eval(&mut it, r#"[db.tenant_exists("acme"), db.tenant_exists("ghost")]"#), "[true, false]");
     // There is no template to list them by.

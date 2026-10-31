@@ -1,0 +1,12 @@
+// Q-174 A runtime error names the line that failed and not how it got there: a helper with several callers gives the same line for each, and only `quillo dap` shows the calls
+// mode: run
+// fixed-when: /main\.qwe:\d+/
+// From FEEDBACK21.md §Q-174 (found on c59890e).
+
+import price.qwe use share
+
+fn checkout(n) = share(100, n)
+fn split_bill(n) = share(200, n)
+
+print(checkout(2))
+print(split_bill(0))

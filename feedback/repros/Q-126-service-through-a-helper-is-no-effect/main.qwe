@@ -1,6 +1,5 @@
 // Q-126 A service called from a helper is not seen as the http effect: `fn f() with db = load()` passes, where calling the service directly warns
 // mode: check
-// open-when: main.qwe: ok
 // fixed-when: may use the http effect
 // From FEEDBACK16.md §Q-126 (found on b28e689).
 

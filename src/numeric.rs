@@ -411,8 +411,8 @@ fn pfsum(x: &[f64]) -> f64 {
     if let Some(sp) = parts.iter().filter_map(|p| p.1).reduce(|a, b| a + b) {
         return sp;
     }
-    let (all, _) = exact(parts.into_iter().flat_map(|p| p.0));
-    rounded_sum(&all)
+    let (all, special) = exact(parts.into_iter().flat_map(|p| p.0));
+    special.unwrap_or_else(|| rounded_sum(&all))
 }
 
 /// The sum as floats that do not overlap (whose exact sum it is), and the
@@ -440,6 +440,13 @@ fn exact(xs: impl IntoIterator<Item = f64>) -> (Vec<f64>, Option<f64>) {
             x = hi;
         }
         partials.truncate(i);
+        // A sum past the floats leaves an infinity and its own rounding error,
+        // which would cancel to 0 (FEEDBACK16.md, Q-113; branch feedback20-fixes).
+        if !x.is_finite() {
+            special = Some(special.unwrap_or(0.0) + x);
+            partials.clear();
+            continue;
+        }
         partials.push(x);
     }
     (partials, special)
@@ -476,7 +483,14 @@ fn rounded_sum(partials: &[f64]) -> f64 {
 }
 
 fn mean_of(x: &[f64]) -> f64 {
-    div2(psum(x, |v| v), x.len() as f64)
+    let n = x.len() as f64;
+    let m = div2(psum(x, |v| v), n);
+    // The sum may pass the floats where the mean does not, as in Python
+    // (FEEDBACK16.md, Q-114; branch feedback20-fixes).
+    if !m.is_finite() && x.iter().all(|v| v.is_finite()) {
+        return csum(x.iter().map(|v| v / n));
+    }
+    m
 }
 
 /// The sum of squared deviations from `m`, corrected for `m`'s own
@@ -1014,12 +1028,18 @@ fn m_hypot(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Float(norm2(&v)))
 }
 
+/// The largest size in `v`, or NaN with one in it: `f64::max` passes over NaN
+/// (FEEDBACK16.md, Q-115; branch feedback20-fixes).
+fn largest(v: &[f64]) -> f64 {
+    v.iter().fold(0.0f64, |m, x| if m.is_nan() || x.is_nan() { f64::NAN } else { m.max(x.abs()) })
+}
+
 /// The Euclidean length, scaled so that squaring neither overflows nor underflows.
 fn norm2(v: &[f64]) -> f64 {
     if v.iter().any(|x| x.is_infinite()) {
         return f64::INFINITY;
     }
-    let big = v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    let big = largest(v);
     if big == 0.0 || big.is_nan() {
         return big;
     }
@@ -1123,11 +1143,13 @@ fn m_gcd(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn m_lcm(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let v = ints(&args, "math.lcm", line)?;
+    // A zero anywhere makes it 0, before any absolute value can overflow
+    // (FEEDBACK16.md, Q-147; branch feedback20-fixes).
+    if v.contains(&0) {
+        return Ok(Value::Int(0));
+    }
     let mut acc = 1i64;
     for n in v {
-        if n == 0 {
-            return Ok(Value::Int(0));
-        }
         let n = n.checked_abs().ok_or_else(|| overflow(line))?;
         acc = (acc / gcd(acc, n)).checked_mul(n).ok_or_else(|| overflow(line))?;
     }
@@ -1219,7 +1241,16 @@ fn m_prod(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn m_fsum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::Float(pfsum(&xs(&args, 0, "math.fsum", line)?)))
+    let x = xs(&args, 0, "math.fsum", line)?;
+    let s = pfsum(&x);
+    // What Python raises (FEEDBACK16.md, Q-113; branch feedback20-fixes).
+    if s.is_nan() && x.contains(&f64::INFINITY) && x.contains(&f64::NEG_INFINITY) {
+        return fail(line, "`math.fsum`: inf and -inf have no sum");
+    }
+    if !s.is_finite() && x.iter().all(|v| v.is_finite()) {
+        return fail(line, "`math.fsum`: the sum is too large for a float");
+    }
+    Ok(Value::Float(s))
 }
 
 fn pair(args: &[Value], f: &str, line: u32) -> Result<(Vec<f64>, Vec<f64>, bool), Ctrl> {
@@ -1906,7 +1937,8 @@ fn arith(op: Op, a: &Value, b: &Value, f: &str, line: u32) -> R {
                     if y == 0 {
                         return fail(line, format!("`{}`: division by zero", f));
                     }
-                    x.checked_rem(y)
+                    // (FEEDBACK16.md, Q-146; branch feedback20-fixes)
+                    Some(x.wrapping_rem(y))
                 }
                 Op::Div => {
                     if y == 0 {
@@ -2008,7 +2040,7 @@ fn v_norm(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     } else if p == 1.0 {
         csum(x.iter().map(|v| v.abs()))
     } else if p.is_infinite() {
-        x.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+        largest(&x)
     } else {
         csum(x.iter().map(|v| v.abs().powf(p))).powf(1.0 / p)
     }))

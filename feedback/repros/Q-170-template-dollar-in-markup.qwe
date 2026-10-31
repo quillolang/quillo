@@ -1,0 +1,8 @@
+// Q-170 `${name}` in markup prints a stray `$` before the value, and `quillo check` says nothing: the habit from a template string, in the one place it means something else
+// mode: check
+// fixed-when: is text, and shows on the page
+// From FEEDBACK20.md §Q-170 (found on 9e8c2fb).
+
+let name = "web"
+
+route GET / = <p>${name}</p>

@@ -103,6 +103,33 @@ impl Pool {
         Ok(pool)
     }
 
+    /// Makes the schema a URL names, or says false when it is there. Of two at once, the
+    /// server lets one make it (FEEDBACK20.md, Q-165; branch feedback20-fixes). A database
+    /// of its own (`postgres://host/app_{tenant}`) is made beforehand, so it only says.
+    pub fn claim(url: &str) -> Result<bool, String> {
+        let Options { url: plain, max, schema, tls } = take_options(url)?;
+        let Some(schema) = schema else {
+            return Pool::open_as(url, false).map(|_| false).or_else(|e| Err(format!("its database is made beforehand: {}", e)));
+        };
+        let mut config: tokio_postgres::Config = plain.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+        let tls = tls.settle(&mut config)?;
+        let pool = Pool {
+            config: config.clone().into(),
+            async_config: config,
+            tls,
+            idle: Mutex::new((Vec::new(), 0)),
+            freed: Condvar::new(),
+            max,
+            lanes: OnceLock::new(),
+        };
+        let mut c = pool.checkout()?;
+        match c.batch(&format!("create schema \"{}\"", schema)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.contains("already exists") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
         Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false })
@@ -230,6 +257,10 @@ fn take_options(url: &str) -> Result<Options, String> {
         match pair.split_once('=') {
             Some(("pool_size", v)) => {
                 o.max = v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad pool_size: {}", v))?;
+            }
+            // For the tenants' list (see `TenantDbs`), not for the connection.
+            Some(("open_tenants", v)) => {
+                v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad open_tenants: {}", v))?;
             }
             Some(("schema", v)) => {
                 if !crate::site::tenant_name_ok(v) {
@@ -1084,7 +1115,9 @@ impl ToSql for PgParam {
         let int = || -> Result<i64, BoxErr> {
             match v {
                 Value::Int(n) => Ok(*n),
-                Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Ok(*f as i64),
+                // `as` would give the largest int for one too large: that stores a number no
+                // one wrote (FEEDBACK16.md, Q-110; branch feedback20-fixes).
+                Value::Float(f) if f.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) => Ok(*f as i64),
                 Value::Dec(d) if d.round(0, crate::decimal::Rounding::Down).ok() == Some(*d) => d.trunc_i64().ok_or_else(|| bad(v, ty)),
                 Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty)),
                 _ => Err(bad(v, ty)),
@@ -1190,25 +1223,27 @@ fn decode(ty: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
                     let days = us.div_euclid(86_400_000_000);
                     let rest = us.rem_euclid(86_400_000_000);
                     let z = if *ty == Type::TIMESTAMPTZ { "Z" } else { "" };
-                    format!("{}T{}{}", date_text(days), time_text(rest), z)
+                    format!("{}T{}{}", date_text(days), time_text(rest as u64), z)
                 }
             })
         }
-        Type::TIME => Value::str(time_text(i64::from_be_bytes(take(raw, &mut at)?))),
+        Type::TIME => Value::str(time_text(i64::from_be_bytes(take(raw, &mut at)?) as u64)),
         Type::INTERVAL => {
             let us = i64::from_be_bytes(take(raw, &mut at)?);
             let days = i32::from_be_bytes(take(raw, &mut at)?);
             let months = i32::from_be_bytes(take(raw, &mut at)?);
             let mut parts = Vec::new();
             if months != 0 {
-                parts.push(format!("{} mon{}", months, if months.abs() == 1 { "" } else { "s" }));
+                // `unsigned_abs`: the smallest of each has no positive of its own type, and
+                // `abs` gave wrong text for it (FEEDBACK19.md, Q-160; branch feedback20-fixes).
+                parts.push(format!("{} mon{}", months, if months.unsigned_abs() == 1 { "" } else { "s" }));
             }
             if days != 0 {
-                parts.push(format!("{} day{}", days, if days.abs() == 1 { "" } else { "s" }));
+                parts.push(format!("{} day{}", days, if days.unsigned_abs() == 1 { "" } else { "s" }));
             }
             if us != 0 || parts.is_empty() {
                 let sign = if us < 0 { "-" } else { "" };
-                parts.push(format!("{}{}", sign, time_text(us.abs())));
+                parts.push(format!("{}{}", sign, time_text(us.unsigned_abs())));
             }
             Value::str(parts.join(" "))
         }
@@ -1216,11 +1251,7 @@ fn decode(ty: &Type, raw: &[u8]) -> Result<Value, BoxErr> {
         _ => match ty.kind() {
             Kind::Array(elem) => array(elem, raw)?,
             Kind::Domain(inner) => decode(inner, raw)?,
-            _ => match std::str::from_utf8(raw) {
-                // text, varchar, enums, citext and other text-like types
-                Ok(s) => Value::str(s),
-                Err(_) => Value::str(String::from_utf8_lossy(raw)),
-            },
+            _ => other_type(ty, raw),
         },
     })
 }
@@ -1342,7 +1373,43 @@ fn date_text(days: i64) -> String {
 }
 
 /// Microseconds since midnight as HH:MM:SS[.ffffff].
-fn time_text(us: i64) -> String {
+/// A value of a type with no reader of its own. Types with a binary form of their own are
+/// read as PostgreSQL writes them; text-like ones (text, varchar, enums, citext) are text
+/// already, and what is left is shown as `bytea` is, as bytes passed off as text say nothing
+/// (FEEDBACK16.md, Q-117; branch feedback20-fixes).
+fn other_type(ty: &Type, raw: &[u8]) -> Value {
+    if let ("money", Ok(cents)) = (ty.name(), <[u8; 8]>::try_from(raw)) {
+        if let Some(d) = crate::decimal::Dec::new(i64::from_be_bytes(cents) as i128, 2) {
+            return Value::Dec(d);
+        }
+    }
+    let hex = |b: &[u8], sep: &str| b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join(sep);
+    let text = match (ty.name(), raw) {
+        ("inet" | "cidr", [family, bits, _, _, addr @ ..]) => {
+            let shown = match (family, addr.len()) {
+                (2, 4) => Some(std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]).to_string()),
+                (3, 16) => <[u8; 16]>::try_from(addr).ok().map(|a| std::net::Ipv6Addr::from(a).to_string()),
+                _ => None,
+            };
+            let whole = if addr.len() == 4 { 32 } else { 128 };
+            shown.map(|a| if ty.name() == "cidr" || *bits != whole { format!("{}/{}", a, bits) } else { a })
+        }
+        ("macaddr", b) if b.len() == 6 => Some(hex(b, ":")),
+        ("macaddr8", b) if b.len() == 8 => Some(hex(b, ":")),
+        ("bit" | "varbit", [a, b, c, d, bytes @ ..]) => {
+            let n = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
+            Some(bytes.iter().flat_map(|x| (0..8).rev().map(move |i| if x >> i & 1 == 1 { '1' } else { '0' })).take(n).collect())
+        }
+        _ => None,
+    };
+    match (text, std::str::from_utf8(raw)) {
+        (Some(t), _) => Value::str(t),
+        (None, Ok(s)) => Value::str(s),
+        (None, Err(_)) => Value::str(format!("\\x{}", hex(raw, ""))),
+    }
+}
+
+fn time_text(us: u64) -> String {
     let secs = us / 1_000_000;
     let frac = us % 1_000_000;
     let base = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);

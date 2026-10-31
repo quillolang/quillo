@@ -53,7 +53,7 @@ fn each_subdomain_is_a_tenant_with_its_own_data() {
 
     // A host can name any tenant; only the program makes one.
     let r = send(&mut it, "GET", "ghost.example.com", "/notes", "");
-    assert_eq!(r.status, 500, "{}", r.text());
+    assert_eq!(r.status, 404, "{}", r.text());
     assert!(!d.join("data/ghost.db").exists());
     assert_eq!(send(&mut it, "POST", "example.com", "/signup/acme", "").text(), "1");
     assert_eq!(send(&mut it, "POST", "example.com", "/signup/beta", "").text(), "1");
@@ -101,7 +101,7 @@ route GET /notes = db.query("select text from notes") | map((n) => n.text)
         it.handle(&HttpRequest { method: "GET".into(), url: "/notes".into(), headers, body: Vec::new(), remote: "127.0.0.1".into() }).text()
     };
     assert_eq!(get(&mut it, "seed"), r#"["seeded"]"#);
-    assert_eq!(get(&mut it, "other"), "internal error\n");
+    assert_eq!(get(&mut it, "other"), "not found\n");
     assert!(!d.join("data/other.db").exists());
     // A name that is not safe in a file name is no tenant.
     let mut bad = Interp::new(&d);

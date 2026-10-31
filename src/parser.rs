@@ -43,6 +43,8 @@ const TOO_DEEP: &str = "the code nests too deeply";
 pub struct Parser {
     lx: Lexer,
     peeked: Option<Token>,
+    /// Inside a `type` declaration.
+    in_typedef: bool,
     /// While > 0, `name => ...` is not an arrow function: in `for x in xs => body`
     /// the `=>` belongs to the loop.
     no_bare_arrow: u32,
@@ -206,7 +208,7 @@ impl Parser {
     }
 
     pub fn with_line(src: &str, line: u32) -> Self {
-        Parser { lx: Lexer::new(src, line), peeked: None, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
+        Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
                  privates: Default::default(), privacy_tag: crate::privacy::tag(None, src) }
     }
 
@@ -921,7 +923,7 @@ impl Parser {
                 "return" => {
                     self.next()?;
                     let e = if can_start_expr(&self.peek()?) { Some(self.parse_expr()?) } else { None };
-                    return Ok(Stmt::Return(e));
+                    return Ok(Stmt::Return(e, line));
                 }
                 _ => {}
             }
@@ -1174,6 +1176,12 @@ impl Parser {
             if name == "list" && self.eat(&Tok::Lt)? {
                 elem = Some(Box::new(self.parse_type()?));
                 self.expect(&Tok::Gt, "`>` after the list's type")?;
+                // In a `type`, this `>` ends the line: it is no comparison, to go on
+                // past it (FEEDBACK16.md, Q-136; branch feedback20-fixes). Elsewhere a
+                // body may stand on the next line, as it always could after `>`.
+                if self.in_typedef {
+                    self.lx.last = Some(Tok::RBracket);
+                }
             }
             if name == "nil" {
                 return Err(QuilloError::new("use `null` instead of `nil`", t.line));
@@ -1206,6 +1214,13 @@ impl Parser {
     /// `type Name = ...` after the `=`: a record's fields, each perhaps with
     /// a default (`role: str = "member"`), or another type.
     fn parse_typedef(&mut self, name: String, line: u32) -> PResult<TypeDef> {
+        self.in_typedef = true;
+        let r = self.typedef_body(name, line);
+        self.in_typedef = false;
+        r
+    }
+
+    fn typedef_body(&mut self, name: String, line: u32) -> PResult<TypeDef> {
         self.skip_seps()?;
         if self.eat(&Tok::LBrace)? {
             let mut defaults = Vec::new();
@@ -1867,12 +1882,14 @@ impl Parser {
                     "anonymous functions are written `(x) => x * 2` (or `x => x * 2`); `fn` is for named functions",
                     line,
                 )),
-                "reply" => self.parse_reply(line),
+                // A reply's status may be a reply: it nests, and counts as nesting
+                // (FEEDBACK16.md, Q-133; branch feedback20-fixes).
+                "reply" => self.nested(|p| p.parse_reply(line)),
                 // `?? return null`, `pat => return x`: leaves the function, as
                 // the statement does.
                 "return" => {
                     let e = if can_start_expr(&self.peek()?) { Some(self.parse_expr()?) } else { None };
-                    Ok(Expr::Block(vec![Stmt::Return(e)]))
+                    Ok(Expr::Block(vec![Stmt::Return(e, line)]))
                 }
                 kw if KEYWORDS.contains(&kw) => Err(QuilloError::new(format!("unexpected keyword `{}`", kw), line)),
                 _ if self.peeked.is_none() && self.lx.peek_char() == Some('`') => {
@@ -2392,6 +2409,7 @@ impl Parser {
             return Err(QuilloError::new(msg, line));
         }
         let mut children = Vec::new();
+        let mut dollars = Vec::new();
         if !self_closing {
             let text = self.lx.text();
             let opened = OpenTag {
@@ -2402,7 +2420,7 @@ impl Parser {
                 indent: text[start - col_at(text, start) as usize..].iter().take_while(|c| **c == ' ' || **c == '\t').collect(),
             };
             self.open.push(opened);
-            let r = self.parse_html_children(&tag, line);
+            let r = self.parse_html_children(&tag, line, &mut dollars);
             self.open.pop();
             children = r?;
         }
@@ -2425,7 +2443,7 @@ impl Parser {
             }
         }
         let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
-        Ok(HtmlEl { tag, id, classes, attrs, children, line, facts })
+        Ok(HtmlEl { tag, id, classes, attrs, children, line, dollars, facts })
     }
 
     /// What is between an element's tags, up to its end tag. A missing end
@@ -2433,7 +2451,7 @@ impl Parser {
     /// as the fix (branch editor-end-tags): before an end tag that closes
     /// an element around it, before the `}` that ends the code around it,
     /// or before the declaration that the file goes on with.
-    fn parse_html_children(&mut self, tag: &str, line: u32) -> PResult<Vec<HtmlChild>> {
+    fn parse_html_children(&mut self, tag: &str, line: u32, dollars: &mut Vec<u32>) -> PResult<Vec<HtmlChild>> {
         let mut children = Vec::new();
         let mut text = String::new();
         loop {
@@ -2476,6 +2494,9 @@ impl Parser {
                     }
                 }
                 (Some('{'), _) => {
+                    if text.ends_with('$') {
+                        dollars.push(self.lx.line);
+                    }
                     push_text(&mut children, &mut text);
                     children.push(HtmlChild::Expr(and_as_if(self.parse_braced_expr()?)));
                 }

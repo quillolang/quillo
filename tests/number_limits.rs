@@ -43,7 +43,6 @@ fn a_least_common_multiple_too_large_for_an_int_stops() {
 
 /// Any list with a zero in it has 0 as its answer, whatever comes first.
 #[test]
-#[ignore = "finding: math.lcm(MIN, 0) is an overflow though math.lcm(0, MIN) is 0: the zero is only seen if it comes first"]
 fn a_zero_makes_a_least_common_multiple_zero_wherever_it_stands() {
     assert_eq!(gives(&format!("math.lcm({}, 0)", MIN)), "0");
     assert_eq!(gives(&format!("math.lcm({}, 2, 0)", MAX)), "0");
@@ -86,7 +85,6 @@ fn arithmetic_on_lists_stops_at_the_item_that_overflows() {
 
 /// Nothing is left over, in Python and in the browser's JavaScript too.
 #[test]
-#[ignore = "finding: the smallest int % -1 is `integer overflow` (Rust's checked_rem), and the same in vec.mod; the remainder is 0, which fits"]
 fn the_smallest_int_divides_by_minus_one_with_nothing_left_over() {
     assert_eq!(gives(&format!("{} % -1", MIN)), "0");
     assert_eq!(gives(&format!("vec.mod([{}], [-1])", MIN)), "[0]");

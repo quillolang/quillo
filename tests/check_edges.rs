@@ -154,7 +154,6 @@ fn a_bare_return_is_null() {
 }
 
 #[test]
-#[ignore = "finding: a bare `return` that breaks the return type is reported on the line before it"]
 fn a_bare_return_is_reported_on_its_own_line() {
     says("fn f() -> int {\n let x = 1\n print(x)\n return\n}", &["4 `f` must return int, but this returns null"]);
 }
@@ -199,7 +198,6 @@ fn a_call_to_a_service_in_a_function_limited_to_others_is_an_error() {
 }
 
 #[test]
-#[ignore = "finding: a service called from a helper is not seen as the http effect (called_names drops the service's name)"]
 fn a_call_to_a_service_in_a_helper_is_an_http_effect() {
     let app = App::new("svc-effect", &[
         ("billing.qwe", "server fn invoice() = 1\n"),
@@ -283,7 +281,6 @@ fn a_method_needs_a_function_of_that_name() {
 }
 
 #[test]
-#[ignore = "finding: a local function called as a method (`1.adder()`) is still warned about as unused"]
 fn a_local_function_called_as_a_method_is_used() {
     clean("fn f() {\n let adder = (x) => x + 10\n 1.adder()\n}\nprint(f())");
 }
@@ -555,7 +552,6 @@ fn i(on) = <p class={on ? "ok" : "ok"}>9</p>
 }
 
 #[test]
-#[ignore = "finding: the strings of `class={if on { \"a\" } else { \"b\" }}` are not read, though those of `on ? \"a\" : \"b\"` are"]
 fn classes_in_an_if_with_blocks_are_read() {
     let app = App::new("classes-if", &[(
         "main.qwe",
@@ -715,14 +711,13 @@ fn a_view_of_views_is_followed_only_a_few_deep() {
 }
 
 #[test]
-fn code_that_nests_past_the_parsers_watch_is_stopped() {
+fn a_chain_of_replies_counts_as_nesting() {
     let src = format!("fn f() = {}200\n", "reply ".repeat(600));
     // On a stack the size quillo gives its work: a test thread's is too small for this in a debug build.
-    std::thread::Builder::new().stack_size(64 << 20).spawn(move || says(&src, &["1 the code nests too deeply"])).unwrap().join().unwrap();
+    std::thread::Builder::new().stack_size(64 << 20).spawn(move || says(&src, &["1 the code nests too deeply (more than 256 levels)"])).unwrap().join().unwrap();
 }
 
 #[test]
-#[ignore = "finding: `reply reply ... 200` escapes the parser's nesting limit, and enough of them overflow its stack"]
 fn a_long_chain_of_replies_is_refused_not_a_crash() {
     let app = App::new("reply-chain", &[("main.qwe", &format!("fn f() = {}200\n", "reply ".repeat(30_000)))]);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_quillo")).arg("check").arg(app.main()).output().unwrap();

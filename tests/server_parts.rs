@@ -212,7 +212,6 @@ fn patches_make_the_new_value_of_each_shape() {
 }
 
 #[test]
-#[ignore = "finding: a map that only changed its keys' order is patched as the same (`old == new` ignores order), so the page keeps the old order under the new hash"]
 fn a_map_in_another_order_goes_whole() {
     let new = json!({ "b": 2, "a": 1 });
     assert_eq!(diff(&json!({ "a": 1, "b": 2 }), &new), json!({ "$v": { "b": 2, "a": 1 } }));

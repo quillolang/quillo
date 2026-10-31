@@ -1,0 +1,12 @@
+// Q-164 A request that computes outlives SIGTERM: the guide says a stopping server waits for up to 10 seconds, but the wait is never reached and it runs until a second signal
+// mode: script
+// script: steps.sh
+// open-when: still running 12 s after one SIGTERM
+// fixed-when: stopped after one SIGTERM
+// From FEEDBACK20.md §Q-164 (found on 9e8c2fb). Q-081 is the same for a job, which is fixed; a request is not.
+
+route GET /forever {
+    let i = 0
+    while true { i = i + 1 }
+    "never"
+}

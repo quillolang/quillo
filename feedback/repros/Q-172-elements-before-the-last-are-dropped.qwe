@@ -1,0 +1,12 @@
+// Q-172 Of two elements side by side in a component or view, only the last reaches the page, and `quillo check` says ok: the first, with any handler on it, is gone without a word
+// mode: check
+// fixed-when: this element is not on the page
+// From FEEDBACK21.md §Q-172 (found on c59890e). A body gives its last expression, so this
+// follows from that rule; what is missing is a word from `quillo check`.
+
+component Pair() {
+    <p>one</p>
+    <p>two</p>
+}
+
+route GET / = <html><body><Pair/></body></html>

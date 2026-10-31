@@ -139,11 +139,23 @@ fn a_type_without_a_reader_is_still_a_string() {
 }
 
 #[test]
-#[ignore = "finding: types with a binary form Quillo has no reader for (inet, macaddr, money, ...) come back as their raw bytes"]
 fn an_address_comes_back_as_its_text() {
     let Some(pg) = server("inet") else { return };
     let mut it = program("inet", &pg.url, "");
     assert_eq!(v(&mut it, "'192.168.0.1'::inet"), "\"192.168.0.1\"");
+    assert_eq!(v(&mut it, "'192.168.0.1/24'::inet"), "\"192.168.0.1/24\"");
+    assert_eq!(v(&mut it, "'10.0.0.0/8'::cidr"), "\"10.0.0.0/8\"");
+    assert_eq!(v(&mut it, "'2001:db8::1'::inet"), "\"2001:db8::1\"");
+    assert_eq!(v(&mut it, "'08:00:2b:01:02:03'::macaddr"), "\"08:00:2b:01:02:03\"");
+    assert_eq!(v(&mut it, "'08:00:2b:01:02:03:04:05'::macaddr8"), "\"08:00:2b:01:02:03:04:05\"");
+    assert_eq!(v(&mut it, "'12.50'::money"), "12.50m");
+    assert_eq!(v(&mut it, "'-0.05'::money"), "-0.05m");
+    assert_eq!(v(&mut it, "B'10110'::bit(5)"), "\"10110\"");
+    assert_eq!(v(&mut it, "B'1'::varbit"), "\"1\"");
+    // A type with no reader is bytes, shown as `bytea` is: here two floats.
+    assert!(v(&mut it, "point(1, 2)").starts_with("\"\\\\x"), "{}", v(&mut it, "point(1, 2)"));
+    // And a type whose bytes are text stays text.
+    assert_eq!(v(&mut it, "'a b'::tsvector::text"), "\"'a' 'b'\"");
 }
 
 const COLUMNS: &str = "db.exec(\"create table t (i2 smallint, i4 int, i8 bigint, f4 real, f8 double precision, b boolean, j jsonb, ts timestamp)\")\n";
@@ -191,7 +203,6 @@ fn values_are_sent_as_the_column_wants_them() {
 }
 
 #[test]
-#[ignore = "finding: a float too large for bigint is stored as 9223372036854775807 instead of being refused"]
 fn a_float_too_large_for_a_bigint_is_refused() {
     let Some(pg) = server("toolarge") else { return };
     let mut it = program("toolarge", &pg.url, COLUMNS);
@@ -341,7 +352,6 @@ fn a_pool_with_every_connection_taken() {
 }
 
 #[test]
-#[ignore = "finding: outside a request, a transaction waiting for a connection sleeps holding the interpreter lock, so the one holding the connection cannot end; 30 s, then an error"]
 fn transactions_wait_their_turn_outside_the_server_too() {
     let Some(pg) = server("turns") else { return };
     let mut it = program("turns", &format!("{}?pool_size=1", pg.url), "db.exec(\"create table t (n int)\")\n");

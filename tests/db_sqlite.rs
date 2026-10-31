@@ -293,7 +293,7 @@ fn a_tenant_that_was_never_made_cannot_be_reached_from_a_request() {
     let mut it = load(&d, src);
     says(eval(&mut it, "db.query(\"select 1\")"), "this code runs for none");
     let r = request(&mut it, "GET", "/t", &[("X-Tenant", "ghost")], "");
-    assert_eq!(r.status, 500);
+    assert_eq!(r.status, 404);
     assert!(!d.join("data/ghost.db").exists());
 }
 
@@ -434,7 +434,6 @@ fn a_transaction_that_cannot_commit_says_so() {
 }
 
 #[test]
-#[ignore = "finding: a plain db.transaction whose commit fails (deferred foreign key) stays open: its row is seen after and later statements run inside it"]
 fn a_transaction_that_cannot_commit_leaves_nothing_behind() {
     let d = dir("release2");
     let mut it = load(&d, DEFERRED);

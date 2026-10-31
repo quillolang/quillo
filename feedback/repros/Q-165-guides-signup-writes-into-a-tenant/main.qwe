@@ -1,0 +1,16 @@
+// Q-165 The guide's signup writes into a tenant that already exists: `with_tenant` makes a tenant or enters one, so anyone who signs up a taken name runs that code in its database
+// mode: script
+// script: steps.sh
+// open-when: the sample checks for an existing tenant: no
+// fixed-when: the sample checks for an existing tenant: yes
+// From FEEDBACK20.md §Q-165 (found on 9e8c2fb). The program is the guide's, under "Many tenants".
+
+tenant_from("example.com")
+db.open("data/{tenant}.db")
+db.migrate()
+
+route POST /signup { form: { name: str } } {
+    with_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))
+    "made " + name
+}
+route GET /plans = db.query("select plan from settings")

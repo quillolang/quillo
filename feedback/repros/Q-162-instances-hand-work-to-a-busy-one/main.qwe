@@ -1,0 +1,13 @@
+// Q-162 With `--instances`, the first instance accepts for all of them and connections go out in turn whether an instance is busy or not: computing on the first stops the whole server taking connections, and on any other holds 1 in N of them
+// mode: script
+// script: steps.sh
+// open-when: /hung: [1-9]/
+// fixed-when: hung: 0 of 10
+// From FEEDBACK20.md §Q-162 (found on 9e8c2fb).
+
+route GET /ping = "pong"
+route GET /forever {
+    let i = 0
+    while true { i = i + 1 }
+    "never"
+}

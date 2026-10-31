@@ -106,7 +106,6 @@ fn the_rarer_component_forms_work_in_a_page() {
 }
 
 #[test]
-#[ignore = "finding: `{true}` in markup is the text true on the server and nothing in the browser (runtime.js, put)"]
 fn true_as_a_child_is_the_same_text_in_the_browser() {
     let Some(chrome) = chrome().filter(|_| node_ready()) else { return };
     let r = run_page(&chrome, "forms.qwe", "/", "forms.js");

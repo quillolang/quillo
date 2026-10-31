@@ -165,7 +165,6 @@ fn values_javascript_numbers_cannot_hold_are_written_exactly() {
 }
 
 #[test]
-#[ignore = "finding: a constant map with a `__proto__` key and plain values goes out as JSON, whose literal sets the prototype: the key is lost"]
 fn a_key_named_proto_is_a_key_in_the_bundle() {
     same_is("let m = { \"__proto__\": 1 }", "m[\"__proto__\"]", "1");
     same_is("let m = { \"__proto__\": { admin: true } }", "m.admin", "null");
@@ -303,12 +302,11 @@ fn a_page_whose_text_seems_to_assign_a_runtime_name_carries_its_own() {
 
 #[test]
 fn a_pipe_into_a_server_fn_compiles_to_a_call() {
-    let js = client::bundle(&loaded("server fn save(x) = x\ncomponent C() = <p>{1 | save}</p>")).unwrap();
+    let js = client::bundle(&loaded("server fn save(x) = x\ncomponent C() = <button @click={() => { 1 | save }}>go</button>")).unwrap();
     assert!(js.contains("W.call("), "the call is gone");
 }
 
 #[test]
-#[ignore = "finding: `x | save` in markup, with a server fn, is not refused as `save(x)` is: the page gets a Promise"]
 fn a_pipe_into_a_server_fn_in_markup_is_refused() {
     assert_eq!(
         refused("server fn save(x) = x\ncomponent C() = <p>{1 | save}</p>"),
@@ -344,14 +342,13 @@ fn the_kept_page_lists_forget_their_roots_past_a_limit() {
 }
 
 #[test]
-#[ignore = "finding: a float literal too large for a float is inf on the server and null in the browser"]
 fn a_float_too_large_for_a_literal_is_the_same_in_the_browser() {
     same_is("", "1e999", "inf");
 }
 
 #[test]
 fn a_float_too_large_for_a_literal_compiles() {
-    assert!(client::test_script(&loaded("fn f() = 1e999\n"), "f").unwrap().contains("null"));
+    assert!(client::test_script(&loaded("fn f() = 1e999\n"), "f").unwrap().contains("Infinity"));
 }
 
 #[test]

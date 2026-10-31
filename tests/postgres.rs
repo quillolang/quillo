@@ -377,7 +377,7 @@ route GET /notes = db.query("select text from notes") | map((n) => n.text)
         it.handle(&req).text()
     };
     // Only the program makes a tenant: a made-up one gets nothing.
-    assert_eq!(send(&mut it, "GET", "ghost", ""), "internal error\n");
+    assert_eq!(send(&mut it, "GET", "ghost", ""), "not found\n");
     assert_eq!(send(&mut it, "SIGNUP", "acme", ""), "1");
     assert_eq!(send(&mut it, "SIGNUP", "beta", ""), "1");
     assert_eq!(send(&mut it, "POST", "acme", r#"{"text":"acme's"}"#), "ok");

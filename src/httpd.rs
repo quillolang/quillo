@@ -21,10 +21,10 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,158 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 /// Every event loop's waker, to tell them when `STOPPING` is set.
 static LOOPS: Mutex<Vec<Arc<Waker>>> = Mutex::new(Vec::new());
 /// How long requests in progress get to finish when the server stops.
-const DRAIN: Duration = Duration::from_secs(10);
+pub const DRAIN: Duration = Duration::from_secs(10);
+
+/// What an event loop is running: when it last resumed a request (ms, 0 when it is waiting).
+/// A watchdog reads these, so that a loop computing is seen from outside it (FEEDBACK20.md,
+/// Q-162 and Q-163; branch feedback20-fixes).
+#[derive(Default)]
+struct Busy {
+    since: AtomicU64,
+    request: AtomicUsize,
+    told: AtomicBool,
+    over: AtomicBool,
+}
+
+/// Each event loop's `Busy`.
+static LOOPS_BUSY: Mutex<Vec<Arc<Busy>>> = Mutex::new(Vec::new());
+/// The longest a request may compute without letting go, in ms; 0 for no limit.
+static MAX_COMPUTE: AtomicU64 = AtomicU64::new(0);
+/// Whether a request somewhere has passed it: read at each step of a loop, so it stays one load.
+pub static OVER_TIME: AtomicBool = AtomicBool::new(false);
+/// What each request in progress is, for the log.
+static RUNNING: Mutex<Option<HashMap<(usize, usize), String>>> = Mutex::new(None);
+/// An instance computing for this long is logged.
+const STUCK: Duration = Duration::from_secs(5);
+/// An instance computing for this long gets no new connections, while another is free.
+/// Short, as passing one by costs nothing, and a connection put on one that goes on
+/// computing waits as long as it does.
+const TOO_BUSY: Duration = Duration::from_millis(50);
+
+thread_local! {
+    static OWN_BUSY: std::cell::RefCell<Option<Arc<Busy>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn clock() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// `--max-compute`.
+pub fn limit_compute(ms: u64) {
+    MAX_COMPUTE.store(ms, SeqCst);
+}
+
+/// Whether requests are limited. Compiled code has no steps to look between, so it is
+/// left out then.
+pub fn compute_limited() -> bool {
+    MAX_COMPUTE.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether the request running here has passed `--max-compute`; it asks once.
+pub fn over_time() -> bool {
+    let over = OWN_BUSY.with(|b| b.borrow().as_ref().is_some_and(|b| b.over.swap(false, SeqCst)));
+    OVER_TIME.store(lock(&LOOPS_BUSY).iter().any(|b| b.over.load(SeqCst)), SeqCst);
+    over
+}
+
+/// A request's number is its event loop's, so the two say which it is.
+fn own_request() -> (usize, usize) {
+    (OWN_BUSY.with(|b| b.borrow().as_ref().map_or(0, |b| Arc::as_ptr(b) as usize)), request_number())
+}
+
+/// Remembers what this request is, until `request_done`.
+pub fn request_began(what: String) {
+    lock(&RUNNING).get_or_insert_with(HashMap::new).insert(own_request(), what);
+}
+
+/// See `request_began`.
+pub fn request_done() {
+    if let Some(m) = lock(&RUNNING).as_mut() {
+        m.remove(&own_request());
+    }
+}
+
+/// A line of the log for an error: with the request it belongs to, so that an id a visitor
+/// reports leads to it, and as an object where the log is objects (FEEDBACK21.md, Q-175;
+/// branch feedback20-fixes).
+pub fn error_line(text: &str) {
+    let key = own_request();
+    let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+    if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
+        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "error", "request": what, "error": text }));
+    } else if let Some(what) = what {
+        eprintln!("quillo: error: {}: {}", what, text);
+    } else {
+        eprintln!("quillo: error: {}", text);
+    }
+}
+
+/// What is in progress, for a line in the log.
+pub fn in_progress() -> Vec<String> {
+    lock(&RUNNING).as_ref().map_or_else(Vec::new, |m| m.values().cloned().collect())
+}
+
+/// Looks at the event loops from outside: says when one has been computing for a while,
+/// and ends a request past `--max-compute`, at its next step. Nothing is preempted: a
+/// request holds no state another could find half done.
+fn watch_loops() {
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if crate::debug::on() {
+            continue;
+        }
+        let now = clock();
+        let limit = MAX_COMPUTE.load(SeqCst);
+        for b in lock(&LOOPS_BUSY).iter() {
+            let since = b.since.load(SeqCst);
+            if since == 0 {
+                b.told.store(false, SeqCst);
+                continue;
+            }
+            let for_ms = now.saturating_sub(since);
+            if for_ms >= STUCK.as_millis() as u64 && !b.told.swap(true, SeqCst) {
+                let key = (Arc::as_ptr(b) as usize, b.request.load(SeqCst));
+                let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
+                // Not `log`: that waits for its loop, and this one is not coming back.
+                eprintln!("quillo: an instance has been computing for {} s without letting go: {}", for_ms / 1000, what.as_deref().unwrap_or("a request"));
+            }
+            if limit != 0 && for_ms >= limit {
+                b.over.store(true, SeqCst);
+                OVER_TIME.store(true, SeqCst);
+            }
+        }
+    }
+}
+
+/// With several instances, connections are taken on a thread that runs no program, so a
+/// request computing cannot hold them up, and each goes to the next instance that is not
+/// computing, or to the next in turn if all are (FEEDBACK20.md, Q-162; branch feedback20-fixes).
+fn take_connections(listener: std::net::TcpListener, inboxes: Vec<Arc<Inbox>>, busy: Vec<Arc<Busy>>) {
+    let mut turn = 0usize;
+    let free = |b: &Busy| {
+        let since = b.since.load(SeqCst);
+        since == 0 || clock().saturating_sub(since) < TOO_BUSY.as_millis() as u64
+    };
+    while !STOPPING.load(SeqCst) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let _ = stream.set_nonblocking(true);
+                let n = inboxes.len();
+                let to = (0..n).map(|k| (turn + k) % n).find(|i| free(&busy[*i])).unwrap_or(turn % n);
+                turn = to + 1;
+                lock(&inboxes[to].conns).push((TcpStream::from_std(stream), peer));
+                let _ = inboxes[to].waker.wake();
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                log(format!("quillo: cannot accept a connection: {}\n", e));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
 
 /// Stops the server gracefully (see `STOPPING`).
 pub fn stop() {
@@ -410,6 +561,9 @@ pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max
     }
     let mut apps = apps.into_iter().zip(polls).enumerate();
     let (_, (first_app, first_poll)) = apps.next().ok_or("no instances")?;
+    let busy: Vec<Arc<Busy>> = inboxes.iter().map(|_| Arc::new(Busy::default())).collect();
+    lock(&LOOPS_BUSY).extend(busy.iter().cloned());
+    let _ = std::thread::Builder::new().name("quillo-watch".into()).spawn(watch_loops);
     let mut others = Vec::new();
     for (i, (app, poll)) in apps {
         let inbox = inboxes[i].clone();
@@ -417,20 +571,30 @@ pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max
             std::thread::Builder::new()
                 .name("quillo-instance".into())
                 .stack_size(crate::server::WORKER_STACK)
-                .spawn(move || {
-                    if let Err(e) = run_loop(app, poll, None, inbox, Vec::new(), i, max_waiting) {
-                        eprintln!("quillo: {}", e);
+                .spawn({
+                    let busy = busy[i].clone();
+                    move || {
+                        if let Err(e) = run_loop(app, poll, None, inbox, busy, max_waiting) {
+                            eprintln!("quillo: {}", e);
+                        }
                     }
                 })
                 .map_err(|e| format!("cannot start an instance: {}", e))?,
         );
     }
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let mut listener = TcpListener::from_std(listener);
-    first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
     let own = inboxes[0].clone();
-    let all = if inboxes.len() > 1 { inboxes } else { Vec::new() };
-    let r = run_loop(first_app, first_poll, Some(listener), own, all, 0, max_waiting);
+    let first_busy = busy[0].clone();
+    let listener = if inboxes.len() > 1 {
+        let (taken, all) = (busy, inboxes);
+        std::thread::Builder::new().name("quillo-accept".into()).spawn(move || take_connections(listener, all, taken)).map_err(|e| e.to_string())?;
+        None
+    } else {
+        let mut listener = TcpListener::from_std(listener);
+        first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
+        Some(listener)
+    };
+    let r = run_loop(first_app, first_poll, listener, own, first_busy, max_waiting);
     // Stopping: the other instances finish their requests too.
     for t in others {
         let _ = t.join();
@@ -443,12 +607,12 @@ fn run_loop(
     poll: Poll,
     listener: Option<TcpListener>,
     inbox: Arc<Inbox>,
-    instances: Vec<Arc<Inbox>>,
-    index: usize,
+    busy: Arc<Busy>,
     max_waiting: usize,
 ) -> Result<(), String> {
     // mimalloc here too (see src/alloc.rs).
     crate::alloc::waiter_thread();
+    OWN_BUSY.with(|b| *b.borrow_mut() = Some(busy.clone()));
     let waker = inbox.waker.clone();
     lock(&LOOPS).push(waker.clone());
     let pool = Arc::new(Pool {
@@ -469,9 +633,7 @@ fn run_loop(
         poll,
         listener,
         inbox,
-        instances,
-        index,
-        turn: 0,
+        busy,
         requests: 0,
         slots: Vec::new(),
         free: Vec::new(),
@@ -497,10 +659,7 @@ struct Loop {
     /// Connections handed to this instance.
     inbox: Arc<Inbox>,
     /// Every instance's inbox, for the one that listens (empty when alone).
-    instances: Vec<Arc<Inbox>>,
-    index: usize,
-    /// The instance the next connection goes to.
-    turn: usize,
+    busy: Arc<Busy>,
     /// Requests started, for their numbers.
     requests: usize,
     slots: Vec<Slot>,
@@ -641,20 +800,7 @@ impl Loop {
         loop {
             let Some(listener) = &self.listener else { return };
             match listener.accept() {
-                Ok((stream, peer)) => {
-                    // With several instances, each gets the next one in turn.
-                    if !self.instances.is_empty() {
-                        let to = self.turn % self.instances.len();
-                        self.turn += 1;
-                        if to != self.index {
-                            let inbox = &self.instances[to];
-                            lock(&inbox.conns).push((stream, peer));
-                            let _ = inbox.waker.wake();
-                            continue;
-                        }
-                    }
-                    self.adopt(stream, peer);
-                }
+                Ok((stream, peer)) => self.adopt(stream, peer),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -923,7 +1069,11 @@ impl Loop {
         let Some(r) = self.tasks[id].as_mut() else { return };
         let outer = crate::stack::switch(r.limit);
         REQUEST.with(|c| c.set(r.request));
+        self.busy.request.store(r.request, SeqCst);
+        self.busy.since.store(clock(), SeqCst);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.task.resume(())));
+        self.busy.since.store(0, SeqCst);
+        self.busy.over.store(false, SeqCst);
         r.limit = crate::stack::switch(outer);
         YIELDER.with(|c| c.set(0));
         match res {

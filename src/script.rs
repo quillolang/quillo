@@ -57,7 +57,7 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
                     todo.push((x, depth + 1));
                 }
             }
-            Value::Err(x) => todo.push((x, depth + 1)),
+            Value::Err(x, _) => todo.push((x, depth + 1)),
             _ => n += 8,
         }
         if n > SCRIPT_BYTES {
@@ -104,9 +104,9 @@ fn bad(what: &str) -> Value {
 /// What a script may not contain, if anything.
 fn forbidden_stmt(s: &Stmt) -> Option<&'static str> {
     match s {
-        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e)) => forbidden(e),
+        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e), _) => forbidden(e),
         Stmt::SetField(o, _, _, e, _) => forbidden(o).or_else(|| forbidden(e)),
-        Stmt::Return(None) => None,
+        Stmt::Return(None, _) => None,
         Stmt::Fn(_) => Some("a script cannot define functions (use `(x) => ...`)"),
         Stmt::Route(_) | Stmt::Mount(..) => Some("a script cannot define routes"),
         Stmt::Service(..) => Some("a script cannot call services"),

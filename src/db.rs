@@ -260,6 +260,11 @@ pub struct TenantDbs {
     open: Mutex<indexmap::IndexMap<String, Arc<Backend>>>,
     /// The migrations each is brought up to date with when opened.
     migrations: Mutex<Option<std::path::PathBuf>>,
+    /// `?open_tenants=N` in a server's URL: how many are kept open, in place of
+    /// `OPEN_PG_TENANTS`, as a SaaS passes 16 customers early and each past it connects
+    /// again. Connections are not shared between tenants: they keep statements prepared
+    /// against one schema (FEEDBACK20.md, Q-168; branch feedback20-fixes).
+    most_open: Option<usize>,
 }
 
 /// Where a tenant's database is: `{tenant}` in a path or URL, or what a
@@ -271,7 +276,11 @@ enum Target {
 
 impl TenantDbs {
     fn new(target: Target) -> TenantDbs {
-        TenantDbs { target, open: Mutex::new(Default::default()), migrations: Mutex::new(None) }
+        let most_open = match &target {
+            Target::Text(t) => t.split_once('?').and_then(|(_, q)| q.split('&').find_map(|p| p.strip_prefix("open_tenants=")?.parse().ok())),
+            Target::Fn(_) => None,
+        };
+        TenantDbs { target, open: Mutex::new(Default::default()), migrations: Mutex::new(None), most_open }
     }
 
     fn template(&self) -> Option<&str> {
@@ -320,7 +329,7 @@ fn db_err(e: impl std::fmt::Display) -> Value {
 /// words itself (FEEDBACK5.md, Q-053; branch stays-fixes).
 fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
     let kind = match args.first() {
-        Some(Value::Err(e)) => match &**e {
+        Some(Value::Err(e, _)) => match &**e {
             Value::Str(s) => s.strip_prefix("db: ").and_then(kind_of),
             _ => None,
         },
@@ -333,6 +342,15 @@ fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
 fn kind_of(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| m.contains(w));
+    // MariaDB's own words, for a failed check (4025) and for a row changed since the
+    // snapshot (1020), which a transaction retries on (FEEDBACK16.md, Q-122; branch
+    // feedback20-fixes).
+    if has(&["record has changed since last read", "(1020)"]) {
+        return Some("conflict");
+    }
+    if m.contains("constraint `") && m.contains(" failed for ") || m.contains("(4025)") {
+        return Some("check");
+    }
     if has(&["unique constraint failed", "violates unique constraint", "duplicate entry", "(1062)"]) {
         Some("unique")
     } else if has(&["foreign key constraint failed", "violates foreign key constraint", "a foreign key constraint fails", "(1451)", "(1452)"]) {
@@ -438,11 +456,8 @@ fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
 /// default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    match slot {
-        Some(DbSlot::One(b)) => return Ok(b),
-        Some(DbSlot::PerTenant(t)) => return tenant_backend(it, &t),
-        Some(DbSlot::Shards(_)) => return Err("the program's database cannot be shards".into()),
-        None => {}
+    if let Some(slot) = slot {
+        return backend_in(it, slot);
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
     if target.contains("{tenant}") {
@@ -451,10 +466,19 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
         return tenant_backend(it, &t);
     }
     let b = Arc::new(open_backend(it, &target)?);
-    let mut slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match slot.get_or_insert(DbSlot::One(b)) {
-        DbSlot::One(b) => Ok(b.clone()),
-        _ => unreachable!("set just above"),
+    // Opening is done outside the lock, so another request's `db.open` may have got here
+    // first, with a database per tenant: that is the program's, and this one is let go
+    // (FEEDBACK19.md, Q-159; branch feedback20-fixes).
+    let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(DbSlot::One(b)).clone();
+    backend_in(it, slot)
+}
+
+/// The database a slot of the program's gives.
+fn backend_in(it: &mut Interp, slot: DbSlot) -> Result<Arc<Backend>, String> {
+    match slot {
+        DbSlot::One(b) => Ok(b),
+        DbSlot::PerTenant(t) => tenant_backend(it, &t),
+        DbSlot::Shards(_) => Err("the program's database cannot be shards".into()),
     }
 }
 
@@ -472,20 +496,37 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
             return Ok(open[last].clone());
         }
     }
-    let target = tenant_target(it, dbs, &name)?;
+    let no_such = |it: &mut Interp| {
+        // Asked for by the host, so not the program's mistake: see `Interp::handle`
+        // (FEEDBACK20.md, Q-167; branch feedback20-fixes).
+        it.no_such_tenant = true;
+        format!("there is no tenant {:?}: new_tenant({:?}, ...) makes its database", &*name, &*name)
+    };
+    let target = match tenant_target_or_none(it, dbs, &name)? {
+        Some(t) => t,
+        None if it.tenant_named => return Err(format!("tenant {}: the function for tenants' databases gave null, not a path or a URL", name)),
+        None => return Err(no_such(it)),
+    };
     // A request's host can name any tenant, so only the program makes one
-    // (`with_tenant`, when signing a tenant up): made-up names make nothing.
+    // (`new_tenant`, when signing a tenant up): made-up names make nothing.
     let make = it.tenant_named;
     if !is_server_url(&target) && target != ":memory:" {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
         if !make && !full.exists() {
-            return Err(format!("there is no tenant {:?}: with_tenant({:?}, ...) makes its database", &*name, &*name));
+            return Err(no_such(it));
         }
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
     }
-    let b = Arc::new(open_backend_as(it, &target, make).map_err(|e| format!("tenant {}: {}", name, e))?);
+    // A server that is down stays an error; only a schema or a database that is not there
+    // means no such tenant.
+    let b = match open_backend_as(it, &target, make) {
+        Err(e) if !make && (e.contains("there is no schema") || e.contains("Unknown database") || (e.contains("database") && e.contains("does not exist"))) => {
+            return Err(no_such(it));
+        }
+        b => Arc::new(b.map_err(|e| format!("tenant {}: {}", name, e))?),
+    };
     let is_default = matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
     let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
     if let Some(dir) = dir {
@@ -497,20 +538,45 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
     }
     let mut open = dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Each open server tenant keeps connections (a few each).
-    let most = if is_server_url(&target) { OPEN_PG_TENANTS } else { OPEN_TENANTS };
+    let most = if is_server_url(&target) { dbs.most_open.unwrap_or(OPEN_PG_TENANTS) } else { OPEN_TENANTS };
     while open.len() >= most {
         open.shift_remove_index(0);
     }
     Ok(open.entry(name.to_string()).or_insert(b).clone())
 }
 
-/// Where tenant `name`'s database is: its template filled in, or what the
-/// function gives for it (which may not use that database itself).
-fn tenant_target(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> Result<String, String> {
-    match tenant_target_or_none(it, dbs, name)? {
-        Some(t) => Ok(t),
-        None => Err(format!("tenant {}: the function for tenants' databases gave null, not a path or a URL", name)),
-    }
+/// Makes tenant `name`'s database, and says false when there is one already, in one step
+/// on each kind of database, so that of two signups for one name only one makes it
+/// (FEEDBACK20.md, Q-165; branch feedback20-fixes).
+pub(crate) fn claim_tenant(it: &mut Interp, name: &str, line: u32) -> Result<bool, Ctrl> {
+    let dbs = per_tenant(it, None, "new_tenant", line)?;
+    let target = match tenant_target_or_none(it, &dbs, name) {
+        Ok(Some(t)) => t,
+        Ok(None) => return fail(line, format!("`new_tenant`: the function for tenants' databases gave null for {:?}", name)),
+        Err(e) => return fail(line, format!("`new_tenant`: {}", e)),
+    };
+    let made = if pg::is_url(&target) {
+        it.unlocked(move || pg::Pool::claim(&target))
+    } else if is_mysql_url(&target) {
+        #[cfg(feature = "mysql")]
+        let r = it.unlocked(move || crate::my::Pool::claim(&target));
+        #[cfg(not(feature = "mysql"))]
+        let r = Err("this Quillo was built without MySQL (cargo build --features mysql)".to_string());
+        r
+    } else if target == ":memory:" {
+        Ok(true)
+    } else {
+        let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+        if let Some(dir) = full.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&full) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(format!("{}: {}", full.display(), e)),
+        }
+    };
+    made.or_else(|e| fail(line, format!("`new_tenant`: {}", e)))
 }
 
 /// `tenant_target`; None when the function gives null (no such tenant).
@@ -534,7 +600,7 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
     match r {
         Ok(Value::Str(s)) | Err(Ctrl::Return(Value::Str(s))) => Ok(Some(s.to_string())),
         Ok(Value::Nil) | Err(Ctrl::Return(Value::Nil)) => Ok(None),
-        Ok(Value::Err(e)) => Err(format!("tenant {}: {}", name, e.display())),
+        Ok(Value::Err(e, _)) => Err(format!("tenant {}: {}", name, e.display())),
         Ok(other) => Err(format!("tenant {}: the function for tenants' databases gave {}, not a path or a URL", name, other.type_name())),
         Err(Ctrl::Error(e)) => Err(format!("tenant {}: {}", name, e.msg)),
         Err(_) => Err(format!("tenant {}: the function for tenants' databases did not give a path or a URL", name)),
@@ -565,8 +631,10 @@ pub(crate) fn checkout_for_tx(it: &mut Interp, b: &Arc<Backend>) -> Result<Pinne
             return Err(pool.none_free());
         }
         // Made inside the future: a timer belongs to the runtime that runs it.
+        // Outside a request the lock is let go for it: whoever holds the connection needs
+        // it to finish (FEEDBACK16.md, Q-134; branch feedback20-fixes).
         if crate::httpd::await_elsewhere(Box::pin(async move { tokio::time::sleep(pause).await })).is_none() {
-            std::thread::sleep(pause);
+            it.unlocked(move || std::thread::sleep(pause));
         }
         pause = (pause * 2).min(std::time::Duration::from_millis(50));
     }
@@ -1529,7 +1597,7 @@ pub(crate) fn attempt(
         Ok(b) => b,
         Err(e) => return (Ok(db_err(e)), false),
     };
-    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
+    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(..)));
     let nested_isolation = || fail(line, "a transaction inside another cannot change its isolation: give it to the outermost one");
     match &*b {
         Backend::Sqlite(m) => {
@@ -1556,7 +1624,9 @@ pub(crate) fn attempt(
                 (false, false) => "rollback to quillo_tx; release quillo_tx",
             };
             let ended = run(end);
-            if ended.is_err() && immediate && commit {
+            // The outermost `release` is a commit, and one that fails leaves the transaction
+            // open, as `commit` does (FEEDBACK16.md, Q-108; branch feedback20-fixes).
+            if ended.is_err() && outermost && commit {
                 let _ = run("rollback");
             }
             tx_end(it, mark, commit && ended.is_ok());
@@ -1939,7 +2009,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         None => it.call(&f, Vec::new(), line),
         Some(e) => Ok(db_err(e)),
     };
-    let ok = failed.is_none() && matches!(&r, Ok(v) if !matches!(v, Value::Err(_)));
+    let ok = failed.is_none() && matches!(&r, Ok(v) if !matches!(v, Value::Err(..)));
     let outcome = if ok { commit_parts(it, &mut parts, &sys, &gid) } else { Err(String::new()) };
     if outcome.is_err() {
         abort_parts(it, &mut parts, &begun);

@@ -1,7 +1,7 @@
 // Q-113 `math.fsum([1e308, 1e308])` gives 0.0, and `fsum([inf, -inf])` gives NaN; both are errors in Python, which the guide says this follows
 // mode: run
 // open-when: /0\.0/
-// fixed-when: /rror/
+// fixed-when: too large for a float
 // From FEEDBACK16.md §Q-113 (found on b28e689).
 
 print(math.fsum([1e308, 1e308]))

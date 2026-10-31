@@ -1,7 +1,6 @@
 // Q-136 `type Ids = list<int>` at the end of a line does not parse: the newline after `>` is taken as a continuation
 // mode: check
 // open-when: expected end of statement
-// fixed-when: main ok
 // fixed-when: ok (
 // From FEEDBACK16.md §Q-136 (found on b28e689).
 

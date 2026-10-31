@@ -65,7 +65,7 @@ pub fn runs_by_itself(e: &Expr) -> bool {
 
 fn stmt_runs_by_itself(s: &Stmt) -> bool {
     match s {
-        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) | Stmt::Return(Some(e)) => runs_by_itself(e),
+        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) | Stmt::Return(Some(e), _) => runs_by_itself(e),
         _ => false,
     }
 }

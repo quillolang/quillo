@@ -1,0 +1,11 @@
+// Q-167 A made-up subdomain is a 500 that names `with_tenant`, where a site with no such customer would say 404: every scanner fills the error log, and the status tells who is a tenant
+// mode: script
+// script: steps.sh
+// open-when: there is no tenant
+// fixed-when: unknown tenant: 404
+// From FEEDBACK20.md §Q-167 (found on 9e8c2fb).
+
+tenant_from("example.com")
+db.open("data/{tenant}.db")
+
+route GET / = db.query("select 1 as one")

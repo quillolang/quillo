@@ -122,6 +122,8 @@ pub struct Interp {
     /// Whether the program named the tenant (`with_tenant`), rather than a
     /// request's host: only then may its database be made.
     pub tenant_named: bool,
+    /// This request asked a tenant's database that is not there (see `tenant_backend`).
+    pub no_such_tenant: bool,
     /// The current request's body when it carries files (see `upload`).
     pub upload_body: Option<Arc<[u8]>>,
     /// `Set-Cookie` lines for the response being made (see `session`).
@@ -608,7 +610,7 @@ fn render_value(v: &Value, out: &mut String) {
         }
         Value::Str(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
-        other => escape_into(&other.display(), out),
+        other => escape_into(&crate::server::hidden(other).as_ref().unwrap_or(other).display(), out),
     }
 }
 
@@ -617,7 +619,7 @@ fn script_value(v: &Value, out: &mut String) {
     match v {
         Value::Nil | Value::Bool(false) => {}
         Value::Html(h) => out.push_str(&h.replace("</", "<\\/").replace("<!--", "<\\!--")),
-        other => out.push_str(&script_json(&other.to_json())),
+        other => out.push_str(&script_json(&crate::server::hidden(other).as_ref().unwrap_or(other).to_json())),
     }
 }
 
@@ -634,7 +636,7 @@ pub fn script_json(j: &serde_json::Value) -> String {
 /// into an error value, its decimal and a BigInt.
 pub fn island_json(v: &Value) -> serde_json::Value {
     match v {
-        Value::Err(e) => serde_json::json!({ "$quillo_err": island_json(e) }),
+        Value::Err(e, _) => serde_json::json!({ "$quillo_err": island_json(e) }),
         Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
         Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
@@ -674,7 +676,7 @@ pub fn not_sendable(v: &Value) -> Option<&'static str> {
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
         Value::Html(_) => Some("html"),
         Value::Response(_) => Some("a response"),
-        Value::Err(e) => not_sendable(e),
+        Value::Err(e, _) => not_sendable(e),
     }
 }
 
@@ -801,7 +803,10 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                     BinOp::Sub => x.checked_sub(y),
                     BinOp::Mul => x.checked_mul(y),
                     BinOp::Div => x.checked_div(y),
-                    _ => x.checked_rem(y),
+                    // Nothing is left over from dividing the smallest int by -1,
+                    // which `checked_rem` calls an overflow (FEEDBACK16.md, Q-146;
+                    // branch feedback20-fixes).
+                    _ => Some(x.wrapping_rem(y)),
                 };
                 return r.map(Int).ok_or_else(overflow);
             }
@@ -872,6 +877,7 @@ impl Interp {
             site: Arc::new(crate::site::Site::default()),
             tenant: None,
             tenant_named: false,
+            no_such_tenant: false,
             request_id: None,
             deadline: None,
             upload_body: None,
@@ -955,6 +961,7 @@ impl Interp {
             site: self.site.clone(),
             tenant: None,
             tenant_named: false,
+            no_such_tenant: false,
             request_id: None,
             deadline: None,
             upload_body: None,
@@ -1604,12 +1611,18 @@ impl Interp {
                 }
                 let mut r = Ok(Value::Nil);
                 for s in stmts.iter() {
-                    if let Err(e) = self.exec_stmt(s, &g) {
-                        r = Err(match e {
-                            Ctrl::Error(e) => Ctrl::Error(e.in_file(&fname)),
-                            other => other,
-                        });
-                        break;
+                    match self.exec_stmt(s, &g) {
+                        Ok(_) => {}
+                        // `return` at a file's top level leaves that file, not the one
+                        // that used it (FEEDBACK16.md, Q-109; branch feedback20-fixes).
+                        Err(Ctrl::Return(_)) => break,
+                        Err(e) => {
+                            r = Err(match e {
+                                Ctrl::Error(e) => Ctrl::Error(e.in_file(&fname)),
+                                other => other,
+                            });
+                            break;
+                        }
                     }
                 }
                 if debugging {
@@ -1699,7 +1712,7 @@ impl Interp {
                 define(env, name, v);
                 Ok(Value::Nil)
             }
-            Stmt::Return(e) => {
+            Stmt::Return(e, _) => {
                 let v = match e {
                     Some(e) => self.eval(e, env)?,
                     None => Value::Nil,
@@ -1746,7 +1759,7 @@ impl Interp {
             }
             Expr::Coalesce(a, b) => {
                 let v = self.eval(a, env)?;
-                if matches!(v, Value::Nil | Value::Err(_)) {
+                if matches!(v, Value::Nil | Value::Err(..)) {
                     self.eval(b, env)
                 } else {
                     Ok(v)
@@ -1792,7 +1805,7 @@ impl Interp {
             }
             Expr::Try(x) => {
                 let v = self.eval(x, env)?;
-                if let Value::Err(_) = v {
+                if let Value::Err(..) = v {
                     Err(Ctrl::Return(v))
                 } else {
                     Ok(v)
@@ -1818,6 +1831,7 @@ impl Interp {
             Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line, true),
             Expr::While(cond, body, line) => {
                 while self.eval(cond, env)?.truthy() {
+                    self.within_limit(*line)?;
                     if self.fuel != u64::MAX {
                         self.burn(*line)?;
                     }
@@ -1854,7 +1868,7 @@ impl Interp {
     fn eval_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Value, Ctrl> {
         // A block that declares nothing runs in the scope around it: the
         // same names mean the same, with no scope to make (a loop's body).
-        let declares = !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(_)));
+        let declares = !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..)));
         let scope = if declares { Scope::child(env) } else { env.clone() };
         let mut last = Value::Nil;
         let n = stmts.len();
@@ -1895,6 +1909,16 @@ impl Interp {
             m.insert(k.into(), v);
         }
         self.script_made(Value::map(m), 0)
+    }
+
+    /// A step of a loop or a call: `--max-compute` ends a request here, between statements,
+    /// so nothing is left half done (FEEDBACK20.md, Q-163; branch feedback20-fixes).
+    #[inline]
+    fn within_limit(&mut self, line: u32) -> Result<(), Ctrl> {
+        if crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time() {
+            return fail(line, "this request computed for longer than --max-compute allows");
+        }
+        Ok(())
     }
 
     /// `v`, unless a sandboxed script made it too big; a script also pays
@@ -2096,6 +2120,7 @@ impl Interp {
     /// One step of a loop: `item` bound by `pat` in a scope of its own (the
     /// last step's again, when nothing kept it), and the body's value.
     fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, line: u32) -> Result<Value, Ctrl> {
+        self.within_limit(line)?;
         if self.fuel != u64::MAX {
             self.burn(line)?;
         }
@@ -2264,7 +2289,7 @@ impl Interp {
                 }
                 _ => {}
             },
-            Value::Err(e) if name == "error" => return Ok((**e).clone()),
+            Value::Err(e, _) if name == "error" => return Ok((**e).clone()),
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
@@ -2321,12 +2346,13 @@ impl Interp {
 
     /// `args[i] == None` means "not given": the parameter's default is used.
     pub fn call_closure(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        self.within_limit(line)?;
         if self.fuel != u64::MAX {
             self.burn(line)?;
         }
         // Numbers in, a number out: in machine code once it is called again.
         #[cfg(feature = "jit")]
-        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() {
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
             if let Some(r) = crate::jit::call(c, &args, self.depth) {
                 return in_file(r, &c.def.file);
             }
@@ -2367,7 +2393,7 @@ impl Interp {
             self.allowed = a;
         }
         let r = r?;
-        if let (Some(ety), Value::Err(payload)) = (&def.err, &r) {
+        if let (Some(ety), Value::Err(payload, _)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
                 return in_file(fail(
                     def.line,
@@ -2519,7 +2545,7 @@ impl Interp {
         };
         Scope::done(scope);
         if let Some(ty) = &def.ret {
-            if !matches!(r, Value::Err(_)) {
+            if !matches!(r, Value::Err(..)) {
                 if let Err(why) = crate::record::fits(&self.types, ty, &r, false) {
                     return fail(
                         def.line,
@@ -2918,6 +2944,13 @@ impl Interp {
                             if f.pat.is_type_test() {
                                 binds.push((f.path.last().unwrap().clone(), d));
                                 continue;
+                            }
+                            // The same, under a name of its own (see `privacy`).
+                            if let Pattern::As(q, n) = &f.pat {
+                                if q.is_type_test() {
+                                    binds.push((n.clone(), d));
+                                    continue;
+                                }
                             }
                             d
                         }
@@ -3486,8 +3519,8 @@ impl Interp {
         let data = format!(
             " data-c=\"{}\" data-p=\"{}\" data-s=\"{}\"{}{}{}",
             escape(tag),
-            escape(&island_json(&Value::map(props)).to_string()),
-            escape(&island_json(&Value::map(state)).to_string()),
+            escape(&island_json(&crate::server::for_visitor(Value::map(props))).to_string()),
+            escape(&island_json(&crate::server::for_visitor(Value::map(state))).to_string()),
             live_attrs,
             if eager { " data-e" } else { "" },
             extra

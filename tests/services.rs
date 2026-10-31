@@ -634,7 +634,7 @@ fn what_a_service_publishes_goes_back_with_its_answer() {
     // Nothing published: the answer is as it always was.
     assert_eq!(call("quiet", "[]"), (200, r#"{"ok":1}"#.to_string()));
     // Published in a transaction that rolled back: not sent.
-    assert_eq!(call("undone", "[7]"), (200, r#"{"err":"rolled back"}"#.to_string()));
+    assert_eq!(call("undone", "[7]"), (200, r#"{"err":"rolled back","own":true}"#.to_string()));
 }
 
 /// A file the app and one of its services both `use` runs in each, whichever

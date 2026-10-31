@@ -276,12 +276,12 @@ pub fn construct(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, 
         None => Value::Nil,
     };
     if td.is_record() && !matches!(v, Value::Map(_)) {
-        return Ok(Value::err(Value::str(format!("{}: expects a map of its fields, got {} {}", name, v.type_name(), short(&v)))));
+        return Ok(Value::own_err(Value::str(format!("{}: expects a map of its fields, got {} {}", name, v.type_name(), short(&v)))));
     }
     let ty = Ty { names: vec![name.clone()], optional: false, elem: None, fields: None };
     Ok(match make(it, &ty, &v, false)? {
         Ok(x) => x,
-        Err(w) => Value::err(Value::str(match w.here(&td.ty, &v).text() {
+        Err(w) => Value::own_err(Value::str(match w.here(&td.ty, &v).text() {
             Some(t) => format!("{}: {}", name, t),
             None => format!("{}: must be {}, got {} {}", name, td.ty.text(), v.type_name(), short(&v)),
         })),

@@ -183,7 +183,6 @@ fn errors_mariadb_gives_have_kinds() {
 }
 
 #[test]
-#[ignore = "finding: db.error_kind does not know MariaDB's failed check: `CONSTRAINT ... failed` (4025)"]
 fn a_failed_check_on_mariadb_is_a_check() {
     let Some(s) = server() else { return };
     let mut it = program("check", &s.url("check"), "db.exec(\"create table p (c int check (c > 0))\")\n");
@@ -191,7 +190,6 @@ fn a_failed_check_on_mariadb_is_a_check() {
 }
 
 #[test]
-#[ignore = "finding: db.error_kind does not know MariaDB's snapshot conflict (1020), though a transaction retries on it"]
 fn a_row_changed_since_the_snapshot_is_a_conflict() {
     let Some(s) = server() else { return };
     let src = format!("let other = db.connect(\"{}?pool_min=1&pool_max=9\")\ndb.exec(\"create table t (n int primary key)\")\ndb.exec(\"insert into t values (1)\")\n", s.url("snapshot"));

@@ -95,7 +95,6 @@ fn what_cannot_be_exported_says_why() {
 }
 
 #[test]
-#[ignore = "finding: the `;` of an array type ends the signature, so `pub fn f(x: [u8; 4])` is neither exported nor reported"]
 fn an_array_parameter_is_exported_or_said_not_to_be() {
     let p = native::parse("pub fn f(x: [u8; 4]) -> i64 { 1 }");
     assert_eq!(p.exports.len() + p.problems.len(), 1, "{:?}", p);

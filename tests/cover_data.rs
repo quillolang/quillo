@@ -653,7 +653,6 @@ fn slow_proxy(to: u16, delay: Duration) -> u16 {
 }
 
 #[test]
-#[ignore = "finding: `unreachable!` at src/db.rs:457 is reached: the first query opens $QUILLO_DB outside the lock, and a `db.open(\"t/{tenant}.db\")` by another request meanwhile leaves a per-tenant slot there, so the first request panics and gets a 500"]
 fn tenants_opened_while_the_default_database_opens() {
     let Some(pg) = support::postgres("cover-open") else { return };
     let pg_port: u16 = pg.url.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
@@ -721,7 +720,6 @@ fn a_query_that_fails_unexpectedly_is_an_error_value_and_the_server_goes_on() {
 }
 
 #[test]
-#[ignore = "finding: src/pg.rs decodes INTERVAL with `us.abs()`, which overflows on the smallest interval: `select interval '-2562047788:00:54.775808'` panics in a debug build and gives wrong text in a release one"]
 fn the_smallest_interval_is_read_as_it_is() {
     let Some(pg) = support::postgres("cover-interval2") else { return };
     let f = interval_app("interval2", &pg);

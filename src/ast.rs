@@ -304,6 +304,10 @@ pub struct HtmlEl {
     pub attrs: Vec<(String, AttrVal)>,
     pub children: Vec<HtmlChild>,
     pub line: u32,
+    /// The lines where its text has a `$` right before a `{`, as a template's
+    /// `${name}` is written, for `quillo check` to ask about: once parsed, `$` is
+    /// text like `{"$"}`, which means it (FEEDBACK20.md, Q-170; branch feedback20-fixes).
+    pub dollars: Vec<u32>,
     /// What rendering needs to know of it, worked out when it is parsed.
     pub facts: ElFacts,
 }
@@ -431,7 +435,9 @@ pub enum Stmt {
     /// ...` says how the page takes it (see `LibOptions`; branch library-hints); a
     /// module's `use * as THREE` is the name `"*"`.
     Use(String, Option<Vec<(String, String)>>, u32, LibOptions),
-    Return(Option<Expr>),
+    /// With its line: a bare `return` has no expression to tell it
+    /// (FEEDBACK16.md, Q-138; branch feedback20-fixes).
+    Return(Option<Expr>, u32),
     /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
     State(String, Expr, u32),
     /// `mount /prefix = "app.qwe"`: another program, served under the prefix.

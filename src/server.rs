@@ -260,6 +260,7 @@ impl Interp {
         self.deferred.clear();
         self.tenant = None;
         self.tenant_named = false;
+        self.no_such_tenant = false;
         self.upload_body = None;
         self.set_cookies.clear();
         self.session = None;
@@ -284,6 +285,12 @@ impl Interp {
             }
         }
         self.prefetching = None;
+        // A host that names no customer is a page that is not there, where the route met
+        // that and did not answer for itself. A route that needs no database still
+        // answers, as `www.example.com` does (FEEDBACK20.md, Q-167; branch feedback20-fixes).
+        if self.no_such_tenant && resp.status >= 500 {
+            resp = plain(404, "not found\n");
+        }
         // A streamed answer: its function, for the server to run after the
         // head; or, with no server to, run now into the body.
         if resp.header(crate::stream::MARK).is_some() {
@@ -862,9 +869,9 @@ impl Interp {
             let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
             self.current_request = None;
             return match res {
-                Ok(v) | Err(Ctrl::Return(v)) => match v {
+                Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                     Value::Response(r) => render_response(&r),
-                    Value::Err(e) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
+                    Value::Err(e, _) => json_response(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
                     v => json_response(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
                 },
                 Err(Ctrl::Reply(r)) => render_response(&r),
@@ -913,9 +920,9 @@ impl Interp {
                 self.shared.track(&topics);
                 self.current_request = None;
                 let answer = Arc::new(match res {
-                    Ok(v) | Err(Ctrl::Return(v)) => match v {
+                    Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
                         Value::Response(r) => return render_response(&r),
-                        Value::Err(e) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
+                        Value::Err(e, _) => crate::livecache::Answer::new(crate::interp::island_json(&e), true),
                         v => crate::livecache::Answer::new(crate::interp::island_json(&v), false),
                     },
                     Err(Ctrl::Reply(r)) => return render_response(&r),
@@ -1226,6 +1233,50 @@ fn script_tag_for(body: &[u8], path: &[u8]) -> bool {
     false
 }
 
+/// Whether a value has an error in it that a visitor is not to read, at any depth.
+fn holds_hidden_error(v: &Value) -> bool {
+    match v {
+        Value::Err(e, own) => !own || holds_hidden_error(e),
+        Value::List(l) => l.iter().any(holds_hidden_error),
+        Value::Map(m) => m.iter().any(|(_, x)| holds_hidden_error(x)),
+        _ => false,
+    }
+}
+
+fn without_hidden_errors(v: &Value) -> Value {
+    match v {
+        Value::Err(e, false) => {
+            let text = e.display();
+            // Anyone can try a subdomain: that is not worth a line each.
+            if !text.starts_with("db: there is no tenant") {
+                crate::httpd::error_line(&text);
+            }
+            Value::err(Value::str("internal error"))
+        }
+        Value::Err(e, true) => Value::own_err(without_hidden_errors(e)),
+        Value::List(l) => Value::list(l.iter().map(without_hidden_errors).collect()),
+        Value::Map(m) => Value::map(m.iter().map(|(k, x)| (k.clone(), without_hidden_errors(x))).collect()),
+        other => other.clone(),
+    }
+}
+
+/// What a visitor may see of `v`, when that is less than `v`: an error a builtin made says
+/// `internal error`, and its text, a database's SQL or an address with its key, goes to the
+/// log. `err(...)` written by the program is meant to be read and stays. Its author sees
+/// all of it under `--watch`, and services, which are the program's own, get it whole
+/// (FEEDBACK20.md, Q-161, and FEEDBACK21.md, Q-171; branch feedback20-fixes).
+pub fn hidden(v: &Value) -> Option<Value> {
+    if SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) || !holds_hidden_error(v) {
+        return None;
+    }
+    Some(without_hidden_errors(v))
+}
+
+/// `hidden`, for a value owned here.
+pub fn for_visitor(v: Value) -> Value {
+    hidden(&v).unwrap_or(v)
+}
+
 /// Turns what a route produced into an HTTP response.
 pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
     match res {
@@ -1234,7 +1285,7 @@ pub fn finish(res: Result<Value, Ctrl>) -> HttpResponse {
         Err(Ctrl::Error(e)) => {
             // A prefetch stopped before it changed something is expected.
             if !e.msg.contains(crate::interp::PREFETCH_REFUSED) {
-                eprintln!("quillo: error: {}", e);
+                crate::httpd::error_line(&e.to_string());
             }
             // The message names files and lines of the program; it is for
             // its author (`--watch`), not for whoever sent the request.
@@ -1293,9 +1344,14 @@ fn value_response(v: Value) -> HttpResponse {
     match v {
         Value::Response(r) => render_response(&r),
         other => {
+            // So that no 500 is without a reason in the log (FEEDBACK21.md, Q-171; branch
+            // feedback20-fixes).
+            if let Value::Err(e, true) = &other {
+                crate::httpd::error_line(&e.display());
+            }
             let status = match &other {
                 Value::Nil => 204,
-                Value::Err(_) => 500,
+                Value::Err(..) => 500,
                 _ => 200,
             };
             render_response(&Response { status, headers: Vec::new(), body: Body::Value(other) })
@@ -1321,7 +1377,7 @@ fn render_response(r: &Response) -> HttpResponse {
             Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
             other => {
                 let mut out = Vec::new();
-                other.json_into(&mut out);
+                hidden(other).as_ref().unwrap_or(other).json_into(&mut out);
                 (Some("application/json"), out)
             }
         },
@@ -1985,6 +2041,7 @@ impl Worker {
         }
         // The request's id: given (another service calling, a proxy), or made.
         let rid = crate::service::request_id(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-request-id")).map(|(_, v)| v.as_str()));
+        crate::httpd::request_began(format!("{} {} (rid {})", req.method, log_url(&req.url), rid));
         let mut resp = if app.watch && req.url == "/_quillo/dev" {
             plain(200, &self.generation.to_string())
         } else {
@@ -2007,6 +2064,7 @@ impl Worker {
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
+        crate::httpd::request_done();
         if !resp.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-request-id")) {
             resp.headers.push(("x-request-id".into(), rid.to_string()));
         }

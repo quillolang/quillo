@@ -32,6 +32,7 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1) |
 | `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
 | `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
+| `--max-compute 2s` | end a request that computes this long without letting go, as a 500 (see Concurrency) |
 | `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency); not with `--watch`, `--register` or `--split` |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
@@ -254,7 +255,9 @@ Most expressions read as they would in JavaScript. The differences:
   `{ ...m, name: v }`, `[...xs, 3]`; `...null` spreads nothing.
 - Named functions are `fn name(params) = expr` or `fn name(params) { ... }`; anonymous
   ones are arrows, which may declare a return type too (`(x: int): int => x * 2`).
-  Blocks give back their last expression, so `return` is only for leaving early. A call
+  Blocks give back their last expression, so `return` is only for leaving early (at the
+  top level of a `use`d file it leaves that file). Of two elements side by side, the
+  first goes nowhere and `quillo check` warns: wrap them in one element. A call
   gives every parameter without a default, and no more: `f(1, 2)` for a one-parameter
   `f` is an error, as is a missing one. A default is worked out at each call, in order,
   and may use the parameters before it (`fn page(n, size = n * 10)`).
@@ -570,7 +573,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 
 - Text follows JSX's rules: each line is trimmed, blank lines are dropped and the rest
   are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
-  for a brace.
+  for a brace. A `$` is text too, so `${name}` shows a `$` before the value, and
+  `quillo check` asks: write `{name}`, or `{"$"}{name}` for a price.
 - `.class` and `#id` shorthand, with `{}` interpolation in the name. A class may hold
   `:` before a letter or digit and `/` before a digit, as Tailwind's do:
   `<em.hover:underline>`, `<div.md:flex.w-1/2>`.
@@ -2032,6 +2036,17 @@ fn touch() {
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
 
+- An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
+  made says `internal error` instead, wherever it would reach a visitor: as a route's
+  value, inside a map or list, in markup, or from a `server fn`. A database's has the SQL
+  and the tables, an `http` call's the address with its key, a file's its path, so that
+  text goes to the log. `--watch` shows it, and code on the server still reads it:
+  `db.error_kind(r)`, `is_err(r)`, `error(r)`. To show a visitor something, say it:
+  `err("Billing is down, try again soon")`. A service's own `err` reaches its caller's
+  visitors in the same way.
+- A failed request's line in the log names it, with the id in its `x-request-id`:
+  `quillo: error: GET /checkout (rid 1cf61931): main.qwe:8: division by zero`. Under
+  `--log json` it is an object, with `level`, `request` and `error`.
 - `respond(status, body, headers)` takes a status from 100 to 599; header names are
   written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
@@ -2091,9 +2106,11 @@ server's code:
   go out: `file()` sends one as it is, so write what you made (a PDF, an image) under the
   program's folder and serve it from there. The body is read whole, up to `--max-body`,
   before the route runs: it cannot be read as it arrives.
-- **A time limit on a route:** none. A route that never returns holds its coroutine for
-  good (and, if it computes rather than waits, every other request on its instance; see
-  [Concurrency](#concurrency-and-reloading)). What is limited is the socket: a request
+- **A time limit on a route:** for computing, `--max-compute 2s` ends a request that
+  computes that long without letting go, as a 500; see
+  [Concurrency](#concurrency-and-reloading). A wait is not limited: a route waiting on
+  something that never comes holds its coroutine for good, and no one else. Also limited
+  is the socket: a request
   still arriving after 30 s is dropped, an idle keep-alive connection is closed after
   60 s, and a client that stops reading its answer is let go after 30 s.
 - **Rate limiting:** none for routes (a `rate_limit` builtin was removed). Count what
@@ -2921,7 +2938,7 @@ What each does at its edges, where the answer is not what another language would
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
 | `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int; `round(x, 2)` a float with at most 15 places; a decimal takes a mode (see [Decimals](#decimals)) |
-| `int(x)` | a float or decimal cut toward zero; `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
+| `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
 | `str(x)` | a whole float as `2.0`, never in exponent form (`1e16` is `10000000000000000`); a list or map as Quillo writes it (`{ a: 1, b: "x" }`); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
@@ -3887,7 +3904,8 @@ db.open("data/{tenant}.db")         // a SQLite file per tenant
 db.migrate()                        // run for each tenant's database when it is made
 
 route POST /signup { form: { name: str } } {
-    with_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
+    let made = new_tenant(name, () => db.exec("insert into settings (plan) values ('free')"))   // makes acme.db
+    if is_err(made) { reply 409 "That name is taken" }
     redirect(`https://${name}.example.com/`)
 }
 route GET / = <h1>Welcome, {tenant()}</h1>
@@ -3920,22 +3938,31 @@ route GET / = <h1>Welcome, {tenant()}</h1>
 - `db.tenants()` lists the SQLite files, the PostgreSQL schemas or the MySQL databases
   there are; for `postgres://host/app_{tenant}`, and for a function, it is an error:
   keep the list yourself.
-- A tenant's database (file or schema) is made, and migrated, the first time code runs
-  `with_tenant(name, ...)` for it, as when signing the tenant up. A request's host can
-  name any tenant, so requests only open databases that exist: `db` calls for a made-up
-  `anything.example.com` give an error, and make no file or schema.
+- `new_tenant(name, f)` is for signing up: it makes the tenant's database, migrates it and
+  runs `f` for it, or gives an error when that tenant exists, so a second signup for one
+  name cannot land in a customer's data. It is one step on the database, so of two signups
+  at once one makes it. Names such as `www` and `admin` are the program's to refuse.
+- A request's host can name any tenant, so requests only open databases that exist, and
+  make no file or schema. A request for a made-up `anything.example.com` that needs its
+  database answers 404, unless the route answers for itself; one that needs no database
+  answers as usual, so `www.example.com` can be a page of its own.
 - Each open tenant has its own connections (a pool and its shared ones, as above), so
   give PostgreSQL a small `pool_size`. At most 1,024 SQLite tenants' databases, and 16
   PostgreSQL or MySQL ones, are open at once, the least recently used closed first;
-  others are opened again when needed, their migrations run on each opening. Code that
-  runs for no tenant, such as a request to the bare domain, gets an error from `db`.
+  others are opened again when needed, their migrations run on each opening, and past
+  the limit each request connects again: 3 ms against 0.2 ms on one machine, more over
+  TLS. `?open_tenants=64` in the URL keeps that many open, at `pool_size` connections
+  each: leave room in the server's `max_connections`. Connections are never shared
+  between tenants, as they keep statements prepared against one schema. Code that runs
+  for no tenant, such as a request to the bare domain, gets an error from `db`.
 - Live updates stay within a tenant: a change to one tenant's table wakes only that
   tenant's pages, even when the tenants share one database, and a write made for no
   tenant (a job, a script) wakes none.
-- `with_tenant("acme", () => ...)` runs code for a tenant: to sign it up, or outside a
-  request, in a script or a scheduled job.
+- `with_tenant("acme", () => ...)` runs code for a tenant, making its database if there is
+  none: outside a request, in a script or a scheduled job.
 - What stays shared: global variables, one copy for the whole process, so keep a
-  tenant's data in its database (or in maps keyed by `tenant()`). Views that call
+  tenant's data in its database (or in maps keyed by `tenant()`). `quillo check` warns on a
+  function or route that writes a global in a program with `tenant_from`. Views that call
   `tenant()` or read the database are never served from the view cache. Cookies
   belong to the host they were set on, so each subdomain has its own.
 
@@ -4084,7 +4111,15 @@ million rows keeps every other request on its instance waiting until it ends. Qu
 not break into it, since that would end the promise above (a handler runs on its own
 between waits). Images, `crypto.hash_password`, files and Rust (`.qwer`) functions run off
 the loop, and sorting and `stats`, `vec` and `math` on large lists are spread over the
-cores. So put long computing in Rust (see [Rust](#rust)), or run more instances.
+cores. So put long computing in Rust (see [Rust](#rust)), or run more instances: with
+several, connections are taken on a thread of their own and go to an instance that is not
+computing, so one stuck instance holds up only the connections already on it.
+
+An instance computing for 5 s is logged, with its request. `--max-compute 2s` ends a request
+that computes that long without letting go: a 500, between two statements, so nothing is
+left half done, and a line in the log. Time spent waiting does not count. Compiled code has
+nowhere to stop, so under `--max-compute` functions are not compiled. `quillo check` warns on
+a `while` that cannot end.
 
 How long a wait may last:
 
@@ -4469,9 +4504,9 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   JSON): pass a file's path, or base64 text, instead.
 - The rest of the file is ordinary Rust: private functions, structs, `impl`s, modules,
   `use`. A `pub fn` that is generic (a written lifetime counts: `fn f<'a>`), `async`,
-  takes `&mut`, or has a type that cannot cross is not exported, and `quillo check` says
-  why. A fixed-size array, or another crate's type named `Value`, passes the check and
-  fails the build.
+  takes `&mut`, or has a type that cannot cross, as a fixed-size array cannot, is not
+  exported, and `quillo check` says why. Another crate's type named `Value` passes the
+  check and fails the build.
 - The `//! [dependencies]` lines are the file's crates, as in `Cargo.toml`: any crate
   from crates.io or git. They come first, after other `//!` lines if any; the first line
   that is not `//!` ends them. Only that table is read (no `[features]` table, no

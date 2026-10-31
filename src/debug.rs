@@ -122,8 +122,8 @@ fn rearm(st: &State) {
 pub fn stmt_line(s: &Stmt) -> Option<u32> {
     let l = match s {
         Stmt::Let(_, _, l) | Stmt::Assign(_, _, _, l) | Stmt::SetField(_, _, _, _, l) | Stmt::State(_, _, l) | Stmt::Use(_, _, l, _) => *l,
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_line(e),
-        Stmt::Return(None) | Stmt::Fn(_) | Stmt::Route(_) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) => 0,
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_line(e),
+        Stmt::Return(None, _) | Stmt::Fn(_) | Stmt::Route(_) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) => 0,
     };
     (l > 0).then_some(l)
 }
@@ -570,7 +570,7 @@ fn children(v: &Value, start: Option<u64>, count: Option<u64>) -> Vec<(String, V
             xs.iter().enumerate().skip(start).take(count).map(|(i, x)| (i.to_string(), x.clone())).collect()
         }
         Value::Map(m) => m.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-        Value::Err(x) => vec![("error".into(), (**x).clone())],
+        Value::Err(x, _) => vec![("error".into(), (**x).clone())],
         Value::Response(r) => {
             let mut out = vec![("status".to_string(), Value::Int(r.status as i64))];
             let headers = r.headers.iter().map(|(k, v)| Value::list(vec![Value::str(k), Value::str(v)])).collect();
@@ -594,7 +594,7 @@ fn variable(here: &mut Stopped, name: &str, v: &Value) -> Json {
             here.node(Node::Value(v.clone()))
         }
         Value::Map(m) if !m.is_empty() => here.node(Node::Value(v.clone())),
-        Value::Err(_) | Value::Response(_) => here.node(Node::Value(v.clone())),
+        Value::Err(..) | Value::Response(_) => here.node(Node::Value(v.clone())),
         _ => 0,
     };
     var["variablesReference"] = json!(r);
@@ -665,7 +665,7 @@ fn write_preview(v: &Value, budget: usize, out: &mut String, top: bool) {
             let left = budget.saturating_sub(out.len()).max(20);
             push_cut(out, &format!("{:?}", &**h), left);
         }
-        Value::Err(x) => {
+        Value::Err(x, _) => {
             out.push_str("err(");
             write_preview(x, budget, out, false);
             out.push(')');
@@ -719,7 +719,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<u32>) {
         out.push(l);
     }
     match s {
-        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::State(_, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e)) => walk(e, out),
+        Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::State(_, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e), _) => walk(e, out),
         Stmt::SetField(o, _, _, e, _) => {
             walk(o, out);
             walk(e, out)

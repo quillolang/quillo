@@ -1,0 +1,11 @@
+// Q-175 A server's error line does not say which request it belongs to: no route and no request id, though the visitor gets `x-request-id`, and under `--log json` it is plain text among the JSON objects
+// mode: script
+// script: steps.sh
+// open-when: error line names the request: no
+// fixed-when: error line names the request: yes
+// From FEEDBACK21.md §Q-175 (found on c59890e).
+
+fn share(a, b) = a / b
+
+route GET /checkout = share(100, int(request.query.n ?? "0"))
+route GET /ok = "ok"

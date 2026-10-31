@@ -67,7 +67,6 @@ fn infinities_and_nans_in_sums() {
 /// The guide: what Python raises is an error here too. Python raises OverflowError
 /// for the first and ValueError for the second.
 #[test]
-#[ignore = "finding: math.fsum([1e308, 1e308]) gives 0.0, not an overflow error (an infinite partial cancels against its own rounding error); fsum([inf, -inf]) gives NaN, which Python refuses"]
 fn an_exact_sum_that_cannot_be_held_is_an_error() {
     assert!(eval_str("math.fsum([1e308, 1e308])").is_err());
     assert!(eval_str("math.fsum([1e308, 1e308, -1e308])").is_err());
@@ -77,7 +76,6 @@ fn an_exact_sum_that_cannot_be_held_is_an_error() {
 /// statistics.mean is exact, so a sum past the floats does no harm:
 /// mean([1e308, 1e308]) is 1e308, and mean([1e308, 1e308, -1e308]) 3.333333333333333e+307.
 #[test]
-#[ignore = "finding: stats.mean([1e308, 1e308]) gives inf where Python's gives 1e308: its running sum overflows"]
 fn a_mean_is_not_lost_to_the_sum_overflowing() {
     assert_eq!(gives("stats.mean([1e308, 1e308]) == 1e308"), "true");
     assert_eq!(gives("stats.mean([1e308, 1e308, -1e308]) == 3.333333333333333e307"), "true");
@@ -85,7 +83,6 @@ fn a_mean_is_not_lost_to_the_sum_overflowing() {
 
 /// Python: math.hypot(nan, nan) is nan, as is math.dist([nan], [0]).
 #[test]
-#[ignore = "finding: math.hypot, math.dist and vec.norm give 0.0 for all-NaN input, not NaN (f64::max skips NaN, so the is_nan check in norm2 never holds)"]
 fn nothing_but_nan_has_no_length() {
     assert_eq!(gives("math.isnan(math.hypot(math.nan, math.nan))"), "true");
     assert_eq!(gives("math.isnan(math.dist([math.nan], [0]))"), "true");

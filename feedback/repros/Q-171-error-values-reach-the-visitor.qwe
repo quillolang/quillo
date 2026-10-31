@@ -1,0 +1,11 @@
+// Q-171 A route that gives an `http.*` or file error sends the visitor its text: an internal address with its key, a path on the server. The log has no text at all. Q-161's fix covers `db:` values only
+// mode: serve
+// get: /billing
+// get: /keys
+// open-when: {"error":"http:
+// open-when: {"error":"read_file:
+// fixed-when: internal error
+// From FEEDBACK21.md §Q-171 (found on c59890e).
+
+route GET /billing = http.get("http://127.0.0.1:1/internal/billing?key=abc")
+route GET /keys = read_file("/srv/app/secrets/keys.json")

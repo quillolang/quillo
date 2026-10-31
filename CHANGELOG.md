@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+### Databases and tenants
+
+- **A visitor only reads errors the program wrote.** One a builtin made, from a database, an
+  `http` call, a file or a conversion, says `internal error` as a route's value, inside a map
+  or list, in markup or from a `server fn`, and its text, with the SQL, an address or a path,
+  goes to the log. `err(...)` is sent as it is, also from a service, `--watch` shows
+  everything, and code on the server still reads it (`db.error_kind`).
+- **Every failed request has a log line**, naming the route and the `x-request-id`, and an
+  object under `--log json`.
+- **`new_tenant(name, f)`** makes a tenant or gives an error when it exists, in one step on
+  the database. A second signup cannot land in a customer's data, and the guide's sample
+  uses it.
+- **A made-up subdomain is a 404** where the route needs its database, and a server that is
+  down stays an error. A route that needs no database answers as usual.
+- **`?open_tenants=N`** in a server database's URL keeps that many tenants open, past the 16
+  at which each request connects again.
+- **`quillo check` warns on a global written by a request** in a program with `tenant_from`.
+- A commit that fails, in `db.transaction` or a migration, now rolls back, on all three
+  databases. A request no longer panics when the default database opens beside a tenant's.
+- PostgreSQL: `inet`, `cidr`, `macaddr`, `macaddr8`, `money` and `bit` are read as what they
+  are, and types with no reader show as hex. A float past a bigint is refused, not stored as
+  the largest bigint, and the smallest interval reads correctly. MariaDB's failed check and
+  changed-row errors have a `db.error_kind`. Outside a request, a transaction waiting for a
+  connection no longer stops the one holding it.
+
+### One request cannot stop a server
+
+- **`--max-compute 2s`** ends a request that computes that long without letting go, as a 500
+  between statements. Waiting does not count.
+- **An instance computing for 5 s is logged**, with its request.
+- **With `--instances`, connections are taken on a thread of their own** and skip an
+  instance that is computing, so one stuck instance holds up only the connections on it.
+- **The first `SIGTERM` keeps its promise:** a request still computing after 10 s is named
+  and the process exits with status 0.
+- `quillo check` warns on a `while` that cannot end.
+
+### Checks and corrections
+
+- **`quillo check` refuses what a module does not have.** `json.title` and `db.nothing` read
+  as null, and now say `` `json` has no `title` ``, with a hint when a route's shape bound
+  the name. Under `--no-check` they are null as before.
+- **`quillo check` warns on an element that goes nowhere.** Of two elements side by side in
+  a body, only the last reaches the page; the first gets a warning, in a component, a view
+  or a function.
+- **`quillo check` warns on `${name}` in markup**, which shows a `$` before the value.
+  `{"$"}{name}` says the `$` is meant.
+- A service called through a helper counts as the `http` effect, a local function called as
+  a method counts as used, a bare `return` is reported on its own line, and the strings of
+  `class={if on { "a" } else { "b" }}` are read.
+- **A plugin function with a fixed-size array** (`[u8; 4]`) was dropped in silence. It is now
+  reported as not exported, and the functions after it stay.
+- **`return` at the top level of a `use`d file leaves that file**, where it ended the whole
+  program without a word.
+- **A private name beside a typed field** (`private let q`, `route GET /q ? { q: str } = q`)
+  no longer reads the variable: `q` is what the request sent.
+- **`type Ids = list<int>` may end a line**, and a long chain of `reply` is refused as too
+  deep, where it crashed the check.
+- **Numbers.** `int(1.0e30)` is an error value, not the largest int, in the browser too.
+  `math.fsum` is an error when the sum passes the floats (it gave 0.0) and for `inf` with
+  `-inf`, as in Python. `stats.mean` no longer turns inf when only its sum overflows.
+  `math.hypot`, `math.dist` and `vec.norm` give NaN for NaN. The smallest int `% -1` is 0,
+  `math.lcm` is 0 with a zero anywhere, and `date.add_days` and `date.add_months` no longer
+  panic on the smallest int in a debug build.
+- **Dates.** A named zone keeps its offset in the last two days of 9999.
+- **Server and browser agree on more.** `{true}` is the text true in the browser too, where
+  it disappeared. `1e999`, and a top-level constant that is inf, are `inf` in the browser,
+  where they were null, and an infinity reads `inf` there, not `Infinity`. A constant map
+  with a `__proto__` key keeps it. Under `--no-check`, `{1 | save}` in a component is refused
+  as `{save(1)}` is. A live value whose map only changed its keys' order reaches the page.
+
 ### Additions
 
 - **A file sees its own names, the builtins and what it takes.** `use lib/forum` takes a

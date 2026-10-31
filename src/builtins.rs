@@ -75,6 +75,7 @@ pub fn install(env: &Env) {
         ("tenant", tenant),
         ("tenant_from", tenant_from),
         ("with_tenant", with_tenant),
+        ("new_tenant", new_tenant),
         ("__service", crate::service::call),
         ("__service_later", crate::service::later),
         ("__record", crate::record::construct),
@@ -261,7 +262,12 @@ fn to_str(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 fn to_int(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(match arg(&args, 0) {
         Value::Int(n) => Value::Int(n),
-        Value::Float(f) if f.is_finite() => Value::Int(f.trunc() as i64),
+        // A float past an int's range is an error value, as a dec is
+        // (FEEDBACK16.md, Q-111; branch feedback20-fixes).
+        Value::Float(f) if f.is_finite() => match f.trunc() {
+            t if (-9223372036854775808.0..9223372036854775808.0).contains(&t) => Value::Int(t as i64),
+            _ => Value::err(Value::str(format!("{} is too large for an int", Value::Float(f).display()))),
+        },
         Value::Bool(b) => Value::Int(b as i64),
         // The whole part (toward zero).
         Value::Dec(d) => d.trunc_i64().map_or_else(|| Value::err(Value::str(format!("{} is too large for an int", d))), Value::Int),
@@ -697,16 +703,16 @@ fn spread_list(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 // ---- errors ------------------------------------------------------------
 
 fn err(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::err(arg(&args, 0)))
+    Ok(Value::own_err(arg(&args, 0)))
 }
 
 fn is_err(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(Value::Bool(matches!(arg(&args, 0), Value::Err(_))))
+    Ok(Value::Bool(matches!(arg(&args, 0), Value::Err(..))))
 }
 
 fn unwrap(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
-        Value::Err(e) => fail(line, format!("unwrap of an error: {}", e.display())),
+        Value::Err(e, _) => fail(line, format!("unwrap of an error: {}", e.display())),
         v => Ok(v),
     }
 }
@@ -1065,6 +1071,23 @@ fn with_tenant(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     it.tenant = outer;
     it.tenant_named = named;
     r
+}
+
+/// `new_tenant(name, f)`: `with_tenant` for a signup, which makes the tenant's database and
+/// gives an error when there is one, where `with_tenant` would run `f` in the customer's
+/// (FEEDBACK20.md, Q-165; branch feedback20-fixes).
+fn new_tenant(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let name = s_arg(&args, 0, "new_tenant", line)?;
+    if !crate::site::tenant_name_ok(&name) {
+        return fail(line, format!("`new_tenant`: {:?} cannot be a tenant's name (lowercase letters, digits, - and _)", name));
+    }
+    if !matches!(args.get(1), Some(Value::Func(_) | Value::Builtin(..))) {
+        return fail(line, format!("`new_tenant` expects a function second, got {}", args.get(1).map_or("nothing", |v| v.type_name())));
+    }
+    if !crate::db::claim_tenant(it, &name, line)? {
+        return Ok(Value::own_err(Value::str(format!("there is already a tenant {:?}", &*name))));
+    }
+    with_tenant(it, args, line)
 }
 
 /// `redirect(url, status = 303)`. 303 makes browsers follow with a GET,
@@ -1641,7 +1664,7 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // The value's hash, kept: the page's first refresh can be a patch
     // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
     if let Ok(v) = &r {
-        if !matches!(v, Value::Err(_)) {
+        if !matches!(v, Value::Err(..)) {
             let a = crate::value::js_numbers(false, || crate::livecache::Answer::new(crate::interp::island_json(v), false));
             it.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(a.h, a.value.clone(), a.text.len());
             info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));

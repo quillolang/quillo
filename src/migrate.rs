@@ -63,8 +63,13 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
                     )
                 });
                 match done {
+                    // A deferred constraint fails at the commit, which leaves the file open
+                    // (FEEDBACK16.md, Q-143; branch feedback20-fixes).
                     Ok(_) => {
-                        c.execute_batch("commit").map_err(|e| e.to_string())?;
+                        if let Err(e) = c.execute_batch("commit") {
+                            let _ = c.execute_batch("rollback");
+                            return Err(format!("migration {} failed: {}", name, e));
+                        }
                         applied.push(name.clone());
                     }
                     Err(e) => {
@@ -118,7 +123,10 @@ fn my_run(c: &mut crate::my::Conn, todo: &[(String, String)]) -> Result<Vec<Stri
             });
             match done {
                 Ok(_) => {
-                    c.batch("commit")?;
+                    if let Err(e) = c.batch("commit") {
+                        let _ = c.batch("rollback");
+                        return Err(format!("migration {} failed: {}", name, e));
+                    }
                     applied.push(name.clone());
                 }
                 Err(e) => {
@@ -157,7 +165,10 @@ fn pg_run(c: &mut pg::Conn, todo: &[(String, String)]) -> Result<Vec<String>, St
             });
             match done {
                 Ok(_) => {
-                    c.batch("commit")?;
+                    if let Err(e) = c.batch("commit") {
+                        let _ = c.batch("rollback");
+                        return Err(format!("migration {} failed: {}", name, e));
+                    }
                     applied.push(name.clone());
                 }
                 Err(e) => {

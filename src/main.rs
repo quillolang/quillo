@@ -46,6 +46,7 @@ options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
   --host H       address to listen on (default 127.0.0.1)
   --instances N  run the program N times over, each on a core of its own
+  --max-compute 2s  end a request that computes this long without letting go, as a 500
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
   --workers N    requests that can wait (for a database, the network) at
@@ -137,7 +138,7 @@ fn main() {
 /// is its value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with",
 ];
 
@@ -506,6 +507,13 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            ("--max-compute", Some(v)) => match compute_limit(v) {
+                Some(ms) => quillo::httpd::limit_compute(ms),
+                None => {
+                    eprintln!("quillo: --max-compute needs a length of time: 500ms, 2s or 1m");
+                    return Err(2);
+                }
+            },
             ("--instances", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => o.instances = n,
                 _ => {
@@ -650,6 +658,18 @@ mod with {
     }
 }
 
+/// A length of time for `--max-compute`, in ms.
+fn compute_limit(v: &str) -> Option<u64> {
+    let (n, unit) = v.find(|c: char| !c.is_ascii_digit()).map_or((v, ""), |at| v.split_at(at));
+    let n: u64 = n.parse().ok().filter(|n| *n > 0)?;
+    n.checked_mul(match unit {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        _ => return None,
+    })
+}
+
 fn stop_on_signal(member: Option<quillo::cluster::Membership>) {
     stop_on_signal_with(member, None)
 }
@@ -669,6 +689,13 @@ fn stop_on_signal_with(member: Option<quillo::cluster::Membership>, joining: Opt
         }
         with::stop_all();
         quillo::httpd::stop();
+        // A request computing never comes back to its loop, so the time is kept from here
+        // (FEEDBACK20.md, Q-164; branch feedback20-fixes).
+        std::thread::spawn(|| {
+            std::thread::sleep(quillo::httpd::DRAIN + std::time::Duration::from_millis(500));
+            eprintln!("quillo: stopping with requests in progress: {}", quillo::httpd::in_progress().join(", "));
+            std::process::exit(0);
+        });
     });
 }
 

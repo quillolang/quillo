@@ -1,0 +1,3 @@
+public fn share(total, people) {
+    return total / people
+}

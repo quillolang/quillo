@@ -1,6 +1,6 @@
 // Q-128 The strings of `class={if on { "a" } else { "b" }}` are not read, though those of `on ? "a" : "b"` are: a misspelt class passes `quillo check`
-// mode: check
-// open-when: ok (
+// mode: cli
+// args: check --classes Q-128-classes-in-an-if-are-not-read.qwe
 // fixed-when: no style sheet has a rule for `.okk`
 // From FEEDBACK16.md §Q-128 (found on b28e689).
 

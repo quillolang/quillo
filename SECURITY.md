@@ -28,6 +28,12 @@ The `quillo` runtime and server (`src/`), the browser runtime it serves
 (`src/client/runtime.js`) and the editor extension (`editors/vscode`). Sandboxed scripts (`run_script`, `check_program`) are meant to be safe for
 code written by a program's users, so a way out of them is in scope.
 
+## What a visitor sees of a failure
+
+An error a builtin made says `internal error` to a visitor, wherever it would reach one, and
+its text goes to the log; `--watch` shows it, for development. Text a program sends is its
+own: `err(...)`, and `str(r)` of an error, go out as they are.
+
 ## How dependencies are checked
 
 `cargo deny` checks every dependency for known vulnerabilities, licences and sources in

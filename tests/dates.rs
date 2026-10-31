@@ -323,10 +323,9 @@ fn at_says_what_is_wrong() {
     fails("date.at(\"2026-10-27\", \"09:15\", 3)", "`date.at` expects a time zone");
 }
 
-/// `offset_at` takes an offset of 0 for what jiff cannot hold, which ends
-/// about two days before the calendar does: the zone is silently dropped.
+/// jiff's times end about two days before the calendar does; the zone's offset
+/// is still the one written.
 #[test]
-#[ignore = "finding: in the last two days of 9999 a named zone's offset is taken as 0, so the time is written as UTC"]
 fn the_calendars_last_day_keeps_a_zones_offset() {
     assert_eq!(text("date.to_zone(\"9999-12-31T12:00:00Z\", \"America/New_York\")"), "9999-12-31T07:00:00-05:00");
     assert_eq!(text("date.at(\"9999-12-31\", \"23:00\", \"America/New_York\")"), "9999-12-31T23:00:00-05:00");
@@ -342,7 +341,6 @@ fn the_calendars_last_day_is_in_range_at_a_fixed_offset() {
 /// `n.abs()` overflows on the smallest int: a panic where overflow is checked
 /// (`cargo test`'s build); `unsigned_abs` would not.
 #[test]
-#[ignore = "finding: date.add_days and date.add_months panic on the smallest int in a build with overflow checks"]
 fn the_smallest_int_is_out_of_range() {
     fails("date.add_days(\"2026-01-01\", -9223372036854775807 - 1)", "`date.add_days`: the date is out of range");
     fails("date.add_months(\"2026-01-01\", -9223372036854775807 - 1)", "`date.add_months`: the date is out of range");

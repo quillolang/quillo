@@ -125,7 +125,7 @@ fn compiled_code_fails_as_the_interpreter_does() {
             ("pow3(10)", "59049"),
             ("pow3(50)", "ERROR 15: integer overflow"),
             ("rem(7, 0)", "ERROR 19: division by zero"),
-            ("rem(-9223372036854775807 - 1, -1)", "ERROR 19: integer overflow"),
+            ("rem(-9223372036854775807 - 1, -1)", "0"),
             ("neg(-9223372036854775807 - 1)", "ERROR 52: integer overflow"),
             ("less(0.0 / 0.0, 1.0)", "ERROR 20: cannot compare float with float"),
             ("work(20000000)", "ERROR 4: range is too large"),

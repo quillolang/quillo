@@ -197,12 +197,12 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // The work and its answer, in one transaction.
     let mut kept: Option<HttpResponse> = None;
     let mut lost = false;
-    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(_)));
+    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(..)));
     let r = crate::txn::run(it, None, &opts.tx, line, &mut |it| {
         kept = None;
         lost = false;
         let v = match it.call(&f, Vec::new(), line) {
-            Ok(v) if !matches!(v, Value::Err(_)) => v,
+            Ok(v) if !matches!(v, Value::Err(..)) => v,
             other => return other,
         };
         let a = render(rpc.as_deref(), Ok(v.clone()))?;
@@ -312,9 +312,9 @@ fn render(rpc: Option<&str>, r: R) -> Result<HttpResponse, Ctrl> {
         body: j.to_string().into_bytes(),
     };
     Ok(match r {
-        Ok(v) | Err(Ctrl::Return(v)) => match v {
-            Value::Response(_) => crate::server::finish(Ok(v)),
-            Value::Err(e) => json(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
+        Ok(v) | Err(Ctrl::Return(v)) => match crate::server::for_visitor(v) {
+            v @ Value::Response(_) => crate::server::finish(Ok(v)),
+            Value::Err(e, _) => json(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
             v => json(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
         },
         Err(Ctrl::Reply(x)) => crate::server::finish(Err(Ctrl::Reply(x))),
@@ -376,7 +376,7 @@ fn sql(it: &mut Interp, query: bool, sql: &str, params: Vec<Value>) -> Result<Va
     for first in [true, false] {
         let r = if query { crate::db::query_on(it, None, args.clone()) } else { crate::db::exec_on(it, None, args.clone()) };
         match r {
-            Ok(Value::Err(e)) => {
+            Ok(Value::Err(e, _)) => {
                 let msg = e.display();
                 if first && msg.contains(TABLE) {
                     make_table(it);

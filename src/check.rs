@@ -629,6 +629,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("tenant", "", "str | null"),
     ("tenant_from", "str | fn", "null"),
     ("with_tenant", "str, fn", "any"),
+    ("new_tenant", "str, fn", "any"),
     ("save_upload", "map, str", "str | error(str)"),
     ("read_upload", "map", "str | error(str)"),
     ("js", "str, any...", "any"),
@@ -868,6 +869,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 const BROWSER_MODULES: &[&str] = &["json", "math", "bit", "stats", "vec", "date", "money", "re"];
 
 pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "bit", "stats", "vec", "date", "money", "re"];
+
+/// What the modules hold that is not a function.
+const MODULE_VALUES: &[&str] = &["math.pi", "math.e", "math.tau", "math.inf", "math.nan"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -1455,6 +1459,8 @@ struct Checker {
     /// The program's functions that give only SQL-safe text (each result
     /// `sql_name(...)`, say): calling one is as safe as `sql_name` itself.
     sql_name_fns: HashSet<String>,
+    /// The program has `tenant_from`: a global written by a request is every tenant's.
+    tenants: bool,
     /// What is known of variables' text for the SQL warning, innermost
     /// last: the depth of the scope each was made in, its name, and what
     /// it holds (see `SqlVar`).
@@ -1539,6 +1545,7 @@ impl Checker {
             unparsed_names: HashSet::new(),
             unparsed_texts: Vec::new(),
             sql_name_fns: HashSet::new(),
+            tenants: false,
             sql_vars: Vec::new(),
             next_sql: SqlVar::Other,
             url_vars: Vec::new(),
@@ -1671,6 +1678,9 @@ impl Checker {
                 }
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
+            }
+            if matches!(s, Stmt::Expr(Expr::Call(f, _, _)) if matches!(&**f, Expr::Ident(n, _) if n == "tenant_from")) {
+                self.tenants = true;
             }
             // The file comes first now (FEEDBACK19.md, Q-156; branch feedback19-fixes).
             if let Stmt::Use(path, names, line, options) = s {
@@ -2145,6 +2155,19 @@ impl Checker {
         Some(v)
     }
 
+    /// What `x.name` finds when `x` does not have it: a function, called on `x`,
+    /// which makes it a use of a local of that name (FEEDBACK16.md, Q-137; branch
+    /// feedback20-fixes).
+    fn method(&mut self, name: &str) -> Option<Var> {
+        match self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name)) {
+            Some(v) => {
+                v.used = true;
+                Some(v.clone())
+            }
+            None => self.globals.get(name).cloned(),
+        }
+    }
+
     fn ident(&mut self, name: &str) -> (T, Option<Arc<Sig>>) {
         match self.lookup(name) {
             Some(v) => {
@@ -2405,6 +2428,12 @@ impl Checker {
                          to continue the line above, write `- x` with a space or end that line with `-`",
                     );
                 }
+                // A body gives its last expression, so of two elements side by
+                // side the first goes nowhere (FEEDBACK21.md, Q-172; branch feedback20-fixes).
+                if let (false, Expr::Html(_, line)) = (last, e) {
+                    self.line = *line;
+                    self.warn("this element is not on the page: only the last one in a body is; wrap them in one element");
+                }
                 if last {
                     t
                 } else {
@@ -2484,6 +2513,14 @@ impl Checker {
                         }
                         if v.kind == Kind::Global && self.in_component().is_some() && v.sig.is_none() {
                             self.browser_global(name, &v);
+                        }
+                        // The one way found for a customer's data to reach another with no
+                        // mistake in the SQL. A map keyed by `tenant()` is what the guide says
+                        // to do (FEEDBACK20.md, Q-166; branch feedback20-fixes).
+                        let keyed = matches!(e, Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "set")
+                            && matches!(args.get(1), Some(Expr::Call(k, _, _)) if matches!(&**k, Expr::Ident(n, _) if n == "tenant")));
+                        if self.tenants && v.kind == Kind::Global && !self.fns.is_empty() && self.in_component().is_none() && !keyed {
+                            self.warn(format!("`{}` is one copy for every tenant: keep a tenant's data in its database, or in a map keyed by tenant()", name));
                         }
                         if v.kind == Kind::State {
                             let key = (v.file.clone(), v.line, name.clone());
@@ -2595,7 +2632,8 @@ impl Checker {
                 }
                 T::of(NIL)
             }
-            Stmt::Return(e) => {
+            Stmt::Return(e, line) => {
+                self.line = *line;
                 let t = match e {
                     Some(e) => self.expr(e),
                     None => T::of(NIL),
@@ -2785,7 +2823,7 @@ impl Checker {
             } else if let Some((m, f)) = n.split_once('.') {
                 if MODULES.contains(&m) {
                     mask |= builtin_effect(&format!("{}.{}", m, f));
-                } else if self.services.contains_key(m) {
+                } else if self.services.contains_key(m) && !d.params.iter().any(|p| p.name == m) {
                     mask |= crate::ast::effect_bit("http");
                 }
             }
@@ -3037,6 +3075,7 @@ impl Checker {
             Expr::Field(obj, name, line) => {
                 let t = self.expr(obj);
                 self.line = *line;
+                self.module_member(obj, name);
                 self.field(t, obj, name)
             }
             Expr::Index(obj, idx, line) => {
@@ -3141,6 +3180,11 @@ impl Checker {
             Expr::While(c, body, line) => {
                 let ct = self.expr(c);
                 self.line = *line;
+                // Only what cannot end: with a call in it, a `reply` may be in that function
+                // (FEEDBACK20.md, Q-163; branch feedback20-fixes).
+                if matches!(&**c, Expr::Lit(Lit::Bool(true))) && !["Call(", "Return(", "Reply("].iter().any(|w| format!("{:?}", body).contains(w)) {
+                    self.warn("this `while` never ends: nothing in it can stop it, and it holds its instance (see --max-compute)");
+                }
                 self.js_truthiness(ct, c, Truth::Cond);
                 let mut yes = Vec::new();
                 self.facts(c, true, &mut yes);
@@ -3153,7 +3197,7 @@ impl Checker {
                 let mut never = false;
                 for (i, s) in stmts.iter().enumerate() {
                     let st = self.stmt(s, i + 1 == stmts.len());
-                    if matches!(s, Stmt::Return(_)) || (st.bits == 0 && matches!(s, Stmt::Expr(_))) {
+                    if matches!(s, Stmt::Return(..)) || (st.bits == 0 && matches!(s, Stmt::Expr(_))) {
                         never = true;
                     }
                     // `if x == null { return ... }`: after it, `x` is not null.
@@ -3312,7 +3356,7 @@ impl Checker {
                     return T::ANY;
                 }
             }
-            let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
+            let found = self.method(name);
             let sig = found.as_ref().and_then(|v| v.sig.clone()).filter(|_| recv.bits & MAP == 0);
             let mut all = vec![recv];
             all.extend(pre);
@@ -3568,6 +3612,21 @@ impl Checker {
 
     fn is_local(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
+    }
+
+    /// `json.title` reads as null at run time: what a module does not have is a
+    /// mistake, called or not (FEEDBACK18.md, Q-107; branch feedback20-fixes).
+    fn module_member(&mut self, obj: &Expr, name: &str) {
+        let Expr::Ident(m, _) = obj else { return };
+        if !MODULES.contains(&m.as_str()) || self.is_local(m) || self.globals.get(m.as_str()).is_some_and(|g| &*g.file != "<builtin>") {
+            return;
+        }
+        let full = format!("{}.{}", m, name);
+        if MODULE_VALUES.contains(&full.as_str()) || BUILTINS.iter().any(|(n, _, _)| *n == full) {
+            return;
+        }
+        let hint = if self.is_local(name) { format!(" (`{}` alone is the name here: a shape binds its fields)", name) } else { crate::error::removed_note(&full) };
+        self.error(format!("`{}` has no `{}`{}", m, name, hint));
     }
 
     /// `json.parse(s)`, `db.query(...)`, `http.get(...)`.
@@ -4153,7 +4212,7 @@ impl Checker {
         if t.bits & RESP != 0 && matches!(name, "status" | "headers" | "body") {
             return T::ANY;
         }
-        let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
+        let found = self.method(name);
         match found {
             Some(v) if v.t.bits & FN != 0 => {
                 self.record(name, &v);
@@ -4169,6 +4228,10 @@ impl Checker {
     }
 
     fn html(&mut self, el: &HtmlEl) {
+        for line in &el.dollars {
+            self.line = *line;
+            self.warn("the `$` before this `{` is text, and shows on the page: `{name}` alone gives the value here (`${name}` is for templates); write `{\"$\"}{name}` if the `$` is meant");
+        }
         self.line = el.line;
         if let Some(id) = &el.id {
             self.expr(id);
@@ -4334,7 +4397,7 @@ fn exits(e: &Expr) -> bool {
     match e {
         Expr::Reply(..) => true,
         Expr::Block(stmts) => match stmts.last() {
-            Some(Stmt::Return(_)) => true,
+            Some(Stmt::Return(..)) => true,
             Some(Stmt::Expr(x)) => exits(x),
             _ => false,
         },
@@ -4423,15 +4486,26 @@ fn called_names(e: &Expr, out: &mut Vec<String>) {
             Expr::Ident(n, _) => out.push(n.clone()),
             Expr::Field(obj, n, _) => match &**obj {
                 Expr::Ident(m, _) if MODULES.contains(&m.as_str()) => out.push(format!("{}.{}", m, n)),
+                // `billing.charge()` may be a service's, a call over HTTP, or a
+                // method: the name of what it is called on goes along for
+                // `fn_effects` to tell (FEEDBACK16.md, Q-126; branch feedback20-fixes).
+                Expr::Ident(m, _) => {
+                    out.push(n.clone());
+                    out.push(format!("{}.{}", m, n));
+                }
                 _ => out.push(n.clone()),
             },
             _ => {}
         },
-        Expr::Pipe(_, rhs, _) => {
-            if let Expr::Ident(n, _) = &**rhs {
-                out.push(n.clone())
+        Expr::Pipe(_, rhs, _) => match &**rhs {
+            Expr::Ident(n, _) => out.push(n.clone()),
+            Expr::Field(obj, n, _) => {
+                if let Expr::Ident(m, _) = &**obj {
+                    out.push(format!("{}.{}", m, n));
+                }
             }
-        }
+            _ => {}
+        },
         _ => {}
     });
 }
@@ -4513,6 +4587,13 @@ fn class_uses(order: &[Item]) -> Vec<(String, Arc<str>, u32)> {
                 }
             }
             Expr::Match(_, arms, _) => arms.iter().for_each(|a| words(&a.body, out)),
+            // `if on { "a" } else { "b" }`, as `on ? "a" : "b"` (FEEDBACK16.md, Q-128;
+            // branch feedback20-fixes).
+            Expr::Block(stmts) => {
+                if let Some(Stmt::Expr(x)) = stmts.last() {
+                    words(x, out)
+                }
+            }
             Expr::Binary(BinOp::And, _, b, _) => words(b, out),
             Expr::Binary(BinOp::Or, a, b, _) | Expr::Coalesce(a, b) => {
                 words(a, out);
@@ -4823,10 +4904,10 @@ fn walk_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
                 walk_expr(o, f);
                 walk_expr(e, f)
             }
-            Stmt::Return(Some(e)) => walk_expr(e, f),
+            Stmt::Return(Some(e), _) => walk_expr(e, f),
             Stmt::Fn(d) => walk_expr(&d.body, f),
             Stmt::Route(r) => walk_expr(&r.body, f),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => {}
             Stmt::Type(td) => td.defaults.iter().for_each(|(_, e)| walk_expr(e, f)),
         }
     }
@@ -4862,10 +4943,10 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
                 assigned_in(o, out);
                 assigned_in(e, out)
             }
-            Stmt::Return(Some(e)) => assigned_in(e, out),
+            Stmt::Return(Some(e), _) => assigned_in(e, out),
             Stmt::Fn(d) => assigned_in(&d.body, out),
             Stmt::Route(r) => assigned_in(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None, _) => {}
         }
     }
 }
@@ -5003,7 +5084,7 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
                 let vars = block_vars(stmts, safe, vars);
                 match stmts.last() {
                     Some(Stmt::Expr(x)) => ok(x, safe, &vars),
-                    Some(Stmt::Return(Some(x))) => ok(x, safe, &vars),
+                    Some(Stmt::Return(Some(x), _)) => ok(x, safe, &vars),
                     _ => false,
                 }
             }
@@ -5039,7 +5120,7 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
                             vars.remove(n);
                         }
                     }
-                    Stmt::Return(Some(r)) if !ok(r, safe, &vars) => returns_ok = false,
+                    Stmt::Return(Some(r), _) if !ok(r, safe, &vars) => returns_ok = false,
                     _ => {}
                 }
             }

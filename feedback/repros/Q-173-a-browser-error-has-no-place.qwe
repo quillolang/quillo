@@ -1,0 +1,17 @@
+// Q-173 A runtime error in the browser prints its message alone: no file, no line, no call chain, under --watch too, where the source maps exist. The server says `file:line`
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { clicked: true }
+// open-when: quillo: division by zero
+// fixed-when: /\.qwe:\d+/
+// From FEEDBACK21.md §Q-173 (found on c59890e).
+
+fn inner(a, b) = a / b
+fn share(a) = inner(a, 0)
+
+component Pay() {
+    state n = 7
+    <button id="go" @click={() => { n = share(n) }}>pay {n}</button>
+}
+
+route GET / = <html><body><Pay/></body></html>

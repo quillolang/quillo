@@ -127,7 +127,9 @@ fn date_text(z: i64) -> String {
 /// The same month n months on, its day clamped to the month's length.
 fn add_months(z: i64, n: i64) -> Option<i64> {
     let (y, m, d) = civil(z);
-    if n.abs() > 120_000 {
+    // `unsigned_abs`: the smallest int has no `abs` (FEEDBACK16.md, Q-141; branch
+    // feedback20-fixes).
+    if n.unsigned_abs() > 120_000 {
         return None;
     }
     let total = y * 12 + (m - 1) + n;
@@ -410,7 +412,7 @@ fn days_in_month(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn add_days(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.add_days";
     let (z, n) = (date_arg(&args, 0, f, line)?, int_arg(&args, 1, f, line)?);
-    day_value((n.abs() <= 4_000_000).then(|| z + n), f, line)
+    day_value((n.unsigned_abs() <= 4_000_000).then(|| z + n), f, line)
 }
 
 fn add_months_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -422,7 +424,7 @@ fn add_months_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn add_years(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.add_years";
     let (z, n) = (date_arg(&args, 0, f, line)?, int_arg(&args, 1, f, line)?);
-    day_value((n.abs() <= 10_000).then(|| add_months(z, n * 12)).flatten(), f, line)
+    day_value((n.unsigned_abs() <= 10_000).then(|| add_months(z, n * 12)).flatten(), f, line)
 }
 
 fn days_between(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -488,11 +490,16 @@ fn zone(args: &[Value], i: usize, f: &str, line: u32) -> Result<Zone, Ctrl> {
     }
 }
 
-/// The zone's offset at an instant (seconds since 1970, UTC).
+/// The zone's offset at an instant (seconds since 1970, UTC). jiff's times end
+/// about two days before the calendar does: past that, the offset where they end
+/// (FEEDBACK16.md, Q-116; branch feedback20-fixes).
 fn offset_at(z: &Zone, instant: i64) -> i64 {
     match z {
         Zone::Fixed(o) => *o,
-        Zone::Named(tz) => jiff::Timestamp::from_second(instant).map_or(0, |t| tz.to_offset(t).seconds() as i64),
+        Zone::Named(tz) => {
+            let last = instant.clamp(jiff::Timestamp::MIN.as_second(), jiff::Timestamp::MAX.as_second());
+            jiff::Timestamp::from_second(last).map_or(0, |t| tz.to_offset(t).seconds() as i64)
+        }
     }
 }
 

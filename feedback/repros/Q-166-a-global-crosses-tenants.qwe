@@ -1,0 +1,15 @@
+// Q-166 A global variable a route writes is one copy for every tenant, and `quillo check` says nothing: tenant beta reads what acme's request left
+// mode: check
+// fixed-when: /warning.*tenant/
+// From FEEDBACK20.md §Q-166 (found on 9e8c2fb). The guide says globals are shared; nothing says so at the line.
+
+tenant_from("example.com")
+
+let last_seen = "nobody"
+
+route GET /who = tenant()
+route GET /peek {
+    let was = last_seen
+    last_seen = str(tenant())
+    was
+}

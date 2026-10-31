@@ -114,7 +114,6 @@ fn the_classes_after_an_if_with_no_else_are_read() {
 /// A call of a service is a call over HTTP: a function that makes one and
 /// is called where `http` is not allowed is told so, as it is for `http.get`.
 #[test]
-#[ignore = "finding: called_names keeps only the method's name for `billing.charge()`, so the `http` effect of a service called in a helper is never counted (check.rs:2796 cannot run)"]
 fn a_service_called_in_a_helper_counts_as_the_http_effect() {
     let d = Folder::new("service-effect", &[("main.qwe", "service billing = \"billing.qwe\"\nfn charge() = billing.charge(1)\nfn safe() with db {\n    charge()\n}\n"), ("billing.qwe", "server fn charge(n) = n\n")]);
     let said: Vec<String> = check_file(&d.join("main.qwe")).diagnostics.iter().map(shown).collect();
@@ -224,11 +223,11 @@ fn a_rust_signature_with_an_array_is_left_out() {
     let parsed = quillo::native::parse("pub fn first(a: [u8; 3]) -> i64 { a[0] as i64 }\npub fn two() -> i64 { 2 }\n");
     let names: Vec<&str> = parsed.exports.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["two"]);
-    assert!(parsed.problems.is_empty(), "{:?}", parsed.problems);
+    assert_eq!(parsed.problems.len(), 1, "{:?}", parsed.problems);
+    assert!(parsed.problems[0].1.contains("`first` is not exported"), "{:?}", parsed.problems);
 }
 
 #[test]
-#[ignore = "finding: a `pub fn` with `;` in its parameters (`[u8; 3]`) is dropped in silence; the signature is cut at that `;`, `matching` finds no `)`, and `item` answers None, as for what is not a function"]
 fn a_rust_signature_with_an_array_says_it_is_not_exported() {
     let parsed = quillo::native::parse("pub fn first(a: [u8; 3]) -> i64 { a[0] as i64 }\n");
     assert_eq!(parsed.problems.len(), 1, "{:?}", parsed.exports.iter().map(|e| &e.name).collect::<Vec<_>>());

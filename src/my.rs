@@ -52,6 +52,10 @@ fn opts_of(url: &str) -> Result<Opts, String> {
         let flag = |v: &str| v.parse::<bool>().map_err(|_| format!("{} is true or false, not {:?}", k, v));
         let path = || std::path::PathBuf::from(crate::server::percent_decode(v, false));
         match k {
+            // For the tenants' list (see `TenantDbs`), not for the connection.
+            "open_tenants" => {
+                v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| format!("bad open_tenants: {}", v))?;
+            }
             "require_ssl" => require = Some(flag(v)?),
             "verify_ca" => verify_ca = flag(v)?,
             "verify_identity" => verify_identity = flag(v)?,
@@ -143,6 +147,24 @@ impl Pool {
         let c = run(pool.get_conn()).map_err(|e| e.to_string())?;
         drop(Conn(Some(c), None));
         Ok(Pool { pool: Some(pool) })
+    }
+
+    /// Makes the database a URL names, or says false when it is there. Of two at once, the
+    /// server lets one make it (FEEDBACK20.md, Q-165; branch feedback20-fixes).
+    pub fn claim(url: &str) -> Result<bool, String> {
+        let opts = opts_of(url)?;
+        let name = opts.db_name().unwrap_or("").replace('`', "``");
+        let server = OptsBuilder::from_opts(opts.clone()).db_name(None::<String>);
+        run(async {
+            let mut c = mysql_async::Conn::new(server).await.map_err(|e| e.to_string())?;
+            let made = match c.query_drop(format!("create database `{}`", name)).await {
+                Ok(()) => Ok(true),
+                Err(e) if e.to_string().contains("database exists") => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = c.disconnect().await;
+            made
+        })
     }
 
     pub fn checkout(&self) -> Result<Conn, String> {

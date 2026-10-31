@@ -120,7 +120,7 @@ impl Renamer<'_> {
                 self.expr(o)?;
                 self.expr(e)
             }
-            Stmt::Expr(e) | Stmt::Return(Some(e)) => self.expr(e),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.expr(e),
             Stmt::Fn(def) => self.func(def),
             Stmt::Route(r) => {
                 let r = Arc::get_mut(r).expect("a route just parsed has one owner");
@@ -140,7 +140,7 @@ impl Renamer<'_> {
                 self.expr(e)
             }
             Stmt::Service(_, _, _, Some(e), _) => self.expr(e),
-            Stmt::Type(_) | Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None) => Ok(()),
+            Stmt::Type(_) | Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => Ok(()),
         }
     }
 
@@ -185,6 +185,12 @@ impl Renamer<'_> {
             }
             Pattern::Record(fields) => {
                 for f in fields {
+                    // `{ q: str }` binds its key: under a new name, what it binds
+                    // is told apart from the key by `as`, or the body's renamed `q`
+                    // reads the variable (FEEDBACK16.md, Q-112; branch feedback20-fixes).
+                    if let (true, Some(to)) = (f.pat.is_type_test(), f.path.last().and_then(|k| self.map.get(k))) {
+                        f.pat = Pattern::As(Box::new(std::mem::replace(&mut f.pat, Pattern::Wild)), to.clone());
+                    }
                     self.pat(&mut f.pat)?;
                     if let Some(d) = f.default.as_mut() {
                         self.expr(d)?;

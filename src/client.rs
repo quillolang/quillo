@@ -1294,10 +1294,10 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
                 expr_assigned(o, out);
                 expr_assigned(e, out)
             }
-            Stmt::Return(Some(e)) => expr_assigned(e, out),
+            Stmt::Return(Some(e), _) => expr_assigned(e, out),
             Stmt::Fn(d) => expr_assigned(&d.body, out),
             Stmt::Route(r) => expr_assigned(&r.body, out),
-            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None, _) => {}
         }
     }
 }
@@ -1411,7 +1411,7 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
     let stmts = |ss: &[Stmt], f: &mut dyn FnMut(&Expr)| {
         for st in ss {
             match st {
-                Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) | Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x)) => {
+                Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) | Stmt::Expr(x) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => {
                     each_expr_in(x, f, fns)
                 }
                 Stmt::SetField(o, _, _, x, _) => {
@@ -1421,7 +1421,7 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
                 Stmt::Fn(d) if fns => each_expr_in(&d.body, f, fns),
                 Stmt::Fn(_) => {}
                 Stmt::Route(r) => each_expr_in(&r.body, f, fns),
-                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None) => {}
+                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None, _) => {}
             }
         }
     };
@@ -1480,7 +1480,7 @@ fn leaves_early(body: &Expr) -> bool {
     let mut found = false;
     each_expr(body, &mut |e| match e {
         Expr::Try(_) => found = true,
-        Expr::Block(ss) if ss.iter().any(|s| matches!(s, Stmt::Return(_))) => found = true,
+        Expr::Block(ss) if ss.iter().any(|s| matches!(s, Stmt::Return(..))) => found = true,
         _ => {}
     });
     found
@@ -1695,10 +1695,23 @@ fn lit_js(l: &Lit) -> String {
         // Past 2^53 a JS number is not whole: a BigInt, as the runtime has them.
         Lit::Int(n) if n.unsigned_abs() > (1 << 53) - 1 => format!("{}n", n),
         Lit::Int(n) => n.to_string(),
-        Lit::Float(f) if f.is_finite() => format!("{:?}", f),
+        Lit::Float(f) => float_js(*f),
         Lit::Dec(d) => format!("new W.Dec({}n, {})", d.mantissa(), d.scale()),
-        Lit::Float(_) => "null".into(),
         Lit::Str(s) => js_str(s),
+    }
+}
+
+/// A float as JavaScript. JSON has no `inf`: `1e999` is inf on the server, and
+/// was null here (FEEDBACK16.md, Q-120; branch feedback20-fixes).
+fn float_js(f: f64) -> String {
+    if f.is_finite() {
+        format!("{:?}", f)
+    } else if f.is_nan() {
+        "NaN".into()
+    } else if f > 0.0 {
+        "Infinity".into()
+    } else {
+        "-Infinity".into()
     }
 }
 
@@ -1711,8 +1724,11 @@ fn value_js(v: &Value) -> String {
         match v {
             Value::Dec(_) => false,
             Value::Int(n) => n.unsigned_abs() <= (1 << 53) - 1,
+            Value::Float(f) => f.is_finite(),
             Value::List(l) => l.iter().all(exact),
-            Value::Map(m) => m.values().all(exact),
+            // In a JSON literal `__proto__` sets the prototype, and the key is
+            // lost (FEEDBACK16.md, Q-119; branch feedback20-fixes).
+            Value::Map(m) => m.iter().all(|(k, x)| &**k != "__proto__" && exact(x)),
             _ => true,
         }
     }
@@ -1722,6 +1738,7 @@ fn value_js(v: &Value) -> String {
     match v {
         Value::Dec(d) => format!("new W.Dec({}n, {})", d.mantissa(), d.scale()),
         Value::Int(n) => format!("{}n", n),
+        Value::Float(f) => float_js(*f),
         Value::List(l) => format!("[{}]", l.iter().map(value_js).collect::<Vec<_>>().join(",")),
         // `"__proto__": x` in a literal would set the object's prototype.
         Value::Map(m) => format!(
@@ -2337,7 +2354,7 @@ impl<'a> Compiler<'a> {
                 Expr::Block(ss) => {
                     for st in ss {
                         match st {
-                            Stmt::Return(_) => exits = true,
+                            Stmt::Return(..) => exits = true,
                             Stmt::Assign(n, ..) => {
                                 changed.insert(n.clone());
                             }
@@ -2696,7 +2713,7 @@ impl<'a> Compiler<'a> {
                         body.push_str("return null;\n");
                     }
                 }
-                Stmt::Return(e) => {
+                Stmt::Return(e, _) => {
                     let v = match e {
                         Some(e) => self.expr(e)?,
                         None => "null".into(),
@@ -2890,9 +2907,11 @@ impl<'a> Compiler<'a> {
                         self.line = *l;
                         self.call(callee, args, Some(v))?
                     }
+                    // `x | save` is a call, and refused as `save(x)` is in a
+                    // component's markup (FEEDBACK16.md, Q-127; branch feedback20-fixes).
                     other => {
                         let f = self.callee_value(other)?;
-                        self.await_if(f.1, format!("W.call({}, [{}])", f.0, v))
+                        self.finish_call(if let Expr::Ident(n, _) = other { n } else { "this function" }, f.1, format!("W.call({}, [{}])", f.0, v))?
                     }
                 }
             }
@@ -3440,12 +3459,18 @@ impl<'a> Compiler<'a> {
                         }
                         None => "null".into(),
                     };
+                    // The same as a type test, under a name of its own (see `privacy`).
+                    let named = match &f.pat {
+                        Pattern::As(q, n) if q.is_type_test() => format!(", as: {}", js_str(n)),
+                        _ => String::new(),
+                    };
                     out.push(format!(
-                        "{{path: [{}], p: {}, d: {}, ty: {}}}",
+                        "{{path: [{}], p: {}, d: {}, ty: {}{}}}",
                         f.path.iter().map(|k| js_str(k)).collect::<Vec<_>>().join(", "),
                         self.pattern(&f.pat)?,
                         d,
-                        f.pat.is_type_test()
+                        f.pat.is_type_test(),
+                        named
                     ));
                 }
                 format!("{{k: \"r\", fs: [{}]}}", out.join(", "))

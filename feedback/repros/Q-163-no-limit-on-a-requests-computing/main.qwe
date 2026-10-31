@@ -1,0 +1,13 @@
+// Q-163 Nothing limits how long a request computes: a loop that never ends holds its instance until the process is killed, with no log line. Expected: `--max-compute`, ending it as a 500 at a statement boundary
+// mode: script
+// script: steps.sh
+// open-when: no such limit
+// open-when: answer with a limit: 000
+// fixed-when: answer with a limit: 500
+// From FEEDBACK20.md §Q-163 (found on 9e8c2fb). The plan is watchdog, deadline, check warning, never preemption.
+
+route GET /forever {
+    let i = 0
+    while true { i = i + 1 }
+    "never"
+}

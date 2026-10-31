@@ -173,7 +173,7 @@ fn atom(v: &J) -> bool {
 
 /// The patch that makes `new` out of `old`.
 pub fn diff(old: &J, new: &J) -> J {
-    if old == new {
+    if same(old, new) {
         return json!({ "$=": 1 });
     }
     if atom(old) || atom(new) {
@@ -190,7 +190,7 @@ pub fn diff(old: &J, new: &J) -> J {
             let mut m = Map::new();
             for (k, v) in b {
                 match a.get(k) {
-                    Some(o) if o == v => {}
+                    Some(o) if same(o, v) => {}
                     Some(o) => {
                         m.insert(k.clone(), diff(o, v));
                     }
@@ -209,6 +209,17 @@ pub fn diff(old: &J, new: &J) -> J {
         }
         (J::Array(a), J::Array(b)) => list_diff(a, b),
         _ => json!({ "$v": new }),
+    }
+}
+
+/// `==`, but a map with its keys in another order differs: `serde_json` ignores
+/// the order, and a page that loops over a map shows it (FEEDBACK16.md, Q-121;
+/// branch feedback20-fixes).
+fn same(a: &J, b: &J) -> bool {
+    match (a, b) {
+        (J::Object(x), J::Object(y)) => x.len() == y.len() && x.iter().zip(y).all(|((k, v), (l, w))| k == l && same(v, w)),
+        (J::Array(x), J::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same(v, w)),
+        _ => a == b,
     }
 }
 
@@ -239,7 +250,7 @@ fn list_diff(a: &[J], b: &[J]) -> J {
     };
     for (j, x) in b.iter().enumerate() {
         let id = id_of(x);
-        let k = if id.is_none() && a.get(j) == Some(x) {
+        let k = if id.is_none() && a.get(j).is_some_and(|y| same(y, x)) {
             Some(j)
         } else if let Some(id) = &id {
             by_id.get(id).copied()
@@ -256,7 +267,7 @@ fn list_diff(a: &[J], b: &[J]) -> J {
             t.get(&x.to_string()).copied()
         };
         match k {
-            Some(k) if a[k] == *x => match &mut run {
+            Some(k) if same(&a[k], x) => match &mut run {
                 Some((s, n)) if *s + *n == k => *n += 1,
                 _ => {
                     flush(&mut run, &mut ops);

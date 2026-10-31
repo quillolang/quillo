@@ -1,7 +1,7 @@
 // Q-114 `stats.mean([1e308, 1e308])` gives inf, where Python gives 1e308: the running sum overflows
 // mode: run
 // open-when: inf
-// fixed-when: /e\+?308/
+// fixed-when: 1000000000000000
 // From FEEDBACK16.md §Q-114 (found on b28e689).
 
 print(stats.mean([1e308, 1e308]))

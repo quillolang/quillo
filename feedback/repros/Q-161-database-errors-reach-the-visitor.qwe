@@ -1,0 +1,11 @@
+// Q-161 A route that gives a database's error sends the visitor its text: the SQL, the table and the column, on any server, not only under --watch
+// mode: serve
+// get: /users
+// open-when: {"error":"db: no such column
+// fixed-when: internal error
+// From FEEDBACK20.md §Q-161 (found on 9e8c2fb).
+
+db.open(":memory:")
+db.exec("create table if not exists users (id integer primary key, email text)")
+
+route GET /users = db.query("select nope from users")

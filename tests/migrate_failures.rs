@@ -136,11 +136,10 @@ fn a_file_that_fails_at_its_commit_is_reported() {
     std::fs::create_dir(d.join("migrations")).unwrap();
     std::fs::write(d.join("migrations/001_kids.sql"), FAILS_AT_COMMIT).unwrap();
     let mut it = load(&d, "db.open(\"app.db\")\n");
-    says(eval(&mut it, "db.migrate()"), "db.migrate: FOREIGN KEY constraint failed");
+    says(eval(&mut it, "db.migrate()"), "db.migrate: migration 001_kids.sql failed: FOREIGN KEY constraint failed");
 }
 
 #[test]
-#[ignore = "finding: a migration that fails at its commit stays open: the file isn't rolled back, and the next db.migrate says it can't start a transaction"]
 fn a_file_that_fails_at_its_commit_is_rolled_back() {
     let d = dir("commit-rollback");
     std::fs::create_dir(d.join("migrations")).unwrap();

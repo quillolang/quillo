@@ -556,10 +556,13 @@ function ownMakeName(n, t, v, depth) {
 
 const fmtKey = (k) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : JSON.stringify(k);
 
+// A number's text, as the server's: JavaScript writes Infinity (FEEDBACK16.md, Q-120; branch feedback20-fixes).
+const numText = (v) => v === Infinity ? "inf" : v === -Infinity ? "-inf" : String(v);
+
 function repr(v) {
   if (isNil(v)) return "null";
   if (typeof v === "string") return JSON.stringify(v);
-  if (typeof v === "number") return String(v);
+  if (typeof v === "number") return numText(v);
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return String(v);
   if (v instanceof Dec) return decText(v) + "m";
@@ -572,7 +575,7 @@ function repr(v) {
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : typeof v === "number" ? String(v) : v instanceof Dec ? decText(v) : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Dec ? decText(v) : repr(v);
 // A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
 const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
@@ -878,6 +881,7 @@ function matchInto(p, v, b) {
             x = f.d();
             // A default is taken as written, even `int = null`.
             if (f.ty) { b[f.path[f.path.length - 1]] = x; continue; }
+            if (f.as) { b[f.as] = x; continue; }
           } else if (x === undefined) return false;
           else x = null;
         }
@@ -1172,6 +1176,8 @@ B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }
 // HTML made from text (by raw or markdown) is that text, as on the server.
 B.str = meta((v) => v instanceof Html && v.text !== undefined ? v.text : display(v), "str", null);
 B.int = meta((v) => {
+  // Past an int's range, as on the server (FEEDBACK16.md, Q-111; branch feedback20-fixes).
+  if (typeof v === "number" && isFinite(v) && Math.abs(v) >= 2 ** 63) return new Err(`${display(v)} is too large for an int`);
   if (isInt(v) || typeof v === "bigint") return v;
   // The whole part (toward zero).
   if (v instanceof Dec) { const w = v.m / p10(v.s); return w < I64_MIN || w > I64_MAX ? new Err(`${decText(v)} is too large for an int`) : intOf(w); }
@@ -2175,6 +2181,8 @@ const fsum = (xs) => {
       x = hi;
     }
     partials.length = i;
+    // As on the server (FEEDBACK16.md, Q-113; branch feedback20-fixes).
+    if (!Number.isFinite(x)) { special += x; seen = true; partials.length = 0; continue; }
     partials.push(x);
   }
   if (seen) return special;
@@ -2185,7 +2193,8 @@ const fsum = (xs) => {
   if (n > 0 && ((lo < 0 && partials[n - 1] < 0) || (lo > 0 && partials[n - 1] > 0))) { const y = lo * 2, x = hi + y; if (y === x - hi) hi = x; }
   return hi;
 };
-const meanOf = (x) => div2(csum2(x), x.length);
+// The sum may pass the floats where the mean does not (FEEDBACK16.md, Q-114; branch feedback20-fixes).
+const meanOf = (x) => { const m = div2(csum2(x), x.length); return Number.isFinite(m) || !x.every(Number.isFinite) ? m : csum(x.map((v) => v / x.length)); };
 const ssOf = (x, m) => {
   const d = x.map((v) => v - m), c = csum(d), [hi, lo] = cdot2(d, d), fix = c * c / x.length, t = hi - fix;
   return t <= 0 ? [0, 0] : [t, lo - ((t - hi) + fix)];
@@ -2331,7 +2340,7 @@ B.math = {
   ldexp: (x, e) => { N(x, "math.ldexp"); I(e, "math.ldexp", 2); e = Math.min(Math.max(e, -10000), 10000); let r = x; while (e > 1000) { r *= 2 ** 1000; e -= 1000; } while (e < -1000) { r *= 2 ** -1000; e += 1000; } return mathChecked("ldexp", x, r * 2 ** e, true); },
   factorial: (n) => { natural(n, "math.factorial"); let r = 1; for (let k = 2; k <= n; k++) r = overflowed(r * k); return r; },
   gcd: (...args) => intsOf(args, "math.gcd").reduce(gcd2, 0),
-  lcm: (...args) => { let acc = 1; for (const n of intsOf(args, "math.lcm")) { if (n === 0) return 0; acc = overflowed(acc / gcd2(acc, n) * Math.abs(n)); } return acc; },
+  lcm: (...args) => { const v = intsOf(args, "math.lcm"); if (v.includes(0)) return 0; let acc = 1; for (const n of v) acc = overflowed(acc / gcd2(acc, n) * Math.abs(n)); return acc; },
   comb: (n, k) => {
     natural(n, "math.comb"); natural(k, "math.comb", 2);
     if (k > n) return 0;
@@ -2359,7 +2368,12 @@ B.math = {
     for (const x of L(l, "math.prod")) { if (typeof x !== "number") fail(`\`math.prod\` expects numbers, got ${typeName(x)}${decNote(x)}`); acc = isInt(acc) && isInt(x) ? overflowed(acc * x) : acc * x; }
     return acc;
   },
-  fsum: (l) => fsum(NS(l, "math.fsum")),
+  fsum: (l) => {
+    const x = NS(l, "math.fsum"), s = fsum(x);
+    if (Number.isNaN(s) && x.includes(Infinity) && x.includes(-Infinity)) fail("`math.fsum`: inf and -inf have no sum");
+    if (!Number.isFinite(s) && x.every(Number.isFinite)) fail("`math.fsum`: the sum is too large for a float");
+    return s;
+  },
   sumprod: (p, q) => dotOf(p, q, "math.sumprod"),
   erf: unary("erf", erf),
   erfc: unary("erfc", erfc),
@@ -4267,7 +4281,8 @@ function claimText(c, t) {
 
 // The nodes for value `v` (text, markup, a list of them), into `out`.
 function put(v, c, out) {
-  if (isNil(v) || v === false || v === true) return;
+  // `true` is text, as the server writes it (FEEDBACK16.md, Q-118; branch feedback20-fixes).
+  if (isNil(v) || v === false) return;
   if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
   if (v instanceof Html) { v.make(c, out); return; }
   const t = display(v);

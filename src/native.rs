@@ -217,8 +217,18 @@ fn item(src: &str, from: usize, _line: u32) -> Option<(Result<Export, String>, u
     let body = &src[at..];
     let name: String = body.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
     let name_end = at + body.find(&name)? + name.len();
-    // The signature runs to the body's `{` (or a `;`).
-    let sig_end = name_end + src[name_end..].find(['{', ';'])?;
+    // The signature runs to the body's `{` (or a `;`), outside brackets: an
+    // array type has a `;` of its own (FEEDBACK16.md, Q-142; branch feedback20-fixes).
+    let mut depth = 0;
+    let sig_end = name_end
+        + src[name_end..].find(|c| {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && matches!(c, '{' | ';')
+        })?;
     let sig = &src[name_end..sig_end];
     let end = if src.as_bytes()[sig_end] == b'{' { block_end(src, sig_end) } else { sig_end + 1 };
     if !kind.is_empty() {
@@ -347,6 +357,9 @@ pub fn quillo_type(t: &str) -> Result<String, String> {
         "String" | "str" | "char" => "str".into(),
         "()" => "null".into(),
         "Value" => "any".into(),
+        // A slice is made from a list; an array has a length no list promises
+        // (FEEDBACK16.md, Q-142; branch feedback20-fixes).
+        _ if t.starts_with('[') && t.contains(';') => return Err(format!("the fixed-size array `{}` cannot cross between Rust and Quillo: take a slice or a Vec", t)),
         _ if t.starts_with('[') => "list".into(),
         _ => {
             if let Some(x) = inner(t, "Option<") {

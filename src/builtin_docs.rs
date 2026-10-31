@@ -57,7 +57,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     // Values
     ("print", "values", "Writes the values as text, a space between, on stdout (the console in a page)."),
     ("str", "x", "`x` as text: a whole float as `2.0`, a list or map as Quillo writes it, null as `null`."),
-    ("int", "x", "A number cut toward zero, `true` as 1, or text of digits; `\"1.0\"` is an error value."),
+    ("int", "x", "A number cut toward zero, `true` as 1, or text of digits; `\"1.0\"` and a number too large for an int are error values."),
     ("float", "x", "A number or numeric text as a float; anything else is an error value."),
     ("dec", "x", "A decimal from text, an int, or a float through its shortest text; else an error value."),
     ("format_number", "x, locale, digits", "`x` as `locale` writes numbers (else the program's, or en-US), rounded to `digits` if given."),
@@ -119,6 +119,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     // Tenants
     ("tenant", "", "The tenant the code runs for, or null."),
     ("tenant_from", "rule", "Sets each request's tenant: the host's part before the domain `rule`, or what a function of it gives."),
+    ("new_tenant", "name, f", "Makes a tenant's database and runs `f` for it, or gives an error when that tenant exists, so a signup cannot land in a customer's data."),
     ("with_tenant", "name, f", "Runs `f` for that tenant, with its database and live updates; a new tenant's database is made."),
     // Components
     ("url", "", "`{ path, query, hash }` of the request, or of the address bar in the browser, where it is followed."),
@@ -295,7 +296,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("math.isinf", "x", "Whether `x` is an infinity."),
     ("math.isnan", "x", "Whether `x` is `NaN`."),
     ("math.prod", "xs, start", "The items multiplied, times `start` (1 unless given); an int while everything is one."),
-    ("math.fsum", "xs", "The sum of `xs` as a float, exactly rounded."),
+    ("math.fsum", "xs", "The sum of `xs` as a float, exactly rounded; an error if it passes the floats on the way, or for `inf` with `-inf`."),
     ("math.sumprod", "a, b", "The sum of the products of two lists of one length; ints stay exact."),
     ("math.erf", "x", "The error function of `x`."),
     ("math.erfc", "x", "`1 - erf(x)`, accurate for large `x`."),
