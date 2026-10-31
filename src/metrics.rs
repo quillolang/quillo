@@ -35,6 +35,20 @@ pub fn start() {
     STARTED.get_or_init(Instant::now);
 }
 
+/// What became of prefetches: answered, refused, and used by a click (FEEDBACK22.md, Q-181;
+/// branch feedback22-fixes).
+static PREFETCHES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A prefetch was answered with `status`.
+pub fn prefetched(status: u16) {
+    PREFETCHES[if status == 503 { 1 } else { 0 }].fetch_add(1, Relaxed);
+}
+
+/// A page says it came from a prefetch.
+pub fn prefetch_used() {
+    PREFETCHES[2].fetch_add(1, Relaxed);
+}
+
 /// A request was answered with `status` after `secs`.
 pub fn answered(status: u16, secs: f64) {
     if !ENABLED.load(Relaxed) {
@@ -65,6 +79,10 @@ pub fn render() -> String {
     let _ = writeln!(s, "quillo_request_duration_seconds_bucket{{le=\"+Inf\"}} {}", total);
     let _ = writeln!(s, "quillo_request_duration_seconds_sum {}", LATENCY_MICROS.load(Relaxed) as f64 / 1e6);
     let _ = writeln!(s, "quillo_request_duration_seconds_count {}", total);
+    s.push_str("# HELP quillo_prefetches_total Pages asked for ahead of a click: answered, refused, and used by a click.\n# TYPE quillo_prefetches_total counter\n");
+    for (name, n) in ["answered", "refused", "used"].iter().zip(&PREFETCHES) {
+        let _ = writeln!(s, "quillo_prefetches_total{{result=\"{}\"}} {}", name, n.load(Relaxed));
+    }
     s.push_str("# HELP quillo_requests_in_progress Requests being answered.\n# TYPE quillo_requests_in_progress gauge\n");
     let _ = writeln!(s, "quillo_requests_in_progress {}", IN_PROGRESS.load(Relaxed));
     s.push_str("# HELP quillo_connections Open client connections.\n# TYPE quillo_connections gauge\n");

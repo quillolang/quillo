@@ -274,6 +274,8 @@ impl Interp {
         // A page asked for ahead of a click: made without changing anything.
         let prefetch = is_prefetch(req).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.prefetching = prefetch.clone();
+        let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.changed = changed.clone();
         let mut resp = self.handle_inner(req);
         // A prefetch's deferred parts: worked out now, as part of the prefetch, which
         // may change nothing (branch defer).
@@ -285,6 +287,7 @@ impl Interp {
             }
         }
         self.prefetching = None;
+        self.changed = None;
         // A host that names no customer is a page that is not there, where the route met
         // that and did not answer for itself. A route that needs no database still
         // answers, as `www.example.com` does (FEEDBACK20.md, Q-167; branch feedback20-fixes).
@@ -329,9 +332,24 @@ impl Interp {
                 // was): with a 503 it drops the prefetch and loads the page.
                 return HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() };
             }
-            if resp.status == 200 && resp.header("cache-control").is_none() {
+            // Only this page's own fetch needs the HTTP cache: Chrome keeps a speculation
+            // rule's answer itself, and would keep it there too. `Vary`, so that it does not
+            // outlive the session it was made for (FEEDBACK22.md, Q-176; branch
+            // feedback22-fixes).
+            let own = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-quillo-prefetch"));
+            if own && resp.status == 200 && resp.header("cache-control").is_none() {
                 resp.headers.push(("cache-control".into(), "private, max-age=30".into()));
+                resp.headers.push(("vary".into(), "Cookie".into()));
             }
+        }
+        // What this changed may be in a page kept for a click: Chrome lets those go on
+        // this. Not on every request: a server fn that reads is a POST as well, and a `GET`
+        // may count a visit. A session changing is always one: logging in or out by a link
+        // leaves pages of the old one (FEEDBACK22.md, Q-177; branch feedback22-fixes).
+        let wrote = changed.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        let session = resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && v.contains("quillo_session="));
+        if (wrote || session) && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) && resp.header("clear-site-data").is_none() {
+            resp.headers.push(("clear-site-data".into(), "\"prefetchCache\", \"prerenderCache\"".into()));
         }
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
@@ -339,7 +357,7 @@ impl Interp {
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
-                resp.body.splice(at..at, format!("<script>{}</script>", PREFETCH_JS).into_bytes());
+                resp.body.splice(at..at, format!("<script>{}</script>{}", PREFETCH_JS, used_script(&self.base)).into_bytes());
             }
         }
         // A page that plays a stream loads the player.
@@ -1330,6 +1348,19 @@ pub const PREFETCH_JS: &str = concat!(
     "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])d.addEventListener(v,(e)=>go(link(e)),o)})()"
 );
 
+/// With metrics on: a page landed on from a prefetch says so, as only it can tell. The page
+/// that asked for it is told nothing, and a click answered from a prefetch never reaches the
+/// server (FEEDBACK22.md, Q-181; branch feedback22-fixes).
+fn used_script(base: &str) -> String {
+    if !crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return String::new();
+    }
+    format!(
+        "<script>addEventListener(\"load\",()=>{{const n=performance.getEntriesByType(\"navigation\")[0];if(n&&n.deliveryType===\"navigational-prefetch\")navigator.sendBeacon(\"{}/_quillo/prefetch-used\")}})</script>",
+        base
+    )
+}
+
 /// Whether a request is a prefetch: this page's (`PREFETCH_JS`) or the
 /// browser's own (speculation rules, `<link rel=prefetch>`).
 pub fn is_prefetch(req: &HttpRequest) -> bool {
@@ -1987,6 +2018,10 @@ impl Worker {
         if app.watch && path == "/_quillo/events" {
             return serve_events(app.clone(), req);
         }
+        if path.ends_with("/_quillo/prefetch-used") && crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::metrics::prefetch_used();
+            return Answer::Respond(plain(204, ""));
+        }
         if path.ends_with("/_quillo/live") {
             return serve_live(app.shared.clone(), req);
         }
@@ -2041,8 +2076,14 @@ impl Worker {
         // The request's id: given (another service calling, a proxy), or made.
         let rid = crate::service::request_id(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-request-id")).map(|(_, v)| v.as_str()));
         crate::httpd::request_began(format!("{} {} (rid {})", req.method, log_url(&req.url), rid));
+        let prefetch = is_prefetch(&req);
         let mut resp = if app.watch && req.url == "/_quillo/dev" {
             plain(200, &self.generation.to_string())
+        } else if prefetch && crate::httpd::others_waiting() {
+            // A guess is work nobody has asked for yet, so it does not go before anyone. The
+            // browser drops the 503, and a click is made as usual (FEEDBACK22.md, Q-179;
+            // branch feedback22-fixes).
+            HttpResponse { status: 503, headers: vec![("cache-control".into(), "no-store".into())], body: Vec::new() }
         } else {
             match (&mut self.local, &*self.program) {
                 (Some(it), _) => match {
@@ -2064,6 +2105,9 @@ impl Worker {
             }
         };
         crate::httpd::request_done();
+        if prefetch && crate::metrics::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::metrics::prefetched(resp.status);
+        }
         if !resp.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-request-id")) {
             resp.headers.push(("x-request-id".into(), rid.to_string()));
         }
@@ -2119,7 +2163,10 @@ impl Worker {
         if req.url != "/.well-known/appspecific/com.chrome.devtools.json" && !delivery {
             match crate::metrics::LOG.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::metrics::TEXT => {
-                    crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms)\n", req.method, log_url(&req.url), resp.status, took * 1000.0))
+                    // A page nobody has seen, marked so that what counts the log does not
+                    // count it (FEEDBACK22.md, Q-181; branch feedback22-fixes).
+                    let mark = if prefetch { " prefetch" } else { "" };
+                    crate::httpd::log_fmt(format_args!("{} {} -> {} ({:.1}ms){}\n", req.method, log_url(&req.url), resp.status, took * 1000.0, mark))
                 }
                 crate::metrics::JSON => {
                     let tenant = match self.local.as_ref().and_then(|it| it.tenant.clone().flatten()) {
@@ -2127,7 +2174,7 @@ impl Worker {
                         None => String::new(),
                     };
                     crate::httpd::log_fmt(format_args!(
-                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{},\"rid\":{}}}\n",
+                        "{{\"time\":\"{}\",\"method\":{},\"path\":{},\"status\":{},\"ms\":{:.2},\"ip\":{}{}{},\"rid\":{}}}\n",
                         crate::httpd::iso_now(),
                         serde_json::Value::from(req.method.as_str()),
                         serde_json::Value::from(&*log_url(&req.url)),
@@ -2135,6 +2182,7 @@ impl Worker {
                         took * 1000.0,
                         serde_json::Value::from(req.remote.as_str()),
                         tenant,
+                        if prefetch { ",\"prefetch\":true" } else { "" },
                         serde_json::Value::from(&*rid)
                     ))
                 }

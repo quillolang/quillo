@@ -3756,6 +3756,8 @@ function idemKey() {
 // may be a patch to that (FEEDBACK2.md, Q-028; branch feedback6-fixes).
 async function rpcRaw(name, args, live, idem) {
   let r;
+  // It may change what was kept for a link (see `Ahead`).
+  if (!live) aheadDrop();
   const headers = { "content-type": "application/json" };
   const had = live && live.h, base = live && live.base;
   if (live) headers["x-quillo-live"] = "1";
@@ -4691,6 +4693,67 @@ function navChanged() {
   Nav.at.set(location.href);
 }
 
+// A link in a component is followed here, so a page fetched ahead would be thrown away, and
+// the wait is all data. So what is kept is that page's components' state: taken as a page
+// being resumed takes it, it needs no new way to ask for data and shows no `null` first
+// (FEEDBACK22.md, Q-180; branch feedback22-fixes).
+const Ahead = { to: "", states: null, at: 0, turn: 0 };
+// As long as a browser may keep a prefetch of ours.
+const AHEAD_KEPT = 30000;
+
+function aheadDrop() {
+  Ahead.to = "";
+  Ahead.states = null;
+  Ahead.turn++;
+}
+
+// Where a link in a component goes, if it is one this program follows itself.
+function followed(a) {
+  if (!a || !a.closest(ISLANDS)) return null;
+  if ((a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return null;
+  const u = new URL(a.href, location.href);
+  if (u.origin !== location.origin) return null;
+  // Only links into this program; others load normally.
+  if (BASE && u.pathname !== BASE && !u.pathname.startsWith(BASE + "/")) return null;
+  return (u.pathname.slice(BASE.length) || "/").startsWith("/_quillo/") ? null : u;
+}
+
+function fetchAhead(e) {
+  const a = e.target.closest && e.target.closest("a[href]");
+  const u = a && !a.closest("[data-no-prefetch]") ? followed(a) : null;
+  const c = navigator.connection;
+  if (!u || !window.__quillo_pf || (c && (c.saveData || /2g/.test(c.effectiveType || "")))) return;
+  const to = u.pathname + u.search;
+  if (to === Ahead.to || to === location.pathname + location.search) return;
+  aheadDrop();
+  Ahead.to = to;
+  const turn = Ahead.turn;
+  fetch(to, { credentials: "same-origin", headers: { "x-quillo-prefetch": "1" } })
+    .then((r) => (r.ok ? r.text() : null))
+    .then((html) => {
+      if (html === null || turn !== Ahead.turn) return;
+      Ahead.states = new DOMParser().parseFromString(html, "text/html");
+      Ahead.at = Date.now();
+    })
+    .catch(() => {});
+}
+
+// The state for the components a page brings. Not for one already on this page: it lives on
+// and takes nothing, so one made beside it would take its place in the line and show
+// another's data. That one asks for its data, as it would have.
+function aheadFor(u) {
+  const doc = Ahead.states, fresh = u.pathname + u.search === Ahead.to && Date.now() - Ahead.at < AHEAD_KEPT;
+  aheadDrop();
+  if (!doc || !fresh) return null;
+  const here = new Set([...document.querySelectorAll(ISLANDS)].map((i) => i.dataset.c)), q = {};
+  for (const i of doc.querySelectorAll(ISLANDS)) {
+    if (here.has(i.dataset.c) || i.hasAttribute("data-qd")) continue;
+    liveSeen(...(i.dataset.v || "").split(":"));
+    (q[i.dataset.c] = q[i.dataset.c] || []).push({ s: islandJSON(i.dataset.s, {}), l: islandJSON(i.dataset.l, null) });
+  }
+  return q;
+}
+
 function navStart() {
   if (Nav.on || typeof window === "undefined") return;
   Nav.on = true;
@@ -4698,17 +4761,15 @@ function navStart() {
   window.__quillo_nav = true;
   window.addEventListener("popstate", navChanged);
   window.addEventListener("hashchange", navChanged);
+  let pointed = 0;
+  const o = { capture: true, passive: true };
+  document.addEventListener("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => fetchAhead(e), 65); }, o);
+  for (const v of ["pointerdown", "touchstart", "focusin"]) document.addEventListener(v, fetchAhead, o);
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    const a = e.target.closest && e.target.closest("a[href]");
-    if (!a || !a.closest(ISLANDS)) return;
-    if ((a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return;
-    const u = new URL(a.href, location.href);
-    if (u.origin !== location.origin) return;
-    // Only links into this program; others load normally.
-    if (BASE && u.pathname !== BASE && !u.pathname.startsWith(BASE + "/")) return;
+    const u = followed(e.target.closest && e.target.closest("a[href]"));
+    if (!u) return;
     const path = u.pathname.slice(BASE.length) || "/";
-    if (path.startsWith("/_quillo/")) return;
     // A spot on this page: the browser scrolls there and sets :target, and
     // its popstate (or hashchange) updates url().
     if (u.hash && u.pathname === location.pathname && u.search === location.search) return;
@@ -4734,7 +4795,11 @@ function navigate(to) {
   }
   if (full !== location.pathname + location.search + location.hash) history.pushState(null, "", full);
   window.scrollTo(0, 0);
+  // For the render this sets off, which runs as a microtask queued before this one's.
+  const kept = aheadFor(u);
+  if (kept) hydrating = kept;
   navChanged();
+  if (kept) queueMicrotask(() => { if (hydrating === kept) hydrating = null; });
   if (u.hash) toHash();
   return null;
 }

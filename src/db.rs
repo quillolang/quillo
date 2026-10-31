@@ -1501,7 +1501,7 @@ pub(crate) fn call_done(it: &mut Interp, id: &str, status: u16, answer: &str) {
 }
 
 fn select(it: &mut Interp, on: Option<usize>, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
-    if it.prefetching.is_some() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
+    if it.writes_noted() && !only_reads(&sql) && it.no_writes("SQL that writes", 0).is_err() {
         return Err(crate::interp::PREFETCH_REFUSED.into());
     }
     let b = backend_on(it, on)?;

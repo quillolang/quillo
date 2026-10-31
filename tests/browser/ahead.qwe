@@ -1,0 +1,50 @@
+// A link in a component pointed at: the page's state is fetched ahead, so its components
+// start with it and ask for nothing, with no `null` shown first. Driven by ahead.js
+// (FEEDBACK22.md, Q-180; branch feedback22-fixes).
+
+server fn load_items() {
+    sleep(200)
+    ["a", "b"]
+}
+server fn load_for(who: str) {
+    sleep(200)
+    who
+}
+server fn touch() = "touched"
+
+component Items() {
+    state items = load_items()
+    <p id="items">{items == null ? "nothing yet" : len(items)}</p>
+}
+
+// On every page: that one lives on and takes nothing, so one made beside it must not take
+// its place in the line.
+component Named(who: str) {
+    state name = load_for(who)
+    <p class="named">{name == null ? "nothing yet" : name}</p>
+}
+
+component Fresh() {
+    state n = load_for("fresh")
+    <p id="fresh">{n == null ? "nothing yet" : n}</p>
+}
+
+component App() {
+    state said = ""
+    let path = url().path
+    <div>
+        <a id="go" href="/items">items</a>
+        <a id="both" href="/both">both</a>
+        <a id="after" href="/after">after a call</a>
+        <a id="off" href="/off" data-no-prefetch>not ahead</a>
+        <button id="touch" @click={() => { said = touch() }}>touch</button>
+        <p id="said">{said}</p>
+        <Named who="stays"/>
+        {path == "/items" ? <Items/> : null}
+        {path == "/both" ? <Named who="made after"/> : null}
+        {path == "/after" ? <Fresh/> : null}
+        {path == "/off" ? <Items/> : null}
+    </div>
+}
+
+route GET /*rest = <html><body><App/></body></html>

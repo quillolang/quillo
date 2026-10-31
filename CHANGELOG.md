@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Prefetching
+
+- **A page kept for a click no longer outlives a logout.** Only Quillo's own background
+  fetch uses the browser's cache, and with `Vary: Cookie`.
+- **A request that changes something lets kept pages go**, with `Clear-Site-Data`, in Chrome
+  and Edge. A `POST` that reads and a `GET` that counts a visit do not.
+- **A prerender runs nothing until it is shown**: no component, `server fn` or live update.
+- **Prefetches never go ahead of a visitor:** with anyone waiting, one is refused first.
+- **Links in components start with their data:** pointing at one fetches the state of the
+  components on the page it leads to, so they show no `null` first.
+- **The log marks a prefetch**, and `--metrics` counts those answered, refused and used.
+
 ### Databases and tenants
 
 - **A visitor only reads errors the program wrote.** One a builtin made, from a database, an

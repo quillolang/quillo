@@ -80,11 +80,17 @@ const TOO_BUSY: Duration = Duration::from_millis(50);
 
 thread_local! {
     static OWN_BUSY: std::cell::RefCell<Option<Arc<Busy>>> = const { std::cell::RefCell::new(None) };
+    static WAITING: Cell<usize> = const { Cell::new(0) };
 }
 
 fn clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Whether others are waiting behind the request starting here.
+pub fn others_waiting() -> bool {
+    WAITING.with(|c| c.get()) > 0
 }
 
 /// `--max-compute`.
@@ -712,9 +718,11 @@ impl Loop {
             let ready = self.ready.len();
             for _ in 0..ready {
                 if let Some(i) = self.ready.pop_front() {
+                    WAITING.with(|c| c.set(self.ready.len() + self.runnable.len()));
                     self.serve(i);
                 }
             }
+            WAITING.with(|c| c.set(0));
             // A reload, or threads `parallel` started, are waiting to run.
             if gil.waiting() > 0 {
                 gil.hand_over();

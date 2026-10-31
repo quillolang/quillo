@@ -192,6 +192,10 @@ pub struct Interp {
     /// set when the code tried to change something, which stopped it (see
     /// `no_writes`). Shared with what it runs in parallel.
     pub(crate) prefetching: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Set when a request that may change something does: the guard's own list of what
+    /// changes things, so that a page kept for a click can be let go (FEEDBACK22.md, Q-177;
+    /// branch feedback22-fixes).
+    pub(crate) changed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Tenant databases whose function (`db.open((tenant) => ...)`) is
     /// running, which may not use them itself.
     pub(crate) db_resolving: Vec<usize>,
@@ -908,6 +912,7 @@ impl Interp {
             db_on: None,
             wrote_req: None,
             prefetching: None,
+            changed: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: String::new(),
@@ -992,6 +997,7 @@ impl Interp {
             db_on: None,
             wrote_req: None,
             prefetching: None,
+            changed: None,
             db_resolving: Vec::new(),
             db_loop: None,
             base: self.base.clone(),
@@ -1171,6 +1177,9 @@ impl Interp {
     /// what would stops it here, and the prefetch is answered "not
     /// prefetched" (the page is made when the link is followed).
     pub(crate) fn no_writes(&mut self, what: &str, line: u32) -> Result<(), Ctrl> {
+        if let Some(flag) = &self.changed {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         match &self.prefetching {
             Some(flag) => {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1178,6 +1187,12 @@ impl Interp {
             }
             None => Ok(()),
         }
+    }
+
+    /// Whether what changes something matters to this request (see `no_writes`).
+    #[inline]
+    pub(crate) fn writes_noted(&self) -> bool {
+        self.prefetching.is_some() || self.changed.is_some()
     }
 
     /// `parallel(f, g, ...)`: calls the functions at once and gives back
@@ -1280,6 +1295,7 @@ impl Interp {
         it.tenant_named = self.tenant_named;
         it.request_id = self.request_id.clone();
         it.prefetching = self.prefetching.clone();
+        it.changed = self.changed.clone();
         it.upload_body = self.upload_body.clone();
         it.locale = self.locale.clone();
         it
@@ -1509,7 +1525,7 @@ impl Interp {
                 fail(*line, why)
             }
             Stmt::Assign(name, op, e, line) => {
-                if self.prefetching.is_some() && lookup_global(env, name).map_or(false, |(_, global)| global) {
+                if self.writes_noted() && lookup_global(env, name).map_or(false, |(_, global)| global) {
                     self.no_writes(&format!("assigning `{}`", name), *line)?;
                 }
                 let rhs = match self.in_place(name, op, e, env)? {
@@ -2322,7 +2338,7 @@ impl Interp {
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, line)?;
                 }
-                if self.prefetching.is_some() && CHANGES.contains(name) {
+                if self.writes_noted() && CHANGES.contains(name) {
                     self.no_writes(name, line)?;
                 }
                 if !self.tracks.is_empty() && crate::viewcache::impure_builtin(name) {

@@ -664,6 +664,48 @@ fn a_link_pointed_at_is_there_when_followed() {
     assert_eq!(r, serde_json::json!({ "fast": true, "kept": true, "errors": [] }));
 }
 
+/// A link in a component pointed at: its page's state is there when it is followed, with
+/// no `null` first and nothing asked for; never for a component already on the page, and
+/// not after a call may have changed it (FEEDBACK22.md, Q-180; branch feedback22-fixes).
+#[test]
+fn a_link_in_a_component_pointed_at_starts_with_its_state() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("ahead.qwe"), free_port(), Some(&dir.join("ahead.js")));
+    assert_eq!(r, serde_json::json!({
+        "errors": [],
+        "fetched": 1,
+        "at_once": "2",
+        "then": "2",
+        "asked_for_items": 0,
+        "both": ["stays", "made after"],
+        "said": "touched",
+        "after_a_call": "nothing yet",
+        "after_a_call_then": "fresh",
+        "not_ahead": 0,
+    }));
+}
+
+/// A prerender runs nothing until it is shown, and then runs as any page (FEEDBACK22.md,
+/// Q-178; branch feedback22-fixes).
+#[test]
+fn a_prerendered_page_starts_when_it_is_shown() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("prerender.qwe"), free_port(), Some(&dir.join("prerender.js")));
+    assert_eq!(r, serde_json::json!({
+        "held": { "text": "not yet", "calls": 0 },
+        "shown": { "text": "ran", "calls": 1 },
+        "errors": [],
+    }));
+}
+
 /// A component's translations: the server's locale and text, then the same
 /// plural rules in the browser.
 #[test]

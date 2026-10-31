@@ -19,8 +19,15 @@ further guess adds to that, so it comes first. Then measurement (Q-181): nobody 
 rate yet, so nobody can tell whether a predictor helps. And the largest gain is not a smarter
 guess: links in components get no prefetching at all (Q-180).
 
-Nothing here is fixed: no Quillo source was changed for this report. Fix first, in this order:
-Q-176 and Q-177 together, Q-178, Q-179, Q-181, Q-180, and only then a model of what comes next.
+All six are fixed on branch `feedback22-fixes`; a model of what comes next is still to do. Three
+choices differ from the suggestions below:
+
+- **Q-177 is sent on what changes something, and only outside a `GET`,** but for a session. A
+  program that counts a visit on each `GET` would otherwise wipe its own prefetches on every page.
+- **Q-178 holds the runtime's start,** which `@mount`, live updates and `server fn`s all come from.
+- **Q-180 leaves out a component already on the page.** It lives on and takes no state, so one made
+  beside it would take its place in the line and show another's data. It asks for its data as it
+  always did, and kept state is dropped after 30 seconds and on any `server fn` call.
 
 ## Seen again
 

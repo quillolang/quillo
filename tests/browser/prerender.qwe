@@ -1,0 +1,14 @@
+// A prerender nobody follows runs nothing, and one followed runs as a page does. A real one
+// cannot be driven here, as a debugger turns prerendering off, so the page says it is one
+// until prerender.js says it is shown (FEEDBACK22.md, Q-178; branch feedback22-fixes).
+
+let SAY = "Object.defineProperty(document, 'prerendering', { value: true, configurable: true });"
+
+server fn touch() = "ran"
+
+component Mounts() {
+    state done = "not yet"
+    <div id="mounted" @mount={(el) => { done = touch() }}>{done}</div>
+}
+
+route GET / = <html><head><script>{raw(SAY)}</script></head><body><Mounts/></body></html>

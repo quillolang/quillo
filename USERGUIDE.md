@@ -2247,7 +2247,8 @@ Every page Quillo serves asks for the pages it links to before they are clicked:
 link of the same site pointed at (for 65 ms), pressed, touched or reached with Tab. By
 the time the click lands, the page is there. Browsers with speculation rules (Chrome,
 Edge) keep the page for the navigation themselves; others get it in the background and
-keep it in their cache for 30 seconds, which the server allows for this.
+keep it in their cache for 30 seconds, which the server allows for this, unless someone
+has logged in or out.
 
 - **Prefetching changes nothing.** A route asked for ahead of a click may read (the
   database, files, other servers) but not write: `db.exec` or SQL that writes, assigning
@@ -2255,11 +2256,25 @@ keep it in their cache for 30 seconds, which the server allows for this.
   and calls to services stop it, and it is answered "not prefetched" (503, which the
   browser drops; the request log shows it as any 503, with no error line). The page is
   then made, as usual, when the link is followed. So a `GET` that does something (a
-  logout link, a counter) is never done by pointing at it.
+  logout link, a counter) is never done by pointing at it. A page prerendered runs none
+  of its components, `server fn`s or live updates until someone opens it.
+- **Links a page's components follow** are fetched for the state of the components on the
+  page they lead to, so those start with their data and no `null` first (see
+  [Single-page apps](#single-page-apps)). It is kept for 30 seconds, until a `server fn` is
+  called, and only for components not already on the page; the others ask as usual.
+- **Keeping up with changes:** a request that changes something, or logs someone in or
+  out, answers with `Clear-Site-Data: "prefetchCache", "prerenderCache"`, so a page kept
+  for a click is not shown out of date; Chrome obeys it from version 138. A `GET` does not
+  send it, nor a `POST` that only reads. Elsewhere, a change that is not a login can be up
+  to 30 seconds old on the click.
+- **When the server is busy:** with anyone waiting, a prefetch is refused before it runs,
+  so prefetches never go ahead of a visitor.
+- **Seeing what it does:** the log marks them, `GET /docs -> 200 (0.4ms) prefetch`, and
+  `"prefetch": true` under `--log json`. With `--metrics`, `quillo_prefetches_total` counts
+  those `answered`, `refused`, and `used` by a click, as a page reports in Chrome and Edge.
 - **What is left alone:** links to other sites, with `target` or `download`, to the
-  same page (`#section`), those a page's components follow themselves (see
-  [Single-page apps](#single-page-apps)), anything inside an element with
-  `data-no-prefetch`, and every link on a connection saving data.
+  same page (`#section`), anything inside an element with `data-no-prefetch`, and every
+  link on a connection saving data.
 - A route that sets its own `cache-control` keeps it. `quillo run --no-prefetch` turns
   prefetching off.
 
@@ -4439,6 +4454,7 @@ With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
 | `quillo_requests_total` | requests answered, by status class |
 | `quillo_request_duration_seconds` | a histogram (1 ms, 2.5, 5, 10, 25, 50, 100, 250 ms, 1 s, 5 s) |
 | `quillo_requests_in_progress`, `quillo_connections` | now |
+| `quillo_prefetches_total{result}` | pages asked for ahead of a click: `answered`, `refused`, `used` |
 | `quillo_uptime_seconds` | since the server started |
 | `quillo_bundles` | sets of components whose bundle is kept (see [Components](#components)) |
 | `quillo_udp_received_total`, `quillo_udp_dropped_total` | packets (see [UDP](#udp)) |
