@@ -15,6 +15,8 @@
 // (default) or "lg". on_end: called once, with nothing, when it reaches zero, when
 // the Countdown is inside one of your components.
 
+import ui/kit/theme.qwe use ui_cls
+
 let countdown_css = css`
 .ui-cd { display: inline-grid; gap: 6px; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-cd-label { color: var(--ui-muted); }

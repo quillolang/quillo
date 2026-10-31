@@ -4,6 +4,32 @@
 // place (its address found on the map, the pin moved by hand), and the
 // outside services' status.
 
+import lib/dates.qwe use CITY_ZONES, plural
+import lib/pricing.qwe use POLICIES
+import lib/stays.qwe
+    use AMENITIES, KINDS, add_listing, decide_request, load_calendar, load_host, load_outside, set_nights
+import ui/kit/avatar.qwe use Avatar
+import ui/kit/badge.qwe use Badge
+import ui/kit/bar_chart.qwe use BarChart
+import ui/kit/button.qwe use Button
+import ui/kit/calendar_heatmap.qwe use CalendarHeatmap
+import ui/kit/card.qwe use Card
+import ui/kit/chip_group.qwe use ChipGroup
+import ui/kit/countdown.qwe use Countdown
+import ui/kit/empty_state.qwe use EmptyState
+import ui/kit/map_view.qwe use MapView
+import ui/kit/month_calendar.qwe use MonthCalendar
+import ui/kit/select.qwe use Select
+import ui/kit/stat.qwe use Stat
+import ui/kit/status_dot.qwe use StatusDot
+import ui/kit/switch.qwe use Switch
+import ui/kit/text_area.qwe use TextArea
+import ui/kit/text_field.qwe use TextField
+import ui/kit/timeline.qwe use Timeline
+import ui/search.qwe use toggled
+import ui/shell.qwe use Shell
+import ui/stay.qwe use Problem
+
 view HostPage(me) = <Shell {me} title="Hosting" here="/host"><HostDashboard/></Shell>
 
 component HostDashboard() {

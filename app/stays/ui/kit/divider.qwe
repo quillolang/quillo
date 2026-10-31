@@ -8,6 +8,8 @@
 // vertical: an upright line, as tall as the row it is in. spacing: "sm", "md"
 // (default) or "lg", the room around it.
 
+import ui/kit/theme.qwe use ui_cls
+
 let divider_css = css`
 .ui-divider { flex: none; margin: 16px 0; border: 0; border-top: 1px solid var(--ui-border); }
 .ui-divider-v { align-self: stretch; min-height: 1em; margin: 0 12px; border-top: 0; border-left: 1px solid var(--ui-border); }

@@ -16,6 +16,8 @@
 // id ("ui-carousel"); give each one on a page its own.
 // CarouselSlide: label (its name for screen readers, after "2 of 5"), children.
 
+import ui/kit/theme.qwe use ui_cls
+
 let carousel_css = css`
 .ui-carousel { position: relative; display: grid; gap: 10px; min-width: 0; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
 .ui-carousel-view { position: relative; min-width: 0; }

@@ -2,6 +2,11 @@
 // how many operators turn up against the line's minimum, with leave approved
 // and asked for. A week or a month; it follows every decision live.
 
+import lib/auth.qwe use viewer
+import lib/roster.qwe use lines_of, manpower
+import lib/rota.qwe use SHIFT_NAMES, day_label
+import ui/page.qwe use Problem
+
 server fn load_manpower(from: date, to: date) with db, time {
     let u = viewer() ?? return err("Sign in first")
     if u.role == "operator" { return err("Managers and supervisors only") }

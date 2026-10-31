@@ -25,6 +25,9 @@ async function main() {
     "--js-flags=--expose-gc", "--enable-precise-memory-info",
     "about:blank",
   ], { stdio: ["ignore", "ignore", "pipe"] });
+  // Every wait below checks the deadline, but a reply Chrome never sends would
+  // wait for good: end the run, or one lost reply holds up the whole suite.
+  setTimeout(() => { console.error("Chrome stopped answering"); proc.kill(); process.exit(1); }, timeout + 10000).unref();
   // Chrome prints "DevTools listening on ws://127.0.0.1:PORT/..." when ready.
   let log = "";
   proc.stderr.on("data", (d) => { log += d; });

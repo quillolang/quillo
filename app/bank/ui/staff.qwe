@@ -1,6 +1,13 @@
 // The staff's pages: the dashboard (live: figures, transfers held for a
 // supervisor, desk sessions, what everyone did), customers, and one customer.
 
+import lib/auth.qwe use is_supervisor
+import lib/bank.qwe
+    use cash_in, decide_transfer, load_customer, load_dashboard, set_account_status
+import lib/desk.qwe use KIND_TITLES
+import lib/format.qwe use plural, when
+import ui/shell.qwe use Empty, Head, Logo, Problem, StaffShell, Status
+
 view StaffLoginPage(next: str, problem) =
     <html lang="en">
         <Head title="Staff sign in"/>

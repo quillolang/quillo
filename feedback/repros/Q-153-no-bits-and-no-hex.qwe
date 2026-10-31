@@ -1,0 +1,6 @@
+// Q-153 No way to work on bits, and no hex literals
+// mode: run
+// fixed-when: 15 1099511627776
+// From FEEDBACK19.md §Q-153 (found on b28e689).
+
+print(bit.and(0xFF, 0x0F), bit.shl(1, 40))

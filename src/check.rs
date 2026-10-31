@@ -541,6 +541,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("upper", "str", "str"),
     ("lower", "str", "str"),
     ("trim", "str", "str"),
+    ("filled", "any", "any"),
     ("split", "str, str=", "list"),
     ("join", "list | null, str=", "str"),
     ("contains", "str | list | map | null, any", "bool"),
@@ -780,6 +781,12 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("math.factorial", "int", "int"),
     ("math.gcd", "int | list...", "int"),
     ("math.lcm", "int | list...", "int"),
+    ("bit.and", "int, int", "int"),
+    ("bit.or", "int, int", "int"),
+    ("bit.xor", "int, int", "int"),
+    ("bit.not", "int", "int"),
+    ("bit.shl", "int, int", "int"),
+    ("bit.shr", "int, int", "int"),
     ("math.comb", "int, int", "int"),
     ("math.perm", "int, int | null=", "int"),
     ("math.isqrt", "int", "int"),
@@ -858,9 +865,9 @@ const BUILTINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Modules the browser has too (src/client/runtime.js).
-const BROWSER_MODULES: &[&str] = &["json", "math", "stats", "vec", "date", "money", "re"];
+const BROWSER_MODULES: &[&str] = &["json", "math", "bit", "stats", "vec", "date", "money", "re"];
 
-pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "stats", "vec", "date", "money", "re"];
+pub const MODULES: &[&str] = &["json", "db", "http", "udp", "channel", "media", "crypto", "image", "math", "bit", "stats", "vec", "date", "money", "re"];
 
 /// Builtins the browser has (see client.rs).
 const BROWSER_ONLY_SERVER: &[&str] =
@@ -1090,7 +1097,6 @@ pub enum SymbolKind {
     View,
     Component,
     Variable,
-    Builtin,
     Route,
 }
 
@@ -1148,6 +1154,24 @@ pub struct Analysis {
     /// The program's `.qwe` files, where an editor looks for the classes
     /// markup writes (branch class-tools).
     pub files: Vec<String>,
+    /// What files use and do not take, for `quillo fix` (src/modules.rs).
+    pub imports: Vec<Import>,
+    /// Browser libraries taken with a plain `use` (file, line).
+    pub respell: Vec<crate::modules::Respell>,
+    /// What a file took and calls something of its own, or that two files define: the
+    /// file, and the symbol under the name it has there (src/modules.rs).
+    pub taken: Vec<(String, Symbol)>,
+}
+
+/// A name a file uses from another, which it does not `use` (branch feedback19-fixes).
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub file: String,
+    pub name: String,
+    /// Its path, as the program writes it.
+    pub from: String,
+    /// For a browser library, the file and line of the `use` to say again.
+    pub script: Option<(String, u32)>,
 }
 
 impl Analysis {
@@ -1257,14 +1281,14 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     c.confined = opts.confined;
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
-    match Parser::new(src).parse_program() {
+    match Parser::new(src).parse_program().map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
         Ok(stmts) => {
             let mut seen = HashSet::new();
             if let Ok(p) = Path::new(file).canonicalize() {
                 seen.insert(p);
             }
             let mut order = Vec::new();
-            c.expand(Arc::new(stmts), main, base_dir, &mut seen, &mut order);
+            c.expand(stmts, main, base_dir, &mut seen, &mut order);
             c.out.classes = class_rules(&order, base_dir);
             for it in &order {
                 if !c.out.files.iter().any(|f| **f == *it.file) {
@@ -1285,6 +1309,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             }
             c.run(order);
             c.state_details();
+            c.as_written();
         }
         Err(e) => {
             if crate::error::may_be_newer_syntax(&e.msg) {
@@ -1378,9 +1403,19 @@ struct Checker {
     effect_cache: HashMap<usize, u8>,
     /// Functions of `.qwer` files the program uses, with their files.
     natives: Vec<(Arc<str>, crate::native::Export)>,
-    /// Names browser libraries give (`use Chart from "...js"`): each with its
+    /// Names browser libraries give (`client "...js" use Chart`): each with its
     /// script, and the file and line of its `use` (branch js-libraries).
     js_libs: Vec<(String, String, Arc<str>, u32)>,
+    /// What each file sees (src/modules.rs).
+    links: crate::modules::Links,
+    /// Each file's key, as finding it means asking the file system.
+    keys: HashMap<Arc<str>, PathBuf>,
+    /// Names every file sees: types, and services.
+    everywhere: HashSet<String>,
+    /// Names already reported as not taken, by the file using them.
+    told: HashSet<(Arc<str>, String)>,
+    /// Browser libraries' names: the file and line of their `use`.
+    scripts: HashMap<String, (Arc<str>, u32)>,
     /// Each `state` (by its file, line and name): the types it takes (its
     /// first value's, and what is assigned to it), and the references to it,
     /// whose hover text says so once the program is checked.
@@ -1482,6 +1517,11 @@ impl Checker {
             effect_cache: HashMap::new(),
             natives: Vec::new(),
             js_libs: Vec::new(),
+            links: Default::default(),
+            keys: HashMap::new(),
+            everywhere: HashSet::new(),
+            told: HashSet::new(),
+            scripts: HashMap::new(),
             state_types: HashMap::new(),
             live_ok: false,
             services: HashMap::new(),
@@ -1551,10 +1591,31 @@ impl Checker {
         Some(base.join(path))
     }
 
+    /// Works out what each file sees (src/modules.rs), and gives the main file with its
+    /// names as they are called in the program.
+    fn link(&mut self, stmts: Arc<Vec<Stmt>>, src: &str, file: &str, base: &Path) -> Result<Arc<Vec<Stmt>>, crate::error::QuilloError> {
+        let (confined, overrides) = (self.confined, &self.overrides);
+        self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
+            if confined && !Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+                return None;
+            }
+            let text = overrides.get(full).cloned().map_or_else(|| std::fs::read_to_string(full), Ok).ok()?;
+            Parser::new(&text).parse_program().ok().map(Arc::new)
+        });
+        for p in std::mem::take(&mut self.links.problems) {
+            self.diag_at(Arc::from(p.file.display().to_string()), p.line, Severity::Error, p.message);
+        }
+        match self.links.renames(&crate::modules::key(Path::new(file))) {
+            Some(names) => reparsed(src, names).map(Arc::new),
+            None => Ok(stmts),
+        }
+    }
+
     /// Lists statements in the order the top level runs them, following `use`.
     fn expand(&mut self, stmts: Arc<Vec<Stmt>>, file: Arc<str>, base: &Path, seen: &mut HashSet<PathBuf>, order: &mut Vec<Item>) {
         for s in stmts.iter() {
             if let Stmt::Service(name, prefix, path, _, line) = s {
+                self.everywhere.insert(name.clone());
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 match crate::service::offered(&full) {
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
@@ -1593,6 +1654,7 @@ impl Checker {
             // A type defined twice is reported with every other name (`defines`).
             if let Stmt::Type(td) = s {
                 RECORDS.with(|r| r.borrow_mut().insert(td.name.clone(), td.clone()));
+                self.everywhere.insert(td.name.clone());
             }
             if let Stmt::Mount(prefix, path, line) = s {
                 // A mounted program is a program of its own: check it alone.
@@ -1610,18 +1672,28 @@ impl Checker {
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
             }
+            // The file comes first now (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+            if let Stmt::Use(path, names, line, options) = s {
+                if options.old {
+                    let r = crate::modules::Respell::new(&file, *line, &crate::modules::resolve(base, path), names.as_deref(), options);
+                    self.diag_at(file.clone(), *line, Severity::Warning, format!("write this as `{} use {}` (`quillo fix` does)", r.head, r.names));
+                    self.out.respell.push(r);
+                }
+            }
             if let (Stmt::Use(path, Some(names), line, _), true) = (s, crate::ast::is_script(match s { Stmt::Use(p, ..) => p, _ => "" })) {
                 for (global, name) in names {
                     let src = if global == name { path.clone() } else { format!("{} ({})", path, global) };
                     self.js_libs.push((name.clone(), src, file.clone(), *line));
+                    self.scripts.entry(name.clone()).or_insert((file.clone(), *line));
                 }
                 continue;
             }
             if let Stmt::Use(path, names, line, _) = s {
+                let path = &crate::modules::resolve(base, path);
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are taken by each `use` that names some (branch imports).
-                if !seen.insert(key) && (names.is_none() || !path.ends_with(".qwer")) {
+                if !seen.insert(key.clone()) && (names.is_none() || !path.ends_with(".qwer")) {
                     continue;
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
@@ -1653,8 +1725,8 @@ impl Checker {
                                     if let Some((other, _)) = self.natives.iter().find(|(f, x)| *f != fname && x.name == alias) {
                                         let other = std::path::Path::new(&**other).file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
                                         self.diag_at(file.clone(), *line, Severity::Warning, format!(
-                                            "`{}` comes from {} and {}: this one replaces the other; take one under another name: use {} as {}_{} from {}",
-                                            alias, other, short, alias, short.trim_end_matches(".qwer"), alias, path));
+                                            "`{}` comes from {} and {}: this one replaces the other; take one under another name: import {} use {} as {}_{}",
+                                            alias, other, short, path, alias, short.trim_end_matches(".qwer"), alias));
                                     }
                                     if !self.natives.iter().any(|(f, x)| *f == fname && x.name == alias) {
                                         self.natives.push((fname.clone(), crate::native::Export { name: alias, ..e.clone() }));
@@ -1671,10 +1743,14 @@ impl Checker {
                     continue;
                 }
                 match text {
-                    Ok(src) => match Parser::new(&src).parse_program() {
+                    Ok(src) => match match (self.links.renames(&key), self.links.parsed.get(&key)) {
+                        (Some(names), _) => reparsed(&src, names).map(Arc::new),
+                        (None, Some(parsed)) => Ok(parsed.clone()),
+                        (None, None) => Parser::new(&src).parse_program().map(Arc::new),
+                    } {
                         Ok(sub) => {
                             self.uses += 1;
-                            self.expand(Arc::new(sub), fname, base, seen, order);
+                            self.expand(sub, fname, base, seen, order);
                             self.uses -= 1;
                         }
                         Err(e) => {
@@ -1957,6 +2033,7 @@ impl Checker {
         if self.quiet > 0 {
             return;
         }
+        self.taken(name, v);
         let def = if &*v.file == "<builtin>" { None } else { Some((v.file.to_string(), v.line)) };
         let detail = var_detail(name, v);
         if v.kind == Kind::State {
@@ -1966,6 +2043,41 @@ impl Checker {
             }
         }
         self.out.references.push(Reference { file: self.file.to_string(), line: self.line, name: name.to_string(), def, detail });
+    }
+
+    /// A global of another file must be one this file took (FEEDBACK19.md, Q-154; branch
+    /// feedback19-fixes). For now that is a warning, and the name still works, so a
+    /// program can move a file at a time; `quillo fix` writes the `use`.
+    fn taken(&mut self, name: &str, v: &Var) {
+        if v.kind != Kind::Global || &*v.file == "<builtin>" || v.file == self.file || self.everywhere.contains(name) {
+            return;
+        }
+        let (file, from) = (self.key_of(&self.file.clone()), self.key_of(&v.file));
+        if let Some(choices) = self.links.choices(&file, name) {
+            let shown: Vec<String> = choices.iter().map(|f| self.links.written(f)).collect();
+            self.error(format!("`{}` comes from {}: take the one you mean: import {} use {}", name, shown.join(" and "), shown[0], name));
+            return;
+        }
+        if self.links.sees(&file, &from, name) || !self.told.insert((self.file.clone(), name.to_string())) {
+            return;
+        }
+        let script = self.scripts.get(name).cloned();
+        let shown = crate::privacy::demangle(name);
+        let at = self.links.written(&from);
+        self.warn(match script {
+            Some(_) => format!("`{}` is a browser library this file does not take: write its line here too (`quillo fix` does)", shown),
+            None => format!("`{}` comes from {}, which this file does not take: add `import {} use {}` (`quillo fix` writes it)", shown, at, at, shown),
+        });
+        self.out.imports.push(crate::check::Import {
+            file: self.file.to_string(),
+            name: shown,
+            from: at,
+            script: script.map(|(f, l)| (f.to_string(), l)),
+        });
+    }
+
+    fn key_of(&mut self, file: &Arc<str>) -> PathBuf {
+        self.keys.entry(file.clone()).or_insert_with(|| crate::modules::key(Path::new(&**file))).clone()
     }
 
     /// Hover text for state: the types it takes over the component, which
@@ -1978,6 +2090,43 @@ impl Checker {
                     r.detail = text.clone();
                 }
             }
+        }
+    }
+
+    /// The editor is told each name as its file wrote it: `helper` or `a_helper`, not
+    /// what linking made of them, which reads as a private name and is the same word for
+    /// two functions (FEEDBACK19.md, Q-154; branch feedback19-fixes).
+    fn as_written(&mut self) {
+        let links = std::mem::take(&mut self.links);
+        let mut written: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for file in self.out.files.clone() {
+            let Some(names) = links.renames(&crate::modules::key(Path::new(&file))) else { continue };
+            let mut names: Vec<(&String, &String)> = names.iter().collect();
+            names.sort();
+            for (name, inner) in names.iter().rev() {
+                written.entry(file.clone()).or_default().insert(inner.to_string(), name.to_string());
+            }
+            for (name, inner) in names {
+                if let Some(s) = self.out.symbols.iter().find(|s| s.name == *inner && s.file != file) {
+                    let shown = Symbol { name: name.clone(), detail: crate::privacy::demangle(&s.detail), ..s.clone() };
+                    self.out.taken.push((file.clone(), shown));
+                }
+            }
+        }
+        let shown = |file: &str, name: &mut String, detail: &mut String| {
+            if let Some(w) = written.get(file).and_then(|names| names.get(name.as_str())) {
+                *name = w.clone();
+                *detail = crate::privacy::demangle(detail);
+            }
+        };
+        for r in &mut self.out.references {
+            shown(&r.file, &mut r.name, &mut r.detail);
+        }
+        for s in &mut self.out.symbols {
+            shown(&s.file, &mut s.name, &mut s.detail);
+        }
+        for l in &mut self.out.locals {
+            shown(&l.file, &mut l.name, &mut l.detail);
         }
     }
 
@@ -2025,7 +2174,11 @@ impl Checker {
                         })
                         .collect();
                     private_in.sort();
-                    if !private_in.is_empty() {
+                    if let Some(files) = self.links.shared(name) {
+                        // Several files define it, and this one took it from none.
+                        let shown: Vec<String> = files.iter().map(|f| self.links.written(f)).collect();
+                        self.error(format!("`{}` comes from {}: take the one you mean: import {} use {}", name, shown.join(" and "), shown[0], name));
+                    } else if !private_in.is_empty() {
                         self.error(format!("`{}` is private to {}: only {} sees it (make it `public` there, or call something public)", name,
                             private_in.join(" and "), if private_in.len() == 1 { "that file" } else { "each of those files" }));
                     } else {
@@ -2324,6 +2477,11 @@ impl Checker {
                         if v.kind == Kind::Global && &*v.file == "<builtin>" {
                             self.error(format!("cannot assign to `{}`: it is a builtin", name));
                         }
+                        // Writing another file's global takes it as reading does (FEEDBACK19.md,
+                        // Q-154; branch feedback19-fixes).
+                        if self.quiet == 0 {
+                            self.taken(name, &v);
+                        }
                         if v.kind == Kind::Global && self.in_component().is_some() && v.sig.is_none() {
                             self.browser_global(name, &v);
                         }
@@ -2414,14 +2572,8 @@ impl Checker {
                             self.line = *line;
                         }
                     }
-                    Some(e) => {
-                        let t = self.expr(e);
-                        self.line = *line;
-                        if t.bits != 0 && t.bits & MAP == 0 {
-                            self.error(format!("service {}: its options are a map, like {{ timeout: \"2s\", retries: 2 }}", name));
-                        }
-                    }
-                    None => {}
+                    // The parser only keeps a map here.
+                    _ => {}
                 }
                 T::of(NIL)
             }
@@ -2796,7 +2948,7 @@ impl Checker {
                 let y = self.under(facts, |c| c.expr(b));
                 self.line = *line;
                 match op {
-                    BinOp::Or => self.js_truthiness(x, a, Truth::Or),
+                    BinOp::Or => self.js_truthiness(fallback_says(x, b), a, Truth::Or),
                     BinOp::And => self.js_truthiness(x, a, Truth::And),
                     _ => {}
                 }
@@ -3099,12 +3251,6 @@ impl Checker {
                 }
             }
         }
-        // `audit(...)`: the module `audit` is a function too.
-        if let Expr::Ident(n, _) = callee {
-            if n == "audit" && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
-                return self.module_call(n, "", args, pre);
-            }
-        }
         // `x.f(args)`: a function stored in map x, or `f(x, args)`.
         if let Expr::Field(obj, name, _) = callee {
             // `billing.later.invoice(args)`: the same call, made later; its id.
@@ -3354,16 +3500,13 @@ impl Checker {
     /// `false` and errors are false; in JavaScript, `""` and `0` are false
     /// too. Code that reads the same in both then means something else, and
     /// nothing fails: `name || "anonymous"` keeps an empty name. Warned only
-    /// where the value is known to be a string or a number (or null).
+    /// where the value is known to be a string or a number (or null), or
+    /// where `||`'s fallback says so (see `fallback_says`).
     fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
         if t.bits & (STR | NUM | DEC) == 0 || t.bits & !(STR | NUM | DEC | NIL) != 0 {
             return;
         }
-        let x = match e {
-            Expr::Ident(n, _) => n.clone(),
-            Expr::Field(o, n, _) if matches!(**o, Expr::Ident(..)) => format!("{}.{}", callee_name(o), n),
-            _ => "x".into(),
-        };
+        let x = dotted(e).unwrap_or_else(|| "x".into());
         let what = if x == "x" { "this value".to_string() } else { format!("`{}`", x) };
         let nullable = t.bits & NIL != 0;
         // What JavaScript would test. A value that may be null is checked
@@ -3383,6 +3526,11 @@ impl Checker {
         let test = tests.join(" && ");
         let unless_null = if nullable { " unless it is null" } else { "" };
         let msg = match how {
+            // A string that may be null: `filled` says both tests at once
+            // (FEEDBACK19.md, Q-151; branch feedback19-fixes).
+            Truth::Or if nullable && empties == ["\"\""] => format!(
+                "{what} counts as true even when it is {empty} (unlike JavaScript), so `||` keeps it{unless_null}: write `filled({x}) ?? ...`, or `{x} ?? ...` to replace only null"
+            ),
             Truth::Or => format!(
                 "{what} counts as true even when it is {empty} (unlike JavaScript), so `||` keeps it{unless_null}: write `{test} ? {x} : ...`{}",
                 if nullable { format!(", or `{x} ?? ...` to replace only null") } else { String::new() }
@@ -4215,6 +4363,41 @@ fn route_path(r: &RouteDef) -> String {
     s
 }
 
+/// A value of no known type before `||`, as its fallback describes it:
+/// `request.query.name || "anonymous"` wants text and `row.n || 10` a number,
+/// and those are where a blank field or a count of 0 is kept without a word.
+/// `""` and `0` are left out, as both languages then give the same answer
+/// (FEEDBACK19.md, Q-150; branch feedback19-fixes).
+fn fallback_says(left: T, fallback: &Expr) -> T {
+    if !left.is_any() {
+        return left;
+    }
+    match fallback {
+        Expr::Lit(Lit::Str(s)) if !s.is_empty() => T::of(STR | NIL),
+        Expr::Template(_) => T::of(STR | NIL),
+        Expr::Lit(Lit::Int(n)) if *n != 0 => T::of(NUM | NIL),
+        Expr::Lit(Lit::Float(f)) if *f != 0.0 => T::of(NUM | NIL),
+        Expr::Lit(Lit::Dec(d)) if !d.is_zero() => T::of(DEC | NIL),
+        _ => left,
+    }
+}
+
+/// `a.b.c` as it is written, for a name or a chain of fields on one.
+fn dotted(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n, _) => Some(n.clone()),
+        Expr::Field(o, n, _) => Some(format!("{}.{}", dotted(o)?, n)),
+        _ => None,
+    }
+}
+
+/// A file parsed again, with its names as they are called in the program.
+fn reparsed(src: &str, names: &HashMap<String, String>) -> Result<Vec<Stmt>, crate::error::QuilloError> {
+    let mut stmts = Parser::new(src).parse_program()?;
+    crate::privacy::rename_as(&mut stmts, names, "a name another file has too")?;
+    Ok(stmts)
+}
+
 /// Where a value is used as true or false.
 #[derive(Clone, Copy)]
 enum Truth {
@@ -4733,7 +4916,7 @@ fn type_test_t(p: &Pattern) -> T {
     }
 }
 
-fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
+pub(crate) fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     match p {
         Pattern::Bind(n) => out.push(n.clone()),
         Pattern::Alt(ps) => ps.iter().for_each(|q| pattern_names(q, out)),

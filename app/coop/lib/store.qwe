@@ -2,6 +2,10 @@
 // savings, through salary deductions (in up to 6 installments), or at pickup.
 // The office marks orders ready and collected.
 
+import lib/amounts.qwe use pad, peso
+import lib/auth.qwe use acting, acting_as, acting_member, audit, viewer
+import lib/ledger.qwe use OFFICE, account_of, member_topic, new_journal, post
+
 type OrderLine = { item: int, qty: int }
 type NewOrder = { store: str, lines: list<OrderLine>, pay: "savings" | "salary" | "pickup", installments: int = 1 }
 

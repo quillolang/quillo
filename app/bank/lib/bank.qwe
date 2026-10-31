@@ -3,6 +3,11 @@
 // (cust:<id> for a customer's pages, staff for the dashboard).
 
 // An account as pages show it.
+import lib/auth.qwe use acting_client, acting_staff, is_supervisor, log, staff
+import lib/desk.qwe use open_desks
+import lib/format.qwe use LOCALE, day_start, parse_amount, shown, signed
+import lib/iban.qwe use iban_clean, iban_pretty, iban_problem
+
 fn account_view(a) = merge(a, {
     pretty: iban_pretty(a.number),
     shown: shown(a.balance, a.currency),

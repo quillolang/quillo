@@ -2,6 +2,10 @@
 // transaction that moves one to its next state. All live: a record made or
 // moved anywhere shows at once wherever its object is shown.
 
+import lib/objects.qwe use load_form, load_list, run_transaction, submit_create
+import lib/text.qwe use plural
+import ui/page.qwe use Problem, StepPill
+
 view FieldInput(f, value, people: list, on_change) {
     let id = `fld-${f.id}`
     match f.type {

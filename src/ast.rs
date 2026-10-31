@@ -424,13 +424,12 @@ pub enum Stmt {
     Expr(Expr),
     Fn(Arc<FnDef>),
     Route(Arc<RouteDef>),
-    /// `use "lib.qwe"` (and `use * from "..."`): every public name. With names,
-    /// `use cache_get as redis_get, cache_set from "redis.qwer"`: those only, each
-    /// under the name after `as` (a `.qwer` file's, in 0.6; branch imports). From a
-    /// script, `use Chart from "https://.../chart.umd.min.js"`: the names it gives the
-    /// page, for the browser (see `is_script`; branch js-libraries). `use Chart with
-    /// module, preload from ...` says how the page takes it (see `LibOptions`; branch
-    /// library-hints); a module's `use * as THREE` is the name `"*"`.
+    /// `use "lib.qwe"`: every public name. With names, `import redis.qwer use cache_get
+    /// as redis_get, cache_set`: those only, each under the name after `as`. From a
+    /// script, `client "https://.../chart.umd.min.js" use Chart`: the names it gives the
+    /// page, for the browser (see `is_script`; branch js-libraries), and `preload module
+    /// ...` says how the page takes it (see `LibOptions`; branch library-hints); a
+    /// module's `use * as THREE` is the name `"*"`.
     Use(String, Option<Vec<(String, String)>>, u32, LibOptions),
     Return(Option<Expr>),
     /// `state name = expr` (or `~name = expr`) in a component: set once, kept between renders.
@@ -477,20 +476,23 @@ pub fn is_script(path: &str) -> bool {
 }
 
 /// What a page does ahead of a browser library it can load (branch library-hints):
-/// `with preload` fetches its script from the `<head>`, `with preconnect` only opens
-/// the connection to its host.
+/// `preload` fetches its script from the `<head>`, `preconnect` only opens the
+/// connection to its host.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LibHint {
     Preload,
     Preconnect,
 }
 
-/// What `with` says of a browser library (branch library-hints): `module` for an ES
-/// module, whose exports are kept in the runtime rather than on the page, and a hint.
+/// How a browser library is taken (branch library-hints): `module` for an ES module,
+/// whose exports are kept in the runtime rather than on the page, and a hint.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LibOptions {
     pub module: bool,
     pub hint: Option<LibHint>,
+    /// Written as 0.6 did, `use names from file`, which `quillo fix` turns around
+    /// (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+    pub old: bool,
 }
 
 /// Whether a script says by its name that it is an ES module (branch library-hints).

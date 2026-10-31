@@ -14,6 +14,8 @@
 // action (a Button, a form with one). wide: "inline" (default) or "hidden", on
 // screens wider than 720px. label: what screen readers call it ("Actions").
 
+import ui/kit/theme.qwe use ui_cls
+
 let action_bar_css = css`
 .ui-action-bar {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border: 1px solid var(--ui-border);

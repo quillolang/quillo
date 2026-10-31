@@ -1,6 +1,24 @@
 // Paying for a hold, the guest's trips (cancelling with the refund shown
 // first, reviews after a stay), and saved places.
 
+import lib/dates.qwe use day_label, plural
+import lib/stays.qwe
+    use cancel_booking, cancel_preview, leave_review, load_booking, load_trips, pay_booking, release_hold
+import ui/kit/alert.qwe use Alert
+import ui/kit/badge.qwe use Badge
+import ui/kit/button.qwe use Button
+import ui/kit/card.qwe use Card
+import ui/kit/card_input.qwe use CardInput
+import ui/kit/countdown.qwe use Countdown
+import ui/kit/empty_state.qwe use EmptyState
+import ui/kit/price_breakdown.qwe use PriceBreakdown
+import ui/kit/rating.qwe use Rating
+import ui/kit/steps.qwe use Steps
+import ui/kit/text_area.qwe use TextArea
+import ui/search.qwe use ResultCard
+import ui/shell.qwe use Shell
+import ui/stay.qwe use Problem
+
 view CheckoutPage(me, id: int) =
     <Shell {me} title="Confirm and pay">
         <Checkout {id}/>

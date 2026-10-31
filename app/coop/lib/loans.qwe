@@ -9,6 +9,13 @@
 //   paid        the last installment is paid
 //   cancelled   the member withdrew it before the board decided
 
+import lib/amounts.qwe use centavos, pad, peso, plural
+import lib/auth.qwe use acting_as, acting_member, audit, viewer
+import lib/ledger.qwe
+    use BOARD, OFFICE, account_of, member_topic, new_journal, open_account, post, today
+import lib/members.qwe use member_by_number, months_member
+import lib/products.qwe use charges, directors, schedule_of, total_interest
+
 type LoanForm = {
     product: str,                      // its code
     amount: str,

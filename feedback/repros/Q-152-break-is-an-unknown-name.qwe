@@ -1,0 +1,8 @@
+// Q-152 `break` is only an unknown name
+// mode: check
+// fixed-when: `return` leaves a loop
+// From FEEDBACK19.md §Q-152 (found on b28e689).
+
+for x in [1, 2] {
+    break
+}

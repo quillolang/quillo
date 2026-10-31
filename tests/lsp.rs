@@ -151,7 +151,7 @@ fn a_used_file_is_checked_as_part_of_its_program() {
     std::fs::write(dir.join("main.qwe"), "use \"lib/util.qwe\"\nuse \"lib/pages.qwe\"\nroute GET / = home()\n").unwrap();
     std::fs::write(dir.join("lib/util.qwe"), "fn shout(s: str) -> str = upper(s) + \"!\"\n").unwrap();
     let pages = dir.join("lib/pages.qwe");
-    std::fs::write(&pages, "fn home() = shout(\"hi\")\n").unwrap();
+    std::fs::write(&pages, "import lib/util.qwe use shout\nfn home() = shout(\"hi\")\n").unwrap();
     let uri = format!("file://{}", pages.display());
 
     let mut c = Client::start();
@@ -165,10 +165,10 @@ fn a_used_file_is_checked_as_part_of_its_program() {
         }
     };
     // `shout` is from another file of the program: no error.
-    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "fn home() = shout(\"hi\")\n" } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": "import lib/util.qwe use shout\nfn home() = shout(\"hi\")\n" } }));
     assert_eq!(diags(&mut c), json!([]));
     // A real mistake still is one, from the text being edited.
-    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "fn home() = shuot(\"hi\")\n" }] }));
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "import lib/util.qwe use shout\nfn home() = shuot(\"hi\")\n" }] }));
     let d = diags(&mut c);
     assert_eq!(d.as_array().unwrap().len(), 1, "{}", d);
     assert!(d[0]["message"].as_str().unwrap().contains("unknown name `shuot` (did you mean `shout`?)"), "{}", d);
@@ -687,6 +687,70 @@ fn every_builtin_says_what_it_does() {
     }
 }
 
+/// Parameter hints past the usual calls: a plugin's function, parameters whose
+/// types hold commas and brackets, text the reading has to step over; and a
+/// builtin's line on hover (branch feedback19-fixes).
+#[test]
+fn hints_know_plugins_awkward_types_and_awkward_text() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-hints-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let plugin = "/// Adds two numbers.\npub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n";
+    let defs = "use lib.qwer\n\nfn pick(kind: \"a,b\" | \"c\", xs: list<int>, m: { a: int, b: int }, last: int) = last\nfn odd(x: \"a\\\"b\", y: int) = y\n\n";
+    std::fs::write(dir.join("lib.qwer"), plugin).unwrap();
+    std::fs::write(dir.join("main.qwe"), defs).unwrap();
+    let uri = format!("file://{}/main.qwe", dir.display());
+    let lib = format!("file://{}/lib.qwer", dir.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": defs } }));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lib, "languageId": "rust", "version": 1, "text": plugin } }));
+    let mut version = 1;
+    let mut help = |c: &mut Client, sample: &str| -> Value {
+        let text = format!("{}{}", defs, sample);
+        let at = text.find('¦').unwrap();
+        let (line, column) = (text[..at].matches('\n').count(), text[..at].rsplit('\n').next().unwrap().encode_utf16().count());
+        version += 1;
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text.replace('¦', "") }] }));
+        c.request("textDocument/signatureHelp", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": column } }), &mut Vec::new())
+    };
+    let sig = |h: &Value| h["signatures"][0]["label"].as_str().unwrap_or("").to_string();
+
+    // A plugin's function has its parameters' names, from the Rust.
+    let h = help(&mut c, "let a = add(1, ¦)\n");
+    assert!(sig(&h).contains("add(a: int, b: int)"), "{}", h);
+    assert_eq!(h["activeParameter"], json!(1), "{}", h);
+    assert_eq!(h["signatures"][0]["documentation"]["value"], json!("Adds two numbers."), "{}", h);
+    // Commas within a type's quotes and brackets do not end the parameter.
+    let h = help(&mut c, "let a = pick(\"c\", [1], { a: 1, b: 2 }, ¦)\n");
+    assert_eq!(h["signatures"][0]["parameters"].as_array().unwrap().len(), 4, "{}", h);
+    assert_eq!(h["activeParameter"], json!(3), "{}", h);
+    assert!(sig(&h).contains("xs: list<int>"), "{}", h);
+    // A signature that does not read to its end has no hint, and nothing fails.
+    assert_eq!(help(&mut c, "let a = odd(¦)\n"), Value::Null);
+    // An escaped backquote does not end a template.
+    assert!(sig(&help(&mut c, "let a = `x\\`y${len(¦)}`\n")).starts_with("len("));
+    // A string left open ends with its line.
+    assert!(sig(&help(&mut c, "let a = contains(\"open\n    len(¦)\n")).starts_with("len("));
+
+    // A plugin's file has no hints or `use` lines or classes of its own.
+    let at_add = json!({ "textDocument": { "uri": lib }, "position": { "line": 1, "character": 8 } });
+    assert_eq!(c.request("textDocument/signatureHelp", at_add.clone(), &mut notes), Value::Null);
+    assert!(c.request("textDocument/definition", at_add, &mut notes).is_object());
+
+    // A builtin's hover has the line about it.
+    let text = "let a = trim(\" x \")\n";
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 99 }, "contentChanges": [{ "text": text }] }));
+    let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 9 } }), &mut notes);
+    let shown = h["contents"]["value"].as_str().unwrap();
+    assert!(shown.contains("trim(") && shown.contains("without the whitespace at both ends"), "{}", h);
+
+    let _ = quillo::lsp::Server::default();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Completion offers what is in scope at the cursor, nearest first: not
 /// another function's locals, nor a `let` before its line, and a line just
 /// typed in a block still sees the block's names (branch signature-help).
@@ -727,4 +791,193 @@ fn completion_offers_the_variables_in_scope() {
     // Past the block's end, nothing of it.
     let typed = src.replace("    late\n}\n", "    late\n}\n\n");
     assert!(names(&typed, 18).is_empty());
+}
+
+/// One name in two files, and names taken as others (FEEDBACK19.md, Q-154; branch
+/// feedback19-fixes): each file's word goes to what that file means by it.
+#[test]
+fn names_of_files_are_found_as_each_file_wrote_them() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-taken-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    std::fs::write(dir.join("lib/a.qwe"), "fn helper(x: int) -> str = \"a\"\nview Card(n: int) = <b>{n}</b>\nfn only_a() = 1\nprivate fn secret() = 1\n").unwrap();
+    std::fs::write(dir.join("lib/b.qwe"), "fn helper(y: str, helper2 = 1) -> str = \"b\"\nview Card(n: int) = <i>{n}</i>\nroute GET /b = \"b\"\n").unwrap();
+    let text = "use helper as a_helper, Card as Tile from lib/a.qwe\nuse helper, Card from lib/b.qwe\nuse only_a from lib/a\nprint(a_helper(1), helper(\"x\"), only_a())\nroute GET / = <Tile n={1}/>\nroute GET /c = <Card n={2}/>\n";
+    let main = dir.join("main.qwe");
+    std::fs::write(&main, text).unwrap();
+    let uri = format!("file://{}", main.display());
+
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("initialized", json!({}));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let at = |line: u32, character: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+    let shown = |r: &Value| r["contents"]["value"].as_str().unwrap_or("").to_string();
+    let goes = |r: &Value| (r["uri"].as_str().unwrap_or("").rsplit('/').next().unwrap().to_string(), r["range"]["start"]["line"].as_u64());
+    let labels = |r: &Value| r.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let line3 = "print(a_helper(1), helper(\"x\"), only_a())";
+    let col = |word: &str| line3.find(word).unwrap() as u32 + 1;
+
+    // In the code: the alias, and a name two files have.
+    let hover = c.request("textDocument/hover", at(3, col("a_helper")), &mut notes);
+    assert!(shown(&hover).contains("fn helper(x: int) -> str") && !shown(&hover).contains("private"), "{}", hover);
+    assert_eq!(goes(&c.request("textDocument/definition", at(3, col("a_helper")), &mut notes)), ("a.qwe".to_string(), Some(0)));
+    let hover = c.request("textDocument/hover", at(3, col("helper(\"x\")")), &mut notes);
+    assert!(shown(&hover).contains("fn helper(y: str") && !shown(&hover).contains("private"), "{}", hover);
+    assert_eq!(goes(&c.request("textDocument/definition", at(3, col("helper(\"x\")")), &mut notes)), ("b.qwe".to_string(), Some(0)));
+    // What a call shows, and what is offered.
+    let help = c.request("textDocument/signatureHelp", at(3, col("a_helper(1") + 8), &mut notes);
+    assert!(help["signatures"][0]["label"].as_str().unwrap().contains("x: int"), "{}", help);
+    let items = labels(&c.request("textDocument/completion", at(3, 0), &mut notes));
+    assert!(["a_helper", "helper", "only_a"].iter().all(|n| items.iter().any(|i| i == n)), "{:?}", items);
+    assert!(!items.iter().any(|i| i.contains("__pv")), "{:?}", items);
+    let tags = labels(&c.request("textDocument/completion", at(4, 15), &mut notes));
+    assert!(tags.iter().any(|t| t == "Tile") && tags.iter().any(|t| t == "Card"), "{:?}", tags);
+
+    // On a `use` line, the name goes to the file it is taken from, with or without `.qwe`.
+    let hover = c.request("textDocument/hover", at(0, 5), &mut notes);
+    assert!(shown(&hover).contains("fn helper(x: int)") && shown(&hover).contains("From a.qwe, called `a_helper` here"), "{}", hover);
+    let hover = c.request("textDocument/hover", at(2, 5), &mut notes);
+    assert!(shown(&hover).contains("fn only_a()") && !shown(&hover).contains("called"), "{}", hover);
+    assert_eq!(goes(&c.request("textDocument/definition", at(1, 5), &mut notes)), ("b.qwe".to_string(), Some(0)));
+    assert_eq!(goes(&c.request("textDocument/definition", at(2, 5), &mut notes)), ("a.qwe".to_string(), Some(2)));
+
+    // In a file that defines one, its own is plain, and not called private.
+    let lib = dir.join("lib/a.qwe");
+    let lib_uri = format!("file://{}", lib.display());
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lib_uri, "languageId": "quillo", "version": 1, "text": std::fs::read_to_string(&lib).unwrap() } }));
+    let hover = c.request("textDocument/hover", json!({ "textDocument": { "uri": lib_uri }, "position": { "line": 0, "character": 4 } }), &mut notes);
+    assert!(shown(&hover).starts_with("```quillo\nfn helper(x: int)"), "{}", hover);
+
+    // Naming what a `.qwe` file offers: its public names, less those taken.
+    let line = "client /assets/chart.js use Chart\n";
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": line }] }));
+    let hover = c.request("textDocument/hover", at(0, 12), &mut notes);
+    assert!(shown(&hover).contains("/assets/chart.js"), "{}", hover);
+    let typed = "use helper, only from lib/a.qwe\n";
+    c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": typed }] }));
+    let names = labels(&c.request("textDocument/completion", at(0, 16), &mut notes));
+    assert!(names.iter().any(|n| n == "only_a") && names.iter().any(|n| n == "Card"), "{:?}", names);
+    assert!(!names.iter().any(|n| n == "helper" || n.contains("secret")), "{:?}", names);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file first, so the editor knows the names as they are typed (FEEDBACK19.md, Q-156;
+/// branch feedback19-fixes).
+#[test]
+fn imports_are_hovered_followed_and_completed_file_first() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::create_dir_all(dir.join("public/assets")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    std::fs::write(dir.join("lib/forum.qwe"), "fn latest() = 1\nfn older(n: int) = n\nprivate fn hidden() = 2\n").unwrap();
+    std::fs::write(dir.join("lib/deep.qwe"), "fn deep() = 3\n").unwrap();
+    std::fs::write(dir.join("rusty.qwer"), "/// Shouts.\npub fn shout(s: String) -> String {\n    s\n}\n").unwrap();
+    std::fs::write(dir.join("public/assets/map.js"), "").unwrap();
+    std::fs::write(dir.join("public/assets/m.mjs"), "").unwrap();
+    std::fs::write(dir.join("other.js"), "").unwrap();
+    let text = concat!(
+        "import lib/forum.qwe use latest, older as past\n", // 0
+        "import lib/forum.qwe // the rest\n",                // 1
+        "    use *\n",                                       // 2
+        "import lib/forum\n",                                // 3
+        "        use latest\n",                              // 4
+        "import rusty use shout\n",                          // 5
+        "client \"https://a.b/c.js\"\n",                      // 6
+        "    use Chart\n",                                   // 7
+        "let sql = `\n",                                     // 8
+        "import\n",                                          // 9
+        "client\n",                                          // 10
+        "`\n",                                               // 11
+        "print(latest(), past(1), shout(\"a\"), deep())\n",  // 12
+    );
+    let main = dir.join("main.qwe");
+    std::fs::write(&main, format!("{}import lib/deep.qwe use deep\n", text)).unwrap();
+    let text = format!("{}import lib/deep.qwe use deep\n", text);
+    let uri = format!("file://{}", main.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("initialized", json!({}));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": text } }));
+    let at = |line: u32, character: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+    let shown = |r: &Value| r["contents"]["value"].as_str().unwrap_or("").to_string();
+    let goes = |r: &Value| (r["uri"].as_str().unwrap_or("").rsplit('/').next().unwrap().to_string(), r["range"]["start"]["line"].as_u64());
+
+    // The file, and a name, on one line.
+    assert!(shown(&c.request("textDocument/hover", at(0, 10), &mut notes)).contains("run once"));
+    assert!(shown(&c.request("textDocument/hover", at(0, 26), &mut notes)).contains("fn latest()"));
+    let h = c.request("textDocument/hover", at(0, 44), &mut notes);
+    assert!(shown(&h).contains("fn older(n: int)") && shown(&h).contains("called `past` here"), "{}", h);
+    assert_eq!(goes(&c.request("textDocument/definition", at(0, 10), &mut notes)), ("forum.qwe".to_string(), Some(0)));
+    assert_eq!(goes(&c.request("textDocument/definition", at(0, 35), &mut notes)), ("forum.qwe".to_string(), Some(1)));
+    // On two lines: the file from its own line, a comment after it, and a name from the next,
+    // deeper than the file's name is long; the space before it is neither.
+    assert_eq!(goes(&c.request("textDocument/definition", at(3, 10), &mut notes)), ("forum.qwe".to_string(), Some(0)));
+    assert!(shown(&c.request("textDocument/hover", at(4, 13), &mut notes)).contains("fn latest()"));
+    assert_eq!(goes(&c.request("textDocument/definition", at(4, 13), &mut notes)), ("forum.qwe".to_string(), Some(0)));
+    assert!(shown(&c.request("textDocument/hover", at(1, 10), &mut notes)).contains("run once"));
+    assert!(c.request("textDocument/hover", at(4, 2), &mut notes).is_null());
+    // A file's Rust names, and an address, which has nothing to read.
+    assert!(shown(&c.request("textDocument/hover", at(5, 18), &mut notes)).contains("Shouts."));
+    assert!(shown(&c.request("textDocument/hover", at(6, 12), &mut notes)).contains("no such file"));
+    // The word on its own, as in a string, is not an import, and an open line with no `use`
+    // after it is not one either.
+    assert!(!shown(&c.request("textDocument/hover", at(9, 2), &mut notes)).contains("run once"));
+    // What the words are.
+    assert!(shown(&c.request("textDocument/hover", at(0, 2), &mut notes)).contains("import lib/auth.qwe use login"));
+    // A file opened alone finds its program through these lines, past the Rust file above it.
+    let deep = dir.join("lib/deep.qwe");
+    let deep_uri = format!("file://{}", deep.display());
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": deep_uri, "languageId": "quillo", "version": 1, "text": "fn deep() = shout(\"a\")\n" } }));
+    let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": deep_uri }, "position": { "line": 0, "character": 13 } }), &mut notes);
+    assert!(shown(&h).contains("shout"), "{}", h);
+
+    // Typing, a stage at a time.
+    let base = text.clone();
+    let mut version = 2;
+    let mut typed = |c: &mut Client, notes: &mut Vec<Value>, above: &str, line: &str| {
+        let whole = format!("{}{}", above, line);
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": whole }] }));
+        version += 1;
+        let n = above.matches('\n').count() as u32;
+        let r = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": n, "character": line.chars().count() as u32 } }), notes);
+        r.as_array().unwrap_or(&Vec::new()).iter().map(|i| i["label"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    let files = ["lib/deep.qwe", "lib/forum.qwe", "rusty.qwer"];
+    assert_eq!(typed(&mut c, &mut notes, &base, "import "), files);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import li"), files);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import \"li"), files);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum.qwe "), ["use"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum.qwe use "), ["*", "latest", "older"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum use la"), ["*", "latest", "older"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum.qwe use latest, "), ["older"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum.qwe use latest as "), Vec::<String>::new());
+    assert_eq!(typed(&mut c, &mut notes, &base, "import lib/forum.qwe use * "), ["as"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "import rusty.qwer use "), ["*", "shout"]);
+    let scripts = ["other.js", "/assets/m.mjs", "/assets/map.js"];
+    assert_eq!(typed(&mut c, &mut notes, &base, "client "), [&["module"][..], &scripts[..]].concat());
+    assert_eq!(typed(&mut c, &mut notes, &base, "preload module "), scripts);
+    assert_eq!(typed(&mut c, &mut notes, &base, "preconnect \"htt"), scripts);
+    assert_eq!(typed(&mut c, &mut notes, &base, "client /assets/map.js "), ["use"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "client /assets/map.js use "), ["*", "default"]);
+    assert_eq!(typed(&mut c, &mut notes, &base, "client module /a.js use go, "), ["default"]);
+    // A name is a name: such a line is offered what any line is.
+    assert!(typed(&mut c, &mut notes, &base, "client = cl").iter().any(|l| l == "let"));
+    assert!(typed(&mut c, &mut notes, &base, "le").iter().any(|l| l == "let"));
+    assert!(typed(&mut c, &mut notes, &base, "impor").iter().any(|l| l == "import"));
+    assert!(typed(&mut c, &mut notes, &base, "  cli").iter().any(|l| l == "client"));
+    assert!(!typed(&mut c, &mut notes, &base, "let x = pre").iter().any(|l| l == "preload"));
+
+    // The next line: the names of the file above; below anything else, or first in a file,
+    // it is a `use` of a file.
+    let above = format!("{}import lib/forum.qwe\n", base);
+    assert_eq!(typed(&mut c, &mut notes, &above, "    use "), ["*", "latest", "older"]);
+    assert_eq!(typed(&mut c, &mut notes, &above, "    use la"), ["*", "latest", "older"]);
+    assert_eq!(typed(&mut c, &mut notes, &format!("{}let x = 1\n", base), "use li"), files);
+    assert_eq!(typed(&mut c, &mut notes, "", "use "), files);
+    let _ = std::fs::remove_dir_all(&dir);
 }

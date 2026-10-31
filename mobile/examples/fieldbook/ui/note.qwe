@@ -2,6 +2,8 @@
 // do with it: share it (the web's share sheet, or the app's), copy it, read it aloud,
 // tick it off (with a haptic tap), delete it (after a confirm).
 
+import lib/notes.qwe use delete_note, set_done, weather_for, weather_words
+
 component NoteView(initial: map) {
     state n = initial
     state weather = null

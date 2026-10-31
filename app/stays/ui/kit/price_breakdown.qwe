@@ -14,6 +14,8 @@
 // total: the total's amount (left out, no total line). total_label: "Total".
 // title: a heading above the lines. note: a small line under the total.
 
+import ui/kit/theme.qwe use ui_cls
+
 let price_breakdown_css = css`
 .ui-price-breakdown { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-price-breakdown-title { margin: 0; font-size: 15px; font-weight: 600; }

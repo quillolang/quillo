@@ -387,6 +387,23 @@ impl Lexer {
     fn lex_number(&mut self) -> Result<Tok, QuilloError> {
         let line = self.line;
         let mut s = String::new();
+        // `0xFF`, `0xFFFF_0000`: masks and flags, for the `bit` module. As with
+        // any int, one past 64 bits is an error, not a wrap (FEEDBACK19.md,
+        // Q-153; branch feedback19-fixes).
+        if self.peek_char() == Some('0') && matches!(self.peek_char_at(1), Some('x' | 'X')) {
+            self.bump();
+            self.bump();
+            while let Some(c) = self.peek_char().filter(|c| c.is_ascii_hexdigit() || *c == '_') {
+                self.bump();
+                if c != '_' {
+                    s.push(c);
+                }
+            }
+            if s.is_empty() {
+                return Err(QuilloError::new("expected hex digits after `0x`", line));
+            }
+            return i64::from_str_radix(&s, 16).map(Tok::Int).map_err(|_| QuilloError::new(format!("number `0x{}` is too large", s), line));
+        }
         let digits = |lx: &mut Lexer, s: &mut String| {
             while let Some(c) = lx.peek_char() {
                 if c.is_ascii_digit() {

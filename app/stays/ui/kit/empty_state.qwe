@@ -15,6 +15,8 @@
 // size: "sm" (for inside a card or a table) or "md" (default). Centred by default;
 // align="start" lines it up on the left.
 
+import ui/kit/theme.qwe use ui_cls
+
 let empty_state_css = css`
 .ui-empty { display: grid; justify-items: center; gap: 6px; padding: 40px 24px; text-align: center;
   font: 14px/1.5 var(--ui-font); color: var(--ui-muted); }

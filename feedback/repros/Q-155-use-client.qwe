@@ -1,0 +1,11 @@
+// Q-155 Nothing tells a browser library from a file of the program
+// mode: check
+// fixed-when: ok (
+// From FEEDBACK19.md §Q-155 (found on b28e689).
+
+client "https://cdn.example/chart.js" use Chart
+client /assets/leaflet.js use L
+
+component Sales() {
+    <canvas @mount={(el) => { Chart.new(el, {}); L.map(el) }}></canvas>
+}

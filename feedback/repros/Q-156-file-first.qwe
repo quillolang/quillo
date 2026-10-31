@@ -1,0 +1,12 @@
+// Q-156 A `use` line names what it takes before the file it takes from
+// mode: check
+// fixed-when: ok (
+// From FEEDBACK19.md §Q-156 (found on b28e689).
+
+preload "https://cdn.example/chart.js"
+    use Chart
+client module "https://cdn.example/three.js" use * as THREE
+
+component Sales() {
+    <canvas @mount={(el) => { Chart.new(el, {}); THREE.Scene.new() }}></canvas>
+}

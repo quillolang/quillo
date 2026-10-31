@@ -13,6 +13,8 @@
 // detail. tone: the dot's colour, "neutral" (default), "accent", "success",
 // "warning", "danger" or "info". It is an <ol>, so screen readers count the steps.
 
+import ui/kit/theme.qwe use ui_cls
+
 let timeline_css = css`
 .ui-timeline { margin: 0; padding: 0; list-style: none; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
 .ui-timeline-item { position: relative; display: grid; grid-template-columns: 22px 1fr; gap: 10px; padding-bottom: 18px;

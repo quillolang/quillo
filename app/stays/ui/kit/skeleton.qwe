@@ -13,6 +13,8 @@
 // The shimmer stops with reduced motion. SkeletonCard: an avatar, two lines and a
 // picture, the shape of a typical card.
 
+import ui/kit/theme.qwe use ui_cls
+
 let skeleton_css = css`
 .ui-skeleton { display: block; border-radius: var(--ui-radius-sm);
   background: linear-gradient(90deg, var(--ui-subtle) 0%, color-mix(in srgb, var(--ui-subtle) 55%, var(--ui-strong)) 50%, var(--ui-subtle) 100%);

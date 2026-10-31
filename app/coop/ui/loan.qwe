@@ -2,6 +2,11 @@
 // where it stands, its co-makers and votes, its schedule, and what the viewer
 // may do with it.
 
+import lib/amounts.qwe use pct, peso, plural
+import lib/loans.qwe
+    use cancel_loan, counter_payment, load_loan, pay_from_savings, release_loan, review_loan, vote_loan
+import ui/page.qwe use Done, Problem, Status
+
 let STEPS = ["submitted", "board", "approved", "released", "paid"]
 
 view Steps(status: str) =

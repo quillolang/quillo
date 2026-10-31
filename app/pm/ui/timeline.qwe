@@ -4,6 +4,12 @@
 // when it is let go. An arrow is red when a task starts before what it waits
 // for is due: the plan cannot hold.
 
+import lib/dates.qwe
+    use day_or_null, day_text, is_weekend, parse_day, parts_of, short_day, week_start, weekday, year_of
+import lib/projects.qwe use can_edit
+import lib/tasks.qwe use load_board, reschedule
+import ui/page.qwe use Problem
+
 let ROW = 34
 let HEAD = 44
 let ZOOMS = [["Days", 36], ["Weeks", 18], ["Months", 7]]

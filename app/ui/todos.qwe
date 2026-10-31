@@ -2,6 +2,8 @@
 // call the server functions in lib/todos.qwe without reloading the page, and
 // js(...) calls the page's own script, public/js/app.js.
 
+import lib/todos.qwe use add_todo, left_of, toggle
+
 component Todos(initial: list<Todo>) {
     state todos = initial
     state draft = ""

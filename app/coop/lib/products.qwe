@@ -5,6 +5,10 @@
 // designer's and the application's previews) and on the server (what is
 // kept when a loan is released).
 
+import lib/amounts.qwe use centavos
+import lib/auth.qwe use acting_as, audit
+import lib/ledger.qwe use BOARD
+
 type ProductForm = {
     code: str,
     name: str,

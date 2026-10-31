@@ -3,6 +3,10 @@
 // read. Every change publishes `project:<id>`, which the board, the open
 // task, the timeline and the reports follow.
 
+import lib/dates.qwe use day_or_null, day_text, parse_day, short_day
+import lib/projects.qwe
+    use changed_project, column_in, columns_of, labels_of, log_activity, member_of, members_of, milestones_of, role_in
+
 let PRIORITIES = ["None", "Low", "Medium", "High", "Urgent"]
 let MAX_BODY = 20000
 

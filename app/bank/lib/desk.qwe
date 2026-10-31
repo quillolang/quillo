@@ -17,6 +17,10 @@
 // Each desk follows one topic, desk:<code>, which every change to the
 // session publishes; the services announce what they make of it themselves.
 
+import lib/auth.qwe use acting_staff, log, staff
+import lib/format.qwe use CURRENCIES, LOCALE, parse_amount, shown
+import lib/iban.qwe use iban_pretty
+
 let SECTIONS = {
     open_account: [
         { id: "personal", title: "About you", fields: [["first_name", "First name"], ["last_name", "Last name"], ["birth_date", "Date of birth"], ["email", "Email"], ["phone", "Phone"]] },

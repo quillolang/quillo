@@ -1,0 +1,9 @@
+// Q-154 A program has one set of names
+// mode: run
+// fixed-when: a b
+// From FEEDBACK19.md §Q-154 (found on b28e689).
+
+import lib/a.qwe use helper as a_helper
+import lib/b.qwe use helper as b_helper
+
+print(a_helper(), b_helper())

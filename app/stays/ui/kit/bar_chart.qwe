@@ -20,6 +20,8 @@
 // chart shows; it names it for screen readers and captions the table they hear.
 // show_label also writes it above the chart.
 
+import ui/kit/theme.qwe use ui_cls
+
 let bar_chart_css = css`
 .ui-bc { --ui-bc-1: light-dark(#2a78d6, #3987e5); --ui-bc-2: light-dark(#eb6834, #d95926);
   --ui-bc-3: light-dark(#1baf7a, #199e70); --ui-bc-4: light-dark(#eda100, #c98500);

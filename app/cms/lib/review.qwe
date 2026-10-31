@@ -7,6 +7,11 @@
 // blocks' versions); presence follows `presence:<id>`, so heartbeats wake
 // nothing else.
 
+import lib/articles.qwe use article_row
+import lib/auth.qwe use acting, has_any
+import lib/blocks.qwe use block_row, owner_key
+import lib/flows.qwe use is_final, transitions_of
+
 let PRESENT_MS = 30_000
 let MAX_POST = 5000
 

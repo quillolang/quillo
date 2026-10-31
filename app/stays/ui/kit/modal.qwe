@@ -11,6 +11,8 @@
 // size: "sm", "md" (default) or "lg". Clicking outside it closes it, unless
 // dismissable={false}.
 
+import ui/kit/theme.qwe use ui_cls
+
 let modal_css = css`
 .ui-modal-host { display: contents; }
 .ui-modal {

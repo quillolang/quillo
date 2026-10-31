@@ -2,6 +2,8 @@
 // id; the sessions table says whose it is, so signing out ends it for good.
 // Also the viewer's time zone, which the browser reports in a cookie.
 
+import lib/dates.qwe use DAY_MS, day_of
+
 let SESSION_DAYS = 30
 
 type Me = { id: int, name: str, hue: int }

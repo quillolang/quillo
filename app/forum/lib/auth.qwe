@@ -2,6 +2,8 @@
 // cookie carries only a random id; the sessions table says whose it is, so
 // signing out (or "everywhere") ends it on the server too.
 
+import lib/text.qwe use left, valid_name
+
 let DAY = 86_400_000
 let SESSION_DAYS = 30
 

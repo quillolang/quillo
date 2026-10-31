@@ -14,6 +14,8 @@
 // size: "sm" or "md" (default). on_input(value) on each key, on_change(value) when
 // it is left changed: both are given the text, inside one of your components.
 
+import ui/kit/theme.qwe use ui_cls
+
 let text_field_css = css`
 .ui-text-field { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-text-field-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }

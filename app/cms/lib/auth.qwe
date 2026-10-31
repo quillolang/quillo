@@ -1,6 +1,9 @@
 // People, their roles and sessions. Someone may hold several roles; the
 // first person to join is the admin, with every role.
 
+import lib/text.qwe use DAY_MS
+import ui/page.qwe use NotAllowed
+
 let ROLES = ["admin", "designer", "writer", "reviewer", "publisher"]
 let SESSION_DAYS = 30
 

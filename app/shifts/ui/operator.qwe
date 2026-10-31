@@ -3,6 +3,11 @@
 // as the days are picked, and their requests, which follow the supervisor's
 // decisions live.
 
+import lib/leave.qwe use apply_leave, cancel_leave, my_balance, my_leaves
+import lib/rota.qwe
+    use SHIFT_NAMES, day_label, days_span, is_day, month_of, offset_on, shift_of, shift_span, working_days
+import ui/page.qwe use Problem
+
 let KINDS = [["annual", "Annual"], ["sick", "Sick"], ["unpaid", "Unpaid"]]
 
 view StatusChip(status: str) = <span class={`chip st-${status}`}>{status}</span>

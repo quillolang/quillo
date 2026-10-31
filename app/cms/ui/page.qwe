@@ -1,6 +1,8 @@
 // The frames: the public site, and the desk staff work in, whose menu
 // follows the roles someone holds. Plus the small views used everywhere.
 
+import lib/auth.qwe use has_any
+
 view Avatar(name: str, hue: int, size: str = "md") =
     <span class={`avatar ${size}`} style={`--hue: ${hue}`} title={name} aria-label={name}>{upper(slice(name, 0, 1))}</span>
 

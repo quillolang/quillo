@@ -24,6 +24,8 @@
 // clear them); without it, the calendar keeps them itself.
 // on_month(month): told the "YYYY-MM" shown when the month is turned.
 
+import ui/kit/theme.qwe use ui_cls
+
 let month_calendar_css = css`
 .ui-month-calendar { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-month-calendar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

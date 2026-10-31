@@ -24,6 +24,8 @@
 // of the selected tab. on_change(index): called with the tab picked. id: a prefix
 // for the tabs' ids, unique on the page. variant as for Tabs.
 
+import ui/kit/theme.qwe use ui_cls
+
 let tabs_css = css`
 .ui-tabs { position: relative; display: flex; flex-wrap: wrap; align-items: flex-end; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-tabs-radio { position: absolute; top: 0; left: 0; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }

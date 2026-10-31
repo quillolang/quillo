@@ -10,6 +10,11 @@
 //
 // Pages showing an object's records follow `object:<id>`.
 
+import lib/auth.qwe use ROLES, acting, has_role
+import lib/blocks.qwe use MAX_TEXT
+import lib/flows.qwe use first_step, step_row, steps_of, transitions_of
+import lib/text.qwe use check_day, day_label, from_json
+
 let FIELD_TYPES = ["text", "longtext", "number", "money", "date", "choice", "yesno", "user"]
 let FIELD_LABELS = { text: "Text", longtext: "Long text", number: "Number", money: "Money", date: "Date", choice: "Choice", yesno: "Yes / no", user: "Person" }
 

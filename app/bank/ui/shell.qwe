@@ -2,6 +2,8 @@
 // a tab bar at the bottom), and the staff's desk (a sidebar and the page).
 // And the small views both use.
 
+import lib/bank.qwe use load_unread
+
 view Head(title: str) =
     <head>
         <meta charset="utf-8"/>

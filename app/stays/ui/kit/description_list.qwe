@@ -15,6 +15,8 @@
 // the left, the detail on the right, stacked again where it is narrow).
 // dividers: lines between the items (true by default). It is a real <dl>.
 
+import ui/kit/theme.qwe use ui_cls
+
 let description_list_css = css`
 .ui-dl { margin: 0; container-type: inline-size; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
 .ui-dl-item { display: grid; gap: 2px; padding: 10px 0; }

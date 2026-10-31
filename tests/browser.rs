@@ -1122,6 +1122,46 @@ fn decimals_cross_to_the_page_and_back() {
     assert_eq!(r, want);
 }
 
+/// Two components of one name, each from its file, on one page: renamed in the bundle
+/// as on the server (FEEDBACK19.md, Q-154; branch feedback19-fixes).
+#[test]
+fn two_files_with_one_component_name_work_side_by_side() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("modules/main.qwe"), free_port(), Some(&dir.join("modules/drive.js")));
+    let want = serde_json::json!({
+        "server": ["red 1", "blue 10"],
+        "after": ["red 2", "blue 11"],
+        "remade": 0,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
+/// `bit` and `filled` come with a page that uses them: its bundle holds only
+/// what the page needs, which a run of the whole runtime would not show
+/// (FEEDBACK19.md, Q-151 and Q-153; branch feedback19-fixes).
+#[test]
+fn bits_and_filled_work_in_a_page_as_on_the_server() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("bits.qwe"), free_port(), Some(&dir.join("bits.js")));
+    let want = serde_json::json!({
+        "server": ["48", "4611686018427387904", "1", "anonymous"],
+        "flipped": "12",
+        "top": "4611686018427387904",
+        "remade": 0,
+        "errors": []
+    });
+    assert_eq!(r, want);
+}
+
 #[test]
 fn in_development_components_come_in_files_of_their_own_mapped_to_their_lines() {
     let Some(chrome) = chrome().filter(|_| node_available()) else {

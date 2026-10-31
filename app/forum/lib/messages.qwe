@@ -2,6 +2,9 @@
 // sides. A conversation's page follows `dm:<id>-<id>` (the pair, smaller id
 // first), and each person's inbox and its unread count follow `inbox:<id>`.
 
+import lib/auth.qwe use acting, viewer
+import lib/forum.qwe use check_body, render
+
 let MESSAGES_A_MINUTE = 30
 
 fn pair_topic(a: int, b: int) -> str = a < b ? `dm:${a}-${b}` : `dm:${b}-${a}`

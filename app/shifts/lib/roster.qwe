@@ -3,6 +3,8 @@
 // every line, day and shift at once, from four queries.
 
 // Someone's crews over time, with each crew's offset and line.
+import lib/rota.qwe use days_span, shift_of
+
 fn spans_of(user_id: int) with db =
     db.query(sql`select m.from_day, m.to_day, c.offset, c.letter, c.id as crew_id, l.id as line_id, l.code as line_code
                  from members m join crews c on c.id = m.crew_id join lines l on l.id = c.line_id

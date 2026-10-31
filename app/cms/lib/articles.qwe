@@ -8,6 +8,11 @@
 // Pages showing an article follow `article:<id>` (its blocks, step and
 // history); lists of articles follow `articles`.
 
+import lib/auth.qwe use acting, has_any, has_role
+import lib/blocks.qwe use blocks_of, owner_key
+import lib/flows.qwe use first_step, is_final, step_row, steps_of, transitions_of
+import lib/text.qwe use from_json, plural, slugify
+
 fn article_row(id: int) with db = unwatched(() =>
     db.one("select id, title, slug, flow_id, step_id, author_id, round, created, updated, published_at from articles where id = ?", id))
 

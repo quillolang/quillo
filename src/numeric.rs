@@ -77,6 +77,10 @@ pub fn install_math(m: &mut Map) {
     }
 }
 
+pub fn install_bit(m: &mut Map) {
+    install(m, "bit.", BIT);
+}
+
 pub fn install_stats(m: &mut Map) {
     install(m, "stats.", STATS);
 }
@@ -776,6 +780,56 @@ pub fn sort_numbers(l: &[Value]) -> Option<Value> {
 }
 
 // ---- math --------------------------------------------------------------
+
+// ---- bit ---------------------------------------------------------------
+
+// `| ` is the pipe, so these are functions, not operators, and each works on
+// the 64 bits of an int, in the browser too (FEEDBACK19.md, Q-153; branch
+// feedback19-fixes).
+
+/// How far to shift: past 63 every bit would be gone, which is a mistake.
+fn shift(args: &[Value], f: &str, line: u32) -> Result<u32, Ctrl> {
+    let n = int(args, 1, f, line)?;
+    match u32::try_from(n) {
+        Ok(k) if k < 64 => Ok(k),
+        _ => fail(line, format!("`{}`: a shift is 0 to 63, got {}", f, n)),
+    }
+}
+
+fn b_and(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(int(&args, 0, "bit.and", line)? & int(&args, 1, "bit.and", line)?))
+}
+
+fn b_or(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(int(&args, 0, "bit.or", line)? | int(&args, 1, "bit.or", line)?))
+}
+
+fn b_xor(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(int(&args, 0, "bit.xor", line)? ^ int(&args, 1, "bit.xor", line)?))
+}
+
+fn b_not(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(!int(&args, 0, "bit.not", line)?))
+}
+
+/// Bits past the top are dropped: this is shifting, not `*`, which refuses.
+fn b_shl(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(int(&args, 0, "bit.shl", line)? << shift(&args, "bit.shl", line)?))
+}
+
+/// The sign is kept, as in JavaScript's `>>`; `bit.and` masks it off.
+fn b_shr(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Int(int(&args, 0, "bit.shr", line)? >> shift(&args, "bit.shr", line)?))
+}
+
+const BIT: &[(&str, BuiltinFn)] = &[
+    ("bit.and", b_and),
+    ("bit.or", b_or),
+    ("bit.xor", b_xor),
+    ("bit.not", b_not),
+    ("bit.shl", b_shl),
+    ("bit.shr", b_shr),
+];
 
 const MATH: &[(&str, BuiltinFn)] = &[
     ("math.sqrt", m_sqrt),

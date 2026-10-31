@@ -1,6 +1,9 @@
 // /device: what platform() says (the server's side, read at start), and a live part that
 // updates each second: the program's clock, the battery, the screen, the minute job.
 
+import lib/notes.qwe use last_beat
+import ui/notes.qwe use ago
+
 fn show(v) = v == null ? "—" : type_of(v) == "map" ? join(keys(v) | map((k) => `${k}: ${v[k]}`), ", ") : str(v)
 
 view DevicePage(p: map, beat) =

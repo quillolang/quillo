@@ -548,7 +548,10 @@ fn i(on) = <p class={on ? "ok" : "ok"}>9</p>
 "#,
     )]);
     let w = |n: u32| format!("main.qwe:{} warning: no style sheet has a rule for `.okk` (did you mean `ok`?)", n);
-    assert_eq!(app.classes(), [w(2), w(3), w(4), w(5), w(6), w(7), w(8)]);
+    // `x || "okk"` is the habit `quillo check` warns about too (FEEDBACK19.md,
+    // Q-150; branch feedback19-fixes).
+    let blank = "main.qwe:5 warning: this value counts as true even when it is \"\" (unlike JavaScript), so `||` keeps it unless it is null: write `filled(x) ?? ...`, or `x ?? ...` to replace only null".to_string();
+    assert_eq!(app.classes(), [w(2), w(3), w(4), w(5), blank, w(6), w(7), w(8)]);
 }
 
 #[test]
@@ -731,7 +734,7 @@ fn a_long_chain_of_replies_is_refused_not_a_crash() {
 fn a_function_from_a_plugin_is_not_a_view() {
     let app = App::new("plugin-tag", &[
         ("kv.qwer", "pub fn get(key: &str) -> Option<String> { let _ = key; None }\n"),
-        ("main.qwe", "use get as Getter from \"kv.qwer\"\nprint(<Getter/>)\n"),
+        ("main.qwe", "import \"kv.qwer\" use get as Getter\nprint(<Getter/>)\n"),
     ]);
     assert_eq!(app.check(Options::default()), ["main.qwe:2 <Getter> is a builtin function, not a view"]);
 }

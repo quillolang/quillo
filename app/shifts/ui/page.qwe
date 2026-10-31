@@ -1,5 +1,7 @@
 // The frame every page uses.
 
+import lib/rota.qwe use SHIFT_NAMES
+
 view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
 
 view ShiftTag(s: str) = <span class={`tag s-${s}`} title={SHIFT_NAMES[s]}>{s}</span>

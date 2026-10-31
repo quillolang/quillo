@@ -2,6 +2,18 @@
 // as plain HTML forms, so joining, signing in and starting a thread work
 // before any script has loaded.
 
+import lib/auth.qwe use is_admin, is_banned, is_mod
+import lib/forum.qwe use marked
+import lib/moderation.qwe use BAN_DAYS
+import lib/polls.qwe use POLL_DAYS
+import lib/text.qwe use ago, compact, excerpt, left, plural
+import ui/editor.qwe use Editor
+import ui/lists.qwe use CategoryCard, ThreadList
+import ui/messages.qwe use Conversation, Inbox
+import ui/mod.qwe use ModLog, ModQueue
+import ui/page.qwe use Avatar, CategoryPill, Empty, Page, Person, Problem, RoleBadge
+import ui/thread.qwe use ThreadView
+
 view Sidebar(cats, tags, people, totals) =
     <aside.side>
         <section.box>

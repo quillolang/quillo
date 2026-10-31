@@ -9,6 +9,10 @@
 
 // "@li" just before the cursor, after a start or a character that is not
 // part of a word, an address or a path (as lib/mentions.qwe reads them).
+import lib/forum.qwe use find_people
+import lib/uploads.qwe use upload_image
+import ui/page.qwe use Avatar, Problem
+
 let MENTION_TYPING = "(?:^|[^A-Za-z0-9_@/.\\[])@([A-Za-z0-9_]{1,20})$"
 
 component Editor(box_id: str, value: str = "", name: str? = null, rows: int = 6, placeholder: str = "",

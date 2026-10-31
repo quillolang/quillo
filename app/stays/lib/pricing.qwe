@@ -15,6 +15,8 @@
 //
 // Prices in the database are in minor units (cents, or yen), as ints.
 
+import lib/dates.qwe use is_day, nights_of, plural, weekend_night
+
 let SERVICE_FEE = 0.12m
 let WEEK_OFF = 0.10m
 let MONTH_OFF = 0.25m

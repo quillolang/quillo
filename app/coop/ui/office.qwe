@@ -2,6 +2,13 @@
 
 // An approved applicant leaves the live list at once, so what the clerk must
 // read out (the first password) is kept by the list, not by its row.
+import lib/amounts.qwe use peso
+import lib/dashboards.qwe use load_help_queue, load_office_loans
+import lib/members.qwe use approve_member, load_applications, reject_member
+import lib/savings.qwe use counter_cash
+import lib/store.qwe use load_open_orders, mark_order
+import ui/page.qwe use Done, Page, Problem, Status, When
+
 component ApplicationItem(a, on_approved) {
     state reason = ""
     state problem = null

@@ -2,6 +2,10 @@
 // member number, a sign-in, a savings and a share capital account), and the
 // member keeps their details and their monthly salary savings.
 
+import lib/amounts.qwe use centavos, pad, peso
+import lib/auth.qwe use DAY_MS, STAFF, acting_as, acting_member, audit, viewer
+import lib/ledger.qwe use OFFICE, member_topic, open_account, setting_int, today
+
 type Application = {
     first_name: str,
     last_name: str,

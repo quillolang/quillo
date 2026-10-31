@@ -18,6 +18,8 @@
 // start, "rating-" + name by default) as for every field.
 // on_change(value): inside one of your components, given the number chosen.
 
+import ui/kit/theme.qwe use ui_cls
+
 let rating_css = css`
 .ui-rating { --ui-rating-size: 24px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-rating-sm { --ui-rating-size: 16px; }

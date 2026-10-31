@@ -16,6 +16,8 @@
 // empty: what shows when there are no slots ("No times").
 // on_pick(id): inside one of your components, the slot chosen.
 
+import ui/kit/theme.qwe use ui_cls
+
 let time_slots_css = css`
 .ui-time-slots { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-time-slots-legend { padding: 0; margin-bottom: 2px; font-size: 13px; font-weight: 500; }

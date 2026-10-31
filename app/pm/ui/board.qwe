@@ -3,6 +3,12 @@
 // people or priorities), or moved with Alt+← and Alt+→ from the keyboard.
 // A card opens in <TaskPanel> (ui/task.qwe) beside the board.
 
+import lib/dates.qwe use day_or_null, due_label
+import lib/projects.qwe use can_edit
+import lib/tasks.qwe use PRIORITIES, create_task, edit_task, load_board, move_task, moved
+import ui/page.qwe use Avatar, LabelChip, PriorityIcon, Problem
+import ui/task.qwe use TaskPanel
+
 let LANES = [["none", "No lanes"], ["assignee", "By person"], ["priority", "By priority"]]
 
 // What a card says, for the search box: its ref, title and assignee.

@@ -3,6 +3,10 @@
 // and a Monte Carlo forecast of when the open work is done. The numbers
 // come from `stats` and `vec`; the pictures are drawn in ui/charts.qwe.
 
+import lib/auth.qwe use today, tz_offset
+import lib/dates.qwe use DAY_MS, day_of, parse_day, week_start
+import lib/projects.qwe use columns_of, member_of, members_of, milestones_of
+
 let FLOW_DAYS = 42
 let WEEKS = 12
 let RUNS = 2000

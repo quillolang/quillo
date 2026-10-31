@@ -12,6 +12,8 @@
 // id: the element's id, for a link to it or a test.
 // on_click(): inside one of your components, what a click does.
 
+import ui/kit/theme.qwe use ui_cls
+
 let button_css = css`
 .ui-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: .5em;

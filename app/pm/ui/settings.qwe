@@ -5,6 +5,11 @@
 // labels, milestones and people. Owners change columns and people; editors
 // change labels and milestones.
 
+import lib/dates.qwe use day_text, parse_day, short_day, year_of
+import lib/projects.qwe
+    use COLORS, COLUMN_KINDS, ROLES, add_column, add_label, add_member, can_edit, delete_column, delete_label, delete_milestone, edit_column, load_settings, remove_member, save_milestone, set_member_role, shift_column
+import ui/page.qwe use Avatar, Problem
+
 component ColumnRow(project_id: int, c, cards: int, first: bool, last_one: bool, owner: bool, on_problem) {
     state name = c.name
     state kind = c.kind

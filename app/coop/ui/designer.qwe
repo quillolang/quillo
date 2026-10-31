@@ -1,6 +1,15 @@
 // The manager's pages: the loan designer (a product's terms, checked and
 // previewed in the browser as they are typed), the rates, and employers.
 
+import lib/amounts.qwe use centavos, pct, peso, plural
+import lib/dashboards.qwe use load_products
+import lib/payroll.qwe use amount_text, new_api_key
+import lib/products.qwe
+    use charges, check_product, propose_product, retire_product, save_product, schedule_of, total_interest
+import lib/savings.qwe use run_daily
+import ui/loan.qwe use Schedule
+import ui/page.qwe use Done, Page, Problem, Status
+
 component ProductsList() {
     state rows = live(load_products)
     <section.card>

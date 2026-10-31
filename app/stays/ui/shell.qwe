@@ -1,6 +1,12 @@
 // The frame of every page: the kit's theme and components' styles, this
 // app's own, Leaflet for maps (from cdnjs), and the bar at the top.
 
+import ui/kit.qwe use kit_css
+import ui/kit/avatar.qwe use Avatar
+import ui/kit/button.qwe use Button
+import ui/kit/empty_state.qwe use EmptyState
+import ui/kit/navbar.qwe use Navbar
+
 let LEAFLET = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4"
 
 let stays_css = css`

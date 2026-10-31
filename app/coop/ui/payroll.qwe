@@ -1,6 +1,10 @@
 // Salary deductions, for the office and for the employers' payroll staff:
 // the batches, one batch's lines (live), its CSV, and remitting it.
 
+import lib/amounts.qwe use peso, plural
+import lib/payroll.qwe use load_batch, load_batches, make_batch, upload_remittance
+import ui/page.qwe use Done, Problem, Status, When
+
 component MakeBatch(employers, period: str) {
     state employer = len(employers) > 0 ? employers[0].id : 0
     state month = period

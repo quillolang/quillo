@@ -3,6 +3,8 @@
 // under uploads/images/ with a random name. Served from /media/<name>.
 // (A GIF is saved as its first frame.)
 
+import lib/auth.qwe use acting
+
 let MAX_IMAGE_BYTES = 8_000_000
 let IMAGE_WIDTH = 1600
 let IMAGES_AN_HOUR = 30

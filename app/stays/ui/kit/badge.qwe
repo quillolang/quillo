@@ -10,6 +10,8 @@
 // label: what the count is, for screen readers ("128 unread messages").
 // size: "sm" or "md" (default). For labels people add or remove, use Tag.
 
+import ui/kit/theme.qwe use ui_cls
+
 let badge_css = css`
 .ui-badge {
   display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px;

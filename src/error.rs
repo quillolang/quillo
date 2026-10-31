@@ -92,8 +92,14 @@ const REMOVED: &[(&[&str], &str)] = &[
 ];
 
 /// ` — removed from Quillo in 0.5.0 (205d7cd): <what to do instead>`, for a
-/// name that was a builtin, or nothing.
+/// name that was a builtin, or what Quillo has for a word it never had
+/// (FEEDBACK19.md, Q-152; branch feedback19-fixes), or nothing.
 pub fn removed_note(name: &str) -> String {
+    match name {
+        "break" => return ": Quillo has no `break`: `return` leaves a loop and the function around it, and `find` stops at the first match".into(),
+        "continue" => return ": Quillo has no `continue`: `filter` the list first, or put the rest of the loop in an `if`".into(),
+        _ => {}
+    }
     REMOVED
         .iter()
         .find(|(names, _)| names.contains(&name))

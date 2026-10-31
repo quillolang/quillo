@@ -1,0 +1,7 @@
+// Q-151 No short way to replace a blank or a missing value
+// mode: run
+// open-when: unknown name `filled`
+// fixed-when: anonymous anonymous
+// From FEEDBACK19.md §Q-151 (found on b28e689).
+
+print(filled("") ?? "anonymous", filled(null) ?? "anonymous")

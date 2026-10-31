@@ -268,7 +268,6 @@ Everything else has a repository of its own:
 | Repository | What it holds |
 |---|---|
 | [quillolang/examples](https://github.com/quillolang/examples) | Small programs, each showing one part of Quillo: routes, a todo app, live notes, a single-page app, infinite scroll, a virtual list of a million rows, the Game of Life, UDP telemetry, a camera stream, Rust in a program, services |
-| [quillolang/apps](https://github.com/quillolang/apps) | Whole applications: a multi-tenant CRM with a shop, campaigns, a page designer and plugins |
 | [quillolang/editors](https://github.com/quillolang/editors) | The VS Code extension |
 | [quillolang/website](https://github.com/quillolang/website) | [quillolang.org](https://quillolang.org), written in Quillo, with the logo and banners |
 | [quillolang/benchmarks](https://github.com/quillolang/benchmarks) | The browser and server benchmarks |

@@ -1,6 +1,8 @@
 // The frame every page uses, the sign-in page, and small pieces shown
 // everywhere.
 
+import lib/amounts.qwe use peso
+
 view Problem(text) = text != null && text != "" && <p.problem role="alert">{text}</p>
 
 view Done(text) = text != null && text != "" && <p.done role="status">{text}</p>

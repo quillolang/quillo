@@ -1,6 +1,10 @@
 // Pages: home (projects and what is on my plate), signing in, and the frame
 // of a project's pages around their components.
 
+import lib/dates.qwe use due_label, parse_day
+import lib/projects.qwe use COLORS
+import ui/page.qwe use Page, PriorityIcon, Problem, ProjectTabs
+
 view ProjectCard(p) {
     let pct = p.tasks == 0 ? 0 : round(p.done / p.tasks * 100)
     <a.project-card href={`/p/${p.key}`} style={`--c: ${p.color}`}>

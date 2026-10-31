@@ -6,6 +6,11 @@
 // member's remittance pays their lines in order (loans, store, savings);
 // what is short is marked, and anything more goes to their savings.
 
+import lib/amounts.qwe use CURRENCY, centavos, peso
+import lib/auth.qwe use STAFF, acting_as, audit, viewer
+import lib/ledger.qwe use OFFICE, account_of, new_journal, post
+import lib/loans.qwe use pay_loan
+
 fn period_of(day: str) -> str = slice(day, 0, 7)
 
 fn period_end(period: str) -> str = date.end_of_month(period + "-01")

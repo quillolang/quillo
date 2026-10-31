@@ -14,7 +14,7 @@ use crate::value::*;
 /// Builtins a script may call: they compute from their arguments and
 /// nothing else (and cannot make huge values from small ones).
 const SAFE: &[&str] = &[
-    "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains", "starts_with", "ends_with",
+    "str", "int", "float", "len", "type_of", "upper", "lower", "trim", "filled", "split", "join", "contains", "starts_with", "ends_with",
     "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "escape", "url_encode", "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten",
     "zip", "take", "drop", "index_of", "map", "filter", "find", "any", "all", "reduce", "sort_by", "count", "group_by",

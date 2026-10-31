@@ -2,6 +2,10 @@
 // it, and an approval may not take a shift below the line's minimum unless
 // the supervisor says why. Rest days inside a leave are not leave.
 
+import lib/auth.qwe use acting, may_see_line, viewer
+import lib/roster.qwe use lines_of, span_on, spans_of, turning_up
+import lib/rota.qwe use FACTORY_TZ, shift_of, working_days
+
 type LeaveRequest = {
     kind: "annual" | "sick" | "unpaid",
     start_day: date,

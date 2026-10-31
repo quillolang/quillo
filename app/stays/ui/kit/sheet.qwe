@@ -15,6 +15,8 @@
 // snap: the height it opens at, "half" (default) or "full". width: how wide it may
 // be on a large screen, in pixels (640).
 
+import ui/kit/theme.qwe use ui_cls
+
 let sheet_css = css`
 .ui-sheet-host { display: contents; }
 .ui-sheet {

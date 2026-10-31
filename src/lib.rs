@@ -26,6 +26,7 @@ pub mod install;
 pub mod imaging;
 pub mod island;
 pub mod jobs;
+pub mod modules;
 pub mod udp;
 pub mod wt;
 pub mod media;

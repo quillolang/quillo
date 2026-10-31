@@ -2,6 +2,12 @@
 // message, notification and moderation counts, who is signed in) and the footer. Plus the small views
 // used everywhere: avatars, badges, tags.
 
+import lib/auth.qwe use is_banned, is_mod
+import lib/forum.qwe use load_unread
+import lib/messages.qwe use load_unread_messages
+import lib/moderation.qwe use load_open_reports
+import lib/text.qwe use left
+
 view Avatar(name: str, hue: int, size: str = "md") =
     <span class={`avatar ${size}`} style={`--hue: ${hue}`} aria-hidden="true">{upper(slice(name, 0, 1))}</span>
 

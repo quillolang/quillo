@@ -10,6 +10,13 @@
 // keeps them for a day while the host decides; a confirmed booking keeps them.
 // Holds and requests that run out are swept each minute, and before each hold.
 
+import lib/auth.qwe use acting, acting_host, me
+import lib/dates.qwe
+    use CITY_ZONES, day_label, is_day, local_day, local_moment, nights_of, plural, range_label, zone_of
+import lib/outside.qwe use forecast, forecast_kept, geocode, metres, places_near, weather_of
+import lib/pricing.qwe
+    use POLICIES, card_problem, cash, night_price, quote, quote_record, refund_of, shown_minor, shown_money, stay_problem
+
 let HOLD_MS = 10 * 60000
 let RESPOND_MS = 24 * 3600000
 let SEARCH_KM = 25.0

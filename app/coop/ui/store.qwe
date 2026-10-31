@@ -1,5 +1,12 @@
 // The web stores, raffles and events.
 
+import lib/amounts.qwe use peso
+import lib/raffles.qwe
+    use book_event, buy_tickets, check_in, create_event, create_raffle, draw_raffle, load_attendance, load_events, load_raffles
+import lib/store.qwe use load_store, place_order
+import ui/page.qwe use Done, Page, Problem, Status
+import ui/public.qwe use event_when
+
 view StoresPage(me, rows) =
     <Page title="Stores" me={me} here="/store">
         <section.card>

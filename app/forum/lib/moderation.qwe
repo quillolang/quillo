@@ -2,6 +2,10 @@
 // reports in a queue (/mod), live, and dismiss them, remove the post or
 // suspend its author. What moderators do goes in a log they all see.
 
+import lib/auth.qwe use DAY, acting, is_admin, is_mod, viewer
+import lib/forum.qwe use take_down
+import lib/text.qwe use plural
+
 let REPORT_REASONS = [["spam", "Spam or advertising"], ["rude", "Rude or abusive"], ["off-topic", "Off topic"], ["other", "Something else"]]
 
 // Suspensions offered, in days; -1 is until lifted, 0 lifts one.

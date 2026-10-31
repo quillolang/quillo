@@ -3,6 +3,10 @@
 // here, from the numbers lib/metrics.qwe gives. Colours are CSS variables
 // (--s1 ... --s8, the series slots, in fixed order; see public/css/pm.css).
 
+import lib/dates.qwe use short_day
+import lib/tasks.qwe use PRIORITIES
+import ui/page.qwe use Avatar
+
 let CW = 640
 let CH = 240
 let PL = 40

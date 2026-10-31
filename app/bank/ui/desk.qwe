@@ -6,6 +6,11 @@
 //                 clerk fills it in (a field just changed lights up), the
 //                 questions to approve, and the PIN to choose.
 
+import lib/desk.qwe
+    use TERMS, desk_answer, desk_ask, desk_cancel, desk_join, desk_pin, desk_release, desk_set, desk_submit, load_desk
+import lib/iban.qwe use iban_pretty
+import ui/shell.qwe use Empty, Problem, StaffShell
+
 let OPTIONS = {
     kind: [["checking", "Checking (everyday)"], ["savings", "Savings"]],
     currency: [["EUR", "Euro"], ["USD", "US dollar"], ["GBP", "Pound sterling"]],

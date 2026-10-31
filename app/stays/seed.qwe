@@ -5,6 +5,9 @@
 // Every demo password is "password".
 
 // A number from 0 to 1, the same for the same seed.
+import lib/dates.qwe use DAY_MS, nights_of
+import lib/pricing.qwe use quote, quote_record
+
 fn wobble(seed: int) -> float {
     let x = math.sin(seed * 12.9898) * 43758.5453
     x - floor(x)

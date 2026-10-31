@@ -16,6 +16,8 @@
 // readers, who hear the total and the busiest day. On a narrow screen it scrolls
 // sideways, starting at the latest weeks.
 
+import ui/kit/theme.qwe use ui_cls
+
 let calendar_heatmap_css = css`
 .ui-ch { display: grid; gap: 8px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); --t: var(--ui-accent); }
 .ui-ch-success { --t: var(--ui-success); }

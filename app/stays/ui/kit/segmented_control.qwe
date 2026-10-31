@@ -12,6 +12,8 @@
 // full: as wide as its container, the segments sharing it. disabled: all of it.
 // on_change(value): inside one of your components, called with the value picked.
 
+import ui/kit/theme.qwe use ui_cls
+
 let segmented_control_css = css`
 .ui-segmented {
   display: inline-flex; justify-self: start; gap: 2px; padding: 3px; border-radius: calc(var(--ui-radius-sm) + 3px);

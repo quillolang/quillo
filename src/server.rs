@@ -451,7 +451,6 @@ impl Interp {
         let method = if req.method == "HEAD" { "GET" } else { req.method.as_str() };
         let query_v = Value::map(parse_urlencoded(qs));
         // Built when a route's path matches, at most once.
-        let mut base: Option<Map> = None;
 
         let mut path_matched = false;
         let mut method_matched = false;
@@ -469,10 +468,7 @@ impl Interp {
             // The request map only for a route that can see it; for others
             // it is made if something asks (`url()`, a server fn).
             let reqv = if r.uses_request {
-                let mut reqmap = match base.take() {
-                    Some(m) => m,
-                    None => build_request(req, path, &query_v),
-                };
+                let mut reqmap = build_request(req, path, &query_v);
                 reqmap.insert("params".into(), params_v);
                 if let Some(id) = &self.request_id {
                     reqmap.insert("id".into(), Value::str(&**id));

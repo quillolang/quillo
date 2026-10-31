@@ -1,6 +1,12 @@
 // The board of directors: loans and loan products before it, live, with each
 // director's vote.
 
+import lib/amounts.qwe use pct, peso, plural
+import lib/dashboards.qwe use load_board
+import lib/loans.qwe use vote_loan
+import lib/products.qwe use vote_product
+import ui/page.qwe use Problem
+
 component VoteBox(kind: str, id: int, mine) {
     state comment = mine.comment ?? ""
     state problem = null

@@ -412,22 +412,22 @@ fn pick(urls: &[String], tried: &[String], o: &Opts) -> Option<String> {
 
 // ---- what a service offers ---------------------------------------------------------------
 
-/// The statements of a program and the files it `use`s.
-fn statements(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Stmt>) -> Result<(), String> {
+/// The statements of a program and the files it `use`s. Every file's paths count from
+/// `base`, the program's folder (FEEDBACK19.md, Q-154; branch feedback19-fixes).
+fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Stmt>) -> Result<(), String> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !seen.insert(key) {
         return Ok(());
     }
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let stmts = Parser::new(&src).parse_program().map_err(|e| format!("{}: {}", path.display(), e))?;
-    let dir = path.parent().unwrap_or(Path::new("."));
     for s in stmts {
         if let Stmt::Use(file, ..) = &s {
             if crate::ast::is_script(file) {
                 out.push(s);
                 continue;
             }
-            statements(&dir.join(file), seen, out)?;
+            statements(&base.join(crate::modules::resolve(base, file)), base, seen, out)?;
         }
         out.push(s);
     }
@@ -437,7 +437,7 @@ fn statements(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Stmt>) -> 
 /// The `server fn`s a service's program offers (its own and its `use`d files').
 pub fn offered(path: &Path) -> Result<Vec<Arc<FnDef>>, String> {
     let mut stmts = Vec::new();
-    statements(path, &mut HashSet::new(), &mut stmts)?;
+    statements(path, path.parent().unwrap_or(Path::new(".")), &mut HashSet::new(), &mut stmts)?;
     Ok(stmts
         .into_iter()
         .filter_map(|s| match s {
@@ -458,7 +458,7 @@ pub fn declared(path: &Path) -> Result<Vec<(String, Option<String>, PathBuf)>, S
             continue;
         }
         let mut stmts = Vec::new();
-        statements(&p, &mut HashSet::new(), &mut stmts)?;
+        statements(&p, p.parent().unwrap_or(Path::new(".")), &mut HashSet::new(), &mut stmts)?;
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
         for s in stmts {
             if let Stmt::Service(name, prefix, file, _, _) = s {

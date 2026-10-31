@@ -23,7 +23,7 @@ const QWE: Lang = Lang {
     line: &["//"],
     block: Some(("/*", "*/")),
     quotes: "\"`",
-    keywords: &["let", "fn", "view", "component", "server", "route", "use", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
+    keywords: &["let", "fn", "view", "component", "server", "route", "use", "import", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
     consts: &["true", "false", "null", "int", "str", "bool", "float", "dec", "map", "list", "any"],
     types: true,
     tags: true,

@@ -18,6 +18,7 @@ usage:
   quillo app <file.qwe> [options]   run a program in a native window (needs a
                                     build with `--features app`)
   quillo check <file.qwe>           check a program without running it
+  quillo fix <file.qwe>             write the `import`s a program's files need
                [--strict-null]      and warn where a value may be null and
                                     null does not work
   quillo docs <file.qwe>            the program's API as OpenAPI 3: its routes,
@@ -260,6 +261,22 @@ fn real_main(args: Vec<String>) -> i32 {
                     eprintln!("quillo: {}", e);
                     1
                 }
+        }),
+        // The `use`s a program's files need (src/modules.rs; branch feedback19-fixes).
+        Some("fix") => with_program(&args[2..], |f, _| match quillo::modules::fix(Path::new(f)) {
+            Ok(said) => {
+                for s in &said {
+                    println!("{}", s);
+                }
+                if said.is_empty() {
+                    println!("{}: nothing to fix", f);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
         }),
         // Plugins from quillolang.org's catalog, into the program's folder.
         Some("install") => quillo::install::main(&args[2..]),

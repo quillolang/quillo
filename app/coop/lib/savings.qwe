@@ -1,6 +1,11 @@
 // Savings and share capital: cash at the counter (a clerk), transfers by the
 // member, and the month's interest on savings, posted by the daily job.
 
+import lib/amounts.qwe use centavos, pad, pct, peso
+import lib/auth.qwe use acting_as, acting_member, audit
+import lib/ledger.qwe use account_of, new_journal, post, setting, setting_int, today
+import lib/members.qwe use member_by_number
+
 type Cash = { member: str, account: "savings" | "share", direction: "in" | "out", amount: str, memo: str = "" }
 
 server fn counter_cash(c: Cash) ! str with db, time, random {

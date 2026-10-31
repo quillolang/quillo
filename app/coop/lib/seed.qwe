@@ -3,6 +3,11 @@
 // before the board), loans at each stage, two stores, a raffle and events.
 // Every password is coop1234.
 
+import lib/auth.qwe use DAY_MS
+import lib/ledger.qwe use account_of, new_journal, open_account, post, today
+import lib/members.qwe use next_member_number
+import lib/products.qwe use schedule_of
+
 let DEMO_PASSWORD = "coop1234"
 
 fn demo_user(username: str, name: str, role: str, member_id, employer_id) with db, time, random =

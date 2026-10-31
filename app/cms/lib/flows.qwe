@@ -3,6 +3,9 @@
 // (each with the role that may run it). The flow designer edits them; pages
 // showing a flow follow `flow:<id>`.
 
+import lib/auth.qwe use ROLES, acting
+import lib/text.qwe use plural
+
 let STEP_COLORS = ["#64748b", "#2a78d6", "#eb6834", "#1baf7a", "#6250d6", "#e87ba4", "#eda100", "#008300"]
 let TRANSITION_KINDS = ["move", "approve", "reject"]
 

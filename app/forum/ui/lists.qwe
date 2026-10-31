@@ -2,6 +2,10 @@
 // reply or a vote anywhere shows on every open list at once. For someone
 // signed in, threads with something they have not seen stand out.
 
+import lib/forum.qwe use load_threads
+import lib/text.qwe use ago, compact, plural, tags_of
+import ui/page.qwe use Avatar, CategoryPill, Empty, Tag
+
 view CategoryCard(c) =
     <a.cat href={`/c/${c.slug}`} style={`--c: ${c.color}`}>
         <h3>{c.name}</h3>

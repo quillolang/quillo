@@ -2,6 +2,9 @@
 // history in the first, made up the same way every time, so the reports
 // have something to show. Everyone's password is password123.
 
+import lib/dates.qwe use DAY_MS, day_of, day_text
+import lib/projects.qwe use columns_of, create_project, labels_of, project_by_key
+
 let SEED_PEOPLE = ["ada", "grace", "linus", "margaret"]
 let SEED_TITLES = [
     "Audit the current site's pages", "Pick the type scale", "Navigation: mobile menu", "Hero section", "Pricing page layout",

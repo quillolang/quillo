@@ -4,6 +4,41 @@
 
 ### Additions
 
+- **A file sees its own names, the builtins and what it takes.** `use lib/forum` takes a
+  file's public names, `import lib/forum use latest, Feed` only those, and
+  `import lib/forum use latest as newest` under another name. What a file takes is for that
+  file, and is not passed on. Two files may each define a `helper`: a file's own comes
+  first, and a file that `use`s both whole is told to choose. A `server fn`, a `type` and a
+  `service` are still defined once in a program, and types and services are seen everywhere.
+  **For now a name a file did not take still works, with a warning**, so a program can move
+  a file at a time; a later release makes it an error.
+- **The file comes first on a line that takes names.** `import lib/forum use latest` for
+  Quillo and Rust files; `client`, `preload` and `preconnect` for what runs in the browser,
+  from a CDN or a file of your own: `client /assets/leaflet.js use L`,
+  `preload "https://..." use Chart`, `client module "https://esm.sh/three" use * as THREE`.
+  A long address may leave its `use` to the next line. Three reasons: the **mental model**
+  (the line reads as what kind of code, where, then which names, and its first word says
+  which side of the program it is on), the **editor** (it knows the file before the names,
+  so it offers them as they are typed), and **readability** (sources line up on the left,
+  and names no longer sit after a long address). These words stay names everywhere else.
+  0.6's `use a from lib/x` and `use Chart with preload from "..."` still work, with a
+  warning; a later release removes them.
+- **`quillo fix main.qwe`** writes the `import` lines a program's files need, and turns 0.6's
+  lines around. Run it once for each program, a service's or a mounted one's too. A second
+  run has nothing to do.
+- **`bit` and hex literals.** `bit.and`, `bit.or`, `bit.xor`, `bit.not`, `bit.shl` and
+  `bit.shr` work on all 64 bits of an int, with the same answers in the browser, and ints
+  may be written `0xFF` or `0xFFFF_0000`. They are functions, as `|` is the pipe. A hex
+  literal past 63 bits is an error, as any int that does not fit is.
+- **`filled(x)`** gives `x`, or null for `""`: `filled(name) ?? "anonymous"` replaces a
+  blank or a missing name, which is what `||` does for text in JavaScript.
+- **`quillo check` warns about `x || "text"` and `x || 10` where `x`'s type is not known**,
+  as with `request.query.name`, `request.json.title` and a row's fields. These are where a
+  blank field or a count of 0 is kept without a word. A warning may appear on a program
+  that had none; `filled(x) ?? ...` or `x ?? ...` says which is meant. `x || ""`, `x || 0`
+  and `x || []` are left alone.
+- **`break` and `continue` say what to write instead**, rather than only that the name is
+  unknown. They are still ordinary names.
 - **ES modules by name.** `use Chart, registerables with module from "..."` takes a
   module's exports, `use default as dayjs with module from "..."` its default export,
   and `use * as THREE with module from "..."` all of it. They are called as any library
@@ -54,6 +89,9 @@
 
 ### Fixes
 
+- **`quillo build` and a service's program followed a `use` from the file's own folder**,
+  though paths count from the program's folder, so a `use` in `lib/a.qwe` looked in
+  `lib/lib/`.
 - **A state read from the page** (`state wide = js("window.innerWidth") > 800`) was null for
   good on a page the server rendered: the initializer now runs again in the browser once
   the component is on the page (FEEDBACK18.md, Q-105).

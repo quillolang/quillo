@@ -2,6 +2,8 @@
 // the caller's transaction: the balance changes in one statement, an entry
 // records it, and the member's pages are told.
 
+import lib/amounts.qwe use peso
+
 let COOP_TZ = env("PUBLIC_COOP_TZ", "Asia/Manila")
 
 fn today() -> str with time = date.today(COOP_TZ)

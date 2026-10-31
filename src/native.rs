@@ -914,7 +914,7 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-    // `use a, b as c from "x.qwer"`: each must be one of its functions (branch imports).
+    // `import "x.qwer" use a, b as c`: each must be one of its functions (branch imports).
     if let Some(only) = only {
         for (name, _) in only {
             if !parsed.exports.iter().any(|e| e.name == *name) {
@@ -1016,13 +1016,14 @@ pub fn display_name(key: &str) -> &str {
 pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let mut todo = vec![main.to_path_buf()];
-    while let Some(f) = todo.pop() {
+    // A `use` counts from its program's folder, in every file; a mounted program is
+    // one of its own (FEEDBACK19.md, Q-154; branch feedback19-fixes).
+    let mut todo = vec![(main.to_path_buf(), main.parent().unwrap_or(Path::new(".")).to_path_buf())];
+    while let Some((f, base)) = todo.pop() {
         let key = f.canonicalize().unwrap_or_else(|_| f.clone());
         if !seen.insert(key) {
             continue;
         }
-        let dir = f.parent().unwrap_or(Path::new(".")).to_path_buf();
         if f.extension().is_some_and(|e| e == "qwer") {
             out.push(build(&f)?.0);
             continue;
@@ -1031,8 +1032,12 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
         for s in prog {
             match s {
-                crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push(dir.join(p)),
-                crate::ast::Stmt::Mount(_, p, _) => todo.push(dir.join(p)),
+                crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve(&base, &p)), base.clone())),
+                crate::ast::Stmt::Mount(_, p, _) => {
+                    let full = base.join(p);
+                    let dir = full.parent().unwrap_or(&base).to_path_buf();
+                    todo.push((full, dir));
+                }
                 _ => {}
             }
         }

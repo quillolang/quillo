@@ -1,6 +1,12 @@
 // Signing in and signing up: plain forms, posted, that work without the
 // page's script.
 
+import ui/kit/alert.qwe use Alert
+import ui/kit/button.qwe use Button
+import ui/kit/card.qwe use Card
+import ui/kit/text_field.qwe use TextField
+import ui/shell.qwe use Shell
+
 view LoginPage(next: str, problem, email: str) =
     <Shell me={null} title="Sign in">
         <Card title="Sign in" class="narrow">

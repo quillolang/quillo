@@ -2,6 +2,13 @@
 // transitions between them, and a diagram drawn from both. Used for
 // article flows and for objects' state machines alike.
 
+import lib/auth.qwe use ROLES
+import lib/flows.qwe
+    use STEP_COLORS, TRANSITION_KINDS, count_at, create_flow, delete_step, delete_transition, load_flow, load_flows, order_steps, rename_flow, save_step, save_transition
+import lib/text.qwe use plural
+import ui/blocks.qwe use err_text
+import ui/page.qwe use Problem
+
 let KIND_LABELS = { move: "moves", approve: "approves", reject: "sends back" }
 
 // The flow as boxes in a row, with an arc for each transition: forward ones

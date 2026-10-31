@@ -1,0 +1,8 @@
+// Two files with one public name, both on a page: each `Card` keeps its own state and
+// its own code in the browser. Driven by modules.js (FEEDBACK19.md, Q-154; branch
+// feedback19-fixes).
+
+import lib/red.qwe use Card as Red
+import lib/blue.qwe use Card as Blue
+
+route GET / = <html><body><Red/><Blue/></body></html>

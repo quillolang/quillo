@@ -16,6 +16,8 @@
 // brand, complete } as each is typed: brand is "visa", "mastercard", "amex",
 // "discover" or null; complete, whether all three are whole and right.
 
+import ui/kit/theme.qwe use ui_cls
+
 let card_input_css = css`
 .ui-card-input { display: grid; gap: 6px; min-width: 0; max-width: 420px; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-card-input-legend { padding: 0; margin-bottom: 2px; font-size: 13px; font-weight: 500; }

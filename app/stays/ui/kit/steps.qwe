@@ -9,6 +9,8 @@
 // Set it to len(steps) when everything is done. vertical: one under another,
 // for timelines and narrow places. label: what screen readers call it ("Progress").
 
+import ui/kit/theme.qwe use ui_cls
+
 let steps_css = css`
 .ui-steps { display: flex; margin: 0; padding: 0; list-style: none; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); counter-reset: ui-steps; }
 .ui-steps-item { position: relative; flex: 1 1 0; min-width: 0; display: grid; justify-items: start; gap: 8px; padding-right: 12px; }

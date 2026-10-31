@@ -25,8 +25,7 @@ Quillo is before 1.0: fixes go into the latest release only.
 ## Scope
 
 The `quillo` runtime and server (`src/`), the browser runtime it serves
-(`src/client/runtime.js`), the editor extension (`editors/vscode`) and the CRM
-(`apps/crm`). Sandboxed scripts (`run_script`, `check_program`) are meant to be safe for
+(`src/client/runtime.js`) and the editor extension (`editors/vscode`). Sandboxed scripts (`run_script`, `check_program`) are meant to be safe for
 code written by a program's users, so a way out of them is in scope.
 
 ## How dependencies are checked

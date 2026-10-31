@@ -1207,6 +1207,8 @@ B.dec = meta((v) => {
 B.upper = meta((s) => S(s, "upper").toUpperCase(), "upper", null);
 B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
 B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
+// What `||` does in JavaScript, for text (FEEDBACK19.md, Q-151; branch feedback19-fixes).
+B.filled = (x) => (x === "" ? null : x);
 B.split = meta((s, sep = " ") => { S(s, "split"); S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); }, "split", null);
 B.join = meta((l, sep = "") => L(l, "join").map(display).join(S(sep, "join", 2)), "join", null);
 B.contains = meta((c, x) => {
@@ -1596,7 +1598,7 @@ B.js = meta((path, ...args) => {
   if (isClass(v)) fail(`${path} is a class: make one with ${path}.new(...) (or js_new("${path}", ...))`);
   return fromPage(Reflect.apply(v, owner, guardCall(`\`js\`: ${path}`, v, args)));
 }, "js", null);
-// `Chart`, `Chart.defaults`: what a library's name (`use Chart from "...js"`)
+// `Chart`, `Chart.defaults`: what a library's name (`client "...js" use Chart`)
 // holds on the page, its functions not called (branch js-libraries).
 B.js_value = (path) => {
   const [, v, missing] = jsPath(path, "js");
@@ -2363,6 +2365,21 @@ B.math = {
   erfc: unary("erfc", erfc),
   gamma: unary("gamma", gamma, pole),
   lgamma: unary("lgamma", lgamma, pole),
+};
+
+// The 64 bits of an int, as on the server: JavaScript's own `&` and `<<` keep
+// 32. An int past 2^53 is a BigInt here (FEEDBACK19.md, Q-153; branch
+// feedback19-fixes).
+const bitsOf = (v, f, i = 1) => { want(isInt(v) || typeof v === "bigint", f, "an int", i, v); return BigInt(v); };
+const fromBits = (b) => intOf(BigInt.asIntN(64, b));
+const shiftOf = (n, f) => { const k = bitsOf(n, f, 2); if (k < 0n || k > 63n) fail(`\`${f}\`: a shift is 0 to 63, got ${k}`); return k; };
+B.bit = {
+  and: (a, b) => fromBits(bitsOf(a, "bit.and") & bitsOf(b, "bit.and", 2)),
+  or: (a, b) => fromBits(bitsOf(a, "bit.or") | bitsOf(b, "bit.or", 2)),
+  xor: (a, b) => fromBits(bitsOf(a, "bit.xor") ^ bitsOf(b, "bit.xor", 2)),
+  not: (a) => fromBits(~bitsOf(a, "bit.not")),
+  shl: (a, n) => fromBits(bitsOf(a, "bit.shl") << shiftOf(n, "bit.shl")),
+  shr: (a, n) => fromBits(bitsOf(a, "bit.shr") >> shiftOf(n, "bit.shr")),
 };
 
 const dataOf = (l, f, least) => {

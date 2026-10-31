@@ -7,6 +7,10 @@
 // version: a save made from an older version is refused, and feedback left on
 // an older version says the block changed since.
 
+import lib/articles.qwe use article_editable, article_row
+import lib/auth.qwe use acting, has_role
+import lib/text.qwe use from_json
+
 let CONTENT_TYPES = ["heading", "text", "quote", "image", "callout", "divider"]
 let DATA_TYPES = ["list", "form", "transaction"]
 let BLOCK_LABELS = {

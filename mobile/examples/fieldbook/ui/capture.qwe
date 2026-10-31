@@ -3,6 +3,8 @@
 // photo (the camera or the library: the input's own picker) and a voice memo
 // (getUserMedia and MediaRecorder).
 
+import lib/notes.qwe use add_audio, add_photo, create_note
+
 component Capture() {
     state title = ""
     state body = ""

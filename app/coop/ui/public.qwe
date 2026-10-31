@@ -1,5 +1,10 @@
 // The public pages: the coop's front page, and applying for membership.
 
+import lib/amounts.qwe use pct, peso
+import lib/auth.qwe use home_of
+import lib/ledger.qwe use setting_int
+import ui/page.qwe use Page, Problem
+
 view Home(me, stats) =
     <Page title="Home" me={me}>
         <section.hero>

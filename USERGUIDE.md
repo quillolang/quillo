@@ -60,8 +60,9 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
-files; see [Rust](#rust)), `quillo repl`, `quillo lsp`, `quillo dap`, `quillo version`
-(or `--version`, `-V`). `quillo check` exits 1 when there is an error (warnings do not
+files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
+[Files of a program](#files-of-a-program)), `quillo repl`, `quillo lsp`, `quillo dap`,
+`quillo version` (or `--version`, `-V`). `quillo check` exits 1 when there is an error (warnings do not
 fail it), `quillo run` 1 when the program does not load or the port cannot be taken, and
 either 2 for a usage mistake (an unknown option, no program, `--register` without its
 secret, options that do not go together). A stopped server exits 0 (see [Stopping and
@@ -160,10 +161,6 @@ app with a JSON API), [notes.qwe](https://github.com/quillolang/examples/blob/ma
 [services](https://github.com/quillolang/examples/tree/main/services) (a shop that bills through a billing service, in one process or
 split apart), and [index.qwe](https://github.com/quillolang/examples/blob/main/index.qwe), which mounts all of them in one server.
 
-A whole application: [crm](https://github.com/quillolang/apps/tree/main/crm) in [quillolang/apps](https://github.com/quillolang/apps) is a multi-tenant CRM for merchants, bloggers
-and news outlets, with a shop, campaigns, a flow designer, and plugins whose rules run in
-the browser and on the server.
-
 ### Phone apps (preview)
 
 A program runs inside an iOS or Android app: the runtime is linked into it and serves the
@@ -229,14 +226,15 @@ Operators are as in JavaScript, with these meanings:
 | `null`, `false` and error values | everything else, `0` and `""` included |
 
 Because `""` is truthy, `name || "anonymous"` keeps an empty name: write
-`name ?? "anonymous"` to replace only null, or `name != "" ? name : "anonymous"`
-(`quillo check` points these out).
+`filled(name) ?? "anonymous"` to replace a blank or a missing name, or
+`name ?? "anonymous"` to replace only null (`quillo check` points these out).
 
 Ints are 64-bit: `+`, `-`, `*` and unary `-` past their range are a runtime error
 (`integer overflow`), never a wrap. An int divided by int 0, or `%` 0, is an error;
 a float divided by zero is `inf` or `NaN`, written so, and ordering either is an error.
 There is no `**`, no bitwise `& | ^ << >>`, no `++`, no `*=` or `/=` (only `=`, `+=`,
-`-=`), no `?.`, no `===`, no `in`; `pow(a, b)` and `math.*` do the arithmetic.
+`-=`), no `?.`, no `===`, no `in`; `pow(a, b)` and `math.*` do the arithmetic, and
+[`bit.*`](#numbers-and-data) the bits (`|` is the pipe).
 Comparisons do not chain: `1 < x < 3` is a syntax error.
 
 From loosest to tightest: `? :`, `??`, `|` (a pipe), `||`, `&&`, comparisons, `..`,
@@ -274,18 +272,25 @@ Most expressions read as they would in JavaScript. The differences:
   mount server style` and the type names (`int`, `str`, ...) are words only where they
   mean something, so `let state = 1` and `let int = 5` are allowed (see [Files of a
   program](#files-of-a-program) for what hiding a builtin costs).
-- Numbers are written `42`, `1_000_000`, `3.14`, `2.5e-3`, `6E+23`: no hex, octal or
-  binary, no `.5`. An int past 64 bits is a parse error; a float past `f64` is `inf`.
+- Numbers are written `42`, `1_000_000`, `3.14`, `2.5e-3`, `6E+23`, `0xFF`,
+  `0xFFFF_0000`: no octal or binary, no `.5`. An int past 64 bits is a parse error
+  (`0x8000000000000000` too: a hex literal is an int, and does not wrap to a negative
+  one); a float past `f64` is `inf`.
 - Only `null`, `false` and error values are falsy: `0` and `""` are truthy. Code
   written by JavaScript habit then runs without failing but means something else:
   `name || "anonymous"` keeps an empty name, and `count && <Badge/>` shows the badge
   for 0. Where a value is known to be a string or a number, the checker warns about
   `||`, `&&`, `!`, `if` and `? :` on it and suggests the explicit form
-  (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`).
+  (`name != "" ? name : "anonymous"`, `count != 0 && <Badge/>`). It warns too where only
+  the fallback says so, as with what comes from a request or a row: `request.query.name
+  || "anonymous"`, `row.n || 10`. `filled(x) ?? "anonymous"` replaces `null` and `""`;
+  `x || ""`, `x || 0` and `x || []` are left alone, as they mean the same in both
+  languages.
 - `match`, `|`, patterns, `route`, `reply`, `state` and `with` effects have no
   JavaScript equivalent.
-- There is no `break` or `continue`: `return` leaves the function, from a loop too,
-  and from a `for … =>` that makes a list; to skip items, `filter` first. `return` is
+- There is no `break` or `continue` (each is an ordinary name, and an error that says
+  this where nothing defines it): `return` leaves the function, from a loop too, and
+  from a `for … =>` that makes a list; to skip items, `filter` first. `return` is
   also an expression, like `reply`: `let m = find(xs) ?? return null`, `"a" => return 1`.
 - Arguments are worked out eagerly, left to right, before the call; only `&&`, `||`,
   `??`, `? :`, `if` and `match` skip what they do not need. A lambda sees the variables
@@ -295,10 +300,10 @@ Most expressions read as they would in JavaScript. The differences:
   `fn` inside a function is a local closure. There is no tail-call optimisation: 10,000
   calls deep is the limit, in a tail position or not.
 - There are no classes, interfaces, enums (a `"a" | "b"` type, checked when the program
-  runs, is the nearest), generics (beyond `list<T>` and map shapes), decorators,
-  exceptions, or modules with their own names: `use` puts a file's names in the one
-  namespace of the program, but those it marks `private` (see [Files of a
-  program](#files-of-a-program)); `mount` and `service` are the boundaries.
+  runs, is the nearest), generics (beyond `list<T>` and map shapes), decorators or
+  exceptions. A file sees its own names and what it takes with `use`, without a prefix:
+  `import lib/auth use login`, then `login()`, not `auth.login()` (see [Files of a
+  program](#files-of-a-program)). `mount` and `service` are the boundaries.
 - Regular expressions are strings given to `re.*` (`re.find_all(text, "@(\\w+)")`), not
   `/.../` literals, and take only the syntax both sides read alike (see the standard
   library).
@@ -943,12 +948,13 @@ component Dashboard() {
 ### JavaScript libraries
 
 A component can hand an element to a library (a chart, a map, an editor) and call into
-it. Name the library with `use`, then call it as JavaScript does:
+it. Name the library on a line that starts with `client`, then call it as JavaScript does:
 
 ```quillo
-use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
-use L from /assets/leaflet.js
-use confetti from "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"
+client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
+client /assets/leaflet.js use L
+client "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"
+    use confetti
 
 component Sales(points: list) {
     state chart = null
@@ -966,12 +972,19 @@ component Where() {
 route GET / = <html><body><Sales points={load_points()}/></body></html>
 ```
 
-- `use Name from <script>`: a path ending in `.js`, or an address, is a browser library.
-  `Name` is what the script defines on the page (`Chart`, `L`, `confetti`, `dayjs`):
-  the name the library's own documentation uses, in its case. Several from one script:
-  `use L, LeafletDraw from /assets/leaflet.js`; another name for one:
-  `use Chart as ChartJS from ...`. Quotes are optional, as for every `use`; put an
+- `client <script> use Name`: `client` says this runs in the browser, and the path says
+  where it comes from: an address (a CDN) or a file of your own, ending in `.js` or
+  `.mjs`. `Name` is what the script defines on the page (`Chart`, `L`, `confetti`,
+  `dayjs`): the name the library's own documentation uses, in its case. Several from one
+  script: `client /assets/leaflet.js use L, LeafletDraw`; another name for one:
+  `client "..." use Chart as ChartJS`. Quotes are optional, as for every path; put an
   address in them, so editors do not read its `//` as a comment.
+- A long address may leave its `use` to the next line, as `confetti` does above, so the
+  names stay at the left. `quillo fix` breaks a line this way when it would be long.
+- `client`, `preload`, `preconnect` and `module` are still names everywhere else:
+  `client / 2` is a division. It is the `use` after a file that makes the line an import.
+- Each file that calls a library says so, as for any name: another file that calls
+  `Chart` writes the same line. The page still loads the script once.
 - `Name.new(args)` makes an object of a class (`new Chart(el, config)`); `Name(args)`
   calls a function (`confetti()`); `Name.fn(args)` calls one of its functions
   (`L.map(el)`, `dayjs.extend(...)`); `Name.field` reads a value (`Chart.version`).
@@ -988,17 +1001,17 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   other kind of address (`ftp:`, `file:`, `data:`) is refused, and so is one with a user
   name or password in it: browsers do not load those, and the page would show it.
 - A page loads a library late: when the browser is idle, or at the first touch of a
-  component that only answers clicks. To get ready for it sooner, say how between the
-  names and `from`, for all the names of that `use`:
+  component that only answers clicks. To get ready for it sooner, start the line with
+  `preload` or `preconnect` in place of `client`:
 
   ```quillo
-  use Chart with preload from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
-  use L with preconnect from "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  preload "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart
+  preconnect "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" use L
   ```
 
-  `with preload` has the page's `<head>` fetch the script (`<link rel="preload"
+  `preload` has the page's `<head>` fetch the script (`<link rel="preload"
   as="script">`), which suits a library the page uses as soon as it opens, such as a
-  chart in its `@mount`. `with preconnect` only opens the connection to the script's
+  chart in its `@mount`. `preconnect` only opens the connection to the script's
   host (`<link rel="preconnect">`), which costs little and suits one a click may need;
   it takes an address, since a path is on the page's own connection. Take one or the
   other: a preload opens the connection itself. Each goes only in
@@ -1011,20 +1024,20 @@ route GET / = <html><body><Sales points={load_points()}/></body></html>
   one with Chart.new(...)"; a name in the wrong case gives an error value,
   `js_new: chart is not defined on this page (did you mean Chart?)`; so does a script
   that did not load.
-- Without `with module`, `use` takes a library that sets a global (a "UMD" or "browser"
+- Without `module`, `client` takes a library that sets a global (a "UMD" or "browser"
   build: `.umd.js`, `.min.js`, `.browser.js`). An ES module is below; an npm package
   needs a CDN that serves it as one.
 
-An ES module (`import`/`export`) gives names by exporting them, and `with module` takes
-them. Nothing goes on `window`: what the module exports is kept in Quillo's runtime, where
+An ES module (`import`/`export`) gives names by exporting them, and `module` after the
+first word takes them. Nothing goes on `window`: what the module exports is kept in Quillo's runtime, where
 the page's scripts cannot reach or replace it, and is called as any library is:
 
 ```quillo
-use Chart, registerables with module from "https://esm.sh/chart.js@4.4.1"
-use Chart as ChartJS with module, preload from "https://esm.sh/chart.js@4.4.1"
-use default as dayjs with module from "https://esm.sh/dayjs@1.11.13"
-use * as THREE with module from "https://esm.sh/three@0.170.0"
-use helper from /assets/helper.mjs
+client module "https://esm.sh/chart.js@4.4.1" use Chart, registerables
+preload module "https://esm.sh/chart.js@4.4.1" use Chart as ChartJS
+client module "https://esm.sh/dayjs@1.11.13" use default as dayjs
+client module "https://esm.sh/three@0.170.0" use * as THREE
+client /assets/helper.mjs use helper
 
 component Scene() {
     <canvas @mount={(el) => {
@@ -1038,7 +1051,7 @@ component Scene() {
   default export, and `* as Name` the whole module (`THREE.Scene.new()`,
   `Name.default(...)`).
 - A file ending in `.mjs` is a module without saying so. A `.js` file or an address may be
-  either, so `with module` says which.
+  either, so `module` says which.
 - With `preload`, the page has `<link rel="modulepreload">`, and with `preconnect` a
   connection made for CORS. A module at another address needs its server to send
   `access-control-allow-origin`, as the public CDNs do, and its own imports must be
@@ -2898,6 +2911,7 @@ What each does at its edges, where the answer is not what another language would
 | `sort(xs)`, `sort_by(xs, f)` | ascending and stable; no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together) and strings (by code point: `"B"` before `"a"`) order; `null`, booleans, lists, maps, a string with a number, or a decimal with a float are an error |
 | `split(s, sep = " ")` | at each single `sep` (`"a  b"` is `["a", "", "b"]`); `split(s, "")` is the characters; no limit |
 | `join(xs, sep = "")` | the items as text, with `sep` between |
+| `filled(x)` | `x`, or `null` for `""`, so `filled(name) ?? "anonymous"` replaces a blank or missing name; `0`, `false`, `[]` and `" "` stay as they are (`filled(trim(x))` counts spaces as blank) |
 | `slice(x, start, end)` | negative positions from the end; both kept within the list or string; `end` before `start` gives an empty one |
 | `range(n)`, `range(a, b)`, `a..b` | `b` left out, step 1, empty when `b <= a`; no step; at most ten million |
 | `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key |
@@ -3045,26 +3059,69 @@ level off: `flatten(flatten(xs))` for two.
 
 ### Files of a program
 
-`use "lib/forum.qwe"` brings another file into the program:
+`use lib/forum.qwe` brings another file into the program, and its names into this file.
+`import` takes some of them. A file sees its own names, the builtins, and what it takes:
 
-- Every file `use`d, and every file those `use`, adds its names to one set of names for
-  the whole program. The order of `use` lines does not matter, and names reach every
-  file: `ui/editor.qwe` can call a function from `lib/forum.qwe` that only `main.qwe`
-  `use`s.
+```quillo
+// ui/thread.qwe
+use lib/forum.qwe                         // every public name of the file
+import lib/forum.qwe use *                // the same
+import lib/forum.qwe use latest, Feed     // only these
+import lib/forum.qwe use latest as newest // this one, called `newest` in this file
+```
+
+The file comes first, and the first word says what kind of thing it is, for three reasons:
+
+1. **Mental model.** The line reads in the order things happen: what kind of code this is,
+   where it is, then which of its names you want. `import` is Quillo or Rust on the
+   server; `client`, `preload` and `preconnect` are the browser, and the word says how
+   the page gets the script. One glance at the start of a line tells you which side of
+   the program you are on, with nothing to read from the end of a long address.
+2. **Editor.** Once the file is written the editor knows its names, so it can offer them
+   as you type, and hide those you already took. With the names first, as `import { a }
+   from "x"` has them, there is nothing to offer until the path is there. The word is
+   `import` rather than `from` for the same reason: `from` starts lines of SQL, and
+   programs use it as a name.
+3. **Readability.** Lines line up by where things come from, so a file's sources read
+   down the left. An address can be long, and the names no longer sit after it at the far
+   right: `use` may take the next line.
+
+0.6's `use latest, Feed from lib/forum.qwe` still works, with a warning; `quillo fix`
+turns it around. A later release removes it.
+
+
+- A `use` is for the file that writes it, and is not passed on: when `lib/a.qwe` `use`s
+  `lib/b.qwe`, a file that `use`s `lib/a.qwe` sees `a`'s names and not `b`'s. The order
+  of `use` lines does not matter, and files may `use` each other.
+- **For now a name the file did not take still works, with a warning**: "`price` comes
+  from lib/money.qwe, which this file does not take: add `import lib/money.qwe use
+  price`". `quillo fix main.qwe` writes those lines, in every file of the program
+  (run it once for each program, a service's or a mounted one's too). A later release
+  makes this an error.
+- Two files may define one name: a `helper` in `lib/a.qwe` and a `helper` in `lib/b.qwe`
+  are two functions, and each `fn`, `view`, `component` and top-level `let` works this
+  way. A file's own name comes first, and then a name it took by name. A file that
+  `use`s both files whole and calls `helper` is told to choose ("`helper` comes from
+  lib/a.qwe and lib/b.qwe: take the one you mean: import lib/a.qwe use helper"). Taking a
+  name the file defines, or one name from two places, is an error: `as` gives one another
+  name.
+- Three things stay the program's. A `server fn`'s name is its address, so it is defined
+  once in a program, and a plain function of that name in another file gives way to it.
+  A `type` and a `service` are defined once too, and every file sees them without a
+  `use`.
 - So a file makes sense only in its program: `quillo check main.qwe` checks it with
   the rest, and so does the editor (a file is checked as part of the program whose main
   file `use`s it; below). Go to definition finds where a name comes from.
-- A name is defined once in a program: a second `fn helper()`, `view`, `component`,
-  `type` or `service` anywhere, or a top-level `let` in another file, is an error that
-  names both places, since it would replace the first everywhere. `let x` twice in one
-  file gives the variable again. Two routes alike are not reported: the first declared
+- Within a file a name is defined once: a second `fn helper()`, `view` or `component` is
+  an error that names both places. `let x` twice in one file gives the variable again.
+  Two routes alike are not reported: the first declared
   answers. A function with a builtin's name is a warning (it replaces the builtin for
   the whole program); a variable may take one (`let count = 0`), a type's name included
   (`let num = 5`, `for str in names`): in `let`, `for` and parameters a name binds, and
   only in `match` does `int` test a type. But a *top-level* `let` named like a builtin
   (`let last = ...`, `let int = ...`) hides it in every file of the program: a warning
   at the `let`, and an error at each call that meant the builtin. The same goes for the
-  modules: a variable called `db`, `http`, `json`, `re`, `math`, `stats`, `vec`,
+  modules: a variable called `db`, `http`, `json`, `re`, `math`, `bit`, `stats`, `vec`,
   `date`, `money`, `crypto`, `image`, `udp`, `channel` or `media` hides the module
   (`let json = request.json`, `let date = row.created`, a parameter `re`), so name such
   values otherwise (`body`, `created`).
@@ -3074,16 +3131,17 @@ level off: `flatten(flatten(xs))` for two.
   (see [Rust](#rust)).
 - A path may be written without quotes: `use lib/auth.qwe`, `use ../shared/auth.qwe`,
   and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is a
-  `.qwe` file (`use lib/auth`), or a `.qwer` one when the `use` takes names. `use *
-  from lib/auth.qwe` says the same as `use lib/auth.qwe`: every public name.
+  `.qwe` file (`use lib/auth`). An `import` finds whichever of `.qwer` and `.qwe` is
+  there. `import lib/auth.qwe use *` says the same as `use lib/auth.qwe`: every public
+  name.
 - A file `use`d twice, or by several files, runs once.
-- A `.js` file or an address is a browser library, for components:
-  `use Chart from "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"`
-  (see [JavaScript libraries](#javascript-libraries)). `use Chart with preload from ...`
-  fetches it from the page's `<head>`, `with preconnect` only connects to its host.
-  `use Chart with module from ...` takes an export of an ES module, kept in the runtime
-  and not on `window`; `use default as Name` and `use * as Name` take the default export
-  and the whole module. A `.mjs` file is a module without saying so.
+- What runs in the browser, an address or a `.js` or `.mjs` file, starts with `client`:
+  `client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart`
+  (see [JavaScript libraries](#javascript-libraries)). `preload` in its place fetches the
+  script from the page's `<head>`, and `preconnect` only connects to its host. `client
+  module "..." use Chart` takes an export of an ES module, kept in the runtime and not on
+  `window`; `use default as Name` and `use * as Name` take the default export and the
+  whole module. A `.mjs` file is a module without saying so.
 - **`private` and `public`.** `private` before a `fn`, `view`, `component` or top-level
   `let` keeps the name to its file: the file uses it as any name, other files do not
   see it, and two files may each have a private `helper` without clashing. `public`
@@ -3102,7 +3160,8 @@ level off: `flatten(flatten(xs))` for two.
   Another file calling `page_of` is told: "`page_of` is private to lib/forum.qwe". Only
   at a file's top level, and not for a `server fn` (an address on the server anyone can
   call; keep the work in a private `fn` it calls) or a `type`. A view's or component's
-  parameter cannot share a private name of its file, as props are passed by name.
+  parameter cannot share a private name of its file, as props are passed by name, nor a
+  name two files define.
   Elsewhere `private` and `public` are ordinary names (`{ private: true }`). A private
   function given to `schedule` or `every` keeps its job to itself, under a name of its
   own (`tick__pv` and eight hex digits in the log).
@@ -3113,6 +3172,8 @@ level off: `flatten(flatten(xs))` for two.
   side by side that `use` one file have it checked as part of the first by name.
 - A file that cannot be parsed is reported first, since what follows may be its doing,
   and the names it defines are not also reported as unknown where they are used.
+- `x.helper()` finds a function by its plain name, so it does not reach a name two files
+  define: write `helper(x)`.
 
 ### Decimals
 
@@ -3277,6 +3338,11 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   gamma lgamma`, and `pi e tau inf nan`. What Python raises is an error here too: a math
   domain error (`math.sqrt(-1)`, `math.log(0)`), a range error (`math.exp(1000)`), an int
   past 64 bits (`math.factorial(21)`).
+- **`bit`:** `and(a, b) or(a, b) xor(a, b) not(a) shl(a, n) shr(a, n)`, on the 64 bits of
+  an int, with the same answers in the browser (where JavaScript's own `&` and `<<` keep
+  32). `shl` drops what goes past the top, unlike `*`, which refuses; `shr` keeps the
+  sign, and `bit.and` masks it off: `bit.and(bit.shr(x, 8), 0xFF)`. A shift outside 0 to
+  63 is an error. A variable called `bit` hides the module, as with `math`.
 - **`stats`:** `mean fmean(data, weights) geometric_mean harmonic_mean`, `median
   median_low median_high mode multimode`, `pvariance variance pstdev stdev` (each with an
   optional known mean), `quantiles(data, n = 4, method = "exclusive")` (n up to 10,000), `covariance
@@ -3938,7 +4004,7 @@ is `any`, so only definite mistakes are reported, and annotations make the check
 stricter. Its types are sets of twelve kinds (`null bool int float dec str list map fn
 html response error`), lists with what they hold and maps with their fields. It reports
 unknown names (with suggestions), names used before they are
-defined, names defined twice, wrong argument counts and types (for builtins too), operators that can never
+defined, names defined twice, names a file did not take, wrong argument counts and types (for builtins too), operators that can never
 work, division by a written zero, return and error types, effects, view and component props,
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
@@ -4411,12 +4477,12 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
   `[patch]`, no `build.rs` of the file's own; a crate's own build scripts do run).
   `serde_json` is always there. C libraries come through `-sys` crates.
-- **Taking names.** `use cache_get, cache_set from redis.qwer` takes only those
-  functions; `as` gives one another name, `use cache_get as redis_get from redis.qwer`,
+- **Taking names.** `import redis.qwer use cache_get, cache_set` takes only those
+  functions; `as` gives one another name, `import redis.qwer use cache_get as redis_get`,
   and it is not there under its own. A name the file does not export is an error that
-  names the nearest it does. `use * from redis.qwer`, or `use redis.qwer`, takes them
-  all. (A `.qwe` file gives every public name: what it keeps to itself it marks
-  `private`, see [Files of a program](#files-of-a-program).)
+  names the nearest it does. `import redis.qwer use *`, or `use redis.qwer`, takes them
+  all. Each file takes what it calls, as with a `.qwe` file (see [Files of a
+  program](#files-of-a-program)).
 - Two `.qwer` files exporting one name: the last `use`d replaces the other, with a
   warning that says how to take one under another name.
 - `quillo check` reads the functions' types from the Rust, without building anything:
@@ -4488,7 +4554,7 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
   version is newer, and kept when it is newer or the same version changed by hand:
   `--force` replaces it. `--dir DIR` installs elsewhere. `name@1.2.0` asks for that
   version, and fails when the catalog has another (it keeps only the newest).
-- Then `use csv.qwer`, or only what you need, `use csv_parse, csv_write from csv`: the
+- Then `use csv.qwer`, or only what you need, `import csv use csv_parse, csv_write`: the
   first run builds it with cargo, as any `.qwer` file.
 
 ### Other stores
@@ -4571,7 +4637,7 @@ does not do it today; the way around it follows.
 | mutate a list or map in place? | No: `push`, `set`, `+` give new ones, cheaply when nothing else holds the old one. See [Standard library](#standard-library) |
 | throw and catch exceptions? | No: failures are error values, `?` passes them on, `??` replaces them. A runtime error ends the request with a 500. See [Errors](#errors) |
 | write `async`/`await`, threads or locks? | No need: waits suspend the request and the server goes on; `parallel` overlaps waits. Long computing holds its instance: put it in Rust or run more instances. See [Concurrency](#concurrency-and-reloading) |
-| use namespaces or modules? | One namespace per program: `use` adds a file's names to it, and a name is defined once, but `private fn` (and `view`, `component`, `let`) keeps a name to its file. `mount` and `service` are the boundaries. See [Files of a program](#files-of-a-program) |
+| use namespaces or modules? | A file sees its own names, the builtins and what it takes with `use`, and two files may define one name. `private` keeps a name to its file, `mount` and `service` are the boundaries, and there are no prefixes (`auth.login()`). See [Files of a program](#files-of-a-program) |
 | recurse deeply? | Up to 10,000 calls; there is no tail-call optimisation |
 | rely on integer overflow wrapping, or bitwise operators? | No: overflow is an error, and there are no `& \| ^ << >>` or `**` (use `pow`, `math.*`) |
 | have the checker prove a `match` covers every case? | Not yet: a value no arm takes fails when it comes |
@@ -4670,6 +4736,8 @@ does not do it today; the way around it follows.
 - `match` exhaustiveness in the checker
 - compiling components to WebAssembly (they compile to JavaScript)
 - a formatter
+- a file's names under a prefix (`use lib/auth as auth`, then `auth.login()`), where `.`
+  in markup is already a class
 - splitting a page's bundle by route, and components loaded lazily
 - discovering services through limer's pool, and `--join` for copies behind NAT
 - phone apps in the stores: uploads to the App Store and Google Play, HarmonyOS NEXT,
@@ -4678,7 +4746,7 @@ does not do it today; the way around it follows.
 ## Layout
 
 ```
-src/main.rs        CLI: run, app, check, docs, build, repl, lsp, dap, version
+src/main.rs        CLI: run, app, check, fix, docs, build, repl, lsp, dap, version
 src/lib.rs         the crate: what the binary and the tests use
 build.rs           stamps the commit into `quillo --version`
 
@@ -4692,6 +4760,7 @@ src/value.rs       values, maps, scopes
 src/error.rs       errors with a file and line
 src/record.rs      records: type User = { ... }, made, checked, in patterns
 src/check.rs       the static checker (quillo check, quillo run, the language server)
+src/modules.rs     what each file of a program sees and takes, and `quillo fix`
 src/script.rs      run_script: code a program's users write, sandboxed
 src/native.rs      Rust in a program: .qwer files read, built, loaded and called
 

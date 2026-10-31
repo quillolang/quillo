@@ -3,6 +3,10 @@
 // blocks, with a toolbar for each when they may be changed, and an optional
 // gutter beside each one (the article's feedback and who is on it).
 
+import lib/blocks.qwe use BLOCK_LABELS, add_block, delete_block, move_block, save_block
+import ui/data.qwe use FormBlock, ListBlock, TransactionBlock
+import ui/page.qwe use Problem
+
 view BlockView(b) = match b.type {
     "heading" => b.data.level == 3 ? <h3.b-heading>{b.data.text}</h3> : <h2.b-heading>{b.data.text}</h2>
     "text" => b.data.md == "" ? <p.muted.empty-block>Empty text.</p> : <div.md>{raw(b.html)}</div>

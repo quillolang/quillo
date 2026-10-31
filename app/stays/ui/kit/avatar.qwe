@@ -13,6 +13,8 @@
 // AvatarGroup: people is a list of { name, src? }, overlapped; past max
 // the rest are counted in a "+N". label names the group for screen readers.
 
+import ui/kit/theme.qwe use ui_cls
+
 let avatar_css = css`
 .ui-avatar {
   position: relative; display: inline-grid; place-items: center; flex: none; vertical-align: middle;

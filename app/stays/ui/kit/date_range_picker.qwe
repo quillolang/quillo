@@ -32,6 +32,8 @@
 //   <DateRangePicker name="stay" label="Dates" min_nights={2} disabled_dates={booked}
 //                    day_labels={prices}/>
 
+import ui/kit/theme.qwe use ui_cls
+
 let date_range_picker_css = css`
 .ui-date-range-picker { position: relative; display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-date-range-picker-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }

@@ -18,6 +18,8 @@
 // thumb moves. on_commit(low, high): the same, once a thumb is let go (the end of a
 // drag, or a key press): for what costs a request, such as a search.
 
+import ui/kit/theme.qwe use ui_cls
+
 let range_slider_css = css`
 .ui-range-slider { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-range-slider-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }

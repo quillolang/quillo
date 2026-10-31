@@ -1,0 +1,16 @@
+// `bit`, hex and `filled` in a page: rendered on the server, resumed in the
+// browser and changed there, an int past 2^53 among them. Driven by bits.js
+// (FEEDBACK19.md, Q-151 and Q-153; branch feedback19-fixes).
+
+component Bits(big: int, name: str) {
+    state flags = 0xF0
+    <div>
+        <p id="mask">{bit.and(flags, 0x3C)}</p>
+        <p id="top">{bit.shl(1, 62)}</p>
+        <p id="big">{bit.and(big, 0xFF)}</p>
+        <p id="name">{filled(name) ?? "anonymous"}</p>
+        <button id="flip" @click={() => { flags = bit.xor(flags, 0xFF) }}>flip</button>
+    </div>
+}
+
+route GET / = <html><body><Bits big={9007199254740993} name=""/></body></html>

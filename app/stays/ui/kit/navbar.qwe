@@ -14,6 +14,8 @@
 // children: actions at the right end (buttons, an avatar).
 // sticky: it stays at the top as the page scrolls.
 
+import ui/kit/theme.qwe use ui_cls
+
 let navbar_css = css`
 .ui-navbar {
   container: ui-navbar / inline-size; position: relative; z-index: 10;

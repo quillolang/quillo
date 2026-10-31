@@ -1,6 +1,13 @@
 // The customers' pages: home, an account's statement, a transfer, messages.
 // Live: a transfer received, a held one decided or a message shows at once.
 
+import lib/bank.qwe use load_account, load_home, load_inbox, payee_of, read_inbox, send_money
+import lib/desk.qwe use KIND_TITLES, desk_join, desks_for_me
+import lib/format.qwe use LOCALE, clock, day_text, parse_amount, when
+import lib/iban.qwe use iban_problem
+import ui/desk.qwe use DeskClient
+import ui/shell.qwe use ClientShell, Empty, Problem, Status
+
 view ClientLoginPage(next: str, problem, number: str) =
     <ClientShell me={null} title="Sign in" tab="">
         <section.login>

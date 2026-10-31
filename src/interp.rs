@@ -82,6 +82,8 @@ pub struct Interp {
     pub routes: Arc<Vec<Arc<RouteDef>>>,
     pub base_dir: Arc<Path>,
     pub(crate) loaded: Arc<HashSet<PathBuf>>,
+    /// What each file's names are called in the program (src/modules.rs).
+    links: Arc<crate::modules::Links>,
     /// Files of programs this one mounts or calls as services: watched
     /// with its own (`--watch`), but not its own, so a file both `use`
     /// is still run here (FEEDBACK4.md, Q-040; branch bank-fixes).
@@ -237,8 +239,8 @@ pub struct Interp {
     pub(crate) streams_direct: bool,
     /// The program's own types (`type User = { ... }`: src/record.rs).
     pub(crate) types: Arc<crate::record::Types>,
-    /// Browser libraries, by the name the program calls each: `use Chart from
-    /// "https://.../chart.umd.min.js"` (branch js-libraries).
+    /// Browser libraries, by the name the program calls each: `client
+    /// "https://.../chart.umd.min.js" use Chart` (branch js-libraries).
     pub(crate) js_libs: Arc<std::collections::BTreeMap<String, crate::client::JsLib>>,
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
@@ -282,11 +284,15 @@ pub const PREFETCH_REFUSED: &str = "not while the page is prefetched";
 /// per file: a file's new text replaces its old parse.
 static PARSED: Mutex<Vec<(Arc<str>, u64, Arc<Vec<Stmt>>)>> = Mutex::new(Vec::new());
 
-fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str) -> Result<Arc<Vec<Stmt>>, QuilloError> {
+/// A file parsed, its names as `names` says they are called in the program (src/modules.rs).
+fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str, names: Option<&std::collections::HashMap<String, String>>) -> Result<Arc<Vec<Stmt>>, QuilloError> {
     let hash = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         src.hash(&mut h);
+        let mut renamed: Vec<_> = names.iter().flat_map(|m| m.iter()).collect();
+        renamed.sort();
+        renamed.hash(&mut h);
         h.finish()
     };
     if let Some(abs) = &abs {
@@ -295,7 +301,11 @@ fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str) -> Result<Arc<Vec<
             return Ok(stmts.clone());
         }
     }
-    let stmts = Arc::new(Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?);
+    let mut stmts = Parser::new(src).in_file(abs.clone()).parse_program().map_err(|e| e.in_file(file))?;
+    if let Some(names) = names {
+        crate::privacy::rename_as(&mut stmts, names, "a name another file has too").map_err(|e| e.in_file(file))?;
+    }
+    let stmts = Arc::new(stmts);
     if let Some(abs) = abs {
         let mut kept = PARSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         kept.retain(|(p, _, _)| *p != abs);
@@ -847,6 +857,7 @@ impl Interp {
             routes: Arc::new(Vec::new()),
             base_dir: Arc::from(base_dir.into().as_path()),
             loaded: Arc::new(HashSet::new()),
+            links: Default::default(),
             watched: Arc::new(HashSet::new()),
             shared,
             services: Default::default(),
@@ -929,6 +940,7 @@ impl Interp {
             routes: self.routes.clone(),
             base_dir: self.base_dir.clone(),
             loaded: self.loaded.clone(),
+            links: self.links.clone(),
             watched: self.watched.clone(),
             shared: self.shared.clone(),
             services: self.services.clone(),
@@ -1318,7 +1330,21 @@ impl Interp {
     pub fn load_source(&mut self, src: &str, file: &str) -> Result<Value, QuilloError> {
         let abs = source_path(Path::new(file));
         self.uses_atomic |= src.contains(".atomic");
-        let stmts = parse_cached(src, abs.clone(), file)?;
+        let mut stmts = parse_cached(src, abs.clone(), file, None)?;
+        // What each file sees, before any of them runs (src/modules.rs).
+        if stmts.iter().any(|s| matches!(s, Stmt::Use(p, ..) if !crate::ast::is_script(p))) {
+            let links = crate::modules::link(Path::new(file), stmts.clone(), &self.base_dir, &mut |_, full| {
+                let src = std::fs::read_to_string(full).ok()?;
+                parse_cached(&src, source_path(full), &full.display().to_string(), None).ok()
+            });
+            if let Some(p) = links.problems.first() {
+                return Err(QuilloError::new(p.message.clone(), p.line).in_file(&p.file.display().to_string()));
+            }
+            if let Some(names) = links.renames(&crate::modules::key(Path::new(file))) {
+                stmts = parse_cached(src, abs.clone(), file, Some(names))?;
+            }
+            self.links = Arc::new(links);
+        }
         Arc::make_mut(&mut self.program).push(stmts.clone());
         let env = self.globals.clone();
         let mut last = Value::Nil;
@@ -1547,11 +1573,12 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::Use(path, names, line, _) => {
+                let path = &crate::modules::resolve(&self.base_dir, path);
                 let full = self.base_dir.join(path);
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
                 // A `.qwer` file's names are defined for each `use` that takes some
                 // (its library is built and opened once); anything else runs once.
-                if !Arc::make_mut(&mut self.loaded).insert(key) && (names.is_none() || !path.ends_with(".qwer")) {
+                if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !path.ends_with(".qwer")) {
                     return Ok(Value::Nil);
                 }
                 // Rust: built, loaded, and its functions defined (see `native`).
@@ -1567,7 +1594,8 @@ impl Interp {
                 let fname = full.display().to_string();
                 let abs = source_path(&full);
                 self.uses_atomic |= src.contains(".atomic");
-                let stmts = parse_cached(&src, abs.clone(), &fname)?;
+                let links = self.links.clone();
+                let stmts = parse_cached(&src, abs.clone(), &fname, links.renames(&key))?;
                 Arc::make_mut(&mut self.program).push(stmts.clone());
                 let g = self.globals.clone();
                 let debugging = crate::debug::on();

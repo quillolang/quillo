@@ -6,6 +6,10 @@
 // Everyone's password is "shift123": M01 is the manager, S01 to S08 the
 // supervisors, E0001 on the operators.
 
+import lib/leave.qwe use factory_today
+import lib/roster.qwe use spans_of
+import lib/rota.qwe use EPOCH, working_days
+
 let AREAS = ["Press", "Weld", "Paint", "Assembly"]
 let FIRST = ["Aiko", "Ben", "Chen", "Dara", "Emil", "Farah", "Goran", "Hana", "Ivan", "Jia", "Kofi", "Lena",
              "Malik", "Nora", "Omar", "Priya", "Quinn", "Rosa", "Sami", "Tariq", "Uma", "Viktor", "Wei", "Yara", "Zane"]

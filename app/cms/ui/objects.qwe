@@ -2,6 +2,16 @@
 // its records, the lists that show them, its state machine, and its
 // records with the history of each.
 
+import lib/auth.qwe use ROLES
+import lib/flows.qwe use load_flows
+import lib/objects.qwe
+    use FIELD_LABELS, FIELD_TYPES, add_field, create_object, delete_field, delete_form, delete_list, edit_field, load_object, load_objects, load_record, save_form, save_list
+import lib/text.qwe use ago, plural
+import ui/blocks.qwe use err_text
+import ui/data.qwe use ListBlock
+import ui/flows.qwe use FlowDiagram
+import ui/page.qwe use Problem
+
 component FieldRow(f, on_problem) {
     state name = f.name
     state required = f.required == 1

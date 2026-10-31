@@ -1,6 +1,13 @@
 // The reports, live: moving a card on the board redraws them for anyone
 // looking. Every chart can be read as a table too.
 
+import lib/dates.qwe use ago, day_of, parse_day, short_day, year_of
+import lib/metrics.qwe use RUNS, load_reports
+import lib/tasks.qwe use load_activity
+import ui/charts.qwe
+    use BurndownChart, CycleChart, FlowChart, Stat, ThroughputChart, Workload, num1
+import ui/page.qwe use Avatar
+
 view ForecastTiles(f, year: int) =
     f.done
         ? <p.muted>Nothing is left to do here.</p>

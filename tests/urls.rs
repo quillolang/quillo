@@ -551,11 +551,11 @@ mod refused {
         user_only: r#"use go from "https://u@cdn.example/lib.js""# => "has a user name in it";
         user_bare: "use go from https://u:p@cdn.example/lib.js" => "has a user name in it";
         user_protocol_relative: r#"use go from "//u:p@cdn.example/lib.js""# => "has a user name in it";
-        preconnect_root_path: "use go with preconnect from /assets/lib.js" => "`with preconnect` is for a script at another address";
-        preconnect_relative: "use go with preconnect from assets/lib.js" => "`with preconnect` is for a script at another address";
-        preconnect_module_path: "use go with module, preconnect from /assets/lib.js" => "`with preconnect` is for a script at another address";
-        preconnect_mjs_path: "use go with preconnect from /assets/lib.mjs" => "`with preconnect` is for a script at another address";
-        whole_without_module: r#"use * as THREE from "https://cdn.example/three.js""# => "write `use * as THREE with module from";
+        preconnect_root_path: "use go with preconnect from /assets/lib.js" => "`preconnect` is for a script at another address";
+        preconnect_relative: "use go with preconnect from assets/lib.js" => "`preconnect` is for a script at another address";
+        preconnect_module_path: "use go with module, preconnect from /assets/lib.js" => "`preconnect` is for a script at another address";
+        preconnect_mjs_path: "use go with preconnect from /assets/lib.mjs" => "`preconnect` is for a script at another address";
+        whole_without_module: r#"use * as THREE from "https://cdn.example/three.js""# => "write client module";
         whole_of_a_qwe: "use * as Auth from lib/auth.qwe" => "takes a whole ES module, not `lib/auth.qwe`";
         default_unnamed: r#"use default with module from "https://cdn.example/lib.js""# => "default export needs a name of yours";
         default_unnamed_mjs: "use default from /assets/lib.mjs" => "default export needs a name of yours";

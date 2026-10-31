@@ -1,6 +1,11 @@
 // Private messages: the inbox and one conversation, both live. A message
 // sent shows on the other person's page, and their inbox count, at once.
 
+import lib/messages.qwe use load_inbox, load_messages, send_message
+import lib/text.qwe use ago, excerpt
+import ui/editor.qwe use Editor
+import ui/page.qwe use Avatar, Empty, Person, Problem, RoleBadge
+
 component Inbox() {
     state items = live(load_inbox)
     {items == null || len(items) == 0

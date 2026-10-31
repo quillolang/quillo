@@ -12,6 +12,8 @@
 // delta's colour (the accent without one). card: false drops the border, for a
 // Stat inside a Card.
 
+import ui/kit/theme.qwe use ui_cls
+
 let stat_css = css`
 .ui-stat { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; align-content: start; min-width: 0; padding: 16px 18px;
   border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);

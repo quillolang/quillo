@@ -1,6 +1,11 @@
 // A thread's poll, live: everyone sees the results move as people vote.
 // Results show once you have voted, or when the poll has closed.
 
+import lib/auth.qwe use is_mod
+import lib/polls.qwe use close_poll, load_poll, vote_poll
+import lib/text.qwe use left, plural
+import ui/page.qwe use Problem
+
 view PollBar(o, total: int, chosen: bool) {
     let pct = total == 0 ? 0 : round(o.votes * 100 / total)
     <li.poll-result class={chosen && "mine"}>

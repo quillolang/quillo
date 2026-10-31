@@ -11,6 +11,8 @@
 // aria-describedby points to.
 // For anything someone must read or click, use a Popover instead.
 
+import ui/kit/theme.qwe use ui_cls
+
 let tooltip_css = css`
 .ui-tooltip { position: relative; display: inline-flex; vertical-align: middle; }
 .ui-tooltip-tip {

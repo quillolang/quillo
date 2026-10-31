@@ -5,6 +5,10 @@
 // ticket is the hash of the seed and the number of tickets sold, so anyone can
 // check that nobody chose it after seeing the tickets.
 
+import lib/amounts.qwe use centavos, plural
+import lib/auth.qwe use STAFF, acting, acting_as, acting_member, audit, viewer
+import lib/ledger.qwe use OFFICE, account_of, member_topic, new_journal, post, today
+
 type NewRaffle = { name: str, prize: str, ticket_price: str, max_tickets: int, per_member: int = 10, closes: date }
 
 server fn create_raffle(r: NewRaffle) ! str with db, time, random {

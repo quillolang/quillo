@@ -30,6 +30,9 @@ const KEYWORDS: &[&str] = &[
     "true", "false", "null", "nil", "reply", "as", "component", "while",
 ];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY"];
+/// What starts a line that takes names from a file: the file comes first, so an editor
+/// knows them while they are typed (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+pub(crate) const IMPORT_WORDS: &[&str] = &["import", "client", "preload", "preconnect"];
 
 /// How deeply expressions, patterns, types and elements may nest. Deeper
 /// source is refused here, so that nothing that walks it later (the
@@ -131,8 +134,18 @@ pub(crate) fn starts_declaration(line: &[char]) -> bool {
         // `use "lib.qwe"`, `use lib/auth`, `use * from ...`, `use a, b from x.qwer` (branch use-editor).
         "use" => second.starts_with('"') || second == "*" || second.contains(['/', '\\', '.']) || line.contains(" from ") || words.next().is_none(),
         "service" => name(second),
+        "import" | "client" | "preload" | "preconnect" => import_line(&line),
         _ => false,
     }
+}
+
+/// Whether a line, as written, starts an `import` or one of its browser kin: told by its
+/// shape, as these words are names too (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+pub(crate) fn import_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let (Some(first), Some(second)) = (words.next(), words.next()) else { return false };
+    let path = second.starts_with('"') || (second.contains(['/', '\\', '.']) && second.chars().any(char::is_alphanumeric));
+    IMPORT_WORDS.contains(&first) && (path || second == "module" || words.any(|w| w == "use"))
 }
 
 /// A component's or view's own CSS (FEEDBACK8.md, Q-067; branch
@@ -178,6 +191,13 @@ fn lit_string(parts: Vec<StrPart>) -> Option<String> {
 
 fn is_path_char(c: char) -> bool {
     c.is_alphanumeric() || "-._~%".contains(c)
+}
+
+/// What a path written without quotes may have: past its first character, what an
+/// address has as well. `:`, `@` and `+`, as in `https://cdn.example/chart@4/chart.js`
+/// (branch js-libraries); `?bundle&v=2#x` and `[::1]` (branch library-hints).
+pub(crate) fn is_use_path_char(c: char, first: bool) -> bool {
+    is_path_char(c) || c == '/' || c == '\\' || (!first && matches!(c, ':' | '@' | '+' | '?' | '=' | '&' | '#' | '[' | ']'))
 }
 
 impl Parser {
@@ -322,18 +342,71 @@ impl Parser {
         Err(QuilloError::new(msg, line))
     }
 
+    /// The first of `n` and on that is not a space, on this line.
+    fn past_spaces(&self, mut n: usize) -> usize {
+        while self.lx.peek_char_at(n).is_some_and(|c| c.is_whitespace() && c != '\n') {
+            n += 1;
+        }
+        n
+    }
+
+    /// Whether `word`, whole, is `n` characters on.
+    fn word_at(&self, n: usize, word: &str) -> bool {
+        word.chars().enumerate().all(|(i, c)| self.lx.peek_char_at(n + i) == Some(c))
+            && !self.lx.peek_char_at(n + word.chars().count()).is_some_and(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    /// How far on the file starts when a `module` comes first. A file may be called that,
+    /// so one `use` follows is the file.
+    fn past_module(&self) -> Option<usize> {
+        let at = self.past_spaces(0);
+        let next = self.past_spaces(at + "module".len());
+        (self.word_at(at, "module") && !self.word_at(next, "use")).then_some(next)
+    }
+
+    /// Past the first word of a line that takes names: whether a file and then `use` come
+    /// next, here or on the next line (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+    /// Read as text, as a path is, and the `use` is what tells it from an expression:
+    /// `client / 2` and `import(x)` are the names they always were.
+    fn at_import(&self) -> bool {
+        let at = |n: usize| self.lx.peek_char_at(n);
+        let mut n = self.past_module().unwrap_or_else(|| self.past_spaces(0));
+        if at(n) == Some('"') {
+            n += 1;
+            while !matches!(at(n), None | Some('"' | '\n')) {
+                n += 1;
+            }
+            n += 1;
+        } else {
+            let start = n;
+            while at(n).is_some_and(|c| is_use_path_char(c, n == start)) {
+                n += 1;
+            }
+            if n == start {
+                return false;
+            }
+        }
+        n = self.past_spaces(n);
+        if at(n) == Some('/') && at(n + 1) == Some('/') {
+            while !matches!(at(n), None | Some('\n')) {
+                n += 1;
+            }
+        }
+        if at(n) == Some('\n') {
+            n = self.past_spaces(n + 1);
+        }
+        self.word_at(n, "use")
+    }
+
+    /// What is left of this statement's line, as written.
+    fn rest_of_line(&self) -> String {
+        (0..).map_while(|i| self.lx.peek_char_at(i).filter(|c| *c != '\n' && *c != ';')).collect()
+    }
+
     /// Whether the rest of the line is names (and `as`), then `from`: read as text, so a
     /// path (`lib\\auth`) is never taken for code (branch imports).
     fn names_then_from(&self) -> bool {
-        let mut line = String::new();
-        let mut i = 0;
-        while let Some(c) = self.lx.peek_char_at(i) {
-            if c == '\n' || c == ';' {
-                break;
-            }
-            line.push(c);
-            i += 1;
-        }
+        let line = self.rest_of_line();
         let words: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
         let Some(at) = words.iter().position(|w| *w == "from") else { return false };
         let ident = |w: &str| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && w.chars().all(|c| c.is_alphanumeric() || c == '_');
@@ -356,9 +429,7 @@ impl Parser {
         }
         let mut p = String::new();
         while let Some(c) = self.lx.peek_char() {
-            // `:`, `@` and `+` for an address: `https://cdn.example/chart@4/chart.js` (branch
-            // js-libraries); what else one has: `?bundle&v=2#x`, `[::1]` (branch library-hints).
-            if is_path_char(c) || c == '/' || c == '\\' || (matches!(c, ':' | '@' | '+' | '?' | '=' | '&' | '#' | '[' | ']') && !p.is_empty()) {
+            if is_use_path_char(c, p.is_empty()) {
                 p.push(if c == '\\' { '/' } else { c });
                 self.lx.bump();
             } else {
@@ -397,6 +468,99 @@ impl Parser {
                 return Ok(options);
             }
         }
+    }
+
+    /// What comes after `use` on a line that starts with the file: `*`, or names.
+    fn import_names(&mut self, line: u32) -> PResult<Option<Vec<(String, String)>>> {
+        let as_name = "the name to call it after `as`";
+        if self.eat(&Tok::Star)? {
+            // Not an operator: the line may end here.
+            self.lx.last = Some(Tok::RParen);
+            return if self.eat_kw("as")? { Ok(Some(vec![("*".to_string(), self.expect_ident(as_name)?)])) } else { Ok(None) };
+        }
+        let mut list: Vec<(String, String)> = Vec::new();
+        loop {
+            let name = self.expect_ident("a name to take after `use`")?;
+            let alias = if self.eat_kw("as")? { self.expect_ident(as_name)? } else { name.clone() };
+            if list.iter().any(|(_, a)| *a == alias) {
+                return Err(QuilloError::new(format!("`{}` is taken twice in this `use`", alias), line));
+            }
+            list.push((name, alias));
+            if !self.eat(&Tok::Comma)? {
+                return Ok(Some(list));
+            }
+            self.eat(&Tok::Newline)?;
+        }
+    }
+
+    /// `import lib/auth.qwe use login, logout as bye`, and for what runs in the browser
+    /// `client /assets/leaflet.js use L`, `preload module "https://..." use Chart` or
+    /// `preconnect "https://..." use L`: the first word says how the page gets it, the
+    /// file comes before its names so that an editor can offer them, and a long address
+    /// may leave its `use` to the next line (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+    fn import_stmt(&mut self, word: &str, line: u32) -> PResult<Stmt> {
+        self.next()?;
+        let module = self.past_module();
+        for _ in 0..module.unwrap_or(0) {
+            self.lx.bump();
+        }
+        let module = module.is_some();
+        let hint = match word {
+            "preload" => Some(LibHint::Preload),
+            "preconnect" => Some(LibHint::Preconnect),
+            _ => None,
+        };
+        let path = self.use_path(true, line)?;
+        self.eat(&Tok::Newline)?;
+        self.next()?;
+        let names = self.import_names(line)?;
+        if word == "import" && (module || crate::ast::is_script(&path)) {
+            return Err(QuilloError::new(format!(
+                "`import` is for Quillo and Rust files; what runs in the browser starts with `client`, `preload` or `preconnect`: client \"{}\" use ...", path), line));
+        }
+        if word != "import" && !crate::ast::is_script(&path) {
+            return Err(QuilloError::new(format!(
+                "`{}` is for what runs in the browser, a .js or .mjs file or an address; {} is Quillo: import {} use ...", word, path, path), line));
+        }
+        self.use_stmt(path, names, line, LibOptions { module, hint, old: false })
+    }
+
+    /// What every way of taking from a file must agree with, however it was written.
+    fn use_stmt(&mut self, path: String, names: Option<Vec<(String, String)>>, line: u32, mut options: LibOptions) -> PResult<Stmt> {
+        if let Some(why) = crate::ast::bad_use_path(&path) {
+            return Err(QuilloError::new(why, line));
+        }
+        // A script's names are what it defines on the page (branch js-libraries).
+        if crate::ast::is_script(&path) {
+            let Some(list) = &names else {
+                return Err(QuilloError::new(format!(
+                    "a script gives the page names of its own: name what it defines, as in client \"{}\" use Chart", path), line));
+            };
+            if let Some((n, _)) = list.iter().find(|(n, _)| n.starts_with("__")) {
+                return Err(QuilloError::new(format!("`{}`: a name from a script cannot start with `__`", n), line));
+            }
+            options.module |= crate::ast::is_module_file(&path);
+            if let (false, Some((_, alias))) = (options.module, list.iter().find(|(n, _)| n == "*")) {
+                return Err(QuilloError::new(format!(
+                    "`* as {}` takes a whole ES module: write client module \"{}\" use * as {}", alias, path, alias), line));
+            }
+            if options.module && list.iter().any(|(n, a)| n == "default" && a == "default") {
+                return Err(QuilloError::new(format!(
+                    "a module's default export needs a name of yours: client module \"{}\" use default as Name", path), line));
+            }
+            if options.hint == Some(LibHint::Preconnect) && crate::ast::script_origin(&path).is_none() {
+                return Err(QuilloError::new(format!(
+                    "`preconnect` is for a script at another address; `{}` is on this site's own connection (`preload` fetches it ahead)", path), line));
+            }
+            return Ok(Stmt::Use(path, names, line, options));
+        }
+        if options.module || options.hint.is_some() {
+            return Err(QuilloError::new(format!("`with module`, `with preload` and `with preconnect` are for a browser library (a `.js` file or an address), not `{}`", path), line));
+        }
+        if let Some((_, alias)) = names.iter().flatten().find(|(n, _)| n == "*") {
+            return Err(QuilloError::new(format!("`* as {}` takes a whole ES module, not `{}`", alias, path), line));
+        }
+        Ok(Stmt::Use(path, names, line, options))
     }
 
     // ---- statements ----------------------------------------------------
@@ -700,8 +864,9 @@ impl Parser {
                             }
                         }
                         if !self.eat_kw("from")? {
-                            return Err(QuilloError::new("`use *` takes every name from a file: use * from lib/auth.qwe", line));
+                            return Err(QuilloError::new("`use *` takes every name from a file: import lib/auth.qwe use *", line));
                         }
+                        options.old = true;
                         self.use_path(whole, line)?
                     } else if !self.names_then_from() {
                         self.use_path(false, line)?
@@ -723,8 +888,8 @@ impl Parser {
                             if self.eat(&Tok::Comma)? {
                                 continue;
                             }
-                            // `use Chart with module, preload from ...`, for all the
-                            // names of the `use` (branch library-hints).
+                            // `use Chart with module, preload from ...`, as 0.6 wrote
+                            // what is now `preload module` (branch library-hints).
                             if self.eat_kw("with")? {
                                 options = self.use_with(line)?;
                             }
@@ -734,51 +899,24 @@ impl Parser {
                         if is_list {
                             self.next()?;
                             names = Some(list);
+                            options.old = true;
                             self.use_path(true, line)?
                         } else {
                             self.restore(saved);
                             self.use_path(false, line)?
                         }
                     };
-                    if let Some(why) = crate::ast::bad_use_path(&path) {
-                        return Err(QuilloError::new(why, line));
+                    return self.use_stmt(path, names, line, options);
+                }
+                w if IMPORT_WORDS.contains(&w) => {
+                    if self.at_import() {
+                        return self.import_stmt(w, line);
                     }
-                    // A script's names are what it defines on the page (branch js-libraries).
-                    if crate::ast::is_script(&path) {
-                        let Some(list) = &names else {
-                            return Err(QuilloError::new(format!(
-                                "a script gives the page names of its own: name what it defines, as in use Chart from \"{}\"", path), line));
-                        };
-                        if let Some((n, _)) = list.iter().find(|(n, _)| n.starts_with("__")) {
-                            return Err(QuilloError::new(format!("`{}`: a name from a script cannot start with `__`", n), line));
-                        }
-                        options.module |= crate::ast::is_module_file(&path);
-                        if let (false, Some((_, alias))) = (options.module, list.iter().find(|(n, _)| n == "*")) {
-                            return Err(QuilloError::new(format!(
-                                "`use * as {}` takes a whole ES module: write `use * as {} with module from \"{}\"`", alias, alias, path), line));
-                        }
-                        if options.module && list.iter().any(|(n, a)| n == "default" && a == "default") {
-                            return Err(QuilloError::new(format!(
-                                "a module's default export needs a name of yours: use default as Name with module from \"{}\"", path), line));
-                        }
-                        if options.hint == Some(LibHint::Preconnect) && crate::ast::script_origin(&path).is_none() {
-                            return Err(QuilloError::new(format!(
-                                "`with preconnect` is for a script at another address; `{}` is on this site's own connection (`with preload` fetches it ahead)", path), line));
-                        }
-                        return Ok(Stmt::Use(path, names, line, options));
+                    // `client /total` is a division, so a path that starts with `/` needs its `use`.
+                    let rest = self.rest_of_line();
+                    if !rest.trim_start().starts_with('/') && import_line(&format!("{} {}", w, rest)) {
+                        return Err(QuilloError::new(format!("`{}` takes names from a file, and says which: {} {} use ...", w, w, rest.trim()), line));
                     }
-                    if options != LibOptions::default() {
-                        return Err(QuilloError::new(format!("`with module`, `with preload` and `with preconnect` are for a browser library (a `.js` file or an address), not `{}`", path), line));
-                    }
-                    if let Some((_, alias)) = names.iter().flatten().find(|(n, _)| n == "*") {
-                        return Err(QuilloError::new(format!("`use * as {}` takes a whole ES module, not `{}`", alias, path), line));
-                    }
-                    if names.is_some() && !path.ends_with(".qwer") {
-                        return Err(QuilloError::new(format!(
-                            "names are taken from a `.qwer` file; a `.qwe` file gives all its public names: write `use {}`, and mark what it keeps to itself `private`",
-                            path), line));
-                    }
-                    return Ok(Stmt::Use(path, names, line, LibOptions::default()));
                 }
                 "return" => {
                     self.next()?;

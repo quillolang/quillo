@@ -1,6 +1,8 @@
 // <NoteList>: every note, following the database live (a note saved from another page,
 // or ticked, shows at once).
 
+import lib/notes.qwe use load_notes
+
 fn ago(ms: int) {
     let s = (now() - ms) / 1000
     s < 60 ? "just now" : s < 3600 ? `${floor(s / 60)} min ago` : s < 86400 ? `${floor(s / 3600)} h ago` : `${floor(s / 86400)} d ago`

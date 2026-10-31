@@ -34,7 +34,7 @@ pub static DEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Builtins that also exist in the browser.
 const CLIENT_BUILTINS: &[&str] = &[
-    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "split", "join", "contains",
+    "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "filled", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
@@ -117,7 +117,7 @@ fn styles_of(it: &Interp, c: &Compiler) -> Vec<String> {
     out
 }
 
-/// A browser library a program uses: `use Chart from "...js"` (branch
+/// A browser library a program uses: `client "...js" use Chart` (branch
 /// js-libraries). `global` is what the script defines on the page, `src` where
 /// it is, `order` its place among the program's (a script after the one it
 /// builds on), `hint` what a page does ahead of it, `export` what it takes from an
@@ -1987,7 +1987,7 @@ impl<'a> Compiler<'a> {
             }
             // The module, not a map of the program's own by its name.
             Value::Map(m)
-                if matches!(name, "json" | "math" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date")
+                if matches!(name, "json" | "math" | "bit" | "stats" | "vec" | "re" | "money" | "channel" | "http" | "date")
                     && m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).map_or(false, |r| r.starts_with('.')))) =>
             {
                 let r = (format!("B.{}", name), false);
@@ -3002,9 +3002,6 @@ impl<'a> Compiler<'a> {
             }
             Expr::Block(stmts) => self.block_expr(stmts)?,
             Expr::Lambda(def) => {
-                if def.effects.is_some() {
-                    self.line = def.line;
-                }
                 let (code, _) = self.function(def)?;
                 code
             }

@@ -12,6 +12,8 @@
 // on_change(value): inside one of your components, given the number (null when
 // it is emptied), after each step or when what was typed is left.
 
+import ui/kit/theme.qwe use ui_cls
+
 let number_input_css = css`
 .ui-number-input { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-number-input-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }

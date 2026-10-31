@@ -17,6 +17,8 @@
 // on_change(value): inside one of your components, given the chosen value (a list
 // of them when multiple).
 
+import ui/kit/theme.qwe use ui_cls
+
 let select_css = css`
 .ui-select { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-select-label { font-size: 13px; font-weight: 500; color: var(--ui-fg); }

@@ -1,5 +1,7 @@
 // The frame every page uses, and the small views used everywhere.
 
+import lib/tasks.qwe use PRIORITIES
+
 view Avatar(name: str, hue: int, size: str = "md") =
     <span class={`avatar ${size}`} style={`--hue: ${hue}`} title={name} aria-hidden="true">{upper(slice(name, 0, 1))}</span>
 

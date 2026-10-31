@@ -4,6 +4,15 @@
 // the first render.
 
 // The reactions on a post, and the palette to add one.
+import lib/auth.qwe use is_banned, is_mod
+import lib/forum.qwe
+    use REACTIONS, bookmark, delete_post, edit_post, load_posts, load_thread, mark_solution, post_reply, preview, react, set_following, set_locked, set_pinned, vote
+import lib/moderation.qwe use REPORT_REASONS, report_post
+import lib/text.qwe use ago, compact, excerpt, left, plural, quote_of, tags_of
+import ui/editor.qwe use Editor
+import ui/page.qwe use Avatar, CategoryPill, Empty, Problem, RoleBadge, Tag
+import ui/poll.qwe use Poll
+
 component Reactions(post, me, on_posts, on_problem) {
     state open = false
     let toggle = (emoji) => {

@@ -1,0 +1,6 @@
+// Q-150 `x || "text"` is not warned about where `x`'s type is not known
+// mode: check
+// fixed-when: `request.query.name` counts as true
+// From FEEDBACK19.md §Q-150 (found on b28e689).
+
+route GET / = request.query.name || "anonymous"

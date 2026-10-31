@@ -17,6 +17,8 @@
 // on_change(value) for a single group, on_change(value, checked) when multiple:
 // inside one of your components, given the chip's value (and whether it is now on).
 
+import ui/kit/theme.qwe use ui_cls
+
 let chip_group_css = css`
 .ui-chips { min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-chips-legend { padding: 0; margin-bottom: 8px; font-size: 13px; font-weight: 500; }

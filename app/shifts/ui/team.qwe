@@ -2,6 +2,10 @@
 // shifts it would take and how many the crew would have left, and the next
 // week of their lines.
 
+import lib/leave.qwe use decide_leave, pending_for_me
+import lib/rota.qwe use day_label
+import ui/page.qwe use Problem, ShiftTag
+
 component Decision(item) {
     state reason = ""
     state force = false

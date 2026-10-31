@@ -3,6 +3,22 @@
 // the dates or the guests change; the price (once a thumb is let go), kinds,
 // amenities and sort are applied in the browser to what came back.
 
+import lib/dates.qwe use plural, range_label
+import lib/stays.qwe use AMENITIES, KINDS, search_stays
+import ui/kit/alert.qwe use Alert
+import ui/kit/badge.qwe use Badge
+import ui/kit/button.qwe use Button
+import ui/kit/chip_group.qwe use ChipGroup
+import ui/kit/date_range_picker.qwe use DateRangePicker
+import ui/kit/empty_state.qwe use EmptyState
+import ui/kit/map_view.qwe use MapView
+import ui/kit/number_input.qwe use NumberInput
+import ui/kit/range_slider.qwe use RangeSlider
+import ui/kit/segmented_control.qwe use SegmentedControl
+import ui/kit/switch.qwe use Switch
+import ui/kit/text_field.qwe use TextField
+import ui/shell.qwe use Shell
+
 let CITIES = [
     { name: "Lisbon", says: "Hills, trams and tiles", hue: 20 },
     { name: "Porto", says: "Port wine by the river", hue: 200 },

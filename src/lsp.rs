@@ -125,10 +125,15 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
             continue;
         }
         let Ok(src) = std::fs::read_to_string(&f) else { continue };
-        for line in src.lines() {
+        let lines: Vec<&str> = src.lines().collect();
+        for n in 0..lines.len() {
+            let Some(u) = use_text(&lines, n, 0).and_then(|(l, _)| use_line(&l)) else { continue };
             // A `.qwer` file uses no other.
-            let Some(u) = use_line(line).filter(|u| !u.path.ends_with(".qwer")) else { continue };
-            let Ok(full) = base.join(&u.path).canonicalize() else { continue };
+            let path = crate::modules::resolve(base, &u.path);
+            if path.ends_with(".qwer") {
+                continue;
+            }
+            let Ok(full) = base.join(&path).canonicalize() else { continue };
             if full == target {
                 return true;
             }
@@ -147,6 +152,8 @@ struct UseLine {
     names: Vec<(String, String, usize)>,
     path: String,
     at: (usize, usize),
+    /// A first line whose `use` is on the next one, or not written yet.
+    open: bool,
 }
 
 fn use_line(src: &str) -> Option<UseLine> {
@@ -165,11 +172,58 @@ fn use_line(src: &str) -> Option<UseLine> {
     };
     let word = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
     let mut i = skip(0);
+    let mut u = UseLine::default();
+    // `import lib/auth.qwe use login`, `preload module "https://..." use Chart`: the file
+    // first, and the `use` here or on the next line (FEEDBACK19.md, Q-156; branch
+    // feedback19-fixes).
+    if crate::parser::IMPORT_WORDS.contains(&word(i, word_end(i)).as_str()) {
+        i = skip(word_end(i));
+        let after = skip(word_end(i));
+        if word(i, word_end(i)) == "module" && word(after, word_end(after)) != "use" {
+            i = after;
+        }
+        let quoted = chars.get(i) == Some(&'"');
+        let start = i + quoted as usize;
+        let mut e = start;
+        while e < chars.len() && (if quoted { chars[e] != '"' } else { !chars[e].is_whitespace() }) {
+            e += 1;
+        }
+        if e == start {
+            return None;
+        }
+        u.path = word(start, e).replace('\\', "/");
+        u.at = (start, e);
+        if !u.path.ends_with(".qwe") && !u.path.ends_with(".qwer") && !crate::ast::is_script(&u.path) {
+            u.path.push_str(".qwer");
+        }
+        i = skip((e + quoted as usize).min(chars.len()));
+        if word(i, word_end(i)) != "use" {
+            u.open = true;
+            return (i == chars.len() || chars[i..].starts_with(&['/', '/'])).then_some(u);
+        }
+        i = skip(i + 3);
+        while word_end(i) > i {
+            let e = word_end(i);
+            let (name, mut j) = (word(i, e), skip(e));
+            let mut alias = name.clone();
+            if word(j, word_end(j)) == "as" {
+                let a = skip(word_end(j));
+                j = word_end(a);
+                alias = word(a, j);
+                j = skip(j);
+            }
+            u.names.push((name, alias, i));
+            if chars.get(j) != Some(&',') {
+                break;
+            }
+            i = skip(j + 1);
+        }
+        return Some(u);
+    }
     if word_end(i) != i + 3 || word(i, i + 3) != "use" {
         return None;
     }
     i = skip(i + 3);
-    let mut u = UseLine::default();
     // `with module, preload`, before `from` (branch library-hints).
     let skip_with = |mut j: usize| {
         if word(j, word_end(j)) == "with" {
@@ -243,6 +297,25 @@ fn use_line(src: &str) -> Option<UseLine> {
     }
     u.at = (i, e);
     Some(u)
+}
+
+/// A `use` as one line, though a long address left it for the next: the line, and where
+/// column `col` of line `at` is in it (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+fn use_text(lines: &[&str], at: usize, col: usize) -> Option<(String, usize)> {
+    let this = *lines.get(at)?;
+    let body = this.trim_start();
+    // As far as the file: a comment may follow it.
+    let head = |l: &str| use_line(l).filter(|u| u.open).map(|u| l.chars().take(u.at.1 + 1).collect::<String>());
+    if let Some(first) = head(this) {
+        let next = lines.get(at + 1).map(|l| l.trim_start()).filter(|l| l.starts_with("use "))?;
+        return Some((format!("{} {}", first, next), col));
+    }
+    if let Some(first) = at.checked_sub(1).and_then(|p| head(lines[p])).filter(|_| body.starts_with("use ")) {
+        let indent = this.chars().count() - body.chars().count();
+        let col = first.chars().count() + 1 + col.saturating_sub(indent);
+        return Some((format!("{} {}", first, body), col));
+    }
+    Some((this.to_string(), col))
 }
 
 /// The folder a file's `use` paths are read from: its program's main
@@ -420,7 +493,6 @@ fn symbol_kind(k: SymbolKind) -> u32 {
         SymbolKind::Function | SymbolKind::ServerFn => 12,
         SymbolKind::View | SymbolKind::Component => 5,
         SymbolKind::Variable => 13,
-        SymbolKind::Builtin => 12,
         SymbolKind::Route => 6,
     }
 }
@@ -783,16 +855,24 @@ impl Server {
             return None;
         }
         let doc = self.docs.get(&uri)?;
-        let src = doc.text.lines().nth(line)?;
-        let u = use_line(src)?;
-        let full = use_base(&uri_to_path(&uri)).join(&u.path);
-        let at = char_col(src, col);
+        let lines: Vec<&str> = doc.text.lines().collect();
+        let (src, at) = use_text(&lines, line, char_col(lines.get(line)?, col))?;
+        let u = use_line(&src)?;
+        let base = use_base(&uri_to_path(&uri));
+        let full = base.join(crate::modules::resolve(&base, &u.path));
         if at >= u.at.0 && at <= u.at.1 {
             return Some((u, full, None));
         }
         let (w, _) = word_at(&doc.text, line, col)?;
         let taken = u.names.iter().find(|(n, a, _)| *n == w || *a == w).map(|(n, a, _)| (n.clone(), a.clone()))?;
         Some((u, full, Some(taken)))
+    }
+
+    /// What a `.qwe` file defines under `name`, for the `use` line that takes it
+    /// (FEEDBACK19.md, Q-154; branch feedback19-fixes).
+    fn defined_in(&self, uri: &str, full: &Path, name: &str) -> Option<check::Symbol> {
+        let key = crate::modules::key(full);
+        self.docs.get(uri)?.analysis.symbols.iter().find(|s| s.name == name && crate::modules::key(Path::new(&s.file)) == key).cloned()
     }
 
     /// A `.qwer` file's exported functions, as open in the editor or saved.
@@ -806,8 +886,13 @@ impl Server {
     fn use_hover(&self, params: &J) -> Option<J> {
         let (u, full, taken) = self.use_here(params)?;
         let short = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
+        let (uri, _, _) = Self::position(params);
+        let found = taken.as_ref().and_then(|(n, a)| Some((self.defined_in(&uri, &full, n)?, n != a, a)));
         let text = if !full.exists() {
             format!("`{}`: no such file", u.path)
+        } else if let Some((s, other, alias)) = found {
+            let called = if other { format!(", called `{}` here", alias) } else { String::new() };
+            format!("```quillo\n{}\n```\n*From {}{}.*", s.detail, short, called)
         } else if let Some((name, alias)) = taken {
             let e = self.exports_of(&full).into_iter().find(|e| e.name == name)?;
             let called = if alias != name { format!(", called `{}` here", alias) } else { String::new() };
@@ -839,16 +924,134 @@ impl Server {
         }
         let file = full.display().to_string();
         let Some((name, _)) = taken else { return Some(self.location(&file, 0, 0, 0)) };
-        let e = self.exports_of(&full).into_iter().find(|e| e.name == name)?;
-        let l = e.line.saturating_sub(1) as usize;
+        let (uri, _, _) = Self::position(params);
+        let line = match self.defined_in(&uri, &full, &name) {
+            Some(s) => s.line,
+            None => self.exports_of(&full).into_iter().find(|e| e.name == name)?.line,
+        };
+        let l = line.saturating_sub(1) as usize;
         let text = self.text_of(&file);
         let (a, b) = find_word(text.lines().nth(l).unwrap_or(""), &name).unwrap_or((0, 0));
         Some(self.location(&file, l, a, b))
     }
 
+    /// The program's files that `wanted` accepts, from its main file's folder.
+    fn use_files(&self, uri: &str, wanted: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let base = use_base(&uri_to_path(uri));
+        let here = uri_to_path(uri).canonicalize().ok();
+        let mut files = Vec::new();
+        let mut todo = vec![(base.clone(), 0)];
+        while let Some((dir, depth)) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if depth < 4 && !name.starts_with('.') && name != "target" && name != "node_modules" {
+                        todo.push((p, depth + 1));
+                    }
+                } else if wanted(&name) && p.canonicalize().ok() != here && files.len() < 500 {
+                    files.push(p.strip_prefix(&base).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Completions that put a file in place of what is typed from column `a`.
+    fn file_items(&self, files: &[String], src: &str, line: usize, a: usize, col16: usize) -> Vec<J> {
+        let range = json!({ "start": { "line": line, "character": utf16_col(src, a) }, "end": { "line": line, "character": col16 } });
+        files.iter().map(|f| json!({ "label": f, "kind": 17, "filterText": f, "textEdit": { "range": range, "newText": f } })).collect()
+    }
+
+    /// The names a file gives, but for those `u` takes elsewhere than column `a`.
+    fn names_of(&self, doc: &Doc, uri: &str, u: &UseLine, a: usize) -> Vec<J> {
+        let base = use_base(&uri_to_path(uri));
+        let full = base.join(crate::modules::resolve(&base, &u.path));
+        // A `.qwe` file: its public names, of those not yet taken (FEEDBACK19.md,
+        // Q-154; branch feedback19-fixes).
+        if full.extension().is_some_and(|e| e == "qwe") {
+            let key = crate::modules::key(&full);
+            return doc
+                .analysis
+                .symbols
+                .iter()
+                .filter(|s| s.kind != SymbolKind::Route && crate::modules::key(Path::new(&s.file)) == key)
+                .filter(|s| crate::privacy::private_name(&s.name).is_none() && !u.names.iter().any(|(n, _, c)| *n == s.name && *c != a))
+                .map(|s| json!({ "label": s.name, "kind": 3, "detail": s.detail }))
+                .collect();
+        }
+        self.exports_of(&full)
+            .iter()
+            .filter(|e| !u.names.iter().any(|(n, _, c)| *n == e.name && *c != a))
+            .map(|e| json!({ "label": e.name, "kind": 3, "detail": check::native_signature(e), "documentation": e.doc }))
+            .collect()
+    }
+
+    /// On a line that starts with the file: the file, then `use`, then the names that
+    /// file gives, which is why it comes first (FEEDBACK19.md, Q-156; branch
+    /// feedback19-fixes). Nothing to say when the line is something else.
+    fn import_completion(&self, doc: &Doc, uri: &str, line: usize, col16: usize) -> Option<J> {
+        let lines: Vec<&str> = doc.text.lines().collect();
+        let src = *lines.get(line)?;
+        let chars: Vec<char> = src.chars().collect();
+        let col = char_col(src, col16).min(chars.len());
+        let mut a = col;
+        while a > 0 && (chars[a - 1].is_alphanumeric() || "-._~%/\\".contains(chars[a - 1])) {
+            a -= 1;
+        }
+        let before: String = chars[..a].iter().collect();
+        let words: Vec<&str> = before.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        let first = *words.first()?;
+        let browser = first != "import";
+        let word = |label: &str| json!({ "label": label, "kind": 14 });
+        if first == "use" && use_line(lines.get(line.checked_sub(1)?)?).is_none_or(|u| !u.open) {
+            return None;
+        }
+        if first != "use" && !words.contains(&"use") {
+            let starts = crate::parser::IMPORT_WORDS.contains(&first) && (words.len() == 1 || crate::parser::import_line(&before));
+            if !starts {
+                return None;
+            }
+            // Where the file goes: at the start, after `module`, or inside its quotes.
+            if words.len() == 1 || (browser && words.len() == 2 && words[1] == "module") || before.matches('"').count() % 2 == 1 {
+                let mut items = Vec::new();
+                if browser && words.len() == 1 {
+                    items.push(word("module"));
+                }
+                let ours = |n: &str| if browser { n.ends_with(".js") || n.ends_with(".mjs") } else { n.ends_with(".qwe") || n.ends_with(".qwer") };
+                // What `public/` holds is served from the site's root.
+                let files: Vec<String> = self.use_files(uri, &ours).iter().map(|f| f.strip_prefix("public/").map_or(f.clone(), |r| format!("/{}", r))).collect();
+                items.extend(self.file_items(&files, src, line, a, col16));
+                return Some(json!(items));
+            }
+            return Some(json!([word("use")]));
+        }
+        let prev = *words.last()?;
+        if prev == "as" {
+            return Some(json!([]));
+        }
+        if prev == "*" {
+            return Some(json!([word("as")]));
+        }
+        let (text, at) = use_text(&lines, line, a)?;
+        let u = use_line(&text)?;
+        let mut items = if prev == "use" { vec![word("*")] } else { Vec::new() };
+        if crate::ast::is_script(&u.path) {
+            items.push(word("default"));
+        } else {
+            items.extend(self.names_of(doc, uri, &u, at));
+        }
+        Some(json!(items))
+    }
+
     /// On a `use` line: the program's files where a path goes, and a
     /// `.qwer` file's functions where names go (branch use-editor).
     fn use_completion(&self, doc: &Doc, uri: &str, line: usize, col16: usize) -> Option<J> {
+        if let Some(items) = self.import_completion(doc, uri, line, col16) {
+            return Some(items);
+        }
         let src = doc.text.lines().nth(line)?;
         let chars: Vec<char> = src.chars().collect();
         let col = char_col(src, col16).min(chars.len());
@@ -889,42 +1092,12 @@ impl Server {
             // A name: the functions of the file after `from`, not yet taken.
             // With no name yet, the line is not a `use` of names: its file is read alone.
             let from = &src[src.find(" from ")?..];
-            let qwer = |u: &UseLine| u.path.ends_with(".qwer");
-            let u = use_line(src).filter(qwer).or_else(|| use_line(&format!("use x{}", from)).filter(qwer))?;
-            let full = use_base(&uri_to_path(uri)).join(&u.path);
-            let items: Vec<J> = self
-                .exports_of(&full)
-                .iter()
-                .filter(|e| !u.names.iter().any(|(n, _, c)| *n == e.name && *c != a))
-                .map(|e| json!({ "label": e.name, "kind": 3, "detail": check::native_signature(e), "documentation": e.doc }))
-                .collect();
-            return Some(json!(items));
+            let ours = |u: &UseLine| !u.names.is_empty() && !crate::ast::is_script(&u.path);
+            let u = use_line(src).filter(ours).or_else(|| use_line(&format!("use x{}", from)).filter(ours))?;
+            return Some(json!(self.names_of(doc, uri, &u, a)));
         }
-        let base = use_base(&uri_to_path(uri));
-        let here = uri_to_path(uri).canonicalize().ok();
-        let mut files = Vec::new();
-        let mut todo = vec![(base.clone(), 0)];
-        while let Some((dir, depth)) = todo.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for e in entries.flatten() {
-                let p = e.path();
-                let name = e.file_name().to_string_lossy().to_string();
-                if p.is_dir() {
-                    if depth < 4 && !name.starts_with('.') && name != "target" && name != "node_modules" {
-                        todo.push((p, depth + 1));
-                    }
-                } else if (name.ends_with(".qwer") || !names && name.ends_with(".qwe")) && p.canonicalize().ok() != here && files.len() < 500 {
-                    files.push(p.strip_prefix(&base).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
-                }
-            }
-        }
-        files.sort();
-        let range = json!({ "start": { "line": line, "character": utf16_col(src, a) }, "end": { "line": line, "character": col16 } });
-        let items: Vec<J> = files
-            .iter()
-            .map(|f| json!({ "label": f, "kind": 17, "filterText": f, "textEdit": { "range": range, "newText": f } }))
-            .collect();
-        Some(json!(items))
+        let files = self.use_files(uri, &|name: &str| name.ends_with(".qwer") || !names && name.ends_with(".qwe"));
+        Some(json!(self.file_items(&files, src, line, a, col16)))
     }
 
     /// What a name called here is: its signature, its parameters' names where
@@ -939,7 +1112,8 @@ impl Server {
                 && (s.name == name || private == Some(name))
                 && (private.is_none() || s.file == file)
         });
-        if let Some(s) = mine.min_by_key(|s| s.file != file) {
+        let taken = doc.analysis.taken.iter().find(|(f, s)| *f == file && s.name == name).map(|(_, s)| s);
+        if let Some(s) = taken.or_else(|| mine.min_by_key(|s| s.file != file)) {
             let text = self.text_of(&s.file);
             let (sig, about) = s.detail.split_once("\n\n").unwrap_or((&s.detail, ""));
             if !s.file.ends_with(".qwer") {
@@ -1306,7 +1480,8 @@ impl Server {
                 items.push(json!({ "label": l.name, "kind": 6, "detail": l.detail, "sortText": format!("0{:04}", items.len()) }));
             }
         }
-        for s in &doc.analysis.symbols {
+        let taken = doc.analysis.taken.iter().filter(|(f, _)| *f == file).map(|(_, s)| s);
+        for s in taken.chain(&doc.analysis.symbols) {
             // Another file's private names are not this file's to use (branch public-private).
             if crate::privacy::private_name(&s.name).is_some() && s.file != file {
                 continue;
@@ -1332,6 +1507,10 @@ impl Server {
         }
         for k in KEYWORDS {
             items.push(json!({ "label": k, "kind": 14 }));
+        }
+        // Names too, so only where a line starts (FEEDBACK19.md, Q-156; branch feedback19-fixes).
+        if before.trim_start().chars().all(is_word) {
+            items.extend(crate::parser::IMPORT_WORDS.iter().map(|k| json!({ "label": k, "kind": 14 })));
         }
         for t in TYPES {
             if seen.insert(t.to_string()) {
@@ -1413,7 +1592,8 @@ impl Server {
         let mut items = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let file = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or("")).display().to_string();
-        for s in &doc.analysis.symbols {
+        let taken = doc.analysis.taken.iter().filter(|(f, _)| *f == file).map(|(_, s)| s);
+        for s in taken.chain(&doc.analysis.symbols) {
             // Another file's private views are not this file's (branch public-private-editor).
             let theirs = crate::privacy::private_name(&s.name).is_some() && s.file != file;
             if matches!(s.kind, SymbolKind::View | SymbolKind::Component) && !theirs && seen.insert(s.name.clone()) {
@@ -1724,9 +1904,13 @@ fn keyword_doc(w: &str) -> Option<String> {
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",
-        "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.\n\n`use Chart with module, preload from \"...\"`\n\nHow a page takes a browser library: `module` for an ES module, kept in the runtime and not on `window`; `preload` fetches it ahead; `preconnect` only connects to its host.",
+        "with" => "`fn f() with db, http = ...`\n\nDeclares the effects a function may use: db, http, fs, env, time, random.",
         "match" => "`match value { pattern [if guard] => result ... }`",
-        "use" => "`use lib/auth.qwe` (or `use lib/auth`, or `use \"lib/auth.qwe\"`) runs another file once: its public names are this file's to use.\n\n`use cache_get as redis_get, cache_set from redis.qwer` takes only those functions of a Rust file, each under the name after `as`; `use * from redis.qwer` takes them all.",
+        "use" => "`use lib/auth.qwe` (or `use lib/auth`, or `use \"lib/auth.qwe\"`) runs another file once: its public names are this file's to use.\n\nTo take some of its names, the file comes first: `import redis.qwer use cache_get as redis_get, cache_set`.",
+        "import" => "`import lib/auth.qwe use login, logout as bye` takes names from a file, each under the name after `as`; `use *` takes them all. The file comes first, so the editor can offer its names. Works for `.qwe` and `.qwer` files.",
+        "client" => "`client /assets/leaflet.js use L` takes what a script defines, for the browser, from your own file or an address. A long address may leave its `use` to the next line. `client module ...` takes an ES module's exports.",
+        "preload" => "`preload \"https://...\" use Chart` is `client` that also has the page's `<head>` fetch the script, for a library used as soon as the page opens.",
+        "preconnect" => "`preconnect \"https://...\" use L` is `client` that also opens the connection to the script's host, for a library a click may need.",
         "mount" => "`mount /prefix = \"app.qwe\"` serves another program under a path prefix, with its own globals and database.",
         "state" => "`state count = 0` in a component: state, set on the first render and kept between renders (`~count = 0` is the short form). Assigning to `count` re-renders the component.",
         "private" => "`private fn helper() = ...` (also `view`, `component`, a top-level `let`)\n\nA name for this file only: other files cannot use it, and each file may have its own `helper`. Not for a `server fn` or a `type`.",

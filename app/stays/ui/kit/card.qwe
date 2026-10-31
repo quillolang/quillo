@@ -12,6 +12,8 @@
 // variant: "outline" (default), "elevated" (a shadow) or "subtle" (a tinted background).
 // padding: "none", "sm", "md" (default) or "lg".
 
+import ui/kit/theme.qwe use ui_cls
+
 let card_css = css`
 .ui-card {
   --ui-card-pad: 20px;

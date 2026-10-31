@@ -8,6 +8,8 @@
 // one of your components (a page's own props are data, not functions).
 // size: "sm" or "md" (default). hint: a line of help under the label.
 
+import ui/kit/theme.qwe use ui_cls
+
 let switch_css = css`
 .ui-switch { display: inline-flex; align-items: flex-start; gap: 10px; cursor: pointer; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
 .ui-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }

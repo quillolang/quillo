@@ -4,6 +4,16 @@
 // right shows the feedback threads; above, where the article is in its flow
 // and what the viewer may do there.
 
+import lib/articles.qwe use act, delete_article, load_article, retitle
+import lib/auth.qwe use has_any
+import lib/blocks.qwe use CONTENT_TYPES, owner_key
+import lib/objects.qwe use load_catalog
+import lib/review.qwe
+    use here, leave, load_presence, load_threads, open_thread, reply_to, set_thread
+import lib/text.qwe use ago
+import ui/blocks.qwe use BlockList, err_text
+import ui/page.qwe use Avatar, Problem, RoleChip, StepPill
+
 view StepTrack(steps: list, current_id: int) {
     let at = index_of(steps | map((s) => s.id), current_id) ?? 0
     <ol.step-track aria-label="Where the article is">

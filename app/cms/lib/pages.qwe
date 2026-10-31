@@ -2,6 +2,10 @@
 // invoices board): lists, forms and transactions beside text. A page can be
 // kept to some roles. Pages showing one follow its owner topic, `page:<id>`.
 
+import lib/auth.qwe use ROLES, acting, has_any, has_role
+import lib/blocks.qwe use blocks_of, owner_key
+import lib/text.qwe use from_json, slugify
+
 fn page_row(id: int) with db = unwatched(() => db.one("select id, title, slug, roles from pages where id = ?", id))
 
 fn may_see_page(u, p) -> bool {

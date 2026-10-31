@@ -14,7 +14,7 @@
 //! `demangle` turns such a name back into what was written, for every message.
 
 use crate::ast::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// What ends every private name: `helper` is `helper__pv1a2b3c4d`.
@@ -78,7 +78,14 @@ pub fn demangle(text: &str) -> String {
 /// or component's parameter has a private name: props are matched by name, and the
 /// renamed parameter would no longer be found.
 pub fn rename(stmts: &mut [Stmt], names: &HashSet<String>, tag: &str) -> Result<(), crate::error::QuilloError> {
-    let r = Renamer { names, tag };
+    let map = names.iter().map(|n| (n.clone(), mangle(n, tag))).collect();
+    rename_as(stmts, &map, "a private name in this file")
+}
+
+/// Renames names in a parsed file as `map` says, which is how a file's names get their
+/// names in the program (src/modules.rs). `what` is how an error calls such a name.
+pub fn rename_as(stmts: &mut [Stmt], map: &HashMap<String, String>, what: &str) -> Result<(), crate::error::QuilloError> {
+    let r = Renamer { map, what };
     for s in stmts.iter_mut() {
         r.stmt(s)?;
     }
@@ -86,16 +93,16 @@ pub fn rename(stmts: &mut [Stmt], names: &HashSet<String>, tag: &str) -> Result<
 }
 
 struct Renamer<'a> {
-    names: &'a HashSet<String>,
-    tag: &'a str,
+    map: &'a HashMap<String, String>,
+    what: &'a str,
 }
 
 type R = Result<(), crate::error::QuilloError>;
 
 impl Renamer<'_> {
     fn name(&self, n: &mut String) {
-        if self.names.contains(n.as_str()) {
-            *n = mangle(n, self.tag);
+        if let Some(to) = self.map.get(n.as_str()) {
+            *n = to.clone();
         }
     }
 
@@ -142,9 +149,9 @@ impl Renamer<'_> {
         let props = def.component || def.name.starts_with(|c: char| c.is_uppercase());
         self.name(&mut def.name);
         for p in def.params.iter_mut() {
-            if props && self.names.contains(&p.name) {
+            if props && self.map.contains_key(&p.name) {
                 return Err(crate::error::QuilloError::new(
-                    format!("`{}` is a private name in this file, and a prop of `{}` too: props are passed by name, so rename one", p.name, demangle(&def.name)),
+                    format!("`{}` is {}, and a prop of `{}` too: props are passed by name, so rename one", p.name, self.what, demangle(&def.name)),
                     def.line,
                 ));
             }

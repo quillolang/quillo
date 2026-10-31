@@ -1,0 +1,6 @@
+fn label(n) = `red ${n}`
+
+component Card() {
+    state n = 1
+    <button id="red" @click={() => { n += 1 }}>{label(n)}</button>
+}

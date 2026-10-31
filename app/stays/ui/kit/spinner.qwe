@@ -10,6 +10,8 @@
 // a button, tone="current" takes the text's colour. With reduced motion it pulses
 // slowly instead of turning.
 
+import ui/kit/theme.qwe use ui_cls
+
 let spinner_css = css`
 .ui-spinner { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle;
   font: 14px/1.4 var(--ui-font); color: var(--ui-muted); --t: var(--ui-accent); --s: 20px; }

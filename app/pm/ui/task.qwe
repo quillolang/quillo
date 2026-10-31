@@ -3,6 +3,12 @@
 
 // `board` is the board's own live data, for the columns, people, labels
 // and milestones the fields choose from.
+import lib/dates.qwe use ago, due_label, parse_day, short_day
+import lib/projects.qwe use can_edit
+import lib/tasks.qwe
+    use PRIORITIES, add_blocker, add_check, add_comment, delete_check, delete_comment, delete_task, edit_task, load_task, remove_blocker, toggle_check, toggle_label
+import ui/page.qwe use Avatar, Problem
+
 component TaskPanel(task_id: int, today: int, board, on_close) {
     state data = live(load_task, task_id)
     state editing_body = false

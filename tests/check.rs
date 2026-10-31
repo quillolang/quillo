@@ -174,7 +174,9 @@ fn javascript_truthiness_is_flagged_where_it_differs() {
     // Not where the meaning is the same, or the type is not known.
     clean("fn f(ok: bool, x) = (ok || x) && !ok ? x : null");
     clean("fn f(x: int | null) = x ?? 0");
-    clean("fn f(u: map) = u.name || \"x\"");
+    // A fallback says what a value of no known type was meant to be
+    // (FEEDBACK19.md, Q-150; branch feedback19-fixes).
+    one("fn f(u: map) = u.name || \"x\"", "`u.name` counts as true even when it is \"\"");
     clean("fn f(xs: list) = xs && len(xs)");
     clean("fn f(s: str) = s != \"\" ? s : \"x\"");
     // A value that may be null is tested for null first: `null > 0` fails.
@@ -500,8 +502,11 @@ fn a_name_defined_twice_is_an_error() {
     std::fs::write(d.join("main.qwe"), "use \"lib/x.qwe\"\nuse \"lib/y.qwe\"\nprint(helper() + shared)\n").unwrap();
     let a = quillo::check::check_file(&d.join("main.qwe"));
     let msgs: Vec<String> = a.diagnostics.iter().map(|d| format!("{}:{} {}", d.file.rsplit('/').next().unwrap(), d.line, d.message)).collect();
-    assert!(msgs.iter().any(|m| m.starts_with("y.qwe:1 `helper` is defined twice, at lib/x.qwe:1 and lib/y.qwe:1")), "{:#?}", msgs);
-    assert!(msgs.iter().any(|m| m.starts_with("y.qwe:2 `shared` is defined twice, at lib/x.qwe:2 and lib/y.qwe:2")), "{:#?}", msgs);
+    // Two files may each have one (FEEDBACK19.md, Q-154): the file that takes both chooses.
+    assert_eq!(msgs, [
+        "main.qwe:3 `helper` comes from lib/x.qwe and lib/y.qwe: take the one you mean: import lib/x.qwe use helper",
+        "main.qwe:3 `shared` comes from lib/x.qwe and lib/y.qwe: take the one you mean: import lib/x.qwe use shared",
+    ]);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -701,7 +706,7 @@ fn use_takes_names_from_plugins() {
         quillo::check::check_file(&d.join("main.qwe")).diagnostics.iter().map(|x| format!("{} {}", x.line, x.message)).collect()
     };
     // Every way to write it.
-    let ok = check("use lib/greet.qwe\nuse lib\\greet\nuse * from \"lib/greet.qwe\"\nuse cache_get as kv_get, cache_set from lib/kv.qwer\nuse cache_get as mem_get from lib/mem\nprint(hello(\"a\"), kv_get(\"k\"), cache_set(\"k\", \"v\"), mem_get(\"k\"))\n");
+    let ok = check("use lib/greet.qwe\nuse lib\\greet\nimport \"lib/greet.qwe\" use *\nimport lib/kv.qwer use cache_get as kv_get, cache_set\nimport lib/mem use cache_get as mem_get\nprint(hello(\"a\"), kv_get(\"k\"), cache_set(\"k\", \"v\"), mem_get(\"k\"))\n");
     assert!(ok.is_empty(), "{:#?}", ok);
     // A name taken under another is not there under its own.
     let renamed = check("use cache_get as kv_get from lib/kv\nprint(cache_get(\"k\"))\n");
@@ -709,12 +714,12 @@ fn use_takes_names_from_plugins() {
     // A function the plugin does not have, with the nearest it has.
     let typo = check("use cache_gett from lib/kv\n");
     assert!(typo.iter().any(|m| m.contains("kv.qwer has no function `cache_gett` (did you mean `cache_get`?)")), "{:#?}", typo);
-    // Names come from a `.qwer` file.
-    let qwe = check("use hello from lib/greet.qwe\n");
-    assert!(qwe.iter().any(|m| m.contains("names are taken from a `.qwer` file")), "{:#?}", qwe);
+    // Names come from a `.qwe` file too (FEEDBACK19.md, Q-154).
+    let qwe = check("import lib/greet.qwe use hello\nprint(hello(\"a\"))\n");
+    assert!(qwe.is_empty(), "{:#?}", qwe);
     // One name from two plugins: a warning, with the way out.
     let both = check("use lib/kv.qwer\nuse lib/mem.qwer\n");
-    assert!(both.iter().any(|m| m.starts_with("2 `cache_get` comes from kv.qwer and mem.qwer") && m.contains("use cache_get as mem_cache_get from lib/mem.qwer")), "{:#?}", both);
+    assert!(both.iter().any(|m| m.starts_with("2 `cache_get` comes from kv.qwer and mem.qwer") && m.contains("import lib/mem.qwer use cache_get as mem_cache_get")), "{:#?}", both);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -723,8 +728,8 @@ fn use_takes_names_from_plugins() {
 /// (branch js-libraries).
 #[test]
 fn browser_libraries_by_name() {
-    clean(r#"use Chart from https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js
-use L, confetti from "/assets/vendor.js"
+    clean(r#"client https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js use Chart
+client "/assets/vendor.js" use L, confetti
 component Sales() {
     state chart = null
     <canvas @mount={(el) => { chart = Chart.new(el, { type: "line" }); L.map(el).setView([1, 2], 3); confetti() }}></canvas>
@@ -732,16 +737,16 @@ component Sales() {
 route GET / = <Sales/>"#);
     one(r#"use "/assets/chart.js""#, "a script gives the page names of its own: name what it defines");
     one(r#"use * from "/assets/chart.js""#, "a script gives the page names of its own");
-    one("use Chart from /assets/chart.js\nprint(chart)", "unknown name `chart`");
+    one("client /assets/chart.js use Chart\nprint(chart)", "unknown name `chart`");
 }
 
 /// `use Chart with preload from ...`: `preload` or `preconnect`, for a browser library,
 /// and `preconnect` only for one at an address (branch library-hints).
 #[test]
 fn browser_library_hints() {
-    clean(r#"use Chart with preload from "https://cdn.example/chart.js"
-use L as Map, Draw with preconnect from https://cdn.example/leaflet.js
-use Local with preload from /assets/local.js
+    clean(r#"preload "https://cdn.example/chart.js" use Chart
+preconnect https://cdn.example/leaflet.js use L as Map, Draw
+preload /assets/local.js use Local
 component Sales() {
     state chart = null
     <canvas @mount={(el) => { chart = Chart.new(el, {}); Map.map(el); Draw.go(); Local.go() }}></canvas>
@@ -750,7 +755,7 @@ route GET / = <Sales/>"#);
     one(r#"use Chart with prefetch from "https://cdn.example/chart.js""#, "takes `module`, `preload` or `preconnect`, not `prefetch`");
     one(r#"use Chart with from "https://cdn.example/chart.js""#, "takes `module`, `preload` or `preconnect`, not `from`");
     one(r#"use Chart with preload, preconnect from "https://cdn.example/chart.js""#, "not both");
-    one("use Local with preconnect from /assets/local.js", "`with preconnect` is for a script at another address");
+    one("use Local with preconnect from /assets/local.js", "`preconnect` is for a script at another address");
     one("use cache_get with preload from redis.qwer", "are for a browser library");
 }
 
@@ -758,23 +763,23 @@ route GET / = <Sales/>"#);
 /// name, and what each says when it is wrong (branch library-hints).
 #[test]
 fn browser_modules() {
-    clean(r#"use Chart, registerables with module from "https://cdn.example/chart.js"
-use Chart as ChartJS with module, preload from "https://cdn.example/chart.js"
-use default as dayjs with module, preconnect from "https://cdn.example/dayjs.js"
-use * as THREE with module from "https://cdn.example/three.js"
-use * as Own from /assets/own.mjs
-use late from "/assets/late.mjs?v=2"
+    clean(r#"client module "https://cdn.example/chart.js" use Chart, registerables
+preload module "https://cdn.example/chart.js" use Chart as ChartJS
+preconnect module "https://cdn.example/dayjs.js" use default as dayjs
+client module "https://cdn.example/three.js" use * as THREE
+client /assets/own.mjs use * as Own
+client "/assets/late.mjs?v=2" use late
 component Sales() {
     state chart = null
     <canvas @mount={(el) => { chart = Chart.new(el, {}); ChartJS.register(registerables); dayjs(); THREE.Scene.new(); Own.go(); late() }}></canvas>
 }
 route GET / = <Sales/>"#);
-    one(r#"use * as THREE from "https://cdn.example/three.js""#, "`use * as THREE` takes a whole ES module: write `use * as THREE with module from");
+    one(r#"use * as THREE from "https://cdn.example/three.js""#, "`* as THREE` takes a whole ES module: write client module");
     one("use * as Auth from lib/auth.qwe", "takes a whole ES module, not `lib/auth.qwe`");
     one(r#"use default with module from "https://cdn.example/dayjs.js""#, "default export needs a name of yours");
     one("use cache_get with module from redis.qwer", "are for a browser library");
-    one("use Local with module, preconnect from /assets/local.js", "`with preconnect` is for a script at another address");
-    one("use Chart with module from /assets/chart.js\nprint(chart)", "unknown name `chart`");
+    one("use Local with module, preconnect from /assets/local.js", "`preconnect` is for a script at another address");
+    one("client module /assets/chart.js use Chart\nprint(chart)", "unknown name `chart`");
 }
 
 /// `js(name, ...)` with the name in a variable: refused by the checker as by

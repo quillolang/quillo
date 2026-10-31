@@ -1,6 +1,11 @@
 // The moderators' queue, live: a report anywhere shows here at once, and a
 // report one moderator handles leaves every moderator's queue.
 
+import lib/auth.qwe use is_admin, is_banned
+import lib/moderation.qwe use BAN_DAYS, REPORT_REASONS, load_reports, resolve_reports, suspend
+import lib/text.qwe use ago, excerpt, plural
+import ui/page.qwe use Empty, Person, Problem, RoleBadge
+
 view ReasonList(reasons: str) {
     let names = split(reasons, ",")
     <span.reasons>{for [key, label] in REPORT_REASONS =>

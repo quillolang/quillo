@@ -18,6 +18,8 @@
 // lines on the bar at low and high (true when they are given). size: "sm", "md"
 // (default) or "lg".
 
+import ui/kit/theme.qwe use ui_cls
+
 let meter_css = css`
 .ui-meter { display: grid; gap: 6px; min-width: 0; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); --t: var(--ui-accent); }
 .ui-meter-neutral { --t: var(--ui-muted); }

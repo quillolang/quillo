@@ -8,6 +8,12 @@
 // changes a thread or its posts calls `changed(id)`. Likewise each person's
 // bell follows `user:<id>`.
 
+import lib/auth.qwe use DAY, acting, is_banned, is_mod, viewer
+import lib/mentions.qwe use link_mentions, mentioned
+import lib/moderation.qwe use log_mod
+import lib/polls.qwe use save_poll
+import lib/text.qwe use NAME_CHARS, left, only_chars, parse_tags
+
 let PAGE = 20
 let MAX_BODY = 20000
 let SLOW_DOWN_MS = 5000

@@ -13,6 +13,8 @@
 // selected: shown as chosen (a filter that is on), with aria-pressed when
 // on_click is given: on_click() makes the whole tag a toggle button.
 
+import ui/kit/theme.qwe use ui_cls
+
 let tag_css = css`
 .ui-tag {
   display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; max-width: 100%;

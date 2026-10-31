@@ -9,6 +9,32 @@
 // once the page shows, never while the server renders it: Overpass is given
 // 8 seconds before Photon is asked instead.
 
+import lib/dates.qwe use day_label, is_day, nights_of, plural, range_label
+import lib/pricing.qwe use night_price, quote, shown_minor, shown_money, stay_problem
+import lib/stays.qwe
+    use AMENITIES, activities_near, around_stay, book_activity, hold_stay, load_stay, toggle_saved, weather_for
+import ui/kit/action_bar.qwe use ActionBar
+import ui/kit/alert.qwe use Alert
+import ui/kit/avatar.qwe use Avatar
+import ui/kit/badge.qwe use Badge
+import ui/kit/button.qwe use Button
+import ui/kit/card.qwe use Card
+import ui/kit/carousel.qwe use Carousel, CarouselSlide
+import ui/kit/date_range_picker.qwe use DateRangePicker
+import ui/kit/description_list.qwe use DescriptionList
+import ui/kit/empty_state.qwe use EmptyState
+import ui/kit/guest_picker.qwe use GuestPicker
+import ui/kit/lightbox.qwe use Lightbox
+import ui/kit/map_view.qwe use MapView
+import ui/kit/number_input.qwe use NumberInput
+import ui/kit/price_breakdown.qwe use PriceBreakdown
+import ui/kit/rating.qwe use Rating
+import ui/kit/segmented_control.qwe use SegmentedControl
+import ui/kit/skeleton.qwe use Skeleton
+import ui/kit/spinner.qwe use Spinner
+import ui/kit/time_slots.qwe use TimeSlots
+import ui/shell.qwe use Shell
+
 view StayPage(me, id: int, start: str, end: str, guests: int) =
     <Shell {me} title="A place to stay" maps={true}>
         <StayView {id} {start} {end} {guests}/>

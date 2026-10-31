@@ -12,6 +12,8 @@
 // the dot, for something live or urgent (still with reduced motion). size: "sm",
 // "md" (default) or "lg".
 
+import ui/kit/theme.qwe use ui_cls
+
 let status_dot_css = css`
 .ui-sd { display: inline-flex; align-items: center; gap: 7px; vertical-align: middle; font: 14px/1.4 var(--ui-font);
   color: var(--ui-fg); --t: var(--ui-strong); --d: 8px; }

@@ -2,6 +2,12 @@
 // FORUM_DEMO=1; only an empty forum is filled. Every demo account's password
 // is "password", so never turn this on for a forum people really use.
 
+import lib/auth.qwe use DAY
+import lib/forum.qwe use render
+import lib/messages.qwe use conversation_of, mark_messages_read
+import lib/polls.qwe use save_poll
+import lib/text.qwe use parse_tags
+
 fn seed_user(name: str, role: str, hue: int, bio: str, days_ago: int) with db, time, random =
     db.exec("insert into users (name, email, password_hash, role, hue, bio, created) values (?, ?, ?, ?, ?, ?, ?)",
         name, `${name}@example.com`, crypto.hash_password("password"), role, hue, bio, now() - days_ago * DAY).last_id

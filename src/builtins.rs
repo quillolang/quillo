@@ -21,6 +21,7 @@ pub fn install(env: &Env) {
         ("upper", upper),
         ("lower", lower),
         ("trim", trim),
+        ("filled", filled),
         ("split", split),
         ("join", join),
         ("contains", contains),
@@ -165,6 +166,9 @@ pub fn install(env: &Env) {
     let mut math = Map::new();
     crate::numeric::install_math(&mut math);
     define(env, "math", Value::map(math));
+    let mut bit = Map::new();
+    crate::numeric::install_bit(&mut bit);
+    define(env, "bit", Value::map(bit));
     let mut stats = Map::new();
     crate::numeric::install_stats(&mut stats);
     define(env, "stats", Value::map(stats));
@@ -320,6 +324,12 @@ fn upper(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn lower(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::str(s_arg(&args, 0, "lower", line)?.to_lowercase()))
+}
+
+/// The value, or null for `""`: what `||` does in JavaScript, for text, as
+/// `filled(name) ?? "anonymous"` (FEEDBACK19.md, Q-151; branch feedback19-fixes).
+fn filled(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    Ok(args.into_iter().next().filter(|v| !matches!(v, Value::Str(s) if s.is_empty())).unwrap_or(Value::Nil))
 }
 
 fn trim(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -1685,7 +1695,7 @@ fn js(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
 }
 
-/// A name from a browser library (`use Chart from "...js"`), called while the
+/// A name from a browser library (`client "...js" use Chart`), called while the
 /// server renders: null, as `js(...)` gives (branch js-libraries).
 pub fn js_lib(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
     Ok(Value::Nil)

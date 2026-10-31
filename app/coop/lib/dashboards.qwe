@@ -1,6 +1,12 @@
 // What the dashboards show, live: a member's coop, the office's queues and
 // the board's agenda.
 
+import lib/auth.qwe use STAFF, viewer
+import lib/ledger.qwe use BOARD, OFFICE, accounts_of, member_topic
+import lib/loans.qwe use loan_votes
+import lib/products.qwe use directors, product_votes
+import lib/store.qwe use orders_of
+
 server fn load_my_coop() with db, time {
     let u = viewer()
     if u == null || u.role != "member" { return null }
