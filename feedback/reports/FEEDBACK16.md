@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| App | No app: new tests for every part of `src/`, written to reach the code no test reached. 81 new test files under `tests/`, 1,036 tests |
+| App | No app: new tests for every part of `src/`, written to reach the code no test reached. 81 new test files under `tests/`, 1,037 tests |
 | Quillo | 0.6.0 (b28e689), with the uncommitted work of branch `library-hints` in the tree |
 | Model | Claude (Opus 5.5), one session and nine agents, seven for the parts of the source and two for what was left |
 | Tested with | `cargo llvm-cov` over `cargo test --release --all-features`, a real window for `quillo app`, headless Chrome, throwaway PostgreSQL and MariaDB servers, the repros under `feedback/run.mjs` |
 
-What worked well: nearly everything a test reached did what the guide says. The 1,036 new tests turned up
-42 issues, most of them at the far edge of a type's range or on a path nobody takes on a good
+What worked well: nearly everything a test reached did what the guide says. The 1,037 new tests turned up
+43 issues, most of them at the far edge of a type's range or on a path nobody takes on a good
 day. The standard library's error values held up well, `date.*` above all: 600 untested lines,
 now tested, and one wrong answer in them, for the last two days of the year 9999. The parser's
 messages were right almost everywhere they were asked to be.
@@ -628,6 +628,22 @@ the test that found it, which is why a test of it failed only under load. Not re
 
 **Suggestion:** set the flag before the server takes its first request (src/server.rs:1681).
 
+### Q-150. A PostgreSQL connection given back as it dies goes back in the pool
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | CI, on Linux | 1 |
+
+`give_back` keeps a connection unless `client.is_closed()` is true, and that is set a moment after
+the query fails. So after the server ends a connection, the error can reach the caller first, the
+dead connection is kept, and the next caller gets "Connection reset by peer" on a query that should
+have had a fresh connection. On macOS the timing hid it; Ubuntu showed it on the first CI run.
+Test: `db_postgres::a_connection_given_back_as_it_dies_is_not_handed_out_again`, which passed 8 of 8
+on macOS: the failure is from Ubuntu, and the cause is from reading the code.
+
+**Suggestion:** have `failed` note a connection the server ended (SQLSTATE 57P01, or any error with
+no code), and let `give_back` drop it without waiting for `is_closed`.
+
 ## Where the AI struggled
 
 | What I wrote first | Why | What happened | Cost |
@@ -643,6 +659,7 @@ the test that found it, which is why a test of it failed only under load. Not re
 | Took the total from `cargo llvm-cov` and the agents' counts as the same thing | both say "missed lines" | the agents counted each source line once, and the total counts each closure on its own: db.rs was 17 missed to them and 79 to the total. The first reads 99.1% well before the second reaches 99%, and hides every unrun `.map_err(\|e\| ...)` | 1 round of two more agents |
 | Treated 201 unrun closures as missing tests | they were listed as code that never ran | all were `\|e\| e.into_inner()` on a lock, run only if another thread panics holding it. Written as `std::sync::PoisonError::into_inner` (199 lines, 29 files) there is nothing to run, and nothing changes | 1 read of the list |
 | Called `Address already in use` flakiness and retried | the repo has a known first-request flake | a port is found free, then taken before the server binds it: a real race in the new tests' helpers, fixed by asking for another port | 3 full runs |
+| Ran the new tests only on macOS | that is where the work was | Ubuntu failed a test on the first push, and the failure was a real race macOS timing hid (Q-150): the test was right | 1 CI run |
 | "desktop.rs can reach 43.6% at most" | an agent took "needs a window" as the end of it | a real window, a stub `open` on the PATH and a page reporting back reached 92% | 1 test, gated by QUILLO_TEST_WINDOW |
 
 ## Limitations

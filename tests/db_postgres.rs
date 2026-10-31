@@ -291,8 +291,30 @@ fn a_connection_that_died_is_replaced() {
     let pid: String = pid.chars().filter(|c| c.is_ascii_digit()).collect();
     psql(&pg, &pg.url, &[&format!("select pg_terminate_backend({})", pid)]);
     assert!(c.query("select 1", &[], None).is_err());
+    // The client hears of the close a moment after the query fails (FEEDBACK16.md, Q-150).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(c.query("select 1", &[], None), Err(e) if e.contains("connection closed")) {
+        assert!(Instant::now() < deadline, "the client never saw the close");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     pool.give_back(c);
     // Not kept: the next is a new one, though the pool holds one at most.
+    let mut c = pool.checkout().unwrap();
+    assert_eq!(c.query("select 1 as x", &[], None).unwrap()[0].repr(), "{ x: 1 }");
+    pool.give_back(c);
+}
+
+#[test]
+#[ignore = "finding: a connection given back right after the server ended it is kept, so the next caller gets a reset (seen on Linux; `is_closed` is set a moment later)"]
+fn a_connection_given_back_as_it_dies_is_not_handed_out_again() {
+    let Some(pg) = server("died-race") else { return };
+    let pool = quillo::pg::Pool::open(&format!("{}?pool_size=1", pg.url)).unwrap();
+    let mut c = pool.checkout().unwrap();
+    let pid = c.query("select pg_backend_pid() as p", &[], None).unwrap()[0].repr();
+    let pid: String = pid.chars().filter(|c| c.is_ascii_digit()).collect();
+    psql(&pg, &pg.url, &[&format!("select pg_terminate_backend({})", pid)]);
+    assert!(c.query("select 1", &[], None).is_err());
+    pool.give_back(c);
     let mut c = pool.checkout().unwrap();
     assert_eq!(c.query("select 1 as x", &[], None).unwrap()[0].repr(), "{ x: 1 }");
     pool.give_back(c);
