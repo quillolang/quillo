@@ -20,7 +20,8 @@ fn a_file_where_the_apps_folder_goes_names_it() {
     let (bundle, app) = root("file-for-folder");
     std::fs::write(&app, "in the way").unwrap();
     let e = sync(&bundle, &app).unwrap_err();
-    assert!(e.starts_with(&app.display().to_string()) && e.contains("Not a directory"), "{}", e);
+    // macOS says "Not a directory", Linux "File exists".
+    assert!(e.starts_with(&app.display().to_string()) && e.contains("os error"), "{}", e);
 }
 
 #[test]

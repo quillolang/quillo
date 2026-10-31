@@ -291,7 +291,7 @@ fn a_connection_that_died_is_replaced() {
     let pid: String = pid.chars().filter(|c| c.is_ascii_digit()).collect();
     psql(&pg, &pg.url, &[&format!("select pg_terminate_backend({})", pid)]);
     assert!(c.query("select 1", &[], None).is_err());
-    // The client hears of the close a moment after the query fails (FEEDBACK16.md, Q-150).
+    // The client hears of the close a moment after the query fails (FEEDBACK16.md, Q-160).
     let deadline = Instant::now() + Duration::from_secs(5);
     while !matches!(c.query("select 1", &[], None), Err(e) if e.contains("connection closed")) {
         assert!(Instant::now() < deadline, "the client never saw the close");

@@ -167,4 +167,4 @@ rewrites **Status**. Rows without a repro are kept up to date by hand.
 | Q-147 | `math.lcm` with a zero depends on the order | loud | b28e689, [FEEDBACK16 §Q-147](reports/FEEDBACK16.md) | coverage | open (b28e689) | [repro](repros/Q-147-lcm-with-zero-depends-on-the-order.qwe) |
 | Q-148 | A breakpoint inside a block in markup is verified but never stops | silent | b28e689, [FEEDBACK16 §Q-148](reports/FEEDBACK16.md) | coverage | open | ignored test |
 | Q-149 | Under `--watch`, a file served before the watcher has started is never watched | silent | b28e689, [FEEDBACK16 §Q-149](reports/FEEDBACK16.md) | coverage | open | ignored test |
-| Q-150 | A PostgreSQL connection given back as it dies goes back in the pool | silent | b28e689, [FEEDBACK16 §Q-150](reports/FEEDBACK16.md) | coverage | open | ignored test |
+| Q-160 | A PostgreSQL connection given back as it dies goes back in the pool | silent | b28e689, [FEEDBACK16 §Q-160](reports/FEEDBACK16.md) | coverage | open | ignored test |

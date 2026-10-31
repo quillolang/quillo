@@ -628,7 +628,7 @@ the test that found it, which is why a test of it failed only under load. Not re
 
 **Suggestion:** set the flag before the server takes its first request (src/server.rs:1681).
 
-### Q-150. A PostgreSQL connection given back as it dies goes back in the pool
+### Q-160. A PostgreSQL connection given back as it dies goes back in the pool
 
 | Kind | Detected by | Attempts |
 |---|---|---|
@@ -659,7 +659,7 @@ no code), and let `give_back` drop it without waiting for `is_closed`.
 | Took the total from `cargo llvm-cov` and the agents' counts as the same thing | both say "missed lines" | the agents counted each source line once, and the total counts each closure on its own: db.rs was 17 missed to them and 79 to the total. The first reads 99.1% well before the second reaches 99%, and hides every unrun `.map_err(\|e\| ...)` | 1 round of two more agents |
 | Treated 201 unrun closures as missing tests | they were listed as code that never ran | all were `\|e\| e.into_inner()` on a lock, run only if another thread panics holding it. Written as `std::sync::PoisonError::into_inner` (199 lines, 29 files) there is nothing to run, and nothing changes | 1 read of the list |
 | Called `Address already in use` flakiness and retried | the repo has a known first-request flake | a port is found free, then taken before the server binds it: a real race in the new tests' helpers, fixed by asking for another port | 3 full runs |
-| Ran the new tests only on macOS | that is where the work was | Ubuntu failed a test on the first push, and the failure was a real race macOS timing hid (Q-150): the test was right | 1 CI run |
+| Ran the new tests only on macOS | that is where the work was | Ubuntu failed a test on the first push, and the failure was a real race macOS timing hid (Q-160): the test was right | 1 CI run |
 | "desktop.rs can reach 43.6% at most" | an agent took "needs a window" as the end of it | a real window, a stub `open` on the PATH and a page reporting back reached 92% | 1 test, gated by QUILLO_TEST_WINDOW |
 
 ## Limitations
