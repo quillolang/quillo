@@ -531,6 +531,8 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
 /// out, and `T...` for any number. `error(str)` is an error value.
 const BUILTINS: &[(&str, &str, &str)] = &[
     ("print", "any...", "null"),
+    ("error", "any", "any"),
+    ("args", "", "list"),
     ("str", "any=", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
@@ -705,6 +707,8 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("date.now", "str | null=", "str"),
     ("date.parse", "str, str | null=", "str | error(str)"),
     ("date.valid", "any, str | null=", "bool"),
+    ("date.valid_zone", "any", "bool"),
+    ("re.valid", "any, str | null=", "bool"),
     ("date.of", "int, int, int", "str"),
     ("date.parts", "str", "map"),
     ("date.weekday", "str", "int"),
@@ -879,7 +883,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -1393,6 +1397,8 @@ struct Item {
 }
 
 struct Checker {
+    /// The functions being read in their own `let`.
+    letting: Vec<String>,
     /// Files' text to use instead of what is on disk.
     overrides: HashMap<PathBuf, String>,
     globals: HashMap<String, Var>,
@@ -1534,6 +1540,7 @@ impl Checker {
             services: HashMap::new(),
             hint: None,
             strict_null: false,
+            letting: Vec::new(),
             confined: false,
             uses: 0,
             depth: 0,
@@ -2206,7 +2213,14 @@ impl Checker {
                         self.error(format!("`{}` is private to {}: only {} sees it (make it `public` there, or call something public)", name,
                             private_in.join(" and "), if private_in.len() == 1 { "that file" } else { "each of those files" }));
                     } else {
-                        self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
+                        // `let walk = (n) => walk(n - 1)`: it does not exist yet, and a guess
+                        // at another name helps nobody (FEEDBACK25.md, Q-324; branch
+                        // feedback26-fixes).
+                        if self.letting.iter().any(|l| l == name) {
+                            self.error(format!("`{}` does not exist until its `let` ends: a function that calls itself is a `fn`", name));
+                        } else {
+                            self.error(format!("unknown name `{}`{}", name, if removed.is_empty() { self.suggest(name) } else { removed }));
+                        }
                     }
                 }
                 (T::ANY, None)
@@ -2443,7 +2457,14 @@ impl Checker {
             }
             Stmt::Let(p, e, line) => {
                 self.line = *line;
+                let making = matches!((p, e), (Pattern::Bind(_), Expr::Lambda(_)));
+                if let (true, Pattern::Bind(n)) = (making, p) {
+                    self.letting.push(n.clone());
+                }
                 let t = self.expr(e);
+                if making {
+                    self.letting.pop();
+                }
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
                 let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
@@ -2470,7 +2491,11 @@ impl Checker {
                 // browser sets it, and the server says so if it is ever run there
                 // (FEEDBACK12.md, Q-085; branch feedback12-fixes).
                 let helper = t.vague() && !self.fns.is_empty();
-                if self.in_component().is_none() && !helper {
+                if matches!(o, Expr::Ident(n, _) if n == "session") {
+                    // In a route nothing here is about a page (FEEDBACK26.md, Q-201;
+                    // branch feedback26-fixes).
+                    self.error(format!("cannot set `{}` on `session`: use `set_session({{ {}: ... }})`", name, name));
+                } else if self.in_component().is_none() && !helper {
                     self.error(format!("cannot set `{}`: only the page's objects (an element, an event) have fields that are set, in a component", name));
                 } else if !t.vague() {
                     if t.bits & MAP != 0 {
@@ -3031,6 +3056,12 @@ impl Checker {
             Expr::Pipe(lhs, rhs, line) => {
                 let v = self.expr(lhs);
                 self.line = *line;
+                // `a && xs | any(f)` reads as `(a && xs) | any(f)`, which works while
+                // `a` holds, the case tried first (FEEDBACK25.md, Q-319; branch feedback26-fixes).
+                if let Expr::Binary(op @ (BinOp::And | BinOp::Or), _, _, _) = &**lhs {
+                    let sym = if matches!(op, BinOp::And) { "&&" } else { "||" };
+                    self.warn(format!("`a {sym} xs | f()` reads as `(a {sym} xs) | f()`, as `|` binds looser than `{sym}`: write `a {sym} (xs | f())`"));
+                }
                 // `` `select ... ${q}` | db.query ``: the text is the SQL.
                 let target = match &**rhs {
                     Expr::Call(callee, _, _) => self.sql_target(callee),
@@ -3077,6 +3108,13 @@ impl Checker {
             Expr::Field(obj, name, line) => {
                 let t = self.expr(obj);
                 self.line = *line;
+                // In a component's body it reads as JavaScript's `?.` and gives the right
+                // value, so nothing shows that it remakes the component on each change
+                // (FEEDBACK25.md, Q-305; branch feedback26-fixes). `http.get(u)?.json`,
+                // leaving when a call failed, is what `?` is for.
+                if matches!(&**obj, Expr::Try(x) if matches!(&**x, Expr::Ident(..) | Expr::Field(..))) && self.in_component().is_some() {
+                    self.warn(format!("`x?.{name}` is not optional chaining: `?` leaves on an error, and a component that can leave is remade on each change, which loses the focus of an input. A field of null is null, so write `x.{name}`"));
+                }
                 self.module_member(obj, name);
                 self.field(t, obj, name)
             }
@@ -3191,6 +3229,11 @@ impl Checker {
                 let mut yes = Vec::new();
                 self.facts(c, true, &mut yes);
                 self.under(yes, |s| s.expr(body));
+                // It leaves only by a `return`: nothing comes after it (FEEDBACK25.md,
+                // Q-322; branch feedback26-fixes).
+                if matches!(&**c, Expr::Lit(Lit::Bool(true))) {
+                    return T::NEVER;
+                }
                 T::of(NIL)
             }
             Expr::Block(stmts) => {
@@ -3223,6 +3266,7 @@ impl Checker {
             }
             Expr::Lambda(d) => {
                 self.line = d.line;
+                self.try_at_the_end(d);
                 let hint = self.hint.take();
                 self.lambda_body_hinted(d, hint);
                 T::of(FN)
@@ -3260,6 +3304,7 @@ impl Checker {
             }
             Expr::Lambda(d) => {
                 self.line = d.line;
+                self.try_at_the_end(d);
                 self.lambda_body(d);
                 (T::of(FN), Some(Arc::new(Sig::of_def(d))))
             }
@@ -3267,7 +3312,39 @@ impl Checker {
         }
     }
 
+    /// `map(xs, (x) => f(x)?)`: `?` leaves the lambda, which was ending anyway, so the
+    /// error is one more item and what is around it goes on (FEEDBACK26.md, Q-198;
+    /// branch feedback26-fixes).
+    fn try_at_the_end(&mut self, d: &FnDef) {
+        let last = match &d.body {
+            Expr::Block(stmts) => match stmts.last() {
+                Some(Stmt::Expr(e)) => e,
+                _ => return,
+            },
+            e => e,
+        };
+        if matches!(last, Expr::Try(_)) {
+            self.warn("`?` here changes nothing: it leaves this function, which was ending anyway, so what called it goes on with the error as a value. To stop at the first failure, use a `for` loop, where `?` leaves the function around it".to_string());
+        }
+    }
+
+    /// `re.test(s, "(a+)+$")`: the server's engine takes this in its stride, and the
+    /// browser's backtracks, doubling with each character, with no way to stop it
+    /// (FEEDBACK25.md, Q-315; branch feedback26-fixes).
+    fn pattern_runs_in_runs(&mut self, callee: &Expr, args: &[Expr]) {
+        let Expr::Field(m, _, _) = callee else { return };
+        if !matches!(&**m, Expr::Ident(n, _) if n == "re") {
+            return;
+        }
+        for a in args {
+            if matches!(a, Expr::Lit(Lit::Str(p)) if runs_in_runs(p)) {
+                self.warn("this pattern repeats something that repeats, as `(a+)+`: on the wrong text it can hang a browser tab, with no way to stop it. Bound the counts (`{1,8}`), or run it in a `server fn`".to_string());
+            }
+        }
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<T>) -> T {
+        self.pattern_runs_in_runs(callee, args);
         let line = self.line;
         // `User({ ... })`: a field the record does not have is a mistake.
         if let (Expr::Ident(n, _), Some(Expr::Map(entries)), None) = (callee, args.first(), &pre) {
@@ -3358,7 +3435,8 @@ impl Checker {
                     return T::ANY;
                 }
             }
-            let found = self.method(name);
+            // `error` is a builtin too, but `x.error` on what cannot fail is a mistake.
+        let found = if name == "error" { None } else { self.method(name) };
             let sig = found.as_ref().and_then(|v| v.sig.clone()).filter(|_| recv.bits & MAP == 0);
             let mut all = vec![recv];
             all.extend(pre);
@@ -4067,7 +4145,9 @@ impl Checker {
                     };
                     if let Some(why) = mismatch(*a, p.full) {
                         self.error(format!("{} of `{}` {}{}", what(), name, why, hides(&sig, name)));
-                    } else if divided && p.ty & INT != 0 && p.ty & FLOAT == 0 && a.bits & FLOAT != 0 {
+                    // A parameter that takes decimals takes what `/` gives: rounding
+                    // it would lose the cents (FEEDBACK25.md, Q-321; branch feedback26-fixes).
+                    } else if divided && p.ty & INT != 0 && p.ty & FLOAT == 0 && p.ty & DEC == 0 && a.bits & FLOAT != 0 {
                         self.warn(format!(
                             "{} of `{}` must be an int, and `/` gives one only when it divides evenly (`7 / 2` is 3.5): write `floor(...)` or `round(...)`",
                             what(), name
@@ -4207,18 +4287,19 @@ impl Checker {
             }
         }
         if t.bits & (MAP | NIL) != 0 || t.is_any() {
-            if t.bits & MAP == 0 && t.bits & ERR != 0 && name == "error" {
+            if t.bits & MAP == 0 && t.bits & ERR != 0 && matches!(name, "error" | "message") {
                 return T::of(t.err);
             }
             return T::ANY;
         }
-        if t.bits & ERR != 0 && name == "error" {
+        if t.bits & ERR != 0 && matches!(name, "error" | "message") {
             return T::of(t.err);
         }
         if t.bits & RESP != 0 && matches!(name, "status" | "headers" | "body") {
             return T::ANY;
         }
-        let found = self.method(name);
+        // `error` is a builtin too, but `x.error` on what cannot fail is a mistake.
+        let found = if name == "error" { None } else { self.method(name) };
         match found {
             Some(v) if v.t.bits & FN != 0 => {
                 self.record(name, &v);
@@ -5264,4 +5345,37 @@ fn nesting_problem(stack: &[String], tag: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Whether a pattern has a group holding a run that is itself repeated.
+fn runs_in_runs(p: &str) -> bool {
+    let cs: Vec<char> = p.chars().collect();
+    let mut groups: Vec<bool> = Vec::new();
+    let (mut i, mut class) = (0, false);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            ']' if class => class = false,
+            _ if class => {}
+            '[' => class = true,
+            '(' => groups.push(false),
+            '+' | '*' => {
+                if let Some(g) = groups.last_mut() {
+                    *g = true;
+                }
+            }
+            ')' => {
+                let held = groups.pop().unwrap_or(false);
+                if held && matches!(cs.get(i + 1), Some('+' | '*')) {
+                    return true;
+                }
+                if let Some(g) = groups.last_mut() {
+                    *g |= held;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }

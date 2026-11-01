@@ -1,0 +1,8 @@
+// Q-200 A repeated query parameter or form field keeps only its last value, and asking for a list refuses every request
+// mode: serve
+// get: /many?a=1&a=2
+// open-when: bad request
+// fixed-when: {"a":["1","2"]}
+// From FEEDBACK26.md §Q-200 (found on 5f7f76c).
+
+route GET /many ? { a: [str] } = { a }

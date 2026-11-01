@@ -1,0 +1,13 @@
+// Q-198 `?` in a lambda leaves the lambda, and the route answers 200 with errors in its list
+// mode: serve
+// get: /filter
+// open-when: "g":[]
+// fixed-when: "g":{"error":"internal error"}
+// From FEEDBACK26.md §Q-198 (found on 5f7f76c).
+
+fn r(path: str) = read_file(path)
+
+route GET /filter {
+    let g = filter(["/a", "/b"], (p) => r(p)? != "")
+    { g: g, after: "ran" }
+}

@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "filled", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
-    "set", "remove", "merge", "err", "is_err", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
+    "set", "remove", "merge", "err", "is_err", "error", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
     "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
     // FEEDBACK13.md, Q-091; branch feedback13-fixes.
@@ -2663,6 +2663,9 @@ impl<'a> Compiler<'a> {
                     if def.server || def.component {
                         return self.err("`server fn` and `component` must be declared at the top level");
                     }
+                    // It can see itself, as on the server (FEEDBACK25.md, Q-316; branch
+                    // feedback26-fixes).
+                    self.declare(&def.name, Some(false));
                     let is_async = self.lambda_is_async(def)?;
                     let js = self.declare(&def.name, Some(is_async));
                     decls.push(js.clone());
@@ -2922,6 +2925,17 @@ impl<'a> Compiler<'a> {
                 let t = self.temp();
                 let x = self.expr(a)?;
                 let y = self.expr(b)?;
+                // A stop on the left is guarded against too, as on the server
+                // (FEEDBACK25.md, Q-318; branch feedback26-fixes). Not for a name or a
+                // field, which is most of them. Something that cannot wait stays
+                // without a wait, or a handler would lose its place.
+                let plain = matches!(&**a, Expr::Ident(..) | Expr::Lit(_) | Expr::Field(..) | Expr::Index(..));
+                let x = if plain {
+                    x
+                } else {
+                    let body = format!("try {{ return {x}; }} catch (e) {{ return W.guarded(e); }}");
+                    if x.contains("await ") { self.iife(&body) } else { format!("(() => {{ {body} }})()") }
+                };
                 format!("((({t} = {x}) === null || {t} === undefined || {t} instanceof W.Err) ? {y} : {t})")
             }
             Expr::Pipe(lhs, rhs, line) => {
@@ -2966,6 +2980,11 @@ impl<'a> Compiler<'a> {
                 // `x.js` is no call of `js` with the name x holds.
                 if fb == "B.js" || fb == "B.js_new" {
                     fb = "null".into();
+                }
+                // Read only if the field is missing: a `let n` beside `x.n` must not
+                // make this depend on `n` (FEEDBACK25.md, Q-310; branch feedback26-fixes).
+                if fb.ends_with(".v") || fb.starts_with("$p.") {
+                    fb = format!("new W.Later(() => {})", fb);
                 }
                 // Names Object.prototype has need the careful check for a
                 // map's own key; any other is read directly when present.

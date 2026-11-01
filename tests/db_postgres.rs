@@ -733,7 +733,7 @@ fn a_system_without_certificates_says_so() {
     let empty = d.join("empty.pem");
     std::fs::write(&empty, "").unwrap();
     let file = d.join("app.qwe");
-    std::fs::write(&file, "route GET /open = str(db.open(\"postgres://u@127.0.0.1:1/x?sslrootcert=system\"))\n").unwrap();
+    std::fs::write(&file, "route GET /open = error(db.open(\"postgres://u@127.0.0.1:1/x?sslrootcert=system\"))\n").unwrap();
     let s = support::serve(&file, &[("SSL_CERT_FILE", empty.to_str().unwrap()), ("SSL_CERT_DIR", d.to_str().unwrap())]);
     says(support::send(s.port, "GET", "/open", &[], "").body, "sslrootcert=system: no CA certificates found on this system");
 }

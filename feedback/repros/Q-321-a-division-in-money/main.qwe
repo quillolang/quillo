@@ -1,0 +1,8 @@
+// Q-321 `/` inside `money.of` or `money.mul` warns "must be an int", and the advice would lose the cents
+// mode: check
+// open-when: divides evenly
+// fixed-when: main.qwe: ok
+// From FEEDBACK25.md §Q-321 (found on 5f7f76c).
+
+fn part(price, left: int, days: int) = money.of(price * left / days, "USD", "half_up")
+print(part(100, 1, 3))

@@ -1,0 +1,7 @@
+// Q-317 An unknown time zone cannot be tested for or caught, and one bad prop is a 500
+// mode: run
+// open-when: unknown
+// fixed-when: fallback
+// From FEEDBACK25.md §Q-317 (found on 5f7f76c).
+
+print(date.to_zone("2026-10-27T14:30:00Z", "Mars/Base") ?? "fallback")

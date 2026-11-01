@@ -280,7 +280,8 @@ impl Value {
         }
     }
 
-    /// Text form used by string interpolation and `str()`.
+    /// Text form used by string interpolation and `str()`. An error the program
+    /// did not write stays hidden in it, on a server (see `hiding`).
     pub fn display(&self) -> String {
         match self {
             Value::Str(s) => s.to_string(),
@@ -335,9 +336,14 @@ impl Value {
                 }
                 out.push_str(" }");
             }
-            Value::Err(e, _, _) => {
+            Value::Err(e, own, at) => {
                 out.push_str("err(");
-                e.repr_into(out);
+                if !own && hiding() {
+                    crate::server::log_hidden(e, at);
+                    out.push_str("\"internal error\"");
+                } else {
+                    e.repr_into(out);
+                }
                 out.push(')');
             }
             other => other.scalar_repr(out),
@@ -470,6 +476,32 @@ thread_local! {
     static JS_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A server hides errors the program did not write: their text may hold an address
+/// with its password, or a path. Turned into text they would lose the mark that says
+/// so, and go out in a template string or `str()` with a 200, so here they are hidden
+/// as they are turned into text, and said in the log (FEEDBACK26.md, Q-197; branch
+/// feedback26-fixes). Not under `--watch`, where errors are shown to their author, and
+/// not in a script, which has no visitors.
+pub static HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// For `told`: text that goes to the log, not to a visitor.
+    static TOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn hiding() -> bool {
+    HIDING.load(std::sync::atomic::Ordering::Relaxed) && !TOLD.with(|t| t.get())
+}
+
+/// `f`, which makes text that stays on this machine, with errors as they are. It
+/// does not wait: another request on this thread must not run inside it.
+pub fn told<R>(f: impl FnOnce() -> R) -> R {
+    let was = TOLD.with(|t| t.replace(true));
+    let r = f();
+    TOLD.with(|t| t.set(was));
+    r
+}
+
 /// Runs `f` writing floats as JavaScript does (or not), as it was after.
 pub fn js_numbers<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let was = JS_NUMBERS.with(|j| j.replace(on));
@@ -478,9 +510,8 @@ pub fn js_numbers<R>(on: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// A number as JavaScript's `String(x)` writes it: `8` for 8.0, an
-/// exponent from 1e21 up and below 1e-6 (`1e+21`, `1.5e-7`). An infinity is
-/// `inf`, as everywhere else on both sides (FEEDBACK16.md, Q-120; branch
+/// A number as the page writes it: `8` for 8.0, with no exponent. An infinity
+/// is `inf`, as everywhere else on both sides (FEEDBACK16.md, Q-120; branch
 /// feedback20-fixes).
 pub fn js_number(f: f64) -> String {
     if f.is_nan() {
@@ -499,15 +530,14 @@ pub fn js_number(f: f64) -> String {
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let k = digits.len() as i32;
     let n = exp.parse::<i32>().unwrap_or(0) + 1;
-    let text = if k <= n && n <= 21 {
+    // Never in exponent form, on either side (FEEDBACK25.md, Q-309; branch
+    // feedback26-fixes).
+    let text = if k <= n {
         format!("{}{}", digits, "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
+    } else if 0 < n {
         format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{}", "0".repeat((-n) as usize), digits)
     } else {
-        let e = if n - 1 >= 0 { format!("+{}", n - 1) } else { (n - 1).to_string() };
-        if k == 1 { format!("{}e{}", digits, e) } else { format!("{}.{}e{}", &digits[..1], &digits[1..], e) }
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
     };
     if f < 0.0 { format!("-{}", text) } else { text }
 }
@@ -560,6 +590,17 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Dec(x), Value::Dec(y)) => Some(x.cmp(*y)),
         (Value::Dec(x), Value::Int(y)) => Some(x.cmp(crate::decimal::Dec::from_i64(*y))),
         (Value::Int(x), Value::Dec(y)) => Some(crate::decimal::Dec::from_i64(*x).cmp(*y)),
+        // Item by item, which is how to sort by several keys: `sort_by(rows, (r) =>
+        // [r.a, r.b])` (FEEDBACK25.md, Q-320; branch feedback26-fixes).
+        (Value::List(x), Value::List(y)) => {
+            for (p, q) in x.iter().zip(y.iter()) {
+                match compare(p, q)? {
+                    Ordering::Equal => {}
+                    other => return Some(other),
+                }
+            }
+            Some(x.len().cmp(&y.len()))
+        }
         _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
 }
@@ -1036,11 +1077,16 @@ mod tests {
 
 #[cfg(test)]
 mod js_number_tests {
-    /// What Node's `String(x)` gives for each.
+    /// What Node's `String(x)` gives for each, with no exponent.
     #[test]
     fn numbers_are_written_as_javascript_writes_them() {
         let xs = [8.0, 2.5, 0.1 + 0.2, 1e21, 1.5e-7, 1e-6, 123456789012345680000.0, -0.000001234, 1e300, 5e-324, -42.0, 100.0, 0.5, 1.0 / 3.0, 9007199254740992.0, 1e16, 12345.6789];
-        let js = "8 2.5 0.30000000000000004 1e+21 1.5e-7 0.000001 123456789012345680000 -0.000001234 1e+300 5e-324 -42 100 0.5 0.3333333333333333 9007199254740992 10000000000000000 12345.6789";
+        let js = format!(
+            "8 2.5 0.30000000000000004 1{} 0.00000015 0.000001 123456789012345680000 -0.000001234 1{} 0.{}5 -42 100 0.5 0.3333333333333333 9007199254740992 10000000000000000 12345.6789",
+            "0".repeat(21),
+            "0".repeat(300),
+            "0".repeat(323)
+        );
         assert_eq!(xs.iter().map(|x| super::js_number(*x)).collect::<Vec<_>>().join(" "), js);
     }
 }

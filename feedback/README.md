@@ -37,6 +37,8 @@ cooperative: members, savings, fixed deposits, a loan designer, loans approved b
 [FEEDBACK22.md](reports/FEEDBACK22.md) (no app: what predictive preloading would take, and what prefetching does today after a write or a logout, in a prerender, and under load),
 [FEEDBACK23.md](reports/FEEDBACK23.md) (no app: how Quillo can run a saga across its services, tested with four services through crashes and refusals, and what stands in the way),
 [FEEDBACK24.md](reports/FEEDBACK24.md) (no app: how `live()` holds up with large records and 1000 active users, from reading, and how a form is made idempotent),
+[FEEDBACK25.md](reports/FEEDBACK25.md) (no app: 100 smart components for the kit, each doing real work in the browser, and where the server and the browser differ),
+[FEEDBACK26.md](reports/FEEDBACK26.md) (no app: 100 more plugins, and how an error's text, a repeated field and a script's arguments are handled),
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

@@ -48,6 +48,7 @@ options for `run`:
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
   --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
+  -- a b         what follows is the program's, for args()
   --live-per-client N  pages one client may have waiting for live data (default 256)
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
@@ -120,7 +121,16 @@ is the page the window opens on (default /).";
 static ALLOC: quillo::alloc::Split = quillo::alloc::Split;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // `quillo run tool.qwe -- a b`: what follows is the program's, for `args()`
+    // (FEEDBACK26.md, Q-202; branch feedback26-fixes).
+    if args.get(1).is_some_and(|c| c == "run" || c.ends_with(".qwe")) {
+        if let Some(at) = args.iter().position(|a| a == "--") {
+            let theirs = args.split_off(at + 1);
+            args.pop();
+            let _ = quillo::builtins::PROGRAM_ARGS.set(theirs);
+        }
+    }
     // The window must run on the main thread (macOS requires it); the
     // program gets a thread of its own.
     if args.get(1).map(String::as_str) == Some("app") {

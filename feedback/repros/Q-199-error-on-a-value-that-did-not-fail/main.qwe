@@ -1,0 +1,12 @@
+// Q-199 `.error` on a value that did not fail is null for a map and a 500 for a str or int
+// mode: serve
+// get: /text
+// open-when: GET /text -> 500
+// fixed-when: {"v":null}
+// From FEEDBACK26.md §Q-199 (found on 5f7f76c).
+
+fn pick(k: str) = json.parse(k)
+route GET /text {
+    let s = pick("\"text\"")
+    { v: s.error }
+}

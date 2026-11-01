@@ -1,0 +1,17 @@
+// Q-314 List `set` is quadratic on both sides and `push` in the browser, though the guide says in place
+// mode: run
+// open-when: slow
+// fixed-when: fast
+// From FEEDBACK25.md §Q-314 (found on 5f7f76c).
+
+fn fill(n) {
+    let xs = range(0, n)
+    for i in range(1, n) {
+        xs = set(xs, i, xs[i - 1] + 1)
+    }
+    xs[n - 1]
+}
+
+let t = now()
+fill(50000)
+print(now() - t < 1000 ? "fast" : "slow")

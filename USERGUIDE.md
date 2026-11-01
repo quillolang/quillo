@@ -38,6 +38,7 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency); not with `--watch`, `--register` or `--split` |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
+| `-- a b` | what follows is the program's: `args()` gives `["a", "b"]`, for a script |
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
@@ -515,8 +516,13 @@ match event {
 
 `err(x)` makes an error value. Builtins such as `int("abc")` and `json.parse`
 return errors instead of crashing. `?` after an expression returns the error from
-the current function, and `??` falls back when the left side is null or an error.
-Field access on null gives null (so there is no need for `?.`):
+the current function, and `??` falls back when the left side is null or an error, or
+could not be worked out: `1m / 0m ?? 0m`, `date.of(y, m, d) ?? today`,
+`re.test(s, typed) ?? false`. Without `??`, such a stop ends the request with a 500, so
+a total that overflows cannot go on as a value and reach the database unseen; with it,
+you have said what to do. `is_err(r)` asks whether a value failed and `error(r)` (or
+`r.error`, `r.message`) what it says, and on any other value that is null. Field access
+on null gives null (so there is no need for `?.`):
 
 ```quillo
 fn parse_age(s: str) -> int ! str =
@@ -527,6 +533,16 @@ fn parse_age(s: str) -> int ! str =
 fn next_year(s) = parse_age(s)? + 1         // err("bad age: x") for "x"
 let age = int(request.query.age) ?? 18
 ```
+
+`?` leaves the function it is written in, and in a lambda that is the lambda:
+`map(xs, (x) => f(x)?)` gives a list with the errors in it and goes on, and `quillo
+check` says so. To stop at the first failure, use a `for` loop, where `?` leaves the
+function around it. `filter`, `find`, `any`, `all` and `count` give back an error their
+function gives, since it has said neither yes nor no, so `filter(xs, f)?` stops there;
+`map` keeps each result, an error too. In a component's body, `?` and `return` are ways
+out of it, so a body with one is made again whole on each change, which loses the focus
+of an input; `x?.y` is such a `?`, and `quillo check` says so. A field of null is null, so
+write `x.y`.
 
 `! T` in a signature declares what the function's errors contain. It is checked: a
 function declared `! str` that returns `err(42)` is a runtime error, and `quillo check`
@@ -587,7 +603,7 @@ Functions without `with` may do anything.
 
 ### HTML literals
 
-HTML is a value, not a string. It is written like JSX: text goes in as it is,
+HTML is a value, not a string. It is written like JSX, with no `<>` fragments: text goes in as it is,
 expressions go in `{...}`, and everything is escaped unless it is already HTML:
 
 ```quillo
@@ -902,10 +918,17 @@ route GET / = <html><body><Counter start={5}/></body></html>
   | `<quillo-media>` | `data-state`: `connecting`, `waiting`, `playing`, `ended`, `unsupported`; one that sends: `starting`, `sending`, `refused`, `ended`, `unsupported` |
   | a component's `style` | `data-q-<id>` on the elements it writes |
 - In the browser, numbers are JavaScript numbers, so a whole float such as `2.0` prints
-  as `2`. While the server renders a component it writes numbers the same way (`8`,
-  `1e+21`), so the page it sends is the one the browser would make and is taken up, not
-  made again. Arithmetic gives the same results on both sides. Elsewhere the server
-  writes `2.0`. With `--watch`, a component the browser had to make again says which,
+  as `2`, and `json.stringify(json.parse("1.0"))` gives `1`. While the server renders a
+  component it writes numbers the same way, so the page it sends is the one the browser
+  would make and is taken up, not made again. Neither side uses an exponent. Arithmetic
+  gives the same results on both sides: ints stay exact past 2^53, to 64 bits, as do
+  those from `json.parse` where the browser says what the text was (Chrome, Edge,
+  Firefox and Safari since 2025). Elsewhere the server writes `2.0`. `math.*` may differ
+  in the last digits, as each side has its own library.
+- A map keeps its keys in order on the server. In the browser, keys that look like whole
+  numbers come first, in number order, as in any JavaScript object, so `keys`, `values`
+  and `for [k, v] in m` over `group_by(xs, (x) => x.id)` can differ, and a page showing
+  such a map is made again. Sort the keys, or keep a list. With `--watch`, a component the browser had to make again says which,
   and what differed, in the console.
 
 ### Composition
@@ -964,6 +987,8 @@ component Dashboard() {
   when it changes, give the component a `key` that changes with it. There is no hook
   that says the prop changed under a state copied from it: the `key` starts afresh, and
   loses what was typed.
+- A function called in markup with a state, `{tick(on)}`, makes its elements anew at each
+  change, so an input in it loses the focus: use a `view`, whose props are live.
 - A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
   component) is called again as a whole when what it is given changes.
 - Views are plain functions: they have no state and add nothing to the browser bundle
@@ -1804,9 +1829,13 @@ route METHOD /path { ... block ... }
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them.
+  A name sent more than once keeps its last value in `request.query` and `request.form`;
+  a list in the pattern takes them all, as a group of checkboxes sends: `? { tag: [str] }`
+  gives `["a", "b"]` for `?tag=a&tag=b`, one value a list of one, and none an empty list.
+  So does `{ form: { tag: [str] } }`, for a urlencoded form.
 - **Request pattern:** matched against the `request` map. Its fields, and all of them:
-  `method`, `path`, `query`, `params`, `headers`, `cookies`, `body`, `json`, `form`,
-  `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
+  `method`, `path`, `query`, `query_string` (the query as it came), `params`, `headers`,
+  `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
   are `tenant()` and `locale()`. JSON is matched strictly: the string `"7"` is not an
   int. Form fields, headers and cookies are converted like query values. `{ json: User }`
   takes the body as a [record](#records). A pattern on the host is a pattern on the
@@ -2091,10 +2120,13 @@ fn touch() {
 
 - An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
   made says `internal error` instead, wherever it would reach a visitor: as a route's
-  value, inside a map or list, in markup, or from a `server fn`. A database's has the SQL
+  value, inside a map or list, in markup, or from a `server fn`, and when it is turned
+  into text: a template string, `str`, `join`, `json.stringify`. A database's has the SQL
   and the tables, an `http` call's the address with its key, a file's its path, so that
-  text goes to the log. `--watch` shows it, and code on the server still reads it:
-  `db.error_kind(r)`, `is_err(r)`, `error(r)`. To show a visitor something, say it:
+  text goes to the log with the request. `print` shows it too, as `--watch` and a script
+  do, and code on the server still reads it: `db.error_kind(r)`, `is_err(r)`, `error(r)`.
+  What is read that way is plain text, no longer protected: `{ line: error(r) }` sends
+  it. To show a visitor something, say it:
   `err("Billing is down, try again soon")`. A service's own `err` reaches its caller's
   visitors in the same way.
 - A failed request's line in the log names it, with the id in its `x-request-id`:
@@ -3097,8 +3129,13 @@ stays the simpler choice when the next move depends on the answer.
   match and `$`, or a function given the match) and `re.split`. A match is
   `{ text, start, end, groups, named }`, positions counting characters as `slice` does.
   Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
-  matches line breaks too). They give the same answers on the server and in the
-  browser, so a pattern takes only what both read alike: characters, `.`, `[...]`,
+  matches line breaks too). `re.valid(p, flags)` asks whether a pattern can be run, for
+  one from data. They give the same answers on the server and in the browser, but for
+  groups in a loop (`(?:(a)|b)*` on `ab`, where the browser clears `(a)` on each round), and
+  not at the same cost: the server's engine takes the same time on any text, and the
+  browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
+  check` warns of. Bound the counts (`{1,8}`), or run a visitor's own pattern in a `server
+  fn`. So a pattern takes only what both read alike: characters, `.`, `[...]`,
   `\d \w \s \b` (ASCII digits and word characters, as in JavaScript) and their capitals,
   `^ $`, `(...)`, `(?:...)`, `(?<name>...)`, `|`, and `* + ? {n} {n,} {n,m}` (lazy with
   `?`). Lookaround, backreferences and `\p{...}` are errors, found by `quillo check`
@@ -3153,11 +3190,12 @@ What each does at its edges, where the answer is not what another language would
 
 | Call | Gives |
 |---|---|
-| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together) and strings (by code point: `"B"` before `"a"`) order; `null`, booleans, lists, maps, a string with a number, or a decimal with a float are an error |
+| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item; no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together) and strings (by code point: `"B"` before `"a"`) order; `null`, booleans, lists, maps, a string with a number, or a decimal with a float are an error |
 | `split(s, sep = " ")` | at each single `sep` (`"a  b"` is `["a", "", "b"]`); `split(s, "")` is the characters; no limit |
 | `join(xs, sep = "")` | the items as text, with `sep` between |
 | `filled(x)` | `x`, or `null` for `""`, so `filled(name) ?? "anonymous"` replaces a blank or missing name; `0`, `false`, `[]` and `" "` stay as they are (`filled(trim(x))` counts spaces as blank) |
 | `slice(x, start, end)` | negative positions from the end; both kept within the list or string; `end` before `start` gives an empty one |
+| `take(x, n)`, `drop(x, n)` | a negative `n` counts as 0, unlike `slice`: `take(xs, -2)` is empty, `drop(xs, -1)` all of it, so a count worked out by subtraction stays safe |
 | `range(n)`, `range(a, b)`, `a..b` | `b` left out, step 1, empty when `b <= a`; no step; at most ten million |
 | `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key |
 | `unique(xs)` | the first of equal items (equal as `==` says) |
@@ -3299,7 +3337,8 @@ text: `set(m, 5, x)` keys it `"5"`, and `m[5]`, `get(m, 5)` and `has(m, 5)` read
 or list built in a loop with `m = set(m, k, v)` (or `push`, `merge`, `remove`), or as
 `reduce`'s total with `(m, x) => set(m, ...)`, is changed in place, since nothing else
 holds it: building one of 20,000 takes milliseconds. Where something else still holds
-it (the loop reads `m` in the same call, say), each step copies it. `flatten` takes one
+it (a second name for it, say), each step copies it. In the browser a list's `push` and
+`set` always copy, so build a long list there with `for`, or `flatten` chunks. `flatten` takes one
 level off: `flatten(flatten(xs))` for two.
 
 ### Files of a program
@@ -3682,7 +3721,9 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
 - **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
   milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
   way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
-- **Time zones:** `date.to_zone(t, tz)` is the same instant at the zone's offset then
+- **Time zones:** `date.valid_zone(z)` asks whether a zone exists, for one a person typed;
+  a zone it does not know stops the call, so `date.to_zone(t, z) ?? t` guards it too.
+  `date.to_zone(t, tz)` is the same instant at the zone's offset then
   (daylight saving included); `date.date_in(t, tz)` its calendar date there;
   `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go
   forward is moved forward by the gap, 02:30 becoming 03:30; a time that happens twice

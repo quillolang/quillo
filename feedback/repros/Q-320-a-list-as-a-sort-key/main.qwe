@@ -1,0 +1,7 @@
+// Q-320 Three type errors pass `quillo check` through an untyped parameter
+// mode: run
+// open-when: cannot compare list with list
+// fixed-when: [1, 2]
+// From FEEDBACK25.md §Q-320 (found on 5f7f76c).
+
+print(sort_by([{ a: 2, b: 1 }, { a: 1, b: 2 }], (x) => [x.a, x.b]) | map((x) => x.a))

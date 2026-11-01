@@ -1,0 +1,10 @@
+// Q-323 An error value's message cannot be read
+// mode: run
+// flags: --no-check
+// open-when: no field
+// fixed-when: invalid JSON
+// From FEEDBACK25.md §Q-323 (found on 5f7f76c).
+
+let e = json.parse("[1,")
+print(e.message)
+print(error(e))

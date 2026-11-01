@@ -597,7 +597,13 @@ impl Parser {
                 if let Some(h) = old_syntax_hint(&other) {
                     return self.err_at(h);
                 }
-                self.err_at(format!("expected end of statement, found {}", other.describe()))
+                // What a JavaScript habit gets here (FEEDBACK25.md, Q-324; branch
+                // feedback26-fixes).
+                match other {
+                    Tok::Comma => self.err_at("expected end of statement, found `,`: there is one `let` to a line"),
+                    Tok::Colon => self.err_at("expected end of statement, found `:`: a map's key is a name or text, and for one in a variable use `set(m, k, v)`"),
+                    _ => self.err_at(format!("expected end of statement, found {}", other.describe())),
+                }
             }
         }
     }
@@ -1768,6 +1774,9 @@ impl Parser {
                                 break;
                             }
                         }
+                        if p.at(&Tok::FatArrow)? {
+                            return p.err_at("a function's parameters are plain names, not patterns: `(p) => p[0] + p[1]`");
+                        }
                         p.expect(&Tok::RParen, "`)` after arguments")?;
                         Ok(args)
                     })?;
@@ -1865,7 +1874,8 @@ impl Parser {
                 if self.peeked.is_none() && self.lx.peek_char().map_or(false, |c| c.is_alphabetic()) {
                     self.parse_html(line)
                 } else {
-                    Err(QuilloError::new("expected an expression, found `<`", line))
+                    let fragment = self.peeked.is_none() && self.lx.peek_char() == Some('>');
+                    Err(QuilloError::new(if fragment { "there are no `<>` fragments: wrap the elements in one, like <div>, or give a list" } else { "expected an expression, found `<`" }, line))
                 }
             }
             Tok::Ident(k) => match k.as_str() {

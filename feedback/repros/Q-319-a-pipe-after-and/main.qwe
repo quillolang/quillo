@@ -1,0 +1,7 @@
+// Q-319 `a && xs | f()` passes `quillo check`, and fails only when `a` is false
+// mode: check
+// fixed-when: binds looser
+// From FEEDBACK25.md §Q-319 (found on 5f7f76c).
+
+fn f(xs, y) = y != null && xs | any((x) => x == 1)
+print(f([1], 2))

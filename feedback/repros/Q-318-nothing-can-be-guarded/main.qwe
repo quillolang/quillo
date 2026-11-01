@@ -1,0 +1,14 @@
+// Q-318 Nothing else can be guarded either: there is no `try`, and `??` catches only some errors
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { o: document.getElementById("o").textContent };
+// open-when: "o": ""
+// fixed-when: "o": "caught"
+// From FEEDBACK25.md §Q-318 (found on 5f7f76c).
+
+component P() {
+    state o = ""
+    <div><button id="go" @click={() => { o = str(1m / 0m ?? "caught") }}>go</button><p id="o">{o}</p></div>
+}
+
+route GET / = <html><body><P/></body></html>

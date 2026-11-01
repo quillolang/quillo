@@ -1,0 +1,14 @@
+// Q-300 In the browser, an int computed past 2^53 loses units, with no error
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { o: document.getElementById("o").textContent };
+// open-when: "o": "12000000000000000"
+// fixed-when: "o": "12000000000000001"
+// From FEEDBACK25.md §Q-300 (found on 5f7f76c).
+
+component P() {
+    state o = ""
+    <div><button id="go" @click={() => { o = str(4000000000000000 * 3 + 1) }}>go</button><p id="o">{o}</p></div>
+}
+
+route GET / = <html><body><P/></body></html>

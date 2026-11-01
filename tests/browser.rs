@@ -238,8 +238,8 @@ fn table_rows_and_numbers_are_taken_up_as_written() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let r = run_page_with(&chrome, &dir.join("tables.qwe"), free_port(), Some(&dir.join("tables.js")));
     let want = serde_json::json!({
-        "server": { "top": ["aoff", "boff"], "sheet": ["xoff", "yoff"], "options": ["one", "two"], "score": "8 days, 8.04e+22 0" },
-        "after": { "top": ["aoff", "bon"], "sheet": ["xon", "yoff", "zon"], "score": "8 days, 8.04e+22 1" },
+        "server": { "top": ["aoff", "boff"], "sheet": ["xoff", "yoff"], "options": ["one", "two"], "score": "8 days, 80400000000000000000000 0" },
+        "after": { "top": ["aoff", "bon"], "sheet": ["xon", "yoff", "zon"], "score": "8 days, 80400000000000000000000 1" },
         "wrapped": 0,
         "rows": 3,
         "remade": 0,
@@ -740,6 +740,40 @@ fn a_loader_with_a_gap_refreshes_no_oftener() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let r = run_page_with(&chrome, &dir.join("gap.qwe"), free_port(), Some(&dir.join("gap.js")));
     assert_eq!(r, serde_json::json!({ "errors": [], "refreshes_few": true, "ended_with_the_last": "10" }));
+}
+
+/// What differed between the server and the browser, and what stopped a page
+/// (FEEDBACK25.md; branch feedback26-fixes).
+#[test]
+fn the_server_and_the_browser_agree() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("sides.qwe"), free_port(), Some(&dir.join("sides.js")));
+    assert_eq!(r["differ"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    let v = &r["values"];
+    assert_eq!(v["computed"], "12000000000000001", "{}", r);
+    assert_eq!(v["last_digit"], 1);
+    assert_eq!(v["huge"], "1000000000000000000000");
+    assert_eq!(v["json_int"], "9007199254740993");
+    assert_eq!(v["constructor"], 1);
+    assert_eq!(v["local_fn"], 3);
+    assert_eq!(v["sorted"], serde_json::json!([11, 12, 21]));
+    for k in ["guard_dec", "guard_date", "guard_pattern", "guard_zone"] {
+        assert_eq!(v[k], "caught", "{}", k);
+    }
+    assert_eq!(v["valid_zone"], serde_json::json!([true, false, true, false]));
+    assert_eq!(v["valid_pattern"], serde_json::json!([true, false]));
+    for k in ["filtered", "found", "any_of", "all_of", "counted", "message"] {
+        assert_eq!(v[k], true, "{}", k);
+    }
+    assert_eq!(r["inner_gone"], true);
+    assert_eq!(r["typed"], "hello");
+    assert_eq!(r["field"], "hello");
+    assert_eq!(r["cr"], 4);
 }
 
 /// A prerender runs nothing until it is shown, and then runs as any page (FEEDBACK22.md,

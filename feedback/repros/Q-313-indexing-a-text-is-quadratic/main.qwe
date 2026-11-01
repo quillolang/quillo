@@ -1,0 +1,25 @@
+// Q-313 `s[i]` copies the whole string in the browser, so a loop over a text is quadratic
+// mode: browser
+// page: /
+// probe: const t0 = performance.now(); document.getElementById("go").click(); for (let i = 0; i < 200 && !document.getElementById("o").textContent; i++) await new Promise((r) => setTimeout(r, 50)); return { fast: performance.now() - t0 < 2500 };
+// open-when: "fast": false
+// fixed-when: "fast": true
+// From FEEDBACK25.md §Q-313 (found on 5f7f76c).
+
+fn count(n) {
+    let s = repeat("a", n)
+    let c = 0
+    for i in range(0, n) {
+        if s[i] == "a" {
+            c += 1
+        }
+    }
+    c
+}
+
+component P() {
+    state o = ""
+    <div><button id="go" @click={() => { o = str(count(100000)) }}>go</button><p id="o">{o}</p></div>
+}
+
+route GET / = <html><body><P/></body></html>

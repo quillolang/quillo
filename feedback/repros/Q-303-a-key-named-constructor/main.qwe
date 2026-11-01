@@ -1,0 +1,16 @@
+// Q-303 In the browser, reading a map by index throws if the map holds the key `constructor`
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { o: document.getElementById("o").textContent };
+// open-when: "o": ""
+// fixed-when: "o": "1"
+// From FEEDBACK25.md §Q-303 (found on 5f7f76c).
+
+fn read(m, k) = m[k]
+
+component P() {
+    state o = ""
+    <div><button id="go" @click={() => { o = str(read(json.parse("{\"constructor\":1}"), "constructor")) }}>go</button><p id="o">{o}</p></div>
+}
+
+route GET / = <html><body><P/></body></html>

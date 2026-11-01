@@ -1,0 +1,38 @@
+// Q-197 A hidden error's text reaches a visitor through a template string or `str()`
+// mode: serve
+// get: /text
+// get: /str
+// get: /markup
+// get: /json
+// get: /joined
+// open-when: value: err("read_file
+// fixed-when: value: err("internal error")
+// fixed-when: {"line":"err(\"internal error\")"}
+// From FEEDBACK26.md §Q-197 (found on 5f7f76c).
+
+fn r(path: str) = read_file(path)
+
+route GET /text {
+    let x = r("/nope/secret-path.txt")
+    `value: ${x}`
+}
+
+route GET /str {
+    let x = r("/nope/secret-path.txt")
+    { line: str(x) }
+}
+
+route GET /markup {
+    let x = r("/nope/secret-path.txt")
+    <p>{`${x}`}</p>
+}
+
+route GET /json {
+    let x = r("/nope/secret-path.txt")
+    { line: json.stringify({ x }) }
+}
+
+route GET /joined {
+    let x = r("/nope/secret-path.txt")
+    join([x], ",")
+}

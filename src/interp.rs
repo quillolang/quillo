@@ -221,6 +221,8 @@ pub struct Interp {
     /// what it wrote and also read does not wake it again (FEEDBACK13.md,
     /// Q-090; branch feedback13-fixes).
     pub(crate) own_seqs: Vec<u64>,
+    /// In a template string written straight in `print(...)`.
+    printing: bool,
     /// Running a scheduled job or a tick, not a request: its `sleep` ends at a
     /// stop or a reload (FEEDBACK12.md, Q-081 and Q-082; branch feedback12-sleep).
     pub(crate) in_job: bool,
@@ -392,6 +394,11 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
 }
 
 /// Converts request text to the type a pattern asks for.
+/// Whether `??` may take a stop: not one that means the request must end.
+fn guardable(msg: &str) -> bool {
+    !msg.contains(PREFETCH_REFUSED) && !msg.contains("--max-compute") && !msg.contains("the script ")
+}
+
 pub fn coerce(t: &str, s: &str) -> Option<Value> {
     let s = s.trim();
     match t {
@@ -921,6 +928,7 @@ impl Interp {
             is_service: false,
             retired: Default::default(),
             own_seqs: Vec::new(),
+            printing: false,
             in_job: false,
             env_file: Default::default(),
             declared_services: Default::default(),
@@ -1006,6 +1014,7 @@ impl Interp {
             is_service: self.is_service,
             retired: self.retired.clone(),
             own_seqs: Vec::new(),
+            printing: false,
             in_job: self.in_job,
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
@@ -1774,7 +1783,13 @@ impl Interp {
                 binop(*op, x, y, *line)
             }
             Expr::Coalesce(a, b) => {
-                let v = self.eval(a, env)?;
+                // What the left side could not work out is a value to guard against
+                // too: bad input stops a decimal's `/`, `date.of` or a pattern, and
+                // there is no `try` (FEEDBACK25.md, Q-318; branch feedback26-fixes).
+                let v = match self.eval(a, env) {
+                    Err(Ctrl::Error(e)) if guardable(&e.msg) => Value::Nil,
+                    other => other?,
+                };
                 if matches!(v, Value::Nil | Value::Err(..)) {
                     self.eval(b, env)
                 } else {
@@ -2013,11 +2028,10 @@ impl Interp {
         if bname != fname.as_str() {
             return Ok(None);
         }
-        let mut reads = false;
-        for a in &args[1..] {
-            crate::client::each_expr(a, &mut |x| reads |= matches!(x, Expr::Ident(n, _) if n == name));
-        }
-        if reads || lookup_global(env, name).map_or(true, |(_, global)| global) {
+        // The other arguments are worked out first, so they may read it: what they
+        // keep of it holds it, and it is then copied (FEEDBACK25.md, Q-314; branch
+        // feedback26-fixes).
+        if lookup_global(env, name).map_or(true, |(_, global)| global) {
             return Ok(None);
         }
         let mut vals = Vec::with_capacity(args.len());
@@ -2271,8 +2285,14 @@ impl Interp {
         if let Some(p) = pre {
             argv.push(p);
         }
+        // `print(`it failed: ${r}`)` is the program's own log (FEEDBACK26.md, Q-197;
+        // branch feedback26-fixes).
+        let printing = matches!(f, Value::Builtin("print", _));
         for a in args {
-            argv.push(self.eval(a, env)?);
+            self.printing = printing && matches!(a, Expr::Template(_));
+            let v = self.eval(a, env);
+            self.printing = false;
+            argv.push(v?);
         }
         self.db_on = db_on;
         self.call(&f, argv, line)
@@ -2305,7 +2325,7 @@ impl Interp {
                 }
                 _ => {}
             },
-            Value::Err(e, _, _) if name == "error" => return Ok((**e).clone()),
+            Value::Err(e, _, _) if name == "error" || name == "message" => return Ok((**e).clone()),
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
@@ -2324,6 +2344,12 @@ impl Interp {
             }
         }
         if matches!(v, Value::Map(_)) {
+            return Ok(Value::Nil);
+        }
+        // A value that did not fail has no error, whatever it is, as for a map: a value
+        // whose type nothing checked must not stop a route for asking (FEEDBACK26.md,
+        // Q-199; branch feedback26-fixes).
+        if matches!(name, "error" | "message") && !matches!(v, Value::Err(..)) {
             return Ok(Value::Nil);
         }
         fail(line, format!("{} has no field `{}`", v.type_name(), name))
@@ -2938,6 +2964,17 @@ impl Interp {
                 }
                 None => None,
             },
+            // `{ tag: [str] }` in a query or a form: every value of that name
+            // (FEEDBACK26.md, Q-200; branch feedback26-fixes).
+            Pattern::List(items, None) if lenient && items.len() == 1 => {
+                let Value::List(l) = v else { return Ok(None) };
+                let mut out = Vec::with_capacity(l.len());
+                for x in l.iter() {
+                    let Some(y) = self.match_pat(&items[0], x, mode, env, binds)? else { return Ok(None) };
+                    out.push(y);
+                }
+                Some(Value::list(out))
+            }
             Pattern::List(items, rest) => {
                 let Value::List(l) = v else { return Ok(None) };
                 if l.len() < items.len() || (rest.is_none() && l.len() != items.len()) {
@@ -3328,6 +3365,7 @@ impl Interp {
                 TPart::Expr(x) => match self.eval(x, env)? {
                     Value::Str(t) => out.push_str(&t),
                     Value::Int(n) => push_int(out, n),
+                    v if self.printing => out.push_str(&crate::value::told(|| v.display())),
                     v => out.push_str(&v.display()),
                 },
             }
@@ -3376,6 +3414,15 @@ impl Interp {
                 out.push_str(name);
                 out.push_str("=\"");
                 escape_into(&v.json_text(), out);
+                out.push('"');
+            }
+            // The HTML parser folds a CR, so `value={s}` would read otherwise here than
+            // after an update (FEEDBACK25.md, Q-312; branch feedback26-fixes).
+            Value::Str(s) if s.contains('\r') => {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                out.push_str(&escape(s).replace('\r', "&#13;"));
                 out.push('"');
             }
             other => {

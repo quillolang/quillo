@@ -1,0 +1,11 @@
+// Q-305 `x?.y` is accepted, and quietly rebuilds the whole component on every change
+// mode: check
+// fixed-when: is not optional chaining
+// From FEEDBACK25.md §Q-305 (found on 5f7f76c).
+
+component C() {
+    state s = 1
+    let shown = s == 1 ? null : { text: "a" }
+    <p>{shown?.text}</p>
+}
+route GET / = <html><body><C/></body></html>

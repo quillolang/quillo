@@ -73,6 +73,35 @@ pub fn parse_urlencoded(s: &str) -> Map {
     m
 }
 
+/// `req` as `request`, its form as `all_values` makes it, for `{ form: { tag: [str] } }`.
+fn form_lists(pat: Option<&crate::ast::Pattern>, reqv: &Value, req: &HttpRequest) -> Option<Value> {
+    let Some(crate::ast::Pattern::Record(fields)) = pat else { return None };
+    let f = fields.iter().find(|f| f.path.len() == 1 && f.path[0] == "form")?;
+    let Value::Map(m) = reqv else { return None };
+    let form = all_values(&f.pat, m.get("form")?, &String::from_utf8_lossy(&req.body))?;
+    let mut out = (**m).clone();
+    out.insert("form".into(), form);
+    Some(Value::map(out))
+}
+
+/// `m` with the names `pat` asks a list of holding all their values in `raw`, and
+/// none when they are absent, as a group of checkboxes with nothing ticked sends
+/// nothing (FEEDBACK26.md, Q-200; branch feedback26-fixes).
+fn all_values(pat: &crate::ast::Pattern, m: &Value, raw: &str) -> Option<Value> {
+    let crate::ast::Pattern::Record(fields) = pat else { return None };
+    let Value::Map(map) = m else { return None };
+    let names: Vec<&String> = fields.iter().filter(|f| f.path.len() == 1 && matches!(f.pat, crate::ast::Pattern::List(_, None)) && f.pat.is_type_test()).map(|f| &f.path[0]).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut out = (**map).clone();
+    for n in names {
+        let all = raw.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).filter(|(k, _)| percent_decode(k, true) == **n);
+        out.insert(n.as_str().into(), Value::list(all.map(|(_, v)| Value::str(percent_decode(v, true))).collect()));
+    }
+    Some(Value::map(out))
+}
+
 fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
     let mut out = Vec::new();
     for (i, seg) in def.iter().enumerate() {
@@ -203,6 +232,8 @@ fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map {
     m.insert("method".into(), Value::str(&req.method));
     m.insert("path".into(), Value::str(path));
     m.insert("query".into(), query.clone());
+    // As it came: what a repeated name's others were, and what a signed URL signed.
+    m.insert("query_string".into(), Value::str(req.url.split_once('?').map_or("", |(_, q)| q)));
     m.insert("params".into(), Value::map(Map::new()));
     m.insert("headers".into(), Value::map(headers));
     m.insert("cookies".into(), Value::map(cookies));
@@ -516,8 +547,13 @@ impl Interp {
             }
 
             let mut binds = Vec::new();
+            // A list in a pattern takes all of a name's values.
+            let query_all = r.query.as_ref().and_then(|p| all_values(p, &query_v, qs));
+            let query_v = query_all.as_ref().unwrap_or(&query_v);
+            let form_all = form_lists(r.body_pat.as_ref(), &reqv, req);
+            let reqv = form_all.unwrap_or(reqv);
             // The `routes` groups' patterns too, outermost first (branch route-groups).
-            let checks = std::iter::once((r.query.as_ref(), &query_v, Mode::Lenient))
+            let checks = std::iter::once((r.query.as_ref(), query_v, Mode::Lenient))
                 .chain(r.guards.iter().map(|g| (Some(g), &reqv, Mode::Request)))
                 .chain(std::iter::once((r.body_pat.as_ref(), &reqv, Mode::Request)));
             let mut matched = true;
@@ -1402,14 +1438,19 @@ fn holds_hidden_error(v: &Value) -> bool {
     }
 }
 
+/// What a hidden error said, for the log.
+pub(crate) fn log_hidden(e: &Value, at: &Place) {
+    let text = crate::value::told(|| e.display());
+    // Anyone can try a subdomain: that is not worth a line each.
+    if !text.starts_with("db: there is no tenant") {
+        crate::httpd::error_line(&at.before(&text));
+    }
+}
+
 fn without_hidden_errors(v: &Value) -> Value {
     match v {
         Value::Err(e, false, at) => {
-            let text = e.display();
-            // Anyone can try a subdomain: that is not worth a line each.
-            if !text.starts_with("db: there is no tenant") {
-                crate::httpd::error_line(&at.before(&text));
-            }
+            log_hidden(e, at);
             Value::err(Value::str("internal error"))
         }
         Value::Err(e, true, _) => Value::own_err(without_hidden_errors(e)),
@@ -2407,6 +2448,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
         eprintln!("quillo: watching for changes");
     }
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
+    crate::value::HIDING.store(!app.watch, std::sync::atomic::Ordering::Relaxed);
     // `--plain-http` too (FEEDBACK13.md, Q-089; branch feedback13-fixes).
     let asked = crate::session::PLAIN_HTTP_ASKED.load(std::sync::atomic::Ordering::Relaxed);
     crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some() || asked, std::sync::atomic::Ordering::Relaxed);
@@ -2437,6 +2479,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
 /// interpreter locks; it gives them up here.
 pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), String> {
     take_descriptors();
+    crate::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
     let shown = listener.local_addr().map_or_else(|_| addr.to_string(), |a| a.to_string());
     let apps: Vec<Arc<App>> = apps.into_iter().map(Arc::new).collect();

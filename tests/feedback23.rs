@@ -184,6 +184,7 @@ fn only_an_answer_finishes_a_call_made_later() {
     let front = r#"
 db.open("front.db")
 service mailer = "mailer.qwe"
+fn shown(s) = s == null ? null : merge(s, { error: error(s.error) })
 route GET /send/:f = match f {
     "s401" => mailer.later.s401()
     "s404" => mailer.later.s404()
@@ -192,7 +193,7 @@ route GET /send/:f = match f {
     "bad" => mailer.later.bad()
     _ => mailer.later.said_no()
 }
-route GET /status/:id = json.stringify(later.status(id))
+route GET /status/:id = json.stringify(shown(later.status(id)))
 route GET /kept = len(db.query("select id from _quillo_later"))
 "#;
     let d = dir("answers", &[("mailer.qwe", mailer), ("front.qwe", front)]);
@@ -208,11 +209,11 @@ route GET /kept = len(db.query("select id from _quillo_later"))
     for (f, id) in &waits {
         let got = status(id);
         assert_eq!(got["state"], "waiting", "{}: {}", f, got);
-        assert!(got["error"]["error"].as_str().unwrap().contains(&f[1..]), "{}: {}", f, got);
+        assert!(got["error"].as_str().unwrap().contains(&f[1..]), "{}: {}", f, got);
     }
     // It cannot succeed: marked, not tried again, and its row kept.
     eventually(15, "a 400 was not marked", || status(&bad)["state"] == "failed");
-    assert!(status(&bad)["error"]["error"].as_str().unwrap().contains("not its arguments"), "{}", status(&bad));
+    assert!(status(&bad)["error"].as_str().unwrap().contains("not its arguments"), "{}", status(&bad));
     assert_eq!(get(&s, "/kept"), "5");
     // The function answered, with a no: finished, and the caller can learn of it.
     eventually(15, "an error value did not finish the call", || status(&no)["state"] == "done");
@@ -233,11 +234,12 @@ fn a_call_refused_for_a_day_is_marked_and_can_be_sent_again() {
     let front = r#"
 db.open("front.db")
 service mailer = "mailer.qwe"
+fn shown(s) = s == null ? null : merge(s, { error: error(s.error) })
 route GET /send = mailer.later.s500()
 route GET /old = db.exec("update _quillo_later set tries = 289, at = 0")
 route GET /again = db.exec("update _quillo_later set at = 0, tries = 0 where tries < 0")
 route GET /status/:id = later.status(id)
-route GET /seen/:id = json.stringify(later.status(id))
+route GET /seen/:id = json.stringify(shown(later.status(id)))
 "#;
     let d = dir("given-up", &[("mailer.qwe", "server fn s500() = 1\n"), ("front.qwe", front)]);
     let url = format!("http://127.0.0.1:{}", stand.port);
@@ -285,7 +287,7 @@ fn as_service(file: &Path, port: u16) -> Child {
 fn a_call_outlives_a_deploy_that_does_not_fit_it() {
     let right = "db.open(\"mailer.db\")\ndb.exec(\"create table if not exists sent (who text)\")\nserver fn send(who: str) {\n    db.exec(\"insert into sent (who) values (?)\", who)\n    who\n}\n";
     let wrong = right.replace("who: str)", "who: str, urgent: bool)");
-    let d = dir("deploy", &[("right.qwe", right), ("mailer.qwe", right), ("deployed.qwe", &wrong), ("front.qwe", "db.open(\"front.db\")\nservice mailer = \"mailer.qwe\"\nroute GET /send/:who = mailer.later.send(who)\nroute GET /status/:id = json.stringify(later.status(id))\n")]);
+    let d = dir("deploy", &[("right.qwe", right), ("mailer.qwe", right), ("deployed.qwe", &wrong), ("front.qwe", "db.open(\"front.db\")\nservice mailer = \"mailer.qwe\"\nfn shown(s) = s == null ? null : merge(s, { error: error(s.error) })\nroute GET /send/:who = mailer.later.send(who)\nroute GET /status/:id = json.stringify(shown(later.status(id)))\n")]);
     let port = support::free_port();
     let url = format!("http://127.0.0.1:{}", port);
     let mut service = as_service(&d.join("deployed.qwe"), port);
@@ -293,7 +295,7 @@ fn a_call_outlives_a_deploy_that_does_not_fit_it() {
     let id = get(&s, "/send/ana");
     let status = || serde_json::from_str::<serde_json::Value>(&get(&s, &format!("/status/{}", id))).unwrap();
     eventually(15, "the call was not tried", || status()["tries"].as_i64().unwrap_or(0) >= 1);
-    assert!(status()["error"]["error"].as_str().unwrap().contains("409"), "{}", status());
+    assert!(status()["error"].as_str().unwrap().contains("409"), "{}", status());
     let _ = service.kill();
     let _ = service.wait();
     let mut service = as_service(&d.join("right.qwe"), port);
@@ -307,13 +309,13 @@ fn a_call_outlives_a_deploy_that_does_not_fit_it() {
 #[test]
 fn a_step_that_stops_with_an_error_runs_again() {
     let work = "let broken = true\nlet ran = 0\nserver fn mend() { broken = false }\nserver fn step(x: str) {\n    if broken {\n        json.parse(\"[]\").no.such\n    }\n    ran = ran + 1\n    x\n}\nserver fn times() = ran\n";
-    let front = "db.open(\"front.db\")\nservice work = \"work.qwe\"\nroute GET /go = work.later.step(\"x\")\nroute GET /mend = work.mend()\nroute GET /status/:id = json.stringify(later.status(id))\nroute GET /times = work.times()\n";
+    let front = "db.open(\"front.db\")\nservice work = \"work.qwe\"\nfn shown(s) = s == null ? null : merge(s, { error: error(s.error) })\nroute GET /go = work.later.step(\"x\")\nroute GET /mend = work.mend()\nroute GET /status/:id = json.stringify(shown(later.status(id)))\nroute GET /times = work.times()\n";
     let d = dir("stops", &[("work.qwe", work), ("front.qwe", front)]);
     let s = serve(&d.join("front.qwe"), &[]);
     let id = get(&s, "/go");
     let status = || serde_json::from_str::<serde_json::Value>(&get(&s, &format!("/status/{}", id))).unwrap();
     eventually(15, "the step was not tried", || status()["tries"].as_i64().unwrap_or(0) >= 1);
-    assert!(status()["error"]["error"].as_str().unwrap().contains("internal error in `step`"), "{}", status());
+    assert!(status()["error"].as_str().unwrap().contains("internal error in `step`"), "{}", status());
     get(&s, "/mend");
     eventually(15, "the step did not run again", || status()["state"] == "done");
     assert_eq!(get(&s, "/times"), "1");
@@ -321,7 +323,7 @@ fn a_step_that_stops_with_an_error_runs_again() {
 
 #[test]
 fn a_call_given_up_on_is_counted() {
-    let d = dir("counted", &[("work.qwe", "server fn step(x: int) = x\n"), ("front.qwe", "db.open(\"front.db\")\nservice work = \"work.qwe\"\nlet wrong = json.parse(\"[\\\"not a number\\\"]\")\nroute GET /go = work.later.step(wrong[0])\nroute GET /status/:id = json.stringify(later.status(id))\n")]);
+    let d = dir("counted", &[("work.qwe", "server fn step(x: int) = x\n"), ("front.qwe", "db.open(\"front.db\")\nservice work = \"work.qwe\"\nfn shown(s) = s == null ? null : merge(s, { error: error(s.error) })\nlet wrong = json.parse(\"[\\\"not a number\\\"]\")\nroute GET /go = work.later.step(wrong[0])\nroute GET /status/:id = json.stringify(shown(later.status(id)))\n")]);
     let port = support::free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")

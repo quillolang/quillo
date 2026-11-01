@@ -1,0 +1,71 @@
+// The same code on the server and in the browser, side by side: what FEEDBACK25.md found
+// differing, and what stopped a page. Driven by sides.js (branch feedback26-fixes).
+
+fn word_count(words) {
+    let m = {}
+    for w in words {
+        m = set(m, w, get(m, w, 0) + 1)
+    }
+    m
+}
+fn read(m, k) = m[k]
+
+fn outer() {
+    fn f(n) = n == 0 ? 0 : 1 + f(n - 1)
+    f(3)
+}
+
+fn bad_pattern() = "(" + ""
+
+fn results() = {
+    computed: `${4000000000000000 * 3 + 1}`,
+    summed: `${9007199254740991 + 2}`,
+    last_digit: (4000000000000000 * 3 + 1) % 10,
+    huge: str(1e21),
+    tiny: str(0.0000001),
+    negative: str(-1.5e-7),
+    large_text: is_err(int("99999999999999999999")),
+    json_int: `${json.parse("9007199254740993")}`,
+    dec_of_huge: is_err(dec(1e30)),
+    not_a_number: is_err(float("NaN")),
+    infinite: str(float("-inf")),
+    constructor: read(word_count(["constructor", "a"]), "constructor"),
+    local_fn: outer(),
+    sorted: sort_by([{ a: 2, b: 1 }, { a: 1, b: 2 }, { a: 1, b: 1 }], (x) => [x.a, x.b]) | map((x) => x.a * 10 + x.b),
+    guard_dec: 1m / 0m ?? "caught",
+    guard_date: date.of(2026, 2, 30) ?? "caught",
+    guard_pattern: re.test("a", bad_pattern()) ?? "caught",
+    guard_zone: date.to_zone("2026-10-27T14:30:00Z", "Mars/Base") ?? "caught",
+    guard_value: int("x") ?? 0,
+    nothing_to_guard: 2m * 2m ?? "caught",
+    valid_zone: [date.valid_zone("Europe/Paris"), date.valid_zone("Mars/Base"), date.valid_zone("+05:45"), date.valid_zone(7)],
+    valid_pattern: [re.valid("a+"), re.valid(bad_pattern())],
+    message: int("x").message != null,
+    filtered: is_err(filter(["1", "x"], (s) => int(s)? > 0)),
+    found: is_err(find(["x"], (s) => int(s)? > 0)),
+    any_of: is_err(any(["x"], (s) => int(s)? > 0)),
+    all_of: is_err(all(["x"], (s) => int(s)? > 0)),
+    counted: is_err(count(["x"], (s) => int(s)? > 0)),
+}
+
+component Sides() {
+    state text = ""
+    state a = 3
+    state shown = ""
+    state ran = 0
+    let wait = () => { js_new("Date") }
+    let n = a > 0 ? 1 : 2
+    let rows = [{ id: "x", found: a > 1 ? { n: a } : null }]
+    <div>
+        <button id="run" @click={() => { shown = json.stringify(results()) }}>Run</button>
+        <input id="in" value={text} @input={(e) => { wait(); text = e.value }}/>
+        <p id="typed">{text}</p>
+        <button id="drop" @click={() => { a = 1 }}>Drop</button>
+        <ul>{for f in rows => <li key={f.id}>{f.found != null && <b id="inner">{f.found.n * a}</b>}</li>}</ul>
+        <p id="unused">{n}</p>
+        <input id="cr" type="hidden" value={"a\r\nb"}/>
+        <pre id="browser">{shown}</pre>
+    </div>
+}
+
+route GET / = <html><body><pre id="server">{json.stringify(results())}</pre><Sides/></body></html>

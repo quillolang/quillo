@@ -141,7 +141,7 @@ pub fn builtin_effect(name: &str) -> u8 {
     } else {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
-            "env" => "env",
+            "env" | "args" => "env",
             "now" | "sleep" | "date.today" | "date.now" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
@@ -205,6 +205,8 @@ impl Pattern {
     pub fn is_type_test(&self) -> bool {
         match self {
             Pattern::Type(_) => true,
+            // `{ tag: [str] }`: every value of a query's or a form's name.
+            Pattern::List(items, None) => items.len() == 1 && items[0].is_type_test(),
             Pattern::Alt(ps) => {
                 ps.iter().all(|p| matches!(p, Pattern::Type(_) | Pattern::Lit(Lit::Nil)))
                     && ps.iter().any(|p| matches!(p, Pattern::Type(_)))

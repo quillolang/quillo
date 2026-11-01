@@ -1,0 +1,6 @@
+// Q-315 A pattern instant on the server can hang the browser, and nothing can stop it
+// mode: check
+// fixed-when: can hang a browser tab
+// From FEEDBACK25.md §Q-315 (found on 5f7f76c).
+
+print(re.test("aaa", "(a+)+$"))

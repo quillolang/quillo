@@ -36,6 +36,7 @@ const FNS: &[(&str, BuiltinFn)] = &[
     ("date.now", now),
     ("date.parse", parse),
     ("date.valid", valid),
+    ("date.valid_zone", valid_zone),
     ("date.of", of),
     ("date.parts", parts),
     ("date.weekday", weekday_fn),
@@ -342,6 +343,12 @@ fn day_value(z: Option<i64>, f: &str, line: u32) -> R {
 // date-time: text a page sends, checked with `date.valid(s)` alone, may be a
 // date-time that `date.add_days` and the rest refuse with a runtime error
 // (FEEDBACK13.md, Q-093; branch feedback13-fixes).
+/// `date.valid_zone(z)`: a zone is what people type (FEEDBACK25.md, Q-317; branch
+/// feedback26-fixes).
+fn valid_zone(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))) && zone(&args, 0, "date.valid_zone", line).is_ok()))
+}
+
 fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (date, stamp) = match args.get(1) {
         None | Some(Value::Nil) => (true, true),

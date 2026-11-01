@@ -1,0 +1,19 @@
+// Q-316 A local `fn` that calls itself passes `quillo check`, then the program will not start
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 300)); return { o: document.getElementById("o").textContent };
+// open-when: unknown name
+// fixed-when: "o": "3"
+// From FEEDBACK25.md §Q-316 (found on 5f7f76c).
+
+fn outer() {
+    fn f(n) = n == 0 ? 0 : 1 + f(n - 1)
+    f(3)
+}
+
+component P() {
+    state o = ""
+    <div><button id="go" @click={() => { o = str(outer()) }}>go</button><p id="o">{o}</p></div>
+}
+
+route GET / = <html><body><P/></body></html>

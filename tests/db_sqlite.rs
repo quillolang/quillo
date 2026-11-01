@@ -651,7 +651,7 @@ fn with_quillo_db_calls_made_later_are_kept_there() {
 fn db_atomic_says_when_nothing_can_hold_its_decisions() {
     let d = dir("env-system");
     let app = d.join("app.qwe");
-    let src = "db.open(\"data/{tenant}.db\")\nlet other = db.connect(\"other.db\")\nroute GET /a = str(db.atomic([other], () => 1))\n";
+    let src = "db.open(\"data/{tenant}.db\")\nlet other = db.connect(\"other.db\")\nroute GET /a = error(db.atomic([other], () => 1))\n";
     std::fs::write(&app, src).unwrap();
     let s = support::serve(&app, &[("QUILLO_SYSTEM_DB", "/no/such/dir/system.db")]);
     let r = support::send(s.port, "GET", "/a", &[], "");

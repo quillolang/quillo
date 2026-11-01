@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### An error's text stays off the page
+
+- **An error Quillo made no longer reaches a visitor by being turned into text.** A template
+  string, `str`, `join` or `json.stringify` of one, with a database's address or a file's path
+  in it, went out with a 200. On a server it now says `internal error` wherever it becomes
+  text, and the text goes to the log with the request. `print`, `--watch` and scripts keep it.
+- **`filter`, `find`, `any`, `all` and `count` give back an error their function gives.** A failed
+  permission check in a `filter` looked like nothing to see. `quillo check` warns on a `?` that
+  ends a lambda, where it changes nothing.
+
+### The server and the browser agree
+
+- **Ints stay exact past 2^53 in the browser**, as `*`, `+` and `-` go on with big ints, so an
+  amount in cents keeps its units. So do `json.parse` of a large id and `int` of long text.
+- **Neither side writes an exponent**, `dec` of a huge float is an error on both, and `float("nan")`
+  and `float("inf")` work on both.
+- **A map holding the key `constructor` is a map**, not one of the page's objects, so a word count
+  no longer stops on that word.
+- **A `\r` in an attribute** reads the same from the server's HTML and after an update.
+- **`s[i]` in a loop is no longer quadratic in the browser.** Neither is a list's `set` on the
+  server: 50,000 went from 3.6 s to 9 ms.
+
+### Guarding against bad input
+
+- **`??` also takes a stop on its left:** `1m / 0m ?? 0m`, `date.of(y, m, d) ?? today`,
+  `re.test(s, typed) ?? false`. Without it a stop still ends the request, so a total that
+  overflows cannot go on as a value. `date.valid_zone` and `re.valid` ask first.
+- **`error(r)`, `r.error` and `r.message`** are null on any value that did not fail, whatever it
+  is, where a str or an int stopped the route.
+
+### Components
+
+- **An input keeps what was typed** past a wait in its handler: `e.value` is what it held when
+  the event came.
+- **`x.n` no longer depends on a local `n`,** and a place inside a row's `cond && <markup>` no longer
+  runs after its branch has gone.
+- **A local `fn` can call itself** in the browser, as on the server.
+
+### Requests and scripts
+
+- **A list in a pattern takes all of a name's values:** `? { tag: [str] }`, `{ form: { tag: [str] } }`,
+  where it matched nothing. `request.query_string` is the query as it came.
+- **`quillo run tool.qwe -- a b`** gives a script `args()`.
+- **`sort_by` takes a list of keys,** as lists compare item by item.
+
+### `quillo check`
+
+- It warns on `x?.y` in a component, `a && xs | f()`, and a pattern that can hang a browser tab,
+  and no longer on `/` in `money.of`, or on a `while true` that returns.
+- Clearer messages for `<>`, `{ [k]: 1 }`, `let a = 1, b = 2`, `([a, b]) => ...`, a function calling
+  itself in its own `let`, and `session.x = 1`.
+
 ### Live data at a thousand pages
 
 Measured with real sockets, 250 pages on the build before and on this one, and 1,000 and

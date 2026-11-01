@@ -11,6 +11,8 @@ type R = Result<Value, Ctrl>;
 pub fn install(env: &Env) {
     let fns: &[(&'static str, BuiltinFn)] = &[
         ("print", print),
+        ("error", error_of),
+        ("args", program_args),
         ("str", to_str),
         ("int", to_int),
         ("float", to_float),
@@ -252,8 +254,25 @@ fn f_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Value, Ctrl> {
 
 // ---- general -----------------------------------------------------------
 
+/// What followed `--` on the command line.
+pub static PROGRAM_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn program_args(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::list(PROGRAM_ARGS.get().map_or(Vec::new(), |a| a.iter().map(Value::str).collect())))
+}
+
+/// `error(r)`: what an error says, and null for any other value (FEEDBACK26.md, Q-199;
+/// branch feedback26-fixes).
+fn error_of(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    Ok(match arg(&args, 0) {
+        Value::Err(e, _, _) => (*e).clone(),
+        _ => Value::Nil,
+    })
+}
+
 fn print(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    let line = args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" ");
+    // The program's own log: what it hides from visitors, it sees.
+    let line = crate::value::told(|| args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" "));
     println!("{}", line);
     Ok(Value::Nil)
 }
@@ -432,8 +451,13 @@ fn filter(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "filter", line)?;
     let mut out = Vec::new();
     for x in l.iter() {
-        if it.call1(&f, x.clone(), line)?.truthy() {
-            out.push(x.clone());
+        // A predicate that failed has said neither yes nor no: as a no, a failed
+        // permission check looks like nothing to see (FEEDBACK26.md, Q-198; branch
+        // feedback26-fixes).
+        match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            r if r.truthy() => out.push(x.clone()),
+            _ => {}
         }
     }
     Ok(Value::list(out))
@@ -443,8 +467,10 @@ fn find(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "find", line)?;
     let f = f_arg(&args, 1, "find", line)?;
     for x in l.iter() {
-        if it.call1(&f, x.clone(), line)?.truthy() {
-            return Ok(x.clone());
+        match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            r if r.truthy() => return Ok(x.clone()),
+            _ => {}
         }
     }
     Ok(Value::Nil)
@@ -454,8 +480,10 @@ fn any(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "any", line)?;
     let f = f_arg(&args, 1, "any", line)?;
     for x in l.iter() {
-        if it.call1(&f, x.clone(), line)?.truthy() {
-            return Ok(Value::Bool(true));
+        match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            r if r.truthy() => return Ok(Value::Bool(true)),
+            _ => {}
         }
     }
     Ok(Value::Bool(false))
@@ -465,8 +493,10 @@ fn all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "all", line)?;
     let f = f_arg(&args, 1, "all", line)?;
     for x in l.iter() {
-        if !it.call1(&f, x.clone(), line)?.truthy() {
-            return Ok(Value::Bool(false));
+        match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            r if !r.truthy() => return Ok(Value::Bool(false)),
+            _ => {}
         }
     }
     Ok(Value::Bool(true))
@@ -623,8 +653,10 @@ fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    // `set(xs, i, v)`: a list with item i (from the end when negative) v.
-    if let Value::List(_) = arg(&args, 0) {
+    // `set(xs, i, v)`: a list with item i (from the end when negative) v. Asked without
+    // a copy: one kept for the length of this block would make each `set` a copy of the
+    // list, and a loop over it quadratic (FEEDBACK25.md, Q-314; branch feedback26-fixes).
+    if matches!(args.first(), Some(Value::List(_))) {
         let i = i_arg(&args, 1, "set", line)?;
         let v = arg(&args, 2);
         let mut args = args;
@@ -1145,7 +1177,9 @@ fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    let j = arg(&args, 0).to_json();
+    // As `str` is (FEEDBACK26.md, Q-197; branch feedback26-fixes).
+    let v = arg(&args, 0);
+    let j = if crate::value::hiding() { crate::server::hidden(&v).unwrap_or(v).to_json() } else { v.to_json() };
     let pretty = arg(&args, 1).truthy();
     let s = if pretty { serde_json::to_string_pretty(&j) } else { serde_json::to_string(&j) };
     Ok(Value::str(s.unwrap_or_default()))
@@ -1431,8 +1465,10 @@ fn count(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "count", line)?;
     let mut n = 0;
     for x in l.iter() {
-        if it.call1(&f, x.clone(), line)?.truthy() {
-            n += 1;
+        match it.call1(&f, x.clone(), line)? {
+            e @ Value::Err(..) => return Ok(e),
+            r if r.truthy() => n += 1,
+            _ => {}
         }
     }
     Ok(Value::Int(n))

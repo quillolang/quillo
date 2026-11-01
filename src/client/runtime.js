@@ -182,7 +182,7 @@ function decParse(s, rounded) {
   return new Dec(neg ? -mag : mag, scale);
 }
 // A float through its shortest text, so 0.1 is 0.1.
-const decFromFloat = (f) => (Number.isFinite(f) ? decParse(f.toExponential(), true) : null);
+const decFromFloat = (f) => (Number.isFinite(f) && Math.abs(f) < 7.9228162514264337e28 ? decParse(f.toExponential(), true) : null);
 // A value as a decimal, for a `dec` pattern or record field.
 function asDec(v) {
   if (v instanceof Dec) return v;
@@ -242,8 +242,14 @@ function foreignCall(o, name, args) {
 }
 // An object from the page's scripts (an element, a library's), not one the
 // program made: its inherited properties and methods are its fields too.
-const foreign = (v) => v !== null && typeof v === "object" && (v === globalThis || v.constructor !== Object && v.constructor !== undefined
-  && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec));
+// By its prototype: a map may hold the key `constructor` (FEEDBACK25.md, Q-303; branch
+// feedback26-fixes).
+const foreign = (v) => {
+  if (v === null || typeof v !== "object") return false;
+  if (v === globalThis) return true;
+  const p = Object.getPrototypeOf(v);
+  return p !== Object.prototype && p !== null && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec);
+};
 // Functions of the page that run text as code or HTML, or that step around
 // the checks here (setting any property, calling a method with any `this`,
 // reading a property by a name from data, making a function from text, or
@@ -557,7 +563,21 @@ function ownMakeName(n, t, v, depth) {
 const fmtKey = (k) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : JSON.stringify(k);
 
 // A number's text, as the server's: JavaScript writes Infinity (FEEDBACK16.md, Q-120; branch feedback20-fixes).
-const numText = (v) => v === Infinity ? "inf" : v === -Infinity ? "-inf" : String(v);
+// Never in exponent form, as on the server (FEEDBACK25.md, Q-309; branch
+// feedback26-fixes).
+const numText = (v) => {
+  if (v === Infinity) return "inf";
+  if (v === -Infinity) return "-inf";
+  const s = String(v), at = s.indexOf("e");
+  if (at < 0) return s;
+  const neg = s[0] === "-", exp = Number(s.slice(at + 1));
+  const [whole, part = ""] = s.slice(neg ? 1 : 0, at).split(".");
+  const digits = whole + part, point = whole.length + exp;
+  const text = point <= 0 ? "0." + "0".repeat(-point) + digits
+    : point >= digits.length ? digits + "0".repeat(point - digits.length)
+    : digits.slice(0, point) + "." + digits.slice(point);
+  return (neg ? "-" : "") + text;
+};
 
 function repr(v) {
   if (isNil(v)) return "null";
@@ -618,13 +638,27 @@ function cmp(a, b) {
   if ((typeof a === "bigint" || typeof a === "number") && (typeof b === "bigint" || typeof b === "number")) {
     return a < b ? -1 : a > b ? 1 : 0;
   }
+  // Item by item, as on the server (FEEDBACK25.md, Q-320; branch feedback26-fixes).
+  if (Array.isArray(a) && Array.isArray(b)) {
+    for (let i = 0; i < a.length && i < b.length; i++) {
+      const c = cmp(a[i], b[i]);
+      if (c !== 0) return c;
+    }
+    return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+  }
   return null;
 }
 
 // ---- operators ---------------------------------------------------------
 
+// Ints past 2^53 are exact, as a literal is, or a sum of money in cents loses units
+// with no error (FEEDBACK25.md, Q-300; branch feedback26-fixes). Past 64 bits it is
+// left as a number: here a whole float cannot be told from an int.
+const SAFE = Number.MAX_SAFE_INTEGER;
+const big = (r, a, b, op, verb) => (r > SAFE || r < -SAFE) && Number.isSafeInteger(a) && Number.isSafeInteger(b) && Math.abs(r) < 2 ** 63 ? bigArith(a, b, op, verb) : r;
+
 function add(a, b) {
-  if (typeof a === "number" && typeof b === "number") return a + b;
+  if (typeof a === "number" && typeof b === "number") { const r = a + b; return r > SAFE || r < -SAFE ? big(r, a, b, "+", "add") : r; }
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
   if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
@@ -643,8 +677,8 @@ function arith(a, b, op, verb) {
   if (isInt(a) && isInt(b) && b === 0) fail("division by zero");
   return op === "/" ? a / b : a % b;
 }
-const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? a - b : arith(a, b, "-", "subtract"));
-const mul = (a, b) => (typeof a === "number" && typeof b === "number" ? a * b : arith(a, b, "*", "multiply"));
+const sub = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a - b, a, b, "-", "subtract") : arith(a, b, "-", "subtract"));
+const mul = (a, b) => (typeof a === "number" && typeof b === "number" ? big(a * b, a, b, "*", "multiply") : arith(a, b, "*", "multiply"));
 const div = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a / b : arith(a, b, "/", "divide"));
 const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0 ? a % b : arith(a, b, "%", "take the remainder of"));
 
@@ -678,8 +712,8 @@ function neg(v) {
 function eventField(e, name) {
   const t = e.target || {};
   switch (name) {
-    case "value": return t.value === undefined ? null : t.value;
-    case "checked": return !!t.checked;
+    case "value": return hasOwn(e, "$value") ? e.$value : t.value === undefined ? null : t.value;
+    case "checked": return hasOwn(e, "$checked") ? e.$checked : !!t.checked;
     case "type": return e.type;
     case "key": return e.key === undefined ? null : e.key;
     case "target": return t;
@@ -730,12 +764,17 @@ function field(v, name, fb) {
     if (name === "values") return B.values(v);
     return null;
   }
-  if (v instanceof Err && name === "error") return v.error;
+  if (v instanceof Err && (name === "error" || name === "message")) return v.error;
   if (isEvent(v)) return eventField(v, name);
-  const f = fb || (hasOwn(B, name) ? B[name] : null);
+  const f = (fb instanceof Later ? fb.read() : fb) || (hasOwn(B, name) ? B[name] : null);
   if (typeof f === "function") return f(v);
+  // As on the server (FEEDBACK26.md, Q-199; branch feedback26-fixes).
+  if (name === "error" || name === "message") return null;
   fail(`${typeName(v)} has no field \`${name}\``);
 }
+
+// What `field` falls back on, read only if it does.
+class Later { constructor(read) { this.read = read; } }
 
 function index(o, i) {
   if (Array.isArray(o) && isInt(i)) {
@@ -746,13 +785,17 @@ function index(o, i) {
   if (foreign(o) && (typeof i === "string" || isInt(i))) return field(o, String(i), null);
   if (isMap(o) && (typeof i === "string" || isInt(i))) return hasOwn(o, String(i)) ? o[String(i)] : null;
   if (typeof o === "string" && isInt(i)) {
-    const cs = Array.from(o);
+    // A text read by index in a loop is split once, and not at all when no
+    // character takes two units (FEEDBACK25.md, Q-313; branch feedback26-fixes).
+    if (o !== indexed.text) indexed = { text: o, chars: /[\ud800-\udfff]/.test(o) ? Array.from(o) : null };
+    const cs = indexed.chars || o;
     const n = i < 0 ? cs.length + i : i;
     return n >= 0 && n < cs.length ? cs[n] : null;
   }
   if (isNil(o)) return null;
   fail(`cannot index ${typeName(o)} with ${typeName(i)}`);
 }
+let indexed = { text: "", chars: null };
 
 function callFn(f, args) {
   if (typeof f !== "function") fail(`cannot call ${typeName(f)}: it is not a function`);
@@ -956,7 +999,12 @@ function extreme(l, name, want) {
 function coerce(t, s) {
   s = s.trim();
   if (t === "int") return /^[+-]?\d+$/.test(s) ? parseInt(s, 10) : null;
-  if (t === "float" || t === "num") return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
+  // `nan` and `inf` as the server reads them (FEEDBACK25.md, Q-309; branch feedback26-fixes).
+  if (t === "float" || t === "num") {
+    const named = /^([+-]?)(inf|infinity|nan)$/i.exec(s);
+    if (named) return named[2][0].toLowerCase() === "n" ? NaN : named[1] === "-" ? -Infinity : Infinity;
+    return s !== "" && !isNaN(Number(s)) ? Number(s) : null;
+  }
   if (t === "dec") return decParse(s, false);
   if (t === "date") return isDay(s) ? s : null;
   return null;
@@ -1174,6 +1222,7 @@ B.parallel = meta(async (...fs) => {
 }, "parallel", null);
 B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
 // HTML made from text (by raw or markdown) is that text, as on the server.
+B.error = meta((v) => (v instanceof Err ? v.error : null), "error", null);
 B.str = meta((v) => v instanceof Html && v.text !== undefined ? v.text : display(v), "str", null);
 B.int = meta((v) => {
   // Past an int's range, as on the server (FEEDBACK16.md, Q-111; branch feedback20-fixes).
@@ -1183,7 +1232,13 @@ B.int = meta((v) => {
   if (v instanceof Dec) { const w = v.m / p10(v.s); return w < I64_MIN || w > I64_MAX ? new Err(`${decText(v)} is too large for an int`) : intOf(w); }
   if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
   if (typeof v === "boolean") return v ? 1 : 0;
-  if (typeof v === "string") { const n = coerce("int", v); return n === null ? new Err(`not an int: ${JSON.stringify(v)}`) : n; }
+  if (typeof v === "string") {
+    // By its digits: past 2^53 a number has lost them (FEEDBACK25.md, Q-301; branch feedback26-fixes).
+    const t = v.trim();
+    if (!/^[+-]?\d+$/.test(t)) return new Err(`not an int: ${JSON.stringify(v)}`);
+    const b = BigInt(t);
+    return b < I64_MIN || b > I64_MAX ? new Err(`not an int: ${JSON.stringify(v)}`) : intOf(b);
+  }
   return new Err(`cannot convert ${typeName(v)} to int`);
 }, "int", null);
 B.float = meta((v) => {
@@ -1205,7 +1260,7 @@ B.type_of = meta((v) => typeName(v), "type_of", null);
 // shortest text, so dec(0.1) is 0.1m).
 B.dec = meta((v) => {
   if (v instanceof Dec) return v;
-  if (isInt(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
+  if (Number.isSafeInteger(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
   if (typeof v === "number") return decFromFloat(v) ?? new Err("cannot convert float to dec: it is too large, or not a number");
   if (typeof v === "string") return decParse(v.trim(), false) ?? new Err(`not a decimal: ${JSON.stringify(v)}`);
   return new Err(`cannot convert ${typeName(v)} to dec`);
@@ -1243,12 +1298,16 @@ B.map = meta((l, f) => {
 B.filter = meta((l, f) => {
   F(f, "filter");
   const a = L(l, "filter"), out = [];
-  for (let i = 0; i < a.length; i++) if (truthy(cb(f, "filter", a[i]))) out.push(a[i]);
+  for (let i = 0; i < a.length; i++) {
+    const r = cb(f, "filter", a[i]);
+    if (r instanceof Err) return r;
+    if (truthy(r)) out.push(a[i]);
+  }
   return out;
 }, "filter", null);
-B.find = meta((l, f) => { F(f, "find"); for (const x of L(l, "find")) if (truthy(cb(f, "find", x))) return x; return null; }, "find", null);
-B.any = meta((l, f) => { F(f, "any"); return L(l, "any").some((x) => truthy(cb(f, "any", x))); }, "any", null);
-B.all = meta((l, f) => { F(f, "all"); return L(l, "all").every((x) => truthy(cb(f, "all", x))); }, "all", null);
+B.find = meta((l, f) => { F(f, "find"); for (const x of L(l, "find")) { const r = cb(f, "find", x); if (r instanceof Err) return r; if (truthy(r)) return x; } return null; }, "find", null);
+B.any = meta((l, f) => { F(f, "any"); for (const x of L(l, "any")) { const r = cb(f, "any", x); if (r instanceof Err) return r; if (truthy(r)) return true; } return false; }, "any", null);
+B.all = meta((l, f) => { F(f, "all"); for (const x of L(l, "all")) { const r = cb(f, "all", x); if (r instanceof Err) return r; if (!truthy(r)) return false; } return true; }, "all", null);
 B.reduce = meta((l, acc, f) => { F(f, "reduce", 3); for (const x of L(l, "reduce")) acc = cb(f, "reduce", acc, x); return acc; }, "reduce", null);
 B.sum = meta((l) => L(l, "sum").reduce((a, x) => add(a, x), 0), "sum", null);
 B.min = meta((l) => extreme(l, "min", -1), "min", null);
@@ -1547,7 +1606,7 @@ B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x)
 B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
 B.take = meta((v, n) => { n = Math.max(I(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
 B.drop = meta((v, n) => { n = Math.max(I(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
-B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); return l.filter((x) => truthy(cb(f, "count", x))).length; }, "count", null);
+B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); let n = 0; for (const x of l) { const r = cb(f, "count", x); if (r instanceof Err) return r; if (truthy(r)) n++; } return n; }, "count", null);
 B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const k = keyText(cb(f, "group_by", x)); if (!hasOwn(out, k)) Object.defineProperty(out, k, { value: [], enumerable: true, writable: true, configurable: true }); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
@@ -1663,7 +1722,9 @@ B.waiting = meta(() => false, "waiting", null);
 // answers (src/defer.rs; branch defer).
 B.defer = meta((v) => v, "defer", null);
 B.json = {
-  parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
+  // An id in a document keeps its digits, where the browser says what they were
+  // (FEEDBACK25.md, Q-301; branch feedback26-fixes).
+  parse: (s) => { S(s, "json.parse"); try { return fromJSON(JSON.parse(s, (k, v, c) => typeof v === "number" && !Number.isSafeInteger(v) && c && /^-?\d+$/.test(c.source) && Math.abs(v) < 2 ** 63 ? intOf(BigInt(c.source)) : v)); } catch (e) { return new Err("invalid JSON: " + e.message); } },
   stringify: (v, pretty) => jsonText(v, truthy(pretty) ? 2 : undefined),
 };
 
@@ -1878,6 +1939,7 @@ function reExpand(t, x) {
 }
 
 B.re = {
+  valid: (p, flags) => { if (typeof p !== "string") return false; try { reOf(p, flags, "re.valid", 2); return true; } catch (e) { return false; } },
   test: (s, p, flags) => { S(s, "re.test"); return reAll(s, reOf(p, flags, "re.test", 3), 1).length > 0; },
   find: (s, p, flags) => { S(s, "re.find"); const [x] = reAll(s, reOf(p, flags, "re.find", 3), 1); return x ? reValue(x) : null; },
   find_all: (s, p, flags) => { S(s, "re.find_all"); return reAll(s, reOf(p, flags, "re.find_all", 3), Infinity).map(reValue); },
@@ -3030,6 +3092,7 @@ B.date = {
   },
   // "date" or "date-time" as the second argument takes only that (FEEDBACK13.md,
   // Q-093; branch feedback13-fixes).
+  valid_zone: (z) => { if (typeof z !== "string") return false; try { dtZone(z, "date.valid_zone", 1); return true; } catch (e) { return false; } },
   valid: (s, kind) => {
     if (!isNil(kind) && kind !== "date" && kind !== "date-time") fail(`\`date.valid\` takes "date" or "date-time" as argument 2, got ${dtGot(kind)}`);
     return (kind !== "date-time" && dtDate(s) !== null) || (kind !== "date" && dtStamp(s) !== null);
@@ -4222,18 +4285,29 @@ function runCalc(c) {
 }
 
 function flush() {
-  let rounds = 0;
+  let rounds = 0, jumps = 0;
   while (effectQueue.length) {
     if (++rounds > 1000) {
       effectQueue = [];
       report("updates go round in a loop: something sets what it reads");
       break;
     }
-    const q = effectQueue;
+    let q = effectQueue;
     effectQueue = [];
     // In the order they were made (mostly so already).
     for (let i = 1; i < q.length; i++) if (q[i - 1].id > q[i].id) { q.sort((a, b) => a.id - b.id); break; }
-    for (const c of q) if (!c.dead) fresh(c);
+    for (let i = 0; i < q.length; i++) {
+      const c = q[i];
+      if (!c.dead) fresh(c);
+      // What this woke goes first when it was made earlier: a row's `cond &&` before
+      // the place inside it, which must not run once its branch has gone
+      // (FEEDBACK25.md, Q-311; branch feedback26-fixes).
+      if (effectQueue.length && i + 1 < q.length && effectQueue.some((n) => n.id < q[i + 1].id) && ++jumps < 100000) {
+        q = q.slice(i + 1).concat(effectQueue).sort((a, b) => a.id - b.id);
+        effectQueue = [];
+        i = -1;
+      }
+    }
   }
   flushing = false;
 }
@@ -4947,6 +5021,10 @@ function fire(el, type, ev) {
   const f = type === "click" ? el.__click : el.__w && el.__w[type];
   if (typeof f !== "function") return;
   if (type === "submit") ev.preventDefault();
+  // What the field held when the event came: after a wait the field shows the state
+  // again, and `e.value` would read that (FEEDBACK25.md, Q-304; branch feedback26-fixes).
+  const t = ev.target;
+  if (t && t.value !== undefined) { ev.$value = t.value; ev.$checked = !!t.checked; }
   try {
     const r = f.length > 0 ? f(ev) : f();
     if (r instanceof Promise) r.catch(report);
@@ -5641,6 +5719,8 @@ const G = {};
 const C = {};
 const W = {};
 W.Err = Err;
+// A stop that `??` guards against, and anything else goes on.
+W.guarded = (e) => { if (e instanceof QuilloError) return null; throw e; };
 // What `js(...)` gave, waited for if it is a Promise (see `call` in
 // src/client.rs): what it settles to, or its rejection as an error value.
 W.settle = async (v) => {
@@ -5674,6 +5754,7 @@ W.range = intRange;
 W.neg = neg;
 W.field = field;
 W.fieldp = fieldp;
+W.Later = Later;
 W.setf = setField;
 W.index = index;
 W.call = callFn;

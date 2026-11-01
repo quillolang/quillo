@@ -28,6 +28,7 @@ type R = Result<Value, Ctrl>;
 
 pub fn install(m: &mut Map) {
     m.insert("test".into(), Value::Builtin("re.test", test));
+    m.insert("valid".into(), Value::Builtin("re.valid", valid));
     m.insert("find".into(), Value::Builtin("re.find", find));
     m.insert("find_all".into(), Value::Builtin("re.find_all", find_all));
     m.insert("replace".into(), Value::Builtin("re.replace", replace));
@@ -426,6 +427,14 @@ fn text_arg(args: &[Value], f: &str, line: u32) -> Result<std::sync::Arc<str>, C
 }
 
 /// `re.test(s, pattern, flags)`: whether it matches anywhere in `s`.
+/// `re.valid(pattern, flags)`: a pattern from data can be asked about first
+/// (FEEDBACK25.md, Q-318; branch feedback26-fixes).
+fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Some(p @ Value::Str(_)) = args.first() else { return Ok(Value::Bool(false)) };
+    let asked = [Value::Nil, p.clone(), args.get(1).cloned().unwrap_or(Value::Nil)];
+    Ok(Value::Bool(regex_of(&asked, 2, "re.valid", line).is_ok()))
+}
+
 fn test(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.test", line)?;
     Ok(Value::Bool(regex_of(&args, 2, "re.test", line)?.is_match(&s)))

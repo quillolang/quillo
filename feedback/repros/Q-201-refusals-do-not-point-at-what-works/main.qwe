@@ -1,0 +1,10 @@
+// Q-201 Two refusals do not point at what works
+// mode: check
+// open-when: only the page
+// fixed-when: set_session
+// From FEEDBACK26.md §Q-201 (found on 5f7f76c).
+
+route GET /s {
+    session.x = 1
+    { ok: true }
+}

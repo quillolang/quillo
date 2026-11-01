@@ -1,0 +1,7 @@
+// Q-324 Syntax that is missing, with a message that does not say so
+// mode: check
+// open-when: expected an expression, found `<`
+// fixed-when: no `<>` fragments
+// From FEEDBACK25.md §Q-324 (found on 5f7f76c).
+
+route GET / = <></>

@@ -449,7 +449,7 @@ route GET /s = stream((send) => {
     send("hello\n")
     let each = db.connect((t) => pour(send))
     let r = with_tenant("a", () => each.query("select 1"))
-    write_file("after.txt", `${r}`)
+    write_file("after.txt", `${error(r)}`)
     send("again\n")
     write_file("never.txt", "sent")
 })

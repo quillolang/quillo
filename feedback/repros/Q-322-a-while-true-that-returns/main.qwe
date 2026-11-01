@@ -1,0 +1,16 @@
+// Q-322 `quillo check` refuses a return type on a `while true` that returns
+// mode: check
+// open-when: must return int
+// fixed-when: main.qwe: ok
+// From FEEDBACK25.md §Q-322 (found on 5f7f76c).
+
+fn first_even(xs: list) -> int {
+    let i = 0
+    while true {
+        if xs[i] % 2 == 0 {
+            return xs[i]
+        }
+        i += 1
+    }
+}
+print(first_even([1, 2]))

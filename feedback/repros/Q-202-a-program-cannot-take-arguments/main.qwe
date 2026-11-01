@@ -1,0 +1,8 @@
+// Q-202 A program cannot take arguments from the command line
+// mode: script
+// script: steps.sh
+// open-when: unknown option
+// fixed-when: ["a", "b"]
+// From FEEDBACK26.md §Q-202 (found on 5f7f76c).
+
+print(args())

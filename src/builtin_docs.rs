@@ -55,6 +55,8 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("remove", "x, key", "A new list without the items equal to `key`, or a new map without that key."),
     ("merge", "a, b", "A new map of `a` and `b`; where both have a key, `b`'s value. Two maps only."),
     // Values
+    ("error", "x", "What an error value says, and null for any other value."),
+    ("args", "", "What followed `--` on the command line: `quillo run tool.qwe -- a b`."),
     ("print", "values", "Writes the values as text, a space between, on stdout (the console in a page)."),
     ("str", "x", "`x` as text: a whole float as `2.0`, a list or map as Quillo writes it, null as `null`."),
     ("int", "x", "A number cut toward zero, `true` as 1, or text of digits; `\"1.0\"` and a number too large for an int are error values."),
@@ -208,6 +210,8 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("date.today", "tz", "Today's date as `YYYY-MM-DD`, in the zone `tz`: UTC unless given."),
     ("date.now", "tz", "The date-time now, to the second, at the zone's offset: UTC unless given."),
     ("date.parse", "s, pattern", "A date or date-time from text, read as ISO or by `pattern`; an error value if it is not one."),
+    ("date.valid_zone", "z", "Whether `z` is a time zone: a name, an offset, or `UTC`."),
+    ("re.valid", "pattern, flags", "Whether `pattern` is a pattern Quillo can run."),
     ("date.valid", "s, kind", "Whether `s` is a date or a date-time; `kind` is `\"date\"` or `\"date-time\"` for only that."),
     ("date.of", "y, m, d", "The date with this year, month and day; no such date is an error."),
     ("date.parts", "d", "`{ year, month, day, weekday }`, and `hour`, `minute`, `second`, `offset` for a date-time."),

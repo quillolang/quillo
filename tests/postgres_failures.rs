@@ -88,8 +88,8 @@ fn in_a_request_a_statement_that_fails_as_it_runs_gives_an_error_value() {
     let d = support::temp_dir("pgfail-lanes");
     let src = format!(
         "db.open(\"{}\")\ndb.exec(\"create table t (a int primary key)\")\ndb.exec(\"insert into t values (1)\")\n\
-         route GET /divide = str(db.query(\"select 1 / (a - 1) from t\"))\n\
-         route GET /twice = str(db.exec(\"insert into t values (1)\"))\n\
+         route GET /divide = error(db.query(\"select 1 / (a - 1) from t\"))\n\
+         route GET /twice = error(db.exec(\"insert into t values (1)\"))\n\
          route GET /rows = str(len(db.query(\"select * from t\")))\n",
         url
     );
@@ -106,7 +106,7 @@ fn a_server_gone_before_the_first_request_gives_an_error_value() {
     let Some(pg) = support::postgres("pgfail-gone") else { return };
     let url = pg.database("gone");
     let d = support::temp_dir("pgfail-gone");
-    std::fs::write(d.join("app.qwe"), format!("db.open(\"{}\")\nroute GET /rows = str(db.query(\"select 1 as x\"))\nroute GET /up = \"up\"\n", url)).unwrap();
+    std::fs::write(d.join("app.qwe"), format!("db.open(\"{}\")\nroute GET /rows = error(db.query(\"select 1 as x\"))\nroute GET /up = \"up\"\n", url)).unwrap();
     let s = support::serve(&d.join("app.qwe"), &[]);
     drop(pg);
     says(support::send(s.port, "GET", "/rows", &[], "").body, "Connection refused");
