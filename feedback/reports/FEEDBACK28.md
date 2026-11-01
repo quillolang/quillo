@@ -7,7 +7,7 @@
 | Model | Claude (Opus 5.5) |
 | Tested with | `quillo check`, and headless Chrome with real touch input at 390 by 844 and 820 by 1180, or 820 by 1180 and 1180 by 820 for the tablet batches. `--watch` for components remade on load, by hand |
 
-**Status of the components:** FULL-RUN-RESULT
+**Status of the components:** all 877 pass on both 0.6.0 binaries, d702589 and 378e64b, the one live since 2026-11-01, at kit b03290b: every test, by slices of about 110 components, once on each binary, 2,154 runs. Seven failed: `water_tracker` on both, a demo and test written for 2026-11-01 that began a new day, rightly, from the 2nd (fixed); and `bottom_sheet`, `markup_overlay` and `workout_timer` once each under load, each then passing three times alone on each binary. The whole gallery, 877 sections and 1,921 islands, loads and wakes with no error on both. Moving the browser's clock 45 days and a year ahead found one more demo with a date in it, `countdown`, which counted to 2027-01-01 (fixed). The kit's benchmark: 378e64b starts 744 components in 1.1 s and 372 MB, d702589 in 1.4 s and 502 MB.
 
 **What this does not show.** Nothing here ran on Safari's engine, in WKWebView, in Android's WebView, on a
 simulator, on an emulator or on a real device. Everything is Chrome's phone emulation. There was no real
@@ -49,6 +49,177 @@ The theme of this report is **the seam between Quillo and the page**. Inside Qui
 meets a page object, a JavaScript function, a Promise or a hand-set attribute, the rules change without a sign: what
 waits, what compares, what is kept. A second theme is the phone apps themselves, whose shells drop links, differ from
 each other, and lack calls that a real phone app needs.
+
+## What the fixes broke: the kit on 378e64b
+
+The fixes for this report and FEEDBACK29 were merged to `main` as 378e64b. Run on it, the kit's 877
+components failed in about 120 places, 40 of them components that were live and passing on d702589. Some
+were kit code that leaned on old bugs, such as `context_menu` finding the pressed item with `==`, which
+only worked because any two plain elements were equal. The rest are below. All 877 now pass on both
+binaries, as kit `87110b8` works round each one, but a program outside the kit meets them as written.
+
+These start at Q-415, as Q-334 to Q-349 were used up and other reports reached Q-414. Each was found by one
+or more of the eight agents fixing the kit, and the four marked so were run again here on both binaries.
+Repros are inline; none is in `feedback/INDEX.md` or `feedback/repros/` yet.
+
+### Q-415. A handler pauses where nothing waits, and the page updates in the middle of it
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent, a regression from Q-336 and Q-340 | kit tests, in all eight slices; run again here | many |
+
+```quillo
+component P() {
+    state a = 0
+    let note = () => null
+    <button id="m" @keydown={(e) => {
+        let was = a
+        let step = match e.key {
+            "x" => 1
+            _ => 0
+        }
+        a = was + step
+        note()
+    }}>{a}</button>
+}
+```
+
+Two keydowns sent one after the other give `2` on d702589 and `1` on 378e64b. Nothing in the handler
+waits, but 378e64b compiles it `async`, as it calls a function, and then each `match`, `if` block and `for`
+in it becomes `await (async () => ...)()`, which always yields. `finish_wait` in `src/client.rs` emits
+`(W.waits(t = call) ? await W.settle(t) : t)` through `await_if(true, ...)`, which makes a function
+`async` though its await is conditional, and every call of an `async` component function is awaited.
+Every `x.m(...)` counts, `date.valid`, `date.parts` and `re.replace` included.
+
+At that pause the page updates. So `e.target` can already be off the page (`null has no method
+querySelector`), `e.currentTarget` is null, a second event sent at once reads state the first has not set,
+and a pointer move or lift can run before the press that came first. For an event sent by a script,
+`preventDefault` after the pause comes after `dispatchEvent` has returned. Real key presses are not
+affected: with real arrow keys the page did not scroll on either binary, run here, as the browser runs
+what is pending before acting on a real event.
+
+It cost the most: about 30 components, from context menus and key grids to a brush chart and a swipe deck.
+Workaround: find elements and keep `e.currentTarget` before any state changes, and move logic a handler calls
+into top-level `fn`s, which do not wait on either binary.
+
+**Suggestion:** await only a value that is a Promise, and do not make a block or a function `async` because a
+call in it might return one.
+
+### Q-416. A component's own function given to `map`, `filter` or `reduce` is refused, and the page stops updating there
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent while rendering, loud in a handler | kit tests; run again here | 1 to 2 each |
+
+```quillo
+fn twice(x: int) -> int = x * 2
+component Sums() {
+    state out = "none"
+    let double = (x: int) => twice(x)
+    <div>
+        <p>{join([1, 2, 3] | map(double), ",")}</p>
+        <button id="go" @click={() => { out = join([1, 2, 3] | map((x) => double(x)), ",") }}>{out}</button>
+    </div>
+}
+```
+
+On d702589 the click shows `2,4,6`. On 378e64b it stays `none`, and the console says
+`` `map` cannot call a function that waits, on the server or the page (`js` in it waits) `` though there is no
+`js` in it. `double` only calls a top-level `fn`. The same goes for one that calls `money.of` or reads a field of
+what a call gave. `quillo check` says ok. When this happens while the page renders, as in `realtime_chart`,
+that part of the page silently stops updating. Eleven kit components were moved to top-level `fn`s for it.
+
+### Q-417. A state that starts from a module's method is null at first in a component the page makes
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | `task_row`'s Undo; run again here | 1 |
+
+```quillo
+fn shout(s: str) -> str = upper(s)
+component Child(today: str = "") {
+    state day = date.valid(today, "date") ? today : "none"
+    <p.child>{shout(day)}</p>
+}
+component Parent() {
+    state show = false
+    <div><button.go @click={() => { show = true }}>go</button>{show && <Child today="2026-11-01"/>}</div>
+}
+```
+
+After the click, d702589 shows `2026-11-01`; 378e64b shows nothing, and logs
+`` argument `s` of `shout` must be str, got null ``. The initializer is compiled `async`, by Q-415's rule, so the
+state is null until it settles. A component the server renders hides this. 20 kit files start a state from
+`date.`, `re.`, `money.`, `math.`, `stats.` or `vec.`; only `task_row` showed it in a test.
+
+### Q-418. A replayed `@load` has no image, and the real one comes as well
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | `image_crop`, which then broke the whole gallery page; run again here | 1 |
+
+An `<img @load={...}>` the server rendered, already loaded when the component starts, logs on d702589
+`load tag=IMG w=600`, once. On 378e64b it logs `load tag=null w=null`, then `load tag=IMG w=600`: the replay that
+Q-345's fix added is a `new Event` that is never dispatched, so its `target` is not the image, and the browser's
+own `load` still arrives. A handler reading the image's size gets null and runs twice.
+
+### Q-419. A prop's Promise of nothing and a prop that gives nothing are the same
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | `pull_to_refresh` waited for ever | 1 |
+
+As a prop's call is now waited for (Q-335), `cb={() => js("Promise.resolve")}` and `cb={() => { later = 1 }}` both
+give the caller `null`; d702589 gave `promise` and `null`. A component that told "the answer is coming, call `done`
+later" from "this was the answer" can no longer, and waited for ever.
+
+### Q-420. A page object's method takes the name of the component's own function
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent | `voice_recorder` stuck at "starting" | 1 |
+
+```quillo
+component P() {
+    state out = "idle"
+    state rec = null
+    let resume = () => { if rec != null { rec.resume() } }
+    let start = () => {
+        let r = js("Promise.resolve", js_new("Promise", (done) => {
+            let ctx = js_new("AudioContext")
+            ctx.resume()
+            done(true)
+        }))
+        out = is_err(r) ? "err" : "ok"
+    }
+    <button @click={start}>{out}</button>
+}
+```
+
+`ctx.resume()` falls back to the component's own `resume`, which is `async` on 378e64b, so the function handed to
+the Promise becomes `async` too. When `js_new("AudioContext")` throws, that no longer rejects the Promise: it
+never settles, and the handler hangs with an uncaught error. d702589 gives `err`. Workaround: no component function
+named like a method the code calls. Not run again here.
+
+### Q-421. Five changes in what code means, with no warning
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| silent or loud | kit tests and `quillo check` | 1 each |
+
+Each is a fix or a choice that can stand, but code written for 0.6 breaks without a word. The changelog gives
+the first, second and last as fixes, not as something a program must change; the third and fourth are not in it:
+
+| Was | Now | Broke |
+|---|---|---|
+| A component given no children has empty HTML | `null`, so `str(children) != ""` is true | five components lost their default text |
+| `js_new("Promise", ...)` is waited for: FEEDBACK25 and this report give it as the way to catch a throw | it stays a Promise, so a throw is an unhandled rejection | 131 places in the kit, now `js("Promise.resolve", js_new("Promise", ...))` |
+| A child's `@mount` runs before its parent's | a parent's can run first | `large_title_bar` observed a null element |
+| `session` is a name like any other | `quillo check` takes it for the request's session: `cannot set metadata on session` | `now_playing`, and the whole gallery would not start |
+| `==` on page elements is true for any two plain ones | identity, as Q-334 asked | kit code that leaned on the old answer |
+
+**Suggestion:** a line for each in the changelog under "what to change in your code", and a check warning for
+`str(children)`.
 
 ## Seen again
 
