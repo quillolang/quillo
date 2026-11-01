@@ -4683,7 +4683,7 @@ them. Against Python 3.9 on a 10-core Mac, the middle of three runs each:
 | `s += "x"` a million times | 0.04 s | 0.04 s |
 | `s[i]` over 300,000 characters | 0.02 s | 0.02 s |
 
-The closest are a `while` over a text and a map of lists, at about nine tenths of Python's time;
+The closest are a `while` over a text and a map of lists, a little under Python's time;
 loops over numbers and lists of them run in machine code (see [Compiled numbers](#compiled-numbers)).
 
 ### Debugging

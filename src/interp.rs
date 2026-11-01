@@ -1781,113 +1781,15 @@ impl Interp {
                 };
                 fail(*line, why)
             }
-            Stmt::Assign(name, op, e, line) => {
-                if self.writes_noted() && lookup_global(env, name).map_or(false, |(_, global)| global) {
-                    self.no_writes(&format!("assigning `{}`", name), *line)?;
-                }
-                let name = *name;
-                let v = match op {
-                    AssignOp::Set => {
-                        // `x = x + e` as `x += e`: a number in place, a list or text grown where
-                        // it is. `e` first, as `+=` has it, when that cannot change `x`.
-                        let grown = match e {
-                            Expr::Binary(bop @ (BinOp::Add | BinOp::Sub), a, b, _) if self.fuel == u64::MAX && matches!(&**a, Expr::Ident(n, _) if *n == name) => {
-                                let sub = *bop == BinOp::Sub;
-                                let list_or_text = !sub && crate::value::growable(env, name);
-                                if list_or_text || quiet(b) {
-                                    let more = self.eval(b, env)?;
-                                    if crate::value::bump_local(env, name, &more, sub) {
-                                        return Ok(Value::Nil);
-                                    }
-                                    if list_or_text {
-                                        match self.grown(name, more, env, *line)? {
-                                            Some(v) => Some(v),
-                                            None => return Ok(Value::Nil),
-                                        }
-                                    } else {
-                                        let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
-                                        Some(binop(*bop, old, more, *line)?)
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        match grown {
-                            Some(v) => v,
-                            None => match self.in_place_call(Some(name), e, env)? {
-                                Some(_) if std::mem::take(&mut self.stored) => return Ok(Value::Nil),
-                                Some(v) => v,
-                                None => self.eval(e, env)?,
-                            },
-                        }
-                    }
-                    AssignOp::Add | AssignOp::Sub => {
-                        let rhs = self.eval(e, env)?;
-                        let sub = matches!(op, AssignOp::Sub);
-                        if crate::value::bump_local(env, name, &rhs, sub) {
-                            return Ok(Value::Nil);
-                        }
-                        if !sub && self.fuel == u64::MAX && crate::value::growable(env, name) {
-                            match self.grown(name, rhs, env, *line)? {
-                                Some(v) => v,
-                                None => return Ok(Value::Nil),
-                            }
-                        } else {
-                            let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
-                            // A script's limit on what it makes holds here as for `+`: `a += a`
-                            // went past it, as far as memory goes (FEEDBACK29.md; branch
-                            // feedback29-fixes).
-                            let op = if sub { BinOp::Sub } else { BinOp::Add };
-                            if self.fuel != u64::MAX {
-                                self.script_binop(op, old, rhs, *line)?
-                            } else {
-                                binop(op, old, rhs, *line)?
-                            }
-                        }
-                    }
-                };
-                // A local has nothing following it, and nor has a global while the program
-                // loads: a statement should not cost five looks at the same name
-                // (FEEDBACK29.md; branch feedback29-fixes).
-                let v = match crate::value::assign_local(env, name, v) {
-                    Ok(()) => return Ok(Value::Nil),
-                    Err(v) => v,
-                };
-                if crate::value::loading() && assign(env, name, v.clone()) {
+            // `i += 1` on a local number, a loop's commonest statement, here and at once.
+            Stmt::Assign(name, op @ (AssignOp::Add | AssignOp::Sub), e, line) if !self.writes_noted() => {
+                let rhs = self.eval(e, env)?;
+                if crate::value::bump_local(env, *name, &rhs, matches!(op, AssignOp::Sub)) {
                     return Ok(Value::Nil);
                 }
-                let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
-                // Which fields of a global map changed, for what follows
-                // one field (FEEDBACK12.md, Q-084; branch open-fixes).
-                let followed = self.shared.field_reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name.as_str());
-                let fields = match lookup_global(env, name) {
-                    Some((old, true)) if followed => changed_fields(&old, &v),
-                    _ => Vec::new(),
-                };
-                match assign_global(env, name, v) {
-                    None => fail(
-                        *line,
-                        format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name),
-                    ),
-                    Some(global) => {
-                        if global {
-                            let mut topics = vec![format!("var:{}", name)];
-                            topics.extend(fields.into_iter().map(|k| format!("var:{}.{}", name, k)));
-                            self.publish(topics);
-                            // Cached renders do not record the functions
-                            // they called, so a new one starts afresh.
-                            if function {
-                                if let Some(c) = &self.view_cache {
-                                    c.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-                                }
-                            }
-                        }
-                        Ok(Value::Nil)
-                    }
-                }
+                self.exec_assign(name, op, e, line, env, Some(rhs))
             }
+            Stmt::Assign(name, op, e, line) => self.exec_assign(name, op, e, line, env, None),
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
                 if def.server && !self.server_fns.contains(&def.name) {
@@ -2069,6 +1971,121 @@ impl Interp {
         }
     }
 
+    /// `name = e`, `+=` and `-=`: out of `run_stmt`, whose frame every statement pays for and
+    /// deeply nested code stacks (FEEDBACK29.md; branch feedback29-fixes).
+    #[inline(never)]
+    fn exec_assign(&mut self, name: &Sym, op: &AssignOp, e: &Expr, line: &u32, env: &Env, given: Option<Value>) -> Result<Value, Ctrl> {
+        if self.writes_noted() && lookup_global(env, name).map_or(false, |(_, global)| global) {
+            self.no_writes(&format!("assigning `{}`", name), *line)?;
+        }
+        let name = *name;
+        let v = match op {
+            AssignOp::Set => {
+                // `x = x + e` as `x += e`: a number in place, a list or text grown where
+                // it is. `e` first, as `+=` has it, when that cannot change `x`.
+                let grown = match e {
+                    Expr::Binary(bop @ (BinOp::Add | BinOp::Sub), a, b, _) if self.fuel == u64::MAX && matches!(&**a, Expr::Ident(n, _) if *n == name) => {
+                        let sub = *bop == BinOp::Sub;
+                        let list_or_text = !sub && crate::value::growable(env, name);
+                        if list_or_text || quiet(b) {
+                            let more = self.eval(b, env)?;
+                            if crate::value::bump_local(env, name, &more, sub) {
+                                return Ok(Value::Nil);
+                            }
+                            if list_or_text {
+                                match self.grown(name, more, env, *line)? {
+                                    Some(v) => Some(v),
+                                    None => return Ok(Value::Nil),
+                                }
+                            } else {
+                                let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
+                                Some(binop(*bop, old, more, *line)?)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match grown {
+                    Some(v) => v,
+                    None => match self.in_place_call(Some(name), e, env)? {
+                        Some(_) if std::mem::take(&mut self.stored) => return Ok(Value::Nil),
+                        Some(v) => v,
+                        None => self.eval(e, env)?,
+                    },
+                }
+            }
+            AssignOp::Add | AssignOp::Sub => {
+                // `run_stmt` may have worked it out already.
+                let rhs = match given {
+                    Some(v) => v,
+                    None => self.eval(e, env)?,
+                };
+                let sub = matches!(op, AssignOp::Sub);
+                if crate::value::bump_local(env, name, &rhs, sub) {
+                    return Ok(Value::Nil);
+                }
+                if !sub && self.fuel == u64::MAX && crate::value::growable(env, name) {
+                    match self.grown(name, rhs, env, *line)? {
+                        Some(v) => v,
+                        None => return Ok(Value::Nil),
+                    }
+                } else {
+                    let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
+                    // A script's limit on what it makes holds here as for `+`: `a += a`
+                    // went past it, as far as memory goes (FEEDBACK29.md; branch
+                    // feedback29-fixes).
+                    let op = if sub { BinOp::Sub } else { BinOp::Add };
+                    if self.fuel != u64::MAX {
+                        self.script_binop(op, old, rhs, *line)?
+                    } else {
+                        binop(op, old, rhs, *line)?
+                    }
+                }
+            }
+        };
+        // A local has nothing following it, and nor has a global while the program
+        // loads: a statement should not cost five looks at the same name
+        // (FEEDBACK29.md; branch feedback29-fixes).
+        let v = match crate::value::assign_local(env, name, v) {
+            Ok(()) => return Ok(Value::Nil),
+            Err(v) => v,
+        };
+        if crate::value::loading() && assign(env, name, v.clone()) {
+            return Ok(Value::Nil);
+        }
+        let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
+        // Which fields of a global map changed, for what follows
+        // one field (FEEDBACK12.md, Q-084; branch open-fixes).
+        let followed = self.shared.field_reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name.as_str());
+        let fields = match lookup_global(env, name) {
+            Some((old, true)) if followed => changed_fields(&old, &v),
+            _ => Vec::new(),
+        };
+        match assign_global(env, name, v) {
+            None => fail(
+                *line,
+                format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name),
+            ),
+            Some(global) => {
+                if global {
+                    let mut topics = vec![format!("var:{}", name)];
+                    topics.extend(fields.into_iter().map(|k| format!("var:{}.{}", name, k)));
+                    self.publish(topics);
+                    // Cached renders do not record the functions
+                    // they called, so a new one starts afresh.
+                    if function {
+                        if let Some(c) = &self.view_cache {
+                            c.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+                        }
+                    }
+                }
+                Ok(Value::Nil)
+            }
+        }
+    }
+
     /// Evaluates an expression. Only the cheap cases are handled inline; the
     /// rest live in separate functions so that each nested call uses little
     /// stack (deep recursion in Quillo is deep recursion here).
@@ -2180,7 +2197,7 @@ impl Interp {
                     Ok(Value::Nil)
                 }
             }
-            Expr::Block(stmts) => self.eval_block(stmts, env),
+            Expr::Block(stmts) => self.eval_block(stmts, env, true),
             Expr::Lambda(def) => Ok(Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() }))),
             Expr::Template(parts) => self.eval_template(parts, env),
             Expr::List(items) => self.eval_list(items, env),
@@ -2261,13 +2278,10 @@ impl Interp {
         }
     }
 
+    /// A block, and its value if `keep`. One frame for each block nested, as deeply nested
+    /// source is run on the stack `stack::for_nesting` makes room for.
     #[inline(never)]
-    fn eval_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Value, Ctrl> {
-        self.block_with(stmts, env, true)
-    }
-
-    /// A block, and its value if `keep`.
-    fn block_with(&mut self, stmts: &[Stmt], env: &Env, keep: bool) -> Result<Value, Ctrl> {
+    fn eval_block(&mut self, stmts: &[Stmt], env: &Env, keep: bool) -> Result<Value, Ctrl> {
         // One statement that declares nothing, as `if c { t += 1 }` has: that statement.
         if let ([s @ (Stmt::Expr(_) | Stmt::Assign(..))], false) = (stmts, crate::debug::on()) {
             return match s {
@@ -2301,7 +2315,7 @@ impl Interp {
                 }
                 Ok(Value::Nil)
             }
-            Expr::Block(stmts) => self.block_with(stmts, env, false),
+            Expr::Block(stmts) => self.eval_block(stmts, env, false),
             e => self.eval(e, env),
         }
     }
@@ -2317,6 +2331,9 @@ impl Interp {
             last = match s {
                 // What nobody takes the value of: a loop in it makes no list.
                 Stmt::Expr(e) if (i + 1 < n || !keep) && !crate::debug::on() => self.eval_unused(e, scope)?,
+                // The block's value, with no statement's frame between: a block in a block
+                // nests one frame deeper, not three.
+                Stmt::Expr(e) if !crate::debug::on() => self.eval(e, scope)?,
                 s => self.exec_stmt(s, scope)?,
             };
         }
@@ -3544,7 +3561,7 @@ impl Interp {
                     self.render_expr_into(last, &scope, out)
                 }
                 _ => {
-                    let v = self.eval_block(stmts, env)?;
+                    let v = self.eval_block(stmts, env, true)?;
                     render_value(&v, out);
                     Ok(())
                 }
