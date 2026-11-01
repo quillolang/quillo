@@ -1,0 +1,16 @@
+// Q-355 `s[i]` on the server walks the string from the start
+// mode: run
+// open-when: killed after
+// fixed-when: 1000000
+// From FEEDBACK29.md §Q-355 (found on d702589): 300,000 took 3.5 s, and it grew with the square.
+
+fn f(s) {
+    let c = 0
+    for i in 0..len(s) {
+        if s[i] == "x" {
+            c += 1
+        }
+    }
+    c
+}
+print(f(repeat("x", 1000000)))

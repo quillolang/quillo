@@ -1,0 +1,9 @@
+// Q-344 A cursor counts UTF-16 units and `slice` counts characters, and nothing converts
+// mode: run
+// open-when: unknown name `cursor_index`
+// fixed-when: 2 hi
+// From FEEDBACK28.md §Q-344 (found on 5f7f76c).
+
+let text = "😀 hi"
+let at = cursor_index(text, 3)
+print(at, slice(text, at))

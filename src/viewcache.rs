@@ -174,6 +174,8 @@ pub fn impure_builtin(name: &str) -> bool {
                 | "sleep"
                 | "file"
                 | "read_file"
+                | "stdin"
+                | "read_line"
                 | "write_file"
                 | "delete_file"
                 | "check_program"

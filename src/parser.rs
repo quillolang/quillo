@@ -150,6 +150,25 @@ pub(crate) fn import_line(line: &str) -> bool {
     IMPORT_WORDS.contains(&first) && (path || second == "module" || words.any(|w| w == "use"))
 }
 
+/// A style in a body that writes no element of its own, only components and views, as
+/// `view V() { style global css; <Inner/> }`: nothing on the page carries its mark, which is
+/// how a page's sheet is chosen, so its `__style` names it, to be noted as it runs
+/// (FEEDBACK28.md, Q-345; branch feedback29-fixes).
+fn name_unmarked_styles(body: &mut Expr, styling: Option<Styling>) {
+    let Some(Styling { scope: Some(id), marked: 0, .. }) = styling else { return };
+    let Expr::Block(stmts) = body else { return };
+    for s in stmts {
+        if let Stmt::Expr(Expr::Call(f, args, _)) = s {
+            if matches!(&**f, Expr::Ident(n, _) if n == "__style") {
+                if args.len() == 1 {
+                    args.push(Expr::Lit(Lit::Nil));
+                }
+                args.push(Expr::Lit(Lit::Str(id.as_str().into())));
+            }
+        }
+    }
+}
+
 /// A component's or view's own CSS (FEEDBACK8.md, Q-067; branch
 /// feedback8-fixes): after `style ...` in its body, each element it writes
 /// carries `data-q-<id>`, on the server and in the browser alike, and its
@@ -161,6 +180,8 @@ struct Styling {
     scope: Option<String>,
     /// Elements written so far: a `style` comes before them.
     els: u32,
+    /// Those that carry its mark: not a component's or view's tag.
+    marked: u32,
 }
 
 fn can_start_expr(t: &Tok) -> bool {
@@ -599,6 +620,12 @@ impl Parser {
                 }
                 // What a JavaScript habit gets here (FEEDBACK25.md, Q-324; branch
                 // feedback26-fixes).
+                if let Some(h) = habit(&other) {
+                    return self.err_at(h);
+                }
+                if let Some(h) = self.word_before().and_then(|w| word_habit(&w)) {
+                    return self.err_at(h);
+                }
                 match other {
                     Tok::Comma => self.err_at("expected end of statement, found `,`: there is one `let` to a line"),
                     Tok::Colon => self.err_at("expected end of statement, found `:`: a map's key is a name or text, and for one in a variable use `set(m, k, v)`"),
@@ -949,6 +976,7 @@ impl Parser {
                     let rhs = self.parse_expr()?;
                     return Ok(Stmt::SetField(*obj, name, op, rhs, line));
                 }
+                Expr::List(_) => return Err(QuilloError::new("several names are not assigned at once: `let [c, d] = [b, a + b]`, then assign each", line)),
                 _ => return Err(QuilloError::new("only variables, and the fields of the page's objects (`el.value = x`), can be assigned to", line)),
             };
             let rhs = self.parse_expr()?;
@@ -961,10 +989,13 @@ impl Parser {
         self.expect(&Tok::LParen, "`(`")?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen)? {
+            if self.at(&Tok::DotDot)? {
+                return self.err_at("a function takes no `...rest`: take a list");
+            }
             let pname = self.expect_ident("a parameter name")?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
             let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
-            params.push(Param { name: pname, ty, default });
+            params.push(Param { name: pname.into(), ty, default });
             if !self.eat(&Tok::Comma)? {
                 break;
             }
@@ -996,7 +1027,7 @@ impl Parser {
         let may = std::mem::take(&mut self.view_next);
         // A helper written inside a styled component or view is part of it.
         let scope = if may { None } else { self.styling.as_ref().and_then(|s| s.scope.clone()) };
-        let styling = Styling { owner: name.clone(), may, params: params.iter().map(|p| p.name.clone()).collect(), scope, els: 0 };
+        let styling = Styling { owner: name.clone(), may, params: params.iter().map(|p| p.name.to_string()).collect(), scope, els: 0, marked: 0 };
         let outer = self.styling.replace(styling);
         let body = if self.eat(&Tok::Assign)? {
             self.measured(Self::parse_arrow_body)
@@ -1006,8 +1037,9 @@ impl Parser {
             self.styling = outer;
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
         };
-        self.styling = outer;
-        let (body, nesting) = body?;
+        let ours = std::mem::replace(&mut self.styling, outer);
+        let (mut body, nesting) = body?;
+        name_unmarked_styles(&mut body, ours);
         Ok(FnDef { name, params, ret, err, effects, server: false, component: false, body, line, nesting, file: self.file.clone(), hot: Default::default() })
     }
 
@@ -1042,7 +1074,7 @@ impl Parser {
         let mut read = None;
         crate::check::walk_expr(&e, &mut |x| {
             if let Expr::Ident(n, _) = x {
-                if read.is_none() && params.contains(n) {
+                if read.is_none() && params.contains(&n.to_string()) {
                     read = Some(n.clone());
                 }
             }
@@ -1075,20 +1107,24 @@ impl Parser {
         self.expect(&Tok::LParen, "`(`")?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen)? {
+            if self.at(&Tok::DotDot)? {
+                return self.err_at("a function takes no `...rest`: take a list");
+            }
             let pname = self.expect_ident("a parameter name")?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
             let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
-            params.push(Param { name: pname, ty, default });
+            params.push(Param { name: pname.into(), ty, default });
             if !self.eat(&Tok::Comma)? {
                 break;
             }
         }
         self.expect(&Tok::RParen, "`)`")?;
-        let styling = Styling { owner: name.clone(), may: true, params: params.iter().map(|p| p.name.clone()).collect(), scope: None, els: 0 };
+        let styling = Styling { owner: name.clone(), may: true, params: params.iter().map(|p| p.name.to_string()).collect(), scope: None, els: 0, marked: 0 };
         let outer = self.styling.replace(styling);
         let body = self.measured(|p| p.component_body(&name));
-        self.styling = outer;
-        let (body, nesting) = body?;
+        let ours = std::mem::replace(&mut self.styling, outer);
+        let (mut body, nesting) = body?;
+        name_unmarked_styles(&mut body, ours);
         let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, component: true, body, line, nesting, file: self.file.clone(), hot: Default::default() };
         key_not_a_param(&def)?;
         Ok(def)
@@ -1502,7 +1538,7 @@ impl Parser {
                 self.next()?;
                 let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
                 let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
-                params.push(Param { name, ty, default });
+                params.push(Param { name: name.into(), ty, default });
                 if !self.eat(&Tok::Comma)? {
                     break;
                 }
@@ -1710,6 +1746,9 @@ impl Parser {
             };
             self.next()?;
             self.deeper()?;
+            if op == BinOp::Mul && self.at(&Tok::Star)? {
+                return self.err_at("there is no `**`: `pow(x, 2)`");
+            }
             let rhs = self.parse_unary()?;
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs), line);
         }
@@ -1769,6 +1808,9 @@ impl Parser {
                     let args = self.no_bare_arrow_off(|p| {
                         let mut args = Vec::new();
                         while !p.at(&Tok::RParen)? {
+                            if p.at(&Tok::DotDot)? {
+                                return p.err_at("a spread goes in a list or a map, not in a call: pass the list");
+                            }
                             args.push(p.parse_expr()?);
                             if !p.eat(&Tok::Comma)? {
                                 break;
@@ -1776,6 +1818,13 @@ impl Parser {
                         }
                         if p.at(&Tok::FatArrow)? {
                             return p.err_at("a function's parameters are plain names, not patterns: `(p) => p[0] + p[1]`");
+                        }
+                        if p.at(&Tok::Colon)? {
+                            return p.err_at("there are no named arguments: pass a map, as `f({ c: 9 })`");
+                        }
+                        let next = p.peek()?.clone();
+                        if let Some(h) = habit(&next) {
+                            return p.err_at(h);
                         }
                         p.expect(&Tok::RParen, "`)` after arguments")?;
                         Ok(args)
@@ -1799,7 +1848,13 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.next()?;
+                    if self.at(&Tok::Colon)? {
+                        return self.err_at("there are no slices with `:`, and no step: `slice(xs, a, b)`, and `filter` over `enumerate` for every second one");
+                    }
                     let i = self.no_bare_arrow_off(|p| p.parse_expr())?;
+                    if self.at(&Tok::Colon)? {
+                        return self.err_at("there are no slices with `:`: `slice(xs, a, b)`");
+                    }
                     self.expect(&Tok::RBracket, "`]`")?;
                     e = Expr::Index(Box::new(e), Box::new(i), line);
                 }
@@ -1907,17 +1962,17 @@ impl Parser {
                     let parts = self.lx.lex_template()?;
                     self.lx.last = Some(Tok::RParen);
                     let t = self.template(parts)?;
-                    Ok(Expr::Call(Box::new(Expr::Ident(k.clone(), line)), vec![t], line))
+                    Ok(Expr::Call(Box::new(Expr::Ident(k.clone().into(), line)), vec![t], line))
                 }
                 _ => {
                     // `x => body`: an arrow function with one parameter.
                     if self.no_bare_arrow == 0 && self.at(&Tok::FatArrow)? {
                         self.next()?;
                         let body = self.measured(Self::parse_arrow_body)?;
-                        let params = vec![Param { name: k.clone(), ty: None, default: None }];
+                        let params = vec![Param { name: k.clone().into(), ty: None, default: None }];
                         return Ok(arrow(params, None, body, line, self.file.clone()));
                     }
-                    Ok(Expr::Ident(k.clone(), line))
+                    Ok(Expr::Ident(k.clone().into(), line))
                 }
             },
             other => Err(QuilloError::new(format!("expected an expression, found {}", other.describe()), line)),
@@ -1925,6 +1980,14 @@ impl Parser {
     }
 
     /// After `{` in expression position: a map if it is empty or starts with
+    /// The word just before the next token, for what an error can say of it.
+    fn word_before(&self) -> Option<String> {
+        let text = self.lx.text();
+        let upto = self.lx.pos.min(text.len());
+        let line: Vec<char> = text[..upto].iter().rev().copied().skip_while(|c| !c.is_whitespace()).skip_while(|c| c.is_whitespace()).take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        (!line.is_empty()).then(|| line.into_iter().rev().collect())
+    }
+
     /// `key:`, `key,` or `{ key }`; otherwise a block. A keyword may be a key
     /// (`{ view: "grid" }`), but not a shorthand one.
     fn brace_is_map(&mut self) -> PResult<bool> {
@@ -2007,13 +2070,14 @@ impl Parser {
                     Some(s) => (s, false),
                     None => return Err(QuilloError::new("map keys must be plain strings", t.line)),
                 },
+                Tok::LBracket => return Err(QuilloError::new("a map's key is a name or text, and for one in a variable use `set(m, k, v)`", t.line)),
                 other => return Err(QuilloError::new(format!("expected a map key, found {}", other.describe()), t.line)),
             };
             if self.eat(&Tok::Colon)? {
                 let v = self.parse_expr()?;
                 entries.push((key, v));
             } else if shorthand_ok {
-                entries.push((key.clone(), Expr::Ident(key, t.line)));
+                entries.push((key.clone(), Expr::Ident(key.into(), t.line)));
             } else {
                 return Err(QuilloError::new(format!("expected `:` after map key \"{}\"", key), t.line));
             }
@@ -2119,7 +2183,7 @@ impl Parser {
     /// parameter does; `match` tests types.
     fn parse_binding(&mut self) -> PResult<Pattern> {
         Ok(match self.parse_pattern()? {
-            Pattern::Type(n) if TYPE_NAMES.contains(&n.as_str()) => Pattern::Bind(n),
+            Pattern::Type(n) if TYPE_NAMES.contains(&n.as_str()) => Pattern::Bind(n.into()),
             p => p,
         })
     }
@@ -2146,6 +2210,9 @@ impl Parser {
         } else if self.at(&Tok::LBrace)? {
             self.parse_block()?
         } else {
+            if matches!(self.peek()?, Tok::Ident(k) if k == "if") {
+                return self.err_at("a `for` takes no `if`: `filter` the list first, or put the `if` in its body");
+            }
             return self.err_at("expected `=>` or `{` after the `for` list");
         };
         Ok(Expr::For(pat, Box::new(iter), Box::new(body), line))
@@ -2220,7 +2287,7 @@ impl Parser {
                 t if KEYWORDS.contains(&t) => {
                     return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", t), line))
                 }
-                _ => Pattern::Bind(k.clone()),
+                _ => Pattern::Bind(k.clone().into()),
             }),
             Tok::LBracket => {
                 let mut items = Vec::new();
@@ -2254,7 +2321,7 @@ impl Parser {
                     let pat = if self.eat(&Tok::Colon)? {
                         self.parse_pattern()?
                     } else {
-                        Pattern::Bind(path.last().unwrap().clone())
+                        Pattern::Bind(path.last().unwrap().clone().into())
                     };
                     let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
                     fields.push(RecField { path, pat, default });
@@ -2389,7 +2456,7 @@ impl Parser {
                         attrs.push(("...".to_string(), AttrVal::Spread(e)));
                     } else {
                         match self.parse_braced_expr()? {
-                            Expr::Ident(name, l) => attrs.push((name.clone(), AttrVal::Expr(Expr::Ident(name, l)))),
+                            Expr::Ident(name, l) => attrs.push((name.clone().to_string(), AttrVal::Expr(Expr::Ident(name, l)))),
                             _ => {
                                 return Err(QuilloError::new(
                                     format!("in <{}>, write {{name}} (short for name={{name}}) or {{...map}}", tag),
@@ -2458,6 +2525,7 @@ impl Parser {
             if let Some(scope) = &s.scope {
                 if !tag.starts_with(|c: char| c.is_uppercase()) {
                     attrs.push((format!("data-q-{}", scope), AttrVal::Bool));
+                    s.marked += 1;
                 }
             }
         }
@@ -2700,6 +2768,28 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
 }
 
 /// What to write instead of an old Wisp-era spelling.
+/// What to write for what Python and JavaScript write, where a token gives it away
+/// (FEEDBACK29.md, Q-359; branch feedback29-fixes).
+fn habit(t: &Tok) -> Option<&'static str> {
+    match t {
+        Tok::Ident(k) if k == "in" => Some("there is no `in`: `contains(xs, x)`, or `has(m, k)` for a map"),
+        Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge => Some("comparisons do not chain: `a < x && x < b`"),
+        _ => None,
+    }
+}
+
+/// The same, for a word that reads as a name until what follows it.
+fn word_habit(w: &str) -> Option<&'static str> {
+    Some(match w {
+        "try" | "catch" | "except" => "there is no `try`: errors are values, so `?` passes one on and `??` replaces it",
+        "class" => "there are no classes: `type` for a record, and functions",
+        "yield" => "there are no generators: return a list",
+        "throw" | "raise" => "there is no `throw`: `return err(...)`",
+        "def" | "function" | "func" => "a function is `fn name(x) = ...`",
+        _ => return None,
+    })
+}
+
 fn old_syntax_hint(t: &Tok) -> Option<&'static str> {
     match t {
         Tok::Ident(k) => match k.as_str() {
@@ -2863,7 +2953,7 @@ fn pattern_names_request(p: &Pattern) -> bool {
 /// The names a `let` pattern binds.
 fn pattern_binds(p: &Pattern, out: &mut Vec<String>) {
     match p {
-        Pattern::Bind(n) => out.push(n.clone()),
+        Pattern::Bind(n) => out.push(n.to_string()),
         Pattern::As(inner, n) => {
             pattern_binds(inner, out);
             out.push(n.clone());

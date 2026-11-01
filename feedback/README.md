@@ -39,6 +39,8 @@ cooperative: members, savings, fixed deposits, a loan designer, loans approved b
 [FEEDBACK24.md](reports/FEEDBACK24.md) (no app: how `live()` holds up with large records and 1000 active users, from reading, and how a form is made idempotent),
 [FEEDBACK25.md](reports/FEEDBACK25.md) (no app: 100 smart components for the kit, each doing real work in the browser, and where the server and the browser differ),
 [FEEDBACK26.md](reports/FEEDBACK26.md) (no app: 100 more plugins, and how an error's text, a repeated field and a script's arguments are handled),
+[FEEDBACK28.md](reports/FEEDBACK28.md) (no app: 200 phone and tablet components for the kit, and the seam between Quillo and the page: what waits, what compares, what a handler set),
+[FEEDBACK29.md](reports/FEEDBACK29.md) (no app: everyday programs written in Quillo and in Python, timed, and what a script lacks as a command-line tool),
 [BUGREPORT1.md](reports/BUGREPORT1.md).
 
 ## Each run

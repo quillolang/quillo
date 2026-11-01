@@ -1,0 +1,11 @@
+// Q-356 `for i in 0..n` stops at ten million, though it makes no list
+// mode: run
+// open-when: range is too large
+// fixed-when: 20000000
+// From FEEDBACK29.md §Q-356 (found on d702589).
+
+let t = 0
+for i in 0..20000000 {
+    t += 1
+}
+print(t)

@@ -454,9 +454,11 @@ impl Interp {
         // and of those its bundle can show, at an address that changes when
         // they do, in its <head> (FEEDBACK8.md, Q-068; branch
         // feedback8-fixes).
+        let unmarked = std::mem::take(&mut self.styles_used);
         if html && req.method != "HEAD" {
             let mut ids = crate::styles::ids_in(&resp.body);
             ids.extend(bundle_styles);
+            ids.extend(unmarked);
             // The libraries named `with preload` or `with preconnect`, before the
             // sheet (branch library-hints).
             let mut link = hints;
@@ -2449,6 +2451,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     }
     SHOW_ERRORS.store(app.watch, std::sync::atomic::Ordering::Relaxed);
     crate::value::HIDING.store(!app.watch, std::sync::atomic::Ordering::Relaxed);
+    crate::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
     // `--plain-http` too (FEEDBACK13.md, Q-089; branch feedback13-fixes).
     let asked = crate::session::PLAIN_HTTP_ASKED.load(std::sync::atomic::Ordering::Relaxed);
     crate::session::PLAIN_HTTP.store(app.watch || app.launch_token.is_some() || asked, std::sync::atomic::Ordering::Relaxed);
@@ -2480,6 +2483,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
 pub fn serve_many(apps: Vec<App>, addr: &str, workers: usize) -> Result<(), String> {
     take_descriptors();
     crate::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {}: {}", addr, e))?;
     let shown = listener.local_addr().map_or_else(|_| addr.to_string(), |a| a.to_string());
     let apps: Vec<Arc<App>> = apps.into_iter().map(Arc::new).collect();

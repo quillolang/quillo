@@ -37,7 +37,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "print", "str", "int", "float", "dec", "len", "type_of", "upper", "lower", "trim", "filled", "split", "join", "contains",
     "starts_with", "ends_with", "replace", "slice", "map", "filter", "find", "any", "all", "reduce", "sum", "min",
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
-    "set", "remove", "merge", "err", "is_err", "error", "unwrap", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
+    "set", "remove", "merge", "err", "is_err", "error", "unwrap", "run_after", "page_updated", "js_has", "cursor_index", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
     "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
     // FEEDBACK13.md, Q-091; branch feedback13-fixes.
@@ -89,6 +89,61 @@ fn compiled<'a>(it: &'a Interp, roots: Option<&[String]>) -> Result<(Compiler<'a
 }
 
 /// The components a compile made: the roots and every one they show.
+/// Why `js(path)` or `js_new(path)` is refused, if it is: what runs text as code, and the
+/// ways around the checks the runtime makes on the page's functions (setting any property,
+/// calling with any `this`, parsing markup). `quillo check` asks the same, so it says what
+/// `quillo run` would (FEEDBACK28.md, Q-347; branch feedback29-fixes).
+pub(crate) fn js_path_problem(f: &str, path: &str) -> Option<String> {
+    const TEXT_AS_CODE: &[&str] = &[
+        "eval",
+        "Function",
+        "setTimeout",
+        "setInterval",
+        "execScript",
+        "insertAdjacentHTML",
+        "setHTMLUnsafe",
+        "parseHTMLUnsafe",
+        "createContextualFragment",
+        "write",
+        "writeln",
+        "constructor",
+        "__proto__",
+    ];
+    const AROUND: &[&str] = &[
+        "Reflect.apply",
+        "Reflect.construct",
+        "Reflect.get",
+        "Reflect.set",
+        "Reflect.defineProperty",
+        "Reflect.setPrototypeOf",
+        "Reflect.getOwnPropertyDescriptor",
+        "Object.assign",
+        "Object.defineProperty",
+        "Object.defineProperties",
+        "Object.setPrototypeOf",
+        "Object.getOwnPropertyDescriptor",
+        "Object.getOwnPropertyDescriptors",
+        "DOMParser",
+    ];
+    let last = path.rsplit('.').next().unwrap_or("");
+    if TEXT_AS_CODE.contains(&last) {
+        let instead = match last {
+            "setTimeout" => ": `run_after(ms, f)` runs a function once, later",
+            "setInterval" => ": `every(ms, f)` runs a function again and again",
+            _ => "",
+        };
+        return Some(format!("`{}` does not call {}: it runs text as code{}", f, path, instead));
+    }
+    let mut bare: &str = path;
+    while let Some(rest) = ["window.", "globalThis.", "self."].iter().find_map(|p| bare.strip_prefix(p)) {
+        bare = rest;
+    }
+    if AROUND.contains(&bare) {
+        return Some(format!("`{}` does not call {}: it steps around the checks on the page's functions", f, path));
+    }
+    None
+}
+
 fn components_of(it: &Interp, c: &Compiler) -> Vec<String> {
     let mut out: Vec<String> = c
         .globals
@@ -1303,7 +1358,7 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign(n, _, e, _) => {
-                out.insert(n.clone());
+                out.insert(n.to_string());
                 expr_assigned(e, out);
             }
             Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => expr_assigned(e, out),
@@ -1382,12 +1437,12 @@ fn sync_called(body: &Expr) -> HashSet<String> {
         each_expr_in(e, &mut |x| match x {
             Expr::Call(c, _, _) => {
                 if let Expr::Ident(n, _) = &**c {
-                    out.insert(n.clone());
+                    out.insert(n.to_string());
                 }
             }
             Expr::Pipe(_, b, _) => {
                 if let Expr::Ident(n, _) = &**b {
-                    out.insert(n.clone());
+                    out.insert(n.to_string());
                 }
             }
             _ => {}
@@ -1573,9 +1628,9 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
         each_expr_in(
             e,
             &mut |x| match x {
-                Expr::Ident(n, _) if n == "env" && !shadowed.contains(n) => envs += 1,
-                Expr::Ident(n, _) if !shadowed.contains(n) => {
-                    found |= sources.contains(n.as_str()) || services.contains(n) || vars.contains(n) || fns.contains(n)
+                Expr::Ident(n, _) if n == "env" && !shadowed.contains(&n.to_string()) => envs += 1,
+                Expr::Ident(n, _) if !shadowed.contains(&n.to_string()) => {
+                    found |= sources.contains(n.as_str()) || services.contains(n.as_str()) || vars.contains(n.as_str()) || fns.contains(n.as_str())
                 }
                 Expr::Field(_, n, _) => found |= fns.contains(n),
                 Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
@@ -1593,7 +1648,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
         let (mut envs, mut public) = (0, 0);
         each_expr(e, &mut |x| match x {
             Expr::Ident(n, _) if n == "env" => envs += 1,
-            Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || vars.contains(n),
+            Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || vars.contains(n.as_str()),
             Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
             _ => {}
         });
@@ -1611,7 +1666,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
                     }
                     Stmt::Fn(d) if !fns.contains(&d.name) => {
                         // Its parameters are its own, whatever their names.
-                        let params: Vec<String> = d.params.iter().map(|p| p.name.clone()).collect();
+                        let params: Vec<String> = d.params.iter().map(|p| p.name.to_string()).collect();
                         if uses(&d.body, true, &params, &vars, &fns) {
                             fns.insert(d.name.clone());
                         }
@@ -1650,7 +1705,7 @@ fn simple_pattern(p: &Pattern, v: &str, out: &mut Vec<(String, String)>) -> Opti
             if out.iter().any(|(m, _)| m == n) {
                 return None;
             }
-            out.push((n.clone(), v.to_string()));
+            out.push((n.to_string(), v.to_string()));
             Some(String::new())
         }
         Pattern::Lit(l) => Some(format!("W.eq({}, {})", lit_js(l), v)),
@@ -1678,7 +1733,7 @@ fn simple_pattern(p: &Pattern, v: &str, out: &mut Vec<(String, String)>) -> Opti
 /// Names a pattern binds, in order.
 fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     match p {
-        Pattern::Bind(n) => out.push(n.clone()),
+        Pattern::Bind(n) => out.push(n.to_string()),
         Pattern::Alt(ps) => ps.iter().for_each(|q| pattern_names(q, out)),
         Pattern::As(q, n) => {
             pattern_names(q, out);
@@ -1773,7 +1828,7 @@ impl<'a> Compiler<'a> {
     fn new(it: &'a Interp) -> Self {
         let mut assigned = HashSet::new();
         for stmts in it.program.iter() {
-            collect_assigned(stmts, &mut assigned);
+            crate::check::global_assigned(stmts, &mut assigned);
         }
         Compiler {
             it,
@@ -2345,7 +2400,7 @@ impl<'a> Compiler<'a> {
                 let (v, _) = self.reactive_expr(d)?;
                 defaults.push(format!("{}: () => ({})", js_str(&p.name), v));
             }
-            self.declare_as(&p.name, Local::Prop(p.name.clone()));
+            self.declare_as(&p.name, Local::Prop(p.name.to_string()));
         }
         if !defaults.is_empty() {
             let _ = writeln!(out, "$p = W.props($p, {{{}}});", defaults.join(", "));
@@ -2388,7 +2443,7 @@ impl<'a> Compiler<'a> {
             _ => HashSet::new(),
         };
         expr_assigned(&def.body, &mut self.mutable);
-        if exits || changed.iter().any(|n| !states.contains(n)) {
+        if exits || changed.iter().any(|n| !states.iter().any(|s| s.as_str() == n.as_str())) {
             self.ctx().hoisted = true;
             let mut copy = String::new();
             for p in &def.params {
@@ -2447,7 +2502,7 @@ impl<'a> Compiler<'a> {
                         let _ = writeln!(body, "{};", v);
                     }
                 }
-                Stmt::Let(p, e, line) if !matches!(e, Expr::Lambda(_)) && !matches!(p, Pattern::Bind(n) if self.mutable.contains(n)) => {
+                Stmt::Let(p, e, line) if !matches!(e, Expr::Lambda(_)) && !matches!(p, Pattern::Bind(n) if self.mutable.contains(n.as_str())) => {
                     self.line = *line;
                     let (v, r) = self.reactive_expr(e)?;
                     if !r {
@@ -2564,7 +2619,7 @@ impl<'a> Compiler<'a> {
                 Stmt::Let(p, e, line) => {
                     self.line = *line;
                     if let (Pattern::Bind(n), Expr::Lambda(d)) = (p, e) {
-                        let not_sync = self.sync_calls.last().map_or(false, |s| !s.contains(n));
+                        let not_sync = self.sync_calls.last().map_or(false, |s| !s.contains(n.as_str()));
                         let c = self.ctx();
                         let own = c.component.is_some() && !c.view && not_sync;
                         if own || c.waits_js {
@@ -2792,7 +2847,7 @@ impl<'a> Compiler<'a> {
             },
             _ => return self.err("`live` needs a server fn by name: state items = live(load_items, ...)"),
         };
-        Ok(Some((fname, &args[1..], every)))
+        Ok(Some((fname.to_string(), &args[1..], every)))
     }
 
     /// Whether a function waits on the server (it calls a `server fn`, or a
@@ -3081,7 +3136,7 @@ impl<'a> Compiler<'a> {
         let Expr::Ident(n, _) = e else { return None };
         for ctx in self.ctxs.iter().rev() {
             for scope in ctx.scopes.iter().rev() {
-                if let Some(l) = scope.get(n) {
+                if let Some(l) = scope.get(n.as_str()) {
                     return if let Local::State(js) = l { Some(js.clone()) } else { None };
                 }
             }
@@ -3117,6 +3172,10 @@ impl<'a> Compiler<'a> {
                 }
                 let _ = write!(pre, "const $x = $l[$k]; ");
                 Ok((format!("const $l = W.enumlist({});\nfor (let $k = 0; $k < $l.length; $k++)", l), pre, x, "$x".into()))
+            }
+            Expr::Call(callee, args, _) if args.len() == 3 && builtin(self, callee, "range")? => {
+                let (a, b, c) = (self.expr(&args[0])?, self.expr(&args[1])?, self.expr(&args[2])?);
+                Ok((format!("const $r = W.stepped({}, {}, {});\nfor (let $x = $r[0]; $r[2] > 0 ? $x < $r[1] : $x > $r[1]; $x += $r[2])", a, b, c), String::new(), pat, "$x".into()))
             }
             Expr::Call(callee, args, _) if (args.len() == 1 || args.len() == 2) && builtin(self, callee, "range")? => {
                 let a = self.expr(&args[0])?;
@@ -3241,6 +3300,13 @@ impl<'a> Compiler<'a> {
             }
             let is_async = self.is_async_name(name);
             let call = format!("W.mcall({}, {}, {}, [{}])", recv, js_str(name), fb, argv.join(", "));
+            // One rule for what waits: a call of the page's that gives a Promise, as
+            // `img.decode()` and `audio.play()` do, is waited for where code can wait, as
+            // `js(...)` is; `.then`, `.catch` and `.finally` keep it (FEEDBACK28.md, Q-336;
+            // branch feedback29-fixes).
+            if !is_async && !self.keep_promise && !matches!(name.as_str(), "then" | "catch" | "finally") && (self.ctx().waits_js || self.ctx().state_init) {
+                return self.finish_wait(name, call);
+            }
             return self.finish_call(name, is_async, call);
         }
         if let Some(name) = public_env(callee, args).filter(|_| !self.is_local("env")) {
@@ -3300,10 +3366,29 @@ impl<'a> Compiler<'a> {
         // `server fn` is: its rejection an error value (FEEDBACK6.md, Q-057;
         // branch feedback6-fixes). Elsewhere, and before `.then`, it stays a
         // Promise.
-        if (f == "B.js" || f == "B.js_new") && !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
-            return self.finish_call(&name, true, format!("W.settle({})", call));
+        // What `js_new` makes is kept as it is, a Promise too, to be waited for where it is
+        // used (FEEDBACK28.md, Q-336; branch feedback29-fixes).
+        if (f == "B.js" || f == "B.page_updated") && !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
+            return self.finish_wait(&name, call);
+        }
+        // A function given as a prop may wait, or not: its Promise is waited for as a
+        // `server fn`'s is (FEEDBACK28.md, Q-335; branch feedback29-fixes).
+        if !is_async && !self.keep_promise && self.ctx().waits_js && !f.starts_with("B.") {
+            return self.finish_wait(&name, call);
         }
         self.finish_call(&name, is_async, call)
+    }
+
+    /// `call`, waited for only if it gave a Promise. A plain read does not wait, or
+    /// what follows it, `e.preventDefault()` say, would run too late (FEEDBACK28.md,
+    /// Q-340; branch feedback29-fixes).
+    fn finish_wait(&mut self, name: &str, call: String) -> Result<String, QuilloError> {
+        if self.ctx().component.is_some() {
+            return self.finish_call(name, true, call);
+        }
+        let t = self.temp();
+        let waited = self.await_if(true, format!("W.settle({})", t));
+        Ok(format!("(W.waits({t} = {call}) ? {waited} : {t})"))
     }
 
     /// `Chart`, `L.map`, `Chart.new`: a name a browser library gives, and the
@@ -3312,11 +3397,11 @@ impl<'a> Compiler<'a> {
     fn lib_path(&mut self, e: &Expr) -> Result<Option<String>, QuilloError> {
         match e {
             Expr::Ident(n, _) => {
-                if !self.it.js_libs.contains_key(n) {
+                if !self.it.js_libs.contains_key(n.as_str()) {
                     return Ok(None);
                 }
                 Ok(match self.resolve(n)? {
-                    Resolved::Global(js, _) if js.starts_with("B.js_value(") => self.it.js_libs.get(n).map(|l| l.global.clone()),
+                    Resolved::Global(js, _) if js.starts_with("B.js_value(") => self.it.js_libs.get(n.as_str()).map(|l| l.global.clone()),
                     _ => None,
                 })
             }
@@ -3340,9 +3425,10 @@ impl<'a> Compiler<'a> {
             argv.push(self.expr(a)?);
         }
         let call = format!("B.{}({})", f, argv.join(", "));
-        // Its Promise is waited for where code can wait, as `js(...)`'s is.
-        if !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
-            return self.finish_call(path, true, format!("W.settle({})", call));
+        // Its Promise is waited for where code can wait, as `js(...)`'s is; what `new`
+        // makes is kept.
+        if f == "js" && !self.keep_promise && (self.ctx().waits_js || self.ctx().state_init) {
+            return self.finish_wait(path, call);
         }
         self.finish_call(path, false, call)
     }
@@ -3379,51 +3465,10 @@ impl<'a> Compiler<'a> {
         if !ok {
             return self.err(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", f, path));
         }
-        let banned = [
-            "eval",
-            "Function",
-            "setTimeout",
-            "setInterval",
-            "execScript",
-            "insertAdjacentHTML",
-            "setHTMLUnsafe",
-            "parseHTMLUnsafe",
-            "createContextualFragment",
-            "write",
-            "writeln",
-            "constructor",
-            "__proto__",
-        ];
-        let last = path.rsplit('.').next().unwrap_or("");
-        if banned.contains(&last) {
-            return self.err(format!("`{}` does not call {}: it runs text as code", f, path));
+        match js_path_problem(f, path) {
+            Some(why) => self.err(why),
+            None => Ok(()),
         }
-        // Ways around the checks the runtime makes on the page's functions:
-        // setting any property, calling with any `this`, parsing markup.
-        let around = [
-            "Reflect.apply",
-            "Reflect.construct",
-            "Reflect.get",
-            "Reflect.set",
-            "Reflect.defineProperty",
-            "Reflect.setPrototypeOf",
-            "Reflect.getOwnPropertyDescriptor",
-            "Object.assign",
-            "Object.defineProperty",
-            "Object.defineProperties",
-            "Object.setPrototypeOf",
-            "Object.getOwnPropertyDescriptor",
-            "Object.getOwnPropertyDescriptors",
-            "DOMParser",
-        ];
-        let mut bare: &str = path;
-        while let Some(rest) = ["window.", "globalThis.", "self."].iter().find_map(|p| bare.strip_prefix(p)) {
-            bare = rest;
-        }
-        if around.contains(&bare) {
-            return self.err(format!("`{}` does not call {}: it steps around the checks on the page's functions", f, path));
-        }
-        Ok(())
     }
 
     fn is_local(&self, name: &str) -> bool {
@@ -3772,7 +3817,7 @@ impl<'a> Compiler<'a> {
     /// getters where they read what changes, and its children as markup.
     fn comp_call(&mut self, el: &HtmlEl) -> Result<String, QuilloError> {
         self.line = el.line;
-        let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone(), el.line))?;
+        let (f, _) = self.callee_value(&Expr::Ident(el.tag.clone().into(), el.line))?;
         if f.starts_with("G[") && matches!(lookup(&self.it.globals, &el.tag), Some(Value::Func(c)) if !c.def.component && !c.def.server) {
             self.need_view(&el.tag)?;
         }

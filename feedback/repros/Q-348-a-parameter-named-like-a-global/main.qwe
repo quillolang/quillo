@@ -1,0 +1,16 @@
+// Q-348 Assigning a local named like a global gives a false error
+// mode: serve
+// get: /
+// open-when: is a server variable that
+// fixed-when: <b>1</b>
+// From FEEDBACK28.md §Q-348 (found on 5f7f76c). Nothing changes the global: `other` assigns its
+// own parameter. On 5f7f76c `quillo check` refused it; on the first fix, `quillo run`.
+
+let rows = [1]
+fn other(rows) {
+    rows = rows + [1]
+    rows
+}
+component P() { <b>{len(rows)}</b> }
+route GET / = <html><body><P/></body></html>
+route GET /o = str(other([2]))

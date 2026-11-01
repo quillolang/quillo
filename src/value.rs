@@ -1,5 +1,6 @@
 use crate::ast::FnDef;
 use crate::interp::{Ctrl, Interp};
+use crate::sym::{Name, Sym};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -455,6 +456,90 @@ impl Value {
             J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), Value::from_json(v))).collect()),
         }
     }
+
+    /// JSON text as a value, read as `from_json` reads it, with no tree of serde_json's
+    /// made and thrown away between: half of the time it took (FEEDBACK29.md; branch
+    /// feedback29-fixes).
+    pub fn parse_json(text: &str) -> serde_json::Result<Value> {
+        serde_json::from_str::<Parsed>(text).map(|p| p.0)
+    }
+}
+
+/// A value read from JSON (`Value::parse_json`).
+struct Parsed(Value);
+
+struct ParsedKey(Key);
+
+impl<'de> serde::Deserialize<'de> for Parsed {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Parsed, D::Error> {
+        d.deserialize_any(ParsedVisitor)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ParsedKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<ParsedKey, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ParsedKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_str<E>(self, s: &str) -> Result<ParsedKey, E> {
+                Ok(ParsedKey(Key::new(s)))
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+struct ParsedVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
+    type Value = Parsed;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+
+    fn visit_unit<E>(self) -> Result<Parsed, E> {
+        Ok(Parsed(Value::Nil))
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Parsed, E> {
+        Ok(Parsed(Value::Bool(b)))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Parsed, E> {
+        Ok(Parsed(Value::Int(n)))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Parsed, E> {
+        Ok(Parsed(i64::try_from(n).map_or(Value::Float(n as f64), Value::Int)))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Parsed, E> {
+        Ok(Parsed(Value::Float(n)))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Parsed, E> {
+        Ok(Parsed(Value::str(s)))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed, A::Error> {
+        let mut out = Vec::new();
+        while let Some(Parsed(v)) = seq.next_element()? {
+            out.push(v);
+        }
+        Ok(Parsed(Value::list(out)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
+        let mut out = Map::new();
+        while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
+            out.insert(k, v);
+        }
+        Ok(Parsed(Value::map(out)))
+    }
 }
 
 fn fmt_float(f: f64) -> String {
@@ -487,6 +572,30 @@ pub static HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 thread_local! {
     /// For `told`: text that goes to the log, not to a visitor.
     static TOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set once a server starts: what is for a script alone (`stdin`, `exit`) is refused then.
+pub static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn serving() -> bool {
+    SERVING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// While a program's top level runs, as it loads: nothing follows a global yet (no live
+    /// page, no cached view, no other request), so one may be changed where it is, as a
+    /// local is. That is where a script does all it does (FEEDBACK29.md, Q-353; branch
+    /// feedback29-fixes).
+    static LOADING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn loading() -> bool {
+    LOADING.with(|l| l.get())
+}
+
+/// Sets whether a program is loading on this thread; what it was.
+pub fn set_loading(on: bool) -> bool {
+    LOADING.with(|l| l.replace(on))
 }
 
 pub fn hiding() -> bool {
@@ -680,18 +789,23 @@ pub struct Scope {
     parent: Option<Env>,
 }
 
-/// The lock on a scope's variables. Quillo code runs under the interpreter
+/// The lock on the globals' variables. Quillo code runs under the interpreter
 /// lock, so this is never contended; unlike `std::sync::Mutex` (which on
-/// some systems allocates an OS lock), it is one flag in place.
+/// some systems allocates an OS lock), it is one flag in place. A scope inside
+/// them is reached only from Quillo code, which that lock has one thread at a
+/// time running, and a name looked up from deep in a program would pay for this
+/// at each scope on the way (see `Scope::vars`; FEEDBACK29.md; branch
+/// feedback29-fixes).
 struct VarsCell {
     locked: std::sync::atomic::AtomicBool,
     vars: std::cell::UnsafeCell<Vars>,
 }
 
-// Access goes through `lock`, which hands out one guard at a time.
+// SAFETY: access goes through `lock`, which hands out one guard at a time, or through
+// `inner`, under the interpreter lock.
 unsafe impl Sync for VarsCell {}
 
-struct VarsGuard<'a>(&'a VarsCell);
+struct VarsGuard<'a>(&'a VarsCell, bool);
 
 impl VarsCell {
     fn new(vars: Vars) -> Self {
@@ -703,7 +817,12 @@ impl VarsCell {
         while self.locked.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
-        VarsGuard(self)
+        VarsGuard(self, true)
+    }
+
+    #[inline(always)]
+    fn inner(&self) -> VarsGuard<'_> {
+        VarsGuard(self, false)
     }
 }
 
@@ -723,34 +842,10 @@ impl std::ops::DerefMut for VarsGuard<'_> {
 }
 
 impl Drop for VarsGuard<'_> {
+    #[inline(always)]
     fn drop(&mut self) {
-        self.0.locked.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// A variable's name, kept in place when short (as nearly all are), so
-/// binding a parameter or loop variable needs no allocation.
-enum Name {
-    Short(u8, [u8; 22]),
-    Long(Box<str>),
-}
-
-impl Name {
-    fn new(s: &str) -> Name {
-        if s.len() <= 22 {
-            let mut b = [0u8; 22];
-            b[..s.len()].copy_from_slice(s.as_bytes());
-            Name::Short(s.len() as u8, b)
-        } else {
-            Name::Long(s.into())
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        match self {
-            // SAFETY: the bytes were copied from a `str`, whole.
-            Name::Short(n, b) => unsafe { std::str::from_utf8_unchecked(&b[..*n as usize]) },
-            Name::Long(s) => s,
+        if self.1 {
+            self.0.locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -760,8 +855,10 @@ impl Name {
 enum Vars {
     /// The first few in place (no allocation besides the scope's own),
     /// then a vector.
-    Few([Option<(Name, Value)>; INLINE], Vec<(Name, Value)>),
-    Many(HashMap<Box<str>, Value, BuildFx>),
+    /// Last, a bit for each name it holds (`Sym::bit`): most scopes a name is looked for
+    /// in do not have it, and this says so in one read.
+    Few([Option<(Sym, Value)>; INLINE], Vec<(Sym, Value)>, u64),
+    Many(HashMap<Sym, Value, BuildFx>),
 }
 
 const INLINE: usize = 4;
@@ -771,72 +868,81 @@ const FEW: usize = 16;
 
 impl Vars {
     fn few() -> Vars {
-        Vars::Few([None, None, None, None], Vec::new())
+        Vars::Few([None, None, None, None], Vec::new(), 0)
     }
 
-    fn get(&self, name: &str) -> Option<&Value> {
+    #[inline]
+    fn get(&self, name: Sym) -> Option<&Value> {
         match self {
-            Vars::Few(slots, more) => slots
-                .iter()
-                .flatten()
-                .chain(more.iter())
-                .find(|(n, _)| n.as_str() == name)
-                .map(|(_, x)| x),
-            Vars::Many(m) => m.get(name),
+            Vars::Few(_, _, bits) if *bits & name.bit() == 0 => None,
+            Vars::Few(slots, more, _) => {
+                for (n, v) in slots.iter().flatten() {
+                    if *n == name {
+                        return Some(v);
+                    }
+                }
+                more.iter().find(|(n, _)| *n == name).map(|(_, x)| x)
+            }
+            Vars::Many(m) => m.get(&name),
         }
     }
 
-    fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+    #[inline]
+    fn get_mut(&mut self, name: Sym) -> Option<&mut Value> {
         match self {
-            Vars::Few(slots, more) => slots
-                .iter_mut()
-                .flatten()
-                .chain(more.iter_mut())
-                .find(|(n, _)| n.as_str() == name)
-                .map(|(_, x)| x),
-            Vars::Many(m) => m.get_mut(name),
+            Vars::Few(_, _, bits) if *bits & name.bit() == 0 => None,
+            Vars::Few(slots, more, _) => {
+                for (n, v) in slots.iter_mut().flatten() {
+                    if *n == name {
+                        return Some(v);
+                    }
+                }
+                more.iter_mut().find(|(n, _)| *n == name).map(|(_, x)| x)
+            }
+            Vars::Many(m) => m.get_mut(&name),
         }
     }
 
-    fn insert(&mut self, name: &str, value: Value) {
+    #[inline]
+    fn insert(&mut self, name: Sym, value: Value) {
         if let Some(slot) = self.get_mut(name) {
             *slot = value;
             return;
         }
         match self {
-            Vars::Few(slots, more) => {
+            Vars::Few(slots, more, bits) => {
+                *bits |= name.bit();
                 if let Some(free) = slots.iter_mut().find(|s| s.is_none()) {
-                    *free = Some((Name::new(name), value));
+                    *free = Some((name, value));
                 } else if more.len() + INLINE < FEW {
-                    more.push((Name::new(name), value));
+                    more.push((name, value));
                 } else {
-                    let mut m: HashMap<Box<str>, Value, BuildFx> = slots
-                        .iter_mut()
-                        .filter_map(|s| s.take())
-                        .chain(more.drain(..))
-                        .map(|(k, x)| (k.as_str().into(), x))
-                        .collect();
-                    m.insert(name.into(), value);
+                    let mut m: HashMap<Sym, Value, BuildFx> = slots.iter_mut().filter_map(|s| s.take()).chain(more.drain(..)).collect();
+                    m.insert(name, value);
                     *self = Vars::Many(m);
                 }
             }
             Vars::Many(m) => {
-                m.insert(name.into(), value);
+                m.insert(name, value);
             }
         }
     }
 
     /// Empties it, keeping its room, for a scope used again.
+    #[inline]
     fn clear(&mut self) {
         match self {
-            Vars::Few(slots, more) => {
+            Vars::Few(slots, more, bits) => {
+                *bits = 0;
                 for s in slots.iter_mut() {
                     if let Some((_, v)) = s.take() {
                         drop_value(v);
                     }
                 }
-                for (_, v) in more.drain(..) {
-                    drop_value(v);
+                if !more.is_empty() {
+                    for (_, v) in more.drain(..) {
+                        drop_value(v);
+                    }
                 }
             }
             Vars::Many(_) => *self = Vars::few(),
@@ -845,9 +951,7 @@ impl Vars {
 
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
-            Vars::Few(slots, more) => {
-                slots.iter().flatten().chain(more.iter()).map(|(k, x)| (k.as_str().to_string(), x.clone())).collect()
-            }
+            Vars::Few(slots, more, _) => slots.iter().flatten().chain(more.iter()).map(|(k, x)| (k.to_string(), x.clone())).collect(),
             Vars::Many(m) => m.iter().map(|(k, x)| (k.to_string(), x.clone())).collect(),
         }
     }
@@ -874,6 +978,11 @@ impl std::hash::Hasher for Fx {
 
     fn write_u8(&mut self, b: u8) {
         self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 
     fn finish(&self) -> u64 {
@@ -913,20 +1022,41 @@ impl Scope {
         });
     }
 
-    /// Empties a scope for another loop step, if nothing else holds it (a
-    /// function made in the last step would): then it can be used again.
-    pub fn reuse(e: &mut Env) -> bool {
-        match Arc::get_mut(e) {
-            Some(s) => {
-                s.vars.vars.get_mut().clear();
-                true
+    /// A loop step's scope given its variable's next value, if nothing else holds it and it
+    /// holds that variable alone: the value back if not, for `reuse` and `define`.
+    #[inline]
+    pub fn rebind(e: &mut Env, name: Sym, v: Value) -> Result<(), Value> {
+        if Arc::strong_count(e) != 1 {
+            return Err(v);
+        }
+        let mut vars = e.vars();
+        match &mut *vars {
+            Vars::Few([Some((n, slot)), None, None, None], more, _) if *n == name && more.is_empty() => {
+                *slot = v;
+                Ok(())
             }
-            None => false,
+            _ => Err(v),
         }
     }
 
+    /// Empties a scope for another loop step, if nothing else holds it (a
+    /// function made in the last step would): then it can be used again.
+    pub fn reuse(e: &mut Env) -> bool {
+        // Nothing takes a weak hold of a scope, so one owner is enough to know it.
+        if Arc::strong_count(e) != 1 {
+            return false;
+        }
+        e.vars().clear();
+        true
+    }
+
+    #[inline(always)]
     fn vars(&self) -> VarsGuard<'_> {
-        self.vars.lock()
+        if self.parent.is_some() {
+            self.vars.inner()
+        } else {
+            self.vars.lock()
+        }
     }
 }
 
@@ -940,7 +1070,9 @@ pub fn scope_vars(env: &Env) -> Vec<(String, Value)> {
     env.vars().entries()
 }
 
-pub fn lookup(env: &Env, name: &str) -> Option<Value> {
+#[inline]
+pub fn lookup(env: &Env, name: impl Name) -> Option<Value> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
@@ -966,7 +1098,8 @@ pub fn within(env: &Env, root: &Env) -> bool {
 
 /// The nearest function named `name` in scope, passing over other values
 /// of that name: `xs.keys` still calls `keys` where a local `keys` is a list.
-pub fn lookup_fn(env: &Env, name: &str) -> Option<Value> {
+pub fn lookup_fn(env: &Env, name: impl Name) -> Option<Value> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         if let Some(v @ (Value::Func(_) | Value::Builtin(..))) = cur.vars().get(name) {
@@ -976,10 +1109,33 @@ pub fn lookup_fn(env: &Env, name: &str) -> Option<Value> {
     }
 }
 
+/// Calls `f` with the nearest variable `name` where it is, a global too, without copying it.
+#[inline]
+pub fn with_var<R>(env: &Env, name: Sym, f: impl FnOnce(&Value) -> R) -> Option<R> {
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(v) = cur.vars().get(name) {
+            return Some(f(v));
+        }
+        cur = cur.parent.as_deref()?;
+    }
+}
+
+/// The builtin the nearest variable `name` holds, if it holds one: its name and function.
+#[inline]
+pub fn builtin_named(env: &Env, name: Sym) -> Option<(&'static str, BuiltinFn)> {
+    with_var(env, name, |v| match v {
+        Value::Builtin(n, f) => Some((*n, *f)),
+        _ => None,
+    })?
+}
+
 /// Calls `f` with local variable `name` where it is, without copying it;
 /// None if it is not a local (globals are read through `lookup`, which the
 /// view cache follows).
-pub fn with_local<R>(env: &Env, name: &str, f: impl FnOnce(&Value) -> R) -> Option<R> {
+#[inline]
+pub fn with_local<R>(env: &Env, name: impl Name, f: impl FnOnce(&Value) -> R) -> Option<R> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         let parent = cur.parent.as_deref()?;
@@ -990,12 +1146,14 @@ pub fn with_local<R>(env: &Env, name: &str, f: impl FnOnce(&Value) -> R) -> Opti
     }
 }
 
-pub fn define(env: &Env, name: &str, v: Value) {
-    env.vars().insert(name, v);
+#[inline]
+pub fn define(env: &Env, name: impl Name, v: Value) {
+    env.vars().insert(name.make(), v);
 }
 
 /// Like `lookup`, and whether the variable is a global.
-pub fn lookup_global(env: &Env, name: &str) -> Option<(Value, bool)> {
+pub fn lookup_global(env: &Env, name: impl Name) -> Option<(Value, bool)> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         if let Some(v) = cur.vars().get(name) {
@@ -1006,7 +1164,8 @@ pub fn lookup_global(env: &Env, name: &str) -> Option<(Value, bool)> {
 }
 
 /// Like `assign`; `Some(true)` when the variable was a global.
-pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
+pub fn assign_global(env: &Env, name: impl Name, v: Value) -> Option<bool> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         if let Some(slot) = cur.vars().get_mut(name) {
@@ -1018,27 +1177,269 @@ pub fn assign_global(env: &Env, name: &str, v: Value) -> Option<bool> {
 }
 
 /// Takes a variable's value out of the nearest scope that has it, leaving
-/// null there, unless that is the globals: so that in `m = set(m, k, v)`
-/// the map has one owner, and is changed rather than copied.
-pub fn take_local(env: &Env, name: &str) -> Option<Value> {
+/// null there, unless that is the globals (but while the program loads): so
+/// that in `m = set(m, k, v)` the map has one owner, and is changed rather
+/// than copied.
+pub fn take_local(env: &Env, name: impl Name) -> Option<Value> {
+    let name = name.known()?;
     let mut cur: &Scope = env;
     loop {
         let global = cur.parent.is_none();
         if let Some(slot) = cur.vars().get_mut(name) {
-            return (!global).then(|| std::mem::replace(slot, Value::Nil));
+            return (!global || loading()).then(|| std::mem::replace(slot, Value::Nil));
         }
         cur = cur.parent.as_deref()?;
     }
 }
 
 /// Updates an existing variable in the nearest scope that has it.
-pub fn assign(env: &Env, name: &str, v: Value) -> bool {
+pub fn assign(env: &Env, name: impl Name, v: Value) -> bool {
     assign_global(env, name, v).is_some()
+}
+
+/// Whether the nearest variable of this name may be taken out to be changed: a local, or
+/// a global while the program loads.
+#[inline]
+pub fn takable(env: &Env, name: Sym) -> bool {
+    let mut cur: &Scope = env;
+    loop {
+        if cur.vars().get(name).is_some() {
+            return cur.parent.is_some() || loading();
+        }
+        match cur.parent.as_deref() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
+/// Whether the nearest variable of this name holds a list or a text that may be grown
+/// where it is: a local, or a global while the program loads.
+pub fn growable(env: &Env, name: Sym) -> bool {
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(v) = cur.vars().get(name) {
+            return matches!(v, Value::List(_) | Value::Str(_)) && (cur.parent.is_some() || loading());
+        }
+        match cur.parent.as_deref() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
+/// `f` on the place of the nearest variable of this name, if there is one.
+pub fn with_slot<R>(env: &Env, name: Sym, f: impl FnOnce(&mut Value) -> R) -> Option<R> {
+    let mut cur: &Scope = env;
+    loop {
+        if let Some(slot) = cur.vars().get_mut(name) {
+            return Some(f(slot));
+        }
+        cur = cur.parent.as_deref()?;
+    }
+}
+
+/// Adds `t` to the end of `s` where it is, if nothing else holds `s`: false if something
+/// does. `Arc<str>` has no room to spare, so this is what CPython does for `s += t`, which
+/// is to ask the allocator for the block to be larger: it nearly always can, or it moves
+/// it, in steps that grow with the block, so that a loop's appends are not quadratic
+/// (FEEDBACK29.md, Q-354; branch feedback29-fixes). `the_text_block_is_laid_out_as_assumed`
+/// holds `Arc`'s layout to what is assumed here.
+pub fn append_text(s: &mut Arc<str>, t: &str) -> bool {
+    use std::alloc::{realloc, Layout};
+    const HEADER: usize = 2 * std::mem::size_of::<usize>();
+    const ALIGN: usize = std::mem::align_of::<usize>();
+    let round = |n: usize| (n + ALIGN - 1) & !(ALIGN - 1);
+    if Arc::get_mut(s).is_none() {
+        return false;
+    }
+    if t.is_empty() {
+        return true;
+    }
+    let old = s.len();
+    let new = old + t.len();
+    let Ok(layout) = Layout::from_size_align(round(HEADER + old), ALIGN) else { return false };
+    let Ok(_) = Layout::from_size_align(round(HEADER + new), ALIGN) else { return false };
+    let held = std::mem::replace(s, Arc::from(""));
+    // SAFETY: nothing else holds the block (asked above), which starts `HEADER` before the
+    // text and has `layout` (see the test); `realloc` gives a block of the size `Arc` works
+    // out for the longer text, with the counts as they were, and the new bytes are text
+    // added to the end of text. If it fails, the old block is still there and is taken back.
+    unsafe {
+        let text = Arc::into_raw(held) as *const u8 as *mut u8;
+        let block = text.sub(HEADER);
+        let grown = realloc(block, layout, round(HEADER + new));
+        if grown.is_null() {
+            *s = Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, old) as *const str);
+            return false;
+        }
+        let text = grown.add(HEADER);
+        std::ptr::copy_nonoverlapping(t.as_ptr(), text.add(old), t.len());
+        *s = Arc::from_raw(std::ptr::slice_from_raw_parts(text as *const u8, new) as *const str);
+    }
+    true
+}
+
+/// `push` (a value to add) or `set` (a place and a value) of `vals`, the first left free for
+/// what is changed, on a list or map where it is: false, with nothing changed, for what the
+/// builtin is to refuse or that is otherwise.
+pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
+    match (slot, &mut *vals) {
+        (Value::List(l), [_, x]) => Arc::make_mut(l).push(std::mem::replace(x, Value::Nil)),
+        (Value::List(l), [_, Value::Int(i), x]) => {
+            let n = l.len() as i64;
+            let i = if *i < 0 { n + *i } else { *i };
+            if i < 0 || i >= n {
+                return false;
+            }
+            Arc::make_mut(l)[i as usize] = std::mem::replace(x, Value::Nil);
+        }
+        (Value::Map(m), [_, Value::Str(k), x]) => {
+            Arc::make_mut(m).insert(Key::new(k), std::mem::replace(x, Value::Nil));
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// `whole[key]` given `item` (a `push`) or changed at one place (`set`), where it is:
+/// false, with nothing changed, if that is not how it goes. A map without the key takes
+/// `start` for it. See `Interp::in_place_nested`.
+pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut vals: Vec<Value>) -> bool {
+    fn at(l: &[Value], i: i64) -> Option<usize> {
+        let n = l.len() as i64;
+        let i = if i < 0 { n + i } else { i };
+        (i >= 0 && i < n).then_some(i as usize)
+    }
+    let last = vals.pop().unwrap_or(Value::Nil);
+    let change = |x: &mut Value, last: Value, inner: Option<&Value>| -> bool {
+        match (x, inner) {
+            (Value::List(l), None) => Arc::make_mut(l).push(last),
+            (Value::List(l), Some(Value::Int(i))) => {
+                let Some(i) = at(l, *i) else { return false };
+                Arc::make_mut(l)[i] = last;
+            }
+            (Value::Map(m), Some(k)) => {
+                Arc::make_mut(m).insert(k.key_text().into(), last);
+            }
+            _ => return false,
+        }
+        true
+    };
+    let inner = vals.first();
+    match (whole, key) {
+        (Value::List(l), Value::Int(i)) => {
+            let Some(i) = at(l, *i) else { return false };
+            change(&mut Arc::make_mut(l)[i], last, inner)
+        }
+        (Value::Map(m), k) => {
+            let text;
+            let k: &str = match k {
+                Value::Str(s) => s,
+                k => {
+                    text = k.key_text();
+                    &text
+                }
+            };
+            let m = Arc::make_mut(m);
+            if let Some(x) = m.get_mut(k) {
+                return change(x, last, inner);
+            }
+            let Some(mut x) = start else { return false };
+            let done = change(&mut x, last, inner);
+            if done {
+                m.insert(k.into(), x);
+            }
+            done
+        }
+        _ => false,
+    }
+}
+
+/// `x += n` where `x` is a local number and it fits: false for anything else, which
+/// `binop` then works out, or refuses.
+#[inline]
+pub fn bump_local(env: &Env, name: Sym, n: &Value, sub: bool) -> bool {
+    let mut cur: &Scope = env;
+    while let Some(parent) = cur.parent.as_deref() {
+        if let Some(slot) = cur.vars().get_mut(name) {
+            match (&mut *slot, n) {
+                (Value::Int(a), Value::Int(b)) => {
+                    let Some(x) = (if sub { a.checked_sub(*b) } else { a.checked_add(*b) }) else { return false };
+                    *a = x;
+                }
+                (Value::Float(a), Value::Float(b)) => *a = if sub { *a - b } else { *a + b },
+                _ => return false,
+            }
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// Sets a variable that is not a global, which nothing outside follows; the value back
+/// if there is none. An assignment's usual case, and it is one walk up the scopes.
+#[inline]
+pub fn assign_local(env: &Env, name: Sym, v: Value) -> Result<(), Value> {
+    let mut cur: &Scope = env;
+    loop {
+        let Some(parent) = cur.parent.as_deref() else { return Err(v) };
+        if let Some(slot) = cur.vars().get_mut(name) {
+            *slot = v;
+            return Ok(());
+        }
+        cur = parent;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `append_text` takes for granted of `Arc<str>`: the counts, then the text, in a
+    /// block of the size it works out. A new Rust that lays it out otherwise fails here.
+    #[test]
+    fn the_text_block_is_laid_out_as_assumed() {
+        const HEADER: usize = 2 * std::mem::size_of::<usize>();
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 100] {
+            let s: Arc<str> = Arc::from("x".repeat(n));
+            let t = s.clone();
+            // SAFETY: both counts are in the live block just before the text, or this test
+            // has found that they are not, which is the point of it.
+            let strong = unsafe { *(Arc::as_ptr(&s) as *const u8).sub(HEADER).cast::<usize>() };
+            let weak = unsafe { *(Arc::as_ptr(&s) as *const u8).sub(HEADER).add(HEADER / 2).cast::<usize>() };
+            assert_eq!((strong, weak), (2, 1), "{}", n);
+            drop(t);
+        }
+    }
+
+    #[test]
+    fn text_is_added_where_it_is_only_if_nothing_else_holds_it() {
+        let mut s: Arc<str> = Arc::from("ab");
+        assert!(append_text(&mut s, "c"));
+        assert_eq!(&*s, "abc");
+        let t = s.clone();
+        assert!(!append_text(&mut s, "d"));
+        assert_eq!((&*s, &*t), ("abc", "abc"));
+        drop(t);
+        assert!(append_text(&mut s, ""));
+        assert_eq!(&*s, "abc");
+        // A weak hold is a hold.
+        let w = Arc::downgrade(&s);
+        assert!(!append_text(&mut s, "d"));
+        drop(w);
+        // Across every size of block, the way a loop goes, with letters of all lengths.
+        let mut s: Arc<str> = Arc::from("");
+        let mut want = String::new();
+        for i in 0..200_000 {
+            let piece = ["a", "é", "語", "😀"][i % 4];
+            assert!(append_text(&mut s, piece));
+            want.push_str(piece);
+        }
+        assert_eq!(&*s, want.as_str());
+        assert_eq!(Arc::strong_count(&s), 1);
+    }
 
     #[test]
     fn keys_short_and_long_read_as_their_text() {

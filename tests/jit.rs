@@ -83,6 +83,7 @@ fn retype() {
 fn even(n) = n % 2 == 0
 fn down(n) = n == 0 ? 0 : down(n - 1)
 fn neg(n) = -n
+fn kept(n: int) = for i in range(n) => i
 "#;
 
 #[test]
@@ -128,7 +129,10 @@ fn compiled_code_fails_as_the_interpreter_does() {
             ("rem(-9223372036854775807 - 1, -1)", "0"),
             ("neg(-9223372036854775807 - 1)", "ERROR 52: integer overflow"),
             ("less(0.0 / 0.0, 1.0)", "ERROR 20: cannot compare float with float"),
-            ("work(20000000)", "ERROR 4: range is too large"),
+            // A loop that keeps no list has no list's limit (FEEDBACK29.md, Q-356; branch
+            // feedback29-fixes): Python's answer, compiled or not. One that keeps its list has.
+            ("work(20000000)", "926193"),
+            ("kept(20000000)", "ERROR 53: range is too large"),
             ("down(20000)", "ERROR 51: too much recursion (more than 10000 nested calls) in `down`"),
         ],
     );

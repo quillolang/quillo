@@ -93,7 +93,10 @@ class MainActivity : Activity() {
                 val url = req.url.toString()
                 if (origin.isEmpty() || url.startsWith("$origin/") || url == origin) return false
                 if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
-                if (url.startsWith("http://") || url.startsWith("https://")) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                // What the system handles: a link to dial or to mail does what it does in a
+                // browser (FEEDBACK28.md, Q-346; branch feedback29-fixes).
+                val system = listOf("http:", "https:", "tel:", "sms:", "mailto:", "geo:", "market:")
+                if (system.any { url.startsWith(it) }) runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
                 return true
             }
 

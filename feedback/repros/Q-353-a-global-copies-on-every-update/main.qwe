@@ -1,0 +1,11 @@
+// Q-353 A variable at the top level of a file copies on every update
+// mode: run
+// open-when: killed after
+// fixed-when: 300000
+// From FEEDBACK29.md §Q-353 (found on d702589). Over 40 s on d702589.
+
+let xs = []
+for i in 0..300000 {
+    xs = xs | push(i)
+}
+print(len(xs))

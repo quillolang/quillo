@@ -253,7 +253,7 @@ fn whole(x: f64) -> Value {
 }
 
 fn overflow(line: u32) -> Ctrl {
-    Ctrl::Error(crate::QuilloError::new("integer overflow", line))
+    Ctrl::Error(Box::new(crate::QuilloError::new("integer overflow", line)))
 }
 
 // ---- sums --------------------------------------------------------------

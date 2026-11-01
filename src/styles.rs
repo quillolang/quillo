@@ -59,7 +59,7 @@ impl Styles {
                             f.def.line,
                         ))
                     }
-                    Err(Ctrl::Error(e)) => return Err(e),
+                    Err(Ctrl::Error(e)) => return Err(*e),
                     Err(_) => return Err(QuilloError::new(format!("`style` in `{}` must be CSS text", f.def.name), f.def.line)),
                 };
                 let key = format!("{}-{}", id, k);

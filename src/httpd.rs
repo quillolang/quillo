@@ -467,7 +467,6 @@ impl Pool {
         } else if self.threads.fetch_add(1, SeqCst) < self.max {
             let pool = self.clone();
             let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || {
-                crate::alloc::waiter_thread();
                 pool.work()
             });
             if started.is_err() {
@@ -621,8 +620,6 @@ fn run_loop(
     busy: Arc<Busy>,
     max_waiting: usize,
 ) -> Result<(), String> {
-    // mimalloc here too (see src/alloc.rs).
-    crate::alloc::waiter_thread();
     OWN_BUSY.with(|b| *b.borrow_mut() = Some(busy.clone()));
     let waker = inbox.waker.clone();
     lock(&LOOPS).push(waker.clone());

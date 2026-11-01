@@ -60,8 +60,6 @@ fn pool() -> &'static Pool {
 }
 
 fn worker(p: &'static Pool) {
-    // What these threads allocate is freed on others: mimalloc's (src/alloc.rs).
-    crate::alloc::waiter_thread();
     let mut seen = 0;
     let mut st = p.state.lock().unwrap();
     loop {

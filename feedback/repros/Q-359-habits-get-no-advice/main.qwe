@@ -1,0 +1,7 @@
+// Q-359 Python's and JavaScript's habits get messages that do not say what to write
+// mode: run
+// open-when: expected `)` after arguments, found `in`
+// fixed-when: contains(xs, x)
+// From FEEDBACK29.md §Q-359 (found on d702589). One of fifteen; tests/feedback29.rs has all.
+
+print(2 in [1, 2])

@@ -187,7 +187,9 @@ final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUID
         guard let url = action.request.url, let scheme = url.scheme else { return decisionHandler(.allow) }
         let mine = url.absoluteString.hasPrefix(origin) || scheme == "about" || scheme == "data" || scheme == "blob"
         if mine || origin.isEmpty { return decisionHandler(.allow) }
-        if scheme == "http" || scheme == "https" { UIApplication.shared.open(url) }
+        // What the system handles: a link to dial or to mail does what it does in a browser
+        // (FEEDBACK28.md, Q-346; branch feedback29-fixes).
+        if ["http", "https", "tel", "sms", "mailto", "facetime", "maps", "itms-apps"].contains(scheme) { UIApplication.shared.open(url) }
         decisionHandler(.cancel)
     }
 

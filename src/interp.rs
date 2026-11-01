@@ -8,20 +8,30 @@ use crate::shared::Shared;
 use crate::value::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Non-local exits: runtime errors, `return` (and `?`), and `reply`.
+/// Non-local exits: runtime errors, `return` (and `?`), and `reply`. An error is boxed: every
+/// expression's result is a `Result<Value, Ctrl>`, and it is a third smaller so, where an
+/// error is rare (FEEDBACK29.md; branch feedback29-fixes).
 pub enum Ctrl {
-    Error(QuilloError),
+    Error(Box<QuilloError>),
     Return(Value),
     Reply(Arc<Response>),
 }
 
 impl From<QuilloError> for Ctrl {
     fn from(e: QuilloError) -> Self {
+        Ctrl::Error(Box::new(e))
+    }
+}
+
+impl From<Box<QuilloError>> for Ctrl {
+    fn from(e: Box<QuilloError>) -> Self {
         Ctrl::Error(e)
     }
 }
+
+static NEXT_CODE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Builtins that change something: a page prefetched does not call them
 /// (see `Interp::no_writes`).
@@ -52,17 +62,17 @@ const CHANGES: &[&str] = &[
 /// unless it knows already.
 pub(crate) fn in_file<T>(r: Result<T, Ctrl>, file: &Option<Arc<str>>) -> Result<T, Ctrl> {
     match (r, file) {
-        (Err(Ctrl::Error(e)), Some(f)) if e.wants_file() => Err(Ctrl::Error(e.in_file(&crate::error::shown_path(f)))),
+        (Err(Ctrl::Error(e)), Some(f)) if e.wants_file() => Err(Ctrl::Error(Box::new(e.in_file(&crate::error::shown_path(f))))),
         (r, _) => r,
     }
 }
 
 pub fn fail<T>(line: u32, msg: impl Into<String>) -> Result<T, Ctrl> {
-    Err(Ctrl::Error(QuilloError::new(msg, line)))
+    Err(Ctrl::Error(Box::new(QuilloError::new(msg, line))))
 }
 
 fn undefined(name: &str, line: u32) -> Ctrl {
-    Ctrl::Error(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line))
+    Ctrl::Error(Box::new(QuilloError::new(format!("unknown name `{}`{}", name, crate::error::removed_note(name)), line)))
 }
 
 /// How strictly a pattern compares values. Query strings, form fields and
@@ -223,6 +233,16 @@ pub struct Interp {
     pub(crate) own_seqs: Vec<u64>,
     /// In a template string written straight in `print(...)`.
     printing: bool,
+    /// What `in_place_call` gave back is already where it goes.
+    stored: bool,
+    /// This program's, for compiled loops (src/jitloop.rs): new for each one loaded, the
+    /// same in a fork, so code made for one program's loop is never another's.
+    pub(crate) code_id: u64,
+    /// Whether a program's last statement gives its value, as `load_source` returns it.
+    keep_last: bool,
+    /// The long text last read by index, and what a short one needed.
+    text: Option<TextIndex>,
+    text_small: Option<Vec<u32>>,
     /// Running a scheduled job or a tick, not a request: its `sleep` ends at a
     /// stop or a reload (FEEDBACK12.md, Q-081 and Q-082; branch feedback12-sleep).
     pub(crate) in_job: bool,
@@ -256,6 +276,8 @@ pub struct Interp {
     /// The components this request's page was rendered with: the browser
     /// loads a bundle of those (and what they use) alone.
     pub island_names: Vec<String>,
+    /// Styles that ran with no element to carry their mark (see `style_noop`).
+    pub styles_used: Vec<String>,
     /// The page's waiting components, rendered again after it (src/defer.rs;
     /// branch defer), the deferred states of the island rendering now, and the
     /// states a second render takes as they were.
@@ -397,6 +419,25 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
 /// Whether `??` may take a stop: not one that means the request must end.
 fn guardable(msg: &str) -> bool {
     !msg.contains(PREFETCH_REFUSED) && !msg.contains("--max-compute") && !msg.contains("the script ")
+}
+
+/// What is known of a text read by index.
+struct TextIndex {
+    text: Arc<str>,
+    chars: usize,
+    /// Where each character starts, unless each is a byte.
+    offsets: Option<Vec<u32>>,
+}
+
+/// A character as text, shared for the ASCII ones: a loop over a text makes one each
+/// round.
+fn one_char(c: char) -> Value {
+    static ASCII: OnceLock<Vec<Value>> = OnceLock::new();
+    if c.is_ascii() {
+        let all = ASCII.get_or_init(|| (0u8..128).map(|b| Value::str((b as char).to_string())).collect());
+        return all[c as usize].clone();
+    }
+    Value::str(c.to_string())
 }
 
 pub fn coerce(t: &str, s: &str) -> Option<Value> {
@@ -691,6 +732,34 @@ pub fn not_sendable(v: &Value) -> Option<&'static str> {
     }
 }
 
+fn same_file(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// `(_i) => true`, as `map` is given to fill a list: always the same, so it is not called.
+fn constant_lambda(def: &FnDef) -> Option<&Lit> {
+    let [p] = def.params.as_slice() else { return None };
+    if p.ty.is_some() || p.default.is_some() || def.ret.is_some() || def.err.is_some() || def.effects.is_some() || def.server || def.component {
+        return None;
+    }
+    match &def.body {
+        Expr::Lit(l) => Some(l),
+        _ => None,
+    }
+}
+
+/// `(x) => x`, as `count(flags, (f) => f)` and `filter` are given: what it is given is what
+/// it gives, with no scope to make (FEEDBACK29.md; branch feedback29-fixes).
+fn identity(def: &FnDef) -> bool {
+    let [p] = def.params.as_slice() else { return false };
+    p.ty.is_none() && p.default.is_none() && def.ret.is_none() && def.err.is_none() && def.effects.is_none() && !def.server && !def.component
+        && matches!(&def.body, Expr::Ident(n, _) if *n == p.name)
+}
+
 /// The field a function only reads from its one parameter, as in
 /// `(x) => x.name`, when calling it can do nothing else (no types,
 /// defaults or effects to check).
@@ -706,6 +775,110 @@ fn projection(def: &FnDef) -> Option<(&str, u32)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// A component called as a function, by another name than its own (`let make = Dead`, then
+/// `make()`) or given to `map`: its HTML would come with nothing in the page to run it, so
+/// its clicks would do nothing, with no word (FEEDBACK28.md, Q-345; branch feedback29-fixes).
+fn component_called(name: &str) -> String {
+    format!("`{}` is a component, which the page runs from its tag: write <{} ... />, as a function it would show and never answer", name, name)
+}
+
+/// What `children` is in a view or component: null for a tag given none, as the browser has
+/// it, so `children == null` is the same on both sides and the page takes up the server's
+/// HTML (FEEDBACK28.md, Q-345; branch feedback29-fixes).
+fn children_of(el: &HtmlEl, kids: String) -> Value {
+    if el.children.is_empty() {
+        Value::Nil
+    } else {
+        Value::html(kids)
+    }
+}
+
+/// The names of the builtins an assignment can do where it is.
+fn update_names() -> (Sym, Sym, Sym, Sym) {
+    static NAMES: OnceLock<(Sym, Sym, Sym, Sym)> = OnceLock::new();
+    *NAMES.get_or_init(|| (Sym::new("set"), Sym::new("push"), Sym::new("merge"), Sym::new("remove")))
+}
+
+/// `f(x, a)`, `x | f(a)` or `x.f(a)`: the function's name, `x`, the rest and the line.
+pub(crate) fn call_on(e: &Expr) -> Option<(Sym, &Expr, &[Expr], u32)> {
+    match e {
+        Expr::Call(f, args, line) => match (&**f, args.split_first()) {
+            (Expr::Ident(f, _), Some((first, rest))) => Some((*f, first, rest, *line)),
+            (Expr::Field(o, f, _), _) => Some((Sym::new(f), o, args, *line)),
+            _ => None,
+        },
+        Expr::Pipe(lhs, rhs, _) => match &**rhs {
+            Expr::Call(f, args, line) => match &**f {
+                Expr::Ident(f, _) => Some((*f, lhs, args, *line)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An expression that calls nothing, so it does the same worked out twice, or earlier.
+pub(crate) fn quiet(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(_) | Expr::Ident(..) => true,
+        Expr::Unary(_, x, _) | Expr::Field(x, _, _) => quiet(x),
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => quiet(a) && quiet(b),
+        Expr::List(xs) => xs.iter().all(quiet),
+        Expr::Map(xs) => xs.iter().all(|(_, x)| quiet(x)),
+        _ => false,
+    }
+}
+
+/// An expression that cannot fail, whatever is in scope.
+fn constant(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(_) => true,
+        Expr::List(xs) => xs.iter().all(constant),
+        Expr::Map(xs) => xs.iter().all(|(_, x)| constant(x)),
+        _ => false,
+    }
+}
+
+/// Whether two quiet expressions are written the same.
+pub(crate) fn same_expr(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Ident(x, _), Expr::Ident(y, _)) => x == y,
+        (Expr::Lit(Lit::Int(x)), Expr::Lit(Lit::Int(y))) => x == y,
+        (Expr::Lit(Lit::Str(x)), Expr::Lit(Lit::Str(y))) => x == y,
+        (Expr::Field(x, f, _), Expr::Field(y, g, _)) => f == g && same_expr(x, y),
+        (Expr::Index(x, i, _), Expr::Index(y, j, _)) => same_expr(x, y) && same_expr(i, j),
+        (Expr::Binary(p, x, i, _), Expr::Binary(q, y, j, _)) => p == q && same_expr(x, y) && same_expr(i, j),
+        (Expr::Call(f, xs, _), Expr::Call(g, ys, _)) => {
+            same_expr(f, g) && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_expr(x, y))
+        }
+        _ => false,
+    }
+}
+
+/// Builtins that only compute from what they are given: called twice, the same.
+const PURE: &[&str] = &["str", "int", "float", "lower", "upper", "trim", "len", "abs", "round", "floor", "ceil"];
+
+/// `quiet`, or calls of those builtins, as they are in `env`: `set(m, str(i % 10), get(m,
+/// str(i % 10), []) | push(i))` works its key out once, where it is written twice, and that
+/// is the same (FEEDBACK29.md, Q-352; branch feedback29-fixes).
+fn pure(e: &Expr, env: &Env) -> bool {
+    match e {
+        Expr::Call(f, args, _) => {
+            let Expr::Ident(n, _) = &**f else { return false };
+            PURE.contains(&n.as_str())
+                && matches!(crate::value::builtin_named(env, *n), Some((b, _)) if b == n.as_str())
+                && args.iter().all(|a| pure(a, env))
+        }
+        Expr::Lit(_) | Expr::Ident(..) => true,
+        Expr::Unary(_, x, _) | Expr::Field(x, _, _) => pure(x, env),
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => pure(a, env) && pure(b, env),
+        Expr::List(xs) => xs.iter().all(|x| pure(x, env)),
+        Expr::Map(xs) => xs.iter().all(|(_, x)| pure(x, env)),
+        _ => false,
     }
 }
 
@@ -741,6 +914,18 @@ pub(crate) fn dec_hint(a: &Value, b: &Value) -> &'static str {
     }
 }
 
+/// `dec_hint`, and for `<` and the rest, `i < 0` after `index_of`, as from JavaScript
+/// (FEEDBACK28.md, Q-347; branch feedback29-fixes).
+fn compare_hint(a: &Value, b: &Value) -> &'static str {
+    match (a, b) {
+        (Value::Nil, b) if !matches!(b, Value::Nil) => NIL_COMPARED,
+        (a, Value::Nil) if !matches!(a, Value::Nil) => NIL_COMPARED,
+        _ => dec_hint(a, b),
+    }
+}
+
+const NIL_COMPARED: &str = ": what is not found is null, not -1, from `index_of`, `find` and `get` too, so ask `x == null` first";
+
 /// Arithmetic with a decimal: with another, or an int, it is exact and
 /// gives a decimal; with a float it is an error, never a silent float.
 fn dec_op(op: BinOp, a: &Value, b: &Value, line: u32) -> Result<Value, Ctrl> {
@@ -757,15 +942,40 @@ fn dec_op(op: BinOp, a: &Value, b: &Value, line: u32) -> Result<Value, Ctrl> {
         BinOp::Div => x.div(y),
         _ => x.rem(y),
     };
-    r.map(Value::Dec).map_err(|e| Ctrl::Error(QuilloError::new(e.message(), line)))
+    r.map(Value::Dec).map_err(|e| Ctrl::Error(Box::new(QuilloError::new(e.message(), line))))
+}
+
+/// Two ints, for the operators where nothing can go otherwise: None for all else, which
+/// `binop` works out or refuses. Inside `eval`, it is a third of what a loop's sum costs.
+#[inline(always)]
+fn int_op(op: BinOp, x: i64, y: i64) -> Option<Value> {
+    Some(match op {
+        BinOp::Add => Value::Int(x.checked_add(y)?),
+        BinOp::Sub => Value::Int(x.checked_sub(y)?),
+        BinOp::Mul => Value::Int(x.checked_mul(y)?),
+        BinOp::Mod if x >= 0 && y > 0 => Value::Int(x % y),
+        BinOp::Lt => Value::Bool(x < y),
+        BinOp::Le => Value::Bool(x <= y),
+        BinOp::Gt => Value::Bool(x > y),
+        BinOp::Ge => Value::Bool(x >= y),
+        BinOp::Eq => Value::Bool(x == y),
+        BinOp::Ne => Value::Bool(x != y),
+        _ => return None,
+    })
 }
 
 pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
     use Value::*;
-    let overflow = || Ctrl::Error(QuilloError::new("integer overflow", line));
+    let overflow = || Ctrl::Error(Box::new(QuilloError::new("integer overflow", line)));
     match op {
         BinOp::Add => match (a, b) {
             (Int(x), Int(y)) => x.checked_add(y).map(Int).ok_or_else(overflow),
+            (Str(x), Str(y)) => {
+                let mut s = String::with_capacity(x.len() + y.len());
+                s.push_str(&x);
+                s.push_str(&y);
+                Ok(Value::str(s))
+            }
             (Str(x), y) => Ok(Value::str(format!("{}{}", x, y.display()))),
             (x, Str(y)) => Ok(Value::str(format!("{}{}", x.display(), y))),
             (Html(x), Html(y)) => Ok(Value::html(format!("{}{}", x, y))),
@@ -839,7 +1049,7 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
         BinOp::Ne => Ok(Bool(!equal(&a, &b))),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let Some(ord) = compare(&a, &b) else {
-                return fail(line, format!("cannot compare {} with {}{}", a.type_name(), b.type_name(), dec_hint(&a, &b)));
+                return fail(line, format!("cannot compare {} with {}{}", a.type_name(), b.type_name(), compare_hint(&a, &b)));
             };
             Ok(Bool(match op {
                 BinOp::Lt => ord.is_lt(),
@@ -929,6 +1139,11 @@ impl Interp {
             retired: Default::default(),
             own_seqs: Vec::new(),
             printing: false,
+            stored: false,
+            keep_last: true,
+            code_id: NEXT_CODE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            text: None,
+            text_small: None,
             in_job: false,
             env_file: Default::default(),
             declared_services: Default::default(),
@@ -941,6 +1156,7 @@ impl Interp {
             streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
+            styles_used: Vec::new(),
             deferred: Vec::new(),
             island_defers: Vec::new(),
             state_preset: None,
@@ -1015,6 +1231,11 @@ impl Interp {
             retired: self.retired.clone(),
             own_seqs: Vec::new(),
             printing: false,
+            stored: false,
+            keep_last: true,
+            code_id: self.code_id,
+            text: None,
+            text_small: None,
             in_job: self.in_job,
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
@@ -1027,6 +1248,7 @@ impl Interp {
             streams_direct: false,
             rendered_island: false,
             island_names: Vec::new(),
+            styles_used: Vec::new(),
             deferred: Vec::new(),
             island_defers: Vec::new(),
             state_preset: None,
@@ -1101,7 +1323,7 @@ impl Interp {
     }
 
     /// The renders being cached did something that cannot be.
-    fn mark_impure(&mut self) {
+    pub(crate) fn mark_impure(&mut self) {
         for t in &mut self.tracks {
             t.impure = true;
         }
@@ -1384,7 +1606,9 @@ impl Interp {
         if debugging {
             crate::debug::enter(self, "<main>", abs, 1);
         }
+        let loading = crate::value::set_loading(true);
         let r = self.load_stmts(&stmts, &env, file, &mut last);
+        crate::value::set_loading(loading);
         if debugging {
             crate::debug::leave(self);
         }
@@ -1394,10 +1618,25 @@ impl Interp {
     }
 
     fn load_stmts(&mut self, stmts: &[Stmt], env: &Env, file: &str, last: &mut Value) -> Result<(), QuilloError> {
-        for s in stmts.iter() {
-            match self.exec_stmt(s, env) {
+        let n = stmts.len();
+        for (i, s) in stmts.iter().enumerate() {
+            // What gives a value no one takes: a loop in it makes no list. The last statement
+            // gives the program's value, which only a program loaded from text is asked for
+            // (FEEDBACK29.md, Q-356; branch feedback29-fixes).
+            let r = match s {
+                Stmt::Expr(e) if (i + 1 < n || !self.keep_last) && !crate::debug::on() => self.eval_unused(e, env),
+                s => self.exec_stmt(s, env),
+            };
+            match r {
                 Ok(v) => *last = v,
                 Err(Ctrl::Error(e)) => return Err(e.in_file(file)),
+                // An error that reaches the top has no one left to hand it to: the
+                // program failed, and says so (FEEDBACK29.md, Q-350; branch
+                // feedback29-fixes).
+                Err(Ctrl::Return(Value::Err(e, _, at))) => {
+                    let text = crate::value::told(|| e.display());
+                    return Err(QuilloError::new(at.before(&text), 0).in_file(file));
+                }
                 Err(Ctrl::Return(v)) => {
                     *last = v;
                     break;
@@ -1497,7 +1736,11 @@ impl Interp {
         if let Ok(p) = path.canonicalize() {
             Arc::make_mut(&mut self.loaded).insert(p);
         }
-        self.load_source(&src, &path.display().to_string())
+        // Nothing asks a program run from its file for its value.
+        let keep = std::mem::replace(&mut self.keep_last, false);
+        let r = self.load_source(&src, &path.display().to_string());
+        self.keep_last = keep;
+        r
     }
 
     #[inline]
@@ -1511,6 +1754,11 @@ impl Interp {
     pub(crate) fn run_stmt(&mut self, s: &Stmt, env: &Env) -> Result<Value, Ctrl> {
         match s {
             Stmt::Expr(e) => self.eval(e, env),
+            Stmt::Let(Pattern::Bind(n), e, _) => {
+                let v = self.eval(e, env)?;
+                define(env, *n, v);
+                Ok(Value::Nil)
+            }
             Stmt::Let(p, e, line) => {
                 let v = self.eval(e, env)?;
                 let mut binds = Vec::new();
@@ -1537,18 +1785,79 @@ impl Interp {
                 if self.writes_noted() && lookup_global(env, name).map_or(false, |(_, global)| global) {
                     self.no_writes(&format!("assigning `{}`", name), *line)?;
                 }
-                let rhs = match self.in_place(name, op, e, env)? {
-                    Some(v) => v,
-                    None => self.eval(e, env)?,
-                };
+                let name = *name;
                 let v = match op {
-                    AssignOp::Set => rhs,
+                    AssignOp::Set => {
+                        // `x = x + e` as `x += e`: a number in place, a list or text grown where
+                        // it is. `e` first, as `+=` has it, when that cannot change `x`.
+                        let grown = match e {
+                            Expr::Binary(bop @ (BinOp::Add | BinOp::Sub), a, b, _) if self.fuel == u64::MAX && matches!(&**a, Expr::Ident(n, _) if *n == name) => {
+                                let sub = *bop == BinOp::Sub;
+                                let list_or_text = !sub && crate::value::growable(env, name);
+                                if list_or_text || quiet(b) {
+                                    let more = self.eval(b, env)?;
+                                    if crate::value::bump_local(env, name, &more, sub) {
+                                        return Ok(Value::Nil);
+                                    }
+                                    if list_or_text {
+                                        match self.grown(name, more, env, *line)? {
+                                            Some(v) => Some(v),
+                                            None => return Ok(Value::Nil),
+                                        }
+                                    } else {
+                                        let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
+                                        Some(binop(*bop, old, more, *line)?)
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        match grown {
+                            Some(v) => v,
+                            None => match self.in_place_call(Some(name), e, env)? {
+                                Some(_) if std::mem::take(&mut self.stored) => return Ok(Value::Nil),
+                                Some(v) => v,
+                                None => self.eval(e, env)?,
+                            },
+                        }
+                    }
                     AssignOp::Add | AssignOp::Sub => {
-                        let old = lookup(env, name).ok_or_else(|| undefined(name, *line))?;
-                        let bop = if matches!(op, AssignOp::Add) { BinOp::Add } else { BinOp::Sub };
-                        binop(bop, old, rhs, *line)?
+                        let rhs = self.eval(e, env)?;
+                        let sub = matches!(op, AssignOp::Sub);
+                        if crate::value::bump_local(env, name, &rhs, sub) {
+                            return Ok(Value::Nil);
+                        }
+                        if !sub && self.fuel == u64::MAX && crate::value::growable(env, name) {
+                            match self.grown(name, rhs, env, *line)? {
+                                Some(v) => v,
+                                None => return Ok(Value::Nil),
+                            }
+                        } else {
+                            let old = lookup(env, name).ok_or_else(|| undefined(&name, *line))?;
+                            // A script's limit on what it makes holds here as for `+`: `a += a`
+                            // went past it, as far as memory goes (FEEDBACK29.md; branch
+                            // feedback29-fixes).
+                            let op = if sub { BinOp::Sub } else { BinOp::Add };
+                            if self.fuel != u64::MAX {
+                                self.script_binop(op, old, rhs, *line)?
+                            } else {
+                                binop(op, old, rhs, *line)?
+                            }
+                        }
                     }
                 };
+                // A local has nothing following it, and nor has a global while the program
+                // loads: a statement should not cost five looks at the same name
+                // (FEEDBACK29.md; branch feedback29-fixes).
+                let v = match crate::value::assign_local(env, name, v) {
+                    Ok(()) => return Ok(Value::Nil),
+                    Err(v) => v,
+                };
+                if crate::value::loading() && assign(env, name, v.clone()) {
+                    return Ok(Value::Nil);
+                }
                 let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
                 // Which fields of a global map changed, for what follows
                 // one field (FEEDBACK12.md, Q-084; branch open-fixes).
@@ -1617,7 +1926,7 @@ impl Interp {
                 if path.ends_with(".qwer") {
                     let fname = full.display().to_string();
                     return match crate::native::use_file(self, &full, names.as_deref(), *line) {
-                        Err(Ctrl::Error(e)) => Err(Ctrl::Error(e.in_file(&fname))),
+                        Err(Ctrl::Error(e)) => Err(Ctrl::Error(Box::new(e.in_file(&fname)))),
                         other => other.map(|_| Value::Nil),
                     };
                 }
@@ -1636,14 +1945,27 @@ impl Interp {
                 }
                 let mut r = Ok(Value::Nil);
                 for s in stmts.iter() {
-                    match self.exec_stmt(s, &g) {
+                    // A used file's statements give nothing to anyone.
+                    let ran = match s {
+                        Stmt::Expr(node @ Expr::For(pat, iter, body, line)) if !crate::debug::on() => self.eval_for(node, pat, iter, body, &g, *line, false),
+                        s => self.exec_stmt(s, &g),
+                    };
+                    match ran {
                         Ok(_) => {}
+                        // An error is the program's failure from a used file too, and
+                        // the file it came from says so (FEEDBACK29.md, Q-350; branch
+                        // feedback29-fixes).
+                        Err(Ctrl::Return(Value::Err(e, _, at))) => {
+                            let text = crate::value::told(|| e.display());
+                            r = Err(Ctrl::Error(Box::new(QuilloError::new(at.before(&text), 0).in_file(&fname))));
+                            break;
+                        }
                         // `return` at a file's top level leaves that file, not the one
                         // that used it (FEEDBACK16.md, Q-109; branch feedback20-fixes).
                         Err(Ctrl::Return(_)) => break,
                         Err(e) => {
                             r = Err(match e {
-                                Ctrl::Error(e) => Ctrl::Error(e.in_file(&fname)),
+                                Ctrl::Error(e) => Ctrl::Error(Box::new(e.in_file(&fname))),
                                 other => other,
                             });
                             break;
@@ -1704,7 +2026,7 @@ impl Interp {
                 sub.base = format!("{}{}", self.base, prefix);
                 // What a service mounts is part of the service.
                 sub.is_service = self.is_service;
-                sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())))?;
+                sub.load_file(&full).map_err(|e| Ctrl::Error(Box::new(e.in_file(&full.display().to_string()))))?;
                 // Watch the mounted program's files too: watched, not loaded,
                 // so a file both `use` still runs here (FEEDBACK4.md, Q-040;
                 // branch bank-fixes).
@@ -1757,7 +2079,7 @@ impl Interp {
                 if self.reads.is_some() || !self.tracks.is_empty() {
                     self.note_global_read(env, n);
                 }
-                lookup(env, n).ok_or_else(|| undefined(n, *line))
+                lookup(env, *n).ok_or_else(|| undefined(n, *line))
             }
             // As in JavaScript: the operand that decided the result.
             Expr::Binary(BinOp::And, a, b, _) => {
@@ -1777,6 +2099,13 @@ impl Interp {
             Expr::Binary(op, a, b, line) => {
                 let x = self.eval(a, env)?;
                 let y = self.eval(b, env)?;
+                if let (Value::Int(p), Value::Int(q)) = (&x, &y) {
+                    if let Some(v) = int_op(*op, *p, *q) {
+                        // Ints have nothing to let go of.
+                        std::mem::forget((x, y));
+                        return Ok(v);
+                    }
+                }
                 if self.fuel != u64::MAX {
                     return self.script_binop(*op, x, y, *line);
                 }
@@ -1859,14 +2188,51 @@ impl Interp {
             Expr::Unary(op, x, line) => self.eval_unary(*op, x, env, *line),
             Expr::Index(obj, idx, line) => self.eval_index(obj, idx, env, *line),
             Expr::Match(subj, arms, line) => self.eval_match(subj, arms, env, *line),
-            Expr::For(pat, iter, body, line) => self.eval_for(pat, iter, body, env, *line, true),
+            Expr::For(pat, iter, body, line) => self.eval_for(e, pat, iter, body, env, *line, true),
             Expr::While(cond, body, line) => {
-                while self.eval(cond, env)?.truthy() {
+                // A body that declares has one scope for all its rounds, unless one of them
+                // leaves something holding it, as a `for` has.
+                let stmts = match &**body {
+                    Expr::Block(stmts) if !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..))) => Some(stmts),
+                    _ => None,
+                };
+                let mut scope: Option<Env> = None;
+                let mut rounds = 0u64;
+                loop {
+                    // A long loop goes on in machine code from here (src/jitloop.rs).
+                    #[cfg(feature = "jit")]
+                    if rounds == crate::jitloop::WARM && self.loops_compile() {
+                        if let Some(s) = scope.take() {
+                            Scope::done(s);
+                        }
+                        match crate::jitloop::run(self, e, env, None) {
+                            Some(crate::jitloop::Ran::Done) => break,
+                            Some(crate::jitloop::Ran::Failed(err)) => return Err(err),
+                            Some(crate::jitloop::Ran::Resume(_)) | None => {}
+                        }
+                    }
+                    rounds += 1;
+                    if !self.eval(cond, env)?.truthy() {
+                        break;
+                    }
                     self.within_limit(*line)?;
                     if self.fuel != u64::MAX {
                         self.burn(*line)?;
                     }
-                    self.eval(body, env)?;
+                    match stmts {
+                        Some(stmts) => {
+                            if !scope.as_mut().map_or(false, Scope::reuse) {
+                                scope = Some(Scope::child(env));
+                            }
+                            self.block_in(stmts, scope.as_ref().expect("set above"), false)?;
+                        }
+                        None => {
+                            self.eval_unused(body, env)?;
+                        }
+                    }
+                }
+                if let Some(s) = scope {
+                    Scope::done(s);
                 }
                 Ok(Value::Nil)
             }
@@ -1897,21 +2263,62 @@ impl Interp {
 
     #[inline(never)]
     fn eval_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Value, Ctrl> {
+        self.block_with(stmts, env, true)
+    }
+
+    /// A block, and its value if `keep`.
+    fn block_with(&mut self, stmts: &[Stmt], env: &Env, keep: bool) -> Result<Value, Ctrl> {
+        // One statement that declares nothing, as `if c { t += 1 }` has: that statement.
+        if let ([s @ (Stmt::Expr(_) | Stmt::Assign(..))], false) = (stmts, crate::debug::on()) {
+            return match s {
+                Stmt::Expr(e) if keep => self.eval(e, env),
+                Stmt::Expr(e) => self.eval_unused(e, env),
+                s => self.run_stmt(s, env),
+            };
+        }
         // A block that declares nothing runs in the scope around it: the
         // same names mean the same, with no scope to make (a loop's body).
-        let declares = !stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..)));
-        let scope = if declares { Scope::child(env) } else { env.clone() };
+        if stmts.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(..) | Stmt::Return(..))) {
+            return self.block_in(stmts, env, keep);
+        }
+        let scope = Scope::child(env);
+        let last = self.block_in(stmts, &scope, keep)?;
+        Scope::done(scope);
+        Ok(last)
+    }
+
+    /// `e` for what it does, its value not used: a loop in it, in an `if`'s branch or a
+    /// block, makes no list of what each round gave, and so may go to machine code
+    /// (FEEDBACK29.md; branch feedback29-fixes).
+    fn eval_unused(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
+        match e {
+            Expr::For(pat, iter, body, line) => self.eval_for(e, pat, iter, body, env, *line, false),
+            Expr::If(c, a, b) => {
+                if self.eval(c, env)?.truthy() {
+                    self.eval_unused(a, env)?;
+                } else if let Some(b) = b {
+                    self.eval_unused(b, env)?;
+                }
+                Ok(Value::Nil)
+            }
+            Expr::Block(stmts) => self.block_with(stmts, env, false),
+            e => self.eval(e, env),
+        }
+    }
+
+    #[inline]
+    /// The statements of a block in `scope`, and the last one's value, if `keep`: a loop's
+    /// body has none that is used, unless its loop's list is (FEEDBACK29.md, Q-356; branch
+    /// feedback29-fixes).
+    fn block_in(&mut self, stmts: &[Stmt], scope: &Env, keep: bool) -> Result<Value, Ctrl> {
         let mut last = Value::Nil;
         let n = stmts.len();
         for (i, s) in stmts.iter().enumerate() {
             last = match s {
-                // A loop whose list nobody takes makes none.
-                Stmt::Expr(Expr::For(pat, iter, body, line)) if i + 1 < n && !crate::debug::on() => self.eval_for(pat, iter, body, &scope, *line, false)?,
-                s => self.exec_stmt(s, &scope)?,
+                // What nobody takes the value of: a loop in it makes no list.
+                Stmt::Expr(e) if (i + 1 < n || !keep) && !crate::debug::on() => self.eval_unused(e, scope)?,
+                s => self.exec_stmt(s, scope)?,
             };
-        }
-        if declares {
-            Scope::done(scope);
         }
         Ok(last)
     }
@@ -1942,6 +2349,12 @@ impl Interp {
         self.script_made(Value::map(m), 0)
     }
 
+    /// Whether a loop may go on in machine code: nothing watches what it does there.
+    #[cfg(feature = "jit")]
+    fn loops_compile(&self) -> bool {
+        self.fuel == u64::MAX && self.reads.is_none() && self.tracks.is_empty() && !crate::debug::on() && !crate::httpd::compute_limited() && crate::jit::enabled()
+    }
+
     /// A step of a loop or a call: `--max-compute` ends a request here, between statements,
     /// so nothing is left half done (FEEDBACK20.md, Q-163; branch feedback20-fixes).
     #[inline]
@@ -1950,6 +2363,51 @@ impl Interp {
             return fail(line, "this request computed for longer than --max-compute allows");
         }
         Ok(())
+    }
+
+    /// `s[n]`: a character, from the end when negative. A long text is indexed once
+    /// and kept, so a loop over it is not quadratic (FEEDBACK29.md, Q-355; branch
+    /// feedback29-fixes).
+    fn char_at(&mut self, s: &Arc<str>, n: i64) -> Value {
+        let (chars, offsets) = self.text_index(s);
+        let n = if n < 0 { chars as i64 + n } else { n };
+        if n < 0 || n >= chars as i64 {
+            return Value::Nil;
+        }
+        let n = n as usize;
+        match offsets {
+            None => one_char(s.as_bytes()[n] as char),
+            Some(o) => {
+                let at = o[n] as usize;
+                one_char(s[at..].chars().next().expect("the offset of a character"))
+            }
+        }
+    }
+
+    /// How many characters `s` has, and where each is unless each is a byte.
+    fn text_index(&mut self, s: &Arc<str>) -> (usize, Option<&[u32]>) {
+        const SMALL: usize = 64;
+        let kept = matches!(&self.text, Some(t) if Arc::ptr_eq(&t.text, s));
+        if !kept {
+            let plain = s.is_ascii();
+            if s.len() < SMALL {
+                // Too short to be worth keeping: looked at each time.
+                let offsets = (!plain).then(|| s.char_indices().map(|(i, _)| i as u32).collect::<Vec<u32>>());
+                self.text_small = offsets;
+                let chars = self.text_small.as_ref().map_or(s.len(), Vec::len);
+                return (chars, self.text_small.as_deref());
+            }
+            let offsets = (!plain && s.len() <= u32::MAX as usize).then(|| s.char_indices().map(|(i, _)| i as u32).collect::<Vec<u32>>());
+            let chars = offsets.as_ref().map_or(s.len(), Vec::len);
+            self.text = Some(TextIndex { text: s.clone(), chars, offsets });
+        }
+        let t = self.text.as_ref().expect("kept above");
+        (t.chars, t.offsets.as_deref())
+    }
+
+    /// `len(s)`, with what `s[i]` keeps: `while i < len(s)` asks each round.
+    pub(crate) fn text_len(&mut self, s: &Arc<str>) -> usize {
+        self.text_index(s).0
     }
 
     /// `v`, unless a sandboxed script made it too big; a script also pays
@@ -1993,7 +2451,7 @@ impl Interp {
             UnOp::Not => Ok(Value::Bool(!v.truthy())),
             UnOp::Neg => match v {
                 Value::Int(n) => {
-                    n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(QuilloError::new("integer overflow", line)))
+                    n.checked_neg().map(Value::Int).ok_or_else(|| Ctrl::Error(Box::new(QuilloError::new("integer overflow", line))))
                 }
                 Value::Float(f) => Ok(Value::Float(-f)),
                 Value::Dec(d) => Ok(Value::Dec(d.neg())),
@@ -2007,47 +2465,209 @@ impl Interp {
     /// runs, which then changes it rather than copying it, so the loop
     /// costs its length and not its square. Not when the other arguments
     /// read the variable, nor for a global, which other requests read.
-    fn in_place(&mut self, name: &str, op: &AssignOp, e: &Expr, env: &Env) -> Result<Option<Value>, Ctrl> {
-        match op {
-            AssignOp::Set => self.in_place_call(Some(name), e, env),
-            _ => Ok(None),
+    /// `xs += ys` and `xs = xs + ys` on a list, which grow it as `push` does (FEEDBACK29.md,
+    /// Q-352; branch feedback29-fixes), and `s += t` on a text, added to where it is when
+    /// nothing else holds it (Q-354): None when that is done, or else the value to assign,
+    /// as `+` has it.
+    fn grown(&mut self, name: Sym, more: Value, env: &Env, line: u32) -> Result<Option<Value>, Ctrl> {
+        if let Value::Str(t) = &more {
+            if self.text_added(name, t, env) {
+                return Ok(None);
+            }
         }
+        let mut more = Some(more);
+        let done = crate::value::with_slot(env, name, |slot| match (slot, more.as_ref()) {
+            (Value::List(l), Some(Value::List(_))) => {
+                let Some(Value::List(items)) = more.take() else { unreachable!("looked at above") };
+                let l = Arc::make_mut(l);
+                match Arc::try_unwrap(items) {
+                    Ok(items) => l.extend(items),
+                    Err(shared) => l.extend_from_slice(&shared),
+                }
+                true
+            }
+            _ => false,
+        });
+        if done == Some(true) {
+            return Ok(None);
+        }
+        let old = lookup(env, name).ok_or_else(|| undefined(&name, line))?;
+        binop(BinOp::Add, old, more.unwrap_or(Value::Nil), line).map(Some)
+    }
+
+    /// `t` added to the text a variable holds where it is, if nothing else holds it. What
+    /// `s[i]` keeps of it stays right, so `while len(s) < n { s += "x" }` stays linear.
+    fn text_added(&mut self, name: Sym, t: &str, env: &Env) -> bool {
+        let mut kept = self.text.take();
+        let mut index = None;
+        let added = crate::value::with_slot(env, name, |slot| {
+            let Value::Str(s) = slot else { return false };
+            let mut own = kept.take_if(|k| Arc::ptr_eq(&k.text, s));
+            if let Some(k) = &mut own {
+                k.text = Arc::from("");
+            }
+            if !crate::value::append_text(s, t) {
+                return false;
+            }
+            // Letters of one byte each so far, by no list of where they start: the first
+            // that is longer starts one.
+            if let Some(mut k) = own.filter(|k| k.offsets.is_some() || t.is_ascii()) {
+                let start = s.len() - t.len();
+                k.chars += t.chars().count();
+                if let Some(o) = &mut k.offsets {
+                    o.extend(t.char_indices().map(|(i, _)| (start + i) as u32));
+                }
+                k.text = s.clone();
+                index = Some(k);
+            }
+            true
+        });
+        self.text = index.or(kept);
+        added == Some(true)
     }
 
     /// The same for a call that is a function's whole body, on one of its
     /// own parameters, as in `reduce(xs, {}, (m, x) => set(m, x.id, x))`
     /// (`name` is None: the caller has checked it is a parameter).
-    fn in_place_call(&mut self, name: Option<&str>, e: &Expr, env: &Env) -> Result<Option<Value>, Ctrl> {
-        let Expr::Call(f, args, line) = e else { return Ok(None) };
-        let (Expr::Ident(fname, _), Some(Expr::Ident(first, _))) = (&**f, args.first()) else { return Ok(None) };
-        if name.is_some_and(|n| n != first) || !matches!(fname.as_str(), "set" | "push" | "merge" | "remove") {
+    fn in_place_call(&mut self, name: Option<Sym>, e: &Expr, env: &Env) -> Result<Option<Value>, Ctrl> {
+        // The same call, however it is written: `set(m, k, v)`, `m | set(k, v)` and
+        // `m.set(k, v)` (FEEDBACK29.md, Q-352; branch feedback29-fixes).
+        let Some((fname, Expr::Ident(first, _), args, line)) = call_on(e) else { return Ok(None) };
+        let first = *first;
+        let (set, push, merge, remove) = update_names();
+        if name.is_some_and(|n| n != first) || !(fname == set || fname == push || fname == merge || fname == remove) {
             return Ok(None);
         }
-        let name = first.as_str();
-        let Some(b @ Value::Builtin(bname, _)) = lookup(env, fname) else { return Ok(None) };
+        let stored = name.is_some();
+        let name = first;
+        // `m.set(...)` is a function a map holds, if it does.
+        if matches!(e, Expr::Call(f, ..) if matches!(&**f, Expr::Field(..))) && !matches!(lookup(env, name), Some(Value::List(_))) && !matches!(lookup(env, name), Some(Value::Map(m)) if !m.contains_key(fname.as_str())) {
+            return Ok(None);
+        }
+        // The builtin of that name, unless something nearer has it; no copy of it is made
+        // to ask.
+        let Some((bname, bf)) = crate::value::builtin_named(env, fname) else { return Ok(None) };
         if bname != fname.as_str() {
             return Ok(None);
         }
+        let b = Value::Builtin(bname, bf);
         // The other arguments are worked out first, so they may read it: what they
         // keep of it holds it, and it is then copied (FEEDBACK25.md, Q-314; branch
-        // feedback26-fixes).
-        if lookup_global(env, name).map_or(true, |(_, global)| global) {
+        // feedback26-fixes). A global too while nothing is being served, as nothing
+        // else can read it: a script's top level is where most of it is (FEEDBACK29.md,
+        // Q-353; branch feedback29-fixes).
+        if !crate::value::takable(env, name) {
             return Ok(None);
         }
-        let mut vals = Vec::with_capacity(args.len());
+        if fname == set && self.fuel == u64::MAX {
+            if let Some(v) = self.in_place_nested(name, args, env)? {
+                return Ok(Some(v));
+            }
+        }
+        // Where it is, with no call to make, when that is all it takes.
+        if self.fuel == u64::MAX && (fname == push && args.len() == 1 || fname == set && args.len() == 2) {
+            let mut few = [Value::Nil, Value::Nil, Value::Nil];
+            for (i, a) in args.iter().enumerate() {
+                few[i + 1] = self.eval(a, env)?;
+            }
+            let few = &mut few[..=args.len()];
+            let done = crate::value::with_slot(env, name, |slot| crate::value::update(slot, few));
+            if done == Some(true) {
+                // An assignment has nothing left to do.
+                self.stored = stored;
+                return Ok(if stored { Some(Value::Nil) } else { take_local(env, name) });
+            }
+            let Some(old) = take_local(env, name) else { return Ok(None) };
+            few[0] = old;
+            return self.call(&b, few.to_vec(), line).map(Some);
+        }
+        let mut vals = Vec::with_capacity(args.len() + 1);
         vals.push(Value::Nil);
-        for a in &args[1..] {
+        for a in args {
             vals.push(self.eval(a, env)?);
         }
         let Some(old) = take_local(env, name) else { return Ok(None) };
         vals[0] = old;
-        self.call(&b, vals, *line).map(Some)
+        self.call(&b, vals, line).map(Some)
+    }
+
+    /// `m = set(m, k, get(m, k, []) | push(x))` and `g = set(g, y, set(g[y], x, v))`, which
+    /// is what a list of lists or a map of lists is written with: what is in `m` is read,
+    /// changed and put back, and read out of `m` it has two owners, so each round copied
+    /// all of it (FEEDBACK29.md, Q-352; branch feedback29-fixes). Here it is changed where
+    /// it is. The value, or None to do it the long way: anything that could fail or
+    /// surprise is left to that, which is why all that is worked out here has no effect
+    /// and may be worked out again.
+    fn in_place_nested(&mut self, name: Sym, args: &[Expr], env: &Env) -> Result<Option<Value>, Ctrl> {
+        let [key, inner] = args else { return Ok(None) };
+        let Some((op, recv, rest, _)) = call_on(inner) else { return Ok(None) };
+        let fits = match (op.as_str(), rest.len()) {
+            ("push", 1) | ("set", 2) => true,
+            _ => false,
+        };
+        if !fits || !pure(key, env) || !rest.iter().all(|x| pure(x, env)) {
+            return Ok(None);
+        }
+        // What was read: `m[k]`, or `get(m, k)` with what to start from.
+        let (same_key, start) = match recv {
+            Expr::Index(o, k, _) if matches!(&**o, Expr::Ident(n, _) if *n == name) => (&**k, None),
+            r => match call_on(r) {
+                Some((f, Expr::Ident(n, _), [k, more @ ..], _)) if f == "get" && *n == name && more.len() < 2 && more.iter().all(constant) => {
+                    if !matches!(lookup(env, f), Some(Value::Builtin("get", _))) {
+                        return Ok(None);
+                    }
+                    (k, more.first())
+                }
+                _ => return Ok(None),
+            },
+        };
+        if !same_expr(key, same_key) || !matches!(lookup(env, op), Some(Value::Builtin(b, _)) if b == op.as_str()) {
+            return Ok(None);
+        }
+        let key = self.eval(key, env)?;
+        let start = match start {
+            Some(d) => Some(self.eval(d, env)?),
+            None => None,
+        };
+        let mut vals = Vec::with_capacity(2);
+        for a in rest {
+            vals.push(self.eval(a, env)?);
+        }
+        let done = crate::value::with_slot(env, name, |whole| crate::value::update_inside(whole, &key, start, vals));
+        Ok(if done == Some(true) { take_local(env, name) } else { None })
     }
 
     #[inline(never)]
     fn eval_index(&mut self, obj: &Expr, idx: &Expr, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        // `xs[i]` of a variable reads the item where the list is, without a hold on all of
+        // it to let go of after; the index first, which reads and calls nothing, so the order
+        // changes nothing (FEEDBACK29.md; branch feedback29-fixes).
+        if let Expr::Ident(var, _) = obj {
+            if self.reads.is_none() && self.tracks.is_empty() && quiet(idx) {
+                let i = self.eval(idx, env)?;
+                if let Value::Int(n) = i {
+                    let found = crate::value::with_var(env, *var, |v| match v {
+                        Value::List(l) => {
+                            let at = if n < 0 { l.len() as i64 + n } else { n };
+                            Some(if at >= 0 { l.get(at as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
+                        }
+                        Value::Str(s) => Some(self.char_at(s, n)),
+                        _ => None,
+                    });
+                    if let Some(Some(v)) = found {
+                        return Ok(v);
+                    }
+                }
+                let o = self.eval(obj, env)?;
+                return self.index_value(o, i, line);
+            }
+        }
         let o = self.eval(obj, env)?;
         let i = self.eval(idx, env)?;
+        self.index_value(o, i, line)
+    }
+
+    fn index_value(&mut self, o: Value, i: Value, line: u32) -> Result<Value, Ctrl> {
         match (&o, &i) {
             (Value::List(l), Value::Int(n)) => {
                 let n = if *n < 0 { l.len() as i64 + n } else { *n };
@@ -2057,15 +2677,7 @@ impl Interp {
             // Keys are text: a number is the key it is written as, as for
             // `set` and `get`.
             (Value::Map(m), Value::Int(n)) => Ok(m.get(n.to_string().as_str()).cloned().unwrap_or(Value::Nil)),
-            (Value::Str(s), Value::Int(n)) => {
-                let len = s.chars().count() as i64;
-                let n = if *n < 0 { len + n } else { *n };
-                Ok(if n >= 0 {
-                    s.chars().nth(n as usize).map(|c| Value::str(c.to_string())).unwrap_or(Value::Nil)
-                } else {
-                    Value::Nil
-                })
-            }
+            (Value::Str(s), Value::Int(n)) => Ok(self.char_at(s, *n)),
             (Value::Nil, _) => Ok(Value::Nil),
             _ => fail(line, format!("cannot index {} with {}", o.type_name(), i.type_name())),
         }
@@ -2096,20 +2708,44 @@ impl Interp {
     #[inline(never)]
     /// `for`: the list of what the body gave for each item (`keep`), or
     /// nothing when no one takes it.
-    fn eval_for(&mut self, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32, keep: bool) -> Result<Value, Ctrl> {
+    #[allow(clippy::too_many_arguments)]
+    fn eval_for(&mut self, node: &Expr, pat: &Pattern, iter: &Expr, body: &Expr, env: &Env, line: u32, keep: bool) -> Result<Value, Ctrl> {
         let mut out = Vec::new();
         let mut scope = None;
         // `range(a, b)` and `a..b`: counted, without making the list.
-        if let Some((a, b)) = self.counted(iter, env, line)? {
+        if let Some((a, b, step)) = self.counted(iter, env, line, keep)? {
             if keep {
                 // A script stops after its steps: no room for more.
-                out.reserve(((b - a).max(0) as u64).min(self.fuel) as usize);
+                out.reserve(crate::builtins::range_count(a, b, step).min(self.fuel) as usize);
             }
-            for i in a..b {
-                let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line)?;
+            let mut i = a;
+            let mut rounds = 0u64;
+            while if step > 0 { i < b } else { i > b } {
+                // A long loop goes on in machine code from here (src/jitloop.rs).
+                #[cfg(feature = "jit")]
+                if !keep && rounds == crate::jitloop::WARM && self.loops_compile() {
+                    if let Some(s) = scope.take() {
+                        Scope::done(s);
+                    }
+                    match crate::jitloop::run(self, node, env, Some((i, b, step))) {
+                        Some(crate::jitloop::Ran::Done) => break,
+                        Some(crate::jitloop::Ran::Resume(k)) => {
+                            i = k;
+                            rounds += 1;
+                            continue;
+                        }
+                        Some(crate::jitloop::Ran::Failed(e)) => return Err(e),
+                        None => {}
+                    }
+                }
+                rounds += 1;
+                let v = self.for_step(pat, Value::Int(i), body, env, &mut scope, line, keep)?;
                 if keep {
                     out.push(v);
                 }
+                // Past the last int there is nothing to count to.
+                let Some(next) = i.checked_add(step) else { break };
+                i = next;
             }
         } else {
             let it = self.eval(iter, env)?;
@@ -2131,7 +2767,7 @@ impl Interp {
                 out.reserve(items.len());
             }
             for item in items {
-                let v = self.for_step(pat, item.clone(), body, env, &mut scope, line)?;
+                let v = self.for_step(pat, item.clone(), body, env, &mut scope, line, keep)?;
                 if keep {
                     out.push(v);
                 }
@@ -2149,51 +2785,73 @@ impl Interp {
 
     /// One step of a loop: `item` bound by `pat` in a scope of its own (the
     /// last step's again, when nothing kept it), and the body's value.
-    fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, line: u32) -> Result<Value, Ctrl> {
+    #[allow(clippy::too_many_arguments)]
+    fn for_step(&mut self, pat: &Pattern, item: Value, body: &Expr, env: &Env, scope: &mut Option<Env>, line: u32, keep: bool) -> Result<Value, Ctrl> {
         self.within_limit(line)?;
         if self.fuel != u64::MAX {
             self.burn(line)?;
         }
-        if !scope.as_mut().map_or(false, Scope::reuse) {
-            *scope = Some(Scope::child(env));
+        // The loop's variable given its next value where it is, when the last round left
+        // nothing else in its scope (FEEDBACK29.md; branch feedback29-fixes).
+        let rebound = match (pat, scope.as_mut()) {
+            (Pattern::Bind(n), Some(sc)) => Scope::rebind(sc, *n, item),
+            _ => Err(item),
+        };
+        if let Err(item) = rebound {
+            if !scope.as_mut().map_or(false, Scope::reuse) {
+                *scope = Some(Scope::child(env));
+            }
+            let sc = scope.as_ref().expect("set above");
+            if let Pattern::Bind(n) = pat {
+                define(sc, *n, item);
+            } else {
+                let mut binds = Vec::new();
+                if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
+                    return fail(line, format!("`for` pattern does not match {}", short(&item)));
+                }
+                for (n, x) in binds {
+                    define(sc, &n, x);
+                }
+            }
         }
         let sc = scope.as_ref().expect("set above");
-        if let Pattern::Bind(n) = pat {
-            define(sc, n, item);
-        } else {
-            let mut binds = Vec::new();
-            if self.match_pat(pat, &item, Mode::Strict, env, &mut binds)?.is_none() {
-                return fail(line, format!("`for` pattern does not match {}", short(&item)));
-            }
-            for (n, x) in binds {
-                define(sc, &n, x);
-            }
+        // The body's own variables can go in this scope: it is new each round.
+        match body {
+            Expr::Block(stmts) => self.block_in(stmts, sc, keep),
+            body if keep => self.eval(body, sc),
+            body => self.eval_unused(body, sc),
         }
-        self.eval(body, sc)
     }
 
-    /// The bounds of `range(a, b)`, `range(n)` or `a..b` (the builtin, not
-    /// a variable of that name), checked as those check them; None for
+    /// The bounds of `range(a, b)`, `range(a, b, step)`, `range(n)` or `a..b` (the
+    /// builtin, not a variable of that name), checked as those check them; None for
     /// anything else.
-    fn counted(&mut self, iter: &Expr, env: &Env, line: u32) -> Result<Option<(i64, i64)>, Ctrl> {
-        let (a, b, f) = match iter {
-            Expr::Binary(BinOp::Range, a, b, _) => (self.eval(a, env)?, self.eval(b, env)?, None),
-            Expr::Call(callee, args, _) if (args.len() == 1 || args.len() == 2) && matches!(&**callee, Expr::Ident(n, _) if n == "range") => {
+    fn counted(&mut self, iter: &Expr, env: &Env, line: u32, keep: bool) -> Result<Option<(i64, i64, i64)>, Ctrl> {
+        let (a, b, step, f) = match iter {
+            Expr::Binary(BinOp::Range, a, b, _) => (self.eval(a, env)?, self.eval(b, env)?, Value::Int(1), None),
+            Expr::Call(callee, args, _) if (1..=3).contains(&args.len()) && matches!(&**callee, Expr::Ident(n, _) if n == "range") => {
                 let Some(f @ Value::Builtin("range", _)) = lookup(env, "range") else { return Ok(None) };
-                if args.len() == 1 {
-                    (Value::Int(0), self.eval(&args[0], env)?, Some(f))
-                } else {
-                    (self.eval(&args[0], env)?, self.eval(&args[1], env)?, Some(f))
+                match args.as_slice() {
+                    [b] => (Value::Int(0), self.eval(b, env)?, Value::Int(1), Some(f)),
+                    [a, b] => (self.eval(a, env)?, self.eval(b, env)?, Value::Int(1), Some(f)),
+                    [a, b, c] => (self.eval(a, env)?, self.eval(b, env)?, self.eval(c, env)?, Some(f)),
+                    _ => unreachable!("one to three"),
                 }
             }
             _ => return Ok(None),
         };
-        match (&a, &b) {
-            (Value::Int(x), Value::Int(y)) if y.saturating_sub(*x) <= 10_000_000 => Ok(Some((*x, *y))),
+        match (&a, &b, &step) {
+            // A loop that keeps nothing makes no list, so a list's limit means nothing
+            // here (FEEDBACK29.md, Q-356; branch feedback29-fixes).
+            (Value::Int(x), Value::Int(y), Value::Int(s)) if *s != 0 && (!keep || crate::builtins::range_count(*x, *y, *s) <= 10_000_000) => Ok(Some((*x, *y, *s))),
             // Anything else fails as it would have.
             _ => match f {
                 Some(f) => {
-                    let args = if matches!(iter, Expr::Call(_, args, _) if args.len() == 1) { vec![b] } else { vec![a, b] };
+                    let args = match iter {
+                        Expr::Call(_, args, _) if args.len() == 1 => vec![b],
+                        Expr::Call(_, args, _) if args.len() == 2 => vec![a, b],
+                        _ => vec![a, b, step],
+                    };
                     self.call(&f, args, line).map(|_| None)
                 }
                 None => binop(BinOp::Range, a, b, line).map(|_| None),
@@ -2295,6 +2953,11 @@ impl Interp {
             argv.push(v?);
         }
         self.db_on = db_on;
+        if let Value::Func(c) = &f {
+            if c.def.component {
+                return fail(line, component_called(&c.def.name));
+            }
+        }
         self.call(&f, argv, line)
     }
 
@@ -2352,7 +3015,8 @@ impl Interp {
         if matches!(name, "error" | "message") && !matches!(v, Value::Err(..)) {
             return Ok(Value::Nil);
         }
-        fail(line, format!("{} has no field `{}`", v.type_name(), name))
+        let hint = if name == "length" && matches!(v, Value::List(_) | Value::Str(_)) { ": `len(x)` is how many it holds" } else { "" };
+        fail(line, format!("{} has no field `{}`{}", v.type_name(), name, hint))
     }
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
@@ -2385,7 +3049,7 @@ impl Interp {
             }
             Value::Func(c) => {
                 let c = c.clone();
-                self.call_closure(&c, args.into_iter().map(Some).collect(), line)
+                self.call_closure_given(&c, args, line)
             }
             other => fail(line, format!("cannot call {}: it is not a function", other.type_name())),
         }
@@ -2414,6 +3078,26 @@ impl Interp {
         self.call_closure_with(c, args, n, line)
     }
 
+    /// `call_closure` with every argument given: no list of them to make again.
+    fn call_closure_given(&mut self, c: &Closure, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        self.within_limit(line)?;
+        if self.fuel != u64::MAX {
+            self.burn(line)?;
+        }
+        #[cfg(feature = "jit")]
+        if self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
+            if let Some(r) = crate::jit::call(c, &args, self.depth) {
+                return in_file(r, &c.def.file);
+            }
+        }
+        if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def), args.len(), self.fuel) {
+            let v = args.into_iter().next().unwrap_or(Value::Nil);
+            return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
+        }
+        let n = args.len();
+        self.call_closure_with(c, args.into_iter().map(Some), n, line)
+    }
+
     /// `f(x)`, as `call` but without making a list of the one argument: for
     /// `map`, `filter` and the like, which call f for each item.
     pub fn call1(&mut self, f: &Value, x: Value, line: u32) -> Result<Value, Ctrl> {
@@ -2424,8 +3108,27 @@ impl Interp {
             self.burn(line)?;
             self.burn(line)?;
         }
-        if let (Some((field, at)), u64::MAX) = (projection(&c.def), self.fuel) {
-            return in_file(self.get_field(x, field, &c.env, at), &c.def.file);
+        if self.fuel == u64::MAX {
+            if identity(&c.def) {
+                return Ok(x);
+            }
+            if let Some(l) = constant_lambda(&c.def) {
+                return Ok(lit_value(l));
+            }
+            if let Some((field, at)) = projection(&c.def) {
+                return in_file(self.get_field(x, field, &c.env, at), &c.def.file);
+            }
+        }
+        if c.def.component {
+            return fail(line, component_called(&c.def.name));
+        }
+        // A number for a number, as most of these functions are (FEEDBACK29.md; branch
+        // feedback29-fixes).
+        #[cfg(feature = "jit")]
+        if matches!(x, Value::Int(_) | Value::Float(_) | Value::Bool(_)) && self.fuel == u64::MAX && self.depth < MAX_DEPTH && !crate::debug::on() && !crate::httpd::compute_limited() {
+            if let Some(r) = crate::jit::call(c, std::slice::from_ref(&x), self.depth) {
+                return in_file(r, &c.def.file);
+            }
         }
         let c = c.clone();
         self.call_closure_with(&c, std::iter::once(Some(x)), 1, line)
@@ -2494,8 +3197,14 @@ impl Interp {
             None => None,
         };
         self.depth += 1;
-        let caller = std::mem::replace(&mut self.cur_file, def.file.clone());
-        let outer_caller = std::mem::replace(&mut self.caller_file, caller.clone());
+        // A call within its file, as most are, has nothing to change here (FEEDBACK29.md;
+        // branch feedback29-fixes).
+        let same = same_file(&self.cur_file, &def.file) && same_file(&self.caller_file, &def.file);
+        let swapped = (!same).then(|| {
+            let caller = std::mem::replace(&mut self.cur_file, def.file.clone());
+            let outer = std::mem::replace(&mut self.caller_file, caller.clone());
+            (caller, outer)
+        });
         let was_component = def.server && std::mem::replace(&mut self.in_component, false);
         let debugging = crate::debug::on();
         if debugging {
@@ -2511,11 +3220,16 @@ impl Interp {
         let r = match in_file(r, &def.file) {
             // On the way out: a call that succeeds pays nothing (FEEDBACK21.md, Q-174; branch
             // feedback20-fixes).
-            Err(Ctrl::Error(e)) => Err(Ctrl::Error(e.called(&def.name, caller.as_ref(), line))),
+            Err(Ctrl::Error(e)) => {
+                let caller = swapped.as_ref().map_or(&self.cur_file, |(c, _)| c);
+                Err(Ctrl::Error(Box::new(e.called(&def.name, caller.as_ref(), line))))
+            }
             r => r,
         };
-        self.cur_file = caller;
-        self.caller_file = outer_caller;
+        if let Some((caller, outer)) = swapped {
+            self.cur_file = caller;
+            self.caller_file = outer;
+        }
         if was_component {
             self.in_component = true;
         }
@@ -2651,7 +3365,7 @@ impl Interp {
                     );
                 }
             }
-            define(&scope, &p.name, v);
+            define(&scope, p.name, v);
         }
         Ok(scope)
     }
@@ -2915,7 +3629,7 @@ impl Interp {
         Ok(match p {
             Pattern::Wild => Some(v.clone()),
             Pattern::Bind(n) => {
-                binds.push((n.clone(), v.clone()));
+                binds.push((n.to_string(), v.clone()));
                 Some(v.clone())
             }
             Pattern::Lit(l) => {
@@ -3472,7 +4186,7 @@ impl Interp {
             let mut args = Vec::with_capacity(params.len());
             for p in params {
                 if p.name == "children" {
-                    args.push(Some(Value::html(std::mem::take(&mut kids))));
+                    args.push(Some(children_of(el, std::mem::take(&mut kids))));
                     continue;
                 }
                 args.push(match el.attrs.iter().find(|(n, _)| *n == p.name) {
@@ -3499,9 +4213,9 @@ impl Interp {
         for p in &c.def.params {
             if p.name == "children" {
                 if component {
-                    props.insert(p.name.as_str().into(), Value::str(&kids));
+                    props.insert(p.name.as_str().into(), if el.children.is_empty() { Value::Nil } else { Value::str(&kids) });
                 }
-                args.push(Some(Value::html(std::mem::take(&mut kids))));
+                args.push(Some(children_of(el, std::mem::take(&mut kids))));
                 continue;
             }
             let pos = given.iter().position(|(n, _)| n == &p.name);

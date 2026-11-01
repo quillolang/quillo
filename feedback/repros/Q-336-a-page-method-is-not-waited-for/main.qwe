@@ -1,0 +1,17 @@
+// Q-336 What waits and what does not has no single rule
+// mode: browser
+// page: /
+// probe: window.__slow = { get: () => new Promise((r) => setTimeout(() => r("done"), 20)) }; await new Promise((r) => setTimeout(r, 300)); document.getElementById("b").click(); await new Promise((r) => setTimeout(r, 300)); return { got: document.getElementById("b").textContent }
+// open-when: /"got": "(\{\}|\[object|promise|)"/
+// fixed-when: "got": "done"
+// From FEEDBACK28.md §Q-336 (found on 5f7f76c). A method of what the page gave that gives a
+// Promise was not waited for, where `js()` is.
+
+component C() {
+    state o = ""
+    <button id="b" @click={() => {
+        let slow = js("window.__slow")
+        o = str(slow.get())
+    }}>{o}</button>
+}
+route GET / = <html><body><C/></body></html>

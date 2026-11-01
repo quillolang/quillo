@@ -924,14 +924,14 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     // A build takes seconds: other requests go on meanwhile (on a reload,
     // with the version that runs now).
     let built = it.unlocked(move || build(&path));
-    let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
-    let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
+    let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     // `import "x.qwer" use a, b as c`: each must be one of its functions (branch imports).
     if let Some(only) = only {
         for (name, _) in only {
             if !parsed.exports.iter().any(|e| e.name == *name) {
-                return Err(Ctrl::Error(crate::error::QuilloError::new(missing_export(&file, name, &parsed.exports), line)));
+                return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(missing_export(&file, name, &parsed.exports), line))));
             }
         }
     }

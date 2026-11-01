@@ -27,11 +27,18 @@ origin only), for what a web view cannot reach. A component calls it with `js()`
 | `js("quilloNative.battery")` | `{ level, state, low_power }`; `level` is null when the system does not say |
 | `js("quilloNative.notify", title, body, seconds)` | a local notification, asking the person the first time |
 | `js("quilloNative.keepAwake", true)` | the screen stays on while the app is open |
-| `js("quilloNative.brightness")`, `("quilloNative.brightness", 0.8)` | the screen's brightness, read or set |
-| `js("quilloNative.share", text, url)` | the system's share sheet |
+| `js("quilloNative.brightness")`, `("quilloNative.brightness", 0.8)` | the screen's brightness, read or set, 0 to 1; on Android `null` gives it back to the system, as iOS does when the app leaves the screen |
+| `js("quilloNative.share", text, url)` | the system's share sheet: `{ shared, to }`, whether it was sent and where (an activity's name on iOS; both `null` on Android, which does not say) |
 | `js("quilloNative.openSettings")` | the app's page in Settings, to turn on what was refused |
 | `js("quilloNative.wait", ms)` | a pause of up to 60 s, which a component has no other way to take |
 | `js("quilloNative.info")` | the calls this app has |
+
+A link the web view cannot open itself, `tel:`, `sms:`, `mailto:`, a maps link (`geo:` on
+Android, `maps:` on iOS) or a store's (`market:`, `itms-apps:`), goes to the app the phone
+opens it with; other schemes are dropped. The program is served on the same port at each
+launch while it is free (kept in the app's data folder as `port`), so its pages keep one
+origin, and `localStorage` and IndexedDB, which go by origin, keep what they had
+(FEEDBACK28.md, Q-339, Q-346).
 
 The camera, the microphone and recording work through the web's own `getUserMedia` and
 `MediaRecorder`, and photos through `<input type=file capture>`: the app grants them to

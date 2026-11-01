@@ -1,0 +1,8 @@
+// Q-350 A `?` at the top level of a script stops it with no message and exit 0
+// mode: run
+// open-when: /^\s*$/
+// fixed-when: not an int
+// From FEEDBACK29.md §Q-350 (found on d702589).
+
+let n = int("z")?
+print("after")

@@ -137,10 +137,46 @@ fn forbidden(e: &Expr) -> Option<&'static str> {
 }
 
 pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
-    let stmts = match crate::parser::Parser::new(src).parse_program() {
-        Ok(s) => s,
-        Err(e) => return bad(&format!("line {}: {}", e.line, e.msg)),
+    // Names are kept for good, and this source may be a visitor's: its own are its own
+    // (src/sym.rs), and messages say them as it wrote them.
+    let (parsed, names) = crate::sym::Sym::in_script(|| crate::parser::Parser::new(src).parse_program());
+    let out = match parsed {
+        Ok(stmts) => run_parsed(it, &stmts, &names, vars),
+        Err(e) => bad(&format!("line {}: {}", e.line, e.msg)),
     };
+    if names.is_empty() {
+        return out;
+    }
+    match &out {
+        Value::Err(e, _, _) if matches!(&**e, Value::Str(_)) => bad(&said_as_written(&e.display(), &names)),
+        _ => out,
+    }
+}
+
+/// `msg` with a script's own names as it wrote them: a message quotes a name in backticks,
+/// `` `$2` ``, and that is put back as `` `total` ``. Other text is the script's own.
+fn said_as_written(msg: &str, names: &std::collections::HashMap<String, Sym>) -> String {
+    let back: std::collections::HashMap<&str, &str> = names.iter().map(|(k, v)| (v.as_str(), k.as_str())).collect();
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(at) = rest.find("`$") {
+        out.push_str(&rest[..at]);
+        let digits = rest[at + 2..].bytes().take_while(u8::is_ascii_digit).count();
+        let token = &rest[at + 1..at + 2 + digits];
+        match back.get(token) {
+            Some(name) if rest[at + 2 + digits..].starts_with('`') => {
+                out.push('`');
+                out.push_str(name);
+            }
+            _ => out.push_str(&rest[at..at + 2 + digits]),
+        }
+        rest = &rest[at + 2 + digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>) -> Value {
     // Its world: the safe builtins, then its variables.
     let root = Scope::root();
     for name in SAFE {
@@ -153,9 +189,12 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Value {
     crate::dates::install_pure(&mut date);
     define(&root, "date", Value::map(date));
     let env = Scope::child(&root);
+    // A variable the script never names is none of its business, and makes no name.
     if let Some(m) = vars {
         for (k, v) in m.iter() {
-            define(&env, k, v.clone());
+            if let Some(n) = names.get(k.as_str()).copied().or_else(|| Sym::known(k.as_str())) {
+                define(&env, n, v.clone());
+            }
         }
     }
     // A budget of steps, and no effects for what the script reaches by

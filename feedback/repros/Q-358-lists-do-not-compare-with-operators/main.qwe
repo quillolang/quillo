@@ -1,0 +1,7 @@
+// Q-358 Lists order in `sort` and `max`, but `<` refuses them
+// mode: run
+// open-when: cannot compare list with list
+// fixed-when: true false
+// From FEEDBACK29.md §Q-358 (found on d702589).
+
+print([1, 2] < [1, 3], [2] <= [1, 9])

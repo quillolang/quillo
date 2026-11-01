@@ -176,10 +176,17 @@ fn round_of_a_huge_float_stays_a_float() {
 }
 
 #[test]
-fn pow_goes_to_a_float_when_an_int_cannot_hold_it() {
+fn pow_of_ints_overflows_as_multiplying_does() {
+    // A float there printed digits as if they were exact (FEEDBACK29.md, Q-351; branch
+    // feedback29-fixes): an int's answer is exact, or it fails, as `*` does.
     assert_eq!(ev("pow(2, 10)"), "1024");
-    assert_eq!(ev("type_of(pow(10, 30))"), "\"float\"");
-    assert_eq!(ev("pow(10, 30) == 1.0e30"), "true");
+    assert_eq!(ev("pow(2, 62)"), "4611686018427387904");
+    assert_eq!(ev("pow(-2, 63)"), "-9223372036854775808");
+    fails("pow(2, 63)", "integer overflow");
+    fails("pow(10, 30)", "integer overflow");
+    // A float on either side, or a negative power, is a float.
+    assert_eq!(ev("pow(10.0, 30) == 1.0e30"), "true");
+    assert_eq!(ev("type_of(pow(2, -1))"), "\"float\"");
 }
 
 #[test]

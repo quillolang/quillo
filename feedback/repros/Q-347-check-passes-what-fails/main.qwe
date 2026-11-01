@@ -1,0 +1,18 @@
+// Q-347 `quillo check` passes what fails at once or does nothing
+// mode: check
+// open-when: main.qwe: ok
+// fixed-when: does not call setTimeout
+// fixed-when: `push` gives a new value and changes nothing
+// fixed-when: `type_of` never gives "decimal"
+// From FEEDBACK28.md §Q-347 (found on 5f7f76c).
+
+component C() {
+    state o = ""
+    <button @click={() => {
+        js("setTimeout", () => { o = "a" }, 50)
+        let xs = [1, 2]
+        xs.push(3)
+        o = type_of(1.5m) == "decimal" ? "dec" : str(len(xs))
+    }}>{o}</button>
+}
+route GET / = <html><body><C/></body></html>

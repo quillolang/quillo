@@ -106,6 +106,12 @@ impl Renamer<'_> {
         }
     }
 
+    fn sym(&self, n: &mut Sym) {
+        if let Some(to) = self.map.get(n.as_str()) {
+            *n = to.into();
+        }
+    }
+
     fn stmt(&self, s: &mut Stmt) -> R {
         match s {
             Stmt::Let(p, e, _) => {
@@ -113,7 +119,7 @@ impl Renamer<'_> {
                 self.expr(e)
             }
             Stmt::Assign(n, _, e, _) => {
-                self.name(n);
+                self.sym(n);
                 self.expr(e)
             }
             Stmt::SetField(o, _, _, e, _) => {
@@ -149,13 +155,13 @@ impl Renamer<'_> {
         let props = def.component || def.name.starts_with(|c: char| c.is_uppercase());
         self.name(&mut def.name);
         for p in def.params.iter_mut() {
-            if props && self.map.contains_key(&p.name) {
+            if props && self.map.contains_key(p.name.as_str()) {
                 return Err(crate::error::QuilloError::new(
                     format!("`{}` is {}, and a prop of `{}` too: props are passed by name, so rename one", p.name, self.what, demangle(&def.name)),
                     def.line,
                 ));
             }
-            self.name(&mut p.name);
+            self.sym(&mut p.name);
             if let Some(d) = p.default.as_mut() {
                 self.expr(d)?;
             }
@@ -165,7 +171,7 @@ impl Renamer<'_> {
 
     fn pat(&self, p: &mut Pattern) -> R {
         match p {
-            Pattern::Bind(n) => self.name(n),
+            Pattern::Bind(n) => self.sym(n),
             Pattern::As(inner, n) => {
                 self.pat(inner)?;
                 self.name(n);
@@ -204,7 +210,7 @@ impl Renamer<'_> {
 
     fn expr(&self, e: &mut Expr) -> R {
         match e {
-            Expr::Ident(n, _) => self.name(n),
+            Expr::Ident(n, _) => self.sym(n),
             Expr::Lit(_) => {}
             Expr::Template(parts) => {
                 for p in parts {

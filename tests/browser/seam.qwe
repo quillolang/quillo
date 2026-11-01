@@ -1,0 +1,186 @@
+// Where Quillo meets the page (FEEDBACK28.md; branch feedback29-fixes): what compares, what waits,
+// and what a handler set by hand. Driven by seam.js.
+
+server fn fetched(x: str) -> str = x + "!"
+server fn refused(x: str) = err("no")
+
+// Q-334
+component Same() {
+    state said = ""
+    <div @mount={(el) => {
+        let a = el.querySelector("#a")
+        let b = el.querySelector("#b")
+        let again = el.querySelector("#a")
+        said = `${a == b} ${a != b} ${a == again} ${index_of([a, b], b)} ${contains([a], b)} ${a == null} ${{ x: 1 } == { x: 1 }} ${[1] == [1]}`
+    }}><i id="a">a</i><i id="b">b</i><span id="same">{said}</span></div>
+}
+
+// Q-335, Q-336
+component Child(cb, plain) {
+    state out = ""
+    state out2 = ""
+    <div>
+        <button id="prop" @click={() => { let r = cb("a"); out = `${type_of(r)} ${r}` }}>a</button>
+        <button id="prop-plain" @click={() => { let r = plain("b"); out2 = `${type_of(r)} ${r}` }}>b</button>
+        <span id="prop-out">{out}</span>
+        <span id="prop-plain-out">{out2}</span>
+    </div>
+}
+
+// Q-340
+component Late() {
+    state o = ""
+    <a id="late" href="#after" @click={(e) => {
+        let t = js("document.title")
+        e.preventDefault()
+        o = "stopped"
+    }}>{o}</a>
+}
+
+// Q-341
+component Has() {
+    state o = ""
+    <button id="has" @click={() => {
+        let w = js("window")
+        o = json.stringify([js_has("navigator.vibrate"), js_has("Notification"), js_has("no.such.thing"), js_has("document.title"), js_has("nothing"), w.Array.from([1, 2]), w.Object.keys({ a: 1 }), w.nothing_here])
+    }}>{o}</button>
+}
+
+// Q-337
+component Box() {
+    state n = 0
+    state m = 0
+    state on = false
+    state el = null
+    <div>
+        <div id="box" class={on ? "on" : "off"} style={`--a: ${n}; color: red`} @mount={(e) => { el = e }}>{m}</div>
+        <button id="hand" @click={() => { el.style.transform = "translateX(5px)"; el.classList.add("hand"); m += 1 }}>a</button>
+        <button id="same-text" @click={() => { n += 0 }}>b</button>
+        <button id="new-text" @click={() => { n += 1 }}>c</button>
+        <button id="flip" @click={() => { on = !on }}>d</button>
+    </div>
+}
+
+// Q-338
+component Quiet() {
+    state quiet = true
+    state n = 0
+    <div>
+        <video id="v" muted={quiet} playsinline></video>
+        <button id="unmute" @click={() => { quiet = !quiet }}>x</button>
+        <details id="d" open={true}><summary>s</summary>{n}</details>
+        <button id="other" @click={() => { n += 1 }}>y</button>
+    </div>
+}
+
+// Q-342
+component Rows() {
+    state items = [{ id: 1, on: true }, { id: 2, on: true }, { id: 3, on: true }]
+    <div>
+        <ul id="rows">{for x in items => x.on ? <li key={x.id}>on</li> : <li key={x.id}>off</li>}</ul>
+        <button id="flip-rows" @click={() => { items = items | map((x) => merge(x, { on: !x.on })) }}>f</button>
+        <button id="empty" @click={() => { items = [] }}>e</button>
+        <button id="fill" @click={() => { items = [{ id: 7, on: false }] }}>g</button>
+    </div>
+}
+
+// Q-344
+component Cursor() {
+    state o = ""
+    <button id="cursor" @click={() => {
+        o = json.stringify([cursor_index("😀 @an rest", 6), cursor_index("abc", 2), cursor_index("", 3), cursor_index("abc", 99), cursor_index("abc", -1), cursor_index("é😀a", 3), slice("😀 @an rest", 0, cursor_index("😀 @an rest", 6))])
+    }}>{o}</button>
+}
+
+// Q-349
+component Later() {
+    state shown = false
+    state o = ""
+    state el = null
+    <div @mount={(e) => { el = e }}>
+        <button id="after" @click={() => { run_after(30, () => { o = "ran" }) }}>a</button>
+        <button id="tick" @click={() => {
+            shown = true
+            page_updated()
+            o = el.querySelector("#panel") != null ? "there" : "not yet"
+        }}>t</button>
+        {shown && <input id="panel"/>}
+        <span id="later">{o}</span>
+    </div>
+}
+
+// A timer from `@mount`, and one from a click, end with their component.
+component Gone() {
+    state alive = false
+    state clicked = true
+    state o = ""
+    <div>
+        {alive && <Timer on_done={() => { o = `${o} mount` }}/>}
+        {clicked && <ClickTimer on_done={() => { o = `${o} click` }}/>}
+        <button id="show" @click={() => { alive = true }}>s</button>
+        <button id="gone" @click={() => { alive = false; clicked = false }}>g</button>
+        <span id="gone-out">{o}</span>
+    </div>
+}
+
+component Timer(on_done) {
+    <span id="timer" @mount={(_e) => { run_after(60, on_done) }}>t</span>
+}
+
+component ClickTimer(on_done) {
+    <button id="click-timer" @click={() => { run_after(60, on_done) }}>t</button>
+}
+
+// Q-336: one rule for what waits.
+component Waits() {
+    state o = ""
+    state o2 = ""
+    state o3 = ""
+    <div>
+        <button id="waits" @click={() => {
+            let slow = js("window.__slow")
+            o = slow.get()
+        }}>w</button>
+        <button id="then" @click={() => {
+            js("Promise.resolve").then((x) => { o2 = `then ${str(x)}` })
+        }}>t</button>
+        <button id="kept" @click={() => {
+            let p = js_new("Promise", (done) => { o3 = "made" })
+            o3 = `${o3}, went on`
+        }}>k</button>
+        <span id="waits-out">{o}</span>
+        <span id="then-out">{o2}</span>
+        <span id="kept-out">{o3}</span>
+    </div>
+}
+
+// Q-345, 2: a component given no children has null for them, on both sides.
+component Bare(children) {
+    state c = null
+    <aside id="bare">{children == null && (c != null ? <div>open</div> : <p>none</p>)}</aside>
+}
+
+component HoldsBare() {
+    <div><Bare/></div>
+}
+
+// Q-349: `every` from a handler ends with its component.
+component Ticks() {
+    state alive = true
+    state n = 0
+    <div>
+        {alive && <Ticker on_tick={() => { n += 1 }}/>}
+        <button id="ticks-stop" @click={() => { alive = false }}>s</button>
+        <span id="ticks">{n}</span>
+    </div>
+}
+
+component Ticker(on_tick) {
+    <button id="ticker" @click={() => { every(10, on_tick) }}>t</button>
+}
+
+component Top() {
+    <Child cb={(x) => fetched(x)} plain={(x) => x + "?"}/>
+}
+
+route GET / = <html><body><Same/><Top/><Late/><Has/><Box/><Quiet/><Rows/><Cursor/><Later/><Gone/><Waits/><HoldsBare/><Ticks/></body></html>

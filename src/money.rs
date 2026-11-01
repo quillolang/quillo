@@ -309,7 +309,7 @@ fn mode(args: &[Value], i: usize, f: &str, line: u32) -> Result<Rounding, Ctrl> 
 }
 
 fn dec_err(line: u32) -> impl Fn(crate::decimal::DecError) -> Ctrl {
-    move |e| Ctrl::Error(crate::QuilloError::new(e.message(), line))
+    move |e| Ctrl::Error(Box::new(crate::QuilloError::new(e.message(), line)))
 }
 
 /// `amount` with exactly the currency's decimals.

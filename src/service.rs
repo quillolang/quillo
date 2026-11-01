@@ -484,12 +484,12 @@ pub fn namespace(it: &mut Interp, name: &str, defs: &[Arc<FnDef>], line: u32) ->
     let mut m = Map::new();
     let mut later = Map::new();
     for d in defs {
-        let params: Vec<String> = d.params.iter().map(|p| if p.default.is_some() { format!("{} = null", p.name) } else { p.name.clone() }).collect();
+        let params: Vec<String> = d.params.iter().map(|p| if p.default.is_some() { format!("{} = null", p.name) } else { p.name.clone().to_string() }).collect();
         let names: Vec<&str> = d.params.iter().map(|p| p.name.as_str()).collect();
         let required = d.params.iter().filter(|p| p.default.is_none()).count();
         let mut made = |builtin: &str| -> R {
             let src = format!("({}) => {}({:?}, {:?}, [{}], {})", params.join(", "), builtin, name, d.name, names.join(", "), required);
-            let lambda = Parser::new(&src).parse_expr().map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e.msg, line)))?;
+            let lambda = Parser::new(&src).parse_expr().map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e.msg, line))))?;
             let g = it.globals.clone();
             it.eval(&lambda, &g)
         };
@@ -1154,7 +1154,7 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
         set_opts(name, o, line)?;
     }
     let full = it.base_dir.join(file);
-    let defs = offered(&full).map_err(|e| Ctrl::Error(crate::error::QuilloError::new(e, line)))?;
+    let defs = offered(&full).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     {
         let mut c = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for d in &defs {
@@ -1183,7 +1183,7 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
                 sub.services = it.services.clone();
                 sub.is_service = true;
                 sub.env_file = std::sync::Arc::new(own);
-                let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(e.in_file(&full.display().to_string())));
+                let loaded = sub.load_file(&full).map_err(|e| Ctrl::Error(Box::new(e.in_file(&full.display().to_string()))));
                 it.services.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
                 loaded?;
                 it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string(), (key, sub.fork()));

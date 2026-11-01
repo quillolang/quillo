@@ -1,0 +1,23 @@
+// Q-352 `x = x | set(...)` and `x = x.push(...)` copy, and that is the form the guide teaches
+// mode: run
+// open-when: killed after
+// fixed-when: 1000000 100
+// From FEEDBACK29.md §Q-352 (found on d702589): each round copied the list, and a map of lists
+// copied the inner list. Over 40 s on d702589.
+
+fn f(n) {
+    let xs = []
+    for i in 0..n {
+        xs = xs | push(i)
+    }
+    len(xs)
+}
+fn g(n) {
+    let m = {}
+    for i in 0..n {
+        let k = str(i % 100)
+        m = m | set(k, get(m, k, []) | push(i))
+    }
+    len(m)
+}
+print(f(1000000), g(200000))

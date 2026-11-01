@@ -1,0 +1,35 @@
+// Q-345 Four ways a component loses part of itself, with no word
+// mode: serve
+// get: /
+// get: /dead
+// flags: --no-check
+// open-when: <aside></aside>
+// fixed-when: /_quillo/s/
+// fixed-when: <p>none</p>
+// fixed-when: /dead -> 500
+// From FEEDBACK28.md §Q-345 (found on 5f7f76c): a view whose body is only a component sent no
+// sheet for its `style global`; a component given no children had empty HTML for them on the
+// server and null in the browser; a component called as a function rendered with no island.
+// The third, an image's `load` before the component started, is in tests/browser/seam.
+// `quillo check` says `make()` is an error now, hence --no-check, to see what `run` does.
+
+let v_css = css`#p { color: rgb(1, 2, 3) }`
+view Inner() = <p id="p">inner</p>
+view V() {
+    style global v_css
+    <Inner/>
+}
+component VC(children) {
+    state c = null
+    <aside>{children == null && (c != null ? <div>open</div> : <p>none</p>)}</aside>
+}
+component E() {
+    <div><VC/></div>
+}
+component Dead() {
+    state n = 0
+    <button @click={() => { n += 1 }}>{n}</button>
+}
+let make = Dead
+route GET / = <html><head></head><body><V/><E/></body></html>
+route GET /dead = <html><body>{make()}</body></html>

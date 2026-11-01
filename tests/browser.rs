@@ -776,6 +776,42 @@ fn the_server_and_the_browser_agree() {
     assert_eq!(r["cr"], 4);
 }
 
+/// Where Quillo meets the page: what compares, what waits, what a handler set by hand, and
+/// the rows and timers around it (FEEDBACK28.md; branch feedback29-fixes).
+#[test]
+fn the_seam_with_the_page_holds() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
+    let r = run_page_with(&chrome, &dir.join("seam.qwe"), free_port(), Some(&dir.join("seam.js")));
+    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["same"], "false true true 1 false false true true", "{}", r);
+    assert_eq!(r["prop"], "str a!", "{}", r);
+    assert_eq!(r["prop_plain"], "str b?", "{}", r);
+    assert_eq!(r["late"], serde_json::json!(["", "stopped"]), "{}", r);
+    assert_eq!(r["has"], serde_json::json!([true, true, false, true, false, [1, 2], ["a"], null]), "{}", r);
+    assert_eq!(r["hand"], serde_json::json!(["translateX(5px)", true]), "{}", r);
+    assert_eq!(r["same_text"], serde_json::json!(["translateX(5px)", true]), "{}", r);
+    assert_eq!(r["new_text"], serde_json::json!(["translateX(5px)", "1", "red", true]), "{}", r);
+    assert_eq!(r["flip"], serde_json::json!([true, false, true, "translateX(5px)"]), "{}", r);
+    assert_eq!(r["muted"], serde_json::json!([true, false, true]), "{}", r);
+    assert_eq!(r["closed_stays"], false, "{}", r);
+    assert_eq!(r["empty_after_flip"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["fill"], serde_json::json!(["off"]), "{}", r);
+    assert_eq!(r["flip_twice"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["cursor"], serde_json::json!([5, 2, 0, 3, 0, 2, "😀 @an"]), "{}", r);
+    assert_eq!(r["after"], "ran", "{}", r);
+    assert_eq!(r["tick"], "there", "{}", r);
+    assert_eq!(r["gone"], "", "{}", r);
+    assert_eq!(r["waits"], "done", "{}", r);
+    assert_eq!(r["then"], "then null", "{}", r);
+    assert_eq!(r["kept"], "made, went on", "{}", r);
+    assert_eq!(r["bare"], "none", "{}", r);
+    assert_eq!(r["ticks"], serde_json::json!([true, 0]), "{}", r);
+}
+
 /// A prerender runs nothing until it is shown, and then runs as any page (FEEDBACK22.md,
 /// Q-178; branch feedback22-fixes).
 #[test]

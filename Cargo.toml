@@ -49,6 +49,7 @@ webpki-roots = "0.26"
 rustls-native-certs = "0.8"
 bytes = "1"
 # float_roundtrip: a float in JSON is read as the nearest one, not a step off.
+serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Time zones for `date` (src/dates.rs): the system's database, and a bundled
 # copy where there is none (Windows, small containers).

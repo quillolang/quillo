@@ -507,7 +507,8 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
                     _ => None,
                 },
                 BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match (x, y) {
-                    (INT | FLOAT, INT | FLOAT) | (STR, STR) | (DEC, DEC | INT) | (INT, DEC) => Some(BOOL),
+                    // Lists order item by item (FEEDBACK29.md, Q-358; branch feedback29-fixes).
+                    (INT | FLOAT, INT | FLOAT) | (STR, STR) | (DEC, DEC | INT) | (INT, DEC) | (LIST, LIST) => Some(BOOL),
                     _ => None,
                 },
                 BinOp::Range => match (x, y) {
@@ -532,7 +533,14 @@ fn binop_t(op: BinOp, a: T, b: T) -> Option<T> {
 const BUILTINS: &[(&str, &str, &str)] = &[
     ("print", "any...", "null"),
     ("error", "any", "any"),
+    ("run_after", "num, fn", "null"),
+    ("page_updated", "", "null"),
+    ("js_has", "str", "bool"),
+    ("cursor_index", "str, int", "int"),
     ("args", "", "list"),
+    ("stdin", "", "str | error(str)"),
+    ("read_line", "", "str | null | error(str)"),
+    ("exit", "int=", "null"),
     ("str", "any=", "str"),
     ("int", "any", "int | error(str)"),
     ("float", "any", "float | error(str)"),
@@ -566,7 +574,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("first", "list | null", "any"),
     ("last", "list | null", "any"),
     ("push", "list | null, any=", "list"),
-    ("range", "int, int=", "list"),
+    ("range", "int, int=, int=", "list"),
     ("enumerate", "list | null", "list"),
     ("keys", "map | null", "list"),
     ("values", "map | null", "list"),
@@ -645,7 +653,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("receive", "str, fn, map | null=", "null | error(str)"),
     ("url", "", "map"),
     ("css", "str", "str"),
-    ("__style", "str, bool | null=", "null"),
+    ("__style", "str, bool | null=, str=", "null"),
     ("ready", "str, fn", "null"),
     ("style_with", "str", "null"),
     ("sql", "str", "str"),
@@ -883,7 +891,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -967,7 +975,7 @@ impl Sig {
                 .params
                 .iter()
                 .map(|p| PSig {
-                    name: p.name.clone(),
+                    name: p.name.to_string(),
                     ty: p.ty.as_ref().map_or(ANY, ty_bits),
                     full: p.ty.as_ref().map_or(T::ANY, ty_t),
                     optional: p.default.is_some(),
@@ -1042,7 +1050,7 @@ pub fn def_text(d: &FnDef) -> String {
         .params
         .iter()
         .map(|p| {
-            let mut s = p.name.clone();
+            let mut s = p.name.to_string();
             if let Some(t) = &p.ty {
                 s.push_str(&format!(": {}", t.text()));
             }
@@ -1409,6 +1417,8 @@ struct Checker {
     /// Checking top-level code as it runs (not a function or route body).
     sequential: bool,
     assigned: HashSet<String>,
+    /// Of those, the ones assigned where nothing local has that name.
+    assigned_globals: HashSet<String>,
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
     effect_cache: HashMap<usize, u8>,
@@ -1525,6 +1535,7 @@ impl Checker {
             quiet: 0,
             sequential: true,
             assigned: HashSet::new(),
+            assigned_globals: HashSet::new(),
             ret_cache: HashMap::new(),
             in_progress: HashSet::new(),
             effect_cache: HashMap::new(),
@@ -1823,6 +1834,7 @@ impl Checker {
     fn run(&mut self, order: Vec<Item>) {
         for it in &order {
             collect_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned);
+            global_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned_globals);
         }
         // Helpers such as `fn table_of(id) = sql_name(`obj_${id}`)`, found
         // again until no more are: one may call another.
@@ -1956,15 +1968,16 @@ impl Checker {
                     let t = self.expr(e);
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
+                    self.keep_component(p, e, &mut binds);
                     // What text a global holds, for the SQL warning in the
                     // functions that use it; one reassigned anywhere holds
                     // nothing known.
                     if let Pattern::Bind(n) = p {
-                        if !self.assigned.contains(n) {
+                        if !self.assigned.contains(n.as_str()) {
                             let k = self.sql_kind(e);
-                            self.sql_vars.push((0, n.clone(), k));
+                            self.sql_vars.push((0, n.to_string(), k));
                             let u = self.url_fixed(e);
-                            self.url_vars.push((0, n.clone(), u));
+                            self.url_vars.push((0, n.to_string(), u));
                         }
                     }
                     for (n, t, sig) in binds {
@@ -2262,7 +2275,9 @@ impl Checker {
         if self.in_component().is_none() || v.sig.is_some() {
             return;
         }
-        if self.assigned.contains(name) {
+        // Not for a parameter or a local of that name, in the program or a kit it uses
+        // (FEEDBACK28.md, Q-348; branch feedback29-fixes).
+        if self.assigned_globals.contains(name) {
             let c = self.in_component().unwrap();
             self.error(format!(
                 "<{}> runs in the browser, but `{}` is a server variable that changes; pass it as a prop or read it with a `server fn`",
@@ -2459,7 +2474,7 @@ impl Checker {
                 self.line = *line;
                 let making = matches!((p, e), (Pattern::Bind(_), Expr::Lambda(_)));
                 if let (true, Pattern::Bind(n)) = (making, p) {
-                    self.letting.push(n.clone());
+                    self.letting.push(n.to_string());
                 }
                 let t = self.expr(e);
                 if making {
@@ -2467,6 +2482,7 @@ impl Checker {
                 }
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
+                self.keep_component(p, e, &mut binds);
                 let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
                 let url = matches!(p, Pattern::Bind(_)) && self.url_fixed(e);
                 for (n, t, sig) in binds {
@@ -2525,7 +2541,7 @@ impl Checker {
                 if let Some(v) = self.url_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
                     v.2 = url;
                 }
-                let found = self.scopes.iter().rev().find_map(|s| s.get(name).cloned()).or_else(|| self.globals.get(name).cloned());
+                let found = self.scopes.iter().rev().find_map(|s| s.get(name.as_str()).cloned()).or_else(|| self.globals.get(name.as_str()).cloned());
                 match found {
                     None => self.error(format!("cannot assign to `{}`: it was never declared (use `let {} = …`)", name, name)),
                     Some(v) => {
@@ -2549,7 +2565,7 @@ impl Checker {
                             self.warn(format!("`{}` is one copy for every tenant: keep a tenant's data in its database, or in a map keyed by tenant()", name));
                         }
                         if v.kind == Kind::State {
-                            let key = (v.file.clone(), v.line, name.clone());
+                            let key = (v.file.clone(), v.line, name.to_string());
                             if let Some(e) = self.state_types.get_mut(&key) {
                                 let now = match op {
                                     AssignOp::Set => rhs,
@@ -2572,7 +2588,7 @@ impl Checker {
                         }
                         if v.kind != Kind::Global {
                             for i in (0..self.scopes.len()).rev() {
-                                if let Some(x) = self.scopes[i].get_mut(name) {
+                                if let Some(x) = self.scopes[i].get_mut(name.as_str()) {
                                     x.used = true;
                                     break;
                                 }
@@ -2697,7 +2713,7 @@ impl Checker {
                 if let (true, Expr::Call(_, args, _)) = (is_live, e) {
                     let loader = if matches!(args.first(), Some(Expr::Map(_))) { args.get(1) } else { args.first() };
                     if let Some(Expr::Ident(f, _)) = loader {
-                        let ret = self.scopes.iter().rev().find_map(|s| s.get(f).cloned()).or_else(|| self.globals.get(f).cloned()).and_then(|v| v.sig).and_then(|s| s.ret);
+                        let ret = self.scopes.iter().rev().find_map(|s| s.get(f.as_str()).cloned()).or_else(|| self.globals.get(f.as_str()).cloned()).and_then(|v| v.sig).and_then(|s| s.ret);
                         if let Some(r) = ret {
                             t = r;
                         }
@@ -2889,10 +2905,20 @@ impl Checker {
     // ---- patterns ------------------------------------------------------
 
     /// Names a pattern binds, with their types.
+    /// `let make = Dead`, where `Dead` is a component: `make` is it too, so `make()` is said
+    /// to be a call of a component, which shows and never answers (FEEDBACK28.md, Q-345;
+    /// branch feedback29-fixes).
+    fn keep_component(&mut self, p: &Pattern, e: &Expr, binds: &mut [(String, T, Option<Arc<Sig>>)]) {
+        let (Pattern::Bind(_), Expr::Ident(m, _), [(_, _, sig)]) = (p, e, binds) else { return };
+        if let Some(s) = self.lookup(m).and_then(|v| v.sig).filter(|s| s.component) {
+            *sig = Some(s);
+        }
+    }
+
     fn bind_pattern(&mut self, p: &Pattern, t: T, out: &mut Vec<(String, T, Option<Arc<Sig>>)>) {
         match p {
             Pattern::Wild | Pattern::Lit(_) => {}
-            Pattern::Bind(n) => out.push((n.clone(), t, None)),
+            Pattern::Bind(n) => out.push((n.to_string(), t, None)),
             Pattern::Type(_) => {}
             Pattern::Alt(ps) => {
                 for q in ps {
@@ -3002,6 +3028,9 @@ impl Checker {
                 }
             }
             Expr::Binary(op, a, b, line) => {
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.type_name_compared(a, b);
+                }
                 let x = self.expr(a);
                 // `x != null && f(x)`: the right side runs only if the left holds.
                 let mut facts = Vec::new();
@@ -3241,6 +3270,9 @@ impl Checker {
                 let mut t = T::of(NIL);
                 let mut never = false;
                 for (i, s) in stmts.iter().enumerate() {
+                    if i + 1 < stmts.len() {
+                        self.answer_dropped(s);
+                    }
                     let st = self.stmt(s, i + 1 == stmts.len());
                     if matches!(s, Stmt::Return(..)) || (st.bits == 0 && matches!(s, Stmt::Expr(_))) {
                         never = true;
@@ -3328,6 +3360,61 @@ impl Checker {
         }
     }
 
+    /// `xs.push(3)` alone on a line changes nothing, as values do not change: it reads as
+    /// JavaScript's call (FEEDBACK28.md, Q-347; branch feedback29-fixes).
+    /// `xs.push(3)` alone: the builtin's answer, the new list, dropped (FEEDBACK28.md, Q-347;
+    /// branch feedback29-fixes). Only the builtin's, on what is known to be a list or a map:
+    /// the program's own `set` and a page's object's `held.set(k, v)` change what they hold.
+    fn answer_dropped(&mut self, s: &Stmt) {
+        let Stmt::Expr(e) = s else { return };
+        let (name, on) = match e {
+            Expr::Call(f, args, _) => match &**f {
+                Expr::Field(o, name, _) => match &**o {
+                    Expr::Ident(o, _) => (name.as_str(), Some(o.as_str())),
+                    _ => return,
+                },
+                Expr::Ident(name, _) if !args.is_empty() => (name.as_str(), None),
+                _ => return,
+            },
+            Expr::Pipe(l, r, _) => match (&**l, &**r) {
+                (Expr::Ident(..), Expr::Call(f, ..)) => match &**f {
+                    Expr::Ident(name, _) => (name.as_str(), None),
+                    _ => return,
+                },
+                _ => return,
+            },
+            _ => return,
+        };
+        if !matches!(name, "push" | "set" | "merge" | "remove") || self.is_local(name) {
+            return;
+        }
+        if !self.globals.get(name).is_some_and(|v| &*v.file == "<builtin>") {
+            return;
+        }
+        if let Some(o) = on {
+            let t = self.scopes.iter().rev().find_map(|s| s.get(o)).or_else(|| self.globals.get(o)).map(|v| v.t);
+            if !t.is_some_and(|t| t.bits != ANY && t.bits & (LIST | MAP) != 0 && t.bits & !(LIST | MAP | NIL) == 0) {
+                return;
+            }
+        }
+        self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `x = x | {}(...)`", name, name));
+    }
+
+    /// `type_of(x) == "decimal"` is never true, and nothing says so (FEEDBACK28.md, Q-347;
+    /// branch feedback29-fixes).
+    fn type_name_compared(&mut self, a: &Expr, b: &Expr) {
+        for (c, l) in [(a, b), (b, a)] {
+            let (Expr::Call(f, _, _), Expr::Lit(Lit::Str(t))) = (c, l) else { continue };
+            if !matches!(&**f, Expr::Ident(n, _) if n == "type_of") {
+                continue;
+            }
+            const NAMES: &[&str] = &["int", "float", "dec", "str", "bool", "list", "map", "fn", "html", "response", "null", "error", "promise", "element", "event", "object"];
+            if !NAMES.contains(&&**t) && !RECORDS.with(|r| r.borrow().contains_key(&**t)) {
+                self.warn(format!("`type_of` never gives {:?}: it gives int, float, dec, str, bool, list, map, fn, html, response, null or error, or a record's type", &**t));
+            }
+        }
+    }
+
     /// `re.test(s, "(a+)+$")`: the server's engine takes this in its stride, and the
     /// browser's backtracks, doubling with each character, with no way to stop it
     /// (FEEDBACK25.md, Q-315; branch feedback26-fixes).
@@ -3361,12 +3448,18 @@ impl Checker {
         // `js(name, ...)`: the name is written in the code, as loading the
         // program requires (FEEDBACK18.md, Q-100; branch feedback18-fixes).
         if let (Expr::Ident(n, _), None) = (callee, &pre) {
-            if (n == "js" || n == "js_new") && !self.is_local(n) && self.globals.get(n).map_or(false, |v| &*v.file == "<builtin>") {
+            if (n == "js" || n == "js_new") && !self.is_local(n) && self.globals.get(n.as_str()).map_or(false, |v| &*v.file == "<builtin>") {
                 match args.first() {
                     Some(Expr::Lit(Lit::Str(path))) => {
                         let ok = !path.is_empty() && path.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$'));
                         if !ok {
                             self.error(format!("`{}`: {:?} is not a dotted name such as \"L.map\"", n, path));
+                        } else if let Some(why) = crate::client::js_path_problem(n, path) {
+                            // What `quillo run` refuses, refused here too (FEEDBACK28.md, Q-347;
+                            // branch feedback29-fixes).
+                            self.error(why);
+                        } else if let Some(m @ ("bind" | "call" | "apply")) = path.rsplit_once('.').map(|(_, m)| m) {
+                            self.warn(format!("`{}(\"{}\")` is most likely Function's `{}`, which Quillo code does not call, and the handler stops there: give the function itself, or wrap it in a lambda", n, path, m));
                         }
                     }
                     Some(_) => self.error(format!("`{}` needs the name of what it calls written out, like {}(\"Chart\", ...)", n, n)),
@@ -3379,14 +3472,14 @@ impl Checker {
             // `billing.later.invoice(args)`: the same call, made later; its id.
             if let Expr::Field(inner, later, _) = &**obj {
                 if let (Expr::Ident(m, _), "later") = (&**inner, later.as_str()) {
-                    if self.services.contains_key(m) && !self.is_local(m) {
+                    if self.services.contains_key(m.as_str()) && !self.is_local(m) {
                         self.service_call(m, name, args, pre);
                         return T::of(STR);
                     }
                 }
             }
             if let Expr::Ident(m, _) = &**obj {
-                if self.services.contains_key(m) && !self.is_local(m) {
+                if self.services.contains_key(m.as_str()) && !self.is_local(m) {
                     return self.service_call(m, name, args, pre);
                 }
                 if MODULES.contains(&m.as_str()) && !self.is_local(m) {
@@ -3500,12 +3593,12 @@ impl Checker {
                 };
                 if let Some(t) = known(name) {
                     let null = matches!(op, BinOp::Eq) == yes;
-                    out.push((name.clone(), if null { T::of(NIL) } else { t.without(NIL) }));
+                    out.push((name.clone().to_string(), if null { T::of(NIL) } else { t.without(NIL) }));
                 }
             }
             Expr::Ident(n, _) if yes => {
                 if let Some(t) = known(n) {
-                    out.push((n.clone(), t.without(NIL | ERR)));
+                    out.push((n.to_string(), t.without(NIL | ERR)));
                 }
             }
             Expr::Unary(UnOp::Not, x, _) => self.facts(x, !yes, out),
@@ -4053,18 +4146,18 @@ impl Checker {
             Expr::Call(c, _, _) => match &**c {
                 Expr::Ident(n, _) if n == "watch" => other = true,
                 Expr::Ident(n, _) => {
-                    let program_fn = self.globals.get(n).and_then(|v| v.sig.clone()).map_or(false, |s| !s.builtin && s.def.is_some());
+                    let program_fn = self.globals.get(n.as_str()).and_then(|v| v.sig.clone()).map_or(false, |s| !s.builtin && s.def.is_some());
                     if program_fn {
                         other = true;
                     }
                 }
                 Expr::Field(o, _, _) => match &**o {
                     Expr::Ident(n, _) if n == "db" => other = true,
-                    Expr::Ident(n, _) if self.services.contains_key(n) => service = Some(n.clone()),
+                    Expr::Ident(n, _) if self.services.contains_key(n.as_str()) => service = Some(n.to_string()),
                     Expr::Field(inner, later, _) if later == "later" => {
                         if let Expr::Ident(n, _) = &**inner {
-                            if self.services.contains_key(n) {
-                                service = Some(n.clone());
+                            if self.services.contains_key(n.as_str()) {
+                                service = Some(n.to_string());
                             }
                         }
                     }
@@ -4081,7 +4174,7 @@ impl Checker {
     /// a function of the program that only returns such text.
     fn sql_safe_call(&self, f: &Expr) -> bool {
         matches!(f, Expr::Ident(n, _) if !self.is_local(n)
-            && (n == "sql_name" || n == "sql_param" || self.sql_name_fns.contains(n)))
+            && (n == "sql_name" || n == "sql_param" || self.sql_name_fns.contains(n.as_str())))
     }
 
     /// A call of something of type `ft`: arguments, effects, browser rules
@@ -4226,7 +4319,7 @@ impl Checker {
             let loader = if matches!(arg_exprs.first(), Some(Expr::Map(_))) { arg_exprs.get(1) } else { arg_exprs.first() };
             match loader {
                 Some(Expr::Ident(f, _)) => {
-                    let is_server = self.globals.get(f).and_then(|v| v.sig.clone()).map_or(true, |s| s.server || s.def.is_none() && !s.builtin);
+                    let is_server = self.globals.get(f.as_str()).and_then(|v| v.sig.clone()).map_or(true, |s| s.server || s.def.is_none() && !s.builtin);
                     if !is_server {
                         self.error(format!("`live` needs a server fn: `{}` is not one", f));
                     }
@@ -4307,7 +4400,8 @@ impl Checker {
             }
             _ => {
                 if t.bits != 0 {
-                    self.error(format!("{} has no field `{}`", bits_text(t.bits), name));
+                    let hint = if name == "length" && t.bits & (LIST | STR) != 0 { ": `len(x)` is how many it holds" } else { "" };
+                    self.error(format!("{} has no field `{}`{}", bits_text(t.bits), name, hint));
                 }
                 T::ANY
             }
@@ -4356,8 +4450,8 @@ impl Checker {
                 }
                 match v {
                     AttrVal::Expr(Expr::Ident(n, _)) => {
-                        let found = self.scopes.iter().rev().find_map(|s| s.get(n).cloned());
-                        if found.is_none() && self.in_component().is_some() && self.globals.contains_key(n) {
+                        let found = self.scopes.iter().rev().find_map(|s| s.get(n.as_str()).cloned());
+                        if found.is_none() && self.in_component().is_some() && self.globals.contains_key(n.as_str()) {
                             self.error(format!("`bind:{}` needs component state or a local variable, like ~{}", prop, n));
                         }
                     }
@@ -4535,7 +4629,7 @@ fn fallback_says(left: T, fallback: &Expr) -> T {
 /// `a.b.c` as it is written, for a name or a chain of fields on one.
 fn dotted(e: &Expr) -> Option<String> {
     match e {
-        Expr::Ident(n, _) => Some(n.clone()),
+        Expr::Ident(n, _) => Some(n.to_string()),
         Expr::Field(o, n, _) => Some(format!("{}.{}", dotted(o)?, n)),
         _ => None,
     }
@@ -4559,7 +4653,7 @@ enum Truth {
 
 fn callee_name(e: &Expr) -> String {
     match e {
-        Expr::Ident(n, _) => n.clone(),
+        Expr::Ident(n, _) => n.to_string(),
         Expr::Field(_, n, _) => n.clone(),
         _ => "this value".into(),
     }
@@ -4570,7 +4664,7 @@ fn callee_name(e: &Expr) -> String {
 fn called_names(e: &Expr, out: &mut Vec<String>) {
     walk_expr(e, &mut |x| match x {
         Expr::Call(c, _, _) => match &**c {
-            Expr::Ident(n, _) => out.push(n.clone()),
+            Expr::Ident(n, _) => out.push(n.to_string()),
             Expr::Field(obj, n, _) => match &**obj {
                 Expr::Ident(m, _) if MODULES.contains(&m.as_str()) => out.push(format!("{}.{}", m, n)),
                 // `billing.charge()` may be a service's, a call over HTTP, or a
@@ -4585,7 +4679,7 @@ fn called_names(e: &Expr, out: &mut Vec<String>) {
             _ => {}
         },
         Expr::Pipe(_, rhs, _) => match &**rhs {
-            Expr::Ident(n, _) => out.push(n.clone()),
+            Expr::Ident(n, _) => out.push(n.to_string()),
             Expr::Field(obj, n, _) => {
                 if let Expr::Ident(m, _) = &**obj {
                     out.push(format!("{}.{}", m, n));
@@ -5018,11 +5112,55 @@ fn walk_html(el: &HtmlEl, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// Assignments to what is a global where they are written: each function's parameters and
+/// the names it binds are its own. The browser's compile asks the same, so that `quillo run`
+/// and `quillo check` agree (FEEDBACK28.md, Q-348; branch feedback29-fixes).
+pub(crate) fn global_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
+    // What `e` assigns that it does not bind itself: a `let`, a `state`, a lambda's
+    // parameter, a `for`'s or a `match` arm's names, anywhere in it.
+    fn in_expr(e: &Expr, mut locals: HashSet<String>, out: &mut HashSet<String>) {
+        walk_expr(e, &mut |x| {
+            let mut names = Vec::new();
+            match x {
+                Expr::Block(stmts) => {
+                    for s in stmts {
+                        match s {
+                            Stmt::Let(p, ..) => pattern_names(p, &mut names),
+                            Stmt::State(n, ..) => names.push(n.clone()),
+                            _ => {}
+                        }
+                    }
+                }
+                Expr::Lambda(d) => names.extend(d.params.iter().map(|p| p.name.to_string())),
+                Expr::For(p, ..) => pattern_names(p, &mut names),
+                Expr::Match(_, arms, _) => arms.iter().for_each(|a| pattern_names(&a.pat, &mut names)),
+                _ => {}
+            }
+            locals.extend(names);
+        });
+        let mut inner = HashSet::new();
+        assigned_in(e, &mut inner);
+        out.extend(inner.into_iter().filter(|n| !locals.contains(n)));
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign(n, _, e, _) => {
+                out.insert(n.to_string());
+                in_expr(e, HashSet::new(), out);
+            }
+            Stmt::Fn(d) => in_expr(&d.body, d.params.iter().map(|p| p.name.to_string()).collect(), out),
+            Stmt::Route(r) => in_expr(&r.body, HashSet::new(), out),
+            Stmt::Let(_, e, _) | Stmt::Expr(e) => in_expr(e, HashSet::new(), out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign(n, _, e, _) => {
-                out.insert(n.clone());
+                out.insert(n.to_string());
                 assigned_in(e, out)
             }
             Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => assigned_in(e, out),
@@ -5043,7 +5181,7 @@ fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
         if let Expr::Block(stmts) = x {
             for s in stmts {
                 if let Stmt::Assign(n, ..) = s {
-                    out.insert(n.clone());
+                    out.insert(n.to_string());
                 }
             }
         }
@@ -5086,7 +5224,7 @@ fn type_test_t(p: &Pattern) -> T {
 
 pub(crate) fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     match p {
-        Pattern::Bind(n) => out.push(n.clone()),
+        Pattern::Bind(n) => out.push(n.to_string()),
         Pattern::Alt(ps) => ps.iter().for_each(|q| pattern_names(q, out)),
         Pattern::As(q, n) => {
             pattern_names(q, out);
@@ -5161,8 +5299,8 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
     fn ok(e: &Expr, safe: &HashSet<String>, vars: &HashSet<String>) -> bool {
         match e {
             Expr::Lit(Lit::Str(_)) => true,
-            Expr::Ident(n, _) => vars.contains(n),
-            Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n)),
+            Expr::Ident(n, _) => vars.contains(n.as_str()),
+            Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n.as_str())),
             Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(x) if ok(x, safe, vars))),
             Expr::Binary(BinOp::Add, a, b, _) => ok(a, safe, vars) && ok(b, safe, vars),
             Expr::If(_, a, b) => ok(a, safe, vars) && b.as_deref().map_or(false, |b| ok(b, safe, vars)),
@@ -5184,9 +5322,9 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
         for st in stmts {
             if let Stmt::Let(Pattern::Bind(n), x, _) = st {
                 if ok(x, safe, &vars) {
-                    vars.insert(n.clone());
+                    vars.insert(n.to_string());
                 } else {
-                    vars.remove(n);
+                    vars.remove(n.as_str());
                 }
             }
         }
@@ -5202,9 +5340,9 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
                 match st {
                     Stmt::Let(Pattern::Bind(n), v, _) => {
                         if ok(v, safe, &vars) {
-                            vars.insert(n.clone());
+                            vars.insert(n.to_string());
                         } else {
-                            vars.remove(n);
+                            vars.remove(n.as_str());
                         }
                     }
                     Stmt::Return(Some(r), _) if !ok(r, safe, &vars) => returns_ok = false,

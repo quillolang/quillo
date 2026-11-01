@@ -1,0 +1,7 @@
+// Q-351 `pow` of ints turns into a float past 2^63 and prints wrong digits as if exact
+// mode: run
+// open-when: 9223372036854776000
+// fixed-when: too big
+// From FEEDBACK29.md §Q-351 (found on d702589). Now an overflow, as `*` gives, which `??` takes.
+
+print(pow(2, 63) ?? "too big")

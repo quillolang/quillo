@@ -107,6 +107,7 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
     let token = crate::server::launch_token()?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
     let thread_token = token.clone();
+    let port_file = data.join("port");
     std::thread::Builder::new()
         .name("quillo-mobile".into())
         .stack_size(crate::server::WORKER_STACK)
@@ -129,7 +130,11 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
             let mut app = App::new(Loaded::Ready(interp), shared, &path, &base, false);
             app.launch_token = Some(thread_token);
             let ready = tx.clone();
-            if let Err(e) = crate::server::serve_with(app, "127.0.0.1:0", 8, move |a| {
+            // The same port at each launch: a page's origin holds it, and `localStorage`
+            // and IndexedDB go by origin (FEEDBACK28.md, Q-339; branch feedback29-fixes).
+            let kept = kept_port(&port_file);
+            if let Err(e) = crate::server::serve_with(app, &kept, 8, move |a| {
+                let _ = std::fs::write(&port_file, a.port().to_string());
                 let _ = ready.send(Ok(a.port()));
             }) {
                 let _ = tx.send(Err(e));
@@ -140,9 +145,40 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
     Ok(Started { port, url: format!("http://127.0.0.1:{}/?{}={}", port, crate::server::LAUNCH_PARAM, token) })
 }
 
+/// Where to listen: the port of the last launch, if it is free.
+fn kept_port(file: &Path) -> String {
+    let free = std::fs::read_to_string(file).ok().and_then(|t| t.trim().parse::<u16>().ok()).filter(|p| *p != 0 && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok());
+    format!("127.0.0.1:{}", free.unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launch_keeps_its_port_if_it_can() {
+        let d = std::env::temp_dir().join(format!("quillo-port-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join("port");
+        // None yet, and nonsense: the system picks.
+        assert_eq!(kept_port(&file), "127.0.0.1:0");
+        std::fs::write(&file, "not a port").unwrap();
+        assert_eq!(kept_port(&file), "127.0.0.1:0");
+        std::fs::write(&file, "0").unwrap();
+        assert_eq!(kept_port(&file), "127.0.0.1:0");
+        // Taken, as by the last launch not yet gone: the system picks. Free: that one. Other
+        // tests take ports meanwhile, and may take the one let go: a few goes.
+        let kept = (0..5).any(|_| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            std::fs::write(&file, port.to_string()).unwrap();
+            assert_eq!(kept_port(&file), "127.0.0.1:0");
+            drop(l);
+            kept_port(&file) == format!("127.0.0.1:{}", port)
+        });
+        assert!(kept);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn a_bundle_is_copied_and_what_the_program_wrote_stays() {

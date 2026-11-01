@@ -1,68 +1,40 @@
-//! The program's memory allocator: mimalloc on the event loops and the
-//! threads that wait for the server (database runtime, waiting pool), the
-//! system's elsewhere (the main thread, before the server starts).
+//! The program's memory allocator: mimalloc, on every thread.
 //!
 //! What the waiting threads make, such as rows read from the database, is
 //! mostly freed on an event loop; freeing on another thread is cheap in
 //! mimalloc and costly in the system allocator. On the event loops,
 //! measured on macOS (quillolang/benchmarks, server/), mimalloc answers 5% more small
 //! requests a second than the system allocator, and 7% more pages that
-//! build lists and HTML. Each block is freed by the allocator that made it;
-//! mimalloc knows its own (`mi_is_in_heap_region`).
+//! build lists and HTML. A script makes and frees everything on one thread, and on
+//! macOS the system's allocator cost it a tenth of its time. Having both, with each
+//! block freed by the one that made it, cost an eighth of the time of reading JSON
+//! in asking which that was (FEEDBACK29.md; branch feedback29-fixes).
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::c_void;
 
-thread_local! {
-    static WAITER: Cell<bool> = const { Cell::new(false) };
-}
+pub struct Mi;
 
-/// Marks the current thread (an event loop, or one that waits for the
-/// server): its allocations come from mimalloc from now on.
-pub fn waiter_thread() {
-    WAITER.with(|w| w.set(true));
-}
-
-pub struct Split;
-
-fn mimalloc_owns(p: *mut u8) -> bool {
-    // SAFETY: only reads mimalloc's map of the memory it reserved.
-    unsafe { libmimalloc_sys::mi_is_in_heap_region(p as *const c_void) }
-}
-
-// SAFETY: every block goes back to the allocator it came from, with the
-// layout it was made with, as `GlobalAlloc` requires of each.
-unsafe impl GlobalAlloc for Split {
+// SAFETY: every block comes from mimalloc and goes back to it, with the
+// alignment it was made with.
+unsafe impl GlobalAlloc for Mi {
+    #[inline]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if WAITER.with(|w| w.get()) {
-            libmimalloc_sys::mi_malloc_aligned(l.size(), l.align()) as *mut u8
-        } else {
-            System.alloc(l)
-        }
+        libmimalloc_sys::mi_malloc_aligned(l.size(), l.align()) as *mut u8
     }
 
+    #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        if WAITER.with(|w| w.get()) {
-            libmimalloc_sys::mi_zalloc_aligned(l.size(), l.align()) as *mut u8
-        } else {
-            System.alloc_zeroed(l)
-        }
+        libmimalloc_sys::mi_zalloc_aligned(l.size(), l.align()) as *mut u8
     }
 
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if mimalloc_owns(p) {
-            libmimalloc_sys::mi_free(p as *mut c_void)
-        } else {
-            System.dealloc(p, l)
-        }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, _: Layout) {
+        libmimalloc_sys::mi_free(p as *mut c_void)
     }
 
+    #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        if mimalloc_owns(p) {
-            libmimalloc_sys::mi_realloc_aligned(p as *mut c_void, size, l.align()) as *mut u8
-        } else {
-            System.realloc(p, l, size)
-        }
+        libmimalloc_sys::mi_realloc_aligned(p as *mut c_void, size, l.align()) as *mut u8
     }
 }

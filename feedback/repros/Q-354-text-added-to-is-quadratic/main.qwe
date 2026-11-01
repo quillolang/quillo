@@ -1,0 +1,14 @@
+// Q-354 `s += "x"` in a loop is quadratic
+// mode: run
+// open-when: killed after
+// fixed-when: 2000000
+// From FEEDBACK29.md §Q-354 (found on d702589): 1,000,000 took 19.7 s.
+
+fn f(n) {
+    let s = ""
+    for i in 0..n {
+        s += "x"
+    }
+    len(s)
+}
+print(f(2000000))

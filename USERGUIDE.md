@@ -39,6 +39,7 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
 | `-- a b` | what follows is the program's: `args()` gives `["a", "b"]`, for a script |
+| `--allow-path DIR` | `read_file` and `write_file` may use `DIR` too, as a script used as a tool needs (see [Scripts as tools](#scripts-as-tools)); any part of the program may then, routes too |
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
 | `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
@@ -184,7 +185,12 @@ make builds for the stores;
 WebTransport, `.qwer` plugins built at run time, anything that starts a process). The
 app puts `window.quilloNative` on the program's pages for what a web view cannot reach:
 `js("quilloNative.location")`, `.haptic`, `.battery`, `.notify`, `.keepAwake`,
-`.brightness`, `.share`, `.openSettings`, `.wait`. It has run on a real iPhone. Uploads to the stores are not
+`.brightness`, `.share`, `.openSettings`, `.wait`. Both apps answer `.share` as `{ shared,
+to }` (on Android both `null`, as it cannot tell), on Android `.brightness(null)` gives the
+screen back to the system (iOS does when the app leaves the screen), a `tel:`, `sms:`, `mailto:` or maps link opens what the phone opens it with,
+and the program is served on the same port at each launch where it can, so `localStorage`,
+which goes by the page's address, keeps what it had (FEEDBACK28.md, Q-339, Q-346; built and
+read, not yet run on a phone). It has run on a real iPhone. Uploads to the stores are not
 done yet, and HarmonyOS NEXT is planned (`mobile/harmony/PLAN.md`). `platform()` (see [Standard library](#standard-library)) tells a program
 it is in a phone app, and on what. `mobile/examples/fieldbook` tries the phone's hardware
 from a program.
@@ -534,6 +540,10 @@ fn next_year(s) = parse_age(s)? + 1         // err("bad age: x") for "x"
 let age = int(request.query.age) ?? 18
 ```
 
+At the top of a program, or of a file it uses, an error that `?` passes on has no one to
+take it: the program stops, saying what it was, with status 1, and a server does not start
+half made (FEEDBACK29.md, Q-350).
+
 `?` leaves the function it is written in, and in a lambda that is the lambda:
 `map(xs, (x) => f(x)?)` gives a list with the errors in it and goes on, and `quillo
 check` says so. To stop at the first failure, use a `for` loop, where `?` leaves the
@@ -687,7 +697,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   need its attribute: for a library whose classes are its own already (the UI kit's are all
   `ui-...`), whose rules may reach into what the caller passes in (`.ui-card-body >
   :first-child`). It is still sent only to pages that show the component, and companions
-  that share one stylesheet (`Tabs` and `Tab`, each `style global tabs_css`) send it once.
+  that share one stylesheet (`Tabs` and `Tab`, each `style global tabs_css`) send it once,
+  also from a view whose body is only another component's tag (FEEDBACK28.md, Q-345).
 - A page is sent the styles of the components and views on it, and of those its bundle can
   show, as a sheet of its own in its `<head>`, `/_quillo/s/<hash>.css`, which the browser
   keeps for good. A `<style>` the page writes is for what is not a component's.
@@ -803,9 +814,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   field (give each input its own state, and make the map with a `let`). `bind:value`
   listens to `input` and `bind:checked` to `change`; an `@input` (or `@change`) on the
   same input runs after the binding, with the state already set: `<input
-  bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`) is held to `x`: after
+  bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`, and a `<video>`'s or `<audio>`'s `muted`) is held to `x`: after
   each handler it is set back to the state, so typing the state does not take is
   undone. A bare `<input>` keeps what is typed, read through `e.value` or `e.form`.
+- `style={...}` and `class={...}` change only what they name when what they read
+  changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
+  home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and
+  leave what a person opened or closed alone otherwise (FEEDBACK28.md, Q-337, Q-338).
+- `==` on two of the page's objects (elements, events) asks whether they are the same one
+  (Q-334).
 - Assigning state updates the page a moment later (once the handler's synchronous code
   is done, or at its first wait), all changes at once. A state is changed when it gets a
   different value: assigning the same list again does nothing, and assigning an equal
@@ -816,11 +833,15 @@ route GET / = <html><body><Counter start={5}/></body></html>
   for as long as the code that called it stands: `if running { every(100, step) }`
   runs a game while `running` is true, starts again with the new speed when that changes,
   and stops when `running` is false or the component leaves the page. On the server it
-  does nothing. It is called from the component's code (or a `let` or `if` there), not
-  from an event handler, which is an error; a handler sets the state that the `if`
-  reads. A tab in the background is slowed by the browser to once a second at most.
-  `every` is the only clock: there is no `setTimeout`, so a one-off delay, a debounce
-  or a throttle is an `every` under a state flag that the tick itself turns off.
+  does nothing. It is called from the component's code (or a `let` or `if` there), or
+  from one of its event handlers or its `@mount`, where it runs until the component
+  leaves the page (started after a handler's first wait, it belongs to no one, and is an
+  error). A tab in the background is slowed by the browser to once a second at most.
+- `run_after(ms, f)` calls `f` once, `ms` milliseconds on, unless its component has gone
+  first: from a handler, `@mount` or the component's code alike. There is no
+  `setTimeout`; a debounce or a throttle is an `every` under a state flag that the tick
+  turns off. `page_updated()` in a handler waits until the page shows what the handler
+  has set so far, to read or focus what that made appear (FEEDBACK28.md, Q-349).
   `listen(url, f)` follows a stream the same way (see [Streaming](#streaming)), and opens
   it again when the connection drops (after a second, doubling up to 30 s), not when the
   stream ends.
@@ -935,7 +956,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
 Views and components nest like HTML: a capitalized tag renders another view or
 component, its attributes are the props, and what is between the tags arrives as the
-`children` parameter.
+`children` parameter, or `null` for a tag with nothing between (`<Card title="x"/>`),
+on the server as in the browser, so `children == null` tells the two apart (FEEDBACK28.md,
+Q-345). A component is used by its tag: called as a function (`let make = Dead`, then
+`make()`, or given to `map`) it would show and never answer, so it is an error, and `quillo
+check` says so.
 
 ```quillo
 view Card(title: str, children) = <section.card><h2>{title}</h2>{children}</section>
@@ -1171,10 +1196,19 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   `@mount`, in a `state` initializer, and in the component's `let` functions that its
   markup does not call (`let locate = () => { ... }`, then `@click={locate}`): `let cam =
   js("navigator.mediaDevices.getUserMedia", { video: true })` is the stream, or an
-  error value if it was refused. Elsewhere (a function `map` calls, a function the
-  markup calls, a statement that runs again), and with `.then`, `.catch` or `.finally`
-  after it, it stays a Promise: `js("load").then((x) => { data = x })`. `type_of` calls
-  one `promise`.
+  error value if it was refused. The same holds for a method of what the page gave
+  (`img.decode()`, `audio.play()`) and for a function given as a prop, so there is one
+  rule: a call of the page's that gives a Promise is waited for where code can wait.
+  Elsewhere (a function `map` calls, a function the markup calls, a statement that runs
+  again, a top-level `fn`), with `.then`, `.catch` or `.finally` after it, and for what
+  `js_new` makes (`js_new("Promise", ...)`, kept to be used later), it stays a Promise:
+  `js("load").then((x) => { data = x })`. `type_of` calls one `promise`. A function of the
+  program's that the page calls with `undefined`, as `.then` does for a Promise of
+  nothing, is given `null` (FEEDBACK28.md, Q-336).
+- `js_has("navigator.vibrate")` says whether the page has a feature without calling it,
+  as `js(...)` would; `false` on the server (Q-341). A field's `selectionStart` counts
+  UTF-16 units, as JavaScript does, and `slice`, `len` and `s[i]` count characters:
+  `cursor_index(text, el.selectionStart)` turns the one into the other (Q-344).
 - A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
   gives null while the server renders the component, and runs again in the browser
   once the component is on the page, which sets the state from what it gives.
@@ -1715,9 +1749,9 @@ component Clock() {
 }
 ```
 
-A handler does not start them (`every` there is an error): it sets the state that the
-statement reads. There is no `setTimeout`; a one-off delay, a debounce or a throttle is an
-`every` under a state flag that its tick turns off.
+A handler may start one too, which then lasts as long as its component, or set the state
+that the statement reads. For once, later, `run_after(ms, f)`. There is no `setTimeout`; a
+debounce or a throttle is an `every` under a state flag that its tick turns off.
 
 ### Lists and rows
 
@@ -3190,13 +3224,13 @@ What each does at its edges, where the answer is not what another language would
 
 | Call | Gives |
 |---|---|
-| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item; no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together) and strings (by code point: `"B"` before `"a"`) order; `null`, booleans, lists, maps, a string with a number, or a decimal with a float are an error |
+| `sort(xs)`, `sort_by(xs, f)` | ascending and stable; `f` may give a list to sort by several keys, `sort_by(rows, (r) => [r.a, r.b])`, as lists compare item by item, and so do `<`, `>`, `<=` and `>=` (`[1, 2] < [1, 3]`); no comparator and no descending flag (`reverse(sort(xs))`, or `vec.argsort(xs, true)`). Numbers (ints, floats and decimals together), strings (by code point: `"B"` before `"a"`) and lists of those order; `null`, booleans, maps, a string with a number, or a decimal with a float are an error, and comparing `null` says that a miss of `index_of`, `find` or `get` is `null`, not -1 |
 | `split(s, sep = " ")` | at each single `sep` (`"a  b"` is `["a", "", "b"]`); `split(s, "")` is the characters; no limit |
 | `join(xs, sep = "")` | the items as text, with `sep` between |
 | `filled(x)` | `x`, or `null` for `""`, so `filled(name) ?? "anonymous"` replaces a blank or missing name; `0`, `false`, `[]` and `" "` stay as they are (`filled(trim(x))` counts spaces as blank) |
 | `slice(x, start, end)` | negative positions from the end; both kept within the list or string; `end` before `start` gives an empty one |
 | `take(x, n)`, `drop(x, n)` | a negative `n` counts as 0, unlike `slice`: `take(xs, -2)` is empty, `drop(xs, -1)` all of it, so a count worked out by subtraction stays safe |
-| `range(n)`, `range(a, b)`, `a..b` | `b` left out, step 1, empty when `b <= a`; no step; at most ten million |
+| `range(n)`, `range(a, b)`, `a..b`, `range(a, b, step)` | `b` left out, step 1, empty when `b <= a`; a negative step counts down; a list of at most ten million, while a `for` whose list no one keeps counts without one |
 | `group_by(xs, f)` | a map from each key, as text, to the items with it, in order: `1` and `"1"` are one key |
 | `unique(xs)` | the first of equal items (equal as `==` says) |
 | `zip(a, b)` | pairs, as long as the shorter |
@@ -3210,7 +3244,7 @@ What each does at its edges, where the answer is not what another language would
 | `len(x)` | a string's characters, a list's items, a map's keys; an `html` value's bytes |
 | `min([])`, `max([])`, `first([])` | `null`; `sum([])` is `0`, and a sum of decimals stays exact |
 | `sqrt(-1)` | `NaN`, while `math.sqrt(-1)` is an error, as in Python |
-| `pow(2, 10)` | an int while it fits, else a float |
+| `pow(2, 10)` | an int, exact, or an overflow as `*` gives (`pow(2, 63)`); a float on either side, or a negative power, gives a float |
 | `print(a, b)` | the values as text, a space between, on stdout (the console in a page) |
 | `now()` | milliseconds since 1970, an int |
 | `sleep(ms)` | no maximum; other requests run meanwhile; in a scheduled job or a tick, ends it (status 503) when the server stops or the program is loaded again, so a loop that runs for ever stops; a request waits it out (it is answered at a stop, up to 10 s, and finishes on its version at a reload) |
@@ -3231,12 +3265,15 @@ What is not in the standard library, and what to do instead:
   [Rust](#rust)).
 - **Formatting text.** No `sprintf` or padding: template strings, `repeat`, `slice`,
   `format_number`, `money.format` and `date.format`.
-- **CSV, XML, YAML.** No parsers: `split` and `re` for simple CSV, Rust for the rest.
-  JSON, Markdown and regular expressions are built in.
+- **CSV, XML, YAML.** No parsers built in: `split` and `re` for simple CSV, or the
+  catalog's plugins `csv`, `xml`, `yaml`, `toml`, `gzip`, `tar` and `bignum` (`quillo
+  install csv`, see [Plugins](#plugins-from-the-catalog)). JSON, Markdown and regular expressions are
+  built in.
 - **`url_decode`.** Not there: query strings, forms and cookies arrive decoded.
 - **A seed for `random`.** None: runs are not repeatable.
-- **The command line, stdin, other processes.** A program reads none of its arguments
-  and no stdin, and cannot run a command: `env`, files, and `--with` beside it.
+- **Other processes.** A program cannot run a command: `env`, files, and `--with` beside
+  it. A script reads its arguments with `args()` and its input with `stdin()` and
+  `read_line()` (see [Scripts as tools](#scripts-as-tools)).
 - **Hashing a value.** `crypto.sha256(json.stringify(v))`. Values never change, so
   nothing needs copying.
 - **Building a long string.** `+` makes a new string each time: push the pieces to a
@@ -3336,9 +3373,15 @@ text: `set(m, 5, x)` keys it `"5"`, and `m[5]`, `get(m, 5)` and `has(m, 5)` read
 `set(xs, i, v)` gives a list with item `i` replaced (from the end when negative). A map
 or list built in a loop with `m = set(m, k, v)` (or `push`, `merge`, `remove`), or as
 `reduce`'s total with `(m, x) => set(m, ...)`, is changed in place, since nothing else
-holds it: building one of 20,000 takes milliseconds. Where something else still holds
-it (a second name for it, say), each step copies it. In the browser a list's `push` and
-`set` always copy, so build a long list there with `for`, or `flatten` chunks. `flatten` takes one
+holds it: building one of 20,000 takes milliseconds. It is the same however it is
+written, `m = m | set(k, v)`, `m = m.set(k, v)`, `xs += [x]` or `xs = xs + ys`, at a
+script's top level too, and for what is inside: `m = set(m, k, get(m, k, []) | push(x))`
+(a map of lists) and `g = set(g, y, set(g[y], x, v))` (a grid) change the inner list
+where it is, with a key made by `str`, `lower`, `trim` or `int` too, as those give the same
+written twice. `s += t` adds to the text where it is. Where something else still holds it
+(a second name for it, say), each step copies it, so that name keeps what it had. In the
+browser a list's `push` and `set` always copy, so build a long list there with `for`, or
+`flatten` chunks. `flatten` takes one
 level off: `flatten(flatten(xs))` for two.
 
 ### Files of a program
@@ -4594,6 +4637,55 @@ quillo> db.query("select * from notes")
   served. Ctrl-D exits. It has no line editing or history of its own: `rlwrap quillo
   repl` adds them.
 
+### Scripts as tools
+
+A program with no routes is a script: `quillo run tool.qwe` runs it from the top and ends.
+What follows `--` is its arguments, `args()`; `stdin()` is all that is piped in, and
+`read_line()` the next line, `null` at the end; `exit(n)` ends it with status `n`. A script
+that ends by itself ends with 0, and one that fails (a stop, or an error a `?` at the top
+passes on) with 1, saying what it was. Files are the program's folder's, as for a server;
+`--allow-path DIR` names another folder that `read_file` and `write_file` may use, by its
+own path or through `..`, where a link leads being what counts (FEEDBACK29.md, Q-357). It is
+named, never assumed: the same program may serve strangers later, and in a program that
+serves, `stdin`, `read_line` and `exit` are errors.
+
+```quillo noexec
+// cat orders.csv | quillo run total.qwe -- EUR
+let currency = args()[0] ?? "USD"
+let total = 0m
+let line = read_line()
+while line != null {
+    let parts = split(line, ",")
+    total += dec(parts[2]) ?? 0m
+    line = read_line()
+}
+print(`${total} ${currency}`)
+exit(total > 0m ? 0 : 3)
+```
+
+Written the way each is usually written, a script is faster than Python's: `bench/vs-python/run.py`
+times seventeen everyday programs in both, process start included, and Quillo is ahead in all of
+them. Against Python 3.9 on a 10-core Mac, the middle of three runs each:
+
+| | Python | Quillo |
+|---|---:|---:|
+| `fib(35)` | 1.11 s | 0.05 s |
+| a float loop of 50 million | 1.71 s | 0.04 s |
+| a `for` summing 5 million | 0.14 s | 0.10 s |
+| `filter`, `map`, `sum` over 3 million | 0.09 s | 0.07 s |
+| a million `xs = xs \| push(i)` | 0.04 s | 0.01 s |
+| a map of lists, 100,000 pushes | 0.02 s | 0.02 s |
+| a grid of 1,000 by 1,000, 100,000 writes | 0.02 s | 0.01 s |
+| a field read a million times | 0.03 s | 0.02 s |
+| 300,000 JSON rows grouped | 0.17 s | 0.14 s |
+| word frequency over 1.2 million words | 0.22 s | 0.20 s |
+| a sieve to 2 million | 0.09 s | 0.07 s |
+| `s += "x"` a million times | 0.04 s | 0.04 s |
+| `s[i]` over 300,000 characters | 0.02 s | 0.02 s |
+
+The closest are a `while` over a text and a map of lists, at about nine tenths of Python's time;
+loops over numbers and lists of them run in machine code (see [Compiled numbers](#compiled-numbers)).
+
 ### Debugging
 
 `quillo dap` is a debugger for editors: it speaks the Debug Adapter Protocol on stdin and
@@ -4730,10 +4822,11 @@ up to date the moment something it shows changes.
 ## Compiled numbers
 
 A top-level function that only does arithmetic on ints, floats and bools is compiled to
-machine code (with [Cranelift](https://cranelift.dev)) the second time it is called, for
-the types of the arguments it gets: `let`, assignment, `if`, `&&`, `||`, `return`,
-`for` over `range(...)` or `a..b`, `while`, and calls of other such functions, itself
-included.
+machine code (with [Cranelift](https://cranelift.dev)) the second time it is called, or the
+first if it has a loop of its own, for the types of the arguments it gets: `let`,
+assignment, `if`, `&&`, `||`, `return`, `for` over `range(...)` or `a..b`, `while`, and
+calls of other such functions, itself included. So is a lambda of that kind given a
+number, as `map` and `filter` give one: `xs | filter((x) => x % 3 == 0)`.
 It then runs as it would have, only faster: `fib(32)` takes 11 ms (Node 11, Bun 21),
 and a loop of ten million steps 29 ms (Node and Bun take about 280 ms for the same
 loop, on doubles).
@@ -4750,6 +4843,27 @@ loop, on doubles).
 - A function it calls that is assigned something else is not called by the old code.
 - Not with a fuel limit (scripts given a budget of steps), and not in builds without
   the `jit` feature (`cargo build --no-default-features --features mysql`).
+  `QUILLO_JIT=0` runs everything in the interpreter, to compare the two.
+
+A loop goes to machine code by itself, wherever it is: in a function that does other
+things too, or at a script's top. Its first 256 rounds run in the interpreter; a loop that
+has gone that far is compiled for the types its variables have then, and goes on from the
+round it is at. Its body may use ints, floats and bools, lists of them and lists of such
+lists held in variables: `xs[i]`, `g[y][x]`, `len(xs)`, and `xs = xs | set(i, v)`, `g =
+set(g, y, set(g[y], x, v))` and `xs = xs | push(v)` in any of their forms; `let`,
+assignment, `if`, `for` over a range and `while`. A list read in a loop costs about 4 ns a
+round, written about 5, where the interpreter takes 45 (FEEDBACK29.md).
+
+- What it does is what the interpreter does: an error is the interpreter's own, made from
+  the same values (an overflow, a `%` by zero, a `set` past the end, a step of 0).
+- An item of another type than the code was made for, or a read past the end, gives the
+  round back to the interpreter, with its numbers as the round began. A list written
+  cannot be put back, so a loop that reads after writing in the same round is not
+  compiled, and runs as before.
+- A list it writes is taken out of its variable while it runs, and put back after; one
+  only read is held. What else holds the list keeps what it had.
+- Not in a server for a global the loop assigns (what follows it must be told), not under
+  the debugger, with `--max-compute`, in a script with a budget, or in a cached view.
 
 ## Rust
 
@@ -4958,7 +5072,7 @@ does not do it today; the way around it follows.
 | write `async`/`await`, threads or locks? | No need: waits suspend the request and the server goes on; `parallel` overlaps waits. Long computing holds its instance: put it in Rust or run more instances. See [Concurrency](#concurrency-and-reloading) |
 | use namespaces or modules? | A file sees its own names, the builtins and what it takes with `use`, and two files may define one name. `private` keeps a name to its file, `mount` and `service` are the boundaries, and there are no prefixes (`auth.login()`). See [Files of a program](#files-of-a-program) |
 | recurse deeply? | Up to 10,000 calls; there is no tail-call optimisation |
-| rely on integer overflow wrapping, or bitwise operators? | No: overflow is an error, and there are no `& \| ^ << >>` or `**` (use `pow`, `math.*`) |
+| rely on integer overflow wrapping, or bitwise operators? | No wrapping: overflow is an error. There are no `& \| ^ << >>` or `**`: `bit.and`, `bit.or`, `bit.xor`, `bit.not`, `bit.shl`, `bit.shr`, and `pow` |
 | have the checker prove a `match` covers every case? | Not yet: a value no arm takes fails when it comes |
 | format code automatically? | Not yet: there is no formatter |
 | use Unicode names? | Yes: `let café = 1` |
@@ -4973,7 +5087,7 @@ does not do it today; the way around it follows.
 | use npm packages, TypeScript, a bundler? | No: component code is Quillo, compiled to JavaScript by `quillo`; a library is a `<script>` reached with `js(...)`. See [JavaScript libraries](#javascript-libraries) |
 | use React-style context, portals, refs, lifecycle hooks? | No context or portals; `@mount` is the one hook (its returned function is the cleanup) and gives the element. See [Composition](#composition) |
 | split the bundle by route or load a component lazily? | No: a page's bundle has every component it can show; it loads when someone reaches for it |
-| use `setTimeout`, debounce or throttle? | No `setTimeout`: `every(ms, f)` under a state flag is the clock. See [Components](#components) |
+| use `setTimeout`, debounce or throttle? | No `setTimeout`: `run_after(ms, f)` for once, and `every(ms, f)` under a state flag for a debounce. See [Components](#components) |
 | use `localStorage`, the clipboard, `window`? | Through the page: `js("localStorage.getItem", k)`. Nothing is built in for them |
 | use event modifiers like `@click.prevent`? | No: `e.preventDefault()` in the handler |
 | scope CSS to a component, or use Tailwind? | Yes: `style` in a component is scoped, and `--with` and `style_with` run Tailwind and PostCSS. See [HTML literals](#html-literals) |
@@ -5023,7 +5137,7 @@ does not do it today; the way around it follows.
 | encrypt SQLite at rest? | No: the disk's encryption, or a server database |
 | do exact money arithmetic? | Yes: decimals and `money`. See [Decimals](#decimals) |
 | do data science? | Python's `math` and `statistics` and numpy's array operations, on every core; no data frames or plotting. See [Numbers and data](#numbers-and-data) |
-| read CSV, XML, YAML, base64? | Not built in: `split` and `re`, or a Rust crate |
+| read CSV, XML, YAML, TOML? | Not built in: the catalog's `csv`, `xml`, `yaml` and `toml` plugins, or `split` and `re`. No base64 yet. See [Plugins](#plugins-from-the-catalog) |
 | know the visitor's time zone on the server? | Not by itself: the page tells it with a cookie. See [Dates and times](#dates-and-times) |
 
 ### Services and scale

@@ -34,6 +34,8 @@ pub mod native;
 pub mod interp;
 #[cfg(feature = "jit")]
 pub mod jit;
+#[cfg(feature = "jit")]
+pub mod jitloop;
 pub mod lexer;
 pub mod livecache;
 pub mod metrics;
@@ -58,6 +60,7 @@ pub mod par;
 pub mod service;
 pub mod stream;
 pub mod styles;
+pub mod sym;
 pub mod shared;
 pub mod session;
 pub mod site;

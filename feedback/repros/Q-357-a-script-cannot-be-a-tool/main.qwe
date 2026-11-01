@@ -1,0 +1,11 @@
+// Q-357 A script cannot be a command-line tool
+// mode: cli
+// args: run main.qwe --allow-path /etc --no-check
+// open-when: /unknown|must stay inside/
+// fixed-when: allowed false
+// From FEEDBACK29.md §Q-357 (found on d702589). `--allow-path`, `stdin()`, `read_line()` and
+// `exit(n)`. What is piped in, and the status, are in tests/feedback29.rs: the runner gives
+// a repro no input of its own.
+
+print("allowed", is_err(read_file("/etc/hosts")))
+exit(0)

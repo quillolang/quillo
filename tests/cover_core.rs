@@ -148,8 +148,12 @@ fn state_stays_when_a_component_returns_early() {
 /// A component called as a function makes its HTML with no page around it:
 /// its `state` is a variable.
 #[test]
-fn a_component_called_as_a_function_has_its_state_as_a_variable() {
-    assert_eq!(value("component C() {\n    state x = 1\n    <b>{x}</b>\n}\n`${C()}`\n"), "\"<b>1</b>\"");
+fn a_component_called_as_a_function_says_to_write_its_tag() {
+    // Its HTML would come with nothing in the page to run it (FEEDBACK28.md, Q-345; branch
+    // feedback29-fixes).
+    let Err(e) = quillo::eval_str("component C() {\n    state x = 1\n    <b>{x}</b>\n}\n`${C()}`\n") else { panic!("it ran") };
+    let e = e.to_string();
+    assert!(e.contains("`C` is a component") && e.contains("<C ... />"), "{}", e);
 }
 
 /// A cached view reads `.len` of a global that is no map: a method, not a

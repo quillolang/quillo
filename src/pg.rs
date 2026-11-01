@@ -648,7 +648,6 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(RUNTIME_THREADS.load(Relaxed).max(1))
             .thread_name("quillo-pg")
-            .on_thread_start(crate::alloc::waiter_thread)
             .enable_all()
             .build()
             .expect("a runtime for Postgres")

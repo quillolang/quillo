@@ -1,0 +1,17 @@
+// Q-334 `==` calls any two page elements equal
+// mode: browser
+// page: /
+// probe: await new Promise((r) => setTimeout(r, 300)); document.getElementById("b").click(); await new Promise((r) => setTimeout(r, 200)); return { same: document.getElementById("b").textContent }
+// open-when: "same": "true true"
+// fixed-when: "same": "false true"
+// From FEEDBACK28.md §Q-334 (found on 5f7f76c).
+
+component C() {
+    state o = ""
+    <button id="b" @click={() => {
+        let a = js("document.body")
+        let h = js("document.head")
+        o = `${str(a == h)} ${str(a == js("document.body"))}`
+    }}>{o}</button>
+}
+route GET / = <html><body><C/></body></html>

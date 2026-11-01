@@ -377,6 +377,7 @@ impl Lexer {
                 '?' if n == Some('?') => two(self, Tok::QQ),
                 '?' => Tok::Question,
                 '~' => Tok::Tilde,
+                '@' => return Err(QuilloError::new("unexpected character `@`: there are no decorators, and in markup it starts an event, as `@click`", line)),
                 other => return Err(QuilloError::new(format!("unexpected character `{}`", other), line)),
             }
         };

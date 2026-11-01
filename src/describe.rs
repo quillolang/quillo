@@ -145,7 +145,7 @@ impl Parts {
             let params: Vec<J> = d
                 .params
                 .iter()
-                .map(|p| json!({ "name": p.name, "schema": p.ty.as_ref().map_or(json!({}), ty_schema), "required": p.default.is_none() }))
+                .map(|p| json!({ "name": p.name.as_str(), "schema": p.ty.as_ref().map_or(json!({}), ty_schema), "required": p.default.is_none() }))
                 .collect();
             let mut f = Map::new();
             f.insert("contract".into(), json!(contract(d)));

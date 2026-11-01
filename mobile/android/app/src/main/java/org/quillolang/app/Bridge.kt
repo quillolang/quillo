@@ -171,7 +171,10 @@ class Bridge(private val activity: MainActivity, private val web: WebView) {
     private fun brightness(args: JSONArray, answer: (Any?, String?) -> Unit) {
         val lp = activity.window.attributes
         if (args.length() > 0) {
-            lp.screenBrightness = args.optDouble(0, 0.5).coerceIn(0.0, 1.0).toFloat()
+            // Null or below 0 gives it back to the system (FEEDBACK28.md, Q-346; branch
+            // feedback29-fixes).
+            val asked = args.optDouble(0, -1.0)
+            lp.screenBrightness = if (asked < 0 || asked.isNaN()) -1f else asked.coerceAtMost(1.0).toFloat()
             activity.window.attributes = lp
         }
         val now = if (lp.screenBrightness >= 0) lp.screenBrightness.toDouble()
@@ -184,7 +187,9 @@ class Bridge(private val activity: MainActivity, private val web: WebView) {
         if (parts.isEmpty()) return answer(null, "nothing to share")
         val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, parts.joinToString("\n"))
         activity.startActivity(Intent.createChooser(send, null))
-        answer(true, null)
+        // As iOS answers: Android does not say whether it was sent (FEEDBACK28.md, Q-346;
+        // branch feedback29-fixes).
+        answer(org.json.JSONObject().put("shared", org.json.JSONObject.NULL).put("to", org.json.JSONObject.NULL), null)
     }
 
     companion object {

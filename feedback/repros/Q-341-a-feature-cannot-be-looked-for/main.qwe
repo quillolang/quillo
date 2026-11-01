@@ -1,0 +1,8 @@
+// Q-341 A page's feature cannot be looked for: `js("a.b")` calls it
+// mode: run
+// open-when: unknown name `js_has`
+// fixed-when: false
+// From FEEDBACK28.md §Q-341 (found on 5f7f76c). `js_has` looks without calling; on the server,
+// with no page, it is false.
+
+print(js_has("navigator.vibrate"))

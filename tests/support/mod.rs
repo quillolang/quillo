@@ -247,11 +247,22 @@ impl Server {
 }
 
 pub fn serve(file: &Path, env: &[(&str, &str)]) -> Server {
+    serve_opts(file, env, &[])
+}
+
+/// `serve` without the static checks first: for what `quillo check` refuses, run anyway.
+#[allow(dead_code)]
+pub fn serve_unchecked(file: &Path) -> Server {
+    serve_opts(file, &[], &["--no-check"])
+}
+
+fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(file)
         .args(["--port", &port.to_string(), "--workers", "8"])
+        .args(opts)
         .envs(env.iter().copied())
         .env("QUILLO_SECRET", "test secret for the tests")
         .stdin(Stdio::null())

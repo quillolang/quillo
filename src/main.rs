@@ -49,6 +49,8 @@ options for `run`:
   --max-compute 2s  end a request that computes this long without letting go, as a 500
   --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
   -- a b         what follows is the program's, for args()
+  --allow-path DIR  read_file and write_file may use DIR too, for a script
+                 used as a tool (any part of the program may then)
   --live-per-client N  pages one client may have waiting for live data (default 256)
                  (separate variables, as N processes would have; the
                  database and `publish` changes reach them all)
@@ -115,10 +117,9 @@ options for `run`:
 port, by default one the system picks, answers only the window. `--open PATH`
 is the page the window opens on (default /).";
 
-// The system's allocator on the event loops, mimalloc on the threads that
-// wait for them (see quillo::alloc).
+// See quillo::alloc.
 #[global_allocator]
-static ALLOC: quillo::alloc::Split = quillo::alloc::Split;
+static ALLOC: quillo::alloc::Mi = quillo::alloc::Mi;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
@@ -150,7 +151,7 @@ fn main() {
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
-    "--max-body", "--max-compute", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
+    "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with",
 ];
 
@@ -550,6 +551,12 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
+            ("--allow-path", Some(v)) => {
+                if let Err(e) = quillo::builtins::allow_path(v) {
+                    eprintln!("quillo: --allow-path needs a folder that is there: {}", e);
+                    return Err(2);
+                }
+            }
             ("--max-compute", Some(v)) => match compute_limit(v) {
                 Some(ms) => quillo::httpd::limit_compute(ms),
                 None => {
@@ -991,6 +998,7 @@ fn repl() -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
     let mut buf = String::new();
+    let mut kept: Vec<Vec<Stmt>> = Vec::new();
     println!("Quillo {} — enter expressions; Ctrl-D exits", quillo::version());
     // The program here, which `quillo run` serves (FEEDBACK6.md, Q-059; branch feedback6-fixes).
     if Path::new("main.qwe").is_file() {
@@ -1016,7 +1024,10 @@ fn repl() -> i32 {
         };
         buf.clear();
         let globals = interp.globals.clone();
-        for s in &stmts {
+        // Kept for the session: a compiled loop's code goes by where its loop is (src/jitloop.rs).
+        kept.push(stmts);
+        let stmts = kept.last().expect("just pushed");
+        for s in stmts {
             match interp.exec_stmt(s, &globals) {
                 Ok(v) => {
                     if matches!(s, Stmt::Expr(_)) && !matches!(v, Value::Nil) {

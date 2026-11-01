@@ -31,14 +31,14 @@ use std::sync::Arc;
 
 /// A value's type in compiled code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum T {
+pub(crate) enum T {
     I,
     F,
     B,
 }
 
 impl T {
-    fn of(v: &Value) -> Option<T> {
+    pub(crate) fn of(v: &Value) -> Option<T> {
         match v {
             Value::Int(_) => Some(T::I),
             Value::Float(_) => Some(T::F),
@@ -47,7 +47,7 @@ impl T {
         }
     }
 
-    fn ir(self) -> Type {
+    pub(crate) fn ir(self) -> Type {
         match self {
             T::I => types::I64,
             T::F => types::F64,
@@ -90,11 +90,32 @@ struct Jit {
 
 thread_local! {
     static JIT: RefCell<Option<Jit>> = const { RefCell::new(None) };
+    static LAST: std::cell::Cell<Option<Quick>> = const { std::cell::Cell::new(None) };
+}
+
+/// The function called last, if what it calls cannot change under it.
+#[derive(Clone, Copy)]
+struct Quick {
+    def: usize,
+    code: u64,
+    entry: Entry,
+    ret: T,
 }
 
 /// How many functions this thread has compiled (for tests).
 pub fn compiled() -> usize {
     JIT.with(|j| j.borrow().as_ref().map_or(0, |j| j.done.values().filter(|c| c.is_some()).count()))
+}
+
+/// `f` with this thread's module, made if it is the first: for loops' code (src/jitloop.rs).
+pub(crate) fn with_module<R>(f: impl FnOnce(&mut JITModule) -> Option<R>) -> Option<R> {
+    JIT.with(|j| {
+        let mut j = j.borrow_mut();
+        if j.is_none() {
+            *j = new_jit();
+        }
+        f(&mut j.as_mut()?.module)
+    })
 }
 
 fn new_jit() -> Option<Jit> {
@@ -107,32 +128,71 @@ fn new_jit() -> Option<Jit> {
 }
 
 /// `c(args)` in machine code, when it can be: None to interpret it.
-pub fn call(c: &Closure, args: &[Option<Value>], depth: usize) -> Option<Result<Value, Ctrl>> {
+/// An argument as a call has it: given, or left to its default.
+pub trait Arg {
+    fn given(&self) -> Option<&Value>;
+}
+
+impl Arg for Option<Value> {
+    #[inline(always)]
+    fn given(&self) -> Option<&Value> {
+        self.as_ref()
+    }
+}
+
+impl Arg for Value {
+    #[inline(always)]
+    fn given(&self) -> Option<&Value> {
+        Some(self)
+    }
+}
+
+/// Whether machine code is made at all: `QUILLO_JIT=0` runs everything in the
+/// interpreter, to tell the two apart (FEEDBACK29.md; branch feedback29-fixes).
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QUILLO_JIT").map_or(true, |v| v != "0"))
+}
+
+pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Option<Result<Value, Ctrl>> {
     let def = &c.def;
     let hot = def.hot.load(Relaxed);
-    if hot == NEVER {
+    if hot == NEVER || !enabled() {
         return None;
     }
-    // Compiled on the second call: one call alone is not worth it.
+    // Compiled on the second call, as one call alone is not worth it, unless that one
+    // call has a loop to spend its time in (FEEDBACK29.md; branch feedback29-fixes).
     if hot < 1 {
+        if !shape_ok(def) {
+            def.hot.store(NEVER, Relaxed);
+            return None;
+        }
         def.hot.store(hot + 1, Relaxed);
-        return None;
+        if !has_loop(&def.body) {
+            return None;
+        }
     }
     if args.len() != def.params.len() || args.len() > 16 {
         def.hot.store(NEVER, Relaxed);
         return None;
     }
-    let mut sig = Vec::with_capacity(args.len());
+    let mut code = args.len() as u64;
     let mut raw = [0u64; 16];
     for (i, a) in args.iter().enumerate() {
-        let a = a.as_ref()?;
-        sig.push(T::of(a)?);
-        raw[i] = match a {
-            Value::Int(n) => *n as u64,
-            Value::Float(f) => f.to_bits(),
-            Value::Bool(b) => *b as u64,
+        let (t, bits) = match a.given()? {
+            Value::Int(n) => (0, *n as u64),
+            Value::Float(f) => (1, f.to_bits()),
+            Value::Bool(b) => (2, *b as u64),
             _ => return None,
         };
+        code = code << 2 | t;
+        raw[i] = bits;
+    }
+    let at = Arc::as_ptr(def) as usize;
+    // A function given to `map` or `filter` is called for each item: the last one
+    // called is at hand, with no table to look in.
+    if let Some(q) = LAST.get().filter(|q| q.def == at && q.code == code) {
+        return run(q.entry, q.ret, &raw, depth);
     }
     let compiled = JIT.with(|j| {
         let mut j = j.borrow_mut();
@@ -140,7 +200,8 @@ pub fn call(c: &Closure, args: &[Option<Value>], depth: usize) -> Option<Result<
             *j = new_jit();
         }
         let jit = j.as_mut()?;
-        let key = (Arc::as_ptr(def) as usize, sig.clone());
+        let sig: Vec<T> = args.iter().filter_map(|a| T::of(a.given()?)).collect();
+        let key = (at, sig.clone());
         if let Some(done) = jit.done.get(&key) {
             return done.clone();
         }
@@ -151,6 +212,9 @@ pub fn call(c: &Closure, args: &[Option<Value>], depth: usize) -> Option<Result<
         jit.done.insert(key, made.clone());
         made
     })?;
+    if compiled.deps.is_empty() {
+        LAST.set(Some(Quick { def: at, code, entry: compiled.entry, ret: compiled.ret }));
+    }
     // What it calls is still what it was compiled with.
     for (name, at) in &compiled.deps {
         match lookup(&c.env, name) {
@@ -158,21 +222,35 @@ pub fn call(c: &Closure, args: &[Option<Value>], depth: usize) -> Option<Result<
             _ => return None,
         }
     }
+    run(compiled.entry, compiled.ret, &raw, depth)
+}
+
+fn run(entry: Entry, ret: T, raw: &[u64; 16], depth: usize) -> Option<Result<Value, Ctrl>> {
     // Calls as deep as the stack left allows (a recursion deeper than that
     // gives up, and the interpreter, which grows the stack, goes on).
     let left = crate::stack::remaining().unwrap_or(64 << 10);
     let mut ctx = Ctx { bail: 0, depth: 0, max: (MAX_DEPTH.saturating_sub(depth)).min(left / 512) as u64 };
     // SAFETY: `entry` was made for exactly these argument types, read from
     // `raw` in order; `ctx` outlives the call.
-    let r = unsafe { (compiled.entry)(raw.as_ptr(), &mut ctx) };
+    let r = unsafe { entry(raw.as_ptr(), &mut ctx) };
     if ctx.bail != 0 {
         return None;
     }
-    Some(Ok(match compiled.ret {
+    Some(Ok(match ret {
         T::I => Value::Int(r as i64),
         T::F => Value::Float(f64::from_bits(r)),
         T::B => Value::Bool(r != 0),
     }))
+}
+
+/// Whether a function that compiles has a loop of its own.
+fn has_loop(e: &Expr) -> bool {
+    match e {
+        Expr::For(..) | Expr::While(..) => true,
+        Expr::Block(ss) => ss.iter().any(|s| matches!(s, Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::Return(Some(e), _) if has_loop(e))),
+        Expr::If(c, a, b) => has_loop(c) || has_loop(a) || b.as_deref().is_some_and(has_loop),
+        _ => false,
+    }
 }
 
 // ---- which functions, and their types ----------------------------------
@@ -270,7 +348,7 @@ impl<'a> Plan<'a> {
         // guessed, and the guess must come out.
         for guess in [T::I, T::F, T::B] {
             self.open.insert(key.clone(), (guess, false));
-            let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.clone()).zip(args.iter().copied()).collect()] };
+            let mut sc = Scopes { stack: vec![def.params.iter().map(|p| p.name.to_string()).zip(args.iter().copied()).collect()] };
             let mut ret = None;
             let got = self.body(&def.body, &mut sc, &mut ret);
             let (_, used) = self.open.remove(&key).unwrap();
@@ -342,7 +420,7 @@ impl<'a> Plan<'a> {
                     ts.push(self.value(a, sc, ret)?);
                 }
                 let t = self.func(&callee.def, &ts)?;
-                let dep = (name.clone(), Arc::as_ptr(&callee.def) as usize);
+                let dep = (name.to_string(), Arc::as_ptr(&callee.def) as usize);
                 if !self.deps.contains(&dep) {
                     self.deps.push(dep);
                 }
@@ -465,7 +543,7 @@ fn range_of<'e>(iter: &'e Expr, env: &Env) -> Option<(Option<&'e Expr>, &'e Expr
 
 /// The type of `x op y`, as the interpreter's `binop` gives it, when it is
 /// one compiled code can have.
-fn arith_type(op: BinOp, x: T, y: T) -> Option<T> {
+pub(crate) fn arith_type(op: BinOp, x: T, y: T) -> Option<T> {
     use T::*;
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul => match (x, y) {
@@ -988,14 +1066,6 @@ impl Gen<'_, '_> {
                     None => self.b.ins().iconst(types::I64, 0),
                 };
                 let end = self.value(b, ret)?;
-                // As the interpreter: at most ten million steps.
-                let span = self.b.ins().isub(end, start);
-                let (p, q) = (self.b.ins().bxor(end, start), self.b.ins().bxor(end, span));
-                let both = self.b.ins().band(p, q);
-                let wrapped = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, both, 0);
-                self.check(wrapped);
-                let big = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, span, 10_000_000);
-                self.check(big);
                 let k = self.b.declare_var(types::I64);
                 self.b.def_var(k, start);
                 let (head, step, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());

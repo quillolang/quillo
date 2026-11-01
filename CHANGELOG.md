@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+### Faster than Python, and a script as a tool (FEEDBACK29.md)
+
+- **Everyday programs run faster than Python's**, in all seventeen that `bench/vs-python/run.py`
+  times, from three on 6ec94b4: `s += "x"` a million times went from 19.7 s to 0.04 s, word
+  frequency over 1.2 million words from 34 s to 0.20 s, a million pushes from over 40 s to
+  0.01 s, a sieve from over 40 s to 0.07 s, a float loop from 6.3 s to 0.04 s. Variables are
+  found by a pointer, not by their text; a function with a loop of its own, and a lambda given a
+  number, go to machine code on the first call; JSON is read straight into values; and mimalloc
+  allocates on every thread.
+- **A loop goes to machine code by itself**, in any function or at a script's top, once it has
+  run 256 rounds, when it works on numbers and lists of them: a list read costs about 4 ns a
+  round where it took 45. An error is the interpreter's own, and an item of another type gives
+  the round back to the interpreter. `QUILLO_JIT=0` runs everything in the interpreter.
+- **A statement's value no one takes is not made:** a `for` in an `if`'s branch built the list
+  of what each round gave, and threw it away.
+- **An update is made where it is, however it is written:** `m = m | set(k, v)`, `m = m.set(k,
+  v)`, `xs += [x]` and `xs = xs + ys`, at a script's top level too, and what is inside, as in
+  `m = set(m, k, get(m, k, []) | push(x))` and `g = set(g, y, set(g[y], x, v))`, a key made with
+  `str`, `lower` and the like too, which in a `reduce` of 600,000 went from minutes to 0.1 s. `s += t` adds
+  to the text where it is, and `s[i]` reads it in constant time. A second name for the value
+  keeps what it had (Q-352 to Q-355).
+- **A loop whose list no one keeps makes none**, at the top of a script, in another loop's
+  body, anywhere, so it goes past ten million (Q-356). `range(a, b, step)` counts by a step, down
+  too.
+- **A script can be a command-line tool:** `stdin()` reads what is piped in, `read_line()` a
+  line at a time, `exit(n)` ends with a status, and `quillo run --allow-path DIR` lets
+  `read_file` and `write_file` use a folder outside the program's. None of the three builtins
+  works in a program that serves (Q-357).
+- **An error that `?` passes on at the top stops the program**, saying what it was, with status 1,
+  from a file it uses too, and a server does not start half made (Q-350).
+- **`pow` of ints is exact, or an overflow as `*` gives:** `pow(2, 63)` was a float printed with
+  digits that looked exact. A float on either side, or a negative power, still gives a float
+  (Q-351). This changes what programs that relied on the float get.
+- **Lists compare with `<`, `>`, `<=` and `>=`**, item by item as `sort` has them, and `quillo check`
+  takes it (Q-358).
+- **Habits from Python and JavaScript are told what to write:** `2 in xs`, `1 < x < 3`, `x ** 2`,
+  `xs[1:3]`, `f(c: 9)`, `f(...xs)`, `try`, `class`, `yield`, `throw`, `def` and more (Q-359). The
+  guide names the `bit.*` functions and the catalog's `csv`, `xml`, `yaml` and `toml` (Q-360).
+
+### Where Quillo meets the page (FEEDBACK28.md)
+
+- **One rule for what waits:** a call of the page's that gives a Promise is waited for in a handler,
+  `@mount` and a state's initializer, `js(...)` as before and now also a method of what the page gave
+  (`img.decode()`, `audio.play()`) and a function given as a prop. `.then`, `.catch` and `.finally`
+  keep the promise, and so does `js_new`. A plain read through `js` no longer makes the rest of a
+  handler late, so `e.preventDefault()` after it works. A function the page calls with `undefined`,
+  as `.then` does, is given `null` (Q-335, Q-336, Q-340).
+- **`style={...}` and `class={...}` change only what they name**, so what a handler set by hand stays
+  and a drag no longer jumps home; `muted` is held to its state, and `<details open>` leaves what a
+  person opened alone (Q-337, Q-338). `==` on two of the page's objects asks whether they are the
+  same one (Q-334). A keyed row that moves keeps its pointer capture where the browser can move it
+  so (Q-343). A row written `a ? <x/> : <y/>` goes when its list empties (Q-342).
+- **`run_after(ms, f)`** runs `f` once, unless its component has gone first, **`page_updated()`** waits
+  in a handler until the page shows what it set, and `every` may be started from a handler or
+  `@mount`, ending with its component (Q-349). **`js_has(name)`** looks for a feature without
+  calling it (Q-341), and **`cursor_index(s, n)`** turns a field's cursor into a character's place
+  (Q-344).
+- **A component keeps all of itself:** a view's `style global` reaches the page when its body is
+  only another component, `children` is `null` on both sides when none are given, an image's
+  `load` that came first is not lost, and a component called as a function is an error, which
+  `quillo check` says too (Q-345).
+- **`quillo check` says what fails at once:** what `quillo run` refuses of `js(...)`, a `.bind` that
+  will stop a handler, a builtin's answer dropped (`xs.push(3)`), a type name `type_of` never gives,
+  and messages say `len(x)` for `.length`, that a miss is `null` and not -1, and to use
+  `addEventListener` for `onfinish = f` (Q-347). A parameter or a local named like a global is no
+  longer taken for the global, by the check or the browser's compile (Q-348).
+- **The phone apps** keep their port from one launch to the next, so `localStorage` keeps what it
+  had, open `tel:`, `sms:`, `mailto:` and maps links with the system, and answer `share` alike;
+  on Android `brightness(null)` gives the screen back to the system (Q-339, Q-346). Built for both,
+  not yet run on a phone.
+
 ### An error's text stays off the page
 
 - **An error Quillo made no longer reaches a visitor by being turned into text.** A template

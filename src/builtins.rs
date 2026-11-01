@@ -12,7 +12,14 @@ pub fn install(env: &Env) {
     let fns: &[(&'static str, BuiltinFn)] = &[
         ("print", print),
         ("error", error_of),
+        ("run_after", nothing_here),
+        ("page_updated", nothing_here),
+        ("js_has", no_page),
+        ("cursor_index", cursor_index),
         ("args", program_args),
+        ("stdin", stdin_text),
+        ("read_line", read_line),
+        ("exit", exit_with),
         ("str", to_str),
         ("int", to_int),
         ("float", to_float),
@@ -257,8 +264,88 @@ fn f_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Value, Ctrl> {
 /// What followed `--` on the command line.
 pub static PROGRAM_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
+/// In the browser only: on the server, while a component renders, nothing happens.
+fn nothing_here(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Nil)
+}
+
+fn no_page(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    Ok(Value::Bool(false))
+}
+
+/// `cursor_index(s, n)`: the character a field's cursor at `n` is before.
+fn cursor_index(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Value::Str(s) = arg(&args, 0) else { return fail(line, "`cursor_index` expects a str as argument 1") };
+    let n = i_arg(&args, 1, "cursor_index", line)?.max(0) as usize;
+    let (mut units, mut chars) = (0, 0);
+    for c in s.chars() {
+        if units >= n {
+            break;
+        }
+        units += c.len_utf16();
+        chars += 1;
+    }
+    Ok(Value::Int(chars))
+}
+
 fn program_args(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
     Ok(Value::list(PROGRAM_ARGS.get().map_or(Vec::new(), |a| a.iter().map(Value::str).collect())))
+}
+
+// A script as a command-line tool: what is piped to it, and the status it ends with
+// (FEEDBACK29.md, Q-357; branch feedback29-fixes). Not while the program serves, where the
+// input is the terminal's and a request is not the one to end the process.
+
+fn for_scripts(name: &str, line: u32) -> Result<(), Ctrl> {
+    if crate::value::serving() {
+        return fail(line, format!("`{}` is for a script: a program that serves reads requests, and stops when it is told to", name));
+    }
+    Ok(())
+}
+
+/// `stdin()`: all that is piped in, as text; "" for nothing.
+fn stdin_text(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    use std::io::Read;
+    for_scripts("stdin", line)?;
+    let mut b = Vec::new();
+    Ok(match std::io::stdin().lock().read_to_end(&mut b) {
+        Ok(_) => Value::str(String::from_utf8_lossy(&b)),
+        Err(e) => Value::err(Value::str(format!("stdin: {}", e))),
+    })
+}
+
+/// `read_line()`: the next line in, without its line break; null at the end.
+fn read_line(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    use std::io::BufRead;
+    for_scripts("read_line", line)?;
+    let mut s = String::new();
+    Ok(match std::io::stdin().lock().read_line(&mut s) {
+        Ok(0) => Value::Nil,
+        Ok(_) => {
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            Value::str(s)
+        }
+        Err(e) => Value::err(Value::str(format!("read_line: {}", e))),
+    })
+}
+
+/// `exit(n)`: ends the script with status `n`, 0 to 255, once what it printed is out.
+fn exit_with(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    use std::io::Write;
+    for_scripts("exit", line)?;
+    let n = match args.first() {
+        None => 0,
+        Some(Value::Int(n)) if (0..=255).contains(n) => *n as i32,
+        Some(v) => return fail(line, format!("`exit` takes a status from 0 to 255, got {}", crate::interp::short(v))),
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(n)
 }
 
 /// `error(r)`: what an error says, and null for any other value (FEEDBACK26.md, Q-199;
@@ -329,9 +416,9 @@ fn to_dec(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     })
 }
 
-fn len(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn len(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Int(match arg(&args, 0) {
-        Value::Str(s) => s.chars().count() as i64,
+        Value::Str(s) => it.text_len(&s) as i64,
         Value::List(l) => l.len() as i64,
         Value::Map(m) => m.len() as i64,
         Value::Html(h) => h.len() as i64,
@@ -611,14 +698,35 @@ fn last(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn push(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut args = args;
     let item = if args.len() > 1 { args.remove(1) } else { Value::Nil };
-    let l = l_arg(&args, 0, "push", line)?;
+    let mut l = l_arg(&args, 0, "push", line)?;
     drop(args);
-    let mut v = Arc::unwrap_or_clone(l);
-    v.push(item);
-    Ok(Value::list(v))
+    Arc::make_mut(&mut l).push(item);
+    Ok(Value::List(l))
+}
+
+/// How many ints `range(a, b, step)` gives. A step that is not 0.
+pub(crate) fn range_count(a: i64, b: i64, step: i64) -> u64 {
+    let (span, by) = if step > 0 { (b as i128 - a as i128, step as i128) } else { (a as i128 - b as i128, -(step as i128)) };
+    if span <= 0 {
+        return 0;
+    }
+    ((span + by - 1) / by).min(u64::MAX as i128) as u64
 }
 
 fn range(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // With a step, as `for` and a list of every tenth want (FEEDBACK29.md, Q-360; branch
+    // feedback29-fixes).
+    if args.len() > 2 {
+        let (a, b, step) = (i_arg(&args, 0, "range", line)?, i_arg(&args, 1, "range", line)?, i_arg(&args, 2, "range", line)?);
+        if step == 0 {
+            return fail(line, "`range`: a step of 0 never gets anywhere");
+        }
+        let n = range_count(a, b, step);
+        if n > 10_000_000 {
+            return fail(line, "range is too large");
+        }
+        return Ok(Value::list((0..n as i64).map(|i| Value::Int(a + i * step)).collect()));
+    }
     let (a, b) = if args.len() > 1 {
         (i_arg(&args, 0, "range", line)?, i_arg(&args, 1, "range", line)?)
     } else {
@@ -643,6 +751,9 @@ fn values(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let (Some(Value::Map(m)), Some(Value::Str(k))) = (args.first(), args.get(1)) {
+        return Ok(m.get(&**k).cloned().unwrap_or_else(|| arg(&args, 2)));
+    }
     let m = m_arg(&args, 0, "get", line)?;
     let k = arg(&args, 1).key_text();
     Ok(m.get(k.as_str()).cloned().unwrap_or_else(|| arg(&args, 2)))
@@ -653,6 +764,11 @@ fn has(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    set_of(args, line)
+}
+
+/// `set` itself, needing no interpreter: compiled loops make its errors with it (src/jitloop.rs).
+pub(crate) fn set_of(args: Vec<Value>, line: u32) -> R {
     // `set(xs, i, v)`: a list with item i (from the end when negative) v. Asked without
     // a copy: one kept for the length of this block would make each `set` a copy of the
     // list, and a loop over it quadratic (FEEDBACK25.md, Q-314; branch feedback26-fixes).
@@ -660,25 +776,23 @@ fn set(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let i = i_arg(&args, 1, "set", line)?;
         let v = arg(&args, 2);
         let mut args = args;
-        let Value::List(l) = std::mem::replace(&mut args[0], Value::Nil) else { unreachable!() };
+        let Value::List(mut l) = std::mem::replace(&mut args[0], Value::Nil) else { unreachable!() };
         drop(args);
         let n = l.len() as i64;
         let at = if i < 0 { n + i } else { i };
         if at < 0 || at >= n {
             return fail(line, format!("`set`: index {} is outside a list of {}", i, n));
         }
-        let mut l = Arc::unwrap_or_clone(l);
-        l[at as usize] = v;
-        return Ok(Value::list(l));
+        Arc::make_mut(&mut l)[at as usize] = v;
+        return Ok(Value::List(l));
     }
-    let m = m_arg(&args, 0, "set", line)?;
+    let mut m = m_arg(&args, 0, "set", line)?;
     let (k, v) = (arg(&args, 1).key_text(), arg(&args, 2));
     // The arguments let go first: a map no one else holds is changed, not
     // copied (see `in_place` in src/interp.rs).
     drop(args);
-    let mut m = Arc::unwrap_or_clone(m);
-    m.insert(k.into(), v);
-    Ok(Value::map(m))
+    Arc::make_mut(&mut m).insert(k.into(), v);
+    Ok(Value::Map(m))
 }
 
 fn remove(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -1170,8 +1284,8 @@ fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn json_parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "json.parse", line)?;
-    Ok(match serde_json::from_str::<serde_json::Value>(&s) {
-        Ok(j) => Value::from_json(&j),
+    Ok(match Value::parse_json(&s) {
+        Ok(v) => v,
         Err(e) => Value::err(Value::str(format!("invalid JSON: {}", e))),
     })
 }
@@ -1187,13 +1301,54 @@ fn json_stringify(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 
 // ---- files -------------------------------------------------------------
 
-/// A path under the program's folder; `..` and absolute paths are refused.
+/// Folders outside the program's own that its files may be in: `quillo run --allow-path DIR`,
+/// for a tool its owner starts from a shell (FEEDBACK29.md, Q-357; branch feedback29-fixes).
+/// Named, never assumed: the same program may serve strangers tomorrow.
+static ALLOWED_PATHS: std::sync::RwLock<Vec<std::path::PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// Adds a folder for `--allow-path`, as it really is (links followed); why not, if not.
+pub fn allow_path(dir: &str) -> Result<(), String> {
+    let real = Path::new(dir).canonicalize().map_err(|e| format!("{}: {}", dir, e))?;
+    if !real.is_dir() {
+        return Err(format!("{} is not a folder", dir));
+    }
+    ALLOWED_PATHS.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(real);
+    Ok(())
+}
+
+/// A path under the program's folder; `..` and absolute paths are refused, unless they
+/// lead into a folder `--allow-path` named.
 pub(crate) fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     let rel = Path::new(p);
-    if p.is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+    if p.is_empty() {
         return None;
     }
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return allowed_path(it, p);
+    }
     Some(it.base_dir.join(rel))
+}
+
+/// `p` as it really is, if that is inside a folder `--allow-path` named. A file not made yet
+/// is where the nearest folder above it that is there really is, and what follows that is
+/// plain names: a `..` past it is refused.
+fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
+    let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if dirs.is_empty() {
+        return None;
+    }
+    let full = if Path::new(p).is_absolute() { std::path::PathBuf::from(p) } else { it.base_dir.join(p) };
+    let mut at = full.as_path();
+    let mut rest = Vec::new();
+    let real = loop {
+        if let Ok(r) = at.canonicalize() {
+            break r;
+        }
+        rest.push(at.file_name()?);
+        at = at.parent()?;
+    };
+    let real = rest.iter().rev().fold(real, |r, name| r.join(name));
+    dirs.iter().any(|d| real.starts_with(d)).then_some(real)
 }
 
 /// `read_file(path)`: the file's text, or an error value.
@@ -1329,7 +1484,7 @@ fn num_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<f64, Ctrl> {
 fn abs(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
         Value::Dec(d) => Ok(Value::Dec(d.abs())),
-        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(crate::QuilloError::new("integer overflow", line))),
+        Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| Ctrl::Error(Box::new(crate::QuilloError::new("integer overflow", line)))),
         _ => Ok(Value::Float(num_arg(&args, 0, "abs", line)?.abs())),
     }
 }
@@ -1359,7 +1514,7 @@ fn round_dec(d: crate::decimal::Dec, args: &[Value], line: u32) -> R {
         },
         Some(other) => return fail(line, format!("`round` expects a str as argument 3, got {}", other.type_name())),
     };
-    d.round(digits, mode).map(Value::Dec).map_err(|e| Ctrl::Error(crate::QuilloError::new(e.message(), line)))
+    d.round(digits, mode).map(Value::Dec).map_err(|e| Ctrl::Error(Box::new(crate::QuilloError::new(e.message(), line))))
 }
 
 /// `round(x)` gives an int; `round(x, digits)` a float with that many
@@ -1401,8 +1556,13 @@ fn sqrt(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `pow(x, y)`: an int when both are ints and y >= 0 (and it fits), else a float.
 fn pow(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let (Value::Int(x), Value::Int(y)) = (arg(&args, 0), arg(&args, 1)) {
-        if let Some(r) = u32::try_from(y).ok().and_then(|y| x.checked_pow(y)) {
-            return Ok(Value::Int(r));
+        // As `*` does: a float this size prints digits that were made up
+        // (FEEDBACK29.md, Q-351; branch feedback29-fixes). `math.pow` is the float.
+        if let Ok(y) = u32::try_from(y) {
+            return match x.checked_pow(y) {
+                Some(r) => Ok(Value::Int(r)),
+                None => fail(line, "integer overflow"),
+            };
         }
     }
     Ok(Value::Float(num_arg(&args, 0, "pow", line)?.powf(num_arg(&args, 1, "pow", line)?)))
@@ -1798,7 +1958,16 @@ fn style_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `style ...` in a component's or view's body: nothing as the code runs;
 /// the program takes the CSS when it loads (FEEDBACK8.md, Q-067; branch
 /// feedback8-fixes).
-fn style_noop(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+fn style_noop(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
+    // A style whose body has no element to carry its mark is noted as it runs, and the
+    // view around it is not kept, as a kept one would not run this (see
+    // `name_unmarked_styles` in src/parser.rs).
+    if let Some(Value::Str(id)) = args.get(2) {
+        if !it.styles_used.iter().any(|u| **u == **id) {
+            it.styles_used.push(id.to_string());
+        }
+        it.mark_impure();
+    }
     Ok(Value::Nil)
 }
 

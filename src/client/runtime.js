@@ -49,6 +49,9 @@ const DEC_FLOAT = ": a dec is exact and a float is not, so convert one with dec(
 const FLOAT_ONLY = " (this works on floats: convert a dec with float(x))";
 const isFloatV = (v) => typeof v === "number" && !Number.isInteger(v);
 const decHint = (a, b) => ((a instanceof Dec && isFloatV(b)) || (b instanceof Dec && isFloatV(a)) ? DEC_FLOAT : "");
+const compareHint = (a, b) => (isNil(a) !== isNil(b) ? NIL_COMPARED : decHint(a, b));
+// As on the server (FEEDBACK28.md, Q-347; branch feedback29-fixes).
+const NIL_COMPARED = ": what is not found is null, not -1, from `index_of`, `find` and `get` too, so ask `x == null` first";
 
 // Whether to add one to what is kept, given the first digit dropped,
 // whether any after it are not zero, and whether what is kept is odd.
@@ -340,7 +343,14 @@ function lenient(v, depth) {
     let w = lenientFns.get(v);
     if (!w) {
       const f = v;
-      w = function (...a) { return f.apply(this, a.slice(0, f.length)); };
+      // What the page passes as `undefined` is null to Quillo, as what its functions give
+      // back is: a Promise of nothing calls `.then`'s function so (FEEDBACK28.md, Q-336;
+      // branch feedback29-fixes).
+      w = function (...a) {
+        const b = a.slice(0, f.length);
+        for (let i = 0; i < b.length; i++) if (b[i] === undefined) b[i] = null;
+        return f.apply(this, b);
+      };
       lenientFns.set(v, w);
     }
     return w;
@@ -392,6 +402,8 @@ function setField(o, name, v, op) {
       : `${typeName(o)} has no field \`${name}\` to set: only the page's objects (an element, an event) do`);
   }
   foreignName(name);
+  if (/^on/i.test(name) && typeof v === "function")
+    fail(`\`${name}\` is not set from Quillo code, as it would take text to run as code too: write x.addEventListener("${name.slice(2)}", f), or @${name.slice(2)} on an element`);
   if (/^on/i.test(name) || name === "innerHTML" || name === "outerHTML" || name === "srcdoc")
     fail(`\`${name}\` is not set from Quillo code: it runs text as code or HTML`);
   if (isEvent(o) && !(name in o) && o.target) o = o.target;
@@ -611,6 +623,9 @@ function eq(a, b) {
   if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
+  // The page's objects are themselves, not their fields: any two elements have none
+  // (FEEDBACK28.md, Q-334; branch feedback29-fixes).
+  if (foreign(a) || foreign(b)) return false;
   if (isMap(a) && isMap(b)) {
     const ka = Object.keys(a);
     return ka.length === Object.keys(b).length && ka.every((k) => hasOwn(b, k) && eq(a[k], b[k]));
@@ -684,7 +699,7 @@ const mod = (a, b) => (typeof a === "number" && typeof b === "number" && b !== 0
 
 function order(a, b) {
   const c = cmp(a, b);
-  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}${decHint(a, b)}`);
+  if (c === null) fail(`cannot compare ${typeName(a)} with ${typeName(b)}${compareHint(a, b)}`);
   return c;
 }
 const lt = (a, b) => order(a, b) < 0;
@@ -756,7 +771,13 @@ function field(v, name, fb) {
       if (name in v) {
         foreignName(name);
         const x = v[name];
-        return x === undefined ? null : typeof x === "function" ? (...a) => foreignCall(v, name, a) : x;
+        if (x === undefined) return null;
+        if (typeof x !== "function") return x;
+        // It keeps what it is, as `window.Array.from` and `requestPermission` hang off it
+        // (FEEDBACK28.md, Q-341; branch feedback29-fixes).
+        const call = (...a) => foreignCall(v, name, a);
+        call.$page = x;
+        return call;
       }
     } else if (hasOwn(v, name)) return v[name];
     if (name === "len") return B.len(v);
@@ -766,11 +787,20 @@ function field(v, name, fb) {
   }
   if (v instanceof Err && (name === "error" || name === "message")) return v.error;
   if (isEvent(v)) return eventField(v, name);
+  if (typeof v === "function" && v.$page) {
+    foreignName(name);
+    const x = v.$page[name];
+    if (x === undefined) return null;
+    if (typeof x !== "function") return x;
+    const call = (...a) => foreignCall(v.$page, name, a);
+    call.$page = x;
+    return call;
+  }
   const f = (fb instanceof Later ? fb.read() : fb) || (hasOwn(B, name) ? B[name] : null);
   if (typeof f === "function") return f(v);
   // As on the server (FEEDBACK26.md, Q-199; branch feedback26-fixes).
   if (name === "error" || name === "message") return null;
-  fail(`${typeName(v)} has no field \`${name}\``);
+  fail(`${typeName(v)} has no field \`${name}\`${name === "length" && (Array.isArray(v) || typeof v === "string") ? ": `len(x)` is how many it holds" : ""}`);
 }
 
 // What `field` falls back on, read only if it does.
@@ -808,6 +838,7 @@ function callFn(f, args) {
 // `recv.name(args)`: a function stored in the map, or `name(recv, args)`.
 function mcall(recv, name, fb, args) {
   if (foreign(recv) && typeof recv[name] === "function") return foreignCall(recv, name, args);
+  if (typeof recv === "function" && recv.$page && typeof recv.$page[name] === "function") return foreignCall(recv.$page, name, args);
   if (isMap(recv) && hasOwn(recv, name)) return callFn(recv[name], args);
   if (typeof fb === "function") return fb(recv, ...args);
   fail(`${typeName(recv)} has no method \`${name}\``);
@@ -963,7 +994,7 @@ const N = (v, f, i = 1) => { want(typeof v === "number", f, "a number", i, v); r
 // Every caller passes one argument (two for `reduce`).
 function cb(f, who, a, b) {
   const r = arguments.length > 3 ? f(a, b) : f(a);
-  if (r instanceof Promise) fail(`\`${who}\` cannot call a function that waits on the server; use a \`for\` loop instead`);
+  if (r instanceof Promise) fail(`\`${who}\` cannot call a function that waits, on the server or the page (\`js\` in it waits): use a \`for\` loop instead`);
   return r;
 }
 
@@ -1198,8 +1229,45 @@ B.listen = meta((url, f) => {
 // as the code that asked keeps asking. `if running { every(100, step) }`
 // runs again when `running` changes, and stops it when it is false; the
 // component leaving the page stops it too.
+// `run_after(ms, f)`: once, gone with the component (FEEDBACK28.md, Q-349; branch
+// feedback29-fixes).
+B.run_after = meta((ms, f) => {
+  N(ms, "run_after");
+  F(f, "run_after", 2);
+  const own = Owner || Acting;
+  if (own && own.dead) return null;
+  const id = setTimeout(() => {
+    try {
+      const r = f();
+      if (r instanceof Promise) r.catch(report);
+    } catch (e) {
+      report(e);
+    }
+  }, Math.max(ms, 0));
+  if (own) (own.clean || (own.clean = [])).push(() => clearTimeout(id));
+  return null;
+}, "run_after", null);
+// `page_updated()`: waits until the page shows what was just set.
+B.page_updated = meta(() => new Promise((done) => { if (flushing && effectQueue.length) flush(); queueMicrotask(() => done(null)); }), "page_updated", null);
+// `js_has("a.b")`: whether the page has it, without calling it (FEEDBACK28.md, Q-341; branch
+// feedback29-fixes).
+B.js_has = meta((name) => {
+  let o = globalThis;
+  for (const p of S(name, "js_has").split(".")) {
+    if (o === null || o === undefined || !(typeof o === "object" || typeof o === "function") || !(p in o)) return false;
+    o = o[p];
+  }
+  return o !== undefined;
+}, "js_has", null);
+// `cursor_index(s, n)`: a field's cursor counts UTF-16 units, and `slice` counts characters
+// (FEEDBACK28.md, Q-344; branch feedback29-fixes).
+B.cursor_index = meta((s, n) => Array.from(S(s, "cursor_index").slice(0, Math.max(I(n, "cursor_index", 2), 0))).length, "cursor_index", null);
 B.every = meta((ms, f) => {
-  if (!Owner) fail("`every` works in a component");
+  // In a component, or a handler or `@mount` of one, as `run_after` (FEEDBACK28.md, Q-349;
+  // branch feedback29-fixes).
+  const own = Owner || Acting;
+  if (!own) fail("`every` works in a component");
+  if (own.dead) return null;
   N(ms, "every");
   F(f, "every", 2);
   const id = setInterval(() => {
@@ -1210,7 +1278,7 @@ B.every = meta((ms, f) => {
       report(e);
     }
   }, Math.max(ms, 1));
-  onCleanup(() => clearInterval(id));
+  (own.clean || (own.clean = [])).push(() => clearInterval(id));
   return null;
 }, "every", null);
 
@@ -1322,7 +1390,15 @@ B.reverse = meta((v) => {
 B.first = meta((l) => { l = L(l, "first"); return l.length ? l[0] : null; }, "first", null);
 B.last = meta((l) => { l = L(l, "last"); return l.length ? l[l.length - 1] : null; }, "last", null);
 B.push = meta((l, x = null) => L(l, "push").concat([x]), "push", null);
-B.range = meta((a, b) => b === undefined ? intRange(0, I(a, "range")) : intRange(I(a, "range"), I(b, "range", 2)), "range", null);
+B.range = meta((a, b, c) => {
+  if (c !== undefined) {
+    const [from, to, step] = W.stepped(a, b, c), out = [];
+    if ((to - from) / step > 10000000) fail("range is too large");
+    for (let i = from; step > 0 ? i < to : i > to; i += step) out.push(i);
+    return out;
+  }
+  return b === undefined ? intRange(0, I(a, "range")) : intRange(I(a, "range"), I(b, "range", 2));
+}, "range", null);
 B.enumerate = meta((l) => L(l, "enumerate").map((v, i) => [i, v]), "enumerate", null);
 B.keys = meta((m) => Object.keys(M(m, "keys")), "keys", null);
 B.values = meta((m) => { m = M(m, "values"); return Object.keys(m).map((k) => m[k]); }, "values", null);
@@ -1600,7 +1676,14 @@ B.round = meta((x, d, mode) => {
 B.floor = meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : Math.floor(N(x, "floor")), "floor", null);
 B.ceil = meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : Math.ceil(N(x, "ceil")), "ceil", null);
 B.sqrt = meta((x) => Math.sqrt(N(x, "sqrt")), "sqrt", null);
-B.pow = meta((x, y) => N(x, "pow") ** N(y, "pow", 2), "pow", null);
+B.pow = meta((x, y) => {
+  // As `*` does, exactly (FEEDBACK29.md, Q-351; branch feedback29-fixes).
+  if ((isInt(x) || typeof x === "bigint") && isInt(y) && y >= 0) {
+    if (y > 64 && (x > 1 || x < -1)) fail("integer overflow");
+    return bigChecked(BigInt(x) ** BigInt(y));
+  }
+  return N(x, "pow") ** N(y, "pow", 2);
+}, "pow", null);
 B.unique = meta((l) => { const out = []; for (const x of L(l, "unique")) if (!out.some((y) => eq(x, y))) out.push(x); return out; }, "unique", null);
 B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])), "flatten", null);
 B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
@@ -4086,6 +4169,9 @@ async function liveRefresh(sub, newArgs) {
 const CLEAN = 0, CHECK = 1, DIRTY = 2;
 let Listener = null;
 let Owner = null;
+// The component (or row) a handler or `@mount` running now belongs to, for what it
+// starts to end with it: `run_after` and `every`.
+let Acting = null;
 let effectQueue = [];
 let flushing = false;
 let calcIds = 0;
@@ -4664,7 +4750,14 @@ function hole(el, kind, name, v, svg, i) {
 
 function liveApply(x) { setProp(this.el, this.name, x, undefined); }
 function attrApply(x) { setProp(this.el, this.name, x, this.old); this.old = x; }
-function classApply(x) { if (x !== this.old) setClass(this.el, x, this.name); this.old = x; }
+function classApply(x) {
+  if (x === this.old) return;
+  if (typeof this.old === "string" && typeof x === "string") {
+    classTokens(this.el, this.old, x);
+    if (x === "" && this.el.classList.length === 0) this.el.removeAttribute("class");
+  } else setClass(this.el, x, this.name);
+  this.old = x;
+}
 
 // A value shown among other nodes, at placeholder `at`.
 function showAt(p, at, v, svg, i) {
@@ -4997,13 +5090,62 @@ function scriptURL(u) {
   return s.startsWith("javascript:") || s.startsWith("vbscript:");
 }
 
+// A style's declarations, by property.
+function styleParts(text) {
+  const out = new Map();
+  let at = 0, depth = 0, quote = "";
+  const take = (end) => {
+    const d = text.slice(at, end), c = d.indexOf(":");
+    if (c > 0) out.set(d.slice(0, c).trim(), d.slice(c + 1).trim());
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) { if (ch === quote) quote = ""; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (ch === ";" && depth === 0) { take(i); at = i + 1; }
+  }
+  take(text.length);
+  return out;
+}
+
+// `style={...}` and `class={...}` change what they name and nothing else: what a handler
+// set on the element stays, as a drag's transform (FEEDBACK28.md, Q-337; branch
+// feedback29-fixes).
+function styleApply(el, was, now) {
+  if (was === now) return;
+  const before = styleParts(was), after = styleParts(now);
+  for (const name of before.keys()) if (!after.has(name)) el.style.removeProperty(name);
+  for (const [name, value] of after) {
+    if (before.get(name) === value) continue;
+    const m = /^(.*?)\s*!\s*important$/i.exec(value);
+    el.style.setProperty(name, m ? m[1] : value, m ? "important" : "");
+  }
+}
+
+function classTokens(el, was, now) {
+  if (was === now) return;
+  const before = was.split(/\s+/).filter(Boolean), after = now.split(/\s+/).filter(Boolean);
+  for (const c of before) if (!after.includes(c)) el.classList.remove(c);
+  for (const c of after) if (!before.includes(c)) el.classList.add(c);
+}
+
 function setProp(el, k, v, old) {
-  if (k === "value" || k === "checked" || k === "selected") {
+  // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
+  // feedback29-fixes).
+  if (k === "value" || k === "checked" || k === "selected" || k === "muted") {
     // Taking up the server's HTML: what the page shows (typed, ticked) stays.
     if (claiming) return;
     const nv = k === "value" ? (isNil(v) ? "" : display(v)) : truthy(v);
     if (el[k] !== nv) el[k] = nv;
     if (k !== "value") { if (nv) el.setAttribute(k, ""); else el.removeAttribute(k); }
+    return;
+  }
+  // What a person opened or closed stays until the value itself changes.
+  if (k === "open" && old !== undefined && truthy(old) === truthy(v)) return;
+  if ((k === "style" || k === "class") && typeof v === "string" && (typeof old === "string" || isNil(old) || old === false) && old !== undefined) {
+    (k === "style" ? styleApply : classTokens)(el, typeof old === "string" ? old : "", v);
     return;
   }
   if (isNil(v) || v === false) { el.removeAttribute(k); return; }
@@ -5025,11 +5167,15 @@ function fire(el, type, ev) {
   // again, and `e.value` would read that (FEEDBACK25.md, Q-304; branch feedback26-fixes).
   const t = ev.target;
   if (t && t.value !== undefined) { ev.$value = t.value; ev.$checked = !!t.checked; }
+  const was = Acting;
+  Acting = el.__own || null;
   try {
     const r = f.length > 0 ? f(ev) : f();
     if (r instanceof Promise) r.catch(report);
   } catch (e) {
     report(e);
+  } finally {
+    Acting = was;
   }
   // An input shows the state's value even if the user typed something the
   // state did not take (once what the handler changed is shown).
@@ -5043,6 +5189,12 @@ function listen(el, t, f) {
   // Events named with a `$` are Quillo's own: `$mount` (not named here, so
   // that bundles without it leave it out).
   if (t.charCodeAt(0) === 36) { if (typeof f === "function" && mountHook) mountHook(el, f); return; }
+  // An image from the server's HTML may have finished before this ran (FEEDBACK28.md,
+  // Q-345; branch feedback29-fixes).
+  if (claiming && el.tagName === "IMG" && el.complete && (t === "load" ? el.naturalWidth > 0 : t === "error" && el.getAttribute("src") && el.naturalWidth === 0)) {
+    queueMicrotask(() => fire(el, t, new Event(t)));
+  }
+  el.__own = Owner;
   if (t === "click") {
     el.__click = f;
     if (!delegating) { delegating = true; document.addEventListener("click", delegated); }
@@ -5077,11 +5229,15 @@ function $mount(el, f) {
     for (const [el, f, owner] of $mount.q.splice(0)) {
       if (!el.isConnected || (owner && owner.dead)) continue;
       const keep = (g) => { if (typeof g === "function" && owner) (owner.clean || (owner.clean = [])).push(() => unhook(g)); };
+      const was = Acting;
+      Acting = owner;
       try {
         const r = f.length > 0 ? f(el) : f();
         if (r instanceof Promise) r.then(keep, report); else keep(r);
       } catch (e) {
         report(e);
+      } finally {
+        Acting = was;
       }
     }
   });
@@ -5230,9 +5386,22 @@ function clearRows(st, p) {
     range.setStartBefore(first);
     range.setEndBefore(end);
     range.deleteContents();
+  } else {
+    // A row that changed its element after it was made names the one it began with:
+    // each is taken out by its own record (FEEDBACK28.md, Q-342; branch feedback29-fixes).
+    for (const r of old) removeNodes(r.nodes);
   }
   for (const r of old) dispose(r.scope);
   st.rows = [];
+}
+
+// A move that keeps what a node holds, such as a pointer's capture, where the browser can
+// (FEEDBACK28.md, Q-343; branch feedback29-fixes).
+function moveNode(p, n, before) {
+  if (p.moveBefore && n.isConnected && p.isConnected) {
+    try { p.moveBefore(n, before); return; } catch (e) { /* a move it cannot make */ }
+  }
+  p.insertBefore(n, before);
 }
 
 function reconcile(st, items, key, row, svg) {
@@ -5292,7 +5461,7 @@ function reconcile(st, items, key, row, svg) {
       if (r.item._v !== items[i]) r.item.set(items[i]);
       if (moved && !stay[i]) {
         const ns = nodesOf(r.nodes);
-        if (ns.length === 1) p.insertBefore(ns[0], after);
+        if (ns.length === 1) moveNode(p, ns[0], after);
         else { const f = document.createDocumentFragment(); for (const x of ns) f.appendChild(x); p.insertBefore(f, after); }
       }
       const f = firstOf(r.nodes);
@@ -5719,6 +5888,7 @@ const G = {};
 const C = {};
 const W = {};
 W.Err = Err;
+W.waits = (v) => v instanceof Promise || (v !== null && typeof v === "object" && typeof v.then === "function" && foreign(v));
 // A stop that `??` guards against, and anything else goes on.
 W.guarded = (e) => { if (e instanceof QuilloError) return null; throw e; };
 // What `js(...)` gave, waited for if it is a Promise (see `call` in
@@ -5771,11 +5941,18 @@ W.tryv = tryv;
 // `for` over `enumerate(xs)`, `range(a, b)` and `a..b`, by number: checked
 // as those check, without making the list.
 W.enumlist = (l) => L(l, "enumerate");
+// A loop makes no list, so a list's limit means nothing here (FEEDBACK29.md, Q-356;
+// branch feedback29-fixes).
 W.span = (a, b, dots) => {
   if (!dots) { if (b === undefined) { b = I(a, "range"); a = 0; } else { a = I(a, "range"); b = I(b, "range", 2); } }
   if (!isInt(a) || !isInt(b)) fail("`..` needs two ints");
-  if (b - a > 10000000) fail("range is too large");
   return [a, b];
+};
+// `range(a, b, step)` (FEEDBACK29.md, Q-360; branch feedback29-fixes).
+W.stepped = (a, b, c) => {
+  const r = [I(a, "range"), I(b, "range", 2), I(c, "range", 3)];
+  if (r[2] === 0) fail("`range`: a step of 0 never gets anywhere");
+  return r;
 };
 W.iter = iter;
 W.match = match;

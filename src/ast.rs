@@ -1,3 +1,4 @@
+pub use crate::sym::Sym;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ pub enum UnOp {
 pub enum Expr {
     Lit(Lit),
     Template(Vec<TPart>),
-    Ident(String, u32),
+    Ident(Sym, u32),
     List(Vec<Expr>),
     Map(Vec<(String, Expr)>),
     Unary(UnOp, Box<Expr>, u32),
@@ -141,7 +142,7 @@ pub fn builtin_effect(name: &str) -> u8 {
     } else {
         match name {
             "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
-            "env" | "args" => "env",
+            "env" | "args" | "stdin" | "read_line" | "exit" => "env",
             "now" | "sleep" | "date.today" | "date.now" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
             "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
@@ -153,7 +154,7 @@ pub fn builtin_effect(name: &str) -> u8 {
 
 #[derive(Debug, Clone)]
 pub struct Param {
-    pub name: String,
+    pub name: Sym,
     pub ty: Option<Ty>,
     pub default: Option<Expr>,
 }
@@ -187,7 +188,7 @@ pub struct FnDef {
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Wild,
-    Bind(String),
+    Bind(Sym),
     Lit(Lit),
     /// A type name such as `int`; matches any value of that type.
     Type(String),
@@ -423,7 +424,7 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(Pattern, Expr, u32),
-    Assign(String, AssignOp, Expr, u32),
+    Assign(Sym, AssignOp, Expr, u32),
     /// `obj.name = expr` (or `+=`, `-=`): a field of one of the page's
     /// objects (an element, an event), set in a component.
     SetField(Expr, String, AssignOp, Expr, u32),
