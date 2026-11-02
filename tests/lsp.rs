@@ -981,3 +981,53 @@ fn imports_are_hovered_followed_and_completed_file_first() {
     assert_eq!(typed(&mut c, &mut notes, "", "use "), files);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A new `import` line names a file the program does not take yet, and `use ` with no
+/// name after it does not parse: the file's names are read from the file itself, as the
+/// editor has it (branch runtime-coverage).
+#[test]
+fn a_new_import_line_offers_the_names_of_a_file_not_yet_taken() {
+    let dir = std::env::temp_dir().join(format!("quillo-lsp-new-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    std::fs::write(dir.join("lib/order.qwe"), "fn total(x: int) = x * 2\nfn place(n: str) = n\nprivate fn secret() = 1\nroute GET /o = \"o\"\n").unwrap();
+    std::fs::write(dir.join("lib/broken.qwe"), "fn half( = \n").unwrap();
+    std::fs::write(dir.join("lib/user.qwe"), "fn saved() = 1\n").unwrap();
+    let main = dir.join("main.qwe");
+    let base = "route GET / = \"hi\"\n";
+    std::fs::write(&main, base).unwrap();
+    let uri = format!("file://{}", main.display());
+    let mut c = Client::start();
+    let mut notes = Vec::new();
+    c.request("initialize", json!({ "capabilities": {} }), &mut notes);
+    c.notify("initialized", json!({}));
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "quillo", "version": 1, "text": base } }));
+    let mut version = 2;
+    // The text typed after the route; the cursor at the end of its last line.
+    let mut typed = |c: &mut Client, notes: &mut Vec<Value>, lines: &str| {
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": format!("{}{}\n", base, lines) }] }));
+        version += 1;
+        let last = lines.rsplit('\n').next().unwrap();
+        let at = json!({ "line": 1 + lines.matches('\n').count(), "character": last.chars().count() });
+        let r = c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": at }), notes);
+        r.as_array().unwrap_or(&Vec::new()).iter().map(|i| i["label"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    // Its public names, however the file is written; not its private ones or its routes.
+    assert_eq!(typed(&mut c, &mut notes, "import lib/order.qwe use "), ["*", "total", "place"]);
+    assert_eq!(typed(&mut c, &mut notes, "import \"lib/order.qwe\" use "), ["*", "total", "place"]);
+    assert_eq!(typed(&mut c, &mut notes, "import lib/order use "), ["*", "total", "place"]);
+    assert_eq!(typed(&mut c, &mut notes, "import ./lib/order.qwe use "), ["*", "total", "place"]);
+    // Those taken already are not offered again.
+    assert_eq!(typed(&mut c, &mut notes, "import lib/order.qwe use total, "), ["place"]);
+    // On the next line, under the file.
+    assert_eq!(typed(&mut c, &mut notes, "import lib/order.qwe\n    use "), ["*", "total", "place"]);
+    // No such file, or one that does not parse: nothing but `*`.
+    assert_eq!(typed(&mut c, &mut notes, "import lib/missing.qwe use "), ["*"]);
+    assert_eq!(typed(&mut c, &mut notes, "import lib/broken.qwe use "), ["*"]);
+    // A file open in the editor: as typed there, not as saved.
+    let user = dir.join("lib/user.qwe");
+    c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": format!("file://{}", user.display()), "languageId": "quillo", "version": 1, "text": "fn unsaved() = 2\n" } }));
+    assert_eq!(typed(&mut c, &mut notes, "import lib/user.qwe use "), ["*", "unsaved"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -973,11 +973,19 @@ impl Server {
         // Q-154; branch feedback19-fixes).
         if full.extension().is_some_and(|e| e == "qwe") {
             let key = crate::modules::key(&full);
-            return doc
-                .analysis
-                .symbols
-                .iter()
-                .filter(|s| s.kind != SymbolKind::Route && crate::modules::key(Path::new(&s.file)) == key)
+            let of = |s: &&check::Symbol| s.kind != SymbolKind::Route && crate::modules::key(Path::new(&s.file)) == key;
+            let mut symbols: Vec<&check::Symbol> = doc.analysis.symbols.iter().filter(of).collect();
+            // A file the program does not take yet: a new `import x.qwe use ` line does not
+            // parse until a name follows, so the file is read on its own (branch
+            // runtime-coverage).
+            let alone;
+            if symbols.is_empty() {
+                let name = full.display().to_string();
+                alone = check::check_source_opts(&self.text_of(&name), &name, full.parent().unwrap_or(Path::new(".")), self.opts);
+                symbols = alone.symbols.iter().filter(of).collect();
+            }
+            return symbols
+                .into_iter()
                 .filter(|s| crate::privacy::private_name(&s.name).is_none() && !u.names.iter().any(|(n, _, c)| *n == s.name && *c != a))
                 .map(|s| json!({ "label": s.name, "kind": 3, "detail": s.detail }))
                 .collect();
