@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # origin/main, to find the lines of runtime.js a change touches.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # 24: its CLDR (47) is the one money's locale table was made from, which
       # tests/money.rs compares with Intl.
@@ -28,8 +31,10 @@ jobs:
         run: cargo build --release
       - name: The environment check, and the sample app it runs
         run: sh scripts/doctor.sh --build
-      - name: Tests (the browser test uses the runner's Chrome)
-        run: cargo test
+      # The tests, measuring what of src/client/runtime.js they run: below 99.50%
+      # of its lines, or a line changed since main that no test runs, fails.
+      - name: Tests (the browser tests use the runner's Chrome), and runtime.js's coverage
+        run: BASE=origin/main sh scripts/runtime-coverage.sh
       - name: Check the sample app and the test programs
         run: for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; done
 

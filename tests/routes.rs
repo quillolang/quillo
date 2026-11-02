@@ -386,8 +386,11 @@ fn the_browser_bundle_only_carries_what_the_page_uses() {
     // more: what is asked is that a page carries less than one that uses more
     // (branch open-fixes).
     assert!(js.len() < js2.len(), "{} vs {}", js.len(), js2.len());
-    // No comments or indentation.
-    assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
+    // No comments or indentation, unless the runtime goes out as written to measure its
+    // coverage (scripts/runtime-coverage.sh).
+    if std::env::var_os("QUILLO_RUNTIME_COVERAGE").is_none_or(|v| v.is_empty()) {
+        assert!(!js.lines().any(|l| l.starts_with(' ') || l.trim_start().starts_with("//")));
+    }
 }
 
 /// The scripts a page loads, in order.
