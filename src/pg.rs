@@ -505,6 +505,9 @@ fn describe(e: &postgres::Error) -> String {
             if let Some(d) = db.detail() {
                 s.push_str(&format!(" ({})", d));
             }
+            // Its SQLSTATE, which `db.error_kind` reads: the words are in the server's language
+            // (FEEDBACK43.md, Q-493; branch feedback40-43).
+            s.push_str(&format!(" [{}]", db.code().code()));
             s
         }
         None => {

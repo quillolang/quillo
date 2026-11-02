@@ -256,6 +256,12 @@ pub fn serve_unchecked(file: &Path) -> Server {
     serve_opts(file, &[], &["--no-check"])
 }
 
+/// `serve` with options of `quillo run`'s.
+#[allow(dead_code)]
+pub fn serve_with(file: &Path, opts: &[&str]) -> Server {
+    serve_opts(file, &[], opts)
+}
+
 fn serve_opts(file: &Path, env: &[(&str, &str)], opts: &[&str]) -> Server {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))

@@ -488,7 +488,7 @@ let has = db.query("select k from (values ('{\"a\": 1}'::jsonb)) as v(k) where k
  bad.error, count.error, is_err(fk), is_err(strict), db.one("select 1 where false"), missing.error, extra, has]
 "#,
     );
-    assert!(r.starts_with("[{ id: 1 }, [\"Ada\", \"Bob\"], \"db: relation \\\"nope\\\" does not exist\", \"db: the query has 1 parameter, got 2\", true, true, null, \"db: no value for :b\", { s: 1 }, [{ k: { a: 1 } }]]"), "{}", r);
+    assert!(r.starts_with("[{ id: 1 }, [\"Ada\", \"Bob\"], \"db: relation \\\"nope\\\" does not exist [42P01]\", \"db: the query has 1 parameter, got 2\", true, true, null, \"db: no value for :b\", { s: 1 }, [{ k: { a: 1 } }]]"), "{}", r);
 }
 
 fn transactions_commit_roll_back_and_nest(url: &str) {

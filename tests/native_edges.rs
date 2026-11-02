@@ -156,7 +156,7 @@ fn types_are_written_any_way_rust_takes() {
 
 #[test]
 fn a_name_that_is_not_there_gets_the_nearest() {
-    let e = |n: &str, f: &str| Export { name: n.into(), params: Vec::new(), ret: None, line: 1, doc: f.into() };
+    let e = |n: &str, f: &str| Export { name: n.into(), params: Vec::new(), ret: None, line: 1, doc: f.into(), effects: quillo::ast::ALL_EFFECTS };
     let have = [e("greet", ""), e("sum", "")];
     assert_eq!(native::missing_export("x.qwer", "gret", &have), "x.qwer has no function `gret` (did you mean `greet`?)");
     assert_eq!(native::missing_export("x.qwer", "completely", &have), "x.qwer has no function `completely`; it has `greet`, `sum`");
@@ -203,8 +203,20 @@ fn a_library_that_does_not_fit_is_refused() {
     std::fs::write(d.join("two.qwer"), "pub fn two() -> i64 { 2 }\npub fn three() -> i64 { 3 }\n").unwrap();
     let (one, _) = native::build(&d.join("one.qwer")).unwrap();
     let (two, _) = native::build(&d.join("two.qwer")).unwrap();
-    // Built with one function, where two are expected.
+    // Built with one function, where two are expected: not the library the lock names, so
+    // built again (FEEDBACK41.md, Q-477; branch feedback40-43).
     std::fs::copy(&one, &two).unwrap();
+    let mut it = Interp::new(&d);
+    it.load_source("use \"two.qwer\"\nlet n = three()\n", "main.qwe").unwrap();
+    // With no lock (a folder from before locks), the library itself still says it does not fit.
+    // In a folder of its own: a library loaded once stays loaded, by its path.
+    let d = dir("misfit-unlocked");
+    std::fs::write(d.join("one.qwer"), "pub fn one() -> i64 { 1 }\n").unwrap();
+    std::fs::write(d.join("two.qwer"), "pub fn two() -> i64 { 2 }\npub fn three() -> i64 { 3 }\n").unwrap();
+    let (one, _) = native::build(&d.join("one.qwer")).unwrap();
+    let (two, _) = native::build(&d.join("two.qwer")).unwrap();
+    std::fs::copy(&one, &two).unwrap();
+    std::fs::remove_file(d.join(".quillo/plugins.lock")).unwrap();
     let e = Interp::new(&d).load_source("use \"two.qwer\"\n", "main.qwe").err().unwrap().to_string();
     assert!(e.contains("was made for another version of Quillo; delete it to build it again"), "{}", e);
 }

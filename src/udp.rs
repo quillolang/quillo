@@ -367,8 +367,9 @@ impl Loopback {
         if crate::jobs::local() {
             return Ok(Loopback(None, Vec::new(), addr));
         }
-        let s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-        s.set_nodelay(true)?;
+        let s = crate::jobs::dial(addr, Duration::from_secs(5))?;
+        // Not on a local socket, which has no Nagle to turn off.
+        let _ = s.set_nodelay(true);
         Ok(Loopback(Some(s), Vec::new(), addr))
     }
 

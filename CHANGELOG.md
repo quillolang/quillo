@@ -32,6 +32,103 @@
   in `localStorage` and IndexedDB stays with the old `http://127.0.0.1:<port>` and is not
   copied. Its database is not touched.
 - **A `.rs` file a program `use`s is Rust**, where it was read as Quillo.
+- **PostgreSQL's error messages end in their SQLSTATE**, as ` [23505]`. Code that compares
+  an error's whole text, or shows it, sees the code too; `db.error_kind` is the way to
+  tell failures apart.
+- **A Rust file needs `//! effects: ...` to be called inside a `with` function** (or
+  `//! effects: none`). Without it, its functions still run outside any `with`, and are
+  refused inside one, at run time and by `quillo check`. Add the line to your `.qwer` and
+  `.rs` files, and to the catalog plugins you call that way.
+- **A link that leads out of the program's folder is refused**, by `read_file`,
+  `write_file`, `delete_file`, `file`, `files`, `save_upload` and `check_program`, and so
+  is a link that leads nowhere. A deploy's `uploads -> /srv/shared/uploads` needs
+  `--allow-path /srv/shared/uploads`.
+- **`.quillo/plugins.lock` is checked when it is there.** Deploy it with
+  `.quillo/native/`: a library that does not match it is built again, or refused under
+  `--no-build`. A folder with no lock loads as before, with a warning; to get a lock,
+  remove `.quillo/native/` and run `quillo build`.
+- **A connection's calls need the `db` effect**: `analytics.query(...)` in a function
+  declared `with http` is now an error. Add `db` to its `with`.
+- **`udp.listen` (and `media.rtp`) need the `net` effect**, and `save_upload` and `files`
+  the `fs` effect: add them to the `with` of the functions that call them.
+
+### Shared servers: a socket, FastCGI and a policy (FEEDBACK41.md)
+
+- **`--listen unix:PATH`** listens on a Unix socket instead of a TCP port, made with mode
+  0600 (`--socket-mode 660` for the web server's group) and removed when the server
+  stops; a socket left by a server that did not stop cleanly is taken over, one another
+  server answers on is not. `$PORT` may hold an absolute path. A path is at most 100
+  bytes. Not with `--split`, `--instances`, `--register` or `--join`. Jobs reach the
+  program through the socket, and the server says to add `--trust-proxy 127.0.0.1` until
+  it is given (Q-479).
+- **`quillo fcgi main.qwe`** answers FastCGI: on the socket `mod_fcgid` gives it on file
+  descriptor 0, or its own with `--listen unix:PATH` or `--port`, for nginx's
+  `fastcgi_pass`. Each request goes to the server as an HTTP request, `request.ip` from
+  `REMOTE_ADDR`, and its answer goes back as it is written (Q-479).
+- **Links are followed and judged** by the file builtins: one leading out of the folder,
+  or nowhere, is refused, said once in the log with `--allow-path FOLDER`; `files()`
+  gives the same 404 whether a folder outside is there or not, and `check_program` reads
+  nothing through such a link (Q-475).
+- **Effects:** `save_upload` and `files` are `fs`; `udp.listen` and `media.rtp` are `net`.
+  A Rust file declares `//! effects: db, http` (or `none`), checked by `quillo check` and at
+  run time; without it, it is refused inside a `with`, and an editor's hover says
+  `(effects: not declared)` (Q-476).
+- **`.quillo/plugins.lock`** holds each built library's SHA-256, written by every build,
+  `quillo build` included; a library that does not match is built again, or refused under
+  **`--no-build`**, which never builds (Q-477).
+- **A policy** (Q-478): `/etc/quillo/policy.toml`, then each `--policy FILE`, then
+  `quillo.policy` beside the program, each only narrowing. `[plugins] build` and `allow`
+  (`name` or `name@version`, by `//! version:`), `[effects] allow`, `[http] private` and
+  `hosts` (each redirect judged too), `[env] names`, and `[limits] workers`,
+  `max_compute` and `max_body`. `quillo check --policy FILE` says what would be refused.
+  Not done: a signed catalog, `local = false`, `--sandbox` and WebAssembly plugins;
+  `private = false` covers `http.*`, not `db.connect` or UDP.
+- **Threads:** a wait thread the system will not start is said once, and starting one is
+  tried again when there is none; a `ulimit -u` below what the server may use is said at
+  start (Q-480).
+- **The Linux release binaries are linked against glibc 2.17** with zig, so they start on
+  CentOS 7, CloudLinux 7 and 8 and AlmaLinux 8, and still load plugins. The release
+  workflow checks the binary in a CentOS 7 container. It takes effect with the next tag
+  (Q-424).
+- The guide has "The policy" and "Quillo on a shared server (cPanel)", and the website a
+  guide for shared hosting.
+
+### Services the app does not hold (FEEDBACK40.md)
+
+- **A service's file that does not parse is read for its `server fn` headers**, so a
+  mistake in a route or a body of the service no longer stops an app run with
+  `--no-check` (Q-471).
+- **With no file and an address**, the app asks the running service for its functions as
+  it starts, as a signed call (`_contracts`), each address in turn; only those the caller
+  may call are given. `quillo check` warns that the file is not here, and a call to it
+  still needs `http` (Q-471).
+- **`--split --watch`** reloads the app when a service's files change, so a function added
+  to a service is called at once (Q-472).
+- **`--split` checks the whole tree once** before starting any service, each warning said
+  once; the services skip their first check (Q-473).
+- **A service that ends at start is said at once**, `service billing stopped at start
+  (exit status: 1; see its lines above)`, not after 20 s (Q-474).
+
+### Databases and plugins (FEEDBACK43.md)
+
+- **A connection's calls need the `db` effect** in `quillo check`, as at run time;
+  `c.query(...)` on an untyped parameter in a `with` function without `db` is a warning
+  (Q-488).
+- **A Rust function's effects are its file's `//! effects:` line** (Q-489, with Q-476).
+- **`db.open` replacing a database is announced** to live pages, every tenant's, and live
+  calls are not answered from the old one (Q-490).
+- **One database, one name:** a SQLite file by any spelling is one connection and one set
+  of live topics; a server URL's topics leave out the user, the password and the
+  options (Q-491).
+- **`conn.sql_name(x)` and `db.sql_name(x)`** quote a name for that database: backticks on
+  MySQL (Q-492).
+- **PostgreSQL errors carry their SQLSTATE** (` [23505]`), and `db.error_kind` reads it
+  first, so it works whatever language the server speaks (Q-493).
+
+### Checking (FEEDBACK42.md)
+
+- **`quillo check` warns of `sleep(0.2)`**: `sleep` takes milliseconds, and a number written
+  between 0 and 1 is a fraction of one (Q-482).
 
 ### HTTP the server speaks (FEEDBACK36.md)
 

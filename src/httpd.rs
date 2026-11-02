@@ -99,6 +99,11 @@ pub fn limit_compute(ms: u64) {
     MAX_COMPUTE.store(ms, SeqCst);
 }
 
+/// The limit now, in milliseconds; 0 for none.
+pub fn compute_limit_ms() -> u64 {
+    MAX_COMPUTE.load(SeqCst)
+}
+
 /// Whether requests are limited. Compiled code has no steps to look between, so it is
 /// left out then.
 pub fn compute_limited() -> bool {
@@ -242,6 +247,82 @@ fn take_connections(listener: std::net::TcpListener, inboxes: Vec<Arc<Inbox>>, b
             }
         }
     }
+}
+
+/// Where a server's connections come from: a TCP port, or something else that makes them and
+/// gives them on (a Unix socket's listener, FastCGI's), on a thread of its own.
+pub enum Listener {
+    Tcp(std::net::TcpListener),
+    Other(Box<dyn FnOnce(Hand) + Send>),
+}
+
+/// Gives connections made elsewhere to the instances, as `take_connections` does: to the next
+/// one not computing.
+#[derive(Clone)]
+pub struct Hand {
+    inboxes: Vec<Arc<Inbox>>,
+    busy: Vec<Arc<Busy>>,
+    turn: Arc<AtomicUsize>,
+}
+
+impl Hand {
+    /// A connection, as a `TcpStream` (a local socket's descriptor is one too: reads, writes and
+    /// shutting down are the same calls), and who it is from.
+    pub fn give(&self, stream: std::net::TcpStream, peer: SocketAddr) {
+        let _ = stream.set_nonblocking(true);
+        let n = self.inboxes.len();
+        let free = |b: &Busy| {
+            let since = b.since.load(SeqCst);
+            since == 0 || clock().saturating_sub(since) < TOO_BUSY.as_millis() as u64
+        };
+        let turn = self.turn.load(SeqCst);
+        let to = (0..n).map(|k| (turn + k) % n).find(|i| free(&self.busy[*i])).unwrap_or(turn % n);
+        self.turn.store(to + 1, SeqCst);
+        lock(&self.inboxes[to].conns).push((TcpStream::from_std(stream), peer));
+        let _ = self.inboxes[to].waker.wake();
+    }
+
+    pub fn stopping(&self) -> bool {
+        STOPPING.load(SeqCst)
+    }
+}
+
+/// Connections on a Unix socket (`--listen unix:PATH`), each given on as it is taken
+/// (FEEDBACK41.md, Q-479; branch feedback40-43).
+#[cfg(unix)]
+pub fn unix_connections(listener: std::os::unix::net::UnixListener) -> Box<dyn FnOnce(Hand) + Send> {
+    Box::new(move |hand: Hand| {
+        use std::os::fd::AsRawFd;
+        let local: SocketAddr = ([127, 0, 0, 1], 0).into();
+        // Waited on a tenth of a second at a time, so that once the server stops the listener
+        // goes at once, as a TCP one does: a server started meanwhile finds the socket free
+        // rather than handing its connections to one that is leaving.
+        let mut fds = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        while !hand.stopping() {
+            // SAFETY: one live pollfd, for the listener's descriptor, which `listener` keeps open.
+            let ready = unsafe { libc::poll(&mut fds, 1, 100) };
+            if ready <= 0 {
+                continue;
+            }
+            match listener.accept() {
+                Ok((s, _)) => hand.give(local_as_tcp(s), local),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => {
+                    log(format!("quillo: cannot accept a connection: {}\n", e));
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    })
+}
+
+/// A local socket's descriptor, as the `TcpStream` the server reads and writes.
+#[cfg(unix)]
+pub fn local_as_tcp(s: std::os::unix::net::UnixStream) -> std::net::TcpStream {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // SAFETY: the descriptor is given up by `s`; reads, writes, shutting down and timeouts are
+    // the same calls on a local socket as on a TCP one (as src/embed.rs does).
+    unsafe { std::net::TcpStream::from_raw_fd(s.into_raw_fd()) }
 }
 
 /// Stops the server gracefully (see `STOPPING`).
@@ -503,8 +584,32 @@ impl Pool {
             let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || {
                 pool.work()
             });
-            if started.is_err() {
-                self.threads.fetch_sub(1, SeqCst);
+            if let Err(e) = started {
+                let left = self.threads.fetch_sub(1, SeqCst) - 1;
+                // Said once (FEEDBACK41.md, Q-480; branch feedback40-43). With no thread at all,
+                // tried again a little later, a few times: another process may have ended. Not
+                // run here: the loop would wait with it, and every connection with the loop.
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, SeqCst) {
+                    eprintln!("quillo: cannot start a thread for waiting work ({}; the account's process limit?); requests wait for the {} threads there are", e, left);
+                }
+                // Tried again at most once a second, so the loop does not wait each time.
+                static TRIED: AtomicU64 = AtomicU64::new(0);
+                let now = clock();
+                if left == 0 && now.saturating_sub(TRIED.swap(now, SeqCst)) >= 1000 {
+                    for wait in [5, 20, 75] {
+                        std::thread::sleep(Duration::from_millis(wait));
+                        if self.threads.fetch_add(1, SeqCst) >= self.max {
+                            self.threads.fetch_sub(1, SeqCst);
+                            break;
+                        }
+                        let pool = self.clone();
+                        if std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work()).is_ok() {
+                            break;
+                        }
+                        self.threads.fetch_sub(1, SeqCst);
+                    }
+                }
             }
         } else {
             self.threads.fetch_sub(1, SeqCst);
@@ -595,6 +700,11 @@ pub fn serve(app: Arc<App>, listener: std::net::TcpListener, max_waiting: usize)
 /// own, on a thread of its own. The first accepts the connections and
 /// hands them to each in turn. Does not return.
 pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max_waiting: usize) -> Result<(), String> {
+    serve_on(apps, Listener::Tcp(listener), max_waiting)
+}
+
+/// `serve_instances`, with connections from `listener`.
+pub fn serve_on(apps: Vec<Arc<App>>, listener: Listener, max_waiting: usize) -> Result<(), String> {
     let mut polls = Vec::new();
     let mut inboxes = Vec::new();
     for _ in &apps {
@@ -626,17 +736,26 @@ pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max
                 .map_err(|e| format!("cannot start an instance: {}", e))?,
         );
     }
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let own = inboxes[0].clone();
     let first_busy = busy[0].clone();
-    let listener = if inboxes.len() > 1 {
-        let (taken, all) = (busy, inboxes);
-        std::thread::Builder::new().name("quillo-accept".into()).spawn(move || take_connections(listener, all, taken)).map_err(|e| e.to_string())?;
-        None
-    } else {
-        let mut listener = TcpListener::from_std(listener);
-        first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
-        Some(listener)
+    let listener = match listener {
+        Listener::Tcp(listener) => {
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            if inboxes.len() > 1 {
+                let (taken, all) = (busy, inboxes);
+                std::thread::Builder::new().name("quillo-accept".into()).spawn(move || take_connections(listener, all, taken)).map_err(|e| e.to_string())?;
+                None
+            } else {
+                let mut listener = TcpListener::from_std(listener);
+                first_poll.registry().register(&mut listener, LISTENER, Interest::READABLE).map_err(|e| e.to_string())?;
+                Some(listener)
+            }
+        }
+        Listener::Other(take) => {
+            let hand = Hand { inboxes, busy, turn: Arc::new(AtomicUsize::new(0)) };
+            std::thread::Builder::new().name("quillo-accept".into()).spawn(move || take(hand)).map_err(|e| e.to_string())?;
+            None
+        }
     };
     let r = run_loop(first_app, first_poll, listener, own, first_busy, max_waiting);
     // Stopping: the other instances finish their requests too.
@@ -1511,6 +1630,11 @@ pub const PROXIED: &str = "x-quillo-from-trusted-proxy";
 /// client is the connection's peer, as anyone can send that header (FEEDBACK24.md,
 /// Q-189; branch feedback24-fixes).
 static TRUSTED: std::sync::OnceLock<Vec<(std::net::IpAddr, u32)>> = std::sync::OnceLock::new();
+
+/// Whether `--trust-proxy` named any.
+pub fn trusts_proxies() -> bool {
+    TRUSTED.get().is_some()
+}
 
 /// Takes `10.0.0.0/8,127.0.0.1`; false if a part of it is neither.
 pub fn trust_proxies(list: &str) -> bool {

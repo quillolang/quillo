@@ -132,8 +132,12 @@ pub fn effect_names(mask: u8) -> Vec<&'static str> {
 /// The effect a builtin needs, by its name; 0 for pure builtins.
 pub fn builtin_effect(name: &str) -> u8 {
     // Reads an error value it is given; asks the database nothing.
-    if name == "db.error_kind" {
+    if name == "db.error_kind" || name == "db.sql_name" {
         return 0;
+    }
+    // A `.qwer` function: what its file declares (FEEDBACK43.md, Q-489; branch feedback40-43).
+    if name.starts_with("native:") {
+        return crate::native::effects_of(name);
     }
     let e = if name.starts_with("db.") || name == "idempotent" || name == "later.status" {
         "db"
@@ -141,11 +145,13 @@ pub fn builtin_effect(name: &str) -> u8 {
         "http"
     } else {
         match name {
-            "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" => "fs",
+            // `save_upload` writes a file (FEEDBACK41.md, Q-476; branch feedback40-43).
+            "file" | "read_file" | "write_file" | "delete_file" | "check_program" | "image.info" | "image.convert" | "save_upload" | "files" => "fs",
             "env" | "args" | "stdin" | "read_line" | "exit" => "env",
             "now" | "sleep" | "date.today" | "date.now" => "time",
             "random" | "random_int" | "uuid" | "crypto.token" | "crypto.hash_password" => "random",
-            "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => "net",
+            // Listening is net too: a port opened (FEEDBACK41.md, Q-478; branch feedback40-43).
+            "udp.send" | "udp.reply" | "udp.listen" | "media.rtp" | "channel.send" | "channel.broadcast" => "net",
             _ => return 0,
         }
     };

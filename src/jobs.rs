@@ -405,6 +405,28 @@ pub fn local() -> bool {
     LOCAL.get().is_some()
 }
 
+/// The Unix socket this process's server listens on, when it listens on one (`--listen unix:`).
+static UNIX_SELF: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn listening_at(path: &std::path::Path) {
+    let _ = UNIX_SELF.set(path.to_path_buf());
+}
+
+/// Whether this process's server listens on a Unix socket.
+pub fn on_unix_socket() -> bool {
+    UNIX_SELF.get().is_some()
+}
+
+/// A connection to this process's own server: its Unix socket when it has one, else `addr`
+/// (FEEDBACK41.md, Q-479; branch feedback40-43).
+pub fn dial(addr: std::net::SocketAddr, timeout: std::time::Duration) -> std::io::Result<std::net::TcpStream> {
+    #[cfg(unix)]
+    if let Some(p) = UNIX_SELF.get() {
+        return Ok(crate::httpd::local_as_tcp(std::os::unix::net::UnixStream::connect(p)?));
+    }
+    std::net::TcpStream::connect_timeout(&addr, timeout)
+}
+
 /// A POST to this process's own server, with the token only it has: its status and body.
 pub fn post_self(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
     use std::io::{Read, Write};
@@ -419,7 +441,7 @@ pub fn post_self(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> std::io
         let r = f(req);
         return Ok((r.status, r.body));
     }
-    let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
+    let mut s = dial(addr, std::time::Duration::from_secs(5))?;
     write!(
         s,
         "POST {} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

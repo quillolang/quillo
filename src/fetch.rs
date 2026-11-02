@@ -330,7 +330,9 @@ fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
     }
     let b = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .redirects(o.redirects)
+        // Under a policy that limits where it goes, each redirect is followed here, its address
+        // judged (see `follow`), not by the client, which would go anywhere.
+        .redirects(if crate::policy::get().limits_http() { 0 } else { o.redirects })
         // `Authorization` goes on to the same host, as `fetch` keeps it for the same origin: an
         // API that adds a `/` by a redirect answered 401 (FEEDBACK36.md, Q-437; branch
         // feedback36-39).
@@ -338,7 +340,10 @@ fn agent(o: Opts, stream: bool, url: &str) -> Result<ureq::Agent, String> {
         .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")));
     let b = if stream { b.timeout_read(Duration::from_secs(300)) } else { b.timeout(Duration::from_secs(60)) };
     // Through a proxy, the proxy looks the name up: `public_only` checks it before the call.
-    let b = if o.public_only && proxy.is_none() { b.resolver(resolve_public) } else { b };
+    // Under a policy with `private = false` too: the name is judged as it is looked up to
+    // connect, not only before, which a name that changes its answer would get past
+    // (FEEDBACK41.md, Q-478; branch feedback40-43).
+    let b = if (o.public_only || !crate::policy::get().private) && proxy.is_none() { b.resolver(resolve_public) } else { b };
     let b = match &proxy {
         Some(p) => b.proxy(ureq::Proxy::new(p).map_err(|e| format!("the proxy in the environment, {}: {}", p, e))?),
         None => b,
@@ -400,9 +405,23 @@ fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, St
     let mut url = url.to_string();
     let mut headers = headers.to_vec();
     let mut hops = 0;
+    let (mut method, mut body) = (method.to_string(), body);
+    let policed = crate::policy::get().limits_http();
     loop {
-        let resp = call(o, stream, method, &url, &headers, body.as_ref())?;
-        let again = matches!(resp.status(), 307 | 308) && !matches!(method, "GET" | "HEAD") && o.redirects > 0;
+        // Each address, the first and each one it is sent on to (FEEDBACK41.md, Q-478; branch
+        // feedback40-43).
+        crate::policy::get().http(&url)?;
+        let resp = call(o, stream, &method, &url, &headers, body.as_ref())?;
+        let status = resp.status();
+        let again = o.redirects > 0
+            && (matches!(status, 307 | 308) && !matches!(method.as_str(), "GET" | "HEAD") || policed && matches!(status, 301 | 302 | 303 | 307 | 308));
+        // As the client does when it follows them: a 301, 302 or 303 after anything but a GET
+        // or a HEAD is a GET with no body.
+        if again && matches!(status, 301 | 302 | 303) && !matches!(method.as_str(), "GET" | "HEAD") {
+            method = "GET".into();
+            body = None;
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type") && !k.eq_ignore_ascii_case("content-length"));
+        }
         let next = if again { resp.header("location").and_then(|l| join_url(&url, l)) } else { None };
         let Some(next) = next else { return Ok((url, resp)) };
         hops += 1;

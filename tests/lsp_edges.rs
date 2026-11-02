@@ -242,7 +242,7 @@ fn every_use_line_is_read() {
     assert!(all.contains("get(str) -> str | null") && all.contains("put(str, str) -> bool"), "{}", all);
     // Under another name, a function goes by that name.
     let one = s.hover(&uri, 3, 12);
-    assert!(one.starts_with("```quillo\nread(str) -> str | null\n```\nReads a key.\n"), "{}", one);
+    assert!(one.starts_with("```quillo\nread(str) -> str | null  (effects: not declared)\n```\nReads a key.\n"), "{}", one);
     assert!(one.ends_with("*From kv.qwer, called `read` here.*"), "{}", one);
     let taken = s.hover(&uri, 3, 22);
     assert!(taken.contains("`kv.qwer`: Rust, the functions taken") && taken.contains("read(str) -> str | null") && !taken.contains("put("), "{}", taken);

@@ -145,6 +145,28 @@ pub struct Live {
     /// feedback24-fixes).
     groups: HashMap<String, (Arc<Group>, usize)>,
     by_topic: HashMap<String, Vec<Arc<Group>>>,
+    /// Topics ending in `:*` published lately (`db:*`, a switched database), with when.
+    wilds: Vec<(String, u64, Instant)>,
+}
+
+/// How long a wildcard is kept as one (see `wilds_expire`).
+const WILD_FOR: Duration = Duration::from_secs(60);
+
+/// `db:*`, `app|db@x:*`, and `*@db:*` for every tenant's.
+pub fn is_wildcard(t: &str) -> bool {
+    t.ends_with(":*")
+}
+
+/// Whether `topic` is under wildcard `pattern`: what precedes its `*`, and with `*@` in it, any
+/// one tenant's name there (FEEDBACK43.md, Q-490; branch feedback40-43).
+pub fn under(pattern: &str, topic: &str) -> bool {
+    let p = pattern.strip_suffix('*').unwrap_or(pattern);
+    match p.split_once("*@") {
+        Some((pre, post)) => topic.strip_prefix(pre).and_then(|rest| rest.split_once('@')).is_some_and(|(tenant, after)| {
+            !tenant.is_empty() && !tenant.contains('|') && after.starts_with(post)
+        }),
+        None => topic.starts_with(p) && topic != pattern,
+    }
 }
 
 /// Pages waiting on the same topics.
@@ -160,7 +182,28 @@ const MOST_TOPICS: usize = 1 << 16;
 
 impl Live {
     fn changed_after(&self, topic: &str, since: u64) -> bool {
-        self.versions.get(topic).map_or(self.floor > since, |v| *v > since)
+        if self.versions.get(topic).map_or(self.floor > since, |v| *v > since) {
+            return true;
+        }
+        // `db:*` changed: so did `db:notes` (Q-490).
+        self.wilds.iter().any(|(p, at, _)| *at > since && under(p, topic))
+    }
+
+    /// Wildcards a minute old are let go: the topics under them count as changed at the floor
+    /// from then on, as forgotten topics do, so a page that last asked before one still hears it.
+    fn wilds_expire(&mut self) {
+        if self.wilds.is_empty() {
+            return;
+        }
+        let old: Vec<(String, u64)> = self.wilds.iter().filter(|(_, _, t)| t.elapsed() >= WILD_FOR).map(|(p, s, _)| (p.clone(), *s)).collect();
+        if old.is_empty() {
+            return;
+        }
+        self.wilds.retain(|(_, _, t)| t.elapsed() < WILD_FOR);
+        for (p, s) in old {
+            self.versions.retain(|k, _| !under(&p, k));
+            self.floor = self.floor.max(s);
+        }
     }
 
     /// The groups following `topics`, to wake once the lock is let go.
@@ -194,7 +237,7 @@ impl Default for Live {
     /// The count starts at 1: a page that saw 1 knows the state at 1, while
     /// 0 means "I know nothing yet" (asking returns the current count).
     fn default() -> Self {
-        Live { seq: 1, versions: HashMap::new(), floor: 0, groups: HashMap::new(), by_topic: HashMap::new() }
+        Live { seq: 1, versions: HashMap::new(), floor: 0, groups: HashMap::new(), by_topic: HashMap::new(), wilds: Vec::new() }
     }
 }
 
@@ -278,14 +321,35 @@ impl Shared {
         if topics.is_empty() {
             return 0;
         }
+        // `db:*`: every topic under `db:`, for a database that was switched. The runs shared
+        // from it are dropped too, as they need not have a topic anyone follows (FEEDBACK43.md,
+        // Q-490; branch feedback40-43).
+        let all: Vec<&str> = topics.iter().map(String::as_str).filter(|t| is_wildcard(t)).collect();
+        if !all.is_empty() {
+            self.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).forget_under(&all);
+        }
         let mut live = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         live.seq += 1;
         let seq = live.seq;
         for t in topics {
             live.versions.insert(t.clone(), seq);
         }
+        live.wilds_expire();
+        for w in &all {
+            live.wilds.retain(|(p, _, _)| p != w);
+            live.wilds.push((w.to_string(), seq, Instant::now()));
+        }
+        // The pages waiting on a topic under it are woken; those that ask later find the
+        // wildcard (see `changed_after`).
+        let mut waking: Vec<&String> = topics.iter().collect();
+        let under: Vec<String> = if all.is_empty() {
+            Vec::new()
+        } else {
+            live.by_topic.keys().filter(|k| all.iter().any(|p| under(p, k))).cloned().collect()
+        };
+        waking.extend(under.iter());
         live.forget();
-        let woken = live.following(&topics.iter().collect::<Vec<_>>());
+        let woken = live.following(&waking);
         drop(live);
         for g in woken {
             g.changed.notify_all();
@@ -444,4 +508,48 @@ pub struct Services {
     /// Being loaded: a service using one being loaded calls it when it is
     /// there, without loading it twice.
     pub loading: Mutex<std::collections::HashSet<String>>,
+}
+
+#[cfg(test)]
+mod wildcard_tests {
+    use super::*;
+
+    // FEEDBACK43.md, Q-490; branch feedback40-43.
+    #[test]
+    fn a_wildcard_names_what_is_under_it() {
+        assert!(under("db:*", "db:notes"));
+        assert!(!under("db:*", "db:*"));
+        assert!(!under("db:*", "acme@db:notes"));
+        assert!(!under("db:*", "db@x:notes"));
+        assert!(under("db@x:*", "db@x:notes"));
+        assert!(under("*@db:*", "acme@db:notes"));
+        assert!(!under("*@db:*", "db:notes"));
+        assert!(!under("*@db:*", "@db:notes"));
+        assert!(!under("*@db:*", "acme@var:x"));
+        assert!(under("app|db:*", "app|db:notes"));
+        assert!(under("app|*@db:*", "app|acme@db:notes"));
+        assert!(!under("app|*@db:*", "other|acme@db:notes"));
+        assert!(!under("*@db:*", "a|acme@db:notes"));
+        assert!(is_wildcard("db:*") && !is_wildcard("db:notes") && !is_wildcard("*"));
+    }
+
+    #[test]
+    fn a_wildcard_let_go_still_counts_for_pages_that_asked_before_it() {
+        let mut live = Live::default();
+        live.versions.insert("db:notes".into(), 2);
+        live.versions.insert("var:x".into(), 2);
+        live.seq = 5;
+        let long_ago = Instant::now().checked_sub(WILD_FOR + Duration::from_secs(1)).unwrap();
+        live.wilds.push(("db:*".into(), 5, long_ago));
+        assert!(live.changed_after("db:notes", 3));
+        live.wilds_expire();
+        assert!(live.wilds.is_empty(), "let go");
+        assert!(live.changed_after("db:notes", 3), "a page from before it still hears it");
+        assert!(!live.changed_after("db:notes", 5), "one from after it does not");
+        assert!(!live.changed_after("var:x", 3), "what is not under it is as it was");
+        // One still fresh is kept.
+        live.wilds.push(("db:*".into(), 6, Instant::now()));
+        live.wilds_expire();
+        assert_eq!(live.wilds.len(), 1);
+    }
 }

@@ -183,6 +183,14 @@ impl LiveCache {
         runs.push(Run { viewer, seq, topics, at: Instant::now(), answer });
     }
 
+    /// Drops the shared runs that read a topic under one of `wildcards` (`db:*`).
+    pub fn forget_under(&mut self, wildcards: &[&str]) {
+        self.runs.retain(|_, rs| {
+            rs.retain(|r| !r.topics.iter().any(|t| wildcards.iter().any(|w| crate::shared::under(w, t))));
+            !rs.is_empty()
+        });
+    }
+
     /// Keeps a value a page now has, by its hash, for patches against it.
     pub fn keep(&mut self, h: u64, text: &Arc<str>) {
         if let Some(k) = self.values.get_mut(&h) {

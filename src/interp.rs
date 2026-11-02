@@ -1161,7 +1161,7 @@ impl Interp {
             cur_file: None,
             caller_file: None,
             fuel: u64::MAX,
-            allowed: ALL_EFFECTS,
+            allowed: crate::policy::ceiling(),
             script: None,
             restrictor: None,
             server_fns: Arc::new(Vec::new()),
@@ -1261,7 +1261,7 @@ impl Interp {
             cur_file: None,
             caller_file: None,
             fuel: u64::MAX,
-            allowed: ALL_EFFECTS,
+            allowed: crate::policy::ceiling(),
             script: None,
             restrictor: None,
             server_fns: self.server_fns.clone(),
@@ -1368,8 +1368,15 @@ impl Interp {
         let raw = topics.clone();
         let topics: Vec<String> = topics.into_iter().map(|t| self.scope_topic(t)).collect();
         if self.tx_depth > 0 {
-            self.pending.extend(topics);
-            self.pending_raw.extend(raw);
+            // Once each: 100,000 inserts in a transaction are one change to their table, not
+            // 100,000 to announce when it commits. The two lists stay the same length, as a
+            // rollback cuts both at one place.
+            for (t, r) in topics.into_iter().zip(raw) {
+                if !self.pending.iter().rev().take(64).any(|p| *p == t) {
+                    self.pending.push(t);
+                    self.pending_raw.push(r);
+                }
+            }
         } else {
             let seq = self.shared.publish(&topics);
             if self.reads.is_some() {
@@ -3439,6 +3446,7 @@ impl Interp {
                 f.name,
                 f.effects.as_deref().unwrap_or_default().join(", ")
             ),
+            None if crate::policy::ceiling() != ALL_EFFECTS => format!("`{}` needs {}, which {} does not allow", what, need, crate::policy::get().effects_source()),
             None => format!("`{}` needs {}, which is not allowed here", what, need),
         }
     }
@@ -3476,6 +3484,9 @@ impl Interp {
     fn check_builtin_effect(&self, name: &str, line: u32) -> Result<(), Ctrl> {
         let need = builtin_effect(name);
         if need & !self.allowed != 0 {
+            if need == ALL_EFFECTS && name.starts_with("native:") {
+                return fail(line, crate::native::undeclared(crate::native::display_name(name), self.restrictor.as_ref().map(|f| f.name.as_str())));
+            }
             return fail(line, self.effect_denied(name, need));
         }
         Ok(())

@@ -63,6 +63,9 @@ pub struct Export {
     pub line: u32,
     /// Its `///` comment.
     pub doc: String,
+    /// What it may do, from the file's `//! effects:` line: every effect when the file
+    /// declares none (FEEDBACK41.md, Q-476; FEEDBACK43.md, Q-489; branch feedback40-43).
+    pub effects: u8,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +75,8 @@ pub struct Parsed {
     pub exports: Vec<Export>,
     /// What cannot be exported, by line.
     pub problems: Vec<(u32, String)>,
+    /// `//! effects: db, http` (or `none`): what its functions may do; `None` when not said.
+    pub effects: Option<u8>,
 }
 
 /// Reads a `.qwer` file's header and its top-level `pub fn`s.
@@ -79,9 +84,23 @@ pub fn parse(src: &str) -> Parsed {
     let mut out = Parsed::default();
     // The header: `//!` lines at the top, from `[dependencies]` on.
     let mut in_deps = false;
-    for line in src.lines() {
+    for (n, line) in src.lines().enumerate() {
         let Some(rest) = line.trim_start().strip_prefix("//!") else { break };
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        if let Some(list) = rest.trim().strip_prefix("effects:") {
+            let mut mask = 0;
+            for e in list.split(',').map(str::trim).filter(|e| !e.is_empty() && *e != "none") {
+                // `db.analytics`: a database by its alias is the db effect.
+                let base = e.split('.').next().unwrap_or(e);
+                match crate::ast::effect_bit(base) {
+                    0 => out.problems.push((n as u32 + 1, format!("`{}` is not an effect (they are {}, or none)", e, crate::ast::EFFECTS.join(", ")))),
+                    b => mask |= b,
+                }
+            }
+            out.effects = Some(mask);
+            in_deps = false;
+            continue;
+        }
         if rest.trim().starts_with('[') {
             in_deps = rest.trim() == "[dependencies]";
             continue;
@@ -166,7 +185,7 @@ pub fn parse(src: &str) -> Parsed {
         let bad = e.params.iter().map(|(_, t)| t.as_str()).chain(e.ret.as_deref()).find_map(|t| quillo_type(t).err());
         match bad {
             Some(msg) => out.problems.push((e.line, format!("`{}` is not exported: {}", e.name, msg))),
-            None => keep.push(e),
+            None => keep.push(Export { effects: out.effects.unwrap_or(crate::ast::ALL_EFFECTS), ..e }),
         }
     }
     out.exports = keep;
@@ -256,7 +275,7 @@ fn item(src: &str, from: usize, _line: u32) -> Option<(Result<Export, String>, u
         params.push((pat, norm(ty)));
     }
     let ret = sig[close + 1..].trim().strip_prefix("->").map(norm).filter(|t| t != "()");
-    Some((Ok(Export { name, params, ret, line: 0, doc: String::new() }), end))
+    Some((Ok(Export { name, params, ret, line: 0, doc: String::new(), effects: crate::ast::ALL_EFFECTS }), end))
 }
 
 /// Where the block opening at `open` ends (past its `}`).
@@ -830,16 +849,102 @@ fn lib_path(qwer: &Path, src: &str) -> PathBuf {
 /// One build at a time in this process (instances load the same files).
 static BUILDING: Mutex<()> = Mutex::new(());
 
+/// `--no-build`: libraries are loaded as built, never built here, so no crate's build script
+/// runs on the server (FEEDBACK41.md, Q-477; branch feedback40-43).
+pub static NO_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn no_build() -> bool {
+    NO_BUILD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// `quillo build`: a library in a folder with no lock is built again, so that the lock it writes
+// names what was built, not what was found there.
+thread_local! {
+    static REBUILD_UNLOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `.quillo/plugins.lock`, beside `.quillo/native/`: each library's name and SHA-256, written as
+/// it is built. A library is loaded only if it is the one built, not merely named like it.
+fn lock_file(lib: &Path) -> PathBuf {
+    lib.parent().and_then(Path::parent).unwrap_or(Path::new(".")).join("plugins.lock")
+}
+
+fn file_hash(p: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(p).map_err(|e| format!("cannot read {}: {}", p.display(), e))?;
+    Ok(crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)))
+}
+
+fn lib_name(lib: &Path) -> String {
+    lib.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Why `lib` is not the library its lock says was built, if it is not.
+fn not_as_built(lib: &Path) -> Option<String> {
+    let name = lib_name(lib);
+    let lock = std::fs::read_to_string(lock_file(lib)).unwrap_or_default();
+    let Some(want) = lock.lines().find_map(|l| l.strip_prefix(&format!("{} ", name))) else {
+        return Some(format!("{} has no line in .quillo/plugins.lock", name));
+    };
+    match file_hash(lib) {
+        Ok(h) if h == want.trim() => None,
+        Ok(_) => Some(format!("{} is not the library that was built (its SHA-256 differs from .quillo/plugins.lock's)", name)),
+        Err(e) => Some(e),
+    }
+}
+
+/// Whether the folder has a lock at all: one built before there were locks has none, and its
+/// libraries load as they did, with a warning, unless `--no-build` says to load only what a lock
+/// names.
+fn has_lock(lib: &Path) -> bool {
+    lock_file(lib).is_file()
+}
+
+/// One process at a time changes a folder's lock (`--split` starts several that build).
+#[cfg(unix)]
+fn lock_guard(lock: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock.with_extension("lock.guard")).ok()?;
+    // SAFETY: a descriptor of an open file, held for as long as the lock is.
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+}
+
+#[cfg(not(unix))]
+fn lock_guard(_: &Path) -> Option<()> {
+    Some(())
+}
+
+/// Puts `lib`'s line in the lock, in place of those of the same file's earlier libraries.
+fn lock_built(lib: &Path, stem: &str) -> Result<(), String> {
+    let hash = file_hash(lib)?;
+    let path = lock_file(lib);
+    let _guard = lock_guard(&path);
+    let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, stem);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with(&prefix) && !l.trim().is_empty()).map(String::from).collect();
+    lines.push(format!("{} {}", lib_name(lib), hash));
+    lines.sort();
+    let tmp = path.with_extension(format!("lock.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| format!("cannot write {}: {}", path.display(), e))
+}
+
 /// Every Rust file `files` names whose library is not built yet, built in one cargo call over a
 /// workspace, so that cargo builds them side by side, where each `use` built its own one after
 /// another (FEEDBACK37.md, Q-454; branch feedback36-39). Each member is the file's crate with a
 /// manifest of its own in the workspace (a crate's own is a workspace by itself). What fails
 /// here is built again, alone, by its `use`, which says why.
 pub fn prebuild(files: &[PathBuf]) {
+    if no_build() {
+        return;
+    }
     let mut todo = Vec::new();
     for f in files {
+        // What the policy refuses is not built: cargo would run its build scripts first.
+        if plugin_allowed(f).is_err() {
+            continue;
+        }
         let Ok(src) = std::fs::read_to_string(f) else { continue };
-        if !lib_path(f, &src).is_file() {
+        let lib = lib_path(f, &src);
+        if !lib.is_file() || (has_lock(&lib) && not_as_built(&lib).is_some()) {
             todo.push((f.clone(), src));
         }
     }
@@ -901,6 +1006,7 @@ fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<
     let tmp = lib.with_extension("tmp");
     std::fs::copy(&built, &tmp).map_err(|e| format!("cannot copy {}: {}", built.display(), e))?;
     std::fs::rename(&tmp, lib).map_err(|e| e.to_string())?;
+    lock_built(lib, &name)?;
     // Libraries of this file's earlier contents go (those loaded stay loaded).
     if let Ok(rd) = std::fs::read_dir(out_dir) {
         let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, name);
@@ -920,12 +1026,36 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     let parsed = parse(&src);
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let lib = lib_path(qwer, &src);
-    if lib.is_file() {
+    // Built, and the library that was built: loaded (Q-477).
+    let as_built = |lib: &Path| -> Result<bool, String> {
+        if !lib.is_file() {
+            return Ok(false);
+        }
+        if !has_lock(lib) && !no_build() && !REBUILD_UNLOCKED.with(|r| r.get()) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("quillo: .quillo/plugins.lock is not there, so the libraries in .quillo/native are loaded unchecked, as before; `quillo build` writes it");
+            }
+            return Ok(true);
+        }
+        match not_as_built(lib) {
+            None => Ok(true),
+            Some(why) if no_build() => Err(format!("will not load the library of {}: {}; build it with `quillo build`, which writes the lock, and bring .quillo along", qwer.display(), why)),
+            Some(why) => {
+                eprintln!("quillo: {}: building it again", why);
+                Ok(false)
+            }
+        }
+    };
+    if as_built(&lib)? {
         return Ok((lib, parsed));
     }
     let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if lib.is_file() {
+    if as_built(&lib)? {
         return Ok((lib, parsed));
+    }
+    if no_build() {
+        return Err(format!("{} is not built, and --no-build says not to build it here: build it with `quillo build` and bring .quillo along", qwer.display()));
     }
     let (crate_name, dir) = prepare(&abs, &parsed)?;
     let target = cache_dir().join("target");
@@ -974,6 +1104,12 @@ struct Function {
     name: String,
     file: String,
     params: Vec<String>,
+    effects: u8,
+}
+
+/// What a `.qwer` function may do, by its builtin name: every effect when its file says nothing.
+pub fn effects_of(name: &str) -> u8 {
+    functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map_or(crate::ast::ALL_EFFECTS, |f| f.effects)
 }
 
 fn functions() -> &'static Mutex<HashMap<&'static str, Arc<Function>>> {
@@ -1008,9 +1144,21 @@ fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
     }
 }
 
+/// Why the policy refuses plugin `qwer`, named by its file and its `//! version:`, if it does.
+pub fn plugin_allowed(qwer: &Path) -> Result<(), String> {
+    let p = crate::policy::get();
+    if p.plugins.is_empty() {
+        return Ok(());
+    }
+    let version = std::fs::read_to_string(qwer).ok().and_then(|t| crate::install::header_version(&t));
+    p.plugin(&stem(qwer), version.as_deref())
+}
+
 /// `use "x.qwer"`: builds and loads it, and defines its functions.
 pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>, line: u32) -> Result<(), Ctrl> {
     let path = qwer.to_path_buf();
+    // A plugin the policy names, at a version it names (FEEDBACK41.md, Q-478; branch feedback40-43).
+    plugin_allowed(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     // A build takes seconds: other requests go on meanwhile (on a reload,
     // with the version that runs now).
     let built = it.unlocked(move || build(&path));
@@ -1037,7 +1185,7 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         // a version loaded later has names of its own.
         let key: &'static str = Box::leak(format!("native:{}:{}", lib_path.display(), e.name).into_boxed_str());
         functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_insert_with(|| {
-            Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone(), params: e.params.iter().map(|(n, _)| n.clone()).collect() })
+            Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone(), params: e.params.iter().map(|(n, _)| n.clone()).collect(), effects: e.effects })
         });
         for n in names {
             define(&it.globals, n, Value::Builtin(key, call_placeholder));
@@ -1164,12 +1312,25 @@ fn too_large(v: &serde_json::Value, at: String) -> Option<(String, String)> {
 }
 
 /// What a `native:` builtin is called, for messages: its function's name.
+/// Why a `.qwer` function whose file declares no effects is refused inside a `with`.
+pub fn undeclared(name: &str, within: Option<&str>) -> String {
+    let at = within.map_or("here".to_string(), |f| format!("in `{}`, whose `with` limits what it may do", f));
+    format!("`{}` is Rust whose file does not say what it does, so it may do anything and is refused {}: put `//! effects: ...` (or `//! effects: none`) at the top of its .qwer file", name, at)
+}
+
 pub fn display_name(key: &str) -> &str {
     key.rsplit(':').next().unwrap_or(key)
 }
 
 /// `quillo build`: every `.qwer` file a program uses, built now.
 pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
+    REBUILD_UNLOCKED.with(|r| r.set(true));
+    let built = build_all_now(main);
+    REBUILD_UNLOCKED.with(|r| r.set(false));
+    built
+}
+
+fn build_all_now(main: &Path) -> Result<Vec<PathBuf>, String> {
     let files = rust_files(main)?;
     prebuild(&files);
     files.iter().map(|f| build(f).map(|(l, _)| l)).collect()

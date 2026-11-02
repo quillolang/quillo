@@ -2666,8 +2666,31 @@ fn take_descriptors() {
     }
 }
 
+/// On Linux a process limit counts threads, for the whole account on a shared server (CloudLinux's
+/// NPROC): a limit that leaves less than the server's own threads is said at start (FEEDBACK41.md,
+/// Q-480; branch feedback40-43).
+#[cfg(unix)]
+fn threads_allowed(workers: usize) {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `r` is a live rlimit for the call to write.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut r) } != 0 || r.rlim_cur == libc::RLIM_INFINITY {
+        return;
+    }
+    // Its event loop, the watch, accept and job threads, and a wait thread for each worker.
+    let needs = workers + 1 + 8;
+    if (r.rlim_cur as usize) < needs {
+        eprintln!(
+            "quillo: the process limit (ulimit -u) is {}, and this server may use {} threads: requests may wait for a thread; raise it, or give --workers fewer",
+            r.rlim_cur, needs
+        );
+    }
+}
+
 #[cfg(not(unix))]
 fn take_descriptors() {}
+
+#[cfg(not(unix))]
+fn threads_allowed(_: usize) {}
 
 pub fn serve(app: App, addr: &str, workers: usize) -> Result<(), String> {
     serve_with(app, addr, workers, |_| {})
@@ -2682,11 +2705,126 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     if let Some(b) = bound {
         crate::platform::set_listening(&b.ip().to_string(), b.port());
     }
-    let shown = bound.map_or_else(|| addr.to_string(), |a| a.to_string());
+    let shown = format!("http://{}", bound.map_or_else(|| addr.to_string(), |a| a.to_string()));
+    serve_from(app, crate::httpd::Listener::Tcp(listener), bound, &shown, workers, listening)
+}
+
+/// `serve` on a Unix socket at `path`, made for this process's user alone (`mode`, 0600 unless
+/// said), and gone when the server stops: on a shared server a TCP port on 127.0.0.1 is every
+/// account's, a socket in a folder of one's own is not (FEEDBACK41.md, Q-479; branch
+/// feedback40-43).
+#[cfg(unix)]
+pub fn serve_unix(app: App, path: &Path, mode: u32, workers: usize) -> Result<(), String> {
+    take_descriptors();
+    let listener = unix_listener(path, mode)?;
+    let mine = file_id(path);
+    crate::jobs::listening_at(path);
+    let shown = format!("unix:{}", path.display());
+    // Its jobs and own calls reach it through the socket; the address stands for it.
+    let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+    let r = serve_from(app, crate::httpd::Listener::Other(crate::httpd::unix_connections(listener)), Some(stand_in), &shown, workers, |_| {});
+    remove_if_mine(path, mine);
+    r
+}
+
+/// The device and inode of `path`: which file it is, whatever its name.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Removes the socket this server made, and not one a server started since has made there.
+#[cfg(unix)]
+fn remove_if_mine(path: &Path, mine: Option<(u64, u64)>) {
+    if mine.is_some() && file_id(path) == mine {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A FastCGI socket at `path`, for `quillo fcgi --listen unix:PATH`.
+#[cfg(unix)]
+pub fn fcgi_unix(path: &Path, mode: u32) -> Result<crate::fcgi::Source, String> {
+    unix_listener(path, mode).map(crate::fcgi::Source::Unix)
+}
+
+/// `quillo fcgi`: the program behind a FastCGI process manager. It answers no HTTP of its own;
+/// its jobs and its own calls reach it through a socket only this process knows of.
+#[cfg(unix)]
+pub fn serve_fcgi(app: App, source: crate::fcgi::Source, made: Option<&Path>, workers: usize) -> Result<(), String> {
+    take_descriptors();
+    let shown = match &source {
+        crate::fcgi::Source::Unix(_) => format!("FastCGI{}", made.map_or(String::new(), |p| format!(" at unix:{}", p.display()))),
+        crate::fcgi::Source::Tcp(l) => format!("FastCGI at {}", l.local_addr().map_or("?".to_string(), |a| a.to_string())),
+    };
+    // Its own calls: a private socket beside its connections, in a folder only it can enter, made
+    // new under a name no one can guess (one already there is someone else's, and refused).
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("quillo-fcgi-{}", crate::service::new_id(16)));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("cannot make the private folder {}: {}", dir.display(), e))?;
+    let own = dir.join("self.sock");
+    let own_listener = unix_listener(&own, 0o600)?;
+    crate::jobs::listening_at(&own);
+    let made_id = made.and_then(file_id);
+    let fcgi = crate::fcgi::connections(source, app.max_body);
+    let selfs = crate::httpd::unix_connections(own_listener);
+    let both: Box<dyn FnOnce(crate::httpd::Hand) + Send> = Box::new(move |hand: crate::httpd::Hand| {
+        let h = hand.clone();
+        let _ = std::thread::Builder::new().name("quillo-accept-self".into()).spawn(move || selfs(h));
+        fcgi(hand);
+    });
+    let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+    let r = serve_from(app, crate::httpd::Listener::Other(both), Some(stand_in), &shown, workers, |_| {});
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(p) = made {
+        remove_if_mine(p, made_id);
+    }
+    r
+}
+
+/// A Unix socket listened on at `path`, with `mode`: one left behind by a server that did not stop
+/// cleanly is taken over; one a server answers on, or a file that is not a socket, is not.
+#[cfg(unix)]
+fn unix_listener(path: &Path, mode: u32) -> Result<std::os::unix::net::UnixListener, String> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    // One left by a server that did not stop cleanly is taken over; one a server answers on is not.
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            return Err(format!("cannot listen on unix:{}: it is there, and not a socket", path.display()));
+        }
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(format!("cannot listen on unix:{}: a server is listening there", path.display()));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    // The system keeps a socket's path in about 100 bytes (`sun_path`).
+    if path.as_os_str().len() > 100 {
+        return Err(format!("cannot listen on unix:{}: a socket's path is at most 100 bytes; use a shorter one, or one relative to here", path.display()));
+    }
+    // Made for its owner alone from the start (then given `mode`): with the process's umask it
+    // would be open to all until the chmod, and a connection made then would be served.
+    // SAFETY: umask sets and gives back the process's mask; nothing else here makes files now.
+    let before = unsafe { libc::umask(0o077) };
+    let bound = std::os::unix::net::UnixListener::bind(path);
+    unsafe { libc::umask(before) };
+    let listener = bound.map_err(|e| format!("cannot listen on unix:{}: {}", path.display(), e))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("cannot set unix:{}'s mode: {}", path.display(), e))?;
+    Ok(listener)
+}
+
+fn serve_from(
+    app: App,
+    listener: crate::httpd::Listener,
+    bound: Option<std::net::SocketAddr>,
+    shown: &str,
+    workers: usize,
+    listening: impl FnOnce(std::net::SocketAddr),
+) -> Result<(), String> {
+    threads_allowed(workers);
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.len();
-        eprintln!("quillo: {} route{} listening on http://{}", n, if n == 1 { "" } else { "s" }, shown);
+        eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
         if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             eprintln!("quillo: database {}", db);
         }
@@ -2719,7 +2857,7 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
         start_builds(&app, a);
         listening(a);
     }
-    crate::httpd::serve(app, listener, workers + 1)
+    crate::httpd::serve_on(vec![app], listener, workers + 1)
 }
 
 /// The paths of the program's `build` declarations (routes whose body is `__built`).
@@ -2747,7 +2885,7 @@ fn start_builds(app: &Arc<App>, addr: std::net::SocketAddr) {
     for p in paths {
         let _ = std::thread::Builder::new().name("quillo-build".into()).spawn(move || {
             use std::io::{Read, Write};
-            if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+            if let Ok(mut s) = crate::jobs::dial(addr, std::time::Duration::from_secs(5)) {
                 let _ = write!(s, "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", p);
                 let _ = s.read_to_end(&mut Vec::new());
             }
@@ -2886,7 +3024,11 @@ fn start_jobs(app: &Arc<App>, addr: std::net::SocketAddr) {
     }
     // Also for a program that listens on no port yet: a reload may add one.
     start_udp(app, addr);
-    crate::wt::serving(addr);
+    // On a Unix socket, no WebTransport: pages could not reach its port. A program inside an app,
+    // with no port either, has channels over the bridge, which need it.
+    if !crate::jobs::on_unix_socket() {
+        crate::wt::serving(addr);
+    }
     // The program's jobs and ticks, and those of the services it runs in its
     // process, as `<service>~<name>` (FEEDBACK12.md, Q-080 and Q-083; branch
     // feedback12-fixes).

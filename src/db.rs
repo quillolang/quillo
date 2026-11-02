@@ -53,6 +53,7 @@ pub fn install(m: &mut Map) {
         ("db.shards", shards),
         ("db.atomic", atomic),
         ("db.error_kind", error_kind),
+        ("db.sql_name", sql_name_on),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -75,15 +76,29 @@ pub fn is_mysql_url(s: &str) -> bool {
 /// Whether the program's database is MySQL (or will be, once opened):
 /// `sql_name` quotes names as it reads them.
 pub(crate) fn program_db_is_mysql(it: &Interp) -> bool {
-    match slot_on(it, None) {
+    is_mysql_on(it, None)
+}
+
+/// Whether the database `on` names (the program's for `None`) is MySQL.
+fn is_mysql_on(it: &Interp, on: Option<usize>) -> bool {
+    match slot_on(it, on) {
         Some(DbSlot::One(b)) => b.is_mysql(),
         Some(DbSlot::PerTenant(t)) => match &t.target {
             Target::Text(s) => is_mysql_url(s),
             Target::Fn(_) => t.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().next().map_or(false, |b| b.is_mysql()),
         },
         Some(DbSlot::Shards(_)) => false,
+        None if on.is_some() => false,
         None => std::env::var("QUILLO_DB").map_or(false, |t| is_mysql_url(&t)),
     }
+}
+
+/// `analytics.sql_name(col)`: a name quoted for the database it is called on, not the
+/// program's: MySQL reads "x" as text (FEEDBACK43.md, Q-492; branch feedback40-43).
+fn sql_name_on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
+    let mysql = is_mysql_on(it, on);
+    crate::builtins::sql_idents(&args, "sql_name", line, |s| if mysql { format!("`{}`", s) } else { format!("\"{}\"", s) })
 }
 
 /// A database on a server (not a SQLite file).
@@ -342,6 +357,18 @@ fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
 fn kind_of(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| m.contains(w));
+    // PostgreSQL's SQLSTATE, in whatever language its words are (Q-493).
+    let sqlstate = m.rsplit_once(" [").and_then(|(_, c)| c.strip_suffix(']')).filter(|c| c.len() == 5);
+    if let Some(code) = sqlstate {
+        match code {
+            "23505" => return Some("unique"),
+            "23503" => return Some("foreign_key"),
+            "23502" => return Some("not_null"),
+            "23514" => return Some("check"),
+            "40001" | "40p01" | "55p03" => return Some("conflict"),
+            _ => {}
+        }
+    }
     // MariaDB's own words, for a failed check (4025) and for a row changed since the
     // snapshot (1020), which a transaction retries on (FEEDBACK16.md, Q-122; branch
     // feedback20-fixes).
@@ -370,6 +397,8 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
     c.execute_batch("pragma foreign_keys = on")?;
     wal(&c)?;
+    // The statements a program makes, compiled once each (see `rows`).
+    c.set_prepared_statement_cache_capacity(64);
     Ok(c)
 }
 
@@ -785,12 +814,21 @@ fn bind(stmt: &mut rusqlite::Statement, params: &[Value]) -> Result<(), String> 
 }
 
 pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    // Compiled once and kept, as a statement made again and again is (a row read by its key per
+    // request, an insert in a loop): faster than Python's sqlite3 there too (branch
+    // feedback40-43).
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
     bind(&mut stmt, params)?;
-    let cols: Vec<(String, Col)> = stmt.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect();
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
+    // Its columns as of its first row: a statement kept from before the table changed is made
+    // again by SQLite as it runs, and its columns before that are the old table's.
+    let mut cols: Option<Vec<(String, Col)>> = None;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let cols = cols.get_or_insert_with(|| {
+            let st: &rusqlite::Statement = row.as_ref();
+            st.columns().iter().map(|c| (c.name().to_string(), col_kind(c.decl_type()))).collect()
+        });
         let mut m = Map::new();
         for (i, (c, kind)) in cols.iter().enumerate() {
             m.insert(c.into(), from_sql(row.get_ref(i).map_err(|e| e.to_string())?, *kind));
@@ -814,7 +852,8 @@ pub(crate) fn announce(it: &mut Interp, sql: &str, on: Option<usize>) {
 /// As `announce`, the writes left out when the statement changed nothing.
 fn announce_as(it: &mut Interp, sql: &str, on: Option<usize>, wrote: bool) {
     let t = crate::sqlinfo::tables_of(sql);
-    let prefix = match on.and_then(|i| it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(l, _)| l.clone())) {
+    let label = on.and_then(|i| it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(l, _)| l.split('#').next().unwrap_or(l).to_string()));
+    let prefix = match label {
         Some(label) => format!("db@{}:", label),
         None => "db:".to_string(),
     };
@@ -1064,7 +1103,16 @@ pub static OPENED: Mutex<Option<String>> = Mutex::new(None);
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match slot_for(it, &args, "db.open", line)? {
         Ok(slot) => {
-            *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
+            let before = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(slot);
+            // Another database: pages showing the old one's rows ask again, and what was shared
+            // from it is not given out (FEEDBACK43.md, Q-490; branch feedback40-43).
+            if before.is_some() {
+                // Every tenant's: the slot is the program's, whichever tenant's request opened it.
+                let base = if it.base.is_empty() { String::new() } else { format!("{}|", it.base) };
+                let topics = vec![format!("{}db:*", base), format!("{}*@db:*", base)];
+                // At once: a transaction rolled back does not undo the switch.
+                it.shared.publish(&topics);
+            }
             if let Some(Value::Str(t)) = args.first() {
                 if !is_server_url(t) && &**t != ":memory:" && !t.contains("{tenant}") {
                     let full = if Path::new(&**t).is_absolute() { Path::new(&**t).to_path_buf() } else { it.base_dir.join(&**t) };
@@ -1084,7 +1132,14 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let label = match args.first() {
         // A label for its live updates' topics, the same on every server (and no secret in it).
-        Some(Value::Str(t)) => crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(t.as_bytes()))[..12].to_string(),
+        Some(Value::Str(t)) => {
+            let hash = |x: &str| crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(x.as_bytes()))[..12].to_string();
+            let topics = hash(&target_label(&it.base_dir, t));
+            // A server's connection is the same one only for the same URL: another user or other
+            // options is another pool, though its tables are the same topics. What follows `#`
+            // is not part of the topics (see `announce_as`).
+            if is_server_url(t) { format!("{}#{}", topics, hash(t)) } else { topics }
+        }
         _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()),
     };
     if matches!(args.first(), Some(Value::Str(_))) {
@@ -1101,6 +1156,36 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(connection(conns.len() - 1))
 }
 
+/// What names a database, whatever the spelling of its target: a SQLite file by its real path
+/// (from the program's folder when inside it, so servers deployed to other folders agree), a
+/// server by its scheme, host, port and database, without the credentials or options, which
+/// change during a rotation (FEEDBACK43.md, Q-491; branch feedback40-43).
+pub fn target_label(base: &Path, t: &str) -> String {
+    if is_server_url(t) {
+        let (scheme, rest) = t.split_once("://").unwrap_or(("", t));
+        let scheme = if scheme == "postgresql" { "postgres" } else { scheme };
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h).to_ascii_lowercase();
+        return format!("{}://{}/{}", scheme, host, path);
+    }
+    if t == ":memory:" || t.contains("{tenant}") {
+        return t.to_string();
+    }
+    let full = if Path::new(t).is_absolute() { Path::new(t).to_path_buf() } else { base.join(t) };
+    // A file not made yet: its folder's real path, and its name.
+    let real = std::fs::canonicalize(&full).ok().or_else(|| {
+        let dir = std::fs::canonicalize(full.parent()?).ok()?;
+        Some(dir.join(full.file_name()?))
+    });
+    let real = real.unwrap_or(full);
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    match real.strip_prefix(&base) {
+        Ok(inside) => inside.display().to_string(),
+        Err(_) => real.display().to_string(),
+    }
+}
+
 /// A connection as programs see it: `db`'s functions, and its number.
 fn connection(i: usize) -> Value {
     let mut m = Map::new();
@@ -1113,6 +1198,7 @@ fn connection(i: usize) -> Value {
         ("db.migrate", migrate),
         ("db.tenants", tenants),
         ("db.tenant_exists", tenant_exists),
+        ("db.sql_name", sql_name_on),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -1186,7 +1272,7 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 if params.is_empty() {
                     c.execute_batch(&sql).map_err(|e| e.to_string())?;
                 } else {
-                    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut stmt = c.prepare_cached(&sql).map_err(|e| e.to_string())?;
                     bind(&mut stmt, &params)?;
                     stmt.raw_execute().map_err(|e| e.to_string())?;
                 }
@@ -2418,6 +2504,17 @@ mod tests {
             ("Server error: `ERROR 40001 (1213): Deadlock found when trying to get lock'", Some("conflict")),
             ("no such table: listings", None),
             ("near \"selct\": syntax error", None),
+            // PostgreSQL in another language: by its SQLSTATE (FEEDBACK43.md, Q-493; branch
+            // feedback40-43).
+            ("doppelter Schlüsselwert verletzt Unique-Constraint »seats_pkey« (Schlüssel »(k)=(1)« existiert bereits.) [23505]", Some("unique")),
+            ("Einfügen oder Aktualisieren in Tabelle »b« verletzt Fremdschlüssel-Constraint »b_a_fkey« [23503]", Some("foreign_key")),
+            ("NULL-Wert in Spalte »email« verletzt Not-Null-Constraint [23502]", Some("not_null")),
+            ("neue Zeile verletzt Check-Constraint »r_check« [23514]", Some("check")),
+            ("konnte Zugriff nicht serialisieren [40001]", Some("conflict")),
+            ("Verklemmung (Deadlock) entdeckt [40P01]", Some("conflict")),
+            ("konnte Sperre nicht setzen [55P03]", Some("conflict")),
+            ("Relation »x« existiert nicht [42P01]", None),
+            ("a value [1, 2] in brackets", None),
         ];
         for (msg, want) in cases {
             assert_eq!(kind_of(msg), want, "{}", msg);

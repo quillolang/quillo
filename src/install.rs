@@ -105,7 +105,7 @@ fn split_name(arg: &str) -> Result<(String, Option<String>), String> {
 }
 
 /// The `//! version: X.Y.Z` line of a plugin's header.
-fn header_version(text: &str) -> Option<String> {
+pub(crate) fn header_version(text: &str) -> Option<String> {
     text.lines()
         .take_while(|l| l.trim_start().starts_with("//!"))
         .find_map(|l| l.trim_start().trim_start_matches("//!").trim().strip_prefix("version:").map(|v| v.trim().to_string()))

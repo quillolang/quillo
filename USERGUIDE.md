@@ -31,6 +31,10 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | Option | |
 |---|---|
 | `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1); the port is 0 to 65535, 0 for any free one (`platform().server.port` says which), and `--host localhost` is 127.0.0.1 |
+| `--listen unix:PATH` | listen on a Unix socket instead of a TCP port, for a web server on the same machine: made with mode 0600, removed when the server stops, and at most 100 bytes long (a short path relative to the folder `quillo` runs in). A `$PORT` that holds an absolute path (`/home/u/app.sock`, or `unix:/home/u/app.sock`) is taken the same way. Not with `--split`, `--instances`, `--register` or `--join` (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
+| `--socket-mode 660` | the socket's permissions, in octal; the owner must keep read and write (`600`, the default, or `660` for a web server in the owner's group) |
+| `--policy FILE` | narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
+| `--no-build` | never build a Rust file here: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
 | `--watch`, `-w` | reload when the program or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
 | `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
 | `--max-compute 2s` | end a request that computes this long without letting go, as a 500 (see Concurrency) |
@@ -92,7 +96,9 @@ files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files ne
 [Files of a program](#files-of-a-program)), `quillo serve <folder>` (a folder of files as
 they are, as a static host serves it; see [Static files](#static-files)), `quillo classes
 <file.qwe>` (the classes the program's markup writes, one a line; see [HTML
-literals](#html-literals)), `quillo repl`, `quillo lsp`, `quillo dap`,
+literals](#html-literals)), `quillo fcgi <file.qwe>` (the program behind FastCGI, for
+`mod_fcgid` or nginx's `fastcgi_pass`; see [Quillo on a shared
+server](#quillo-on-a-shared-server-cpanel)), `quillo repl`, `quillo lsp`, `quillo dap`,
 `quillo version` (or `--version`, `-V`), which names the commit: from a source archive
 it reads the `COMMIT` file `git archive` writes, else says `(commit unknown)`. `quillo
 <file.qwe>` is `quillo run <file.qwe>`, options and all, whatever the case of its
@@ -104,11 +110,12 @@ program: serve its folder as it is with `quillo serve .` ``, and the same for Ma
 (with `markdown_page`), Rust (`use "t.rs"`), and `.css`, `.js`, `.json`, `.txt`, `.xml`,
 `.csv` and `.svg` files (`file()`); a folder with no `main.qwe` but an `index.html` is
 told `quillo serve`. `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
-they do not have (`check` has `--strict-null`). `quillo check` exits 1 when there is an error (warnings do not
+they do not have (`check` has `--strict-null` and `--policy FILE`). `quillo check` exits 1 when there is an error (warnings do not
 fail it), `quillo run` 1 when the program does not load or the port cannot be taken, and
 either 2 for a usage mistake (an unknown option, an option without its value, no program, `--register` without its
 secret, options that do not go together, a `--port` outside 0 to 65535, a `--tls-cert` or
-`--tls-key` file that is not there). An option that takes a value refuses another option
+`--tls-key` file that is not there, a policy file that cannot be read or says something
+a policy does not say). An option that takes a value refuses another option
 in its place: `--service-name --watch` says `needs a value, and --watch is an option`. A stopped server exits 0 (see [Stopping and
 health](#stopping-and-health)).
 
@@ -129,7 +136,7 @@ Everything Quillo reads from the environment:
 
 | Variable | |
 |---|---|
-| `PORT` | the port, when `--port` is not given |
+| `PORT` | the port, when `--port` is not given; an absolute path is a Unix socket to listen on, as `--listen unix:` |
 | `QUILLO_SECRET` | signs sessions (see [Cookies and sessions](#cookies-and-sessions)); without it, a key made at start |
 | `QUILLO_QUERY_STATS` | `1`: query stats on from the start, as `--query-stats` |
 | `QUILLO_HEALTH_TOKEN` | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
@@ -144,9 +151,11 @@ Everything Quillo reads from the environment:
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |
 | `QUILLO_CHROME`, `QUILLO_TEST_PG_BIN`, `QUILLO_TEST_MYSQL_BIN`, `QUILLO_TEST_LOG`, `LIMER` | `cargo test`: where Chrome, PostgreSQL, MariaDB and limer are; show the test servers' output |
 
-There is no other configuration file, `HOST` is not read (`--host` is), and `RUST_LOG`
+The one other configuration is the policy, which only takes away: `/etc/quillo/policy.toml`,
+`--policy FILE` and `quillo.policy` beside the program (see [The policy](#the-policy)).
+`HOST` is not read (`--host` is), and `RUST_LOG`
 and `NO_COLOR` do nothing. The program's paths (`use`, `db.open`, `read_file`, `.env`,
-`quillo-system.db`, `.quillo/native`) count from the program file's folder, whatever
+`quillo.policy`, `quillo-system.db`, `.quillo/native`) count from the program file's folder, whatever
 folder `quillo` was started in.
 
 ### Desktop apps
@@ -709,13 +718,13 @@ The effects, and the builtins behind each:
 
 | Effect | Builtins |
 |---|---|
-| `db` | every `db.*` but `db.error_kind`; `idempotent`, `later.status` |
+| `db` | every `db.*` but `db.error_kind` and `db.sql_name`, and the same on a connection from `db.connect` (`analytics.query`); `idempotent`, `later.status` |
 | `http` | `http.*`, and calls to services |
-| `fs` | `file`, `read_file`, `write_file`, `delete_file`, `check_program`, `image.info`, `image.convert` |
-| `env` | `env` |
+| `fs` | `file`, `files`, `read_file`, `write_file`, `delete_file`, `save_upload`, `check_program`, `image.info`, `image.convert` |
+| `env` | `env`, `args`, `stdin`, `read_line`, `exit` |
 | `time` | `now`, `sleep`, `date.today`, `date.now` |
 | `random` | `random`, `random_int`, `uuid`, `crypto.token`, `crypto.hash_password` (its salt) |
-| `net` | `udp.send`, `udp.reply`, `channel.send`, `channel.broadcast` |
+| `net` | `udp.listen`, `udp.send`, `udp.reply`, `media.rtp`, `channel.send`, `channel.broadcast` |
 
 Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
@@ -723,6 +732,31 @@ or a function declared with more effects, is an error, both at runtime and in
 for everything the function calls, including the lambdas it passes to `map`: the
 effects allowed are narrowed on the way in, and nothing called can widen them.
 Functions without `with` may do anything.
+
+- **A connection's calls** need `db` as `db`'s do: `analytics.query(...)` in a `with
+  http` function is an error. On a parameter with no type, `c.query(...)` (or `.one`,
+  `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
+  like a database call, which needs the db effect ``.
+- **A Rust function** (a `.qwer` or `.rs` file) has the effects its file declares in
+  its header, `//! effects: db, http` (or `//! effects: none`). A file without that line
+  may do anything, so its functions run outside any `with` as before, and are refused
+  inside one, at run time and by `quillo check`: `` `hi` is Rust whose file does not say
+  what it does, so it may do anything and is refused in `greet` ``. An editor's hover
+  shows `(effects: not declared)` for them. Quillo cannot see inside the Rust: the line
+  is the file's word, not a proof (see [Rust](#rust)).
+- **The policy** sets a `with` on the whole program from outside it: its `[effects]
+  allow` is what every route, job and function may use at most, and a Rust file with no
+  `//! effects:` line is refused anywhere under it (see [The policy](#the-policy)).
+
+```quillo noexec
+use "store.qwer"            // //! effects: fs
+use "hi.qwer"               // no effects line
+
+fn keep(text: str) with fs = store_put(text)        // allowed: store.qwer says fs
+fn stamp() with time = store_put(str(now()))        // error: store_put needs fs
+fn greet() with time = hi("Ana")                    // error: hi.qwer says nothing
+print(hi("Ana"))                                    // outside any `with`: runs
+```
 
 ### HTML literals
 
@@ -1522,8 +1556,9 @@ component Notes(initial: list) {
   Not seen: what a trigger, a stored procedure or a `copy` writes, writes to the tables
   behind a view a loader reads (the view's name is what is recorded), and MySQL's
   `delete t from t join u` form. Publish a topic for those.
-- Topics have names: a table is `db:notes` (`db@analytics:notes` on a connection from
-  `db.connect`, by its label), a global `var:todos`, and `publish("thread:7")` what it
+- Topics have names: a table is `db:notes` (`db@55c8e71313e4:notes` on a connection from
+  `db.connect`, by a label made from where the database is, the same for every spelling
+  of it: see [Several databases](#several-databases)), a global `var:todos`, and `publish("thread:7")` what it
   says. With tenants, every topic but a global's belongs to the tenant, so a `publish`
   wakes only the same tenant's pages; in a mounted program they are the mount's.
   `watch` and `publish` take several topics at once; `unwatched(f)` calls `f` with
@@ -2251,7 +2286,9 @@ route POST /avatar {
 - `save_upload(file, path)` writes the file under the program's folder (making folders
   as needed) and gives the path back; `read_upload(file)` gives a text file's contents.
   Both give an error value when the request has no files, or the record is not one of
-  this request's; a path that leads outside the folder is a runtime error.
+  this request's; a path that leads outside the folder, by `..` or through a link
+  (see [Paths and links](#paths-and-links)), is a runtime error. `save_upload` needs the
+  `fs` effect.
 - `save_upload`, `write_file` and `delete_file` refuse the program's own files, and give
   an error value saying so: the `.qwe` and Rust (`.qwer`, `.rs`) files it loaded (or a folder holding
   one), `.env` and `.env.*`, the SQLite database it has open with its `-wal`, `-shm` and
@@ -2295,8 +2332,9 @@ pages of other sites cannot add without asking first; a form another site posts 
 a program, as `{ file, line, severity, message }` maps, with some files' text given in
 place of what is on disk: a tool that writes Quillo code can check it before writing
 it. The code checked may come from users, so it reads only files inside the program's
-folder: a `use`, `mount` or `service` path with `..` or starting with `/` is reported
-as an error, not read. `delete_file(path)` removes a file or folder inside the
+folder: a `use`, `mount` or `service` path with `..`, starting with `/`, or leading out
+of the folder through a link is reported as an error (`path must stay inside the
+program's folder: data/x.qwe`), not read. `delete_file(path)` removes a file or folder inside the
 program's folder.
 
 ### Scripts from users
@@ -3086,7 +3124,9 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
   has one; else the plain 404.
 - Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`
   is; nor are the program's own (`.qwe`, `.qwer`, `.rs`). Each file goes as `file()`
-  sends it, its `ETag`, ranges and type included.
+  sends it, its `ETag`, ranges and type included. A path that leads out of the program's
+  folder through a link is a miss, whether what it leads to is there or not (see [Paths
+  and links](#paths-and-links)). `files` and `file` need the `fs` effect.
 - The options: `index` (a file name, `index.html` unless given), `extensions` (those a
   clean URL may leave out, `["html"]` unless given), `not_found` (the page for a miss,
   `404.html` unless given; `null` for none) and `cache`, as `file()`'s. Another option is
@@ -3264,11 +3304,18 @@ service /billing = "billing.qwe"
   same again when it is restarted), its log lines marked with its name, all signed with
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
-  set); they stop with it (killed, not drained). Each is started as `quillo run
-  <file> --port P --as-service --service-name NAME`, with `--base`, `--watch`,
-  `--no-check` and `--describe` passed down, and `--log`, `--workers`, `--max-body`, `--metrics`,
-  `--no-jobs`, `--env-file` and `--service-url` not; a service that is not up within
-  20 s stops the app with exit 1. A service whose process ends while the app runs is
+  set); they stop with it (killed, not drained). Before any service starts, the app
+  checks the whole tree once, its own files and every service's, and says each warning
+  once; an error anywhere stops it there, before anything waits. Each is then started as
+  `quillo run <file> --port P --as-service --service-name NAME`, with `--base`, `--watch`,
+  `--no-check`, `--no-build`, `--describe` and the `--policy` files passed down, and
+  `--log`, `--workers`, `--max-body`, `--metrics`, `--no-jobs`, `--env-file` and
+  `--service-url` not; it skips its own first check, which the app has made (a reload
+  under `--watch` checks again). A service that is not up within 20 s stops the app with
+  exit 1, and one whose process ends while starting is said at once: `service billing
+  stopped at start (exit status: 1; see its lines above)`. Under `--watch` the app
+  watches its services' files too, as in one process: a function added to `billing.qwe`
+  reloads billing's process and the app, and the app calls it at once. A service whose process ends while the app runs is
   started again, the same way, after a second (twice as long each time it ends again
   soon, at most 30 s), with a line in the log. `--scale risk=3` runs `risk` as three
   copies (up to 64), called in turn; they share its database, so give it one that
@@ -3319,6 +3366,26 @@ service /billing = "billing.qwe"
   service's name is a name of the program that declares it, so `service notify = ...`
   (or a file `notify.qwe`) hides the builtin `notify` there, with a warning; inside the
   service, a `server fn count` hides `count` the same way.
+- **The service's file**, beside the app, is how the app knows what `billing.add` takes.
+  As the app loads, it reads only the file's `server fn` headers (and those of the files
+  it `use`s), so a mistake in one of its routes or bodies does not stop an app run with
+  `--no-check` (`quillo check`, and `--split`, still check the file whole). A service
+  that runs elsewhere need not be here at all: with no file and an address
+  (`--service-url` or `QUILLO_SERVICE_BILLING`), the app asks the running service for its
+  functions as it starts, as a call like any other (signed, each address in turn), and
+  takes each one's header and contract from the answer. Only the functions this caller
+  may call are given (a `for [...]` keeps the rest). A service that cannot be reached
+  then stops the app: `billing.qwe is not here, and service billing did not give its
+  functions: ...`. `quillo check` warns instead of failing: `service billing: billing.qwe
+  is not here, so its calls are not checked; it must run elsewhere (QUILLO_SERVICE_BILLING
+  or --service-url)`, and a call to it still needs the `http` effect.
+
+  ```sh
+  # on 10.0.0.5, with billing.qwe
+  quillo run billing.qwe --port 8081 --as-service
+  # elsewhere, with main.qwe and no billing.qwe
+  quillo run main.qwe --service-url billing=http://10.0.0.5:8081
+  ```
 - Each service's transactions are its own: there is no transaction across services, and
   `db.atomic` spans databases of one program, not calls. A chain of calls commits step
   by step, so give each step a reference the caller makes up and keep what was done,
@@ -3417,9 +3484,12 @@ When a service runs elsewhere, its calls are made to hold up:
   bad or old signature, another service's, a key or token not taken), 403 for a caller
   `for` or `check` refuses, 404 for no such function, 409 for a contract that differs,
   503 while the call still runs. A server in another language that answers so,
-  remembers call ids, and answers `GET /_quillo/ready`, is a service; its caller still
-  needs a `.qwe` file with the `server fn` signatures for `quillo check` and the
-  contract. The routes under a service's prefix are passed on as they come, but not
+  remembers call ids, and answers `GET /_quillo/ready`, is a service; its caller keeps a
+  `.qwe` file with the `server fn` signatures for `quillo check` and the contract, or the
+  service answers the call `_contracts` (`POST <service>/_quillo/service/_contracts`,
+  signed as any call, no arguments) with `{"ok": [{"header": "server fn add(a: int, b:
+  int) -> int = null", "contract": "add(a: int, b: int) -> int"}, ...]}`, as a Quillo
+  service does for an app without its file. The routes under a service's prefix are passed on as they come, but not
   Quillo's own addresses there. A copy [joins](#copies-that-join) at `POST
   <app>/_quillo/join`, with `{ "service": "billing", "port": 8081, "leave": false }`
   (and `"url"` under `--join-as`), signed as a call is to the service `_join` and the
@@ -3970,7 +4040,8 @@ What is not in the standard library, and what to do instead:
   loop, and at most one per core at a time (others wait their turn), so a flood of
   logins slows logins down rather than taking the server's memory.
 - **Effects:** `sleep(ms)`, `random()`, `random_int(lo, hi)`, `uuid()`, `read_file(path)`,
-  `write_file(path, text)` (paths stay inside the program's folder). `uuid()` takes its
+  `write_file(path, text)` (paths stay inside the program's folder, links followed: see
+  [Paths and links](#paths-and-links)). `uuid()` takes its
   bytes from the operating system, so it can serve as a session id or token; `random()`
   and `random_int()` are fast but predictable, and must not.
 
@@ -4030,7 +4101,8 @@ Safety built in:
   db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
   as `?` parameters instead. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
-  the program's database is MySQL), and named parameters with
+  the program's database is MySQL; `conn.sql_name(name)` quotes for the connection it is
+  called on, `db.sql_name(name)` for the program's), and named parameters with
   `sql_param(name)` (or a list: `sql_param(["title", "body"])` is `:title, :body`) —
   both take only letters, digits and `_`, whatever their argument is made of
   (`` sql_name(`obj_${id}`) ``). SQL made of them, text as written (also kept in a
@@ -4060,6 +4132,44 @@ written twice. `s += t` adds to the text where it is. Where something else still
 browser a list's `push` and `set` always copy, so build a long list there with `for`, or
 `flatten` chunks. `flatten` takes one
 level off: `flatten(flatten(xs))` for two.
+
+### Paths and links
+
+`read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload` and
+`check_program` take a path from the program's folder, and stay in it. A path with `..`
+or starting with `/` is refused, unless `--allow-path` names the folder it leads to. A
+path is judged where it really leads, with its links followed:
+
+- A link inside the folder that leads inside it works as any path: `alias -> real`.
+- A link that leads out of the folder is refused, as `..` is. A cloned repository or an
+  unpacked archive can bring one (`data -> /home/other/...`), and on a shared server the
+  folder it leads to may be another account's. The first one is said in the log, once:
+  `quillo: data/s.txt leads out of the program's folder through a link, to
+  /srv/outside/s.txt, and is refused; --allow-path FOLDER lets the program reach a
+  folder outside`.
+- A link that leads nowhere is refused too: writing through it would make its target,
+  wherever that is.
+- A program run through a link (a deploy's `current -> releases/42`) is inside the
+  folder the link leads to, so its own files work as before.
+- `--allow-path DIR` opens a folder outside on purpose (a path from the folder `quillo`
+  runs in, taken as it really is): a deploy's `uploads -> /srv/shared/uploads` needs
+  `--allow-path /srv/shared/uploads`.
+
+What is refused is what any refused path is: an error value from `read_file`,
+`write_file` and `delete_file` (`read_file: path must stay inside the program's folder:
+data/s.txt`), a 404 from `file` and `files` (the same whether the folder outside is
+there or not), and a runtime error from `save_upload`.
+
+```quillo noexec
+// alias -> real (inside), data -> ../outside, dangling -> ../outside/gone.txt
+print(read_file("alias/in.txt"))                 // inner
+print(read_file("data/s.txt") ?? "refused")      // refused
+print(write_file("dangling", "x") | is_err)      // true
+```
+
+Only the path's parts are looked at, and only a path with a link in it is resolved, so a
+static file costs what it did. A link changed between the check and the open is not
+caught: Quillo does not use Linux's `openat2`.
 
 ### Files of a program
 
@@ -4565,6 +4675,11 @@ the database as it was, so the next `db` call opens `$QUILLO_DB` or SQLite in me
 wrong password runs the app on an empty database that is gone at restart. Write
 `db.open(env("DATABASE_URL")) | unwrap`, which stops the program with the reason.
 
+**Opening another database while it runs.** `db.open` after the start replaces the
+program's database. Open pages showing its rows are told at once, every tenant's (the
+database is the program's, whichever request opened it), and ask again; a live call is
+not answered from what was read in the old one.
+
 **What the calls give.** `db.query` gives every row, all of it in memory (there is no
 cursor: page with `limit` and keyset or `offset`); `db.one` the first row or `null` (on
 PostgreSQL it fetches the whole answer and keeps one: write `limit 1`); `db.exec`
@@ -4597,7 +4712,11 @@ or unique column has the value already), `"foreign_key"`, `"not_null"`, `"check"
 `"conflict"` (another transaction: the database busy, a deadlock, a serialization
 failure), or null for any other failure and for anything else. It needs no effect.
 Every database failure is an error value whose text starts `db: `, with the database's
-own message (PostgreSQL's `detail` in brackets).
+own message (PostgreSQL's `detail` in brackets, then its SQLSTATE in square brackets:
+`db: duplicate key value violates unique constraint "seats_pkey" (Key (k)=(1) already
+exists.) [23505]`). `db.error_kind` reads PostgreSQL's code first (`23505`, `23503`,
+`23502`, `23514`, and `40001`, `40P01` and `55P03` for a conflict), so it gives the same
+word on a server whose messages are in German. MySQL's codes are in its text already.
 
 ```quillo
 let r = db.exec("insert into seats (show, seat) values (?, ?)", show, seat)
@@ -4824,13 +4943,39 @@ db.transaction(() => {
 
 - Call its functions on it, `analytics.query(...)` (or `sql | analytics.one`): that is
   how they know which database. A connection has `exec`, `query`, `one`, `transaction`,
-  `migrate`, `tenants` and `tenant_exists`; `error_kind`, `connect`, `system`, `shards`
+  `migrate`, `tenants`, `tenant_exists` and `sql_name`; `error_kind`, `connect`, `system`, `shards`
   and `atomic` are `db`'s. Connect at the top of the program; the same target
-  again is the same connection, not a new pool.
+  again is the same connection, not a new pool. A SQLite file is the same file by any
+  spelling: `db.connect("./analytics.db")`, `"sub/../analytics.db"` and the full path
+  are one connection.
+- Its calls need the `db` effect, as `db`'s do (see [Effects](#effects)).
 - A transaction is its own database's: one inside another on a different database
   commits or rolls back on its own.
 - Live data tells them apart: a page showing `analytics`' `orders` does not refresh
-  when `db`'s `orders` changes. Its topics carry a label, not the URL.
+  when `db`'s `orders` changes. Its topics carry a label, not the URL: a SQLite file's
+  real path (from the program's folder when it is inside it), or a server's scheme,
+  host, port and database, without the user, the password or the options. So two
+  servers on one database agree on its topics, during a password's rotation too, and a
+  page reading through one connection hears a write made through another. (Another
+  user or other options on a server URL is another pool, with the same topics.)
+- **Names for this database.** `analytics.sql_name(col)` quotes a name as that database
+  reads it, `` `col` `` on MySQL, `"col"` elsewhere; `db.sql_name(col)` does the same for
+  the program's database. Plain `sql_name` quotes for the program's database only, so a
+  program with MySQL beside SQLite or PostgreSQL uses the connection's: MySQL reads
+  `"title"` as text, and `select "title" from items` gives the word `title` in every row.
+  None of them needs an effect, and `quillo check` takes SQL built with them as safe.
+
+```quillo
+db.open("app.db")
+let analytics = db.connect("analytics.db")
+print(analytics.sql_name("total"), db.sql_name(["day", "total"]))
+print(db.connect("./analytics.db") == analytics)
+```
+
+```
+"total" "day", "total"
+true
+```
 - A connection never reaches the browser (its URL may hold a password).
 
 Mounted programs and services have their own `db` too, so one Quillo can run programs
@@ -5056,6 +5201,11 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
   a call whose host comes from a value (a parameter, `request`, text put together before
   the host ends) unless its options say `public_only`, either way: `false` says the call
   is meant to reach inside.
+- Under a policy (see [The policy](#the-policy)), `[http] hosts` lists the hosts any
+  call may reach, and `private = false` keeps every call off this machine and its
+  networks, as `public_only` does, whatever the call's options. Each redirect is judged
+  too, before it is followed. A call refused is an error value: `http: example.com is not
+  among the hosts quillo.policy allows: api.stripe.com, *.mapbox.com`.
 - `cache: seconds` (a GET's, up to a day) keeps a successful answer and gives it again to
   the same call, the same URL, headers and options, from any request, until then. Calls
   to a site that limits how often it is asked, or that charges for each, then go out once
@@ -5118,8 +5268,19 @@ together from values, and an `http.*` host from a value (see [Standard
 library](#standard-library)); a `/` result given to an `int` parameter; a helper with no
 `with` that may use an effect its `with` caller lacks; `http.*` or `net` inside a
 transaction that retries; a live loader fed only by a service; a class a sheet styles
-that nothing writes; a `.qwer` function that cannot be exported. Warnings never make
+that nothing writes; a `.qwer` function that cannot be exported; `sleep` given a number
+written between 0 and 1 (`sleep` takes milliseconds: `` `sleep(0.2)` waits 0.2 ms; for 0.2
+seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `with`
+function without `db`; a service whose file is not here. Warnings never make
 it fail.
+
+`quillo check --policy FILE` checks the program as it would run under that policy (and
+the host's and the program's own, which it always reads): it names the files first
+(`quillo: policy host.toml + quillo.policy (effects: db, http, time; no builds; no
+private addresses)`), then what each would refuse, as errors: a builtin needing an
+effect the policy does not allow (`` `udp.listen` needs the net effect, which host.toml
+does not allow ``), a plugin it does not list, a Rust file with no `//! effects:` line
+under a policy that narrows effects. See [The policy](#the-policy).
 
 What it does not find, so a reader is not surprised: an unknown type name in an
 annotation (`u: Usr`, when no `type Usr` exists; it fails at the first call), division
@@ -5197,7 +5358,14 @@ How long a wait may last:
 
 - `--workers N` (64 by default) requests can wait at once, each on a pool thread; more
   wait for a thread, while requests that only compute go on being answered. PostgreSQL
-  queries take no thread.
+  queries take no thread. A thread the system will not start (an account's process
+  limit, which on Linux counts threads) is said once in the log, `quillo: cannot start a
+  thread for waiting work (...; the account's process limit?); requests wait for the N
+  threads there are`; with none at all, it tries again a few times within a tenth of a
+  second (another process may have ended), at most once a second. At
+  start, a server whose `ulimit -u` is below what it may use says so: `quillo: the process
+  limit (ulimit -u) is 30, and this server may use 73 threads: requests may wait for a
+  thread; raise it, or give --workers fewer`.
 - `http.*`: 10 s to connect, 60 s in all (300 s between the parts of a stream). A call to
   a `service` elsewhere: 5 s to connect, 10 s for a try, or its `timeout` (see
   [Services](#services)).
@@ -5407,8 +5575,9 @@ What follows `--` is its arguments, `args()`; `stdin()` is all that is piped in,
 that ends by itself ends with 0, and one that fails (a stop, or an error a `?` at the top
 passes on) with 1, saying what it was. Files are the program's folder's, as for a server;
 `--allow-path DIR` names another folder that `read_file` and `write_file` may use, by its
-own path or through `..`, where a link leads being what counts (FEEDBACK29.md, Q-357). It is
-named, never assumed: the same program may serve strangers later, and in a program that
+own path or through `..`, where a link leads being what counts (FEEDBACK29.md, Q-357);
+without it, a link out of the folder is refused too (see [Paths and
+links](#paths-and-links)). It is named, never assumed: the same program may serve strangers later, and in a program that
 serves, `stdin`, `read_line` and `exit` are errors. A script whose output pipe closes
 (`quillo run tool.qwe | head -1`) ends quietly, with status 141, as other tools do; a
 server whose stdout closes goes on answering, and what `print` writes is dropped.
@@ -5568,6 +5737,209 @@ With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
 
 It is off by default, since anyone who can reach the server could read it.
 
+### The policy
+
+`with` limits what a function may do, from inside the program. A policy limits what the
+whole program may do, from outside it: the host's, for every program on a server, and
+the site owner's, for one deploy. Policies are small TOML files, read as the program
+starts, by `quillo run`, `quillo fcgi` and `quillo check`:
+
+1. `/etc/quillo/policy.toml`, the host's, whenever it is there (one that is there and
+   cannot be read stops the program);
+2. each `--policy FILE`, in order;
+3. `quillo.policy` beside the program's main file.
+
+Each file only narrows what the ones before it allow: a list is a condition every file
+must meet, so a later file cannot give back what an earlier one took away. A file that
+says something a policy does not say, or a word that is not an effect, stops the program
+with exit 2, naming the file and the line (`quillo.policy:2: `disk` is not an effect`).
+What one refuses names the file that refused it.
+
+```toml
+# /etc/quillo/policy.toml: what any program on this server may do
+[plugins]
+build = false                     # never run cargo: prebuilt libraries only
+allow = ["csv@1", "qr", "markdown"]
+
+[effects]
+allow = ["db", "http", "fs", "time", "random", "env"]   # no net
+
+[http]
+private = false                   # no loopback, private or link-local addresses
+
+[env]
+names = ["QUILLO_SECRET", "DATABASE_URL", "APP_NAME"]
+
+[limits]
+workers = 8
+max_compute = "10s"
+max_body = "10MB"
+```
+
+```toml
+# quillo.policy, beside main.qwe: this program narrows it further
+[http]
+hosts = ["api.stripe.com", "*.mapbox.com"]
+```
+
+| Section | |
+|---|---|
+| `[plugins] build` | `false`: never build a Rust file, as `--no-build` (see [Rust](#rust)) |
+| `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. It names plugins; it does not prove their code |
+| `[effects] allow` | the effects anything in the program may use, as a `with` on its top level, routes, jobs and functions alike; a Rust file with no `//! effects:` line is refused anywhere under it |
+| `[http] hosts` | the hosts `http.*` may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
+| `[http] private` | `false`: `http.*` reaches nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
+| `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
+| `[limits] workers`, `max_compute`, `max_body` | the most `--workers`, `--max-compute` and `--max-body` may be: a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes) |
+
+Under the two files above, with `APP_NAME=Shop`:
+
+```quillo noexec
+route GET / = `${env("APP_NAME") ?? "shop"} on ${env("HOME") ?? "no HOME"}`   // Shop on no HOME
+route GET /charge = http.get("https://api.stripe.com/v1/charges").status       // reaches Stripe
+route GET /other = str(http.get("https://example.com/").error)
+// http: example.com is not among the hosts quillo.policy allows: api.stripe.com, *.mapbox.com
+```
+
+`quillo check --policy host.toml main.qwe` says, before a deploy, what the program would
+be refused, as errors (see [Checking](#checking)):
+
+```
+quillo: policy host.toml + quillo.policy (effects: db, http, fs, env, time, random; no builds; no private addresses)
+main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not allow
+```
+
+- `quillo check` and `quillo run` always read the host's file and `quillo.policy`;
+  `--policy` adds one, and `check` names the files only when one is given.
+- `--split` passes the `--policy` files and `quillo.policy` to its services; a service
+  reads the host's file itself.
+- What a policy holds to is Quillo code and what it loads. A plugin is Rust in the
+  server's process, which a policy cannot watch: it can only choose which plugins load.
+  `private = false` covers `http.*` only, not `db.connect` or UDP.
+- A policy binds the `quillo` that reads it. On a shared server, a user who can upload a
+  binary of their own can run it without one: the boundary between accounts is the
+  system's (Unix users, CloudLinux's CageFS and LVE limits).
+- Not built yet: a catalog whose entries are signed, a policy that allows catalog
+  plugins only, and a sandbox from the system (`--sandbox`, seccomp and Landlock) or for
+  plugins (WebAssembly).
+
+### Quillo on a shared server (cPanel)
+
+A shared hosting account (cPanel, often on CloudLinux, with Apache or LiteSpeed in
+front) gives a folder, a web server the host runs, and no root. It differs from a server
+of one's own in three ways that matter to Quillo:
+
+- **127.0.0.1 is everyone's.** Every account on the machine can connect to a TCP port
+  there, past the web server, so `quillo run --port 8080` is open to the neighbours. A
+  Unix socket in a folder of the account's own, or FastCGI, is not.
+- **Nothing keeps a process of yours running.** There is no systemd. Processes started by
+  hand or by cron are often killed. The web server starts FastCGI programs itself, keeps
+  them up while requests come, and stops them when idle.
+- **The account has limits.** No Rust, a disk and inode quota, and CloudLinux's LVE
+  limits: processes (`NPROC`, which counts threads, for the whole account), and requests
+  at once (`EP`; over it, visitors get a 508 page from the host, not from Quillo).
+
+**The binary.** The Linux releases from the next tag on are linked against glibc 2.17,
+so they start on CentOS 7, CloudLinux 7 and 8, AlmaLinux 8 and newer (0.6.0's need glibc
+2.35). They are glibc builds, not static ones, as a plugin is a library they load.
+
+**FastCGI with `mod_fcgid`**, where the account has it (it is in cPanel's EasyApache 4).
+`quillo fcgi main.qwe` answers FastCGI on the socket the web server gives it on file
+descriptor 0, and Apache starts it, keeps it up and stops it. In the site's folder:
+
+```sh
+#!/bin/sh
+# app.fcgi, made executable with chmod 755
+cd /home/u/app && exec /home/u/bin/quillo fcgi main.qwe --no-build --workers 8
+```
+
+```
+# .htaccess
+Options +ExecCGI
+AddHandler fcgid-script .fcgi
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ app.fcgi [QSA,L]
+```
+
+`.htaccess` and `app.fcgi` go in `public_html` (or the domain's folder); the program
+itself, its `.env` and its database stay outside it, in `/home/u/app`, where Apache does
+not serve them.
+
+- Each request is the request the visitor made: its path (`REQUEST_URI`), headers and
+  body, and `request.ip` is Apache's `REMOTE_ADDR`, with no `--trust-proxy`. The server
+  does the rest as for any visitor: routes, sessions, limits, the log (on Apache's error
+  log).
+- Its jobs and its own calls reach it through a socket only it can open, in a private
+  folder under the system's temporary one.
+- What FastCGI cannot carry: WebSockets. Live data falls back to plain requests, each
+  held until a change or 25 s, so live pages still follow changes; channels over a
+  WebSocket do not work, and WebTransport needs a UDP port of its own. A `stream` or `events` answer
+  arrives whole unless the host sets `mod_fcgid`'s output buffer to 0
+  (`FcgidOutputBufferSize 0`).
+- `mod_fcgid` may start several processes, each with its own global variables, as
+  `--instances` would; keep what must be shared in the database. `quillo fcgi` refuses
+  `--split`, `--instances`, `--register` and `--join`.
+- A request Apache abandons while its answer streams (FastCGI's `ABORT`) ends when the
+  connection closes.
+- Run from a terminal, it says what it needs: `file descriptor 0 is not a socket:
+  quillo fcgi is started by a FastCGI process manager (mod_fcgid), or given --listen
+  unix:PATH or --port`. With `--listen unix:f.sock` (or `--port 9000`, on 127.0.0.1) it
+  makes its own socket instead, for nginx's `fastcgi_pass unix:/srv/app/f.sock` with
+  `include fastcgi_params` on a server of one's own.
+
+**A Unix socket behind `mod_proxy`**, where the host sets it up (a VPS with WHM, or a
+host that offers Quillo): `quillo run main.qwe --listen unix:app.sock --trust-proxy
+127.0.0.1`, kept running by the host, and Apache's
+
+```
+ProxyPass "/" "unix:/home/u/app/app.sock|http://localhost/" upgrade=websocket
+ProxyPassReverse "/" "http://localhost/"
+```
+
+(Apache 2.4.47 or later for `upgrade=websocket`; `ProxyPass` is the host's
+configuration, not `.htaccess`'s). The socket is made with mode 0600, for the account's
+own processes: give `--socket-mode 660` when the web server reaches it through its
+group. A socket left by a server that did not stop cleanly is taken over; one another
+server answers on is not (`a server is listening there`). Every visitor through the
+socket is 127.0.0.1 to the program, which the server says at start until
+`--trust-proxy 127.0.0.1` is given; with it, `request.ip` is the visitor's, from the
+`X-Forwarded-For` Apache adds. Jobs reach the program through the socket.
+
+**Plugins, prebuilt.** The account has no Rust, so build the program's `.qwer` files
+elsewhere with `quillo build main.qwe`, on Linux on the same processor, and on a system
+no newer than the server's (a plugin linked against a newer glibc does not load on an
+older one: build in a CentOS 7 or AlmaLinux 8 container). Upload `.quillo/` with the
+program: `.quillo/native/` and `.quillo/plugins.lock`. Run with `--no-build`, so that
+nothing is ever built on the server, and a library that is not the one built is refused
+rather than built again.
+
+**A policy.** The host's `/etc/quillo/policy.toml` says what any program may do there;
+`quillo.policy` beside the program narrows it for the site (see [The
+policy](#the-policy)). `quillo check --policy policy.toml main.qwe`, run before
+uploading, says what would be refused.
+
+**Threads and `ulimit -u`.** A Quillo server may use `--workers` + 9 threads (73 with the
+default 64), and on Linux the account's process limit counts them, beside PHP, cron and
+SSH. Give `--workers 8` or so (a host's policy can cap it with `[limits] workers`). At
+start a server says when `ulimit -u` is below what it may use, and a thread the system
+refuses is said once (see [Concurrency and reloading](#concurrency-and-reloading)).
+
+**The rest of the account.**
+
+- **Settings:** the `.env` beside the program, or `--env-file` for one outside the
+  public folder. A FastCGI program gets the web server's environment, so keep secrets
+  there and not in `app.fcgi`.
+- **Jobs:** a FastCGI process stopped when idle runs no `schedule` or `every`. Run them
+  from cPanel's Cron Jobs page instead, as a script: `cd /home/u/app && quillo run
+  jobs.qwe`.
+- **The database:** SQLite in a folder outside `public_html`, which one process at a
+  time writes; or the host's MySQL, `db.open(env("DATABASE_URL"))`.
+- **Paths:** a link out of the program's folder is refused (see [Paths and
+  links](#paths-and-links)), so a link to another account's files leads nowhere.
+- **Not built:** Passenger (cPanel's Application Manager starts Node.js, Python and Ruby
+  apps only), and a WHM plugin that installs Quillo for every account.
+
 ## Cached views
 
 A view's HTML depends on its arguments and on the global variables it reads. When a
@@ -5646,6 +6018,7 @@ it (`use "imaging.rs"`, `import imaging.rs use brightness`), so a crate's own `s
 beside the program is left alone. Here is `imaging.qwer`:
 
 ```rust
+//! effects: fs
 //! [dependencies]
 //! image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
@@ -5692,6 +6065,15 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   that is not `//!` ends them. Only that table is read (no `[features]` table, no
   `[patch]`, no `build.rs` of the file's own; a crate's own build scripts do run).
   `serde_json` is always there. C libraries come through `-sys` crates.
+- **`//! effects: fs, http`**, a header line, says what the file's functions do, in the
+  words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`; `db.analytics` is
+  `db`), or `//! effects: none`. It is what lets a `with` function call them: a function
+  declared `with fs` may call `brightness`, one declared `with time` may not. A file
+  without the line may do anything: its functions are refused inside any `with`, and
+  anywhere under a policy that narrows effects (see [Effects](#effects)). A word that is
+  not an effect is said by `quillo check` at its line. Quillo cannot see what Rust does,
+  so the line is the author's claim, read as a promise: write what the code really
+  reaches, and review it in a plugin from elsewhere.
 - **Taking names.** `import redis.qwer use cache_get, cache_set` takes only those
   functions; `as` gives one another name, `import redis.qwer use cache_get as redis_get`,
   and it is not there under its own. A name the file does not export is an error that
@@ -5732,8 +6114,30 @@ How it runs:
   program, and the server needs no Rust: it loads what was built for that content, on
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
-  cargo then. Nothing checks the library against its source: whoever can write
-  `.quillo/native/` runs code in the server.
+  cargo then.
+- **`.quillo/plugins.lock`**, beside `.quillo/native/`, holds each library's file name
+  and SHA-256, a line each, written by every build: `quillo build`, a `use` that built,
+  `--watch`. Deploy it with `.quillo/native/`. A library is loaded only when it is the one
+  built: one whose hash differs, or that has no line, is built again where cargo may run
+  (`quillo: libhi-687dd0b24f29e5cf.dylib is not the library that was built (its SHA-256
+  differs from .quillo/plugins.lock's): building it again`), and refused where it may
+  not. A folder built before there were locks has none: its libraries load as before, with
+  a warning once (`.quillo/plugins.lock is not there, so the libraries in .quillo/native
+  are loaded unchecked, as before; quillo build writes it`). A build writes the lock, but
+  a library already there is not built again, so remove `.quillo/native/` and run
+  `quillo build` to get one. Whoever can write both the library and the lock can still
+  run code in the server.
+- **`--no-build`** never runs cargo, so no crate's build script runs on the server: a
+  library is loaded only as the lock names it, and a file not built is an error
+  (`./hi.qwer is not built, and --no-build says not to build it here: build it with
+  quillo build and bring .quillo along`). Under it, a folder with no lock loads nothing.
+  `--split` passes it to its services, and a policy's `[plugins] build = false` is the
+  same (see [The policy](#the-policy)).
+- **A policy's `[plugins] allow`** names the plugins a program may `use`: `"csv"` any
+  version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line (`1` takes
+  `1.4.2`, not `10.0`). A plugin it does not name is refused before anything is built:
+  `` the plugin `pdf` 2.0.1 is not in the plugins /etc/quillo/policy.toml allows: csv@1, qr ``.
+  It names plugins by their file's name and header; it does not prove their code.
 - A call runs off the event loop, without the lock Quillo code holds, on the threads
   that also wait for databases (`--workers`): a slow function holds up no one, and
   calls from several requests run on several cores at once; many long calls at once
@@ -5780,6 +6184,12 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
   version, and fails when the catalog has another (it keeps only the newest).
 - Then `use csv.qwer`, or only what you need, `import csv use csv_parse, csv_write`: the
   first run builds it with cargo, as any `.qwer` file.
+- A catalog plugin is called inside a `with` function only once its header has a
+  `//! effects:` line, as any Rust file (see [Rust](#rust)). The catalog's files do not
+  have it yet: add it to your copy after reading what the plugin does.
+- `install` checks a file against the catalog it came from, which a changed server
+  could change too: the catalog's entries are not signed yet. A host can still list the
+  plugins and versions it takes, in a policy's `[plugins] allow`.
 
 ### Other stores
 
@@ -5788,6 +6198,7 @@ crate in a `.qwer` file: its functions are the driver, and the program calls the
 any other. A count of visits in Redis:
 
 ```rust
+//! effects: db, env
 //! [dependencies]
 //! redis = "0.27"
 
@@ -5845,6 +6256,9 @@ component Visits(page: str) {
 - What `db` does by itself is the program's to do here: live pages follow what a loader
   `watch`es and a write `publish`es, as above, and writes are not part of
   `db.transaction`.
+- `//! effects: db, env` makes `cache_get` and `cache_incr` the `db` effect (and `env`,
+  for `REDIS_URL`), so a function declared `with db, env` may call them and one declared
+  `with http` may not.
 
 ## Possible or not
 
@@ -5902,6 +6316,8 @@ does not do it today; the way around it follows.
 | put a time limit on a route? | No: only sockets time out |
 | see the visitor's address behind a proxy? | Name it with `--trust-proxy`, and `request.ip` is the visitor's. Otherwise read `x-forwarded-for` from `request.headers` yourself; Quillo never trusts it |
 | run several programs on one port? | Yes, in one process: `mount` or `service /prefix`. See [Mounting programs](#mounting-programs) |
+| listen on a Unix socket, or run behind FastCGI? | Yes: `--listen unix:PATH`, and `quillo fcgi` for `mod_fcgid` or nginx's `fastcgi_pass`. See [Quillo on a shared server](#quillo-on-a-shared-server-cpanel) |
+| run on shared hosting (cPanel)? | Where the account has `mod_fcgid`, with `quillo fcgi` and plugins built beforehand; not through Passenger. See [Quillo on a shared server](#quillo-on-a-shared-server-cpanel) |
 | serve a site as static files? | Yes, when its components call nothing on the server: fetch every page and the bundles it loads, and upload them |
 | make requests run once when retried? | Yes: `idempotent`. See [Idempotent requests](#idempotent-requests) |
 
@@ -5938,7 +6354,8 @@ does not do it today; the way around it follows.
 | Can I... | |
 |---|---|
 | split an app into services without changing its code? | Yes: `service`, in one process or `--split`. See [Services](#services) |
-| write a service in another language? | Yes, if it answers Quillo's signed calls; the caller keeps a `.qwe` file of its signatures. See [Services](#services) |
+| write a service in another language? | Yes, if it answers Quillo's signed calls; the caller keeps a `.qwe` file of its signatures, or the service answers `_contracts`. See [Services](#services) |
+| deploy an app without its services' code? | Yes: with an address and no file, the app asks the running service for its functions. See [Services](#services) |
 | authenticate services with keys of their own, OAuth 2.0 tokens, JWTs or mutual TLS? | Yes: `auth` where a service is declared, `accept_calls` in it, `for [...]` on a `server fn`. See [Authentication between services](#authentication-between-services) |
 | call an API that speaks only HTTP/2, as Apple's push service (APNs) or gRPC? | No: `http.*` speaks HTTP/1.1 only. Use another program for those calls, or an API that takes HTTP/1.1 (Firebase Cloud Messaging's v1 API does) |
 | call out through a company's proxy, trust an internal CA, or present a client certificate? | Yes: `HTTPS_PROXY` and `NO_PROXY` are read, and `http.*` takes `ca`, `cert` and `key`. See [HTTP client](#http-client) |
@@ -5960,7 +6377,9 @@ does not do it today; the way around it follows.
 | get editor support? | Yes: `quillo lsp`, and the VS Code extension |
 | run untrusted users' code? | Yes, sandboxed: `run_script`. Never as `.qwer`. See [Scripts from users](#scripts-from-users) |
 | get structured logs and metrics? | JSON request lines (`--log json`) and Prometheus metrics (`--metrics`); errors are text lines. See [Logs and metrics](#logs-and-metrics) |
-| configure with a file? | Only `.env`; everything else is an option. See the options at the start of this guide |
+| configure with a file? | Only `.env`, and a policy that takes away; everything else is an option. See the options at the start of this guide |
+| limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits. See [The policy](#the-policy) |
+| sandbox a program with the system's help (seccomp, Landlock)? | Not yet: a policy holds Quillo code, not a plugin's Rust |
 
 ## Not built yet
 
@@ -5974,7 +6393,14 @@ does not do it today; the way around it follows.
 - `{{ ... }}` blocks of JavaScript in a component (a design only)
 - in the browser, a map's keys that look like integers keep their order of insertion:
   there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
-- Linux builds linked with musl, or static, for systems older than glibc 2.34
+- Linux builds linked with musl, or static: not planned, since a static binary cannot
+  load plugins. The releases from the next tag on are linked against glibc 2.17 instead
+- a catalog whose entries are signed, its plugins prebuilt for Linux, and `//! effects:`
+  on each of them; a policy that allows catalog plugins only (`local = false`)
+- `quillo run --sandbox` (seccomp and Landlock on Linux), and plugins built to
+  WebAssembly and run sandboxed
+- a policy's `private = false` for `db.connect` and UDP (it covers `http.*` only)
+- Passenger (cPanel's Application Manager) starting a Quillo program
 - phone apps in the stores: uploads to the App Store and Google Play, HarmonyOS NEXT,
   `.qwer` plugins linked into the app, and work while the app is in the background
 - `quillo app` without a socket run on Windows and Linux (the code is wry's on all three;
@@ -5985,7 +6411,7 @@ does not do it today; the way around it follows.
 ## Layout
 
 ```
-src/main.rs        CLI: run, app, new, check, fix, docs, build, repl, lsp, dap, version
+src/main.rs        CLI: run, app, new, check, fix, docs, build, fcgi, repl, lsp, dap, version
 src/new.rs         quillo new: a program to start from
 src/lib.rs         the crate: what the binary and the tests use
 build.rs           stamps the commit into `quillo --version`
@@ -6002,7 +6428,9 @@ src/record.rs      records: type User = { ... }, made, checked, in patterns
 src/check.rs       the static checker (quillo check, quillo run, the language server)
 src/modules.rs     what each file of a program sees and takes, and `quillo fix`
 src/script.rs      run_script: code a program's users write, sandboxed
-src/native.rs      Rust in a program: .qwer files read, built, loaded and called
+src/native.rs      Rust in a program: .qwer files read, built, loaded and called;
+                   .quillo/plugins.lock and --no-build
+src/policy.rs      the policy: what whoever runs Quillo lets a program do
 
 The standard library
 src/builtins.rs    the builtins every program can call
@@ -6030,6 +6458,7 @@ Serving
 src/httpd.rs       the event loop: connections, requests as coroutines, waiting off the loop
 src/server.rs      request matching, server fns, responses, --watch
 src/stream.rs      answers sent as they are made: stream, events, send
+src/fcgi.rs        quillo fcgi: FastCGI requests made HTTP requests for the server
 src/service.rs     services: in this process or elsewhere, signed calls, retries and
                    circuits, calls made later, --split, --scale, --join
 src/ready.rs       GET /_quillo/ready: what a program needs

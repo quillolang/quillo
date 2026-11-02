@@ -201,6 +201,7 @@ fn native_sig(e: &crate::native::Export, file: &Arc<str>) -> Sig {
         p.name = name.clone();
     }
     sig.native = Some(file.clone());
+    sig.effects = Some(e.effects);
     sig
 }
 
@@ -687,6 +688,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "map | fn, fn=", "any"),
     ("db.error_kind", "any", "str | null"),
+    ("db.sql_name", "str | list", "str"),
     ("idempotent", "map | fn, fn=", "any"),
     ("db.migrate", "str=", "list | error(str)"),
     ("db.tenants", "", "list | error(str)"),
@@ -1041,7 +1043,10 @@ impl Sig {
             s.push_str(&format!(" -> {}", r));
         }
         let e = self.effects.unwrap_or(0);
-        if e != 0 {
+        if e == ALL_EFFECTS && self.native.is_some() {
+            // Its file does not say what it does (`//! effects:`).
+            s.push_str("  (effects: not declared)");
+        } else if e != 0 {
             s.push_str(&format!("  (effect: {})", effect_names(e).join(", ")));
         }
         s
@@ -1307,6 +1312,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let mut c = Checker::new(file);
     c.strict_null = opts.strict_null;
     c.confined = opts.confined;
+    c.root = base_dir.to_path_buf();
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     match Parser::new(src).parse_program().map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
@@ -1463,6 +1469,8 @@ struct Checker {
     /// The services a program calls (`service billing = "billing.qwe"`): the
     /// server fns each offers, by name.
     services: HashMap<String, HashMap<String, Arc<Sig>>>,
+    /// Services whose file is not here: their calls are taken as they are written.
+    services_elsewhere: HashSet<String>,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
     hint: Option<Vec<T>>,
@@ -1470,6 +1478,8 @@ struct Checker {
     strict_null: bool,
     /// See `Options::confined`.
     confined: bool,
+    /// The folder of the file checked first: what a confined check stays in.
+    root: PathBuf,
     /// Files `use`d inside one another, and expressions inside one another,
     /// at the point being checked.
     uses: u32,
@@ -1568,10 +1578,12 @@ impl Checker {
             state_types: HashMap::new(),
             live_ok: false,
             services: HashMap::new(),
+            services_elsewhere: HashSet::new(),
             hint: None,
             strict_null: false,
             letting: Vec::new(),
             confined: false,
+            root: PathBuf::new(),
             uses: 0,
             depth: 0,
             main: Arc::from(file),
@@ -1629,7 +1641,9 @@ impl Checker {
     /// for a path that could lead outside the program's folder.
     fn file_at(&mut self, base: &Path, path: &str, file: &Arc<str>, line: u32) -> Option<PathBuf> {
         let plain = !path.is_empty() && Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
-        if self.confined && !plain {
+        // Nor out of it through a link, to read a file elsewhere (FEEDBACK41.md, Q-475; branch
+        // feedback40-43).
+        if self.confined && (!plain || !crate::builtins::stays_in(&self.root, &base.join(path))) {
             self.diag_at(file.clone(), line, Severity::Error, format!("path must stay inside the program's folder: {}", path));
             return None;
         }
@@ -1639,9 +1653,9 @@ impl Checker {
     /// Works out what each file sees (src/modules.rs), and gives the main file with its
     /// names as they are called in the program.
     fn link(&mut self, stmts: Arc<Vec<Stmt>>, src: &str, file: &str, base: &Path) -> Result<Arc<Vec<Stmt>>, crate::error::QuilloError> {
-        let (confined, overrides) = (self.confined, &self.overrides);
+        let (confined, overrides, root) = (self.confined, &self.overrides, self.root.clone());
         self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
-            if confined && !Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full)) {
                 return None;
             }
             let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
@@ -1663,6 +1677,17 @@ impl Checker {
                 self.everywhere.insert(name.clone());
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 match crate::service::offered(&full) {
+                    // A service that runs elsewhere need not be here: its calls are checked when
+                    // the app asks it for its functions, as it starts (FEEDBACK40.md, Q-471;
+                    // branch feedback40-43).
+                    Err(_) if !full.exists() => {
+                        self.diag_at(file.clone(), *line, Severity::Warning, format!(
+                            "service {}: {} is not here, so its calls are not checked; it must run elsewhere ({} or --service-url)",
+                            name, path, crate::service::env_name(name)
+                        ));
+                        self.services_elsewhere.insert(name.clone());
+                        self.services.entry(name.clone()).or_default();
+                    }
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
                     Ok(defs) => {
                         // Called from here: what it takes and gives, as declared.
@@ -1748,6 +1773,9 @@ impl Checker {
                 let text = self.overrides.get(&full).cloned().map_or_else(|| crate::error::read_source(&full), Ok);
                 // Rust: its functions' signatures, read without building it.
                 if crate::native::is_rust(&path) {
+                    if let Err(e) = crate::native::plugin_allowed(&full) {
+                        self.diag_at(file.clone(), *line, Severity::Error, e);
+                    }
                     match text {
                         Ok(src) => {
                             let parsed = crate::native::parse(&src);
@@ -2346,7 +2374,7 @@ impl Checker {
             name: d.name.clone(),
             ret: d.ret.as_ref().map(ty_t),
             err: d.err.as_ref().map(ty_bits),
-            allowed: effects.unwrap_or(ALL_EFFECTS),
+            allowed: effects.unwrap_or(ALL_EFFECTS) & crate::policy::ceiling(),
             restrictor: d.effects.as_ref().map(|e| (d.name.clone(), e.clone())),
             component: d.component.then(|| d.name.clone()),
             nested: false,
@@ -2445,7 +2473,7 @@ impl Checker {
             name: format!("{} {}", r.method, route_path(r)),
             ret: None,
             err: None,
-            allowed: ALL_EFFECTS,
+            allowed: crate::policy::ceiling(),
             restrictor: None,
             component: None,
             nested: false,
@@ -2817,7 +2845,7 @@ impl Checker {
     fn lambda_body_hinted(&mut self, d: &Arc<FnDef>, hint: Option<Vec<T>>) -> T {
         let (outer_allowed, outer_restrictor, component) = match self.fns.last() {
             Some(f) => (f.allowed, f.restrictor.clone(), f.component.clone()),
-            None => (ALL_EFFECTS, None, None),
+            None => (crate::policy::ceiling(), None, None),
         };
         let allowed = d.effects.as_ref().map_or(outer_allowed, |e| effect_mask(e));
         let restrictor = match &d.effects {
@@ -2883,7 +2911,7 @@ impl Checker {
             name: d.name.clone(),
             ret: None,
             err: None,
-            allowed: ALL_EFFECTS,
+            allowed: crate::policy::ceiling(),
             restrictor: None,
             component: None,
             nested: false,
@@ -2945,6 +2973,9 @@ impl Checker {
                     mask |= builtin_effect(&format!("{}.{}", m, f));
                 } else if self.services.contains_key(m) && !d.params.iter().any(|p| p.name == m) {
                     mask |= crate::ast::effect_bit("http");
+                } else if self.sql_var(m) == SqlVar::Conn && !d.params.iter().any(|p| p.name == m) {
+                    // A connection's call, as `db`'s (Q-488).
+                    mask |= builtin_effect(&format!("db.{}", f));
                 }
             }
         }
@@ -2970,11 +3001,41 @@ impl Checker {
         }
     }
 
+    /// `a.query(...)` on a connection from `db.connect` needs the db effect, as `db.query` does;
+    /// on an untyped parameter that may be one, a warning (FEEDBACK43.md, Q-488; branch
+    /// feedback40-43).
+    fn connection_effects(&mut self, obj: &Expr, name: &str, recv: T) {
+        let needs = builtin_effect(&format!("db.{}", name));
+        if needs == 0 {
+            return;
+        }
+        let (allowed, restrictor) = match self.fns.last() {
+            Some(f) => (f.allowed, f.restrictor.clone()),
+            None => return,
+        };
+        if needs & !allowed == 0 {
+            return;
+        }
+        match obj {
+            Expr::Ident(m, _) if self.sql_var(m) == SqlVar::Conn => self.effect_error(&format!("{}.{}", m, name), needs & !allowed, restrictor.as_ref()),
+            Expr::Ident(m, _) if self.is_local(m) && recv.bits == T::ANY.bits && matches!(name, "query" | "one" | "exec" | "transaction") => {
+                if let Some((f, decl)) = &restrictor {
+                    self.warn(format!(
+                        "`{}.{}` reads like a database call, which needs the db effect, but `{}` is declared `with {}`: if `{}` is a connection, add db",
+                        m, name, f, decl.join(", "), m
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
         match restrictor {
             Some((f, decl)) => self.error(format!("`{}` needs {}, but `{}` is declared `with {}`", what, need, f, decl.join(", "))),
+            None if crate::policy::ceiling() != ALL_EFFECTS => self.error(format!("`{}` needs {}, which {} does not allow", what, need, crate::policy::get().effects_source())),
             None => self.error(format!("`{}` needs {}, which is not allowed here", what, need)),
         }
     }
@@ -3224,6 +3285,15 @@ impl Checker {
                 // true (FEEDBACK28.md, Q-421; branch feedback27-35-fixes).
                 if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "str") && matches!(args.as_slice(), [Expr::Ident(c, _)] if c == "children") && !self.is_local("str") && self.is_local("children") {
                     self.warn("`children` is null when none are given, and `str(children)` is \"null\" then: ask `children != null`");
+                }
+                // `sleep` takes milliseconds; Python's takes seconds (FEEDBACK42.md, Q-482; branch
+                // feedback40-43).
+                if let (Expr::Ident(n, _), [Expr::Lit(Lit::Float(f))]) = (callee.as_ref(), args.as_slice()) {
+                    let builtin = !self.is_local("sleep") && self.globals.get("sleep").map_or(false, |v| &*v.file == "<builtin>");
+                    if n == "sleep" && builtin && *f > 0.0 && *f < 1.0 {
+                        let ms = (f * 1000.0).round();
+                        self.warn(format!("`sleep` takes milliseconds: `sleep({f})` waits {f} ms; for {f} seconds write `sleep({ms})`"));
+                    }
                 }
                 self.call(callee, args, None)
             }
@@ -3686,6 +3756,7 @@ impl Checker {
             }
             let recv = self.expr(obj);
             self.line = line;
+            self.connection_effects(obj, name, recv);
             // `let json = ...` in a function, then `json.stringify(...)`: the
             // variable, not the module, whose method this is not (Q-069).
             if let Expr::Ident(m, _) = &**obj {
@@ -3986,6 +4057,19 @@ impl Checker {
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
             argts.push(self.expr(a));
+        }
+        if sig.is_none() && self.services_elsewhere.contains(svc) {
+            // Its functions are not known here, but a call of it is a call over HTTP.
+            let http = crate::ast::effect_bit("http");
+            let (allowed, restrictor) = match self.fns.last() {
+                Some(f) => (f.allowed, f.restrictor.clone()),
+                None => (crate::policy::ceiling(), None),
+            };
+            self.line = line;
+            if http & !allowed != 0 {
+                self.effect_error(&format!("{}.{}", svc, f), http, restrictor.as_ref());
+            }
+            return T::ANY;
         }
         self.line = line;
         let Some(sig) = sig else {
@@ -4344,6 +4428,7 @@ impl Checker {
     fn sql_safe_call(&self, f: &Expr) -> bool {
         matches!(f, Expr::Ident(n, _) if !self.is_local(n)
             && (n == "sql_name" || n == "sql_param" || self.sql_name_fns.contains(n.as_str())))
+            || matches!(f, Expr::Field(o, n, _) if n == "sql_name" && matches!(&**o, Expr::Ident(m, _) if (m == "db" && !self.is_local(m)) || self.sql_var(m) == SqlVar::Conn))
     }
 
     /// A call of something of type `ft`: arguments, effects, browser rules
@@ -4433,10 +4518,13 @@ impl Checker {
         // Effects.
         let (allowed, restrictor) = match self.fns.last() {
             Some(f) => (f.allowed, f.restrictor.clone()),
-            None => (ALL_EFFECTS, None),
+            None => (crate::policy::ceiling(), None),
         };
         let needs = if sig.builtin { sig.effects.unwrap_or(0) } else { sig.effects.unwrap_or(0) };
-        if needs & !allowed != 0 {
+        if needs & !allowed != 0 && needs == ALL_EFFECTS && sig.native.is_some() {
+            let msg = crate::native::undeclared(name, restrictor.as_ref().map(|(f, _)| f.as_str()));
+            self.error(msg);
+        } else if needs & !allowed != 0 {
             self.effect_error(name, needs & !allowed, restrictor.as_ref());
         } else if allowed != ALL_EFFECTS && !sig.builtin && sig.effects.is_none() {
             let inferred = self.fn_effects(&sig);
@@ -5508,7 +5596,8 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
         match e {
             Expr::Lit(Lit::Str(_)) => true,
             Expr::Ident(n, _) => vars.contains(n.as_str()),
-            Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n.as_str())),
+            Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n.as_str()))
+                || matches!(&**f, Expr::Field(o, n, _) if n == "sql_name" && matches!(&**o, Expr::Ident(m, _) if m == "db")),
             Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(x) if ok(x, safe, vars))),
             Expr::Binary(BinOp::Add, a, b, _) => ok(a, safe, vars) && ok(b, safe, vars),
             Expr::If(_, a, b) => ok(a, safe, vars) && b.as_deref().map_or(false, |b| ok(b, safe, vars)),

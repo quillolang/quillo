@@ -500,7 +500,20 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
         return Ok(());
     }
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    let stmts = Parser::new(&src).parse_program().map_err(|e| format!("{}: {}", path.display(), e))?;
+    // What the app needs of a service is its `server fn`s and the services it declares: a file
+    // that does not parse is read for those alone, so an error in a body or a route of the
+    // service's does not stop the app, which the service's own check reports (FEEDBACK40.md,
+    // Q-471; branch feedback40-43).
+    let stmts = match Parser::new(&src).parse_program() {
+        Ok(s) => s,
+        Err(e) => {
+            let found = headers_only(&src);
+            if found.is_empty() {
+                return Err(format!("{}: {}", path.display(), e));
+            }
+            found
+        }
+    };
     for s in stmts {
         if let Stmt::Use(file, ..) = &s {
             if crate::ast::is_script(file) {
@@ -512,6 +525,116 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
         out.push(s);
     }
     Ok(())
+}
+
+/// What a running service says its `server fn`s are: a call of `_contracts`, made as its calls
+/// are (its `auth`, each address in turn), whose answer is each function's header and contract.
+fn functions_of(it: &mut Interp, name: &str, urls: &[String]) -> Result<(Vec<Arc<FnDef>>, Vec<String>), String> {
+    let list = match remote(it, urls, name, CONTRACTS, Vec::new(), None, None, new_id(16)) {
+        Outcome::Ran(Value::List(l)) => l,
+        Outcome::Ran(other) => return Err(format!("its answer is not a list of functions: {}", short(&other))),
+        Outcome::Missed(why) | Outcome::Refused(_, why) => return Err(why),
+    };
+    let mut defs = Vec::new();
+    let mut contracts = Vec::new();
+    for f in list.iter() {
+        let Value::Map(m) = f else { continue };
+        let (Some(Value::Str(header)), Some(Value::Str(contract))) = (m.get("header"), m.get("contract")) else { continue };
+        let stmts = Parser::new(header).parse_program().map_err(|e| format!("cannot read `{}`: {}", header, e))?;
+        if let Some(Stmt::Fn(d)) = stmts.into_iter().next() {
+            defs.push(d);
+            contracts.push(contract.to_string());
+        }
+    }
+    Ok((defs, contracts))
+}
+
+/// The function an app that does not hold a service's file calls to learn its functions.
+const CONTRACTS: &str = "_contracts";
+
+/// This program's `server fn`s, as headers an app can read and their contracts: what a call of
+/// `_contracts` gets, once it has proved its caller as any call does.
+fn contract_list(it: &Interp, who: &str) -> serde_json::Value {
+    let mut out = Vec::new();
+    // Those it may call: one kept to other callers (`for [...]`) is not named to it.
+    for n in it.server_fns.iter().filter(|n| it.fn_callers.get(n.as_str()).map_or(true, |a| a.iter().any(|c| c == who))) {
+        let Some(Value::Func(c)) = lookup(&it.globals, n) else { continue };
+        let d = &c.def;
+        let params: Vec<String> = d
+            .params
+            .iter()
+            .map(|p| format!("{}{}{}", p.name, p.ty.as_ref().map_or(String::new(), |t| format!(": {}", t.text())), if p.default.is_some() { " = null" } else { "" }))
+            .collect();
+        let header = format!(
+            "server fn {}({}){}{} = null",
+            d.name,
+            params.join(", "),
+            d.ret.as_ref().map_or(String::new(), |t| format!(" -> {}", t.text())),
+            d.err.as_ref().map_or(String::new(), |t| format!(" ! {}", t.text()))
+        );
+        out.push(serde_json::json!({ "header": header, "contract": crate::describe::contract(d) }));
+    }
+    serde_json::json!({ "ok": out })
+}
+
+/// The top-level `server fn` headers, `use`s and `service`s of a file that does not parse as a
+/// whole: each read alone, its body left out.
+fn headers_only(src: &str) -> Vec<Stmt> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        let at_top = !l.starts_with([' ', '\t']);
+        // `public server fn` and `private server fn` too.
+        let bare = l.strip_prefix("public ").or_else(|| l.strip_prefix("private ")).unwrap_or(l);
+        let words: Vec<&str> = bare.split_whitespace().take(2).collect();
+        let take = |text: &str| Parser::new(text).parse_program().ok();
+        if at_top && words == ["server", "fn"] {
+            // The header: up to the `=` or `{` after its parameters that leaves a header that
+            // parses; a `{` that does not is a shape's (`-> { title: str }`), and is gone past.
+            let mut header = String::new();
+            let mut depth = 0i32;
+            let mut seen_params = false;
+            let mut found = None;
+            'lines: for line in &lines[i..] {
+                for (k, c) in line.char_indices() {
+                    match c {
+                        '(' | '[' => depth += 1,
+                        ')' | ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                seen_params = true;
+                            }
+                        }
+                        '{' | '=' if depth == 0 && seen_params && !line[..k].ends_with(['-', '!', '<', '>', '=']) && !line[k + 1..].starts_with(['>', '=']) => {
+                            if let Some(stmts) = take(&format!("{}{} = null\n", header, &line[..k])) {
+                                found = Some(stmts);
+                                break 'lines;
+                            }
+                            if c == '{' {
+                                depth += 1;
+                            }
+                        }
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                header.push_str(line);
+                header.push('\n');
+            }
+            if let Some(stmts) = found {
+                out.extend(stmts.into_iter().filter(|s| matches!(s, Stmt::Fn(_))));
+            }
+        } else if at_top && (l.starts_with("use ") || l.starts_with("import ") || l.starts_with("service ")) {
+            if let Some(stmts) = take(l) {
+                out.extend(stmts.into_iter().filter(|s| matches!(s, Stmt::Use(..) | Stmt::Service(..))));
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The `server fn`s a service's program offers (its own and its `use`d files').
@@ -1285,6 +1408,13 @@ const SEEN_FOR: Duration = Duration::from_secs(2 * WINDOW + 60);
 const SEEN_MAX: usize = 100_000;
 
 fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value) -> HttpResponse {
+    if f == CONTRACTS && !it.server_fns.iter().any(|n| n == f) {
+        let who = match &caller {
+            Value::Map(m) => m.get("name").map(|n| n.display()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        return json(200, contract_list(it, &who));
+    }
     let Some(Value::Func(c)) = lookup(&it.globals, f).filter(|_| it.server_fns.iter().any(|n| n == f)) else {
         return refused(404, &format!("no server fn `{}`", f));
     };
@@ -1436,12 +1566,34 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
         }
     }
     let full = it.base_dir.join(file);
-    let defs = offered(&full).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    let fail_at = |e: String| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line)));
+    // A service that runs elsewhere and whose file is not here: asked for its functions, as it
+    // gives them, signed (FEEDBACK40.md, Q-471; branch feedback40-43).
+    // `urls_of`, not `url_of`, which takes the addresses in turn: the mount below is given the
+    // one it would have been.
+    let urls = urls_of(&it.shared, name);
+    let (defs, given) = match offered(&full) {
+        Ok(d) => (d, None),
+        Err(_) if !full.exists() && !urls.is_empty() => {
+            let (d, c) = functions_of(it, name, &urls).map_err(|e| fail_at(format!("{} is not here, and service {} did not give its functions: {}", file, name, e)))?;
+            (d, Some(c))
+        }
+        Err(e) => return Err(fail_at(e)),
+    };
     {
         let mut c = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for d in &defs {
-            c.insert((name.to_string(), d.name.clone()), crate::describe::contract(d));
+        for (k, d) in defs.iter().enumerate() {
+            let contract = given.as_ref().and_then(|g: &Vec<String>| g.get(k).cloned()).unwrap_or_else(|| crate::describe::contract(d));
+            c.insert((name.to_string(), d.name.clone()), contract);
         }
+    }
+    // Its files are watched when it runs apart too, so a function added there reaches the app
+    // (FEEDBACK40.md, Q-472).
+    if full.exists() {
+        let mut seen = HashSet::new();
+        let mut stmts = Vec::new();
+        let _ = statements(&full, full.parent().unwrap_or(Path::new(".")), &mut seen, &mut stmts);
+        Arc::make_mut(&mut it.watched).extend(seen);
     }
     let ns = namespace(it, name, &defs, line)?;
     if let Some(url) = url_of(&it.shared, name) {
@@ -1881,7 +2033,7 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
 /// `--scale risk=3`, a service runs as that many copies, each on a port of
 /// its own, taking calls in turn and sharing its database (FEEDBACK10.md,
 /// Q-075; branch feedback10-fixes).
-pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
+pub fn split(path: &Path, watch: bool, static_check: bool, checked: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
     let services = declared(path)?;
     let _ = APP_URL.set(app_url.to_string());
     if let Some((name, _)) = scale.iter().find(|(n, _)| !services.iter().any(|(s, _, _)| s == n)) {
@@ -1919,8 +2071,19 @@ pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usi
         if watch {
             args.push("--watch".into());
         }
+        if crate::native::NO_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
+            args.push("--no-build".into());
+        }
+        // The app's policy is its services' too (the host's they read themselves).
+        for f in crate::policy::get().files.iter().filter(|f| f.as_path() != Path::new(crate::policy::HOST_FILE)) {
+            args.extend(["--policy".to_string(), f.display().to_string()]);
+        }
         if !static_check {
             args.push("--no-check".into());
+        } else if checked {
+            // Checked by the app already: its first load does not say it all again; a reload
+            // under --watch still checks (FEEDBACK40.md, Q-473; branch feedback40-43).
+            args.push("--checked".into());
         }
         // Its own document, at `/billing/_quillo/describe` through the app, as in one process
         // (FEEDBACK32.md, Q-397; branch feedback27-35-fixes).
@@ -1929,15 +2092,24 @@ pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usi
         }
         let child = start_service(&exe, &args, name)?;
         eprintln!("quillo: service {} ({}) on http://127.0.0.1:{}{}", name, file.display(), port, prefix.as_ref().map_or(String::new(), |p| format!(", served under {}", p)));
+        // Started again later, it checks itself: its file may have changed since.
+        let args: Vec<String> = args.into_iter().filter(|a| a != "--checked").collect();
         running.push(Running { name: name.clone(), exe: exe.clone(), args, child, started: Instant::now(), wait: Duration::from_secs(1), again_at: None });
     }
     let split = Split { services: Arc::new(Mutex::new(running)), stop: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
     // Ready when each answers.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    for ((name, _, _, _), port) in copies.iter().zip(&ports) {
+    for (i, ((name, _, _, _), port)) in copies.iter().zip(&ports).enumerate() {
         while std::net::TcpStream::connect(("127.0.0.1", *port)).is_err() {
             if std::time::Instant::now() > deadline {
                 return Err(format!("service {} did not start (see its lines above)", name));
+            }
+            // One that has ended is not waited for: said at once (FEEDBACK40.md, Q-474; branch
+            // feedback40-43).
+            let ended = split.services.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[i].child.try_wait().ok().flatten();
+            if let Some(status) = ended {
+                std::thread::sleep(Duration::from_millis(100));
+                return Err(format!("service {} stopped at start ({}; see its lines above)", name, status));
             }
             std::thread::sleep(Duration::from_millis(50));
         }

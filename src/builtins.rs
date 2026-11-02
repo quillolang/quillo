@@ -956,6 +956,10 @@ fn url_encode(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
 
 fn env_var(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = s_arg(&args, 0, "env", line)?;
+    // A name the policy does not give: as if not set (FEEDBACK41.md, Q-478; branch feedback40-43).
+    if crate::policy::get().env_name(&name).is_err() {
+        return Ok(arg(&args, 1));
+    }
     Ok(crate::dotenv::var(&it.env_file, &name).map(Value::str).unwrap_or_else(|| arg(&args, 1)))
 }
 
@@ -1089,7 +1093,7 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return Ok(not_found());
     }
-    let full = it.base_dir.join(rel);
+    let Some(full) = inside(it, it.base_dir.join(rel)) else { return Ok(not_found()) };
     let Ok(info) = crate::statics::info(&full) else { return Ok(not_found()) };
     // Options it does not know are refused, naming those it does, as a mistyped `cache` would
     // otherwise go unseen (FEEDBACK27.md, Q-331; branch feedback27-35-fixes). `download` names
@@ -1385,7 +1389,8 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let base = it.base_dir.join(&*dir);
     let serve = |it: &mut Interp, name: String| file(it, vec![Value::str(name), Value::map(file_opts.clone())], line);
     let joined = |rel: &str| if rel.is_empty() { dir.to_string() } else { format!("{}/{}", dir.trim_end_matches('/'), rel) };
-    if !hidden && !rel.split('/').any(|s| s == "..") {
+    // Judged before it is looked at: whether a folder outside is there is not said (Q-475).
+    if !hidden && !rel.split('/').any(|s| s == "..") && stays_in(&it.base_dir, &base.join(rel)) {
         let target = base.join(rel);
         if target.is_dir() {
             let asked = match it.request_value() {
@@ -1466,7 +1471,9 @@ fn save_upload(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => (b.as_ptr() as usize - body.as_ptr() as usize, b.len()),
         Err(e) => return Ok(Value::err(Value::str(format!("save_upload: {}", e)))),
     };
-    let full = it.base_dir.join(rel);
+    let Some(full) = inside(it, it.base_dir.join(rel)) else {
+        return fail(line, format!("`save_upload` needs a path inside the program's folder, and {:?} leads out of it through a link", &*dest));
+    };
     if let Some(why) = own_file(it, &full, true) {
         return Ok(Value::err(Value::str(format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", dest, why))));
     }
@@ -1694,7 +1701,73 @@ pub(crate) fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return allowed_path(it, p);
     }
-    Some(it.base_dir.join(rel))
+    inside(it, it.base_dir.join(rel))
+}
+
+/// `full` if, links followed, it is still in the program's folder (or one `--allow-path`
+/// named): a link inside the folder may lead anywhere, and a cloned repository or an unpacked
+/// archive can bring one (FEEDBACK41.md, Q-475; branch feedback40-43).
+pub(crate) fn inside(it: &Interp, full: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if stays_in(&it.base_dir, &full) {
+        return Some(full);
+    }
+    let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let real = real_path(&full);
+    if real.as_ref().is_some_and(|r| dirs.iter().any(|d| r.starts_with(d))) {
+        return Some(full);
+    }
+    // Said once, as a deploy's `uploads -> ../shared/uploads` is then a 404 with no other word.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let to = real.map_or_else(|| "nowhere (the link is dangling)".to_string(), |r| r.display().to_string());
+        eprintln!(
+            "quillo: {} leads out of the program's folder through a link, to {}, and is refused; `--allow-path FOLDER` lets the program reach a folder outside",
+            full.strip_prefix(&*it.base_dir).unwrap_or(&full).display(),
+            to
+        );
+    }
+    None
+}
+
+/// Whether `full`, a path under `root`, stays under it with its links followed. Each part is
+/// looked at (`lstat`, about a microsecond), and only a path with a link in it is resolved,
+/// which costs ten times that: a static file costs what it did. A link that leads nowhere does
+/// not stay: writing through it would make its target, wherever that is.
+pub(crate) fn stays_in(root: &Path, full: &Path) -> bool {
+    let resolved = || match (real_path(full), root.canonicalize()) {
+        (Some(real), Ok(base)) => real.starts_with(base),
+        _ => false,
+    };
+    let Ok(rel) = full.strip_prefix(root) else { return resolved() };
+    let mut at = root.to_path_buf();
+    for c in rel.components() {
+        at.push(c);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => return resolved(),
+            Ok(_) => {}
+            // What follows is not there: no link in it.
+            Err(_) => return true,
+        }
+    }
+    true
+}
+
+/// Where `p` really is: the nearest part of it that is there, resolved, and the names after it.
+/// None for a link that leads nowhere.
+fn real_path(p: &Path) -> Option<std::path::PathBuf> {
+    let mut at = p;
+    let mut rest = Vec::new();
+    let real = loop {
+        if let Ok(r) = at.canonicalize() {
+            break r;
+        }
+        if std::fs::symlink_metadata(at).is_ok() {
+            return None;
+        }
+        rest.push(at.file_name()?);
+        at = at.parent()?;
+    };
+    Some(rest.iter().rev().fold(real, |r, name| r.join(name)))
 }
 
 /// `p` as it really is, if that is inside a folder `--allow-path` named. A file not made yet
@@ -2585,7 +2658,7 @@ fn sql_ident(v: &Value, f: &str, line: u32) -> Result<String, Ctrl> {
     Ok(s.to_string())
 }
 
-fn sql_idents(args: &[Value], f: &str, line: u32, each: impl Fn(String) -> String) -> R {
+pub(crate) fn sql_idents(args: &[Value], f: &str, line: u32, each: impl Fn(String) -> String) -> R {
     match args.first() {
         Some(Value::List(items)) => {
             let parts: Result<Vec<String>, Ctrl> = items.iter().map(|v| sql_ident(v, f, line).map(&each)).collect();

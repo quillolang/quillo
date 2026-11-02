@@ -182,6 +182,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("db.query", "sql, params", "Every row as a list of maps, all in memory, or an error value."),
     ("db.one", "sql, params", "The first row as a map, or null, or an error value."),
     ("db.transaction", "options, f", "Runs `f` all or nothing; an error value rolls it back. `options` may be left out."),
+    ("db.sql_name", "name", "A name quoted for this database: on a connection (`shop.sql_name(col)`), for that one, as MySQL reads \"x\" as text."),
     ("db.error_kind", "e", "What failed: `unique`, `foreign_key`, `not_null`, `check` or `conflict`, else null."),
     ("db.migrate", "dir", "Runs the `.sql` files of `dir` (`migrations` unless given) not yet run, in name order; gives their names."),
     ("db.tenants", "", "The names of the tenants that have a database; it needs a `{tenant}` target, not a function."),

@@ -428,8 +428,10 @@ fn service_calls_are_checked_against_what_the_service_offers() {
     assert!(diags(&format!("{}fn f() = billing.later.nope()", pre))[0].contains("has no server fn `nope`"));
     // How it is called, after the file.
     assert!(diags("service billing = \"billing.qwe\" { timeout: \"2s\", retries: 1 }\nfn f() = billing.invoice(\"a\", 1)").is_empty());
-    // A file that is not there.
-    assert!(diags("service gone = \"gone.qwe\"\n")[0].contains("cannot read"));
+    // A file that is not there: it runs elsewhere, and its calls are not checked here
+    // (FEEDBACK40.md, Q-471; branch feedback40-43).
+    let gone = diags("service gone = \"gone.qwe\"\nfn f() = gone.anything(1, 2)\n");
+    assert!(gone.len() == 1 && gone[0].contains("service gone: gone.qwe is not here, so its calls are not checked"), "{:?}", gone);
     // Services using one another are each checked once.
     std::fs::write(d.join("a.qwe"), "service b = \"b.qwe\"\nserver fn ping() = b.pong()\n").unwrap();
     std::fs::write(d.join("b.qwe"), "service a = \"a.qwe\"\nserver fn pong() = 1\n").unwrap();

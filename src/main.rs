@@ -14,7 +14,7 @@ macro_rules! eprintln {
 }
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use quillo::ast::Stmt;
 use quillo::interp::Ctrl;
 use quillo::check::SymbolKind;
@@ -59,6 +59,9 @@ usage:
   quillo serve <folder> [options]   serve a folder of files as they are, as a
                                     static host does: index.html, clean URLs,
                                     404.html (the options of `run`)
+  quillo fcgi <file.qwe> [options]  run it behind FastCGI (mod_fcgid starts it with
+                                    its socket on file descriptor 0; or --listen
+                                    unix:PATH, or --port, for nginx's fastcgi_pass)
   quillo <file.qwe>                 same as `quillo run`
 
 The program is the first argument that is not an option, wherever the options
@@ -69,6 +72,9 @@ or `--port=8081`.
 options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
   --host H       address to listen on (default 127.0.0.1)
+  --listen unix:PATH  listen on a Unix socket, for a web server in front (mode 0600; --socket-mode 660)
+  --policy FILE  narrow what it may do, after /etc/quillo/policy.toml and before quillo.policy
+  --no-build     load the .qwer libraries .quillo holds, as plugins.lock names them; never run cargo
   --instances N  run the program N times over, each on a core of its own
   --max-compute 2s  end a request that computes this long without letting go, as a 500
   --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
@@ -190,7 +196,7 @@ fn main() {
 /// Options of `run` and `app` that take a value: the word after one is its
 /// value, not the program.
 const VALUE_OPTIONS: &[&str] = &[
-    "--host", "--port", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
+    "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--max-compute", "--allow-path", "--trust-proxy", "--live-per-client", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
     "--scale", "--join", "--with", "--allow-join", "--join-as",
 ];
@@ -198,7 +204,7 @@ const VALUE_OPTIONS: &[&str] = &[
 /// Options of `run`, `app` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join",
+    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join", "--checked", "--no-build",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -386,12 +392,38 @@ fn with_one_program(args: &[String], known: &[&str], f: impl FnOnce(&str, &[Stri
 fn real_main(args: Vec<String>) -> i32 {
     match args.get(1).map(String::as_str) {
         Some("run") => with_program(&args[2..], run),
+        // FastCGI (FEEDBACK41.md, Q-479; branch feedback40-43).
+        Some("fcgi") => with_program(&args[2..], |f, flags| {
+            FCGI.store(true, std::sync::atomic::Ordering::Relaxed);
+            run(f, flags)
+        }),
         // A debug adapter for editors, on stdin and stdout (src/debug.rs).
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
-        Some("check") => with_one_program(&args, &["--strict-null"], |f, flags| {
-            let strict_null = flags.iter().any(|a| a == "--strict-null");
-            check(f, quillo::check::Options { strict_null, css: true, ..Default::default() })
-        }),
+        Some("check") => {
+            // `--policy FILE`: what the program would be refused under it, said before a deploy
+            // (FEEDBACK41.md, Q-478; branch feedback40-43).
+            let mut rest = Vec::new();
+            let mut policies = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].strip_prefix("--policy=") {
+                    Some(v) => policies.push(PathBuf::from(v)),
+                    None if args[i] == "--policy" && i + 1 < args.len() => {
+                        policies.push(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    None => rest.push(args[i].clone()),
+                }
+                i += 1;
+            }
+            with_one_program(&rest, &["--strict-null"], |f, flags| {
+                if let Err(code) = with_policy(Path::new(f), &policies, !policies.is_empty()) {
+                    return code;
+                }
+                let strict_null = flags.iter().any(|a| a == "--strict-null");
+                check(f, quillo::check::Options { strict_null, css: true, ..Default::default() })
+            })
+        }
         // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
         // branch feedback10-fixes).
         Some("docs") => with_one_program(&args, &[], |f, _| match quillo::describe::of_source(Path::new(f)) {
@@ -510,10 +542,18 @@ fn usage() -> i32 {
 struct RunOptions {
     host: Option<String>,
     port: Option<String>,
+    /// `--policy FILE`s, layers between the host's and the program's (FEEDBACK41.md, Q-478).
+    policies: Vec<PathBuf>,
+    /// `--listen unix:PATH` (FEEDBACK41.md, Q-479; branch feedback40-43).
+    listen: Option<PathBuf>,
+    socket_mode: u32,
     workers: usize,
     watch: bool,
     reload: bool,
     static_check: bool,
+    /// The whole program, services and all, was checked before `--split` started them: the
+    /// first load does not check it again (FEEDBACK40.md, Q-473; branch feedback40-43).
+    checked: bool,
     register: Option<String>,
     service: Option<String>,
     max_body: usize,
@@ -542,10 +582,14 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     let mut o = RunOptions {
         host: None,
         port: None,
+        listen: None,
+        socket_mode: 0o600,
+        policies: Vec::new(),
         workers: 64,
         watch: false,
         reload: false,
         static_check: true,
+        checked: false,
         register: None,
         service: None,
         max_body: quillo::server::MAX_BODY,
@@ -586,6 +630,17 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--as-service", _) => {
                 o.as_service = true;
+                i += 1;
+                continue;
+            }
+            ("--no-build", _) => {
+                quillo::native::NO_BUILD.store(true, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            // Given by `--split` to the services it starts, once it has checked them itself.
+            ("--checked", _) => {
+                o.checked = true;
                 i += 1;
                 continue;
             }
@@ -695,6 +750,21 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             // (FEEDBACK31.md, Q-384; branch feedback27-35-fixes).
             ("--host", Some(v)) if v.eq_ignore_ascii_case("localhost") => o.host = Some("127.0.0.1".into()),
             ("--host", Some(v)) => o.host = Some(v.clone()),
+            ("--listen", Some(v)) => match v.strip_prefix("unix:").filter(|p| !p.is_empty()) {
+                Some(p) => o.listen = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("quillo: --listen takes unix:PATH, a socket to make (for a TCP port, --host and --port), got {:?}", v);
+                    return Err(2);
+                }
+            },
+            ("--policy", Some(v)) => o.policies.push(PathBuf::from(v)),
+            ("--socket-mode", Some(v)) => match u32::from_str_radix(v, 8) {
+                Ok(m) if m <= 0o777 && m & 0o600 == 0o600 => o.socket_mode = m,
+                _ => {
+                    eprintln!("quillo: --socket-mode is octal permissions the owner can read and write, such as 600 or 660, got {:?}", v);
+                    return Err(2);
+                }
+            },
             // A port is checked with the options, a usage mistake (FEEDBACK31.md, Q-381).
             ("--port", Some(v)) => match v.parse::<u16>() {
                 Ok(_) => o.port = Some(v.clone()),
@@ -836,7 +906,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     // Signed service calls name the service they are for (see `service::answer`).
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     quillo::service::serve_as(o.service_name.as_deref().unwrap_or(&stem));
-    let checked = if o.static_check { static_errors(path) } else { Ok(()) };
+    let checked = if o.static_check && !o.checked { static_errors(path) } else { Ok(()) };
     if let (Err(_), false) = (&checked, o.watch) {
         return Err(1);
     }
@@ -1089,6 +1159,9 @@ fn install_stop() {
 /// Runs the program. Whichever way it ends, a program that fails to load, has
 /// nothing to serve or cannot listen included, what runs beside it stops
 /// with it (FEEDBACK16.md, Q-123; branch feedback20-fixes).
+/// `quillo fcgi`: the program answers FastCGI, not HTTP.
+static FCGI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn run(file: &str, flags: &[String]) -> i32 {
     let code = run_program(file, flags);
     with::stop_all();
@@ -1096,11 +1169,30 @@ fn run(file: &str, flags: &[String]) -> i32 {
 }
 
 fn run_program(file: &str, flags: &[String]) -> i32 {
-    let o = match run_options(flags) {
+    let mut o = match run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
     };
     install_stop();
+    // What whoever runs it allows (FEEDBACK41.md, Q-478; branch feedback40-43).
+    if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
+        return code;
+    }
+    {
+        let p = quillo::policy::get();
+        if let Some(w) = p.workers {
+            o.workers = o.workers.min(w);
+        }
+        if let Some(b) = p.max_body {
+            o.max_body = o.max_body.min(b);
+        }
+        if let Some(c) = p.max_compute {
+            let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
+            if now == 0 || now > c {
+                quillo::httpd::limit_compute(c);
+            }
+        }
+    }
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
@@ -1111,6 +1203,20 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
+    // A process manager may pass a socket's path in $PORT.
+    let listen = o.listen.clone().or_else(|| {
+        let p = port.strip_prefix("unix:");
+        (o.port.is_none() && (p.is_some() || port.starts_with('/'))).then(|| PathBuf::from(p.unwrap_or(&port)))
+    });
+    let fcgi = FCGI.load(std::sync::atomic::Ordering::Relaxed);
+    // Nor one that tells others its port, which it does not listen on (`--join`).
+    if (listen.is_some() || fcgi) && (o.split || o.instances > 1 || o.register.is_some() || o.join.is_some() || cfg!(not(unix))) {
+        eprintln!("quillo: {} is for one process (not with --split, --instances, --register or --join), on Unix", if fcgi { "quillo fcgi" } else { "--listen unix:" });
+        return 2;
+    }
+    if listen.as_ref().is_some_and(|l| l.as_os_str().len() <= 100) && !fcgi && !quillo::httpd::trusts_proxies() {
+        eprintln!("quillo: every visitor through unix:{} is 127.0.0.1 to the program (one rate limit, one IP for all): give --trust-proxy 127.0.0.1 so that the web server's X-Forwarded-For is believed", listen.as_ref().unwrap().display());
+    }
     let path = Path::new(file);
     // Announcements are signed with a key made from limer's secret: without
     // one, anyone who can reach a server could make its pages reload.
@@ -1133,7 +1239,19 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         // Q-087; branch open-fixes).
         let reach = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host.as_str() };
         let app_url = if reach.contains(':') { format!("http://[{}]:{}", reach, port) } else { format!("http://{}:{}", reach, port) };
-        match quillo::service::split(path, o.watch, o.static_check, &o.scale, &app_url) {
+        // The whole tree checked once, here, before any service starts: an error in a service is
+        // found before anything waits for it, and each warning is said once, not once a level.
+        // The services started skip their own check (FEEDBACK40.md, Q-473; branch feedback40-43).
+        // A file that is not there is said as it was, by `split` (`cannot read ...`).
+        if o.static_check && path.exists() {
+            // Under --watch an error does not stop it: the app then checks again as it loads, to
+            // show the error on its pages.
+            o.checked = static_errors(path).is_ok();
+            if !o.checked && !o.watch {
+                return 1;
+            }
+        }
+        match quillo::service::split(path, o.watch, o.static_check, o.checked, &o.scale, &app_url) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("quillo: {}", e);
@@ -1184,6 +1302,31 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         None => None,
     };
     stop_on_signal_with(member, joining);
+    #[cfg(unix)]
+    if fcgi {
+        let source = match (&listen, &o.port) {
+            (Some(sock), _) => quillo::server::fcgi_unix(sock, o.socket_mode),
+            (None, Some(_)) => std::net::TcpListener::bind(format!("{}:{}", host, port)).map(quillo::fcgi::Source::Tcp).map_err(|e| format!("cannot listen on {}:{}: {}", host, port, e)),
+            (None, None) => quillo::fcgi::from_fd0(),
+        };
+        return match source.and_then(|s| quillo::server::serve_fcgi(app, s, listen.as_deref(), o.workers)) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        };
+    }
+    #[cfg(unix)]
+    if let Some(sock) = &listen {
+        return match quillo::server::serve_unix(app, sock, o.socket_mode, o.workers) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        };
+    }
     match quillo::server::serve(app, &format!("{}:{}", host, port), o.workers) {
         Ok(()) => 0,
         Err(e) => {
@@ -1209,6 +1352,26 @@ fn static_errors(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Reads the policy that applies to `main` and puts it in force; `say` prints what it is.
+fn with_policy(main: &Path, extra: &[PathBuf], say: bool) -> Result<(), i32> {
+    match quillo::policy::load(main, extra) {
+        Ok(p) => {
+            if say && !p.files.is_empty() {
+                eprintln!("quillo: {}", p.summary());
+            }
+            if !p.build {
+                quillo::native::NO_BUILD.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            quillo::policy::set(p);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("quillo: {}", e);
+            Err(2)
+        }
+    }
+}
 
 fn check(file: &str, opts: quillo::check::Options) -> i32 {
     let analysis = quillo::check::check_file_opts(Path::new(file), Default::default(), opts);

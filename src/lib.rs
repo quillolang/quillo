@@ -44,6 +44,8 @@ pub mod jobs;
 pub mod modules;
 pub mod svcauth;
 pub mod embed;
+pub mod fcgi;
+pub mod policy;
 
 /// Standard base64, padded (`btoa`'s).
 pub fn crypto_b64(bytes: &[u8]) -> String {
