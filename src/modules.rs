@@ -103,7 +103,7 @@ fn lexical(p: &Path) -> std::path::PathBuf {
 }
 
 pub fn resolve(base: &Path, path: &str) -> String {
-    match path.strip_suffix(".qwer").map(|p| format!("{}.qwe", p)) {
+    match path.strip_suffix(".qwer").or_else(|| path.strip_suffix(".rs")).map(|p| format!("{}.qwe", p)) {
         Some(qwe) if !base.join(path).exists() && base.join(&qwe).exists() => qwe,
         _ => path.to_string(),
     }
@@ -149,7 +149,7 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
             let full = base.join(&path);
             let k = key(&full);
             links.written.entry(k.clone()).or_insert(path.clone());
-            if !path.ends_with(".qwer") && !files.iter().any(|(f, _)| *f == k) {
+            if !crate::native::is_rust(&path) && !files.iter().any(|(f, _)| *f == k) {
                 if let Some(parsed) = read(&path, &full) {
                     links.parsed.insert(k.clone(), parsed.clone());
                     files.push((k, parsed));

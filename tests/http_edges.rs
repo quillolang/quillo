@@ -163,8 +163,7 @@ fn reset(s: TcpStream) {
 fn every_status_goes_out_with_its_reason() {
     let srv = start("reasons", APP, &[]);
     let known = [
-        (100, "Continue"),
-        (101, "Switching Protocols"),
+        // A 1xx is no answer a route gives (FEEDBACK36.md, Q-433).
         (200, "OK"),
         (201, "Created"),
         (202, "Accepted"),

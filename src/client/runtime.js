@@ -10,6 +10,14 @@ let BASE = "";
 // are left out of production bundles (see `runtime_units` in client.rs).
 let DEV = false;
 const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !== "/" ? BASE + u : u);
+// In an app, the one way out the app's shell gives (FEEDBACK39.md, Q-465 and Q-470; branch
+// feedback36-39): the page comes from the app itself, through a scheme, and what a scheme cannot
+// carry (a body on Android, a file on WebKit, a socket anywhere) goes through the app's bridge.
+// In a browser, `fetch` and `WebSocket`.
+let WIRE = null;
+if (typeof document !== "undefined" && typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("quillo-wire", { detail: (w) => { WIRE = w; } }));
+const wireFetch = (u, init) => (WIRE && WIRE.fetch ? WIRE.fetch(u, init) : fetch(u, init));
+const openSocket = (path) => (WIRE && WIRE.socket ? WIRE.socket(path) : new WebSocket(location.origin.replace(/^http/, "ws") + path));
 
 // ---- values ------------------------------------------------------------
 
@@ -1065,7 +1073,9 @@ const B = {};
 // ---- streams (src/stream.rs) -------------------------------------------
 // What a streamed answer sends, given to f as it arrives: an event's data
 // (JSON, parsed) and its name, a line of JSON, or a piece of text.
-async function readStream(res, f, who, signal) {
+// `at`: where an event stream's last id and retry are kept, for `listen` to connect again from
+// (FEEDBACK36.md, Q-444; branch feedback36-39).
+async function readStream(res, f, who, signal, at) {
   const type = (res.headers.get("content-type") || "").toLowerCase();
   const kind = type.startsWith("text/event-stream") ? "events" : /ndjson|jsonl|json-seq/.test(type) ? "lines" : "text";
   const parse = (t) => { try { return JSON.parse(t); } catch (_) { return t; } };
@@ -1099,6 +1109,8 @@ async function readStream(res, f, who, signal) {
         if (v[0] === " ") v = v.slice(1);
         if (field === "data") data.push(v);
         else if (field === "event") name = v;
+        else if (field === "id" && at && !v.includes("\0")) at.id = v;
+        else if (field === "retry" && at && /^\d+$/.test(v)) at.retry = +v;
       }
       if (data.length) out.push([parse(data.join("\n")), name]);
     }
@@ -1157,7 +1169,7 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   if (opts.redirects === 0) init.redirect = "manual";
   if (!isNil(secs) && typeof AbortSignal !== "undefined" && AbortSignal.timeout) init.signal = AbortSignal.timeout(Math.max(1, Math.round(secs * 1000)));
   let res;
-  try { res = await fetch(withBase(url), init); } catch (e) {
+  try { res = await wireFetch(withBase(url), init); } catch (e) {
     if (e && e.name === "TimeoutError") return new Err(`http: ${url} took more than ${secs} s`);
     // A browser says only "Failed to fetch" or "Load failed": for another site, what it may be
     // (FEEDBACK33.md, Q-411; branch feedback27-35-fixes).
@@ -1196,7 +1208,7 @@ B.receive = meta(async (url, f, opts) => {
   if (isMap(opts.headers)) for (const k of Object.keys(opts.headers)) init.headers[k] = display(opts.headers[k]);
   if (!isNil(opts.body)) bodyInit(init, opts.body);
   let res;
-  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
+  try { res = await wireFetch(withBase(url), init); } catch (e) { return new Err("receive: " + e.message); }
   if (!res.ok) return new Err(`receive: ${res.status} ${await res.text().catch(() => "")}`.trim());
   try { await readStream(res, f, "receive"); } catch (e) { if (e instanceof QuilloError) throw e; return new Err("receive: " + e.message); }
   return null;
@@ -1215,17 +1227,23 @@ B.listen = meta((url, f) => {
   onCleanup(() => ctl.abort());
   (async () => {
     let wait = 1000;
+    // The last event id and the server's `retry`: connecting again, the stream goes on from
+    // there, as `EventSource` does, where it started over (FEEDBACK36.md, Q-444; branch
+    // feedback36-39).
+    const at = { id: null, retry: null };
     while (!ctl.signal.aborted) {
       try {
-        const res = await fetch(withBase(url), { signal: ctl.signal, headers: { accept: "text/event-stream, application/x-ndjson, */*" } });
+        const headers = { accept: "text/event-stream, application/x-ndjson, */*" };
+        if (at.id) headers["last-event-id"] = at.id;
+        const res = await wireFetch(withBase(url), { signal: ctl.signal, headers });
         if (!res.ok) throw new Error(`${res.status}`);
         wait = 1000;
-        await readStream(res, f, "listen", ctl.signal);
+        await readStream(res, f, "listen", ctl.signal, at);
         return;
       } catch (e) {
         if (ctl.signal.aborted) return;
         if (e instanceof QuilloError) return report(e);
-        await new Promise((r) => setTimeout(r, wait));
+        await new Promise((r) => setTimeout(r, at.retry ?? wait));
         wait = Math.min(wait * 2, 30000);
       }
     }
@@ -1479,7 +1497,7 @@ B.markdown = meta(async (s, o) => {
   if (!isNil(o) && !isMap(o)) fail(`\`markdown\` expects options as a map, got ${typeName(o)}`);
   let r, body = null;
   try {
-    r = await fetch(BASE + "/_quillo/markdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify([s, isNil(o) ? null : toJSON(o)]) });
+    r = await wireFetch(BASE + "/_quillo/markdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify([s, isNil(o) ? null : toJSON(o)]) });
     body = await r.json();
   } catch (e) {
     return new Err(`markdown could not be made: ${e.message}`);
@@ -3472,7 +3490,7 @@ function chanStart() {
 }
 
 async function chanConnect() {
-  const r = await fetch(BASE + "/_quillo/wt-ticket", { method: "POST" });
+  const r = await wireFetch(BASE + "/_quillo/wt-ticket", { method: "POST" });
   if (!r.ok) throw new Error("no ticket");
   const info = await r.json();
   const q = "?t=" + encodeURIComponent(info.ticket);
@@ -3624,7 +3642,7 @@ function chanWatch(name, f) {
 
 function chanSocket(q) {
   return new Promise((ok, no) => {
-    const s = new WebSocket(location.origin.replace(/^http/, "ws") + BASE + "/_quillo/wt" + q);
+    const s = openSocket(BASE + "/_quillo/wt" + q);
     s.binaryType = "arraybuffer";
     let ended;
     const closed = new Promise((r) => (ended = r));
@@ -4081,7 +4099,7 @@ async function rpcRaw(name, args, live, idem) {
   const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
   for (let tries = idem ? 4 : 1; ; ) {
     try {
-      r = await fetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
+      r = await wireFetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
         method: "POST",
         headers,
         body: payload,
@@ -4191,7 +4209,7 @@ async function liveLoop() {
     try {
       if (await liveSocket(url, ctrl.signal)) fails = 0;
       else if (!ctrl.signal.aborted) {
-        const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+        const r = await wireFetch(url, { signal: ctrl.signal, cache: "no-store" });
         if (r.ok) { liveChanged(await r.json()); fails = 0; continue; }
         after = (Number(r.headers.get("retry-after")) || 0) * 1000;
         fails++;
@@ -4214,8 +4232,8 @@ async function liveLoop() {
 // Resolves when the socket closes: true if it had opened.
 function liveSocket(url, signal) {
   return new Promise((resolve) => {
-    if (typeof WebSocket !== "function") return resolve(false);
-    const ws = new WebSocket(location.origin.replace(/^http/, "ws") + url);
+    if (typeof WebSocket !== "function" && !(WIRE && WIRE.socket)) return resolve(false);
+    const ws = openSocket(url);
     let opened = false;
     ws.onopen = () => { opened = true; };
     ws.onmessage = (m) => { if (!signal.aborted) liveChanged(JSON.parse(m.data)); };

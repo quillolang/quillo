@@ -82,6 +82,8 @@ pub struct Info {
     pub len: u64,
     pub etag: String,
     pub last_modified: String,
+    /// `last_modified` as seconds since 1970.
+    pub modified: i64,
     mtime: u128,
 }
 
@@ -111,7 +113,7 @@ pub fn info(full: &Path) -> std::io::Result<Info> {
     let secs = (mtime / 1_000_000_000) as u64;
     // The key of the copy in memory: the time, and the file's identity above it.
     let key = (mtime & u64::MAX as u128) | ((path_hash as u128) << 64);
-    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), mtime: key })
+    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), modified: secs as i64, mtime: key })
 }
 
 /// The whole file, from memory when it is small and unchanged.

@@ -388,19 +388,51 @@ pub fn loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
 /// Asks the server to run a job (`kind` "job") or a tick ("tick"), and waits
 /// for it to finish.
 fn ask(addr: std::net::SocketAddr, kind: &str, name: &str, due: u64) -> std::io::Result<()> {
+    post_self(addr, &format!("/_quillo/{}/{}?at={}", kind, name, due), b"").map(|_| ())
+}
+
+/// What answers this process's requests to itself without a connection, when it has no port: a
+/// program inside an app (src/embed.rs; FEEDBACK39.md, Q-468; branch feedback36-39).
+type Local = Box<dyn Fn(crate::server::HttpRequest) -> crate::server::HttpResponse + Send + Sync>;
+static LOCAL: std::sync::OnceLock<Local> = std::sync::OnceLock::new();
+
+pub fn answer_here(f: Local) {
+    let _ = LOCAL.set(f);
+}
+
+/// Whether requests to itself are answered here, with no connection.
+pub fn local() -> bool {
+    LOCAL.get().is_some()
+}
+
+/// A POST to this process's own server, with the token only it has: its status and body.
+pub fn post_self(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
     use std::io::{Read, Write};
+    if let Some(f) = LOCAL.get() {
+        let req = crate::server::HttpRequest {
+            method: "POST".into(),
+            url: path.to_string(),
+            headers: vec![("host".into(), "localhost".into()), ("x-quillo-job".into(), token().to_string()), ("content-length".into(), body.len().to_string())],
+            body: body.to_vec(),
+            remote: "127.0.0.1".into(),
+        };
+        let r = f(req);
+        return Ok((r.status, r.body));
+    }
     let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
     write!(
         s,
-        "POST /_quillo/{}/{}?at={} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        kind,
-        name,
-        due,
-        token()
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
+        token(),
+        body.len()
     )?;
+    s.write_all(body)?;
     let mut out = Vec::new();
     s.read_to_end(&mut out)?;
-    Ok(())
+    let status = std::str::from_utf8(&out[..out.len().min(16)]).ok().and_then(|h| h.split(' ').nth(1)).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = out.windows(4).position(|w| w == b"\r\n\r\n").map_or(Vec::new(), |i| out[i + 4..].to_vec());
+    Ok((status, body))
 }
 
 #[cfg(test)]

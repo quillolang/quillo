@@ -1,18 +1,21 @@
 # Quillo on phones
 
-A Quillo program as a phone app: the runtime runs inside the app and serves the program
-on 127.0.0.1 to the app's own web view, so the program works offline, keeps its SQLite
-database in the app's container, and is written exactly as it is for a server.
+A Quillo program as a phone app: the runtime runs the program inside the app's process,
+with no HTTP server, and the app's own web view gets its pages from it through a scheme of
+the app's (`quillo://app/` on iOS, `https://quillo.localhost/` on Android). The program
+works offline, keeps its SQLite database in the app's container, and is written exactly as
+it is for a server (FEEDBACK39.md, Q-465 to Q-470).
 
 | | |
 |---|---|
-| `quillo-mobile/` | the runtime as a library: `quillo_start(bundle, data, main, out, len)` for iOS (C), `Quillo.start` for Android (JNI) |
+| `quillo-mobile/` | the runtime as a library: `quillo_open`, `quillo_request`, `quillo_bridge` and the rest for iOS (C), `Quillo.open`, `Quillo.request`, ... for Android (JNI); see [The calls into the runtime](#the-calls-into-the-runtime) |
 | `ios/` | the iOS app: one screen, a WKWebView on the program; `build.sh` makes Quillo.app for the simulator |
 | `android/` | the Android app: the same, with a WebView and the same `window.quilloNative`; `build.sh` makes a debug APK and runs it on an emulator or a phone |
 | `harmony/PLAN.md` | how HarmonyOS NEXT would be done; not built |
 | `examples/about/` | a page showing what `platform()` says |
 | `examples/fieldbook/` | field notes with the place, a photo, a voice memo and the weather, and a probe of 35 things the phone can do (FEEDBACK18.md) |
-| `../src/mobile.rs` | what `start` does: copies the bundled program into the app's container, keeps a session key there, and serves the program to the web view only |
+| `../src/embed.rs` | the program with no socket (`Program`): requests handed in, the bridge's messages, the cookie jar, and the shell's script (`SHELL_JS`) |
+| `../src/mobile.rs` | copies the bundled program into the app's container and keeps a session key there; `start`, the old way, serves it on 127.0.0.1 |
 
 ## The phone's own hardware
 
@@ -37,16 +40,85 @@ A link the web view cannot open itself, `tel:`, `sms:`, `mailto:`, a maps link (
 Android, `maps:` on iOS) or a store's (`market:`, `itms-apps:`), goes to the app the phone
 opens it with; other schemes are dropped. An `<iframe>` of another site loads where it
 is, in the page, rather than sending the person to Safari or Chrome; a frame gets no
-bridge (FEEDBACK33.md, Q-409). The program is served on the same port at each
-launch while it is free (kept in the app's data folder as `port`), so its pages keep one
-origin, and `localStorage` and IndexedDB, which go by origin, keep what they had
-(FEEDBACK28.md, Q-339, Q-346).
+bridge (FEEDBACK33.md, Q-409). The program's pages have one origin at every launch,
+`quillo://app` or `https://quillo.localhost`, so `localStorage` and IndexedDB, which go by
+origin, keep what they had (Q-466).
 
 The camera, the microphone and recording work through the web's own `getUserMedia` and
 `MediaRecorder`, and photos through `<input type=file capture>`: the app grants them to
 its own pages, having asked the person once (Info.plist says why). iOS suspends the app,
-and the program's server with it, when it leaves the screen: a `schedule` job waits until
-it is back.
+and the program with it, when it leaves the screen: a `schedule` job waits until it is
+back. The app calls `quillo_suspend` then, which writes the cookie jar at once, as the app
+may not come back.
+
+## No socket: how the web view reaches the program
+
+Nothing listens, so no other app on the phone and no page in its browser can reach the
+program (Q-469), iOS has no listening socket to take back from a suspended app (Q-467),
+and the apps carry no exception for plain HTTP: iOS's `NSAllowsLocalNetworking` and
+Android's cleartext domain for 127.0.0.1 are gone (`network_security_config.xml` now
+refuses cleartext everywhere). Each request goes this way:
+
+| What the page sends | iOS (WKWebView) | Android (WebView) |
+|---|---|---|
+| A `GET`: pages, scripts, images, `<video>`'s ranges, live data's long poll | the scheme (`WKURLSchemeHandler` on `quillo`) | the scheme (`shouldInterceptRequest` on `https://quillo.localhost`) |
+| A body of text or bytes | the scheme | the bridge: the interceptor is given no body |
+| A body that is a file, a `Blob` or a `FormData` | made bytes in the page (`new Response(body)`), then the scheme: WebKit hands the scheme none of those | made bytes, then the bridge |
+| A form posted by the browser itself | the scheme; one with a file, the bridge | the bridge |
+| Live data and channels | the bridge, as a numbered connection with messages each way | the bridge |
+
+The shell's script (`quillo_shell_js`), run before every page, puts nothing on `window`: the
+runtime asks for its way out (`fetch` and its sockets) with a `quillo-wire` event, and the
+native side hands the page each message with a `quillo-wire-receive` event (`deliver_js`).
+On Android, where every body goes through the bridge, it also takes over the page's own
+`fetch`, so a script's own request with a body goes the same way: the one global it changes. A form
+the scheme cannot carry is sent through the bridge, its answer is kept, and the page goes
+to `/_quillo/posted/<id>`, which shows it once, or to its redirect: back and reload behave as
+after an ordinary post and redirect. On Android an intercepted answer cannot be a redirect,
+so a redirect is a small page that goes on to its address.
+
+What else differs from a server:
+
+- **Cookies.** The web view keeps none for a custom scheme, so the runtime keeps the jar,
+  in `.quillo/cookies.json` in the app's data, and a session key in `.quillo-secret`
+  beside it (unless `QUILLO_SECRET` is set): a session lasts from one launch to the next.
+  Answers reach the web view without `Set-Cookie`, and `document.cookie` is empty to the
+  page's scripts.
+- **`request.ip` is `"app"`.** `platform().runtime` is still `"mobile"`.
+- **Jobs, ticks and calls made later** reach the program with no connection to itself
+  (Q-468).
+- **A `stream` route's answer arrives whole**, when it ends: `quillo_request` answers whole.
+- **Service workers** do not run on a custom scheme. Quillo uses none.
+- **The origin is new.** An app installed before kept its pages' `localStorage` and
+  IndexedDB under `http://127.0.0.1:<port>`; they stay there and are not copied. The
+  program's own database is the program's, and is not touched.
+- Safari's and Chrome's inspectors work as before, at the new addresses.
+
+## The calls into the runtime
+
+The program runs in the app's process (`quillo::embed::Program`), answering on threads of
+its own. The C calls are in `ios/Quillo/quillo.h`; Android's are the same, through JNI,
+in `Quillo.kt`:
+
+| C | Android | |
+|---|---|---|
+| `quillo_open(bundle, data, main, device, err, len)` | `Quillo.open(bundle, data, main, device)` | copies the bundled program into `<data>/app`, loads `main` (main.qwe when empty) and starts it; `device` is a JSON object of what the app knows of the device, for `platform()`. 0, or 1 with the reason in `err`; on Android `""`, or the reason |
+| `quillo_request(method, url, headers_json, body, len)` | `Quillo.request(method, url, headersJson, body)` | one request of the web view's, answered whole: a `QuilloAnswer` (`status`, `headers` as a JSON object, `body`, `len`), freed with `quillo_free_answer`; on Android bytes: the status (4 bytes, big-endian), the length of the headers' JSON (4 bytes), the JSON, then the body |
+| `quillo_bridge(message)` | `Quillo.bridge(message)` | a message the shell's script posted |
+| `quillo_bridge_next(timeout_ms)` | `Quillo.bridgeNext(timeoutMs)` | the next message for the page, JSON to hand the page in a `quillo-wire-receive` event, or null when none came in that time; freed with `quillo_free_text` |
+| `quillo_shell_js(post, bodies)` | `Quillo.shellJs(post, bodies)` | the script to run before every page: `post` names the page's way to send the app a string (`window.webkit.messageHandlers.quilloWire.postMessage`, `quilloWire.postMessage`), and `bodies` is `"bytes"` where the scheme carries bytes but not a `Blob` (WebKit) or `"bridge"` where it carries no body (Android); freed with `quillo_free_text` |
+| `quillo_suspend()`, `quillo_resume()` | `Quillo.suspend()` | the app leaves the screen, and comes back |
+| `quillo_start(...)` | `Quillo.start(...)` | the old way, a server on 127.0.0.1 behind a launch token: kept for apps built before |
+
+How the shells use them: iOS registers a `WKURLSchemeHandler` for `quillo` that calls
+`quillo_request` off the main thread (and drops an answer the web view gave up on), a
+`WKScriptMessageHandler` named `quilloWire` that calls `quillo_bridge`, a `WKUserScript` at
+document start with the shell's script, and a thread that loops on `quillo_bridge_next(1000)`
+and hands each message to the page in a `quillo-wire-receive` event. Android answers
+`shouldInterceptRequest` for its origin with `Quillo.request`, listens with
+`addWebMessageListener("quilloWire", ...)` for the program's origin only, adds the script
+with `addDocumentStartJavaScript`, and posts what `Quillo.bridgeNext` gives back to the page
+that last wrote. `quillo app` uses the same `Program` through wry, in the same process.
 
 ## The app's name, id, version and icon: app.toml
 
@@ -154,10 +226,10 @@ scripts run in turn, one per page loaded.
 
 What happens at launch: the program is copied into
 `Library/Application Support/quillo/app`; files the program writes (its databases) are
-never overwritten by an app update, while its code follows the bundle. The server listens
-on 127.0.0.1 at a port the system picks and answers only the web view (a token in the
-first URL, then a cookie); other apps get 403. When iOS suspends the app, the server is
-suspended with it, and answers again when the app comes back.
+never overwritten by an app update, while its code follows the bundle. `quillo_open`
+starts it with no socket, and the web view opens `quillo://app/`. When iOS suspends the
+app, the program is suspended with it (`quillo_suspend` first), and answers again when the
+app comes back.
 
 ## Android
 
@@ -167,16 +239,18 @@ mobile/android/build.sh app --run      # a debug APK around app/, installed with
 
 `MainActivity` unpacks the program from the APK's assets into the app's files (assets are
 not files), gathers the device's facts (`Build`, the display, memory, locale), starts the
-runtime through JNI (`Quillo.start`, `Java_org_quillolang_app_Quillo_start` in quillo-mobile)
-and shows a WebView on the URL it gives. Links to other sites open in the browser, but for
-app.toml's `site`, whose pages stay in the web view, and frames, which load where they are;
-the back button goes back in the
-program's pages first. 127.0.0.1 is the only place the web view may use cleartext HTTP
-(res/xml/network_security_config.xml); the runtime's own sockets are not the web view's.
+runtime through JNI (`Quillo.open`, `Java_org_quillolang_app_Quillo_open` in quillo-mobile)
+and shows a WebView on `https://quillo.localhost/`, whose requests it answers with
+`Quillo.request`: a `.localhost` name never leads to the network. Links to other sites
+open in the browser, but for app.toml's `site`, whose pages stay in the web view, and
+frames, which load where they are; the back button goes back in the program's pages first.
+The web view may use cleartext HTTP nowhere (res/xml/network_security_config.xml); the
+runtime's own sockets are not the web view's. `onStop` calls `Quillo.suspend`.
 
 - **The bridge** (Bridge.kt): `window.quilloNative` with the same calls as on iOS, put on
   the program's pages before their own scripts and answering only the program's origin
-  (`WebViewCompat.addWebMessageListener`, `addDocumentStartJavaScript`). Haptics go
+  (`WebViewCompat.addWebMessageListener`, `addDocumentStartJavaScript`), and beside it
+  `quilloWire`, the program's own way out for bodies, forms and connections. Haptics go
   through the view (no vibration permission); a notification in N seconds is an alarm,
   delivered while the app is away.
 - **Permissions**: the camera, the microphone, location and notifications are asked of the
@@ -217,9 +291,9 @@ the wrapper. On a Mac: `brew install --cask android-commandlinetools`, then
 on the Android 15 emulator: Fieldbook's probe, notes with the place, a photo from the
 camera and a voice memo, the share sheet, the location prompt refused and allowed.
 
-In the background Android does not stop the app at once, as iOS does: the program's server
-went on answering, and a `schedule` job ran each minute while the app sat behind the home
-screen (on the emulator, plugged in). The system may still stop the process later to save
+In the background Android does not stop the app at once, as iOS does: the program went on
+answering, and a `schedule` job ran each minute while the app sat behind the home screen
+(on the emulator, plugged in, measured when the program was served on 127.0.0.1). The system may still stop the process later to save
 battery or memory; the program starts again from its database when the app is opened.
 
 | When | Runs of the minute job |
@@ -231,8 +305,8 @@ battery or memory; the program starts again from its database when the app is op
 
 ## Calling a server
 
-A page's `http.*` to another site meets CORS, and the page's origin, `127.0.0.1`, is not
-one a site can safely allow. When it fails, it says so: `http: no answer from <host>: it
+A page's `http.*` to another site meets CORS, and the page's origin, `quillo://app` or
+`https://quillo.localhost`, is not one a site can safely allow. When it fails, it says so: `http: no answer from <host>: it
 may not allow this page (CORS), or be plain http, or be unreachable; a server fn can call
 it from the server` (Q-411). So the program reaches a server from a `server fn`, with the
 program's own `http.*`, not from the page.
@@ -277,7 +351,8 @@ Reaching a server (Q-414):
   network, so `127.0.0.1` reaches a server on the Mac there.
 - The runtime's `http.*` and `site` calls trust the certificate roots built into the
   binary, not the phone's, so a company's CA installed on the phone is not trusted by
-  them.
+  them. A call can name its own with `ca`, a PEM file in the program's folder (`ca:
+  "system"`, the machine's store, has not been tried on a phone).
 - App Transport Security does not cover the runtime's own sockets, so the program can
   reach plain `http://`. Prefer https.
 
@@ -285,7 +360,9 @@ Reaching a server (Q-414):
 
 - Compiled numbers: iOS forbids writable code, so there is no JIT (built without the `jit`
   feature); the interpreter runs everything.
-- Channels over WebTransport: pages use the WebSocket.
+- Channels over WebTransport: pages use the app's bridge.
+- A `stream` route's answer sent in parts: it arrives whole.
+- Service workers: none runs on the app's scheme.
 - `.qwer` plugins built at run time: there is no compiler on a phone. Linking plugins into
   the app at build time is planned.
 - Anything that starts a process: `--instances`, `--split`, `--with`, `--watch`.
@@ -293,7 +370,12 @@ Reaching a server (Q-414):
 
 ## Not done yet
 
-- iOS: signing and an upload, waiting on an Apple Developer account; tried on a real iPhone.
+- iOS: signing and an upload, waiting on an Apple Developer account; tried on a real iPhone
+  when the program was served on 127.0.0.1.
+- The shells without a socket on a real phone: run on the iOS simulator and the Android
+  emulator (pages, a server fn, live data, a form with a file, and `localStorage` and the
+  session kept from one launch to the next), not yet on a real device.
+- Copying an old install's `localStorage` to the new origin.
 - Android: an upload to Google Play; tried on real phones.
 - Only the permissions a program uses (both apps ask for camera, microphone and location).
 - HarmonyOS NEXT: see harmony/PLAN.md.

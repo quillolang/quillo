@@ -333,7 +333,7 @@ fn the_launchers_take_the_file_from_app_toml() {
     assert!(read("ios/build.sh").contains("plutil -replace QuilloMain -string \"$APP_MAIN\" \"$plist\""));
     assert!(read("android/build.sh").contains("QUILLO_APP_MAIN=\"$APP_MAIN\""));
     assert!(read("android/app/build.gradle.kts").contains("resValue(\"string\", \"quillo_main\", env(\"QUILLO_APP_MAIN\", \"main.qwe\"))"));
-    assert!(read("android/app/src/main/java/org/quillolang/app/MainActivity.kt").contains("Quillo.start(bundle.path, data.path, activity.getString(R.string.quillo_main), device(activity))"));
+    assert!(read("android/app/src/main/java/org/quillolang/app/MainActivity.kt").contains("Quillo.open(bundle.path, data.path, activity.getString(R.string.quillo_main), device(activity))"));
 }
 
 /// The page at `/`, as an app's web view gets it.

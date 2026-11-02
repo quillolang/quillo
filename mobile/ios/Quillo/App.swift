@@ -1,5 +1,7 @@
-// A Quillo program as an iOS app: the runtime serves it on 127.0.0.1, inside this
-// process, and the one screen is a web view on it. See mobile/README.md.
+// A Quillo program as an iOS app: the runtime runs it inside this process, with no socket,
+// and the one screen is a web view whose pages come from it through the `quillo://app/`
+// scheme (FEEDBACK39.md, Q-465 to Q-470; branch feedback36-39). What a scheme cannot carry,
+// connections for live data and channels, goes through the bridge. See mobile/README.md.
 //
 // What the web view cannot reach (haptics, the battery, local notifications, keeping
 // the screen on, the screen's brightness, the share sheet, a location without the web
@@ -38,8 +40,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         self.window = window
     }
 
-    func sceneDidEnterBackground(_ scene: UIScene) { print("quillo-ios: background") }
-    func sceneWillEnterForeground(_ scene: UIScene) { print("quillo-ios: foreground") }
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        print("quillo-ios: background")
+        quillo_suspend()
+    }
+    func sceneWillEnterForeground(_ scene: UIScene) {
+        print("quillo-ios: foreground")
+        quillo_resume()
+    }
 }
 
 /// Notifications show while the app is open too.
@@ -109,12 +117,12 @@ enum Program {
         let main = (Bundle.main.object(forInfoDictionaryKey: "QuilloMain") as? String) ?? "main.qwe"
         var out = [CChar](repeating: 0, count: 4096)
         let started = Date()
-        let code = quillo_start(bundle, data.path, main, device(screen: screen), &out, out.count)
+        let code = quillo_open(bundle, data.path, main, device(screen: screen), &out, out.count)
         let said = out.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        if code == 0, let url = URL(string: said) {
+        if code == 0 {
             print("quillo-ios: started in \(ms) ms, data in \(data.path)")
-            result = .url(url)
+            result = .url(URL(string: "quillo://app/")!)
         } else {
             print("quillo-ios: did not start: \(said)")
             result = .failed(said)
@@ -135,7 +143,84 @@ window.quilloNative = (() => {
 })();
 """
 
+/// The page's requests, answered by the program in this process: the scheme carries text and
+/// bytes, and the shell script turns a file or a form into bytes first (WebKit gives none of a
+/// `Blob`'s), so every body arrives.
+final class SchemeHandler: NSObject, WKURLSchemeHandler {
+    private var stopped = Set<ObjectIdentifier>()
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        let req = task.request
+        let id = ObjectIdentifier(task)
+        var body = req.httpBody ?? Data()
+        if body.isEmpty, let stream = req.httpBodyStream {
+            stream.open()
+            var buf = [UInt8](repeating: 0, count: 64 << 10)
+            while stream.hasBytesAvailable {
+                let n = stream.read(&buf, maxLength: buf.count)
+                if n <= 0 { break }
+                body.append(buf, count: n)
+            }
+            stream.close()
+        }
+        let headers = (try? JSONSerialization.data(withJSONObject: req.allHTTPHeaderFields ?? [:])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let method = req.httpMethod ?? "GET"
+        let url = req.url?.absoluteString ?? "quillo://app/"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let a = body.withUnsafeBytes { quillo_request(method, url, headers, $0.bindMemory(to: UInt8.self).baseAddress, body.count) }
+            guard let a else { return }
+            let status = Int(a.pointee.status)
+            let hs = a.pointee.headers.map { String(cString: $0) } ?? "{}"
+            let data = a.pointee.body.map { Data(bytes: $0, count: a.pointee.len) } ?? Data()
+            quillo_free_answer(a)
+            let fields = (try? JSONSerialization.jsonObject(with: Data(hs.utf8))) as? [String: String] ?? [:]
+            DispatchQueue.main.async {
+                if self.stopped.remove(id) != nil { return }
+                guard let u = task.request.url, let resp = HTTPURLResponse(url: u, statusCode: status, httpVersion: "HTTP/1.1", headerFields: fields) else { return }
+                task.didReceive(resp)
+                task.didReceive(data)
+                task.didFinish()
+            }
+        }
+    }
+
+    // The web view gave the request up: its answer, when it comes, is dropped.
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) { stopped.insert(ObjectIdentifier(task)) }
+}
+
+/// The page's messages for the program (the shell's script posts them), and the program's for the page,
+/// taken one at a time on a thread of their own.
+final class Wire: NSObject, WKScriptMessageHandler {
+    weak var web: WKWebView?
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame, programOwns(message.frameInfo.securityOrigin), let text = message.body as? String else { return }
+        DispatchQueue.global(qos: .userInitiated).async { quillo_bridge(text) }
+    }
+
+    func start() {
+        Thread.detachNewThread { [weak self] in
+            while true {
+                guard let m = quillo_bridge_next(1000) else {
+                    if self == nil { return }
+                    continue
+                }
+                let json = String(cString: m)
+                quillo_free_text(m)
+                DispatchQueue.main.async { self?.web?.evaluateJavaScript("document.dispatchEvent(new CustomEvent(\"quillo-wire-receive\", { detail: \(json) }))") }
+            }
+        }
+    }
+}
+
+let shellScript: String = {
+    guard let js = quillo_shell_js("window.webkit.messageHandlers.quilloWire.postMessage", "bytes") else { return "" }
+    defer { quillo_free_text(js) }
+    return String(cString: js)
+}()
+
 final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+    private let wire = Wire()
     private var web: WKWebView!
     private var origin = ""
     private let site = ownSite
@@ -159,7 +244,12 @@ final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUID
         bridge = Bridge(owner: self)
         config.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "quillo")
         config.userContentController.addUserScript(WKUserScript(source: bridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        config.userContentController.add(wire, name: "quilloWire")
+        config.userContentController.addUserScript(WKUserScript(source: shellScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        config.setURLSchemeHandler(SchemeHandler(), forURLScheme: "quillo")
         web = WKWebView(frame: .zero, configuration: config)
+        wire.web = web
+        wire.start()
         web.navigationDelegate = self
         web.uiDelegate = self
         web.translatesAutoresizingMaskIntoConstraints = false
@@ -174,7 +264,7 @@ final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUID
         ])
         switch Program.result {
         case .url(let url):
-            origin = "\(url.scheme ?? "http")://\(url.host ?? "127.0.0.1"):\(url.port ?? 80)"
+            origin = "quillo://app"
             web.load(URLRequest(url: url))
         case .failed(let why):
             web.loadHTMLString("<meta name=viewport content='width=device-width'><body style='font:16px -apple-system;padding:24px'><h2>The program did not start</h2><pre style='white-space:pre-wrap'>\(why)</pre></body>", baseURL: nil)
@@ -403,9 +493,9 @@ let ownSite: String = {
     return "https://\(host)\(u.port.map { ":\($0)" } ?? "")"
 }()
 
-/// Whether a page's origin is the program's (127.0.0.1) or the developer's site.
+/// Whether a page's origin is the program's (`quillo://app`) or the developer's site.
 func programOwns(_ o: WKSecurityOrigin) -> Bool {
-    if o.host == "127.0.0.1" { return true }
+    if o.protocol == "quillo" && o.host == "app" { return true }
     guard !ownSite.isEmpty, let u = URL(string: ownSite) else { return false }
     return o.protocol == "https" && o.host == u.host && (o.port == 0 ? 443 : o.port) == (u.port ?? 443)
 }

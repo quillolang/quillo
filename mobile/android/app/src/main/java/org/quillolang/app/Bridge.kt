@@ -50,9 +50,29 @@ class Bridge(private val activity: MainActivity, private val web: WebView) {
             if (isMainFrame) onMessage(msg, reply)
         }
         WebViewCompat.addDocumentStartJavaScript(web, SCRIPT, only)
+        // The program's own way out (src/embed.rs): bodies, forms and connections, which the
+        // WebView's interceptor cannot carry. Only the program's origin.
+        val program = setOf(MainActivity.ORIGIN)
+        WebViewCompat.addWebMessageListener(web, "quilloWire", program) { _, msg, _, isMainFrame, reply ->
+            if (!isMainFrame) return@addWebMessageListener
+            wireReply = reply
+            val text = msg.data ?: return@addWebMessageListener
+            Thread { Quillo.bridge(text) }.start()
+        }
+        WebViewCompat.addDocumentStartJavaScript(web, Quillo.shellJs("quilloWire.postMessage", "bridge") + "\nquilloWire.onmessage = (e) => document.dispatchEvent(new CustomEvent(\"quillo-wire-receive\", { detail: e.data }));", program)
+        Thread {
+            while (!closed) {
+                val m = Quillo.bridgeNext(1000) ?: continue
+                activity.runOnUiThread { wireReply?.postMessage(m) }
+            }
+        }.start()
     }
 
-    fun close() {}
+    /** Where the program's messages for the page go: the page that last sent one. */
+    @Volatile private var wireReply: JavaScriptReplyProxy? = null
+    @Volatile private var closed = false
+
+    fun close() { closed = true }
 
     private fun onMessage(msg: WebMessageCompat, reply: JavaScriptReplyProxy) {
         val m = try { JSONObject(msg.data ?: "{}") } catch (e: Exception) { return }

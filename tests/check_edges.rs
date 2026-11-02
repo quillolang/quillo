@@ -310,11 +310,11 @@ fn truthiness_names_what_it_can() {
 fn http_options_are_checked_where_they_are_written() {
     let host = |n: u32, f: &str| format!("{} warning: the host `http.{}` goes to comes from a value: if a visitor can choose it, they can reach this server's own network (localhost, a cloud's metadata service). Pass {{ public_only: true }} as its options (or public_only: false, when it is meant to reach inside)", n, f);
     says("fn f(u) = http.get(u, {}, { nope: 1 })", &[
-        "1 `http.get`: unknown option `nope` (the options are redirects, public_only, cache, timeout)",
+        "1 `http.get`: unknown option `nope` (the options are redirects, public_only, cache, timeout, ca, cert, key)",
         &host(1, "get"),
     ]);
     says("fn f(u) = http.post(u, {}, {}, { retries: 2 })", &[
-        "1 `http.post`: unknown option `retries` (the options are redirects, public_only, cache, timeout)",
+        "1 `http.post`: unknown option `retries` (the options are redirects, public_only, cache, timeout, ca, cert, key)",
         &host(1, "post"),
     ]);
     // Options made elsewhere may say it; a piped URL is not checked here.
@@ -418,7 +418,7 @@ fn a_services_options_are_checked() {
         app.check(Options::default())
     };
     assert_eq!(run("service billing = \"billing.qwe\" { timout: \"2s\" }\n"), ["main.qwe:1 service billing: no option `timout` (did you mean `timeout`?)"]);
-    assert_eq!(run("service billing = \"billing.qwe\" { zebra: \"2s\" }\n"), ["main.qwe:1 service billing: no option `zebra` (timeout, retries, failures, cooldown)"]);
+    assert_eq!(run("service billing = \"billing.qwe\" { zebra: \"2s\" }\n"), ["main.qwe:1 service billing: no option `zebra` (timeout, retries, failures, cooldown, auth, forward)"]);
 }
 
 #[test]

@@ -79,6 +79,11 @@ pub fn install(env: &Env) {
         ("now", now),
         ("sleep", sleep),
         ("file", file),
+        ("files", files),
+        ("__built", built),
+        ("classes", classes),
+        ("accept_calls", accept_calls),
+        ("__callers", callers),
         ("allow_cross_site", allow_cross_site),
         ("site_headers", site_headers),
         ("__site", crate::sites::declare),
@@ -119,6 +124,7 @@ pub fn install(env: &Env) {
         ("index_of", index_of),
         ("repeat", repeat),
         ("markdown", markdown),
+        ("markdown_page", markdown_page),
         ("highlight", highlight),
         ("run_script", run_script),
         ("ask", ask),
@@ -1013,8 +1019,26 @@ fn mime(path: &Path) -> &'static str {
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "map" => "application/json",
         "webmanifest" => "application/manifest+json",
-        "xml" => "application/xml",
-        "txt" | "md" => "text/plain; charset=utf-8",
+        "xml" | "xsl" => "application/xml",
+        "txt" | "text" => "text/plain; charset=utf-8",
+        // Text a site serves that went out as octet-stream, which `nosniff` keeps a browser
+        // from guessing at: subtitles, calendars, feeds, HLS (FEEDBACK36.md, Q-451; branch
+        // feedback36-39).
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "vtt" => "text/vtt; charset=utf-8",
+        "ics" => "text/calendar; charset=utf-8",
+        "rss" => "application/rss+xml; charset=utf-8",
+        "atom" => "application/atom+xml; charset=utf-8",
+        "jsonld" => "application/ld+json",
+        "geojson" => "application/geo+json",
+        "yaml" | "yml" => "application/yaml; charset=utf-8",
+        "toml" => "application/toml; charset=utf-8",
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "mpd" => "application/dash+xml",
+        "ts" => "video/mp2t",
+        "m4s" => "video/iso.segment",
+        "srt" => "application/x-subrip; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
@@ -1023,10 +1047,19 @@ fn mime(path: &Path) -> &'static str {
         "webp" => "image/webp",
         "avif" => "image/avif",
         "ico" => "image/x-icon",
-        "mp4" => "video/mp4",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "heic" => "image/heic",
+        "jxl" => "image/jxl",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
         "webm" => "video/webm",
         "mp3" => "audio/mpeg",
-        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "opus" => "audio/opus",
+        "ogg" | "oga" => "audio/ogg",
         "wav" => "audio/wav",
         "wasm" => "application/wasm",
         "woff2" => "font/woff2",
@@ -1111,9 +1144,21 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
         }
     }
+    // As RFC 9110 §13.2.2 orders them: `If-Match`, else `If-Unmodified-Since`, refuse with a 412
+    // when the file is not the one meant; then `If-None-Match`, else `If-Modified-Since`, give a
+    // 304 for a file not changed since the date given, a later one or one in another of HTTP's
+    // forms too (FEEDBACK36.md, Q-441; branch feedback36-39).
+    let since = |v: Option<String>| v.and_then(|v| crate::dates::http_seconds(&v));
+    let changed = match asked("if-match", it) {
+        Some(v) => !crate::statics::matches(&v, &info.etag),
+        None => since(asked("if-unmodified-since", it)).is_some_and(|t| info.modified > t),
+    };
+    if changed {
+        return answer(412, headers, Vec::new());
+    }
     let fresh = match asked("if-none-match", it) {
         Some(v) => crate::statics::matches(&v, &info.etag),
-        None => asked("if-modified-since", it).map_or(false, |v| v == info.last_modified),
+        None => since(asked("if-modified-since", it)).is_some_and(|t| info.modified <= t),
     };
     if fresh {
         return answer(304, headers, Vec::new());
@@ -1159,6 +1204,226 @@ fn file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => answer(200, headers, b.to_vec()),
         Err(_) => Ok(not_found()),
     }
+}
+
+/// `accept_calls { keys, shared, jwt, client_cert, check }`: how calls from other services are
+/// taken, at the top level of the program they call (FEEDBACK38.md, Q-458 to Q-462; branch
+/// feedback36-39). See src/svcauth.rs.
+fn accept_calls(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    match crate::svcauth::accept_of(args.first().unwrap_or(&Value::Nil)) {
+        Ok(a) => {
+            it.accept = Some(Arc::new(a));
+            Ok(Value::Nil)
+        }
+        Err(e) => fail(line, e),
+    }
+}
+
+/// `server fn refund(...) for ["shop"]`: the callers it takes, as the parser writes it.
+fn callers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (Some(Value::Str(f)), Some(Value::List(l))) = (args.first(), args.get(1)) else {
+        return fail(line, "`__callers` is written by `server fn ... for [...]`");
+    };
+    let names = l.iter().map(|v| v.display()).collect();
+    Arc::make_mut(&mut it.fn_callers).insert(f.to_string(), names);
+    Ok(Value::Nil)
+}
+
+/// `classes()`: the classes the program's markup writes (FEEDBACK37.md, Q-456; branch
+/// feedback36-39).
+fn classes(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    let files: Vec<&[crate::ast::Stmt]> = it.program.iter().map(|f| f.as_slice()).collect();
+    Ok(Value::list(crate::styles::written_classes(&files).into_iter().map(Value::str).collect()))
+}
+
+/// What `build "/path" = expr` has made: by path and the version of the program (its function's
+/// address), being made, made, or failed; and the last good value of each path, which a reload
+/// that fails keeps serving.
+struct Builds {
+    slots: std::collections::HashMap<(String, usize), Result<Option<Value>, String>>,
+    good: std::collections::HashMap<String, Value>,
+}
+
+static BUILDS: std::sync::Mutex<Option<Builds>> = std::sync::Mutex::new(None);
+static BUILT: std::sync::Condvar = std::sync::Condvar::new();
+
+/// `build "/app.css" = expr`'s route: the value, made by the first request for it (the server's
+/// own, as the port opens) and kept; one that comes meanwhile waits, off the lock. A failure at
+/// the first start stops the program, as `style_with`'s does; after a reload, the last good one
+/// is served (FEEDBACK37.md, Q-454; branch feedback36-39).
+fn built(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let (Some(Value::Str(path)), Some(f @ Value::Func(c))) = (args.first(), args.get(1)) else {
+        return fail(line, "`__built` is the route of a `build` declaration");
+    };
+    let key = (path.to_string(), Arc::as_ptr(&c.def) as usize);
+    let lock = || BUILDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let state = {
+            let mut b = lock();
+            let b = b.get_or_insert_with(|| Builds { slots: Default::default(), good: Default::default() });
+            match b.slots.get(&key) {
+                None => {
+                    b.slots.insert(key.clone(), Ok(None));
+                    None
+                }
+                Some(s) => Some(s.clone()),
+            }
+        };
+        match state {
+            // This request makes it.
+            None => break,
+            Some(Ok(Some(v))) => return Ok(built_answer(path, &v)),
+            Some(Ok(None)) => {
+                let key = key.clone();
+                it.unlocked(move || {
+                    let mut b = lock();
+                    while matches!(b.as_ref().and_then(|b| b.slots.get(&key)), Some(Ok(None))) {
+                        b = BUILT.wait(b).unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                });
+            }
+            Some(Err(e)) => {
+                let good = lock().as_ref().and_then(|b| b.good.get(&**path).cloned());
+                return match good {
+                    Some(v) => Ok(built_answer(path, &v)),
+                    None => Ok(Value::err(Value::str(e))),
+                };
+            }
+        }
+    }
+    let started = std::time::Instant::now();
+    let made = it.call(f, Vec::new(), line);
+    let made = match made {
+        Ok(Value::Err(e, ..)) => Err(e.display()),
+        Ok(v) => Ok(v),
+        Err(Ctrl::Error(e)) => Err(e.msg.clone()),
+        Err(Ctrl::Return(v)) => Ok(v),
+        Err(other) => return Err(other),
+    };
+    let mut b = lock();
+    let b = b.as_mut().expect("made above");
+    let first = !b.good.contains_key(&**path);
+    let answer = match &made {
+        Ok(v) => {
+            b.slots.insert(key, Ok(Some(v.clone())));
+            b.good.insert(path.to_string(), v.clone());
+            eprintln!("quillo: built {} in {:.1} s", path, started.elapsed().as_secs_f64());
+            built_answer(path, v)
+        }
+        Err(e) => {
+            b.slots.insert(key, Err(e.clone()));
+            eprintln!("quillo: build {} failed: {}", path, e);
+            if first && !crate::server::SHOW_ERRORS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::httpd::flush_log();
+                std::process::exit(1);
+            }
+            b.good.get(&**path).map_or_else(|| Value::err(Value::str(e.as_str())), |v| built_answer(path, v))
+        }
+    };
+    BUILT.notify_all();
+    Ok(answer)
+}
+
+/// A build's value as its answer: text and bytes in the type its path's extension names, with
+/// an ETag, so a browser's copy is checked rather than fetched whole.
+fn built_answer(path: &str, v: &Value) -> Value {
+    let (body, ctype) = match v {
+        Value::Response(_) => return v.clone(),
+        Value::Str(s) => (s.as_bytes().to_vec(), mime(Path::new(path)).to_string()),
+        Value::Html(h) => (h.as_bytes().to_vec(), "text/html; charset=utf-8".to_string()),
+        other => {
+            let mut out = Vec::new();
+            other.json_into(&mut out);
+            (out, "application/json".to_string())
+        }
+    };
+    let etag = format!("\"{}\"", &crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&body))[..16]);
+    let headers = vec![("content-type".into(), ctype), ("etag".into(), etag), ("cache-control".into(), "no-cache".into())];
+    Value::Response(Arc::new(Response { status: 200, headers, body: Body::Bytes(body) }))
+}
+
+/// `files("site", path, { index, extensions, not_found, cache })`: a folder of files as a static
+/// host serves it. `/` and `/docs/` are their `index.html`, `/about` finds `about.html`, a folder
+/// named without its `/` is redirected to it, and a miss is the folder's `404.html` when it has
+/// one. Files whose names start with a dot are not served (but `.well-known/`), nor Quillo's own
+/// (`.qwe`, `.qwer`) (FEEDBACK36.md, Q-450; branch feedback36-39).
+fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let dir = s_arg(&args, 0, "files", line)?;
+    let path = match args.get(1) {
+        Some(Value::Str(p)) => p.clone(),
+        None | Some(Value::Nil) => "".into(),
+        Some(v) => return fail(line, format!("`files` takes the path asked for as argument 2, a str, got {}", v.repr())),
+    };
+    let (mut index, mut extensions, mut not_found_page) = ("index.html".to_string(), vec!["html".to_string()], Some("404.html".to_string()));
+    let mut file_opts = Map::new();
+    match args.get(2) {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(m)) => {
+            for (k, v) in m.iter() {
+                match (&**k, v) {
+                    ("index", Value::Str(s)) if !s.is_empty() && !s.contains('/') => index = s.to_string(),
+                    ("extensions", Value::List(l)) => {
+                        extensions = l.iter().map(|e| e.display().trim_start_matches('.').to_string()).filter(|e| !e.is_empty()).collect();
+                    }
+                    ("not_found", Value::Str(s)) => not_found_page = Some(s.to_string()).filter(|s| !s.is_empty()),
+                    ("not_found", Value::Nil) => not_found_page = None,
+                    ("cache", v) => {
+                        file_opts.insert("cache".into(), v.clone());
+                    }
+                    ("index" | "extensions" | "not_found", other) => {
+                        return fail(line, format!("`files`'s {} is {}, got {}", k, if &**k == "extensions" { "a list of str" } else { "a file name" }, other.repr()))
+                    }
+                    (k, _) => return fail(line, format!("`files` has no option `{}`: it takes `index`, `extensions`, `not_found` and `cache`", k)),
+                }
+            }
+        }
+        Some(v) => return fail(line, format!("`files` expects options as a map, got {}", v.type_name())),
+    }
+    let rel = path.trim_matches('/');
+    let hidden = rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known"))
+        || rel.ends_with(".qwe") || crate::native::is_rust(&rel);
+    let base = it.base_dir.join(&*dir);
+    let serve = |it: &mut Interp, name: String| file(it, vec![Value::str(name), Value::map(file_opts.clone())], line);
+    let joined = |rel: &str| if rel.is_empty() { dir.to_string() } else { format!("{}/{}", dir.trim_end_matches('/'), rel) };
+    if !hidden && !rel.split('/').any(|s| s == "..") {
+        let target = base.join(rel);
+        if target.is_dir() {
+            let asked = match it.request_value() {
+                Some(Value::Map(r)) => (r.get("path").map(|p| p.display()), r.get("query_string").map(|q| q.display())),
+                _ => (None, None),
+            };
+            // `/docs` is `/docs/`, so that the page's own relative links resolve.
+            if let (Some(p), q) = asked {
+                if !p.ends_with('/') {
+                    let q = q.filter(|q| !q.is_empty()).map_or(String::new(), |q| format!("?{}", q));
+                    return Ok(Value::Response(Arc::new(Response { status: 301, headers: vec![("location".into(), format!("{}/{}", p, q))], body: Body::Value(Value::Nil) })));
+                }
+            }
+            if target.join(&index).is_file() {
+                return serve(it, joined(&format!("{}/{}", rel, index).trim_start_matches('/').to_string()));
+            }
+        } else if target.is_file() {
+            return serve(it, joined(rel));
+        } else if Path::new(rel).extension().is_none() {
+            for ext in &extensions {
+                if base.join(format!("{}.{}", rel, ext)).is_file() {
+                    return serve(it, joined(&format!("{}.{}", rel, ext)));
+                }
+            }
+        }
+    }
+    if let Some(page) = not_found_page.filter(|p| base.join(p).is_file()) {
+        if let Value::Response(r) = serve(it, joined(&page))? {
+            if r.status == 200 {
+                let mut r = (*r).clone();
+                r.status = 404;
+                // Not the page's validators: they are of another URL's answer.
+                r.headers.retain(|(k, _)| !["etag", "last-modified", "accept-ranges"].contains(&k.as_str()));
+                return Ok(Value::Response(Arc::new(r)));
+            }
+        }
+    }
+    Ok(not_found())
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
@@ -1360,8 +1625,13 @@ fn redirect(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `respond(status, body, headers = {})` builds a response value.
 fn respond(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let status = i_arg(&args, 0, "respond", line)?;
-    if !(100..=599).contains(&status) {
-        return fail(line, format!("`respond` status must be 100-599, got {}", status));
+    // A 1xx is not an answer: the client waits on for one that never comes, or takes the next
+    // request's for it (FEEDBACK36.md, Q-433; branch feedback36-39).
+    if (100..200).contains(&status) {
+        return fail(line, format!("`respond` status must be 200-599, got {}: a 1xx is an interim answer, and the client would wait for the real one", status));
+    }
+    if !(200..=599).contains(&status) {
+        return fail(line, format!("`respond` status must be 200-599, got {}", status));
     }
     let headers = if args.len() > 2 { m_arg(&args, 2, "respond", line)? } else { Arc::new(Map::new()) };
     let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.display())).collect();
@@ -1886,6 +2156,45 @@ fn repeat(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::str(s.repeat(n as usize)))
 }
 
+/// `markdown_page(text, { title, lang, html })`: Markdown as a whole page, with a doctype and a
+/// `<head>`, which a fragment lacks, so a browser showed it in quirks mode; its title is the
+/// option's, or the text's first heading (FEEDBACK36.md, Q-451; branch feedback36-39).
+fn markdown_page(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let text = s_arg(&args, 0, "markdown_page", line)?;
+    let opts = match args.get(1) {
+        None | Some(Value::Nil) => Arc::new(Map::new()),
+        Some(Value::Map(m)) => m.clone(),
+        Some(v) => return fail(line, format!("`markdown_page` expects options as a map, got {}", v.type_name())),
+    };
+    for k in opts.keys() {
+        if !["title", "lang", "html"].contains(&&**k) {
+            return fail(line, format!("`markdown_page` has no option `{}`: it takes `title`, `lang` and `html`", k));
+        }
+    }
+    let heading = || text.lines().find_map(|l| l.trim_start().strip_prefix("# ").map(|t| t.trim().to_string()));
+    let title = match opts.get("title") {
+        Some(Value::Str(t)) => t.to_string(),
+        None | Some(Value::Nil) => heading().unwrap_or_default(),
+        Some(v) => return fail(line, format!("`markdown_page`'s title is a str, got {}", v.repr())),
+    };
+    let lang = match opts.get("lang") {
+        Some(Value::Str(l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!(" lang=\"{}\"", l),
+        None | Some(Value::Nil) => String::new(),
+        Some(v) => return fail(line, format!("`markdown_page`'s lang is a language tag such as \"en\", got {}", v.repr())),
+    };
+    let mut inner = vec![Value::str(&*text)];
+    if let Some(h) = opts.get("html") {
+        inner.push(Value::map([("html".to_string(), h.clone())].into_iter().map(|(k, v)| (k.into(), v)).collect()));
+    }
+    let body = markdown(it, inner, line)?.display();
+    Ok(Value::Html(format!(
+        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title></head><body>{}</body></html>",
+        lang,
+        crate::interp::escape(&title),
+        body
+    ).into()))
+}
+
 /// `markdown(text)`: Markdown as HTML (CommonMark, with tables,
 /// strikethrough and task lists). HTML written in the text is shown as text,
 /// and `javascript:` links are blocked, so it is safe for what visitors
@@ -2125,6 +2434,12 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `style` goes through when the program loads, before it is scoped
 /// (FEEDBACK11.md, Q-079; branch feedback11-fixes). At the top level.
 fn style_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // A function takes all the styles, marked, and gives them back made (FEEDBACK37.md, Q-455;
+    // branch feedback36-39).
+    if let Some(f @ (Value::Func(_) | Value::Builtin(..))) = args.first() {
+        it.style_with_fn = Some(f.clone());
+        return Ok(Value::Nil);
+    }
     let cmd = s_arg(&args, 0, "style_with", line)?;
     if cmd.trim().is_empty() {
         return fail(line, "`style_with` takes the command to run, like style_with(\"npx postcss\")");

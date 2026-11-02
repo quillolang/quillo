@@ -43,6 +43,13 @@ type R = Result<Value, Ctrl>;
 /// Bumped when the generated code changes, so libraries are built again.
 const GLUE_VERSION: &str = "1";
 
+/// Whether `path` is Rust for the program: a `.qwer` file, or a `.rs` one a `use` names, which
+/// editors, `rustfmt` and clippy know as Rust (FEEDBACK37.md, Q-453; branch feedback36-39). A
+/// crate's own `src/*.rs` beside the program is left alone, as nothing uses it.
+pub fn is_rust(path: &str) -> bool {
+    path.ends_with(".qwer") || path.ends_with(".rs")
+}
+
 // ---- reading a .qwer file ----------------------------------------------------
 
 /// An exported function, as written.
@@ -674,13 +681,18 @@ fn glue(qwer: &Path, exports: &[Export]) -> String {
 }
 
 fn manifest(crate_name: &str, deps: &str) -> String {
+    format!("{}[profile.release]\npanic = \"unwind\"\n\n[workspace]\n", package(crate_name, deps, "lib.rs"))
+}
+
+/// A crate's package, library and dependencies; `lib`: where its code is.
+fn package(crate_name: &str, deps: &str, lib: &str) -> String {
     let mut deps = deps.to_string();
     if !deps.lines().any(|l| l.trim_start().starts_with("serde_json")) {
         deps.push_str("serde_json = \"1\"\n");
     }
     format!(
-        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = \"lib.rs\"\n\n[dependencies]\n{}\n[profile.release]\npanic = \"unwind\"\n\n[workspace]\n",
-        crate_name, deps
+        "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = {:?}\n\n[dependencies]\n{}\n",
+        crate_name, lib, deps
     )
 }
 
@@ -807,19 +819,110 @@ pub fn check(qwer: &Path) -> Result<Vec<Note>, String> {
 
 /// The library for a `.qwer` file: built now unless one was built from the
 /// same content, kept in `.quillo/native/` next to the file.
+/// The library a `.qwer` file's content makes, in `.quillo/native/` beside it.
+fn lib_path(qwer: &Path, src: &str) -> PathBuf {
+    let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
+    let hash = hex_hash(&[src.as_bytes(), GLUE_VERSION.as_bytes(), std::env::consts::ARCH.as_bytes()]);
+    let out_dir = abs.parent().unwrap_or(Path::new(".")).join(".quillo").join("native");
+    out_dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, stem(qwer), hash, std::env::consts::DLL_EXTENSION))
+}
+
+/// One build at a time in this process (instances load the same files).
+static BUILDING: Mutex<()> = Mutex::new(());
+
+/// Every Rust file `files` names whose library is not built yet, built in one cargo call over a
+/// workspace, so that cargo builds them side by side, where each `use` built its own one after
+/// another (FEEDBACK37.md, Q-454; branch feedback36-39). Each member is the file's crate with a
+/// manifest of its own in the workspace (a crate's own is a workspace by itself). What fails
+/// here is built again, alone, by its `use`, which says why.
+pub fn prebuild(files: &[PathBuf]) {
+    let mut todo = Vec::new();
+    for f in files {
+        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        if !lib_path(f, &src).is_file() {
+            todo.push((f.clone(), src));
+        }
+    }
+    if todo.len() < 2 {
+        return;
+    }
+    let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut members = Vec::new();
+    for (f, src) in &todo {
+        let abs = f.canonicalize().unwrap_or_else(|_| f.clone());
+        let parsed = parse(src);
+        match prepare(&abs, &parsed) {
+            Ok((name, dir)) => members.push((f.clone(), name, dir, parsed.deps)),
+            Err(_) => return,
+        }
+    }
+    let names: Vec<&str> = members.iter().map(|(_, n, ..)| n.as_str()).collect();
+    let ws = cache_dir().join("workspaces").join(hex_hash(&names.iter().map(|n| n.as_bytes()).collect::<Vec<_>>()));
+    for (_, name, dir, deps) in &members {
+        let m = ws.join("m").join(name);
+        let text = package(name, deps, &dir.join("lib.rs").to_string_lossy());
+        if std::fs::create_dir_all(&m).is_err() || std::fs::write(m.join("Cargo.toml"), text).is_err() {
+            return;
+        }
+    }
+    let list = names.iter().map(|n| format!("\"m/{}\"", n)).collect::<Vec<_>>().join(", ");
+    let root = format!("[workspace]\nresolver = \"2\"\nmembers = [{}]\n\n[profile.release]\npanic = \"unwind\"\n", list);
+    if std::fs::write(ws.join("Cargo.toml"), root).is_err() {
+        return;
+    }
+    eprintln!("quillo: building {} together", members.iter().map(|(f, ..)| f.display().to_string()).collect::<Vec<_>>().join(", "));
+    let target = cache_dir().join("target");
+    let ok = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "--release", "--message-format=short", "--manifest-path"])
+        .arg(ws.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        return;
+    }
+    for ((f, name, ..), (_, src)) in members.iter().zip(&todo) {
+        let _ = keep_lib(f, &lib_path(f, src), name, &target);
+    }
+}
+
+/// Copies the library cargo built for `crate_name` to `lib`, and lets those of the file's earlier
+/// contents go.
+fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<(), String> {
+    let name = stem(qwer);
+    let out_dir = lib.parent().unwrap_or(Path::new("."));
+    let built = target
+        .join("release")
+        .join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("cannot make {}: {}", out_dir.display(), e))?;
+    // Copied, so the next build of this file does not change a library that
+    // is loaded.
+    let tmp = lib.with_extension("tmp");
+    std::fs::copy(&built, &tmp).map_err(|e| format!("cannot copy {}: {}", built.display(), e))?;
+    std::fs::rename(&tmp, lib).map_err(|e| e.to_string())?;
+    // Libraries of this file's earlier contents go (those loaded stay loaded).
+    if let Ok(rd) = std::fs::read_dir(out_dir) {
+        let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, name);
+        for e in rd.flatten() {
+            let p = e.path();
+            let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            if p != lib && f.starts_with(&prefix) && f.len() == prefix.len() + 16 + 1 + std::env::consts::DLL_EXTENSION.len() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     let src = std::fs::read_to_string(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
-    let name = stem(qwer);
-    let hash = hex_hash(&[src.as_bytes(), GLUE_VERSION.as_bytes(), std::env::consts::ARCH.as_bytes()]);
-    let out_dir = abs.parent().unwrap_or(Path::new(".")).join(".quillo").join("native");
-    let lib = out_dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, name, hash, std::env::consts::DLL_EXTENSION));
+    let lib = lib_path(qwer, &src);
     if lib.is_file() {
         return Ok((lib, parsed));
     }
-    // One build at a time in this process (instances load the same files).
-    static BUILDING: Mutex<()> = Mutex::new(());
     let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if lib.is_file() {
         return Ok((lib, parsed));
@@ -848,26 +951,7 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             .collect();
         return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
     }
-    let built = target
-        .join("release")
-        .join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("cannot make {}: {}", out_dir.display(), e))?;
-    // Copied, so the next build of this file does not change a library that
-    // is loaded.
-    let tmp = lib.with_extension("tmp");
-    std::fs::copy(&built, &tmp).map_err(|e| format!("cannot copy {}: {}", built.display(), e))?;
-    std::fs::rename(&tmp, &lib).map_err(|e| e.to_string())?;
-    // Libraries of this file's earlier contents go (those loaded stay loaded).
-    if let Ok(rd) = std::fs::read_dir(&out_dir) {
-        let prefix = format!("{}{}-", std::env::consts::DLL_PREFIX, name);
-        for e in rd.flatten() {
-            let p = e.path();
-            let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-            if p != lib && f.starts_with(&prefix) && f.len() == prefix.len() + 16 + 1 + std::env::consts::DLL_EXTENSION.len() {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
+    keep_lib(qwer, &lib, &crate_name, &target)?;
     Ok((lib, parsed))
 }
 
@@ -1086,6 +1170,18 @@ pub fn display_name(key: &str) -> &str {
 
 /// `quillo build`: every `.qwer` file a program uses, built now.
 pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
+    let files = rust_files(main)?;
+    prebuild(&files);
+    files.iter().map(|f| build(f).map(|(l, _)| l)).collect()
+}
+
+/// The Rust files a program uses, in its files and those it mounts.
+pub fn rust_files(main: &Path) -> Result<Vec<PathBuf>, String> {
+    walk_program(main, &mut |_, _| {})
+}
+
+/// `rust_files`, calling `visit` with each Quillo file read and its statements.
+pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt])) -> Result<Vec<PathBuf>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     // A `use` counts from its program's folder, in every file; a mounted program is
@@ -1096,12 +1192,13 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
         if !seen.insert(key) {
             continue;
         }
-        if f.extension().is_some_and(|e| e == "qwer") {
-            out.push(build(&f)?.0);
+        if f.extension().is_some_and(|e| e == "qwer" || e == "rs") {
+            out.push(f);
             continue;
         }
         let src = std::fs::read_to_string(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
+        visit(&f, &prog);
         for s in prog {
             match s {
                 crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve_from(&base, &f, &p)), base.clone())),

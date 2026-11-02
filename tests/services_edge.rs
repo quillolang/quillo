@@ -119,7 +119,7 @@ fn how_a_service_is_called_is_checked_where_it_is_declared() {
     assert!(bad("{ retries: 11 }").contains("`retries` is a number of tries after the first, 0 to 10, not 11"));
     assert!(bad("{ retries: \"2\" }").contains("`retries` is a number"));
     assert!(bad("{ failures: 0 }").contains("`failures` is how many failures in a row leave an address alone, 1 or more, not 0"));
-    assert!(bad("{ wait: 1 }").contains("no option `wait` (timeout, retries, failures, cooldown)"));
+    assert!(bad("{ wait: 1 }").contains("no option `wait` (timeout, retries, failures, cooldown, auth, forward)"));
 
     let mut it = Interp::new(&d);
     it.load_source("service opts_good = \"work.qwe\" { timeout: 1500.5, cooldown: \"1m\", retries: 0, failures: 1 }\nservice opts_text = \"work.qwe\" { timeout: \"1.5\", cooldown: \"250ms\" }\n", "main.qwe").unwrap();
@@ -830,7 +830,7 @@ fn a_copy_that_cannot_join_says_why() {
     wrong.logged(&format!("cannot join {} as a copy of `risk`: 401", url), 10);
     // No secret at all.
     let none = run(&d.join("risk.qwe"), support::free_port(), &["--as-service", "--join", &url], &[]);
-    none.logged("QUILLO_SERVICE_SECRET is not set", 10);
+    none.logged("QUILLO_SERVICE_SECRET (or QUILLO_SERVICE_KEY) is not set", 10);
     // Named as no service of the app's.
     let other = run(&d.join("risk.qwe"), support::free_port(), &["--as-service", "--service-name", "other", "--join", &url], &[("QUILLO_SERVICE_SECRET", SECRET)]);
     other.logged("404 {\"error\":\"this program has no service `other`\"}", 10);

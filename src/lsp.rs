@@ -130,7 +130,7 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
             let Some(u) = use_text(&lines, n, 0).and_then(|(l, _)| use_line(&l)) else { continue };
             // A `.qwer` file uses no other.
             let path = crate::modules::resolve(base, &u.path);
-            if path.ends_with(".qwer") {
+            if crate::native::is_rust(&path) {
                 continue;
             }
             let Ok(full) = base.join(&path).canonicalize() else { continue };
@@ -193,7 +193,7 @@ fn use_line(src: &str) -> Option<UseLine> {
         }
         u.path = word(start, e).replace('\\', "/");
         u.at = (start, e);
-        if !u.path.ends_with(".qwe") && !u.path.ends_with(".qwer") && !crate::ast::is_script(&u.path) {
+        if !u.path.ends_with(".qwe") && !crate::native::is_rust(&u.path) && !crate::ast::is_script(&u.path) {
             u.path.push_str(".qwer");
         }
         i = skip((e + quoted as usize).min(chars.len()));
@@ -292,7 +292,7 @@ fn use_line(src: &str) -> Option<UseLine> {
         return None;
     }
     u.path = word(i, e).replace('\\', "/");
-    if !u.path.ends_with(".qwe") && !u.path.ends_with(".qwer") {
+    if !u.path.ends_with(".qwe") && !crate::native::is_rust(&u.path) {
         u.path.push_str(if u.names.is_empty() { ".qwe" } else { ".qwer" });
     }
     u.at = (i, e);
@@ -557,7 +557,7 @@ impl Server {
                 "textDocument/didOpen" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
                     let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
-                    let rust = uri.ends_with(".qwer");
+                    let rust = crate::native::is_rust(&uri);
                     self.update(uri.clone(), text);
                     if rust {
                         self.check_rust(uri);
@@ -571,7 +571,7 @@ impl Server {
                 }
                 "textDocument/didSave" => {
                     let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
-                    if uri.ends_with(".qwer") {
+                    if crate::native::is_rust(&uri) {
                         self.check_rust(uri);
                     }
                     // Other open files may `use` the saved one.
@@ -636,7 +636,7 @@ impl Server {
     }
 
     fn update(&mut self, uri: String, text: String) {
-        if uri.ends_with(".qwer") {
+        if crate::native::is_rust(&uri) {
             return self.update_rust(uri, text);
         }
         // An app's style sheet: kept for its classes' rules, as typed.
@@ -820,7 +820,7 @@ impl Server {
     fn hover(&self, params: &J) -> J {
         // In a .qwer file: what Quillo sees of an exported function.
         let (uri, _, _) = Self::position(params);
-        if uri.ends_with(".qwer") {
+        if crate::native::is_rust(&uri) {
             let Some((_, r)) = self.reference_at(params) else { return J::Null };
             let (sig, doc) = r.detail.split_once("\n\n").unwrap_or((&r.detail, ""));
             return json!({ "contents": { "kind": "markdown", "value": format!("```quillo\n{}\n```\n{}\n\n*Exported to the programs that `use` this file.*", sig, doc) } });
@@ -898,7 +898,7 @@ impl Server {
             let called = if alias != name { format!(", called `{}` here", alias) } else { String::new() };
             let doc = if e.doc.is_empty() { String::new() } else { format!("{}\n\n", e.doc) };
             format!("```quillo\n{}\n```\n{}*From {}{}.*", check::native_signature(&crate::native::Export { name: alias, ..e }), doc, short, called)
-        } else if u.path.ends_with(".qwer") {
+        } else if crate::native::is_rust(&u.path) {
             let sigs: Vec<String> = self
                 .exports_of(&full)
                 .iter()
@@ -1020,7 +1020,7 @@ impl Server {
                 if browser && words.len() == 1 {
                     items.push(word("module"));
                 }
-                let ours = |n: &str| if browser { n.ends_with(".js") || n.ends_with(".mjs") } else { n.ends_with(".qwe") || n.ends_with(".qwer") };
+                let ours = |n: &str| if browser { n.ends_with(".js") || n.ends_with(".mjs") } else { n.ends_with(".qwe") || crate::native::is_rust(&n) };
                 // What `public/` holds is served from the site's root.
                 let files: Vec<String> = self.use_files(uri, &ours).iter().map(|f| f.strip_prefix("public/").map_or(f.clone(), |r| format!("/{}", r))).collect();
                 items.extend(self.file_items(&files, src, line, a, col16));
@@ -1096,7 +1096,7 @@ impl Server {
             let u = use_line(src).filter(ours).or_else(|| use_line(&format!("use x{}", from)).filter(ours))?;
             return Some(json!(self.names_of(doc, uri, &u, a)));
         }
-        let files = self.use_files(uri, &|name: &str| name.ends_with(".qwer") || !names && name.ends_with(".qwe"));
+        let files = self.use_files(uri, &|name: &str| crate::native::is_rust(&name) || !names && name.ends_with(".qwe"));
         Some(json!(self.file_items(&files, src, line, a, col16)))
     }
 
@@ -1116,7 +1116,7 @@ impl Server {
         if let Some(s) = taken.or_else(|| mine.min_by_key(|s| s.file != file)) {
             let text = self.text_of(&s.file);
             let (sig, about) = s.detail.split_once("\n\n").unwrap_or((&s.detail, ""));
-            if !s.file.ends_with(".qwer") {
+            if !crate::native::is_rust(&s.file) {
                 return Some((sig.to_string(), Vec::new(), comment_above(&text, s.line)));
             }
             let export = crate::native::parse(&text).exports.into_iter().find(|e| e.line == s.line);

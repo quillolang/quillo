@@ -29,7 +29,5 @@
          serving the program is (FEEDBACK33.md, Q-414; branch feedback27-35-fixes). -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>To reach a server on this network, such as the computer the app is being made on.</string>
-    <key>NSAppTransportSecurity</key>
-    <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict>
 </plist>

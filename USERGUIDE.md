@@ -59,7 +59,9 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
 | `--query-stats` | time database queries for `GET /_quillo/health/queries`: the last 100, overall and per statement (on under `--watch`; see [Stopping and health](#stopping-and-health)) |
 | `--scale NAME=N` | with `--split`: run service NAME as N copies (1 to 64), called in turn (see [Services](#services)) |
-| `--join URL` | with `--as-service` and a `--port`: join the app at URL as one more copy of this service while it runs |
+| `--join URL` | with `--as-service` and a `--port`: join the app at URL as one more copy of this service while it runs, signed with `QUILLO_SERVICE_KEY` when it is set (see [Copies that join](#copies-that-join)) |
+| `--join-as URL` | with `--join`: the address the app calls this copy at (`https://billing-3.internal:8443`); it must lead to where the copy joined from |
+| `--no-join`, `--allow-join A,B` | take no copies that join, or only copies of these services |
 | `--describe` | answer `GET /_quillo/describe` with the program's API, as `quillo docs` writes it |
 | `--env-file F` | the settings file to read (a path from the folder `quillo` runs in; it must exist), instead of the `.env` beside the program (which need not) |
 | `--with CMD` | run a command beside the program (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends, a Ctrl-C or `SIGTERM` while it loads, a panic and a `SIGKILL` too (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
@@ -87,13 +89,21 @@ one and for a folder, runs `quillo new` and opens the folder.
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
 files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
-[Files of a program](#files-of-a-program)), `quillo repl`, `quillo lsp`, `quillo dap`,
+[Files of a program](#files-of-a-program)), `quillo serve <folder>` (a folder of files as
+they are, as a static host serves it; see [Static files](#static-files)), `quillo classes
+<file.qwe>` (the classes the program's markup writes, one a line; see [HTML
+literals](#html-literals)), `quillo repl`, `quillo lsp`, `quillo dap`,
 `quillo version` (or `--version`, `-V`), which names the commit: from a source archive
 it reads the `COMMIT` file `git archive` writes, else says `(commit unknown)`. `quillo
 <file.qwe>` is `quillo run <file.qwe>`, options and all, whatever the case of its
 extension (`quillo MAIN.QWE`). A misspelt command is told the nearest (``unknown command
 `chek` (did you mean `check`?)``), and a file of another extension given with no command is
-told how to run it (`to run the file: quillo run tool`). `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
+told how to run it (`to run the file: quillo run tool`). `quillo run` given a file that is
+not a program says what it is and how to serve it: ``page.html is HTML, not a Quillo
+program: serve its folder as it is with `quillo serve .` ``, and the same for Markdown
+(with `markdown_page`), Rust (`use "t.rs"`), and `.css`, `.js`, `.json`, `.txt`, `.xml`,
+`.csv` and `.svg` files (`file()`); a folder with no `main.qwe` but an `index.html` is
+told `quillo serve`. `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
 they do not have (`check` has `--strict-null`). `quillo check` exits 1 when there is an error (warnings do not
 fail it), `quillo run` 1 when the program does not load or the port cannot be taken, and
 either 2 for a usage mistake (an unknown option, an option without its value, no program, `--register` without its
@@ -125,7 +135,10 @@ Everything Quillo reads from the environment:
 | `QUILLO_HEALTH_TOKEN` | lets a request with `Authorization: Bearer <it>` see each statement's query stats and switch them on or off; 16 characters at least |
 | `QUILLO_DB` | the database when the program does not call `db.open`; without it, SQLite in memory, gone at restart |
 | `QUILLO_SYSTEM_DB` | where Quillo's own tables go with a database per tenant (see [Quillo's own tables](#quillos-own-tables)) |
-| `QUILLO_SERVICE_SECRET`, `QUILLO_SERVICE_<NAME>` | signs calls between services; where service NAME runs (see [Services](#services)) |
+| `QUILLO_SERVICE_SECRET`, `QUILLO_SERVICE_<NAME>` | signs calls between services (several, comma-separated: the first signs, any is taken); where service NAME runs (see [Services](#services)) |
+| `QUILLO_SERVICE_SECRET_PREVIOUS` | a secret still taken while `QUILLO_SERVICE_SECRET` is changed (see [Authentication between services](#authentication-between-services)) |
+| `QUILLO_SERVICE_KEY` | a service's own key: a copy joins with it, and it proves the copy is that service (see [Copies that join](#copies-that-join)) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
 | `LIMER_ADMIN_SECRET` | for `--register` (see [Several servers](#several-servers)) |
 | `QUILLO_NATIVE_CACHE`, `CARGO` | where `.qwer` files are built, and with what (see [Rust](#rust)) |
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |
@@ -151,11 +164,19 @@ The release downloads are built without it. It takes the options of `run` except
 `--host`, `--register` and `--service`, reads the `.env` beside the program (or
 `--env-file`) as `run` does, keeps `--with` commands going until the window closes, and
 takes `--open PATH`, the page the window opens on
-(`--open /admin`; `/` by default). The program is served on 127.0.0.1, at a port the
-system picks (or `--port`), to the window alone:
-the window's first request carries a token made for this launch and trades it
-for a cookie, and requests without one (other programs, pages of other sites)
-get 403. Links to other sites open in the system's browser.
+(`--open /admin`; `/` by default). The program runs in the window's process with no
+HTTP server: nothing listens, and nothing else on the machine can reach it. The window
+asks for its pages through a scheme of its own, `quillo://app/` (`https://quillo.localhost/`
+on Windows), and the program answers each request as a server would, so routes,
+sessions, `server fn`s, uploads and live data work as in a browser (Phone apps, below,
+says what differs). The origin is the same at every launch, so what a page keeps in
+`localStorage` and IndexedDB is there at the next one. The web view
+keeps no cookies for the scheme, so the program's are kept for it in
+`.quillo/app-cookies.json` beside the program, and its session key in
+`.quillo/.quillo-secret` unless `QUILLO_SECRET` is set: someone signed in stays signed in
+from one launch to the next. `--port` has no effect. Links to other sites open in the
+system's browser. Only macOS has run this way; Windows and Linux take the same code
+through wry, not yet run.
 
 Editor support: [quillolang/editors](https://github.com/quillolang/editors) has a VS Code extension (highlighting,
 diagnostics as you type, quick fixes, hover, go to definition, completion, outline, snippets,
@@ -201,9 +222,9 @@ split apart), and [index.qwe](https://github.com/quillolang/examples/blob/main/i
 
 ### Phone apps (preview)
 
-A program runs inside an iOS or Android app: the runtime is linked into it and serves the
-program on 127.0.0.1 to the app's own web view, as `quillo app` does on a desktop, so it works
-offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
+A program runs inside an iOS or Android app: the runtime is linked into it and runs the
+program in the app's process, with no HTTP server, as `quillo app` does on a desktop, so it
+works offline and keeps its SQLite database in the app's container. `mobile/ios/build.sh app
 --run` builds the app around a program folder for the iOS simulator and opens it there, and
 `mobile/android/build.sh app --run` a debug APK for an Android emulator or phone. The
 app's name, id, version, build number, icon and first file (`main = "mobile.qwe"`, by
@@ -216,13 +237,52 @@ app puts `window.quilloNative` on the program's pages for what a web view cannot
 `js("quilloNative.location")`, `.haptic`, `.battery`, `.notify`, `.keepAwake`,
 `.brightness`, `.share`, `.openSettings`, `.wait`. Both apps answer `.share` as `{ shared,
 to }` (on Android both `null`, as it cannot tell), on Android `.brightness(null)` gives the
-screen back to the system (iOS does when the app leaves the screen), a `tel:`, `sms:`, `mailto:` or maps link opens what the phone opens it with,
-and the program is served on the same port at each launch where it can, so `localStorage`,
-which goes by the page's address, keeps what it had (FEEDBACK28.md, Q-339, Q-346; built and
-read, not yet run on a phone). It has run on a real iPhone. Uploads to the stores are not
+screen back to the system (iOS does when the app leaves the screen), and a `tel:`, `sms:`, `mailto:` or maps link opens what the phone opens it with
+(FEEDBACK28.md, Q-346). It has run on a real iPhone, served on 127.0.0.1 as it was then;
+the scheme below has run on the iOS simulator and the Android emulator (pages, a server fn,
+live data, a form with a file, and storage and a session kept from one launch to the next),
+not yet on a real phone. Uploads to the stores are not
 done yet, and HarmonyOS NEXT is planned (`mobile/harmony/PLAN.md`). `platform()` (see [Standard library](#standard-library)) tells a program
 it is in a phone app, and on what. `mobile/examples/fieldbook` tries the phone's hardware
 from a program.
+
+Nothing listens. The web view gets its pages from the program through a scheme the app
+answers: `quillo://app/` on iOS (and in `quillo app` on macOS and Linux),
+`https://quillo.localhost/` on Android (and on Windows). So no other app on the phone, and
+no page in its browser, can reach the program; iOS has no listening socket to take back
+while the app is suspended; and the apps carry no exception for plain HTTP (iOS's
+local-networking ATS key and Android's cleartext config are gone). The origin is the same
+at every launch, so `localStorage` and IndexedDB keep what they had. An install made
+before kept them under `http://127.0.0.1:<port>`, and they stay there: they are not copied
+to the new origin (the program's database is the program's, and is not touched).
+
+What a scheme cannot carry goes through the app's message bridge: on Android every request
+with a body (its interceptor is given none), on WebKit a body that is a file, a `Blob` or a
+`FormData` (it hands the scheme none of those, so the page turns them into bytes first), and
+everywhere the connections live data and channels keep open. The shell's script, run before
+every page, hands the runtime its way out when the runtime asks for it with an event, so
+nothing is put on `window`. On Android, where every body goes through the bridge, it also
+takes over the page's own `fetch`, so a script's own request with a body goes the same way:
+the one global it changes. A form the scheme cannot carry (every post on
+Android, a form with a file on WebKit) is sent through the bridge, and the page goes to its
+answer, as after a post and a redirect. What the program sees is what a server sees, but:
+
+- The cookie jar is the app's. The web view keeps no cookies for a custom scheme, so the
+  program's are kept in `.quillo/cookies.json` in the app's data, with a session key
+  beside them, and a session lasts from one launch to the next. `document.cookie` is
+  empty to the page's scripts.
+- `request.ip` is `"app"`.
+- Jobs, ticks (`every` on the server) and calls made `later` reach the program with no
+  connection to itself.
+- A `stream` route's answer arrives whole, when it ends: the shells hand an answer over in
+  one piece.
+- Service workers do not run on a custom scheme. Quillo uses none; a program's own will
+  not start.
+- Safari's and Chrome's inspectors work as before, at `quillo://app/...` or
+  `https://quillo.localhost/...`.
+
+`mobile/README.md` lists the calls an app makes into the runtime (`quillo_open`,
+`quillo_request`, `quillo_bridge` and the rest).
 
 ## Language tour
 
@@ -680,7 +740,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - Text follows JSX's rules: each line is trimmed, blank lines are dropped and the rest
   are joined with a space. Entities such as `&amp;` and `&mdash;` work; write `{"{"}`
   for a brace. A `$` is text too, so `${name}` shows a `$` before the value, and
-  `quillo check` asks: write `{name}`, or `{"$"}{name}` for a price.
+  `quillo check` asks: write `{name}`, or `{"$"}{name}` for a price. Braces in text are
+  code, so a `return` in them leaves the function: `<pre>f() { return 1 }</pre>` answers
+  `1`, not the page, and `quillo check` warns (`` `{ return ... }` in <pre> leaves the
+  function, and its value is the answer, not the page ``).
 - `.class` and `#id` shorthand, with `{}` interpolation in the name. A class may hold
   `:` before a letter or digit and `/` before a digit, as Tailwind's do:
   `<em.hover:underline>`, `<div.md:flex.w-1/2>`.
@@ -690,8 +753,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   from both are kept. On a view or component, spread
   keys that are not parameters are ignored, so data with extra fields can be passed
   straight through; a misspelled attribute written out is still an error.
-- Attributes: `"text"` (plain, as in JSX; double quotes only) or `{expr}`, for example
-  ``href={`/todos/${id}`}``. `true` renders a bare attribute; `false`/`null` leaves it
+- Attributes: `"text"` (plain, as in JSX) or `{expr}`, for example
+  ``href={`/todos/${id}`}``. HTML's other two ways are taken too, as text with no `{...}`
+  in them: `'single quotes'` and an unquoted value, `<p class='a b' id=top>`, which go
+  out double-quoted. `true` renders a bare attribute; `false`/`null` leaves it
   out. A name may hold `-`, `_`, `:`, `@` and `.` (`data-id`, `bind:value`, `@click`),
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - Event handler attributes (`onclick`, any `on...`) and `srcdoc` take only `"text"`
@@ -707,7 +772,9 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `{name}` ``), and on any map or `{{ ... }}` block as an element's child. A map as an
   attribute (`Prop={{ k: v }}`) is as before.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
-- `<html>` gets `<!doctype html>`.
+- `<html>` gets `<!doctype html>`. A `<!DOCTYPE html>` written before `<html>`, as an HTML
+  file has it, is passed over; before another element it is an error (`` `<!DOCTYPE html>`
+  goes before an <html> element, which gets one by itself ``).
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
   Write it as `` css`...` ``: a template string (braces are plain text, `${...}` fills in
   values) that editors highlight as CSS. `` sql`...` `` does the same for queries.
@@ -733,12 +800,44 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `@media`, `@supports`, `@container` and `@layer` are scoped inside; `@keyframes` and
   `@font-face` are kept as they are. The style is the same for every use of the component,
   so it cannot read its parameters (set a class or `style=` on an element for that).
+- A `style` at a file's top level styles the components that file declares, and nothing
+  else: not the markup of its routes, views or top-level `fn`s (even one its component
+  calls), not other files' components, not the page. It is scoped as a component's own
+  style is, with an attribute of the file's (from its path, the same on the server and in
+  the browser) on every element its components write, and sent once for the file rather
+  than once for each component that shares it:
+
+  ```quillo
+  // lib/cards.qwe
+  style css`.title { color: darkred }`
+  component Card(t) {
+      style css`.title { color: navy }`        // a component's own rule wins over the file's
+      <div.card><h2.title>{t}</h2></div>
+  }
+  component Badge(t) { <span.title>{t}</span> }   // darkred
+  ```
+
+  It comes before the file's first component (``a file's `style` comes before its
+  components``), and the file must declare one (``a file's `style` styles the components
+  declared in it, and this file has none``). Several are joined in order. Its rules come
+  before the components' own, with the same specificity, so a component's own rule wins.
+  `import cards use Card` takes Card with its file's style. `style global` at the top
+  level does the same with the selectors as written, not scoped.
 - `style_with("npx postcss")`, at the top level, passes every component's and view's
   `style` through a command that reads CSS and writes CSS, as the program loads and before
   the styles are scoped: PostCSS with Tailwind's plugin (and its config beside the
   program) makes `@apply`, `theme()` and nesting work in a component's own CSS. All the
   styles go through it at once; what it made is kept while the CSS is the same, and a
-  command that fails stops the program loading, with what it said.
+  command that fails stops the program loading, with what it said. `style_with(f)` takes
+  a function instead, Quillo's or a Rust file's (see [Rust](#rust)): it is called once
+  with all the styles, each after a `/*! quillo-style <id> */` mark, and gives them back
+  with the marks. One that fails, or gives something other than text, stops the program
+  as a command does (``style_with `engine` failed: it gave int, not CSS text``):
+
+  ```quillo
+  fn engine(css) { replace(css, "@apply m-2;", "margin: .5rem;") }
+  style_with(engine)
+  ```
 - With Tailwind's CLI for the page's own sheet: `quillo run main.qwe --watch --with
   "npx tailwindcss -i src/app.css -o public/app.css --watch"`, the sheet served with
   `file()`. Tailwind finds classes written out in strings and attributes (`class="px-3"`,
@@ -746,10 +845,17 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   is found by neither it nor Quillo. Under `--watch`, each time it writes the sheet the
   open pages take it as they are. Tailwind's scanner reads the shorthand too
   (`<div.flex.p-4.md:flex-row>`), but a fraction right before `/>` is read with the
-  slash (`<i.w-1/3/>`): put a space before `/>`. For
+  slash (`<i.w-1/3/>`): put a space before `/>`. `classes()` gives the classes the
+  program's markup writes, sorted, for a CSS engine called from the program, and `quillo
+  classes app.qwe` prints them one a line, for a tool beside it (Tailwind's `@source
+  inline(...)`, or a safelist file). Both read the source: the `.class` shorthand,
+  `class="..."`, `class:name`, and the whole words in the text of `class={...}`; a class
+  made from parts (`` `bg-${color}` ``) is in neither. For
   production, build the sheet once (the same command without `--watch`) as a deploy
   step, and serve it under a name that changes with its content, with `file(..., {
-  cache: "1y" })`: Quillo does not do that step.
+  cache: "1y" })`: Quillo does not do that step. A CSS engine the program calls (a Rust
+  crate in a `.rs` file) can make the sheet as the program starts, with `build "/app.css"
+  = ...` (see [Static files](#static-files)).
 - `style global card_css` is the component's CSS with its selectors as written, not made to
   need its attribute: for a library whose classes are its own already (the UI kit's are all
   `ui-...`), whose rules may reach into what the caller passes in (`.ui-card-body >
@@ -782,8 +888,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
-- Comments: in markup, a line starting with `//` is a comment, and so is `{/* ... */}`,
-  as in JSX; in code, `//` to the end of the line and `/* ... */` anywhere. `//` after
+  An HTML tag written in capitals (`<DIV>`) is taken for a view, and the error says to
+  write it in lowercase, `<div>`.
+- Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`,
+  as in JSX, and `<!-- ... -->`, as in HTML; none of them reaches the page. A `<!--` with
+  no `-->` is an error. In code, `//` to the end of the line and `/* ... */` anywhere. `//` after
   other text on a line is text (`https://...`), and `{"//"}` writes the characters.
 - `<textarea>{text}</textarea>`: the box shows `text`, and shows it again whenever
   `text` changes, even after someone has typed in it; while `text` stays the same,
@@ -797,6 +906,26 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   reports these as errors, a view or component counting as its outer element
   (`<p><Presence/></p>` when `Presence` is a `<div>`); one that may be either
   (`link ? <a> : <span>`) is let through.
+
+#### From HTML
+
+HTML pasted into a literal mostly stays as it is: entities, bare attributes,
+`onclick="..."`, SVG's `viewBox`, custom elements, `<template>`, `<!-- comments -->`,
+`'single-quoted'` and unquoted attribute values, and a `<!DOCTYPE html>` before `<html>`.
+What to change:
+
+| HTML as written | In Quillo |
+|---|---|
+| `<p>one<p>two`, `<li>one<li>two`, closed by what follows | close each one: the error says where (`` `<p>` is never closed: add `</p>` before `</div>` on line 1 ``) |
+| `<style>body { color: red }</style>` | `` <style>{css`body { color: red }`}</style> ``: braces in markup are code |
+| `<script>if (a < b) { go() }</script>` | the code in a string, `<script>{raw(CODE)}</script>`, or in a file of its own |
+| `<DIV CLASS="a">` | lowercase, `<div class="a">`: a capital starts a view's name |
+| `{` and `}` in text, as a code sample in a `<pre>` has them | `{"{"}` and `{"}"}`, or the sample in a string, `<pre>{SAMPLE}</pre>` |
+| a `$` before a `{` in text | `{"$"}` |
+
+To send an HTML file unchanged, serve it with `file()` or `files()`, or a whole folder with
+`quillo serve` (see [Static files](#static-files)); `raw(read_file("page.html"))` puts it
+in a page of the program's, with Quillo's scripts.
 
 ## Components
 
@@ -1952,8 +2081,11 @@ route METHOD /path { ... block ... }
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
   `HEAD` request is served by the `GET` route: the route runs (what it does, it does),
   and the body is dropped. A `route HEAD` is accepted but never matches. An `OPTIONS`
-  request reaches only a route declared `OPTIONS` (or `ANY`); nothing answers CORS
-  preflights by itself, and no `access-control-*` header is written for you.
+  request reaches a route declared `OPTIONS` (or `ANY`). On a path that has routes but
+  none for `OPTIONS`, it is answered 204 with `Allow`, the methods the path takes (`GET,
+  HEAD, OPTIONS, POST`), and so is `OPTIONS *`: a health check that sends it (HAProxy's
+  `option httpchk`) finds the server up. Nothing answers CORS preflights by itself, and
+  no `access-control-*` header is written for you.
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
   `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
@@ -1984,8 +2116,14 @@ route METHOD /path { ... block ... }
   JSON body that starts with a byte-order mark is read.
 - **What the server refuses before a route.** Two `Host` headers, an HTTP/1.1 request
   without one, or one that is not a host and a port, get 400; a method not written in
-  capitals gets 501. A request target in absolute form (`GET http://host/path`) takes its
-  host from the target. A `HEAD` answer carries the `Content-Length` the `GET` would.
+  capitals, or one HTTP does not define (`FROB`), gets 501. A request target in absolute
+  form (`GET http://host/path`) takes its host from the target. A `HEAD` answer carries
+  the `Content-Length` the `GET` would. A body sent with `Content-Encoding: gzip` reaches
+  the route decoded, `--max-body` counting what it decodes to (more is 413); one in
+  another coding gets 415, and one that is not the gzip it says, 400. An `Expect` other
+  than `100-continue` gets 417. An HTTP/1.0 request gets no `100 Continue` (a 1.0 client
+  would take it for the answer) and no chunks: a streamed answer goes with no length and
+  ends with the connection, and an `Upgrade` is ignored.
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
   there is listed under [What a route cannot do](#what-a-route-cannot-do)).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
@@ -1993,8 +2131,8 @@ route METHOD /path { ... block ... }
   function or a block.
 
 If no route matches, the response is 404 for an unknown path, 405 for a known
-path with the wrong method, and 400 when a route matched the path and method but
-none of its patterns matched. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
+matched the path and method but none of its patterns matched. Before any route is tried, a `POST`, `PUT`, `PATCH` or
 `DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
 coming from another site is refused with 403 (see `allow_cross_site` under
 [Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
@@ -2004,17 +2142,24 @@ The statuses the server answers by itself:
 
 | Status | When |
 |---|---|
-| 400 | a malformed request line, header or chunked body; a route matched the path and method but no pattern; a `server fn` call whose body is not a JSON array |
-| 403 | a cross-site form post, `server fn` call or live connection; a desktop app's window token missing |
+| 204 | `OPTIONS` on a path no `OPTIONS` route takes, and `OPTIONS *`, with `Allow` |
+| 304 | a file's, or a route's own `etag`, that the browser already holds |
+| 400 | a malformed request line, header or chunked body; a body that is not the gzip it says; a route matched the path and method but no pattern; a `server fn` call whose body is not a JSON array; a WebSocket handshake that is not a `GET` with `Upgrade` and `Connection` |
+| 403 | a cross-site form post, `server fn` call or live connection; a phone app built the old way, on 127.0.0.1, whose launch token is missing |
 | 404 | no route; an unknown `/_quillo/` path; a `file()` path refused |
-| 405 | the path is known, the method is not |
+| 405 | the path is known, the method is not (with `Allow`) |
+| 408 | a request head not whole after 30 s, or a body of which nothing came for 30 s (logged: `POST /up HTTP/1.1 -> 408 (nothing of the body came for 30 s)`) |
 | 409, 422 | an [idempotent request](#idempotent-requests) running, or sent again with another body |
-| 413 | a body larger than `--max-body` |
-| 415 | a `server fn` call without `content-type: application/json` |
+| 412 | a file whose `If-Match` or `If-Unmodified-Since` it does not meet |
+| 413 | a body larger than `--max-body`, sent or once decoded |
+| 414 | a request line over 64 KiB |
+| 415 | a body in a coding other than gzip; a `server fn` call without `content-type: application/json` |
 | 416 | a `Range` past the end of a file |
+| 417 | an `Expect` other than `100-continue` |
+| 426 | a WebSocket handshake of a version other than 13 |
 | 431 | a request head over 64 KiB, or more than 100 headers |
 | 500 | a runtime error in the route (the body is `internal error`; the message is on stderr, and on the page under `--watch`) |
-| 501 | a `transfer-encoding` other than `chunked` |
+| 501 | a `transfer-encoding` other than `chunked`; a method HTTP does not define |
 | 503 | the server stopping or its program failed to load; a prefetch refused; too many files being sent or pages waiting (with `retry-after: 5`) |
 
 ### Route groups
@@ -2108,7 +2253,7 @@ route POST /avatar {
   Both give an error value when the request has no files, or the record is not one of
   this request's; a path that leads outside the folder is a runtime error.
 - `save_upload`, `write_file` and `delete_file` refuse the program's own files, and give
-  an error value saying so: the `.qwe` and `.qwer` files it loaded (or a folder holding
+  an error value saying so: the `.qwe` and Rust (`.qwer`, `.rs`) files it loaded (or a folder holding
   one), `.env` and `.env.*`, the SQLite database it has open with its `-wal`, `-shm` and
   `-journal` files, and anything in `migrations/`.
 - `filename` is what the browser sent, without any folders; name saved files yourself
@@ -2121,7 +2266,9 @@ route POST /avatar {
   writes (`%22` for `"`, `%0D`, `%0A`) and nothing else, and a quoted name keeps a `;` in it.
 - A multipart body may hold up to 1,000 parts; a text field given twice keeps the last.
 - The body counts against `--max-body` (10 MiB by default): raise it for larger files.
-  The request's head (its line and headers) has limits of its own, 64 KiB and 100
+  It may take as long as it keeps coming, a photo from a phone on a weak link too; one of
+  which nothing comes for 30 s is answered 408, with a line in the log. A proxy in front
+  has limits of its own (nginx's `client_body_timeout`). The request's head (its line and headers) has limits of its own, 64 KiB and 100
   headers, answered 431.
 
 From a component, a file goes to a `server fn` as an argument: pass it the input's file,
@@ -2282,7 +2429,7 @@ fn touch() {
 
 | Value | Response |
 |---|---|
-| html | 200 `text/html` |
+| html | 200 `text/html`; XML when its root names a namespace (`<urlset xmlns="...">`, a sitemap) or it starts `<?xml`: `application/xml`, `application/rss+xml` for `<rss>`, `application/atom+xml` for `<feed xmlns="...">`, and `image/svg+xml` for `<svg xmlns="...">` |
 | str | 200 `text/plain` |
 | map, list, number, bool | 200 JSON |
 | null | 204 |
@@ -2290,6 +2437,8 @@ fn touch() {
 | `respond(status, body, headers)` | exactly that |
 | `redirect(url, status = 303)` | a redirect |
 | `file(path, { cache })` | a file under the program's folder (see [Static files](#static-files)) |
+| `files(folder, path, options)` | a folder of files, as a static host serves it (see [Static files](#static-files)) |
+| `markdown_page(text, { title, lang, html })` | Markdown as a whole page: a doctype, a `<head>` with the title (the option's, else the first `#` heading), and the HTML |
 | `stream(f, { type, status, headers })` | sent as `f` makes it (see [Streaming](#streaming)) |
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
@@ -2308,8 +2457,14 @@ fn touch() {
 - A failed request's line in the log names it, with the id in its `x-request-id`:
   `quillo: error: GET /checkout (rid 1cf61931): main.qwe:8: division by zero`. Under
   `--log json` it is an object, with `level`, `request` and `error`.
-- `respond(status, body, headers)` takes a status from 100 to 599; header names are
-  written in lower case, and a name or value with a control character (a line break) is
+- `respond(status, body, headers)` takes a status from 200 to 599. A 1xx is an interim
+  answer, after which the client waits for the real one, so it is refused, when the
+  program runs and in `quillo check` for a written one (`` `respond` status must be
+  200-599, got 103: a 1xx is an interim answer, and the client would wait for the real
+  one ``); `reply` takes 200 to 599 too. A 205 goes with no body, whatever is given, and
+  each status has its reason phrase (`418 I'm a teapot`). A route's answer that carries
+  an `etag` is a 304 to a `GET` or `HEAD` whose `If-None-Match` holds it, as files are:
+  `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
   the server's, whatever is given. `redirect(url, status)` takes 300 to 399.
 - Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
@@ -2331,7 +2486,8 @@ fn touch() {
   ```
 - Text answers are gzipped for browsers that accept it: a 200 with a body of 1 KiB or
   more whose type is `text/*` or names `json`, `javascript` or `svg`, with `vary:
-  accept-encoding`. Not when the route set `content-encoding`, not streams, not partial
+  accept-encoding`. `Accept-Encoding` is read as HTTP says: names in any case, `x-gzip`
+  as `gzip`, `gzip;q=0` refusing it, and `*` standing for gzip when gzip is not named. Not when the route set `content-encoding`, not streams, not partial
   files (206). There is no brotli.
 - A header cannot be added from a helper: what `respond`, `stream` and `events` are given
   is the answer's, and headers for every page are `site_headers`'. Cookies are the
@@ -2372,8 +2528,8 @@ server's code:
   and `locale()` work in any function the request runs.
 - **A response header from a helper:** no; see [What a route returns](#what-a-route-returns).
 - **HTTPS, HTTP/2, HTTP/3 for pages:** the server speaks HTTP/1.1 over plain TCP
-  (keep-alive, pipelining, chunked bodies and `Expect: 100-continue` included); a proxy
-  in front terminates TLS. `--tls-cert` is for WebTransport only (see [Channels](#channels)).
+  (keep-alive, pipelining, chunked bodies and `Expect: 100-continue` included), and
+  HTTP/1.0 as 1.0 frames it; a proxy in front terminates TLS. `--tls-cert` is for WebTransport only (see [Channels](#channels)).
 - **A WebSocket route of your own:** no. Upgrades are taken only on Quillo's own paths
   (live data, channels, `--watch`); a route gets a plain request. Pages hear from the
   server through `live`, `events`/`listen`, or channels.
@@ -2386,9 +2542,10 @@ server's code:
   computes that long without letting go, as a 500; see
   [Concurrency](#concurrency-and-reloading). A wait is not limited: a route waiting on
   something that never comes holds its coroutine for good, and no one else. Also limited
-  is the socket: a request
-  still arriving after 30 s is dropped, an idle keep-alive connection is closed after
-  60 s, and a client that stops reading its answer is let go after 30 s.
+  is the socket: a request head not whole after 30 s, or a body of which nothing has
+  come for 30 s, is answered 408 and dropped (a body that keeps coming may take as long
+  as it takes), an idle keep-alive connection is closed after 60 s, and a client that
+  stops reading its answer is let go after 30 s.
 - **Rate limiting:** none for routes (a `rate_limit` builtin was removed). Count what
   matters in a table of your own: wrong PINs per account, uploads per hour. What is
   limited by itself: 256 large files being sent at once (8 per client), 4096 pages
@@ -2407,7 +2564,7 @@ server's code:
   (`--watch`); `quillo.js`, `media.js`, `b/<hash>.js`, `r/<hash>.js` and
   `s/<hash>.css` (what pages load); `rpc/<name>` (`server fn` calls) and `markdown`;
   `service/<name>` and `join` (services); `announce` (`--register`); `describe`
-  (`--describe`). `job/<name>`, `channel/<name>`, `udp/<port>` and `later` are the
+  (`--describe`); `posted/<id>` (in an app, a form's answer, shown once). `job/<name>`, `channel/<name>`, `udp/<port>` and `later` are the
   process's own, for its instances, and are 404 to anyone else. Anything else there is
   404. Under a mount or `--base`, `/shop/_quillo/...` serves the mounted program's
   pages' needs (its bundle, calls, live data) and its `ready`; `health` and `metrics`
@@ -2505,7 +2662,7 @@ commits: the work and its answer are kept together, or neither is.
 
 ### Prefetching
 
-Every page Quillo serves asks for the pages it links to before they are clicked: a
+Every page a route makes asks for the pages it links to before they are clicked: a
 link of the same site pointed at (for 65 ms), pressed, touched or reached with Tab. By
 the time the click lands, the page is there. Browsers with speculation rules (Chrome,
 Edge) keep the page for the navigation themselves; others get it in the background and
@@ -2539,6 +2696,9 @@ has logged in or out.
   link on a connection saving data.
 - A route that sets its own `cache-control` keeps it. `quillo run --no-prefetch` turns
   prefetching off.
+- **Pages sent as written:** a file `file()` or `files()` serves, and any answer with an
+  `etag` or a range, goes out as its bytes are, so its `ETag` and `Content-Range` name what
+  is sent: no prefetching script is added to it, nor `--watch`'s.
 
 ### Streaming
 
@@ -2570,7 +2730,24 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   JSON (newline-delimited JSON, with `type: "application/x-ndjson"`). `events(f)`
   sends Server-Sent Events: each value as JSON in an event's data, with a name if
   `send` is given one; `send(null)` is a comment, which keeps a quiet connection
-  open.
+  open. `send(value, { event, id, retry })` names the event, gives it an id, which the
+  browser sends back as `Last-Event-ID` when it connects again, and says how many
+  milliseconds a client waits before it does; `send(null, { id: "8" })` sends an id
+  alone. Another option, or a `retry` that is not a whole number, ends the stream with
+  an error. A program that goes on from the last id reads it in
+  `request.headers["last-event-id"]`:
+
+  ```quillo
+  route GET /feed = events((send) => {
+      let from = int(request.headers["last-event-id"] ?? "0") ?? 0
+      for n in range(from + 1, from + 100) {
+          send({ n }, { event: "tick", id: str(n), retry: 2000 })
+          sleep(1000)
+      }
+  })
+  ```
+- An HTTP/1.0 client, which reads no chunks, gets a stream with no length, ended by
+  closing the connection.
 - The rest of the server carries on meanwhile. A `send` waits only when the client
   reads slower than the program writes, and then it waits as a database call does,
   holding up no other request. Proxies are asked not to hold the answer back.
@@ -2579,18 +2756,20 @@ route POST /ask = events((send) => http.stream("https://api.example.com/v1/chat"
   error in the function after the answer began cuts the connection, so the client
   knows the answer is incomplete.
 - `http.stream(url, f, { method, body, headers })` reads another server's answer as
-  it arrives: `f` gets each event (its data, parsed as JSON when it is, and its
-  name), each line of newline-delimited JSON, or each piece of text, and may stop
-  it by returning `false`. Given `send`, what arrives goes straight on. It gives
-  `{ status, ok, headers }` once the answer has ended (with the `body` when it is
-  not a success), or an error value when it could not be had (also when one event or
-  line goes past 16 MiB without ending). The map also takes
-  `redirects` and `public_only` (see [HTTP client](#http-client)).
+  it arrives: `f` gets each event (its data, parsed as JSON when it is, its name, its
+  id and its `retry`: `(data, name, id, retry)`, the id being the last one the stream
+  gave, as a browser keeps it), each line of newline-delimited JSON, or each piece of
+  text, and may stop it by returning `false`. Given `send`, what arrives goes straight
+  on. It gives `{ status, ok, headers, cookies }` once the answer has ended (with the
+  `body` when it is not a success), or an error value when it could not be had (also
+  when one event or line goes past 16 MiB without ending). The map also takes
+  `redirects`, `public_only`, `ca`, `cert` and `key` (see [HTTP client](#http-client)).
 - In a page, `receive(url, f, { method, body, headers })` in a handler sends the
   request (a file from an input as `body` goes as it is) and calls `f` with what the
   answer streams, until it ends; `listen(url,
   f)` in a component's code follows a stream for as long as the code that called it
-  stands (and opens it again if the connection drops):
+  stands, and opens it again if the connection drops, sending the last event's id as
+  `Last-Event-ID` and waiting the `retry` the server gave, if it gave one:
 
 ```quillo
 component Chat() {
@@ -2732,7 +2911,8 @@ How messages travel:
   reliably and in order (`reliable` changes nothing there). The connection is opened
   again when it drops (after half a second, then longer, up to 15 s), the channels
   joined again, and what was queued sent. A page that also shows live data has two
-  connections, `/_quillo/live` and `/_quillo/wt`.
+  connections, `/_quillo/live` and `/_quillo/wt`. In a phone app or `quillo app`, which
+  have no socket, both go through the app's bridge instead.
 - The server listens for WebTransport on the UDP port with the HTTP port's number
   (`--wt-port` for another), from when the first page asks to connect, on every address
   of the machine unless `--host` is a loopback address. It makes a certificate of its
@@ -2856,13 +3036,22 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   in place of the one the extension gives: `file("exports/r.csv", { download: "rapport
   d'été.csv", type: "text/csv; charset=utf-8" })`.
 - Each file goes out with an `ETag` (a weak one, from the file's size, time, inode and
-  change time) and `Last-Modified`. A browser asking with a current copy
-  (`If-None-Match`, or an `If-Modified-Since` equal to it) gets a `304` with no body. A
-  file replaced by one of the same size and modified time (`cp -p`, `touch -t`, a build
-  that sets every file's time) is a new file, in memory and to the browser.
-- The type comes from the extension: `html htm css js mjs json map webmanifest xml txt
-  md csv svg png jpg jpeg gif webp avif ico mp4 webm mp3 ogg wav wasm woff2 woff ttf
-  otf pdf zip`; anything else is `application/octet-stream`. `file()` is also the only
+  change time) and `Last-Modified`, and as it is on disk: nothing is added to an HTML
+  file, so a range of it is the bytes its `Content-Range` names. A browser asking with a
+  current copy (`If-None-Match`, or an `If-Modified-Since` the file has not changed
+  since, in any of HTTP's three date forms) gets a `304` with no body. `If-Match` that
+  does not name the file's `ETag`, or an `If-Unmodified-Since` it has changed since, gets
+  a `412`, on a `GET` as on a write. A file replaced by one of the same size and
+  modified time (`cp -p`, `touch -t`, a build that sets every file's time) is a new
+  file, in memory and to the browser.
+- The type comes from the extension: `html htm css js mjs json map webmanifest xml xsl
+  txt csv svg png jpg jpeg gif webp avif ico mp4 m4v webm mp3 ogg oga wav wasm woff2
+  woff ttf otf pdf zip`, and `md` (`text/markdown`), `vtt` (subtitles for `<track>`),
+  `ics`, `rss`, `atom`, `jsonld`, `geojson`, `yaml`, `yml`, `toml`, `m3u8`, `mpd`, `ts`,
+  `m4s` (HLS and DASH), `srt`, `tsv`, `bmp`, `tif`, `tiff`, `heic`, `jxl`, `mov`, `m4a`,
+  `aac`, `flac` and `opus`, text ones with `charset=utf-8`; anything else is
+  `application/octet-stream`, which `nosniff` keeps a browser from guessing at (give
+  `type` then). `file()` is also the only
   way to send bytes as they are: a route's other answers are text, HTML or JSON, so a
   file made in the program (a PDF, an image from `image.convert`) is written under the
   program's folder and served from there.
@@ -2883,6 +3072,57 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   to 1 MiB is kept too (32 MiB of them in all), rather than compressed again for each
   request.
 - Paths with `..`, or starting at `/`, get a `404`.
+
+A folder of files, as a static host serves it, is `files(folder, path, options)`:
+
+```quillo
+route GET /*path = files("site", path)
+route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"], not_found: null, cache: "1h" })
+```
+
+- `/` and `/docs/` are their folder's `index.html`, `/about` finds `about.html`, and a
+  folder named without its `/` (`/docs`) is redirected to it (301), so its pages'
+  relative links work. A miss is the folder's `404.html`, sent with status 404, when it
+  has one; else the plain 404.
+- Files whose names start with a dot (`.env`, `.git/`) are not served, but `.well-known/`
+  is; nor are the program's own (`.qwe`, `.qwer`, `.rs`). Each file goes as `file()`
+  sends it, its `ETag`, ranges and type included.
+- The options: `index` (a file name, `index.html` unless given), `extensions` (those a
+  clean URL may leave out, `["html"]` unless given), `not_found` (the page for a miss,
+  `404.html` unless given; `null` for none) and `cache`, as `file()`'s. Another option is
+  a runtime error that lists them.
+
+`quillo serve site` serves a folder that way with no program at all: `index.html`, clean
+URLs and `404.html`, on `--port` (8080 unless given) and with the other options of `run`.
+A Markdown file goes out as `text/markdown`; to show one as a page,
+`markdown_page(read_file("notes.md"))` gives a whole page (a doctype, a `<head>` with
+`<title>`, the first `#` heading unless `title` is given, and `lang` and `html` as
+options; `html: true` keeps HTML written in the text, as `markdown` does).
+
+A file the program makes as it starts, a stylesheet compiled by an engine in Rust, is
+declared with `build` at the top level:
+
+```quillo
+use "tailwind.rs"
+
+build "/app.css" = tailwind(css`@import "tailwindcss";`, classes())
+```
+
+- It is made once the port is open, beside the requests, where work at the top level
+  (`let APP = tailwind(...)`) holds the port shut until it ends. A request for it that
+  comes first waits for it, and is not refused. The log says when it is done: `quillo:
+  built /app.css in 1.5 s`.
+- It is served at its path with the type its extension names (text; markup as HTML;
+  another value as JSON; a `respond(...)` as it is), an `ETag` and `cache-control:
+  no-cache`, so a browser's copy is checked rather than fetched again.
+- One that fails at the first start stops the program with exit 1 (`quillo: build /app.css
+  failed: no engine`). After a reload (`--watch`, `--reload`) it is made again, and while
+  that fails the last good one is served.
+- The path starts with `/`, and holds no `?` and no trailing `/` (`` `build` names the path
+  it is served at ``). Elsewhere `build` is an ordinary name.
+- Ordinary top-level code still runs before the port opens, as a route may need what it
+  sets: only what is declared as a `build` moves off that path. `quillo build` does not
+  make it ahead of time.
 
 ### Translations
 
@@ -3001,9 +3241,12 @@ service /billing = "billing.qwe"
   goes straight to it.
 - **Split**, a service runs elsewhere: `--service-url billing=http://10.0.0.5:8081` (or
   `QUILLO_SERVICE_BILLING`) sends its calls there, `POST /_quillo/service/invoice`,
-  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service).
-  The signature covers the time (a call more than five minutes old is refused), the
-  service it is for, the function, the tenant, the arguments and the call's id. A
+  signed with HMAC-SHA256 under `QUILLO_SERVICE_SECRET` (the same on every service), or
+  proven another way (see [Authentication between
+  services](#authentication-between-services)). The signature covers the time (a call
+  more than five minutes old is refused), the service it is for, the function, the
+  tenant, the arguments, the call's id, the caller's name, its deadline and its
+  contract, and the answer comes back signed with the same key. A
   service takes only calls for itself: its name is the program's file name
   (`billing.qwe` is `billing`), or `--service-name billing` when the file is named
   otherwise. It remembers each call's id for longer than a signature lasts, so a call
@@ -3156,25 +3399,37 @@ When a service runs elsewhere, its calls are made to hold up:
   id, the same for each try of it, and for a call made later the id `.later` gave.
 - **On the wire**, for a balancer's rules, a log, or a service written in another
   language: a call is `POST <service>/_quillo/service/<fn>` with the arguments as a
-  JSON array, and the headers `x-quillo-service: t=<unix seconds>,sig=<hex>`,
-  `x-quillo-to` (the service's name), `x-quillo-call` (the call's id, up to 64 letters
-  and digits), `x-quillo-caller`, `x-quillo-deadline` (milliseconds the caller still
-  waits), `x-quillo-contract`, `x-quillo-tenant` and `x-request-id`. The signature is
-  HMAC-SHA256 under `QUILLO_SERVICE_SECRET` of `quillo-service-2`, the time, the
-  service, the function, the tenant and the call id, each on a line, then the body; the
-  time must be within five minutes. The answer is `{"ok": value}` or `{"err":
-  payload}` (with `"published": [...]`, the topics to announce), 401 for a bad or old
-  signature or another service's, 404 for no such function, 409 for a contract that
-  differs, 503 while the call still runs. A server in another language that answers so,
+  JSON array, and the headers `x-quillo-service: v=3,kid=<key's name>,t=<unix
+  seconds>,sig=<hex>` (`kid` only for a key of the caller's own), `x-quillo-to` (the
+  service's name), `x-quillo-call` (the call's id, up to 64 letters and digits),
+  `x-quillo-caller`, `x-quillo-deadline` (milliseconds the caller still waits),
+  `x-quillo-contract`, `x-quillo-tenant` and `x-request-id`, and `authorization` for a
+  token and `x-quillo-forward-<name>` for each header `forward` passes on. The signature
+  is HMAC-SHA256 under the key (`QUILLO_SERVICE_SECRET`'s first, or the caller's own) of
+  `quillo-service-3`, the time, the service, the function, the tenant, the call id, the
+  `kid`, the caller, the deadline and the contract, each on a line, then the body; the
+  time must be within five minutes. Version 2 (`t=...,sig=...` over `quillo-service-2`,
+  the time, the service, the function, the tenant and the call id) is still taken, with
+  the caller's name then not known. The answer is `{"ok": value}` or `{"err": payload}`
+  (with `"published": [...]`, the topics to announce), signed with the call's key in
+  `x-quillo-answer: sig=<hex>`, HMAC-SHA256 of `quillo-answer-3`, the call id and the
+  status, each on a line, then the body. It is 401 for a call that proves no caller (a
+  bad or old signature, another service's, a key or token not taken), 403 for a caller
+  `for` or `check` refuses, 404 for no such function, 409 for a contract that differs,
+  503 while the call still runs. A server in another language that answers so,
   remembers call ids, and answers `GET /_quillo/ready`, is a service; its caller still
   needs a `.qwe` file with the `server fn` signatures for `quillo check` and the
   contract. The routes under a service's prefix are passed on as they come, but not
   Quillo's own addresses there. A copy [joins](#copies-that-join) at `POST
-  <app>/_quillo/join`, with `{ "service": "billing", "port": 8081, "leave": false }`,
-  signed as a call is (under `QUILLO_SERVICE_SECRET`, a nonce in `x-quillo-call`, taken
-  once). The answer is 200 `{ service, at }`, the address the copy is recorded at, or
-  400 (no port, or an address not known), 401 (a bad or old signature, no nonce), 403
-  (the app has no `QUILLO_SERVICE_SECRET`), 404 (no such service), 405 (not a POST) or
+  <app>/_quillo/join`, with `{ "service": "billing", "port": 8081, "leave": false }`
+  (and `"url"` under `--join-as`), signed as a call is to the service `_join` and the
+  function `billing` (with its `QUILLO_SERVICE_KEY` as `kid=billing`, or under
+  `QUILLO_SERVICE_SECRET`; a nonce in `x-quillo-call`, taken once). The answer is 200 `{
+  service, at }`, the address the copy is recorded at, or 400 (no port, an address not
+  known, a `url` that does not lead to where the copy joined from), 401 (a bad or old
+  signature, no nonce, the shared secret where the app has the service's key, another
+  service's key), 403 (the app has neither `QUILLO_SERVICE_SECRET` nor keys, or
+  `--no-join` and `--allow-join` refuse it), 404 (no such service), 405 (not a POST) or
   409 (a nonce sent before). Only copies call it, so a proxy in front of the app need not
   pass it from outside.
 - **Made later.** `billing.later.invoice(name, 1200)` does not wait: the call is kept, its
@@ -3209,13 +3464,158 @@ When a service runs elsewhere, its calls are made to hold up:
 
 See [services](https://github.com/quillolang/examples/tree/main/services): a shop that bills through a billing service.
 
+#### Authentication between services
+
+A call signed with `QUILLO_SERVICE_SECRET` proves one thing: the caller holds the secret.
+Every service holding it can sign as any other, call any function of any service, and name
+any tenant, so the most exposed service in a system holds the key to all the others. A
+caller can prove more than that, and a service can say whom it takes calls from.
+
+The caller says how it proves who it is, where it declares the service:
+
+```quillo
+service billing = "billing.qwe" { auth: { key: env("SHOP_KEY"), as: "shop" } }
+```
+
+| `auth` | The call |
+|---|---|
+| `"quillo"` (the default) | signed with the shared secret |
+| `{ key, as }` | signed with a key of the caller's own, which the service knows it by: `as` is the name (the program's service name unless given). A key of `notify`'s cannot sign as `shop` |
+| `{ bearer: f }` | `Authorization: Bearer <token>`, the token from `f` (a function, Quillo's or a Rust file's) at each call, or text |
+| `{ oauth: { token_url, client_id, client_secret, scope, audience, method } }` | a token fetched by OAuth 2.0's client credentials grant (`method`: `"post"`, the client's secret in the form, or `"basic"`, in `Authorization`), kept until 30 s before it expires, and fetched again once when the service answers 401 |
+| `{ mtls: { cert, key, ca } }` | a client certificate on the connection (PEM files; `ca` a file or `"system"`), alone or beside one of the others |
+
+A call that proves itself with a token (`bearer`, `oauth`) is not also signed with the shared
+secret, so the service checks the token, not the secret.
+
+```quillo
+service billing = "billing.qwe" { auth: { oauth: {
+    token_url: env("IDP_TOKEN_URL"), client_id: "shop", client_secret: env("SHOP_CLIENT_SECRET"),
+    scope: "billing", audience: "billing",
+} }, forward: ["authorization"] }
+```
+
+`forward: ["authorization"]` passes the visitor's own headers of the request the call is
+made in along with it; the service reads them in `request.forwarded`. A call signed with a key
+or the secret signs them too, so they cannot be changed on the way; they are still what the
+visitor sent. `quillo check` warns of a `key` or `client_secret`
+written in the source, where every copy of the program has it (``service billing: its
+`key` is written in the source, ... read it with env("...")``), and of a misspelt option
+(`auht`: did you mean `auth`?). A wrong value stops the program as it loads, saying what
+is wrong (`` service billing: `oauth` needs `client_id` ``).
+
+The service says what it takes, once, at its top level:
+
+```quillo
+// billing.qwe
+accept_calls {
+    keys: { shop: [env("SHOP_KEY"), env("SHOP_KEY_OLD")], orders: env("ORDERS_KEY") },
+    jwt: { issuer: env("IDP"), audience: "billing", jwks: env("IDP") + "/.well-known/jwks.json" },
+    client_cert: { header: "x-forwarded-client-cert" },
+    check: (caller) => caller.name != "mallory",
+}
+
+server fn refund(account: int, cents: int) for ["shop"] {
+    // request.caller: { name: "shop", by: "key" }
+    { refunded: cents }
+}
+```
+
+- `keys`: a key for each caller, by name; a list takes any of its keys, while one is
+  changed.
+- `shared: false`: calls signed with the shared secret are refused (`this service takes
+  no calls signed with the shared secret`). Without it they are taken as before.
+- `jwt: { issuer, audience, jwks, secret }`: a bearer token, an OAuth 2.0 access token,
+  checked against the identity provider's keys at `jwks` (a URL, kept for ten minutes,
+  fetched again at most once a minute for a key it does not have: RS256, ES256, EdDSA)
+  or against `secret` (HS256). `audience` is required, so a token meant for another
+  service is not taken here; `exp` is required too, and `nbf`, `iss` and `aud` are
+  checked, with a minute's leeway. A token that fails is a 401 that says why (`the
+  bearer token: the token is not for billing (aud)`, `... has expired`, `... has no exp:
+  it would be good for ever`, `an unsigned token`).
+- `client_cert: { header }`: the identity in the header a proxy that ended mutual TLS
+  sets, as Envoy's `x-forwarded-client-cert` (`Subject="CN=shop,O=Acme";URI=spiffe://...`):
+  the SPIFFE id's last part, else the subject's CN. Quillo ends no TLS itself, so the
+  header is believed only from an address `--trust-proxy` names; from anyone else it is
+  a 401.
+- `check: (caller) => ...`, run with `request.caller` before the call's arguments are
+  read: `false` refuses it with 403 (and an error value, with its text), a map takes the
+  caller's place, and `reply` answers the call there.
+- An `accept_calls` with nothing in it is an error, and so is an option it does not have.
+
+`server fn refund(...) for ["shop"]` takes calls from those callers only, checked before
+the arguments are read: another gets 403 (`` `refund` takes calls from shop only; this is
+`notify` ``). `quillo check` refuses `for []`, `for [shop]` (a caller is named in plain
+text, `"shop"`) and `for "shop"`, and `quillo docs` puts each function's callers in
+`x-quillo-callers`, for a gateway to enforce too.
+
+What the function sees, where a service runs elsewhere (in one process a call is a
+function's call: `request.caller` is null, and `for` is not checked):
+
+- `request.caller`: `{ name, by }`, `by` being `"quillo"` (the shared secret; `name` as
+  the caller signed it), `"key"`, `"jwt"` (with `scopes`, from `scope` or `scp`, and the
+  token's `claims`; `name` its `client_id`, `azp` or `sub`) or `"mtls"` (with `subject`,
+  and `uri` for a SPIFFE id). What `check` gave, when it gave a map.
+- `request.user`: the claims of the visitor's token, when the caller forwarded its
+  `authorization` and `accept_calls`'s `jwt` takes it; else null.
+- `request.forwarded`: the headers forwarded, by name.
+
+A call proven several ways is taken by the first that holds, in this order: a key of the
+caller's own, the shared secret, a token, a certificate. A caller with `QUILLO_SERVICE_SECRET`
+set signs every call with it, a bearer one too, so a service that is to check tokens says
+`shared: false`.
+
+Answers are signed back with the key the call was signed with, and a caller that signs
+with a key of its own takes no answer without it (``service billing: the answer from
+http://... is not signed by the service``), so a copy that only says it is the service
+cannot answer for it. Signatures are now version 3, which also covers the caller's name,
+the deadline and the contract; services still take version 2, so upgrade the services
+before their callers.
+
+The shared secret is changed without stopping anything: `QUILLO_SERVICE_SECRET=new,old`
+(or `QUILLO_SERVICE_SECRET=new` and `QUILLO_SERVICE_SECRET_PREVIOUS=old`) signs with the
+first and takes any. Set both on every machine, then drop the old one. `keys` take a list
+for the same.
+
+For a caller that is not a Quillo service (a gateway, a program in another language with
+an OAuth token), `accept_calls { jwt }` takes its token at `/_quillo/service/<fn>` with
+`x-quillo-to` and `x-quillo-call`. Or the service offers routes, a JSON API, checked as
+middleware with the catalog's `jwt.qwer` (2.0.0: `jwt_check(token, secret, { audience,
+issuer, require })`, `exp` required unless told otherwise, and `jwt_verify_jwks` for an
+identity provider's keys) or `oidc.qwer` (1.1.0: `oidc_client_credentials` fetches a
+token, `oidc_verify_access` checks one), and called with `http.*`. That gives up what
+`service` brings: `quillo check` of each call, contracts, retries run once, deadlines,
+`.later` and published topics.
+
+```quillo
+use "jwt.qwer"
+
+route POST /api/refund {
+    let token = replace(request.headers.authorization ?? "", "Bearer ", "")
+    let claims = jwt_check(token, env("JWT_KEY"), { audience: "orders", issuer: "idp" })
+    if is_err(claims) { reply 401 { error: error(claims) } }
+    { refunded: request.json.cents, for: claims.sub }
+}
+```
+
 #### Copies that join
 
 `quillo run billing.qwe --as-service --port 8081 --join http://app:8080` starts one more
-copy of `billing` that joins the app while it runs: it says so, signed with
-`QUILLO_SERVICE_SECRET` (set on both), every 5 s, and that it is leaving when stopped (the
-app drops one it has not heard from in 15 s). Its address is the one it connects from,
-with its `--port`.
+copy of `billing` that joins the app while it runs: it says so, signed, every 5 s, and that
+it is leaving when stopped (the app drops one it has not heard from in 15 s). Its address
+is the one it connects from, with its `--port`, called over `http://`; `--join-as
+https://billing-3.internal:8443` gives the address it is called at instead, which must
+lead to where it joined from.
+
+- A copy signs with `QUILLO_SERVICE_KEY`, billing's own key, when it is set (`kid` is
+  its service's name), else with `QUILLO_SERVICE_SECRET`. An app whose `accept_calls`
+  has a key for `billing` takes copies of `billing` only so: the shared secret is not
+  enough (``this app takes copies of `billing` signed with its key (QUILLO_SERVICE_KEY on
+  the copy)``), and a key of another service's never is. Without such a key, the secret
+  is, as before: anyone with it can join as any service the app declares, and take its
+  calls.
+- `--no-join` takes no copies, and `--allow-join billing,risk` only those (403 to the
+  others).
 
 - When `billing` runs in the app's process, the copies that joined take every call, in
   turn, and the app runs a call itself only when no copy answers it: a monolith takes on
@@ -3239,7 +3639,7 @@ app does not run itself needs `--service-url` or `QUILLO_SERVICE_<NAME>`, and
 
 `quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source: each
 route's path, query and payload patterns, and each `server fn`'s contract
-(`x-quillo-server-fns`), with the routes of the services it serves under their prefixes.
+(`x-quillo-server-fns`, with `x-quillo-callers` for one declared `for [...]`), with the routes of the services it serves under their prefixes.
 `quillo run --describe` serves the same at `GET /_quillo/describe`, for a gateway to
 import. A prefixed service's `server fn`s are not in the app's document: they are called by
 other services, signed, not at `/billing/_quillo/rpc`. Under `--split` the app's document
@@ -3458,6 +3858,9 @@ stays the simpler choice when the next move depends on the answer.
   highlighting included), awaited like a `server fn`: call it in an event handler or a
   `state` initializer, and keep the text in state:
   `@input={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
+  `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
+  a doctype, a `<head>` with its `<title>` (the option's, else the text's first `#`
+  heading), and the HTML in its `<body>`.
 - **Lists:** `map filter find any all reduce sum min max sort sort_by reverse first last push range enumerate slice unique flatten zip take drop count group_by join_on index_of`
 - **Maps:** `keys values get has set remove merge` (`get(m, k, default)`; `merge` takes
   two maps; there is no `entries`: `for [k, v] in m`)
@@ -3467,7 +3870,7 @@ stays the simpler choice when the next move depends on the answer.
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
   (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
-- **Web:** `raw escape url_encode local_path env now file redirect respond json.parse json.stringify
+- **Web:** `raw escape url_encode local_path env now file files markdown_page redirect respond json.parse json.stringify
   cookie set_cookie delete_cookie session set_session end_session site_headers`
   (`local_path` under [Route groups](#route-groups), `site_headers` under [What a route
   returns](#what-a-route-returns)). `url_encode("a b")` is
@@ -3477,7 +3880,7 @@ stays the simpler choice when the next move depends on the answer.
 - **Program and pages:** `highlight(code, lang)` (Quillo, JavaScript and TypeScript,
   Python, Rust, shell, SQL, CSS, HTML and XML, JSON; anything else as escaped text),
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
-  `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `allow_cross_site`,
+  `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `classes`, `accept_calls`, `allow_cross_site`,
   `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
@@ -4620,9 +5023,14 @@ Every HTTP status is a response; failing to connect is an error value, and so is
 that is not `http://` or `https://`. The functions: `http.get(url, headers, options)`,
 `http.delete(url, headers, options)`, `http.post(url, body, headers, options)`,
 `http.put` and `http.patch` as `post`, and `http.request(method, url, body, headers,
-options)`. The answer is `{ status, ok, headers, body, json }`: `ok` for a 2xx, header
-names in lower case, `body` as text (bytes that are not UTF-8 replaced; cut at 64 MiB),
-`json` the body parsed, or `null`. Requests say `User-Agent: quillo/<version>` unless
+options)`. The answer is `{ status, ok, headers, body, json, cookies }`: `ok` for a 2xx,
+header names in lower case, a header sent more than once joined with `, ` (two `Link`s are
+one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
+cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
+(bytes that are not UTF-8 replaced; cut at 64 MiB), `json` the body parsed, or `null`.
+Interim answers (`100 Continue`, `103 Early Hints`) are passed over to the final one. A
+body in `gzip`, `deflate` or `br` is decoded; another coding is an error value that names
+it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requests say `User-Agent: quillo/<version>` unless
 the headers give another; some APIs (OpenStreetMap's Nominatim) refuse that one, so
 name your program. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 Text is sent as `text/plain`, HTML as `text/html`, other values (numbers and decimals
@@ -4637,7 +5045,10 @@ http.get(`https://api.example.com/rates`, { authorization: key }, { cache: 60 })
 http.get(url, {}, { timeout: 5 })                   // an error value after 5 seconds
 ```
 
-- `redirects`: how many to follow, from 0 to 20 (5 unless given).
+- `redirects`: how many to follow, from 0 to 20 (5 unless given). A 301, 302 or 303 after
+  a `POST` is followed as a `GET` without the body, as browsers do; a 307 or 308 after a
+  write is followed with the same method and body. `Authorization` goes on to the same
+  host, and `Authorization` and `Cookie` are not sent on to another origin.
 - `public_only: true` connects only to the public internet: not this machine, a private
   network, or a cloud's metadata service (`169.254.169.254`), however the address is
   written, checked on the address the name gives as it connects (and again for each
@@ -4657,8 +5068,27 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
   a call has 10 seconds to connect and 60 in all; `http.stream`, 300 seconds of silence
   between pieces. A page that waits on a slow service waits that long.
 
+- `ca`: the certificate authorities to trust instead of the usual public ones, a PEM file
+  (named from the program's folder) or `"system"`, the machine's own store: for an
+  internal service under a company's CA.
+- `cert` and `key`: a client certificate and its key, PEM files, presented to the server,
+  as some banks' and governments' APIs ask (mutual TLS). One without the other is an error
+  (`` `cert` and `key` go together ``), and so is a file with no certificate in it.
+
+```quillo
+http.get("https://ledger.internal/balance", {}, { ca: "certs/internal-ca.pem" })
+http.post("https://api.bank.example/payments", order, {}, { cert: "certs/client.pem", key: "certs/client.key" })
+```
+
 Another option is an error, in `quillo check` when the options are written in the call,
 and when it runs: `{ timout: 5 }` is not ignored.
+
+Calls go through the proxy `HTTPS_PROXY` names for `https://` and `HTTP_PROXY` for
+`http://` (in either case, `ALL_PROXY` for both), unless `NO_PROXY` names the host (a
+name, `.example.com` or `example.com` for it and those under it, an address, or `*`).
+This machine (`localhost`, a name under `.localhost`, a loopback address) is never reached
+through one. With a proxy, the proxy looks the name up, so `public_only` checks the host
+before the call is made.
 
 In a component, the same calls go from the page (see [What the browser can reach](#what-the-browser-can-reach)):
 `redirects: 0` makes a redirect an error value there, `timeout` is the same, and
@@ -4842,7 +5272,9 @@ What a reload keeps, and what it starts afresh:
 The first Ctrl-C or `SIGTERM` stops the server gracefully: it takes no new connections,
 closes idle ones, answers the requests in progress (for up to 10 seconds) and exits with
 status 0. A server that joined a pool with `--register` leaves it first, so limer stops
-sending it requests. A second Ctrl-C stops it at once.
+sending it requests. A second Ctrl-C stops it at once. It stops the same when its stderr
+goes into a pipe that has closed (a `tee` or a log shipper that ended): Quillo's own
+messages are then dropped, and never keep it from stopping.
 
 `GET /_quillo/health` answers `200` (`ok`) while the server is ready for requests, and
 `503` (`unavailable`) while it is stopping or its program failed to load: give it to a
@@ -5106,8 +5538,8 @@ query string. With `--log json` the line is a JSON object instead, for log colle
 request's id, also sent back as `x-request-id`). `--log off` turns the request log off;
 errors are still printed. Lines are buffered and written each turn of the event loop,
 or at 32 KiB. Not logged: `/_quillo/health`, `/_quillo/metrics`, Chrome's
-`/.well-known/appspecific/com.chrome.devtools.json`, UDP packets, channel messages. A
-desktop window's launch token never appears in it.
+`/.well-known/appspecific/com.chrome.devtools.json`, UDP packets, channel messages. The
+launch token of a phone app built the old way, on 127.0.0.1, never appears in it.
 
 An error's text can hold what a visitor sent, so in a text line its control characters and
 line breaks are written as escapes (`\n`, `\x1b`): one request is one line, and no one can
@@ -5206,8 +5638,12 @@ round, written about 5, where the interpreter takes 45 (FEEDBACK29.md).
 
 ## Rust
 
-A `.qwer` file is Rust, and a program `use`s it as it uses a `.qwe` file: its top-level
-`pub fn`s are the program's functions. Here is `imaging.qwer`:
+A `.qwer` or `.rs` file is Rust, and a program `use`s it as it uses a `.qwe` file: its
+top-level `pub fn`s are the program's functions. The two extensions are the same to
+Quillo: `.rs` is the one editors, `rustfmt` and clippy know, and `.qwer` is the catalog's
+and `quillo install`'s. A `.rs` file is the program's only when a `use` or `import` names
+it (`use "imaging.rs"`, `import imaging.rs use brightness`), so a crate's own `src/*.rs`
+beside the program is left alone. Here is `imaging.qwer`:
 
 ```rust
 //! [dependencies]
@@ -5278,6 +5714,10 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
 
 How it runs:
 
+- The Rust files the program uses that are not built yet are built before its first
+  statement runs, all in one cargo call over a workspace, so cargo builds them side by
+  side (`quillo: building ./a.rs, ./b.qwer together`); a file that fails there is built
+  again alone by its `use`, which says why.
 - `use` builds the file with `cargo` (`$CARGO`, or the one on the `PATH`), in a crate of
   its own in Quillo's cache: `QUILLO_NATIVE_CACHE`, else `$XDG_CACHE_HOME/quillo/native`,
   else `~/.cache/quillo/native`, else the system's temporary folder. The crates' builds
@@ -5286,9 +5726,9 @@ How it runs:
   text, the glue's version and the processor: the next start loads it without building.
   A build takes seconds the first time, more with large crates, and needs crates.io
   (or cargo's own offline mode).
-- `quillo build app.qwe` builds every `.qwer` file the program and its mounted programs
+- `quillo build app.qwe` builds every Rust file the program and its mounted programs
   use (not those of its services: build each service's file too), and prints where each
-  library went; it also takes a `.qwer` file itself. Deploy `.quillo/native/` with the
+  library went; it also takes a `.qwer` or `.rs` file itself. Deploy `.quillo/native/` with the
   program, and the server needs no Rust: it loads what was built for that content, on
   the same processor and system (there is no cross-compiling: build on Linux for
   Linux), by the same Quillo glue. A Quillo whose glue changed builds again, and needs
@@ -5306,12 +5746,12 @@ How it runs:
   refused before the function runs. A stop (`SIGTERM`) while a request is in a call is
   logged as a stop, `quillo: stopped with GET /slow?ms=14000 still running`, not as a bug
   in Quillo.
-- With `--watch` and `--reload`, a `.qwer` file that changes is built again and the
+- With `--watch` and `--reload`, a Rust file that changes is built again and the
   program reloaded with it. A build that fails prints the compiler's errors, and the
   program goes on as it was. Requests in progress finish with the version they started
   with: libraries stay loaded, the old ones for the life of the process, with their
   `static`s (an old pool stays open).
-- Rust can do anything the server can, so `.qwer` files are the developers', like the
+- Rust can do anything the server can, so Rust files are the developers', like the
   rest of the program: never let a program's users write them (they write sandboxed
   Quillo with `run_script`).
 
@@ -5441,7 +5881,8 @@ does not do it today; the way around it follows.
 | use `setTimeout`, debounce or throttle? | No `setTimeout`: `run_after(ms, f)` for once, and `every(ms, f)` under a state flag for a debounce. See [Components](#components) |
 | use `localStorage`, the clipboard, `window`? | Through the page: `js("localStorage.getItem", k)`. Nothing is built in for them |
 | use event modifiers like `@click.prevent`? | No: `e.preventDefault()` in the handler |
-| scope CSS to a component, or use Tailwind? | Yes: `style` in a component is scoped, and `--with` and `style_with` run Tailwind and PostCSS. See [HTML literals](#html-literals) |
+| scope CSS to a component, or use Tailwind? | Yes: `style` in a component is scoped, a file's `style` styles its components, `--with` and `style_with` run Tailwind and PostCSS, and `style_with(f)` and `build` run an engine of the program's own, fed by `classes()`. See [HTML literals](#html-literals) |
+| paste plain HTML into a page? | Mostly: comments, quotes of either kind, unquoted values and the doctype are taken; unclosed `<p>` and `<li>`, `<style>` and `<script>` braces need changing. See [From HTML](#from-html) |
 | translate the interface? | Yes, with plural rules, on both sides. See [Translations](#translations) |
 | run the app in a desktop window? | Yes, with a build that has the `app` feature (the release downloads do not). See [Desktop apps](#desktop-apps) |
 | compile components to WebAssembly? | Not yet: they compile to JavaScript |
@@ -5452,7 +5893,8 @@ does not do it today; the way around it follows.
 |---|---|
 | serve HTTPS or HTTP/2 from Quillo itself? | No: HTTP/1.1 on plain TCP; a proxy in front (limer, Caddy, nginx) does TLS. See [What a route cannot do](#what-a-route-cannot-do) |
 | write middleware? | Yes, as a pipeline stage that `reply`s, or for many routes at once in a `routes` group (prefix, middleware, request pattern, nested; see [Route groups](#route-groups)); there is no global hook, and no custom 500 page |
-| answer CORS preflights? | Not by itself: declare `route OPTIONS` and set the headers with `respond` |
+| answer CORS preflights? | Not by itself: declare `route OPTIONS` and set the headers with `respond` (with no such route, `OPTIONS` gets 204 and `Allow`, no CORS headers) |
+| serve a folder of HTML and other files as they are? | Yes: `quillo serve site`, or `files("site", path)` in a route, with `index.html`, clean URLs and `404.html`. See [Static files](#static-files) |
 | open WebSockets of my own? | No: `live`, `events` with `listen`, and channels are the ways to push. See [Channels](#channels) |
 | receive or send binary data? | Only as files: `file()`, uploads, `image.*`. There is no bytes value; bodies are text |
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
@@ -5497,6 +5939,9 @@ does not do it today; the way around it follows.
 |---|---|
 | split an app into services without changing its code? | Yes: `service`, in one process or `--split`. See [Services](#services) |
 | write a service in another language? | Yes, if it answers Quillo's signed calls; the caller keeps a `.qwe` file of its signatures. See [Services](#services) |
+| authenticate services with keys of their own, OAuth 2.0 tokens, JWTs or mutual TLS? | Yes: `auth` where a service is declared, `accept_calls` in it, `for [...]` on a `server fn`. See [Authentication between services](#authentication-between-services) |
+| call an API that speaks only HTTP/2, as Apple's push service (APNs) or gRPC? | No: `http.*` speaks HTTP/1.1 only. Use another program for those calls, or an API that takes HTTP/1.1 (Firebase Cloud Messaging's v1 API does) |
+| call out through a company's proxy, trust an internal CA, or present a client certificate? | Yes: `HTTPS_PROXY` and `NO_PROXY` are read, and `http.*` takes `ca`, `cert` and `key`. See [HTTP client](#http-client) |
 | use every core? | Yes: `--instances N`, each with its own variables. See [Concurrency](#concurrency-and-reloading) |
 | run several servers? | Yes, behind limer, sharing a database; live data follows. See [Several servers](#several-servers) |
 | describe my API for a gateway? | Yes: `quillo docs`, `--describe`. See [The program's API (OpenAPI)](#the-programs-api-openapi) |
@@ -5508,9 +5953,9 @@ does not do it today; the way around it follows.
 
 | Can I... | |
 |---|---|
-| write part of a program in Rust? | Yes: `.qwer` files, any crate, called like functions. See [Rust](#rust) |
+| write part of a program in Rust? | Yes: `.rs` or `.qwer` files, any crate, called like functions. See [Rust](#rust) |
 | call C libraries? | Through a Rust `-sys` crate |
-| embed Quillo in a Rust program? | It is a library crate, but not published, and its API may change |
+| embed Quillo in a Rust program? | It is a library crate, but not published, and its API may change. `quillo::embed::Program` runs a program with no socket, handed each request, as the apps do (on Unix only for now) |
 | debug with breakpoints? | Yes, in VS Code or any DAP client, on macOS and Linux, server and browser alike. See [Debugging](#debugging) |
 | get editor support? | Yes: `quillo lsp`, and the VS Code extension |
 | run untrusted users' code? | Yes, sandboxed: `run_script`. Never as `.qwer`. See [Scripts from users](#scripts-from-users) |
@@ -5532,6 +5977,10 @@ does not do it today; the way around it follows.
 - Linux builds linked with musl, or static, for systems older than glibc 2.34
 - phone apps in the stores: uploads to the App Store and Google Play, HarmonyOS NEXT,
   `.qwer` plugins linked into the app, and work while the app is in the background
+- `quillo app` without a socket run on Windows and Linux (the code is wry's on all three;
+  only macOS has run), and a `stream` route's answer sent in parts to an app's web view
+- `quillo build` making a program's `build` declarations ahead of time
+- an HTTP/2 client, for APNs and gRPC
 
 ## Layout
 

@@ -17,6 +17,160 @@
   where a failure is truly not wanted.
 - **`file()` refuses an option it does not know**, and `date.parse` a date-time with no
   offset: read it with `date.at(v, zone)`.
+- **`respond` and `reply` refuse a 1xx status**: it was an interim answer the client waited
+  past. `quillo check` says so for a written one.
+- **`file()` sends HTML files as they are**, without the prefetching script: a static page
+  that relied on it prefetches no more (pages a route makes still do).
+- **Signatures between services are version 3**, and answers are signed back. Services
+  take version 2 too: deploy the services before their callers.
+- **`OPTIONS` on a path is a 204 with `Allow`**, where it was a 405 or a 404, and a method
+  HTTP does not define is a 501.
+- **`http.*` reads `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`.** A server with
+  them set in its environment now calls out through the proxy.
+- **A phone app or `quillo app` has a new origin**, `quillo://app` (or
+  `https://quillo.localhost` on Android and Windows): what an installed app's pages kept
+  in `localStorage` and IndexedDB stays with the old `http://127.0.0.1:<port>` and is not
+  copied. Its database is not touched.
+- **A `.rs` file a program `use`s is Rust**, where it was read as Quillo.
+
+### HTTP the server speaks (FEEDBACK36.md)
+
+- **A body is dropped only when nothing of it comes for 30 s**, with a 408 and a log line
+  (`POST /up HTTP/1.1 -> 408 (nothing of the body came for 30 s)`); a slow upload that
+  keeps coming is taken. A head not whole in 30 s is a 408 too (Q-432, Q-446).
+- **`respond` and `reply` take 200 to 599**: a 1xx is refused, at run time and by `quillo
+  check` (Q-433).
+- **HTTP/1.0 is answered as 1.0:** a stream with no length, ended with the connection, no
+  `100 Continue`, no upgrade (Q-434).
+- **Methods:** every 405 has `Allow`; `OPTIONS` on a path, and `OPTIONS *`, get 204 with
+  `Allow`, so HAProxy's `option httpchk` finds the server up; an unknown method is 501
+  (Q-440).
+- **Content codings:** `Accept-Encoding` is read with q-values and in any case
+  (`gzip;q=0` refuses, `*` and `x-gzip` count) (Q-439); a gzip request body is decoded, with
+  `--max-body` counting what it decodes to, and another coding is 415 (Q-438).
+- **Conditional requests:** `If-Modified-Since` is compared as a date, in HTTP's three
+  forms; `If-Match` and `If-Unmodified-Since` give 412; a route's own `etag` gets a 304;
+  `/_quillo/media.js` has an `ETag` (Q-441).
+- **Smaller ones:** 414 for a long request line, no body on a 205, reason phrases for the
+  statuses that had none (`418 I'm a teapot`), 417 for an `Expect` other than `100-continue`
+  (Q-446). WebSocket handshakes are checked: 400 for a wrong method or headers, 426 for a
+  version other than 13 (Q-445).
+- **`send(value, { event, id, retry })`** in `events`, and `listen` sends `Last-Event-ID`
+  when it connects again and waits the server's `retry` (Q-444).
+
+### The HTTP client (FEEDBACK36.md)
+
+- **Repeated headers are joined with `, `**; `Set-Cookie`s are joined by a line break and
+  given one by one in `r.cookies`, on `http.stream`'s result too (Q-435).
+- **Interim answers are passed over**: a `103 Early Hints` no longer costs the whole time
+  limit (Q-436).
+- **Redirects:** `Authorization` goes on to the same host; a 307 or 308 after a write is
+  followed with its method and body; to another origin, `Authorization` and `Cookie` are
+  dropped (Q-437).
+- **`deflate` and `br` answers are decoded**, and another coding is an error value that
+  names it (Q-438).
+- **Proxies and certificates:** `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` (never
+  for this machine; `public_only` checks the host before the proxy), and the options `ca`
+  (a PEM file or `"system"`), `cert` and `key` (Q-442).
+- **`http.stream`'s function gets `(data, name, id, retry)`** for each event (Q-444).
+- HTTP/2 stays out of reach of `http.*`: Apple's push service and gRPC cannot be called.
+  The guide says so in Possible or not (Q-443).
+
+### Plain HTML, static files and other text (FEEDBACK36.md)
+
+- **`files("site", path, { index, extensions, not_found, cache })`** serves a folder as a
+  static host does: `index.html`, `/about` finding `about.html`, `/docs` redirected to
+  `/docs/`, `404.html` for a miss; dotfiles (but `.well-known/`), `.qwe` and Rust files are
+  not served. **`quillo serve FOLDER`** does it with no program (Q-450).
+- **`quillo run page.html`** (or `.md`, `.rs`, `.css`, and others) says what the file is and
+  how to serve it; a folder with an `index.html` and no `main.qwe` is told `quillo serve`
+  (Q-450).
+- **`file()` sends a file as it is**: an answer with an `ETag` or a range gets no prefetching
+  or `--watch` script (Q-447).
+- **Markup takes HTML as written:** `<!-- comments -->` are dropped, attribute values may
+  be single-quoted or unquoted, and `<!DOCTYPE html>` before `<html>` is passed over (Q-448,
+  Q-449). `quillo check` warns of `{ return ... }` in markup, which left the function, and
+  hints lowercase for `<DIV>`. The guide has a "From HTML" list (Q-449).
+- **New file types:** `vtt`, `ics`, `rss`, `atom`, `jsonld`, `geojson`, `yaml`, `toml`,
+  `m3u8`, `mpd`, `ts`, `m4s`, `srt`, `tsv`, `md` as `text/markdown`, `bmp`, `tiff`, `heic`,
+  `jxl`, `mov`, `m4a`, `aac`, `flac`, `opus` and more (Q-451).
+- **Markup whose root names a namespace, or that starts `<?xml`, goes out as XML:**
+  `application/xml`, `application/rss+xml` for `<rss>`, `application/atom+xml` for
+  `<feed>`, `image/svg+xml` for `<svg xmlns=...>` (Q-451).
+- **`markdown_page(text, { title, lang, html })`**: Markdown as a whole page, with a doctype,
+  a `<head>` and a title (Q-451).
+
+### Rust beside the program, and styles (FEEDBACK37.md)
+
+- **A server whose stderr pipe has closed still stops** on `SIGTERM` or Ctrl-C: Quillo's
+  own messages no longer panic (Q-452).
+- **`.rs` files are Rust as `.qwer` files are:** `use "tw.rs"`, `import tw.rs use f`,
+  `quillo build`, `--watch` and the language server. `.qwer` stays for the catalog and
+  `quillo install`. A crate's own `src/*.rs`, which nothing uses, is left alone (Q-453).
+- **Rust files not built yet are built in one cargo call** before the program runs, side by
+  side: `quillo: building ./a.rs, ./b.qwer together` (Q-454).
+- **`build "/app.css" = expr`** at the top level is made once the port is open, a request
+  for it waiting; it is served with its extension's type and an `ETag`. A failure at the
+  first start stops the program; after a reload the last good one is kept. Not done:
+  `quillo build` making it ahead of time (Q-454).
+- **`style_with(f)` takes a function**, Quillo's or Rust's, given all the marked styles
+  (Q-455).
+- **`classes()` and `quillo classes app.qwe`** list the classes the program's markup writes,
+  for a CSS engine or a safelist; classes made from parts are not in it (Q-456).
+- **A `style` at a file's top level styles the components that file declares**, and
+  nothing else, sent once for the file; a component's own rules win over it. `style
+  global` at the top level likewise, unscoped (Q-457).
+
+### Authentication between services (FEEDBACK38.md)
+
+- **A caller proves who it is with `auth`** where it declares the service: `"quillo"` (the
+  shared secret, the default), `{ key, as }`, `{ bearer }`, `{ oauth: { token_url,
+  client_id, client_secret, scope, audience, method } }` (kept until 30 s before it
+  expires, fetched again once on a 401), and `{ mtls: { cert, key, ca } }`;
+  `forward: ["authorization"]` passes the visitor's headers along (Q-458, Q-460, Q-462).
+- **A service says what it takes with `accept_calls { keys, shared, jwt, client_cert,
+  check }`**: keys by caller, the shared secret or not, JWT access tokens against a JWKS or
+  a secret (`audience` required, `exp` required), a client certificate from a proxy
+  `--trust-proxy` names, and a check of its own (Q-458, Q-460, Q-462).
+- **`server fn refund(...) for ["shop"]`** takes calls from those callers only, before the
+  arguments are read, and `quillo docs` lists them in `x-quillo-callers` (Q-458).
+- **`request.caller`** (`{ name, by, scopes?, claims?, subject?, uri? }`), **`request.user`**
+  (the forwarded token, verified) and **`request.forwarded`** in a function a service
+  answers with (Q-458, Q-460).
+- **Version 3 signatures** cover the caller, the deadline and the contract, and answers are
+  signed back: a caller with a key of its own refuses an unsigned answer (Q-458, Q-459).
+- **`QUILLO_SERVICE_SECRET=new,old`** or **`QUILLO_SERVICE_SECRET_PREVIOUS`**: signed with
+  the first, any taken, so the secret changes with no downtime (Q-461).
+- **Joining:** a copy signs with `QUILLO_SERVICE_KEY`, and an app with a key for that
+  service takes copies only so; `--join-as URL`, `--no-join`, `--allow-join a,b` (Q-459).
+- `quillo check` warns of a `key` or `client_secret` written in the source. The guide has
+  "Authentication between services", the routes way with `jwt.qwer` included (Q-464). In
+  the catalog, `jwt.qwer` 2.0.0 (`jwt_check` with `audience`, `issuer` and `require`,
+  `jwt_verify_jwks`, `exp` required) and `oidc.qwer` 1.1.0 (`oidc_client_credentials`,
+  `oidc_verify_access`) (Q-463).
+
+### Apps with no socket (FEEDBACK39.md)
+
+- **A program runs inside an app with no HTTP server** (`src/embed.rs`): `quillo app` and
+  the iOS and Android shells hand it each request, through the `quillo://app` scheme (iOS,
+  macOS, Linux) or `https://quillo.localhost` (Android, Windows) (Q-465).
+- **The origin stays the same from one launch to the next**, and the page's `localStorage`
+  and IndexedDB with it (Q-466).
+- **No socket:** iOS has none to take back from a suspended app, no other app on the phone
+  can reach the program, and the ATS exception and Android's cleartext config are gone
+  (Q-467, Q-469).
+- **What a scheme cannot carry goes through the app's bridge**: bodies on Android, files and
+  `FormData` on WebKit, and the connections of live data and channels (Q-470). Forms with
+  files (WebKit) and every post (Android) go through it, and the page goes to their answer.
+- **The app keeps the cookie jar** and a session key, so a session lasts a relaunch;
+  `request.ip` is `"app"`; jobs, ticks and calls made later reach the program with no
+  connection to itself (Q-468).
+- **New calls into the runtime:** `quillo_open`, `quillo_request`, `quillo_bridge`,
+  `quillo_bridge_next`, `quillo_shell_js`, `quillo_suspend`, `quillo_resume` and the
+  `quillo_free_*` calls, and on Android `Quillo.open`, `request`, `bridge`, `bridgeNext`,
+  `shellJs` and `suspend`. `quillo_start` is kept for apps built before (mobile/README.md).
+- Only macOS has run `quillo app` this way; Windows and Linux use the same wry code, and
+  HarmonyOS is not built. A `stream` route's answer arrives whole in these shells.
 
 ### Errors that are dropped, and plugins (FEEDBACK27.md)
 
