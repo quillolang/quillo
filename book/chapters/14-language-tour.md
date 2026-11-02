@@ -93,7 +93,10 @@ Most expressions read as they would in JavaScript. The differences:
   mean something, so `let state = 1` and `let int = 5` are allowed (see [Files of a
   program](#files-of-a-program) for what hiding a builtin costs).
 - Numbers are written `42`, `1_000_000`, `3.14`, `2.5e-3`, `6E+23`, `0xFF`,
-  `0xFFFF_0000`: no octal or binary, no `.5`. An int past 64 bits is a parse error
+  `0xFFFF_0000`: no octal or binary, no `.5`. A `_` goes between two digits (`1__000` and
+  `1_` are errors), a number does not start with `0` before more digits (`08` and `010`
+  are errors: write `8`, `10`), nor end with `.` (`1.`: write `1` or `1.0`), and there is
+  no `--` (`--n` is an error: `n -= 1`, or `-(-n)`). An int past 64 bits is a parse error
   (`0x8000000000000000` too: a hex literal is an int, and does not wrap to a negative
   one); a float past `f64` is `inf`.
 - Only `null`, `false` and error values are falsy: `0` and `""` are truthy. Code
@@ -115,7 +118,9 @@ Most expressions read as they would in JavaScript. The differences:
 - Arguments are worked out eagerly, left to right, before the call; only `&&`, `||`,
   `??`, `? :`, `if` and `match` skip what they do not need. A lambda sees the variables
   around it as they are now, not as they were when it was made, and may assign them
-  (`count += 1` inside a handler changes the outer `count`). A block that declares a
+  (`count += 1` inside a handler changes the outer `count`). An assignment may be an
+  arrow's whole body, as in JavaScript: `() => count += 1` is `() => { count += 1 }`, and
+  gives null. A handler is a function, so `@click={count += 1}` is an error that says so. A block that declares a
   name makes a scope: `let x` inside `{ }` hides the outer `x` until the block ends.
   `fn` inside a function is a local closure. There is no tail-call optimisation: 10,000
   calls deep is the limit, in a tail position or not.
@@ -661,7 +666,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   write it in lowercase, `<div>`.
 - Comments: in markup, a line starting with `//` is a comment, and so are `{/* ... */}`,
   as in JSX, and `<!-- ... -->`, as in HTML; none of them reaches the page. A `<!--` with
-  no `-->` is an error. In code, `//` to the end of the line and `/* ... */` anywhere. `//` after
+  no `-->` is an error. In code, `//` to the end of the line and `/* ... */` anywhere; a
+  `/*` never closed is an error at its line, not the rest of the file left out. `//` after
   other text on a line is text (`https://...`), and `{"//"}` writes the characters.
 - `<textarea>{text}</textarea>`: the box shows `text`, and shows it again whenever
   `text` changes, even after someone has typed in it; while `text` stays the same,

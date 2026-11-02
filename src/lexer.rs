@@ -132,6 +132,14 @@ pub struct Lexer {
     /// A `/* ... */` comment just skipped held a line break (on this line):
     /// it ends a statement as that line break would have.
     comment_newline: Option<u32>,
+    /// A `/*` never closed: the line it opened on, said at the end of the input rather than
+    /// the rest of the file being taken for the comment (FEEDBACK45.md, Q-503; branch
+    /// feedback40-43).
+    unclosed: Option<u32>,
+    /// `"Hello ${name}"` in a plain string, which is not a template: the line and the name,
+    /// for `quillo check` to say so when the name is one the program has. A `\$` is text
+    /// meant, and not noted (FEEDBACK45.md, Q-510; branch feedback40-43).
+    pub plain_dollars: Vec<(u32, String)>,
 }
 
 impl Lexer {
@@ -156,9 +164,11 @@ impl Lexer {
             if c == '\r' && it.peek() == Some(&'\n') {
                 continue;
             }
-            chars.push(c);
+            // A lone CR, as old Mac files end lines, is a line break too (FEEDBACK45.md,
+            // Q-529; branch feedback40-43).
+            chars.push(if c == '\r' { '\n' } else { c });
         }
-        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None }
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Vec::new() }
     }
 
     pub fn peek_char(&self) -> Option<char> {
@@ -216,6 +226,8 @@ impl Lexer {
                     if self.peek_char().is_some() {
                         self.bump();
                         self.bump();
+                    } else {
+                        self.unclosed = Some(line);
                     }
                     if self.line != line && self.comment_newline.is_none() {
                         self.comment_newline = Some(line);
@@ -323,7 +335,12 @@ impl Lexer {
         }
         let line = self.line;
         let c = match self.peek_char() {
-            None => return Ok(Token { tok: Tok::Eof, line }),
+            None => {
+                if let Some(at) = self.unclosed {
+                    return Err(QuilloError::new(format!("`/*` on line {} is never closed: add `*/` where the comment ends", at), at));
+                }
+                return Ok(Token { tok: Tok::Eof, line });
+            }
             Some(c) => c,
         };
         let tok = if c.is_ascii_digit() {
@@ -379,6 +396,11 @@ impl Lexer {
                 '+' => Tok::Plus,
                 '-' if n == Some('=') => two(self, Tok::MinusAssign),
                 '-' if n == Some('>') => two(self, Tok::Arrow),
+                // `--n`, JavaScript's decrement, read as `n` (FEEDBACK45.md, Q-529; branch
+                // feedback40-43).
+                '-' if n == Some('-') => {
+                    return Err(QuilloError::new("there is no `--`: to take one away, `n -= 1`; for minus a negative, `-(-n)`", line));
+                }
                 '-' => Tok::Minus,
                 '*' => Tok::Star,
                 '/' => Tok::Slash,
@@ -438,24 +460,39 @@ impl Lexer {
             }
             return i64::from_str_radix(&s, 16).map(Tok::Int).map_err(|_| QuilloError::new(format!("number `0x{}` is too large", s), line));
         }
-        let digits = |lx: &mut Lexer, s: &mut String| {
+        // A `_` goes between two digits: `1__000` and `1_` are refused, as JavaScript and Rust
+        // refuse them (FEEDBACK45.md, Q-529; branch feedback40-43).
+        let digits = |lx: &mut Lexer, s: &mut String| -> Result<(), QuilloError> {
             while let Some(c) = lx.peek_char() {
                 if c.is_ascii_digit() {
                     s.push(c);
                     lx.bump();
                 } else if c == '_' {
+                    if !lx.peek_char_at(1).map_or(false, |d| d.is_ascii_digit()) {
+                        return Err(QuilloError::new("a `_` in a number goes between two digits, as in `1_000`", line));
+                    }
                     lx.bump();
                 } else {
                     break;
                 }
             }
+            Ok(())
         };
-        digits(self, &mut s);
+        digits(self, &mut s)?;
+        // `08`, `010`: no octal, and a zero in front is no number's (old JavaScript read `010`
+        // as 8).
+        if s.len() > 1 && s.starts_with('0') {
+            return Err(QuilloError::new(format!("a number does not start with `0`: write `{}`", s.trim_start_matches('0').chars().next().map_or("0".to_string(), |_| s.trim_start_matches('0').to_string())), line));
+        }
+        // `let x = 1.` at a line's end: the next line was read as a method of the number.
+        if self.peek_char() == Some('.') && self.peek_char_at(1).map_or(true, |c| c == '\n' || c == ' ' || c == '\t' || c == ')' || c == ',' || c == ']') {
+            return Err(QuilloError::new(format!("a number does not end with `.`: write `{}` or `{}.0`", s, s), line));
+        }
         let mut float = false;
         if self.peek_char() == Some('.') && self.peek_char_at(1).map_or(false, |c| c.is_ascii_digit()) {
             s.push('.');
             self.bump();
-            digits(self, &mut s);
+            digits(self, &mut s)?;
             float = true;
         }
         // An exponent: 1e9, 2.5e-3, 6E+23.
@@ -467,7 +504,7 @@ impl Lexer {
                 if signed {
                     s.push(self.bump().unwrap());
                 }
-                digits(self, &mut s);
+                digits(self, &mut s)?;
                 float = true;
             }
         }
@@ -537,6 +574,18 @@ impl Lexer {
             match c {
                 c if c == quote => break,
                 '\\' => buf.push(self.escape(&unterminated)?),
+                '$' if self.peek_char() == Some('{') => {
+                    let mut name = String::new();
+                    let mut n = 1;
+                    while let Some(c) = self.peek_char_at(n).filter(|c| c.is_alphanumeric() || *c == '_') {
+                        name.push(c);
+                        n += 1;
+                    }
+                    if !name.is_empty() && matches!(self.peek_char_at(n), Some('}' | '.')) {
+                        self.plain_dollars.push((self.line, name));
+                    }
+                    buf.push(c);
+                }
                 _ => buf.push(c),
             }
         }

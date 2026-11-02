@@ -606,6 +606,11 @@ impl Parser {
 
     // ---- statements ----------------------------------------------------
 
+    /// What the lexer noted of `${name}` in plain strings (see `Lexer::plain_dollars`).
+    pub fn plain_dollars(&self) -> &[(u32, String)] {
+        &self.lx.plain_dollars
+    }
+
     pub fn parse_program(&mut self) -> PResult<Vec<Stmt>> {
         let mut out = Vec::new();
         loop {
@@ -805,6 +810,11 @@ impl Parser {
                     let saved = self.save();
                     self.next()?;
                     if let Tok::Ident(n) = self.peek()? {
+                        // `type if = int`: the keyword message, as for `let if` (FEEDBACK45.md,
+                        // Q-526; branch feedback40-43).
+                        if KEYWORDS.contains(&n.as_str()) {
+                            return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", n), line));
+                        }
                         let capital = n.chars().next().map_or(false, |c| c.is_ascii_uppercase());
                         self.next()?;
                         if capital && self.at(&Tok::Assign)? {
@@ -1068,6 +1078,11 @@ impl Parser {
             }
         }
         let e = self.parse_expr()?;
+        self.assign_rest(e, line)
+    }
+
+    /// `e`, or the assignment it starts (`n += 1`, `el.value = x`).
+    fn assign_rest(&mut self, e: Expr, line: u32) -> PResult<Stmt> {
         let op = match self.peek()? {
             Tok::Assign => Some(AssignOp::Set),
             Tok::PlusAssign => Some(AssignOp::Add),
@@ -1510,6 +1525,14 @@ impl Parser {
         let mut path = Vec::new();
         while self.lx.peek_char() == Some('/') {
             self.lx.bump();
+            // `/a/{id}` or `/a/{id:int}`, as OpenAPI, Express 5, ASP.NET and FastAPI write a
+            // parameter: read as the path `/a/` and a request pattern, it matched nothing
+            // (FEEDBACK45.md, Q-506; branch feedback40-43).
+            if let Some((name, ty)) = self.braced_param() {
+                let typed = ty.as_ref().map_or(String::new(), |t| format!("({})", t));
+                let written = ty.as_ref().map_or(name.clone(), |t| format!("{}:{}", name, t));
+                return Err(QuilloError::new(format!("path parameters are written `:{0}{1}`, as in `/users/:{0}{1}`, not `{{{2}}}`", name, typed, written), self.lx.line));
+            }
             match self.lx.peek_char() {
                 Some(':') => {
                     self.lx.bump();
@@ -1553,6 +1576,37 @@ impl Parser {
         }
         self.lx.last = Some(Tok::RParen);
         Ok(path)
+    }
+
+    /// `{id}` or `{id:int}` just after a path's `/`: its name and type. Not a request pattern
+    /// (`{ json: ... }`), which has spaces or more than a name.
+    fn braced_param(&self) -> Option<(String, Option<String>)> {
+        if self.lx.peek_char() != Some('{') {
+            return None;
+        }
+        let word = |from: usize| -> (String, usize) {
+            let mut w = String::new();
+            let mut n = from;
+            while let Some(c) = self.lx.peek_char_at(n).filter(|c| c.is_alphanumeric() || *c == '_') {
+                w.push(c);
+                n += 1;
+            }
+            (w, n)
+        };
+        let (name, mut n) = word(1);
+        if name.is_empty() {
+            return None;
+        }
+        let mut ty = None;
+        if self.lx.peek_char_at(n) == Some(':') {
+            let (t, m) = word(n + 1);
+            if t.is_empty() {
+                return None;
+            }
+            ty = Some(t);
+            n = m;
+        }
+        (self.lx.peek_char_at(n) == Some('}')).then_some((name, ty))
     }
 
     fn parse_route_rest(&mut self, method: String, path: Vec<Seg>, line: u32) -> PResult<RouteDef> {
@@ -1775,7 +1829,14 @@ impl Parser {
                 return self.no_bare_arrow_off(|p| p.parse_block());
             }
         }
-        self.parse_expr()
+        // `() => n += 1`, `() => count = 0`: the assignment is the body, as in `() => { n += 1 }`,
+        // and the arrow gives null (FEEDBACK45.md, Q-518; branch feedback40-43).
+        let line = self.line()?;
+        let e = self.parse_expr()?;
+        if matches!(self.peek()?, Tok::Assign | Tok::PlusAssign | Tok::MinusAssign) {
+            return Ok(Expr::Block(vec![self.assign_rest(e, line)?]));
+        }
+        Ok(e)
     }
 
     fn parse_block(&mut self) -> PResult<Expr> {
@@ -1880,6 +1941,11 @@ impl Parser {
     fn parse_cmp(&mut self) -> PResult<Expr> {
         let lhs = self.parse_range()?;
         let line = self.line()?;
+        // `view V() = <p>a</p><p>b</p>`: the second element read as `<` (FEEDBACK45.md, Q-521;
+        // branch feedback40-43).
+        if matches!(lhs, Expr::Html(..)) && matches!(self.peek()?, Tok::Lt) && self.lx.peek_char().map_or(false, |c| c.is_alphabetic()) {
+            return self.err_at("two elements side by side: a view gives one, so wrap them in one, like `<div>...</div>`");
+        }
         let op = match self.peek()? {
             Tok::EqEq => BinOp::Eq,
             Tok::NotEq => BinOp::Ne,
@@ -2247,8 +2313,20 @@ impl Parser {
         // `{ ...m, name: v }` is `merge(m, { name: v })`: later keys win.
         let mut parts: Vec<Expr> = Vec::new();
         let mut entries = Vec::new();
+        let mut first = true;
         loop {
-            self.skip_list_seps()?;
+            // One `,` between entries, as a list takes: `{ a: 1,, b: 2 }` is an empty entry
+            // (FEEDBACK45.md, Q-529; branch feedback40-43).
+            let mut commas = 0;
+            while matches!(self.peek()?, Tok::Newline | Tok::Semi | Tok::Comma) {
+                if matches!(self.next()?.tok, Tok::Comma) {
+                    commas += 1;
+                }
+            }
+            if commas > 1 || (first && commas > 0) {
+                return self.err_at("an empty entry in a map: one `,` goes between two entries");
+            }
+            first = false;
             if self.eat(&Tok::RBrace)? {
                 if parts.is_empty() {
                     return Ok(Expr::Map(entries));
@@ -2389,6 +2467,17 @@ impl Parser {
     /// that name, even one that names a type (`let num = 5`), as a
     /// parameter does; `match` tests types.
     fn parse_binding(&mut self) -> PResult<Pattern> {
+        let line = self.line()?;
+        let word = match self.peek()? {
+            Tok::Ident(k) => Some(k.clone()),
+            _ => None,
+        };
+        // `let fn = 1` (`fn` is a type's name too), `let true = 1`: a keyword, as `let if`
+        // is, not a name nor a pattern that fails as the program runs (FEEDBACK45.md, Q-516,
+        // Q-526; branch feedback40-43).
+        if let Some(k) = word.filter(|k| matches!(k.as_str(), "fn" | "true" | "false" | "null")) {
+            return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", k), line));
+        }
         Ok(match self.parse_pattern()? {
             Pattern::Type(n) if TYPE_NAMES.contains(&n.as_str()) => Pattern::Bind(n.into()),
             p => p,
@@ -3047,6 +3136,20 @@ impl Parser {
         self.lx.stack.push('(');
         self.lx.last = Some(Tok::LParen);
         let e = self.parse_expr()?;
+        // `@click={n += 1}`: an assignment, which a handler runs, not a value (FEEDBACK45.md,
+        // Q-518; branch feedback40-43).
+        if let Some(op) = match self.peek()? {
+            Tok::Assign => Some("="),
+            Tok::PlusAssign => Some("+="),
+            Tok::MinusAssign => Some("-="),
+            _ => None,
+        } {
+            let name = match &e {
+                Expr::Ident(n, _) => n.to_string(),
+                _ => "x".to_string(),
+            };
+            return self.err_at(format!("an assignment is not a value: a handler is a function, `@click={{() => {{ {} {} ... }}}}`", name, op));
+        }
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(e)
     }

@@ -1316,7 +1316,10 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     c.root = base_dir.to_path_buf();
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
-    match Parser::new(src).parse_program().map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
+    let mut parser = Parser::new(src);
+    let parsed = parser.parse_program();
+    c.plain_dollars.extend(parser.plain_dollars().iter().map(|(l, n)| (file.to_string(), *l, n.clone())));
+    match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
         Ok(stmts) => {
             let mut seen = HashSet::new();
             if let Ok(p) = Path::new(file).canonicalize() {
@@ -1423,6 +1426,8 @@ struct Item {
 }
 
 struct Checker {
+    /// `${name}` written in plain strings, by file and line (FEEDBACK45.md, Q-510).
+    plain_dollars: HashSet<(String, u32, String)>,
     /// The functions being read in their own `let`.
     letting: Vec<String>,
     /// A component's `let`s whose value comes from the page (`js(...)`), by component: shown in
@@ -1583,6 +1588,7 @@ impl Checker {
             hint: None,
             strict_null: false,
             letting: Vec::new(),
+            plain_dollars: HashSet::new(),
             confined: false,
             root: PathBuf::new(),
             uses: 0,
@@ -1763,6 +1769,17 @@ impl Checker {
                 continue;
             }
             if let Stmt::Use(path, names, line, _) = s {
+                // `import lib/m.qwe use price as print`: a builtin replaced everywhere, as a
+                // `fn print` would be, which is warned of (FEEDBACK45.md, Q-507; branch
+                // feedback40-43). A plugin's is said at its own line, below.
+                if !crate::native::is_rust(path) {
+                    for (name, alias) in names.iter().flatten().filter(|(n, a)| n != a) {
+                        if self.globals.get(alias).is_some_and(|g| &*g.file == "<builtin>") {
+                            self.diag_at(file.clone(), *line, Severity::Warning, format!(
+                                "`{alias}` hides the builtin `{alias}`: taken under that name, `{name}` is the program's `{alias}` everywhere, so take it under its own name (`use {name}`) or another"));
+                        }
+                    }
+                }
                 let path = &crate::modules::resolve_from(base, Path::new(&*file), path);
                 let Some(full) = self.file_at(base, path, &file, *line) else { continue };
                 let key = full.canonicalize().unwrap_or_else(|_| full.clone());
@@ -3122,7 +3139,12 @@ impl Checker {
 
     fn expr_here(&mut self, e: &Expr) -> T {
         match e {
-            Expr::Lit(l) => lit_t(l),
+            Expr::Lit(l) => {
+                if let Lit::Str(s) = l {
+                    self.plain_dollar(s);
+                }
+                lit_t(l)
+            }
             Expr::Template(parts) => {
                 for p in parts {
                     if let TPart::Expr(x) = p {
@@ -4024,6 +4046,28 @@ impl Checker {
                 "`{}` here is your variable (line {}), not the builtin `{}`; rename the variable to call the builtin",
                 name, v.line, name
             ));
+        }
+    }
+
+    /// `"Hello ${name}"`: a plain string is not a template, so `${name}` is its text. Said when
+    /// the name is one the program has here and the `$` was not written `\$` (FEEDBACK45.md,
+    /// Q-510; branch feedback40-43).
+    fn plain_dollar(&mut self, s: &str) {
+        if self.plain_dollars.is_empty() || !s.contains("${") {
+            return;
+        }
+        for part in s.split("${").skip(1) {
+            let name: String = part.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let key = (self.file.to_string(), self.line, name.clone());
+            let known = self.is_local(&name) || self.globals.get(&name).is_some_and(|g| &*g.file != "<builtin>");
+            if known && self.plain_dollars.contains(&key) {
+                let shown: String = s.chars().take(40).collect();
+                let more = if s.chars().count() > 40 { "..." } else { "" };
+                self.warn(format!(
+                    "this string is not a template, so `${{{name}}}` stays as text: write it in backquotes, `` `{shown}{more}` ``, or `\\${{` to keep the text"
+                ));
+                return;
+            }
         }
     }
 

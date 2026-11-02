@@ -206,7 +206,7 @@ fn markup_says_where_it_went_wrong() {
         ("<div\n  a=\"b\"\n", 3, "unexpected end of input: unclosed <div>"),
         ("<div !>", 1, "unexpected `!` in <div> tag"),
         ("<div></div x>", 1, "expected `>` to close </div"),
-        ("<div>{ /* c </div>", 1, "expected an expression, found end of input"),
+        ("<div>{ /* c </div>", 1, "`/*` on line 1 is never closed: add `*/` where the comment ends"),
     ]);
 }
 

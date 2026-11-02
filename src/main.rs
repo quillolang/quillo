@@ -286,7 +286,12 @@ fn program_and_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
         }
         i += 1;
     }
-    let named = program.unwrap_or_else(|| ".".to_string());
+    let mut named = program.unwrap_or_else(|| ".".to_string());
+    // `quillo check main`: the file is `main.qwe`, as a `use` path without its extension is
+    // (FEEDBACK45.md, Q-528; branch feedback40-43).
+    if !Path::new(&named).exists() && Path::new(&format!("{}.qwe", named)).is_file() {
+        named = format!("{}.qwe", named);
+    }
     if Path::new(&named).is_dir() {
         let main = Path::new(&named).join("main.qwe");
         if !main.is_file() {
@@ -408,9 +413,14 @@ fn real_main(args: Vec<String>) -> i32 {
             while i < args.len() {
                 match args[i].strip_prefix("--policy=") {
                     Some(v) => policies.push(PathBuf::from(v)),
-                    None if args[i] == "--policy" && i + 1 < args.len() => {
+                    None if args[i] == "--policy" && i + 1 < args.len() && !args[i + 1].starts_with('-') => {
                         policies.push(PathBuf::from(&args[i + 1]));
                         i += 1;
+                    }
+                    // Its file left out (FEEDBACK45.md, Q-528; branch feedback40-43).
+                    None if args[i] == "--policy" => {
+                        eprintln!("quillo: `--policy` needs the policy's file: `quillo check main.qwe --policy policy.toml`");
+                        return 2;
                     }
                     None => rest.push(args[i].clone()),
                 }
@@ -1391,12 +1401,14 @@ fn check(file: &str, opts: quillo::check::Options) -> i32 {
     // The whole program: the file and those it `use`s.
     let count = |k: SymbolKind| analysis.symbols.iter().filter(|s| s.kind == k).count();
     let files = analysis.symbols.iter().map(|s| s.file.as_str()).chain([file]).collect::<std::collections::HashSet<_>>().len();
+    // "1 route", not "1 routes" (FEEDBACK45.md, Q-528; branch feedback40-43).
+    let some = |n: usize, what: &str| format!("{} {}{}", n, what, if n == 1 { "" } else { "s" });
     println!(
-        "{}: ok ({} routes, {} functions, {} components{}){}",
+        "{}: ok ({}, {}, {}{}){}",
         file,
-        count(SymbolKind::Route),
-        count(SymbolKind::Function) + count(SymbolKind::ServerFn) + count(SymbolKind::View),
-        count(SymbolKind::Component),
+        some(count(SymbolKind::Route), "route"),
+        some(count(SymbolKind::Function) + count(SymbolKind::ServerFn) + count(SymbolKind::View), "function"),
+        some(count(SymbolKind::Component), "component"),
         if files > 1 { format!(", in {} files", files) } else { String::new() },
         plural_warnings(warnings)
     );

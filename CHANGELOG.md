@@ -181,6 +181,26 @@
 - **PostgreSQL errors carry their SQLSTATE** (` [23505]`), and `db.error_kind` reads it
   first, so it works whatever language the server speaks (Q-493).
 
+### What `quillo check` and the parser say (FEEDBACK45.md)
+
+- **An unclosed `/*` is an error** at the line it opens; the rest of the file, routes and
+  functions included, was silently the comment (Q-503).
+- **`route GET /a/{id}` says to write `:id`**: it was the path `/a/` and a request pattern,
+  and answered every request 404 (Q-506).
+- **`"Hello ${name}"` is pointed out** when `name` is the program's: a plain string is not a
+  template (Q-510). `\${` keeps the text.
+- **A name imported as a builtin's (`use price as print`) is warned of**, as `fn print` is
+  (Q-507).
+- **`let fn`, `let true`, `let null` and `type if`** get the keyword message (Q-526, Q-516).
+- **An assignment may be an arrow's body**: `() => count += 1` is `() => { count += 1 }`;
+  `@click={count += 1}` says a handler is a function (Q-518).
+- **Two elements side by side in a view** say so, not "comparisons do not chain" (Q-521).
+- **Numbers**: `1__000`, `1_`, `08`, `010` and `1.` are errors that say how to write them,
+  there is no `--` (`--n` was `n`), a map takes one `,` between entries, and a lone CR is
+  a line break (Q-529). What changes: a program with one of these no longer loads.
+- **The command line**: `quillo check main` finds `main.qwe`, `--policy` without its file
+  says so, and the summary says `1 route` (Q-528).
+
 ### Developer tools and the browser (FEEDBACK42.md)
 
 - **`quillo check` warns of `sleep(0.2)`**: `sleep` takes milliseconds, and a number written

@@ -271,12 +271,12 @@ fn check_reports_what_it_found_and_counts_the_program() {
     );
     let o = quillo(&dir, &["check", "ok.qwe"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(out(&o), "ok.qwe: ok (1 routes, 2 functions, 1 components)\n");
+    assert_eq!(out(&o), "ok.qwe: ok (1 route, 2 functions, 1 component)\n");
 
     let o = quillo(&dir, &["check", "one.qwe"]);
     assert!(o.status.success());
     assert!(err(&o).contains("one.qwe:1: warning: `s` counts as true"), "{}", err(&o));
-    assert_eq!(out(&o), "one.qwe: ok (0 routes, 1 functions, 0 components), 1 warning\n");
+    assert_eq!(out(&o), "one.qwe: ok (0 routes, 1 function, 0 components), 1 warning\n");
 
     let o = quillo(&dir, &["check", "two.qwe"]);
     assert!(o.status.success());
@@ -291,12 +291,31 @@ fn check_reports_what_it_found_and_counts_the_program() {
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).ends_with("quillo: 2 errors\n"), "{}", err(&o));
 
-    assert_eq!(out(&quillo(&dir, &["check", "uses.qwe"])), "uses.qwe: ok (1 routes, 1 functions, 0 components, in 2 files)\n");
+    assert_eq!(out(&quillo(&dir, &["check", "uses.qwe"])), "uses.qwe: ok (1 route, 1 function, 0 components, in 2 files)\n");
 
     let o = quillo(&dir, &["check", "syntax.qwe"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains(&format!("note: this is quillo {}", env!("CARGO_PKG_VERSION"))), "{}", err(&o));
     assert!(err(&o).ends_with("quillo: 1 error\n"), "{}", err(&o));
+}
+
+/// A program named without `.qwe`, as a `use` path is, and `--policy` with its file left out
+/// (FEEDBACK45.md, Q-528; branch feedback40-43).
+#[test]
+fn check_takes_a_name_without_qwe_and_says_what_an_option_lacks() {
+    let dir = folder("bare-name", &[("main.qwe", "route GET / = \"hi\"\n"), ("tools", "")]);
+    let o = quillo(&dir, &["check", "main"]);
+    assert_eq!(out(&o), "main.qwe: ok (1 route, 0 functions, 0 components)\n", "{}", err(&o));
+    // A file that is there is that file, extension or not.
+    let o = quillo(&dir, &["check", "tools"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = quillo(&dir, &["check", "nothing"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    for args in [&["check", "main.qwe", "--policy"][..], &["check", "main.qwe", "--policy", "--strict-null"]] {
+        let o = quillo(&dir, args);
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(err(&o), "quillo: `--policy` needs the policy's file: `quillo check main.qwe --policy policy.toml`\n");
+    }
 }
 
 #[test]

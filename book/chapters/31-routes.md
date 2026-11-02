@@ -29,7 +29,8 @@ route METHOD /path [with effects] { ... block ... }
 - **Path params** become variables. `:id(int)` only matches what parses as an int (also
   `float`, `dec`, `num`, `str`, and `date`: `/day/:d(date)` takes `2026-11-20`, not
   `2026-02-30`). `*rest` (or `*name`) takes the rest of the path; `*`
-  alone names it `rest`. The path is split at `/`, empty pieces dropped, so `/users`,
+  alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
+  error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
   `/users/` and `//users` are one path; each piece is percent-decoded after the split, so
   a `%2F` stays inside its piece. `request.path` is the path as it came, undecoded.
 

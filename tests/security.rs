@@ -578,7 +578,8 @@ run_script("call(() => e(\"HOME\"))", { call, e: env })"#).unwrap().repr();
 fn nested_shapes(n: usize) -> Vec<(&'static str, String)> {
     vec![
         ("parens", format!("{}1{}", "(".repeat(n), ")".repeat(n))),
-        ("negation", format!("{}1", "-".repeat(n))),
+        // `- - 1`: `--` is no operator (FEEDBACK45.md, Q-529).
+        ("negation", format!("{}1", "- ".repeat(n))),
         ("not", format!("{}true", "!".repeat(n))),
         ("list", format!("{}1{}", "[".repeat(n), "]".repeat(n))),
         ("map", format!("{}1{}", "{ a: ".repeat(n), " }".repeat(n))),
