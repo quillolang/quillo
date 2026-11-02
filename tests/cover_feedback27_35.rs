@@ -316,3 +316,24 @@ fn site_at_the_start_of_a_line_that_is_no_declaration() {
     let d = dir("site-half", &[("main.qwe", b"let site = 1\nsite shop\n")]);
     assert!(!quillo(&d, &["run", "main.qwe", "--no-check"]).status.success());
 }
+
+#[test]
+fn a_program_writes_its_own_migrations_and_an_upload_may_not() {
+    // The program's own migrations, written before and after their folder exists (a regression
+    // the reference pages found on the way to deploying).
+    let d = dir("migrations", &[(
+        "main.qwe",
+        b"db.open(\"app.db\")\nwrite_file(\"migrations/001_a.sql\", \"create table a (x)\")\nwrite_file(\"migrations/002_b.sql\", \"create table b (x)\")\nprint(db.migrate(\"migrations\"))\nprint(is_err(write_file(\"migrations/003_c.sql\", \"create table c (x)\")))\n",
+    )]);
+    let o = quillo(&d, &["run", "main.qwe"]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "[\"001_a.sql\", \"002_b.sql\"]\nfalse\n", "{}", said(&o));
+}
+
+#[test]
+fn a_path_outside_the_program_is_named_as_written() {
+    let d = dir("outside", &[("main.qwe", b"write_file(\"plugins/p.qwe\", \"print(1)\\n\")\nprint(check_program(\"plugins/p.qwe\", { \"plugins/p.qwe\": \"use \\\"../secret.qwe\\\"\\n\" })[0].message)\nprint(check_program(\"plugins/p.qwe\", { \"plugins/p.qwe\": \"import ../../far.qwe use x\\n\" })[0].message)\n")]);
+    let o = quillo(&d, &["run", "main.qwe"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.starts_with("path must stay inside the program's folder: ../secret.qwe\n"), "{}", out);
+    assert!(!out.contains("/var/") && !out.contains("/private/"), "{}", out);
+}
