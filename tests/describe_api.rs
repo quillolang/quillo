@@ -62,7 +62,7 @@ fn path_parameters_keep_their_types_and_a_rest_is_a_string() {
     );
     assert!(p.as_array().unwrap().iter().all(|x| x["in"] == "path" && x["required"] == true));
     let rest = &doc["paths"]["/files/{tail}"]["get"]["parameters"][0];
-    assert_eq!(rest, &json!({ "name": "tail", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the rest of the path" }));
+    assert_eq!(rest, &json!({ "name": "tail", "in": "path", "required": true, "schema": { "type": "string" }, "description": "the rest of the path, slashes included", "x-quillo-rest": true }));
     assert_eq!(doc["paths"]["/all/{rest}"]["get"]["parameters"][0]["name"], "rest");
 }
 

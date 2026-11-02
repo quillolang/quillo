@@ -20,6 +20,11 @@ pub fn set_runtime(r: &'static str) {
     let _ = RUNTIME.set(r);
 }
 
+/// How the program runs: "mobile", "app" or "server".
+pub fn runtime() -> &'static str {
+    RUNTIME.get().copied().unwrap_or("server")
+}
+
 /// What a phone app's launcher knows of the device, as a JSON object. Ignored
 /// when it is not one.
 pub fn set_launcher(json: &str) {
@@ -177,8 +182,38 @@ fn overlay(mut m: serde_json::Map<String, serde_json::Value>, given: &serde_json
     m
 }
 
-pub fn platform(_: &mut crate::interp::Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
-    Ok(info())
+/// Where the server listens: the host and port it was told, then the port it was given when it
+/// bound (`--port 0`). None in a script.
+static LISTENING: std::sync::Mutex<Option<(String, u16)>> = std::sync::Mutex::new(None);
+
+/// Records where the server listens (or is about to).
+pub fn set_listening(host: &str, port: u16) {
+    *LISTENING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((host.trim_matches(['[', ']']).to_string(), port));
+}
+
+/// `platform()`, with `server`: `{ host, port, url, base }` where the program listens, or null
+/// in a script, so a program that reads its own pages (a search index, a cache warmed, a webhook
+/// to itself) need not be told its `--port` again (FEEDBACK34.md, Q-426; branch
+/// feedback27-35-fixes). `url` is one this machine can reach: `0.0.0.0` is `127.0.0.1` there.
+pub fn platform(it: &mut crate::interp::Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
+    let info = info();
+    let listening = LISTENING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let Some((host, port)) = listening else { return Ok(info) };
+    let Value::Map(m) = info else { return Ok(info) };
+    let reach = match host.as_str() {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "::1".to_string(),
+        h => h.to_string(),
+    };
+    let shown = if reach.contains(':') { format!("[{}]", reach) } else { reach };
+    let mut s = crate::value::Map::new();
+    s.insert("host".into(), Value::str(&host));
+    s.insert("port".into(), Value::Int(port as i64));
+    s.insert("url".into(), Value::str(format!("http://{}:{}{}", shown, port, it.base)));
+    s.insert("base".into(), Value::str(&it.base));
+    let mut m = (*m).clone();
+    m.insert("server".into(), Value::map(s));
+    Ok(Value::map(m))
 }
 
 #[cfg(test)]

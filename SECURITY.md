@@ -34,6 +34,24 @@ An error a builtin made says `internal error` to a visitor, wherever it would re
 its text goes to the log; `--watch` shows it, for development. Text a program sends is its
 own: `err(...)`, and `str(r)` of an error, go out as they are.
 
+## What is public
+
+- `/_quillo/describe` (`--describe`), when on, answers anyone: every route, those no page
+  links to as well, each `server fn`'s signature, the file and line of every route, and the
+  version. Keep it private as `/_quillo/metrics` is, with rules at the proxy, or leave it
+  off in production.
+- In a phone app, `env.NAME` values in app.toml are public: anyone can unzip the app and
+  read everything in it. A `.env` is not put in the app.
+
+## Headers sent by default
+
+A page made from who the visitor is (it called `session()` or `cookie()`, or set a cookie)
+gets `Cache-Control: private` and `Vary: Cookie`, unless the route sets its own
+cache-control. Every HTML page gets `X-Frame-Options: SAMEORIGIN`, unless the route sets
+one, or a Content-Security-Policy with `frame-ancestors`. `site_headers(...)` sets headers
+for every answer, or those under a path, that does not set them itself; a null value takes
+one of these away.
+
 ## How dependencies are checked
 
 `cargo deny` checks every dependency for known vulnerabilities, licences and sources in

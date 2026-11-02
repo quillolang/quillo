@@ -128,6 +128,13 @@ fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if let Err(e) = flatten("", &m, &mut flat) {
             return fail(line, format!("`translations` ({}): {}", name, e));
         }
+        // `fr_FR.json`, as gettext and Java name them, is `fr-FR`, the form a request is
+        // matched in, so it can be chosen (FEEDBACK30.md, Q-362; branch feedback27-35-fixes).
+        let name = name.replace('_', "-");
+        if locales.keys().any(|k: &Arc<str>| k.eq_ignore_ascii_case(&name)) {
+            return fail(line, format!("`translations`: the locale {:?} is given twice", name));
+        }
+        warn_unused_forms(&name, &flat);
         locales.insert(Arc::<str>::from(name), flat);
     }
     if locales.is_empty() {
@@ -166,20 +173,55 @@ fn locale_from(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 impl I18n {
     /// The locale here that best serves `tag`: the same, the same language
     /// without its region, or the same language with one.
+    ///
+    /// A script is matched before the language: `zh-Hant-TW` and `zh-TW` are served
+    /// `zh-Hant`, and `sr-Latn-RS` is served `sr-Latn`, the script of a region being CLDR's
+    /// likely one; and a region takes CLDR's parent where there is one, `pt-AO` taking `pt-PT`
+    /// (FEEDBACK30.md, Q-363; branch feedback27-35-fixes).
     pub fn best(&self, tag: &str) -> Option<Arc<str>> {
         let tag = tag.trim().replace('_', "-");
         if tag.is_empty() {
             return None;
         }
-        if let Some(k) = self.locales.keys().find(|k| k.eq_ignore_ascii_case(&tag)) {
-            return Some(k.clone());
+        let find = |want: &str| self.locales.keys().find(|k| k.eq_ignore_ascii_case(want)).cloned();
+        if let Some(k) = find(&tag) {
+            return Some(k);
         }
-        let lang = tag.split('-').next().unwrap_or("");
-        self.locales
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(lang))
-            .or_else(|| self.locales.keys().find(|k| k.split('-').next().is_some_and(|l| l.eq_ignore_ascii_case(lang))))
-            .cloned()
+        let parts: Vec<&str> = tag.split('-').collect();
+        let lang = parts[0];
+        let subtag = |k: &str, sub: &str| k.split('-').skip(1).any(|p| p.eq_ignore_ascii_case(sub));
+        let same_lang = |k: &str| k.split('-').next().is_some_and(|l| l.eq_ignore_ascii_case(lang));
+        let script = parts[1..].iter().find(|p| p.len() == 4 && p.bytes().all(|b| b.is_ascii_alphabetic())).map(|s| s.to_string());
+        let region = parts[1..].iter().find(|p| (p.len() == 2 && p.bytes().all(|b| b.is_ascii_alphabetic())) || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit()))).map(|r| r.to_ascii_uppercase());
+        let script = script.or_else(|| likely_script(lang, region.as_deref()).map(str::to_string));
+        if let Some(sc) = &script {
+            if let Some(r) = &region {
+                if let Some(k) = find(&format!("{}-{}-{}", lang, sc, r)) {
+                    return Some(k);
+                }
+            }
+            if let Some(k) = find(&format!("{}-{}", lang, sc)) {
+                return Some(k);
+            }
+            if let Some(k) = self.locales.keys().find(|k| same_lang(k) && subtag(k, sc)) {
+                return Some(k.clone());
+            }
+        }
+        if let Some(r) = &region {
+            if let Some(k) = find(&format!("{}-{}", lang, r)) {
+                return Some(k);
+            }
+            if let Some(k) = parent_region(lang, r).and_then(|p| find(&format!("{}-{}", lang, p))) {
+                return Some(k);
+            }
+        }
+        // The language alone, then one of its locales: not one in another script than the one
+        // asked for, which would be text the reader may not read.
+        let other_script = |k: &str| match &script {
+            Some(sc) => k.split('-').skip(1).any(|p| p.len() == 4 && !p.eq_ignore_ascii_case(sc)),
+            None => false,
+        };
+        find(lang).filter(|k| !other_script(k)).or_else(|| self.locales.keys().find(|k| same_lang(k) && !other_script(k)).cloned()).or_else(|| find(lang)).or_else(|| self.locales.keys().find(|k| same_lang(k)).cloned())
     }
 
     /// The best of an `Accept-Language` header, by its weights.
@@ -203,12 +245,20 @@ impl I18n {
     }
 
     /// The locale's translations with the default's filling the gaps, as
-    /// JSON for the browser.
-    pub fn browser_json(&self, locale: &str) -> String {
+    /// JSON for the browser: only `wanted`'s keys when the page's code is known to ask
+    /// for no others (`sec.*` is every key that starts `sec.`) (FEEDBACK30.md, Q-372;
+    /// branch feedback27-35-fixes).
+    pub fn browser_json(&self, locale: &str, wanted: Option<&[String]>) -> String {
+        let takes = |k: &str| {
+            k.starts_with("quillo.") || wanted.is_none_or(|w| w.iter().any(|x| match x.strip_suffix('*') {
+                Some(start) => k.starts_with(start),
+                None => x == k,
+            }))
+        };
         let mut all = serde_json::Map::new();
         for l in [&*self.default, locale] {
             if let Some(d) = self.locales.get(l) {
-                let mut keys: Vec<_> = d.keys().collect();
+                let mut keys: Vec<_> = d.keys().filter(|k| takes(k)).collect();
                 keys.sort();
                 for k in keys {
                     all.insert(k.clone(), d[k].to_json());
@@ -223,6 +273,27 @@ impl I18n {
             .replace('\u{2028}', "\\u2028")
             .replace('\u{2029}', "\\u2029")
     }
+}
+
+/// The files of translations pages load, `/_quillo/t/<hash>.js`, by their hash: a page's
+/// keys in its locale, which the browser keeps, as their address names their content.
+static FILES: std::sync::Mutex<Option<HashMap<String, Arc<String>>>> = std::sync::Mutex::new(None);
+
+/// Keeps `json` as a file and gives its hash.
+pub fn keep_file(json: String) -> String {
+    let js = format!("window.__quillo_i18n={};", json);
+    let hash = crate::client::hash_text(&js);
+    let mut g = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 1024 {
+        m.clear();
+    }
+    m.entry(hash.clone()).or_insert_with(|| Arc::new(js));
+    hash
+}
+
+pub fn file(hash: &str) -> Option<Arc<String>> {
+    FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.get(hash).cloned()
 }
 
 fn header(it: &mut Interp, name: &str) -> Option<String> {
@@ -322,8 +393,18 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
     let text = match i18n.entry(&l, &key) {
         Some(Value::Str(s)) => s.to_string(),
         Some(Value::Map(forms)) => {
-            let n = vars.as_ref().and_then(|v| v.get("count")).and_then(|c| c.as_f64());
-            let cat = n.map_or("other", |n| plural(&l, n));
+            // A count read from a form or a query is text, and an amount is a decimal: each is
+            // taken at its number, a decimal's written digits counting as CLDR counts them
+            // (FEEDBACK30.md, Q-367; branch feedback27-35-fixes).
+            let count = vars.as_ref().and_then(|v| v.get("count"));
+            let n = count.and_then(count_of);
+            let cat = match n {
+                // `zero`, where one is written, for 0 in any language, as Rails and i18next read it
+                // (FEEDBACK30.md, Q-366).
+                Some((n, false)) if n == 0.0 && forms.contains_key("zero") => "zero",
+                Some((n, frac)) => plural_of(&l, n, frac),
+                None => "other",
+            };
             forms.get(cat).or_else(|| forms.get("other")).map(|v| v.display().to_string()).unwrap_or_default()
         }
         _ => key.to_string(),
@@ -333,6 +414,64 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
         return Ok(Value::html(interpolate(&text, escaped.as_ref())));
     }
     Ok(Value::str(interpolate(&text, vars.as_deref())))
+}
+
+/// The script a language is written in, in a region, where it has more than one (CLDR's
+/// likely subtags).
+fn likely_script(lang: &str, region: Option<&str>) -> Option<&'static str> {
+    match (lang.to_ascii_lowercase().as_str(), region) {
+        ("zh", Some("TW" | "HK" | "MO")) => Some("Hant"),
+        ("zh", _) => Some("Hans"),
+        ("sr", Some("ME")) => Some("Latn"),
+        ("sr", _) => Some("Cyrl"),
+        ("uz", Some("AF")) => Some("Arab"),
+        ("uz", _) => Some("Latn"),
+        ("pa", Some("PK")) => Some("Arab"),
+        ("bs", _) => Some("Latn"),
+        _ => None,
+    }
+}
+
+/// The region whose text a region takes when it has none of its own (CLDR's parent locales).
+fn parent_region(lang: &str, region: &str) -> Option<&'static str> {
+    const LATAM: &[&str] = &["AR", "BO", "BR", "BZ", "CL", "CO", "CR", "CU", "DO", "EC", "GT", "HN", "MX", "NI", "PA", "PE", "PR", "PY", "SV", "US", "UY", "VE"];
+    match lang.to_ascii_lowercase().as_str() {
+        "pt" if region != "BR" => Some("PT"),
+        "es" if LATAM.contains(&region) => Some("419"),
+        "en" if !matches!(region, "US" | "PR" | "AS" | "GU" | "MP" | "UM" | "VI") => Some("GB"),
+        _ => None,
+    }
+}
+
+/// Plural forms a locale's rules never pick are said at load: a translator's English `few`
+/// would never be read. `zero` is read for 0 in any language (FEEDBACK30.md, Q-366; branch
+/// feedback27-35-fixes).
+fn warn_unused_forms(locale: &str, flat: &HashMap<String, Value>) {
+    let used = categories(locale);
+    let mut keys: Vec<&String> = flat.keys().collect();
+    keys.sort();
+    for k in keys {
+        let Value::Map(forms) = &flat[k] else { continue };
+        for f in forms.keys() {
+            if PLURALS.contains(&&**f) && *f != *"zero" && !used.contains(&&**f) {
+                eprintln!("quillo: warning: translations ({}): `{}` has a `{}` form, which {} never picks (it has {})", locale, k, f, locale, used.join(", "));
+            }
+        }
+    }
+}
+
+/// The plural forms a locale's rules can pick.
+pub fn categories(locale: &str) -> Vec<&'static str> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let samples = (0..=1000).map(|n| (n as f64, false)).chain([(1e6, false), (2e6, false), (1.5, true), (0.5, true), (21.5, true)]);
+    for (n, frac) in samples {
+        let c = plural_of(locale, n, frac);
+        if !seen.contains(&c) {
+            seen.push(c);
+        }
+    }
+    seen.sort_by_key(|c| PLURALS.iter().position(|p| p == c));
+    seen
 }
 
 /// `{name}` replaced by the value's text; other braces are left alone.
@@ -359,19 +498,112 @@ pub fn interpolate(text: &str, vars: Option<&Map>) -> String {
     out
 }
 
+/// A `count`'s number, and whether it is written with a fraction's digits (`1.0m`, `"1.5"`).
+fn count_of(v: &Value) -> Option<(f64, bool)> {
+    match v {
+        Value::Int(i) => Some((*i as f64, false)),
+        Value::Float(f) if f.is_finite() => Some((*f, f.fract() != 0.0)),
+        Value::Dec(d) => Some((d.to_f64(), d.scale() > 0)),
+        Value::Str(s) => {
+            let t = s.trim();
+            let f: f64 = t.parse().ok().filter(|f: &f64| f.is_finite())?;
+            Some((f, t.contains('.')))
+        }
+        _ => None,
+    }
+}
+
 /// The plural form of `n` in a language (CLDR's rules for whole numbers;
 /// fractions take `other`). The browser runtime has the same table.
 pub fn plural(locale: &str, n: f64) -> &'static str {
-    if n.fract() != 0.0 || !n.is_finite() {
-        return "other";
+    plural_of(locale, n, n.fract() != 0.0)
+}
+
+/// The plural form of `n`, `frac` when it is written with a fraction's digits. CLDR's rules,
+/// for the languages below; any other is read as English. The browser runtime has the same
+/// table (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
+pub fn plural_of(locale: &str, n: f64, frac: bool) -> &'static str {
+    let lang = locale.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    let region = locale.split(['-', '_']).nth(1).unwrap_or("").to_ascii_uppercase();
+    if frac || n.fract() != 0.0 || !n.is_finite() {
+        return match lang.as_str() {
+            "lt" => "many",
+            "ro" => "few",
+            "cs" | "sk" => "many",
+            _ => "other",
+        };
     }
     let n = n.abs() as u64;
     let (m10, m100) = (n % 10, n % 100);
-    let lang = locale.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    let millions = n != 0 && n % 1_000_000 == 0;
     match lang.as_str() {
         "ja" | "zh" | "ko" | "th" | "vi" | "id" | "ms" | "lo" | "my" | "km" | "yue" => "other",
+        "pt" if region == "PT" => match n {
+            1 => "one",
+            _ if millions => "many",
+            _ => "other",
+        },
+        "fr" | "pt" if n <= 1 => "one",
+        "fr" | "pt" if millions => "many",
+        "es" | "it" | "ca" if n == 1 => "one",
+        "es" | "it" | "ca" if millions => "many",
+        "es" | "it" | "ca" => "other",
         "fr" | "pt" | "hi" | "bn" | "fa" | "gu" | "kn" | "zu" | "am" if n <= 1 => "one",
         "fr" | "pt" | "hi" | "bn" | "fa" | "gu" | "kn" | "zu" | "am" => "other",
+        "ro" | "mo" => match n {
+            1 => "one",
+            0 => "few",
+            _ if (1..=19).contains(&m100) => "few",
+            _ => "other",
+        },
+        "lt" => {
+            if m10 == 1 && !(11..=19).contains(&m100) {
+                "one"
+            } else if (2..=9).contains(&m10) && !(11..=19).contains(&m100) {
+                "few"
+            } else {
+                "other"
+            }
+        }
+        "lv" => {
+            if m10 == 0 || (11..=19).contains(&m100) {
+                "zero"
+            } else if m10 == 1 && m100 != 11 {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        "sl" => match m100 {
+            1 => "one",
+            2 => "two",
+            3 | 4 => "few",
+            _ => "other",
+        },
+        "is" | "mk" if m10 == 1 && m100 != 11 => "one",
+        "is" | "mk" => "other",
+        "ga" => match n {
+            1 => "one",
+            2 => "two",
+            3..=6 => "few",
+            7..=10 => "many",
+            _ => "other",
+        },
+        "cy" => match n {
+            0 => "zero",
+            1 => "one",
+            2 => "two",
+            3 => "few",
+            6 => "many",
+            _ => "other",
+        },
+        "mt" => match (n, m100) {
+            (1, _) => "one",
+            (2, _) => "two",
+            (0, _) | (_, 3..=10) => "few",
+            (_, 11..=19) => "many",
+            _ => "other",
+        },
         "ru" | "uk" | "be" => {
             if m10 == 1 && m100 != 11 {
                 "one"

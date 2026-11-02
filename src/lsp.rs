@@ -859,7 +859,7 @@ impl Server {
         let (src, at) = use_text(&lines, line, char_col(lines.get(line)?, col))?;
         let u = use_line(&src)?;
         let base = use_base(&uri_to_path(&uri));
-        let full = base.join(crate::modules::resolve(&base, &u.path));
+        let full = base.join(crate::modules::resolve_from(&base, &uri_to_path(&uri), &u.path));
         if at >= u.at.0 && at <= u.at.1 {
             return Some((u, full, None));
         }
@@ -968,7 +968,7 @@ impl Server {
     /// The names a file gives, but for those `u` takes elsewhere than column `a`.
     fn names_of(&self, doc: &Doc, uri: &str, u: &UseLine, a: usize) -> Vec<J> {
         let base = use_base(&uri_to_path(uri));
-        let full = base.join(crate::modules::resolve(&base, &u.path));
+        let full = base.join(crate::modules::resolve_from(&base, &uri_to_path(uri), &u.path));
         // A `.qwe` file: its public names, of those not yet taken (FEEDBACK19.md,
         // Q-154; branch feedback19-fixes).
         if full.extension().is_some_and(|e| e == "qwe") {

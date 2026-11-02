@@ -138,6 +138,7 @@ window.quilloNative = (() => {
 final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
     private var web: WKWebView!
     private var origin = ""
+    private let site = ownSite
     private var bridge: Bridge!
     // `--eval <script>`: run in the page when it has loaded, for automation
     // (screenshots, tests). Given more than once, the scripts run in turn, one per page
@@ -180,12 +181,17 @@ final class ProgramViewController: UIViewController, WKNavigationDelegate, WKUID
         }
     }
 
-    func isOwn(_ origin: WKSecurityOrigin) -> Bool { origin.host == "127.0.0.1" }
+    func isOwn(_ origin: WKSecurityOrigin) -> Bool { programOwns(origin) }
 
     // The program's own pages stay here; a link to another site opens in Safari.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard let url = action.request.url, let scheme = url.scheme else { return decisionHandler(.allow) }
-        let mine = url.absoluteString.hasPrefix(origin) || scheme == "about" || scheme == "data" || scheme == "blob"
+        // A frame loads where it is, as in a browser: an embedded map or video is the page's,
+        // not a link followed. A frame of another origin gets no bridge, which checks the
+        // frame's origin (FEEDBACK33.md, Q-409; branch feedback27-35-fixes).
+        if action.targetFrame?.isMainFrame == false { return decisionHandler(.allow) }
+        let ownSite = !site.isEmpty && (url.absoluteString == site || url.absoluteString.hasPrefix(site + "/"))
+        let mine = url.absoluteString.hasPrefix(origin) || ownSite || scheme == "about" || scheme == "data" || scheme == "blob"
         if mine || origin.isEmpty { return decisionHandler(.allow) }
         // What the system handles: a link to dial or to mail does what it does in a browser
         // (FEEDBACK28.md, Q-346; branch feedback29-fixes).
@@ -254,7 +260,7 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply, CLLocationManager
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping @MainActor (Any?, String?) -> Void) {
         // Only the program's own pages reach the app.
-        guard message.frameInfo.securityOrigin.host == "127.0.0.1" else { return replyHandler(nil, "not from the program") }
+        guard message.frameInfo.isMainFrame, programOwns(message.frameInfo.securityOrigin) else { return replyHandler(nil, "not from the program") }
         let body = message.body as? [String: Any] ?? [:]
         let name = body["name"] as? String ?? ""
         let args = body["args"] as? [Any] ?? []
@@ -386,4 +392,20 @@ final class Bridge: NSObject, WKScriptMessageHandlerWithReply, CLLocationManager
         sheet.popoverPresentationController?.sourceView = owner.view
         owner.present(sheet, animated: true)
     }
+}
+
+/// The developer's own site, from app.toml's `site`: its pages stay in the web view and the
+/// bridge answers them (FEEDBACK33.md, Q-410; branch feedback27-35-fixes). Only https, one
+/// origin, written by the developer, never taken from a page.
+let ownSite: String = {
+    guard let s = Bundle.main.object(forInfoDictionaryKey: "QuilloSite") as? String, s.hasPrefix("https://"),
+          let u = URL(string: s), let host = u.host else { return "" }
+    return "https://\(host)\(u.port.map { ":\($0)" } ?? "")"
+}()
+
+/// Whether a page's origin is the program's (127.0.0.1) or the developer's site.
+func programOwns(_ o: WKSecurityOrigin) -> Bool {
+    if o.host == "127.0.0.1" { return true }
+    guard !ownSite.isEmpty, let u = URL(string: ownSite) else { return false }
+    return o.protocol == "https" && o.host == u.host && (o.port == 0 ? 443 : o.port) == (u.port ?? 443)
 }

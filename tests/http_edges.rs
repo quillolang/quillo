@@ -348,8 +348,8 @@ fn a_flood_of_pipelined_requests_is_answered_in_order() {
 fn a_request_ending_exactly_where_a_read_does_is_answered_though_the_client_stopped_sending() {
     let srv = start("exact", APP, &[]);
     // A read takes 16 KiB: the end of the input comes with the next.
-    let pad = 16384 - "POST /echo HTTP/1.1\r\nContent-Length: 10\r\nx-pad: \r\n\r\n".len() - 10;
-    let req = format!("POST /echo HTTP/1.1\r\nContent-Length: 10\r\nx-pad: {}\r\n\r\n0123456789", "p".repeat(pad));
+    let pad = 16384 - "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nx-pad: \r\n\r\n".len() - 10;
+    let req = format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nx-pad: {}\r\n\r\n0123456789", "p".repeat(pad));
     assert_eq!(req.len(), 16384);
     let mut s = connect(srv.port);
     s.write_all(req.as_bytes()).unwrap();

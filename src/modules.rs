@@ -62,6 +62,42 @@ pub fn key(p: &Path) -> PathBuf {
 
 /// A `use` that takes names from a path with no extension says `.qwer`, as the parser
 /// cannot look: it is a `.qwe` file when that is the one there.
+/// A `use` path as `resolve` reads it, but one that starts `./` or `../` counts from the folder of
+/// the file that writes it, `from`, so a library's file can name its neighbour and be checked
+/// alone (FEEDBACK25.md, Q-325; branch feedback27-35-fixes). Given back as the program's folder
+/// counts it, so every file names one file the same way.
+pub fn resolve_from(base: &Path, from: &Path, path: &str) -> String {
+    if !(path.starts_with("./") || path.starts_with("../")) {
+        return resolve(base, path);
+    }
+    let real = |p: &Path| -> std::path::PathBuf {
+        let abs = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) };
+        abs.canonicalize().unwrap_or_else(|_| lexical(&abs))
+    };
+    let dir = real(from.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")));
+    let target = lexical(&dir.join(path));
+    let base = real(base);
+    let rel = match target.strip_prefix(&base) {
+        Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        Err(_) => target.to_string_lossy().into_owned(),
+    };
+    resolve(&base, &rel)
+}
+
+/// `a/./b/../c` as `a/c`, without asking the system.
+fn lexical(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
 pub fn resolve(base: &Path, path: &str) -> String {
     match path.strip_suffix(".qwer").map(|p| format!("{}.qwe", p)) {
         Some(qwe) if !base.join(path).exists() && base.join(&qwe).exists() => qwe,
@@ -105,7 +141,7 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
             if crate::ast::is_script(path) {
                 continue;
             }
-            let path = resolve(base, path);
+            let path = resolve_from(base, &files[at].0, path);
             let full = base.join(&path);
             let k = key(&full);
             links.written.entry(k.clone()).or_insert(path.clone());
@@ -156,7 +192,7 @@ pub fn link(main: &Path, stmts: Arc<Vec<Stmt>>, base: &Path, read: &mut dyn FnMu
                 imports.names.extend(names.iter().flatten().map(|(_, alias)| alias.clone()));
                 continue;
             }
-            let path = resolve(base, path);
+            let path = resolve_from(base, file, path);
             let k = key(&base.join(&path));
             let target = files.iter().position(|(f, _)| *f == k);
             let mut problem = |message: String| links.problems.push(Problem { file: file.clone(), line: *line, message });
@@ -325,7 +361,7 @@ fn script_line(all: &[Respell], file: &str, line: u32) -> Result<String, String>
     if let Some(r) = all.iter().find(|r| r.file == file && r.line == line) {
         return Ok(r.written());
     }
-    let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {}: {}", file, e))?;
+    let text = crate::error::read_source(file).map_err(|e| format!("cannot read {}: {}", file, e))?;
     let mut lines = text.lines().skip(line as usize - 1);
     let first = lines.next().unwrap_or("").trim();
     Ok(match lines.next().map(str::trim).filter(|n| n.starts_with("use ") && !first.contains(" use ")) {
@@ -344,7 +380,7 @@ pub fn fix(main: &Path) -> Result<Vec<String>, String> {
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut said = Vec::new();
     // A file as it stands: as this has left it, or as it is.
-    let read = |files: &BTreeMap<String, String>, f: &str| files.get(f).cloned().map_or_else(|| std::fs::read_to_string(f).map_err(|e| format!("cannot read {}: {}", f, e)), Ok);
+    let read = |files: &BTreeMap<String, String>, f: &str| files.get(f).cloned().map_or_else(|| crate::error::read_source(f).map_err(|e| format!("cannot read {}: {}", f, e)), Ok);
     let mut respell = a.respell.clone();
     respell.sort_by(|x, y| (&x.file, x.line).cmp(&(&y.file, y.line)));
     respell.dedup_by(|x, y| (&x.file, x.line) == (&y.file, y.line));

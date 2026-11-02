@@ -7,6 +7,9 @@
 #   build = 1                           # a whole number, higher for each upload to a store
 #   icon = "icon.png"                   # 1024 x 1024 PNG, no transparency (default: Quillo's)
 #   main = "mobile.qwe"                 # the file the app starts from (default: main.qwe)
+#   site = "https://app.example.com"    # a site of yours the web view may open, with the bridge
+#   env.API_URL = "https://app.example.com"   # what env("API_URL") gives on the phone: public,
+#                                       # as everything in the app is (FEEDBACK33.md, Q-406)
 #
 # Sets APP_NAME, APP_ID, APP_VERSION, APP_BUILD, APP_ICON (a path), APP_MAIN and APP_CONFIG
 # (the file, or empty when there is none and the defaults are used).
@@ -24,6 +27,9 @@ if [ -n "$APP_CONFIG" ]; then
     APP_BUILD=$(app_value build); APP_ICON=$(app_value icon)
     # One codebase, a file for each platform (FEEDBACK20.md, Q-169; branch feedback20-fixes).
     APP_MAIN=$(app_value main)
+    # A site of the developer's that the web view keeps, with the bridge (FEEDBACK33.md, Q-410;
+    # branch feedback27-35-fixes).
+    APP_SITE=$(app_value site)
 fi
 APP_NAME=${APP_NAME:-Quillo}
 APP_ID=${APP_ID:-org.quillolang.app}
@@ -46,4 +52,28 @@ echo "$APP_BUILD" | grep -Eq '^[1-9][0-9]{0,8}$' || app_fail "build \"$APP_BUILD
 echo "$APP_MAIN" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_./-]*\.qwe$' && ! echo "$APP_MAIN" | grep -q '\.\.' ||
     app_fail "main \"$APP_MAIN\" is not a .qwe file in the program's folder, like mobile.qwe or apps/phone.qwe"
 [ -f "$prog/$APP_MAIN" ] || app_fail "main $APP_MAIN: no such file in $prog"
-export APP_NAME APP_ID APP_VERSION APP_BUILD APP_ICON APP_MAIN APP_CONFIG
+if [ -n "$APP_SITE" ]; then
+    echo "$APP_SITE" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?$' ||
+        app_fail "site \"$APP_SITE\" is an https address with no path, like https://app.example.com"
+fi
+export APP_NAME APP_ID APP_VERSION APP_BUILD APP_ICON APP_MAIN APP_CONFIG APP_SITE
+
+# What of the program's folder goes into the app, for both systems: everything but what is
+# the server's or the machine's. A `.env` holds a server's secrets and every app can be
+# unzipped, so it stays out, as do `.git/` (the program's history, old secrets included),
+# `.quillo/` and any other dotfile; databases, `uploads/` and a program of its own in a
+# subfolder too. What is left out is said (FEEDBACK33.md, Q-407; branch feedback27-35-fixes).
+app_copy_program() {
+    from=$1; to=$2
+    skip=$(cd "$from" && find . -mindepth 2 -name main.qwe -exec dirname {} \; | sed 's#^\./##')
+    left=$(cd "$from" && find . \( -name '.*' ! -name '.' ! -name '.well-known' \) -prune -print | sed 's#^\./##' | sort | tr '\n' ' ' | sed 's/ *$//')
+    (cd "$from" && find . \( -name '.*' ! -name '.' ! -name '.well-known' \) -prune -o -type f \
+        ! -name '*.db' ! -name '*.db-wal' ! -name '*.db-shm' ! -name '*.sqlite' ! -path './uploads/*' -print \
+        | while read -r f; do
+            rel=${f#./}; keep=1
+            for s in $skip; do case "$rel" in "$s"/*) keep="";; esac; done
+            if [ -n "$keep" ]; then mkdir -p "$to/$(dirname "$rel")"; cp "$f" "$to/$rel"; fi
+          done; true)
+    echo "   $(find "$to" -type f | wc -l | tr -d ' ') files${left:+, leaving out: $left}${skip:+, and the programs in $(echo $skip | tr '\n' ' ')}"
+    case " $left " in *" .env "*|*" .env."*) echo "   a .env is the server's: put public values in app.toml as env.NAME = \"...\"";; esac
+}

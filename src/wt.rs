@@ -966,7 +966,15 @@ mod quic {
         let ip = if ip.is_loopback() { ip } else { std::net::IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED) };
         let addr = SocketAddr::new(ip, port);
         let (id, own) = match TLS_CERT.get().zip(TLS_KEY.get()) {
-            Some((cert, key)) => (rt.block_on(Identity::load_pemfiles(cert, key)).map_err(|e| format!("cannot read the certificate: {}", e))?, false),
+            Some((cert, key)) => {
+                let id = rt.block_on(Identity::load_pemfiles(cert, key)).map_err(|e| format!("cannot read the certificate: {}", e))?;
+                // A file with no certificate in it reads, and wtransport then panics on it: said
+                // here instead (FEEDBACK31.md, Q-381; branch feedback27-35-fixes).
+                if id.certificate_chain().as_slice().is_empty() {
+                    return Err(format!("cannot read the certificate: {} holds none", cert.display()));
+                }
+                (id, false)
+            }
             None => (own_identity()?, true),
         };
         let hash = if own { hex_hash(&id) } else { None };

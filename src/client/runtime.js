@@ -1157,7 +1157,15 @@ async function httpCall(fname, method, url, body, headers, opts, at) {
   if (opts.redirects === 0) init.redirect = "manual";
   if (!isNil(secs) && typeof AbortSignal !== "undefined" && AbortSignal.timeout) init.signal = AbortSignal.timeout(Math.max(1, Math.round(secs * 1000)));
   let res;
-  try { res = await fetch(withBase(url), init); } catch (e) { return new Err("http: " + (e && e.name === "TimeoutError" ? `${url} took more than ${secs} s` : e.message)); }
+  try { res = await fetch(withBase(url), init); } catch (e) {
+    if (e && e.name === "TimeoutError") return new Err(`http: ${url} took more than ${secs} s`);
+    // A browser says only "Failed to fetch" or "Load failed": for another site, what it may be
+    // (FEEDBACK33.md, Q-411; branch feedback27-35-fixes).
+    let other = null;
+    try { const u = new URL(withBase(url), location.href); if (u.origin !== location.origin) other = u; } catch (_) {}
+    if (other && e && e.name === "TypeError") return new Err(`http: no answer from ${other.host}: it may not allow this page (CORS), or be plain http, or be unreachable; a server fn can call it from the server (${e.message})`);
+    return new Err("http: " + (e && e.message));
+  }
   if (res.type === "opaqueredirect") return new Err(`http: ${url} redirects, and redirects: 0 does not follow it`);
   let text;
   try { text = await res.text(); } catch (e) { return new Err("http: " + e.message); }
@@ -1335,6 +1343,21 @@ B.dec = meta((v) => {
 }, "dec", null);
 B.upper = meta((s) => S(s, "upper").toUpperCase(), "upper", null);
 B.lower = meta((s) => S(s, "lower").toLowerCase(), "lower", null);
+// An address on this site, or null, as on the server (FEEDBACK31.md, Q-390; branch
+// feedback27-35-fixes).
+B.local_path = meta((s) => {
+  if (typeof s !== "string") return null;
+  s = s.replace(/[\t\n\r]/g, "").replace(/\\/g, "/").replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+  if (!s.startsWith("/") || s.startsWith("//") || /[\x00-\x1f\x7f]/.test(s) || /^\/%(2f|5c)/i.test(s)) return null;
+  return s;
+}, "local_path", null);
+// One Unicode form, as on the server (FEEDBACK31.md, Q-394; branch feedback27-35-fixes).
+B.normalize = meta((s, form) => {
+  S(s, "normalize");
+  const f = isNil(form) ? "NFC" : typeof form === "string" ? form.toUpperCase() : fail(`\`normalize\` expects a form ("NFC", "NFD", "NFKC" or "NFKD") as argument 2, got ${typeName(form)}`);
+  if (!["NFC", "NFD", "NFKC", "NFKD"].includes(f)) fail(`\`normalize\`: the form is "NFC", "NFD", "NFKC" or "NFKD", got ${JSON.stringify(f)}`);
+  return s.normalize(f);
+}, "normalize", null);
 B.trim = meta((s) => S(s, "trim").trim(), "trim", null);
 // What `||` does in JavaScript, for text (FEEDBACK19.md, Q-151; branch feedback19-fixes).
 B.filled = (x) => (x === "" ? null : x);
@@ -1484,6 +1507,23 @@ function noticeEl(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+// `ask`'s own buttons in the page's language: the program's `quillo.ok` and `quillo.cancel`
+// when it translates them, else these (FEEDBACK30.md, Q-377; branch feedback27-35-fixes).
+const ASK_WORDS = { es: ["Aceptar", "Cancelar"], fr: ["OK", "Annuler"], de: ["OK", "Abbrechen"], it: ["OK", "Annulla"], pt: ["OK", "Cancelar"],
+  nl: ["OK", "Annuleren"], sv: ["OK", "Avbryt"], nb: ["OK", "Avbryt"], da: ["OK", "Annuller"], fi: ["OK", "Peruuta"], pl: ["OK", "Anuluj"],
+  cs: ["OK", "Zrušit"], ro: ["OK", "Anulează"], hu: ["OK", "Mégse"], tr: ["Tamam", "İptal"], el: ["OK", "Ακύρωση"], ru: ["ОК", "Отмена"],
+  uk: ["OK", "Скасувати"], ar: ["موافق", "إلغاء"], he: ["אישור", "ביטול"], hi: ["ठीक है", "रद्द करें"], ja: ["OK", "キャンセル"],
+  zh: ["确定", "取消"], "zh-hant": ["確定", "取消"], ko: ["확인", "취소"], th: ["ตกลง", "ยกเลิก"], vi: ["OK", "Hủy"], id: ["OK", "Batal"],
+  ms: ["OK", "Batal"], fil: ["OK", "Kanselahin"], tl: ["OK", "Kanselahin"] };
+const askWords = () => {
+  const d = i18n();
+  const loc = String((d && d.locale) || (typeof document !== "undefined" && document.documentElement.lang) || "en").toLowerCase().replace("_", "-");
+  const lang = loc.split("-")[0];
+  const zhHant = lang === "zh" && /-(hant|tw|hk|mo)\b/.test(loc);
+  const w = ASK_WORDS[zhHant ? "zh-hant" : lang] || ["OK", "Cancel"];
+  const own = (k, i) => d && hasOwn(d.t, k) && typeof d.t[k] === "string" ? d.t[k] : w[i];
+  return [own("quillo.ok", 0), own("quillo.cancel", 1)];
+};
 B.ask = meta((message, options) => new Promise((resolve) => {
   const o = options == null ? {} : M(options, "ask", 2);
   const host = noticeHost(), before = document.activeElement;
@@ -1495,8 +1535,9 @@ B.ask = meta((message, options) => new Promise((resolve) => {
   if (o.title != null) { const h = noticeEl("h2", "q-title", display(o.title)); h.id = id + "-t"; box.appendChild(h); box.setAttribute("aria-labelledby", h.id); }
   const p = noticeEl("p", "q-message", display(message)); p.id = id + "-m"; box.appendChild(p); box.setAttribute("aria-describedby", p.id);
   const row = noticeEl("div", "q-actions");
-  const no = noticeEl("button", "q-cancel", o.cancel != null ? display(o.cancel) : "Cancel");
-  const yes = noticeEl("button", "q-ok", o.ok != null ? display(o.ok) : "OK");
+  const words = askWords();
+  const no = noticeEl("button", "q-cancel", o.cancel != null ? display(o.cancel) : words[1]);
+  const yes = noticeEl("button", "q-ok", o.ok != null ? display(o.ok) : words[0]);
   no.type = yes.type = "button";
   row.append(no, yes);
   box.appendChild(row);
@@ -1762,15 +1803,28 @@ B.js_new = meta((path, ...args) => {
 
 // Translations: the page's locale and its text (see src/i18n.rs).
 const i18n = () => (typeof window !== "undefined" && window.__quillo_i18n) || null;
-// The plural form of n, as on the server (CLDR's rules for whole numbers).
-const plural = (locale, n) => {
-  if (!Number.isInteger(n)) return "other";
+// The plural form of n, as on the server (CLDR's rules), `frac` when it is written with a
+// fraction's digits (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
+const plural = (locale, n, frac) => {
+  const parts = String(locale).split(/[-_]/), lang = parts[0].toLowerCase(), region = (parts[1] || "").toUpperCase();
+  if (frac || !Number.isInteger(n)) return lang === "lt" || lang === "cs" || lang === "sk" ? "many" : lang === "ro" ? "few" : "other";
   n = Math.abs(n);
-  const m10 = n % 10, m100 = n % 100, lang = String(locale).split(/[-_]/)[0].toLowerCase();
-  const few = m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14);
+  const m10 = n % 10, m100 = n % 100, millions = n !== 0 && n % 1000000 === 0;
+  const few = m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14), teen = m100 >= 11 && m100 <= 19;
   switch (lang) {
     case "ja": case "zh": case "ko": case "th": case "vi": case "id": case "ms": case "lo": case "my": case "km": case "yue": return "other";
-    case "fr": case "pt": case "hi": case "bn": case "fa": case "gu": case "kn": case "zu": case "am": return n <= 1 ? "one" : "other";
+    case "pt": if (region === "PT") return n === 1 ? "one" : millions ? "many" : "other";
+    case "fr": return n <= 1 ? "one" : millions ? "many" : "other";
+    case "es": case "it": case "ca": return n === 1 ? "one" : millions ? "many" : "other";
+    case "hi": case "bn": case "fa": case "gu": case "kn": case "zu": case "am": return n <= 1 ? "one" : "other";
+    case "ro": case "mo": return n === 1 ? "one" : n === 0 || (m100 >= 1 && m100 <= 19) ? "few" : "other";
+    case "lt": return m10 === 1 && !teen ? "one" : m10 >= 2 && !teen ? "few" : "other";
+    case "lv": return m10 === 0 || teen ? "zero" : m10 === 1 && m100 !== 11 ? "one" : "other";
+    case "sl": return m100 === 1 ? "one" : m100 === 2 ? "two" : m100 === 3 || m100 === 4 ? "few" : "other";
+    case "is": case "mk": return m10 === 1 && m100 !== 11 ? "one" : "other";
+    case "ga": return n === 1 ? "one" : n === 2 ? "two" : n >= 3 && n <= 6 ? "few" : n >= 7 && n <= 10 ? "many" : "other";
+    case "cy": return n === 0 ? "zero" : n === 1 ? "one" : n === 2 ? "two" : n === 3 ? "few" : n === 6 ? "many" : "other";
+    case "mt": return n === 1 ? "one" : n === 2 ? "two" : n === 0 || (m100 >= 3 && m100 <= 10) ? "few" : teen ? "many" : "other";
     case "ru": case "uk": case "be": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "many";
     case "sr": case "hr": case "bs": return m10 === 1 && m100 !== 11 ? "one" : few ? "few" : "other";
     case "pl": return n === 1 ? "one" : few ? "few" : "many";
@@ -1780,13 +1834,23 @@ const plural = (locale, n) => {
     default: return n === 1 ? "one" : "other";
   }
 };
+// A count's number and whether it has a fraction's digits: text from a form, and a decimal,
+// are taken at their number (FEEDBACK30.md, Q-367; branch feedback27-35-fixes).
+const pluralCount = (c) => {
+  if (typeof c === "number") return Number.isFinite(c) ? [c, !Number.isInteger(c)] : null;
+  if (typeof c === "bigint") return [Number(c), false];
+  if (c instanceof Dec) return [Number(decText(c)), c.s > 0];
+  if (typeof c === "string") { const t = c.trim(), f = t === "" ? NaN : Number(t); return Number.isFinite(f) ? [f, t.includes(".")] : null; }
+  return null;
+};
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
 const translate = (k, vars, esc) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
   let e = d && hasOwn(d.t, k) ? d.t[k] : k;
   if (e && typeof e === "object") {
-    const cat = typeof vars.count === "number" ? plural(d.locale, vars.count) : "other";
+    const c = pluralCount(vars.count);
+    const cat = c === null ? "other" : c[0] === 0 && !c[1] && hasOwn(e, "zero") ? "zero" : plural(d.locale, c[0], c[1]);
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
   return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(display(vars[name])) : m);
@@ -2269,7 +2333,22 @@ B.format_number = meta((x, locale, digits) => {
   else if (typeof x === "number") { d = decFromFloat(x); if (d === null) return display(x); }
   else fail(`\`format_number\` expects a number as argument 1, got ${moneyShort(x)}`);
   const loc = localeData(moneyLocale(locale, "format_number", 2));
-  if (!isNil(digits)) d = decRound(d, Math.min(Math.max(I(digits, "format_number", 3), 0), 28), "half_even");
+  // Ties away from zero, as Intl writes them; `{ min, max }` digits too (FEEDBACK30.md, Q-369;
+  // branch feedback27-35-fixes).
+  if (!isNil(digits)) {
+    const clamp = (n) => Math.min(Math.max(n, 0), 28);
+    let min, max;
+    if (isMap(digits)) {
+      const k = Object.keys(digits).find((k) => k !== "min" && k !== "max");
+      if (k !== undefined) fail(`\`format_number\`'s digits are \`{ min, max }\`, not \`${k}\``);
+      const get = (k) => { const v = digits[k]; if (isNil(v)) return null; if (!isInt(v)) fail(`\`format_number\`'s ${k} is an int, got ${moneyShort(v)}`); return clamp(v); };
+      min = get("min") ?? 0; max = get("max") ?? Math.max(min, 3);
+      if (min > max) fail(`\`format_number\`: min ${min} is more than max ${max}`);
+    } else if (isInt(digits)) min = max = clamp(digits);
+    else fail(`\`format_number\` expects an int or \`{ min, max }\` as argument 3, got ${moneyShort(digits)}`);
+    d = decRound(d, max, "half_up");
+    while (d.s > min && d.m % 10n === 0n) d = new Dec(d.m / 10n, d.s - 1);
+  }
   return (d.m < 0n ? loc.minus : "") + moneyDigits(loc, loc.number, d);
 }, "format_number", null);
 
@@ -2958,14 +3037,47 @@ function dtOffsetAt(zone, instant) {
 }
 // The instant a local time names: in a gap, that far after it; in an
 // overlap, the earlier ("compatible", as on the server).
-function dtLocalInstant(zone, local) {
+// `later` takes the second of two, and `skipped` is "later", "earlier" or "error" (null), as on
+// the server (FEEDBACK30.md, Q-375; branch feedback27-35-fixes).
+function dtLocalInstant(zone, local, later = false, skipped = "later") {
   const before = dtOffsetAt(zone, local - 86400), after = dtOffsetAt(zone, local + 86400);
   const fits = (o) => dtOffsetAt(zone, local - o) === o;
   const a = fits(before), b = fits(after);
-  if (a && b) return local - Math.max(before, after);
+  if (a && b) return later ? local - Math.min(before, after) : local - Math.max(before, after);
+  if (a) return local - before;
   if (b) return local - after;
-  return local - before;
+  return skipped === "earlier" ? local - after : skipped === "error" ? null : local - before;
 }
+// A date and a wall-clock time with no offset, as `datetime-local` gives it: [day, second].
+const dtLocalDateTime = (s) => {
+  if (typeof s !== "string" || !dtAscii(s) || (s.length !== 16 && s.length !== 19) || (s[10] !== "T" && s[10] !== " ")) return null;
+  const day = dtDate(s.slice(0, 10)), sec = dtHms(s.length === 16 ? s.slice(11) + ":00" : s.slice(11));
+  return day === null || sec === null ? null : [day, sec];
+};
+const dtAtLocal = (z, local, opts, f, n) => {
+  let later = false, skipped = "later";
+  if (!isNil(opts)) {
+    if (!isMap(opts)) fail(`\`${f}\` expects options as a map as argument ${n}, got ${dtGot(opts)}`);
+    for (const k of Object.keys(opts)) {
+      const v = opts[k];
+      if (k === "repeated") { if (v !== "earlier" && v !== "later") fail(`\`${f}\`'s repeated is "earlier" or "later", got ${dtGot(v)}`); later = v === "later"; }
+      else if (k === "skipped") { if (v !== "later" && v !== "earlier" && v !== "error") fail(`\`${f}\`'s skipped is "later", "earlier" or "error", got ${dtGot(v)}`); skipped = v; }
+      else fail(`\`${f}\`: the options are repeated and skipped, not \`${k}\``);
+    }
+  }
+  const i = dtLocalInstant(z, local, later, skipped);
+  if (i === null) { const day = Math.floor(local / 86400), sec = dtMod(local, 86400); return new Err(`${f}: ${dtText(day)} ${dtPad(Math.floor(sec / 3600))}:${dtPad(Math.floor(sec % 3600 / 60))} is skipped in that zone, as its clocks move forward`); }
+  return dtStampText(i, "", dtOffsetAt(z, i)) ?? dtOutOfRange(f);
+};
+// An all-zero fraction is none (FEEDBACK30.md, Q-368; branch feedback27-35-fixes).
+const dtKeptFrac = (frac) => /^\.0*$/.test(frac || "") ? "" : frac;
+// RFC 9110's HTTP date, as UTC.
+const dtReadHttp = (s) => {
+  const m = /^[A-Z][a-z]{2}, (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}:\d{2}:\d{2}) GMT$/.exec(s.split(/\s+/).join(" "));
+  if (!m) return null;
+  const day = dtYmd(Number(m[3]), "JanFebMarAprMayJunJulAugSepOctNovDec".indexOf(m[2]) / 3 + 1, Number(m[1])), sec = dtHms(m[4]);
+  return day === null || sec === null ? null : dtStampText(day * 86400 + sec, "", 0);
+};
 const dtClock = () => Math.floor(Date.now() / 1000);
 
 // A language's names and date styles (pattern tokens), after CLDR; the
@@ -3168,7 +3280,10 @@ B.date = {
   now: (tz) => { const z = dtZone(tz, "date.now", 1), t = dtClock(); return dtStampText(t, "", dtOffsetAt(z, t)) || ""; },
   parse: (s, pattern) => {
     dtStr(s, "date.parse", 1);
-    if (isNil(pattern)) { const r = dtReadIso(s.trim()); return r === null ? new Err(`not a date or a date-time: ${dtGot(s)}`) : r; }
+    if (isNil(pattern)) {
+      if (dtLocalDateTime(s.trim()) !== null) return new Err(`${dtGot(s)} has no offset, so it is a wall-clock time and names no instant: read it in its zone with date.at(v, zone)`);
+      const r = dtReadIso(s.trim()) ?? dtReadHttp(s.trim()); return r === null ? new Err(`not a date or a date-time: ${dtGot(s)}`) : r;
+    }
     if (typeof pattern !== "string") fail(`\`date.parse\` expects a pattern (like "DD/MM/YYYY") as argument 2, got ${dtGot(pattern)}`);
     const r = dtRead(Array.from(s.trim()), Array.from(pattern));
     return r === null ? new Err(`${dtGot(s)} is not a date in the form ${dtGot(pattern)}`) : r;
@@ -3219,21 +3334,27 @@ B.date = {
   end_of_month: (v) => { const [y, m] = dtCivil(dtDateArg(v, "date.end_of_month", 1)); return dtText(dtDays(y, m, dtMonthLen(y, m))); },
   to_zone: (v, tz) => {
     const t = dtStampArg(v, "date.to_zone", 1), z = dtZone(tz, "date.to_zone", 2), i = dtInstant(t);
-    return dtStampText(i, t.frac, dtOffsetAt(z, i)) ?? dtOutOfRange("date.to_zone");
+    return dtStampText(i, dtKeptFrac(t.frac), dtOffsetAt(z, i)) ?? dtOutOfRange("date.to_zone");
+  },
+  compare: (a, b) => {
+    const key = (v, n) => { const [z, t] = dtEitherArg(v, "date.compare", n); return t ? [dtInstant(t), Number(((t.frac || "").replace(/^\./, "") + "000000000").slice(0, 9))] : [z * 86400, 0]; };
+    const x = key(a, 1), y = key(b, 2);
+    return x[0] !== y[0] ? (x[0] < y[0] ? -1 : 1) : x[1] !== y[1] ? (x[1] < y[1] ? -1 : 1) : 0;
   },
   date_in: (v, tz) => {
     const t = dtStampArg(v, "date.date_in", 1), z = dtZone(tz, "date.date_in", 2), i = dtInstant(t);
     return dtDay(Math.floor((i + dtOffsetAt(z, i)) / 86400), "date.date_in");
   },
-  at: (v, time, tz) => {
-    const f = "date.at", day = dtDateArg(v, f, 1);
+  at: (v, time, tz, opts) => {
+    const f = "date.at", both = dtLocalDateTime(v);
+    if (both !== null) return dtAtLocal(dtZone(time, f, 2), both[0] * 86400 + both[1], tz, f, 3);
+    const day = dtDateArg(v, f, 1);
     let sec = 0;
     if (!isNil(time)) {
       sec = typeof time === "string" && time.length === 5 ? dtHms(time + ":00") : typeof time === "string" && time.length === 8 ? dtHms(time) : null;
       if (sec === null) fail(`\`${f}\` expects a time (HH:MM or HH:MM:SS) as argument 2, got ${dtGot(time)}`);
     }
-    const z = dtZone(tz, f, 3), i = dtLocalInstant(z, day * 86400 + sec);
-    return dtStampText(i, "", dtOffsetAt(z, i)) ?? dtOutOfRange(f);
+    return dtAtLocal(dtZone(tz, f, 3), day * 86400 + sec, opts, f, 4);
   },
   ms: (v) => {
     const [z, t] = dtEitherArg(v, "date.ms", 1);
@@ -3934,15 +4055,26 @@ async function rpcRaw(name, args, live, idem) {
   if (idem) headers["idempotency-key"] = idem;
   // Files (from an <input type=file>) go as parts of a multipart body, the
   // other arguments as JSON beside them.
+  // A file anywhere in them goes as a part, in a list or a map too, and a FileList is a list of
+  // its files (FEEDBACK30.md, Q-364; branch feedback27-35-fixes).
   let payload;
-  if (args.some((a) => typeof Blob !== "undefined" && a instanceof Blob)) {
+  const files = [];
+  const pack = (v) => {
+    if (typeof Blob !== "undefined" && v instanceof Blob) { files.push(v); return { $quillo_file: files.length - 1 }; }
+    if (typeof FileList !== "undefined" && v instanceof FileList) return Array.from(v, pack);
+    if (Array.isArray(v)) return v.map(pack);
+    if (isMap(v)) { const o = {}; for (const k of Object.keys(v)) putKey(o, k, pack(v[k])); return o; }
+    return toJSON(v, true);
+  };
+  const packed = args.map(pack);
+  if (files.length) {
     payload = new FormData();
-    payload.append("args", JSON.stringify(args.map((a, i) => a instanceof Blob ? { $quillo_file: i } : toJSON(a, true))));
-    args.forEach((a, i) => { if (a instanceof Blob) payload.append("file" + i, a, a.name || "file"); });
+    payload.append("args", JSON.stringify(packed));
+    files.forEach((f, i) => payload.append("file" + i, f, f.name || "file"));
     delete headers["content-type"];
     headers["x-quillo-rpc"] = "1";
   } else {
-    payload = JSON.stringify(args.map((a) => toJSON(a, true)));
+    payload = JSON.stringify(packed);
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
@@ -4356,7 +4488,14 @@ function runCalc(c) {
     Owner = o;
     if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
     c.state = c.effect ? CLEAN : DIRTY;
-    if (c.effect) { report(e); return; }
+    if (c.effect) {
+      report(e);
+      // A place whose value failed is emptied: the last good value beside a field that no
+      // longer says it reads as the page's answer (FEEDBACK30.md, Q-370; branch
+      // feedback27-35-fixes).
+      if (c.apply !== null) { const l2 = Listener; Listener = null; try { c.apply(null); } catch (_) {} finally { Listener = l2; } }
+      return;
+    }
     throw e;
   }
   Listener = l;
@@ -4559,13 +4698,57 @@ function dynApply(x) {
     }
     return;
   }
-  removeNodes(r.nodes);
   const got = [];
   put(x, c, got);
+  // Markup a function made again, as `{tick(on)}` is, with the same elements as on the page and
+  // nothing in it that follows anything itself: the page's elements take the new one's
+  // attributes, text and handlers, and stay, so focus and what was typed stay (FEEDBACK25.md,
+  // Q-306; branch feedback27-35-fixes).
+  if (!this.owned && !this.clean && sameShape(r.nodes, got)) {
+    for (let i = 0; i < got.length; i++) morph(r.nodes[i], got[i]);
+    return;
+  }
+  removeNodes(r.nodes);
   const p = r.end.parentNode;
   if (p) for (const n of got) p.insertBefore(n, r.end);
   r.nodes = got;
   textareaFollows(p);
+}
+
+// Whether two lists of nodes are the same elements and texts, in the same order, all the way
+// down, with nothing in the new ones that runs by itself.
+function sameShape(a, b) {
+  if (a.length !== b.length || a.length === 0) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x.nodeType !== y.nodeType || x.__part || y.__part) return false;
+    if (x.nodeType === 1) {
+      if (x.tagName !== y.tagName || y.__mounted || x.__mounted || (x.type || "") !== (y.type || "")) return false;
+      if (!sameShape(Array.from(x.childNodes), Array.from(y.childNodes)) && (x.childNodes.length || y.childNodes.length)) return false;
+    } else if (x.nodeType !== 3) return false;
+  }
+  return true;
+}
+
+// `old` made to say what `now` says: attributes, the values a person changes, text, handlers.
+function morph(old, now) {
+  if (old.nodeType === 3) { if (old.data !== now.data) old.data = now.data; return; }
+  for (const a of Array.from(old.attributes)) if (!now.hasAttribute(a.name)) old.removeAttribute(a.name);
+  for (const a of Array.from(now.attributes)) if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
+  for (const k of ["value", "checked", "selected", "muted", "indeterminate"]) if (k in now && old[k] !== now[k]) old[k] = now[k];
+  old.__click = now.__click;
+  old.__own = now.__own;
+  if (now.__w) {
+    const cur = old.__w || (old.__w = {}), listening = old.__wl || (old.__wl = {});
+    for (const t of Object.keys(cur)) if (!(t in now.__w)) delete cur[t];
+    for (const t of Object.keys(now.__w)) {
+      cur[t] = now.__w[t];
+      if (!listening[t]) { listening[t] = true; old.addEventListener(t, (ev) => fire(old, t, ev)); }
+    }
+  } else if (old.__w) old.__w = {};
+  if (now.__click && !delegating) { delegating = true; document.addEventListener("click", delegated); }
+  const oc = old.childNodes, nc = now.childNodes;
+  for (let i = 0; i < nc.length; i++) morph(oc[i], nc[i]);
 }
 
 // An element's only content, following `get`: its children, without markers.
@@ -5131,7 +5314,14 @@ function classTokens(el, was, now) {
   for (const c of after) if (!before.includes(c)) el.classList.add(c);
 }
 
+// `style={{ color: c }}`: a property for each key, as on the server (FEEDBACK35.md, Q-429;
+// branch feedback27-35-fixes).
+const styleText = (m) => Object.keys(m).filter((k) => !isNil(m[k]) && m[k] !== false)
+  .map((k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase())) + ": " + display(m[k])).join("; ");
+
 function setProp(el, k, v, old) {
+  if (k === "style" && isMap(v)) v = styleText(v);
+  if (k === "style" && isMap(old)) old = styleText(old);
   // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
   // feedback29-fixes).
   if (k === "value" || k === "checked" || k === "selected" || k === "muted") {
@@ -5192,7 +5382,11 @@ function listen(el, t, f) {
   // An image from the server's HTML may have finished before this ran (FEEDBACK28.md,
   // Q-345; branch feedback29-fixes).
   if (claiming && el.tagName === "IMG" && el.complete && (t === "load" ? el.naturalWidth > 0 : t === "error" && el.getAttribute("src") && el.naturalWidth === 0)) {
-    queueMicrotask(() => fire(el, t, new Event(t)));
+    // Sent to the image itself, so the handler's `e.target` is it; a load of the same address
+    // the browser sends after is the same one, and is not run twice (FEEDBACK28.md, Q-418;
+    // branch feedback27-35-fixes).
+    el.__rep = { t, src: el.currentSrc || el.src };
+    queueMicrotask(() => { const ev = new Event(t); ev.__quilloReplay = true; el.dispatchEvent(ev); });
   }
   el.__own = Owner;
   if (t === "click") {
@@ -5205,7 +5399,11 @@ function listen(el, t, f) {
   const listening = el.__wl || (el.__wl = {});
   if (!listening[t]) {
     listening[t] = true;
-    el.addEventListener(t, (ev) => fire(el, t, ev));
+    el.addEventListener(t, (ev) => {
+      const rep = el.__rep;
+      if (rep && rep.t === t && !ev.__quilloReplay) { el.__rep = null; if (rep.src === (el.currentSrc || el.src)) return; }
+      fire(el, t, ev);
+    });
   }
 }
 
@@ -5305,7 +5503,7 @@ class Item extends Sig {
       for (let i = 0; i < ds.length; i++) {
         const d = ds[i];
         let x;
-        try { x = d.fn(); } catch (e) { report(e); continue; }
+        try { x = d.fn(); } catch (e) { report(e); x = null; }
         if (d.kid && !plainVal(x)) { ds.splice(i--, 1); bound(d.fn, d.apply, d.el, d.name, d.old); continue; }
         d.apply(x);
       }
@@ -5568,7 +5766,11 @@ class Inst extends Scope {
     const had = this.sigs || (this.sigs = {});
     if (had[name]) return had[name];
     if (hasOwn(this.s0, name)) {
-      const s = (had[name] = new Sig(this.s0[name]));
+      // `{"$quillo_prop": "initial"}`: the prop's own value, written once (FEEDBACK30.md, Q-371;
+      // branch feedback27-35-fixes).
+      let v = this.s0[name];
+      if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.$quillo_prop === "string") v = this.props[v.$quillo_prop];
+      const s = (had[name] = new Sig(v));
       if (page) Promise.resolve().then(init).then((x) => s.set(x), report);
       return s;
     }

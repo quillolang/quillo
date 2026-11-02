@@ -257,10 +257,12 @@ fn static_files_refuse_traversal() {
 }
 
 #[test]
-fn head_requests_have_no_body() {
+fn head_requests_have_the_gets_answer_and_the_writer_leaves_its_body_out() {
+    // The program's answer keeps its body, so the head says the GET's length; the HTTP writer
+    // sends no body (tests/feedback31.rs) (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
     let mut it = app(r#"route GET / = "hello""#);
     let r = send(&mut it, "HEAD", "/", None, "");
-    assert_eq!((r.status, r.body.len()), (200, 0));
+    assert_eq!((r.status, r.body.len()), (200, 5));
 }
 
 #[test]

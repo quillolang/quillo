@@ -44,7 +44,7 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 adb="$ANDROID_HOME/platform-tools/adb"
 echo "== $APP_NAME ($APP_ID) $APP_VERSION ($APP_BUILD)${APP_CONFIG:+, from app.toml}"
 [ -z "$APP_CONFIG" ] && echo "   no app.toml in $prog: Quillo's name, id and icon are used"
-export QUILLO_APP_NAME="$APP_NAME" QUILLO_APP_ID="$APP_ID" QUILLO_APP_VERSION="$APP_VERSION" QUILLO_APP_BUILD="$APP_BUILD" QUILLO_APP_MAIN="$APP_MAIN"
+export QUILLO_APP_NAME="$APP_NAME" QUILLO_APP_ID="$APP_ID" QUILLO_APP_VERSION="$APP_VERSION" QUILLO_APP_BUILD="$APP_BUILD" QUILLO_APP_MAIN="$APP_MAIN" QUILLO_APP_SITE="$APP_SITE"
 
 echo "== the runtime, for Android"
 (cd "$root/mobile/quillo-mobile" && cargo ndk -t arm64-v8a -t x86_64 -o "$here/app/src/main/jniLibs" build --release)
@@ -52,14 +52,7 @@ echo "== the runtime, for Android"
 echo "== the program, from $prog"
 assets="$here/app/src/main/assets/program"
 rm -rf "$assets"; mkdir -p "$assets"
-skip=$(cd "$prog" && find . -mindepth 2 -name main.qwe -exec dirname {} \; | sed 's#^\./##')
-(cd "$prog" && find . -type f \
-    ! -name '*.db' ! -name '*.db-wal' ! -name '*.db-shm' ! -name '*.sqlite' ! -path './uploads/*' ! -path './.quillo/*' \
-    | while read -r f; do
-        rel=${f#./}; keep=1
-        for s in $skip; do case "$rel" in "$s"/*) keep="";; esac; done
-        if [ -n "$keep" ]; then mkdir -p "$assets/$(dirname "$rel")"; cp "$f" "$assets/$rel"; fi
-      done; true)
+app_copy_program "$prog" "$assets"
 
 echo "== the icon"
 # A launcher icon at each density, and an adaptive one (Android 8+) whose background is

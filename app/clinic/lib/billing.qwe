@@ -1,0 +1,52 @@
+// Invoices: one per appointment, in the branch's currency, with its tax.
+
+private fn line(label: str, qty: int, unit: map) = { label, qty, unit, amount: money.mul(unit, qty) }
+
+public fn issue_invoice(appointment_id: int) with db, time {
+    let a = db.one(sql`
+        select d.fee, b.currency, b.tax_rate from appointments a
+        join doctors d on d.id = a.doctor_id join branches b on b.id = d.branch_id
+        where a.id = ?`, appointment_id) ?? return err("no appointment")
+    let lines = [
+        line("Consultation", 1, money.of(a.fee, a.currency)?),
+        line("Booking fee", 1, money.of(a.currency == "JPY" ? 300 : 2, a.currency)?),
+    ]
+    let subtotal = reduce(lines, money.zero(a.currency), (acc, l) => money.add(acc, l.amount))
+    let tax = money.mul(subtotal, a.tax_rate / 100, "half_up")
+    let total = money.add(subtotal, tax)
+    let inv = db.one("insert into invoices (appointment_id, currency, subtotal, tax, total, issued_at) values (?, ?, ?, ?, ?, ?) returning id",
+        appointment_id, a.currency, subtotal.amount, tax.amount, total.amount, date.now())?
+    for l in lines {
+        db.exec("insert into invoice_lines (invoice_id, label, qty, unit, amount) values (?, ?, ?, ?, ?)", inv.id, l.label, l.qty, l.unit.amount, l.amount.amount)?
+    }
+    inv.id
+}
+
+public fn invoice(id: int) with db {
+    let i = db.one(sql`
+        select i.*, a.patient_id, a.starts_at, b.name as branch, b.locale, b.tax_rate, b.zone, u.name as patient
+        from invoices i join appointments a on a.id = i.appointment_id
+        join doctors d on d.id = a.doctor_id join branches b on b.id = d.branch_id
+        join users u on u.id = a.patient_id where i.id = ?`, id) ?? return null
+    { ...i, lines: db.query("select * from invoice_lines where invoice_id = ? order by id", id) }
+}
+
+// A field of a CSV row: quoted when it holds a comma, a quote or a line break,
+// and kept from being read as a formula by a spreadsheet.
+private fn cell(v) -> str {
+    let s = str(v ?? "")
+    let s2 = re.test(s, "^[=+\\-@\\t\\r]") ? `'${s}` : s
+    re.test(s2, "[\",\\r\\n]") ? `"${replace(s2, "\"", "\"\"")}"` : s2
+}
+
+public fn invoices_csv(branch_id: int) with db = stream((send) => {
+    send("invoice,issued,patient,branch,currency,subtotal,tax,total\r\n")
+    let rows = db.query(sql`
+        select i.id, i.issued_at, u.name as patient, b.name as branch, i.currency, i.subtotal, i.tax, i.total
+        from invoices i join appointments a on a.id = i.appointment_id join users u on u.id = a.patient_id
+        join doctors d on d.id = a.doctor_id join branches b on b.id = d.branch_id
+        where b.id = ? order by i.id`, branch_id)
+    for r in rows {
+        send(join([r.id, r.issued_at, r.patient, r.branch, r.currency, r.subtotal, r.tax, r.total] | map(cell), ",") + "\r\n")
+    }
+}, { type: "text/csv; charset=utf-8", headers: { "content-disposition": "attachment; filename=\"invoices.csv\"" } })

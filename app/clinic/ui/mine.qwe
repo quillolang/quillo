@@ -1,0 +1,63 @@
+// <Mine>: the patient's appointments, with cancelling; <Results>: their lab
+// results, with an upload of their own.
+
+import lib/zones.qwe use both_times, local_day, days_until
+import lib/booking.qwe use cancel
+import lib/files.qwe use add_result
+
+component Mine(rows: list, my_zone: str, today: str) {
+    state items = rows
+    state problem = null
+    let loc = locale()
+    let booked = items | filter((a) => a.status == "booked")
+    <section.card #mine>
+        <h1>{t("mine.title")}</h1>
+        <p #upcoming>{t("mine.count", { count: len(booked) })}</p>
+        {len(items) == 0 && <p>{t("mine.empty")}</p>}
+        <ul.appts>
+            {for a in items => <li key={a.id} class={a.status}>
+                <b>{a.doctor}</b> · {a.branch}
+                <span.when>{local_day(a.starts_at, a.zone, loc)} {both_times(a.starts_at, a.zone, my_zone)}</span>
+                <span.soon>{t("mine.in_days", { count: days_until(a.starts_at, my_zone, today) })}</span>
+                {a.invoice_id != null && <a href={`/invoices/${a.invoice_id}`}>{money.format({ amount: a.total, currency: a.currency })}</a>}
+                {a.status == "booked"
+                    ? <button type="button" @click={() => {
+                        if ask(t("mine.cancel") + "?", { tone: "danger" }) {
+                            let r = cancel(a.id)
+                            if is_err(r) { problem = r.error } else {
+                                items = items | map((x) => x.id == a.id ? { ...x, status: "cancelled" } : x)
+                            }
+                        }
+                    }}>{t("mine.cancel")}</button>
+                    : <em>{t("mine.cancelled")}</em>}
+            </li>}
+        </ul>
+        {problem != null && <p.problem>{problem}</p>}
+    </section>
+}
+
+component Results(rows: list) {
+    state items = rows
+    state note = ""
+    state msg = null
+    <section.card #results>
+        <h1>{t("results.title")}</h1>
+        <p #nfiles>{t("results.count", { count: len(items) })}</p>
+        <ul>
+            {for r in items => <li key={r.id}><a href={`/results/${r.id}/${url_encode(r.filename)}`}>{r.filename}</a> <small>{r.note}</small></li>}
+        </ul>
+        <label>{t("results.note")} <input bind:value={note}/></label>
+        <input #file type="file" accept="application/pdf,image/*" @change={(e) => {
+            let f = e.target.files[0]
+            if f == null { return null }
+            let r = add_result(f, note)
+            if is_err(r) { msg = r.error } else {
+                msg = r.filename
+                items = [r, ...items]
+                note = ""
+            }
+            e.value = ""
+        }}/>
+        {msg != null && <p.msg #upmsg>{msg}</p>}
+    </section>
+}

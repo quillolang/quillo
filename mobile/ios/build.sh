@@ -53,15 +53,7 @@ build="$here/build/$sdkname"
 out="$build/Quillo.app"
 rm -rf "$build"; mkdir -p "$out/program"
 echo "== the program, from $prog"
-skip=$(cd "$prog" && find . -mindepth 2 -name main.qwe -exec dirname {} \; | sed 's#^\./##')
-(cd "$prog" && find . -type f \
-    ! -name '*.db' ! -name '*.db-wal' ! -name '*.db-shm' ! -name '*.sqlite' ! -path './uploads/*' ! -path './.quillo/*' \
-    | while read -r f; do
-        rel=${f#./}; keep=1
-        for s in $skip; do case "$rel" in "$s"/*) keep="";; esac; done
-        if [ -n "$keep" ]; then mkdir -p "$out/program/$(dirname "$rel")"; cp "$f" "$out/program/$rel"; fi
-      done; true)
-echo "   $(find "$out/program" -type f | wc -l | tr -d ' ') files, leaving out: $(echo $skip | tr '\n' ' ')"
+app_copy_program "$prog" "$out/program"
 
 echo "== the app"
 sdk=$(xcrun --sdk $sdkname --show-sdk-path)
@@ -81,6 +73,7 @@ plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "$plist"
 plutil -replace CFBundleVersion -string "$APP_BUILD" "$plist"
 plutil -replace CFBundleSupportedPlatforms -json "[\"$platform\"]" "$plist"
 plutil -replace QuilloMain -string "$APP_MAIN" "$plist"
+plutil -replace QuilloSite -string "${APP_SITE:-}" "$plist"
 cp "$here/Quillo/PrivacyInfo.xcprivacy" "$out/"
 
 # The icon: an asset catalog of one 1024-point image, compiled by actool, which also

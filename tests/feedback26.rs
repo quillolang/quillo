@@ -316,5 +316,5 @@ fn a_program_takes_its_arguments() {
     assert_eq!(run(&[]).0, "[]\n0\n");
     assert_eq!(run(&["--", "a", "b c", "--port"]).0, "[\"a\", \"b c\", \"--port\"]\n3\n");
     assert_eq!(run(&["--no-check", "--", "x"]).0, "[\"x\"]\n1\n");
-    assert!(run(&["a"]).1.contains("unknown option"));
+    assert!(run(&["a"]).1.contains("unknown argument"));
 }

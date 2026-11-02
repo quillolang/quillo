@@ -103,7 +103,9 @@ fn open(ctx: &str, cookie: &str) -> Option<Value> {
     if j.get("e")?.as_u64()? <= now() {
         return None;
     }
-    Some(Value::from_json(j.get("d")?))
+    // Decimals and ints past 2^53 come back as they went, as an island's do, not as text
+    // that `+` would join (FEEDBACK30.md, Q-374; branch feedback27-35-fixes).
+    Some(crate::interp::from_island_json(j.get("d")?))
 }
 
 /// `payload`, signed with the session key for `purpose`: something the
@@ -196,10 +198,15 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
     };
     // SameSite=None is only kept by browsers on Secure cookies.
     let plain = PLAIN_HTTP.load(std::sync::atomic::Ordering::Relaxed);
-    let secure = same_site == "None" || opt("secure").map_or(!plain, |v| v.truthy());
+    // A deletion carries nothing to keep from a plain connection, and one marked `Secure` is
+    // dropped by a browser there: a cookie set with `secure: false` could never be taken away.
+    // It is `Secure` where the request came over HTTPS, or the name needs it (FEEDBACK34.md,
+    // Q-425; branch feedback27-35-fixes).
+    let default_secure = if f == "delete_cookie" { came_over_https(it) || name.starts_with("__Host-") || name.starts_with("__Secure-") } else { !plain };
+    let secure = same_site == "None" || opt("secure").map_or(default_secure, |v| v.truthy());
     if secure {
         s.push_str("; Secure");
-        warn_if_dropped(it);
+        warn_if_dropped(it, name);
     }
     s.push_str("; SameSite=");
     s.push_str(&same_site);
@@ -211,7 +218,12 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
 /// is not this machine's) is dropped by the browser: signing in there never
 /// sticks, and nothing else would say so. Said once (FEEDBACK13.md, Q-089;
 /// branch feedback13-fixes).
-fn warn_if_dropped(it: &mut Interp) {
+/// Whether the request came over HTTPS, as far as this server can tell: a proxy says so.
+fn came_over_https(it: &mut Interp) -> bool {
+    header(it, "x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"))
+}
+
+fn warn_if_dropped(it: &mut Interp, cookie: &str) {
     if WARNED_PLAIN.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -226,9 +238,11 @@ fn warn_if_dropped(it: &mut Interp) {
     }
     if !WARNED_PLAIN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "quillo: warning: a Secure cookie was sent to http://{} over plain HTTP, which browsers drop: sessions will not stick there. \
+            "quillo: warning: the Secure cookie `{}` was sent to http://{} over plain HTTP, which browsers drop{}. \
              Serve the site over HTTPS (a proxy with TLS in front, sending x-forwarded-proto: https), or run with --plain-http on a network you trust",
-            host
+            cookie,
+            host,
+            if cookie == COOKIE || cookie == HOST_COOKIE { ": sessions will not stick there" } else { "" }
         );
     }
 }
@@ -308,6 +322,7 @@ pub(crate) fn send_cookie(it: &mut Interp, value: &str, age: Option<u64>, line: 
 
 /// `session()`: the map `set_session` stored, or `{}`.
 fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
+    it.visitor_read = true;
     if let Some(s) = &it.session {
         return Ok(s.clone());
     }
@@ -329,6 +344,7 @@ fn cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Str(s)) => s.clone(),
         other => return fail(line, format!("`cookie` expects a cookie's name, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
+    it.visitor_read = true;
     let Some(Value::Map(req)) = it.request_value() else { return Ok(Value::Nil) };
     Ok(match req.get("cookies") {
         Some(Value::Map(c)) => c.get(&*name).cloned().unwrap_or(Value::Nil),
@@ -352,7 +368,7 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         },
     };
     let mut json = Vec::new();
-    serde_json::to_writer(&mut json, &serde_json::json!({ "e": now() + age, "d": data.to_json() })).ok();
+    serde_json::to_writer(&mut json, &serde_json::json!({ "e": now() + age, "d": crate::interp::island_json(&data) })).ok();
     let payload = b64url(&json);
     let ctx = context(it);
     let value = format!("{}.{}", payload, sign(&ctx, &payload));

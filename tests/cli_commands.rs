@@ -62,13 +62,14 @@ fn help_is_on_stdout_and_a_wrong_command_gets_it_on_stderr() {
     for args in [&["help"][..], &["--help"], &["-h"], &["run", "app.qwe", "--help"], &["run", "app.qwe", "-h"]] {
         let o = quillo(&dir, args);
         assert!(o.status.success(), "{:?}", args);
-        assert!(out(&o).contains("usage:\n  quillo run <file.qwe> [options]"), "{:?}", args);
+        assert!(out(&o).contains("usage:\n  quillo new <folder>") && out(&o).contains("\n  quillo run <file.qwe> [options]"), "{:?}", args);
         assert!(!out(&o).contains("ran\n"), "`--help` runs nothing");
     }
+    // A wrong command is told the nearest, not the whole usage (FEEDBACK31.md, Q-389).
     let o = quillo(&dir, &["serve"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(out(&o).is_empty());
-    assert!(err(&o).contains("usage:\n  quillo run <file.qwe> [options]"));
+    assert!(err(&o).contains("unknown command `serve`") && !err(&o).contains("usage:"), "{}", err(&o));
 }
 
 #[test]
@@ -115,7 +116,7 @@ fn an_unknown_option_is_named_with_what_was_probably_meant() {
         (&["run", "app.qwe", "-p", "8081"], "quillo: unknown option `-p` (the port is `--port`)\n"),
         (&["run", "app.qwe", "--quite-unlike-any-option-there-is"], "quillo: unknown option `--quite-unlike-any-option-there-is`\n"),
         // A second program is not one more option.
-        (&["run", "app.qwe", "other.qwe"], "quillo: unknown option `other.qwe`\n"),
+        (&["run", "app.qwe", "other.qwe"], "quillo: unknown argument `other.qwe`: a program's own arguments go after `--`, as `quillo run tool.qwe -- other.qwe`\n"),
     ] {
         assert_eq!(refused(&dir, args), (2, said.to_string()), "{:?}", args);
     }
@@ -205,10 +206,11 @@ fn register_and_join_need_a_numeric_port() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert_eq!((o.status.code(), err(&o).as_str()), (Some(2), "quillo: --register needs a numeric --port\n"));
+    // A port that is no number is refused with the options (FEEDBACK31.md, Q-381).
+    assert_eq!((o.status.code(), err(&o).as_str()), (Some(2), "quillo: --port is a number from 1 to 65535 (or 0 for any free one), got \"eighty\"\n"));
     assert_eq!(
         refused(&dir, &["run", "app.qwe", "--as-service", "--join", "http://127.0.0.1:9", "--port", "eighty"]),
-        (2, "quillo: --join needs a numeric --port\n".into())
+        (2, "quillo: --port is a number from 1 to 65535 (or 0 for any free one), got \"eighty\"\n".into())
     );
     assert_eq!(
         refused(&dir, &["run", "app.qwe", "--join", "http://127.0.0.1:9", "--port", "8081"]),
@@ -352,7 +354,7 @@ fn repl(dir: &Path, args: &[&str], input: &str) -> Output {
 #[test]
 fn the_repl_evaluates_line_by_line_and_keeps_what_it_was_given() {
     let dir = folder("repl", &[]);
-    let o = repl(&dir, &["repl"], "1 + 2\nlet x = 40\nfn more(n) = n + 2\nmore(x)\nprint(\"said\")\n");
+    let o = repl(&dir, &["repl", "-i"], "1 + 2\nlet x = 40\nfn more(n) = n + 2\nmore(x)\nprint(\"said\")\n");
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
     assert!(text.starts_with(&format!("Quillo {}", env!("CARGO_PKG_VERSION"))), "{}", text);
@@ -368,15 +370,16 @@ fn the_repl_evaluates_line_by_line_and_keeps_what_it_was_given() {
 #[test]
 fn the_repl_is_what_quillo_alone_starts() {
     let dir = folder("repl-bare", &[]);
+    // From a pipe, the answers alone (FEEDBACK31.md, Q-388; branch feedback27-35-fixes).
     let o = repl(&dir, &[], "\"strings show as code\"\n");
     assert!(o.status.success());
-    assert!(out(&o).contains("quillo> \"strings show as code\"\n"), "{}", out(&o));
+    assert_eq!(out(&o), "\"strings show as code\"\n");
 }
 
 #[test]
 fn the_repl_waits_for_the_rest_of_an_unfinished_statement() {
     let dir = folder("repl-more", &[]);
-    let o = repl(&dir, &["repl"], "let y =\n5\ny\nfn f() {\n1 + 1\n}\nf()\n");
+    let o = repl(&dir, &["repl", "-i"], "let y =\n5\ny\nfn f() {\n1 + 1\n}\nf()\n");
     assert!(o.status.success());
     let text = out(&o);
     assert!(text.contains("quillo> ....> quillo> 5\n"), "{}", text);
@@ -386,7 +389,7 @@ fn the_repl_waits_for_the_rest_of_an_unfinished_statement() {
 #[test]
 fn the_repl_says_what_went_wrong_and_goes_on() {
     let dir = folder("repl-errors", &[]);
-    let o = repl(&dir, &["repl"], "print(1) print(2) extra words\n1 / 0\nprint(\"first\"); nope(); print(\"not reached\")\n7\n");
+    let o = repl(&dir, &["repl", "-i"], "print(1) print(2) extra words\n1 / 0\nprint(\"first\"); nope(); print(\"not reached\")\n7\n");
     assert!(o.status.success());
     let (text, wrong) = (out(&o), err(&o));
     assert!(wrong.contains("error: line 1: expected"), "{}", wrong);
@@ -400,7 +403,7 @@ fn the_repl_says_what_went_wrong_and_goes_on() {
 #[test]
 fn the_repl_shows_what_a_return_or_a_reply_would_give() {
     let dir = folder("repl-control", &[]);
-    let o = repl(&dir, &["repl"], "return 4\nreply 404 \"gone\"\nnull\n");
+    let o = repl(&dir, &["repl", "-i"], "return 4\nreply 404 \"gone\"\nnull\n");
     assert!(o.status.success());
     let text = out(&o);
     assert!(text.contains("quillo> 4\n"), "{}", text);
@@ -411,7 +414,7 @@ fn the_repl_shows_what_a_return_or_a_reply_would_give() {
 #[test]
 fn the_repl_points_to_the_program_in_its_folder() {
     let dir = folder("repl-main", &[("main.qwe", PRINTS)]);
-    let o = repl(&dir, &["repl"], "");
+    let o = repl(&dir, &["repl", "-i"], "");
     assert!(o.status.success());
     assert!(out(&o).contains("main.qwe is here: `quillo run` serves it\n"), "{}", out(&o));
     assert!(!out(&o).contains("ran\n"), "the repl does not run it");

@@ -132,20 +132,49 @@ pub fn request_done() {
 /// reports leads to it, and as an object where the log is objects (FEEDBACK21.md, Q-175;
 /// branch feedback20-fixes).
 pub fn error_line(text: &str) {
+    error_line_with(text, &[]);
+}
+
+/// `error_line` for an error and the calls it came through. What the error says may hold what a
+/// visitor sent: its line breaks and control characters are written as `\n` and `\x1b`, so it
+/// cannot add lines of its own to the log or reach a terminal (FEEDBACK31.md, Q-378; branch
+/// feedback27-35-fixes).
+pub fn error_line_with(text: &str, calls: &[String]) {
     let key = own_request();
     let what = lock(&RUNNING).as_ref().and_then(|m| m.get(&key).cloned());
     if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
         // The calls it came through, as a field and not in the text (FEEDBACK21.md, Q-174; branch
         // feedback20-fixes).
-        let mut lines = text.lines();
-        let error = lines.next().unwrap_or("");
-        let calls: Vec<&str> = lines.map(str::trim).collect();
-        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "error", "request": what, "error": error, "calls": calls }));
-    } else if let Some(what) = what {
-        eprintln!("quillo: error: {}: {}", what, text);
-    } else {
-        eprintln!("quillo: error: {}", text);
+        eprintln!("{}", serde_json::json!({ "time": iso_now(), "level": "error", "request": what, "error": text, "calls": calls }));
+        return;
     }
+    let mut line = match what {
+        Some(what) => format!("quillo: error: {}: {}", log_safe(&what), log_safe(text)),
+        None => format!("quillo: error: {}", log_safe(text)),
+    };
+    for c in calls {
+        line.push_str("\n  ");
+        line.push_str(&log_safe(c));
+    }
+    eprintln!("{}", line);
+}
+
+/// Text for a line of the log: control characters, line breaks among them, as escapes.
+pub fn log_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(|c| c.is_control() && c != '\t') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push('\t'),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// What is in progress, for a line in the log.
@@ -1329,7 +1358,13 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
         }
         match item {
             Item::Bad(status, why, line) => {
-                log(format!("{} -> {} ({})\n", line, status, why));
+                // As it came, but for what would reach a terminal; an object where the log is
+                // objects (FEEDBACK31.md, Q-378; branch feedback27-35-fixes).
+                if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
+                    log(format!("{}\n", serde_json::json!({ "time": iso_now(), "status": status, "error": why, "line": line })));
+                } else {
+                    log(format!("{} -> {} ({})\n", log_safe(&line), status, why));
+                }
                 write_response(&mut c.output, &crate::server::plain_response(status, &format!("{}\n", why)), false, true);
                 c.closing = true;
                 return Fate::Keep;
@@ -1590,11 +1625,44 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
         }
         (buf[head..head + n].to_vec(), head + n)
     };
+    // One `Host`, a host and a port, as RFC 9112 §3.2 asks: with two, a proxy routing by the first
+    // and this server answering for the last disagree about whose site it is. A request in the
+    // absolute form names its host in its target (§3.2.2). Methods are case-sensitive: `get` is
+    // none this server has (FEEDBACK31.md, Q-393; branch feedback27-35-fixes).
+    let method = r.method.unwrap_or("GET");
+    if !method.bytes().all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_') {
+        return Parsed::Bad(501, "unknown method (methods are written in capitals)");
+    }
+    let mut url = r.path.unwrap_or("/").to_string();
+    let absolute = ["http://", "https://"].iter().find_map(|s| url.get(..s.len()).filter(|p| p.eq_ignore_ascii_case(s)).map(|p| p.len()));
+    if let Some(n) = absolute {
+        let rest = url[n..].to_string();
+        let (authority, path) = match rest.find(['/', '?']) {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.clone(), "/".to_string()),
+        };
+        hs.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
+        hs.push(("host".into(), authority));
+        url = if path.starts_with('?') { format!("/{}", path) } else { path };
+    }
+    let hosts: Vec<&str> = hs.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.as_str()).collect();
+    if hosts.len() > 1 {
+        return Parsed::Bad(400, "more than one host header");
+    }
+    if hosts.is_empty() && version == 1 {
+        return Parsed::Bad(400, "no host header");
+    }
+    if let Some(h) = hosts.first() {
+        let ok = !h.is_empty() && h.len() <= 255 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:[]%~!$&'()*+,;=".contains(&b));
+        if !ok {
+            return Parsed::Bad(400, "bad host header");
+        }
+    }
     let remote = client_of(peer, &hs);
     Parsed::Done {
         req: HttpRequest {
-            method: r.method.unwrap_or("GET").to_ascii_uppercase(),
-            url: r.path.unwrap_or("/").to_string(),
+            method: method.to_string(),
+            url,
             headers: hs,
             body,
             remote,

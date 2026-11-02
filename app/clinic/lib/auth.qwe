@@ -1,0 +1,42 @@
+// Accounts: patients sign themselves up; doctors and the front desk are made
+// by the seed. The session holds the user's id and nothing else.
+
+public type Signup = { name: str, email: str, password: str }
+
+public fn me() with db {
+    let id = session().user ?? return null
+    db.one("select id, email, name, role, locale, zone, branch_id from users where id = ?", id)
+}
+
+public fn sign_up(f: Signup) with db, random {
+    let email = lower(trim(f.email))
+    if len(trim(f.name)) == 0 || !contains(email, "@") || len(f.password) < 8 { return err("bad") }
+    let r = db.exec("insert into users (email, name, password_hash) values (?, ?, ?)", email, trim(f.name), crypto.hash_password(f.password))
+    if db.error_kind(r) == "unique" { return err(t("auth.taken")) }
+    r?
+    set_session({ user: r.last_id })
+    r.last_id
+}
+
+public fn sign_in(email: str, password: str) with db {
+    let u = db.one("select id, password_hash from users where email = ?", lower(trim(email)))
+    if u == null || !crypto.verify_password(password, u.password_hash) { return err(t("auth.wrong")) }
+    set_session({ user: u.id })
+    u.id
+}
+
+public fn sign_out() { end_session() }
+
+// Middleware for route groups.
+public fn signed_in(r) = session().user != null ? r : reply 303 redirect(`/login?next=${url_encode(r.path)}`)
+public fn staff(r) {
+    let u = me()
+    u != null && (u.role == "desk" || u.role == "doctor") ? r : reply 403 "Staff only"
+}
+
+// The visitor's own zone, which a page's script puts in a cookie; the
+// branch's until it has.
+public fn my_zone(fallback: str) -> str {
+    let z = cookie("tz") ?? return fallback
+    date.valid_zone(z) ? z : fallback
+}

@@ -46,6 +46,9 @@ pub struct Site {
     pub udp: Vec<std::sync::Arc<crate::udp::Listener>>,
     /// What `channel.on` handles (see `wt`).
     pub channels: Vec<std::sync::Arc<crate::wt::Handler>>,
+    /// `site_headers(...)`: headers for every answer under a path ("/" for all), a null value
+    /// taking one of Quillo's own away (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
+    pub headers: Vec<(String, Vec<(String, Option<String>)>)>,
 }
 
 impl Site {

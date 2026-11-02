@@ -1,0 +1,46 @@
+// Time in the clinic: every branch books in its own zone, every instant is
+// kept in UTC ("2026-11-03T01:30:00Z"), and a patient sees both the branch's
+// time and their own. Pure functions: pages use them too.
+
+// "08:30" as minutes from midnight.
+public fn minutes_of(hhmm: str) -> int {
+    let [h, m] = split(hhmm, ":")
+    int(h) * 60 + int(m)
+}
+
+// No padding builtin: two digits by hand.
+private fn two(n: int) -> str = n < 10 ? `0${n}` : str(n)
+public fn hhmm(minutes: int) -> str = `${two(floor(minutes / 60))}:${two(minutes % 60)}`
+
+// The instants a doctor can be booked on a local day at a branch. A time the
+// clocks skip (02:30 on the day they go forward) comes back moved forward, so
+// two local times can name one instant: each instant is offered once.
+public fn day_slots(day: str, branch: map, doctor: map) -> list {
+    let weekday = date.weekday(day)
+    let days = split(doctor.days, ",") | map((d) => int(d))
+    if !(days | any((d) => d == weekday)) { return [] }
+    let start = minutes_of(branch.opens)
+    let end = minutes_of(branch.closes)
+    let step = doctor.slot_minutes
+    // `range` takes no step: count the slots that fit.
+    let n = floor((end - start) / step)
+    let times = for i in 0..n => date.to_zone(date.at(day, hhmm(start + i * step), branch.zone), "UTC")
+    times | unique() | sort()
+}
+
+// What a patient reads: the branch's wall clock, and theirs when it differs.
+public fn local_time(t: str, zone: str) -> str = date.format(date.to_zone(t, zone), "HH:mm")
+
+public fn local_day(t: str, zone: str, loc: str) -> str = date.format(date.date_in(t, zone), { locale: loc, style: "full" })
+
+public fn both_times(t: str, branch_zone: str, my_zone: str) -> str {
+    let there = local_time(t, branch_zone)
+    if my_zone == branch_zone || my_zone == "" { return there }
+    let mine = local_time(t, my_zone)
+    let shift = date.days_between(date.date_in(t, branch_zone), date.date_in(t, my_zone))
+    let mark = shift == 0 ? "" : shift > 0 ? ` (+${shift})` : ` (${shift})`
+    `${there} · ${mine}${mark}`
+}
+
+// Whole days from today (in the zone) to the instant's day there.
+public fn days_until(t: str, zone: str, today: str) -> int = date.days_between(today, date.date_in(t, zone))

@@ -1,0 +1,24 @@
+{
+  "app": { "name": "Quillo Clinic", "tagline": "Four branches, one booking desk" },
+  "nav": { "book": "Book", "mine": "My appointments", "results": "Lab results", "desk": "Front desk", "login": "Sign in", "logout": "Sign out", "lang": "Language" },
+  "auth": { "email": "Email", "password": "Password", "name": "Full name", "signup": "Create account", "wrong": "Wrong email or password", "taken": "That email is already registered" },
+  "book": {
+    "branch": "Branch", "doctor": "Doctor", "day": "Day", "pick": "Pick a time",
+    "local": "Times are in {branch} time ({zone}).", "yours": "Your time: {time}",
+    "none": "No free times that day.", "reason": "Reason for the visit", "confirm": "Book {time}",
+    "done": "Booked: {doctor}, {when}", "taken": "Someone has just taken that time. Pick another.",
+    "past": "That time has passed.", "closed": "The branch is closed that day.",
+    "slots": { "zero": "No free times", "one": "{count} free time", "other": "{count} free times" }
+  },
+  "mine": {
+    "title": "My appointments", "empty": "You have no appointments.", "cancel": "Cancel", "cancelled": "Cancelled",
+    "count": { "one": "{count} upcoming appointment", "other": "{count} upcoming appointments" },
+    "in_days": { "zero": "today", "one": "tomorrow", "other": "in {count} days" }
+  },
+  "results": {
+    "title": "Lab results", "upload": "Upload results", "for": "Patient", "note": "Note", "empty": "No results yet.",
+    "count": { "one": "{count} file", "other": "{count} files" }, "too_big": "Files up to 5 MB", "kind": "PDF or image only"
+  },
+  "invoice": { "title": "Invoice {n}", "line": "Item", "qty": "Qty", "unit": "Unit", "amount": "Amount", "subtotal": "Subtotal", "tax": "Tax ({rate}%)", "total": "Total", "export": "Export CSV" },
+  "remind": { "body": "Reminder: {doctor} at {branch}, {when} (your time {local})." }
+}

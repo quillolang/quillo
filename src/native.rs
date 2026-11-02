@@ -430,7 +430,7 @@ mod __quillo {
                     match &v {
                         Value::Number(n) if !n.is_f64() => n.as_i64().and_then(|i| <$t>::try_from(i).ok())
                             .or_else(|| n.as_u64().and_then(|i| <$t>::try_from(i).ok()))
-                            .ok_or_else(|| format!("{} does not fit in {}", n, stringify!($t))),
+                            .ok_or_else(|| format!("!does not fit in {}: {}", stringify!($t), n)),
                         _ => Err(format!("int, got {}", kind(&v))),
                     }
                 }
@@ -601,7 +601,12 @@ mod __quillo {
 
     pub fn arg<T: FromQ>(args: &mut Vec<Value>, i: usize, f: &str, name: &str) -> Result<T, String> {
         let v = args.get_mut(i).map(Value::take).unwrap_or(Value::Null);
-        T::from_q(v).map_err(|e| format!("`{}`: argument `{}` must be {}", f, name, e))
+        // "does not fit" reads as itself, not after "must be" (FEEDBACK27.md, Q-328; branch
+        // feedback27-35-fixes).
+        T::from_q(v).map_err(|e| match e.strip_prefix('!') {
+            Some(e) => format!("`{}`: argument `{}` {}", f, name, e),
+            None => format!("`{}`: argument `{}` must be {}", f, name, e),
+        })
     }
 
     /// Runs a call: `{"ok": v}`, `{"err": "..."}` (an error value),
@@ -884,6 +889,7 @@ struct Function {
     index: u32,
     name: String,
     file: String,
+    params: Vec<String>,
 }
 
 fn functions() -> &'static Mutex<HashMap<&'static str, Arc<Function>>> {
@@ -947,7 +953,7 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         // a version loaded later has names of its own.
         let key: &'static str = Box::leak(format!("native:{}:{}", lib_path.display(), e.name).into_boxed_str());
         functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_insert_with(|| {
-            Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone() })
+            Arc::new(Function { lib: lib.clone(), index: i as u32, name: e.name.clone(), file: file.clone(), params: e.params.iter().map(|(n, _)| n.clone()).collect() })
         });
         for n in names {
             define(&it.globals, n, Value::Builtin(key, call_placeholder));
@@ -993,7 +999,17 @@ pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
     let Some(f) = functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned() else {
         return fail(line, "a Rust function was called without its library");
     };
-    let input = serde_json::to_vec(&serde_json::Value::Array(args.iter().map(|a| a.to_json()).collect())).unwrap_or_default();
+    let json: Vec<serde_json::Value> = args.iter().map(|a| a.to_json()).collect();
+    // The plugin reads its arguments with serde_json, which stops past 128 levels with a line
+    // and column of a text the program never wrote: said here, by the argument's name
+    // (FEEDBACK27.md, Q-328; branch feedback27-35-fixes).
+    for (i, a) in json.iter().enumerate() {
+        if depth(a) > MAX_DEPTH {
+            let name = f.params.get(i).cloned().unwrap_or_else(|| format!("{}", i + 1));
+            return fail(line, format!("`{}`: argument `{}` is nested too deeply: a plugin takes values at most {} levels deep", f.name, name, MAX_DEPTH));
+        }
+    }
+    let input = serde_json::to_vec(&serde_json::Value::Array(json)).unwrap_or_default();
     let lib = f.lib.clone();
     let index = f.index;
     let out = it.unlocked(move || {
@@ -1006,8 +1022,20 @@ pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
             bytes
         }
     });
-    let j: serde_json::Value = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    // An answer too deep for serde_json is said as that, not as a panic that did not happen
+    // (FEEDBACK27.md, Q-329; branch feedback27-35-fixes).
+    let parsed = serde_json::from_slice::<serde_json::Value>(&out);
+    if parsed.as_ref().is_err_and(|e| e.to_string().contains("recursion limit")) {
+        return fail(line, format!("`{}` ({}) gave back a value nested too deeply: Quillo takes a plugin's answer at most {} levels deep", f.name, f.file, MAX_DEPTH));
+    }
+    let j = parsed.unwrap_or(serde_json::Value::Null);
     if let Some(v) = j.get("ok") {
+        // A u64 past i64 inside a value would become a float, a different number that looks
+        // right: refused as the same number alone is (FEEDBACK27.md, Q-327; branch
+        // feedback27-35-fixes).
+        if let Some((at, n)) = too_large(v, String::new()) {
+            return fail(line, format!("`{}` ({}) gave back {} at {}, which is too large for Quillo's int: give it back as text", f.name, f.file, n, if at.is_empty() { "the top".to_string() } else { at }));
+        }
         return Ok(Value::from_json(v));
     }
     if let Some(e) = j.get("err") {
@@ -1018,6 +1046,37 @@ pub fn call(it: &mut Interp, key: &str, args: Vec<Value>, line: u32) -> R {
     }
     let why = j.get("panic").and_then(|e| e.as_str()).unwrap_or("it gave back nothing");
     fail(line, format!("`{}` ({}) panicked: {}", f.name, f.file, why))
+}
+
+/// How deep a value may go across a plugin's edge: serde_json's own limit is 128, counting
+/// the list the arguments come in and the answer's `{"ok": ...}`.
+const MAX_DEPTH: usize = 126;
+
+fn depth(v: &serde_json::Value) -> usize {
+    let mut most = 0;
+    let mut todo = vec![(v, 1)];
+    while let Some((v, d)) = todo.pop() {
+        most = most.max(d);
+        match v {
+            serde_json::Value::Array(a) => todo.extend(a.iter().map(|x| (x, d + 1))),
+            serde_json::Value::Object(o) => todo.extend(o.values().map(|x| (x, d + 1))),
+            _ => {}
+        }
+        if most > MAX_DEPTH {
+            break;
+        }
+    }
+    most
+}
+
+/// The first whole number in `v` past i64's range, and where it is (`.id`, `[2].n`).
+fn too_large(v: &serde_json::Value, at: String) -> Option<(String, String)> {
+    match v {
+        serde_json::Value::Number(n) if n.as_i64().is_none() && n.as_u64().is_some() => Some((at, n.to_string())),
+        serde_json::Value::Array(a) => a.iter().enumerate().find_map(|(i, x)| too_large(x, format!("{}[{}]", at, i))),
+        serde_json::Value::Object(o) => o.iter().find_map(|(k, x)| too_large(x, format!("{}.{}", at, k))),
+        _ => None,
+    }
 }
 
 /// What a `native:` builtin is called, for messages: its function's name.
@@ -1045,7 +1104,7 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
         let prog = crate::parser::Parser::new(&src).parse_program().map_err(|e| e.in_file(&f.display().to_string()).to_string())?;
         for s in prog {
             match s {
-                crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve(&base, &p)), base.clone())),
+                crate::ast::Stmt::Use(p, ..) if !crate::ast::is_script(&p) => todo.push((base.join(crate::modules::resolve_from(&base, &f, &p)), base.clone())),
                 crate::ast::Stmt::Mount(_, p, _) => {
                     let full = base.join(p);
                     let dir = full.parent().unwrap_or(&base).to_path_buf();

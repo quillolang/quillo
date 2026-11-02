@@ -69,6 +69,45 @@ pub fn sync(from: &Path, to: &Path) -> Result<usize, String> {
     Ok(copied)
 }
 
+/// The `env.NAME = "value"` lines of an app.toml (flat TOML, one key a line, as app-config.sh
+/// reads it).
+pub fn app_env(file: &Path) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(file) else { return out };
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("env.") else { continue };
+        let Some((k, v)) = rest.split_once('=') else { continue };
+        let k = k.trim().trim_matches('"');
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            continue;
+        }
+        let v = v.trim();
+        let value = if let Some(q) = v.strip_prefix('"') {
+            let mut s = String::new();
+            let mut chars = q.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => s.push('\n'),
+                        Some('t') => s.push('\t'),
+                        Some(o) => s.push(o),
+                        None => {}
+                    },
+                    c => s.push(c),
+                }
+            }
+            s
+        } else if let Some(q) = v.strip_prefix('\'') {
+            q.split('\'').next().unwrap_or("").to_string()
+        } else {
+            v.split('#').next().unwrap_or("").trim().to_string()
+        };
+        out.insert(k.to_string(), value);
+    }
+    out
+}
+
 /// A key for signing sessions, made once and kept in the app's container, so
 /// a visitor stays signed in when the app is opened again.
 fn keep_secret(data: &Path) -> Result<(), String> {
@@ -118,6 +157,11 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
             let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             crate::service::serve_as(&stem);
             let mut interp = Interp::new(&base);
+            // A phone has no command line and no environment of the developer's: `env.NAME`
+            // lines of app.toml, which the app carries and so are public, are what `env("NAME")`
+            // gives, as a service's own `.env` is read (FEEDBACK33.md, Q-406; branch
+            // feedback27-35-fixes).
+            interp.env_file = std::sync::Arc::new(app_env(&app_dir.join("app.toml")));
             let shared = interp.shared.clone();
             if let Err(e) = interp.load_file(&path) {
                 let _ = tx.send(Err(e.to_string()));

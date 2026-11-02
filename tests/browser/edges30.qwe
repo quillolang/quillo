@@ -1,0 +1,190 @@
+// The browser's side of FEEDBACK28.md (Q-415 to Q-420), FEEDBACK30.md and FEEDBACK35.md (Q-428 to
+// Q-431), each beside the server's answer where both make one (branch feedback27-35-fixes).
+translations({
+    en: { msgs: { zero: "No messages", one: "{count} message", other: "{count} messages" }, a: "A" },
+    es: { msgs: { one: "{count} mensaje", many: "{count} de mensajes", other: "{count} mensajes" }, a: "A", srv: "server only", quillo: { cancel: "Volver" } },
+})
+locale_from((r) => r.query.lang)
+
+fn shout(s: str) -> str = upper(s)
+fn twice(x: int) -> int = x * 2
+
+// What both sides compute, as text.
+fn facts() = [
+    t("msgs", { count: 0 }), t("msgs", { count: 1 }), t("msgs", { count: "1" }), t("msgs", { count: 1.5m }), t("msgs", { count: 1000000 }),
+    date.to_zone("2027-03-15T15:00:00.000Z", "UTC"), date.compare("2027-03-15T15:00:00Z", "2027-03-15T15:00:00.000Z"),
+    date.compare("2027-03-15T15:00:00.500Z", "2027-03-15T15:00:00Z"),
+    date.at("2026-11-01", "01:30", "America/New_York", { repeated: "later" }),
+    date.at("2026-03-08", "02:30", "America/New_York", { skipped: "earlier" }),
+    is_err(date.at("2026-03-08", "02:30", "America/New_York", { skipped: "error" })),
+    date.at("2026-10-27T14:30", "America/New_York"),
+    is_err(date.parse("2026-10-27T14:30")), date.parse("Tue, 27 Oct 2026 14:30:00 GMT"),
+    format_number(2.5, "en-US", 0), format_number(1.005, "en-US", 2), format_number(12.345, "de-DE", 2),
+    format_number(10, "en-US", { max: 3 }), format_number(8.875, "en-US", { max: 3 }), format_number(8.8, "en-US", { min: 2, max: 3 }),
+    len(normalize("cafe\u{301}")), normalize("ﬁ", "NFKC"), normalize("Ⅻ", "nfkd"), len(normalize("é", "NFD")),
+    local_path("/a?b=1"), local_path("/\\evil.example/"), local_path("/\t/evil"), local_path("//x"), local_path("https://x"), local_path(" /y "), local_path("/%2F/z"), local_path(3),
+    t("msgs", { count: 2.5 }), t("msgs", { count: "x" }), t("msgs", { count: null }),
+    date.at("2026-11-01T01:30", "America/New_York", { repeated: "earlier", skipped: "later" }),
+    is_err(date.parse("Tue, 27 Foo 2026 14:30:00 GMT")), date.compare("2027-03-15", "2027-03-15T00:00:00Z"),
+]
+
+// What the new options refuse, in the browser (each a stop, which the page reports).
+component Fails() {
+    <div>
+        <button id="f1" @click={() => { normalize("x", "NFX") }}>1</button>
+        <button id="f2" @click={() => { normalize("x", js("Number", 3)) }}>2</button>
+        <button id="f3" @click={() => { format_number(1, "en-US", { most: 1 }) }}>3</button>
+        <button id="f4" @click={() => { format_number(1, "en-US", { min: 3, max: 1 }) }}>4</button>
+        <button id="f5" @click={() => { format_number(1, "en-US", { max: "2" }) }}>5</button>
+        <button id="f6" @click={() => { format_number(1, "en-US", js("String", "x")) }}>6</button>
+        <button id="f7" @click={() => { date.at("2026-11-01", "01:30", "UTC", { repeated: "second" }) }}>7</button>
+        <button id="f8" @click={() => { date.at("2026-11-01", "01:30", "UTC", { skipped: "never" }) }}>8</button>
+        <button id="f9" @click={() => { date.at("2026-11-01", "01:30", "UTC", { when: 1 }) }}>9</button>
+        <button id="f10" @click={() => { date.at("2026-11-01", "01:30", "UTC", js("Number", 3)) }}>10</button>
+    </div>
+}
+
+// Q-411: a page's call to another site says what it may be.
+component Away() {
+    state said = ""
+    <button id="away" @click={() => { let r = http.get("http://127.0.0.1:9/nothing"); said = is_err(r) ? r.error : "answered" }}>{said}</button>
+}
+
+// Q-418: an image the server rendered, loaded before the component starts: its handler is given
+// the image, once.
+component Pic() {
+    state seen = []
+    <div>
+        <img id="pic" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" @load={(e) => { seen = seen | push(e.target.tagName) }}/>
+        <button id="pic-go" @click={() => { seen = seen }}>{len(seen)}</button>
+        <span id="pic-seen">{join(seen, ",")}</span>
+    </div>
+}
+
+component Facts() {
+    state mine = []
+    <div>
+        <pre id="server">{json.stringify(facts())}</pre>
+        <button id="facts" @click={() => { mine = facts() }}>facts</button>
+        <pre id="browser">{json.stringify(mine)}</pre>
+    </div>
+}
+
+// Q-415: nothing in the handler waits, so two keydowns in a row see each other's state.
+component Keys() {
+    state a = 0
+    let note = () => null
+    <button id="keys" @keydown={(e) => {
+        let was = a
+        let step = match e.key {
+            "x" => 1
+            _ => 0
+        }
+        if step > 0 { a = was + step }
+        note()
+    }}>{a}</button>
+}
+
+// Q-416: a component's function given to `map`, which calls a top-level fn.
+component Sums() {
+    state out = "none"
+    let double = (x: int) => twice(x)
+    <div>
+        <p id="sums-render">{join([1, 2, 3] | map(double), ",")}</p>
+        <button id="sums" @click={() => { out = join([1, 2, 3] | map((x) => double(x)), ",") }}>{out}</button>
+    </div>
+}
+
+// Q-417: a state started from a module's function, in a component the page makes later.
+component Child(today: str = "") {
+    state day = date.valid(today, "date") ? today : "none"
+    <p id="child">{shout(day)}</p>
+}
+component Parent() {
+    state show = false
+    <div><button id="show" @click={() => { show = true }}>go</button>{show && <Child today="2026-11-01"/>}</div>
+}
+
+// Q-420: a Promise's executor that throws rejects it, with a method named like the component's own.
+component Rec() {
+    state out = "idle"
+    state rec = null
+    let resume = () => { if rec != null { rec.resume() } }
+    let start = () => {
+        let r = js("Promise.resolve", js_new("Promise", (done) => {
+            let ctx = js_new("Object")
+            ctx.resume()
+            len(js("Number", 5))
+            done(true)
+        }))
+        out = is_err(r) ? "err" : "ok"
+    }
+    <button id="rec" @click={start}>{out}</button>
+}
+
+// Q-370: a place whose value fails is emptied.
+component Due() {
+    state day = "2026-11-20"
+    <div>
+        <button id="clear" @click={() => { day = "" }}>clear</button>
+        <p id="due">{date.format(day, "dddd D MMMM")}</p>
+    </div>
+}
+
+// Q-371: a state holding its prop, written once, resumes with its rows.
+component Copy(initial: list) {
+    state items = initial
+    <div>
+        <ul id="copy">{for r in items => <li key={r.id}>{r.text}</li>}</ul>
+        <button id="more" @click={() => { items = items | push({ id: 99, text: "added" }) }}>more</button>
+    </div>
+}
+
+// Q-429: a map in `style`.
+component Styled() {
+    state tone = "red"
+    <div id="styled" style={{ color: tone, font_size: "20px", marginTop: "3px", gap: null }} @click={() => { tone = "blue" }}>styled</div>
+}
+
+// Q-428: a component's script, with quotes, runs once and changes nothing.
+component Scripted() {
+    <div><script>window.__scripted = (window.__scripted || 0) + 1; window.__said = "it's \"quoted\""</script></div>
+}
+
+// Q-377: ask's own buttons in the page's language.
+component Asks() {
+    state said = ""
+    <button id="ask" @click={() => { said = ask("Cancelar?") ? "yes" : "no" }}>{said}</button>
+}
+
+// Q-364: files inside a list and a map reach a server fn as files.
+server fn one(file: map) = file.filename
+server fn many(files: list) = files | map((f) => f.filename)
+server fn in_map(m: map) = m.doc.filename
+server fn sizes(files: list) = files | map((f) => f.size)
+component Up() {
+    state out = []
+    <div>
+        <input id="files" type="file" multiple @change={(e) => {
+            let fl = e.target.files
+            out = [one(fl[0]), many([fl[0], fl[1]]), many(fl), in_map({ doc: fl[0] }), sizes(fl)]
+        }}/>
+        <pre id="up">{json.stringify(out)}</pre>
+    </div>
+}
+
+// Q-306: a function in markup given a state keeps its input, and the focus on it.
+component Ticks() {
+    state on = false
+    state typed = ""
+    let tick = (v: bool) => <label><input id="box" type="checkbox" checked={v} @change={(e) => { on = e.target.checked }}/>{v ? "on" : "off"}</label>
+    let field = (t: str) => <input id="field" value={t} @input={(e) => { typed = e.target.value }}/>
+    <div>{tick(on)}{field(typed)}<span id="typed">{typed}</span></div>
+}
+
+let rows = for i in 0..20 => { id: i, text: `row ${i}` }
+
+route GET / = <html lang="en"><body>
+    <Facts/><Keys/><Sums/><Parent/><Rec/><Due/><Copy initial={rows}/><Styled/><Scripted/><Asks/><Up/><Ticks/><Fails/><Away/><Pic/>
+    <p>{t("srv")}</p>
+</body></html>

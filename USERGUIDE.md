@@ -9,6 +9,7 @@ Quillo is a single binary, built with Cargo:
 
 ```sh
 cargo build --release
+./target/release/quillo new hello                        # a program to start from, in hello/
 ./target/release/quillo run app/main.qwe --watch        # the sample app: http://127.0.0.1:8080
 ./target/release/quillo check app.qwe                    # find mistakes without running
 ./target/release/quillo build app.qwe                    # build its Rust (.qwer files) beforehand
@@ -29,19 +30,19 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 
 | Option | |
 |---|---|
-| `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1) |
-| `--watch`, `-w` | reload when the program or a `use`d file changes, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
+| `--port N`, `--host H` | where to listen (default `$PORT` or 8080, on 127.0.0.1); the port is 0 to 65535, 0 for any free one (`platform().server.port` says which), and `--host localhost` is 127.0.0.1 |
+| `--watch`, `-w` | reload when the program or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's) |
 | `--reload` | reload when files change, as in production: no errors shown on pages, no page refreshes |
 | `--max-compute 2s` | end a request that computes this long without letting go, as a 500 (see Concurrency) |
 | `--trust-proxy 10.0.0.0/8` | believe `X-Forwarded-For` from these addresses (see [Live data](#live-data)) |
 | `--live-per-client N` | pages one client may have waiting for live data (default 256) |
-| `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency); not with `--watch`, `--register` or `--split` |
+| `--instances N` | run the program N times over, one event loop each, to use N cores (see Concurrency); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64) |
 | `--no-check` | skip the static checks |
-| `-- a b` | what follows is the program's: `args()` gives `["a", "b"]`, for a script |
+| `-- a b` | after the program, what follows is the program's: `args()` gives `["a", "b"]`, for a script; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` |
 | `--allow-path DIR` | `read_file` and `write_file` may use `DIR` too, as a script used as a tool needs (see [Scripts as tools](#scripts-as-tools)); any part of the program may then, routes too |
 | `--split` | run each `service` as a process of its own (see [Services](#services)) |
-| `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_NAME`); several addresses, comma-separated, are taken in turn |
+| `--service-url NAME=URL` | where service NAME runs, when not here (also `QUILLO_SERVICE_<NAME>`, the name in capitals); several addresses, comma-separated, are taken in turn |
 | `--base PATH` | the path the program is served under (`/shop`): its links and redirects carry it |
 | `--as-service` | serve the program as a service: its `server fn`s answer other services' signed calls, not pages (see [Services](#services)) |
 | `--service-name NAME` | the name other programs call this service by, when it is not the program's file name; calls signed for another service are refused |
@@ -49,10 +50,10 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--no-jobs` | run none of the program's scheduled jobs on this server |
 | `--no-prefetch` | pages do not prefetch the links pointed at (see [Prefetching](#prefetching)) |
 | `--plain-http` | the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
-| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Concurrency](#concurrency-and-reloading)) |
+| `--register URL`, `--service S` | join a limer pool, and share live updates with its other servers; needs `LIMER_ADMIN_SECRET` (see [Several servers](#several-servers)) |
 | `--max-body N` | largest request body to accept, in bytes (default 10 MiB; larger ones get 413) |
 | `--wt-port N` | the UDP port pages connect to over WebTransport (default: the HTTP port's number; see [Channels](#channels)) |
-| `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own |
+| `--tls-cert F`, `--tls-key F` | the certificate WebTransport presents, instead of one of its own; the files must exist |
 | `--no-wt` | no WebTransport: pages' channels and streams use a WebSocket |
 | `--log F` | the request log: `text` (the default), `json` (one object per line) or `off` (see [Logs and metrics](#logs-and-metrics)) |
 | `--metrics` | answer `GET /_quillo/metrics` in Prometheus's text format |
@@ -61,24 +62,52 @@ or `=` (`--port 8081`, `--port=8081`); `-w` is the one short option (`-p` is not
 | `--join URL` | with `--as-service` and a `--port`: join the app at URL as one more copy of this service while it runs |
 | `--describe` | answer `GET /_quillo/describe` with the program's API, as `quillo docs` writes it |
 | `--env-file F` | the settings file to read (a path from the folder `quillo` runs in; it must exist), instead of the `.env` beside the program (which need not) |
-| `--with CMD` | run a command beside the program (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
+| `--with CMD` | run a command beside the program (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends, a Ctrl-C or `SIGTERM` while it loads, a panic and a `SIGKILL` too (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
+
+`quillo new <folder>` writes a program to start from. By default it is the to-do app, the
+eight files of `app/`: a database with a migration, a component, files served.
+`--minimal` writes three: `main.qwe`, `lib/greet.qwe` and `ui/page.qwe`, a page, a
+component and a function both sides use. Both get a `.gitignore` (`*.db`, `*.db-wal`,
+`*.db-shm`, `.env`, `.env.*`, `.quillo/`), and `--binary` copies this `quillo` into
+`<folder>/.quillo/bin/quillo`. It refuses a folder that is not empty (an empty one, or one
+holding only `.git`, is used) and a name Windows refuses (`con`, `aux`, `nul`, `prn`,
+`com1` to `com9`, `lpt1` to `lpt9`, any of `<>:"|?*\`, a trailing dot or space, a line
+break). It writes into a folder beside the target and moves it in place at the end, so a
+failed `new` leaves nothing half made, and it never writes an empty folder. It warns when
+the folder is inside another program, and prints the next step:
+
+```sh
+quillo new hello --minimal
+cd hello && quillo run --watch
+```
+
+In VS Code, *Quillo: New program* (extension 0.14.0) asks for the to-do app or the minimal
+one and for a folder, runs `quillo new` and opens the folder.
 
 The other commands: `quillo check` (below, and [Checking](#checking)), `quillo docs`
 (the API as OpenAPI 3, to stdout; see [Services](#services)), `quillo build` (the Rust
 files; see [Rust](#rust)), `quillo fix` (the `import` lines a program's files need, and 0.6's lines turned around; see
 [Files of a program](#files-of-a-program)), `quillo repl`, `quillo lsp`, `quillo dap`,
-`quillo version` (or `--version`, `-V`). `quillo <file.qwe>` is `quillo run <file.qwe>`, options
-and all. `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
+`quillo version` (or `--version`, `-V`), which names the commit: from a source archive
+it reads the `COMMIT` file `git archive` writes, else says `(commit unknown)`. `quillo
+<file.qwe>` is `quillo run <file.qwe>`, options and all, whatever the case of its
+extension (`quillo MAIN.QWE`). A misspelt command is told the nearest (``unknown command
+`chek` (did you mean `check`?)``), and a file of another extension given with no command is
+told how to run it (`to run the file: quillo run tool`). `check`, `docs`, `build` and `fix` take one program, and refuse a second and an option
 they do not have (`check` has `--strict-null`). `quillo check` exits 1 when there is an error (warnings do not
 fail it), `quillo run` 1 when the program does not load or the port cannot be taken, and
 either 2 for a usage mistake (an unknown option, an option without its value, no program, `--register` without its
-secret, options that do not go together). A stopped server exits 0 (see [Stopping and
+secret, options that do not go together, a `--port` outside 0 to 65535, a `--tls-cert` or
+`--tls-key` file that is not there). An option that takes a value refuses another option
+in its place: `--service-name --watch` says `needs a value, and --watch is an option`. A stopped server exits 0 (see [Stopping and
 health](#stopping-and-health)).
 
 The `.env` beside the program is read into its environment as it starts: `KEY=value`
 lines (`export` allowed, `#` for comments, and ` #` ends a bare value; values in `"..."`
-take `\n`, `\t`, `\"` and `\\`, and `'...'` is as written; a key is letters, digits and
-`_`, and a line that is not so is skipped), for `env("API_KEY")` and for Quillo's own
+take `\n`, `\t`, `\"` and `\\`, and `'...'` is as written; a quoted value goes on to its
+closing quote across lines, as a PEM key does; a byte-order mark at the start is skipped;
+a key is letters, digits and `_`, and a line that is not `KEY=value` is skipped and said
+at the start: `quillo: .env:3: not KEY=value, skipped`), for `env("API_KEY")` and for Quillo's own
 settings (`PORT`, `QUILLO_SECRET`). A variable the environment already has wins, so a
 `.env` left on a server cannot override what production sets. It is read once: a
 `--reload` does not read it again. A service reads the `.env` beside its own file as
@@ -544,6 +573,30 @@ At the top of a program, or of a file it uses, an error that `?` passes on has n
 take it: the program stops, saying what it was, with status 1, and a server does not start
 half made (FEEDBACK29.md, Q-350).
 
+An error value a statement gives and nothing takes, as a call alone on a line whose value
+is an error, is not lost: the log says where it was dropped, where it was made and the
+request it was in, and the program goes on.
+
+```
+main.qwe:10: an error no statement took, made at main.qwe:6: odd (pass it on with ?, give a value with ??, or take it with let _ =)
+```
+
+In a script it goes to stderr, and the script goes on. `f()?` passes it on, `f() ?? x`
+gives a value in its place, and `let _ = f()` takes it and says it is not wanted. Inside
+`db.transaction(() => ...)`, a dropped error rolls the transaction back (see
+[Database](#database)). `quillo check` warns when a call of one of the program's own
+functions that can fail is dropped: one that declares `! T`, or whose body calls `err(`
+or uses `?`. A builtin's dropped error (`db.exec(...)` alone on a line) is not warned of;
+it is logged when it happens (FEEDBACK27.md, Q-332, Q-333).
+
+A builtin given an error where it wants something else says what the error was:
+
+```
+json.parse expects a str as argument 1, got error (it failed before this call, main.qwe:3: read_file: does-not-exist.json: No such file or directory)
+```
+
+`int(r)` of an error says `cannot convert error to int (...)` with the same reason.
+
 `?` leaves the function it is written in, and in a lambda that is the lambda:
 `map(xs, (x) => f(x)?)` gives a list with the errors in it and goes on, and `quillo
 check` says so. To stop at the first failure, use a `for` loop, where `?` leaves the
@@ -649,6 +702,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `srcdoc={...}`: its page cannot reach the site. A view's or component's attributes
   are its parameters, so `on_change={...}` there is fine.
 - `null`/`false` children render nothing; list children render each item, so `{for ... => <li/>}` works.
+  A map as a child is shown as Quillo writes it, which is seldom meant: `quillo check`
+  warns on `<p>{{ name }}</p>` (`` shows the map `{ name: ... }`: to show `name`, write
+  `{name}` ``), and on any map or `{{ ... }}` block as an element's child. A map as an
+  attribute (`Prop={{ k: v }}`) is as before.
 - Void tags (`<br>`, `<img ...>`, `<input ...>`) need no closing tag. Any tag can self-close with `/>`.
 - `<html>` gets `<!doctype html>`.
 - `<style>{style}</style>` takes a style sheet as it is (no escaping, so `a > b` works).
@@ -715,7 +772,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   so it cannot end the script): `<script>const user = {user};</script>`. HTML in it
   (`raw(code)`) goes in as it is, except that `</` becomes `<\/` and `<!--` becomes
   `<\!--`, which mean the same inside JavaScript strings and cannot end the element
-  early, so `raw(json.stringify(x))` there is safe too. A component's `<script>` (made
+  early, so `raw(json.stringify(x))` there is safe too. The script's own text, and a
+  string written in it (`<script>{"if (a < b) go('x')"}</script>`), go in the same way:
+  as written, quotes included, with only `</` and `<!--` escaped. A `{` in a script's text
+  starts a Quillo value, so JavaScript with braces is a parse error that says what to
+  do: ``a `{` in a <script> starts a Quillo value: write the code as a string,
+  <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made
   in the browser, which runs it) takes only text written in the program. Script built
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
 - `raw(s)` marks trusted HTML.
@@ -817,7 +879,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   bind:value={amount} @input={refresh}/>`. An input with `value={x}` (or `checked`, `selected`, and a `<video>`'s or `<audio>`'s `muted`) is held to `x`: after
   each handler it is set back to the state, so typing the state does not take is
   undone. A bare `<input>` keeps what is typed, read through `e.value` or `e.form`.
-- `style={...}` and `class={...}` change only what they name when what they read
+- `style={...}` takes text or a map of properties: `style={{ color: tone, font_size:
+  "2rem", marginTop: "3px", "--gap": "4px" }}`, where `_` and camelCase are written as
+  `-` (`font-size`, `margin-top`), a custom property is kept as it is, and a `null` or
+  `false` value is left out; the same on the server and in the browser.
+  `style={...}` and `class={...}` change only what they name when what they read
   changes: a `transform` or a class a handler set by hand stays, so a drag does not jump
   home. `<details open={x}>` and `<dialog open={x}>` follow `x` when `x` changes, and
   leave what a person opened or closed alone otherwise (FEEDBACK28.md, Q-337, Q-338).
@@ -905,6 +971,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   decimal (`{"$dec": "12.50"}`), an int past 2^53 (`{"$int": "..."}`, a BigInt in the
   browser), an error value (`{"$quillo_err": ...}`). NaN and infinities become `null`;
   dates are their text, as everywhere.
+- A `state` that still holds its very prop (`state items = initial`) is written in the
+  page as a reference to the prop, not as a second copy of it.
 - Components are resumed, not made again: the browser runs a component's code once,
   from the state the server sent, and takes the server's elements as its own (checking that
   they are the same) instead of replacing them, so images do not reload, a scrolled
@@ -918,7 +986,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   to the console (`quillo: ...`), and pushed onto `window.__quilloErrors` if the page
   made that list; the component goes on. There is no error overlay on the page.
 - `ask(message, { title, ok, cancel, tone })` asks in a dialog on the page and waits for
-  the answer (`true` or `false`) — a handler goes on after it; `notify(message, { title,
+  the answer (`true` or `false`) — a handler goes on after it, and its buttons, unless
+  `ok` and `cancel` are given, are in the page's locale (see
+  [Translations](#translations)); `notify(message, { title,
   tone, seconds })` shows a note that goes by itself. Both are markup with `q-` classes
   in a host the page lays out (`<body data-notices="dialog-center toasts-top-right">`)
   and styles: keyboard, focus and screen readers are taken care of (Escape, the
@@ -958,7 +1028,7 @@ Views and components nest like HTML: a capitalized tag renders another view or
 component, its attributes are the props, and what is between the tags arrives as the
 `children` parameter, or `null` for a tag with nothing between (`<Card title="x"/>`),
 on the server as in the browser, so `children == null` tells the two apart (FEEDBACK28.md,
-Q-345). A component is used by its tag: called as a function (`let make = Dead`, then
+Q-345), and `quillo check` warns on `str(children)`, which is `"null"` then. A component is used by its tag: called as a function (`let make = Dead`, then
 `make()`, or given to `map`) it would show and never answer, so it is an error, and `quillo
 check` says so.
 
@@ -988,7 +1058,12 @@ component Dashboard() {
 }
 ```
 
-- **Down:** props. **Up:** pass a function (`on_change`) and call it. There is no
+- **Down:** props. **Up:** pass a function (`on_change`) and call it. A call of a
+  function given as a prop is waited for, so what it gives is what the child gets: a
+  callback that only sets state (`cb={() => { x = 1 }}`) gives `null`, and so does one
+  that ends in a page's Promise (`cb={() => js("Promise.resolve")}`) once it is done. A
+  child that must know whether its caller finished has the caller give `true` when done,
+  or calls a `done` function it is given. There is no
   context or global store: state in the outermost component, passed down, is the store.
   Components placed separately in a page share nothing in the browser; they share
   through the server (`live`, channels).
@@ -1012,8 +1087,11 @@ component Dashboard() {
   when it changes, give the component a `key` that changes with it. There is no hook
   that says the prop changed under a state copied from it: the `key` starts afresh, and
   loses what was typed.
-- A function called in markup with a state, `{tick(on)}`, makes its elements anew at each
-  change, so an input in it loses the focus: use a `view`, whose props are live.
+- A function called in markup with a state, `{tick(on)}`, is called again at each change.
+  When its markup comes out the same shape and nothing in it follows state itself, the
+  page's elements are kept and take the new attributes, text and handlers, so an input in
+  it keeps its focus and what was typed. A function whose markup changes shape is made
+  anew, and its input loses the focus: there, use a `view`, whose props are live.
 - A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
   component) is called again as a whole when what it is given changes.
 - Views are plain functions: they have no state and add nothing to the browser bundle
@@ -1204,14 +1282,29 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
   `js_new` makes (`js_new("Promise", ...)`, kept to be used later), it stays a Promise:
   `js("load").then((x) => { data = x })`. `type_of` calls one `promise`. A function of the
   program's that the page calls with `undefined`, as `.then` does for a Promise of
-  nothing, is given `null` (FEEDBACK28.md, Q-336).
+  nothing, is given `null` (FEEDBACK28.md, Q-336). To wait for what `js_new` makes, and
+  catch its failure, wrap it: `js("Promise.resolve", js_new("Promise", ...))`.
+- A handler pauses only where something waits. A block in it (`match`, `if`, `for`) is
+  made to wait only when something inside it waits; a call of a module's function
+  (`date.`, `re.`, `money.`, `math.`, `stats.`, `vec.`) is never waited for; and a call of
+  a function compiled here (the component's own, or a top-level `fn`) that is known to
+  give no Promise is not waited for, so it can be given to `map`, `filter` and `reduce`.
+  A state started from a module's function is set at once, in a component made later
+  too. A component's own function named like a method of the page's objects is not
+  waited for outside waiting code, so a Promise's executor that throws rejects it.
+- A `let` set from the page (`let w = js("window.innerWidth")`, `js_new(...)`) is null
+  while the server renders, so a component that shows it in its markup is made again in
+  the browser; `quillo check` warns of it: write `state w = js(...)`, which runs again
+  in the browser (below).
 - `js_has("navigator.vibrate")` says whether the page has a feature without calling it,
   as `js(...)` would; `false` on the server (Q-341). A field's `selectionStart` counts
   UTF-16 units, as JavaScript does, and `slice`, `len` and `s[i]` count characters:
   `cursor_index(text, el.selectionStart)` turns the one into the other (Q-344).
 - A `state` initializer that reads the page (`state wide = js("window.innerWidth") > 800`)
   gives null while the server renders the component, and runs again in the browser
-  once the component is on the page, which sets the state from what it gives.
+  once the component is on the page, which sets the state from what it gives. An
+  image's `@load` that came before the code is sent to the image once the code runs
+  (its `e.target` is the image), and runs once.
 - A name the page does not have (a library's `<script>` left out) gives an error value,
   `js: L.map is not defined on this page`, so a component can say so instead of stopping.
 - On the server, `@mount` does nothing and `js` gives null.
@@ -1602,7 +1695,11 @@ Components and server code share a file, but not what they can touch:
 - `http.get`, `http.post` and the rest work in a component's event handlers, `@mount`
   and the functions they call: the request goes from the page, with the browser's rules
   rather than the server's. The other site must allow this one (CORS: it answers with
-  `access-control-allow-origin`), or the call is an error value; the page's cookies are
+  `access-control-allow-origin`), or the call is an error value that says what it may be
+  (`http: no answer from api.example.com: it may not allow this page (CORS), or be plain
+  http, or be unreachable; a server fn can call it from the server`). To reach your own
+  server from a page that is not its own, a phone app's, call it from a `server fn` (the
+  program's `http.*`, or [`site`](#calling-another-quillo-site)); the page's cookies are
   not sent to it (a path of the program's own, `/api/x`, goes to its own server, with
   its cookies); and it reaches what the visitor's machine can, such as a service on
   their own computer or network, not what the server can. Only `redirects: 0` and
@@ -1726,7 +1823,8 @@ false.
   something sets what it reads`). A statement may set another state (`if query == "" {
   results = [] }`), as long as the two do not feed each other.
 - **Errors stay where they are.** An error in a statement or a place on the page is
-  written to the console (`quillo: ...`); the rest of the page goes on updating.
+  written to the console (`quillo: ...`); the rest of the page goes on updating. A place
+  whose expression fails is emptied, rather than left showing its last good value.
 
 ### What a statement starts, it stops
 
@@ -1882,7 +1980,12 @@ route METHOD /path { ... block ... }
   body starts with `{` or `[`; otherwise, and for JSON that does not parse, it is
   `null`. `body` is the body as text: bytes that are not UTF-8 are replaced, so a binary
   body cannot be read as it was (there is no bytes value in the language), and for a
-  multipart body it is empty. `id` is the request's id (see [Services](#services)).
+  multipart body it is empty. `id` is the request's id (see [Services](#services)). A
+  JSON body that starts with a byte-order mark is read.
+- **What the server refuses before a route.** Two `Host` headers, an HTTP/1.1 request
+  without one, or one that is not a host and a port, get 400; a method not written in
+  capitals gets 501. A request target in absolute form (`GET http://host/path`) takes its
+  host from the target. A `HEAD` answer carries the `Content-Length` the `GET` would.
 - **Reserved:** paths under `/_quillo/` belong to Quillo and never reach a route (what is
   there is listed under [What a route cannot do](#what-a-route-cannot-do)).
 - **Order:** routes are tried in the order they are declared, and the first whose method, path and patterns all match handles the request. A later route can be the fallback.
@@ -1960,13 +2063,36 @@ routes / | signed_in {                              // no prefix: middleware onl
   and keeps its routes in the order written, among the file's others. Outside that,
   `routes` is a name like any other (`routes / 2` divides). Routes from groups are
   routes: `quillo docs` lists them by their whole path.
+- **Back where they were.** The login page sends the visitor on to `next` once signed in.
+  `next` came in the address, so anyone can write a link whose `next` is another site:
+  `local_path(next)` gives `next` when it is an address on this site as a browser reads it
+  (tabs and line breaks dropped, `\` read as `/`), else null. `//evil.example`,
+  `/\evil.example`, `https://...` and `javascript:...` are null. It works on both sides.
+
+  ```quillo
+  route POST /login ? { next: str = "/" } { form: { email: str, password: str } } {
+      sign_in(email, password)?
+      redirect(local_path(next) ?? "/")
+  }
+  ```
 
 ### Uploads
 
 A form with `enctype="multipart/form-data"` sends files. Its text fields are in
 `request.form`, as for any form, and each file is in `request.files` under its field's
-name: `{ field, filename, type, size }` (a field with several files, from `multiple`,
-is a list). The bytes stay with the request until saved:
+name: `{ field, filename, type, size }`. The shape follows the count: a field that sent
+one file holds its record, and a field with several, from `multiple`, a list of them. A
+pattern makes it one shape: `{ files: { docs: [map] } }` takes every file of that field
+as a list, one file a list of one and none an empty list, as `[str]` does for form fields:
+
+```quillo
+route POST /docs { files: { docs: [map] } } {
+    for d in docs { save_upload(d, `uploads/${uuid()}.pdf`)? }
+    redirect("/docs")
+}
+```
+
+The bytes stay with the request until saved:
 
 ```quillo
 route POST /avatar {
@@ -1981,9 +2107,18 @@ route POST /avatar {
   as needed) and gives the path back; `read_upload(file)` gives a text file's contents.
   Both give an error value when the request has no files, or the record is not one of
   this request's; a path that leads outside the folder is a runtime error.
+- `save_upload`, `write_file` and `delete_file` refuse the program's own files, and give
+  an error value saying so: the `.qwe` and `.qwer` files it loaded (or a folder holding
+  one), `.env` and `.env.*`, the SQLite database it has open with its `-wal`, `-shm` and
+  `-journal` files, and anything in `migrations/`.
 - `filename` is what the browser sent, without any folders; name saved files yourself
-  (as above) rather than trusting it. The record also carries `start` and `end`, the
+  (as above) rather than trusting it. Save under a folder of the program's with a name the
+  program makes (`uploads/${uuid()}.pdf`), and keep the visitor's name in the database.
+  `quillo check` warns on `save_upload(f, f.filename)`, and on a path that is only a form
+  value, then `/`, then the filename. The record also carries `start` and `end`, the
   file's place in the body.
+- A file's name and a field's name decode the three escapes HTML's multipart encoding
+  writes (`%22` for `"`, `%0D`, `%0A`) and nothing else, and a quoted name keeps a `;` in it.
 - A multipart body may hold up to 1,000 parts; a text field given twice keeps the last.
 - The body counts against `--max-body` (10 MiB by default): raise it for larger files.
   The request's head (its line and headers) has limits of its own, 64 KiB and 100
@@ -2002,8 +2137,10 @@ component Photo() {
 }
 ```
 
-Such a call is sent as multipart with an `X-Quillo-Rpc` header, which pages of other
-sites cannot add without asking first; a form another site posts is refused.
+A file anywhere in the arguments goes as a file, inside a list or a map too, and a
+`FileList` (`e.target.files`) is a list of files, so `add_photos(e.target.files)` gets a
+list of records. Such a call is sent as multipart with an `X-Quillo-Rpc` header, which
+pages of other sites cannot add without asking first; a form another site posts is refused.
 
 ### Checking code from a program
 
@@ -2062,7 +2199,8 @@ stay inside the program's folder.
 
 ```quillo
 route POST /login { form: { email: str, password: str } } {
-    let user = db.one("select * from users where email = ?", email)
+    // stored the same way at signup: one Unicode form, trimmed, in lower case
+    let user = db.one("select * from users where email = ?", lower(normalize(trim(email))))
     if !crypto.verify_password(password, user.password_hash) { reply 401 "Wrong email or password" }
     set_session({ user: user.id })
     redirect("/")
@@ -2078,7 +2216,8 @@ route POST /logout { end_session(); redirect("/") }
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
-  `max_age` is seconds or a duration (`"12h"`, as for cookies below).
+  `max_age` is seconds or a duration (`"12h"`, as for cookies below). A session keeps
+  decimals, and ints past 2^53, as they are, so `session().total + 1m` adds.
 - A session ends when its time is up, however often the visitor comes back: `session()`
   reads the cookie and never sends it again. For a session that lasts while it is used,
   call `set_session` again on the requests that count as use. Once a day is enough, and
@@ -2124,10 +2263,13 @@ fn touch() {
   over plain HTTP on this machine; in production, serve the site over HTTPS (a proxy
   such as limer in front). A browser drops a `Secure` cookie that comes over plain HTTP
   from anywhere but `localhost`, so a site reached as `http://10.0.0.5:8080` cannot keep
-  anyone signed in: the server says so once, the first time it sends such a cookie to a
-  request that came straight from another machine (not through a proxy here, and without
-  `x-forwarded-proto: https`). On a network you trust, `--plain-http` leaves `Secure` out,
-  as `--watch` does. `request.cookies` has what the browser sent, and
+  anyone signed in: the server says so once, naming the cookie, the first time it sends
+  such a cookie to a request that came straight from another machine (not through a proxy
+  here, and without `x-forwarded-proto: https`). On a network you trust, `--plain-http`
+  leaves `Secure` out, as `--watch` does. `delete_cookie` is `Secure` only when the request
+  came over HTTPS (or a proxy's `X-Forwarded-Proto: https` says so), when the name needs it
+  (`__Host-`, `__Secure-`), or when `secure: true` is given, so a cookie set with `secure:
+  false` can be removed over plain HTTP. `request.cookies` has what the browser sent, and
   `cookie(name)` one of them (or null), in any function the request runs, as
   `session()` is: a helper that reads the visitor's time zone from a cookie need not be
   handed `request` by every caller. Outside a request (a job, a script), `session()` is
@@ -2171,14 +2313,29 @@ fn touch() {
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
   the server's, whatever is given. `redirect(url, status)` takes 300 to 399.
 - Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
-  `x-request-id` and `x-content-type-options: nosniff`.
+  `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
+  `x-frame-options: SAMEORIGIN`, unless the route sets one or a
+  `content-security-policy` with `frame-ancestors`. A page made from who the visitor is
+  (it called `session()` or `cookie()`, or set a cookie) carries `cache-control:
+  private` and `vary: cookie`, unless the route set its own `cache-control`, so a shared
+  cache never gives one visitor's page to another.
+- `site_headers(map)` at the top level adds headers to every answer that does not set
+  them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
+  rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
+  checked, and values are one line; `content-length`, `transfer-encoding`, `connection`,
+  `set-cookie` and `content-type` are refused, as a route sets them:
+
+  ```quillo
+  site_headers({ "content-security-policy": "default-src 'self'", "referrer-policy": "same-origin" })
+  site_headers("/embed", { "x-frame-options": null, "content-security-policy": "frame-ancestors *" })
+  ```
 - Text answers are gzipped for browsers that accept it: a 200 with a body of 1 KiB or
   more whose type is `text/*` or names `json`, `javascript` or `svg`, with `vary:
   accept-encoding`. Not when the route set `content-encoding`, not streams, not partial
   files (206). There is no brotli.
 - A header cannot be added from a helper: what `respond`, `stream` and `events` are given
-  is the answer's. Cookies are the exception: `set_cookie` anywhere in the request joins
-  it. `reply status respond(...)` keeps the `respond`'s headers and body with the new
+  is the answer's, and headers for every page are `site_headers`'. Cookies are the
+  exception: `set_cookie` anywhere in the request joins it. `reply status respond(...)` keeps the `respond`'s headers and body with the new
   status.
 
 `reply status [body]` ends the request right away, from anywhere: inside a
@@ -2693,9 +2850,16 @@ route GET /assets/*path = file("public/" + path)
 route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that change with content
 ```
 
-- Each file goes out with an `ETag` (a weak one, from the file's size and time) and
-  `Last-Modified`. A browser asking with a current copy (`If-None-Match`, or an
-  `If-Modified-Since` equal to it) gets a `304` with no body.
+- `file(path, options)` takes three options and refuses any other, naming those it takes:
+  `cache` (below), `download`, a name, which sends `Content-Disposition: attachment` with
+  that name (written so a name in any script arrives whole), and `type`, the content type
+  in place of the one the extension gives: `file("exports/r.csv", { download: "rapport
+  d'été.csv", type: "text/csv; charset=utf-8" })`.
+- Each file goes out with an `ETag` (a weak one, from the file's size, time, inode and
+  change time) and `Last-Modified`. A browser asking with a current copy
+  (`If-None-Match`, or an `If-Modified-Since` equal to it) gets a `304` with no body. A
+  file replaced by one of the same size and modified time (`cp -p`, `touch -t`, a build
+  that sets every file's time) is a new file, in memory and to the browser.
 - The type comes from the extension: `html htm css js mjs json map webmanifest xml txt
   md csv svg png jpg jpeg gif webp avif ico mp4 webm mp3 ogg wav wasm woff2 woff ttf
   otf pdf zip`; anything else is `application/octet-stream`. `file()` is also the only
@@ -2709,7 +2873,7 @@ route GET /build/*path = file("dist/" + path, { cache: "1y" })   // names that c
   is honoured); a range past the end gets a `416`, and several ranges at once the whole
   file.
 - Files up to 1 MiB are kept in memory (64 MiB in all) and re-read when they change on
-  disk. Larger ones are sent from disk as they are written, on a thread of their own
+  disk, or are replaced. Larger ones are sent from disk as they are written, on a thread of their own
   with a 64 KiB buffer, so a video costs no more memory than a page. At most 256 such
   sends run at once, 8 for one client (an IPv4 address, or an IPv6 /64 network; past
   that, a `503` with `Retry-After`). A reader slower than 16 KiB/s is let go after 20
@@ -2739,21 +2903,39 @@ view Header(user) = <header>
 ```
 
 - The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
-  as `en`, `pt-BR` or `zh-Hant`.
+  as `en`, `pt-BR` or `zh-Hant`. A file named with `_` (`fr_FR.json`, as other tools
+  write them) is read as `fr-FR`; two files for one locale are an error.
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
   (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `*` does not), else
   the default: `translations(dir, { default: "en" })`, or `en` when there is one, or
   else the first locale by name. `locale()` gives it.
+- The best match goes by script before language, with CLDR's likely scripts: `zh-TW`,
+  `zh-HK`, `zh-MO` and `zh-Hant-*` get `zh-Hant`, and `zh-CN`, `zh-SG` and plain `zh`
+  get `zh-Hans`; `sr-Latn-RS` gets `sr-Latn`, and `sr` gets `sr-Cyrl`. A locale in
+  another script than the one asked is not taken over one that matches. A region takes
+  CLDR's parent where there is one: `pt-AO` gets `pt-PT`, a Latin American `es-MX` gets
+  `es-419`, and English outside the US gets `en-GB`.
 - Nested keys are written with dots. A key missing in a locale comes from the default
   locale; a key missing there shows as itself.
 - `{name}` is replaced by that value. An entry of plural forms (`zero one two few many
-  other`) picks the form for `count` by the language's rules, which are built in:
-  English and the languages that count as it, French, Portuguese and Hindi (where 0 is
-  singular), Russian, Ukrainian and Belarusian, Serbian, Croatian and Bosnian, Polish,
-  Czech and Slovak, Arabic, Hebrew, and `other` alone for Japanese, Chinese, Korean,
-  Thai, Vietnamese, Indonesian, Malay and their kin. A `count` that is not a whole
-  number takes `other`.
+  other`) picks the form for `count` by the language's rules, CLDR's, which are built in,
+  the same table on the server and in the browser: English and the languages that count
+  as it, French, Brazilian Portuguese and Hindi (where 0 is singular), European
+  Portuguese (`pt-PT`, where only 1 is), Russian, Ukrainian and Belarusian, Serbian,
+  Croatian and Bosnian, Polish, Czech and Slovak, Romanian (0, 2 to 19 and x01 to x19 are
+  `few`), Lithuanian, Latvian, Slovenian, Icelandic, Macedonian, Irish, Welsh, Maltese,
+  Arabic, Hebrew, and `other` alone for Japanese, Chinese, Korean, Thai, Vietnamese,
+  Indonesian, Malay and their kin. French, Spanish, Italian, Catalan and Portuguese take
+  `many` for exact millions (`1000000`). A `zero` form, where one is written, is used for
+  0 in every language.
+- `count` may be a number, or numeric text (`"1"`, as a query or a form gives it), taken
+  at its number. A fraction takes the language's form for fractions: `many` in
+  Lithuanian, Czech and Slovak, `few` in Romanian, `other` elsewhere. A decimal or text
+  written with a fraction's digits counts as a fraction, as CLDR has it: `1.0m` and
+  `"1.0"` take `other` in English ("1.0 items").
+- As it loads, a form the language never picks is warned of: ``translations (en): `a` has
+  a `few` form, which en never picks (it has one, other)``.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
   wrote in them. In that form the values put in (`{name}`) are still escaped, on the
   server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
@@ -2762,8 +2944,16 @@ view Header(user) = <header>
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
-- Components call `t` and `locale` too: a page with components carries its locale's
-  text for the browser. Cached views are kept once per locale.
+- Components call `t` and `locale` too. A page with components loads its locale's text
+  from `/_quillo/t/<hash>.js`, which the browser keeps, rather than carrying it in each
+  page. It holds only the keys the components' code can ask for: each `t("literal")`,
+  every key that starts with a template's literal start (`` t(`sec.${x}`) `` sends
+  `sec.*`), and the `quillo.*` keys. A key worked out any other way (`t(k)`) sends all
+  of them. Cached views are kept once per locale.
+- `ask()`'s buttons follow the page's locale: the program's own `quillo.ok` and
+  `quillo.cancel` translations when it has them, else Quillo's own for about thirty
+  languages (Spanish Aceptar and Cancelar, French, German, Japanese, Chinese, Arabic,
+  ...), else English.
 
 ### Mounting programs
 
@@ -2832,8 +3022,8 @@ service /billing = "billing.qwe"
   one secret (32 random bytes from the system, unless `QUILLO_SERVICE_SECRET` is set,
   so a copy started by hand elsewhere cannot join a split app unless the secret is
   set); they stop with it (killed, not drained). Each is started as `quillo run
-  <file> --port P --as-service --service-name NAME`, with `--base`, `--watch` and
-  `--no-check` passed down, and `--log`, `--workers`, `--max-body`, `--metrics`,
+  <file> --port P --as-service --service-name NAME`, with `--base`, `--watch`,
+  `--no-check` and `--describe` passed down, and `--log`, `--workers`, `--max-body`, `--metrics`,
   `--no-jobs`, `--env-file` and `--service-url` not; a service that is not up within
   20 s stops the app with exit 1. A service whose process ends while the app runs is
   started again, the same way, after a second (twice as long each time it ends again
@@ -2902,21 +3092,7 @@ When a service runs elsewhere, its calls are made to hold up:
 - **Several addresses.** `--service-url billing=http://10.0.0.5:8081,http://10.0.0.6:8081`
   (or the same in `QUILLO_SERVICE_BILLING`): the same service on several servers, called
   in turn.
-- **Copies that join.** `quillo run billing.qwe --as-service --port 8081 --join
-  http://app:8080` starts one more copy of `billing` that joins the app while it runs:
-  it says so, signed with `QUILLO_SERVICE_SECRET` (set on both), every 5 s, and that it
-  is leaving when stopped (the app drops one it has not heard from in 15 s). Its
-  address is the one it connects from, with its `--port`: a copy behind NAT or a proxy
-  is recorded at an address the app cannot reach, so put such a copy behind a balancer
-  instead. The app calls the joined copies first, and falls back to its own when
-  `billing` runs in its process (a monolith that takes on copies as it gets busy,
-  without a line of either changed), or to the addresses it was given; each copy has a
-  circuit of its own. With several app servers, a copy joins each. Behind a balancer
-  instead (limer's `discover` pool with `--register`), keep a call on one copy
-  (`lb_policy hash header x-quillo-call`) or give the copies a database to share, so a
-  call sent again is not run again. Services are not found through limer's pool: each
-  caller is told where a service is (`--service-url`, `QUILLO_SERVICE_<NAME>`), and
-  `QUILLO_SERVICE_SECRET` is set on every machine by hand.
+- **Copies that join** the app while it runs: see [Copies that join](#copies-that-join).
 - **Ready.** `GET /_quillo/ready` answers 200 when what the program needs is there, 503
   when not, with each part as JSON: its database (`select 1`), each service it declares
   (one in its process asked in turn, down its own services; one elsewhere asked at each
@@ -2929,11 +3105,8 @@ When a service runs elsewhere, its calls are made to hold up:
   service deployed apart whose own differs refuses the call and says both:
   ``service risk: 409 `assess` here is `assess(n: int, size: int) -> int`; the caller's
   copy of this service says `assess(n: int) -> int` ``.
-- **Described.** `quillo docs app.qwe` writes the program's API as OpenAPI 3, from its
-  source: each route's path, query and payload patterns, and each `server fn`'s contract
-  (`x-quillo-server-fns`), with the routes of the services it serves under their
-  prefixes. `quillo run --describe` serves the same at `GET /_quillo/describe`, for a
-  gateway to import.
+- **Described** as OpenAPI, for a gateway: see [The program's API
+  (OpenAPI)](#the-programs-api-openapi).
 - **Tried again.** A call that got no connection, or a server answering 502, 503 or 504,
   is tried at the next address, a little later each time (100 ms, doubling, with some
   jitter). A call sent but not answered in time is tried again at the same address, with
@@ -2996,7 +3169,14 @@ When a service runs elsewhere, its calls are made to hold up:
   remembers call ids, and answers `GET /_quillo/ready`, is a service; its caller still
   needs a `.qwe` file with the `server fn` signatures for `quillo check` and the
   contract. The routes under a service's prefix are passed on as they come, but not
-  Quillo's own addresses there.
+  Quillo's own addresses there. A copy [joins](#copies-that-join) at `POST
+  <app>/_quillo/join`, with `{ "service": "billing", "port": 8081, "leave": false }`,
+  signed as a call is (under `QUILLO_SERVICE_SECRET`, a nonce in `x-quillo-call`, taken
+  once). The answer is 200 `{ service, at }`, the address the copy is recorded at, or
+  400 (no port, or an address not known), 401 (a bad or old signature, no nonce), 403
+  (the app has no `QUILLO_SERVICE_SECRET`), 404 (no such service), 405 (not a POST) or
+  409 (a nonce sent before). Only copies call it, so a proxy in front of the app need not
+  pass it from outside.
 - **Made later.** `billing.later.invoice(name, 1200)` does not wait: the call is kept, its
   id is the result, and it is made in the background, tried every second, then a little
   later each time (up to five minutes), until it gets through. Since the service
@@ -3028,6 +3208,89 @@ When a service runs elsewhere, its calls are made to hold up:
     the next, so order is not kept.
 
 See [services](https://github.com/quillolang/examples/tree/main/services): a shop that bills through a billing service.
+
+#### Copies that join
+
+`quillo run billing.qwe --as-service --port 8081 --join http://app:8080` starts one more
+copy of `billing` that joins the app while it runs: it says so, signed with
+`QUILLO_SERVICE_SECRET` (set on both), every 5 s, and that it is leaving when stopped (the
+app drops one it has not heard from in 15 s). Its address is the one it connects from,
+with its `--port`.
+
+- When `billing` runs in the app's process, the copies that joined take every call, in
+  turn, and the app runs a call itself only when no copy answers it: a monolith takes on
+  copies as it gets busy, without a line of either changed.
+- When the app was given addresses (`--service-url`, `QUILLO_SERVICE_<NAME>`), the given
+  addresses and the joined copies are all taken in turn.
+- Each copy has a circuit of its own. With several app servers, a copy joins each.
+- Join the app's own address, not its public one: through a proxy the app sees the
+  proxy's address, unless it runs with `--trust-proxy` naming it. A copy behind NAT is
+  recorded at an address the app cannot reach, so put such a copy behind a balancer
+  instead: limer's `discover` pool with `--register`, keeping a call on one copy
+  (`lb_policy hash header x-quillo-call`) or giving the copies a database to share, so a
+  call sent again is not run again.
+
+Services are found by registration: a copy joins the app (`--join`), and any server joins
+limer's pool (`--register`). A caller does not look a service up by name, so a service the
+app does not run itself needs `--service-url` or `QUILLO_SERVICE_<NAME>`, and
+`QUILLO_SERVICE_SECRET` is set on every machine by hand.
+
+#### The program's API (OpenAPI)
+
+`quillo docs app.qwe` writes the program's API as OpenAPI 3, from its source: each
+route's path, query and payload patterns, and each `server fn`'s contract
+(`x-quillo-server-fns`), with the routes of the services it serves under their prefixes.
+`quillo run --describe` serves the same at `GET /_quillo/describe`, for a gateway to
+import. A prefixed service's `server fn`s are not in the app's document: they are called by
+other services, signed, not at `/billing/_quillo/rpc`. Under `--split` the app's document
+still holds the services' routes, read from their source, and `--describe` is passed down,
+so `/billing/_quillo/describe` answers the service's own document, its paths without the
+prefix.
+
+What the document holds:
+
+- Its title is the program file's name (`main`), both ways. Under `--base /shop` it has
+  `"servers": [{ "url": "/shop" }]`.
+- Several routes on one method and path shape are one operation: their bodies a `oneOf`
+  (each literal field an `enum`), their query parameters merged (required only where every
+  route requires them), the path template named as the first route names it (`/users/{id}`,
+  its parameter a `oneOf` of the routes' types), and `x-quillo-at` a list of the places
+  when there are several.
+- A rest parameter (`/files/*path`) is `/files/{path}`, with `"x-quillo-rest": true` and
+  the description "the rest of the path, slashes included": an OpenAPI template matches one
+  segment, so a gateway routes the rest itself.
+- Each operation has one response, 200, with no content schema.
+
+`/_quillo/describe`, when on, is public: it lists every route, those no page links to as
+well, each `server fn`'s signature, the file and line of every route, and the version of
+Quillo. Keep it private as `/_quillo/metrics` is, with a rule at the proxy, or do not turn
+it on in production.
+
+#### Calling another Quillo site
+
+`site shop = "https://shop.example.com"` names a deployed Quillo site, and `shop.notes(a,
+b)` calls its `server fn notes` as the site's own pages do: `POST
+<url>/_quillo/rpc/notes` with the arguments as a JSON array. It gives the answer's value,
+the site's error as an error value, or an error value when the site cannot be reached.
+Decimals and big ints cross as they do for pages. The address is any expression:
+
+```quillo
+site shop = env("SHOP_URL", "https://shop.example.com")
+
+server fn my_notes() = shop.notes(10)
+```
+
+- In an app of one person (a phone app, `quillo app`, or with `QUILLO_SITE_COOKIES=1`),
+  the cookies the site sets are kept in `.quillo/sites/<name>.json` in the program's
+  folder, so whoever signed in stays signed in. On a server they are not kept (a log line
+  says so, once), as one visitor's session would be every visitor's.
+- It runs on the server side only: `quillo check` refuses `shop.x()` in a component
+  ("call it in a server fn"). `site` stays an ordinary name elsewhere (`let site = ...`).
+- `/_quillo/rpc/<fn>` is a stable wire for programs: a JSON array of arguments in,
+  `{"ok": value}` or `{"err": error}` out. A program needs no `Origin` header; another
+  site's `Origin` is refused.
+- A phone app runs its services inside the app. To use a server's, call the server with
+  `site`, not `service`.
 
 #### Sagas
 
@@ -3153,10 +3416,14 @@ stays the simpler choice when the next move depends on the answer.
 ## Standard library
 
 - **General:** `print str int float dec len type_of`
-- **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of`
+- **Strings:** `upper lower trim split join contains starts_with ends_with replace slice repeat index_of normalize`
   (`upper` and `lower` know all of Unicode: `"straße"` is `"STRASSE"`; `replace`
   replaces every occurrence of plain text, not a pattern; regular expressions are `re`,
-  below)
+  below). `normalize(s, form)` gives one Unicode form of the text, `"NFC"` unless
+  `"NFD"`, `"NFKC"` or `"NFKD"` is given, on both sides: an `é` typed as one character and
+  one typed as `e` and an accent are two texts until normalized. Compare emails and user
+  names normalized, and user names in `"NFKC"`, which also makes `ﬁ` `fi` and a
+  full-width `Ａ` an `A`: `lower(normalize(trim(name), "NFKC"))`.
 - **Regular expressions:** `re.test(text, pattern)` (true or false), `re.find` (the first
   match, or null), `re.find_all` (every match), `re.replace(text, pattern, with)` (every
   match; `with` is text where `$1`, `$<name>`, `$0` and `$$` stand for the groups, the
@@ -3165,8 +3432,10 @@ stays the simpler choice when the next move depends on the answer.
   Flags come last: `"i"` (any case), `"m"` (`^` and `$` at each line) and `"s"` (`.`
   matches line breaks too). `re.valid(p, flags)` asks whether a pattern can be run, for
   one from data. They give the same answers on the server and in the browser, but for
-  groups in a loop (`(?:(a)|b)*` on `ab`, where the browser clears `(a)` on each round), and
-  not at the same cost: the server's engine takes the same time on any text, and the
+  groups in a loop (`(?:(a)|b)*` on `ab`, where the server keeps the group's last match and
+  the browser clears `(a)` on each round: the two engines cannot be made the same, and
+  `quillo check` warns of a capturing group inside a repeated one; capture the whole
+  repetition, `((?:a|b)*)`), and not at the same cost: the server's engine takes the same time on any text, and the
   browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
   check` warns of. Bound the counts (`{1,8}`), or run a visitor's own pattern in a `server
   fn`. So a pattern takes only what both read alike: characters, `.`, `[...]`,
@@ -3198,8 +3467,10 @@ stays the simpler choice when the next move depends on the answer.
 - **Records:** `type User = { ... }` makes `User(fields)`, which builds and checks one
   (see [Records](#records)).
 - **Errors:** `err is_err unwrap`
-- **Web:** `raw escape url_encode env now file redirect respond json.parse json.stringify
-  cookie set_cookie delete_cookie session set_session end_session`. `url_encode("a b")` is
+- **Web:** `raw escape url_encode local_path env now file redirect respond json.parse json.stringify
+  cookie set_cookie delete_cookie session set_session end_session site_headers`
+  (`local_path` under [Route groups](#route-groups), `site_headers` under [What a route
+  returns](#what-a-route-returns)). `url_encode("a b")` is
   `a%20b`, and `url_encode({ q, page: 2 })` is a query string (`q=...&page=2`, leaving
   out keys whose value is null); in the browser too. `env(name, default)` gives the
   default when the variable is not set.
@@ -3218,7 +3489,10 @@ stays the simpler choice when the next move depends on the answer.
   phone app also `model_family` (`"iPhone"`), `memory` (bytes), `screen` (`{ width, height, scale }`, in
   points) and `app` (`{ id, name, version, build }`). What a system does not tell is `null`. It is read
   once: the screen and locale are as they were when the program started. It runs on the server, as
-  `env` does: in a component, call it from a `server fn`.
+  `env` does: in a component, call it from a `server fn`. `server` is where the server listens,
+  `{ host, port, url, base }`: the port it got with `--port 0`, and a `url` reachable from this
+  machine (`0.0.0.0` is written `127.0.0.1`), so a program that reads its own pages need not be
+  told its address again. It is null in a script and while the program loads.
 
 What each does at its edges, where the answer is not what another language would give:
 
@@ -3453,15 +3727,25 @@ turns it around. A later release removes it.
   (`let json = request.json`, `let date = row.created`, a parameter `re`), so name such
   values otherwise (`body`, `created`).
 - Paths are from the main file's folder, not from the file that writes them:
-  `lib/b.qwe` writes `use "lib/c.qwe"`. A path outside the folder works (`use
-  "../shared/auth.qwe"`); there are no globs, and a `.qwer` file is `use`d the same way
-  (see [Rust](#rust)).
+  `lib/b.qwe` writes `use "lib/c.qwe"`. A path that starts `./` or `../` is from the
+  folder of the file that writes it, so a library's file can name its neighbour
+  (`ui/slug.qwe` writes `import ./theme.qwe use cls`) and be checked alone, `quillo check
+  ui/slug.qwe`. A path outside the folder works (`use "../shared/auth.qwe"` in the main
+  file); there are no globs, and a `.qwer` file is `use`d the same way (see
+  [Rust](#rust)) (FEEDBACK25.md, Q-325).
 - A path may be written without quotes: `use lib/auth.qwe`, `use ../shared/auth.qwe`,
   and `use lib\auth.qwe`, its backslash read as `/`. Without an extension it is a
   `.qwe` file (`use lib/auth`). An `import` finds whichever of `.qwer` and `.qwe` is
   there. `import lib/auth.qwe use *` says the same as `use lib/auth.qwe`: every public
   name.
 - A file `use`d twice, or by several files, runs once.
+- **A file's text.** A file is UTF-8; one that is not is refused with the line and column
+  of the first bad byte. A byte-order mark at the start is skipped, and so is a first line
+  starting `#!`, in the main file and in a `use`d one, so a script with
+  `#!/usr/bin/env quillo` runs as `./tool.qwe`. A CRLF is a line break, so a string over
+  two lines is the same text from a Windows checkout (`\r` written as `\r` stays). A
+  character that cannot be seen is named by its code: `unexpected character U+00A0 (a
+  no-break space), which cannot be seen: delete it`.
 - What runs in the browser, an address or a `.js` or `.mjs` file, starts with `client`:
   `client "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" use Chart`
   (see [JavaScript libraries](#javascript-libraries)). `preload` in its place fetches the
@@ -3630,7 +3914,11 @@ money.format(price, "de-DE")                    // "19,99 $"
 - `format_number(x, locale, digits)` writes any number the same way: `format_number(
   1234567.5, "en-IN", 2)` is `"12,34,567.50"`. `digits` is kept within 0 to 28; a float
   too large for a decimal (past about 7.9e28), NaN or an infinity is written plainly,
-  without grouping.
+  without grouping. It rounds a tie away from zero, from the number's shortest decimal, as
+  `Intl.NumberFormat` does, on both sides: `2.5` to 0 digits is `3`, and `1.005` to 2 is
+  `1.01`. `digits` may be `{ min, max }` (`max` is `max(min, 3)` when left out), for as
+  many digits as the number needs within them: `format_number(10, "en-US", { max: 3 })`
+  is `10`, `8.875` stays `8.875`, and `{ min: 2, max: 3 }` writes `8.8` as `8.80`.
 - There are no exchange rates: an amount stays in its currency, and converting is the
   program's arithmetic with a rate it chose. `quillo check` takes every `money.*`
   result as money, so `is_err(r) ? r.error : ...` after `money.mul` is refused by it,
@@ -3732,9 +4020,11 @@ takes a fifteenth of the comprehension's time.
 
 There is no date type: a date is its ISO 8601 text, `"2026-10-27"`, and a date-time is
 RFC 3339 text with its offset, `"2026-10-27T14:30:00Z"` or `"2026-10-27T15:30:00+01:00"`.
-Text like that sorts and compares in time order (date-times when they have the same
-offset: keep them in UTC), and goes through JSON, databases, forms (`<input type="date">`)
-and the browser as it is. The `date` module works on it, on the server and in the browser
+Dates sort and compare in time order as text. Date-times do only when they are written
+the same way, with the same offset and the same digits: `"…14:30:00.000Z"`, as
+JavaScript's `toISOString()` writes it, sorts before `"…14:30:00Z"`, though they are
+one instant. To order or compare date-times, use `date.compare(a, b)` or `date.ms`.
+Both go through JSON, databases, forms and the browser as they are. The `date` module works on it, on the server and in the browser
 alike, with the same answers:
 
 ```quillo
@@ -3743,6 +4033,8 @@ date.now()                            // "2026-10-27T14:30:00Z", to the second
 date.add_months("2026-01-31", 1)      // "2026-02-28": the end of the month, not March
 date.to_zone("2026-10-27T14:30:00Z", "Europe/Paris")       // "2026-10-27T15:30:00+01:00"
 date.at("2026-10-27", "17:00", "America/New_York")         // "2026-10-27T17:00:00-04:00"
+date.at("2026-10-27T17:00", "America/New_York")            // the same, from <input type="datetime-local">
+date.compare("2026-10-27T14:30:00.000Z", "2026-10-27T15:30:00+01:00")   // 0: one instant
 date.days_between("2026-11-05", "2026-11-14")              // 9: the nights of a stay
 date.format("2026-10-27", { locale: "de-DE", style: "long" })  // "27. Oktober 2026"
 date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or an error value
@@ -3764,13 +4056,23 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
 - **Milliseconds:** `date.ms(t)` is a date-time (or a date, at its midnight in UTC) as
   milliseconds since 1970, what `now()` gives, and `date.from_ms(ms, tz)` a time kept that
   way as a date-time (to the second): `date.from_ms(now(), "Europe/Lisbon")`.
+- **Comparing:** `date.compare(a, b)` is -1, 0 or 1 by the instants, fractions of a
+  second included, a date counting as its midnight in UTC: the safe way to order or
+  compare date-times written differently, `sort_by(xs, (x) => date.ms(x.at))` the way
+  to sort them.
 - **Time zones:** `date.valid_zone(z)` asks whether a zone exists, for one a person typed;
   a zone it does not know stops the call, so `date.to_zone(t, z) ?? t` guards it too.
   `date.to_zone(t, tz)` is the same instant at the zone's offset then
-  (daylight saving included); `date.date_in(t, tz)` its calendar date there;
-  `date.at(d, "HH:MM", tz)` the instant a local time names (a time skipped when clocks go
-  forward is moved forward by the gap, 02:30 becoming 03:30; a time that happens twice
-  when they go back is the first). A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
+  (daylight saving included), a fraction of a second that is all zeros dropped (`.000Z`
+  becomes `Z`); `date.date_in(t, tz)` its calendar date there;
+  `date.at(d, "HH:MM", tz, options)` the instant a local time names, and
+  `date.at("2026-10-27T14:30", tz, options)` the same from one text (seconds may follow,
+  and a space may stand for the `T`), as `<input type="datetime-local">` gives it. When
+  clocks go back, a time that happens twice is the first, or `{ repeated: "later" }` the
+  second; when they go forward, a skipped time is moved on by the gap (02:30 becoming
+  03:30), or `{ skipped: "earlier" }` moved back, or `{ skipped: "error" }` an error
+  value: `date.at: 2026-03-08 02:30 is skipped in that zone, as its clocks move
+  forward`. A zone is an IANA name (`"Europe/Paris"`), `"UTC"`, or
   an offset (`"+05:30"`); left out, it is UTC. An offset of zero is written `Z`. The server
   reads the system's time zone database, or a copy built into `quillo` where there is none
   (Windows, small containers); the browser asks its own (`Intl`).
@@ -3785,6 +4087,9 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   Italian, Dutch and Portuguese, as the server and the browser both have them (CLDR's
   forms); any other gives English. `date.parse(s)` reads a date or a date-time, with `T` or
   a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
+  a date-time with no offset is an error value that says to read it with `date.at(v,
+  zone)`, as it names no instant until a zone is given; an HTTP date (`Tue, 27 Oct 2026
+  14:30:00 GMT`) is read as UTC;
   `date.parse(s, pattern)` reads by a pattern (English names; `YY` is 2000 to 2099; with a
   time and no `Z`, UTC; its `Z` reads `Z`, `+01:00` or `+0100`, not `+01`). Either gives
   an error value when the text is not a date. There is no token for fractions of a
@@ -3795,6 +4100,19 @@ but `date.parse` and `date.valid`. Years are 1 to 9999. `date.today` and `date.n
 the clock, so they are the `time` effect, and scripts run with `run_script` have the rest
 of `date` but not them. A program's own variable called `date` hides the module, as with
 the others.
+
+What a form's date and time inputs send, and what reads it:
+
+| Input | Sends | Read it with |
+|---|---|---|
+| `<input type="date">` | `2026-10-27` | as it is: it is a date |
+| `<input type="time">` | `14:30` | `date.at(day, v, zone)`'s second argument |
+| `<input type="datetime-local">` | `2026-10-27T14:30` | `date.at(v, zone)` |
+| `<input type="month">` | `2026-10` | no `date` function reads it: split it, `date.of(y, m, 1)` |
+| `<input type="week">` | `2026-W44` | no `date` function reads it |
+
+None of them carries a zone: the program says which (a user's setting, the `tz` cookie
+below).
 
 Business days, holidays and the day counts of interest are a program's own: a calendar
 is a list of holidays and the arithmetic above.
@@ -3826,7 +4144,13 @@ db.transaction({ isolation: "serializable", retries: 3 }, () => { ... })
 
 Without `db.open`, the database is `$QUILLO_DB` (a path or a URL), or else
 SQLite in memory. A transaction rolls back if its function fails, returns an error
-value or replies early. A SQLite path is from the program's folder, not the one Quillo
+value or replies early, and also when a statement in it gives an error that nothing
+takes: `db.exec(...)` alone on a line that fails rolls the whole transaction back, and
+the transaction gives that error as its value, so half the work is never committed.
+An inner transaction whose error is dropped rolls the outer one back too; `let _ =
+db.transaction(...)` for the inner one says its failure is not wanted, and the outer one
+goes on. `quillo check` warns when a `db.transaction(...)` call's value is dropped
+(FEEDBACK27.md, Q-332). A SQLite path is from the program's folder, not the one Quillo
 runs in, and `quillo run` says which file it opened when it starts
 (`quillo: database /srv/app/app.db`). Only `postgres://`, `postgresql://`, `mysql://` and
 `mariadb://` are servers: any other text, `sqlserver://...` included, is taken for a
@@ -3937,7 +4261,9 @@ start together take turns (an advisory lock on Postgres, an immediate transactio
 SQLite), so each file still runs once. Only files ending `.sql` directly in the folder
 count (no subfolders); they sort by name as text, so `10_x.sql` comes before `2_x.sql`:
 pad the numbers. The name is the key: a renamed file runs again. A file holds no
-`begin` or `commit` of its own. The folder must exist. The table is `_quillo_migrations
+`begin` or `commit` of its own. The folder must exist: a missing one is an error that
+says why it may be gone from a clone (`there is no such folder (git keeps no empty
+folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
 (name, sha256, applied_at)`. Call it right after `db.open`:
 
 ```quillo
@@ -4636,6 +4962,10 @@ quillo> db.query("select * from notes")
   not run here (`quillo check` runs them on a file), and routes declared here are not
   served. Ctrl-D exits. It has no line editing or history of its own: `rlwrap quillo
   repl` adds them.
+- From a pipe (`quillo repl < steps.qwe`) it prints only the answers: no greeting and
+  no prompts. Input that ends inside a statement is an error naming the line it began
+  on, and a statement that failed makes the exit status 1. `quillo repl -i` keeps the
+  greeting and the prompts from a pipe too, as Python's `-i` does.
 
 ### Scripts as tools
 
@@ -4647,7 +4977,9 @@ passes on) with 1, saying what it was. Files are the program's folder's, as for 
 `--allow-path DIR` names another folder that `read_file` and `write_file` may use, by its
 own path or through `..`, where a link leads being what counts (FEEDBACK29.md, Q-357). It is
 named, never assumed: the same program may serve strangers later, and in a program that
-serves, `stdin`, `read_line` and `exit` are errors.
+serves, `stdin`, `read_line` and `exit` are errors. A script whose output pipe closes
+(`quillo run tool.qwe | head -1`) ends quietly, with status 141, as other tools do; a
+server whose stdout closes goes on answering, and what `print` writes is dropped.
 
 ```quillo noexec
 // cat orders.csv | quillo run total.qwe -- EUR
@@ -4777,6 +5109,13 @@ or at 32 KiB. Not logged: `/_quillo/health`, `/_quillo/metrics`, Chrome's
 `/.well-known/appspecific/com.chrome.devtools.json`, UDP packets, channel messages. A
 desktop window's launch token never appears in it.
 
+An error's text can hold what a visitor sent, so in a text line its control characters and
+line breaks are written as escapes (`\n`, `\x1b`): one request is one line, and no one can
+write a line of their own into the log or colour a terminal. A malformed request line is
+written escaped too, and under `--log json` it is an object of its own, `{"time",
+"status", "error", "line"}`. Quillo's own notices (`listening on`, warnings, `stopping`)
+are text lines on stderr in both modes.
+
 With `--metrics`, `GET /_quillo/metrics` answers in Prometheus's text format:
 
 | Metric | |
@@ -4895,6 +5234,13 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   value or `null`; `serde_json::Value` is anything. A function returning
   `Result<T, E>` gives `T`, or an error value with `E`'s message, so `?` and `??` work
   on it. `()` is `null`. References (`&String`, `&Vec<T>`) are fine as parameters.
+  A `u64` past `i64`'s range inside a returned `serde_json::Value` is a runtime error
+  that names where it is (`.id`, `[1].n`), not a float that has lost digits.
+- An argument that does not fit is refused with the parameter's name: `` `small`:
+  argument `n` does not fit in i32: 5000000000 ``. Values cross at most 126 levels deep:
+  an argument nested deeper is refused (`` `deep`: argument `v` is nested too deeply: a
+  plugin takes values at most 126 levels deep ``), and an answer nested deeper is an
+  error that says so (`` `pr_deep` (w.qwer) gave back a value nested too deeply ``).
 - What does not cross: structs (even with `#[derive(Deserialize)]`: take a
   `serde_json::Value` and `serde_json::from_value` it inside), tuples, sets, `Box`,
   `Rc`, `Arc`, `PathBuf`, `Cow`. A decimal arrives as its text, so an `f64` parameter
@@ -4918,6 +5264,9 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   program](#files-of-a-program)).
 - Two `.qwer` files exporting one name: the last `use`d replaces the other, with a
   warning that says how to take one under another name.
+- A `pub fn` named like a builtin (`len`, `get`) hides the builtin in the files that
+  take it, and `quillo check` warns of it at the `.qwer` file's line, with how to take it
+  under another name: `import x.qwer use len as x_len` (FEEDBACK27.md, Q-326).
 - `quillo check` reads the functions' types from the Rust, without building anything:
   calls are checked, and editors show them on hover. The language server also runs
   `cargo check` on each save of a `.qwer` file, and shows Rust's errors in the editor.
@@ -4954,7 +5303,9 @@ How it runs:
 - A panic is a runtime error in the request that called the function (not an error
   value: `??` does not catch it), and the server goes on. `std::process::exit`, an
   abort, or a stack overflow ends the whole server. Arguments of the wrong type are
-  refused before the function runs.
+  refused before the function runs. A stop (`SIGTERM`) while a request is in a call is
+  logged as a stop, `quillo: stopped with GET /slow?ms=14000 still running`, not as a bug
+  in Quillo.
 - With `--watch` and `--reload`, a `.qwer` file that changes is built again and the
   program reloaded with it. A build that fails prints the compiler's errors, and the
   program goes on as it was. Requests in progress finish with the version they started
@@ -5148,6 +5499,8 @@ does not do it today; the way around it follows.
 | write a service in another language? | Yes, if it answers Quillo's signed calls; the caller keeps a `.qwe` file of its signatures. See [Services](#services) |
 | use every core? | Yes: `--instances N`, each with its own variables. See [Concurrency](#concurrency-and-reloading) |
 | run several servers? | Yes, behind limer, sharing a database; live data follows. See [Several servers](#several-servers) |
+| describe my API for a gateway? | Yes: `quillo docs`, `--describe`. See [The program's API (OpenAPI)](#the-programs-api-openapi) |
+| add a copy of a service while it runs? | Yes: `--join`, or behind limer with `--register`. See [Copies that join](#copies-that-join) |
 | deploy without dropping a request? | With `--reload` for the program's files; a new binary is a stop and a start, so run two servers for no gap |
 | keep state in memory across restarts? | No: globals start afresh; keep it in the database |
 
@@ -5172,14 +5525,19 @@ does not do it today; the way around it follows.
 - a file's names under a prefix (`use lib/auth as auth`, then `auth.login()`), where `.`
   in markup is already a class
 - splitting a page's bundle by route, and components loaded lazily
-- discovering services through limer's pool, and `--join` for copies behind NAT
+- a caller finding a service by name through limer's pool, and `--join` for copies behind NAT
+- `{{ ... }}` blocks of JavaScript in a component (a design only)
+- in the browser, a map's keys that look like integers keep their order of insertion:
+  there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
+- Linux builds linked with musl, or static, for systems older than glibc 2.34
 - phone apps in the stores: uploads to the App Store and Google Play, HarmonyOS NEXT,
   `.qwer` plugins linked into the app, and work while the app is in the background
 
 ## Layout
 
 ```
-src/main.rs        CLI: run, app, check, fix, docs, build, repl, lsp, dap, version
+src/main.rs        CLI: run, app, new, check, fix, docs, build, repl, lsp, dap, version
+src/new.rs         quillo new: a program to start from
 src/lib.rs         the crate: what the binary and the tests use
 build.rs           stamps the commit into `quillo --version`
 
@@ -5233,7 +5591,8 @@ src/session.rs     cookies and sessions
 src/idempotency.rs idempotent(f): requests with an Idempotency-Key run once
 src/upload.rs      files sent with a form
 src/statics.rs     files served with file()
-src/site.rs        what a program sets about its site: tenants, cross-site posts
+src/site.rs        what a program sets about its site: tenants, cross-site posts, site_headers
+src/sites.rs       site name = URL: calling another Quillo site's server fns
 src/jobs.rs        jobs run on a schedule
 src/viewcache.rs   reusing views' HTML while their inputs are unchanged
 src/ws.rs          WebSockets, for live updates, --watch reloads and channels

@@ -52,7 +52,7 @@ impl Drop for Mode {
 fn a_folder_that_is_not_there_is_named() {
     let d = dir("missing");
     let mut it = load(&d, "db.open(\"app.db\")\n");
-    says(eval(&mut it, "db.migrate(\"nowhere\")"), &format!("db.migrate: cannot read {}: No such file or directory", d.join("nowhere").display()));
+    says(eval(&mut it, "db.migrate(\"nowhere\")"), &format!("db.migrate: cannot read {}: there is no such folder (git keeps no empty folder", d.join("nowhere").display()));
 }
 
 #[test]

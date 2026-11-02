@@ -126,8 +126,12 @@ route GET /plain = <html><body>{t("hi", { name: "</script>" })}</body></html>
     );
     let page = get(&mut it, "/", &[("Accept-Language", "fr")]).text();
     assert!(page.contains("1 article</button>"), "{}", page);
-    let at = page.find("window.__quillo_i18n=").expect("translations for the browser");
-    assert!(page[at..].contains(r#""locale":"fr""#) && page[at..].contains(r#""nav.about":"About""#), "{}", &page[at..]);
+    // In a file of their own, loaded before the bundle (FEEDBACK30.md, Q-372; branch
+    // feedback27-35-fixes).
+    let at = page.find("/_quillo/t/").expect("translations for the browser");
+    let path = page[at..].split(".js").next().unwrap().to_string() + ".js";
+    let t = get(&mut it, &path, &[("Accept-Language", "fr")]).text();
+    assert!(t.starts_with("window.__quillo_i18n=") && t.contains(r#""locale":"fr""#) && t.contains(r#""items""#), "{}", t);
     assert!(page.find("/_quillo/b/").unwrap() > at);
     // Only pages with components, and never a way out of the script.
     assert!(!get(&mut it, "/plain", &[]).text().contains("__quillo_i18n"));
@@ -152,7 +156,7 @@ fn __t() = [0, 1, 2, 5, 11, 21, 22, 1.5] | map((n) => t("files", { count: n })) 
     let mut it = Interp::new(".");
     it.load_source(src, "case.qwe").unwrap();
     let server = it.call(&quillo::value::lookup(&it.globals, "__t").unwrap(), vec![], 0).ok().unwrap().repr();
-    let words = it.site.i18n.as_ref().unwrap().browser_json("ru");
+    let words = it.site.i18n.as_ref().unwrap().browser_json("ru", None);
     let js = format!("globalThis.window = {{ __quillo_i18n: {} }};\n{}", words, quillo::client::test_script(&it, "__t").unwrap());
     let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -188,7 +192,7 @@ fn __t() = raw(t("welcome", { name: "<i>x</i>" }))
     if !Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
         return;
     }
-    let words = it.site.i18n.as_ref().unwrap().browser_json("en");
+    let words = it.site.i18n.as_ref().unwrap().browser_json("en", None);
     let js = format!("globalThis.window = {{ __quillo_i18n: {} }};\n{}", words, script);
     let out = Command::new("node").arg("-e").arg(&js).output().expect("node");
     assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "<html>", "{}", String::from_utf8_lossy(&out.stderr));

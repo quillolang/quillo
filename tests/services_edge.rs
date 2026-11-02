@@ -510,7 +510,7 @@ fn join_copy(it: &mut Interp, name: &str, port: u16, nonce: &str) {
 }
 
 #[test]
-fn calls_go_in_turn_to_a_copy_that_joined_and_here_again_when_it_does_not_answer() {
+fn calls_go_to_a_copy_that_joined_and_here_again_when_it_does_not_answer() {
     signing();
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
@@ -523,10 +523,11 @@ fn calls_go_in_turn_to_a_copy_that_joined_and_here_again_when_it_does_not_answer
     join_copy(&mut it, "copies", port, &format!("copies{}", std::process::id()));
     assert_eq!(service::urls_of(&it.shared, "copies"), [url.clone()]);
     assert_eq!(service::first_url_of(&it.shared, "copies"), Some(url.clone()));
+    // The copy takes every call while it answers: it joined to take the load off the app
+    // (FEEDBACK32.md, Q-399; branch feedback27-35-fixes).
     let got: Vec<String> = (0..4).map(|_| ev(&mut it, "copies.add(1)")).collect();
-    assert_eq!(got.iter().filter(|g| *g == "100").count(), 2, "{:?}", got);
-    assert_eq!(got.iter().filter(|g| *g == "2").count(), 2, "{:?}", got);
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(got, ["100", "100", "100", "100"], "{:?}", got);
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
 
     // A copy that joined and is gone: here instead.
     let down: u16 = nobody().rsplit(':').next().unwrap().parse().unwrap();
@@ -794,10 +795,11 @@ fn a_copy_joins_says_it_is_there_and_leaves_when_it_stops() {
     let mut copy = run(&d.join("risk.qwe"), copy_port, &["--as-service", "--join", &url], &[("QUILLO_SERVICE_SECRET", SECRET), ("WHO", "the copy")]);
     copy.logged(&format!("joined {} as a copy of `risk`", url), 10);
     app.logged(&format!("service risk: http://127.0.0.1:{} joined", copy_port), 5);
+    // While the copy is in, it takes the calls (FEEDBACK32.md, Q-399; branch feedback27-35-fixes).
     let mut seen: Vec<String> = (0..6).map(|_| app.get("/").1).collect();
     seen.sort();
     seen.dedup();
-    assert_eq!(seen, ["here", "the copy"]);
+    assert_eq!(seen, ["the copy"]);
 
     copy.interrupt();
     assert!(copy.log().contains(&format!("left {} (`risk`)", url)), "{}", copy.log());

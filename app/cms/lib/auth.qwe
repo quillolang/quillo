@@ -25,7 +25,9 @@ fn has_role(u, role: str) -> bool = u != null && (contains(u.roles, role) || con
 
 fn has_any(u, roles: list) -> bool = any(roles, (r) => has_role(u, r))
 
-fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/desk"
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+fn safe_next(next) -> str = local_path(next) ?? "/desk"
 
 fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
 

@@ -41,6 +41,8 @@ pub mod livecache;
 pub mod metrics;
 pub mod migrate;
 pub mod mobile;
+pub mod new;
+pub mod sites;
 pub mod platform;
 pub mod money;
 #[cfg(feature = "mysql")]
@@ -80,7 +82,8 @@ pub use value::Value;
 /// (build.rs): "0.5.0 (d2c2aa4, 2026-10-27)".
 pub fn version() -> String {
     match env!("QUILLO_COMMIT") {
-        "" => env!("CARGO_PKG_VERSION").to_string(),
+        // FEEDBACK31.md, Q-389; branch feedback27-35-fixes.
+        "" => format!("{} (commit unknown)", env!("CARGO_PKG_VERSION")),
         commit => format!("{} ({})", env!("CARGO_PKG_VERSION"), commit),
     }
 }

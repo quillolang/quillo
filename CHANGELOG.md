@@ -2,6 +2,199 @@
 
 ## Unreleased
 
+### What to change in your code
+
+- **`children` given none is `null`,** on both sides: test `children != null`. `quillo
+  check` warns on `str(children)`.
+- **`js_new("Promise", ...)` stays a Promise.** To wait for it and catch its failure, wrap
+  it: `js("Promise.resolve", js_new("Promise", ...))`.
+- **A parent's `@mount` can run before a child's.** Do not count on the order.
+- **`session` is the request's session to `quillo check`**, as it is when the program
+  runs, so the check may now say more about code that uses it.
+- **`==` on two of the page's elements is identity**, not a comparison of their fields.
+- **An error a statement drops is logged**, and inside `db.transaction` rolls it back: a
+  transaction that used to commit half its work now gives the error. Write `let _ = f()`
+  where a failure is truly not wanted.
+- **`file()` refuses an option it does not know**, and `date.parse` a date-time with no
+  offset: read it with `date.at(v, zone)`.
+
+### Errors that are dropped, and plugins (FEEDBACK27.md)
+
+- **An error no statement takes is written to the log**, with where it was dropped, where it
+  was made and the request: `main.qwe:10: an error no statement took, made at main.qwe:6:
+  odd (pass it on with ?, give a value with ??, or take it with let _ =)`. A script writes
+  it to stderr and goes on (Q-332).
+- **Inside `db.transaction`, a dropped error rolls the transaction back**, and the
+  transaction gives that error, nested ones too, so a failed `db.exec` no longer answers
+  200 with half the work committed. `let _ = db.transaction(...)` for an inner one keeps
+  the outer one going (Q-332).
+- **`quillo check` warns of a dropped `db.transaction(...)`**, and of a dropped call of the
+  program's own function that can fail (`! T`, `err(` or `?` in its body). A builtin's
+  dropped error is logged when it happens (Q-333).
+- **A builtin given an error says what it was:** `` `json.parse` expects a str as argument
+  1, got error (it failed before this call, main.qwe:3: read_file: ...) ``, and
+  `int(...)` the same (Q-333).
+- **Plugins:** a `pub fn` named like a builtin is warned of at the `.qwer` file's line, with
+  `import x.qwer use len as x_len` (Q-326); a `u64` past `i64`'s range inside a
+  `serde_json::Value` is an error naming where it is (`.id`, `[1].n`), not a float
+  (Q-327); an argument that does not fit (`` `small`: argument `n` does not fit in i32 ``)
+  or is nested past 126 levels says so, and an answer nested too deep is no longer a
+  false "panicked" (Q-328, Q-329); a `SIGTERM` during a call logs `stopped with GET
+  /slow still running`, not a bug in Quillo (Q-330).
+- **`file(path, options)` refuses options it does not know**, naming `cache`, `download`
+  (a name, sent as `Content-Disposition: attachment`, safe for any script) and `type`
+  (Q-331).
+
+### Uploads, translations, dates (FEEDBACK30.md)
+
+- **`save_upload`, `write_file` and `delete_file` refuse the program's own files:** its
+  `.qwe` and `.qwer` files (and a folder holding one), `.env` and `.env.*`, the open SQLite
+  database with its `-wal`, `-shm` and `-journal`, and `migrations/`. `quillo check` warns
+  on `save_upload(f, f.filename)` (Q-361).
+- **`{ files: { docs: [map] } }`** takes every file of a field as a list, one a list of one
+  and none an empty list (Q-365). A file's and a field's name decode only `%22`, `%0D` and
+  `%0A`, and a quoted name keeps its `;` (Q-373). From a page, a file anywhere in a `server
+  fn`'s arguments goes as a file, and a `FileList` is a list of files (Q-364).
+- **Translations:** `fr_FR.json` is read as `fr-FR`, and two files for one locale are an
+  error. A request's locale is matched by script first, with CLDR's likely scripts (`zh-TW`
+  gets `zh-Hant`, `zh-CN` and `zh` get `zh-Hans`, `sr` gets `sr-Cyrl`) and CLDR's parent
+  regions (`pt-AO` gets `pt-PT`, `es-MX` gets `es-419`, English outside the US `en-GB`)
+  (Q-362, Q-363).
+- **Plural forms are CLDR's on both sides:** a written `zero` form for 0 in every language;
+  Romanian, Lithuanian, Latvian, Slovenian, Icelandic, Macedonian, Irish, Welsh and
+  Maltese added; `many` for exact millions in French, Spanish, Italian, Catalan and
+  Portuguese; `pt-PT` singular for 1 only; fractions take each language's form, and
+  `1.0m` or `"1.5"` count as fractions; a `count` given as text (`"1"`) is taken at its
+  number. A form a language never picks is warned of as the translations load (Q-366,
+  Q-367).
+- **A page's translations are a file the browser keeps**, `/_quillo/t/<hash>.js`, holding
+  only the keys its components can ask for (Q-372), and `ask()`'s buttons are in the
+  page's locale: the program's `quillo.ok` and `quillo.cancel`, else about thirty built in
+  (Q-377).
+- **Dates:** `date.compare(a, b)` orders date-times by their instants, however they are
+  written; `date.to_zone` drops an all-zero fraction (`.000Z` is `Z`); `date.at` takes `{
+  repeated: "earlier" | "later" }` and `{ skipped: "later" | "earlier" | "error" }`, and
+  reads `<input type="datetime-local">`'s `2026-10-27T14:30` as one text; `date.parse`
+  refuses a date-time with no offset, saying to use `date.at`, and reads an HTTP date as
+  UTC (Q-368, Q-375, Q-376).
+- **`format_number` rounds a tie away from zero**, from the number's shortest decimal, as
+  `Intl.NumberFormat` does (2.5 is 3, 1.005 is 1.01), and `digits` may be `{ min, max }`
+  (Q-369).
+- **A session keeps decimals and ints past 2^53** as they are, so `session().total + 1m`
+  adds (Q-374).
+- **In the browser, a place whose expression fails is emptied**, not left at its last good
+  value (Q-370), and a `state` that still holds its prop is written in the page once, as a
+  reference to the prop (Q-371).
+
+### Components and pages (FEEDBACK28.md, FEEDBACK35.md)
+
+- **`{{ ... }}` blocks of JavaScript in a component** are designed, not built (Q-427).
+- **A function in markup given a state keeps its elements** when its markup has the same
+  shape and follows no state itself, so an input in it keeps its focus and what was typed
+  (FEEDBACK25.md, Q-306).
+- **`<script>`'s own text is written as it is**, with only `</` and `<!--` escaped; quotes
+  no longer become `&quot;`. A `{` in a script's text says how to write the code instead
+  (Q-428).
+- **`style={{ color: tone, font_size: "2rem", "--gap": "4px" }}`:** a map of properties, `_`
+  and camelCase written as `-`, custom properties kept, `null` and `false` left out, on
+  both sides (Q-429).
+- **`quillo check` warns on `<p>{{ name }}</p>`**, which shows a map, and on a component's
+  `let` set from the page and shown in markup, which makes the browser remake it: write
+  `state` (Q-430, Q-431).
+- **Handlers pause only where something waits:** a block that waits for nothing, a module's
+  function (`date.`, `re.`, `money.`, ...) and a function compiled here that gives no
+  Promise are not waited for, so they can go to `map`, `filter` and `reduce`; a Promise
+  executor that throws rejects; a replayed `@load` on a server-rendered image runs once,
+  on the image (Q-415 to Q-418, Q-420).
+- **A prop's call is waited for** (since 0.6), so a callback that only sets state gives the
+  child `null`: the guide says how a child learns that its caller finished (Q-419).
+
+### Command line and files (FEEDBACK31.md, FEEDBACK34.md)
+
+- **`quillo new <folder>`** writes a program to start from: the to-do app, or with
+  `--minimal` a page, a component and a function both sides use, with a `.gitignore`;
+  `--binary` copies `quillo` into `.quillo/bin/`. It refuses a folder that is not empty
+  and names Windows refuses, and never leaves a folder half written (Q-422).
+- **Logs cannot be forged:** line breaks and control characters in an error's text are
+  written as `\n` and `\x1b`, a malformed request line is escaped, and under `--log json`
+  is an object of its own. Quillo's notices stay text lines on stderr (Q-378).
+- **A script piped into `head`** ends quietly with status 141; a server whose stdout closes
+  goes on (Q-379).
+- **`.env`:** a byte-order mark is skipped, a quoted value may span lines (PEM keys), and a
+  line that is not `KEY=value` is said at the start (Q-380).
+- **Options:** a value option followed by another option is refused, `--port` is 0 to
+  65535 (0 for any free port), `--tls-cert` and `--tls-key` must exist, all exit 2; `--`
+  ends the options before the program; `--instances` past the cores is warned of; a
+  misspelt command is told the nearest; `quillo MAIN.QWE` runs (Q-381, Q-389);
+  `--host localhost` is 127.0.0.1 (Q-384).
+- **`--with` commands stop on every way out**, a Ctrl-C or `SIGTERM` while loading, a
+  panic and a `SIGKILL` too (Q-382). **`--watch` and `--reload` follow a symbolic link**
+  pointed elsewhere (Q-383).
+- **Source files:** a byte-order mark and a `#!` line are skipped, so `./tool.qwe` runs; a
+  CRLF is a line break; a file that is not UTF-8 is refused at its first bad byte; an
+  invisible character is named by its code. A JSON body with a byte-order mark is read
+  (Q-385 to Q-387).
+- **The REPL from a pipe** prints only the answers, and a failure is exit 1 (Q-388).
+- **`quillo --version` from a source archive** reads `COMMIT`, else says `(commit unknown)`.
+- **`db.migrate` on a missing folder** says git keeps no empty folder (Q-423). The Linux
+  builds need glibc 2.34, which the README now says (Q-424).
+- **`delete_cookie` is `Secure` only over HTTPS**, for a `__Host-` or `__Secure-` name, or
+  with `secure: true`, so a cookie can be removed over plain HTTP (Q-425).
+- **`platform().server`** is `{ host, port, url, base }`, where the server listens, so a
+  program that reads its own pages need not be told its address (Q-426).
+- **`./` and `../` in `use` and `import`** count from the file that writes them, so a
+  library's file names its neighbour and is checked alone (FEEDBACK25.md, Q-325).
+- **`quillo check` warns on a capturing group inside a repeated one** (`(?:(a)|b)*`),
+  where the server's and the browser's engines differ (Q-308).
+
+### The web server (FEEDBACK31.md)
+
+- **`local_path(next)`** gives `next` when it is an address on this site as a browser reads
+  it, else null, for `redirect(local_path(next) ?? "/")` after a login (Q-390).
+- **Pages made from a session or a cookie** get `Cache-Control: private` and `Vary:
+  Cookie`, and every HTML page `X-Frame-Options: SAMEORIGIN`, unless the route sets its own
+  (Q-391).
+- **`site_headers(map)` and `site_headers("/admin", map)`** set headers for every answer
+  that does not set them, a `null` taking one of Quillo's away (Q-391).
+- **`file()` sees a file replaced by one of the same size and time** (`cp -p`, `touch -t`),
+  as its ETag and memory copy include the inode and change time (Q-392).
+- **HTTP framing:** two `Host` headers, an HTTP/1.1 request without one, or a bad one are
+  400; an absolute-form target gives the host; a method not in capitals is 501; a `HEAD`
+  carries the `GET`'s `Content-Length` (Q-393).
+- **`normalize(s, form)`**, one Unicode form, on both sides (Q-394).
+
+### Services and the API document (FEEDBACK32.md)
+
+- **`--describe` matches `quillo docs`:** a prefixed service's server fns are no longer
+  listed; under `--split` the services' routes stay and `--describe` is passed down, so
+  `/billing/_quillo/describe` answers the service's own document (Q-395, Q-397).
+- **Several routes on one method and path are one operation**, with a `oneOf` of bodies and
+  merged query parameters; a rest parameter is `/files/{path}` with `x-quillo-rest`; the
+  title is the program's name, and `--base` gives `servers` (Q-396, Q-398, Q-405).
+- **Joined copies take every call in turn**, the app running a call itself only when no
+  copy answers; with given addresses, the addresses and the copies are taken in turn
+  (Q-399).
+- The guide says how services are found (by registration), documents `/_quillo/join`, and
+  warns that `/_quillo/describe` is public (Q-400 to Q-405).
+
+### Phone apps (FEEDBACK33.md)
+
+- **`env.NAME = "value"` in `app.toml`** is what `env("NAME")` gives on the phone, and is
+  public. What goes into an app is one filter for both systems: no `.env`, dotfiles,
+  databases, `uploads/` or a program in a subfolder, and the build says what it left out;
+  Android keeps folders starting with `_` (Q-406 to Q-408).
+- **An `<iframe>` of another site stays in the page**, with no bridge, and **`site =
+  "https://app.example.com"`** in `app.toml` keeps that origin's pages in the web view with
+  `window.quilloNative` (Q-409, Q-410).
+- **`site shop = "https://..."`** calls a deployed Quillo site's server fns as
+  `shop.notes(a, b)`, keeping the site's cookies in an app of one person; server side
+  only. `/_quillo/rpc/<fn>` is documented as a wire for programs (Q-412, Q-413).
+- **A page's failed `http.*` to another site** says it may be CORS, plain http or
+  unreachable, and that a server fn can call it (Q-411).
+- iOS asks before reaching a computer on the local network (`NSLocalNetworkUsageDescription`),
+  and the guide says the runtime's `http.*` keeps its own certificate roots and may reach
+  plain http (Q-414).
+
 ### Faster than Python, and a script as a tool (FEEDBACK29.md)
 
 - **Everyday programs run faster than Python's**, in all seventeen that `bench/vs-python/run.py`
@@ -482,6 +675,9 @@ Measured with real sockets, 250 pages on the build before and on this one, and 1
 - **Editors:** a missing or mistyped end tag is told at its element with a fix;
   classes in markup go to their CSS rules and are completed.
 - **`--plain-http`**, and a warning for `Secure` cookies over plain HTTP.
+- **`quillo docs` and `--describe`:** the program's API as OpenAPI 3, its routes and its
+  server fns' contracts; a service deployed apart refuses, with 409, a call whose
+  contract differs; `/_quillo/ready` and `ready()`.
 
 ### Security and reliability
 

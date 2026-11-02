@@ -590,10 +590,23 @@ fn webtransport_listens_where_it_is_told_or_says_why_it_cannot() {
     assert!(t.get("hash").is_none(), "{}", t);
     drop(r);
 
-    // One that cannot be read.
-    let r = run(&d.join("main.qwe"), &["--tls-cert", &d.join("none.pem").display().to_string(), "--tls-key", &k], &[]);
+    // One that is no certificate: pages use a WebSocket.
+    std::fs::write(d.join("junk.pem"), "not a certificate").unwrap();
+    let r = run(&d.join("main.qwe"), &["--tls-cert", &d.join("junk.pem").display().to_string(), "--tls-key", &k], &[]);
     assert!(r.ticket().get("port").is_none());
     assert!(r.log().contains("WebTransport is off (cannot read the certificate"), "{}", r.log());
+    drop(r);
+
+    // One that is not there is a usage mistake, said before anything starts (FEEDBACK31.md,
+    // Q-381; branch feedback27-35-fixes).
+    let o = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(d.join("main.qwe"))
+        .args(["--tls-cert", &d.join("none.pem").display().to_string(), "--tls-key", &k])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("none.pem: there is no such file"));
 }
 
 // ---- a service's channels under --split -------------------------------------------------------

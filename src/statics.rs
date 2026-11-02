@@ -91,16 +91,27 @@ pub fn info(full: &Path) -> std::io::Result<Info> {
         return Err(std::io::ErrorKind::NotFound.into());
     }
     let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
-    // Weak: the same file gzipped or not is the same content.
+    // Weak: the same file gzipped or not is the same content. Its inode and change time are in
+    // it too, which a rename over it or a write keeps from staying the same, though the size
+    // and the modified time can (`cp -p`, `touch -t`, a build that sets every time to one): the
+    // memory's copy and the browser's are then seen to be old (FEEDBACK31.md, Q-392; branch
+    // feedback27-35-fixes).
     let path_hash = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         full.hash(&mut h);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (m.ino(), m.dev(), m.ctime(), m.ctime_nsec()).hash(&mut h);
+        }
         h.finish()
     };
     let etag = format!("W/\"{:x}-{:x}-{:x}\"", m.len(), mtime, path_hash & 0xffff_ffff);
     let secs = (mtime / 1_000_000_000) as u64;
-    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), mtime })
+    // The key of the copy in memory: the time, and the file's identity above it.
+    let key = (mtime & u64::MAX as u128) | ((path_hash as u128) << 64);
+    Ok(Info { len: m.len(), etag, last_modified: crate::httpd::http_date(secs), mtime: key })
 }
 
 /// The whole file, from memory when it is small and unchanged.

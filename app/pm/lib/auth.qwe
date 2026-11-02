@@ -19,7 +19,9 @@ fn me() with db, time = user_of_session(session().sid)
 // For loaders: who is asking, without following the sessions table.
 fn viewer() with db, time = unwatched(() => me())
 
-fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+fn safe_next(next) -> str = local_path(next) ?? "/"
 
 fn signed_in(back: str) = me() ?? reply 303 redirect(`/login?next=${url_encode(back)}`)
 

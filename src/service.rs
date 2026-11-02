@@ -66,6 +66,11 @@ pub fn serve_as(name: &str) {
     let _ = SERVED_AS.set(name.to_string());
 }
 
+/// What this process serves as: its file's name (`main` for main.qwe) or `--service-name`.
+pub fn served_as() -> Option<&'static str> {
+    SERVED_AS.get().map(String::as_str)
+}
+
 /// `QUILLO_SERVICE_BILLING` for `billing`.
 pub fn env_name(name: &str) -> String {
     format!("QUILLO_SERVICE_{}", name.to_ascii_uppercase())
@@ -427,7 +432,7 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
                 out.push(s);
                 continue;
             }
-            statements(&base.join(crate::modules::resolve(base, file)), base, seen, out)?;
+            statements(&base.join(crate::modules::resolve_from(base, path, file)), base, seen, out)?;
         }
         out.push(s);
     }
@@ -557,10 +562,10 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
     let configured = configured_urls(&it.shared, name);
     let joined = joined_urls(name);
     if configured.is_empty() {
-        // Here, and in turn with the copies that joined (FEEDBACK10.md,
-        // Q-074; branch feedback10-fixes); here again if none answers.
-        static TURN: AtomicUsize = AtomicUsize::new(0);
-        if joined.is_empty() || TURN.fetch_add(1, Ordering::Relaxed) % (joined.len() + 1) == 0 {
+        // The copies that joined first, in turn, as the guide says: a copy is added to take the
+        // load off the app, so while one answers the app runs none itself, and it runs a call
+        // when no copy answers it (FEEDBACK32.md, Q-399; branch feedback27-35-fixes).
+        if joined.is_empty() {
             return local(it, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)), line);
         }
         let id = call.unwrap_or_else(|| new_id(16));
@@ -569,6 +574,7 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
             ran => ran,
         };
     }
+    // The addresses the app was given and the copies that joined, all taken in turn.
     let mut urls = configured;
     urls.extend(joined.into_iter().filter(|u| !urls.contains(u)).collect::<Vec<_>>());
     remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| new_id(16)))
@@ -1166,6 +1172,8 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
         if let Some(p) = prefix {
             it.remote_mounts.retain(|(q, _)| q != p);
             it.remote_mounts.push((p.to_string(), url));
+            it.remote_sources.retain(|(q, _)| q != p);
+            it.remote_sources.push((p.to_string(), full.clone()));
         }
     } else {
         let key = full.canonicalize().unwrap_or_else(|_| full.clone());
@@ -1648,6 +1656,11 @@ pub fn split(path: &Path, watch: bool, static_check: bool, scale: &[(String, usi
         }
         if !static_check {
             args.push("--no-check".into());
+        }
+        // Its own document, at `/billing/_quillo/describe` through the app, as in one process
+        // (FEEDBACK32.md, Q-397; branch feedback27-35-fixes).
+        if crate::describe::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            args.push("--describe".into());
         }
         let child = start_service(&exe, &args, name)?;
         eprintln!("quillo: service {} ({}) on http://127.0.0.1:{}{}", name, file.display(), port, prefix.as_ref().map_or(String::new(), |p| format!(", served under {}", p)));

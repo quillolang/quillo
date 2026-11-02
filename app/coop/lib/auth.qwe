@@ -28,7 +28,9 @@ fn signed_in_as(back: str, roles: list) {
     u
 }
 
-fn safe_next(next) -> str = type_of(next) == "str" && starts_with(next, "/") && !starts_with(next, "//") ? next : "/"
+// `local_path` reads the address as a browser does, so `/\evil.example` is no way out
+// (FEEDBACK31.md, Q-390; branch feedback27-35-fixes).
+fn safe_next(next) -> str = local_path(next) ?? "/"
 
 fn home_of(role: str) -> str = match role {
     "member" => "/me"

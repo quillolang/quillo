@@ -190,6 +190,11 @@ pub fn note_start() {
 /// newer Quillo would refuse as well (FEEDBACK.md §5, Q-008; branch
 /// feedback6-fixes).
 pub fn may_be_newer_syntax(msg: &str) -> bool {
+    // A character that cannot be seen is no newer syntax (FEEDBACK31.md, Q-386; branch
+    // feedback27-35-fixes).
+    if msg.starts_with("unexpected character U+") {
+        return false;
+    }
     if msg.starts_with("unexpected character") || msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
         return true;
     }
@@ -238,4 +243,17 @@ pub fn which_quillo() -> String {
         );
     }
     format!("this is quillo {}{}{}; if the code was written for a newer Quillo, that would explain it", crate::version(), built, at)
+}
+
+/// A program's file as text. One that is not UTF-8 is refused with the line and column of the
+/// first byte that is not (FEEDBACK31.md, Q-386; branch feedback27-35-fixes).
+pub fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    String::from_utf8(bytes).map_err(|e| {
+        let ok = &e.as_bytes()[..e.utf8_error().valid_up_to()];
+        let line = ok.iter().filter(|&&b| b == b'\n').count() + 1;
+        let col = std::str::from_utf8(ok).map_or(0, |s| s.rsplit('\n').next().map_or(0, |l| l.chars().count())) + 1;
+        let bad = e.as_bytes()[ok.len()];
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("it is not UTF-8 text: byte 0x{:02X} at line {}, column {} (save it as UTF-8)", bad, line, col))
+    })
 }
