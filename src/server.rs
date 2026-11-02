@@ -422,7 +422,10 @@ impl Interp {
         }
         // Pages with components load the browser bundle.
         let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
-        // Every page prefetches the links pointed at.
+        // Every page prefetches the links pointed at: a page a route made, not a file as it is on
+        // disk, whose ETag and byte ranges are of the file (FEEDBACK36.md, Q-447; branch
+        // feedback36-39).
+        let html = html && !as_written(&resp);
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = |body: &[u8], needle: &[u8]| body.windows(needle.len()).rposition(|w| w == needle);
             if let (Some(at), false) = (has(&resp.body, b"</body>"), script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40])) {
@@ -563,11 +566,18 @@ impl Interp {
 
         let mut path_matched = false;
         let mut method_matched = false;
+        // The methods the path takes, for `Allow` (FEEDBACK36.md, Q-440; branch feedback36-39).
+        let mut allowed: Vec<&str> = Vec::new();
         let routes = self.routes.clone();
+        if req.url == "*" && req.method == "OPTIONS" {
+            let mut all: Vec<&str> = routes.iter().map(|r| r.method.as_str()).filter(|m| *m != "ANY").collect();
+            return options_answer(&mut all);
+        }
         for r in routes.iter() {
             let Some(params) = match_path(&r.path, &segs) else { continue };
             path_matched = true;
             if r.method != "ANY" && r.method != method {
+                allowed.push(r.method.as_str());
                 continue;
             }
             method_matched = true;
@@ -641,12 +651,43 @@ impl Interp {
         }
         if method_matched {
             plain(400, "bad request: no route pattern matches this request\n")
+        } else if !KNOWN_METHODS.contains(&method) && !routes.iter().any(|r| r.method == method) {
+            // A method nothing here knows is a 501, not a 405 (RFC 9110 §9.1).
+            plain(501, "unknown method\n")
+        } else if path_matched && method == "OPTIONS" {
+            options_answer(&mut allowed)
         } else if path_matched {
-            plain(405, "method not allowed\n")
+            // A 405 names the methods the path takes (RFC 9110 §15.5.6).
+            let mut resp = plain(405, "method not allowed\n");
+            resp.headers.push(("allow".into(), allow_list(&mut allowed)));
+            resp
         } else {
             plain(404, "not found\n")
         }
     }
+}
+
+/// Methods RFC 9110 and RFC 5789 define: one of them no route takes is a 405 or a 404, any
+/// other a 501.
+const KNOWN_METHODS: [&str; 9] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"];
+
+/// `Allow`'s value: the methods given, with `HEAD` where `GET` is and `OPTIONS`, which is
+/// answered for every path a route has.
+fn allow_list(methods: &mut Vec<&str>) -> String {
+    if methods.contains(&"GET") {
+        methods.push("HEAD");
+    }
+    methods.push("OPTIONS");
+    methods.sort_unstable();
+    methods.dedup();
+    methods.join(", ")
+}
+
+/// `OPTIONS` on a path no route takes it for, or `OPTIONS *`: 204 with `Allow`, as RFC 9110
+/// §9.3.7 says, rather than a 405, which marks the server down for a health check that sends
+/// it (HAProxy's `option httpchk`) (FEEDBACK36.md, Q-440; branch feedback36-39).
+fn options_answer(methods: &mut Vec<&str>) -> HttpResponse {
+    HttpResponse { status: 204, headers: vec![("allow".into(), allow_list(methods))], body: Vec::new() }
 }
 
 impl Interp {
@@ -820,10 +861,23 @@ impl Interp {
             };
         }
         if rest == "media.js" {
+            // With a validator, as quillo.js has, so that a page that plays a stream does not
+            // fetch its 39 KB again each time (FEEDBACK36.md, Q-441; branch feedback36-39).
+            let body = crate::client::media_script(&self.base);
+            let etag = format!("\"{:016x}\"", {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                body.hash(&mut h);
+                h.finish()
+            });
             return HttpResponse {
                 status: 200,
-                headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "no-cache".into())],
-                body: crate::client::media_script(&self.base).into_bytes(),
+                headers: vec![
+                    ("content-type".into(), "text/javascript; charset=utf-8".into()),
+                    ("cache-control".into(), "no-cache".into()),
+                    ("etag".into(), etag),
+                ],
+                body: body.into_bytes(),
             };
         }
         if rest == "quillo.js" {
@@ -1686,9 +1740,35 @@ fn value_response(v: Value) -> HttpResponse {
     }
 }
 
+/// Markup's type: XML when its root says it is in a namespace other than HTML's (a sitemap's
+/// `<urlset xmlns=...>`, a feed), or it starts `<?xml`; SVG when its root is `<svg>`; else HTML
+/// (FEEDBACK36.md, Q-451; branch feedback36-39).
+fn markup_type(h: &str) -> &'static str {
+    let t = h.trim_start();
+    if t.starts_with("<?xml") {
+        return "application/xml; charset=utf-8";
+    }
+    let Some(root) = t.strip_prefix('<') else { return "text/html; charset=utf-8" };
+    let tag: String = root.chars().take_while(|c| c.is_alphanumeric() || *c == ':' || *c == '-').collect();
+    let head = &root[..root.find('>').unwrap_or(root.len())];
+    match tag.as_str() {
+        "svg" if head.contains("xmlns=") => "image/svg+xml",
+        "html" | "svg" | "" => "text/html; charset=utf-8",
+        _ if head.contains("xmlns=") || head.contains("xmlns:") => {
+            match tag.as_str() {
+                "rss" => "application/rss+xml; charset=utf-8",
+                "feed" => "application/atom+xml; charset=utf-8",
+                _ => "application/xml; charset=utf-8",
+            }
+        }
+        "rss" => "application/rss+xml; charset=utf-8",
+        _ => "text/html; charset=utf-8",
+    }
+}
+
 /// Body encoding follows the value: html -> text/html, str -> text/plain,
 /// null -> empty, anything else -> JSON.
-fn render_response(r: &Response) -> HttpResponse {
+pub(crate) fn render_response(r: &Response) -> HttpResponse {
     let (ctype, body): (Option<&str>, Vec<u8>) = match &r.body {
         Body::Bytes(b) => (None, b.clone()),
         // Its function runs once the head is sent (see `Interp::handle`).
@@ -1700,7 +1780,7 @@ fn render_response(r: &Response) -> HttpResponse {
         }
         Body::Value(v) => match v {
             Value::Nil => (None, Vec::new()),
-            Value::Html(h) => (Some("text/html; charset=utf-8"), h.as_bytes().to_vec()),
+            Value::Html(h) => (Some(markup_type(h)), h.as_bytes().to_vec()),
             Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
             other => {
                 let mut out = Vec::new();
@@ -2056,7 +2136,7 @@ mod events {
     }
 }
 
-fn watch(app: Arc<App>) {
+pub(crate) fn watch(app: Arc<App>) {
     let mut files = app.watched_files();
     let mut seen = mtimes(&files);
     let mut served: std::collections::HashMap<PathBuf, Option<std::time::SystemTime>> = Default::default();
@@ -2195,9 +2275,15 @@ fn serve_events(app: Arc<App>, req: HttpRequest) -> Answer {
 }
 
 /// In watch mode, HTML pages get a script that reloads them after a change.
+/// An answer whose bytes are named by a validator or a range (`file()`'s, or a route's own
+/// `etag`): sent as it is, nothing added to it (FEEDBACK36.md, Q-447; branch feedback36-39).
+fn as_written(resp: &HttpResponse) -> bool {
+    resp.status == 206 || resp.header("etag").is_some() || resp.header("content-range").is_some()
+}
+
 fn inject_dev_script(resp: &mut HttpResponse, version: u64) {
     let html = resp.header("content-type").map_or(false, |c| c.starts_with("text/html"));
-    if !html {
+    if !html || as_written(resp) {
         return;
     }
     let body = String::from_utf8_lossy(&resp.body).into_owned();
@@ -2241,8 +2327,28 @@ fn run_program(it: &mut Interp, req: &HttpRequest) -> Option<HttpResponse> {
 }
 
 /// Gzips text responses of 1 KiB or more for clients that accept it.
-fn accepts_gzip(req: &HttpRequest) -> bool {
-    req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v.split(',').any(|e| e.trim().starts_with("gzip")))
+/// Whether `Accept-Encoding` takes gzip, read as RFC 9110 §12.5.3 says: names in any case,
+/// `x-gzip` the same, `q=0` refusing, and `*` standing for gzip when gzip is not named
+/// (FEEDBACK36.md, Q-439; branch feedback36-39).
+pub(crate) fn accepts_gzip(req: &HttpRequest) -> bool {
+    let mut star = None;
+    for (_, v) in req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("accept-encoding")) {
+        for item in v.split(',') {
+            let mut parts = item.split(';');
+            let name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            let q = parts.find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                k.trim().eq_ignore_ascii_case("q").then(|| v.trim().parse::<f64>().unwrap_or(0.0))
+            });
+            let wanted = q.map_or(true, |q| q > 0.0);
+            match name.as_str() {
+                "gzip" | "x-gzip" => return wanted,
+                "*" => star = Some(wanted),
+                _ => {}
+            }
+        }
+    }
+    star.unwrap_or(false)
 }
 
 fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
@@ -2430,14 +2536,14 @@ impl Worker {
                         page.tail.splice(0..0, script.into_bytes());
                     }
                     resp.headers.push(("x-content-type-options".into(), "nosniff".into()));
-                    let mut head = Vec::new();
-                    crate::httpd::write_stream_head(&mut head, &resp);
-                    let close = if !sink.write(&head) {
+                    let chunked = sink.chunked();
+                    let close = if !sink.start(&resp, chunked) {
                         true
                     } else if req.method == "HEAD" {
-                        false
+                        !chunked
                     } else {
-                        !matches!(crate::stream::run(it, p, sink, true), crate::stream::Ended::Done)
+                        // Unchunked, the end of the answer is the end of the connection.
+                        !matches!(crate::stream::run(it, p, sink, chunked), crate::stream::Ended::Done) || !chunked
                     };
                     streamed = Some(close);
                 }
@@ -2509,8 +2615,22 @@ impl Worker {
             };
             return send_file(resp, what, req.method == "HEAD", &req.remote);
         }
+        not_modified(&req, &mut resp);
         compress(&req, &mut resp);
         Answer::Respond(resp)
+    }
+}
+
+/// A route's own `etag` that the browser already holds: a 304, as `file()` and `quillo.js`
+/// give, rather than the whole answer again (FEEDBACK36.md, Q-441; branch feedback36-39).
+fn not_modified(req: &HttpRequest, resp: &mut HttpResponse) {
+    if resp.status != 200 || !matches!(req.method.as_str(), "GET" | "HEAD") {
+        return;
+    }
+    let (Some(etag), Some(asked)) = (resp.header("etag"), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
+    if crate::statics::matches(&asked.1, etag) {
+        resp.status = 304;
+        resp.body.clear();
     }
 }
 
@@ -2596,9 +2716,43 @@ pub fn serve_with(app: App, addr: &str, workers: usize, listening: impl FnOnce(s
     }
     if let Some(a) = bound {
         start_jobs(&app, a);
+        start_builds(&app, a);
         listening(a);
     }
     crate::httpd::serve(app, listener, workers + 1)
+}
+
+/// The paths of the program's `build` declarations (routes whose body is `__built`).
+pub fn build_paths(it: &Interp) -> Vec<String> {
+    it.routes
+        .iter()
+        .filter_map(|r| match &r.body {
+            crate::ast::Expr::Call(f, args, _) if matches!(&**f, crate::ast::Expr::Ident(n, _) if n == "__built") => match args.first() {
+                Some(crate::ast::Expr::Lit(crate::ast::Lit::Str(p))) => Some(p.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Asks for each `build` once the port is open, so that it is being made before a page asks
+/// for it (FEEDBACK37.md, Q-454; branch feedback36-39).
+fn start_builds(app: &Arc<App>, addr: std::net::SocketAddr) {
+    let paths = match &*app.current().1 {
+        Loaded::Ready(it) => build_paths(it),
+        _ => Vec::new(),
+    };
+    let addr = crate::jobs::loopback(addr);
+    for p in paths {
+        let _ = std::thread::Builder::new().name("quillo-build".into()).spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+                let _ = write!(s, "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", p);
+                let _ = s.read_to_end(&mut Vec::new());
+            }
+        });
+    }
 }
 
 /// Serves several instances of one program (`--instances`), each with an
@@ -2717,6 +2871,11 @@ fn start_udp(app: &Arc<App>, addr: std::net::SocketAddr) {
         Loaded::Ready(it) => crate::udp::ports(it),
         Loaded::Failed(_) => Vec::new(),
     });
+}
+
+/// A program inside an app (src/embed.rs): its jobs, ticks and calls made later, with no port.
+pub(crate) fn start_embedded(app: &Arc<App>) {
+    start_jobs(app, std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 }
 
 /// Starts the job scheduler for the program `app` runs (see `jobs`).

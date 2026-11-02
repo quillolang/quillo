@@ -35,7 +35,8 @@ const MAX_HEAD: usize = 64 << 10;
 const MAX_HEADERS: usize = 100;
 /// A kept-alive connection with nothing to do is closed after this long.
 const IDLE: Duration = Duration::from_secs(60);
-/// A request still arriving after this long is given up on.
+/// A request head still arriving after this long, or a body that sends nothing for this
+/// long, is given up on.
 const SLOW: Duration = Duration::from_secs(30);
 /// How long a connection being closed may keep sending (see `linger`).
 const LINGER: Duration = Duration::from_secs(2);
@@ -327,6 +328,10 @@ struct Conn {
     active: Instant,
     /// When the request now arriving began to.
     receiving: Option<Instant>,
+    /// Its head is read, and this is its line for the log: its body is arriving.
+    body_of: Option<String>,
+    /// The request being answered came over HTTP/1.0, which has no chunks.
+    http10: bool,
     /// `100 Continue` was sent for the request now arriving.
     continued: bool,
     /// Close once `output` is written.
@@ -373,7 +378,7 @@ enum Fate {
 
 /// A complete request, or one that cannot be answered.
 enum Item {
-    Request { req: HttpRequest, keep_alive: bool },
+    Request { req: HttpRequest, keep_alive: bool, http10: bool },
     Bad(u16, &'static str, String),
 }
 
@@ -870,6 +875,8 @@ impl Loop {
             writing: false,
             active: self.now,
             receiving: None,
+            body_of: None,
+            http10: false,
             continued: false,
             closing: false,
             lingering: false,
@@ -895,6 +902,10 @@ impl Loop {
             let Slot::Idle(c) = &self.slots[i] else { continue };
             let stale = match c.receiving {
                 _ if c.lingering => now.duration_since(c.active) > LINGER,
+                // A head must come whole in time; a body may take as long as it keeps coming,
+                // as nginx's `client_body_timeout`: a photo from a phone on a weak link took
+                // longer than 30 s and was reset (FEEDBACK36.md, Q-432; branch feedback36-39).
+                Some(_) if c.body_of.is_some() => now.duration_since(c.active) > SLOW,
                 Some(since) => now.duration_since(since) > SLOW,
                 // A client that takes none of its answer for this long
                 // would hold the connection and the answer forever.
@@ -904,7 +915,19 @@ impl Loop {
                 },
             };
             if stale {
-                if let Slot::Idle(c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
+                if let Slot::Idle(mut c) = std::mem::replace(&mut self.slots[i], Slot::Free) {
+                    // Told why, with a 408, and the log says so when the request was known
+                    // (FEEDBACK36.md, Q-432 and Q-446; branch feedback36-39).
+                    if c.receiving.is_some() && !c.lingering {
+                        if let Some(line) = c.body_of.take() {
+                            log_refused(&line, 408, "nothing of the body came for 30 s");
+                        }
+                        write_response(&mut c.output, &crate::server::plain_response(408, "request timeout\n"), false, true);
+                        if let Ok(true) = flush(&mut c) {
+                            self.linger(i, c);
+                            continue;
+                        }
+                    }
                     self.close(i, c);
                 }
             }
@@ -1229,8 +1252,11 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
     let mut items = Vec::new();
     while !c.input.is_empty() {
         match take_one(&mut c.input, &mut c.chunked, &c.peer, max_body) {
-            Taken::Need { expects_continue } => {
+            Taken::Need { expects_continue, body } => {
                 c.receiving.get_or_insert(now);
+                if body && c.body_of.is_none() {
+                    c.body_of = Some(request_line(&c.input));
+                }
                 if expects_continue && !c.continued {
                     c.continued = true;
                     c.output.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -1243,6 +1269,7 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
             }
             Taken::Item(item) => {
                 c.receiving = None;
+                c.body_of = None;
                 c.continued = false;
                 items.push(item);
             }
@@ -1252,8 +1279,33 @@ fn take_requests(c: &mut Conn, max_body: usize, now: Instant) -> Vec<Item> {
 }
 
 enum Taken {
-    Need { expects_continue: bool },
+    Need { expects_continue: bool, body: bool },
     Item(Item),
+}
+
+/// A request's first line as the log writes it: at most 200 bytes, a launch token masked.
+fn request_line(input: &[u8]) -> String {
+    let line = input.split(|b| *b == b'\r').next().unwrap_or(&[]);
+    let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
+    match line.split_once(' ') {
+        Some((method, rest)) => {
+            let (target, version) = rest.split_once(' ').unwrap_or((rest, ""));
+            let sep = if version.is_empty() { "" } else { " " };
+            format!("{} {}{}{}", method, crate::server::log_url(target), sep, version)
+        }
+        None => line,
+    }
+}
+
+/// Logs a request refused before it reached the program.
+fn log_refused(line: &str, status: u16, why: &str) {
+    // As it came, but for what would reach a terminal; an object where the log is
+    // objects (FEEDBACK31.md, Q-378; branch feedback27-35-fixes).
+    if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
+        log(format!("{}\n", serde_json::json!({ "time": iso_now(), "status": status, "error": why, "line": line })));
+    } else {
+        log(format!("{} -> {} ({})\n", log_safe(line), status, why));
+    }
 }
 
 /// The next request in `input`, taken out of it; or what is still needed,
@@ -1261,35 +1313,25 @@ enum Taken {
 /// the input is refused (then it is all dropped).
 fn take_one(input: &mut Vec<u8>, chunked: &mut Option<Dechunk>, peer: &str, max_body: usize) -> Taken {
     match parse(input, peer, max_body, chunked) {
-        Parsed::Need { expects_continue } => {
+        Parsed::Need { expects_continue, body } => {
             // A chunked body's bytes already decoded are not kept twice,
             // nor read again.
             if let Some(d) = chunked {
                 input.drain(d.head..d.head + d.used);
                 d.used = 0;
             }
-            Taken::Need { expects_continue }
+            Taken::Need { expects_continue, body }
         }
         Parsed::Bad(status, why) => {
-            let line = input.split(|b| *b == b'\r').next().unwrap_or(&[]);
-            let line = String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned();
-            // As the log writes any URL: a launch token masked.
-            let line = match line.split_once(' ') {
-                Some((method, rest)) => {
-                    let (target, version) = rest.split_once(' ').unwrap_or((rest, ""));
-                    let sep = if version.is_empty() { "" } else { " " };
-                    format!("{} {}{}{}", method, crate::server::log_url(target), sep, version)
-                }
-                None => line,
-            };
+            let line = request_line(input);
             input.clear();
             *chunked = None;
             Taken::Item(Item::Bad(status, why, line))
         }
-        Parsed::Done { req, len, keep_alive } => {
+        Parsed::Done { req, len, keep_alive, http10 } => {
             *chunked = None;
             input.drain(..len);
-            Taken::Item(Item::Request { req, keep_alive })
+            Taken::Item(Item::Request { req, keep_alive, http10 })
         }
     }
 }
@@ -1313,7 +1355,7 @@ pub mod fuzzing {
                         out.push("bad".to_string());
                         return out;
                     }
-                    Taken::Item(Item::Request { req, keep_alive }) => {
+                    Taken::Item(Item::Request { req, keep_alive, .. }) => {
                         out.push(format!("{} {} {:?} {:?} {}", req.method, req.url, req.headers, req.body, keep_alive));
                         // The answer closes a connection not kept.
                         if !keep_alive {
@@ -1358,19 +1400,14 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
         }
         match item {
             Item::Bad(status, why, line) => {
-                // As it came, but for what would reach a terminal; an object where the log is
-                // objects (FEEDBACK31.md, Q-378; branch feedback27-35-fixes).
-                if crate::metrics::LOG.load(SeqCst) == crate::metrics::JSON {
-                    log(format!("{}\n", serde_json::json!({ "time": iso_now(), "status": status, "error": why, "line": line })));
-                } else {
-                    log(format!("{} -> {} ({})\n", log_safe(&line), status, why));
-                }
+                log_refused(&line, status, why);
                 write_response(&mut c.output, &crate::server::plain_response(status, &format!("{}\n", why)), false, true);
                 c.closing = true;
                 return Fate::Keep;
             }
-            Item::Request { req, keep_alive } => {
+            Item::Request { req, keep_alive, http10 } => {
                 let head = req.method == "HEAD";
+                c.http10 = http10;
                 match worker.answer(app, req, Some(&mut ConnSink(c))) {
                     Answer::Streamed { close } => {
                         if close || !keep_alive {
@@ -1400,6 +1437,10 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
 struct ConnSink<'a>(&'a mut Conn);
 
 impl crate::stream::Sink for ConnSink<'_> {
+    fn chunked(&self) -> bool {
+        !self.0.http10
+    }
+
     fn write(&mut self, data: &[u8]) -> bool {
         let c = &mut *self.0;
         c.output.extend_from_slice(data);
@@ -1462,6 +1503,9 @@ fn flush(c: &mut Conn) -> std::io::Result<bool> {
 fn ip_of(a: &SocketAddr) -> String {
     a.ip().to_string()
 }
+
+/// Set on a request that came from a proxy `--trust-proxy` names.
+pub const PROXIED: &str = "x-quillo-from-trusted-proxy";
 
 /// `--trust-proxy`: the addresses whose `X-Forwarded-For` is believed. Without it the
 /// client is the connection's peer, as anyone can send that header (FEEDBACK24.md,
@@ -1536,9 +1580,10 @@ fn into_std(s: TcpStream) -> Option<std::net::TcpStream> {
 // ---- requests ------------------------------------------------------------
 
 enum Parsed {
-    Need { expects_continue: bool },
+    /// More is needed; `body` when the head is read.
+    Need { expects_continue: bool, body: bool },
     Bad(u16, &'static str),
-    Done { req: HttpRequest, len: usize, keep_alive: bool },
+    Done { req: HttpRequest, len: usize, keep_alive: bool, http10: bool },
 }
 
 /// `chunked_so_far` is what is decoded of a chunked body arriving in `buf`
@@ -1548,13 +1593,13 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
     let mut r = httparse::Request::new(&mut headers);
     let head = match r.parse(buf) {
         Ok(httparse::Status::Complete(n)) => n,
-        Ok(httparse::Status::Partial) if buf.len() > MAX_HEAD => return Parsed::Bad(431, "request headers too large"),
-        Ok(httparse::Status::Partial) => return Parsed::Need { expects_continue: false },
+        Ok(httparse::Status::Partial) if buf.len() > MAX_HEAD => return too_large(buf),
+        Ok(httparse::Status::Partial) => return Parsed::Need { expects_continue: false, body: false },
         Err(httparse::Error::TooManyHeaders) => return Parsed::Bad(431, "too many request headers"),
         Err(_) => return Parsed::Bad(400, "bad request"),
     };
     if head > MAX_HEAD {
-        return Parsed::Bad(431, "request headers too large");
+        return too_large(buf);
     }
     let version = r.version.unwrap_or(1);
     let mut hs: Vec<(String, String)> = Vec::with_capacity(r.headers.len());
@@ -1577,8 +1622,18 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
             codings.extend(value.to_ascii_lowercase().split(',').map(|t| t.trim_matches([' ', '\t']).to_string()).filter(|t| !t.is_empty()));
         } else if h.name.eq_ignore_ascii_case("connection") {
             connection = value.to_ascii_lowercase();
+        } else if h.name.eq_ignore_ascii_case("upgrade") && version == 0 {
+            // HTTP/1.0 has no upgrade: ignored, as RFC 9110 §7.8 says (FEEDBACK36.md, Q-445;
+            // branch feedback36-39).
+            continue;
         } else if h.name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue") {
-            expects_continue = true;
+            // HTTP/1.0 has no interim answers: a 1.0 client takes a `100` for the answer, so
+            // the expectation is ignored, as RFC 9110 §10.1.1 says (FEEDBACK36.md, Q-434;
+            // branch feedback36-39).
+            expects_continue = version >= 1;
+        } else if h.name.eq_ignore_ascii_case("expect") && version >= 1 {
+            // An expectation this server cannot meet (FEEDBACK36.md, Q-446).
+            return Parsed::Bad(417, "unknown expectation (only 100-continue is taken)");
         }
         hs.push((h.name.to_string(), value));
     }
@@ -1610,7 +1665,7 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
             *d = Dechunk::new(head);
         }
         match dechunk(d, &buf[head..], max_body) {
-            Chunked::Need => return Parsed::Need { expects_continue },
+            Chunked::Need => return Parsed::Need { expects_continue, body: true },
             Chunked::TooLarge => return Parsed::Bad(413, "request body too large"),
             Chunked::Bad => return Parsed::Bad(400, "bad chunked body"),
             Chunked::Done(body, used) => (body, head + used),
@@ -1621,7 +1676,7 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
             return Parsed::Bad(413, "request body too large");
         }
         if buf.len() < head + n {
-            return Parsed::Need { expects_continue };
+            return Parsed::Need { expects_continue, body: true };
         }
         (buf[head..head + n].to_vec(), head + n)
     };
@@ -1658,6 +1713,41 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
             return Parsed::Bad(400, "bad host header");
         }
     }
+    // A body sent compressed is read as it was before: gzip decoded (with the same limit on what
+    // it decodes to, so that a small body cannot grow without end), any other coding refused, as
+    // RFC 9110 §8.4 asks, where the route ran on the compressed bytes (FEEDBACK36.md, Q-438;
+    // branch feedback36-39).
+    let mut body = body;
+    if let Some(i) = hs.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-encoding")) {
+        let coding = hs[i].1.trim().to_ascii_lowercase();
+        match coding.as_str() {
+            "identity" | "" => {}
+            "gzip" | "x-gzip" => {
+                use std::io::Read;
+                let mut out = Vec::new();
+                let read = flate2::read::MultiGzDecoder::new(&body[..]).take(max_body as u64 + 1).read_to_end(&mut out);
+                match read {
+                    Err(_) => return Parsed::Bad(400, "the body is not gzip, as its content-encoding says"),
+                    Ok(_) if out.len() > max_body => return Parsed::Bad(413, "request body too large (once decompressed)"),
+                    Ok(_) => body = out,
+                }
+            }
+            _ => return Parsed::Bad(415, "a body in a coding this server cannot read (it takes gzip)"),
+        }
+        hs.remove(i);
+        let n = body.len().to_string();
+        match hs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+            Some((_, v)) => *v = n,
+            None => hs.push(("content-length".into(), n)),
+        }
+    }
+    // Whether it came through a proxy `--trust-proxy` names: what such a proxy says of the client
+    // (the certificate it checked) is believed then only. A client's own such header is dropped
+    // (FEEDBACK38.md, Q-462; branch feedback36-39).
+    hs.retain(|(k, _)| !k.eq_ignore_ascii_case(PROXIED));
+    if TRUSTED.get().is_some_and(|nets| peer.parse().is_ok_and(|ip| trusted(ip, nets))) {
+        hs.push((PROXIED.into(), "1".into()));
+    }
     let remote = client_of(peer, &hs);
     Parsed::Done {
         req: HttpRequest {
@@ -1669,6 +1759,16 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
         },
         len,
         keep_alive,
+        http10: version == 0,
+    }
+}
+
+/// A head over `MAX_HEAD`: 414 when the request line alone is that long, as RFC 9110 §15.5.15
+/// asks, else 431 (FEEDBACK36.md, Q-446; branch feedback36-39).
+fn too_large(buf: &[u8]) -> Parsed {
+    match buf.windows(2).position(|w| w == b"\r\n") {
+        Some(end) if end <= MAX_HEAD => Parsed::Bad(431, "request headers too large"),
+        _ => Parsed::Bad(414, "request target too long"),
     }
 }
 
@@ -1814,12 +1914,14 @@ pub(crate) fn write_head(out: &mut Vec<u8>, resp: &HttpResponse, len: u64, close
     write_head_as(out, resp, Some(len), close)
 }
 
-/// The head of an answer sent in chunks, as it is made.
-pub(crate) fn write_stream_head(out: &mut Vec<u8>, resp: &HttpResponse) {
-    write_head_as(out, resp, None, false);
+/// The head of an answer sent as it is made: in chunks, or, to an HTTP/1.0 client, which
+/// cannot read chunks, with no length and the connection closed at its end, as 1.0 frames
+/// it (FEEDBACK36.md, Q-434; branch feedback36-39).
+pub(crate) fn write_stream_head(out: &mut Vec<u8>, resp: &HttpResponse, chunked: bool) {
+    write_head_as(out, resp, if chunked { None } else { Some(u64::MAX) }, !chunked);
 }
 
-/// With `len` None, the body is chunked.
+/// With `len` None, the body is chunked; `u64::MAX`, it is as long as the connection.
 fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close: bool) -> bool {
     out.extend_from_slice(b"HTTP/1.1 ");
     push_num(out, resp.status as u64);
@@ -1843,8 +1945,13 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
         out.extend_from_slice(b"\r\n");
     }
     let bodyless = resp.status < 200 || resp.status == 204 || resp.status == 304;
-    if !bodyless {
+    // A 205 "must not generate content" (RFC 9110 §15.3.6): it says so, and its body is not
+    // sent (FEEDBACK36.md, Q-446; branch feedback36-39).
+    if resp.status == 205 {
+        out.extend_from_slice(b"content-length: 0\r\n");
+    } else if !bodyless {
         match len {
+            Some(u64::MAX) => {}
             Some(len) => {
                 out.extend_from_slice(b"content-length: ");
                 push_num(out, len);
@@ -1870,7 +1977,7 @@ fn write_head_as(out: &mut Vec<u8>, resp: &HttpResponse, len: Option<u64>, close
         out.extend_from_slice(b"connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    bodyless
+    bodyless || resp.status == 205
 }
 
 thread_local! {
@@ -1940,8 +2047,12 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
+        203 => "Non-Authoritative Information",
         204 => "No Content",
+        205 => "Reset Content",
         206 => "Partial Content",
+        207 => "Multi-Status",
+        300 => "Multiple Choices",
         301 => "Moved Permanently",
         302 => "Found",
         303 => "See Other",
@@ -1952,21 +2063,40 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        402 => "Payment Required",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
         409 => "Conflict",
         410 => "Gone",
         411 => "Length Required",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
+        414 => "URI Too Long",
         415 => "Unsupported Media Type",
         416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        418 => "I'm a teapot",
+        421 => "Misdirected Request",
         422 => "Unprocessable Content",
+        423 => "Locked",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        511 => "Network Authentication Required",
         _ => "",
     }
 }

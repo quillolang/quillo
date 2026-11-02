@@ -151,7 +151,7 @@ fn what_operations_refuse() {
         ("[1][\"a\"]", 1, "cannot index list with str"),
         ("for x in 5 => x", 1, "cannot loop over int"),
         ("for [a] in [1] => a", 1, "`for` pattern does not match 1"),
-        ("reply 99", 1, "reply status must be an HTTP status code, got 99"),
+        ("reply 99", 1, "reply status must be an HTTP status code (200-599), got 99"),
         ("for i in \"a\"..\"b\" { i }", 1, "`..` needs two ints"),
     ];
     for (src, line, msg) in cases {
@@ -163,7 +163,7 @@ fn what_operations_refuse() {
 fn a_long_value_in_a_message_is_cut_short() {
     let long = "x".repeat(60);
     let (_, msg) = fails(&format!("reply \"{}\"", long));
-    assert_eq!(msg, format!("reply status must be an HTTP status code, got \"{}…", "x".repeat(39)));
+    assert_eq!(msg, format!("reply status must be an HTTP status code (200-599), got \"{}…", "x".repeat(39)));
 }
 
 #[test]

@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The program is served to the app on 127.0.0.1 over plain HTTP; nowhere else. -->
+<!-- The program runs in the app, with no socket (FEEDBACK39.md): no plain HTTP anywhere. -->
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
 </network-security-config>

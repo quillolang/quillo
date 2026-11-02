@@ -1,5 +1,20 @@
 //! Quillo: a small web language where routes, payload patterns and HTML are syntax.
 
+/// Quillo's own messages go to stderr, and one that cannot be written is dropped: std's
+/// `eprintln!` panics then, and a server whose stderr went into a pipe that closed (a `| head`,
+/// a log shipper that stopped) could no longer be stopped by a signal, its handler ended by
+/// the panic (FEEDBACK37.md, Q-452; branch feedback36-39).
+macro_rules! eprintln {
+    () => {{
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(b"\n");
+    }};
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod alloc;
 pub mod ast;
 pub mod builtins;
@@ -27,6 +42,17 @@ pub mod imaging;
 pub mod island;
 pub mod jobs;
 pub mod modules;
+pub mod svcauth;
+pub mod embed;
+
+/// Standard base64, padded (`btoa`'s).
+pub fn crypto_b64(bytes: &[u8]) -> String {
+    let mut s: String = crypto::b64url(bytes).chars().map(|c| match c { '-' => '+', '_' => '/', c => c }).collect();
+    while s.len() % 4 != 0 {
+        s.push('=');
+    }
+    s
+}
 pub mod udp;
 pub mod wt;
 pub mod media;

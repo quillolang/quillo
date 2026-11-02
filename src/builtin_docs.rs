@@ -20,6 +20,10 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("slice", "x, start, end", "Part of a list or string, up to but not including `end`; negative positions are from the end."),
     ("index_of", "x, y", "The position of `y` in a list or string, counting from 0, or null if it is not there."),
     ("markdown", "text, options", "Markdown as `html`, safe for visitors' text; option `html` keeps its HTML, `inline` stays in a line."),
+    ("accept_calls", "options", "How calls from other services are taken: `keys` for each caller, `shared`, `jwt`, `client_cert` (a proxy's header), `check`."),
+    ("classes", "", "The classes the program's markup writes, sorted: `.name`, `class=\"...\"`, the text in `class={...}`, `class:name`; not those made from parts."),
+    ("files", "folder, path, options", "A folder served as a static host does: index.html, `/about` as about.html, 404.html; options `index`, `extensions`, `not_found`, `cache`."),
+    ("markdown_page", "text, options", "Markdown as a whole page, with a doctype, a `<head>` and a title (option `title`, else the first heading); options `lang` and `html`."),
     ("highlight", "code, lang", "`code` as escaped HTML, coloured for `lang`; an unknown `lang` gives it plain."),
     // Lists
     ("map", "xs, f", "A list of what `f` gives for each item."),

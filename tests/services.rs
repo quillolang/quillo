@@ -543,7 +543,7 @@ fn how_a_service_is_called_is_set_where_it_is_declared() {
     for (opts, want) in [
         ("{ retries: 99 }", "`retries` is a number of tries after the first, 0 to 10"),
         ("{ timeout: \"soon\" }", "`timeout` is a duration"),
-        ("{ speed: 2 }", "no option `speed` (timeout, retries, failures, cooldown)"),
+        ("{ speed: 2 }", "no option `speed` (timeout, retries, failures, cooldown, auth, forward)"),
         ("[1]", "expected end of statement"),
     ] {
         std::fs::write(d.join("main.qwe"), format!("service billing = \"billing.qwe\" {}\n", opts)).unwrap();

@@ -276,10 +276,16 @@ pub struct Interp {
     /// `ready`, for `/_quillo/ready` (FEEDBACK10.md, Q-076; branch
     /// feedback10-fixes).
     pub declared_services: Arc<Vec<String>>,
+    /// How calls from other services are taken (`accept_calls`), and which callers each
+    /// `server fn ... for [...]` takes (FEEDBACK38.md, Q-458 and Q-460; branch feedback36-39).
+    pub accept: Option<crate::svcauth::Shared>,
+    pub fn_callers: Arc<std::collections::HashMap<String, Vec<String>>>,
     pub ready_checks: Arc<Vec<(String, Value)>>,
     /// The command components' styles go through (`style_with`; FEEDBACK11.md,
     /// Q-079; branch feedback11-fixes).
     pub style_with: Option<String>,
+    /// Or the function they go through (FEEDBACK37.md, Q-455; branch feedback36-39).
+    pub style_with_fn: Option<Value>,
     /// The stream `send` writes to, while a `stream`'s function runs.
     pub(crate) stream_out: Option<crate::stream::Out>,
     /// The function of the streamed answer `handle` just made, for the
@@ -1215,8 +1221,11 @@ impl Interp {
             in_job: false,
             env_file: Default::default(),
             declared_services: Default::default(),
+            accept: None,
+            fn_callers: Default::default(),
             ready_checks: Default::default(),
             style_with: None,
+            style_with_fn: None,
             types: Arc::new(Default::default()),
             js_libs: Arc::new(Default::default()),
             stream_out: None,
@@ -1312,8 +1321,11 @@ impl Interp {
             in_job: self.in_job,
             env_file: self.env_file.clone(),
             declared_services: self.declared_services.clone(),
+            accept: self.accept.clone(),
+            fn_callers: self.fn_callers.clone(),
             ready_checks: self.ready_checks.clone(),
             style_with: self.style_with.clone(),
+            style_with_fn: self.style_with_fn.clone(),
             types: self.types.clone(),
             js_libs: self.js_libs.clone(),
             stream_out: None,
@@ -1916,11 +1928,11 @@ impl Interp {
                 self.note_link(&full);
                 // A `.qwer` file's names are defined for each `use` that takes some
                 // (its library is built and opened once); anything else runs once.
-                if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !path.ends_with(".qwer")) {
+                if !Arc::make_mut(&mut self.loaded).insert(key.clone()) && (names.is_none() || !crate::native::is_rust(&path)) {
                     return Ok(Value::Nil);
                 }
                 // Rust: built, loaded, and its functions defined (see `native`).
-                if path.ends_with(".qwer") {
+                if crate::native::is_rust(&path) {
                     let fname = full.display().to_string();
                     return match crate::native::use_file(self, &full, names.as_deref(), *line) {
                         Err(Ctrl::Error(e)) => Err(Ctrl::Error(Box::new(e.in_file(&fname)))),
@@ -3005,8 +3017,9 @@ impl Interp {
     #[inline(never)]
     fn eval_reply(&mut self, status: &Expr, body: Option<&Expr>, env: &Env, line: u32) -> Result<Value, Ctrl> {
         let code = match self.eval(status, env)? {
-            Value::Int(n) if (100..=599).contains(&n) => n as u16,
-            other => return fail(line, format!("reply status must be an HTTP status code, got {}", short(&other))),
+            // Not a 1xx, which is no answer (FEEDBACK36.md, Q-433; branch feedback36-39).
+            Value::Int(n) if (200..=599).contains(&n) => n as u16,
+            other => return fail(line, format!("reply status must be an HTTP status code (200-599), got {}", short(&other))),
         };
         let body = match body {
             Some(b) => self.eval(b, env)?,

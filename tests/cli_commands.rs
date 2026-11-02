@@ -66,10 +66,10 @@ fn help_is_on_stdout_and_a_wrong_command_gets_it_on_stderr() {
         assert!(!out(&o).contains("ran\n"), "`--help` runs nothing");
     }
     // A wrong command is told the nearest, not the whole usage (FEEDBACK31.md, Q-389).
-    let o = quillo(&dir, &["serve"]);
+    let o = quillo(&dir, &["launch"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(out(&o).is_empty());
-    assert!(err(&o).contains("unknown command `serve`") && !err(&o).contains("usage:"), "{}", err(&o));
+    assert!(err(&o).contains("unknown command `launch`") && !err(&o).contains("usage:"), "{}", err(&o));
 }
 
 #[test]

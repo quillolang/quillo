@@ -30,6 +30,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -125,6 +140,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a334ef7c9e23abf0ce748e8cd309037da93e606ad52eb372e4ce327a0dcfbdfd"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -1305,6 +1330,7 @@ name = "quillo"
 version = "0.6.0"
 dependencies = [
  "argon2",
+ "brotli-decompressor",
  "bytes",
  "corosensei",
  "ctrlc",
@@ -1323,16 +1349,20 @@ dependencies = [
  "psm",
  "pulldown-cmark",
  "regex",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-native-certs",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "stacker",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "unicode-normalization",
  "ureq",
+ "url",
  "webpki-roots 0.26.11",
 ]
 
@@ -1342,6 +1372,7 @@ version = "0.6.0"
 dependencies = [
  "jni",
  "quillo",
+ "serde_json",
 ]
 
 [[package]]

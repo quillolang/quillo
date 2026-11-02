@@ -67,11 +67,17 @@ pub fn contract(d: &FnDef) -> String {
 struct Parts {
     routes: Vec<(String, Arc<RouteDef>)>,
     fns: Vec<(String, Arc<FnDef>)>,
+    /// The callers each server fn takes (`for [...]`), for a gateway to enforce too
+    /// (FEEDBACK38.md, Q-458; branch feedback36-39).
+    callers: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn collect_interp(it: &Interp, prefix: &str, parts: &mut Parts) {
     for r in it.routes.iter() {
         parts.routes.push((prefix.to_string(), r.clone()));
+    }
+    for (f, who) in it.fn_callers.iter() {
+        parts.callers.insert(format!("{}{}", prefix, f), who.clone());
     }
     let mut fns: Vec<Arc<FnDef>> = scope_vars(&it.globals)
         .into_iter()
@@ -120,6 +126,12 @@ fn collect_file(path: &Path, base: &Path, prefix: &str, parts: &mut Parts, seen:
         match s {
             Stmt::Route(r) => parts.routes.push((prefix.to_string(), r)),
             Stmt::Fn(d) if d.server => parts.fns.push((prefix.to_string(), d)),
+            Stmt::Expr(crate::ast::Expr::Call(f, args, _)) if matches!(&*f, crate::ast::Expr::Ident(n, _) if n == "__callers") => {
+                if let [crate::ast::Expr::Lit(crate::ast::Lit::Str(name)), crate::ast::Expr::List(l)] = args.as_slice() {
+                    let who = l.iter().filter_map(|e| if let crate::ast::Expr::Lit(crate::ast::Lit::Str(s)) = e { Some(s.to_string()) } else { None }).collect();
+                    parts.callers.insert(format!("{}{}", prefix, name), who);
+                }
+            }
             Stmt::Use(p, ..) if !crate::ast::is_script(&p) => collect_file(&base.join(crate::modules::resolve_from(base, path, &p)), base, prefix, parts, seen, depth + 1)?,
             // A service with a prefix: its routes are served here.
             Stmt::Service(_, Some(p), file, _, _) => {
@@ -246,6 +258,9 @@ impl Parts {
                 f.insert("error".into(), ty_schema(e));
             }
             f.insert("call".into(), json!(format!("POST {}/_quillo/rpc/{}", prefix, d.name)));
+            if let Some(who) = self.callers.get(&format!("{}{}", prefix, d.name)) {
+                f.insert("x-quillo-callers".into(), json!(who));
+            }
             fns.insert(format!("{}{}", if prefix.is_empty() { String::new() } else { format!("{} ", prefix) }, d.name), J::Object(f));
         }
         json!({
