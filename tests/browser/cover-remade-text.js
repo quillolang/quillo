@@ -6,7 +6,7 @@
   const out = {};
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
   const $ = (s) => document.querySelector(s);
-  for (let i = 0; i < 200 && !window.__quillo_booted; i++) await tick(30);
+  for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
   try {
     $(".said").textContent = "changed by a script";
     $("#wake").click();
@@ -14,7 +14,7 @@
     await tick(100);
     out.clicks = $("#wake").textContent;
     out.said = $(".said").textContent;
-    out.remade = window.__quilloRemade || 0;
+    out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     out.errors = window.__quilloErrors || [];
   } catch (e) {
     out.exception = String((e && e.stack) || e);

@@ -18,7 +18,7 @@
   const warn = console.warn;
   console.warn = (...a) => { warned.push(a.join(" ")); return warn.apply(console, a); };
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
     await tick(200);
     // Picked by a person before the code came: the component hears it once taken up.
     $("#typed").selectedIndex = 1;

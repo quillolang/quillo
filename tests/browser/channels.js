@@ -14,11 +14,11 @@
   };
   const items = (doc) => [...doc.querySelectorAll("li")].map((l) => l.textContent);
   try {
-    out.via = await until(() => window.__quilloChannelVia);
+    out.via = await until(() => (window[Symbol.for("quillo")] || {}).via);
     const fr = document.createElement("iframe");
     fr.src = "/";
     document.body.appendChild(fr);
-    out.viaFrame = await until(() => fr.contentWindow && fr.contentWindow.__quilloChannelVia);
+    out.viaFrame = await until(() => fr.contentWindow && (fr.contentWindow[Symbol.for("quillo")] || {}).via);
     const other = () => fr.contentDocument;
     // Both joined: the server counts them.
     for (let i = 0; i < 100; i++) {

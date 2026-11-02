@@ -131,7 +131,7 @@ fn a_page_that_loads_the_whole_bundle_carries_its_translations_too() {
     let page = send(port, "GET", "/", &[], "").body;
     assert!(page.contains("/_quillo/t/"), "{}", page);
     let tagged = send(port, "GET", "/tagged", &[], "").body;
-    assert!(tagged.contains("window.__quillo_i18n="), "{}", tagged);
+    assert!(tagged.contains(&format!("{}.i18n=", quillo::client::HANDOFF_JS)), "{}", tagged);
 }
 
 #[test]

@@ -475,10 +475,10 @@ fn a_page_that_has_the_prefetch_script_does_not_get_it_twice() {
     let code = quillo::server::PREFETCH_JS;
     let src = format!("route GET /own = raw(\"<body><script>\" + read_file(\"prefetch.js\") + \"</script></body>\")\nroute GET /quoted = raw(\"<body><code>\" + read_file(\"prefetch.js\") + \"</code></body>\")\n");
     let (mut it, d) = files("prefetch", &[("app.qwe", &src), ("prefetch.js", code)]);
-    assert_eq!(get(&mut it, "/own").text().matches("__quillo_pf").count(), 2);
+    assert_eq!(get(&mut it, "/own").text().matches("w.pf=1").count(), 1);
     // Text that quotes it is no script: the page still gets its own.
     assert_eq!(get(&mut it, "/quoted").text().matches("<script>").count(), 1);
-    assert_eq!(get(&mut it, "/quoted").text().matches("__quillo_pf").count(), 4);
+    assert_eq!(get(&mut it, "/quoted").text().matches("w.pf=1").count(), 2);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -499,7 +499,7 @@ route GET /fragment = respond(404, <Page/>)
     assert_eq!(r.status, 200);
     assert_eq!(r.header("cache-control"), Some("private, max-age=30"));
     let text = r.text();
-    assert!(text.contains("<li>1</li>") && text.contains("__quillo_swap"), "{}", text);
+    assert!(text.contains("<li>1</li>") && text.contains("w.swap=function"), "{}", text);
     // Not a page that is sent: nothing follows it.
     let r = send(&mut it, "GET", "/fragment", &[("sec-purpose", "prefetch")], "");
     assert_eq!(r.status, 404);

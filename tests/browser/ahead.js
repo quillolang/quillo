@@ -6,7 +6,7 @@
   const text = (id) => document.getElementById(id)?.textContent ?? null;
   const out = { errors: [] };
   // Something must follow url() for the runtime to follow links: wait until it has.
-  for (let i = 0; i < 100 && !window.__quillo_nav; i++) await sleep(50);
+  for (let i = 0; i < 100 && !(window[Symbol.for("quillo")] || {}).nav; i++) await sleep(50);
   point("go");
   await sleep(900);
   out.fetched = performance.getEntriesByType("resource").filter((e) => e.name.endsWith("/items")).length;

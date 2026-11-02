@@ -4,6 +4,8 @@
 //! to the folder holding mariadbd or mysqld, and mariadb-install-db).
 #![cfg(feature = "mysql")]
 
+mod support;
+
 use quillo::Interp;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -169,6 +171,10 @@ fn mysql() {
     // A database of its own, made when the program makes a tenant: here, by hand.
     let mut it = program(&work, &format!("db.open(\"{}\")\n", url("mysql")));
     assert_eq!(eval(&mut it, "db.exec(\"create database app\").changes"), "1");
+    // Many rows a statement, as pymysql's executemany sends them (branch feedback40-43).
+    assert_eq!(eval(&mut it, "db.exec(\"create database many\").changes"), "1");
+    let many = Interp::new(".").load_source(&format!("db.open(\"{}\")\n{}", url("many"), support::EXEC_MANY), "many.qwe").map(|v| v.repr());
+    assert_eq!(many.unwrap_or_else(|e| panic!("{}", e)), support::EXEC_MANY_WANT);
 
     let mut it = program(&work, &format!("db.open(\"{}\")\n", url("app")));
     // Values and types, both ways.

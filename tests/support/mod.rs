@@ -328,3 +328,24 @@ pub fn send(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body:
     let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     Answer { status, headers, body: body.to_string() }
 }
+
+/// `db.exec_many` on any database (SQLite, PostgreSQL, MariaDB): rows past one statement's
+/// share, none, an update a row at a time, a duplicate that writes nothing, a short row, and
+/// a transaction around it that fails (branch feedback40-43). `EXEC_MANY_WANT` is its value.
+pub const EXEC_MANY: &str = r#"
+db.exec("create table many (id int primary key, name varchar(20))")
+let a = db.exec_many("insert into many (id, name) values (?, ?)", for i in 0..2500 => [i, `n${i}`])
+let b = db.exec_many("insert into many values (?, ?)", [])
+let c = db.exec_many("update many set name = ? where id = ?", [["x", 1], ["ç", 2]])
+let d = db.exec_many("insert into many values (?, ?)", [[5000, "a"], [1, "dup"]])
+let e = db.exec_many("insert into many values (?, ?)", [[6000, "a"], [6001]])
+let f = db.transaction(() => {
+    db.exec_many("insert into many values (?, ?);", [[7000, "g"], [7001, "h"]])
+    err("changed my mind")
+})
+let g = db.transaction(() => db.exec_many("  INSERT INTO many VALUES (?,?)  ", [[8000, "i"]]))
+[a.changes, b.changes, c.changes, is_err(d), e.error, is_err(f), g.changes,
+ db.one("select count(*) as n from many").n, db.one("select name from many where id = 2").name]
+"#;
+
+pub const EXEC_MANY_WANT: &str = r#"[2500, 0, 2, true, "db: row 2 has 1 value, the first has 2", true, 1, 2501, "ç"]"#;

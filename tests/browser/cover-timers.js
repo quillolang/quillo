@@ -17,7 +17,7 @@
   const hits = async () => (await fetch("/hits")).json();
   const errorsSince = (n) => window.__quilloErrors.slice(n);
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
 
     // `run_after` whose function fails: said, and the next timer still runs
     // (a negative delay is no delay).

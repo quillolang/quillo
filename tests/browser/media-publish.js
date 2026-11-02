@@ -61,7 +61,7 @@
   const n = vs.video;
   await t(500);
   out.gone = { video: vs.vd ? vs.vd.state : null, audio: vs.ad ? vs.ad.state : null, sound: vs.actx.state, decoded: vs.video - n };
-  out.via = window.__quilloChannelVia;
+  out.via = (window[Symbol.for("quillo")] || {}).via;
   out.errors = window.__quilloErrors || [];
   p.remove();
   document.body.setAttribute("data-result", JSON.stringify(out));

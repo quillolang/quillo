@@ -2,7 +2,7 @@
 // (localhost is another origin than 127.0.0.1) from a page that reads url().
 // /landed reports where it was loaded; if the page stays, this says why.
 (async () => {
-  for (let i = 0; i < 200 && !window.__quillo_booted; i++) await new Promise((r) => setTimeout(r, 30));
+  for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await new Promise((r) => setTimeout(r, 30));
   const to = document.getElementById("to");
   to.value = `http://localhost:${location.port}/landed/away?from=spa`;
   to.dispatchEvent(new Event("input", { bubbles: true }));

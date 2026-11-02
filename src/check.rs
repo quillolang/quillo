@@ -684,6 +684,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.shards", "list", "map | error(str)"),
     ("db.atomic", "list, fn", "any"),
     ("db.exec", "str, any...", "map | error(str)"),
+    ("db.exec_many", "str, list", "map | error(str)"),
     ("db.query", "str, any...", "list | error(str)"),
     ("db.one", "str, any...", "map | null | error(str)"),
     ("db.transaction", "map | fn, fn=", "any"),
@@ -3019,7 +3020,7 @@ impl Checker {
         }
         match obj {
             Expr::Ident(m, _) if self.sql_var(m) == SqlVar::Conn => self.effect_error(&format!("{}.{}", m, name), needs & !allowed, restrictor.as_ref()),
-            Expr::Ident(m, _) if self.is_local(m) && recv.bits == T::ANY.bits && matches!(name, "query" | "one" | "exec" | "transaction") => {
+            Expr::Ident(m, _) if self.is_local(m) && recv.bits == T::ANY.bits && matches!(name, "query" | "one" | "exec" | "exec_many" | "transaction") => {
                 if let Some((f, decl)) = &restrictor {
                     self.warn(format!(
                         "`{}.{}` reads like a database call, which needs the db effect, but `{}` is declared `with {}`: if `{}` is a connection, add db",
@@ -4285,7 +4286,7 @@ impl Checker {
     /// `db.query`, or `query` on a connection from `db.connect`.
     fn sql_target(&self, callee: &Expr) -> Option<String> {
         let Expr::Field(obj, f, _) = callee else { return None };
-        if !matches!(f.as_str(), "query" | "one" | "exec") {
+        if !matches!(f.as_str(), "query" | "one" | "exec" | "exec_many") {
             return None;
         }
         match &**obj {
@@ -4510,7 +4511,7 @@ impl Checker {
             }
         }
         // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
-        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec") && args.len() == arg_exprs.len() {
+        if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec" | "db.exec_many") && args.len() == arg_exprs.len() {
             if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
                 self.warn_sql(name);
             }

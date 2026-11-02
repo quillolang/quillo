@@ -107,6 +107,8 @@ fn postgres() {
     several_databases_of_several_kinds(&database(&pg, "main_db"), &database(&pg, "other_db"), &database(&pg, "beta_db"));
     replicas_take_reads_and_the_primary_the_rest(&database(&pg, "primary_db"), &database(&pg, "replica_db"));
     one_transaction_over_several_databases(&pg, &database(&pg, "bank_a"), &database(&pg, "bank_b"));
+    // Many rows a statement, as Python's executemany sends them (branch feedback40-43).
+    assert_eq!(run(&database(&pg, "many"), support::EXEC_MANY), support::EXEC_MANY_WANT);
 }
 
 /// Certificates for a test of TLS, written to `dir`: `ca.pem`, a private

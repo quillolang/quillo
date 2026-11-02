@@ -334,7 +334,7 @@ fn __t() = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 19, 20, 21, 22, 25, 100, 101
     let mut it = loaded(&src);
     let server = server_of(&mut it);
     let words = it.site.i18n.as_ref().unwrap().browser_json(locale, None);
-    (server, browser_of(&it, &format!("globalThis.window = {{ __quillo_i18n: {} }};", words)))
+    (server, browser_of(&it, &format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};", words)))
 }
 
 #[test]

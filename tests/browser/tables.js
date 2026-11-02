@@ -16,7 +16,7 @@
     // No row or option in a wrapper: each is its table's or select's own.
     out.wrapped = document.querySelectorAll("quillo-island > tr, quillo-island > option").length;
     out.rows = $("#sheet tbody").rows.length;
-    out.remade = window.__quilloRemade || 0;
+    out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e && e.stack || e); }
   document.body.setAttribute("data-result", JSON.stringify(out));

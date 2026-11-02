@@ -162,6 +162,11 @@
 
 ### Databases and plugins (FEEDBACK43.md)
 
+- **`db.exec_many(sql, rows)`**: a statement for each row, all of them or none, `{ changes
+  }`. On PostgreSQL and MySQL an insert goes as up to 1,000 rows a statement, as Python's
+  `executemany` sends them: 20,000 inserts on PostgreSQL and MariaDB were 1.7 and 2 times
+  Python's time as a loop of `db.exec`, and are now ahead of it.
+
 - **A connection's calls need the `db` effect** in `quillo check`, as at run time;
   `c.query(...)` on an untyped parameter in a `with` function without `db` is a warning
   (Q-488).
@@ -191,6 +196,12 @@
   nothing more, measured on a keyed list of 1,000 rows (Part C; Q-483, Q-484, Q-485).
 - **A component inside another whose text a script changed is made again**: it was left
   empty, with a bare `quillo: text` in the console.
+- **Quillo puts no names of its own on `window`** but `quillo` and a page's
+  `__quilloErrors`: what its loader, prefetching, translations, deferred parts and the
+  runtime hand each other is under one key, `window[Symbol.for("quillo")]` (`booted`,
+  `resumed`, `remade`, `via`, ...), where `__quillo_booted`, `__quilloRemade` and the like
+  were names each. A test or a tool that read them reads the key, or listens to the
+  developer-tools events; Quillo DevTools reads both (Q-486).
 - The guide says what `data-s` and `data-p` hold (Q-487), and to run with `--no-wt` to see
   a channel's messages in the Network panel (Q-485).
 

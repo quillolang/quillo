@@ -17,7 +17,7 @@
   const get = async (p) => { try { const r = await fetch(p); return r.ok ? await r.text() : null; } catch (e) { return null; } };
   const items = () => [...document.querySelectorAll(".listener.a li")].map((l) => l.textContent);
   try {
-    out.via = await until(() => window.__quilloChannelVia);
+    out.via = await until(() => (window[Symbol.for("quillo")] || {}).via);
     const gen = await until(() => get("/gen"));
     await until(async () => (await get("/peers")) === "1");
     // The test waits for this to reach the server, then stops it.

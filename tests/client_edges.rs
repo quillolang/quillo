@@ -271,12 +271,12 @@ fn every_library_and_its_links_for_the_whole_program() {
 fn a_page_takes_the_runtime_from_its_programs_file() {
     let it = loaded("component A() {\n  state n = 0\n  <button @click={() => { n += 1 }}>{n}</button>\n}\ncomponent B() = <p>b</p>\n");
     let rt = client::runtime_file(&it).unwrap().expect("a runtime file");
-    assert!(rt.js.contains("window.__quillo_rt"), "no names handed on");
+    assert!(rt.js.contains("QW.rt = {"), "no names handed on");
     assert_eq!(rt.hash, client::hash_text(&rt.js));
     let page = client::bundle_for(&it, &["B".to_string()], Some(&rt)).unwrap();
     assert!(page.split);
     assert_eq!(page.set, ["B"]);
-    assert!(page.js.contains("window.__quillo_rt"));
+    assert!(page.js.contains("[Symbol.for(\"quillo\")].rt"));
     assert!(page.js.len() < rt.js.len());
     let (whole, also) = client::bundle_and_runtime(&it).unwrap();
     assert_eq!(also.expect("a runtime file").hash, rt.hash);
@@ -288,7 +288,7 @@ fn a_page_with_no_runtime_file_carries_its_own() {
     let it = loaded("component A() = <p>a</p>\n");
     let page = client::bundle_for(&it, &["A".to_string()], None).unwrap();
     assert!(!page.split);
-    assert!(!page.js.contains("window.__quillo_rt"));
+    assert!(!page.js.contains("[Symbol.for(\"quillo\")].rt"));
     assert!(page.js.contains("boot"), "the bundle does not start the page");
 }
 
@@ -321,7 +321,7 @@ fn a_page_needing_more_than_the_file_carries_its_own_runtime() {
     let big = loaded("component A() {\n  state n = 0\n  <button @click={() => { n = md(\"x\") }}>{n}</button>\n}\nfn md(s) = markdown(s) + highlight(s, \"rust\")\n");
     let page = client::bundle_for(&big, &["A".to_string()], Some(&rt)).unwrap();
     assert!(!page.split);
-    assert!(!page.js.contains("window.__quillo_rt"));
+    assert!(!page.js.contains("[Symbol.for(\"quillo\")].rt"));
 }
 
 #[test]

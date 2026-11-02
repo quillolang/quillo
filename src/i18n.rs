@@ -281,7 +281,7 @@ static FILES: std::sync::Mutex<Option<HashMap<String, Arc<String>>>> = std::sync
 
 /// Keeps `json` as a file and gives its hash.
 pub fn keep_file(json: String) -> String {
-    let js = format!("window.__quillo_i18n={};", json);
+    let js = format!("{}.i18n={};", crate::client::HANDOFF_JS, json);
     let hash = crate::client::hash_text(&js);
     let mut g = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let m = g.get_or_insert_with(HashMap::new);

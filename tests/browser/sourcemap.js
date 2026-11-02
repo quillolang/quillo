@@ -75,7 +75,7 @@ async function main() {
     // Wake the components (the bundle loads when one is reached for), and wait for them.
     for (;;) {
       if (Date.now() > deadline) throw new Error("the page did not boot");
-      const ok = await evaluate(`(() => { const b = document.querySelector("button"); if (!b) return false; b.dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); return !!window.__quillo_booted; })()`);
+      const ok = await evaluate(`(() => { const b = document.querySelector("button"); if (!b) return false; b.dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); return !!(window[Symbol.for("quillo")] || {}).booted; })()`);
       if (ok) break;
       await sleep(50);
     }

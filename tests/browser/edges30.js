@@ -68,7 +68,7 @@
   await sleep(200);
   await click("pic-go", 150);
   out.pic = $("pic-seen").textContent;
-  out.remade = window.__quilloRemade || 0;
+  out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
   out.errors = (window.__quilloErrors || []).slice(0, before);
   document.body.setAttribute("data-result", JSON.stringify(out));
 })();

@@ -5611,6 +5611,7 @@ db.open("postgres://user:pass@host:5432/app")       // PostgreSQL
 db.open("mysql://user:pass@host:3306/app")          // MySQL or MariaDB (also mariadb://)
 db.exec("create table if not exists todos (id serial primary key, text text)")
 db.exec("insert into todos (text) values (?)", text)       // { changes, last_id }
+db.exec_many("insert into todos (text) values (?)", [["a"], ["b"]])   // { changes: 2 }, all or none
 db.query("select * from todos where id > ?", 10)           // a list of maps
 db.one("select * from todos where id = :id", { id })       // a map, or null; keys the SQL does not use are ignored
 db.one("insert into todos (text) values (?) returning id", text)
@@ -5632,6 +5633,23 @@ runs in, and `quillo run` says which file it opened when it starts
 `mariadb://` are servers: any other text, `sqlserver://...` included, is taken for a
 SQLite file's path. SQL Server, Oracle and the rest are reached through Rust (see
 [Other stores](#other-stores)).
+
+**Many rows at once: `db.exec_many(sql, rows)`.** It runs the statement for each row, a
+list of its `?` values, and gives `{ changes }`, the rows changed in all. It is all or
+none: it runs in a transaction of its own, or as a savepoint of the one it is in, so a row
+that fails (a duplicate key) leaves the table as it was, and gives the error. An empty
+list changes nothing. On PostgreSQL and MySQL an `insert into t (...) values (?, ...)`
+with nothing after its values goes as inserts of up to 1,000 rows each, as Python's
+`executemany` sends them, not a round trip a row; any other statement (an `update`, an
+insert with `on conflict`) runs a row at a time, in the one call. For one row's
+`last_id`, use `db.exec`.
+
+```quillo
+let rows = for p in imported => [p.sku, p.name, p.price]
+let r = db.exec_many("insert into products (sku, name, price) values (?, ?, ?)", rows)
+if is_err(r) { reply 400 `Not imported: ${r.error}` }
+print(`${r.changes} products`)
+```
 
 **A failed `db.open` does not stop the program.** It gives an error value and leaves
 the database as it was, so the next `db` call opens `$QUILLO_DB` or SQLite in memory: a
@@ -6767,6 +6785,11 @@ A tool asks with a `quillo:devtools-ask` event, its `detail` a JSON string
 
 Reading is open in production, as the page can be read with the browser's debugger anyway;
 setting is not (FEEDBACK42.md, Part C).
+
+Quillo's only names on `window` are `quillo` (the server fns, above) and `__quilloErrors`
+when a page made it. What its own scripts hand each other is under one key,
+`window[Symbol.for("quillo")]`: not an interface, but a test may wait on its `booted`
+before driving a page (Q-486).
 
 #### Other editors
 

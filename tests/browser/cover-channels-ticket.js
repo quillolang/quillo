@@ -36,7 +36,7 @@
     return fetched.apply(this, arguments);
   };
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
     // Refused: asked again after a wait.
     $("#toggle-a").click();
     await until(() => asked.length >= 2, 5000);
@@ -48,11 +48,11 @@
     const n = asked.length;
     await tick(2500);
     out.stoppedAsking = asked.length - n <= 1;
-    out.noVia = window.__quilloChannelVia === undefined;
+    out.noVia = (window[Symbol.for("quillo")] || {}).via === undefined;
     // A listener again, and UDP blocked: a WebSocket instead.
     mode = "blocked";
     $("#toggle-a").click();
-    out.via = await until(() => window.__quilloChannelVia, 10000);
+    out.via = await until(() => (window[Symbol.for("quillo")] || {}).via, 10000);
     out.joined = !!(await until(async () => (await get("/peers")) === "1"));
     await get("/bcast/hello");
     out.heard = !!(await until(() => items().includes("hello")));

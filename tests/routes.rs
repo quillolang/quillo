@@ -436,9 +436,9 @@ fn pages_share_the_runtime_file() {
     assert_ne!(one[1], other[1]);
     let rt = get(&mut it, &one[0]);
     assert_eq!(rt.header("cache-control"), Some("public, max-age=31536000, immutable"));
-    assert!(rt.text().contains("window.__quillo_rt"));
+    assert!(rt.text().contains("QW.rt = {"));
     let b = get(&mut it, &one[1]).text();
-    assert!(b.len() < 3_000 && b.contains("widget ") && b.contains("window.__quillo_rt"), "{} bytes", b.len());
+    assert!(b.len() < 3_000 && b.contains("widget ") && b.contains("[Symbol.for(\"quillo\")].rt"), "{} bytes", b.len());
 }
 
 /// However many sets of components pages are made of, the server keeps a
@@ -800,8 +800,8 @@ route GET /cached = respond(200, "mine", { "cache-control": "no-store" })
         })
     };
     // Pages carry it (once); a fragment of HTML does not.
-    assert_eq!(get(&mut it, "/").text().matches("__quillo_pf=1").count(), 1);
-    assert!(!get(&mut it, "/fragment").text().contains("__quillo_pf"));
+    assert_eq!(get(&mut it, "/").text().matches("w.pf=1").count(), 1);
+    assert!(!get(&mut it, "/fragment").text().contains("w.pf=1"));
     // Reading: prefetched, and kept by the browser for the click.
     let r = prefetch(&mut it, "/read", ("X-Quillo-Prefetch", "1"));
     assert_eq!((r.status, r.header("cache-control")), (200, Some("private, max-age=30")));
@@ -903,13 +903,13 @@ route GET /calls = calls
     // The page: waiting, the placeholder shown, the swap defined, the end of the page last.
     let island = body.find("data-qd=\"0\"").expect("the island waits");
     assert!(body[island..].contains("id=\"wait\""), "{}", body);
-    assert!(body.contains("window.__quillo_swap"), "{}", body);
+    assert!(body.contains("w.swap=function"), "{}", body);
     // A component inside another does not defer: worked out in place.
     assert!(body.contains("<i id=\"inner\">2</i>"), "{}", body);
     // Its part: the component again, with the list.
     let part = body.find("<template data-qt=\"0\">").expect("the part");
     assert!(part > island);
-    assert!(body[part..].contains("<li>a</li><li>b</li>") && body[part..].contains("__quillo_swap(\"0\")"), "{}", body);
+    assert!(body[part..].contains("<li>a</li><li>b</li>") && body[part..].contains(".swap(\"0\")"), "{}", body);
     assert!(!body[part..].contains("data-qd"), "the part does not wait: {}", body);
     assert!(body.trim_end().ends_with("</html>") && body.rfind("<footer>end</footer>").unwrap() < part, "{}", body);
     // The page's own fast state ran once. The slow one: once deferred, and inside

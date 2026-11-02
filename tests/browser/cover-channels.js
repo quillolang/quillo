@@ -18,7 +18,7 @@
   const peers = (n) => until(async () => (await get("/peers")) === String(n));
   const items = (tag) => [...document.querySelectorAll(`.listener.${tag} li`)].map((l) => l.textContent);
   try {
-    out.via = await until(() => window.__quilloChannelVia);
+    out.via = await until(() => (window[Symbol.for("quillo")] || {}).via);
     out.joined = !!(await peers(1));
     // Sent from @mount, before the page was let in: kept, then sent once.
     out.early = await until(async () => {

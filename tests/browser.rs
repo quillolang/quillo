@@ -1450,13 +1450,9 @@ fn in_development_the_runtime_and_the_page_keep_their_own_names() {
         assert_eq!(r["second"], "tally 2", "{}", r);
         assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
     }
-    // The same names on `window` but the one production hands its bundles the runtime by.
-    let names = |r: &serde_json::Value| {
-        let mut v: Vec<String> = r["globals"].as_array().unwrap().iter().filter_map(|n| n.as_str()).filter(|n| *n != "__quillo_rt").map(String::from).collect();
-        v.sort();
-        v
-    };
-    assert_eq!(names(&dev), names(&prod));
+    // The same names on `window`: none of Quillo's, as they are under one key (Q-486).
+    assert_eq!(dev["globals"], prod["globals"]);
+    assert_eq!(dev["globals"], serde_json::json!(["__quilloErrors", "run"]), "{}", dev);
 }
 
 #[test]

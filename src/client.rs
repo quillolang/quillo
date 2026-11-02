@@ -27,6 +27,11 @@ use std::sync::Arc;
 
 const RUNTIME: &str = include_str!("client/runtime.js");
 
+/// The object the runtime and the page's own scripts (the loader, translations, deferred
+/// parts) share, under one key of `window` rather than a name each (`QW` in the runtime;
+/// FEEDBACK42.md, Q-486; branch feedback40-43).
+pub const HANDOFF_JS: &str = "(window[Symbol.for(\"quillo\")]||(window[Symbol.for(\"quillo\")]={}))";
+
 /// The line that gives the runtime Quillo's version, after it as `BASE` is (`VERSION`, which
 /// a developer tool's `hello` says; FEEDBACK42.md, Part C; branch feedback40-43).
 fn version_line() -> String {
@@ -378,7 +383,7 @@ pub struct PageRef {
 /// page's bundle shares, so the browser downloads it once rather than once
 /// for each set of components (FEEDBACK7.md, Q-064; branch feedback7-fixes).
 /// It holds what the whole program uses, and hands the bundles the names
-/// they take from it as `window.__quillo_rt`; inside its function, they do
+/// they take from it as `window[Symbol.for("quillo")].rt`; inside its function, they do
 /// not meet the page's own scripts' names.
 pub struct RuntimeFile {
     pub hash: String,
@@ -397,7 +402,8 @@ pub fn runtime_file(it: &Interp) -> Result<Option<RuntimeFile>, QuilloError> {
 fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     let program = program_text(it, c, boots, false);
     let rt = runtime_units();
-    let keep = shake(rt, &program);
+    // `QW`, which the file hands the bundles the runtime by.
+    let keep = shake(rt, &format!("{}\nQW", program));
     let wanted: HashSet<String> = names_in(&program).into_iter().collect();
     let mut exported: Vec<String> = rt
         .by_name
@@ -414,7 +420,7 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     if rt.by_name.get("VERSION").is_some_and(|&i| keep[i]) {
         js.push_str(&version_line());
     }
-    let _ = writeln!(js, "window.__quillo_rt = {{ {} }};", exported.join(", "));
+    let _ = writeln!(js, "QW.rt = {{ {} }};", exported.join(", "));
     js.push_str("})();\n");
     let hash = hash_text(&js);
     RuntimeFile { hash, js: Arc::new(js), keep, exported: exported.into_iter().collect() }
@@ -449,7 +455,7 @@ impl RuntimeFile {
         }
         let mut out = format!("(function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "));
         minify_into(program, &mut out);
-        out.push_str("})(window.__quillo_rt);\n");
+        out.push_str("})(window[Symbol.for(\"quillo\")].rt);\n");
         Some(out)
     }
 }

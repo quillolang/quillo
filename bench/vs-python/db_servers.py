@@ -112,9 +112,14 @@ def cases(kind, url):
         ("10k reads by key",
          q('let n = 0\nfor i in 0..10000 {\n    let r = db.one("select name from items where id = ?", (i * 7) % 300000)\n    n += len(r.name)\n}\nprint(n)\n'),
          p('cur = c.cursor()\nn = 0\nfor i in range(10000):\n    cur.execute("select name from items where id = %s", ((i * 7) % 300000,))\n    n += len(cur.fetchone()[0])\nprint(n)\n')),
+        # Each with its own batch call: Python's executemany, Quillo's db.exec_many.
         ("20k inserts",
-         q('db.exec("drop table if exists added")\ndb.exec("create table added (id integer, name text)")\ndb.transaction(() => {\n    for i in 0..20000 {\n        db.exec("insert into added values (?, ?)", i, `n${i}`)\n    }\n})\nprint(db.one("select count(*) as n from added").n)\n'),
+         q('db.exec("drop table if exists added")\ndb.exec("create table added (id integer, name text)")\nlet _r = db.exec_many("insert into added values (?, ?)", for i in 0..20000 => [i, `n${i}`])\nprint(db.one("select count(*) as n from added").n)\n'),
          p('cur = c.cursor()\ncur.execute("drop table if exists added")\ncur.execute("create table added (id integer, name text)")\nc.autocommit = False\ncur.executemany("insert into added values (%s, %s)", [(i, f"n{i}") for i in range(20000)])\nc.commit()\ncur.execute("select count(*) from added")\nprint(cur.fetchone()[0])\n')),
+        # One statement a call, in one transaction: a round trip each, on both sides.
+        ("5k inserts one by one",
+         q('db.exec("drop table if exists added")\ndb.exec("create table added (id integer, name text)")\ndb.transaction(() => {\n    for i in 0..5000 {\n        db.exec("insert into added values (?, ?)", i, `n${i}`)\n    }\n})\nprint(db.one("select count(*) as n from added").n)\n'),
+         p('cur = c.cursor()\ncur.execute("drop table if exists added")\ncur.execute("create table added (id integer, name text)")\nc.autocommit = False\nfor i in range(5000):\n    cur.execute("insert into added values (%s, %s)", (i, f"n{i}"))\nc.commit()\ncur.execute("select count(*) from added")\nprint(cur.fetchone()[0])\n')),
         ("group by in SQL",
          q('let rows = db.query("select region, sum(total) as t from items group by region order by region")\nprint(len(rows))\nprint(rows[0].t)\n'),
          p('cur = c.cursor()\ncur.execute("select region, sum(total) as t from items group by region order by region")\nrows = cur.fetchall()\nprint(len(rows))\nprint(rows[0][1])\n')),

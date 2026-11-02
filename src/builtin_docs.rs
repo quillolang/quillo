@@ -179,6 +179,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("db.shards", "targets", "Databases split by a key: `.on(key)` is a shard's connection, `.all(sql)` asks every shard."),
     ("db.atomic", "dbs, f", "Runs `f` as one transaction over the databases listed: all of it commits, or none."),
     ("db.exec", "sql, params", "Runs SQL, with `?` or `:name` values; `{ changes, last_id }`, or an error value."),
+    ("db.exec_many", "sql, rows", "Runs SQL once for each row (a list of its `?` values), all or none; `{ changes }`, or an error value."),
     ("db.query", "sql, params", "Every row as a list of maps, all in memory, or an error value."),
     ("db.one", "sql, params", "The first row as a map, or null, or an error value."),
     ("db.transaction", "options, f", "Runs `f` all or nothing; an error value rolls it back. `options` may be left out."),

@@ -19,9 +19,9 @@
   const warn = console.warn;
   console.warn = (...a) => { warned.push(a.join(" ")); return warn.apply(console, a); };
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
     await tick(200);
-    out.resumedEarly = window.__quilloResumed || 0;
+    out.resumedEarly = (window[Symbol.for("quillo")] || {}).resumed || 0;
     // What should stay the page's own elements.
     const kept = $$(".inner")[0].querySelector("b"), cell = $(".cell"), bold = $("#raw b"), said = $(".said");
     // A script changes the second inner one's <b> to an <em>, same words.
@@ -47,7 +47,7 @@
     out.rawSame = $("#raw b") === bold;
     out.rawWrapped = bold.parentElement.localName;
     out.saidSame = $(".said") === said;
-    out.remade = window.__quilloRemade || 0;
+    out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     out.warned = warned.filter((w) => w.includes("made again"));
     out.errors = window.__quilloErrors || [];
   } catch (e) {

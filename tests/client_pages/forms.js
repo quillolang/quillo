@@ -6,7 +6,7 @@
   const click = async (s) => { $(s).click(); await tick(); };
   try {
     $("#boot").click();
-    for (let i = 0; i < 300 && !window.__quillo_booted; i++) await tick(30);
+    for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
     await tick(100);
     out.late = text("#late");
     await click("#late");

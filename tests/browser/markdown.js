@@ -9,7 +9,7 @@
   // The server's HTML as the page's DOM writes it (<input/> is <input>).
   const dom = (h) => { const t = document.createElement("template"); t.innerHTML = h; return t.innerHTML; };
   try {
-    for (let i = 0; i < 200 && !window.__quillo_booted; i++) await tick(30);
+    for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
     out.first = html("#preview");
     const texts = [
       "# Title\n\nSome *em* and `code`, a [link](javascript:alert(1)).",

@@ -3,7 +3,7 @@
 // load again on the way (window.__kept stays).
 (async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (let i = 0; i < 200 && !window.__quillo_booted; i++) await sleep(30);
+  for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await sleep(30);
   window.__kept = true;
   const seen = (id) => {
     const el = document.getElementById(id);

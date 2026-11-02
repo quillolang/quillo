@@ -5,7 +5,7 @@
   const loaded = () => performance.getEntriesByType("resource").some((r) => r.name.includes("/_quillo/b/"));
   try {
     if (location.pathname === "/clock") {
-      for (let i = 0; i < 100 && !(window.__quillo_booted && +$("#ticks").textContent > 2); i++) await tick(30);
+      for (let i = 0; i < 100 && !((window[Symbol.for("quillo")] || {}).booted && +$("#ticks").textContent > 2); i++) await tick(30);
       out.clockRuns = +$("#ticks").textContent > 2;
     } else {
       await tick(400);
@@ -17,14 +17,14 @@
       $("#name").value = "Ada";
       $("#name").dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
       $("#go").click();
-      for (let i = 0; i < 100 && !window.__quillo_booted; i++) await tick(30);
+      for (let i = 0; i < 100 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
       await tick(100);
       out.loadedOnFocus = loaded();
       out.echo = $("#echo").textContent;
       out.clicked = $("#go").textContent;
       out.value = $("#name").value;
       out.sameNodes = $("#go") === button && $("#go").__mine === true && $("#echo").__mine === true;
-      out.remade = window.__quilloRemade || 0;
+      out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     }
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e && e.stack || e); }

@@ -4,7 +4,7 @@
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const input = () => document.querySelector("form input");
   input().dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
-  for (let i = 0; i < 60 && !window.__quillo_booted; i++) await wait(50);
+  for (let i = 0; i < 60 && !(window[Symbol.for("quillo")] || {}).booted; i++) await wait(50);
   await wait(200);
   for (const text of ["Buy milk", "Ship the iOS build", "Write the mobile docs"]) {
     const box = input();

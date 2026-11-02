@@ -9,7 +9,7 @@
   try {
     for (let i = 0; i < 200 && !$("#plain"); i++) await tick(30);
     await tick(300);
-    out.before = !!window.__quillo_booted;
+    out.before = !!(window[Symbol.for("quillo")] || {}).booted;
     // All in one go, before the bundle can come: a touch press on the grip
     // (its finger gone by then), a shift-click and a double click, a right
     // and a middle click, and a checkbox.
@@ -22,9 +22,9 @@
     fire("#menu", "contextmenu", { button: 2 });
     fire("#menu", "auxclick", { button: 1 });
     $("#box").click();
-    out.kept = (window.__quillo_q || []).length;
+    out.kept = ((window[Symbol.for("quillo")] || {}).q || []).length;
     out.boxWaits = $("#box").checked;
-    for (let i = 0; i < 200 && !window.__quillo_booted; i++) await tick(30);
+    for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
     await tick(200);
     out.heard = $("#got").textContent;
     out.box = $("#box").checked;

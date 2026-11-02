@@ -53,7 +53,7 @@
   `])));
   const tell = (m) => new Promise((ok) => { worker.onmessage = () => ok(); worker.postMessage(m); });
   await tell({ url: location.origin.replace(/^http/, "ws") + "/_quillo/wt?t=" + encodeURIComponent(ticket) });
-  await until(() => window.__quilloChannelVia, 5000);
+  await until(() => (window[Symbol.for("quillo")] || {}).via, 5000);
   await t(500);
   const [key, d1, d2] = chunks.map((x) => x.d);
   const playing = (n) => until(() => v.dataset.state === "playing" && v.mediaStats.video >= n, 5000);

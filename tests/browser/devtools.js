@@ -8,7 +8,7 @@
   try {
     const up = $("#up");
     up.dispatchEvent(new PointerEvent("pointerover", { bubbles: true })); up.focus();
-    for (let i = 0; i < 100 && !window.__quillo_booted; i++) await t(30);
+    for (let i = 0; i < 100 && !(window[Symbol.for("quillo")] || {}).booted; i++) await t(30);
     await t(300);
     up.click(); await t(200);                       // a state set, a component made
     up.click(); await t(200);                       // and gone

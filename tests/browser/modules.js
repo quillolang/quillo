@@ -3,7 +3,7 @@
   const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
   const $ = (s) => document.querySelector(s);
   try {
-    out.early = window.__quillo_booted === true;
+    out.early = (window[Symbol.for("quillo")] || {}).booted === true;
     $("#clicks").click();
     for (let i = 0; i < 200 && $(".made").textContent === "waiting"; i++) await tick(30);
     await tick();

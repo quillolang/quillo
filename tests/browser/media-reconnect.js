@@ -14,7 +14,7 @@
   const sent = p.mediaStats.sent, shown = v.mediaStats.video;
   out.after = await until(() => p.mediaStats.sent > sent + 30 && v.mediaStats.video > shown + 30 && v.dataset.state === "playing", 30000);
   out.state = p.dataset.state;
-  out.via = window.__quilloChannelVia;
+  out.via = (window[Symbol.for("quillo")] || {}).via;
   out.errors = window.__quilloErrors || [];
   p.remove();
   v.remove();

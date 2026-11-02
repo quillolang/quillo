@@ -3,7 +3,7 @@
 // reports what it was asked for, and what this page saw before.
 (async () => {
   const tick = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (let i = 0; i < 200 && !window.__quillo_booted; i++) await tick(30);
+  for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
   const to = document.getElementById("to");
   const go = async (where) => {
     to.value = where;

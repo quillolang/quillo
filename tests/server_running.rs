@@ -138,11 +138,11 @@ route GET / = <html><body><Page/><footer>end</footer></body></html>
 fn a_pages_waiting_parts_follow_it_in_the_same_answer() {
     let srv = run("defer", DEFERRED, &[]);
     let mut s = ask(srv.port, "/");
-    let first = read_to(&mut s, "__quillo_swap");
+    let first = read_to(&mut s, "w.swap=function");
     assert!(first.starts_with("HTTP/1.1 200") && first.contains("transfer-encoding: chunked"), "{}", first);
     assert!(first.contains("id=\"wait\"") && !first.contains("<li>"), "{}", first);
     let rest = all(&mut s);
-    assert!(rest.contains("<li>1</li>") && rest.contains("__quillo_swap(\"0\")"), "{}", rest);
+    assert!(rest.contains("<li>1</li>") && rest.contains(".swap(\"0\")"), "{}", rest);
     assert!(rest.contains("</body></html>") && rest.ends_with("0\r\n\r\n"), "{}", rest);
 }
 
@@ -184,7 +184,7 @@ fn a_mounted_programs_waiting_parts_come_with_its_page() {
 fn a_client_gone_while_a_part_is_worked_out_ends_the_page() {
     let srv = run("defer-gone", DEFERRED, &["--metrics"]);
     let mut s = ask(srv.port, "/");
-    let _ = read_to(&mut s, "__quillo_swap");
+    let _ = read_to(&mut s, "w.swap=function");
     reset(s);
     assert!(until(|| srv.connections() == 1), "{}", srv.connections());
     assert_eq!(srv.get("/").status, 200);

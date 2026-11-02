@@ -22,7 +22,7 @@
   }
   Object.assign(out, {
     state: el.dataset.state, video: s.video, audio: s.audio, codec: s.codec,
-    width: c && c.width, colors: seen.size, via: window.__quilloChannelVia, errors: window.__quilloErrors || [],
+    width: c && c.width, colors: seen.size, via: (window[Symbol.for("quillo")] || {}).via, errors: window.__quilloErrors || [],
   });
   document.body.setAttribute("data-result", JSON.stringify(out));
 })();

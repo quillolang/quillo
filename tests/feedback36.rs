@@ -114,7 +114,7 @@ fn a_folder_of_files_is_served_as_a_static_host_serves_it() {
     let part = send(s.port, "GET", "/index.html", &[("Range", "bytes=0-5")], "");
     assert_eq!((part.status, part.body.as_str()), (206, "<html>"));
     // A page a route makes still prefetches.
-    assert!(get("/page").body.contains("__quillo_pf"));
+    assert!(get("/page").body.contains("w.pf=1"));
 }
 
 #[test]

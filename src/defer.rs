@@ -38,16 +38,18 @@ pub(crate) struct Page {
     pub jobs: Vec<Deferred>,
 }
 
-/// Swaps a waiting island for the one that came: defined once, before the first part.
+/// Swaps a waiting island for the one that came: defined once, before the first part, in the
+/// object the runtime shares with the page's scripts (FEEDBACK42.md, Q-486).
 pub const SWAP: &str = concat!(
-    "<script>window.__quillo_swap=function(i){var d=document,t=d.querySelector('template[data-qt=\"'+i+'\"]'),",
+    "<script>(function(w){w.swap=function(i){var d=document,t=d.querySelector('template[data-qt=\"'+i+'\"]'),",
     "o=d.querySelector('[data-qd=\"'+i+'\"]');if(!t)return;if(o){var n=t.content.firstElementChild;o.replaceWith(t.content);",
-    "if(n&&window.__quillo_resume&&(n.hasAttribute('data-e')||n.hasAttribute('data-l')))window.__quillo_resume(n)}t.remove()}</script>"
+    "if(n&&w.resume&&(n.hasAttribute('data-e')||n.hasAttribute('data-l')))w.resume(n)}t.remove()}})",
+    "(window[Symbol.for('quillo')]||(window[Symbol.for('quillo')]={}))</script>"
 );
 
 /// A waiting component's part: its island, and the line that swaps it in.
 pub fn part(id: usize, island: &str) -> String {
-    format!("<template data-qt=\"{}\">{}</template><script>__quillo_swap(\"{}\")</script>", id, island, id)
+    format!("<template data-qt=\"{}\">{}</template><script>window[Symbol.for(\"quillo\")].swap(\"{}\")</script>", id, island, id)
 }
 
 /// The page split at its last `</body>` (or its end), the swap script at the end of

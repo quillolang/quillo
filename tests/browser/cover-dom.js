@@ -16,7 +16,7 @@
   const text = (s) => $(s).textContent;
   const ids = () => [...$("#rows").children].map((li) => li.id || li.textContent);
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
 
     // What a handler reads of its event.
     $("#tick").click();

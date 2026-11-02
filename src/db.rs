@@ -42,6 +42,7 @@ pub fn install(m: &mut Map) {
     let fns: &[(&'static str, BuiltinFn)] = &[
         ("db.open", open),
         ("db.exec", exec),
+        ("db.exec_many", exec_many),
         ("db.query", query),
         ("db.one", one),
         ("db.transaction", transaction),
@@ -1192,6 +1193,7 @@ fn connection(i: usize) -> Value {
     m.insert(CONN_KEY.into(), Value::Int(i as i64));
     let fns: &[(&'static str, BuiltinFn)] = &[
         ("db.exec", exec),
+        ("db.exec_many", exec_many),
         ("db.query", query),
         ("db.one", one),
         ("db.transaction", transaction),
@@ -1390,6 +1392,95 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     conns.retain(|(l, _)| l != SYSTEM);
     conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
     Ok(Value::Nil)
+}
+
+/// `db.exec_many(sql, rows)`: the statement once for each row (a list of its `?` values), all
+/// of them or none: in a transaction of its own, or a savepoint of the one it is in. `{ changes
+/// }`, or the first error, with nothing written. As Python's `executemany` does, an `insert
+/// into t (...) values (?, ...)` goes to PostgreSQL and MySQL as inserts of many rows each, not
+/// a round trip a row (branch feedback40-43).
+fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
+    let sql = sql_arg(&args, "db.exec_many", line)?;
+    let rows: Vec<Vec<Value>> = match args.get(1) {
+        Some(Value::List(l)) if args.len() == 2 => {
+            let mut rows = Vec::with_capacity(l.len());
+            for (i, r) in l.iter().enumerate() {
+                match r {
+                    Value::List(v) => rows.push(v.to_vec()),
+                    other => return fail(line, format!("`db.exec_many`: row {} is {}, not a list of the statement's values", i + 1, other.type_name())),
+                }
+            }
+            rows
+        }
+        _ => {
+            let got = args.get(1).map_or("nothing", |v| v.type_name());
+            return fail(line, format!("`db.exec_many` takes the SQL and a list of rows, each a list of its values, got {}", got));
+        }
+    };
+    let changes = |n: i64| {
+        let mut m = Map::new();
+        m.insert("changes".into(), Value::Int(n));
+        Value::map(m)
+    };
+    if rows.is_empty() {
+        return Ok(changes(0));
+    }
+    let server = match backend_on(it, on) {
+        Ok(b) => !matches!(&*b, Backend::Sqlite(_)),
+        Err(e) => return Ok(db_err(e)),
+    };
+    let width = rows[0].len();
+    if let Some((i, r)) = rows.iter().enumerate().find(|(_, r)| r.len() != width) {
+        return Ok(db_err(format!("row {} has {} value{}, the first has {}", i + 1, r.len(), if r.len() == 1 { "" } else { "s" }, width)));
+    }
+    // Rows by the statement each, or many to a statement: as many as fit under the servers'
+    // 65,535 parameters, and at most 1,000.
+    let many = if server { values_tuple(&sql, width) } else { None };
+    let per = many.as_ref().map_or(1, |_| (60_000 / width.max(1)).clamp(1, 1000));
+    let mut body = |it: &mut Interp| -> R {
+        let mut total = 0;
+        for chunk in rows.chunks(per) {
+            let text = match &many {
+                Some(head) => {
+                    let one = format!("({})", vec!["?"; width].join(", "));
+                    format!("{}{}", head, vec![one.as_str(); chunk.len()].join(", "))
+                }
+                None => sql.clone(),
+            };
+            let mut a = Vec::with_capacity(1 + chunk.len() * width);
+            a.push(Value::str(&text));
+            for r in chunk {
+                a.extend(r.iter().cloned());
+            }
+            match exec_on(it, on, a)? {
+                Value::Map(m) => total += match m.get("changes") { Some(Value::Int(n)) => *n, _ => 0 },
+                err => return Ok(err),
+            }
+        }
+        Ok(changes(total))
+    };
+    crate::txn::run(it, on, &crate::txn::Options::default(), line, &mut body)
+}
+
+/// `insert into t (a, b) values (?, ?)`, with nothing after its values: the statement up to
+/// and with `values `, to which more rows' `(?, ?)` can be added. None for any other statement,
+/// which runs once a row.
+fn values_tuple(sql: &str, width: usize) -> Option<String> {
+    let t = sql.trim().trim_end_matches(';').trim_end();
+    if !t.get(..6).map_or(false, |w| w.eq_ignore_ascii_case("insert")) || !t.ends_with(')') {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    let at = lower.rfind("values")?;
+    let head = &t[..at];
+    let tuple = t[at + 6..].trim_start();
+    let inner = tuple.strip_prefix('(')?.strip_suffix(')')?;
+    let marks: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if marks.len() != width || marks.iter().any(|m| *m != "?") || head.contains(['?', '\'', '"', '`', '-', '/']) {
+        return None;
+    }
+    Some(format!("{}values ", head))
 }
 
 /// `db.exec` / `db.query` on connection `on` (None: the program's).
@@ -2481,7 +2572,30 @@ pub fn recover(it: &mut Interp) {
 
 #[cfg(test)]
 mod tests {
-    use super::kind_of;
+    use super::{kind_of, values_tuple};
+
+    // An insert of one row's `?`s, with nothing after them, goes as many rows a statement;
+    // anything else a row at a time (branch feedback40-43).
+    #[test]
+    fn which_statements_take_many_rows() {
+        assert_eq!(values_tuple("insert into t (a, b) values (?, ?)", 2).as_deref(), Some("insert into t (a, b) values "));
+        assert_eq!(values_tuple("  INSERT INTO t VALUES (?,?) ; ", 2).as_deref(), Some("INSERT INTO t values "));
+        assert_eq!(values_tuple("insert into t values(?)", 1).as_deref(), Some("insert into t values "));
+        for (sql, width) in [
+            ("insert into t values (?, ?)", 3),                          // not the rows' width
+            ("insert into t values (?, 1)", 2),                          // a value written in
+            ("insert into t values (?, ?) on conflict do nothing", 2),   // something after it
+            ("insert into t values (?, ?) returning id", 2),
+            ("insert into t select ?, ?", 2),
+            ("update t set a = ? where b = ?", 2),
+            ("insert into \"values\" values (?)", 1),                     // quoted names: not taken apart
+            ("insert into t (a) values (?) -- note", 1),
+            ("insert into t (a) select ? where 'values (?)' = ''", 1),
+            ("ins", 1),
+        ] {
+            assert_eq!(values_tuple(sql, width), None, "{}", sql);
+        }
+    }
 
     // Each database's own words for the same failures (FEEDBACK5.md, Q-053;
     // branch stays-fixes).

@@ -471,6 +471,11 @@ A tool asks with a `quillo:devtools-ask` event, its `detail` a JSON string
 Reading is open in production, as the page can be read with the browser's debugger anyway;
 setting is not (FEEDBACK42.md, Part C).
 
+Quillo's only names on `window` are `quillo` (the server fns, above) and `__quilloErrors`
+when a page made it. What its own scripts hand each other is under one key,
+`window[Symbol.for("quillo")]`: not an interface, but a test may wait on its `booted`
+before driving a page (Q-486).
+
 ### Other editors
 
 Any editor with a Debug Adapter Protocol client (Neovim's nvim-dap, Helix, Emacs's

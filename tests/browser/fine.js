@@ -29,7 +29,7 @@
     out.label = await changes(child, () => $("#label").click());
     out.child = $(".child").textContent;
     out.runs = { ...window.tally.runs };
-    out.remade = window.__quilloRemade || 0;
+    out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e.stack || e); }
   document.body.setAttribute("data-result", JSON.stringify(out));

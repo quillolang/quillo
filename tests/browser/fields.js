@@ -4,7 +4,7 @@
   const tick = (ms = 50) => new Promise((r) => setTimeout(r, ms));
   const $ = (s) => document.querySelector(s);
   try {
-    for (let i = 0; i < 200 && !window.__quillo_booted; i++) await tick(30);
+    for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
     out.mounted = $("#q").value;
     $("#clear").click();
     await tick();

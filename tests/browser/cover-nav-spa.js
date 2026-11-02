@@ -20,7 +20,7 @@
     $("#go").click();
   };
   try {
-    await until(() => window.__quillo_booted);
+    await until(() => (window[Symbol.for("quillo")] || {}).booted);
     // The spot the address names, already gone to: scrolled away from, then
     // navigate("#spot") goes there again, with no new history entry.
     window.scrollTo(0, 0);

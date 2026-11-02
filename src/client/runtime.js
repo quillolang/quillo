@@ -1830,7 +1830,11 @@ B.js_new = meta((path, ...args) => {
 }, "js_new", null);
 
 // Translations: the page's locale and its text (see src/i18n.rs).
-const i18n = () => (typeof window !== "undefined" && window.__quillo_i18n) || null;
+// What the page's own scripts (the loader, prefetching, translations, deferred parts) and the
+// runtime hand each other, under one key of `window` rather than a name each; `quillo` and a
+// page's `__quilloErrors` are the only names (FEEDBACK42.md, Q-486; branch feedback40-43).
+const QW = typeof window === "undefined" ? {} : window[Symbol.for("quillo")] || (window[Symbol.for("quillo")] = {});
+const i18n = () => QW.i18n || null;
 // The plural form of n, as on the server (CLDR's rules), `frac` when it is written with a
 // fraction's digits (FEEDBACK30.md, Q-366; branch feedback27-35-fixes).
 const plural = (locale, n, frac) => {
@@ -3484,7 +3488,7 @@ function chanStart() {
       try {
         const c = await chanConnect();
         Chan.conn = c;
-        if (typeof window !== "undefined") window.__quilloChannelVia = c.via;
+        QW.via = c.via;
         wait = 500;
         for (const name of Chan.subs.keys()) c.put(JSON.stringify(["j", name]), true);
         for (const name of Chan.media.keys()) c.put(JSON.stringify(["v", name]), true);
@@ -5170,7 +5174,7 @@ function fetchAhead(e) {
   const a = e.target.closest && e.target.closest("a[href]");
   const u = a && !a.closest("[data-no-prefetch]") ? followed(a) : null;
   const c = navigator.connection;
-  if (!u || !window.__quillo_pf || (c && (c.saveData || /2g/.test(c.effectiveType || "")))) return;
+  if (!u || !QW.pf || (c && (c.saveData || /2g/.test(c.effectiveType || "")))) return;
   const to = u.pathname + u.search;
   if (to === Ahead.to || to === location.pathname + location.search) return;
   aheadDrop();
@@ -5206,7 +5210,7 @@ function navStart() {
   if (Nav.on || typeof window === "undefined") return;
   Nav.on = true;
   // Links in components are followed here: not prefetched as pages.
-  window.__quillo_nav = true;
+  QW.nav = true;
   window.addEventListener("popstate", navChanged);
   window.addEventListener("hashchange", navChanged);
   let pointed = 0;
@@ -5880,7 +5884,7 @@ function asOwnRoot(w, inst) {
 // counted, so a page (or a test) can tell, and said in development, with
 // its name and what differed.
 function remade(name) {
-  if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+  QW.remade = (QW.remade || 0) + 1;
   if (DEV && wanted) console.warn(`quillo: <${name}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
   if (TOOLS) toolsSay("remade", Object.assign({ name }, toolsWanted()));
 }
@@ -6166,12 +6170,12 @@ function resume(el) {
   let ok = true;
   try {
     run(inst, el, true);
-    if (typeof window !== "undefined") window.__quilloResumed = (window.__quilloResumed || 0) + 1;
+    QW.resumed = (QW.resumed || 0) + 1;
   } catch (e) {
     if (e instanceof Mismatch) remade(el.dataset.c);
     else {
       report(e);
-      if (typeof window !== "undefined") window.__quilloRemade = (window.__quilloRemade || 0) + 1;
+      QW.remade = (QW.remade || 0) + 1;
     }
     ok = false;
   }
@@ -6228,7 +6232,7 @@ function wake(e) {
 function boot() {
   toolsStart();
   // A deferred island swapped in after the runtime came: taken up if it runs by itself.
-  window.__quillo_resume = (el) => { if (el && !el.__q) resume(el); };
+  QW.resume = (el) => { if (el && !el.__q) resume(el); };
   // Someone reaching for an island takes it up (before their event is
   // handled: it reaches the component).
   for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
@@ -6241,7 +6245,7 @@ function boot() {
   }
   // The island someone reached for, which brought the bundle, and the one
   // that has the focus.
-  for (const n of [window.__quillo_at, document.activeElement]) {
+  for (const n of [QW.at, document.activeElement]) {
     const i = n && n !== document.body ? outerIsland(n) : null;
     if (i) resume(i);
   }
@@ -6249,9 +6253,9 @@ function boot() {
   // the same elements are on the page, so it is done again on them, each
   // mouse and pointer event as it was made, where and with the buttons and
   // keys it had (branch early-events).
-  const held = window.__quillo_q || [];
-  const redo = window.__quillo_redo;
-  window.__quillo_booted = true;
+  const held = QW.q || [];
+  const redo = QW.redo;
+  QW.booted = true;
   for (const r of held.splice(0)) {
     const i = outerIsland(r.el);
     if (i) resume(i);

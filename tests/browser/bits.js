@@ -10,7 +10,7 @@
     await until(() => text("#mask") !== "48");
     out.flipped = text("#mask");
     out.top = text("#top");
-    out.remade = window.__quilloRemade || 0;
+    out.remade = (window[Symbol.for("quillo")] || {}).remade || 0;
     out.errors = window.__quilloErrors || [];
   } catch (e) { out.exception = String(e && e.stack || e); }
   document.body.setAttribute("data-result", JSON.stringify(out));

@@ -406,7 +406,7 @@ route GET /any = <html><body><Any name="k3"/></body></html>
     );
     let s = serve(&d.join("main.qwe"), &[]);
     let page = send(s.port, "GET", "/", &[], "").body;
-    assert!(!page.contains("__quillo_i18n"), "the text is no longer inline");
+    assert!(!page.contains(".i18n="), "the text is no longer inline");
     let at = page.find("/_quillo/t/").expect("a translations file");
     let path = &page[at..at + page[at..].find(".js").unwrap() + 3];
     let file = send(s.port, "GET", path, &[], "");
