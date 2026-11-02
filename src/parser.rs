@@ -607,8 +607,8 @@ impl Parser {
     // ---- statements ----------------------------------------------------
 
     /// What the lexer noted of `${name}` in plain strings (see `Lexer::plain_dollars`).
-    pub fn plain_dollars(&self) -> &[(u32, String)] {
-        &self.lx.plain_dollars
+    pub fn plain_dollars(&self) -> Vec<(String, String)> {
+        self.lx.plain_dollars.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
     }
 
     pub fn parse_program(&mut self) -> PResult<Vec<Stmt>> {
@@ -723,6 +723,13 @@ impl Parser {
                 "let" => {
                     self.next()?;
                     let pat = self.parse_binding()?;
+                    // `let x: int = 1`, TypeScript's: a `let` takes its value's type
+                    // (FEEDBACK45.md, Q-519; branch feedback40-43).
+                    if self.at(&Tok::Colon)? {
+                        if let Pattern::Bind(n) = &pat {
+                            return self.err_at(format!("a `let` takes no type, but its value's: `let {} = ...`, or `int(...)` to make one", n));
+                        }
+                    }
                     self.expect(&Tok::Assign, "`=`")?;
                     let e = self.parse_expr()?;
                     return Ok(Stmt::Let(pat, e, line));
@@ -812,7 +819,10 @@ impl Parser {
                     if let Tok::Ident(n) = self.peek()? {
                         // `type if = int`: the keyword message, as for `let if` (FEEDBACK45.md,
                         // Q-526; branch feedback40-43).
-                        if KEYWORDS.contains(&n.as_str()) {
+                        if KEYWORDS.contains(&n.as_str()) && self.lx.text().get(self.lx.pos..).map_or(false, |rest| {
+                            let after: String = rest.iter().skip_while(|c| c.is_alphanumeric() || **c == '_').skip_while(|c| **c == ' ' || **c == '\t').take(2).collect();
+                            after.starts_with('=') && !after.starts_with("==")
+                        }) {
                             return Err(QuilloError::new(format!("`{}` is a keyword, so it cannot be a name here: pick another name", n), line));
                         }
                         let capital = n.chars().next().map_or(false, |c| c.is_ascii_uppercase());
@@ -1114,7 +1124,7 @@ impl Parser {
                 return self.err_at("a function takes no `...rest`: take a list");
             }
             let pname = self.expect_ident("a parameter name")?;
-            let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
+            let ty = self.param_type(&pname)?;
             let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
             params.push(Param { name: pname.into(), ty, default });
             if !self.eat(&Tok::Comma)? {
@@ -1122,6 +1132,10 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen, "`)`")?;
+        // `fn f(a: int): int`, TypeScript's and Kotlin's result type (FEEDBACK45.md, Q-519).
+        if self.at(&Tok::Colon)? {
+            return self.err_at("a function's result type follows `->`: `fn f(a: int) -> int = ...`");
+        }
         let ret = if self.eat(&Tok::Arrow)? { Some(self.parse_type()?) } else { None };
         let err = if self.eat(&Tok::Bang)? { Some(self.parse_type()?) } else { None };
         let effects = self.parse_with()?;
@@ -1341,6 +1355,10 @@ impl Parser {
                 }
                 return Ok(Some(n));
             }
+            // `state n: int = 0`: a state takes the type of its value (FEEDBACK45.md, Q-519).
+            if self.at(&Tok::Colon)? {
+                return Err(QuilloError::new(format!("a `state` takes no type, but its value's: `state {} = 0`", n), line));
+            }
         }
         self.restore(saved);
         Ok(None)
@@ -1392,8 +1410,24 @@ impl Parser {
                     names.push(name);
                 }
             } else {
+                // `integer`, `string`, `ayn`: the type meant, when it is plain (FEEDBACK45.md,
+                // Q-517; branch feedback40-43).
+                let meant = match name.as_str() {
+                    "integer" | "long" | "i64" | "i32" | "number" => Some("int"),
+                    "string" | "text" | "String" => Some("str"),
+                    "boolean" | "Boolean" => Some("bool"),
+                    "double" | "f64" | "f32" | "real" => Some("float"),
+                    "decimal" => Some("dec"),
+                    "array" | "vec" | "Vec" => Some("list"),
+                    "dict" | "object" | "record" | "hash" => Some("map"),
+                    "function" | "func" | "lambda" => Some("fn"),
+                    _ => TYPE_NAMES.iter().copied().filter(|t| crate::check::edit_distance(&name, t) <= 2 && crate::check::edit_distance(&name, t) < name.len()).min_by_key(|t| (crate::check::edit_distance(&name, t), *t)),
+                };
                 return Err(QuilloError::new(
-                    format!("unknown type `{}` (known types: {}, null, and the program's own, which start with a capital letter)", name, TYPE_NAMES.join(", ")),
+                    match meant {
+                        Some(m) => format!("unknown type `{}`: did you mean `{}`?", name, m),
+                        None => format!("unknown type `{}` (known types: {}, null, and the program's own, which start with a capital letter)", name, TYPE_NAMES.join(", ")),
+                    },
                     t.line,
                 ));
             }
@@ -1448,8 +1482,21 @@ impl Parser {
                 },
                 other => return Err(QuilloError::new(format!("expected a field name, found {}", other.describe()), t.line)),
             };
+            // `{ name: str, name: int }`: the second won (FEEDBACK45.md, Q-508; branch
+            // feedback40-43).
+            if fields.iter().any(|(f, _)| *f == key) {
+                return Err(QuilloError::new(format!("field `{}` is named twice in this type", key), t.line));
+            }
             self.expect(&Tok::Colon, &format!("`:` and a type after `{}`", key))?;
-            let ty = self.parse_type()?;
+            let ty = match self.parse_type() {
+                Ok(t) => t,
+                // `{ str: name }`: the name and type swapped (FEEDBACK45.md, Q-519).
+                Err(e) if TYPE_NAMES.contains(&key.as_str()) && e.msg.starts_with("unknown type") => {
+                    let written = e.msg.split('`').nth(1).unwrap_or("x").to_string();
+                    return Err(QuilloError::new(format!("`{0}: {1}` has the name and type swapped: write `{1}: {0}`", key, written), e.line));
+                }
+                Err(e) => return Err(e),
+            };
             if let Some(ds) = defaults.as_deref_mut() {
                 if self.eat(&Tok::Assign)? {
                     let e = self.parse_expr()?;
@@ -1528,7 +1575,11 @@ impl Parser {
             // `/a/{id}` or `/a/{id:int}`, as OpenAPI, Express 5, ASP.NET and FastAPI write a
             // parameter: read as the path `/a/` and a request pattern, it matched nothing
             // (FEEDBACK45.md, Q-506; branch feedback40-43).
-            if let Some((name, ty)) = self.braced_param() {
+            // Right after the root `/`, `{json}` is a request pattern, as it always was
+            // (found in review).
+            // Not `id` or `path`: there, `/{id}` is a parameter meant (found in review).
+            const REQUEST: &[&str] = &["method", "query", "query_string", "params", "headers", "cookies", "body", "json", "form", "files", "ip"];
+            if let Some((name, ty)) = self.braced_param().filter(|(n, _)| !(path.is_empty() && REQUEST.contains(&n.as_str()))) {
                 let typed = ty.as_ref().map_or(String::new(), |t| format!("({})", t));
                 let written = ty.as_ref().map_or(name.clone(), |t| format!("{}:{}", name, t));
                 return Err(QuilloError::new(format!("path parameters are written `:{0}{1}`, as in `/users/:{0}{1}`, not `{{{2}}}`", name, typed, written), self.lx.line));
@@ -1576,6 +1627,45 @@ impl Parser {
         }
         self.lx.last = Some(Tok::RParen);
         Ok(path)
+    }
+
+    /// A parameter's `: type`, if it has one, and what other languages' forms of it mean
+    /// (FEEDBACK45.md, Q-519; branch feedback40-43): `int: a` swapped, `a int` (Go), `int a` (C,
+    /// Java), `a?: int` and `a: ?int`, `int[]` and `list[int]`.
+    fn param_type(&mut self, pname: &str) -> PResult<Option<Ty>> {
+        let typed = |n: &str| TYPE_NAMES.contains(&n);
+        match self.peek()?.clone() {
+            Tok::Ident(t) if typed(&t) => {
+                return self.err_at(format!("a parameter's type follows its name after `:`: `{}: {}`", pname, t));
+            }
+            Tok::Ident(n) if typed(pname) => {
+                return self.err_at(format!("a parameter's type follows its name after `:`: `{}: {}`", n, pname));
+            }
+            Tok::Question => {
+                return self.err_at(format!("`?` goes after the type, for a value that may be null: `{}: int?`; for one that may be left out, give it a default, `{} = 0`", pname, pname));
+            }
+            Tok::Colon => {}
+            _ => return Ok(None),
+        }
+        self.next()?;
+        if self.at(&Tok::Question)? {
+            return self.err_at(format!("`?` goes after the type: `{}: int?`", pname));
+        }
+        let ty = match self.parse_type() {
+            Ok(t) => t,
+            // `int: a`: the name is a type's, the type is no type.
+            Err(e) if typed(pname) && e.msg.starts_with("unknown type") => {
+                let written = e.msg.split('`').nth(1).unwrap_or("x").to_string();
+                return Err(QuilloError::new(format!("`{0}: {1}` has the name and type swapped: write `{1}: {0}`", pname, written), e.line));
+            }
+            Err(e) => return Err(e),
+        };
+        if self.at(&Tok::LBracket)? {
+            let elem = ty.names.first().cloned().unwrap_or_default();
+            let elem = if elem == "list" { "int".to_string() } else { elem };
+            return self.err_at(format!("a list's item type goes in `<>`: `{}: list<{}>`", pname, elem));
+        }
+        Ok(Some(ty))
     }
 
     /// `{id}` or `{id:int}` just after a path's `/`: its name and type. Not a request pattern
@@ -1775,6 +1865,8 @@ impl Parser {
     /// After `(`: `(a, b: int = 1): T => body` if that is what follows,
     /// otherwise nothing is consumed.
     fn try_arrow(&mut self, line: u32) -> PResult<Option<Expr>> {
+        // An arrow parameter's type error, told from a parse that only shows this is no arrow.
+        const ARROW_TYPE: &str = "\u{1}arrow type: ";
         let saved = self.save();
         let head = (|| -> PResult<Option<(Vec<Param>, Option<Ty>)>> {
             let mut params = Vec::new();
@@ -1784,7 +1876,21 @@ impl Parser {
                     return Ok(None);
                 }
                 self.next()?;
-                let ty = if self.eat(&Tok::Colon)? { Some(self.parse_type()?) } else { None };
+                // `(a: string) => a`: the type's error, not a parenthesis's; `name :` in a
+                // parenthesis is nothing but an arrow's (FEEDBACK45.md, Q-519).
+                let ty = if self.eat(&Tok::Colon)? {
+                    match self.parse_type() {
+                        Ok(t) => Some(t),
+                        Err(e) if e.msg.starts_with("unknown type") && TYPE_NAMES.contains(&name.as_str()) => {
+                            let written = e.msg.split('`').nth(1).unwrap_or("x").to_string();
+                            return Err(QuilloError::new(format!("{}`{}: {}` has the name and type swapped: write `{}: {}`", ARROW_TYPE, name, written, written, name), e.line));
+                        }
+                        Err(e) if e.msg.starts_with("unknown type") => return Err(QuilloError::new(format!("{}{}", ARROW_TYPE, e.msg), e.line)),
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    None
+                };
                 let default = if self.eat(&Tok::Assign)? { Some(self.parse_expr()?) } else { None };
                 params.push(Param { name: name.into(), ty, default });
                 if !self.eat(&Tok::Comma)? {
@@ -1806,6 +1912,7 @@ impl Parser {
                 Ok(Some(arrow(params, ret, body, line, self.file.clone())))
             }
             Err(e) if e.msg.starts_with(TOO_DEEP) => Err(e),
+            Err(e) if e.msg.starts_with(ARROW_TYPE) => Err(QuilloError::new(e.msg.trim_start_matches(ARROW_TYPE).to_string(), e.line)),
             _ => {
                 self.restore(saved);
                 Ok(None)
@@ -2435,6 +2542,7 @@ impl Parser {
             if self.eat(&Tok::RBrace)? {
                 break;
             }
+            let arm_line = self.line()?;
             let pat = self.parse_pattern()?;
             let guard = if self.eat_kw("if")? {
                 self.no_bare_arrow += 1;
@@ -2446,7 +2554,7 @@ impl Parser {
             };
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
             let body = self.parse_arrow_body()?;
-            arms.push(Arm { pat, guard, body });
+            arms.push(Arm { pat, guard, body, line: arm_line });
         }
         Ok(Expr::Match(Box::new(subj), arms, line))
     }

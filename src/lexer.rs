@@ -136,10 +136,11 @@ pub struct Lexer {
     /// the rest of the file being taken for the comment (FEEDBACK45.md, Q-503; branch
     /// feedback40-43).
     unclosed: Option<u32>,
-    /// `"Hello ${name}"` in a plain string, which is not a template: the line and the name,
-    /// for `quillo check` to say so when the name is one the program has. A `\$` is text
-    /// meant, and not noted (FEEDBACK45.md, Q-510; branch feedback40-43).
-    pub plain_dollars: Vec<(u32, String)>,
+    /// `"Hello ${name}"` in a plain string, which is not a template: the string's text and
+    /// the name, for `quillo check` to say so when the name is one the program has. A `\$`
+    /// is text meant, and not noted (FEEDBACK45.md, Q-510; branch feedback40-43). Shared, not
+    /// copied, by the lexer's clones, which a parser makes to look ahead.
+    pub plain_dollars: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
 }
 
 impl Lexer {
@@ -168,7 +169,7 @@ impl Lexer {
             // Q-529; branch feedback40-43).
             chars.push(if c == '\r' { '\n' } else { c });
         }
-        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Vec::new() }
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default() }
     }
 
     pub fn peek_char(&self) -> Option<char> {
@@ -480,10 +481,8 @@ impl Lexer {
         };
         digits(self, &mut s)?;
         // `08`, `010`: no octal, and a zero in front is no number's (old JavaScript read `010`
-        // as 8).
-        if s.len() > 1 && s.starts_with('0') {
-            return Err(QuilloError::new(format!("a number does not start with `0`: write `{}`", s.trim_start_matches('0').chars().next().map_or("0".to_string(), |_| s.trim_start_matches('0').to_string())), line));
-        }
+        // as 8). Said once the whole number is read, so `007.25` says `7.25`.
+        let leading_zero = s.len() > 1 && s.starts_with('0');
         // `let x = 1.` at a line's end: the next line was read as a method of the number.
         if self.peek_char() == Some('.') && self.peek_char_at(1).map_or(true, |c| c == '\n' || c == ' ' || c == '\t' || c == ')' || c == ',' || c == ']') {
             return Err(QuilloError::new(format!("a number does not end with `.`: write `{}` or `{}.0`", s, s), line));
@@ -507,6 +506,13 @@ impl Lexer {
                 digits(self, &mut s)?;
                 float = true;
             }
+        }
+        if leading_zero {
+            let int_len = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let int = s[..int_len].trim_start_matches('0');
+            let suffix = if self.peek_char() == Some('m') { "m" } else { "" };
+            let fixed = format!("{}{}{}", if int.is_empty() { "0" } else { int }, &s[int_len..], suffix);
+            return Err(QuilloError::new(format!("a number does not start with `0`: write `{}`", fixed), line));
         }
         // `12.50m`: a decimal, kept as written (C#'s suffix).
         if self.peek_char() == Some('m') && !self.peek_char_at(1).map_or(false, |c| c.is_alphanumeric() || c == '_') {
@@ -569,6 +575,7 @@ impl Lexer {
         let unterminated = || QuilloError::new("unexpected end of input: unterminated string", start);
         let quote = self.bump().unwrap_or('"');
         let mut buf = String::new();
+        let mut dollars = Vec::new();
         loop {
             let c = self.bump().ok_or_else(unterminated)?;
             match c {
@@ -582,11 +589,17 @@ impl Lexer {
                         n += 1;
                     }
                     if !name.is_empty() && matches!(self.peek_char_at(n), Some('}' | '.')) {
-                        self.plain_dollars.push((self.line, name));
+                        dollars.push(name);
                     }
                     buf.push(c);
                 }
                 _ => buf.push(c),
+            }
+        }
+        if !dollars.is_empty() {
+            let mut set = self.plain_dollars.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for name in dollars {
+                set.insert((buf.clone(), name));
             }
         }
         Ok(vec![StrPart::Lit(buf)])

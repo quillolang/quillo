@@ -286,6 +286,33 @@ fn list_of(e: T) -> T {
     T { bits: LIST, err: 0, elem: elem_id(e), shape: 0 }
 }
 
+/// What `request` holds, and nothing else, so `request.qurey` is said, with `query` offered
+/// (FEEDBACK45.md, Q-511; branch feedback40-43). The server makes it in server.rs.
+fn request_t() -> T {
+    let text = T::of(STR);
+    let any_map = T::of(MAP);
+    map_of(vec![
+        (Arc::from("method"), text),
+        (Arc::from("path"), text),
+        (Arc::from("query"), any_map),
+        (Arc::from("query_string"), text),
+        (Arc::from("params"), any_map),
+        (Arc::from("headers"), any_map),
+        (Arc::from("cookies"), any_map),
+        (Arc::from("body"), text),
+        (Arc::from("json"), T::ANY),
+        (Arc::from("form"), any_map),
+        (Arc::from("files"), T::ANY),
+        (Arc::from("ip"), text),
+        (Arc::from("id"), text),
+        // In a function a service answers with (service.rs).
+        (Arc::from("call"), text),
+        (Arc::from("caller"), T::ANY),
+        (Arc::from("user"), T::ANY),
+        (Arc::from("forwarded"), T::ANY),
+    ])
+}
+
 fn map_of(fields: Vec<(Arc<str>, T)>) -> T {
     T { bits: MAP, err: 0, elem: 0, shape: shape_id(fields) }
 }
@@ -1318,7 +1345,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let main: Arc<str> = Arc::from(file);
     let mut parser = Parser::new(src);
     let parsed = parser.parse_program();
-    c.plain_dollars.extend(parser.plain_dollars().iter().map(|(l, n)| (file.to_string(), *l, n.clone())));
+    c.plain_dollars.extend(parser.plain_dollars().into_iter().map(|(text, n)| (file.to_string(), text, n)));
     match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, base_dir)) {
         Ok(stmts) => {
             let mut seen = HashSet::new();
@@ -1426,8 +1453,15 @@ struct Item {
 }
 
 struct Checker {
+    /// Top-level functions and `let` lambdas, by name (Q-514).
+    bodies: HashMap<String, Arc<FnDef>>,
+    /// The route's path parameters with no type, while its body is checked (Q-513).
+    text_params: Vec<String>,
+    /// How many scopes deep the route's own is, so a local of the same name is not taken
+    /// for its parameter (found in review).
+    text_params_depth: usize,
     /// `${name}` written in plain strings, by file and line (FEEDBACK45.md, Q-510).
-    plain_dollars: HashSet<(String, u32, String)>,
+    plain_dollars: HashSet<(String, String, String)>,
     /// The functions being read in their own `let`.
     letting: Vec<String>,
     /// A component's `let`s whose value comes from the page (`js(...)`), by component: shown in
@@ -1589,6 +1623,9 @@ impl Checker {
             strict_null: false,
             letting: Vec::new(),
             plain_dollars: HashSet::new(),
+            text_params: Vec::new(),
+            text_params_depth: 0,
+            bodies: HashMap::new(),
             confined: false,
             root: PathBuf::new(),
             uses: 0,
@@ -1661,13 +1698,20 @@ impl Checker {
     /// names as they are called in the program.
     fn link(&mut self, stmts: Arc<Vec<Stmt>>, src: &str, file: &str, base: &Path) -> Result<Arc<Vec<Stmt>>, crate::error::QuilloError> {
         let (confined, overrides, root) = (self.confined, &self.overrides, self.root.clone());
+        // The `${name}` each file's plain strings hold (Q-510), by the file.
+        let mut dollars: Vec<(String, String, String)> = Vec::new();
         self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
             if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full)) {
                 return None;
             }
             let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
-            Parser::new(&text).parse_program().ok().map(Arc::new)
+            let mut p = Parser::new(&text);
+            let parsed = p.parse_program().ok().map(Arc::new);
+            let shown = full.display().to_string();
+            dollars.extend(p.plain_dollars().into_iter().map(|(t, n)| (shown.clone(), t, n)));
+            parsed
         });
+        self.plain_dollars.extend(dollars);
         for p in std::mem::take(&mut self.links.problems) {
             self.diag_at(Arc::from(p.file.display().to_string()), p.line, Severity::Error, p.message);
         }
@@ -1776,7 +1820,7 @@ impl Checker {
                     for (name, alias) in names.iter().flatten().filter(|(n, a)| n != a) {
                         if self.globals.get(alias).is_some_and(|g| &*g.file == "<builtin>") {
                             self.diag_at(file.clone(), *line, Severity::Warning, format!(
-                                "`{alias}` hides the builtin `{alias}`: taken under that name, `{name}` is the program's `{alias}` everywhere, so take it under its own name (`use {name}`) or another"));
+                                "`{alias}` hides the builtin `{alias}`: taken under that name, `{name}` is this file's `{alias}`, so take it under its own name (`use {name}`) or another"));
                         }
                     }
                 }
@@ -1942,6 +1986,17 @@ impl Checker {
         // Everything top-level is known up front; it becomes usable from
         // top-level code once the program has run its definition.
         for it in &order {
+            // What each function reads, for a call from top-level code made before it is all
+            // defined (FEEDBACK45.md, Q-514; branch feedback40-43).
+            match &it.stmt {
+                Stmt::Fn(d) => {
+                    self.bodies.insert(d.name.clone(), d.clone());
+                }
+                Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) => {
+                    self.bodies.insert(n.to_string(), d.clone());
+                }
+                _ => {}
+            }
             match &it.stmt {
                 Stmt::Fn(d) => self.defines(&d.name, &it.file, d.line, false),
                 Stmt::Service(name, _, _, _, line) => self.defines(name, &it.file, *line, false),
@@ -2043,10 +2098,14 @@ impl Checker {
                     }
                     self.line = *line;
                     self.scopes.clear();
+                    if self.literal_mismatch(p, e) {
+                        self.error("this `let` never matches the value it is given, so it fails every time it runs");
+                    }
                     let t = self.expr(e);
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
                     self.keep_component(p, e, &mut binds);
+                    self.keep_lambda(p, e, &mut binds);
                     // What text a global holds, for the SQL warning in the
                     // functions that use it; one reassigned anywhere holds
                     // nothing known.
@@ -2073,6 +2132,9 @@ impl Checker {
                 }
                 other => {
                     self.scopes.clear();
+                    // `xs.push(2)`, `i + 1` alone at the top level (FEEDBACK45.md, Q-505).
+                    self.answer_dropped(other);
+                    self.op_dropped(other);
                     self.stmt(other, false);
                 }
             }
@@ -2117,6 +2179,14 @@ impl Checker {
                     self.diag_at(v.file.clone(), v.line, Severity::Warning, format!("unused variable `{}` (name it `_{}` if that is intended)", name, name));
                 }
             }
+        }
+    }
+
+    /// A second local `fn` or `state` of one name in one body: the second replaced the first
+    /// without a word, as a top-level one does not (FEEDBACK45.md, Q-508; branch feedback40-43).
+    fn twice(&mut self, name: &str, kind: Kind) {
+        if let Some(at) = self.scopes.last().and_then(|s| s.get(name)).filter(|v| v.kind == kind).map(|v| v.line) {
+            self.error(format!("`{}` is defined twice here, at line {} and line {}: the second replaces the first, so rename one", name, at, self.line));
         }
     }
 
@@ -2330,19 +2400,17 @@ impl Checker {
         if name.len() > 1 && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) && HTML_TAGS.contains(&lower.as_str()) {
             return format!(" (HTML tags are written in lowercase here, <{}>: a capital letter starts a view's name)", lower);
         }
-        let mut best: Option<(usize, String)> = None;
-        let mut consider = |cand: &str| {
-            let d = edit_distance(name, cand);
-            if d <= 2 && d < name.len() && best.as_ref().map_or(true, |(bd, _)| d < *bd) {
-                best = Some((d, cand.to_string()));
-            }
-        };
-        for s in &self.scopes {
-            s.keys().for_each(|k| consider(k));
+        // Other languages' names for what Quillo has (FEEDBACK45.md, Q-517; branch feedback40-43).
+        if let Some(q) = other_language(name) {
+            return format!(" (did you mean `{}`?)", q);
         }
-        self.globals.keys().for_each(|k| consider(k));
-        match best {
-            Some((_, n)) => format!(" (did you mean `{}`?)", n),
+        // The same answer every run: the candidates in a fixed order, ties broken by `closest`.
+        let mut cands: Vec<&str> = self.scopes.iter().flat_map(|s| s.keys().map(|k| k.as_str())).collect();
+        cands.extend(self.globals.keys().map(|k| k.as_str()));
+        cands.sort_unstable();
+        cands.dedup();
+        match closest(name, cands.into_iter()) {
+            Some(n) => format!(" (did you mean `{}`?)", n),
             None => String::new(),
         }
     }
@@ -2401,7 +2469,7 @@ impl Checker {
         });
         self.push();
         if d.server {
-            self.define("request", T::of(MAP), None, Kind::Bound);
+            self.define("request", request_t(), None, Kind::Bound);
         }
         self.params(d);
         let t = self.expr(&d.body);
@@ -2416,7 +2484,38 @@ impl Checker {
 
     /// Parameters, those without an annotation typed by `hint` if given.
     fn params_hinted(&mut self, d: &FnDef, hint: Option<Vec<T>>) {
+        // `with db, db` (FEEDBACK45.md, Q-508; branch feedback40-43).
+        if let Some(effs) = &d.effects {
+            if let Some(e) = effs.iter().enumerate().find(|(i, e)| effs[..*i].contains(e)).map(|(_, e)| e) {
+                self.warn(format!("`{}` is named twice in this `with`", e));
+            }
+        }
         for (i, p) in d.params.iter().enumerate() {
+            // `a: Int`, `a: String`: Kotlin's and Java's names, taken for a record of the
+            // program's own that is not there, and every call failed (FEEDBACK45.md, Q-519;
+            // branch feedback40-43).
+            if let Some(ty) = &p.ty {
+                for n in &ty.names {
+                    let builtin = match n.as_str() {
+                        "Int" | "Integer" | "Long" => Some("int"),
+                        "String" | "Str" => Some("str"),
+                        "Bool" | "Boolean" => Some("bool"),
+                        "Any" | "Object" => Some("any"),
+                        "Float" | "Double" => Some("float"),
+                        "List" | "Array" => Some("list"),
+                        "Map" | "Dict" => Some("map"),
+                        _ => None,
+                    };
+                    if let Some(b) = builtin.filter(|_| !RECORDS.with(|r| r.borrow().contains_key(n)) && !self.globals.contains_key(n.as_str())) {
+                        self.error(format!("there is no type `{}`: the builtin types are written in small letters, `{}`", n, b));
+                    }
+                }
+            }
+            // `fn f(a, a)`: the last argument was `a` (FEEDBACK45.md, Q-508; branch
+            // feedback40-43).
+            if d.params[..i].iter().any(|q| q.name == p.name) && p.name != "_" {
+                self.error(format!("parameter `{}` is named twice: each parameter needs a name of its own", p.name));
+            }
             let mut t = p.ty.as_ref().map_or(T::ANY, ty_t);
             if let (None, None, Some(h)) = (&p.ty, &p.default, hint.as_ref().and_then(|h| h.get(i))) {
                 t = *h;
@@ -2487,6 +2586,12 @@ impl Checker {
 
     fn route(&mut self, r: &Arc<RouteDef>) {
         self.line = r.line;
+        // `? { page: itn }` binds `itn` and tests nothing; `{ json: Usr }` never matches
+        // (FEEDBACK45.md, Q-504; branch feedback40-43).
+        for p in r.query.iter().chain(r.body_pat.iter()).chain(r.guards.iter()) {
+            self.pattern_types(p);
+            self.field_type_typos(p);
+        }
         self.fns.push(FnCtx {
             name: format!("{} {}", r.method, route_path(r)),
             ret: None,
@@ -2500,7 +2605,7 @@ impl Checker {
             exits: T::NEVER,
         });
         self.push();
-        self.define("request", T::of(MAP), None, Kind::Bound);
+        self.define("request", request_t(), None, Kind::Bound);
         let mut seen = HashSet::new();
         for seg in &r.path {
             match seg {
@@ -2529,7 +2634,14 @@ impl Checker {
         for (n, t, sig) in binds {
             self.define(&n, t, sig, Kind::Bound);
         }
+        // `:id + 1` gives "51": an untyped parameter is text (FEEDBACK45.md, Q-513).
+        self.text_params_depth = self.scopes.len();
+        self.text_params = r.path.iter().filter_map(|seg| match seg {
+            Seg::Param(n, None) => Some(n.clone()),
+            _ => None,
+        }).collect();
         self.expr(&r.body);
+        self.text_params.clear();
         self.pop();
         self.fns.pop();
     }
@@ -2561,6 +2673,11 @@ impl Checker {
             }
             Stmt::Let(p, e, line) => {
                 self.line = *line;
+                // `let 1 = 2`, `let [a, b] = [1]`: it fails every time it runs (FEEDBACK45.md,
+                // Q-516; branch feedback40-43).
+                if self.literal_mismatch(p, e) {
+                    self.error("this `let` never matches the value it is given, so it fails every time it runs");
+                }
                 let making = matches!((p, e), (Pattern::Bind(_), Expr::Lambda(_)));
                 if let (true, Pattern::Bind(n)) = (making, p) {
                     self.letting.push(n.to_string());
@@ -2586,6 +2703,7 @@ impl Checker {
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
                 self.keep_component(p, e, &mut binds);
+                self.keep_lambda(p, e, &mut binds);
                 let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
                 let url = matches!(p, Pattern::Bind(_)) && self.url_fixed(e);
                 for (n, t, sig) in binds {
@@ -2707,6 +2825,7 @@ impl Checker {
                     if d.server || d.component {
                         self.error("`server fn` and `component` must be declared at the top level");
                     }
+                    self.twice(&d.name, Kind::Fn);
                     let sig = Arc::new(Sig::of_def(d));
                     self.define(&d.name, T::of(FN), Some(sig), Kind::Fn);
                     self.lambda_body(d);
@@ -2785,7 +2904,9 @@ impl Checker {
                 if !self.scopes.is_empty() {
                     self.error("`type` must be at the top level");
                 }
-                // A default must be of its field's type.
+                // A default must be of its field's type. It is made with each record, not as
+                // top-level code runs, so it may read what is defined later (found in review).
+                let sequential = std::mem::replace(&mut self.sequential, false);
                 for (k, e) in &td.defaults {
                     let t = self.expr(e);
                     self.line = td.line;
@@ -2796,6 +2917,7 @@ impl Checker {
                         }
                     }
                 }
+                self.sequential = sequential;
                 T::of(NIL)
             }
             Stmt::Return(e, line) => {
@@ -2844,6 +2966,7 @@ impl Checker {
                     }
                 }
                 let assigned = self.assigned.contains(name);
+                self.twice(name, Kind::State);
                 self.define(name, if assigned { T::ANY } else { t }, None, Kind::State);
                 if self.quiet == 0 {
                     self.state_types.insert((self.file.clone(), *line, name.clone()), (t, Vec::new()));
@@ -2939,7 +3062,7 @@ impl Checker {
         });
         self.push();
         if d.server {
-            self.define("request", T::of(MAP), None, Kind::Bound);
+            self.define("request", request_t(), None, Kind::Bound);
         }
         self.params(d);
         let body = self.expr(&d.body);
@@ -3074,6 +3197,124 @@ impl Checker {
         }
     }
 
+    /// `Usr` in a pattern, with no `type Usr`: a test that never matches (FEEDBACK45.md, Q-504;
+    /// branch feedback40-43). Inside lists, records and alternatives too.
+    fn pattern_types(&mut self, p: &Pattern) {
+        match p {
+            Pattern::Type(n) if n.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                let known = RECORDS.with(|r| r.borrow().contains_key(n)) || self.globals.contains_key(n.as_str());
+                if !known {
+                    let records: Vec<String> = RECORDS.with(|r| r.borrow().keys().cloned().collect());
+                    let near = closest(n, records.iter().map(|s| s.as_str()).chain(crate::parser::TYPE_NAMES.iter().copied()));
+                    self.error(format!("there is no type `{}`, so this never matches{}", n, near.map_or(String::new(), |m| format!(" (did you mean `{}`?)", m))));
+                }
+            }
+            Pattern::Alt(ps) | Pattern::List(ps, _) => ps.iter().for_each(|q| self.pattern_types(q)),
+            Pattern::As(q, _) => self.pattern_types(q),
+            Pattern::Record(fs) => fs.iter().for_each(|f| self.pattern_types(&f.pat)),
+            _ => {}
+        }
+    }
+
+    /// A record's field whose pattern is a name near a type's: `{ page: itn }` (Q-504).
+    fn field_type_typos(&mut self, p: &Pattern) {
+        if let Pattern::Record(fs) = p {
+            for f in fs {
+                match &f.pat {
+                    Pattern::Bind(n) if f.path.last().map_or(true, |l| **n != **l) => {
+                        if let Some(ty) = type_typo(n) {
+                            self.warn(format!("`{}` here is a name, which takes any value: for the type, `{}`", n, ty));
+                        }
+                    }
+                    q => self.field_type_typos(q),
+                }
+            }
+        }
+    }
+
+    /// A literal pattern against a literal of another value, or a list pattern against a list
+    /// of another length: it never matches, and the checker knows both sides (FEEDBACK45.md,
+    /// Q-516; branch feedback40-43).
+    fn literal_mismatch(&self, p: &Pattern, e: &Expr) -> bool {
+        let number = |l: &Lit| match l {
+            Lit::Int(n) => Some(*n as f64),
+            Lit::Float(f) => Some(*f),
+            Lit::Dec(d) => d.to_string().parse::<f64>().ok(),
+            _ => None,
+        };
+        match (p, e) {
+            // `1` matches `1.0`: numbers by their value (found in review).
+            (Pattern::Lit(a), Expr::Lit(b)) if number(a).is_some() && number(b).is_some() => number(a) != number(b),
+            (Pattern::Lit(a), Expr::Lit(b)) => format!("{:?}", a) != format!("{:?}", b),
+            (Pattern::List(items, None), Expr::List(xs)) => items.len() != xs.len(),
+            (Pattern::List(..) | Pattern::Record(_), Expr::Lit(_)) => true,
+            (Pattern::Type(t), Expr::Lit(l)) if crate::parser::TYPE_NAMES.contains(&t.as_str()) => !matches!(
+                (t.as_str(), l),
+                ("int" | "num", Lit::Int(_)) | ("float" | "num", Lit::Float(_)) | ("dec" | "num", Lit::Dec(_)) | ("str", Lit::Str(_)) | ("bool", Lit::Bool(_)) | ("any", _)
+            ),
+            (Pattern::Record(_), Expr::List(_)) | (Pattern::List(..), Expr::Map(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// `f()` from top-level code, where `f` reads a global of this file defined further down:
+    /// the call fails, with "unknown name", which reads as a typo (FEEDBACK45.md, Q-514; branch
+    /// feedback40-43). What `f` reads itself, not what the functions it calls read.
+    fn reads_later(&mut self, name: &str) {
+        let Some(d) = self.bodies.get(name).cloned() else { return };
+        let mut bound: HashSet<String> = d.params.iter().map(|p| p.name.to_string()).collect();
+        let mut read: Vec<String> = Vec::new();
+        sure_reads(&d.body, &mut bound, &mut read);
+        for n in read {
+            if bound.contains(&n) || n == name {
+                continue;
+            }
+            if let Some(v) = self.globals.get(&n).filter(|v| v.kind == Kind::Global && !v.ready && v.file == self.file) {
+                let at = v.line;
+                self.error(format!("`{}` reads `{}`, which is defined at line {}, after this call", name, n, at));
+                return;
+            }
+        }
+    }
+
+    /// `let f = (a, b) => a + b`: `f(1)` is checked as a `fn`'s call is, with the name `f`
+    /// (FEEDBACK45.md, Q-515; branch feedback40-43).
+    fn keep_lambda(&mut self, p: &Pattern, e: &Expr, binds: &mut [(String, T, Option<Arc<Sig>>)]) {
+        let (Pattern::Bind(n), Expr::Lambda(d), [(_, _, sig)]) = (p, e, binds) else { return };
+        // `h = (a, b) => ...` later: no longer the first lambda (found in review).
+        if sig.is_none() && !self.assigned.contains(&**n) {
+            let mut s = Sig::of_def(d);
+            s.name = n.to_string();
+            *sig = Some(Arc::new(s));
+        }
+    }
+
+    /// A lambda given to `map`, `filter`, `reduce`, `sort_by` and the like takes the
+    /// arguments the builtin passes: one item, or the total and an item for `reduce`
+    /// (FEEDBACK45.md, Q-515; branch feedback40-43).
+    fn lambda_arity(&mut self, name: &str, args: &[Expr]) {
+        let (at, passes) = match name {
+            "map" | "filter" | "find" | "any" | "all" | "sort_by" | "group_by" | "count" => (1, 1),
+            "reduce" => (2, 2),
+            _ => return,
+        };
+        let Some(Expr::Lambda(d)) = args.get(at) else { return };
+        let most = d.params.len();
+        let least = d.params.iter().filter(|p| p.default.is_none()).count();
+        if passes >= least && passes <= most {
+            return;
+        }
+        if name == "sort_by" && most == 2 {
+            self.error("`sort_by` passes one item, not two to compare: give what to sort by, `sort_by(xs, (x) => x.n)`");
+        } else if name == "reduce" && most == 1 {
+            self.error("`reduce` passes the total so far and an item: `reduce(xs, 0, (total, x) => total + x)`");
+        } else {
+            let what = if passes == 1 { "one item" } else { "the total so far and an item" };
+            let takes = if least == most { format!("{}", most) } else { format!("{} to {}", least, most) };
+            self.error(format!("`{}` passes its function {}, but this one takes {}", name, what, takes));
+        }
+    }
+
     fn bind_pattern(&mut self, p: &Pattern, t: T, out: &mut Vec<(String, T, Option<Arc<Sig>>)>) {
         match p {
             Pattern::Wild | Pattern::Lit(_) => {}
@@ -3205,6 +3446,8 @@ impl Checker {
                 }
                 let y = self.under(facts, |c| c.expr(b));
                 self.line = *line;
+                self.js_comparisons(op, a, b, x, y);
+                self.line = *line;
                 match op {
                     BinOp::Or => self.js_truthiness(fallback_says(x, b), a, Truth::Or),
                     BinOp::And => self.js_truthiness(x, a, Truth::And),
@@ -3296,6 +3539,11 @@ impl Checker {
             }
             Expr::Call(callee, args, line) => {
                 self.line = *line;
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    if self.sequential && self.fns.is_empty() && !self.is_local(name) {
+                        self.reads_later(name);
+                    }
+                }
                 self.upload_named_by_visitor(callee, args);
                 self.interim_status(callee, args);
                 if let Expr::Field(o, f, _) = callee.as_ref() {
@@ -3394,8 +3642,33 @@ impl Checker {
             Expr::Match(subj, arms, line) => {
                 let mut st = self.expr(subj);
                 self.line = *line;
+                // `match x { }` matches nothing (FEEDBACK45.md, Q-516; branch feedback40-43).
+                if arms.is_empty() {
+                    self.error("this `match` has no arms, so nothing matches: add one, `_ => ...` for any value");
+                }
                 let mut t = T::NEVER;
+                // An arm that takes any value (`_`, a name), and the literals seen, for those
+                // after it that never match (FEEDBACK45.md, Q-527).
+                let mut taken: Option<u32> = None;
+                let mut seen_lits: Vec<String> = Vec::new();
                 for arm in arms {
+                    self.line = arm.line;
+                    if let Some(at) = taken {
+                        self.warn(format!("this arm never matches: the one on line {} takes any value", at));
+                    } else if let (Pattern::Lit(l), None) = (&arm.pat, &arm.guard) {
+                        let key = format!("{:?}", l);
+                        if seen_lits.contains(&key) {
+                            self.warn("this arm never matches: an arm before it has the same value");
+                        }
+                        seen_lits.push(key);
+                    }
+                    if matches!(arm.pat, Pattern::Wild | Pattern::Bind(_)) && arm.guard.is_none() {
+                        taken.get_or_insert(arm.line);
+                    }
+                    self.pattern_types(&arm.pat);
+                    if self.literal_mismatch(&arm.pat, subj) {
+                        self.warn("this arm never matches: the value it is given is another");
+                    }
                     self.push();
                     let mut binds = Vec::new();
                     self.bind_pattern(&arm.pat, st, &mut binds);
@@ -3410,6 +3683,18 @@ impl Checker {
                         self.expr(g);
                     }
                     t = t.union(self.expr(&arm.body));
+                    // `intt => ...`: a name, which takes any value, and goes unused; written for
+                    // a type, most likely (FEEDBACK45.md, Q-504).
+                    if let Pattern::Bind(n) = &arm.pat {
+                        let unused = self.scopes.last().and_then(|s| s.get(&**n)).is_some_and(|v| !v.used);
+                        if unused && !n.starts_with('_') && arm.guard.is_none() {
+                            self.line = arm.line;
+                            match type_typo(n) {
+                                Some(ty) => self.warn(format!("`{n}` here is a name, which takes any value: for the type, `{ty}`")),
+                                None => self.warn(format!("`{n}` takes any value and is not used: write `_` for that")),
+                            }
+                        }
+                    }
                     self.pop();
                 }
                 t
@@ -3440,8 +3725,30 @@ impl Checker {
                 self.line = *line;
                 // Only what cannot end: with a call in it, a `reply` may be in that function
                 // (FEEDBACK20.md, Q-163; branch feedback20-fixes).
-                if matches!(&**c, Expr::Lit(Lit::Bool(true))) && !["Call(", "Return(", "Reply("].iter().any(|w| format!("{:?}", body).contains(w)) {
+                let body_text = format!("{:?}", body);
+                if matches!(&**c, Expr::Lit(Lit::Bool(true))) && !["Call(", "Return(", "Reply("].iter().any(|w| body_text.contains(w)) {
                     self.warn("this `while` never ends: nothing in it can stop it, and it holds its instance (see --max-compute)");
+                } else if !format!("{:?}", c).contains("Call(") && !["Return(", "Reply("].iter().any(|w| body_text.contains(w)) {
+                    // `while i < 3 { i + 1 }`: nothing in it assigns what the condition reads.
+                    // A call in it may assign a global, so then only locals count (FEEDBACK45.md,
+                    // Q-505; branch feedback40-43).
+                    let mut read = Vec::new();
+                    walk_expr(c, &mut |x| {
+                        if let Expr::Ident(n, _) = x {
+                            read.push(n.to_string());
+                        }
+                    });
+                    let mut set = HashSet::new();
+                    assigned_in(body, &mut set);
+                    // A call may set what it reads (a closure, a handler, a page's
+                    // `w.firstChild` while `parent.insertBefore(w.firstChild, w)` runs): let be,
+                    // as `while true` with a call is (found in review). Only names there are: an
+                    // unknown one is said as that.
+                    let calls = body_text.contains("Call(");
+                    let known = read.iter().all(|n| self.is_local(n) || self.globals.contains_key(n.as_str()));
+                    if known && !read.is_empty() && !calls && read.iter().all(|n| !set.contains(n)) {
+                        self.warn(format!("this `while` never ends: nothing in it changes `{}`, which its condition reads", read[0]));
+                    }
                 }
                 self.js_truthiness(ct, c, Truth::Cond);
                 let mut yes = Vec::new();
@@ -3461,6 +3768,7 @@ impl Checker {
                 for (i, s) in stmts.iter().enumerate() {
                     if i + 1 < stmts.len() {
                         self.answer_dropped(s);
+                        self.op_dropped(s);
                     }
                     let st = self.stmt(s, i + 1 == stmts.len());
                     if i + 1 < stmts.len() {
@@ -3557,27 +3865,125 @@ impl Checker {
     /// `xs.push(3)` alone: the builtin's answer, the new list, dropped (FEEDBACK28.md, Q-347;
     /// branch feedback29-fixes). Only the builtin's, on what is known to be a list or a map:
     /// the program's own `set` and a page's object's `held.set(k, v)` change what they hold.
+    /// `clas="a"`, `hreff="/x"`, `@clik={...}`, `className`: written to the page and ignored by
+    /// the browser, or a handler never called (FEEDBACK45.md, Q-509; branch feedback40-43).
+    /// Said only when near a known name: a custom attribute or a library's event is let be.
+    fn attr_typo(&mut self, tag: &str, name: &str) {
+        const ATTRS: &[&str] = &[
+            "class", "id", "href", "src", "srcset", "srcdoc", "sizes", "alt", "title", "style", "type", "name", "value", "placeholder", "disabled",
+            "checked", "selected", "action", "method", "target", "rel", "for", "width", "height", "colspan", "rowspan", "lang", "dir", "hidden",
+            "tabindex", "role", "min", "max", "step", "pattern", "required", "readonly", "multiple", "autofocus", "autocomplete", "accept",
+            "download", "loading", "label", "rows", "cols", "maxlength", "minlength", "content", "charset", "async", "defer", "crossorigin",
+            "integrity", "open", "controls", "autoplay", "loop", "muted", "poster", "preload", "enctype", "novalidate", "form", "list", "size",
+            "wrap", "spellcheck", "draggable", "contenteditable", "key", "headers", "scope", "span", "start", "reversed", "media", "datetime",
+            "cite", "coords", "shape", "usemap", "frameborder", "allow", "allowfullscreen", "sandbox", "referrerpolicy", "nonce", "inputmode",
+            "enterkeyhint", "popover", "popovertarget", "inert", "translate", "accesskey", "kind", "srclang", "default", "high", "low", "optimum",
+            "decoding", "fetchpriority", "formaction", "formmethod", "playsinline", "capture", "dirname", "ping", "hreflang", "itemprop",
+            "itemscope", "itemtype", "slot", "part", "is", "xmlns", "viewBox", "fill", "stroke", "stroke-width", "transform", "points", "path",
+            "cx", "cy", "rx", "ry", "x1", "x2", "y1", "y2", "opacity", "offset", "stop-color", "gradientUnits", "preserveAspectRatio", "bind",
+            "value", "summary", "valign", "align", "border", "color", "face", "bgcolor", "manifest", "http-equiv", "property", "rev",
+            "data", "volume", "currentTime", "playbackRate", "indeterminate", "values", "codebase", "archive", "declare", "standby",
+            "frame", "rules", "axis", "abbr", "char", "charoff", "nowrap", "compact", "noshade", "background", "text", "link", "vlink", "alink",
+        ];
+        // SVG has more attributes than this list could hold (`refX`, `markerWidth`, ...).
+        const SVG: &[&str] = &[
+            "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "text", "tspan", "textPath", "use", "symbol",
+            "defs", "marker", "mask", "pattern", "clipPath", "linearGradient", "radialGradient", "stop", "image", "foreignObject", "filter",
+            "animate", "animateTransform", "animateMotion", "set", "desc", "metadata", "switch", "view",
+        ];
+        // SVG's filters (`feTurbulence`'s `seed`, `scale`), and HTML's text handlers
+        // (`onload="..."`), framework attributes (`x-data`, `hx-get`): found in review.
+        if (SVG.contains(&tag) || tag.starts_with("fe")) && !name.starts_with('@') {
+            return;
+        }
+        if name.starts_with("on") || name.contains('-') || name == "ismap" {
+            return;
+        }
+        const EVENTS: &[&str] = &[
+            "click", "dblclick", "input", "change", "submit", "reset", "keydown", "keyup", "keypress", "focus", "blur", "focusin", "focusout",
+            "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "mouseenter", "mouseleave", "pointerdown", "pointerup", "pointermove",
+            "pointerover", "pointerout", "pointerenter", "pointerleave", "pointercancel", "touchstart", "touchend", "touchmove", "touchcancel",
+            "scroll", "wheel", "contextmenu", "drag", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop", "load", "error",
+            "resize", "select", "toggle", "close", "cancel", "play", "pause", "ended", "timeupdate", "volumechange", "ratechange", "seeked",
+            "seeking", "loadeddata", "loadedmetadata", "canplay", "playing", "waiting", "copy", "cut", "paste", "animationend", "animationstart",
+            "transitionend", "invalid", "beforeinput", "compositionstart", "compositionend", "mount", "auxclick", "gotpointercapture",
+            "lostpointercapture", "beforetoggle", "durationchange", "progress", "stalled", "suspend", "emptied", "abort", "search", "show",
+        ];
+        if tag.contains('-') || name.starts_with("data-") || name.starts_with("aria-") || name.contains(':') {
+            return;
+        }
+        if name == "className" {
+            self.warn("`className` is React's name: write `class`");
+            return;
+        }
+        if name == "htmlFor" {
+            self.warn("`htmlFor` is React's name: write `for`");
+            return;
+        }
+        let (word, list, prefix) = match name.strip_prefix('@') {
+            Some(ev) => (ev, EVENTS, "@"),
+            None => (name, ATTRS, ""),
+        };
+        if word.chars().count() < 4 || list.contains(&word) || list.iter().any(|a| a.eq_ignore_ascii_case(word)) {
+            return;
+        }
+        // `@changed`, `@shown`, `@unload`: an event made from a known one, as libraries name
+        // theirs (found in review); `hreff` stays a slip of `href`.
+        let derived = |n: &str| prefix == "@" && (word == format!("{}d", n) || word == format!("{}ed", n) || word == format!("{}n", n) || ["un", "before", "after", "pre", "post"].iter().any(|p| word == format!("{}{}", p, n)));
+        if let Some(near) = closest(word, list.iter().copied()).filter(|n| !derived(n)) {
+            self.warn(format!("`{prefix}{word}` is no {} the browser knows: did you mean `{prefix}{near}`?", if prefix.is_empty() { "attribute" } else { "event" }));
+        }
+    }
+
+    /// `i + 1`, `x == 2` alone: worked out and dropped, where an assignment was meant
+    /// (FEEDBACK45.md, Q-505; branch feedback40-43).
+    fn op_dropped(&mut self, s: &Stmt) {
+        let Stmt::Expr(Expr::Binary(op, l, _, line)) = s else { return };
+        let Expr::Ident(n, _) = &**l else { return };
+        self.line = *line;
+        match op {
+            BinOp::Eq => self.warn(format!("`{n} == ...` compares, and the answer is dropped: to give `{n}` a value, `{n} = ...`")),
+            BinOp::Add => self.warn(format!("`{n} + ...` is worked out and dropped: to change `{n}`, `{n} += ...`")),
+            BinOp::Sub => self.warn(format!("`{n} - ...` is worked out and dropped: to change `{n}`, `{n} -= ...`")),
+            BinOp::Mul | BinOp::Div => self.warn(format!("this is worked out and dropped: to change `{n}`, `{n} = {n} * ...` (or `/`)")),
+            _ => {}
+        }
+    }
+
     fn answer_dropped(&mut self, s: &Stmt) {
         let Stmt::Expr(e) = s else { return };
-        let (name, on) = match e {
-            Expr::Call(f, args, _) => match &**f {
+        // What it was given, by name if it was a name: `xs` of `xs.push(2)`, `push(xs, 2)` and
+        // `xs | push(2)`, for the message.
+        let (name, on, given, line) = match e {
+            Expr::Call(f, args, line) => match &**f {
                 Expr::Field(o, name, _) => match &**o {
-                    Expr::Ident(o, _) => (name.as_str(), Some(o.as_str())),
+                    Expr::Ident(o, _) => (name.as_str(), Some(o.as_str()), Some(o.to_string()), *line),
                     _ => return,
                 },
-                Expr::Ident(name, _) if !args.is_empty() => (name.as_str(), None),
+                Expr::Ident(name, _) if !args.is_empty() => {
+                    let first = match &args[0] {
+                        Expr::Ident(n, _) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    (name.as_str(), None, first, *line)
+                }
                 _ => return,
             },
-            Expr::Pipe(l, r, _) => match (&**l, &**r) {
-                (Expr::Ident(..), Expr::Call(f, ..)) => match &**f {
-                    Expr::Ident(name, _) => (name.as_str(), None),
+            Expr::Pipe(l, r, line) => match (&**l, &**r) {
+                (Expr::Ident(n, _), Expr::Call(f, ..)) => match &**f {
+                    Expr::Ident(name, _) => (name.as_str(), None, Some(n.to_string()), *line),
                     _ => return,
                 },
                 _ => return,
             },
             _ => return,
         };
-        if !matches!(name, "push" | "set" | "merge" | "remove") || self.is_local(name) {
+        self.line = line;
+        // Builtins that give a new value and do nothing else; not `map` or `filter`, whose
+        // function may be the work (FEEDBACK45.md, Q-505; branch feedback40-43).
+        if !matches!(name, "push" | "set" | "merge" | "remove" | "sort" | "sort_by" | "drop" | "take" | "reverse" | "unique" | "insert" | "append" | "concat" | "flatten")
+            || self.is_local(name)
+        {
             return;
         }
         if !self.globals.get(name).is_some_and(|v| &*v.file == "<builtin>") {
@@ -3589,7 +3995,8 @@ impl Checker {
                 return;
             }
         }
-        self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `x = x | {}(...)`", name, name));
+        let x = given.unwrap_or_else(|| "x".to_string());
+        self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `{} = {} | {}(...)`", name, x, x, name));
     }
 
     /// `save_upload(f, f.filename)`, or a path ending in the visitor's name with no folder of the
@@ -3819,7 +4226,13 @@ impl Checker {
                 }
                 _ => {
                     if recv.bits != 0 {
-                        self.error(format!("{} has no method `{}`", bits_text(recv.bits), name));
+                        // `s.toUpperCase()`: the builtin, called on it (Q-517).
+                        let near = other_language(name)
+                            .map(str::to_string)
+                            // One letter off or two swapped (`uper`), not `foo` for `floor`.
+                            .or_else(|| closest(name, self.globals.iter().filter(|(_, v)| &*v.file == "<builtin>" && v.t.bits & FN != 0).map(|(k, _)| k.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter()).filter(|n| osa_distance(name, n) == 1))
+                            .map_or(String::new(), |n| format!(" (did you mean `{}`?)", n));
+                        self.error(format!("{} has no method `{}`{}", bits_text(recv.bits), name, near));
                     }
                     return T::ANY;
                 }
@@ -3985,7 +4398,48 @@ impl Checker {
     /// nothing fails: `name || "anonymous"` keeps an empty name. Warned only
     /// where the value is known to be a string or a number (or null), or
     /// where `||`'s fallback says so (see `fallback_says`).
+    /// What JavaScript habits mean here (FEEDBACK45.md, Q-513; branch feedback40-43):
+    /// `index_of(...) == -1`, which is never true; a function compared with what is not one;
+    /// a path's untyped parameter, text, added to a number.
+    fn js_comparisons(&mut self, op: &BinOp, a: &Expr, b: &Expr, x: T, y: T) {
+        let minus_one = |e: &Expr| matches!(e, Expr::Lit(Lit::Int(-1))) || matches!(e, Expr::Unary(UnOp::Neg, v, _) if matches!(&**v, Expr::Lit(Lit::Int(1))));
+        let index_of = |e: &Expr| matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "index_of"));
+        if matches!(op, BinOp::Eq | BinOp::Ne) && !self.is_local("index_of") && ((index_of(a) && minus_one(b)) || (index_of(b) && minus_one(a))) {
+            self.warn("`index_of` gives null when it is not there, never -1: compare with `null`");
+            return;
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            for (f, other) in [(a, y), (b, x)] {
+                if let Expr::Ident(n, _) = f {
+                    let is_fn = if std::ptr::eq(f, a) { x.bits == FN } else { y.bits == FN };
+                    if is_fn && other.bits != 0 && other.bits & (FN | NIL) == 0 {
+                        self.warn(format!("`{n}` is a function, so this compares the function, not its answer: `{n}()`"));
+                        return;
+                    }
+                }
+            }
+        }
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) && !self.text_params.is_empty() {
+            for (p, other) in [(a, y), (b, x)] {
+                if let Expr::Ident(n, _) = p {
+                    let the_routes = self.scopes.iter().rposition(|s| s.contains_key(&**n)).map_or(false, |i| i + 1 == self.text_params_depth);
+                    if the_routes && self.text_params.iter().any(|t| t == &**n) && other.bits != 0 && other.bits & !(INT | FLOAT | NIL) == 0 {
+                        self.warn(format!("`{n}` is text from the path, so this does not add numbers: declare `:{n}(int)` to work with it as a number"));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
+        // `if ready {` with `ready` a function: always true, the call forgotten (Q-513).
+        if t.bits == FN {
+            if let Expr::Ident(n, _) = e {
+                self.warn(format!("`{n}` is a function, which counts as true: to test its answer, `{n}()`"));
+                return;
+            }
+        }
         if t.bits & (STR | NUM | DEC) == 0 || t.bits & !(STR | NUM | DEC | NIL) != 0 {
             return;
         }
@@ -4058,13 +4512,11 @@ impl Checker {
         }
         for part in s.split("${").skip(1) {
             let name: String = part.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-            let key = (self.file.to_string(), self.line, name.clone());
+            let key = (self.file.to_string(), s.to_string(), name.clone());
             let known = self.is_local(&name) || self.globals.get(&name).is_some_and(|g| &*g.file != "<builtin>");
             if known && self.plain_dollars.contains(&key) {
-                let shown: String = s.chars().take(40).collect();
-                let more = if s.chars().count() > 40 { "..." } else { "" };
                 self.warn(format!(
-                    "this string is not a template, so `${{{name}}}` stays as text: write it in backquotes, `` `{shown}{more}` ``, or `\\${{` to keep the text"
+                    "this string is not a template, so `${{{name}}}` stays as text: a template is written in backquotes, and `\\${{` keeps the text"
                 ));
                 return;
             }
@@ -4141,7 +4593,11 @@ impl Checker {
         }
         self.line = line;
         let Some((_, p, r)) = BUILTINS.iter().find(|(n, _, _)| *n == full) else {
-            self.error(format!("`{}` has no function `{}`{}", m, f, crate::error::removed_note(&full)));
+            // `json.prase`: the module's nearest (FEEDBACK45.md, Q-517; branch feedback40-43).
+            let prefix = format!("{}.", m);
+            let near = closest(f, BUILTINS.iter().filter_map(|(n, _, _)| n.strip_prefix(prefix.as_str())))
+                .map_or(String::new(), |n| format!(" (did you mean `{}.{}`?)", m, n));
+            self.error(format!("`{}` has no function `{}`{}{}", m, f, near, crate::error::removed_note(&full)));
             return T::ANY;
         };
         if !self.quiet_mode() {
@@ -4538,8 +4994,29 @@ impl Checker {
                         }
                         _ => false,
                     };
+                    // `list<int>` given `[1, "a"]`: each item written out is held to the item type,
+                    // as a value given alone is (FEEDBACK45.md, Q-512; branch feedback40-43). Only
+                    // an item that cannot be one: inferred unions (`x * 2` is `num | dec`) pass.
+                    let bad_item = match (written, p.full.items()) {
+                        (Some(Expr::List(items)), Some(we)) if we.bits != ANY => {
+                            let mut found = None;
+                            for (k, item) in items.iter().enumerate() {
+                                self.quiet += 1;
+                                let it = self.expr(item);
+                                self.quiet -= 1;
+                                if it.bits != 0 && it.bits & we.bits == 0 {
+                                    found = Some((k + 1, it, we));
+                                    break;
+                                }
+                            }
+                            found
+                        }
+                        _ => None,
+                    };
                     if let Some(why) = mismatch(*a, p.full) {
                         self.error(format!("{} of `{}` {}{}", what(), name, why, hides(&sig, name)));
+                    } else if let Some((k, it, we)) = bad_item {
+                        self.error(format!("{} of `{}` must be {}, but its item {} is {}, not {}{}", what(), name, t_text(p.full), k, t_text(it), t_text(we), hides(&sig, name)));
                     // A parameter that takes decimals takes what `/` gives: rounding
                     // it would lose the cents (FEEDBACK25.md, Q-321; branch feedback26-fixes).
                     } else if divided && p.ty & INT != 0 && p.ty & FLOAT == 0 && p.ty & DEC == 0 && a.bits & FLOAT != 0 {
@@ -4555,6 +5032,9 @@ impl Checker {
             }
         }
         // A piped value is the SQL: the pipe looks at it (see `Expr::Pipe`).
+        if sig.builtin {
+            self.lambda_arity(name, arg_exprs);
+        }
         if sig.builtin && matches!(name, "db.query" | "db.one" | "db.exec" | "db.exec_many") && args.len() == arg_exprs.len() {
             if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
                 self.warn_sql(name);
@@ -4705,7 +5185,8 @@ impl Checker {
             }
             _ => {
                 if t.bits != 0 {
-                    let hint = if name == "length" && t.bits & (LIST | STR) != 0 { ": `len(x)` is how many it holds" } else { "" };
+                    let near_len = matches!(name, "length" | "lenght" | "lengh" | "size" | "count") || osa_distance(name, "length") <= 2;
+                    let hint = if near_len && t.bits & (LIST | STR) != 0 { ": `len(x)` is how many it holds" } else { "" };
                     self.error(format!("{} has no field `{}`{}", bits_text(t.bits), name, hint));
                 }
                 T::ANY
@@ -4726,6 +5207,33 @@ impl Checker {
             self.expr(c);
         }
         let is_view = el.tag.chars().next().map_or(false, |c| c.is_uppercase());
+        // `<card/>` for `view Card`: an element no browser has, written to the page as it is
+        // (FEEDBACK45.md, Q-509; branch feedback40-43).
+        const ELEMENTS: &[&str] = &[
+            "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button",
+            "canvas", "caption", "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl",
+            "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header",
+            "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu",
+            "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p", "param", "picture", "pre", "progress", "q",
+            "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span", "strong", "style", "sub",
+            "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track", "u",
+            "ul", "var", "video", "wbr", "svg", "math", "center", "font", "marquee", "big", "tt", "strike", "frame", "frameset", "noframes",
+            // SVG's own.
+            "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "text", "tspan", "textpath", "use", "symbol", "defs",
+            "marker", "mask", "pattern", "clippath", "lineargradient", "radialgradient", "stop", "image", "foreignobject", "filter",
+            "animate", "animatetransform", "animatemotion", "set", "desc", "metadata", "switch", "view", "fegaussianblur", "feoffset",
+            "feblend", "fecolormatrix", "feflood", "fecomposite", "femerge", "femergenode", "feturbulence", "fedisplacementmap",
+        ];
+        if !is_view && !el.tag.contains('-') && !ELEMENTS.contains(&el.tag.to_ascii_lowercase().as_str()) && !self.is_local(&el.tag) {
+            let mut cap = el.tag.clone();
+            if let Some(f) = cap.get_mut(0..1) {
+                f.make_ascii_uppercase();
+            }
+            if cap != el.tag && self.globals.get(&cap).is_some_and(|g| g.sig.is_some() && &*g.file != "<builtin>") {
+                self.line = el.line;
+                self.warn(format!("<{}> is no HTML element, and is written to the page as it is: the view is <{}>", el.tag, cap));
+            }
+        }
         let mut given: Vec<(String, T)> = Vec::new();
         let mut spread = false;
         for (name, v) in &el.attrs {
@@ -4743,7 +5251,22 @@ impl Checker {
                 }
             };
             self.line = el.line;
+            if !is_view {
+                self.attr_typo(&el.tag, name);
+            }
             if let Some(ev) = name.strip_prefix('@') {
+                // A handler's answer goes nowhere, its last statement's too: `items.push(1)`
+                // there changes nothing (FEEDBACK45.md, Q-505; branch feedback40-43).
+                if let AttrVal::Expr(Expr::Lambda(d)) = v {
+                    let last = match &d.body {
+                        Expr::Block(stmts) => stmts.last().cloned(),
+                        e => Some(Stmt::Expr(e.clone())),
+                    };
+                    if let Some(last) = last {
+                        self.answer_dropped(&last);
+                        self.op_dropped(&last);
+                    }
+                }
                 if is_view {
                     self.error(format!("<{}> is a view; `@{}` handlers go on HTML elements", el.tag, ev));
                 } else if t.bits != 0 && t.bits & FN == 0 {
@@ -5521,6 +6044,134 @@ fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// The names `e` reads whenever it runs: not inside a function it makes (which may run later,
+/// or never), nor in a branch of `if`, `match`, `&&`, `||` or `??` that may not be taken
+/// (FEEDBACK45.md, Q-514; found in review). Names it binds go in `bound`.
+fn sure_reads(e: &Expr, bound: &mut HashSet<String>, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(n, _) => out.push(n.to_string()),
+        Expr::Lambda(_) => {}
+        Expr::Block(stmts) => {
+            for st in stmts {
+                match st {
+                    Stmt::Let(p, v, _) => {
+                        sure_reads(v, bound, out);
+                        let mut names = Vec::new();
+                        pattern_names(p, &mut names);
+                        bound.extend(names);
+                    }
+                    Stmt::Fn(f) => {
+                        bound.insert(f.name.clone());
+                    }
+                    Stmt::State(n, v, _) => {
+                        sure_reads(v, bound, out);
+                        bound.insert(n.to_string());
+                    }
+                    Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::Return(Some(x), _) => sure_reads(x, bound, out),
+                    _ => {}
+                }
+            }
+        }
+        Expr::If(c, ..) => sure_reads(c, bound, out),
+        Expr::Match(subj, ..) => sure_reads(subj, bound, out),
+        Expr::Binary(BinOp::And | BinOp::Or, a, _, _) => sure_reads(a, bound, out),
+        Expr::Binary(_, a, b, _) => {
+            sure_reads(a, bound, out);
+            sure_reads(b, bound, out);
+        }
+        Expr::Unary(_, x, _) | Expr::Field(x, _, _) => sure_reads(x, bound, out),
+        Expr::Call(f, args, _) => {
+            sure_reads(f, bound, out);
+            args.iter().for_each(|a| sure_reads(a, bound, out));
+        }
+        Expr::List(xs) => xs.iter().for_each(|x| sure_reads(x, bound, out)),
+        Expr::Map(entries) => entries.iter().for_each(|(_, v)| sure_reads(v, bound, out)),
+        _ => {}
+    }
+}
+
+/// The type a name is a slip of: one letter off, or two swapped (`intt`, `itn`, `strr`,
+/// `lsit`). Not a word a program names things by (`data`, `body`, `key`): found in review.
+fn type_typo(name: &str) -> Option<&'static str> {
+    if name.chars().count() < 3 || matches!(name, "data" | "date" | "body" | "key" | "name" | "val" | "item" | "list" | "map") {
+        return None;
+    }
+    crate::parser::TYPE_NAMES.iter().copied().find(|t| osa_distance(name, t) == 1)
+}
+
+/// What another language calls something Quillo has (FEEDBACK45.md, Q-517).
+fn other_language(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "None" | "undefined" | "nil" | "NULL" | "Nothing" => "null",
+        "True" | "TRUE" => "true",
+        "False" | "FALSE" => "false",
+        "parseInt" | "Number" | "parseFloat" | "Integer" => "int",
+        "String" | "toString" => "str",
+        "toUpperCase" => "upper",
+        "toLowerCase" => "lower",
+        "length" | "size" | "count_of" => "len",
+        "integer" => "int",
+        "string" => "str",
+        "boolean" => "bool",
+        "puts" | "println" | "printf" | "echo" => "print",
+        "where" => "filter",
+        "console" => "print",
+        "JSON" => "json",
+        "Math" => "math",
+        _ => return None,
+    })
+}
+
+/// The candidate nearest `name`, by edit distance with a swap of two letters one edit (`lne`,
+/// `pirnt`), case aside: at most 2 edits, fewer than `name` has letters. Ties go to the same
+/// first letter, then the alphabet, so the answer is the same every run (FEEDBACK45.md, Q-517;
+/// branch feedback40-43).
+fn closest<'a>(name: &str, cands: impl Iterator<Item = &'a str>) -> Option<String> {
+    let lower = name.to_lowercase();
+    let first = lower.chars().next();
+    let mut best: Option<(usize, bool, String)> = None;
+    for c in cands {
+        let lc = c.to_lowercase();
+        if lc == lower {
+            continue;
+        }
+        let d = osa_distance(&lower, &lc);
+        if d > 2 || d >= name.chars().count() {
+            continue;
+        }
+        let other_first = lc.chars().next() != first;
+        let key = (d, other_first, c.to_string());
+        if best.as_ref().map_or(true, |b| key < *b) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, _, c)| c)
+}
+
+/// Levenshtein distance where two letters swapped are one edit (optimal string alignment).
+fn osa_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
 fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
     walk_expr(e, &mut |x| {
         if let Expr::Block(stmts) = x {
@@ -5594,19 +6245,10 @@ pub(crate) fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
     }
 }
 
+/// Edits from `a` to `b`, two letters swapped one of them (`pirnt`, `lne`), so a swap is as near
+/// as a letter left out (FEEDBACK45.md, Q-517; branch feedback40-43).
 pub fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for i in 1..=a.len() {
-        let mut cur = vec![i; b.len() + 1];
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        prev = cur;
-    }
-    prev[b.len()]
+    osa_distance(a, b)
 }
 
 /// The names a file seems to define at its top level, read from its text

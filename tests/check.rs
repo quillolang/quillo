@@ -456,7 +456,8 @@ fn while_loops_are_checked() {
     clean("fn f(n: int) {\n  let i = 0\n  while i < n { i += 1 }\n  i\n}");
     one("fn f() {\n  while nope { }\n}", "unknown name `nope`");
     // As with `if`: 0 is true.
-    one("fn f(n: int) {\n  while n { }\n}", "`n` counts as true even when it is 0");
+    // (A body that changes `n`: one that does not is a loop that never ends, said too.)
+    one("fn f(n: int) {\n  while n { n = 0 }\n}", "`n` counts as true even when it is 0");
 }
 
 #[test]

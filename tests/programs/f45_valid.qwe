@@ -1,0 +1,47 @@
+fn tot(xs: list<int>) = sum(xs)
+let data = json.parse("[1, 2]")
+print(tot(data | map((x) => x * 2)))
+print(tot([data[0] + 1, 2]))
+print(tot([len("a"), int("3") ?? 0]))
+fn half(n: int) = [n / 2, n]
+fn make() = () => later
+let gg = make()
+fn adder(n) = (x) => x + base + n
+let add2 = adder(2)
+fn outer() {
+    fn inner(item) = item * 2
+    inner(3)
+}
+print(outer())
+fn default_n() = base_n
+type Cfg = { n: int = default_n() }
+fn f(x) = if x { later } else { 0 }
+print(f(false))
+let later = 1
+let base = 10
+let base_n = 3
+let item = 5
+print(gg(), add2(1), Cfg({}))
+fn g() {
+    let h = (a) => a
+    h = (a, b) => a + b
+    h(1, 2)
+}
+let one_ok = match 1.0 { 1 => "one", _ => "other" }
+route GET /a/:id {
+    let id2 = int(id) ?? 0
+    id2 + 1
+}
+route GET /b/:n = [1, 2] | map((n) => n * 2)
+route POST /c { json: body } = body
+route GET /d ? { q: name } = name
+view V() = <div><link rel="preload" href="/x.css" onload="this.rel='stylesheet'"/><img src="/a.png" ismap/><div x-data="{}"></div><svg><filter><feTurbulence seed="2"/><feDisplacementMap scale="3"/></filter></svg><p @changed={() => 1} @shown={() => 2}>p</p></div>
+fn loops() {
+    let done = false
+    let set_done = () => { done = true }
+    let i = 0
+    while !done { i += 1; if i > 3 { set_done() } }
+    i
+}
+let one = 1
+let [p1] = [1.0]

@@ -197,9 +197,27 @@
 - **Two elements side by side in a view** say so, not "comparisons do not chain" (Q-521).
 - **Numbers**: `1__000`, `1_`, `08`, `010` and `1.` are errors that say how to write them,
   there is no `--` (`--n` was `n`), a map takes one `,` between entries, and a lone CR is
-  a line break (Q-529). What changes: a program with one of these no longer loads.
+  a line break, in a string too, as Python's universal newlines read one (Q-529). What
+  changes: a program with one of these no longer loads.
 - **The command line**: `quillo check main` finds `main.qwe`, `--policy` without its file
   says so, and the summary says `1 route` (Q-528).
+- **New errors in `quillo check`**, each a program that fails or misbehaves as it runs: a
+  parameter, a field, a local `fn` or `state` named twice (Q-508); a pattern's type that
+  does not exist (Q-504); a `let` or `match` that cannot match (Q-516); a lambda's argument
+  count, by its `let` name or given to `map`, `reduce` and the like (Q-515); `list<int>`
+  given `[1, "a"]` (Q-512); `request.qurey` (Q-511); a call from top-level code to what
+  reads a global defined later (Q-514). What changes: a program with one of these no longer
+  starts until it is fixed (the kit's `nav_search` had one: its own `set` hid the builtin).
+- **New warnings**: a dropped `push`/`sort`/`i + 1` and a `while` nothing in it ends (Q-505);
+  arms that never run (Q-527); `intt =>` (Q-504); `index_of(...) == -1`, `if ready {`, `:id + 1`
+  (Q-513); misspelt attributes and events, `className`, `<card>` for a view (Q-509).
+- **"Did you mean" is the same every run** and counts two letters swapped as one edit
+  (`pirnt` → `print`, `lne` → `len`); it knows other languages' names (`None`, `undefined`,
+  `console.log`, `parseInt`, `toUpperCase`) and is given for module functions
+  (`json.prase`), methods, `xs.lenght` and types (`integer`, `string`, `Int`) (Q-517).
+- **Types written another language's way** say how Quillo writes them: `int: a` swapped,
+  `a int`, `int a`, `int[]`, `list[int]`, `a?: int`, `?int`, `): int`, `let x: int`, `state
+  n: int`, and in an arrow's parameters the type's own error (Q-519).
 
 ### Developer tools and the browser (FEEDBACK42.md)
 

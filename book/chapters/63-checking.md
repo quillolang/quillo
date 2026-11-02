@@ -10,6 +10,13 @@ defined, names defined twice, names a file did not take, wrong argument counts a
 work, division by a written zero, return and error types, effects, view and component props,
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
+Also: a parameter, a record's field, or a local `fn` or `state` named twice; a pattern's
+type the program has not (`Usr`); a `let` or a `match` that cannot match what it is given
+(`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
+by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
+whose item is not what `list<T>` takes (`[1, "a"]` for `list<int>`); a field `request`
+does not have (`request.qurey`); and top-level code calling a function that reads a
+global defined further down.
 When a call to a function of your own named like a builtin (`notify`, `first`) has the
 wrong arguments, the error says so: this `notify` is the program's own, from line 1,
 which hides the builtin `notify`.
@@ -24,7 +31,14 @@ transaction that retries; a live loader fed only by a service; a class a sheet s
 that nothing writes; a `.qwer` function that cannot be exported; `sleep` given a number
 written between 0 and 1 (`sleep` takes milliseconds: `` `sleep(0.2)` waits 0.2 ms; for 0.2
 seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `with`
-function without `db`; a service whose file is not here. Warnings never make
+function without `db`; a service whose file is not here; a name in a pattern that takes
+any value and goes unused, or reads like a type (`intt =>`); an arm that never runs
+after one that takes any value, or with a value an arm before it has; `xs.push(2)`,
+`sort(xs)` or `i + 1` alone, which make a value and drop it; a `while` whose condition
+nothing in it changes; `"Hello ${name}"` in a plain string; `index_of(...) == -1`, a
+function used as a condition (`if ready {`), and a path's untyped parameter added to a
+number; a misspelt attribute or event (`clas`, `@clik`), `className`, and `<card>` for a
+view `Card`; a name imported as a builtin's. Warnings never make
 it fail.
 
 [`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)

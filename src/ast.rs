@@ -77,6 +77,8 @@ pub struct Arm {
     pub pat: Pattern,
     pub guard: Option<Expr>,
     pub body: Expr,
+    /// The line its pattern is on.
+    pub line: u32,
 }
 
 /// A type annotation: one type name or a union such as `int | str`.
