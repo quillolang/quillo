@@ -405,7 +405,7 @@ fn highlight_is_the_same_on_both_sides() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let r = run_page_with(&chrome, &dir.join("highlight.qwe"), free_port(), Some(&dir.join("highlight.js")));
-    let want = serde_json::json!({ "samples": 10, "same": true, "differ": [], "coloured": 9, "errors": [] });
+    let want = serde_json::json!({ "samples": 11, "same": true, "differ": [], "coloured": 10, "errors": [] });
     assert_eq!(r, want);
 }
 

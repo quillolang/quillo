@@ -11,6 +11,8 @@ let SAMPLES = [
     ["rust", "pub fn f(x: &str) -> Option<String> { Some(x.to_string()) } // c"],
     ["json", "{\"a\": [1, true, null], \"b\": \"c\"}"],
     ["sh", "export A=1 # c\nif [ -f x ]; then echo \"hi\"; fi"],
+    // A route's path starts no comment; `with`, `routes` and `import` are keywords.
+    ["qwe", "route ANY /*rest = respond(404, rest) // last\nroutes /*x with db { }\nimport lib/a.qwe use b\nroute GET /a /* note */\nroute get /*x*/"],
     ["nope", "<b> & 'x'"],
 ]
 

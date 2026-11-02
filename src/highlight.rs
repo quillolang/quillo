@@ -23,7 +23,7 @@ const QWE: Lang = Lang {
     line: &["//"],
     block: Some(("/*", "*/")),
     quotes: "\"`",
-    keywords: &["let", "fn", "view", "component", "server", "route", "use", "import", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
+    keywords: &["let", "fn", "view", "component", "server", "route", "routes", "use", "import", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not", "with"],
     consts: &["true", "false", "null", "int", "str", "bool", "float", "dec", "map", "list", "any"],
     types: true,
     tags: true,
@@ -202,6 +202,25 @@ fn starts(s: &[char], i: usize, p: &str) -> bool {
     true
 }
 
+/// Whether `i` is in a route's path (`route ANY /*rest`, `routes /admin`, `mount /blog`),
+/// which the lexer reads as a path: `/*` there starts no comment (branch feedback40-43).
+fn in_route_path(s: &[char], i: usize) -> bool {
+    let mut b = i;
+    while b > 0 && s[b - 1] != '\n' {
+        b -= 1;
+    }
+    let line: String = s[b..i].iter().collect();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let partial = if line.ends_with(char::is_whitespace) || words.is_empty() { "" } else { words[words.len() - 1] };
+    let before = &words[..words.len() - usize::from(!partial.is_empty())];
+    let after = match before {
+        ["route", m] => m.chars().all(|c| c.is_ascii_uppercase()),
+        ["routes"] | ["mount"] => true,
+        _ => false,
+    };
+    after && (partial.is_empty() || partial.starts_with('/'))
+}
+
 fn ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || c == '$'
 }
@@ -242,7 +261,7 @@ pub fn highlight(code: &str, lang: &str) -> String {
         }
         let block = l.block.or(if l.tags { Some(("<!--", "-->")) } else { None });
         if let Some((open, close)) = block {
-            if starts(&s, i, open) && !(l.tags && open == "/*" && in_tag) {
+            if starts(&s, i, open) && !(l.tags && open == "/*" && in_tag) && !(std::ptr::eq(l, &QWE) && in_route_path(&s, i)) {
                 let mut j = i + open.chars().count();
                 while j < s.len() && !starts(&s, j, close) {
                     j += 1;
@@ -427,6 +446,21 @@ mod tests {
     fn html_tags_and_attributes() {
         let h = highlight("<a href=\"/x\">y</a>", "html");
         assert_eq!(h, "&lt;<span class=\"hl-t\">a</span> <span class=\"hl-a\">href</span>=<span class=\"hl-s\">&quot;/x&quot;</span>&gt;y&lt;/<span class=\"hl-t\">a</span>&gt;");
+    }
+
+    #[test]
+    fn a_route_path_starts_no_comment() {
+        // `/*rest` is a path, as the lexer reads it; the rest of the line is code.
+        let h = highlight("route ANY /*rest = respond(404, rest) // last", "qwe");
+        assert!(h.starts_with("<span class=\"hl-k\">route</span> <span class=\"hl-t\">ANY</span> /*rest = <span class=\"hl-f\">respond</span>"), "{}", h);
+        assert!(h.ends_with("<span class=\"hl-c\">// last</span>"), "{}", h);
+        let h = highlight("routes /*x with db { }\nmount /*m = \"a.qwe\"", "qwe");
+        assert!(!h.contains("hl-c"), "{}", h);
+        assert!(h.contains("<span class=\"hl-k\">with</span>"), "{}", h);
+        // Elsewhere `/*` is a comment still, a lower-case word before it too.
+        assert!(highlight("let x = 1 /* one */", "qwe").contains("<span class=\"hl-c\">/* one */</span>"));
+        assert!(highlight("route get /*x*/", "qwe").contains("hl-c"));
+        assert!(highlight("route GET /a /* note */", "qwe").contains("<span class=\"hl-c\">/* note */</span>"));
     }
 
     #[test]

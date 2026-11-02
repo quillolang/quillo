@@ -1604,7 +1604,7 @@ B.notify = meta((message, options) => {
 const HL = (() => {
   const L = (o) => Object.assign({ line: [], block: null, quotes: "", keywords: [], consts: [], types: false, tags: false, css: false, json: false, nocase: false }, o);
   const qwe = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"`", types: true, tags: true,
-    keywords: ["let", "fn", "view", "component", "server", "route", "use", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not"],
+    keywords: ["let", "fn", "view", "component", "server", "route", "routes", "use", "import", "if", "else", "match", "for", "in", "return", "reply", "as", "while", "break", "continue", "type", "and", "or", "not", "with"],
     consts: ["true", "false", "null", "int", "str", "bool", "float", "dec", "map", "list", "any"] });
   const js = L({ line: ["//"], block: ["/*", "*/"], quotes: "\"'`", types: true,
     keywords: ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "export", "extends", "finally", "for",
@@ -1639,6 +1639,16 @@ const HL = (() => {
   const digit = (c) => c !== undefined && c >= "0" && c <= "9";
   const identStart = (c) => alpha(c) || c === "_" || c === "$";
   const identChar = (c, isCss) => alnum(c) || c === "_" || c === "$" || (isCss && c === "-");
+  // In a route's path (`route ANY /*rest`, `routes /admin`, `mount /blog`) `/*` starts no
+  // comment, as the lexer reads a path (highlight.rs in_route_path; branch feedback40-43).
+  const inRoutePath = (s, i) => {
+    let b = i; while (b > 0 && s[b - 1] !== "\n") b--;
+    const line = s.slice(b, i).join(""), words = line.split(/\s+/).filter(Boolean);
+    const partial = /\s$/.test(line) || !words.length ? "" : words[words.length - 1];
+    const before = partial ? words.slice(0, -1) : words;
+    const after = (before.length === 2 && before[0] === "route" && /^[A-Z]*$/.test(before[1])) || (before.length === 1 && (before[0] === "routes" || before[0] === "mount"));
+    return after && (!partial || partial[0] === "/");
+  };
   return (code, name) => {
     const l = langs[String(name || "").toLowerCase()] || plain;
     const s = Array.from(code);
@@ -1650,7 +1660,7 @@ const HL = (() => {
     while (i < n) {
       const c = s[i];
       if (l.line.some((p) => starts(i, p))) { let j = i; while (j < n && s[j] !== "\n") j++; span(i, j, "hl-c"); i = j; continue; }
-      if (block && starts(i, block[0]) && !(l.tags && block[0] === "/*" && inTag)) {
+      if (block && starts(i, block[0]) && !(l.tags && block[0] === "/*" && inTag) && !(l === qwe && inRoutePath(s, i))) {
         let j = i + Array.from(block[0]).length; while (j < n && !starts(j, block[1])) j++;
         j = Math.min(j + Array.from(block[1]).length, n); span(i, j, "hl-c"); i = j; continue;
       }
